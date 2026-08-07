@@ -89,7 +89,14 @@ _FORBIDDEN_PHYSICAL_ATTRIBUTES = {
 }
 
 
-LoopStack = tuple[tuple[IRType, ...] | None, ...]
+@dataclass(frozen=True, slots=True)
+class LoopFrame:
+    carried_types: tuple[IRType, ...]
+    allow_break: bool
+    allow_continue: bool
+
+
+LoopStack = tuple[LoopFrame, ...]
 
 
 class Verifier:
@@ -291,7 +298,7 @@ class Verifier:
         terminator = block.operations[-1]
         is_loop_exit = terminator.opcode in (OpCode.BREAK, OpCode.CONTINUE)
         if terminator.opcode is not expected_terminator and not (
-            is_loop_exit and loop_stack and loop_stack[-1] is not None
+            is_loop_exit and self._loop_exit_allowed(terminator.opcode, loop_stack)
         ):
             self._error(
                 terminator.location,
@@ -411,20 +418,24 @@ class Verifier:
             state_types = tuple(operation.result_types)
             region_yields = (state_types, state_types)
             region_loop_stacks = (
-                loop_stack + (None,),
-                loop_stack + (state_types,),
+                loop_stack + (LoopFrame((), False, False),),
+                loop_stack + (LoopFrame(state_types, True, True),),
             )
         elif operation.opcode is OpCode.STATE_STREAM:
             state_types = self._state_stream_types(operation)
             region_yields = (state_types,)
-            region_loop_stacks = (loop_stack + (None,),)
+            region_loop_stacks = (
+                loop_stack + (LoopFrame(state_types, False, True),),
+            )
         elif operation.opcode in (OpCode.ORDERED, OpCode.FOR):
             state_types = tuple(operation.result_types)
             region_yields = (state_types,)
-            region_loop_stacks = (loop_stack + (state_types,),)
+            region_loop_stacks = (
+                loop_stack + (LoopFrame(state_types, True, True),),
+            )
         elif operation.opcode is OpCode.PARALLEL:
             region_yields = ((),)
-            region_loop_stacks = (loop_stack + (None,),)
+            region_loop_stacks = (loop_stack + (LoopFrame((), False, False),),)
         else:
             region_yields = ((),) * len(operation.regions)
             region_loop_stacks = (loop_stack,) * len(operation.regions)
@@ -635,16 +646,24 @@ class Verifier:
                     offset=1,
                 )
         elif operation.opcode in (OpCode.BREAK, OpCode.CONTINUE):
-            if not loop_stack or loop_stack[-1] is None:
+            if not self._loop_exit_allowed(operation.opcode, loop_stack):
                 self._error(operation.location, "loop exit is only legal inside an iteration region")
                 return
-            carried_types = loop_stack[-1]
-            assert carried_types is not None
             self._verify_operand_types(
                 operation,
-                carried_types,
+                loop_stack[-1].carried_types,
                 operation.opcode.value,
             )
+
+    def _loop_exit_allowed(self, opcode: OpCode, loop_stack: LoopStack) -> bool:
+        if not loop_stack:
+            return False
+        frame = loop_stack[-1]
+        if opcode is OpCode.BREAK:
+            return frame.allow_break
+        if opcode is OpCode.CONTINUE:
+            return frame.allow_continue
+        return False
 
     def _verify_operand_types(
         self,
