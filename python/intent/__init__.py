@@ -9,6 +9,8 @@ from .errors import IntentError
 from .errors import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_kernel_ir
+from .mlir import emit_mlir
+from .mlir import lower_to_mlir
 
 
 __all__ = [
@@ -23,4 +25,6 @@ __all__ = [
     "kernel",
     "FrontendError",
     "lower_to_kernel_ir",
+    "emit_mlir",
+    "lower_to_mlir",
 ]
