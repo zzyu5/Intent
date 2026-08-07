@@ -1,0 +1,88 @@
+# Ragged MoE Expert Kernel DSL 模板
+
+这个 kernel 消费调用方已经准备好的 expert membership，不在 kernel 内隐式选择 routing/grouping 算法。
+
+## Canonical kernel
+
+```python
+@intent.kernel
+def moe_expert_ffn(
+    x: I.In[I.f16, ("T", "D")],
+    route_offsets: I.In[I.i32, ("E_PLUS_1",)],
+    member_routes: I.In[I.i32, ("R",)],
+    route_token: I.In[I.i32, ("NR",)],
+    route_weights: I.In[I.f32, ("NR",)],
+    w1: I.In[I.f16, ("E", "D", "F")],
+    w2: I.In[I.f16, ("E", "F", "D")],
+    y: I.InOut[I.f32, ("T", "D")],
+):
+    T, D = x.shape
+    E, _, F = w1.shape
+
+    groups = I.ragged(
+        outer=I.domain(0, E),
+        offsets=route_offsets,
+        indices=member_routes,
+    )
+
+    for expert in I.parallel(groups.outer):
+        for rr in I.parallel(
+            I.partition(
+                groups[expert],
+                extent=I.auto("ROUTE_TILE"),
+            )
+        ):
+            routes = I.members(rr)
+            token = I.gather(route_token, index=routes)
+            rw = I.gather(route_weights, index=routes)
+            xv = I.gather(x, index=(token, slice(None)))
+
+            h = I.contract(
+                xv,
+                w1[expert, :, :],
+                reduce=((1, 0),),
+                acc_dtype=I.f32,
+            )
+            h = I.maximum(h, 0.0)
+
+            route_out = I.contract(
+                h,
+                w2[expert, :, :],
+                reduce=((1, 0),),
+                acc_dtype=I.f32,
+            )
+
+            I.scatter_reduce(
+                y,
+                index=(token, slice(None)),
+                value=rw[:, None] * route_out,
+                combine=I.add,
+            )
+```
+
+Wrapper 按该算法的调用约定初始化 `y`，例如在 invocation 前清零。
+
+## Source 固定
+
+- 调用方提供的 expert membership；
+- route 到 token 的 relation；
+- expert-selected W1/W2 contractions；
+- activation；
+- router weight；
+- duplicate route 对同一 token 的 `add` combine；
+- `y` 的 InOut ABI。
+
+## Physical Plan 决定
+
+- ragged route tile；
+- static 或 persistent ownership；
+- expert scheduling；
+- MMA/CPU-RVV microkernel；
+- storage、layout 与 pipeline；
+- gather/scatter physical mechanism。
+
+## 边界
+
+`I.ragged` 只解释 `route_offsets` 与 `member_routes`，不执行 grouping，不生成 offsets，也不在 histogram、sort、atomic bucket 或 radix grouping 中做选择。
+
+Routing/grouping 是另一个算法阶段时，由 wrapper 调用明确的 Intent kernel、target-specific kernel 或 `intent.algorithms.*` implementation。
