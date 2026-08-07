@@ -14,5 +14,5 @@ cmake --build "${build_root}" --target intent-opt
 
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="${project_root}/python" \
-python "${project_root}/examples/repro/vector_add.py" \
+python "${project_root}/examples/repro/frontend_triton.py" \
   --intent-opt "${build_root}/tools/intent-opt/intent-opt"
