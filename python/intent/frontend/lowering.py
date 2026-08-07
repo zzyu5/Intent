@@ -257,6 +257,32 @@ class FunctionLowerer:
             self.error(node, str(error))
         return self.value_result_type(lhs_dtype, shape)
 
+    def broadcast_value(
+        self,
+        value: Value,
+        result_shape: tuple[object, ...],
+        node: ast.AST,
+    ) -> Value:
+        dtype, source_shape = self.dtype_and_shape(value.type, node)
+        target_shape = tuple(result_shape)
+        if tuple(source_shape) == target_shape:
+            return value
+        if not target_shape:
+            self.error(node, "tensor value cannot broadcast to a scalar")
+        try:
+            broadcasted = tuple(broadcast_shape(source_shape, target_shape))
+        except ValueError as error:
+            self.error(node, str(error))
+        if broadcasted != target_shape:
+            self.error(node, "value cannot broadcast to the required result shape")
+        operation = self.emit(
+            OpCode.BROADCAST,
+            self.location(node),
+            operands=(value,),
+            result_types=(TensorType(dtype, target_shape),),
+        )
+        return operation.results[0]
+
     def dtype_and_shape(
         self,
         value_type: IRType,

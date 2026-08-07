@@ -13,7 +13,6 @@ from intent.ir import RaggedType
 from intent.ir import RecordType
 from intent.ir import ScalarType
 from intent.ir import TensorType
-from intent.ir import TupleType
 from intent.ir import UnaryOperator
 from intent.ir import Value
 from intent.language import DType
@@ -194,6 +193,9 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
         return Literal(result)
     lhs_value, rhs_value = lowerer.coerce_pair(lhs, rhs, node)
     result_type = lowerer.broadcast_result_type(lhs_value.type, rhs_value.type, node)
+    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    lhs_value = lowerer.broadcast_value(lhs_value, result_shape, node)
+    rhs_value = lowerer.broadcast_value(rhs_value, result_shape, node)
     operation = lowerer.emit(
         OpCode.BINARY,
         lowerer.location(node),
@@ -216,6 +218,9 @@ def _lower_bool(lowerer: object, node: ast.BoolOp) -> Expression:
     for next_value in values[1:]:
         lhs, rhs = lowerer.coerce_pair(result, next_value, node)
         result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+        _, result_shape = lowerer.dtype_and_shape(result_type, node)
+        lhs = lowerer.broadcast_value(lhs, result_shape, node)
+        rhs = lowerer.broadcast_value(rhs, result_shape, node)
         operation = lowerer.emit(
             OpCode.BINARY,
             lowerer.location(node),
@@ -248,6 +253,8 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
             lhs, rhs = lowerer.coerce_pair(left, right, node)
             value_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
             _, shape = lowerer.dtype_and_shape(value_type, node)
+            lhs = lowerer.broadcast_value(lhs, shape, node)
+            rhs = lowerer.broadcast_value(rhs, shape, node)
             result_type = lowerer.value_result_type(intent_bool, shape)
             operation = lowerer.emit(
                 OpCode.COMPARE,
@@ -266,6 +273,9 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
     for comparison in comparisons[1:]:
         lhs, rhs = lowerer.coerce_pair(result, comparison, node)
         result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+        _, result_shape = lowerer.dtype_and_shape(result_type, node)
+        lhs = lowerer.broadcast_value(lhs, result_shape, node)
+        rhs = lowerer.broadcast_value(rhs, result_shape, node)
         operation = lowerer.emit(
             OpCode.BINARY,
             lowerer.location(node),
@@ -287,6 +297,10 @@ def _lower_if_expression(lowerer: object, node: ast.IfExp) -> Expression:
     false_value = lowerer.lower_expression(node.orelse)
     lhs, rhs = lowerer.coerce_pair(true_value, false_value, node)
     result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    condition_value = lowerer.broadcast_value(condition_value, result_shape, node)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node)
+    rhs = lowerer.broadcast_value(rhs, result_shape, node)
     operation = lowerer.emit(
         OpCode.SELECT,
         lowerer.location(node),

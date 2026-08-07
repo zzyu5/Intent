@@ -101,7 +101,6 @@ def Intent_TransposeOp : Intent_UnaryOneResultOp<"transpose">;
 def Intent_BroadcastOp : Intent_UnaryOneResultOp<"broadcast">;
 def Intent_FullOp : Intent_UnaryOneResultOp<"full">;
 def Intent_ZerosOp : Intent_NullaryOneResultOp<"zeros">;
-def Intent_MakeTupleOp : Intent_VariadicOneResultOp<"make_tuple">;
 def Intent_MakeRecordOp : Intent_VariadicOneResultOp<"make_record">;
 def Intent_ExtractOp : Intent_UnaryOneResultOp<"extract">;
 

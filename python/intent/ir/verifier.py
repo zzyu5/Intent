@@ -42,8 +42,8 @@ from .types import RaggedType
 from .types import RecordType
 from .types import RegionType
 from .types import ScalarType
+from .types import StaticDim
 from .types import TensorType
-from .types import TupleType
 from .types import broadcast_shape
 from .types import is_boolean
 from .types import is_integer
@@ -102,11 +102,13 @@ LoopStack = tuple[LoopFrame, ...]
 class Verifier:
     def __init__(self) -> None:
         self.diagnostics: list[Diagnostic] = []
+        self._operation_ids: set[int] = set()
         self._value_ids: set[int] = set()
         self._symbols: dict[str, Function] = {}
 
     def verify(self, module: Module) -> None:
         self.diagnostics.clear()
+        self._operation_ids.clear()
         self._value_ids.clear()
         self._symbols.clear()
 
@@ -320,6 +322,9 @@ class Verifier:
         available: set[Value],
         loop_stack: LoopStack,
     ) -> None:
+        if operation.id in self._operation_ids:
+            self._error(operation.location, f"duplicate operation id {operation.id}")
+        self._operation_ids.add(operation.id)
         if len(operation.results) != len(operation.result_types):
             self._error(operation.location, "operation result count is inconsistent")
 
@@ -1048,12 +1053,20 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "view_load requires explicit IndexRelation")
+            indexed_shape = None
         else:
-            self._verify_index_relation(operation, operation.operands[0].type, relation)
+            indexed_shape = self._verify_index_relation(
+                operation, operation.operands[0].type, relation
+            )
         if self._require_results(operation, 1):
-            result_dtype = self._value_dtype(operation.result_types[0])
-            if result_dtype != operation.operands[0].type.dtype:
-                self._error(operation.location, "view_load result must preserve view element dtype")
+            result = operation.result_types[0]
+            if indexed_shape is not None and not self._matches_dtype_shape(
+                result, operation.operands[0].type.dtype, indexed_shape
+            ):
+                self._error(
+                    operation.location,
+                    "view_load result must match indexed view dtype and shape",
+                )
 
     def _verify_view_store(self, operation: Operation) -> None:
         if len(operation.operands) < 2 or not isinstance(operation.operands[0].type, TensorType):
@@ -1062,8 +1075,9 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "view_store requires explicit IndexRelation")
+            indexed_shape = None
         else:
-            self._verify_index_relation(
+            indexed_shape = self._verify_index_relation(
                 operation,
                 operation.operands[0].type,
                 relation,
@@ -1071,6 +1085,10 @@ class Verifier:
             )
         if self._value_dtype(operation.operands[1].type) != operation.operands[0].type.dtype:
             self._error(operation.location, "view_store value must match view element dtype")
+        if indexed_shape is not None:
+            self._verify_indexed_value_shape(
+                operation, operation.operands[1].type, indexed_shape, "view_store"
+            )
         self._require_results(operation, 0)
 
     def _verify_index_relation(
@@ -1080,7 +1098,8 @@ class Verifier:
         relation: IndexRelation,
         *,
         excluded_operand_positions: tuple[int, ...] = (),
-    ) -> None:
+    ) -> tuple[object, ...] | None:
+        valid = True
         consuming_terms = sum(
             term.kind is not IndexTermKind.NEW_AXIS for term in relation.terms
         )
@@ -1089,7 +1108,18 @@ class Verifier:
                 operation.location,
                 "index relation must consume every source axis exactly once",
             )
+            valid = False
+        result_shape: list[object] = []
+        source_axis = 0
         for term in relation.terms:
+            if term.kind is IndexTermKind.NEW_AXIS:
+                result_shape.append(StaticDim(1))
+                continue
+            if source_axis >= len(source.shape):
+                valid = False
+                continue
+            source_dimension = source.shape[source_axis]
+            referenced_values: list[Value] = []
             for position in term.operand_positions:
                 if position is None:
                     continue
@@ -1099,20 +1129,24 @@ class Verifier:
                     or position >= len(operation.operands)
                 ):
                     self._error(operation.location, "index relation references invalid operand")
+                    valid = False
                     continue
                 index_type = operation.operands[position].type
+                referenced_values.append(operation.operands[position])
                 if term.kind is IndexTermKind.REGION_INDEX:
                     if not isinstance(index_type, (DomainType, RegionType)):
                         self._error(
                             operation.location,
                             "logical region index term requires DomainType/RegionType operand",
                         )
+                        valid = False
                 elif term.kind is IndexTermKind.SLICE:
                     if not is_integer(index_type):
                         self._error(
                             operation.location,
                             "dynamic slice bounds must be scalar integer/index",
                         )
+                        valid = False
                 elif isinstance(index_type, TensorType):
                     if index_type.dtype.category not in (
                         DTypeCategory.SIGNED_INTEGER,
@@ -1120,8 +1154,58 @@ class Verifier:
                         DTypeCategory.INDEX,
                     ):
                         self._error(operation.location, "tensor index operand must be integer")
+                        valid = False
                 elif not is_integer(index_type):
                     self._error(operation.location, "index operand must be integer/index")
+                    valid = False
+
+            if term.kind is IndexTermKind.FULL_SLICE:
+                result_shape.append(source_dimension)
+            elif term.kind is IndexTermKind.STATIC_INDEX:
+                static_index = term.static_values[0]
+                if isinstance(source_dimension, StaticDim) and not (
+                    -source_dimension.value <= static_index < source_dimension.value
+                ):
+                    self._error(
+                        operation.location,
+                        "static index is outside the source dimension",
+                    )
+                    valid = False
+            elif term.kind is IndexTermKind.SLICE:
+                result_shape.append(
+                    DynamicDim(f"slice_{operation.operands[0].id}_{source_axis}")
+                )
+            elif term.kind is IndexTermKind.REGION_INDEX and referenced_values:
+                region = referenced_values[0]
+                rank = getattr(region.type, "rank", 1)
+                result_shape.extend(
+                    DynamicDim(f"region_{region.id}_{axis}") for axis in range(rank)
+                )
+            elif term.kind is IndexTermKind.VALUE_INDEX and referenced_values:
+                index_type = referenced_values[0].type
+                if isinstance(index_type, TensorType):
+                    result_shape.extend(index_type.shape)
+            source_axis += 1
+        return tuple(result_shape) if valid else None
+
+    def _verify_indexed_value_shape(
+        self,
+        operation: Operation,
+        value_type: IRType,
+        indexed_shape: tuple[object, ...],
+        subject: str,
+    ) -> None:
+        value_shape = self._value_shape(value_type)
+        if value_shape is None:
+            self._error(operation.location, f"{subject} value must be scalar/tensor")
+            return
+        try:
+            result = tuple(broadcast_shape(value_shape, indexed_shape))
+        except ValueError:
+            self._error(operation.location, f"{subject} value cannot broadcast to indexed shape")
+            return
+        if result != indexed_shape:
+            self._error(operation.location, f"{subject} value cannot broadcast to indexed shape")
 
     def _verify_reshape(self, operation: Operation) -> None:
         if not self._require_operands(operation, 1) or not self._require_results(operation, 1):
@@ -1163,17 +1247,18 @@ class Verifier:
             return
         source = operation.operands[0].type
         result = operation.result_types[0]
-        if not isinstance(source, TensorType) or not isinstance(result, TensorType):
-            self._error(operation.location, "broadcast requires tensor input and result")
+        source_shape = self._value_shape(source)
+        if source_shape is None or not isinstance(result, TensorType):
+            self._error(operation.location, "broadcast requires scalar/tensor input and tensor result")
             return
         try:
-            shape = broadcast_shape(source.shape, result.shape)
+            shape = broadcast_shape(source_shape, result.shape)
         except ValueError:
-            self._error(operation.location, "tensor shapes are not broadcast-compatible")
+            self._error(operation.location, "value and result shapes are not broadcast-compatible")
             return
         if shape != result.shape:
             self._error(operation.location, "broadcast result shape is inconsistent")
-        if source.dtype != result.dtype:
+        if self._value_dtype(source) != result.dtype:
             self._error(operation.location, "broadcast cannot change element dtype")
 
     def _verify_full(self, operation: Operation) -> None:
@@ -1191,13 +1276,6 @@ class Verifier:
         self._require_operands(operation, 0)
         if self._require_results(operation, 1) and not isinstance(operation.result_types[0], TensorType):
             self._error(operation.location, "zeros result must be a tensor")
-
-    def _verify_make_tuple(self, operation: Operation) -> None:
-        if self._require_results(operation, 1):
-            result = operation.result_types[0]
-            expected = TupleType(tuple(operand.type for operand in operation.operands))
-            if result != expected:
-                self._error(operation.location, "tuple result type does not match operands")
 
     def _verify_make_record(self, operation: Operation) -> None:
         if not self._require_results(operation, 1):
@@ -1221,13 +1299,6 @@ class Verifier:
         source = operation.operands[0].type
         key = operation.attributes.get("key")
         expected: IRType | None = None
-        if (
-            isinstance(source, TupleType)
-            and isinstance(key, int)
-            and not isinstance(key, bool)
-            and 0 <= key < len(source.elements)
-        ):
-            expected = source.elements[key]
         if isinstance(source, RecordType) and isinstance(key, str):
             expected = dict(source.fields).get(key)
         if expected is None or not types_compatible(operation.result_types[0], expected):
@@ -1660,6 +1731,7 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "gather requires explicit index relation")
+            indexed_shape = None
         valid_index = operation.attributes.get("valid_operand_index")
         fill_index = operation.attributes.get("fill_operand_index")
         if not self._valid_operand_index(operation, valid_index) or not self._valid_operand_index(
@@ -1672,7 +1744,7 @@ class Verifier:
             self._error(operation.location, "gather valid/fill operands must be distinct")
             return
         if isinstance(relation, IndexRelation):
-            self._verify_index_relation(
+            indexed_shape = self._verify_index_relation(
                 operation,
                 source,
                 relation,
@@ -1687,11 +1759,15 @@ class Verifier:
             self._error(operation.location, "gather fill must match source element dtype")
         if self._value_dtype(result) != source.dtype:
             self._error(operation.location, "gather result must match source element dtype")
-        expected_shape = self._broadcast_value_shape(
-            (valid_type, fill_type, result), operation, "gather validity/fill/result"
-        )
-        if expected_shape is not None and self._value_shape(result) != expected_shape:
-            self._error(operation.location, "gather validity/fill cannot broadcast to result")
+        if indexed_shape is not None:
+            if not self._matches_dtype_shape(result, source.dtype, indexed_shape):
+                self._error(operation.location, "gather result must match indexed source shape")
+            self._verify_indexed_value_shape(
+                operation, valid_type, indexed_shape, "gather valid"
+            )
+            self._verify_indexed_value_shape(
+                operation, fill_type, indexed_shape, "gather fill"
+            )
 
     def _verify_scatter_unique(self, operation: Operation) -> None:
         self._verify_scatter(operation, require_combine=False)
@@ -1711,13 +1787,14 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "scatter requires explicit index relation")
+            indexed_shape = None
         value_index = operation.attributes.get("value_operand_index")
         if not self._valid_operand_index(operation, value_index) or value_index == 0:
             self._error(operation.location, "scatter requires value operand position")
             return
         assert isinstance(value_index, int)
         if isinstance(relation, IndexRelation):
-            self._verify_index_relation(
+            indexed_shape = self._verify_index_relation(
                 operation,
                 destination,
                 relation,
@@ -1725,6 +1802,13 @@ class Verifier:
             )
         if self._value_dtype(operation.operands[value_index].type) != destination.dtype:
             self._error(operation.location, "scatter value must match destination element dtype")
+        if indexed_shape is not None:
+            self._verify_indexed_value_shape(
+                operation,
+                operation.operands[value_index].type,
+                indexed_shape,
+                "scatter",
+            )
         if require_combine:
             element_type = ScalarType(destination.dtype)
             self._verify_callable_schema(
@@ -1772,12 +1856,18 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "buffer_load requires explicit IndexRelation")
+            indexed_shape = None
         else:
-            self._verify_index_relation(operation, source, relation)
-        if self._require_results(operation, 1) and self._value_dtype(
-            operation.result_types[0]
-        ) != source.dtype:
-            self._error(operation.location, "buffer_load result must preserve buffer dtype")
+            indexed_shape = self._verify_index_relation(operation, source, relation)
+        if self._require_results(operation, 1):
+            result = operation.result_types[0]
+            if indexed_shape is not None and not self._matches_dtype_shape(
+                result, source.dtype, indexed_shape
+            ):
+                self._error(
+                    operation.location,
+                    "buffer_load result must match indexed buffer dtype and shape",
+                )
 
     def _verify_buffer_store(self, operation: Operation) -> None:
         if len(operation.operands) < 2 or not isinstance(operation.operands[0].type, BufferType):
@@ -1792,8 +1882,9 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "buffer_store requires explicit IndexRelation")
+            indexed_shape = None
         else:
-            self._verify_index_relation(
+            indexed_shape = self._verify_index_relation(
                 operation,
                 destination,
                 relation,
@@ -1801,6 +1892,13 @@ class Verifier:
             )
         if self._value_dtype(operation.operands[value_index].type) != destination.dtype:
             self._error(operation.location, "buffer_store value must match buffer dtype")
+        if indexed_shape is not None:
+            self._verify_indexed_value_shape(
+                operation,
+                operation.operands[value_index].type,
+                indexed_shape,
+                "buffer_store",
+            )
         self._require_results(operation, 0)
 
     def _verify_atomic_add(self, operation: Operation) -> None:
@@ -1859,8 +1957,9 @@ class Verifier:
         relation = operation.attributes.get("index")
         if not isinstance(relation, IndexRelation):
             self._error(operation.location, "atomic operation requires explicit IndexRelation")
+            indexed_shape = None
         else:
-            self._verify_index_relation(
+            indexed_shape = self._verify_index_relation(
                 operation,
                 target,
                 relation,
@@ -1868,6 +1967,20 @@ class Verifier:
             )
         if self._value_dtype(operation.operands[value_index].type) != target.dtype:
             self._error(operation.location, "atomic value must match target element dtype")
+        if indexed_shape is not None:
+            self._verify_indexed_value_shape(
+                operation,
+                operation.operands[value_index].type,
+                indexed_shape,
+                "atomic",
+            )
+            if compare_and_swap:
+                self._verify_indexed_value_shape(
+                    operation,
+                    operation.operands[compare_index].type,
+                    indexed_shape,
+                    "atomic_cas compare",
+                )
         if not isinstance(operation.attributes.get("ordering"), AtomicOrdering):
             self._error(operation.location, "atomic operation requires AtomicOrdering")
         if not isinstance(operation.attributes.get("scope"), MemoryScope):

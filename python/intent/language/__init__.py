@@ -31,6 +31,7 @@ from .builtins import inf
 from .builtins import log
 from .builtins import mask
 from .builtins import maximum
+from .builtins import minimum
 from .builtins import members
 from .builtins import mutable_load
 from .builtins import ordered
@@ -122,6 +123,7 @@ __all__ = [
     "log",
     "mask",
     "maximum",
+    "minimum",
     "members",
     "mutable_load",
     "ordered",

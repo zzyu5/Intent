@@ -31,7 +31,6 @@ class OpCode(Enum):
     BROADCAST = "broadcast"
     FULL = "full"
     ZEROS = "zeros"
-    MAKE_TUPLE = "make_tuple"
     MAKE_RECORD = "make_record"
     EXTRACT = "extract"
 

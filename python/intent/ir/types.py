@@ -270,19 +270,6 @@ class BufferType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class TupleType(IRType):
-    elements: tuple[IRType, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "elements", tuple(self.elements))
-        if any(not isinstance(element, IRType) for element in self.elements):
-            raise TypeError("tuple elements must be IRType values")
-
-    def format(self) -> str:
-        return "tuple<" + ",".join(str(element) for element in self.elements) + ">"
-
-
-@dataclass(frozen=True, slots=True)
 class RecordType(IRType):
     fields: tuple[tuple[str, IRType], ...]
 
@@ -415,10 +402,6 @@ def types_compatible(lhs: IRType, rhs: IRType) -> bool:
         )
     if isinstance(lhs, ConstexprType) and isinstance(rhs, ConstexprType):
         return types_compatible(lhs.value_type, rhs.value_type)
-    if isinstance(lhs, TupleType) and isinstance(rhs, TupleType):
-        return len(lhs.elements) == len(rhs.elements) and all(
-            types_compatible(a, b) for a, b in zip(lhs.elements, rhs.elements)
-        )
     if isinstance(lhs, RecordType) and isinstance(rhs, RecordType):
         return (
             tuple(name for name, _ in lhs.fields)

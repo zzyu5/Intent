@@ -16,7 +16,6 @@ from intent.ir import StaticDim
 from intent.ir import StreamType
 from intent.ir import SymbolDim
 from intent.ir import TensorType
-from intent.ir import TupleType
 from intent.ir import UnitType
 from intent.language import DType
 
@@ -53,8 +52,6 @@ def emit_type(value_type: IRType) -> str:
         )
         element = emit_dtype(value_type.dtype)
         return f"tensor<{dimensions + 'x' if dimensions else ''}{element}>"
-    if isinstance(value_type, TupleType):
-        return "tuple<" + ", ".join(emit_type(element) for element in value_type.elements) + ">"
     logical_types = (
         (LogicalIndexType, "logical_index"),
         (DomainType, "domain"),
@@ -70,7 +67,7 @@ def emit_type(value_type: IRType) -> str:
     )
     for python_type, mnemonic in logical_types:
         if isinstance(value_type, python_type):
-            return f"!intent.{mnemonic}<{quote(value_type.format())}>"
+            return f"!intent.{mnemonic}<{quote(emit_type_metadata(value_type))}>"
     raise NotImplementedError(
         f"Kernel IR type {type(value_type).__name__} has no Intent MLIR type"
     )
@@ -85,6 +82,13 @@ def emit_dtype(dtype: DType) -> str:
 
 def emit_view_type(value_type: TensorType, access: str) -> str:
     return f"!intent.view<{emit_type(value_type)}, {quote(access)}>"
+
+
+def emit_type_metadata(value_type: IRType) -> str:
+    if isinstance(value_type, EnumType):
+        members = ",".join(f"{name}={value}" for name, value in value_type.members)
+        return f"enum<{value_type.name};{members}>"
+    return value_type.format()
 
 
 def emit_shape_metadata(value_type: IRType) -> list[str] | None:

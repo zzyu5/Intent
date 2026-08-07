@@ -40,7 +40,6 @@ from .types import StaticDim
 from .types import StreamType
 from .types import SymbolDim
 from .types import TensorType
-from .types import TupleType
 from .types import UNIT
 from .types import UnitType
 from .types import broadcast_shape
@@ -50,6 +49,8 @@ from .values import Block
 from .values import Operation
 from .values import Region
 from .values import Value
+from .values import walk_blocks
+from .values import walk_operations
 from .verifier import Diagnostic
 from .verifier import VerificationError
 from .verifier import Verifier
@@ -101,11 +102,12 @@ __all__ = [
     "StreamType",
     "SymbolDim",
     "TensorType",
-    "TupleType",
     "UNIT",
     "UnaryOperator",
     "UnitType",
     "Value",
+    "walk_blocks",
+    "walk_operations",
     "VerificationError",
     "Verifier",
     "broadcast_shape",

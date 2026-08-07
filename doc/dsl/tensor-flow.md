@@ -19,11 +19,15 @@ p = I.exp(x)
 p2 = I.exp2(x)
 y = I.log(x)
 z = I.rsqrt(x)
+hi = I.maximum(x, y)
+lo = I.minimum(x, y)
 
 masked = I.mask(values, valid=predicate, fill=0)
 ```
 
 用户明确选择数学表达。`I.LOG2E` 是 `log2(e)` 的语言常量，用于把自然指数表达式显式改写到 `exp2` 路径。`I.mask` 固定 logical predicate 和 fill relation，不固定 GPU predicate 或物理 tail 机制。
+
+NumPy-style positional broadcasting 是 source 语义；frontend 将每个实际扩张的 operand 正规化为显式 Kernel IR `broadcast` node。Backend 因而消费已经确定的 logical result shape，不重新推断 source broadcasting。
 
 ## Reduction
 

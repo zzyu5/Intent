@@ -18,6 +18,7 @@ from .attributes import emit_dictionary
 from .attributes import emit_effect
 from .types import emit_shape_metadata
 from .types import emit_type
+from .types import emit_type_metadata
 from .types import emit_view_type
 from .types import quote
 
@@ -58,6 +59,9 @@ class MlirEmitter:
             "intent.kind": function.kind.value,
             "intent.parameters": [
                 self._parameter_metadata(parameter.spec) for parameter in function.parameters
+            ],
+            "intent.results": [
+                self._type_metadata(result_type) for result_type in function.result_types
             ],
             "intent.source": function.location.format(),
         }
@@ -118,12 +122,13 @@ class MlirEmitter:
         attributes = {
             f"intent.{key}": value for key, value in operation.attributes.items()
         }
+        attributes["intent.node"] = operation.id
         if operation.effects:
             attributes["intent.effects"] = [
                 emit_effect(effect, operation.operands) for effect in operation.effects
             ]
         attributes["intent.result_types"] = [
-            value_type.format() for value_type in operation.result_types
+            emit_type_metadata(value_type) for value_type in operation.result_types
         ]
         shapes = [emit_shape_metadata(value_type) for value_type in operation.result_types]
         if any(shape is not None for shape in shapes):
@@ -136,7 +141,7 @@ class MlirEmitter:
         metadata: dict[str, object] = {
             "name": spec.name,
             "kind": spec.kind.value,
-            "type": spec.type.format(),
+            "type": emit_type_metadata(spec.type),
         }
         shape = emit_shape_metadata(spec.type)
         if shape is not None:
@@ -145,12 +150,19 @@ class MlirEmitter:
             metadata["view_kind"] = spec.view_kind.name.lower()
             constraints = spec.constraints
             metadata["constraints"] = {
-                "strides": list(constraints.strides) if constraints.strides is not None else [],
+                "strides": list(constraints.strides) if constraints.strides is not None else None,
                 "layout": constraints.layout,
-                "alignment": constraints.alignment if constraints.alignment is not None else 0,
+                "alignment": constraints.alignment,
                 "alias": constraints.alias,
                 "noalias": constraints.noalias,
             }
+        return metadata
+
+    def _type_metadata(self, value_type: object) -> dict[str, object]:
+        metadata: dict[str, object] = {"type": emit_type_metadata(value_type)}
+        shape = emit_shape_metadata(value_type)
+        if shape is not None:
+            metadata["shape"] = shape
         return metadata
 
     def _function_results(self, function: Function) -> str:

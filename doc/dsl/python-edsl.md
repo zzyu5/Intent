@@ -53,6 +53,10 @@ Kernel body 可以包含：
 - structured primitives；
 - logical mutable buffer 与显式 effects。
 
+Tuple 是 source 侧的结构化多值语法：解构、helper 多结果和 loop/stream carry 都按有序 SSA schema lowering。需要通过名称访问字段时使用 `I.record(...)`；tuple 不形成可变 Python object，也不形成 opaque runtime tuple。
+
+解构或赋值目标 `_` 表示丢弃对应结果：它不进入 DSL 环境，也不会形成需要由 structured region 携带的 SSA state。
+
 Kernel body 不允许：
 
 - 任意 Python object mutation；

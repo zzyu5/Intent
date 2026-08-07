@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -74,6 +75,7 @@ class Block:
 
 @dataclass(eq=False, slots=True)
 class Operation:
+    id: int
     opcode: OpCode
     location: Location
     operands: tuple[Value, ...] = ()
@@ -85,6 +87,8 @@ class Operation:
     owner: Block | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if isinstance(self.id, bool) or not isinstance(self.id, int) or self.id < 0:
+            raise ValueError("operation id must be a non-negative integer")
         if not isinstance(self.opcode, OpCode):
             raise TypeError("operation opcode must be an OpCode")
         if not isinstance(self.location, Location):
@@ -111,3 +115,19 @@ class Operation:
 
 class FunctionBodyOwner:
     """Marker protocol implemented structurally by Function."""
+
+
+def walk_blocks(region: Region) -> Iterator[Block]:
+    for block in region.blocks:
+        yield block
+        for operation in block.operations:
+            for nested in operation.regions:
+                yield from walk_blocks(nested)
+
+
+def walk_operations(region: Region) -> Iterator[Operation]:
+    for block in region.blocks:
+        for operation in block.operations:
+            yield operation
+            for nested in operation.regions:
+                yield from walk_operations(nested)

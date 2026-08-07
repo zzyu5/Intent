@@ -43,6 +43,7 @@ def lower_tensor_intrinsic(
         "log": lambda context, call: _unary(context, call, UnaryOperator.LOG),
         "rsqrt": lambda context, call: _unary(context, call, UnaryOperator.RSQRT),
         "maximum": lambda context, call: _binary(context, call, BinaryOperator.MAXIMUM),
+        "minimum": lambda context, call: _binary(context, call, BinaryOperator.MINIMUM),
         "add": lambda context, call: _binary(context, call, BinaryOperator.ADD),
         "any": lambda context, call: _logical_reduce(context, call, any_value=True),
         "all": lambda context, call: _logical_reduce(context, call, any_value=False),
@@ -189,6 +190,9 @@ def _mask(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     except ValueError as error:
         lowerer.error(node, str(error))
     result_type = lowerer.value_result_type(dtype, result_shape)
+    value = lowerer.broadcast_value(value, result_shape, node)
+    predicate = lowerer.broadcast_value(predicate, result_shape, node)
+    fill = lowerer.broadcast_value(fill, result_shape, node)
     operation = lowerer.emit(
         OpCode.MASK,
         lowerer.location(node),
@@ -225,6 +229,9 @@ def _binary(
     rhs_expression = lowerer.lower_expression(bound["rhs"])
     lhs, rhs = lowerer.coerce_pair(lhs_expression, rhs_expression, node)
     result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node)
+    rhs = lowerer.broadcast_value(rhs, result_shape, node)
     operation = lowerer.emit(
         OpCode.BINARY,
         lowerer.location(node),

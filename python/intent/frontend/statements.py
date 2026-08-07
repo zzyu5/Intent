@@ -16,7 +16,6 @@ from intent.ir import RegionType
 from intent.ir import ResourceKind
 from intent.ir import ScalarType
 from intent.ir import TensorType
-from intent.ir import TupleType
 from intent.ir import Value
 from intent.language import bool as intent_bool
 from intent.language import DType
@@ -112,6 +111,10 @@ def _lower_augmented_assign(lowerer: object, node: ast.AugAssign) -> None:
 
 def _assign_target(lowerer: object, target: ast.AST, expression: Expression) -> None:
     if isinstance(target, ast.Name):
+        if target.id == "_":
+            return
+        if isinstance(expression, Value) and expression.name_hint is None:
+            expression.name_hint = target.id
         lowerer.environment[target.id] = expression
         return
     if isinstance(target, (ast.Tuple, ast.List)):
@@ -132,18 +135,6 @@ def _destructure(lowerer: object, expression: Expression, node: ast.AST) -> tupl
         return expression.elements
     if isinstance(expression, ShapeValue):
         return tuple(expression.dimensions)
-    if isinstance(expression, Value) and isinstance(expression.type, TupleType):
-        values: list[Value] = []
-        for index, element_type in enumerate(expression.type.elements):
-            operation = lowerer.emit(
-                OpCode.EXTRACT,
-                lowerer.location(node),
-                operands=(expression,),
-                result_types=(element_type,),
-                attributes={"key": index},
-            )
-            values.append(operation.results[0])
-        return tuple(values)
     lowerer.error(node, "value is not destructurable")
 
 
@@ -161,7 +152,7 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
         target_node,
         ScalarType(target.type.dtype) if isinstance(expression, Literal) else None,
     )
-    validate_indexed_value(
+    value = validate_indexed_value(
         lowerer,
         value,
         lowered.result_shape,
@@ -633,7 +624,7 @@ def _assigned_names(statements: list[ast.stmt]) -> set[str]:
 
     class Collector(ast.NodeVisitor):
         def visit_Name(self, node: ast.Name) -> None:
-            if isinstance(node.ctx, ast.Store):
+            if isinstance(node.ctx, ast.Store) and node.id != "_":
                 names.add(node.id)
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -650,7 +641,7 @@ def _assigned_names(statements: list[ast.stmt]) -> set[str]:
 
 def _target_names(target: ast.AST) -> set[str]:
     if isinstance(target, ast.Name):
-        return {target.id}
+        return set() if target.id == "_" else {target.id}
     if isinstance(target, (ast.Tuple, ast.List)):
         names: set[str] = set()
         for element in target.elts:

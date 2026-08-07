@@ -21,6 +21,7 @@ class IRBuilder:
     def __init__(self, module_name: str, location: Location) -> None:
         self.module = Module(module_name, [], location)
         self._next_value_id = 0
+        self._next_operation_id = 0
 
     def _value(
         self,
@@ -115,6 +116,7 @@ class IRBuilder:
         result_names: Iterable[str | None] = (),
     ) -> Operation:
         operation = Operation(
+            id=self._next_operation_id,
             opcode=opcode,
             location=location,
             operands=tuple(operands),
@@ -124,6 +126,7 @@ class IRBuilder:
             effects=tuple(effects),
             owner=block,
         )
+        self._next_operation_id += 1
         names = tuple(result_names)
         if names and len(names) != len(operation.result_types):
             raise ValueError("result names and result types must have equal length")

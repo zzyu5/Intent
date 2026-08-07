@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import re
 from enum import Enum
 
 from intent.ir import AutoExtent
@@ -24,7 +25,7 @@ def emit_attribute(value: object) -> str:
     if isinstance(value, str):
         return quote(value)
     if value is None:
-        return quote("none")
+        return "unit"
     if isinstance(value, DType):
         return quote(value.name)
     if isinstance(value, Enum):
@@ -42,8 +43,15 @@ def emit_attribute(value: object) -> str:
 
 def emit_dictionary(values: dict[str, object]) -> str:
     return "{" + ", ".join(
-        f"{key} = {emit_attribute(value)}" for key, value in sorted(values.items())
+        f"{_emit_key(key)} = {emit_attribute(value)}"
+        for key, value in sorted(values.items())
     ) + "}"
+
+
+def _emit_key(key: str) -> str:
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$.]*", key):
+        return key
+    return quote(key)
 
 
 def emit_effect(effect: Effect, operands: tuple[Value, ...]) -> dict[str, object]:

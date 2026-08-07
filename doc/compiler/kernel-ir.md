@@ -2,6 +2,8 @@
 
 Kernel IR 表示一个完整、runtime-visible 的 source kernel algorithm。它位于 Python frontend 与 realizer 之间。
 
+每个 operation 与 SSA value 都有 module 内稳定的非负 node id。Physical Plan 只能通过这些 id 引用 Kernel IR，不复制或按 source 文本重新猜测算法节点。
+
 ## 必须保存的内容
 
 ### Entry 与 ABI
@@ -36,6 +38,8 @@ Kernel IR 表示一个完整、runtime-visible 的 source kernel algorithm。它
 - `parallel`、`ordered` 与 `state_stream`；
 - carry schema、initial state、step 与 final projection；
 - `@intent.fn` 展开的算法 helper relation。
+
+Python tuple state 在 Kernel IR 中正规化为有序的多 SSA carry/result schema；需要字段身份的复合值使用 `RecordType` 与 `make_record/extract`。Kernel IR 不保留一个无法被后端观察的 opaque tuple object。
 
 ## IR 不包含的内容
 

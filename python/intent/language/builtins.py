@@ -59,6 +59,7 @@ exp2 = Intrinsic("exp2")
 log = Intrinsic("log")
 rsqrt = Intrinsic("rsqrt")
 maximum = Intrinsic("maximum")
+minimum = Intrinsic("minimum")
 any = Intrinsic("any")
 all = Intrinsic("all")
 add = Intrinsic("add")
@@ -108,6 +109,7 @@ INTRINSICS = {
         log,
         rsqrt,
         maximum,
+        minimum,
         any,
         all,
         add,

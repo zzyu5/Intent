@@ -22,7 +22,9 @@ from intent.ir import StaticDim
 from intent.ir import TensorType
 from intent.ir import Value
 from intent.ir import broadcast_shape
+from intent.ir.types import is_integer
 from intent.language import bool as intent_bool
+from intent.language import DTypeCategory
 
 from .model import Literal
 from .model import ShapeDimension
@@ -47,7 +49,7 @@ def validate_indexed_value(
     node: ast.AST,
     *,
     expected_dtype: object | None = None,
-) -> None:
+) -> Value:
     value_dtype, value_shape = lowerer.dtype_and_shape(value.type, node)
     if expected_dtype is not None and value_dtype != expected_dtype:
         lowerer.error(node, "stored/scattered value dtype does not match destination")
@@ -57,6 +59,7 @@ def validate_indexed_value(
         lowerer.error(node, str(error))
     if tuple(broadcasted) != tuple(indexed_shape):
         lowerer.error(node, "stored/scattered value cannot broadcast to indexed shape")
+    return lowerer.broadcast_value(value, tuple(indexed_shape), node)
 
 
 def lower_subscript(
@@ -73,6 +76,8 @@ def lower_subscript(
     source = source_expression
     if isinstance(source.type, RaggedType):
         selector = lowerer.materialize(lowerer.lower_expression(node.slice), node.slice)
+        if not is_integer(selector.type):
+            lowerer.error(node.slice, "ragged member selector must be integer/index")
         operation = lowerer.emit(
             OpCode.RAGGED_MEMBER,
             lowerer.location(node),
@@ -174,6 +179,8 @@ def lower_index(
                             static_values.append(static)
                         else:
                             value = lowerer.materialize(lowerer.lower_expression(component), component)
+                            if not is_integer(value.type):
+                                lowerer.error(component, "dynamic slice bound must be scalar integer/index")
                             positions.append(first_operand_position + len(operands))
                             static_values.append(None)
                             operands.append(value)
@@ -189,6 +196,10 @@ def lower_index(
             continue
         static = _static_integer(raw_term)
         if static is not None:
+            if isinstance(source_dimension, StaticDim) and not (
+                -source_dimension.value <= static < source_dimension.value
+            ):
+                lowerer.error(raw_term, "static tensor index is outside the source dimension")
             terms.append(IndexTerm(IndexTermKind.STATIC_INDEX, static_values=(static,)))
             source_axis += 1
             continue
@@ -199,9 +210,15 @@ def lower_index(
             terms.append(IndexTerm(IndexTermKind.REGION_INDEX, (position,)))
             result_shape.extend(lowerer.dynamic_shape_for_region(value))
         elif isinstance(value.type, TensorType):
+            if value.type.dtype.category not in (
+                DTypeCategory.SIGNED_INTEGER,
+                DTypeCategory.UNSIGNED_INTEGER,
+                DTypeCategory.INDEX,
+            ):
+                lowerer.error(raw_term, "tensor index must have integer/index dtype")
             terms.append(IndexTerm(IndexTermKind.VALUE_INDEX, (position,)))
             result_shape.extend(value.type.shape)
-        elif isinstance(value.type, (ScalarType, LogicalIndexType)):
+        elif isinstance(value.type, (ScalarType, LogicalIndexType)) and is_integer(value.type):
             terms.append(IndexTerm(IndexTermKind.VALUE_INDEX, (position,)))
         else:
             lowerer.error(raw_term, "index expression must be integer, index tensor, or region")

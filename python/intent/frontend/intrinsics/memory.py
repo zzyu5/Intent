@@ -16,8 +16,10 @@ from intent.ir import ScalarType
 from intent.ir import TensorType
 from intent.ir import Value
 from intent.ir import broadcast_shape
+from intent.ir.types import is_integer
 from intent.language import f32
 from intent.language import bool as intent_bool
+from intent.language import index as intent_index
 
 from ..indexing import lower_index
 from ..indexing import validate_indexed_value
@@ -89,12 +91,16 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     fill_dtype, fill_shape = lowerer.dtype_and_shape(fill.type, node)
     if fill_dtype != source.type.dtype:
         lowerer.error(node, "gather fill dtype must match source dtype")
-    try:
-        result_shape = broadcast_shape(
-            broadcast_shape(lowered.result_shape, valid_shape), fill_shape
-        )
-    except ValueError as error:
-        lowerer.error(node, str(error))
+    result_shape = tuple(lowered.result_shape)
+    for shape, subject in ((valid_shape, "valid"), (fill_shape, "fill")):
+        try:
+            broadcasted = tuple(broadcast_shape(shape, result_shape))
+        except ValueError as error:
+            lowerer.error(node, str(error))
+        if broadcasted != result_shape:
+            lowerer.error(node, f"gather {subject} cannot broadcast to indexed shape")
+    valid = lowerer.broadcast_value(valid, result_shape, node)
+    fill = lowerer.broadcast_value(fill, result_shape, node)
     operands = (source, *lowered.operands, valid, fill)
     effects = ()
     if source in lowerer.view_kinds:
@@ -138,7 +144,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
         bound["value"],
         ScalarType(destination.type.dtype) if isinstance(value_expression, Literal) else None,
     )
-    validate_indexed_value(
+    value = validate_indexed_value(
         lowerer, value, lowered.result_shape, node, expected_dtype=destination.type.dtype
     )
     operands = (destination, *lowered.operands, value)
@@ -209,7 +215,7 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         bound["value"],
         ScalarType(target.type.dtype) if isinstance(value_expression, Literal) else None,
     )
-    validate_indexed_value(
+    value = validate_indexed_value(
         lowerer, value, lowered.result_shape, node, expected_dtype=target.type.dtype
     )
     operands = (target, value, *lowered.operands)
@@ -319,10 +325,10 @@ def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         bound["value"],
         ScalarType(target.type.dtype) if isinstance(value_expression, Literal) else None,
     )
-    validate_indexed_value(
+    compare = validate_indexed_value(
         lowerer, compare, lowered.result_shape, node, expected_dtype=target.type.dtype
     )
-    validate_indexed_value(
+    value = validate_indexed_value(
         lowerer, value, lowered.result_shape, node, expected_dtype=target.type.dtype
     )
     if not lowerer.types_compatible_for_literal(compare.type, value.type):
@@ -359,12 +365,16 @@ def _random(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     bound = bind_call(lowerer, node, ("seed", "index", "dtype"), required=("seed", "index"))
     seed = lowerer.materialize(lowerer.lower_expression(bound["seed"]), bound["seed"])
     identity = lowerer.materialize(lowerer.lower_expression(bound["index"]), bound["index"])
+    if not is_integer(seed.type):
+        lowerer.error(bound["seed"], "random seed must be integer/index")
     dtype = require_dtype(lowerer, bound["dtype"]) if "dtype" in bound else f32
     if dtype == intent_bool:
         lowerer.error(node, "I.random result dtype must be numeric")
     if isinstance(identity.type, LogicalIndexType):
         shape: tuple[object, ...] = ()
     elif isinstance(identity.type, TensorType):
+        if identity.type.dtype != intent_index:
+            lowerer.error(bound["index"], "random index tensor must have index dtype")
         shape = tuple(identity.type.shape)
     else:
         lowerer.error(node, "random identity must be logical index/index tensor")
@@ -397,7 +407,7 @@ def _atomic_inputs(
         bound["value"],
         ScalarType(target.type.dtype) if isinstance(value_expression, Literal) else None,
     )
-    validate_indexed_value(
+    value = validate_indexed_value(
         lowerer, value, lowered.result_shape, node, expected_dtype=target.type.dtype
     )
     return target, lowered, value
