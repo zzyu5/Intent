@@ -27,6 +27,21 @@ Backend emitter 接收 Kernel IR 与 Physical Plan，构造一个具体目标 ke
 
 Emitter 不选择新的 source algorithm。它实现 Physical Plan 已经选择的 realization。
 
+Emitter 开始前必须验证 Kernel IR 与 Physical Plan。生成过程只按稳定 node ID 读取 Plan binding，并按 IR 的 def-use 与 region 结构发射代码；禁止根据 kernel 名称套用模板，也禁止重新猜测 Python AST 中已经 lowering 的语义。Plan 缺失 binding、binding 指向错误 region，或目标尚未支持某个结构时，编译立即失败。
+
+## 首个 Triton lowering
+
+一维 pointwise realization 将 Plan 映射为一个 Triton entry：
+
+- Plan program ownership 生成 `tl.program_id(0)`；
+- extent 与 launch block 生成 `program * BLOCK_SIZE + tl.arange(...)`；
+- masked boundary 生成 `offsets < N_ELEMENTS`，并传给每个 load/store；
+- global contiguous storage 与 source index relation生成 pointer offset；
+- pointwise primitive binding 生成对应的 `+`、`-`、`*` 或 `/`；
+- Plan launch 保存 grid、block size、warp 数和 stage 数，用户调用 artifact 时不再传 grid。
+
+Emitter 输出独立、可读的 Triton Python source，并将其编译成 callable entry。当前没有 Plan binding 的 reduce、contract、ragged、atomic、state stream 或多维 address lowering 不会静默退回 Python 实现。
+
 ## 与下层 kernel 系统的关系
 
 Intent 不重做 Triton、TileLang、cuTile 或 native compiler 已经成熟的 instruction、layout、pipeline 与 machine code generation。它决定应构造怎样的 target kernel program，再由下层映射到具体机器。

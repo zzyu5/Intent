@@ -4,6 +4,9 @@ from .definitions import HelperDefinition
 from .definitions import KernelDefinition
 from .definitions import fn
 from .definitions import kernel
+from .driver import compile
+from .backend import CompiledArtifact
+from .backend.triton import TritonTarget
 from .errors import DefinitionError
 from .errors import IntentError
 from .errors import LanguageUseError
@@ -23,6 +26,9 @@ __all__ = [
     "LanguageUseError",
     "fn",
     "kernel",
+    "compile",
+    "CompiledArtifact",
+    "TritonTarget",
     "FrontendError",
     "lower_to_kernel_ir",
     "emit_mlir",

@@ -16,6 +16,15 @@ print(compiled.ir)
 - 可读、可导出的 target source；
 - 对应 backend 或 lower-level IR。
 
+当前 Triton target 的调用形式为：
+
+```python
+compiled = intent.compile(kernel, target=intent.TritonTarget(device=0))
+compiled(lhs, rhs, output)
+```
+
+`source` 与 Intent MLIR 在 compile 返回时即可读取。Triton 的 TTIR、TTGIR、LLVM IR、PTX 等 backend IR 由第一次真实 launch 触发 JIT 后写入同一个 artifact；artifact 不用第二套编译路径伪造这些结果。
+
 ## Generated code 是正式输出
 
 生成代码应：
