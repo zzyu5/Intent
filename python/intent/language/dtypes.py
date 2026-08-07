@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins as python_builtins
 from dataclasses import dataclass
 from enum import Enum
 
@@ -24,8 +25,8 @@ class DType:
             raise ValueError("dtype name must not be empty")
         if not isinstance(self.category, DTypeCategory):
             raise TypeError("dtype category must be a DTypeCategory")
-        if isinstance(self.bits, bool) or (
-            self.bits is not None and not isinstance(self.bits, int)
+        if isinstance(self.bits, python_builtins.bool) or (
+            self.bits is not None and not isinstance(self.bits, python_builtins.int)
         ):
             raise TypeError("dtype bit width must be an integer or None")
         if self.bits is not None and self.bits <= 0:
