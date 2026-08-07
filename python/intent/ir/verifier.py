@@ -1102,8 +1102,11 @@ class Verifier:
                     continue
                 index_type = operation.operands[position].type
                 if term.kind is IndexTermKind.REGION_INDEX:
-                    if not isinstance(index_type, RegionType):
-                        self._error(operation.location, "region index term requires RegionType operand")
+                    if not isinstance(index_type, (DomainType, RegionType)):
+                        self._error(
+                            operation.location,
+                            "logical region index term requires DomainType/RegionType operand",
+                        )
                 elif term.kind is IndexTermKind.SLICE:
                     if not is_integer(index_type):
                         self._error(
@@ -1638,6 +1641,8 @@ class Verifier:
         source = operation.operands[0].type
         if not isinstance(source, (RegionType, DomainType)):
             self._error(operation.location, "members expects ragged member region")
+        elif isinstance(source, RegionType) and source.relation != "ragged_member":
+            self._error(operation.location, "members expects ragged_member index relation")
         elif isinstance(source, DomainType) and source.flavor is not DomainFlavor.RAGGED_MEMBER:
             self._error(operation.location, "members expects ragged member domain")
         result = operation.result_types[0]

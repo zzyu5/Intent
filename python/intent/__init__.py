@@ -7,6 +7,8 @@ from .definitions import kernel
 from .errors import DefinitionError
 from .errors import IntentError
 from .errors import LanguageUseError
+from .frontend import FrontendError
+from .frontend import lower_to_kernel_ir
 
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     "LanguageUseError",
     "fn",
     "kernel",
+    "FrontendError",
+    "lower_to_kernel_ir",
 ]
