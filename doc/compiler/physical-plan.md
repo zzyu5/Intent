@@ -53,6 +53,8 @@ intent_plan.plan
 
 这是一份 compiler IR，而不是开放字典。每类 binding 都必须能回指一个存在且种类相符的 Kernel IR 节点；backend emitter 只消费经过 Kernel IR verifier 与 Plan verifier 共同验证的组合。
 
+当前 Plan 只由 C++ `intent-realize` 构造。Python frontend 到 Kernel MLIR 为止；host compiler 通过 stdin/stdout 调用 realizer，随后把同一个组合 MLIR 交给 C++ translator。项目中不保留 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
+
 完整 Plan verifier 的长期合法性边界是：
 
 - entry 与 ABI view 集合不变，storage/layout binding 完整覆盖这些 view；
@@ -114,7 +116,7 @@ Triton 中的 `BLOCK_SIZE_M/N/K`、`GROUP_SIZE_M`、`num_warps` 与 `num_stages`
 - stage policy 为 shared-memory threshold 上的 2/4 stages，`num_warps = 8`；
 - grid policy 使用 target resource/occupancy 计算，并限制 program count 不超过 row extent。
 
-Realizer 按 def-use 识别 `load → max → broadcast → subtract → exp → sum → broadcast → divide → store`，不检查函数名。该 Plan 只是第一份可执行实例，不代表搜索、cost model、其他 traversal 或通用 reduction realization 已完成。
+Realizer 的共享 C++ analysis 按 operation 数量、region、ABI、index relation 与 def-use 识别 `load → max → broadcast → subtract → exp → sum → broadcast → divide → store`，不检查函数名。它随后采用确定 policy 构造上述 Plan；当前没有候选枚举、搜索或 cost model。该 Plan 只是第一份可执行实例，不代表其他 traversal 或通用 reduction realization 已完成。
 
 ## 合法性边界
 

@@ -12,18 +12,7 @@ Intent 是高性能 kernel DSL，不是逐项审批 compiler 数值自由的合�
 6. Base-2 exponential 使用显式 `I.exp2`。
 7. 严格数学或确定性路径属于 host/backend compile policy，不是每个 primitive 的 source 参数。
 
-```python
-compiled = intent.compile(
-    kernel,
-    target=device,
-    options={
-        "matmul_precision": "strict",
-        "deterministic": True,
-    },
-)
-```
-
-具体 option 由 backend 定义。无法兑现时，backend 可以拒绝该 compile policy。
+当前公开 `compile` API 尚未实现 numerics policy 参数，因此不会用一个未生效的 `options` 字典表达这些要求。未来加入此能力时，它应作为 compiler/target policy 进入 C++ realizer；无法兑现的 policy 必须令编译失败，而不是在 Python wrapper 中静默替换算法。
 
 Portable source 不增加：
 

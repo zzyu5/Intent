@@ -2,6 +2,8 @@
 
 Backend translator 接收同一 MLIR module 中的 Intent Kernel IR 与 Physical Plan，构造一个具体目标 kernel program。
 
+当前 backend semantic path 全部位于 C++：`intent-realize` 生成 Plan，Plan dialect verifier 验证 Plan 与 Kernel IR 的绑定，`intent-translate` 发射目标源码。Python 只负责调用这两个工具和运行已经生成的 Triton source；它不构造 Plan，也不参与目标代码选择。
+
 ## 对应关系
 
 | Intent | Triton | TileLang | cuTile | CPU/RVV |
@@ -39,6 +41,8 @@ Translator 开始前必须由 MLIR parser 读取 module，并验证 Kernel IR �
 - reduction/pointwise bindings按 Kernel IR def-use 生成 `tl.max`、subtract、`tl.exp`、`tl.sum` 与 divide；
 - pipeline/launch binding 生成 stage policy、warps 与 occupancy-based program count；
 - storage/layout binding 决定 row-major pointer relation 与 ABI read/write direction。
+
+这是一个经过严格 verifier 约束的专用 emitter，不是“任意 Plan 字符串解释器”。当前代码直接读取 ownership worker axis、reduction axis、pipeline stages、launch warps、target/device/warp 与 ABI storage direction；其余字段只能取 stable-softmax verifier 接受的唯一值，例如 `next_power_of_two`、masked negative-infinity boundary、row-major layout 和 persistent occupancy。Emitter 因而发射与这些已验证值对应的固定结构。要支持第二种 tile、boundary、layout 或 traversal，必须先扩展 Plan legality 与 C++ emission 分支，不能让未识别值落入默认实现。
 
 Translator 输出独立、可读的 Triton Python source，并将其编译成 callable entry。首个 translator 只接受上述 stable-softmax structure；其他 reduce、contract、ragged、atomic、state stream 或 control-flow realization 不会静默退回 Python 实现。
 

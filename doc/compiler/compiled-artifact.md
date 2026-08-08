@@ -3,7 +3,12 @@
 ## Compile result
 
 ```python
-compiled = intent.compile(kernel, target=device, translator=intent_translate)
+compiled = intent.compile(
+    kernel,
+    target=intent.TritonTarget(device=0),
+    realizer=intent_realize,
+    translator=intent_translate,
+)
 
 print(compiled.source)
 print(compiled.ir)
@@ -12,9 +17,11 @@ print(compiled.ir)
 编译产物至少包含：
 
 - 一个 callable target kernel entry；
-- 对应 launch configuration；
+- 包含 Kernel IR 与 Physical Plan 的组合 MLIR；
 - 可读、可导出的 target source；
-- 对应 backend 或 lower-level IR。
+- 第一次真实 launch 后由 Triton JIT 产生的 backend 或 lower-level IR。
+
+Launch policy 由组合 MLIR 中的 Plan 和生成源码共同保存，artifact 不维护第二份 Python launch/Plan 数据模型。
 
 当前 Triton target 的调用形式为：
 
@@ -22,12 +29,13 @@ print(compiled.ir)
 compiled = intent.compile(
     stable_softmax,
     target=intent.TritonTarget(device=0),
+    realizer="/path/to/intent-realize",
     translator="/path/to/intent-translate",
 )
 compiled(input, output)
 ```
 
-`source` 与包含 Kernel IR/Physical Plan 的 MLIR 在 compile 返回时即可读取。Triton source 必须由 `intent-translate` 解析这份 MLIR 后产生。Triton 的 TTIR、TTGIR、LLVM IR、PTX 等 backend IR 由第一次真实 launch 触发 JIT 后写入同一个 artifact；artifact 不用第二套编译路径伪造这些结果。
+`source` 与包含 Kernel IR/Physical Plan 的 MLIR 在 compile 返回时即可读取。Physical Plan 必须由 `intent-realize` 从 Kernel MLIR 产生，Triton source 必须由 `intent-translate` 解析组合 MLIR 后产生。Triton 的 TTIR、TTGIR、LLVM IR、PTX 等 backend IR 由第一次真实 launch 触发 JIT 后写入同一个 artifact；artifact 不用第二套编译路径伪造这些结果。
 
 ## Generated code 是正式输出
 

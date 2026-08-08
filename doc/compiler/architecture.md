@@ -51,20 +51,22 @@ Realizer 接收 Kernel IR、target information 与 compile policy，联合选择
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 
+Backend boundary 从 Intent Kernel MLIR 开始。当前 `intent-realize` 是 C++/MLIR 工具：它解析并验证 Kernel MLIR，在 C++ 中匹配受支持的算法结构并构造 `intent_plan` dialect。Python compiler 只负责把 Kernel MLIR 送入该工具，不保存 Physical Plan 对象，也不执行 tile、pipeline 或 launch 决策。
+
 ## Physical Plan
 
-Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node ID 绑定 Kernel IR，可以被验证、比较、搜索与交给 backend lowering；Python dataclass 只能是构造 Plan 的临时对象，不能成为 backend 的旁路输入。
+Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node ID 绑定 Kernel IR，可以被验证、比较、搜索与交给 backend lowering。正式边界中只有 MLIR Plan；不存在 Python Plan、Python Plan serializer 或绕过 MLIR verifier 的旁路输入。
 
 详见 [Physical Plan](physical-plan.md)。
 
 ## Backend Emitter
 
-Translator 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Triton backend 的正式输出是可读 Python source，不要求先转换成 Triton MLIR。
+Translator 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。当前 translator 本身是 C++/MLIR 实现；Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 
 ## Compiled Artifact 与 runtime
 
-Artifact 保存可调用 entry、launch configuration、可读生成源码和后端/低层 IR。Runtime 只负责提交这个 entry；完整图与多-kernel 调度仍在 Python wrapper。
+Artifact 保存组合 MLIR、可读生成源码、可调用 entry，以及首次真实 JIT 后得到的后端/低层 IR。Launch policy 位于 Physical Plan 和生成源码中，不再以第二套 Python 配置对象保存。Runtime 只负责物化并提交这个 entry；完整图与多-kernel 调度仍在 Python wrapper。
 
 详见 [编译产物与运行边界](compiled-artifact.md)。
