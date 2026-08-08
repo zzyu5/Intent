@@ -9,16 +9,17 @@ target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentCuTileDialect
   MLIRIntentCuTileEmission
-  MLIRIntentCuTileRealization
+  MLIRIntentCuTileProjection
+  MLIRIntentGPURealization
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTileLangDialect
   MLIRIntentTileLangEmission
-  MLIRIntentTileLangRealization
+  MLIRIntentTileLangProjection
   MLIRIntentTransforms
   MLIRIntentTritonDialect
   MLIRIntentTritonEmission
-  MLIRIntentTritonRealization
+  MLIRIntentTritonProjection
   MLIRParser
   MLIRIR
   MLIRSupport

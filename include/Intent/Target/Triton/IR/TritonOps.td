@@ -8,7 +8,17 @@ class IntentTriton_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentTriton_Dialect, mnemonic, traits>;
 
 def IntentTriton_TargetOp : IntentTriton_Op<"target"> {
-  let arguments = (ins StrAttr:$architecture, I64Attr:$device, I64Attr:$warp_size);
+  let arguments = (ins I64Attr:$device);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTriton_CapabilitiesOp : IntentTriton_Op<"capabilities"> {
+  let arguments = (ins
+    ArrayAttr:$intent_decided,
+    ArrayAttr:$delegated,
+    ArrayAttr:$absent
+  );
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -41,12 +51,6 @@ def IntentTriton_StorageOp : IntentTriton_Op<"storage"> {
   let hasVerifier = 1;
 }
 
-def IntentTriton_LayoutOp : IntentTriton_Op<"layout"> {
-  let arguments = (ins I64Attr:$value, StrAttr:$kind, DenseI64ArrayAttr:$order);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
 def IntentTriton_ReductionOp : IntentTriton_Op<"reduction"> {
   let arguments = (ins I64Attr:$node, StrAttr:$lowering, I64Attr:$axis);
   let results = (outs);
@@ -54,7 +58,7 @@ def IntentTriton_ReductionOp : IntentTriton_Op<"reduction"> {
 }
 
 def IntentTriton_PointwiseOp : IntentTriton_Op<"pointwise"> {
-  let arguments = (ins I64Attr:$node, StrAttr:$lowering);
+  let arguments = (ins I64Attr:$node, StrAttr:$lowering, BoolAttr:$defer);
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -117,47 +121,15 @@ def IntentTriton_BoundaryOp : IntentTriton_Op<"boundary"> {
     DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$predicate,
     StrAttr:$load_fill,
-    StrAttr:$store_mask
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTriton_PipelineOp : IntentTriton_Op<"pipeline"> {
-  let arguments = (ins
-    I64Attr:$loop_node,
-    I64Attr:$low_stages,
-    I64Attr:$high_stages,
-    I64Attr:$smem_threshold,
-    BoolAttr:$prefetch,
-    BoolAttr:$async_copy
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTriton_LaunchOp : IntentTriton_Op<"launch"> {
-  let arguments = (ins
-    I64Attr:$loop_node,
-    StrAttr:$grid_policy,
-    I64Attr:$num_warps
+    StrAttr:$store_mask,
+    BoolAttr:$defer
   );
   let results = (outs);
   let hasVerifier = 1;
 }
 
 def IntentTriton_AutotuneOp : IntentTriton_Op<"autotune"> {
-  let arguments = (ins ArrayAttr:$key);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTriton_ConfigOp : IntentTriton_Op<"config"> {
-  let arguments = (ins
-    DictionaryAttr:$parameters,
-    I64Attr:$num_stages,
-    I64Attr:$num_warps
-  );
+  let arguments = (ins ArrayAttr:$key, DictionaryAttr:$parameter_map);
   let results = (outs);
   let hasVerifier = 1;
 }

@@ -6,10 +6,10 @@ include "mlir/IR/DialectBase.td"
 def IntentTriton_Dialect : Dialect {
   let name = "intent_triton";
   let cppNamespace = "::intent::triton::plan";
-  let summary = "Resolved Triton mechanisms for an Intent realization";
+  let summary = "Triton projection of a shared GPU realization";
   let description = [{
-    IntentTriton records concrete target choices selected by the Triton
-    realizer. These operations are not logical Kernel IR semantics.
+    IntentTriton records Triton spellings for shared GPU decisions, the
+    surface capability cut, and explicit delegation to the Triton compiler.
   }];
 }
 

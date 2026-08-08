@@ -6,6 +6,13 @@
 using namespace mlir;
 
 namespace intent::tilelang::emission {
+namespace {
+
+std::string dimensionSpelling(StringRef symbol) {
+  return symbol == "T" ? "DIM_T" : symbol.str();
+}
+
+} // namespace
 
 FailureOr<RealizationIndex>
 indexRealization(intent::plan::RealizationOp realization) {
@@ -20,14 +27,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.axesByRole[value.getRole()] = value;
     } else if (auto value = dyn_cast<plan::ProgramOp>(operation))
       index.program = value;
-    else if (auto value = dyn_cast<plan::PipelineOp>(operation))
-      index.pipeline = value;
-    else if (auto value = dyn_cast<plan::LaunchOp>(operation))
-      index.launch = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
-    else if (auto value = dyn_cast<plan::LayoutOp>(operation))
-      index.layouts[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -60,8 +61,6 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
   for (Operation &operation : searchSpace.getBody().front()) {
     if (auto autotune = dyn_cast<plan::AutotuneOp>(operation))
       index.autotune = autotune;
-    else if (auto config = dyn_cast<plan::ConfigOp>(operation))
-      index.configs.push_back(config);
   }
   return index;
 }
@@ -120,12 +119,10 @@ LogicalResult SourceEmitter::indexABI() {
     if (!tensor)
       return kernel.entry.emitOpError("TileLang emitter requires ranked views");
     plan::StorageOp storage = planIndex.storage.lookup(argument.valueID);
-    plan::LayoutOp layout = planIndex.layouts.lookup(argument.valueID);
-    if (!storage || storage.getSpace() != "global" || !layout ||
-        layout.getKind() != "row_major")
+    if (!storage || storage.getSpace() != "global")
       return kernel.entry.emitOpError()
              << "ABI value " << argument.valueID
-             << " lacks a global row-major TileLang binding";
+             << " lacks a global TileLang binding";
     ABIView emitted{&argument, view, tensor, {}};
     auto shape = argument.metadata.getAs<ArrayAttr>("shape");
     if (!shape || shape.size() != static_cast<size_t>(tensor.getRank()))
@@ -133,11 +130,12 @@ LogicalResult SourceEmitter::indexABI() {
              << "view " << argument.name << " has incomplete shape metadata";
     for (auto [axis, extent] : llvm::enumerate(shape)) {
       if (auto symbol = dyn_cast<StringAttr>(extent)) {
-        emitted.shape.push_back(symbol.getValue().str());
-        if (!dimensionOwners.count(symbol.getValue())) {
-          dimensionOwners[symbol.getValue()] =
+        std::string spelling = dimensionSpelling(symbol.getValue());
+        emitted.shape.push_back(spelling);
+        if (!dimensionOwners.count(spelling)) {
+          dimensionOwners[spelling] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
-          dimensionOrder.push_back(symbol.getValue().str());
+          dimensionOrder.push_back(std::move(spelling));
         }
       } else if (auto integer = dyn_cast<IntegerAttr>(extent)) {
         emitted.shape.push_back(std::to_string(integer.getInt()));
@@ -228,9 +226,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
 
   StringRef mapping = programMapping;
   if (mapping == "persistent_rows") {
-    if (!planIndex.pipeline || !planIndex.launch || searchSpace)
+    if (searchSpace)
       return realization.emitOpError(
-          "fixed TileLang rows require launch/pipeline and no search space");
+          "fixed TileLang rows cannot consume a search space");
     auto lane = planIndex.axesByRole.find("lane_0");
     if (!planIndex.axesByRole.count("program_0") ||
         lane == planIndex.axesByRole.end())
@@ -248,28 +246,28 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return kernel.entry.emitOpError(
           "fixed-row TileLang program requires one output view");
   } else if (mapping == "grouped_2d_tiles") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+    if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
-          "tiled TileLang program requires backend autotune candidates");
+          "tiled TileLang program requires a delegated backend tuner");
     for (StringRef role : {"program_0", "program_1", "reduction_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
                << "tiled TileLang program lacks " << role << " axis";
   } else if (mapping == "multi_axis_stream") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty() ||
+    if (!searchSpace || !searchIndex.autotune ||
         planIndex.streams.size() != 1)
       return realization.emitOpError(
-          "streamed TileLang program requires one stream and autotune candidates");
+          "streamed TileLang program requires one stream and a delegated tuner");
     for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
                << "streamed TileLang program lacks " << role << " axis";
   } else if (raggedStages) {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty() ||
+    if (!searchSpace || !searchIndex.autotune ||
         !planIndex.ragged || planIndex.stages.empty() ||
         planIndex.atomics.empty())
       return realization.emitOpError(
-          "ragged TileLang staging requires traversal, stages, atomic merge, and candidates");
+          "ragged TileLang staging requires traversal, stages, atomic merge, and a delegated tuner");
   } else {
     return planIndex.program.emitOpError("has no TileLang program emitter");
   }
@@ -412,25 +410,19 @@ void SourceEmitter::emitImports() {
   output << "import torch\n";
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
+  output << "from intent.runtime.tuning.tilelang import DEFAULT_NUM_STAGES, DEFAULT_THREADS, row_configuration\n";
   if (searchSpace) {
     output << "from tilelang.autotuner import autotune, set_autotune_inputs\n";
-    output << "\n_CONFIGS = [\n";
-    for (plan::ConfigOp config : searchIndex.configs) {
-      output << "    {";
-      bool first = true;
-      for (NamedAttribute parameter : config.getParameters()) {
-        if (!first)
-          output << ", ";
-        output << "'" << parameter.getName().getValue() << "': "
-               << cast<IntegerAttr>(parameter.getValue()).getInt();
-        first = false;
-      }
-      if (!first)
+    output << "from intent.runtime.tuning.tilelang import autotune_configurations\n";
+    output << "\n_PARAMETER_MAP = {";
+    for (auto [index, mapping] :
+         llvm::enumerate(searchIndex.autotune.getParameterMap())) {
+      if (index)
         output << ", ";
-      output << "'num_stages': " << config.getNumStages()
-             << ", 'threads': " << config.getThreads() << "},\n";
+      output << "'" << mapping.getName().getValue() << "': '"
+             << cast<StringAttr>(mapping.getValue()).getValue() << "'";
     }
-    output << "]\n";
+    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
   }
   output << "\n\n";
 }
@@ -451,13 +443,13 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       parameter("MAX_ROUTES");
     if (programMapping == "persistent_rows") {
       parameter("TILE_SIZE");
-      parameter("num_stages=1");
-      parameter("threads=128");
+      parameter("num_stages=DEFAULT_NUM_STAGES");
+      parameter("threads=DEFAULT_THREADS");
     } else {
-      for (NamedAttribute config : searchIndex.configs.front().getParameters())
+      for (NamedAttribute config : searchIndex.autotune.getParameterMap())
         parameter(config.getName().getValue().str() + "=1");
-      parameter("num_stages=1");
-      parameter("threads=128");
+      parameter("num_stages=DEFAULT_NUM_STAGES");
+      parameter("threads=DEFAULT_THREADS");
     }
   };
   auto emitMainParameters = [&](raw_ostream &stream) -> LogicalResult {
@@ -553,8 +545,16 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   if (mapping == "persistent_rows") {
     output << "        with T.Kernel(M, threads=threads) as program_index:\n";
   } else if (mapping == "grouped_2d_tiles") {
-    output << "        with T.Kernel(T.ceildiv(N, TILE_SIZE_N), "
-              "T.ceildiv(M, TILE_SIZE_M), threads=threads) as (bid_n, bid_m):\n";
+    output << "        with T.Kernel(T.ceildiv(M, TILE_SIZE_M) * "
+              "T.ceildiv(N, TILE_SIZE_N), threads=threads) as bid:\n";
+    output << "            num_bid_m = T.ceildiv(M, TILE_SIZE_M)\n";
+    output << "            num_bid_n = T.ceildiv(N, TILE_SIZE_N)\n";
+    output << "            num_bid_in_group = GROUP_SIZE_M * num_bid_n\n";
+    output << "            group_id = bid // num_bid_in_group\n";
+    output << "            first_bid_m = group_id * GROUP_SIZE_M\n";
+    output << "            group_size_m = T.min(num_bid_m - first_bid_m, GROUP_SIZE_M)\n";
+    output << "            bid_m = first_bid_m + (bid % group_size_m)\n";
+    output << "            bid_n = (bid % num_bid_in_group) // group_size_m\n";
   } else if (mapping == "multi_axis_stream") {
     output << "        with T.Kernel(T.ceildiv(Q, TILE_SIZE_M), H, B, "
               "threads=threads) as (bid_program_2, index_program_1, "
@@ -828,9 +828,9 @@ LogicalResult SourceEmitter::emitWrapper() {
     emitBuilderArguments(false);
     if (!dimensionOrder.empty())
       output << ", ";
-    output << "1 << (N - 1).bit_length(), num_stages="
-           << planIndex.pipeline.getNumStages() << ", threads="
-           << planIndex.launch.getThreads() << ")\n";
+    output << "row_configuration(N).tile_size, "
+              "num_stages=row_configuration(N).num_stages, "
+              "threads=row_configuration(N).threads)\n";
   }
   output << "        _KERNEL_CACHE[cache_key] = compiled\n";
   output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";

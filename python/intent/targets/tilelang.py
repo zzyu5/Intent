@@ -4,19 +4,18 @@ from dataclasses import dataclass
 
 from intent.runtime import CompiledArtifact
 from intent.runtime.tilelang import materialize_tilelang_artifact
+from intent.targets.gpu import GpuDeviceCapabilities, resolve_gpu_device
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedTileLangTarget:
-    architecture: str
-    device: int
+    capabilities: GpuDeviceCapabilities
 
     @property
     def compiler_options(self) -> tuple[str, ...]:
         return (
             "--target=tilelang",
-            f"--architecture={self.architecture}",
-            f"--device={self.device}",
+            *self.capabilities.compiler_options,
         )
 
     @property
@@ -42,12 +41,4 @@ class TileLangTarget:
 
     def resolve(self) -> ResolvedTileLangTarget:
         import tilelang
-        import torch
-
-        if not torch.cuda.is_available() or self.device >= torch.cuda.device_count():
-            raise RuntimeError("requested TileLang CUDA device is unavailable")
-        major, minor = torch.cuda.get_device_capability(self.device)
-        return ResolvedTileLangTarget(
-            architecture=f"sm_{major}{minor}",
-            device=self.device,
-        )
+        return ResolvedTileLangTarget(resolve_gpu_device(self.device))

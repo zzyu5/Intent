@@ -2,6 +2,7 @@
 #define INTENT_TARGET_TRITON_IR_TRITONOPS_H
 
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Projection/Capabilities.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
@@ -10,6 +11,8 @@
 #include "Intent/Target/Triton/IR/TritonOps.h.inc"
 
 namespace intent::triton::plan {
+
+const intent::target::CapabilityProfile &getCapabilityProfile();
 
 mlir::LogicalResult
 verifyTritonRealization(intent::plan::RealizationOp realization);

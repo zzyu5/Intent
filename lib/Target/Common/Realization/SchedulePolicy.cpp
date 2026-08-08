@@ -7,8 +7,7 @@ using namespace mlir;
 
 namespace intent::target {
 
-FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
-                                           const ScheduleRules &rules) {
+FailureOr<ScheduleDecision> decideGpuSchedule(const KernelFacts &facts) {
   FailureOr<ScheduleStructure> structure = analyzeScheduleStructure(facts);
   if (failed(structure))
     return failure();
@@ -40,7 +39,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
         "one"});
     decision.axes.push_back(
         AxisDecision{memberDomain, facts.domainSourceAxes.lookup(memberDomain),
-                     "program_1", rules.raggedMemberTile.str()});
+                     "program_1", "ragged_member"});
     FailureOr<std::string> memberKey =
         sourceDimensionSymbol(*memberDomain, facts);
     if (failed(memberKey))
@@ -65,6 +64,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
     decision.stages = std::move(*stages);
     decision.traversal = "expert_major";
     decision.mapping = "ragged_stages";
+    decision.autotuneParameters = {"ragged_member", "feature", "reduction"};
     decision.usesAutotuner = true;
     return decision;
   }
@@ -101,7 +101,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
       decision.axes.push_back(AxisDecision{
           domain, facts.domainSourceAxes.lookup(domain),
           "program_" + std::to_string(index),
-          tiled ? rules.streamProgramTile.str() : "one"});
+          tiled ? "query" : "one"});
       if (tiled) {
         FailureOr<std::string> key = sourceDimensionSymbol(*domain, facts);
         if (failed(key))
@@ -111,7 +111,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
     }
     decision.axes.push_back(AxisDecision{
         streamDomain, facts.domainSourceAxes.lookup(streamDomain), "stream_0",
-        rules.streamTile.str()});
+        "stream"});
     FailureOr<std::string> streamKey =
         sourceDimensionSymbol(*streamDomain, facts);
     if (failed(streamKey))
@@ -119,30 +119,29 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
     decision.autotuneKeys.push_back(*streamKey);
     decision.traversal = "forward";
     decision.mapping = "multi_axis_stream";
+    decision.autotuneParameters = {"query", "stream"};
     decision.usesAutotuner = true;
     return decision;
   }
 
   for (auto [index, domain] : llvm::enumerate(structure->programDomains)) {
-    if (index >= rules.programTiles.size() &&
+    if (index >= 2 &&
         structure->tiledProgramDomains.contains(domain)) {
-      domain->emitOpError("exceeds the supported ")
-          << rules.targetName << " tiled program rank";
+      domain->emitOpError("exceeds the supported GPU tiled program rank");
       return failure();
     }
     decision.axes.push_back(AxisDecision{
         domain, facts.domainSourceAxes.lookup(domain),
         "program_" + std::to_string(index),
         structure->tiledProgramDomains.contains(domain)
-            ? rules.programTiles[index].str()
+            ? (index == 0 ? "program_m" : "program_n")
             : "one"});
   }
   for (auto [index, domain] : llvm::enumerate(structure->contractionDomains))
     decision.axes.push_back(AxisDecision{
         domain, facts.domainSourceAxes.lookup(domain),
         "reduction_" + std::to_string(index),
-        (index == 0 ? rules.firstReductionTile : rules.extraReductionTile)
-            .str()});
+        index == 0 ? "reduction" : "reduction_extra"});
   for (Operation *domain : structure->vectorDomains) {
     if (facts.contractionDomains.contains(domain))
       continue;
@@ -152,7 +151,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
         });
     decision.axes.push_back(AxisDecision{
         domain, facts.domainSourceAxes.lookup(domain),
-        "lane_" + std::to_string(index), rules.vectorTile.str()});
+        "lane_" + std::to_string(index), "row_vector"});
   }
 
   if (structure->tiledProgramDomains.empty()) {
@@ -164,7 +163,7 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
       return failure();
     }
     decision.traversal = "persistent";
-    decision.mapping = rules.persistentMapping.str();
+    decision.mapping = "row_strided";
     return decision;
   }
 
@@ -185,6 +184,8 @@ FailureOr<ScheduleDecision> decideSchedule(const KernelFacts &facts,
       return failure();
     decision.autotuneKeys.push_back(*key);
   }
+  decision.autotuneParameters = {"program_m", "program_n", "reduction",
+                                 "group_m"};
   decision.usesAutotuner = true;
   return decision;
 }

@@ -4,21 +4,18 @@ from dataclasses import dataclass
 
 from intent.runtime import CompiledArtifact
 from intent.runtime.triton import materialize_triton_artifact
+from intent.targets.gpu import GpuDeviceCapabilities, resolve_gpu_device
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedTritonTarget:
-    architecture: str
-    device: int
-    warp_size: int
+    capabilities: GpuDeviceCapabilities
 
     @property
     def compiler_options(self) -> tuple[str, ...]:
         return (
             "--target=triton",
-            f"--architecture={self.architecture}",
-            f"--device={self.device}",
-            f"--warp-size={self.warp_size}",
+            *self.capabilities.compiler_options,
         )
 
     @property
@@ -43,13 +40,4 @@ class TritonTarget:
             raise ValueError("Triton target device must be a non-negative integer")
 
     def resolve(self) -> ResolvedTritonTarget:
-        import torch
-
-        if not torch.cuda.is_available() or self.device >= torch.cuda.device_count():
-            raise RuntimeError("requested Triton CUDA device is unavailable")
-        major, minor = torch.cuda.get_device_capability(self.device)
-        return ResolvedTritonTarget(
-            architecture=f"sm_{major}{minor}",
-            device=self.device,
-            warp_size=32,
-        )
+        return ResolvedTritonTarget(resolve_gpu_device(self.device))

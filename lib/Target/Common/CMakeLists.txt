@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentTargetCommon
   Analysis/Kernel.cpp
   Emission/Driver.cpp
   Emission/Lifecycle.cpp
+  Projection/Capabilities.cpp
   Realization/Driver.cpp
   Realization/KernelFacts.cpp
   Realization/Proofs.cpp

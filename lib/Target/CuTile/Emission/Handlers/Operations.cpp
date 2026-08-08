@@ -222,13 +222,10 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   line("bid = ct.bid(" + std::to_string(workerAxis) + ")");
   line("num_bid_m = ct.cdiv(M, TILE_SIZE_M)");
   line("num_bid_n = ct.cdiv(N, TILE_SIZE_N)");
-  line("num_bid_in_group = " + std::to_string(planIndex.program.getGroupSize()) +
-       " * num_bid_n");
+  line("num_bid_in_group = GROUP_SIZE_M * num_bid_n");
   line("group_id = bid // num_bid_in_group");
-  line("first_bid_m = group_id * " +
-       std::to_string(planIndex.program.getGroupSize()));
-  line("group_size_m = min(num_bid_m - first_bid_m, " +
-       std::to_string(planIndex.program.getGroupSize()) + ")");
+  line("first_bid_m = group_id * GROUP_SIZE_M");
+  line("group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)");
   line("bid_m = first_bid_m + (bid % group_size_m)");
   line("bid_n = (bid % num_bid_in_group) // group_size_m");
   return success();
@@ -242,22 +239,15 @@ LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
-  bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                   [](Operation *user) {
-                                     return user->getName().getStringRef() ==
-                                            "intent.contract";
-                                   });
-  if (feedsContract &&
-      (planIndex.program.getMapping() == "grouped_2d_tiles" ||
-       isRaggedStages())) {
-    deferredLoads[operation.getResult(0)] = &operation;
-    return success();
-  }
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a cuTile load boundary");
+  if (boundary.getDefer()) {
+    deferredLoads[operation.getResult(0)] = &operation;
+    return success();
+  }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   FailureOr<std::string> indices = indexTuple(operation, false);
   if (failed(view) || failed(indices))
@@ -441,15 +431,10 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
                 : FailureOr<StringRef>(failure());
   if (isRaggedStages() && binding &&
       binding.getLowering() == "ct.indirect_gather") {
-    bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                     [](Operation *user) {
-                                       return user->getName().getStringRef() ==
-                                              "intent.contract";
-                                     });
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation) || failed(valid) || failed(fill))
       return failure();
-    if (feedsContract && (*view)->tensor.getRank() == 2) {
+    if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
@@ -673,18 +658,20 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
        ", axis=1, shape=" + *lhsShape + ")");
   line(result +
        " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
-  line("operand_dtype = ct.tfloat32 if " + (*lhsView)->argument->name +
-       ".dtype == ct.float32 else " + (*lhsView)->argument->name + ".dtype");
+  std::string operandDtype =
+      dtypeName((*lhsView)->tensor.getElementType(), operation);
+  if (operandDtype.empty())
+    return failure();
   line("for k_tile in range(num_tiles_k):");
   ++indentation;
   std::string lhs = makeResultName(*lhsLoad, 0);
   std::string rhs = makeResultName(*rhsLoad, 0);
   line(lhs + " = ct.load(" + (*lhsView)->argument->name + ", index=" +
        *lhsIndex + ", shape=" + *lhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).astype(operand_dtype)");
+       ", padding_mode=ct.PaddingMode.ZERO).astype(" + operandDtype + ")");
   line(rhs + " = ct.load(" + (*rhsView)->argument->name + ", index=" +
        *rhsIndex + ", shape=" + *rhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).astype(operand_dtype)");
+       ", padding_mode=ct.PaddingMode.ZERO).astype(" + operandDtype + ")");
   line(result + " = ct.mma(" + lhs + ", " + rhs + ", " + result + ")");
   --indentation;
   bindResult(operation, 0, result);

@@ -1,8 +1,10 @@
 #include "Intent/Target/Triton/IR/TritonOps.h"
 
+#include "Intent/Target/Common/Projection/Capabilities.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
-#include "mlir/IR/Builders.h"
 
 using namespace mlir;
 using namespace intent::triton::plan;
@@ -20,35 +22,69 @@ LogicalResult requireNode(Operation *operation, int64_t value) {
   return requireNonNegative(operation, value, "Kernel IR node ID");
 }
 
-} // namespace
-
-LogicalResult TargetOp::verify() {
-  if (getArchitecture().empty() || getDeviceAttr().getInt() < 0 ||
-      getWarpSizeAttr().getInt() <= 0)
-    return emitOpError("requires architecture, device and warp size");
+LogicalResult verifyStringKeys(Operation *operation, ArrayAttr keys) {
+  if (keys.empty())
+    return operation->emitOpError("requires at least one specialization key");
+  llvm::StringSet<> unique;
+  for (Attribute attribute : keys) {
+    auto key = dyn_cast<StringAttr>(attribute);
+    if (!key || key.getValue().empty() ||
+        !unique.insert(key.getValue()).second)
+      return operation->emitOpError(
+          "specialization keys must be unique non-empty strings");
+  }
   return success();
 }
 
+StringRef projectedMapping(StringRef mapping) {
+  return mapping == "row_strided" ? StringRef("grid_stride") : mapping;
+}
+
+} // namespace
+
+LogicalResult TargetOp::verify() {
+  return requireNonNegative(*this, getDevice(), "device");
+}
+
+const intent::target::CapabilityProfile &
+intent::triton::plan::getCapabilityProfile() {
+  static const StringRef intentDecided[] = {
+      "tile_shape", "ownership", "traversal", "boundary",
+      "value_residency", "matrix_primitive"};
+  static const StringRef delegated[] = {
+      "layout", "pipeline", "launch_resources", "register_allocation",
+      "instruction_selection", "autotune_candidates"};
+  static const StringRef absent[] = {"explicit_onchip_buffer_allocation"};
+  static const intent::target::CapabilityProfile profile{intentDecided,
+                                                          delegated, absent};
+  return profile;
+}
+
+LogicalResult CapabilitiesOp::verify() {
+  return intent::target::verifyCapabilityProfile(
+      *this, getIntentDecided(), getDelegated(), getAbsent(),
+      getCapabilityProfile());
+}
+
 LogicalResult AxisOp::verify() {
-  if (failed(requireNode(*this, getNodeAttr().getInt())))
+  if (failed(requireNode(*this, getNode())) ||
+      getSourceAxisAttr().getInt() < 0)
     return failure();
-  if (getSourceAxisAttr().getInt() < 0)
-    return emitOpError("source axis must be non-negative");
   if (getRole().empty() || getTile().empty())
-    return emitOpError("requires a physical role and tile choice");
+    return emitOpError("requires a physical role and tile spelling");
   return success();
 }
 
 LogicalResult ProgramOp::verify() {
-  if (failed(requireNode(*this, getLoopNodeAttr().getInt())))
+  if (failed(requireNode(*this, getLoopNode())) || getWorkerAxes().empty() ||
+      getWorkerAxes().size() > 3)
     return failure();
-  if (getWorkerAxes().empty() || getWorkerAxes().size() > 3)
-    return emitOpError("requires between one and three Triton program axes");
+  llvm::DenseSet<int64_t> axes;
   for (int64_t axis : getWorkerAxes())
-    if (axis < 0 || axis > 2)
-      return emitOpError("program axes must be in [0, 2]");
+    if (axis < 0 || axis > 2 || !axes.insert(axis).second)
+      return emitOpError("program axes must be unique values in [0, 2]");
   if (getTraversal().empty() || getMapping().empty())
-    return emitOpError("requires traversal and program mapping choices");
+    return emitOpError("requires traversal and program mapping spellings");
   return success();
 }
 
@@ -57,47 +93,29 @@ LogicalResult StorageOp::verify() {
     return failure();
   if (getSpace() != "global" && getSpace() != "shared" &&
       getSpace() != "register")
-    return emitOpError("contains an unsupported Triton storage space");
-  return success();
-}
-
-LogicalResult LayoutOp::verify() {
-  if (failed(requireNonNegative(*this, getValue(), "Kernel IR value ID")))
-    return failure();
-  if (getKind().empty() || getOrder().empty())
-    return emitOpError("requires a layout kind and dimension order");
-  llvm::DenseSet<int64_t> dimensions;
-  for (int64_t dimension : getOrder())
-    if (dimension < 0 || !dimensions.insert(dimension).second)
-      return emitOpError("layout order must be a non-negative permutation");
+    return emitOpError("contains an unsupported Triton storage spelling");
   return success();
 }
 
 LogicalResult ReductionOp::verify() {
-  if (failed(requireNode(*this, getNodeAttr().getInt())))
+  if (failed(requireNode(*this, getNode())) || getAxisAttr().getInt() < 0)
     return failure();
-  if (getAxisAttr().getInt() < 0)
-    return emitOpError("reduction axis must be non-negative");
   if (getLowering() != "tl.max" && getLowering() != "tl.sum")
-    return emitOpError("contains an unsupported Triton reduction lowering");
+    return emitOpError("contains an unsupported Triton reduction spelling");
   return success();
 }
 
 LogicalResult PointwiseOp::verify() {
-  if (failed(requireNode(*this, getNode())))
+  if (failed(requireNode(*this, getNode())) || getLowering().empty())
     return failure();
-  if (getLowering().empty())
-    return emitOpError("requires a target lowering name");
   return success();
 }
 
 LogicalResult ContractOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
-  if (getLowering() != "tl.dot")
-    return emitOpError("contains an unsupported Triton contraction primitive");
-  if (getAccumulatorType() != "f32")
-    return emitOpError("Triton contraction currently requires f32 accumulation");
+  if (getLowering() != "tl.dot" || getAccumulatorType() != "f32")
+    return emitOpError("requires tl.dot with f32 accumulation");
   return success();
 }
 
@@ -107,8 +125,7 @@ LogicalResult StreamOp::verify() {
     return failure();
   if (getTile().empty() || getOrder() != "forward" ||
       getCarrySpace() != "register")
-    return emitOpError(
-        "requires a forward tile stream with register-carried state");
+    return emitOpError("requires a forward register-carried stream spelling");
   return success();
 }
 
@@ -118,7 +135,7 @@ LogicalResult RaggedOp::verify() {
       failed(requireNode(*this, getMemberNode())))
     return failure();
   if (getTraversal() != "expert_offset_ranges")
-    return emitOpError("contains an unsupported Triton ragged traversal");
+    return emitOpError("contains an unsupported Triton ragged spelling");
   return success();
 }
 
@@ -138,198 +155,127 @@ LogicalResult AtomicOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
   if (getLowering() != "tl.atomic_add" || getScope() != "gpu")
-    return emitOpError("requires a GPU-scoped tl.atomic_add lowering");
+    return emitOpError("requires a GPU-scoped tl.atomic_add spelling");
   return success();
 }
 
 LogicalResult BoundaryOp::verify() {
-  if (failed(requireNode(*this, getNode())) || getDomainNodes().empty())
+  if (failed(requireNode(*this, getNode())))
     return failure();
   for (int64_t domain : getDomainNodes())
     if (failed(requireNode(*this, domain)))
       return failure();
-  if (getPredicate() != "index_lt_extent" ||
+  if ((!getDomainNodes().empty() && getPredicate() != "index_lt_extent") ||
+      (getDomainNodes().empty() && getPredicate() != "none") ||
       getStoreMask() != "predicate")
-    return emitOpError("contains an unsupported boundary mechanism");
+    return emitOpError("contains an unsupported Triton boundary spelling");
   if (getLoadFill() != "negative_infinity" && getLoadFill() != "zero" &&
       getLoadFill() != "none")
-    return emitOpError("contains an unsupported masked-load fill");
-  return success();
-}
-
-LogicalResult PipelineOp::verify() {
-  if (failed(requireNode(*this, getLoopNode())) || getLowStages() <= 0 ||
-      getHighStages() <= 0 || getSmemThreshold() <= 0)
-    return emitOpError("requires a loop and positive pipeline parameters");
-  if (getPrefetch() || getAsyncCopy())
-    return emitOpError("contains an unsupported pipeline mechanism");
-  return success();
-}
-
-LogicalResult LaunchOp::verify() {
-  if (failed(requireNode(*this, getLoopNode())) || getNumWarps() <= 0)
-    return failure();
-  if (getGridPolicy().empty())
-    return emitOpError("requires a grid policy");
+    return emitOpError("contains an unsupported Triton load fill");
   return success();
 }
 
 LogicalResult AutotuneOp::verify() {
-  if (getKey().empty())
-    return emitOpError("requires at least one specialization key");
-  llvm::StringSet<> keys;
-  for (Attribute attribute : getKey()) {
-    auto key = dyn_cast<StringAttr>(attribute);
-    if (!key || key.getValue().empty() || !keys.insert(key.getValue()).second)
-      return emitOpError("autotune keys must be unique non-empty strings");
-  }
-  return success();
-}
-
-LogicalResult ConfigOp::verify() {
-  if (getParameters().empty() || getNumStages() <= 0 || getNumWarps() <= 0)
-    return emitOpError("requires positive Triton autotune parameters");
-  for (NamedAttribute parameter : getParameters()) {
-    auto value = dyn_cast<IntegerAttr>(parameter.getValue());
-    if (!value || value.getInt() <= 0)
-      return emitOpError(
-          "Triton config parameters must be positive integers");
-  }
-  return success();
+  if (failed(verifyStringKeys(*this, getKey())))
+    return failure();
+  return intent::target::verifyParameterMap(*this, getParameterMap());
 }
 
 LogicalResult intent::triton::plan::verifyTritonRealization(
     intent::plan::RealizationOp realization) {
-  if (realization.getTarget() != "triton")
-    return realization.emitOpError("is not a Triton realization");
+  if (failed(intent::plan::verifyGpuRealization(realization)))
+    return failure();
   unsigned targets = 0;
+  unsigned capabilities = 0;
   unsigned programs = 0;
-  unsigned pipelines = 0;
-  unsigned launches = 0;
-  ProgramOp programChoice;
-  PipelineOp pipelineChoice;
-  LaunchOp launchChoice;
-  StreamOp streamChoice;
-  RaggedOp raggedChoice;
-  llvm::DenseSet<int64_t> axes;
-  llvm::StringSet<> axisRoles;
-  llvm::DenseSet<int64_t> storage;
-  llvm::DenseSet<int64_t> layouts;
-  llvm::DenseSet<int64_t> primitives;
-  llvm::DenseSet<int64_t> boundaries;
-  llvm::DenseSet<int64_t> stageOrdinals;
+  ProgramOp surfaceProgram;
+  intent::plan::ProgramOp machineProgram;
+  llvm::DenseSet<int64_t> machineAxes;
+  llvm::DenseSet<int64_t> surfaceAxes;
+  llvm::DenseMap<int64_t, intent::plan::TransferOp> transfers;
+  llvm::DenseSet<int64_t> surfaceOperations;
   for (Operation &operation : realization.getBody().front()) {
-    if (isa<intent::plan::YieldOp>(operation))
-      continue;
+    if (auto value = dyn_cast<intent::plan::ProgramOp>(operation))
+      machineProgram = value;
+    else if (auto value = dyn_cast<intent::plan::AxisOp>(operation))
+      machineAxes.insert(value.getNode());
+    else if (auto value = dyn_cast<intent::plan::TransferOp>(operation))
+      transfers[value.getNode()] = value;
     if (operation.getName().getDialectNamespace() != "intent_triton")
-      return operation.emitOpError("is not legal in a Triton realization");
+      continue;
     if (isa<TargetOp>(operation))
       ++targets;
-    else if (auto axis = dyn_cast<AxisOp>(operation)) {
-      if (!axes.insert(axis.getNode()).second)
-        return axis.emitOpError("duplicates an axis node binding");
-      if (!axisRoles.insert(axis.getRole()).second)
-        return axis.emitOpError("duplicates a physical axis role");
-    } else if (auto program = dyn_cast<ProgramOp>(operation)) {
+    else if (isa<CapabilitiesOp>(operation))
+      ++capabilities;
+    else if (auto value = dyn_cast<AxisOp>(operation))
+      surfaceAxes.insert(value.getNode());
+    else if (auto value = dyn_cast<ProgramOp>(operation)) {
       ++programs;
-      programChoice = program;
-    } else if (auto binding = dyn_cast<StorageOp>(operation)) {
-      if (!storage.insert(binding.getValue()).second)
-        return binding.emitOpError("duplicates a storage value binding");
-    } else if (auto binding = dyn_cast<LayoutOp>(operation)) {
-      if (!layouts.insert(binding.getValue()).second)
-        return binding.emitOpError("duplicates a layout value binding");
-    } else if (auto binding = dyn_cast<ReductionOp>(operation)) {
-      if (!primitives.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates an operation lowering");
-    } else if (auto binding = dyn_cast<PointwiseOp>(operation)) {
-      if (!primitives.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates an operation lowering");
-    } else if (auto binding = dyn_cast<ContractOp>(operation)) {
-      if (!primitives.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates an operation lowering");
-    } else if (auto stream = dyn_cast<StreamOp>(operation)) {
-      if (streamChoice)
-        return stream.emitOpError("duplicates an ordered stream binding");
-      streamChoice = stream;
-    } else if (auto ragged = dyn_cast<RaggedOp>(operation)) {
-      if (raggedChoice)
-        return ragged.emitOpError("duplicates a ragged traversal binding");
-      raggedChoice = ragged;
-    } else if (auto stage = dyn_cast<StageOp>(operation)) {
-      if (!stageOrdinals.insert(stage.getOrdinal()).second)
-        return stage.emitOpError("duplicates a physical stage ordinal");
-    } else if (auto atomic = dyn_cast<AtomicOp>(operation)) {
-      if (!primitives.insert(atomic.getNode()).second)
-        return atomic.emitOpError("duplicates an operation lowering");
-    } else if (auto binding = dyn_cast<BoundaryOp>(operation)) {
-      if (!boundaries.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates a boundary binding");
-    } else if (auto pipeline = dyn_cast<PipelineOp>(operation)) {
-      ++pipelines;
-      pipelineChoice = pipeline;
-    } else if (auto launch = dyn_cast<LaunchOp>(operation)) {
-      ++launches;
-      launchChoice = launch;
+      surfaceProgram = value;
+    } else if (isa<StorageOp, StreamOp, RaggedOp, StageOp>(operation)) {
+    } else if (auto value = dyn_cast<ReductionOp>(operation))
+      surfaceOperations.insert(value.getNode());
+    else if (auto value = dyn_cast<PointwiseOp>(operation))
+      surfaceOperations.insert(value.getNode());
+    else if (auto value = dyn_cast<ContractOp>(operation))
+      surfaceOperations.insert(value.getNode());
+    else if (auto value = dyn_cast<AtomicOp>(operation))
+      surfaceOperations.insert(value.getNode());
+    else if (auto value = dyn_cast<BoundaryOp>(operation)) {
+      auto transfer = transfers.find(value.getNode());
+      if (transfer == transfers.end() ||
+          transfer->second.getDefer() != value.getDefer())
+        return value.emitOpError("does not project its machine transfer decision");
     } else
-      return operation.emitOpError(
-          "is not a recognized resolved Triton choice");
+      return operation.emitOpError("is not legal in a Triton projection");
   }
-  if (targets != 1 || programs != 1 || pipelines > 1 || launches > 1)
+  if (targets != 1 || capabilities != 1 || programs != 1 || !machineProgram)
     return realization.emitOpError(
-        "requires one target/program and at most one fixed pipeline/launch");
-  if (pipelineChoice && pipelineChoice.getLoopNode() != programChoice.getLoopNode())
-    return pipelineChoice.emitOpError("does not bind the resolved program root");
-  if (launchChoice && launchChoice.getLoopNode() != programChoice.getLoopNode())
-    return launchChoice.emitOpError("does not bind the resolved program root");
-  if (programChoice.getMapping() == "grid_stride" &&
-      (!pipelineChoice || !launchChoice))
-    return realization.emitOpError(
-        "grid-stride programs require fixed pipeline and launch choices");
-  if (programChoice.getMapping() == "grouped_2d_tiles" &&
-      (pipelineChoice || launchChoice))
-    return realization.emitOpError(
-        "autotuned grouped programs cannot carry fixed pipeline/launch choices");
-  if (programChoice.getMapping() == "multi_axis_stream" &&
-      (pipelineChoice || launchChoice || !streamChoice))
-    return realization.emitOpError(
-        "multi-axis streams require one stream and no fixed pipeline/launch");
-  if (programChoice.getMapping() == "ragged_stages" &&
-      (!raggedChoice || stageOrdinals.empty() || pipelineChoice || launchChoice))
-    return realization.emitOpError(
-        "ragged stages require a ragged traversal and explicit stages without fixed launch choices");
-  if (streamChoice && !axes.contains(streamChoice.getAxisNode()))
-    return streamChoice.emitOpError("references an unbound stream axis");
-  if (programChoice.getMapping() != "grid_stride" &&
-      programChoice.getMapping() != "grouped_2d_tiles" &&
-      programChoice.getMapping() != "multi_axis_stream" &&
-      programChoice.getMapping() != "ragged_stages")
-    return programChoice.emitOpError("contains an unsupported Triton mapping");
+        "requires one Triton surface, capability cut, and program projection");
+  if (machineAxes.size() != surfaceAxes.size() ||
+      llvm::any_of(machineAxes, [&](int64_t node) {
+        return !surfaceAxes.contains(node);
+      }))
+    return realization.emitOpError("Triton axes do not project the GPU axes");
+  if (surfaceProgram.getLoopNode() != machineProgram.getLoopNode() ||
+      surfaceProgram.getWorkerAxes() != machineProgram.getWorkerAxes() ||
+      surfaceProgram.getTraversal() != machineProgram.getTraversal() ||
+      surfaceProgram.getMapping() != projectedMapping(machineProgram.getMapping()))
+    return surfaceProgram.emitOpError("does not project the GPU program decision");
   return success();
 }
 
 LogicalResult intent::triton::plan::verifyTritonSearchSpace(
     intent::plan::SearchSpaceOp searchSpace) {
-  if (searchSpace.getTarget() != "triton")
-    return searchSpace.emitOpError("is not a Triton search space");
-  unsigned autotune = 0;
-  unsigned configs = 0;
+  if (failed(intent::plan::verifyGpuSearchSpace(searchSpace)))
+    return failure();
+  auto machine =
+      *searchSpace.getBody().front().getOps<intent::plan::AutotuneOp>().begin();
+  AutotuneOp surface;
+  unsigned count = 0;
   for (Operation &operation : searchSpace.getBody().front()) {
-    if (isa<intent::plan::YieldOp>(operation))
-      continue;
     if (operation.getName().getDialectNamespace() != "intent_triton")
-      return operation.emitOpError("is not legal in a Triton search space");
-    if (isa<AutotuneOp>(operation))
-      ++autotune;
-    else if (isa<ConfigOp>(operation))
-      ++configs;
-    else
-      return operation.emitOpError(
-          "is a resolved choice, not a search candidate");
+      continue;
+    if (auto value = dyn_cast<AutotuneOp>(operation)) {
+      surface = value;
+      ++count;
+    } else
+      return operation.emitOpError("is not legal in a Triton search projection");
   }
-  if (autotune != 1 || configs == 0)
+  if (count != 1 || surface.getKey() != machine.getKey())
     return searchSpace.emitOpError(
-        "requires one autotune key declaration and at least one config");
+        "requires one Triton tuner projection with the GPU specialization keys");
+  llvm::StringSet<> expected;
+  for (Attribute parameter : machine.getParameters())
+    expected.insert(cast<StringAttr>(parameter).getValue());
+  llvm::StringSet<> projected;
+  for (NamedAttribute mapping : surface.getParameterMap())
+    projected.insert(cast<StringAttr>(mapping.getValue()).getValue());
+  if (expected.size() != projected.size())
+    return surface.emitOpError("does not map every GPU tunable parameter");
+  for (const auto &role : expected)
+    if (!projected.contains(role.getKey()))
+      return surface.emitOpError("does not map every GPU tunable parameter");
   return success();
 }
 

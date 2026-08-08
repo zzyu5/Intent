@@ -8,5 +8,6 @@ add_mlir_dialect_library(MLIRIntentTileLangDialect
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRIntentPlanDialect
+  MLIRIntentTargetCommon
   MLIRSupport
 )

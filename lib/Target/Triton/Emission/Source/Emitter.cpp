@@ -22,14 +22,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.axesByRole[value.getRole()] = value;
     } else if (auto value = dyn_cast<plan::ProgramOp>(operation))
       index.program = value;
-    else if (auto value = dyn_cast<plan::PipelineOp>(operation))
-      index.pipeline = value;
-    else if (auto value = dyn_cast<plan::LaunchOp>(operation))
-      index.launch = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
-    else if (auto value = dyn_cast<plan::LayoutOp>(operation))
-      index.layouts[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -51,11 +45,6 @@ indexRealization(intent::plan::RealizationOp realization) {
     realization.emitOpError("lacks target or program realization choices");
     return failure();
   }
-  if (index.program.getMapping() == "grid_stride" &&
-      (!index.pipeline || !index.launch)) {
-    realization.emitOpError("grid-stride emission requires fixed pipeline/launch");
-    return failure();
-  }
   return index;
 }
 
@@ -67,8 +56,6 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
   for (Operation &operation : searchSpace.getBody().front()) {
     if (auto autotune = dyn_cast<plan::AutotuneOp>(operation))
       index.autotune = autotune;
-    else if (auto config = dyn_cast<plan::ConfigOp>(operation))
-      index.configs.push_back(config);
   }
   return index;
 }
@@ -124,11 +111,10 @@ LogicalResult SourceEmitter::indexABI() {
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("Triton emitter requires ranked views");
-    if (!planIndex.storage.count(argument.valueID) ||
-        !planIndex.layouts.count(argument.valueID))
+    if (!planIndex.storage.count(argument.valueID))
       return kernel.entry.emitOpError()
              << "ABI value " << argument.valueID
-             << " lacks storage/layout realization";
+             << " lacks global storage realization";
     ABIView emitted{&argument, view, tensor, argument.name + "_ptr", {}, {}};
     for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
       emitted.strides.push_back(argument.name + "_stride_" +
@@ -245,20 +231,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (searchSpace)
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
-    if (planIndex.pipeline.getLoopNode() != planIndex.program.getLoopNode() ||
-        planIndex.launch.getLoopNode() != planIndex.program.getLoopNode())
-      return realization.emitOpError(
-          "fixed pipeline/launch must bind the resolved program root");
-    if (planIndex.launch.getGridPolicy() != "persistent_occupancy")
-      return planIndex.launch.emitOpError(
-          "has no fixed grid-stride source emitter");
   } else if (planIndex.program.getMapping() == "grouped_2d_tiles") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+    if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
-          "grouped tiled program requires a backend autotune search space");
-    if (planIndex.pipeline || planIndex.launch)
-      return realization.emitOpError(
-          "autotuned grouped scheduling cannot carry fixed pipeline/launch choices");
+          "grouped tiled program requires a delegated backend tuner");
     for (StringRef role : {"program_0", "program_1", "reduction_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -275,12 +251,12 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         return searchIndex.autotune.emitOpError(
             "key order does not match program_0/program_1/reduction_0");
   } else if (planIndex.program.getMapping() == "multi_axis_stream") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+    if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
-          "ordered stream requires a backend autotune search space");
-    if (planIndex.pipeline || planIndex.launch || planIndex.streams.size() != 1)
+          "ordered stream requires a delegated backend tuner");
+    if (planIndex.streams.size() != 1)
       return realization.emitOpError(
-          "ordered stream requires one stream binding and no fixed launch");
+          "ordered stream requires one stream binding");
     for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -297,18 +273,15 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         return searchIndex.autotune.emitOpError(
             "key order does not match program_2/stream_0");
   } else if (raggedStages) {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty() ||
+    if (!searchSpace || !searchIndex.autotune ||
         !planIndex.ragged || planIndex.stages.empty() ||
         planIndex.atomics.empty())
       return realization.emitOpError(
-          "ragged staging requires target traversal, stages, atomic merge, and backend candidates");
+          "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
     for (StringRef role : {"program_0", "program_1"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
                << "ragged staging lacks " << role << " axis";
-    if (planIndex.pipeline || planIndex.launch)
-      return realization.emitOpError(
-          "ragged staging cannot carry a fixed pipeline or launch choice");
   } else {
     return planIndex.program.emitOpError("has no Triton program emitter");
   }
@@ -473,8 +446,22 @@ void SourceEmitter::emitImports() {
   output << "import torch\n";
   output << "import triton\n";
   output << "import triton.language as tl\n";
-  if (planIndex.program.getMapping() == "grid_stride")
+  if (planIndex.program.getMapping() == "grid_stride") {
     output << "from triton.runtime import driver\n";
+    output << "from intent.runtime.tuning.triton import row_configuration, row_program_count\n";
+  }
+  if (searchSpace) {
+    output << "from intent.runtime.tuning.triton import autotune_configurations\n";
+    output << "\n_PARAMETER_MAP = {";
+    for (auto [index, mapping] :
+         llvm::enumerate(searchIndex.autotune.getParameterMap())) {
+      if (index)
+        output << ", ";
+      output << "'" << mapping.getName().getValue() << "': '"
+             << cast<StringAttr>(mapping.getValue()).getValue() << "'";
+    }
+    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
+  }
   output << "\n\n";
 }
 
@@ -491,9 +478,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         indicesLoad && indicesLoad->getNumOperands() == 1
             ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
             : FailureOr<ABIView *>(failure());
-    if (failed(offsets) || failed(indices) || searchIndex.configs.empty())
+    if (failed(offsets) || failed(indices) || !searchIndex.autotune)
       return raggedRelation->emitOpError(
-          "cannot resolve staged ragged metadata or search candidates");
+          "cannot resolve staged ragged metadata or delegated tuner");
     ABIView *atomicDestination = nullptr;
     for (const auto &binding : planIndex.atomics) {
       Operation *atomic = kernel.nodes.lookup(binding.first);
@@ -509,20 +496,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
       llvm::raw_string_ostream source(stageBodies[stage]);
-      source << "@triton.autotune(\n    configs=[\n";
-      for (plan::ConfigOp config : searchIndex.configs) {
-        source << "        triton.Config({";
-        for (auto [index, parameter] :
-             llvm::enumerate(config.getParameters())) {
-          if (index)
-            source << ", ";
-          source << "'" << parameter.getName().getValue() << "': "
-                 << cast<IntegerAttr>(parameter.getValue()).getInt();
-        }
-        source << "}, num_stages=" << config.getNumStages()
-               << ", num_warps=" << config.getNumWarps() << "),\n";
-      }
-      source << "    ],\n    key=[";
+      source << "@triton.autotune(\n    configs=_CONFIGS,\n    key=[";
       for (auto [index, attribute] :
            llvm::enumerate(searchIndex.autotune.getKey())) {
         if (index)
@@ -554,7 +528,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         for (int64_t valueID : binding.getOutputs())
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
       parameter("MAX_ROUTES");
-      for (NamedAttribute config : searchIndex.configs.front().getParameters())
+      for (NamedAttribute config : searchIndex.autotune.getParameterMap())
         parameter(config.getName().getValue().str() + ": tl.constexpr");
       source << "):\n";
       source.flush();
@@ -587,20 +561,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     return success();
   }
   if (searchSpace) {
-    output << "@triton.autotune(\n    configs=[\n";
-    for (plan::ConfigOp config : searchIndex.configs) {
-      output << "        triton.Config({";
-      for (auto [index, parameter] :
-           llvm::enumerate(config.getParameters())) {
-        if (index)
-          output << ", ";
-        output << "'" << parameter.getName().getValue() << "': "
-               << cast<IntegerAttr>(parameter.getValue()).getInt();
-      }
-      output << "}, num_stages=" << config.getNumStages()
-             << ", num_warps=" << config.getNumWarps() << "),\n";
-    }
-    output << "    ],\n    key=[";
+    output << "@triton.autotune(\n    configs=_CONFIGS,\n    key=[";
     for (auto [index, attribute] : llvm::enumerate(searchIndex.autotune.getKey())) {
       if (index)
         output << ", ";
@@ -658,10 +619,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   for (ABIView &view : views)
     for (const std::string &stride : view.strides)
       emitParameter(stride);
-  if (searchIndex.configs.empty())
-    return realization.emitOpError(
-        "autotuned Triton emission has no physical configurations");
-  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
     emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
   output << "):\n";
   return success();
@@ -846,15 +804,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
     output << "_PROPERTIES = driver.active.utils.get_device_properties(_DEVICE.index)\n";
-    output << "_NUM_SM = _PROPERTIES['multiprocessor_count']\n";
-    output << "_NUM_REGS = _PROPERTIES['max_num_regs']\n";
-    output << "_SIZE_SMEM = _PROPERTIES['max_shared_mem']\n";
-    output << "_WARP_SIZE = " << planIndex.target.getWarpSize() << "\n";
-    output << "_NUM_WARPS = " << planIndex.launch.getNumWarps() << "\n";
-    output << "_LOW_STAGES = " << planIndex.pipeline.getLowStages() << "\n";
-    output << "_HIGH_STAGES = " << planIndex.pipeline.getHighStages() << "\n";
-    output << "_SMEM_THRESHOLD = " << planIndex.pipeline.getSmemThreshold()
-           << "\n\n\n";
+    output << "_WARP_SIZE = torch.cuda.get_device_properties(_DEVICE).warp_size\n\n\n";
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -905,8 +855,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << "        raise ValueError('realized views violate noalias')\n";
       }
     output << "    n_rows, n_cols = " << shapeOwner->argument->name << ".shape\n";
-    output << "    block_size = triton.next_power_of_2(n_cols)\n";
-    output << "    num_stages = _HIGH_STAGES if _SIZE_SMEM > _SMEM_THRESHOLD else _LOW_STAGES\n";
+    output << "    configuration = row_configuration(n_cols, _PROPERTIES)\n";
     output << "    kernel = " << kernelName << ".warmup(";
     bool first = true;
     auto emitArgument = [&](StringRef argument) {
@@ -921,12 +870,13 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(view.argument->name + ".stride(0)");
     for (StringRef argument : {"n_rows", "n_cols"})
       emitArgument(argument);
-    output << ", BLOCK_SIZE=block_size, num_stages=num_stages, "
-              "num_warps=_NUM_WARPS, grid=" << programGrid("1") << ")\n";
+    output << ", BLOCK_SIZE=configuration.tile_size, "
+              "num_stages=configuration.num_stages, "
+              "num_warps=configuration.num_warps, grid=" << programGrid("1")
+           << ")\n";
     output << "    kernel._init_handles()\n";
-    output << "    occupancy = _NUM_REGS // (kernel.n_regs * _WARP_SIZE * _NUM_WARPS)\n";
-    output << "    occupancy = min(occupancy, _SIZE_SMEM // kernel.metadata.shared)\n";
-    output << "    num_programs = min(_NUM_SM * occupancy, n_rows)\n";
+    output << "    num_programs = row_program_count(n_rows, kernel, _PROPERTIES, "
+              "_WARP_SIZE, configuration)\n";
     output << "    return " << kernelName << "[" << programGrid("num_programs")
            << "](";
     first = true;
@@ -934,7 +884,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(view.argument->name);
     for (ABIView &view : views)
       emitArgument(view.argument->name + ".stride(0)");
-    for (StringRef argument : {"n_rows", "n_cols", "block_size", "num_stages"})
+    for (StringRef argument : {"n_rows", "n_cols", "configuration.tile_size",
+                               "configuration.num_stages"})
       emitArgument(argument);
     output << ")\n\n\n";
     output << "def run(";
@@ -1261,9 +1212,9 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
       return failure();
     }
   } else if (role == "program_0")
-    base = store ? "offs_program_0" : "load_program_0";
+    base = "offs_program_0";
   else if (role == "program_1")
-    base = store ? "offs_program_1" : "load_program_1";
+    base = "offs_program_1";
   else if (role == "reduction_0")
     base = "offs_reduction_0";
   else if (role == "lane_0")
@@ -1375,13 +1326,6 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
                                         : dimensionName(**domain);
     if (failed(extent))
       return failure();
-    if ((!gridStride &&
-         planIndex.program.getMapping() == "grouped_2d_tiles" && !store &&
-         (axis->getRole() == "program_0" ||
-          axis->getRole() == "program_1"))) {
-      ++vectorAxis;
-      continue;
-    }
     FailureOr<std::string> index =
         indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
     if (failed(index))

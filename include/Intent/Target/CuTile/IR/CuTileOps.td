@@ -8,7 +8,17 @@ class IntentCuTile_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentCuTile_Dialect, mnemonic, traits>;
 
 def IntentCuTile_TargetOp : IntentCuTile_Op<"target"> {
-  let arguments = (ins StrAttr:$architecture, I64Attr:$device);
+  let arguments = (ins I64Attr:$device);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentCuTile_CapabilitiesOp : IntentCuTile_Op<"capabilities"> {
+  let arguments = (ins
+    ArrayAttr:$intent_decided,
+    ArrayAttr:$delegated,
+    ArrayAttr:$absent
+  );
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -29,8 +39,7 @@ def IntentCuTile_ProgramOp : IntentCuTile_Op<"program"> {
     I64Attr:$loop_node,
     DenseI64ArrayAttr:$worker_axes,
     StrAttr:$traversal,
-    StrAttr:$mapping,
-    I64Attr:$group_size
+    StrAttr:$mapping
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -38,12 +47,6 @@ def IntentCuTile_ProgramOp : IntentCuTile_Op<"program"> {
 
 def IntentCuTile_StorageOp : IntentCuTile_Op<"storage"> {
   let arguments = (ins I64Attr:$value, StrAttr:$space);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentCuTile_LayoutOp : IntentCuTile_Op<"layout"> {
-  let arguments = (ins I64Attr:$value, DenseI64ArrayAttr:$order);
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -60,7 +63,7 @@ def IntentCuTile_ReductionOp : IntentCuTile_Op<"reduction"> {
 }
 
 def IntentCuTile_PointwiseOp : IntentCuTile_Op<"pointwise"> {
-  let arguments = (ins I64Attr:$node, StrAttr:$lowering);
+  let arguments = (ins I64Attr:$node, StrAttr:$lowering, BoolAttr:$defer);
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -128,34 +131,15 @@ def IntentCuTile_BoundaryOp : IntentCuTile_Op<"boundary"> {
     DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$access,
     StrAttr:$padding,
-    BoolAttr:$check_bounds
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentCuTile_LaunchOp : IntentCuTile_Op<"launch"> {
-  let arguments = (ins
-    I64Attr:$loop_node,
-    StrAttr:$grid_policy,
-    I64Attr:$occupancy
+    BoolAttr:$check_bounds,
+    BoolAttr:$defer
   );
   let results = (outs);
   let hasVerifier = 1;
 }
 
 def IntentCuTile_AutotuneOp : IntentCuTile_Op<"autotune"> {
-  let arguments = (ins ArrayAttr:$key);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentCuTile_ConfigOp : IntentCuTile_Op<"config"> {
-  let arguments = (ins
-    DictionaryAttr:$parameters,
-    I64Attr:$num_ctas,
-    I64Attr:$occupancy
-  );
+  let arguments = (ins ArrayAttr:$key, DictionaryAttr:$parameter_map);
   let results = (outs);
   let hasVerifier = 1;
 }

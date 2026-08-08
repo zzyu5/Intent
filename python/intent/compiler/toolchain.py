@@ -32,7 +32,10 @@ def run_compiler(
             check=False,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"{role} failed:\n{completed.stderr}")
+            raise RuntimeError(
+                f"{role} failed with exit code {completed.returncode}:\n"
+                f"{completed.stderr}{completed.stdout}"
+            )
         if not source_path.is_file() or not mlir_path.is_file():
             raise RuntimeError(f"{role} did not produce both compiler outputs")
         source = source_path.read_text(encoding="utf-8")

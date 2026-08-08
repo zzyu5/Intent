@@ -6,11 +6,10 @@ include "mlir/IR/DialectBase.td"
 def IntentTileLang_Dialect : Dialect {
   let name = "intent_tilelang";
   let cppNamespace = "::intent::tilelang::plan";
-  let summary = "Resolved TileLang mechanisms for an Intent realization";
+  let summary = "TileLang projection of a shared GPU realization";
   let description = [{
-    IntentTileLang records concrete TileLang scheduling, explicit buffer spaces,
-    layouts, primitive, pipeline and launch choices. These operations are not
-    Kernel IR semantics.
+    IntentTileLang spells shared GPU decisions, including explicit on-chip
+    buffer allocation, and records the choices delegated to TileLang.
   }];
 }
 

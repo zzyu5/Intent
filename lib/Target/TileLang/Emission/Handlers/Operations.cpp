@@ -172,24 +172,19 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
 LogicalResult SourceEmitter::leaveParallel(Operation &) { return success(); }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
-  bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                   [](Operation *user) {
-                                     return user->getName().getStringRef() ==
-                                            "intent.contract";
-                                   });
-  if (feedsContract &&
-      (programMapping == "grouped_2d_tiles" ||
-       isRaggedStages())) {
-    deferredLoads[operation.getResult(0)] = &operation;
-    return success();
-  }
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  if (failed(node) || !boundary)
+    return operation.emitOpError("lacks a TileLang load projection");
+  if (boundary.getDefer()) {
+    deferredLoads[operation.getResult(0)] = &operation;
+    return success();
+  }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   FailureOr<std::string> result =
-      allocateResult(operation, 0, feedsContract ? "shared" : "fragment");
-  if (failed(node) || !boundary || failed(view) || failed(result))
+      allocateResult(operation, 0, boundary.getResultSpace());
+  if (failed(view) || failed(result))
     return operation.emitOpError("lacks a mechanical TileLang load binding");
   if (boundary.getTransfer() == "parallel_elements") {
     FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
@@ -225,7 +220,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     }
     line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
     --indentation;
-    if (feedsContract)
+    if (boundary.getResultSpace() == "shared")
       line("T.sync_threads()");
     bindResult(operation, 0, *result);
     return success();
@@ -602,19 +597,25 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
-  if (failed(node) || !binding || binding.getReuseOperandAttr().getInt() != -1 ||
+  int64_t reuseOperand =
+      binding ? binding.getReuseOperandAttr().getInt() : int64_t{-2};
+  if (failed(node) || !binding || reuseOperand < -1 ||
+      reuseOperand >= static_cast<int64_t>(operation.getNumOperands()) ||
       failed(relation) || !validIndex || !fillIndex)
     return operation.emitOpError("lacks a TileLang gather binding");
+  auto resultStorage = [&]() -> FailureOr<std::string> {
+    if (reuseOperand < 0)
+      return allocateResult(operation, 0, "fragment");
+    FailureOr<StringRef> reused = lookupValue(operation, reuseOperand);
+    if (failed(reused))
+      return failure();
+    return reused->str();
+  };
   if (isRaggedStages() && binding.getLowering() == "T.indirect_gather") {
-    bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                     [](Operation *user) {
-                                       return user->getName().getStringRef() ==
-                                              "intent.contract";
-                                     });
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
-    if (feedsContract && (*view)->tensor.getRank() == 2) {
+    if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
@@ -626,19 +627,35 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
           "staged indirect gather requires one indexed vector source");
     FailureOr<StringRef> indices =
         lookupValue(operation, *(*relation)[0].operands.front());
-    FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
-    FailureOr<StringRef> fill = lookupValue(operation, fillIndex.getInt());
-    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
-    if (failed(indices) || failed(valid) || failed(fill) || failed(result))
+    auto element = [&](IntegerAttr operandIndex) -> FailureOr<std::string> {
+      FailureOr<StringRef> value = lookupValue(operation, operandIndex.getInt());
+      if (failed(value))
+        return failure();
+      auto tensor = dyn_cast<RankedTensorType>(
+          operation.getOperand(operandIndex.getInt()).getType());
+      if (!tensor)
+        return value->str();
+      if (tensor.getRank() != 1) {
+        operation.emitOpError(
+            "requires scalar or rank-one ragged gather predicates and fills");
+        return failure();
+      }
+      return value->str() + "[gather_i]";
+    };
+    FailureOr<std::string> valid = element(validIndex);
+    FailureOr<std::string> fill = element(fillIndex);
+    FailureOr<std::string> allocated = resultStorage();
+    if (failed(indices) || failed(valid) || failed(fill) || failed(allocated))
       return failure();
+    std::string result = *allocated;
     line("for gather_i in T.Parallel(TILE_SIZE_M):");
     ++indentation;
-    line(*result + "[gather_i] = T.if_then_else(member_start + gather_i < "
-         "route_end and " + valid->str() + ", " +
+    line(result + "[gather_i] = T.if_then_else(member_start + gather_i < "
+         "route_end and " + *valid + ", " +
          (*view)->argument->name + "[" + indices->str() + "[gather_i]], " +
-         fill->str() + ")");
+         *fill + ")");
     --indentation;
-    bindResult(operation, 0, *result);
+    bindResult(operation, 0, result);
     return success();
   }
   if ((binding.getLowering() != "expand_dims" &&
@@ -649,7 +666,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
   FailureOr<StringRef> fill = lookupValue(operation, fillIndex.getInt());
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  FailureOr<std::string> result = resultStorage();
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
   if (failed(source) || failed(valid) || failed(fill) || failed(result) ||
       failed(extents) || extents->size() != 2)
@@ -904,18 +921,13 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
 
   FailureOr<StringRef> lhs = lookupValue(operation, 0);
   FailureOr<StringRef> rhs = lookupValue(operation, 1);
-  auto emittedOperandSpace = [](Value value) -> StringRef {
-    Operation *definition = value.getDefiningOp();
-    return definition &&
-                   definition->getName().getStringRef() == "intent.view_load"
-               ? StringRef("shared")
-               : StringRef("fragment");
-  };
-  if (binding.getLhsSpace() != emittedOperandSpace(operation.getOperand(0)) ||
-      binding.getRhsSpace() != emittedOperandSpace(operation.getOperand(1)) ||
+  if ((binding.getLhsSpace() != "shared" &&
+       binding.getLhsSpace() != "fragment") ||
+      (binding.getRhsSpace() != "shared" &&
+       binding.getRhsSpace() != "fragment") ||
       binding.getAccumulatorSpace() != "fragment")
     return operation.emitOpError(
-        "direct TileLang contraction has inconsistent plan spaces");
+        "direct TileLang contraction has invalid projected spaces");
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(lhs) || failed(rhs) || failed(result))
     return failure();

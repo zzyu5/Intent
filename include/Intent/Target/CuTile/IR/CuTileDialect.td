@@ -6,10 +6,10 @@ include "mlir/IR/DialectBase.td"
 def IntentCuTile_Dialect : Dialect {
   let name = "intent_cutile";
   let cppNamespace = "::intent::cutile::plan";
-  let summary = "Resolved cuTile mechanisms for an Intent realization";
+  let summary = "cuTile projection of a shared GPU realization";
   let description = [{
-    IntentCuTile records concrete cuda.tile scheduling, memory-access,
-    primitive and launch choices. These operations are not Kernel IR semantics.
+    IntentCuTile records cuda.tile spellings for shared GPU decisions, the
+    surface capability cut, and explicit delegation to the cuda.tile compiler.
   }];
 }
 

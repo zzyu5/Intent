@@ -20,12 +20,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.axesByRole[value.getRole()] = value;
     } else if (auto value = dyn_cast<plan::ProgramOp>(operation))
       index.program = value;
-    else if (auto value = dyn_cast<plan::LaunchOp>(operation))
-      index.launch = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
-    else if (auto value = dyn_cast<plan::LayoutOp>(operation))
-      index.layouts[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -58,8 +54,6 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
   for (Operation &operation : searchSpace.getBody().front()) {
     if (auto autotune = dyn_cast<plan::AutotuneOp>(operation))
       index.autotune = autotune;
-    else if (auto config = dyn_cast<plan::ConfigOp>(operation))
-      index.configs.push_back(config);
   }
   return index;
 }
@@ -115,11 +109,10 @@ LogicalResult SourceEmitter::indexABI() {
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("cuTile emitter requires ranked views");
-    if (!planIndex.storage.count(argument.valueID) ||
-        !planIndex.layouts.count(argument.valueID))
+    if (!planIndex.storage.count(argument.valueID))
       return kernel.entry.emitOpError()
              << "ABI value " << argument.valueID
-             << " lacks cuTile storage/layout realization";
+             << " lacks global cuTile storage realization";
     ABIView emitted{&argument, view, tensor, {}};
     auto shape = argument.metadata.getAs<ArrayAttr>("shape");
     if (!shape || shape.size() != static_cast<size_t>(tensor.getRank()))
@@ -216,9 +209,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     auto program = planIndex.axesByRole.find("program_0");
     auto lane = planIndex.axesByRole.find("lane_0");
     if (program == planIndex.axesByRole.end() ||
-        lane == planIndex.axesByRole.end() || !planIndex.launch)
+        lane == planIndex.axesByRole.end())
       return realization.emitOpError(
-          "persistent rows require program_0, lane_0 and launch choices");
+          "persistent rows require program_0 and lane_0 choices");
     vectorDomain = kernel.nodes.lookup(lane->second.getNode());
     for (ABIView &view : views) {
       if (view.view.getAccess() == "out" && !fixedOutput)
@@ -230,16 +223,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!fixedOutput || searchSpace)
       return realization.emitOpError(
           "fixed persistent rows require one output and no search space");
-    if (planIndex.launch.getGridPolicy() != "static_persistent")
-      return planIndex.launch.emitOpError(
-          "has no persistent-row cuTile source emitter");
   } else if (planIndex.program.getMapping() == "grouped_2d_tiles") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+    if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
-          "grouped cuTile program requires backend autotune candidates");
-    if (planIndex.launch)
-      return realization.emitOpError(
-          "autotuned grouped cuTile program cannot carry fixed launch hints");
+          "grouped cuTile program requires a delegated backend tuner");
     for (StringRef role : {"program_0", "program_1", "reduction_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -256,12 +243,12 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         return searchIndex.autotune.emitOpError(
             "key order does not match program/reduction roles");
   } else if (planIndex.program.getMapping() == "multi_axis_stream") {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+    if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
-          "ordered cuTile stream requires backend autotune candidates");
-    if (planIndex.launch || planIndex.streams.size() != 1)
+          "ordered cuTile stream requires a delegated backend tuner");
+    if (planIndex.streams.size() != 1)
       return realization.emitOpError(
-          "ordered cuTile stream requires one stream and no fixed launch");
+          "ordered cuTile stream requires one stream");
     for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -286,18 +273,15 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         kernelConstants.push_back(dimension);
     }
   } else if (raggedStages) {
-    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty() ||
+    if (!searchSpace || !searchIndex.autotune ||
         !planIndex.ragged || planIndex.stages.empty() ||
         planIndex.atomics.empty())
       return realization.emitOpError(
-          "ragged staging requires target traversal, stages, atomic merge, and backend candidates");
+          "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
     for (StringRef role : {"program_0", "program_1"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
                << "ragged staging lacks " << role << " axis";
-    if (planIndex.launch)
-      return realization.emitOpError(
-          "ragged staging cannot carry a fixed launch choice");
   } else {
     return planIndex.program.emitOpError("has no cuTile program emitter");
   }
@@ -459,10 +443,22 @@ void SourceEmitter::emitImports() {
   output << "import math\n";
   output << "import cuda.tile as ct\n";
   output << "import torch\n";
+  if (planIndex.program.getMapping() == "persistent_rows")
+    output << "from intent.runtime.tuning.cutile import ROW_OCCUPANCY, row_configuration, row_program_count\n";
   if (searchSpace) {
     output << "from math import ceil\n";
-    output << "from types import SimpleNamespace\n";
     output << "from cuda.tile.tune import exhaustive_search\n";
+    output << "from intent.runtime.tuning.cutile import autotune_configurations, autotune_timeout\n";
+    output << "\n_PARAMETER_MAP = {";
+    for (auto [index, mapping] :
+         llvm::enumerate(searchIndex.autotune.getParameterMap())) {
+      if (index)
+        output << ", ";
+      output << "'" << mapping.getName().getValue() << "': '"
+             << cast<StringAttr>(mapping.getValue()).getValue() << "'";
+    }
+    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
+    output << "_TUNE_TIMEOUT = autotune_timeout(_PARAMETER_MAP)\n";
   }
   output << "\nConstInt = ct.Constant[int]\n\n\n";
 }
@@ -480,9 +476,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         indicesLoad && indicesLoad->getNumOperands() == 1
             ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
             : FailureOr<ABIView *>(failure());
-    if (failed(offsets) || failed(indices) || searchIndex.configs.empty())
+    if (failed(offsets) || failed(indices) || !searchIndex.autotune)
       return raggedRelation->emitOpError(
-          "cannot resolve staged ragged metadata or search candidates");
+          "cannot resolve staged ragged metadata or delegated tuner");
 
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
       llvm::raw_string_ostream source(stageBodies[stage]);
@@ -506,7 +502,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         for (int64_t valueID : binding.getOutputs())
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
       parameter("MAX_ROUTES: ConstInt");
-      for (NamedAttribute config : searchIndex.configs.front().getParameters())
+      for (NamedAttribute config : searchIndex.autotune.getParameterMap())
         parameter(config.getName().getValue().str() + ": ConstInt");
       source << "):\n";
       source.flush();
@@ -543,8 +539,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     return success();
   }
   if (planIndex.program.getMapping() == "persistent_rows") {
-    output << "@ct.kernel(occupancy=" << planIndex.launch.getOccupancy()
-           << ")\n";
+    output << "@ct.kernel(occupancy=ROW_OCCUPANCY)\n";
     programIndex = makeRegionArgumentName(*programRoot, 0);
     vectorIndex = makeResultName(*vectorDomain, 0);
     valueNames[programRoot->getRegion(0).front().getArgument(0)] = programIndex;
@@ -573,10 +568,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   } else {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
-    if (searchIndex.configs.empty())
-      return realization.emitOpError(
-          "autotuned cuTile emission has no physical configurations");
-    for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
       emitParameter(parameter.getName().getValue().str() + ": ConstInt");
   }
   output << "):\n";
@@ -616,16 +608,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &body : stageBodies)
       output << "\n" << body;
 
-    output << "\n_CONFIGS = (\n";
-    for (plan::ConfigOp config : searchIndex.configs) {
-      output << "    SimpleNamespace(";
-      for (NamedAttribute parameter : config.getParameters())
-        output << parameter.getName().getValue() << "="
-               << cast<IntegerAttr>(parameter.getValue()).getInt() << ", ";
-      output << "num_ctas=" << config.getNumCtas()
-             << ", occupancy=" << config.getOccupancy() << "),\n";
-    }
-    output << ")\n_TUNE_CACHE = {}\n\n\n";
+    output << "\n_TUNE_CACHE = {}\n\n\n";
 
     output << "def launch(";
     bool firstParameter = true;
@@ -706,7 +689,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << ", " << inputs.front()->argument->name
              << ".dtype, str(_DEVICE))\n";
       output << "    if cache_key_" << stage << " not in _TUNE_CACHE:\n";
-      output << "        with ct.compiler_timeout(10):\n";
+      output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
       output << "            result = exhaustive_search(\n";
       output << "                _CONFIGS,\n                stream,\n";
       output << "                lambda cfg: (ceil(" << feature
@@ -729,7 +712,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       output << "max_routes, ";
-      for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
         output << "cfg." << parameter.getName().getValue() << ", ";
       output << "),\n";
       output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
@@ -754,7 +737,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       output << "max_routes, ";
-      for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
         output << "best." << parameter.getName().getValue() << ", ";
       output << "))\n";
     }
@@ -803,7 +786,6 @@ LogicalResult SourceEmitter::emitWrapper() {
       return kernel.entry.emitOpError(
           "persistent-row wrapper requires an input view");
     ABIView *shapeOwner = inputs.front();
-    output << "_OCCUPANCY = " << planIndex.launch.getOccupancy() << "\n\n\n";
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -832,9 +814,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "        raise ValueError('persistent-row views must be contiguous')\n";
     }
     output << "    n_rows, n_cols = " << shapeOwner->argument->name << ".shape\n";
-    output << "    tile_size = 1 << (n_cols - 1).bit_length()\n";
-    output << "    num_sms = torch.cuda.get_device_properties(_DEVICE).multi_processor_count\n";
-    output << "    num_programs = min(num_sms * _OCCUPANCY, n_rows)\n";
+    output << "    configuration = row_configuration(n_cols)\n";
+    output << "    num_programs = row_program_count(n_rows, _DEVICE, configuration.occupancy)\n";
     output << "    return ct.launch(torch.cuda.current_stream(), (num_programs, 1, 1), "
            << kernelName << ", (";
     for (auto [index, view] : llvm::enumerate(views)) {
@@ -842,7 +823,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << view.argument->name;
     }
-    output << ", n_rows, tile_size, n_cols))\n\n\n";
+    output << ", n_rows, configuration.tile_size, n_cols))\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {
       if (index)
@@ -877,16 +858,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   if (!outputView)
     return kernel.entry.emitOpError("autotuned cuTile wrapper has no output view");
 
-  output << "_CONFIGS = (\n";
-  for (plan::ConfigOp config : searchIndex.configs) {
-    output << "    SimpleNamespace(";
-    for (NamedAttribute parameter : config.getParameters())
-      output << parameter.getName().getValue() << "="
-             << cast<IntegerAttr>(parameter.getValue()).getInt() << ", ";
-    output << "num_ctas=" << config.getNumCtas()
-           << ", occupancy=" << config.getOccupancy() << "),\n";
-  }
-  output << ")\n_TUNE_CACHE = {}\n\n\n";
+  output << "_TUNE_CACHE = {}\n\n\n";
   output << "def launch(";
   bool firstParameter = true;
   for (ABIView &view : views) {
@@ -941,9 +913,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   output << ", " << inputs.front()->argument->name << ".dtype, str(_DEVICE))\n";
   output << "    if cache_key not in _TUNE_CACHE:\n";
-  output << "        with ct.compiler_timeout("
-         << (planIndex.program.getMapping() == "multi_axis_stream" ? 10 : 5)
-         << "):\n";
+  output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
   output << "            result = exhaustive_search(\n";
   output << "                _CONFIGS,\n                stream,\n";
   if (planIndex.program.getMapping() == "grouped_2d_tiles") {
@@ -970,7 +940,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << scalar.name << ", ";
   for (const std::string &dimension : kernelConstants)
     output << dimension << ", ";
-  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
     output << "cfg." << parameter.getName().getValue() << ", ";
   output << "),\n";
   output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
@@ -996,7 +966,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << scalar.name << ", ";
   for (const std::string &dimension : kernelConstants)
     output << dimension << ", ";
-  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
     output << "best." << parameter.getName().getValue() << ", ";
   output << "))\n\n\n";
   output << "def run(";

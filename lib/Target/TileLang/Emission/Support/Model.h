@@ -21,12 +21,9 @@ namespace intent::tilelang::emission {
 struct RealizationIndex {
   plan::TargetOp target;
   plan::ProgramOp program;
-  plan::PipelineOp pipeline;
-  plan::LaunchOp launch;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::StorageOp> storage;
-  llvm::DenseMap<int64_t, plan::LayoutOp> layouts;
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
@@ -39,7 +36,6 @@ struct RealizationIndex {
 
 struct SearchIndex {
   plan::AutotuneOp autotune;
-  llvm::SmallVector<plan::ConfigOp> configs;
 };
 
 struct ABIView {

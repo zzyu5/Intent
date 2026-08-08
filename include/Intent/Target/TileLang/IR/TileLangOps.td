@@ -8,7 +8,17 @@ class IntentTileLang_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentTileLang_Dialect, mnemonic, traits>;
 
 def IntentTileLang_TargetOp : IntentTileLang_Op<"target"> {
-  let arguments = (ins StrAttr:$architecture, I64Attr:$device);
+  let arguments = (ins I64Attr:$device);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTileLang_CapabilitiesOp : IntentTileLang_Op<"capabilities"> {
+  let arguments = (ins
+    ArrayAttr:$intent_decided,
+    ArrayAttr:$delegated,
+    ArrayAttr:$absent
+  );
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -29,8 +39,7 @@ def IntentTileLang_ProgramOp : IntentTileLang_Op<"program"> {
     I64Attr:$loop_node,
     DenseI64ArrayAttr:$worker_axes,
     StrAttr:$traversal,
-    StrAttr:$mapping,
-    I64Attr:$group_size
+    StrAttr:$mapping
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -38,16 +47,6 @@ def IntentTileLang_ProgramOp : IntentTileLang_Op<"program"> {
 
 def IntentTileLang_StorageOp : IntentTileLang_Op<"storage"> {
   let arguments = (ins I64Attr:$value, StrAttr:$space);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTileLang_LayoutOp : IntentTileLang_Op<"layout"> {
-  let arguments = (ins
-    I64Attr:$value,
-    StrAttr:$kind,
-    DenseI64ArrayAttr:$order
-  );
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -70,7 +69,8 @@ def IntentTileLang_PointwiseOp : IntentTileLang_Op<"pointwise"> {
     I64Attr:$node,
     StrAttr:$lowering,
     StrAttr:$space,
-    I64Attr:$reuse_operand
+    I64Attr:$reuse_operand,
+    BoolAttr:$defer
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -140,44 +140,16 @@ def IntentTileLang_BoundaryOp : IntentTileLang_Op<"boundary"> {
     StrAttr:$access,
     StrAttr:$transfer,
     StrAttr:$padding,
-    BoolAttr:$check_bounds
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTileLang_PipelineOp : IntentTileLang_Op<"pipeline"> {
-  let arguments = (ins
-    I64Attr:$loop_node,
-    I64Attr:$num_stages,
-    BoolAttr:$async_copy
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTileLang_LaunchOp : IntentTileLang_Op<"launch"> {
-  let arguments = (ins
-    I64Attr:$loop_node,
-    StrAttr:$grid_policy,
-    I64Attr:$threads
+    BoolAttr:$check_bounds,
+    StrAttr:$result_space,
+    BoolAttr:$defer
   );
   let results = (outs);
   let hasVerifier = 1;
 }
 
 def IntentTileLang_AutotuneOp : IntentTileLang_Op<"autotune"> {
-  let arguments = (ins ArrayAttr:$key);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentTileLang_ConfigOp : IntentTileLang_Op<"config"> {
-  let arguments = (ins
-    DictionaryAttr:$parameters,
-    I64Attr:$num_stages,
-    I64Attr:$threads
-  );
+  let arguments = (ins ArrayAttr:$key, DictionaryAttr:$parameter_map);
   let results = (outs);
   let hasVerifier = 1;
 }

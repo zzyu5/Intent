@@ -2,13 +2,14 @@
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
 #include "Intent/Target/CuTile/Emission/Translate.h"
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"
-#include "Intent/Target/CuTile/Realization/Realize.h"
+#include "Intent/Target/CuTile/Projection/Project.h"
+#include "Intent/Target/GPU/Realization/Realize.h"
 #include "Intent/Target/TileLang/Emission/Translate.h"
 #include "Intent/Target/TileLang/IR/TileLangDialect.h"
-#include "Intent/Target/TileLang/Realization/Realize.h"
+#include "Intent/Target/TileLang/Projection/Project.h"
 #include "Intent/Target/Triton/Emission/Translate.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"
-#include "Intent/Target/Triton/Realization/Realize.h"
+#include "Intent/Target/Triton/Projection/Project.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
@@ -25,19 +26,16 @@ namespace {
 enum class TargetKind { Triton, CuTile, TileLang };
 
 mlir::LogicalResult realize(mlir::ModuleOp module, TargetKind target,
-                            llvm::StringRef architecture, int64_t device,
-                            int64_t warpSize) {
+                            const intent::gpu::DeviceCapabilities &device) {
+  if (mlir::failed(intent::gpu::realizeKernel(module, device)))
+    return mlir::failure();
   switch (target) {
   case TargetKind::Triton:
-    return intent::triton::realizeKernel(
-        module, intent::triton::TargetOptions{architecture.str(), device,
-                                              warpSize});
+    return intent::triton::projectSurface(module);
   case TargetKind::CuTile:
-    return intent::cutile::realizeKernel(
-        module, intent::cutile::TargetOptions{architecture.str(), device});
+    return intent::cutile::projectSurface(module);
   case TargetKind::TileLang:
-    return intent::tilelang::realizeKernel(
-        module, intent::tilelang::TargetOptions{architecture.str(), device});
+    return intent::tilelang::projectSurface(module);
   }
   llvm_unreachable("unknown Intent target");
 }
@@ -69,14 +67,25 @@ int main(int argc, char **argv) {
           clEnumValN(TargetKind::CuTile, "cutile", "emit cuTile source"),
           clEnumValN(TargetKind::TileLang, "tilelang",
                      "emit TileLang source")));
-  llvm::cl::opt<std::string> architecture(
-      "architecture", llvm::cl::desc("target architecture"),
-      llvm::cl::Required);
   llvm::cl::opt<int64_t> device("device", llvm::cl::desc("target device"),
                                 llvm::cl::init(0));
-  llvm::cl::opt<int64_t> warpSize(
-      "warp-size", llvm::cl::desc("Triton target warp size"),
-      llvm::cl::init(32));
+  llvm::cl::opt<int64_t> computeUnits(
+      "compute-units", llvm::cl::desc("GPU compute-unit count"),
+      llvm::cl::Required);
+  llvm::cl::opt<int64_t> sharedMemoryPerUnit(
+      "shared-memory-per-unit",
+      llvm::cl::desc("GPU shared-memory bytes per compute unit"),
+      llvm::cl::Required);
+  llvm::cl::opt<int64_t> registersPerUnit(
+      "registers-per-unit",
+      llvm::cl::desc("GPU registers per compute unit"), llvm::cl::Required);
+  llvm::cl::opt<bool> matrixUnits(
+      "matrix-units", llvm::cl::desc("GPU exposes matrix units"),
+      llvm::cl::Required);
+  llvm::cl::opt<bool> dynamicVectorWidth(
+      "dynamic-vector-width",
+      llvm::cl::desc("GPU worker vector width is dynamic"),
+      llvm::cl::Required);
   llvm::cl::opt<std::string> irOutputFilename(
       "ir-output", llvm::cl::desc("realized Intent MLIR output"),
       llvm::cl::Required);
@@ -103,10 +112,19 @@ int main(int argc, char **argv) {
                       intent::triton::plan::IntentTritonDialect>();
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
-  if (!module || mlir::failed(realize(*module, target, architecture, device,
-                                      warpSize)) ||
-      mlir::failed(mlir::verify(*module)))
+  intent::gpu::DeviceCapabilities capabilities{
+      device, computeUnits, sharedMemoryPerUnit, registersPerUnit, matrixUnits,
+      dynamicVectorWidth};
+  if (!module)
     return 1;
+  if (mlir::failed(realize(*module, target, capabilities))) {
+    llvm::errs() << "Intent realization or surface projection failed\n";
+    return 1;
+  }
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "realized Intent module verification failed\n";
+    return 1;
+  }
 
   std::string source;
   llvm::raw_string_ostream sourceStream(source);

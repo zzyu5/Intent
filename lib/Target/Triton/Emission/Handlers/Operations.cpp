@@ -235,10 +235,6 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   line("pid_n = (pid % num_pid_in_group) // group_size_m");
   line("offs_program_0 = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)");
   line("offs_program_1 = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)");
-  line("load_program_0 = offs_program_0 % " +
-       roleDimensions.lookup("program_0"));
-  line("load_program_1 = offs_program_1 % " +
-       roleDimensions.lookup("program_1"));
   return success();
 }
 
@@ -250,21 +246,16 @@ LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
-  bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                   [](Operation *user) {
-                                     return user->getName().getStringRef() ==
-                                            "intent.contract";
-                                   });
-  if (feedsContract &&
-      (planIndex.program.getMapping() == "grouped_2d_tiles" ||
-       isRaggedStages())) {
-    deferredLoads[operation.getResult(0)] = &operation;
-    return success();
-  }
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
-  if (failed(node) || !boundary || boundary.getLoadFill() == "none")
+  if (failed(node) || !boundary)
+    return operation.emitOpError("lacks a resolved Triton load projection");
+  if (boundary.getDefer()) {
+    deferredLoads[operation.getResult(0)] = &operation;
+    return success();
+  }
+  if (boundary.getLoadFill() == "none")
     return operation.emitOpError("lacks a semantics-preserving load boundary");
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(view))
@@ -454,15 +445,10 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
                 : FailureOr<StringRef>(failure());
   if (isRaggedStages() && binding &&
       binding.getLowering() == "tl.indirect_gather") {
-    bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
-                                     [](Operation *user) {
-                                       return user->getName().getStringRef() ==
-                                              "intent.contract";
-                                     });
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation) || failed(valid) || failed(fill))
       return failure();
-    if (feedsContract && (*view)->tensor.getRank() == 2) {
+    if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }

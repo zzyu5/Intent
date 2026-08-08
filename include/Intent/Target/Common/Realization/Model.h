@@ -14,7 +14,7 @@ struct OperationFacts {
   explicit OperationFacts(KernelModel &kernel) : semantics(kernel) {}
 
   KernelFacts semantics;
-  llvm::DenseMap<mlir::Operation *, std::string> primitiveLowerings;
+  llvm::DenseMap<mlir::Operation *, std::string> primitiveRoles;
 };
 
 struct AxisDecision {
@@ -34,6 +34,7 @@ struct ScheduleDecision {
   std::string mapping;
   llvm::SmallVector<int64_t> workerAxes;
   llvm::SmallVector<std::string> autotuneKeys;
+  llvm::SmallVector<std::string> autotuneParameters;
   bool usesAutotuner = false;
 };
 

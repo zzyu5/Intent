@@ -8,5 +8,6 @@ add_mlir_dialect_library(MLIRIntentTritonDialect
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRIntentPlanDialect
+  MLIRIntentTargetCommon
   MLIRSupport
 )
