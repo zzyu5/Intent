@@ -23,41 +23,100 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.dim", "intent.domain", "intent.partition",
-                         "intent.yield", "intent.return"})
+                         "intent.yield", "intent.return", "intent.ragged",
+                         "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
   if (failed(addHandler(registry, "intent.constant",
-                        [&](Operation &op) { return emitter.emitConstant(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitConstant(op);
+                        })) ||
       failed(addHandler(
           registry, "intent.parallel",
           [&](Operation &op) { return emitter.enterParallel(op); },
           [&](Operation &op) { return emitter.leaveParallel(op); })) ||
       failed(addHandler(registry, "intent.view_load",
-                        [&](Operation &op) { return emitter.emitLoad(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitLoad(op);
+                        })) ||
       failed(addHandler(registry, "intent.reduce",
-                        [&](Operation &op) { return emitter.emitReduction(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitReduction(op);
+                        })) ||
       failed(addHandler(registry, "intent.broadcast",
-                        [&](Operation &op) { return emitter.emitBroadcast(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitBroadcast(op);
+                        })) ||
       failed(addHandler(registry, "intent.unary",
-                        [&](Operation &op) { return emitter.emitUnary(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitUnary(op);
+                        })) ||
       failed(addHandler(registry, "intent.binary",
-                        [&](Operation &op) { return emitter.emitBinary(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitBinary(op);
+                        })) ||
       failed(addHandler(registry, "intent.cast",
-                        [&](Operation &op) { return emitter.emitCast(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitCast(op);
+                        })) ||
       failed(addHandler(registry, "intent.full",
-                        [&](Operation &op) { return emitter.emitFull(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitFull(op);
+                        })) ||
       failed(addHandler(registry, "intent.zeros",
-                        [&](Operation &op) { return emitter.emitZeros(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitZeros(op);
+                        })) ||
+      failed(addHandler(registry, "intent.members", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitMembers(op);
+      })) ||
       failed(addHandler(registry, "intent.gather",
-                        [&](Operation &op) { return emitter.emitGather(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitGather(op);
+                        })) ||
       failed(addHandler(
           registry, "intent.state_stream",
           [&](Operation &op) { return emitter.enterStateStream(op); },
           [&](Operation &op) { return emitter.leaveStateStream(op); })) ||
       failed(addHandler(registry, "intent.contract",
-                        [&](Operation &op) { return emitter.emitContract(op); })) ||
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitContract(op);
+                        })) ||
       failed(addHandler(registry, "intent.view_store",
-                        [&](Operation &op) { return emitter.emitStore(op); })))
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitStore(op);
+                        })) ||
+      failed(addHandler(registry, "intent.scatter_reduce", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAtomic(op);
+      })))
     return failure();
   return success();
 }
@@ -87,11 +146,29 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     return operation.emitOpError("has an unsupported cuTile constant value");
   }
   line(result + " = " + expression);
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
+  if (isRaggedStages()) {
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "ragged program ownership requires one region argument");
+    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    if (axis->getRole() == "program_0")
+      valueNames[argument] = "expert";
+    else if (axis->getRole() == "program_1")
+      valueNames[argument] = "member_offsets";
+    else
+      return operation.emitOpError("has no ragged program-axis role");
+    return success();
+  }
   if (planIndex.program.getMapping() == "multi_axis_stream") {
     if (&operation == programRoot) {
       line("bid_program_2 = ct.bid(" +
@@ -171,7 +248,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                                             "intent.contract";
                                    });
   if (feedsContract &&
-      planIndex.program.getMapping() == "grouped_2d_tiles") {
+      (planIndex.program.getMapping() == "grouped_2d_tiles" ||
+       isRaggedStages())) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
@@ -203,7 +281,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   } else {
     return boundary.emitOpError("is not a load-like cuTile access");
   }
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -218,7 +296,7 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
        ", " + std::to_string(binding.getAxis()) + ", keepdims=" +
        (binding.getKeepDims() ? "True" : "False") + ")");
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -230,7 +308,7 @@ LogicalResult SourceEmitter::emitBroadcast(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "alias" ||
       failed(operand))
     return operation.emitOpError("lacks a cuTile broadcast binding");
-  valueNames[operation.getResult(0)] = operand->str();
+  bindResult(operation, 0, operand->str());
   return success();
 }
 
@@ -247,7 +325,7 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
                                : binding.getLowering().str() + "(" +
                                      operand->str() + ")";
   line(result + " = " + expression);
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -278,7 +356,7 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   }
   std::string result = makeResultName(operation, 0);
   line(result + " = " + expression);
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -298,7 +376,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
     return failure();
   std::string result = makeResultName(operation, 0);
   line(result + " = ct.astype(" + operand->str() + ", " + targetType + ")");
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -320,7 +398,7 @@ LogicalResult SourceEmitter::emitFull(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   line(result + " = ct.full(" + *shape + ", " + fill->str() +
        ", dtype=" + dtype + ")");
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -340,7 +418,7 @@ LogicalResult SourceEmitter::emitZeros(Operation &operation) {
     return failure();
   std::string result = makeResultName(operation, 0);
   line(result + " = ct.zeros(" + *shape + ", dtype=" + dtype + ")");
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -361,16 +439,65 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  if (failed(node) || !binding || binding.getLowering() != "alias_column" ||
+  if (isRaggedStages() && binding &&
+      binding.getLowering() == "ct.indirect_gather") {
+    bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
+                                     [](Operation *user) {
+                                       return user->getName().getStringRef() ==
+                                              "intent.contract";
+                                     });
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    if (failed(view) || failed(relation) || failed(valid) || failed(fill))
+      return failure();
+    if (feedsContract && (*view)->tensor.getRank() == 2) {
+      deferredLoads[operation.getResult(0)] = &operation;
+      return success();
+    }
+    if ((*view)->tensor.getRank() != 1 || relation->size() != 1 ||
+        (*relation)[0].kind != "value_index" ||
+        (*relation)[0].operands.size() != 1 ||
+        !(*relation)[0].operands.front())
+      return operation.emitOpError(
+          "staged indirect gather requires one indexed vector source");
+    FailureOr<StringRef> index =
+        lookupValue(operation, *(*relation)[0].operands.front());
+    if (failed(index))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.gather(" + (*view)->argument->name + ", " +
+         index->str() + ", check_bounds=True, padding_value=" + fill->str() +
+         ")");
+    line(result + " = ct.where(member_mask & " + valid->str() + ", " +
+         result + ", " + fill->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  if (failed(node) || !binding ||
+      (binding.getLowering() != "alias_column" &&
+       binding.getLowering() != "expand_dims") ||
       failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "full_slice" ||
       (*relation)[1].kind != "new_axis" || failed(source) || failed(valid) ||
       failed(fill))
     return operation.emitOpError("lacks a mechanical cuTile gather binding");
   std::string result = makeResultName(operation, 0);
-  line(result + " = ct.where(" + valid->str() + ", " + source->str() + ", " +
+  std::string expanded =
+      binding.getLowering() == "expand_dims" ? source->str() + "[:, None]"
+                                              : source->str();
+  line(result + " = ct.where(" + valid->str() + ", " + expanded + ", " +
        fill->str() + ")");
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitMembers(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "members emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  if (failed(node) || !binding || binding.getLowering() != "ct.members" ||
+      operation.getNumResults() != 1)
+    return operation.emitOpError("lacks a staged cuTile members binding");
+  bindResult(operation, 0, "routes");
   return success();
 }
 
@@ -434,6 +561,77 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "ct.mma" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a cuTile contraction binding");
+  if (isRaggedStages()) {
+    if (activeStages.size() != 1)
+      return operation.emitOpError(
+          "must belong to exactly one resolved physical stage");
+    unsigned stage = activeStages.front();
+    Operation *lhsAccess = deferredLoads.lookup(operation.getOperand(0));
+    Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
+    FailureOr<ABIView *> rhsView =
+        rhsLoad && rhsLoad->getNumOperands() > 0
+            ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
+            : FailureOr<ABIView *>(failure());
+    if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
+        binding.getLhsTranspose() || binding.getRhsTranspose())
+      return operation.emitOpError(
+          "staged contraction requires one expert-selected rank-three weight");
+    std::string reduction = stageReductionDimensions.lookup(stage);
+    std::string result = makeResultName(operation, 0);
+    line(result +
+         " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
+    line("for k_tile in range(ct.cdiv(" + reduction + ", TILE_SIZE_K)):");
+    ++indentation;
+    line("offs_reduction = k_tile * TILE_SIZE_K + "
+         "ct.arange(TILE_SIZE_K, dtype=ct.int32)");
+
+    std::string lhs;
+    if (lhsAccess) {
+      if (lhsAccess->getName().getStringRef() != "intent.gather")
+        return lhsAccess->emitOpError(
+            "is not a staged indirect contraction input");
+      FailureOr<SmallVector<target::IndexTerm>> relation =
+          target::parseIndexRelation(*lhsAccess);
+      FailureOr<ABIView *> lhsView =
+          lookupView(lhsAccess->getOperand(0), *lhsAccess);
+      if (failed(relation) || failed(lhsView) || relation->size() != 2 ||
+          (*relation)[0].kind != "value_index" ||
+          (*relation)[0].operands.size() != 1 ||
+          !(*relation)[0].operands.front() ||
+          (*relation)[1].kind != "full_slice")
+        return lhsAccess->emitOpError(
+            "has no staged row-gather contraction relation");
+      FailureOr<StringRef> rows =
+          lookupValue(*lhsAccess, *(*relation)[0].operands.front());
+      if (failed(rows))
+        return failure();
+      lhs = makeResultName(*lhsAccess, 0);
+      line(lhs + " = ct.gather(" + (*lhsView)->argument->name + ", (" +
+           rows->str() + "[:, None], offs_reduction[None, :]), "
+           "check_bounds=True, padding_value=0.0)");
+      line(lhs + " = ct.where(member_mask[:, None], " + lhs + ", 0.0)");
+    } else {
+      auto workspace = workspaceNames.find(operation.getOperand(0));
+      if (workspace == workspaceNames.end())
+        return operation.emitOpError(
+            "staged contraction input has no materialized workspace");
+      lhs = "stage_input";
+      line(lhs + " = ct.gather(" + workspace->second +
+           ", (safe_member_offsets[:, None], offs_reduction[None, :]), "
+           "check_bounds=True, padding_value=0.0).astype(ct.tfloat32)");
+    }
+    std::string rhs = makeResultName(*rhsLoad, 0);
+    line(rhs + " = ct.load(" + (*rhsView)->argument->name +
+         ", index=(expert, k_tile, bid_feature), shape=(1, TILE_SIZE_K, "
+         "TILE_SIZE_N), padding_mode=ct.PaddingMode.ZERO).reshape((TILE_SIZE_K, "
+         "TILE_SIZE_N))");
+    if (!lhsAccess)
+      line(rhs + " = " + rhs + ".astype(ct.tfloat32)");
+    line(result + " = ct.mma(" + lhs + ", " + rhs + ", " + result + ")");
+    --indentation;
+    bindResult(operation, 0, result);
+    return success();
+  }
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
   if (!lhsLoad && !rhsLoad) {
@@ -453,7 +651,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
          ", 0.0, dtype=ct.float32)");
     line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression +
          ", " + result + ")");
-    valueNames[operation.getResult(0)] = result;
+    bindResult(operation, 0, result);
     return success();
   }
   if (!lhsLoad || !rhsLoad || binding.getLhsTranspose() ||
@@ -489,7 +687,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
        ", padding_mode=ct.PaddingMode.ZERO).astype(operand_dtype)");
   line(result + " = ct.mma(" + lhs + ", " + rhs + ", " + result + ")");
   --indentation;
-  valueNames[operation.getResult(0)] = result;
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -525,6 +723,41 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
          ", tile=" + tile + ")");
   } else
     return boundary.emitOpError("is not a store-like cuTile access");
+  return success();
+}
+
+LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "atomic emission");
+  plan::AtomicOp binding =
+      succeeded(node) ? planIndex.atomics.lookup(*node) : plan::AtomicOp();
+  auto valueIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<StringRef> stored =
+      valueIndex ? lookupValue(operation, valueIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  if (failed(node) || !binding || binding.getLowering() != "ct.atomic_add" ||
+      binding.getMemoryOrder() != "relaxed" ||
+      binding.getMemoryScope() != "device" || !valueIndex ||
+      failed(relation) || relation->size() != 2 ||
+      (*relation)[0].kind != "value_index" ||
+      (*relation)[0].operands.size() != 1 ||
+      !(*relation)[0].operands.front() ||
+      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored) ||
+      (*view)->tensor.getRank() != 2)
+    return operation.emitOpError("lacks a mechanical cuTile atomic merge");
+  FailureOr<StringRef> rows =
+      lookupValue(operation, *(*relation)[0].operands.front());
+  if (failed(rows))
+    return failure();
+  line("atomic_rows = ct.where(member_mask, " + rows->str() + ", " +
+       (*view)->argument->name + ".shape[0])");
+  line("ct.atomic_add(" + (*view)->argument->name +
+       ", (atomic_rows[:, None], offs_feature[None, :]), " + stored->str() +
+       ", check_bounds=True, memory_order=ct.MemoryOrder.RELAXED, "
+       "memory_scope=ct.MemoryScope.DEVICE)");
   return success();
 }
 

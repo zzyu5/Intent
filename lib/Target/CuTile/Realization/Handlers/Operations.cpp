@@ -299,11 +299,13 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
             auto axis = axes && axes.size() == 1
                             ? dyn_cast<IntegerAttr>(axes[0])
                             : IntegerAttr();
-            if (failed(node) || !axis)
+            auto lowering = facts.primitiveLowerings.find(&operation);
+            if (failed(node) || !axis ||
+                lowering == facts.primitiveLowerings.end())
               return failure();
             builder.create<plan::ReductionOp>(
                 operation.getLoc(), i64(builder, *node),
-                string(builder, facts.primitiveLowerings.lookup(&operation)),
+                string(builder, lowering->second),
                 i64(builder, axis.getInt()), builder.getBoolAttr(true));
             return success();
           })))
@@ -316,11 +318,12 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =
                   target::getNodeID(operation, "primitive binding");
-              if (failed(node))
+              auto lowering = facts.primitiveLowerings.find(&operation);
+              if (failed(node) || lowering == facts.primitiveLowerings.end())
                 return failure();
               builder.create<plan::PointwiseOp>(
                   operation.getLoc(), i64(builder, *node),
-                  string(builder, facts.primitiveLowerings.lookup(&operation)));
+                  string(builder, lowering->second));
               return success();
             })))
       return failure();
@@ -329,11 +332,12 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
           registry, "intent.gather", [&](Operation &operation) -> LogicalResult {
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "primitive binding");
-            if (failed(node))
+            auto found = facts.primitiveLowerings.find(&operation);
+            if (failed(node) || found == facts.primitiveLowerings.end())
               return failure();
             StringRef lowering = policy.mapping == "multi_axis_stream"
-                                     ? "alias_column"
-                                     : facts.primitiveLowerings.lookup(&operation);
+                                     ? StringRef("alias_column")
+                                     : StringRef(found->second);
             builder.create<plan::PointwiseOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, lowering));

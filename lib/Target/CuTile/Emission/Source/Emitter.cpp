@@ -36,6 +36,12 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.streams[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
       index.boundaries[value.getNode()] = value;
+    else if (auto value = dyn_cast<plan::RaggedOp>(operation))
+      index.ragged = value;
+    else if (auto value = dyn_cast<plan::StageOp>(operation))
+      index.stages.push_back(value);
+    else if (auto value = dyn_cast<plan::AtomicOp>(operation))
+      index.atomics[value.getNode()] = value;
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks cuTile target or program choices");
@@ -74,7 +80,11 @@ LogicalResult SourceEmitter::emit() {
 LogicalResult SourceEmitter::prepare() {
   if (failed(indexABI()))
     return failure();
-  return resolvePhysicalBindings();
+  if (failed(resolvePhysicalBindings()))
+    return failure();
+  if (isRaggedStages())
+    return prepareRaggedStages();
+  return success();
 }
 
 LogicalResult SourceEmitter::registerOperationHandlers(
@@ -144,14 +154,20 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
   bool multiAxis = planIndex.program.getMapping() == "multi_axis_stream";
-  if ((!multiAxis && planIndex.program.getWorkerAxes().size() != 1) ||
-      (multiAxis && planIndex.program.getWorkerAxes().size() != 2))
+  bool raggedStages = isRaggedStages();
+  if ((!multiAxis && !raggedStages &&
+       planIndex.program.getWorkerAxes().size() != 1) ||
+      ((multiAxis || raggedStages) &&
+       planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
         "block-axis count does not match the cuTile program mapping");
   for (auto &entry : planIndex.axes) {
     Operation *domain = kernel.nodes.lookup(entry.first);
-    if (!domain || domain->getName().getStringRef() != "intent.domain")
-      return entry.second.emitOpError("does not bind an intent.domain op");
+    if (!domain ||
+        (domain->getName().getStringRef() != "intent.domain" &&
+         domain->getName().getStringRef() != "intent.ragged_outer" &&
+         domain->getName().getStringRef() != "intent.ragged_member"))
+      return entry.second.emitOpError("does not bind a logical domain op");
     FailureOr<std::string> dimension = dimensionName(*domain);
     if (failed(dimension))
       return entry.second.emitOpError("cannot resolve its source dimension");
@@ -269,10 +285,174 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (!physicalDimension)
         kernelConstants.push_back(dimension);
     }
+  } else if (raggedStages) {
+    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty() ||
+        !planIndex.ragged || planIndex.stages.empty() ||
+        planIndex.atomics.empty())
+      return realization.emitOpError(
+          "ragged staging requires target traversal, stages, atomic merge, and backend candidates");
+    for (StringRef role : {"program_0", "program_1"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ragged staging lacks " << role << " axis";
+    if (planIndex.launch)
+      return realization.emitOpError(
+          "ragged staging cannot carry a fixed launch choice");
   } else {
     return planIndex.program.emitOpError("has no cuTile program emitter");
   }
   return success();
+}
+
+LogicalResult SourceEmitter::prepareRaggedStages() {
+  raggedRelation = kernel.nodes.lookup(planIndex.ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(planIndex.ragged.getOuterNode());
+  raggedMember = kernel.nodes.lookup(planIndex.ragged.getMemberNode());
+  if (!raggedRelation ||
+      raggedRelation->getName().getStringRef() != "intent.ragged" ||
+      !raggedOuter ||
+      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
+      !raggedMember ||
+      raggedMember->getName().getStringRef() != "intent.ragged_member")
+    return planIndex.ragged.emitOpError(
+        "does not resolve to canonical ragged operations");
+
+  kernel.entry.walk([&](Operation *operation) {
+    if (operation->getName().getStringRef() == "intent.members" &&
+        !membersOperation)
+      membersOperation = operation;
+  });
+  if (!membersOperation)
+    return raggedRelation->emitOpError("has no member enumeration operation");
+
+  llvm::sort(planIndex.stages, [](plan::StageOp lhs, plan::StageOp rhs) {
+    return lhs.getOrdinal() < rhs.getOrdinal();
+  });
+  stageBodies.resize(planIndex.stages.size());
+  auto shapeLabel = [&](Value value, unsigned axis,
+                        Operation &consumer) -> FailureOr<std::string> {
+    auto result = dyn_cast<OpResult>(value);
+    Operation *definition = result ? result.getOwner() : nullptr;
+    auto shapes = definition
+                      ? definition->getAttrOfType<ArrayAttr>(
+                            "intent.result_shapes")
+                      : ArrayAttr();
+    auto shape = shapes && result.getResultNumber() < shapes.size()
+                     ? dyn_cast<ArrayAttr>(shapes[result.getResultNumber()])
+                     : ArrayAttr();
+    auto label = shape && axis < shape.size() ? dyn_cast<StringAttr>(shape[axis])
+                                             : StringAttr();
+    if (!label || label.getValue().empty()) {
+      consumer.emitOpError("stage axis has no canonical symbolic extent");
+      return failure();
+    }
+    return label.getValue().str();
+  };
+
+  for (auto [position, stage] : llvm::enumerate(planIndex.stages)) {
+    if (stage.getOrdinal() != position)
+      return stage.emitOpError("stage ordinals must be contiguous from zero");
+    Operation *contract = kernel.nodes.lookup(stage.getNode());
+    if (!contract || contract->getName().getStringRef() != "intent.contract" ||
+        contract->getNumResults() != 1)
+      return stage.emitOpError("does not bind one canonical contraction");
+    auto resultType = dyn_cast<RankedTensorType>(contract->getResult(0).getType());
+    if (!resultType || resultType.getRank() != 2)
+      return stage.emitOpError("requires a rank-two staged contraction result");
+    FailureOr<std::string> feature =
+        shapeLabel(contract->getResult(0), 1, *contract);
+    auto reduce = contract->getAttrOfType<ArrayAttr>("intent.reduce");
+    auto pair = reduce && reduce.size() == 1
+                    ? dyn_cast<ArrayAttr>(reduce[0])
+                    : ArrayAttr();
+    auto lhsAxis = pair && pair.size() == 2
+                       ? dyn_cast<IntegerAttr>(pair[0])
+                       : IntegerAttr();
+    FailureOr<std::string> reduction =
+        lhsAxis && lhsAxis.getInt() >= 0
+            ? shapeLabel(contract->getOperand(0), lhsAxis.getInt(), *contract)
+            : FailureOr<std::string>(failure());
+    if (failed(feature) || failed(reduction))
+      return failure();
+    stageFeatureDimensions[position] = *feature;
+    stageReductionDimensions[position] = *reduction;
+
+    llvm::DenseSet<Value> inputs;
+    for (int64_t valueID : stage.getInputs()) {
+      auto found = kernel.values.find(valueID);
+      if (found == kernel.values.end())
+        return stage.emitOpError("references an unknown stage input value");
+      inputs.insert(found->second);
+    }
+    if (!stage.getOutputs().empty()) {
+      for (int64_t valueID : stage.getOutputs()) {
+        auto found = kernel.values.find(valueID);
+        if (found == kernel.values.end() ||
+            !isa<RankedTensorType>(found->second.getType()) ||
+            !stageOutputOwners.try_emplace(found->second, position).second)
+          return stage.emitOpError("has an invalid stage output value");
+        workspaceNames[found->second] =
+            "workspace_" + std::to_string(valueID);
+        llvm::DenseSet<Value> visited;
+        collectStageValue(found->second, position, inputs, visited);
+      }
+    } else {
+      for (const auto &binding : planIndex.atomics) {
+        Operation *atomic = kernel.nodes.lookup(binding.first);
+        if (!atomic)
+          return raggedRelation->emitOpError(
+              "has a plan atomic without a canonical operation");
+        operationStages[atomic].push_back(position);
+        for (Value operand : atomic->getOperands()) {
+          llvm::DenseSet<Value> visited;
+          collectStageValue(operand, position, inputs, visited);
+        }
+      }
+    }
+    if (!llvm::is_contained(operationStages.lookup(contract), position))
+      return stage.emitOpError("stage roots do not depend on its contraction");
+  }
+  return success();
+}
+
+void SourceEmitter::collectStageValue(Value value, unsigned stage,
+                                      const llvm::DenseSet<Value> &inputs,
+                                      llvm::DenseSet<Value> &visited) {
+  if (inputs.contains(value) || !visited.insert(value).second)
+    return;
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return;
+  auto &stages = operationStages[definition];
+  if (!llvm::is_contained(stages, stage))
+    stages.push_back(stage);
+  for (Value operand : definition->getOperands())
+    collectStageValue(operand, stage, inputs, visited);
+}
+
+bool SourceEmitter::selectOperation(Operation &operation) {
+  if (!isRaggedStages())
+    return true;
+  activeStages = operationStages.lookup(&operation);
+  return !activeStages.empty();
+}
+
+void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {
+  stageBodies[stage].append(indent * 4, ' ');
+  stageBodies[stage] += text.str();
+  stageBodies[stage] += "\n";
+}
+
+void SourceEmitter::bindResult(Operation &operation, unsigned index,
+                               StringRef name) {
+  Value value = operation.getResult(index);
+  valueNames[value] = name.str();
+  auto outputStage = stageOutputOwners.find(value);
+  if (!isRaggedStages() || outputStage == stageOutputOwners.end())
+    return;
+  line("ct.scatter(" + workspaceNames.lookup(value) +
+       ", (safe_member_offsets[:, None], offs_feature[None, :]), " +
+       name.str() + ", check_bounds=True)");
 }
 
 void SourceEmitter::emitImports() {
@@ -289,6 +469,79 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
+  if (isRaggedStages()) {
+    Operation *offsetsLoad = raggedRelation->getOperand(1).getDefiningOp();
+    Operation *indicesLoad = raggedRelation->getOperand(2).getDefiningOp();
+    FailureOr<ABIView *> offsets =
+        offsetsLoad && offsetsLoad->getNumOperands() == 1
+            ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
+            : FailureOr<ABIView *>(failure());
+    FailureOr<ABIView *> indices =
+        indicesLoad && indicesLoad->getNumOperands() == 1
+            ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
+            : FailureOr<ABIView *>(failure());
+    if (failed(offsets) || failed(indices) || searchIndex.configs.empty())
+      return raggedRelation->emitOpError(
+          "cannot resolve staged ragged metadata or search candidates");
+
+    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
+      llvm::raw_string_ostream source(stageBodies[stage]);
+      source << "@ct.kernel\ndef " << kernelName << "_stage_" << stage << "(";
+      bool first = true;
+      auto parameter = [&](StringRef value) {
+        if (!first)
+          source << ", ";
+        source << value;
+        first = false;
+      };
+      for (ABIView &view : views)
+        parameter(view.argument->name);
+      for (ABIScalar &scalar : scalars) {
+        StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
+        parameter(scalar.name + ": " + annotation.str());
+      }
+      for (const std::string &dimension : dimensionOrder)
+        parameter(dimension + ": ConstInt");
+      for (plan::StageOp binding : planIndex.stages)
+        for (int64_t valueID : binding.getOutputs())
+          parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
+      parameter("MAX_ROUTES: ConstInt");
+      for (NamedAttribute config : searchIndex.configs.front().getParameters())
+        parameter(config.getName().getValue().str() + ": ConstInt");
+      source << "):\n";
+      source.flush();
+
+      std::string feature = stageFeatureDimensions.lookup(stage);
+      stageLine(stage, "bid_feature = ct.bid(0)");
+      stageLine(stage, "bid_expert_route = ct.bid(1)");
+      stageLine(stage,
+                "num_route_tiles = ct.cdiv(MAX_ROUTES, TILE_SIZE_M)");
+      stageLine(stage, "expert = bid_expert_route // num_route_tiles");
+      stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
+      stageLine(stage, "route_begin = ct.load(" +
+                           (*offsets)->argument->name +
+                           ", index=expert, shape=())");
+      stageLine(stage, "route_end = ct.load(" +
+                           (*offsets)->argument->name +
+                           ", index=expert + 1, shape=())");
+      stageLine(stage,
+                "member_offsets = route_begin + route_tile * TILE_SIZE_M + "
+                "ct.arange(TILE_SIZE_M, dtype=ct.int32)");
+      stageLine(stage, "member_mask = member_offsets < route_end");
+      stageLine(stage,
+                "safe_member_offsets = ct.where(member_mask, member_offsets, " +
+                    (*indices)->argument->name + ".shape[0])");
+      stageLine(stage, "routes = ct.gather(" + (*indices)->argument->name +
+                           ", member_offsets, check_bounds=True, "
+                           "padding_value=0)");
+      stageLine(stage, "routes = ct.where(member_mask, routes, 0)");
+      stageLine(stage,
+                "offs_feature = bid_feature * TILE_SIZE_N + "
+                "ct.arange(TILE_SIZE_N, dtype=ct.int32)");
+      stageLine(stage, "feature_mask = offs_feature < " + feature);
+    }
+    return success();
+  }
   if (planIndex.program.getMapping() == "persistent_rows") {
     output << "@ct.kernel(occupancy=" << planIndex.launch.getOccupancy()
            << ")\n";
@@ -338,10 +591,205 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.float32";
     if (type.isBF16())
       return "torch.bfloat16";
+    if (auto integer = dyn_cast<IntegerType>(type);
+        integer && integer.getWidth() == 32)
+      return "torch.int32";
     return {};
   };
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
+
+  if (isRaggedStages()) {
+    SmallVector<ABIView *> inputs;
+    ABIView *merge = nullptr;
+    for (ABIView &view : views) {
+      if (view.view.getAccess() == "in")
+        inputs.push_back(&view);
+      else if (view.view.getAccess() == "inout" && !merge)
+        merge = &view;
+      else
+        return kernel.entry.emitOpError(
+            "ragged stages require input views and one inout merge view");
+    }
+    if (!merge)
+      return kernel.entry.emitOpError("ragged stages have no merge destination");
+    for (const std::string &body : stageBodies)
+      output << "\n" << body;
+
+    output << "\n_CONFIGS = (\n";
+    for (plan::ConfigOp config : searchIndex.configs) {
+      output << "    SimpleNamespace(";
+      for (NamedAttribute parameter : config.getParameters())
+        output << parameter.getName().getValue() << "="
+               << cast<IntegerAttr>(parameter.getValue()).getInt() << ", ";
+      output << "num_ctas=" << config.getNumCtas()
+             << ", occupancy=" << config.getOccupancy() << "),\n";
+    }
+    output << ")\n_TUNE_CACHE = {}\n\n\n";
+
+    output << "def launch(";
+    bool firstParameter = true;
+    for (ABIView &view : views) {
+      if (!firstParameter)
+        output << ", ";
+      output << view.argument->name;
+      firstParameter = false;
+    }
+    for (ABIScalar &scalar : scalars) {
+      if (!firstParameter)
+        output << ", ";
+      output << scalar.name;
+      firstParameter = false;
+    }
+    output << "):\n";
+    for (ABIView &view : views) {
+      StringRef dtype = torchDtype(view.tensor.getElementType());
+      if (dtype.empty())
+        return kernel.entry.emitOpError("has an unsupported staged ABI dtype");
+      output << "    if " << view.argument->name << ".device != _DEVICE:\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " must reside on the realized CUDA device')\n";
+      output << "    if " << view.argument->name << ".ndim != "
+             << view.tensor.getRank() << ":\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " has the wrong rank')\n";
+      output << "    if " << view.argument->name << ".dtype != " << dtype
+             << ":\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " has the wrong dtype')\n";
+    }
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
+    for (ABIView &view : views) {
+      output << "    if tuple(" << view.argument->name << ".shape) != (";
+      for (auto [axis, extent] : llvm::enumerate(view.shape)) {
+        if (axis)
+          output << ", ";
+        output << extent;
+      }
+      if (view.shape.size() == 1)
+        output << ",";
+      output << "):\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " shape violates the kernel symbols')\n";
+    }
+    Operation *offsetsLoad = raggedRelation->getOperand(1).getDefiningOp();
+    FailureOr<ABIView *> offsets =
+        offsetsLoad && offsetsLoad->getNumOperands() == 1
+            ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
+            : FailureOr<ABIView *>(failure());
+    if (failed(offsets))
+      return failure();
+    output << "    max_routes = int((" << (*offsets)->argument->name
+           << "[1:] - " << (*offsets)->argument->name
+           << "[:-1]).max().item())\n";
+    for (plan::StageOp stage : planIndex.stages)
+      for (int64_t valueID : stage.getOutputs()) {
+        Value value = kernel.values.lookup(valueID);
+        auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        StringRef dtype =
+            tensor ? torchDtype(tensor.getElementType()) : StringRef();
+        if (!tensor || tensor.getRank() != 2 || dtype.empty())
+          return stage.emitOpError("has an unsupported workspace tensor");
+        output << "    " << workspaceNames.lookup(value) << " = torch.empty((R, "
+               << stageFeatureDimensions.lookup(stage.getOrdinal())
+               << "), device=_DEVICE, dtype=" << dtype << ")\n";
+      }
+    output << "    stream = torch.cuda.current_stream()\n";
+    std::string experts = roleDimensions.lookup("program_0");
+    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
+      std::string feature = stageFeatureDimensions.lookup(stage);
+      output << "    cache_key_" << stage << " = (" << stage;
+      for (const std::string &dimension : dimensionOrder)
+        output << ", " << dimension;
+      output << ", " << inputs.front()->argument->name
+             << ".dtype, str(_DEVICE))\n";
+      output << "    if cache_key_" << stage << " not in _TUNE_CACHE:\n";
+      output << "        with ct.compiler_timeout(10):\n";
+      output << "            result = exhaustive_search(\n";
+      output << "                _CONFIGS,\n                stream,\n";
+      output << "                lambda cfg: (ceil(" << feature
+             << " / cfg.TILE_SIZE_N), " << experts
+             << " * ceil(max_routes / cfg.TILE_SIZE_M), 1),\n";
+      output << "                " << kernelName << "_stage_" << stage
+             << ",\n";
+      output << "                lambda cfg: (";
+      for (ABIView &view : views) {
+        if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
+          output << "torch.zeros_like(" << view.argument->name << "), ";
+        else
+          output << view.argument->name << ", ";
+      }
+      for (ABIScalar &scalar : scalars)
+        output << scalar.name << ", ";
+      for (const std::string &dimension : dimensionOrder)
+        output << dimension << ", ";
+      for (plan::StageOp binding : planIndex.stages)
+        for (int64_t valueID : binding.getOutputs())
+          output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+      output << "max_routes, ";
+      for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+        output << "cfg." << parameter.getName().getValue() << ", ";
+      output << "),\n";
+      output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
+      output << "            )\n";
+      output << "        best = result.best.config\n";
+      output << "        _TUNE_CACHE[cache_key_" << stage << "] = (best, "
+             << kernelName << "_stage_" << stage
+             << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
+      output << "    best, tuned_kernel = _TUNE_CACHE[cache_key_" << stage
+             << "]\n";
+      output << "    grid = (ceil(" << feature
+             << " / best.TILE_SIZE_N), " << experts
+             << " * ceil(max_routes / best.TILE_SIZE_M), 1)\n";
+      output << "    ct.launch(stream, grid, tuned_kernel, (";
+      for (ABIView &view : views)
+        output << view.argument->name << ", ";
+      for (ABIScalar &scalar : scalars)
+        output << scalar.name << ", ";
+      for (const std::string &dimension : dimensionOrder)
+        output << dimension << ", ";
+      for (plan::StageOp binding : planIndex.stages)
+        for (int64_t valueID : binding.getOutputs())
+          output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+      output << "max_routes, ";
+      for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+        output << "best." << parameter.getName().getValue() << ", ";
+      output << "))\n";
+    }
+    output << "    return " << merge->argument->name << "\n\n\n";
+    output << "def run(";
+    for (auto [index, view] : llvm::enumerate(inputs)) {
+      if (index)
+        output << ", ";
+      output << view->argument->name;
+    }
+    output << "):\n";
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
+    output << "    " << merge->argument->name << " = torch.zeros((";
+    for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    output << "), device=_DEVICE, dtype="
+           << torchDtype(merge->tensor.getElementType()) << ")\n";
+    output << "    launch(";
+    bool first = true;
+    for (ABIView &view : views) {
+      if (!first)
+        output << ", ";
+      output << view.argument->name;
+      first = false;
+    }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
+    output << ")\n    return " << merge->argument->name << "\n";
+    return success();
+  }
 
   if (planIndex.program.getMapping() == "persistent_rows") {
     SmallVector<ABIView *> inputs;
@@ -617,7 +1065,9 @@ FailureOr<ABIView *> SourceEmitter::lookupView(Value value,
 FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
                                                     Operation &consumer) {
   if (Operation *definition = indexedValue.getDefiningOp())
-    if (definition->getName().getStringRef() == "intent.domain")
+    if (definition->getName().getStringRef() == "intent.domain" ||
+        definition->getName().getStringRef() == "intent.ragged_outer" ||
+        definition->getName().getStringRef() == "intent.ragged_member")
       return definition;
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
@@ -635,12 +1085,17 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   }
   Operation *source = owner->getOperand(0).getDefiningOp();
-  if (source && source->getName().getStringRef() == "intent.domain")
+  if (source &&
+      (source->getName().getStringRef() == "intent.domain" ||
+       source->getName().getStringRef() == "intent.ragged_outer" ||
+       source->getName().getStringRef() == "intent.ragged_member"))
     return source;
   if (source && source->getName().getStringRef() == "intent.partition" &&
       source->getNumOperands() == 1) {
     Operation *domain = source->getOperand(0).getDefiningOp();
-    if (domain && domain->getName().getStringRef() == "intent.domain")
+    if (domain &&
+        (domain->getName().getStringRef() == "intent.domain" ||
+         domain->getName().getStringRef() == "intent.ragged_member"))
       return domain;
   }
   consumer.emitOpError("cannot resolve a partition to its source domain");
@@ -663,6 +1118,29 @@ FailureOr<plan::AxisOp> SourceEmitter::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
+  StringRef name = domain.getName().getStringRef();
+  if (name == "intent.ragged_outer") {
+    Operation *relation = domain.getOperand(0).getDefiningOp();
+    Operation *source = relation && relation->getNumOperands() == 3
+                            ? relation->getOperand(0).getDefiningOp()
+                            : nullptr;
+    if (!source)
+      return failure();
+    return dimensionName(*source);
+  }
+  if (name == "intent.ragged_member") {
+    Operation *relation = domain.getOperand(0).getDefiningOp();
+    Operation *indices = relation && relation->getNumOperands() == 3
+                             ? relation->getOperand(2).getDefiningOp()
+                             : nullptr;
+    if (!indices || indices->getName().getStringRef() != "intent.view_load" ||
+        indices->getNumOperands() != 1)
+      return failure();
+    FailureOr<ABIView *> view = lookupView(indices->getOperand(0), domain);
+    if (failed(view) || (*view)->shape.empty())
+      return failure();
+    return (*view)->shape.front();
+  }
   if (domain.getNumOperands() < 2)
     return failure();
   Operation *dim = domain.getOperand(1).getDefiningOp();
@@ -897,7 +1375,17 @@ std::string SourceEmitter::makeRegionArgumentName(Operation &operation,
 }
 
 void SourceEmitter::line(StringRef text) {
+  if (isRaggedStages()) {
+    for (unsigned stage : activeStages)
+      stageLine(stage, text, indentation);
+    return;
+  }
   output.indent(indentation * 4) << text << "\n";
+}
+
+bool SourceEmitter::isRaggedStages() {
+  return planIndex.program &&
+         planIndex.program.getMapping() == "ragged_stages";
 }
 
 LogicalResult emitRealizedKernelSource(

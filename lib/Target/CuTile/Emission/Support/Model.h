@@ -8,6 +8,7 @@
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -30,6 +31,9 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
+  plan::RaggedOp ragged;
+  llvm::SmallVector<plan::StageOp> stages;
+  llvm::DenseMap<int64_t, plan::AtomicOp> atomics;
 };
 
 struct SearchIndex {
@@ -71,10 +75,13 @@ public:
   mlir::LogicalResult emitFull(mlir::Operation &operation);
   mlir::LogicalResult emitZeros(mlir::Operation &operation);
   mlir::LogicalResult emitGather(mlir::Operation &operation);
+  mlir::LogicalResult emitMembers(mlir::Operation &operation);
   mlir::LogicalResult enterStateStream(mlir::Operation &operation);
   mlir::LogicalResult leaveStateStream(mlir::Operation &operation);
   mlir::LogicalResult emitContract(mlir::Operation &operation);
   mlir::LogicalResult emitStore(mlir::Operation &operation);
+  mlir::LogicalResult emitAtomic(mlir::Operation &operation);
+  bool selectOperation(mlir::Operation &operation);
 
 private:
   mlir::LogicalResult prepare() override;
@@ -106,6 +113,15 @@ private:
   emitTensorShape(mlir::Operation &operation, unsigned resultIndex);
   mlir::FailureOr<unsigned> emittedTensorRank(mlir::Operation &operation,
                                              bool store);
+  mlir::LogicalResult prepareRaggedStages();
+  void collectStageValue(mlir::Value value, unsigned stage,
+                         const llvm::DenseSet<mlir::Value> &inputs,
+                         llvm::DenseSet<mlir::Value> &visited);
+  void stageLine(unsigned stage, llvm::StringRef text,
+                 unsigned indent = 1);
+  void bindResult(mlir::Operation &operation, unsigned index,
+                  llvm::StringRef name);
+  bool isRaggedStages();
   std::string dtypeName(mlir::Type type, mlir::Operation &consumer);
   std::string makeResultName(mlir::Operation &operation, unsigned index);
   std::string makeRegionArgumentName(mlir::Operation &operation,
@@ -132,6 +148,18 @@ private:
   llvm::SmallVector<std::string> kernelConstants;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>
+      operationStages;
+  llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;
+  llvm::DenseMap<mlir::Value, std::string> workspaceNames;
+  llvm::SmallVector<std::string> stageBodies;
+  llvm::SmallVector<unsigned> activeStages;
+  llvm::DenseMap<unsigned, std::string> stageFeatureDimensions;
+  llvm::DenseMap<unsigned, std::string> stageReductionDimensions;
+  mlir::Operation *raggedRelation = nullptr;
+  mlir::Operation *raggedOuter = nullptr;
+  mlir::Operation *raggedMember = nullptr;
+  mlir::Operation *membersOperation = nullptr;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;
