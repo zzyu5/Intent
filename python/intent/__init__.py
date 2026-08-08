@@ -12,6 +12,7 @@ from .frontend import FrontendError
 from .frontend import lower_to_mlir
 from .runtime import CompiledArtifact
 from .targets import CuTileTarget
+from .targets import TileLangTarget
 from .targets import TritonTarget
 
 
@@ -28,6 +29,7 @@ __all__ = [
     "compile",
     "CompiledArtifact",
     "CuTileTarget",
+    "TileLangTarget",
     "TritonTarget",
     "FrontendError",
     "lower_to_mlir",

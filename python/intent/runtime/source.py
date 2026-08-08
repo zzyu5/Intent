@@ -21,7 +21,7 @@ def materialize_python_source(
     namespace: dict[str, object] = {
         "__name__": f"intent.generated.{target_name}.{entry_name}",
     }
-    code = python_builtins.compile(source, filename, "exec")
+    code = python_builtins.compile(source, filename, "exec", dont_inherit=True)
     exec(code, namespace)
     launcher = namespace.get("launch")
     runner = namespace.get("run")
