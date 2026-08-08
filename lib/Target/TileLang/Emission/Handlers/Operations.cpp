@@ -1003,6 +1003,10 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   FailureOr<std::string> indices = accessIndices(operation, false);
   if (failed(indices))
     return failure();
+  if (!isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) {
+    line((*view)->argument->name + "[" + *indices + "] = " + stored->str());
+    return success();
+  }
   line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
        *indices + "])");
   return success();

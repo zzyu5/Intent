@@ -2,6 +2,7 @@
 
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/GPU/Projection/MachinePlan.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 
@@ -120,8 +121,16 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   bool rowStrided = indexed->program.getMapping() == "row_strided";
   for (intent::plan::TransferOp transfer : indexed->transfers) {
     bool load = transfer.getAccess() == "load";
-    StringRef access = rowStrided ? (load ? "gather" : "scatter")
-                                  : (load ? "load" : "store");
+    bool vectorized = llvm::any_of(
+        transfer.getDomainNodes(), [&](int64_t node) {
+          auto axis = llvm::find_if(indexed->axes, [&](intent::plan::AxisOp value) {
+            return value.getNodeAttr().getInt() == node;
+          });
+          return axis != indexed->axes.end() && axis->getTile() != "one";
+        });
+    StringRef access = rowStrided && vectorized
+                           ? (load ? "gather" : "scatter")
+                           : (load ? "load" : "store");
     builder.create<plan::BoundaryOp>(
         transfer.getLoc(), transfer.getNodeAttr(), transfer.getDomainNodesAttr(),
         gpu::stringAttr(builder, access), transfer.getFillAttr(),

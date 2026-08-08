@@ -222,9 +222,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (view.view.getAccess() == "out" && !fixedOutput)
         fixedOutput = &view;
     }
-    if (!fixedOutput || fixedOutput->tensor.getRank() != 2)
+    if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
+        fixedOutput->tensor.getRank() > 2)
       return kernel.entry.emitOpError(
-          "grid-stride Triton program requires one rank-two output view");
+          "grid-stride Triton program requires one rank-one or rank-two output view");
     if (searchSpace)
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
@@ -1383,10 +1384,11 @@ FailureOr<unsigned> SourceEmitter::emittedTensorRank(Operation &operation,
   } else if (operation.getNumResults() == 1) {
     type = operation.getResult(0).getType();
   }
-  auto tensor = dyn_cast<RankedTensorType>(type);
-  if (!tensor)
-    return operation.emitOpError("boundary value is not a ranked tensor");
-  return static_cast<unsigned>(tensor.getRank());
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return static_cast<unsigned>(tensor.getRank());
+  if (type.isIntOrIndexOrFloat())
+    return 0;
+  return operation.emitOpError("boundary value is neither a tensor nor a scalar");
 }
 
 FailureOr<std::string>
