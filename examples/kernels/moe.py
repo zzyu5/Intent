@@ -1,0 +1,56 @@
+import intent
+import intent.language as I
+
+
+TOKENS = 4096
+HIDDEN = 4096
+INTERMEDIATE = 14336
+EXPERTS = 8
+TOP_K = 2
+
+
+@intent.kernel
+def moe_expert_ffn(
+    x: I.In[I.f16, ("T", "D")],
+    route_offsets: I.In[I.i32, ("E_PLUS_1",)],
+    member_routes: I.In[I.i32, ("R",)],
+    route_token: I.In[I.i32, ("NR",)],
+    route_weights: I.In[I.f32, ("NR",)],
+    w1: I.In[I.f16, ("E", "D", "F")],
+    w2: I.In[I.f16, ("E", "F", "D")],
+    y: I.InOut[I.f32, ("T", "D")],
+):
+    T, D = x.shape
+    E, _, F = w1.shape
+    groups = I.ragged(
+        outer=I.domain(0, E),
+        offsets=route_offsets,
+        indices=member_routes,
+    )
+    for expert in I.parallel(groups.outer):
+        for route_region in I.parallel(
+            I.partition(groups[expert], extent=I.auto("ROUTE_TILE"))
+        ):
+            routes = I.members(route_region)
+            token = I.gather(route_token, index=routes)
+            weight = I.gather(route_weights, index=routes)
+            values = I.gather(x, index=(token, slice(None)))
+            hidden = I.contract(
+                values,
+                w1[expert, :, :],
+                reduce=((1, 0),),
+                acc_dtype=I.f32,
+            )
+            hidden = I.maximum(hidden, 0.0)
+            route_output = I.contract(
+                hidden,
+                w2[expert, :, :],
+                reduce=((1, 0),),
+                acc_dtype=I.f32,
+            )
+            I.scatter_reduce(
+                y,
+                index=(token, slice(None)),
+                value=weight[:, None] * route_output,
+                combine=I.add,
+            )

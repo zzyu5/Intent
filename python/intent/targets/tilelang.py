@@ -12,19 +12,16 @@ class ResolvedTileLangTarget:
     device: int
 
     @property
-    def realizer_options(self) -> tuple[str, ...]:
+    def compiler_options(self) -> tuple[str, ...]:
         return (
+            "--target=tilelang",
             f"--architecture={self.architecture}",
             f"--device={self.device}",
         )
 
     @property
-    def realizer_role(self) -> str:
-        return "Intent TileLang realizer"
-
-    @property
-    def translator_role(self) -> str:
-        return "Intent TileLang translator"
+    def compiler_role(self) -> str:
+        return "Intent TileLang compiler"
 
     def materialize(
         self,

@@ -2,7 +2,7 @@
 
 Backend translator 接收同一 MLIR module 中的 Intent Kernel IR 与 Physical Plan，构造一个具体目标 kernel program。
 
-当前 backend semantic path 全部位于 C++：`intent-realize` 生成 Plan，Plan dialect verifier 验证 Plan 与 Kernel IR 的绑定，`intent-translate` 发射目标源码。Python 只负责调用这两个工具和运行已经生成的 Triton source；它不构造 Plan，也不参与目标代码选择。
+Backend semantic path 全部位于 C++：`intent-compile` 先生成 Plan，由 Plan dialect verifier 验证 Plan 与 Kernel IR 的绑定，再调用选定 target emitter 发射源码。Python 只调用这一个 compiler 并运行已经生成的目标源码；它不构造 Plan，也不参与目标代码选择。
 
 ## 对应关系
 

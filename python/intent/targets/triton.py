@@ -13,20 +13,17 @@ class ResolvedTritonTarget:
     warp_size: int
 
     @property
-    def realizer_options(self) -> tuple[str, ...]:
+    def compiler_options(self) -> tuple[str, ...]:
         return (
+            "--target=triton",
             f"--architecture={self.architecture}",
             f"--device={self.device}",
             f"--warp-size={self.warp_size}",
         )
 
     @property
-    def realizer_role(self) -> str:
-        return "Intent Triton realizer"
-
-    @property
-    def translator_role(self) -> str:
-        return "Intent Triton translator"
+    def compiler_role(self) -> str:
+        return "Intent Triton compiler"
 
     def materialize(
         self,

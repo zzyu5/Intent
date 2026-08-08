@@ -53,7 +53,7 @@ intent_plan.plan
 
 这是一份 compiler IR，而不是开放字典。每类 binding 都必须能回指一个存在且种类相符的 Kernel IR 节点；backend emitter 只消费经过 Kernel IR verifier 与 Plan verifier 共同验证的组合。
 
-当前 Plan 只由 C++ `intent-realize` 构造。Python frontend 到 Kernel MLIR 为止；host compiler 通过 stdin/stdout 调用 realizer，随后把同一个组合 MLIR 交给 C++ translator。项目中不保留 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
+Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 到 Kernel MLIR 为止；同一 C++ 进程验证组合 MLIR后再交给选定 target emitter。项目中不保留 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
 
 完整 Plan verifier 的长期合法性边界是：
 

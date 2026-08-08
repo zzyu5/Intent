@@ -12,19 +12,16 @@ class ResolvedCuTileTarget:
     device: int
 
     @property
-    def realizer_options(self) -> tuple[str, ...]:
+    def compiler_options(self) -> tuple[str, ...]:
         return (
+            "--target=cutile",
             f"--architecture={self.architecture}",
             f"--device={self.device}",
         )
 
     @property
-    def realizer_role(self) -> str:
-        return "Intent cuTile realizer"
-
-    @property
-    def translator_role(self) -> str:
-        return "Intent cuTile translator"
+    def compiler_role(self) -> str:
+        return "Intent cuTile compiler"
 
     def materialize(
         self,

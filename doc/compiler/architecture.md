@@ -7,9 +7,7 @@ Python wrapper / Host API
           ↓
 Source Frontend
           ↓
-Kernel IR
-          ↓
-Intent Kernel MLIR
+Canonical Intent Kernel MLIR
           ↓
 Realizer
           ↓
@@ -37,7 +35,7 @@ Frontend 读取受限 Python eDSL，解析：
 - domain/region、tensor expressions、控制流、structured primitives；
 - logical buffers 与 effects。
 
-Frontend 的输出是保持 source algorithm 的 Kernel IR，并将其序列化为注册过的 Intent MLIR dialect。Python IR builder 可以作为 AST lowering 的内部构造器，但 MLIR 进入 backend boundary 后，后端不得绕回 Python object 重新解释算法。
+Frontend 在 AST lowering 期间只维护 symbol、shape、region、constexpr 与源码位置等临时状态，并直接构造注册过的 canonical Intent Kernel MLIR。Python 不维护一套与 MLIR 平行的 typed Kernel IR；MLIR 进入 backend boundary 后，后端也不得绕回 Python object 重新解释算法。
 
 ## Kernel IR
 
@@ -51,7 +49,7 @@ Realizer 接收 Kernel IR、target information 与 compile policy，联合选择
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 
-Backend boundary 从 Intent Kernel MLIR 开始。当前 `intent-realize` 是 C++/MLIR 工具：它解析并验证 Kernel MLIR，在 C++ 中匹配受支持的算法结构并构造 `intent_plan` dialect。Python compiler 只负责把 Kernel MLIR 送入该工具，不保存 Physical Plan 对象，也不执行 tile、pipeline 或 launch 决策。
+Backend boundary 从 Intent Kernel MLIR 开始。C++/MLIR compiler 解析并验证 Kernel MLIR，通过共享分析、per-op handler、合法性证明与 target policy 构造 `intent_plan` dialect。Python compiler 只负责把 Kernel MLIR 送入该工具，不保存 Physical Plan 对象，也不执行 tile、pipeline 或 launch 决策。
 
 ## Physical Plan
 
@@ -61,7 +59,7 @@ Physical Plan 是 realizer 的 target realization 结果，是独立于 source l
 
 ## Backend Emitter
 
-Translator 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。当前 translator 本身是 C++/MLIR 实现；Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
+Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 

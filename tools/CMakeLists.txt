@@ -1,7 +1,2 @@
-add_subdirectory(intent-cutile-realize)
-add_subdirectory(intent-cutile-translate)
+add_subdirectory(intent-compile)
 add_subdirectory(intent-opt)
-add_subdirectory(intent-realize)
-add_subdirectory(intent-translate)
-add_subdirectory(intent-tilelang-realize)
-add_subdirectory(intent-tilelang-translate)
