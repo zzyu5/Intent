@@ -47,6 +47,23 @@ void emitAutotuneSpace(ModuleOp module, func::FuncOp entry,
                builder.getNamedAttr("BLOCK_SIZE_K",
                                     i64(builder, config.stream))}),
           i64(builder, config.stages), i64(builder, config.warps));
+  } else if (policy.raggedRelation) {
+    struct RaggedConfig {
+      int64_t m, n, k, stages, warps;
+    };
+    constexpr RaggedConfig configs[] = {
+        {32, 64, 32, 4, 4},   {64, 64, 32, 4, 4},
+        {64, 128, 32, 4, 4},  {128, 64, 32, 4, 4},
+        {128, 128, 32, 4, 4}, {128, 128, 64, 3, 8},
+    };
+    for (const RaggedConfig &config : configs)
+      builder.create<plan::ConfigOp>(
+          entry.getLoc(),
+          builder.getDictionaryAttr(
+              {builder.getNamedAttr("BLOCK_SIZE_M", i64(builder, config.m)),
+               builder.getNamedAttr("BLOCK_SIZE_N", i64(builder, config.n)),
+               builder.getNamedAttr("BLOCK_SIZE_K", i64(builder, config.k))}),
+          i64(builder, config.stages), i64(builder, config.warps));
   } else {
     struct ContractConfig {
       int64_t m, n, k, group, stages, warps;

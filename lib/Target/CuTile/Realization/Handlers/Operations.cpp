@@ -73,29 +73,48 @@ LogicalResult registerAnalysisHandlers(target::OperationHandlerRegistry &registr
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
                          "intent.partition", "intent.parallel",
                          "intent.view_load", "intent.view_store", "intent.yield",
-                         "intent.return", "intent.state_stream"})
+                         "intent.return", "intent.state_stream", "intent.ragged",
+                         "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
 
   for (auto [name, lowering] :
        {std::pair<StringRef, StringRef>{"intent.full", "ct.full"},
-        {"intent.zeros", "ct.zeros"}, {"intent.gather", "expand_dims"}})
+        {"intent.zeros", "ct.zeros"}, {"intent.members", "ct.members"},
+        {"intent.gather", "expand_dims"}})
     if (failed(addHandler(
             registry, name,
             [&, name, lowering](Operation &operation) -> LogicalResult {
               if (name == "intent.gather") {
                 FailureOr<SmallVector<target::IndexTerm>> relation =
                     target::parseIndexRelation(operation);
-                if (failed(relation) || relation->size() != 2 ||
-                    (*relation)[0].kind != "full_slice" ||
-                    (*relation)[1].kind != "new_axis")
+                if (failed(relation))
+                  return failure();
+                bool expand = relation->size() == 2 &&
+                              (*relation)[0].kind == "full_slice" &&
+                              (*relation)[1].kind == "new_axis";
+                bool indirect = llvm::any_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "value_index";
+                });
+                if (!expand && !indirect)
                   return operation.emitOpError(
                       "has no mechanical cuTile gather lowering");
+                facts.primitiveLowerings[&operation] =
+                    expand ? "expand_dims" : "ct.indirect_gather";
+                return success();
               }
               facts.primitiveLowerings[&operation] = lowering.str();
               return success();
             })))
       return failure();
+
+  if (failed(addHandler(
+          registry, "intent.scatter_reduce",
+          [&](Operation &operation) -> LogicalResult {
+            facts.primitiveLowerings[&operation] = "ct.atomic_add";
+            return success();
+          })))
+    return failure();
 
   if (failed(addHandler(
           registry, "intent.reduce", [&](Operation &operation) -> LogicalResult {
@@ -171,15 +190,21 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     if (failed(addHandler(registry, name, noOp)))
       return failure();
 
-  if (failed(addHandler(
-          registry, "intent.domain", [&](Operation &operation) -> LogicalResult {
+  auto bindAxis = [&](Operation &operation) -> LogicalResult {
             auto choice = llvm::find_if(
                 policy.axes, [&](const AxisDecision &axis) {
                   return axis.domain == &operation;
                 });
-            if (choice == policy.axes.end())
+            if (choice == policy.axes.end()) {
+              bool raggedSource = llvm::any_of(
+                  facts.semantics.raggedRelations, [&](const auto &entry) {
+                    return entry.second.outerSource == &operation;
+                  });
+              if (raggedSource)
+                return success();
               return operation.emitOpError(
                   "is not assigned a cuTile physical role");
+            }
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "plan binding");
             if (failed(node))
@@ -188,6 +213,32 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
                 operation.getLoc(), i64(builder, *node),
                 i64(builder, choice->sourceAxis), string(builder, choice->role),
                 string(builder, choice->tile));
+            return success();
+          };
+  for (StringRef name :
+       {"intent.domain", "intent.ragged_outer", "intent.ragged_member"})
+    if (failed(addHandler(registry, name, bindAxis)))
+      return failure();
+
+  if (failed(addHandler(
+          registry, "intent.ragged", [&](Operation &operation) -> LogicalResult {
+            auto found = facts.semantics.raggedRelations.find(&operation);
+            if (found == facts.semantics.raggedRelations.end() ||
+                found->second.memberDomains.size() != 1)
+              return operation.emitOpError(
+                  "has no resolved cuTile ragged ownership");
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "ragged binding");
+            FailureOr<int64_t> outer = target::getNodeID(
+                *found->second.outerDomain, "ragged outer binding");
+            FailureOr<int64_t> member = target::getNodeID(
+                *found->second.memberDomains.front(), "ragged member binding");
+            if (failed(node) || failed(outer) || failed(member))
+              return failure();
+            builder.create<plan::RaggedOp>(
+                operation.getLoc(), i64(builder, *node), i64(builder, *outer),
+                i64(builder, *member),
+                string(builder, "expert_offset_ranges"));
             return success();
           })))
     return failure();
@@ -210,6 +261,8 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     return failure();
 
   auto bindBoundary = [&](Operation &operation) -> LogicalResult {
+    if (facts.semantics.wholeViewLoads.contains(&operation))
+      return success();
     FailureOr<int64_t> node =
         target::getNodeID(operation, "boundary binding");
     if (failed(node))
@@ -257,7 +310,8 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
-                         "intent.cast", "intent.full", "intent.zeros"})
+                         "intent.cast", "intent.full", "intent.zeros",
+                         "intent.members"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =
@@ -283,6 +337,21 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
             builder.create<plan::PointwiseOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, lowering));
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.scatter_reduce",
+          [&](Operation &operation) -> LogicalResult {
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "atomic binding");
+            if (failed(node))
+              return failure();
+            builder.create<plan::AtomicOp>(
+                operation.getLoc(), i64(builder, *node),
+                string(builder, "ct.atomic_add"), string(builder, "relaxed"),
+                string(builder, "device"));
             return success();
           })))
     return failure();
@@ -382,6 +451,27 @@ LogicalResult emitPlan(ModuleOp module, const TargetOptions &targetOptions,
                                    builder.getDenseI64ArrayAttr(order));
   }
 
+  llvm::DenseSet<int64_t> materialized;
+  for (const target::ContractionStage &stage : policy.stages)
+    for (Value value : stage.outputs) {
+      FailureOr<int64_t> valueID =
+          target::getValueID(value, kernel, *stage.contraction,
+                             "staged workspace binding");
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      if (failed(valueID) || !tensor || !materialized.insert(*valueID).second)
+        return stage.contraction->emitOpError(
+            "has an invalid staged workspace value");
+      SmallVector<int64_t> order;
+      for (int64_t dimension = 0; dimension < tensor.getRank(); ++dimension)
+        order.push_back(dimension);
+      builder.create<plan::StorageOp>(
+          stage.contraction->getLoc(), i64(builder, *valueID),
+          string(builder, "global"));
+      builder.create<plan::LayoutOp>(
+          stage.contraction->getLoc(), i64(builder, *valueID),
+          builder.getDenseI64ArrayAttr(order));
+    }
+
   target::OperationHandlerRegistry registry;
   if (failed(registerBindingHandlers(registry, facts, policy, builder)) ||
       failed(target::traverseKernel(entry, registry,
@@ -389,6 +479,32 @@ LogicalResult emitPlan(ModuleOp module, const TargetOptions &targetOptions,
     return failure();
 
   builder.setInsertionPointToEnd(&body);
+  for (auto [ordinal, stage] : llvm::enumerate(policy.stages)) {
+    FailureOr<int64_t> node =
+        target::getNodeID(*stage.contraction, "stage binding");
+    if (failed(node))
+      return failure();
+    SmallVector<int64_t> inputs;
+    SmallVector<int64_t> outputs;
+    for (Value value : stage.inputs) {
+      FailureOr<int64_t> valueID = target::getValueID(
+          value, kernel, *stage.contraction, "stage input binding");
+      if (failed(valueID))
+        return failure();
+      inputs.push_back(*valueID);
+    }
+    for (Value value : stage.outputs) {
+      FailureOr<int64_t> valueID = target::getValueID(
+          value, kernel, *stage.contraction, "stage output binding");
+      if (failed(valueID))
+        return failure();
+      outputs.push_back(*valueID);
+    }
+    builder.create<plan::StageOp>(
+        stage.contraction->getLoc(), i64(builder, ordinal), i64(builder, *node),
+        builder.getDenseI64ArrayAttr(inputs),
+        builder.getDenseI64ArrayAttr(outputs));
+  }
   if (!policy.usesAutotuner) {
     FailureOr<int64_t> loopNode =
         target::getNodeID(*policy.programRoot, "fixed launch binding");

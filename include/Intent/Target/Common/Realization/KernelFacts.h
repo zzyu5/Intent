@@ -47,6 +47,15 @@ struct RaggedMemberFact {
   mlir::Value selector;
 };
 
+struct ContractionFact {
+  mlir::Operation *operation = nullptr;
+  llvm::SmallVector<LogicalAxis> lhsAxes;
+  llvm::SmallVector<LogicalAxis> rhsAxes;
+  llvm::SmallVector<LogicalAxis> resultAxes;
+  llvm::SmallVector<unsigned> lhsReductionAxes;
+  llvm::SmallVector<unsigned> rhsReductionAxes;
+};
+
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
@@ -70,6 +79,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Value, mlir::Operation *> memberValues;
   llvm::DenseSet<mlir::Operation *> wholeViewLoads;
   llvm::DenseSet<mlir::Operation *> scatterReductions;
+  llvm::DenseMap<mlir::Operation *, ContractionFact> contractions;
 };
 
 mlir::LogicalResult analyzeKernelFacts(KernelFacts &facts);

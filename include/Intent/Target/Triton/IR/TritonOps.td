@@ -83,6 +83,34 @@ def IntentTriton_StreamOp : IntentTriton_Op<"stream"> {
   let hasVerifier = 1;
 }
 
+def IntentTriton_RaggedOp : IntentTriton_Op<"ragged"> {
+  let arguments = (ins
+    I64Attr:$node,
+    I64Attr:$outer_node,
+    I64Attr:$member_node,
+    StrAttr:$traversal
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTriton_StageOp : IntentTriton_Op<"stage"> {
+  let arguments = (ins
+    I64Attr:$ordinal,
+    I64Attr:$node,
+    DenseI64ArrayAttr:$inputs,
+    DenseI64ArrayAttr:$outputs
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTriton_AtomicOp : IntentTriton_Op<"atomic"> {
+  let arguments = (ins I64Attr:$node, StrAttr:$lowering, StrAttr:$scope);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentTriton_BoundaryOp : IntentTriton_Op<"boundary"> {
   let arguments = (ins
     I64Attr:$node,

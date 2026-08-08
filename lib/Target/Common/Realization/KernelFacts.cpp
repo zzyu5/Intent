@@ -745,6 +745,16 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             for (auto [axis, logicalAxis] : llvm::enumerate(rhs->second))
               if (!rhsReduced.contains(axis))
                 resultAxes.push_back(logicalAxis);
+            ContractionFact fact;
+            fact.operation = &operation;
+            fact.lhsAxes = lhs->second;
+            fact.rhsAxes = rhs->second;
+            fact.resultAxes = resultAxes;
+            fact.lhsReductionAxes.assign(lhsReduced.begin(), lhsReduced.end());
+            fact.rhsReductionAxes.assign(rhsReduced.begin(), rhsReduced.end());
+            llvm::sort(fact.lhsReductionAxes);
+            llvm::sort(fact.rhsReductionAxes);
+            facts.contractions[&operation] = std::move(fact);
             return bindResultAxes(operation, 0, std::move(resultAxes), facts);
           })))
     return failure();

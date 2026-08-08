@@ -2,6 +2,7 @@
 #define INTENT_LIB_TARGET_CUTILE_REALIZATION_SUPPORT_MODEL_H
 
 #include "Intent/Target/Common/Realization/KernelFacts.h"
+#include "Intent/Target/Common/Realization/ScheduleStructure.h"
 #include "Intent/Target/CuTile/Config/Target.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -29,6 +30,8 @@ struct AxisDecision {
 struct PolicyDecision {
   mlir::Operation *programRoot;
   mlir::Operation *stateStream;
+  mlir::Operation *raggedRelation;
+  llvm::SmallVector<intent::target::ContractionStage> stages;
   llvm::SmallVector<AxisDecision> axes;
   std::string traversal;
   std::string mapping;

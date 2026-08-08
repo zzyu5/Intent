@@ -39,10 +39,17 @@ struct KernelModel {
   KernelABI abi;
   RegionStructure regions;
   llvm::DenseMap<int64_t, mlir::Operation *> nodes;
+  llvm::DenseMap<int64_t, mlir::Value> values;
+  llvm::DenseMap<mlir::Value, int64_t> valueIDs;
 };
 
 mlir::FailureOr<int64_t> getNodeID(mlir::Operation &operation,
                                    llvm::StringRef consumer);
+
+mlir::FailureOr<int64_t> getValueID(mlir::Value value,
+                                    const KernelModel &kernel,
+                                    mlir::Operation &consumer,
+                                    llvm::StringRef purpose);
 
 mlir::FailureOr<KernelABI> analyzeKernelABI(mlir::func::FuncOp entry);
 

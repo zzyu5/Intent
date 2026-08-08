@@ -112,6 +112,36 @@ LogicalResult StreamOp::verify() {
   return success();
 }
 
+LogicalResult RaggedOp::verify() {
+  if (failed(requireNode(*this, getNode())) ||
+      failed(requireNode(*this, getOuterNode())) ||
+      failed(requireNode(*this, getMemberNode())))
+    return failure();
+  if (getTraversal() != "expert_offset_ranges")
+    return emitOpError("contains an unsupported Triton ragged traversal");
+  return success();
+}
+
+LogicalResult StageOp::verify() {
+  if (getOrdinalAttr().getInt() < 0 || failed(requireNode(*this, getNode())))
+    return failure();
+  for (int64_t value : getInputs())
+    if (failed(requireNonNegative(*this, value, "stage input value ID")))
+      return failure();
+  for (int64_t value : getOutputs())
+    if (failed(requireNonNegative(*this, value, "stage output value ID")))
+      return failure();
+  return success();
+}
+
+LogicalResult AtomicOp::verify() {
+  if (failed(requireNode(*this, getNode())))
+    return failure();
+  if (getLowering() != "tl.atomic_add" || getScope() != "gpu")
+    return emitOpError("requires a GPU-scoped tl.atomic_add lowering");
+  return success();
+}
+
 LogicalResult BoundaryOp::verify() {
   if (failed(requireNode(*this, getNode())) || getDomainNodes().empty())
     return failure();
@@ -180,12 +210,14 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
   PipelineOp pipelineChoice;
   LaunchOp launchChoice;
   StreamOp streamChoice;
+  RaggedOp raggedChoice;
   llvm::DenseSet<int64_t> axes;
   llvm::StringSet<> axisRoles;
   llvm::DenseSet<int64_t> storage;
   llvm::DenseSet<int64_t> layouts;
   llvm::DenseSet<int64_t> primitives;
   llvm::DenseSet<int64_t> boundaries;
+  llvm::DenseSet<int64_t> stageOrdinals;
   for (Operation &operation : realization.getBody().front()) {
     if (isa<intent::plan::YieldOp>(operation))
       continue;
@@ -220,6 +252,16 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
       if (streamChoice)
         return stream.emitOpError("duplicates an ordered stream binding");
       streamChoice = stream;
+    } else if (auto ragged = dyn_cast<RaggedOp>(operation)) {
+      if (raggedChoice)
+        return ragged.emitOpError("duplicates a ragged traversal binding");
+      raggedChoice = ragged;
+    } else if (auto stage = dyn_cast<StageOp>(operation)) {
+      if (!stageOrdinals.insert(stage.getOrdinal()).second)
+        return stage.emitOpError("duplicates a physical stage ordinal");
+    } else if (auto atomic = dyn_cast<AtomicOp>(operation)) {
+      if (!primitives.insert(atomic.getNode()).second)
+        return atomic.emitOpError("duplicates an operation lowering");
     } else if (auto binding = dyn_cast<BoundaryOp>(operation)) {
       if (!boundaries.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a boundary binding");
@@ -252,11 +294,16 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
       (pipelineChoice || launchChoice || !streamChoice))
     return realization.emitOpError(
         "multi-axis streams require one stream and no fixed pipeline/launch");
+  if (programChoice.getMapping() == "ragged_stages" &&
+      (!raggedChoice || stageOrdinals.empty() || pipelineChoice || launchChoice))
+    return realization.emitOpError(
+        "ragged stages require a ragged traversal and explicit stages without fixed launch choices");
   if (streamChoice && !axes.contains(streamChoice.getAxisNode()))
     return streamChoice.emitOpError("references an unbound stream axis");
   if (programChoice.getMapping() != "grid_stride" &&
       programChoice.getMapping() != "grouped_2d_tiles" &&
-      programChoice.getMapping() != "multi_axis_stream")
+      programChoice.getMapping() != "multi_axis_stream" &&
+      programChoice.getMapping() != "ragged_stages")
     return programChoice.emitOpError("contains an unsupported Triton mapping");
   return success();
 }

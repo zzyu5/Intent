@@ -89,6 +89,39 @@ def IntentCuTile_StreamOp : IntentCuTile_Op<"stream"> {
   let hasVerifier = 1;
 }
 
+def IntentCuTile_RaggedOp : IntentCuTile_Op<"ragged"> {
+  let arguments = (ins
+    I64Attr:$node,
+    I64Attr:$outer_node,
+    I64Attr:$member_node,
+    StrAttr:$traversal
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentCuTile_StageOp : IntentCuTile_Op<"stage"> {
+  let arguments = (ins
+    I64Attr:$ordinal,
+    I64Attr:$node,
+    DenseI64ArrayAttr:$inputs,
+    DenseI64ArrayAttr:$outputs
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentCuTile_AtomicOp : IntentCuTile_Op<"atomic"> {
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$lowering,
+    StrAttr:$memory_order,
+    StrAttr:$memory_scope
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentCuTile_BoundaryOp : IntentCuTile_Op<"boundary"> {
   let arguments = (ins
     I64Attr:$node,

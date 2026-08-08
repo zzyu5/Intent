@@ -15,6 +15,17 @@ FailureOr<int64_t> getNodeID(Operation &operation, StringRef consumer) {
   return node.getInt();
 }
 
+FailureOr<int64_t> getValueID(Value value, const KernelModel &kernel,
+                              Operation &consumer, StringRef purpose) {
+  auto found = kernel.valueIDs.find(value);
+  if (found == kernel.valueIDs.end()) {
+    consumer.emitOpError() << "references a value without intent ID for "
+                           << purpose;
+    return failure();
+  }
+  return found->second;
+}
+
 FailureOr<KernelABI> analyzeKernelABI(func::FuncOp entry) {
   auto parameterNodes = entry->getAttrOfType<ArrayAttr>("intent.parameter_nodes");
   auto parameters = entry->getAttrOfType<ArrayAttr>("intent.parameters");
@@ -89,14 +100,45 @@ FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
   if (failed(abi) || failed(regions))
     return failure();
 
-  KernelModel model{entries.front(), std::move(*abi), std::move(*regions),
-                    llvm::DenseMap<int64_t, Operation *>()};
+  KernelModel model{entries.front(),
+                    std::move(*abi),
+                    std::move(*regions),
+                    llvm::DenseMap<int64_t, Operation *>(),
+                    llvm::DenseMap<int64_t, Value>(),
+                    llvm::DenseMap<Value, int64_t>()};
+  auto indexValue = [&](int64_t id, Value value, Operation &owner) {
+    if (id < 0 || !model.values.try_emplace(id, value).second ||
+        !model.valueIDs.try_emplace(value, id).second) {
+      owner.emitOpError("duplicates an intent value ID in canonical Kernel IR");
+      return failure();
+    }
+    return success();
+  };
+  for (const ABIArgument &argument : model.abi.arguments)
+    if (failed(indexValue(argument.valueID, argument.value,
+                          *model.entry.getOperation())))
+      return failure();
   WalkResult result = model.entry.walk([&](Operation *operation) {
     auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
     if (node && !model.nodes.try_emplace(node.getInt(), operation).second) {
       operation->emitOpError("duplicates an intent.node in canonical Kernel IR");
       return WalkResult::interrupt();
     }
+    auto resultNodes =
+        operation->getAttrOfType<ArrayAttr>("intent.result_nodes");
+    if (operation->getNumResults() != 0 &&
+        (!resultNodes || resultNodes.size() != operation->getNumResults())) {
+      operation->emitOpError("has incomplete canonical result value IDs");
+      return WalkResult::interrupt();
+    }
+    if (resultNodes)
+      for (auto [index, attribute] : llvm::enumerate(resultNodes)) {
+        auto valueID = dyn_cast<IntegerAttr>(attribute);
+        if (!valueID ||
+            failed(indexValue(valueID.getInt(), operation->getResult(index),
+                              *operation)))
+          return WalkResult::interrupt();
+      }
     return WalkResult::advance();
   });
   if (result.wasInterrupted())

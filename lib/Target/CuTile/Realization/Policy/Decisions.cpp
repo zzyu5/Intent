@@ -2,6 +2,7 @@
 
 #include "Intent/Target/Common/Realization/ScheduleStructure.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 using namespace mlir;
 
@@ -17,9 +18,66 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
   PolicyDecision policy;
   policy.programRoot = structure->programRoot;
   policy.stateStream = nullptr;
+  policy.raggedRelation = nullptr;
   policy.workerAxes = {0};
   policy.groupSize = 1;
   policy.fixedOccupancy = 0;
+
+  if (!structure->raggedOwnerships.empty()) {
+    if (structure->raggedOwnerships.size() != 1 ||
+        structure->raggedOwnerships.front().memberDomains.size() != 1 ||
+        structure->scatterReductions.size() != 1 ||
+        !structure->orderedStreamDomains.empty() ||
+        structure->programDomains.size() != 2 ||
+        structure->tiledProgramDomains.size() != 1) {
+      semantics.kernel.entry.emitOpError(
+          "ragged staging requires one outer/member ownership, one additive merge, and one tiled member domain");
+      return failure();
+    }
+    const target::RaggedOwnership &ownership =
+        structure->raggedOwnerships.front();
+    FailureOr<SmallVector<target::ContractionStage>> stages =
+        target::analyzeContractionPipeline(semantics);
+    if (failed(stages))
+      return failure();
+    Operation *memberDomain = ownership.memberDomains.front();
+    policy.axes.push_back(AxisDecision{
+        ownership.outerDomain,
+        semantics.domainSourceAxes.lookup(ownership.outerDomain), "program_0",
+        "one"});
+    policy.axes.push_back(
+        AxisDecision{memberDomain,
+                     semantics.domainSourceAxes.lookup(memberDomain),
+                     "program_1", "TILE_SIZE_M"});
+    FailureOr<std::string> memberKey =
+        target::sourceDimensionSymbol(*memberDomain, semantics);
+    if (failed(memberKey))
+      return failure();
+    policy.autotuneKeys.push_back(*memberKey);
+    llvm::StringSet<> keys;
+    keys.insert(*memberKey);
+    for (const target::ContractionStage &stage : *stages) {
+      const target::ContractionFact &contract =
+          semantics.contractions.lookup(stage.contraction);
+      for (const target::LogicalAxis &axis :
+           llvm::concat<const target::LogicalAxis>(
+               contract.lhsAxes, contract.rhsAxes, contract.resultAxes)) {
+        if (axis.domain || axis.extent == "1" ||
+            StringRef(axis.extent).starts_with("?region_") ||
+            !keys.insert(axis.extent).second)
+          continue;
+        policy.autotuneKeys.push_back(axis.extent);
+      }
+    }
+    policy.workerAxes = {0, 1};
+    policy.raggedRelation = ownership.relation;
+    policy.stages = std::move(*stages);
+    policy.traversal = "expert_major";
+    policy.mapping = "ragged_stages";
+    policy.groupSize = 1;
+    policy.usesAutotuner = true;
+    return policy;
+  }
 
   if (!structure->orderedStreamDomains.empty()) {
     if (structure->orderedStreamDomains.size() != 1 ||

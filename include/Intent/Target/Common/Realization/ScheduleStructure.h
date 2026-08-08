@@ -11,6 +11,12 @@ struct RaggedOwnership {
   llvm::SmallVector<mlir::Operation *> memberDomains;
 };
 
+struct ContractionStage {
+  mlir::Operation *contraction;
+  llvm::SmallVector<mlir::Value> inputs;
+  llvm::SmallVector<mlir::Value> outputs;
+};
+
 struct ScheduleStructure {
   llvm::SmallVector<mlir::Operation *> programDomains;
   llvm::DenseSet<mlir::Operation *> tiledProgramDomains;
@@ -27,6 +33,9 @@ analyzeScheduleStructure(const KernelFacts &facts);
 
 mlir::FailureOr<std::string>
 sourceDimensionSymbol(mlir::Operation &domain, const KernelFacts &facts);
+
+mlir::FailureOr<llvm::SmallVector<ContractionStage>>
+analyzeContractionPipeline(const KernelFacts &facts);
 
 } // namespace intent::target
 

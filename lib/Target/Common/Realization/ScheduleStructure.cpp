@@ -29,6 +29,20 @@ orderedDomains(const llvm::DenseSet<Operation *> &domains) {
   return result;
 }
 
+bool dependsOn(Value value, Operation &producer,
+               llvm::DenseSet<Value> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+  if (value.getDefiningOp() == &producer)
+    return true;
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return dependsOn(operand, producer, visited);
+  });
+}
+
 } // namespace
 
 FailureOr<std::string> sourceDimensionSymbol(Operation &domain,
@@ -140,6 +154,51 @@ analyzeScheduleStructure(const KernelFacts &facts) {
   }
   structure.programRoot = *rootCandidates.begin();
   return structure;
+}
+
+FailureOr<SmallVector<ContractionStage>>
+analyzeContractionPipeline(const KernelFacts &facts) {
+  SmallVector<Operation *> contractions;
+  contractions.reserve(facts.contractions.size());
+  for (const auto &entry : facts.contractions)
+    contractions.push_back(entry.first);
+  llvm::sort(contractions, [](Operation *lhs, Operation *rhs) {
+    return lhs->getAttrOfType<IntegerAttr>("intent.node").getInt() <
+           rhs->getAttrOfType<IntegerAttr>("intent.node").getInt();
+  });
+  if (contractions.empty()) {
+    facts.kernel.entry.emitOpError("has no contraction pipeline to realize");
+    return failure();
+  }
+
+  SmallVector<ContractionStage> stages;
+  for (Operation *contraction : contractions)
+    stages.push_back(ContractionStage{contraction, {}, {}});
+  for (size_t index = 0; index + 1 < contractions.size(); ++index) {
+    Operation *producer = contractions[index];
+    Operation *consumer = contractions[index + 1];
+    SmallVector<Value> dependentOperands;
+    for (Value operand : consumer->getOperands()) {
+      llvm::DenseSet<Value> visited;
+      if (dependsOn(operand, *producer, visited))
+        dependentOperands.push_back(operand);
+    }
+    if (dependentOperands.size() != 1 ||
+        !isa<RankedTensorType>(dependentOperands.front().getType())) {
+      consumer->emitOpError(
+          "does not form one materializable edge from the preceding contraction");
+      return failure();
+    }
+    Value materialized = dependentOperands.front();
+    if (!facts.kernel.valueIDs.count(materialized)) {
+      consumer->emitOpError(
+          "contraction stage edge has no canonical value identity");
+      return failure();
+    }
+    stages[index].outputs.push_back(materialized);
+    stages[index + 1].inputs.push_back(materialized);
+  }
+  return stages;
 }
 
 } // namespace intent::target
