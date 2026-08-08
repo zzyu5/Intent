@@ -9,26 +9,26 @@ namespace intent::triton::realization {
 namespace {
 
 FailureOr<Operation *> ownedDomain(Operation &parallel,
-                                   const OperationFacts &facts) {
+                                   const target::KernelFacts &semantics) {
   Operation *source = parallel.getOperand(0).getDefiningOp();
-  if (facts.domainSourceAxes.count(source))
+  if (semantics.domainSourceAxes.count(source))
     return source;
-  auto partition = facts.partitionDomains.find(source);
-  if (partition != facts.partitionDomains.end())
+  auto partition = semantics.partitionDomains.find(source);
+  if (partition != semantics.partitionDomains.end())
     return partition->second;
   parallel.emitOpError("has no source domain for policy selection");
   return failure();
 }
 
 FailureOr<std::string> sourceDimension(Operation &domain,
-                                       const OperationFacts &facts) {
-  Value source = facts.domainSources.lookup(&domain);
-  int64_t axis = facts.domainSourceAxes.lookup(&domain);
-  auto argument = llvm::find_if(facts.kernel.abi.arguments,
+                                       const target::KernelFacts &semantics) {
+  Value source = semantics.domainSources.lookup(&domain);
+  int64_t axis = semantics.domainSourceAxes.lookup(&domain);
+  auto argument = llvm::find_if(semantics.kernel.abi.arguments,
                                 [&](const target::ABIArgument &candidate) {
                                   return candidate.value == source;
                                 });
-  if (argument == facts.kernel.abi.arguments.end()) {
+  if (argument == semantics.kernel.abi.arguments.end()) {
     domain.emitOpError("does not refer to a canonical ABI argument");
     return failure();
   }
@@ -46,22 +46,23 @@ FailureOr<std::string> sourceDimension(Operation &domain,
 } // namespace
 
 FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
-  if (facts.parallels.empty()) {
-    facts.kernel.entry.emitOpError("has no parallel ownership to realize");
+  const target::KernelFacts &semantics = facts.semantics;
+  if (semantics.parallels.empty()) {
+    semantics.kernel.entry.emitOpError("has no parallel ownership to realize");
     return failure();
   }
 
   SmallVector<Operation *> programDomains;
   llvm::DenseSet<Operation *> programDomainSet;
   llvm::DenseSet<Operation *> tiledProgramDomains;
-  for (Operation *parallel : facts.parallels) {
-    FailureOr<Operation *> domain = ownedDomain(*parallel, facts);
+  for (Operation *parallel : semantics.parallels) {
+    FailureOr<Operation *> domain = ownedDomain(*parallel, semantics);
     if (failed(domain))
       return failure();
     if (programDomainSet.insert(*domain).second)
       programDomains.push_back(*domain);
     Operation *source = parallel->getOperand(0).getDefiningOp();
-    if (facts.partitionDomains.count(source))
+    if (semantics.partitionDomains.count(source))
       tiledProgramDomains.insert(*domain);
   }
 
@@ -73,15 +74,15 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
     });
     return result;
   };
-  SmallVector<Operation *> vectorDomains = ordered(facts.vectorDomains);
+  SmallVector<Operation *> vectorDomains = ordered(semantics.vectorDomains);
   SmallVector<Operation *> streamedDomains =
-      ordered(facts.streamedReductionDomains);
+      ordered(semantics.streamedReductionDomains);
 
   llvm::DenseSet<Operation *> classified = programDomainSet;
-  classified.insert(facts.vectorDomains.begin(), facts.vectorDomains.end());
-  classified.insert(facts.streamedReductionDomains.begin(),
-                    facts.streamedReductionDomains.end());
-  for (const auto &binding : facts.boundaryDomains)
+  classified.insert(semantics.vectorDomains.begin(), semantics.vectorDomains.end());
+  classified.insert(semantics.streamedReductionDomains.begin(),
+                    semantics.streamedReductionDomains.end());
+  for (const auto &binding : semantics.boundaryDomains)
     for (Operation *domain : binding.second)
       if (!classified.contains(domain)) {
         domain->emitOpError(
@@ -92,7 +93,7 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
   PolicyDecision policy;
   policy.workerAxes = {0};
   llvm::DenseSet<Operation *> rootCandidates;
-  for (const target::RegionNode &region : facts.kernel.regions.nodes) {
+  for (const target::RegionNode &region : semantics.kernel.regions.nodes) {
     if (region.operation->getName().getStringRef() != "intent.parallel")
       continue;
     bool hasParallelAncestor = false;
@@ -102,16 +103,16 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
         hasParallelAncestor = true;
         break;
       }
-      auto position = facts.kernel.regions.positions.find(ancestor);
-      ancestor = position == facts.kernel.regions.positions.end()
+      auto position = semantics.kernel.regions.positions.find(ancestor);
+      ancestor = position == semantics.kernel.regions.positions.end()
                      ? nullptr
-                     : facts.kernel.regions.nodes[position->second].parent;
+                     : semantics.kernel.regions.nodes[position->second].parent;
     }
     if (!hasParallelAncestor)
       rootCandidates.insert(region.operation);
   }
   if (rootCandidates.size() != 1) {
-    facts.kernel.entry.emitOpError(
+    semantics.kernel.entry.emitOpError(
         "Triton policy requires exactly one root parallel ownership region");
     return failure();
   }
@@ -125,30 +126,30 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
       return failure();
     }
     policy.axes.push_back(AxisDecision{
-        domain, facts.domainSourceAxes.lookup(domain),
+        domain, semantics.domainSourceAxes.lookup(domain),
         "program_" + std::to_string(index),
         tiledProgramDomains.contains(domain) ? programTiles[index].str() : "one"});
   }
   for (auto [index, domain] : llvm::enumerate(streamedDomains))
     policy.axes.push_back(AxisDecision{
-        domain, facts.domainSourceAxes.lookup(domain),
+        domain, semantics.domainSourceAxes.lookup(domain),
         "reduction_" + std::to_string(index),
         index == 0 ? "BLOCK_SIZE_K" : "BLOCK_SIZE_REDUCTION"});
   for (Operation *domain : vectorDomains) {
-    if (facts.streamedReductionDomains.contains(domain))
+    if (semantics.streamedReductionDomains.contains(domain))
       continue;
     unsigned index = llvm::count_if(policy.axes, [](const AxisDecision &axis) {
       return StringRef(axis.role).starts_with("lane_");
     });
     policy.axes.push_back(AxisDecision{
-        domain, facts.domainSourceAxes.lookup(domain),
+        domain, semantics.domainSourceAxes.lookup(domain),
         "lane_" + std::to_string(index), "next_power_of_two"});
   }
 
   if (tiledProgramDomains.empty()) {
     if (programDomains.size() != 1 || vectorDomains.size() != 1 ||
         !streamedDomains.empty()) {
-      facts.kernel.entry.emitOpError(
+      semantics.kernel.entry.emitOpError(
           "persistent grid-stride requires one program and one vector domain");
       return failure();
     }
@@ -160,7 +161,7 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
 
   if (programDomains.size() != 2 || tiledProgramDomains.size() != 2 ||
       streamedDomains.size() != 1) {
-    facts.kernel.entry.emitOpError(
+    semantics.kernel.entry.emitOpError(
         "grouped tiled scheduling requires two tiled program axes and one "
         "streamed reduction axis");
     return failure();
@@ -169,7 +170,7 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
   policy.mapping = "grouped_2d_tiles";
   for (Operation *domain :
        {programDomains[0], programDomains[1], streamedDomains[0]}) {
-    FailureOr<std::string> key = sourceDimension(*domain, facts);
+    FailureOr<std::string> key = sourceDimension(*domain, semantics);
     if (failed(key))
       return failure();
     policy.autotuneKeys.push_back(*key);

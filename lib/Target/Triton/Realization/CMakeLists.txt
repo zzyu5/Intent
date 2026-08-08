@@ -2,7 +2,6 @@ add_mlir_library(MLIRIntentTritonRealization
   Driver/Realize.cpp
   Handlers/Operations.cpp
   Policy/Decisions.cpp
-  Proof/Semantics.cpp
   Search/Candidates.cpp
 
   LINK_LIBS PUBLIC

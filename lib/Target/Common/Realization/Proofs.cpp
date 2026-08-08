@@ -1,10 +1,10 @@
-#include "Support/Model.h"
+#include "Intent/Target/Common/Realization/KernelFacts.h"
 
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 
-namespace intent::triton::realization {
+namespace intent::target {
 
 bool proveMaskedLaneNeutrality(Value loaded) {
   Operation *maximum = nullptr;
@@ -41,4 +41,4 @@ bool proveMaskedLaneNeutrality(Value loaded) {
   });
 }
 
-} // namespace intent::triton::realization
+} // namespace intent::target
