@@ -28,6 +28,7 @@ struct AxisDecision {
 
 struct PolicyDecision {
   mlir::Operation *programRoot;
+  mlir::Operation *stateStream;
   llvm::SmallVector<AxisDecision> axes;
   std::string traversal;
   std::string mapping;

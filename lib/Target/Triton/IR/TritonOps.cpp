@@ -101,6 +101,17 @@ LogicalResult ContractOp::verify() {
   return success();
 }
 
+LogicalResult StreamOp::verify() {
+  if (failed(requireNode(*this, getNode())) ||
+      failed(requireNode(*this, getAxisNode())))
+    return failure();
+  if (getTile().empty() || getOrder() != "forward" ||
+      getCarrySpace() != "register")
+    return emitOpError(
+        "requires a forward tile stream with register-carried state");
+  return success();
+}
+
 LogicalResult BoundaryOp::verify() {
   if (failed(requireNode(*this, getNode())) || getDomainNodes().empty())
     return failure();
@@ -168,6 +179,7 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
   ProgramOp programChoice;
   PipelineOp pipelineChoice;
   LaunchOp launchChoice;
+  StreamOp streamChoice;
   llvm::DenseSet<int64_t> axes;
   llvm::StringSet<> axisRoles;
   llvm::DenseSet<int64_t> storage;
@@ -204,6 +216,10 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
     } else if (auto binding = dyn_cast<ContractOp>(operation)) {
       if (!primitives.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation lowering");
+    } else if (auto stream = dyn_cast<StreamOp>(operation)) {
+      if (streamChoice)
+        return stream.emitOpError("duplicates an ordered stream binding");
+      streamChoice = stream;
     } else if (auto binding = dyn_cast<BoundaryOp>(operation)) {
       if (!boundaries.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a boundary binding");
@@ -232,6 +248,16 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
       (pipelineChoice || launchChoice))
     return realization.emitOpError(
         "autotuned grouped programs cannot carry fixed pipeline/launch choices");
+  if (programChoice.getMapping() == "multi_axis_stream" &&
+      (pipelineChoice || launchChoice || !streamChoice))
+    return realization.emitOpError(
+        "multi-axis streams require one stream and no fixed pipeline/launch");
+  if (streamChoice && !axes.contains(streamChoice.getAxisNode()))
+    return streamChoice.emitOpError("references an unbound stream axis");
+  if (programChoice.getMapping() != "grid_stride" &&
+      programChoice.getMapping() != "grouped_2d_tiles" &&
+      programChoice.getMapping() != "multi_axis_stream")
+    return programChoice.emitOpError("contains an unsupported Triton mapping");
   return success();
 }
 

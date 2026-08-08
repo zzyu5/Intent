@@ -97,6 +97,17 @@ LogicalResult ContractOp::verify() {
   return success();
 }
 
+LogicalResult StreamOp::verify() {
+  if (failed(requireNode(*this, getNodeAttr().getInt())) ||
+      failed(requireNode(*this, getAxisNodeAttr().getInt())))
+    return failure();
+  if (getTile().empty() || getOrder() != "forward" ||
+      getCarrySpace() != "register")
+    return emitOpError(
+        "requires a forward tile stream with register-carried state");
+  return success();
+}
+
 LogicalResult BoundaryOp::verify() {
   if (failed(requireNode(*this, getNodeAttr().getInt())) ||
       getDomainNodes().empty())
@@ -160,6 +171,7 @@ LogicalResult intent::cutile::plan::verifyCuTileRealization(
   unsigned launches = 0;
   ProgramOp programChoice;
   LaunchOp launchChoice;
+  StreamOp streamChoice;
   llvm::DenseSet<int64_t> axes;
   llvm::StringSet<> axisRoles;
   llvm::DenseSet<int64_t> storage;
@@ -195,6 +207,10 @@ LogicalResult intent::cutile::plan::verifyCuTileRealization(
     } else if (auto binding = dyn_cast<ContractOp>(operation)) {
       if (!primitives.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation lowering");
+    } else if (auto stream = dyn_cast<StreamOp>(operation)) {
+      if (streamChoice)
+        return stream.emitOpError("duplicates an ordered stream binding");
+      streamChoice = stream;
     } else if (auto binding = dyn_cast<BoundaryOp>(operation)) {
       if (!boundaries.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a boundary binding");
@@ -215,8 +231,15 @@ LogicalResult intent::cutile::plan::verifyCuTileRealization(
   if (programChoice.getMapping() == "grouped_2d_tiles" && launchChoice)
     return realization.emitOpError(
         "autotuned grouped tiles cannot carry a fixed launch choice");
+  if (programChoice.getMapping() == "multi_axis_stream" &&
+      (launchChoice || !streamChoice))
+    return realization.emitOpError(
+        "multi-axis streams require one stream and no fixed launch");
+  if (streamChoice && !axes.contains(streamChoice.getAxisNode()))
+    return streamChoice.emitOpError("references an unbound stream axis");
   if (programChoice.getMapping() != "persistent_rows" &&
-      programChoice.getMapping() != "grouped_2d_tiles")
+      programChoice.getMapping() != "grouped_2d_tiles" &&
+      programChoice.getMapping() != "multi_axis_stream")
     return programChoice.emitOpError("contains an unsupported cuTile mapping");
   return success();
 }

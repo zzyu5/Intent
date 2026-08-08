@@ -74,13 +74,15 @@ analyzeScheduleStructure(const KernelFacts &facts) {
       structure.tiledProgramDomains.insert(*domain);
   }
   structure.vectorDomains = orderedDomains(facts.vectorDomains);
-  structure.streamedReductionDomains =
-      orderedDomains(facts.streamedReductionDomains);
+  structure.contractionDomains = orderedDomains(facts.contractionDomains);
+  structure.orderedStreamDomains = orderedDomains(facts.orderedStreamDomains);
 
   llvm::DenseSet<Operation *> classified = programDomainSet;
   classified.insert(facts.vectorDomains.begin(), facts.vectorDomains.end());
-  classified.insert(facts.streamedReductionDomains.begin(),
-                    facts.streamedReductionDomains.end());
+  classified.insert(facts.contractionDomains.begin(),
+                    facts.contractionDomains.end());
+  classified.insert(facts.orderedStreamDomains.begin(),
+                    facts.orderedStreamDomains.end());
   for (const auto &binding : facts.boundaryDomains)
     for (Operation *domain : binding.second)
       if (!classified.contains(domain)) {

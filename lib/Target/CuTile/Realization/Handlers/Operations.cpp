@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -72,8 +73,28 @@ LogicalResult registerAnalysisHandlers(target::OperationHandlerRegistry &registr
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
                          "intent.partition", "intent.parallel",
                          "intent.view_load", "intent.view_store", "intent.yield",
-                         "intent.return"})
+                         "intent.return", "intent.state_stream"})
     if (failed(addHandler(registry, name, noOp)))
+      return failure();
+
+  for (auto [name, lowering] :
+       {std::pair<StringRef, StringRef>{"intent.full", "ct.full"},
+        {"intent.zeros", "ct.zeros"}, {"intent.gather", "expand_dims"}})
+    if (failed(addHandler(
+            registry, name,
+            [&, name, lowering](Operation &operation) -> LogicalResult {
+              if (name == "intent.gather") {
+                FailureOr<SmallVector<target::IndexTerm>> relation =
+                    target::parseIndexRelation(operation);
+                if (failed(relation) || relation->size() != 2 ||
+                    (*relation)[0].kind != "full_slice" ||
+                    (*relation)[1].kind != "new_axis")
+                  return operation.emitOpError(
+                      "has no mechanical cuTile gather lowering");
+              }
+              facts.primitiveLowerings[&operation] = lowering.str();
+              return success();
+            })))
       return failure();
 
   if (failed(addHandler(
@@ -121,7 +142,8 @@ LogicalResult registerAnalysisHandlers(target::OperationHandlerRegistry &registr
                 accType.getValue() != "f32" || !multiply ||
                 multiply.getValue() != "multiply" || !combine ||
                 combine.getValue() != "add" || !lhsAxis || !rhsAxis ||
-                lhsAxis.getInt() != 1 || rhsAxis.getInt() != 0)
+                lhsAxis.getInt() != 1 ||
+                (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1))
               return operation.emitOpError(
                   "has no semantics-preserving cuTile ct.mma binding");
             facts.primitiveLowerings[&operation] = "ct.mma";
@@ -235,7 +257,8 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
-                         "intent.cast"})
+                         "intent.cast", "intent.full", "intent.zeros",
+                         "intent.gather"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =
@@ -255,9 +278,44 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
                 target::getNodeID(operation, "primitive binding");
             if (failed(node))
               return failure();
+            auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
+            auto pair = reduce && reduce.size() == 1
+                            ? dyn_cast<ArrayAttr>(reduce[0])
+                            : ArrayAttr();
+            auto lhsAxis = pair && pair.size() == 2
+                               ? dyn_cast<IntegerAttr>(pair[0])
+                               : IntegerAttr();
+            auto rhsAxis = pair && pair.size() == 2
+                               ? dyn_cast<IntegerAttr>(pair[1])
+                               : IntegerAttr();
+            if (!lhsAxis || !rhsAxis)
+              return operation.emitOpError("has no canonical contraction pair");
             builder.create<plan::ContractOp>(
                 operation.getLoc(), i64(builder, *node), string(builder, "ct.mma"),
-                string(builder, "f32"));
+                string(builder, "f32"), builder.getBoolAttr(false),
+                builder.getBoolAttr(rhsAxis.getInt() == 1));
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.state_stream",
+          [&](Operation &operation) -> LogicalResult {
+            if (&operation != policy.stateStream)
+              return operation.emitOpError("is not the resolved ordered stream");
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "stream binding");
+            Operation *domain = operation.getOperand(0).getDefiningOp();
+            FailureOr<int64_t> axisNode = domain
+                                              ? target::getNodeID(
+                                                    *domain, "stream axis binding")
+                                              : FailureOr<int64_t>(failure());
+            if (failed(node) || failed(axisNode))
+              return failure();
+            builder.create<plan::StreamOp>(
+                operation.getLoc(), i64(builder, *node), i64(builder, *axisNode),
+                string(builder, "TILE_SIZE_N"), string(builder, "forward"),
+                string(builder, "register"));
             return success();
           })))
     return failure();

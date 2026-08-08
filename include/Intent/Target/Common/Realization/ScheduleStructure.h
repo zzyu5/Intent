@@ -9,7 +9,8 @@ struct ScheduleStructure {
   llvm::SmallVector<mlir::Operation *> programDomains;
   llvm::DenseSet<mlir::Operation *> tiledProgramDomains;
   llvm::SmallVector<mlir::Operation *> vectorDomains;
-  llvm::SmallVector<mlir::Operation *> streamedReductionDomains;
+  llvm::SmallVector<mlir::Operation *> contractionDomains;
+  llvm::SmallVector<mlir::Operation *> orderedStreamDomains;
   mlir::Operation *programRoot = nullptr;
 };
 

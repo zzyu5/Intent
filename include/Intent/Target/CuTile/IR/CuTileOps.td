@@ -69,7 +69,21 @@ def IntentCuTile_ContractOp : IntentCuTile_Op<"contract"> {
   let arguments = (ins
     I64Attr:$node,
     StrAttr:$lowering,
-    StrAttr:$accumulator_type
+    StrAttr:$accumulator_type,
+    BoolAttr:$lhs_transpose,
+    BoolAttr:$rhs_transpose
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentCuTile_StreamOp : IntentCuTile_Op<"stream"> {
+  let arguments = (ins
+    I64Attr:$node,
+    I64Attr:$axis_node,
+    StrAttr:$tile,
+    StrAttr:$order,
+    StrAttr:$carry_space
   );
   let results = (outs);
   let hasVerifier = 1;

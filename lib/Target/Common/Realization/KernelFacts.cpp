@@ -43,57 +43,185 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
   return success();
 }
 
-LogicalResult recordLoadDomains(Operation &operation, KernelFacts &facts) {
-  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
-  if (failed(relation))
+FailureOr<LogicalAxis> axisFromView(Value source, unsigned sourceAxis,
+                                    const KernelFacts &facts,
+                                    Operation &consumer) {
+  auto argument = llvm::find_if(facts.kernel.abi.arguments,
+                                [&](const ABIArgument &candidate) {
+                                  return candidate.value == source;
+                                });
+  if (argument == facts.kernel.abi.arguments.end()) {
+    consumer.emitOpError("axis source is not a canonical ABI view");
     return failure();
-  SmallVector<Operation *> domains;
-  for (const IndexTerm &term : *relation) {
-    if (term.kind != "region_index")
-      continue;
-    if (term.operands.size() != 1 || !term.operands.front())
-      return operation.emitOpError(
-          "region_index provenance requires one dynamic operand");
-    FailureOr<Operation *> domain = resolveDomain(
-        operation.getOperand(*term.operands.front()), facts, operation);
-    if (failed(domain))
-      return failure();
-    domains.push_back(*domain);
   }
-  auto tensor = operation.getNumResults() == 1
-                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
-                    : RankedTensorType();
-  if (!tensor || static_cast<size_t>(tensor.getRank()) != domains.size())
+  auto shape = argument->metadata.getAs<ArrayAttr>("shape");
+  if (!shape || sourceAxis >= shape.size()) {
+    consumer.emitOpError("axis exceeds canonical ABI shape metadata");
+    return failure();
+  }
+  if (auto symbol = dyn_cast<StringAttr>(shape[sourceAxis]))
+    return LogicalAxis{nullptr, symbol.getValue().str()};
+  if (auto integer = dyn_cast<IntegerAttr>(shape[sourceAxis]))
+    return LogicalAxis{nullptr, std::to_string(integer.getInt())};
+  consumer.emitOpError("axis has an unsupported ABI extent");
+  return failure();
+}
+
+FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
+                                      const KernelFacts &facts,
+                                      Operation &consumer) {
+  auto source = facts.domainSources.find(&domain);
+  auto sourceAxis = facts.domainSourceAxes.find(&domain);
+  if (source == facts.domainSources.end() ||
+      sourceAxis == facts.domainSourceAxes.end() || sourceAxis->second < 0) {
+    consumer.emitOpError("domain has no canonical ABI axis identity");
+    return failure();
+  }
+  FailureOr<LogicalAxis> axis =
+      axisFromView(source->second, sourceAxis->second, facts, consumer);
+  if (failed(axis))
+    return failure();
+  axis->domain = &domain;
+  return axis;
+}
+
+FailureOr<SmallVector<StringRef>> resultShapeLabels(Operation &operation,
+                                                    unsigned resultIndex) {
+  auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
+  auto shape = shapes && resultIndex < shapes.size()
+                   ? dyn_cast<ArrayAttr>(shapes[resultIndex])
+                   : ArrayAttr();
+  if (!shape)
+    return SmallVector<StringRef>();
+  SmallVector<StringRef> labels;
+  for (Attribute attribute : shape) {
+    auto label = dyn_cast<StringAttr>(attribute);
+    if (!label) {
+      operation.emitOpError("result shape contains a non-symbolic axis label");
+      return failure();
+    }
+    labels.push_back(label.getValue());
+  }
+  return labels;
+}
+
+FailureOr<LogicalAxis> axisFromLabel(StringRef label, KernelFacts &facts,
+                                     Operation &consumer) {
+  auto known = facts.axisLabels.find(label);
+  if (known != facts.axisLabels.end())
+    return known->second;
+  for (const auto &binding : facts.domainSourceAxes) {
+    FailureOr<LogicalAxis> axis = axisFromDomain(*binding.first, facts, consumer);
+    if (failed(axis))
+      return failure();
+    if (axis->extent == label) {
+      facts.axisLabels[label] = *axis;
+      return axis;
+    }
+  }
+  LogicalAxis implicit{nullptr, label.str()};
+  facts.axisLabels[label] = implicit;
+  return implicit;
+}
+
+LogicalResult bindResultAxes(Operation &operation, unsigned resultIndex,
+                             SmallVector<LogicalAxis> axes,
+                             KernelFacts &facts) {
+  if (resultIndex >= operation.getNumResults())
+    return operation.emitOpError("axis provenance references a missing result");
+  auto tensor = dyn_cast<RankedTensorType>(operation.getResult(resultIndex).getType());
+  if (!tensor)
+    return axes.empty()
+               ? success()
+               : operation.emitOpError("scalar result cannot carry tensor axes");
+  if (static_cast<size_t>(tensor.getRank()) != axes.size())
     return operation.emitOpError(
-        "indexed region provenance does not match the loaded tensor rank");
-  facts.valueDomains[operation.getResult(0)] = std::move(domains);
+        "logical axis provenance does not match the tensor rank");
+  FailureOr<SmallVector<StringRef>> labels =
+      resultShapeLabels(operation, resultIndex);
+  if (failed(labels) || (!labels->empty() && labels->size() != axes.size()))
+    return operation.emitOpError("result shape labels do not match logical axes");
+  for (auto [label, axis] : llvm::zip(*labels, axes))
+    facts.axisLabels[label] = axis;
+  facts.valueAxes[operation.getResult(resultIndex)] = std::move(axes);
   return success();
 }
 
-LogicalResult propagatePointwiseDomains(Operation &operation,
-                                        KernelFacts &facts) {
+FailureOr<SmallVector<LogicalAxis>> axesFromResultShape(Operation &operation,
+                                                       unsigned resultIndex,
+                                                       KernelFacts &facts) {
+  FailureOr<SmallVector<StringRef>> labels =
+      resultShapeLabels(operation, resultIndex);
+  if (failed(labels))
+    return failure();
+  SmallVector<LogicalAxis> axes;
+  for (StringRef label : *labels) {
+    FailureOr<LogicalAxis> axis = axisFromLabel(label, facts, operation);
+    if (failed(axis))
+      return failure();
+    axes.push_back(*axis);
+  }
+  return axes;
+}
+
+LogicalResult recordLoadAxes(Operation &operation, KernelFacts &facts) {
+  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  SmallVector<LogicalAxis> axes;
+  unsigned sourceAxis = 0;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      axes.push_back(LogicalAxis{nullptr, "1"});
+      continue;
+    }
+    if (term.kind == "full_slice" || term.kind == "slice") {
+      FailureOr<LogicalAxis> axis =
+          axisFromView(operation.getOperand(0), sourceAxis++, facts, operation);
+      if (failed(axis))
+        return failure();
+      axes.push_back(*axis);
+      continue;
+    }
+    if (term.kind == "static_index") {
+      ++sourceAxis;
+      continue;
+    }
+    if (term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "indexed axis provenance requires one dynamic operand");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "region_index") {
+      FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
+      if (failed(domain))
+        return failure();
+      FailureOr<LogicalAxis> axis = axisFromDomain(**domain, facts, operation);
+      if (failed(axis))
+        return failure();
+      axes.push_back(*axis);
+    } else if (term.kind == "value_index") {
+      auto indexedAxes = facts.valueAxes.find(indexed);
+      if (indexedAxes != facts.valueAxes.end())
+        axes.append(indexedAxes->second);
+    } else {
+      return operation.emitOpError("has an unsupported indexed axis relation");
+    }
+    ++sourceAxis;
+  }
+  return bindResultAxes(operation, 0, std::move(axes), facts);
+}
+
+LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("pointwise provenance requires one result");
   auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
   if (!result)
     return success();
-  SmallVector<Operation *> selected;
-  for (Value operand : operation.getOperands()) {
-    auto found = facts.valueDomains.find(operand);
-    if (found == facts.valueDomains.end())
-      continue;
-    if (selected.empty() || found->second.size() > selected.size())
-      selected = found->second;
-    else if (found->second.size() == selected.size() && found->second != selected)
-      return operation.emitOpError(
-          "pointwise operands carry incompatible logical domains");
-  }
-  if (!selected.empty() &&
-      selected.size() != static_cast<size_t>(result.getRank()))
-    return operation.emitOpError(
-        "pointwise logical domains do not match the result rank");
-  facts.valueDomains[operation.getResult(0)] = std::move(selected);
-  return success();
+  FailureOr<SmallVector<LogicalAxis>> axes =
+      axesFromResultShape(operation, 0, facts);
+  if (failed(axes))
+    return failure();
+  return bindResultAxes(operation, 0, std::move(*axes), facts);
 }
 
 LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
@@ -186,7 +314,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     operation, facts,
                     feedsContract ? "zero" : "negative_infinity")))
               return failure();
-            return recordLoadDomains(operation, facts);
+            return recordLoadAxes(operation, facts);
           })))
     return failure();
 
@@ -207,53 +335,214 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.reduce", [&](Operation &operation) -> LogicalResult {
             auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
             auto input = operation.getNumOperands() > 0
-                             ? facts.valueDomains.find(operation.getOperand(0))
-                             : facts.valueDomains.end();
-            if (!axes || axes.empty() || input == facts.valueDomains.end())
+                             ? facts.valueAxes.find(operation.getOperand(0))
+                             : facts.valueAxes.end();
+            if (!axes || axes.empty() || input == facts.valueAxes.end())
               return operation.emitOpError(
-                  "reduction axes have no logical-domain provenance");
+                  "reduction axes have no logical-axis provenance");
             SmallVector<unsigned> reducedAxes;
             for (Attribute attribute : axes) {
               auto axis = dyn_cast<IntegerAttr>(attribute);
               if (!axis || axis.getInt() < 0 ||
                   static_cast<size_t>(axis.getInt()) >= input->second.size())
                 return operation.emitOpError(
-                    "reduction axis has no logical-domain provenance");
+                    "reduction axis has no logical-axis provenance");
               reducedAxes.push_back(axis.getInt());
-              facts.vectorDomains.insert(input->second[axis.getInt()]);
+              if (Operation *domain = input->second[axis.getInt()].domain)
+                facts.vectorDomains.insert(domain);
             }
             llvm::sort(reducedAxes, std::greater<unsigned>());
-            SmallVector<Operation *> resultDomains = input->second;
+            SmallVector<LogicalAxis> resultAxes = input->second;
             for (unsigned axis : reducedAxes)
-              resultDomains.erase(resultDomains.begin() + axis);
+              resultAxes.erase(resultAxes.begin() + axis);
             if (operation.getNumResults() == 1)
-              facts.valueDomains[operation.getResult(0)] =
-                  std::move(resultDomains);
+              return bindResultAxes(operation, 0, std::move(resultAxes), facts);
             return success();
           })))
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
-                         "intent.cast"})
+                         "intent.cast", "intent.compare", "intent.select",
+                         "intent.mask"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
-              return propagatePointwiseDomains(operation, facts);
+              return propagatePointwiseAxes(operation, facts);
             })))
       return failure();
+
+  for (StringRef name : {"intent.full", "intent.zeros"})
+    if (failed(addHandler(
+            registry, name, [&](Operation &operation) -> LogicalResult {
+              FailureOr<SmallVector<LogicalAxis>> axes =
+                  axesFromResultShape(operation, 0, facts);
+              if (failed(axes))
+                return failure();
+              return bindResultAxes(operation, 0, std::move(*axes), facts);
+            })))
+      return failure();
+
+  if (failed(addHandler(
+          registry, "intent.indices", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
+              return operation.emitOpError("has no canonical indices schema");
+            FailureOr<Operation *> domain =
+                resolveDomain(operation.getOperand(0), facts, operation);
+            if (failed(domain))
+              return failure();
+            FailureOr<LogicalAxis> axis =
+                axisFromDomain(**domain, facts, operation);
+            if (failed(axis))
+              return failure();
+            return bindResultAxes(operation, 0, {*axis}, facts);
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.gather", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() < 1 || operation.getNumResults() != 1)
+              return operation.emitOpError("has no canonical gather schema");
+            FailureOr<SmallVector<IndexTerm>> relation =
+                parseIndexRelation(operation);
+            if (failed(relation))
+              return failure();
+            SmallVector<LogicalAxis> resultAxes;
+            auto sourceAxes = facts.valueAxes.find(operation.getOperand(0));
+            bool sourceIsView =
+                isa<intent::ViewType>(operation.getOperand(0).getType());
+            unsigned sourceAxis = 0;
+            for (const IndexTerm &term : *relation) {
+              if (term.kind == "new_axis") {
+                resultAxes.push_back(LogicalAxis{nullptr, "1"});
+                continue;
+              }
+              if (term.kind == "full_slice" || term.kind == "slice") {
+                if (sourceIsView) {
+                  FailureOr<LogicalAxis> axis = axisFromView(
+                      operation.getOperand(0), sourceAxis, facts, operation);
+                  if (failed(axis))
+                    return failure();
+                  resultAxes.push_back(*axis);
+                } else {
+                  if (sourceAxes == facts.valueAxes.end() ||
+                      sourceAxis >= sourceAxes->second.size())
+                    return operation.emitOpError(
+                        "gather source axis has no logical provenance");
+                  resultAxes.push_back(sourceAxes->second[sourceAxis]);
+                }
+                ++sourceAxis;
+                continue;
+              }
+              if (term.kind == "static_index") {
+                ++sourceAxis;
+                continue;
+              }
+              if (term.operands.size() != 1 || !term.operands.front())
+                return operation.emitOpError(
+                    "gather index requires one dynamic operand");
+              Value indexed = operation.getOperand(*term.operands.front());
+              if (term.kind == "region_index") {
+                FailureOr<Operation *> domain =
+                    resolveDomain(indexed, facts, operation);
+                if (failed(domain))
+                  return failure();
+                FailureOr<LogicalAxis> axis =
+                    axisFromDomain(**domain, facts, operation);
+                if (failed(axis))
+                  return failure();
+                resultAxes.push_back(*axis);
+              } else if (term.kind == "value_index") {
+                auto indexedAxes = facts.valueAxes.find(indexed);
+                if (indexedAxes != facts.valueAxes.end())
+                  resultAxes.append(indexedAxes->second);
+              } else {
+                return operation.emitOpError("has an unsupported gather relation");
+              }
+              ++sourceAxis;
+            }
+            return bindResultAxes(operation, 0, std::move(resultAxes), facts);
+          })))
+    return failure();
+
+  auto enterStateStream = [&](Operation &operation) -> LogicalResult {
+    auto stateCount = operation.getAttrOfType<IntegerAttr>("intent.state_count");
+    auto extent = operation.getAttrOfType<DictionaryAttr>("intent.extent");
+    auto tile = extent ? extent.getAs<StringAttr>("name") : StringAttr();
+    if (!stateCount || stateCount.getInt() <= 0 || !tile ||
+        tile.getValue().empty() || operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getNumOperands() !=
+            static_cast<unsigned>(stateCount.getInt() + 1) ||
+        operation.getNumResults() !=
+            static_cast<unsigned>(stateCount.getInt()))
+      return operation.emitOpError("has no canonical state-stream schema");
+    Operation *axisDomain = operation.getOperand(0).getDefiningOp();
+    if (!axisDomain || !facts.domainSourceAxes.count(axisDomain))
+      return operation.emitOpError(
+          "state stream requires a canonical source domain");
+    Block &body = operation.getRegion(0).front();
+    if (body.getNumArguments() !=
+        static_cast<unsigned>(stateCount.getInt() + 1))
+      return operation.emitOpError(
+          "state stream body does not match carried state");
+    StateStreamFact fact{axisDomain, stateCount.getInt(), tile.getValue().str(),
+                         &body, {}, {}, {}};
+    for (int64_t index = 0; index < stateCount.getInt(); ++index) {
+      Value initial = operation.getOperand(index + 1);
+      Value argument = body.getArgument(index + 1);
+      fact.initialState.push_back(initial);
+      fact.bodyState.push_back(argument);
+      auto axes = facts.valueAxes.find(initial);
+      if (isa<RankedTensorType>(initial.getType()) &&
+          axes == facts.valueAxes.end())
+        return operation.emitOpError(
+            "tensor state has no logical-axis provenance");
+      if (axes != facts.valueAxes.end()) {
+        facts.valueAxes[argument] = axes->second;
+        facts.valueAxes[operation.getResult(index)] = axes->second;
+      }
+    }
+    facts.orderedStreamDomains.insert(axisDomain);
+    facts.stateStreams[&operation] = std::move(fact);
+    return success();
+  };
+  auto leaveStateStream = [&](Operation &operation) -> LogicalResult {
+    StateStreamFact &fact = facts.stateStreams[&operation];
+    Operation &terminator = fact.body->back();
+    if (terminator.getName().getStringRef() != "intent.yield" ||
+        terminator.getNumOperands() != static_cast<unsigned>(fact.stateCount))
+      return operation.emitOpError(
+          "state stream must yield every carried value");
+    for (int64_t index = 0; index < fact.stateCount; ++index) {
+      Value yielded = terminator.getOperand(index);
+      fact.yieldedState.push_back(yielded);
+      auto initialAxes = facts.valueAxes.find(fact.initialState[index]);
+      auto yieldedAxes = facts.valueAxes.find(yielded);
+      if (initialAxes != facts.valueAxes.end() &&
+          (yieldedAxes == facts.valueAxes.end() ||
+           yieldedAxes->second != initialAxes->second))
+        return operation.emitOpError(
+            "yielded state changes its logical axis identity");
+    }
+    return success();
+  };
+  if (failed(registry.add(
+          "intent.state_stream",
+          OperationHandler{enterStateStream, leaveStateStream})))
+    return failure();
 
   if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto lhs = operation.getNumOperands() == 2
-                           ? facts.valueDomains.find(operation.getOperand(0))
-                           : facts.valueDomains.end();
+                           ? facts.valueAxes.find(operation.getOperand(0))
+                           : facts.valueAxes.end();
             auto rhs = operation.getNumOperands() == 2
-                           ? facts.valueDomains.find(operation.getOperand(1))
-                           : facts.valueDomains.end();
-            if (!reduce || reduce.empty() || lhs == facts.valueDomains.end() ||
-                rhs == facts.valueDomains.end() || operation.getNumResults() != 1)
+                           ? facts.valueAxes.find(operation.getOperand(1))
+                           : facts.valueAxes.end();
+            if (!reduce || reduce.empty() || lhs == facts.valueAxes.end() ||
+                rhs == facts.valueAxes.end() || operation.getNumResults() != 1)
               return operation.emitOpError(
-                  "contraction has no logical-domain provenance");
+                  "contraction has no logical-axis provenance");
             llvm::DenseSet<unsigned> lhsReduced;
             llvm::DenseSet<unsigned> rhsReduced;
             for (Attribute attribute : reduce) {
@@ -273,19 +562,17 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   !rhsReduced.insert(rhsAxis.getInt()).second)
                 return operation.emitOpError(
                     "contraction pair has invalid logical-domain provenance");
-              facts.streamedReductionDomains.insert(
-                  lhs->second[lhsAxis.getInt()]);
+              if (Operation *domain = lhs->second[lhsAxis.getInt()].domain)
+                facts.contractionDomains.insert(domain);
             }
-            SmallVector<Operation *> resultDomains;
-            for (auto [axis, domain] : llvm::enumerate(lhs->second))
+            SmallVector<LogicalAxis> resultAxes;
+            for (auto [axis, logicalAxis] : llvm::enumerate(lhs->second))
               if (!lhsReduced.contains(axis))
-                resultDomains.push_back(domain);
-            for (auto [axis, domain] : llvm::enumerate(rhs->second))
+                resultAxes.push_back(logicalAxis);
+            for (auto [axis, logicalAxis] : llvm::enumerate(rhs->second))
               if (!rhsReduced.contains(axis))
-                resultDomains.push_back(domain);
-            facts.valueDomains[operation.getResult(0)] =
-                std::move(resultDomains);
-            return success();
+                resultAxes.push_back(logicalAxis);
+            return bindResultAxes(operation, 0, std::move(resultAxes), facts);
           })))
     return failure();
   return success();
@@ -301,6 +588,14 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
       return definition;
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
+  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
+      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
+    Operation *domain = owner->getOperand(0).getDefiningOp();
+    if (domain && facts.domainSourceAxes.count(domain))
+      return domain;
+    consumer.emitOpError("cannot resolve a state stream to its source domain");
+    return failure();
+  }
   if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
       owner->getNumOperands() != 1) {
     consumer.emitOpError("indexes with a value not owned by a parallel region");
