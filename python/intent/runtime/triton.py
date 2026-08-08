@@ -1,9 +1,15 @@
-from __future__ import annotations
-
-import builtins as python_builtins
-import linecache
-
 from .artifact import CompiledArtifact
+from .source import materialize_python_source
+
+
+def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
+    asm = getattr(compiled_kernel, "asm", None)
+    if not isinstance(asm, dict):
+        raise RuntimeError("Triton launch did not return a compiled kernel artifact")
+    result = {name: value for name, value in asm.items() if isinstance(value, str)}
+    if not result:
+        raise RuntimeError("Triton compiled artifact exposes no textual backend IR")
+    return result
 
 
 def materialize_triton_artifact(
@@ -11,21 +17,10 @@ def materialize_triton_artifact(
     module_text: str,
     entry_name: str,
 ) -> CompiledArtifact:
-    filename = f"<intent-triton:{entry_name}>"
-    source_lines = source.splitlines(keepends=True)
-    linecache.cache[filename] = (len(source), None, source_lines, filename)
-    namespace: dict[str, object] = {
-        "__name__": f"intent.generated.{entry_name}",
-    }
-    code = python_builtins.compile(source, filename, "exec")
-    exec(code, namespace)
-    launcher = namespace.get("launch")
-    runner = namespace.get("run")
-    if not callable(launcher) or not callable(runner):
-        raise RuntimeError("generated Triton source must define launch() and run()")
-    return CompiledArtifact(
+    return materialize_python_source(
+        target_name="triton",
         source=source,
-        mlir=module_text,
-        _launcher=launcher,
-        _runner=runner,
+        module_text=module_text,
+        entry_name=entry_name,
+        backend_ir_collector=_collect_triton_ir,
     )

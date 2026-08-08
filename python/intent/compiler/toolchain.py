@@ -3,31 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from intent.targets import ResolvedTritonTarget
 
-
-def realize_mlir(
-    kernel_mlir: str,
-    realizer: str | Path,
-    target: ResolvedTritonTarget,
-) -> str:
-    return _run(
-        realizer,
-        kernel_mlir,
-        (
-            f"--architecture={target.architecture}",
-            f"--device={target.device}",
-            f"--warp-size={target.warp_size}",
-        ),
-        "Intent realizer",
-    )
-
-
-def translate_mlir(module_text: str, translator: str | Path) -> str:
-    return _run(translator, module_text, (), "Intent Triton translator")
-
-
-def _run(
+def run_tool(
     executable_path: str | Path,
     module_text: str,
     options: tuple[str, ...],

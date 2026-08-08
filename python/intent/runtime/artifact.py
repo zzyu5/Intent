@@ -6,12 +6,16 @@ from dataclasses import field
 from typing import Any
 
 
+BackendIRCollector = Callable[[object], dict[str, str]]
+
+
 @dataclass(slots=True)
 class CompiledArtifact:
     source: str
     mlir: str
     _launcher: Callable[..., object] = field(repr=False)
     _runner: Callable[..., object] = field(repr=False)
+    _backend_ir_collector: BackendIRCollector | None = field(repr=False)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
 
     @property
@@ -27,11 +31,5 @@ class CompiledArtifact:
 
     def __call__(self, *arguments: Any) -> None:
         compiled_kernel = self._launcher(*arguments)
-        asm = getattr(compiled_kernel, "asm", None)
-        if not isinstance(asm, dict):
-            raise RuntimeError("Triton launch did not return a compiled kernel artifact")
-        self.backend_ir = {
-            name: value for name, value in asm.items() if isinstance(value, str)
-        }
-        if not self.backend_ir:
-            raise RuntimeError("Triton compiled artifact exposes no textual backend IR")
+        if self._backend_ir_collector is not None:
+            self.backend_ir = self._backend_ir_collector(compiled_kernel)

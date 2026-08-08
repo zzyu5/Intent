@@ -5,24 +5,26 @@ from pathlib import Path
 from intent.api import KernelDefinition
 from intent.frontend import lower_to_mlir
 from intent.runtime import CompiledArtifact
-from intent.runtime.triton import materialize_triton_artifact
-from intent.targets import TritonTarget
+from intent.targets.base import Target
 
-from .toolchain import realize_mlir
-from .toolchain import translate_mlir
+from .toolchain import run_tool
 
 
 def compile(
     definition: KernelDefinition[object, object],
     *,
-    target: TritonTarget,
+    target: Target,
     realizer: str | Path,
     translator: str | Path,
     constexprs: dict[str, object] | None = None,
 ) -> CompiledArtifact:
-    if not isinstance(target, TritonTarget):
-        raise NotImplementedError("only TritonTarget is implemented")
     kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
-    realized_mlir = realize_mlir(kernel_mlir, realizer, target.resolve())
-    source = translate_mlir(realized_mlir, translator)
-    return materialize_triton_artifact(source, realized_mlir, definition.__name__)
+    resolved = target.resolve()
+    realized_mlir = run_tool(
+        realizer,
+        kernel_mlir,
+        resolved.realizer_options,
+        resolved.realizer_role,
+    )
+    source = run_tool(translator, realized_mlir, (), resolved.translator_role)
+    return resolved.materialize(source, realized_mlir, definition.__name__)

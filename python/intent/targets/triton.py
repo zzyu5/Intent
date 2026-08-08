@@ -2,12 +2,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from intent.runtime import CompiledArtifact
+from intent.runtime.triton import materialize_triton_artifact
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedTritonTarget:
     architecture: str
     device: int
     warp_size: int
+
+    @property
+    def realizer_options(self) -> tuple[str, ...]:
+        return (
+            f"--architecture={self.architecture}",
+            f"--device={self.device}",
+            f"--warp-size={self.warp_size}",
+        )
+
+    @property
+    def realizer_role(self) -> str:
+        return "Intent Triton realizer"
+
+    @property
+    def translator_role(self) -> str:
+        return "Intent Triton translator"
+
+    def materialize(
+        self,
+        source: str,
+        module_text: str,
+        entry_name: str,
+    ) -> CompiledArtifact:
+        return materialize_triton_artifact(source, module_text, entry_name)
 
 
 @dataclass(frozen=True, slots=True)
