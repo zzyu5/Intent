@@ -1,163 +1,142 @@
-# 前端、Kernel IR 与首个 Realization 的重新审计
+# Frontend、Kernel IR 与首个 Triton Realization
 
-## 结论修正
+## 本轮结论
 
-上一版报告把“当前 `OpCode` 枚举均能由示例产生”称为“完整前端”，并把一个手写 vector-add Triton emitter 称为后端闭环。这两个结论均不成立。
-
-当前真实状态是：
+当前正式编译路径已经变为：
 
 ```text
 Python DSL
-  -> Python Kernel IR
-  -> Intent MLIR 文本导出
-
-Python Kernel IR
-  -> Python PhysicalPlan dataclass
-  -> 手写 pointwise Triton emitter
+  -> typed Python Kernel IR
+  -> Intent Kernel MLIR
+  -> stable-softmax Realizer
+  -> Physical Plan MLIR
+  -> MLIR parse + Kernel/Plan verify
+  -> C++ Triton source translator
+  -> Triton JIT
+  -> callable artifact
 ```
 
-`intent.compile()` 没有消费 Intent MLIR。Intent MLIR 是旁路展示产物；Physical Plan 也不是 MLIR。现有 emitter 只匹配一维 f32 loop，并固定 tile、warp 与 pipeline 参数。因此它只能证明最小 plumbing，不能证明 MLIR backend、完整 frontend 或 realizer 设计成立。
+最终目标代码是 Triton Python source，不是 Triton MLIR。Backend translator 只接收同一 MLIR module 中的 Kernel IR 与 Physical Plan；它不接收 Python Kernel IR、Python Plan 或 AST 旁路输入。
 
-## Intent MLIR 与 TianchenIR 的关系
+“完整 frontend”在这里严格指文档定义的 Core 构造具有闭合表示链，不表示所有算法、所有组合或所有后端都已经实现。Physical Plan、realizer 与 backend 本轮只完成一个真实 stable-softmax realization。
 
-当前 Intent dialect 不是 TianchenIR 的复制改名。两者共享 `intent` dialect 名、MLIR TableGen 组织方式以及少量常见 mnemonic，但 IR schema 不同：
+## Intent MLIR 的身份
 
-- 当前设计以 domain、region、partition、parallel、ordered、state stream、ragged 与 logical view 为核心；
-- TianchenIR 以具体 tensor operations 和既有 IntentIR JSON lowering 为核心；
-- 当前项目额外定义了 logical domain/region/record/view 等类型；
-- 同名 reduce、scan、gather、transpose 等 operation 的参数和语义并不相同。
+当前 Intent dialect 是本项目重新定义的干净 Kernel IR 边界，不是 TianchenIR 的复制改名。二者共享 MLIR/TableGen 技术栈与少量常见 operation 名称，但 schema 和编译目标不同：
 
-但是，“重新定义”不等于“已经成熟”。当前 ODS 中大量 operation 仍以 `AnyType` 和未声明属性表示，C++ 侧没有 operation semantic verifier。Python verifier 保存了更丰富的语义，而 MLIR dialect 尚未独立守住这些结构边界。
+- 当前设计以 logical domain/region、parallel/ordered/state stream、logical view/index relation、structured tensor primitive 与 effects 为核心；
+- TianchenIR 的既有 IntentIR JSON lowering 和具体 tensor-op 体系不是当前 backend 的依赖；
+- 当前 backend 只消费本项目产生并验证的 Intent Kernel MLIR 与 `intent_plan` MLIR。
 
-## 50/50 coverage 实际证明什么
+## Frontend 与 Kernel IR 的完成边界
 
-现有 coverage 只证明：当前枚举中的每个 opcode 至少被某个选定示例产生一次，生成的 Python Kernel IR 通过 Python verifier，打印出的 MLIR 文本能被 parser 接受。
-
-它不证明：
-
-- 每个构造的所有 dtype、shape、axis、constexpr 和 control-flow schema；
-- symbolic shape 的跨参数一致性；
-- stride、alignment、alias/noalias 的完整 ABI 语义；
-- record reduce/scan、复杂 helper、多结果与嵌套 helper；
-- dynamic domain、ragged 边界、gather invalid/fill 与 scatter conflict；
-- ordering、scope、effect dependency 与 RNG identity；
-- 文档中全部算法能够从 Kernel IR realization 到后端；
-- MLIR 自己能够验证或供 backend 直接消费。
-
-因此不能用一个封闭 opcode 集合的存在性覆盖，证明语言已经覆盖所有算法逻辑。
-
-## 本轮“完整 frontend / Kernel IR”的完成标准
-
-本轮完整性限定为文档定义的 Core，而不是“所有可能算法名称”。每个 Core 构造必须同时具备：
+文档 Core 已建立同一条实现链：
 
 ```text
 Python DSL surface
   -> AST lowering
   -> typed Kernel IR node/type
   -> Python semantic verifier
-  -> 稳定 Intent MLIR schema
-  -> MLIR structural/backend-boundary verifier
+  -> Intent MLIR serialization
+  -> C++ Kernel IR boundary verifier
 ```
 
-Core 包括：
+覆盖的 Core 类别包括：
 
 - kernel/helper ABI、view kind、dtype、symbolic shape、runtime scalar 与 constexpr；
 - domain/region/product/partition、parallel/ordered/state stream；
-- structured if/for/while 与多 SSA carry；
+- structured if/for/while 与 SSA carry；
 - tensor expression、broadcast、reshape、transpose、mask 与 cast；
 - reduce、scan、contract 与 record state；
-- index relation、gather/scatter、ragged membership；
+- index relation、gather/scatter 与 ragged membership；
 - logical buffer、atomic、fence、effects 与 logical RNG identity。
 
-`sort/topk/group_by` 等不是 opaque Core operation。若需要它们，应由明确算法实现使用 Core 组合，而不是让 realizer 偷换 source algorithm。算法库是否齐全与 Core frontend 是否闭合分开验收。
+MLIR 边界显式保存 parameter、operation result 和 nested-region block argument 的稳定 value ID 与 source name；operation 使用独立稳定 node ID。Verifier 检查 ID 唯一性、result/type/shape metadata、region/terminator schema、index payload、effects、ABI constraints 以及 operation 必需属性。
 
-## 正式编译数据流
+本轮 repro 中的 11 个代表 kernel 共同产生全部 50 个当前 Core opcode，并全部经过 MLIR parser 和 Kernel IR verifier。这证明 Core 构造存在闭合路径，但不证明每个构造的全部 dtype、rank、shape、axis、嵌套方式与非法输入都已穷举。
 
-本轮采用：
+ODS 中仍有一批 operation 使用 `AnyType` 与 metadata 表达跨构造语义；当前严格语义由 typed Python IR verifier 和 C++ Kernel IR boundary verifier 共同守住。因此这里不把它表述成“所有语义都已编码为各 op 的原生 ODS verifier”。
 
-```text
-Python DSL
-  -> Kernel IR
-  -> Intent Kernel MLIR
-  -> Realizer
-  -> Physical Plan MLIR
-  -> MLIR parse + verify
-  -> Triton source translator
-  -> Triton JIT
-  -> Runtime
-```
+## Physical Plan MLIR
 
-目标不是 Triton MLIR。Backend 的正式输出是可读、可独立运行的 Triton Python source。
+`intent_plan` 是独立注册的 MLIR dialect。首个 Plan 保存：
 
-关键边界是：translator 必须读取已经被 MLIR parser/verifier 接受的 Kernel IR + Physical Plan，不能绕回 Python Kernel IR 或按 kernel 名称套模板。Python 可以负责 DSL frontend、编译入口和 runtime wrapper，但不能在 MLIR 之外保留另一份决定后端语义的 plan。
+- logical `M/N` extent 与 `one/next_power_of_two` tile；
+- persistent program ownership 与 grid-stride traversal；
+- ABI value 的 global storage、read/write access 与 row-major layout；
+- max、broadcast、subtract、exp、sum、broadcast、divide 的 primitive binding；
+- reduction axis 与 identity；
+- masked column tail、`column < N` predicate 与 negative-infinity load fill；
+- 2/4-stage policy、shared-memory threshold、warps 与 persistent-occupancy grid policy；
+- target architecture/device/warp size；
+- 对 Kernel IR operation/value 的稳定 ID 引用。
 
-## Physical Plan MLIR 的本轮边界
+Plan verifier 会把 `M/N` 重新绑定到 input view 的 symbolic shape 和两个 source domain，检查 row/column index relation、ABI/storage/layout、primitive operator/axis/identity、完整 def-use、boundary、ownership、pipeline 与 launch 的一致性。
 
-Realizer、搜索、cost model 与 tile policy 是项目最复杂的部分，本轮不宣称完成。只为一个真实 kernel 建立最小但通用的 Plan MLIR schema，至少表达：
+Plan 中保存的是 `persistent_occupancy` grid policy。具体 `num_programs` 依赖 Triton JIT 得到的 register/shared-memory usage，因此由生成的 runtime wrapper 在 warmup 后计算，并限制为不超过 `n_rows`；本轮没有把这个动态数值伪装成静态 Plan 字段。中间 tensor SSA 的实际 register/spill 分配同样留给 Triton 编译器，Plan 不虚构固定 register placement。
 
-- logical extent 与 physical tile；
-- worker ownership 与 traversal；
-- storage、layout 与 access mode；
-- primitive binding；
-- boundary/tail；
-- pipeline；
-- launch grid、program count、warps 与 stages；
-- 对 Kernel IR operation/value 的稳定引用。
+Realizer 当前只识别一个严格的 stable-softmax def-use pattern，并采用与上游实现相同的确定性 policy。搜索、候选生成、cost model、其他 tile/traversal 和其他 kernel realization 尚未完成。
 
-Plan verifier 必须证明这些引用属于当前 entry，并保持 source ABI、logical workset、tensor-flow、state、index relation 与 effects。未实现的 realization 明确失败，不提供 Python fallback。
+## Triton source translation
 
-## 首个真实 kernel：Triton fused stable softmax
+`intent-translate` 使用 MLIR parser 读取 module，执行 Kernel IR verifier 与 MLIR/Plan verifier，再发射 Triton source。它不按函数名识别 softmax；realizer 和 translator 都验证实际 operation 类型、node binding、region、def-use、index relation 与 ABI flow。
 
-首个闭环固定使用：
+首个 translator 是 stable-softmax 专用 lowering，不是通用 Triton backend。其具体生成关系为：
+
+- Plan ownership 生成 `program_id(0)`、`num_programs(0)` 和 persistent grid-stride row loop；
+- Plan column extent 与 boundary 生成 `tl.arange`、`column < n_cols`、masked load/store 和 negative-infinity fill；
+- Kernel IR body 按 operation 顺序与 SSA def-use 生成 `tl.max`、subtract、`tl.exp`、`tl.sum` 和 divide；
+- Plan primitive axis/identity、pipeline stage policy、warps、target 与 grid policy 参与生成；
+- ABI storage 与 index relation 决定 input/output pointer direction、row stride 与 address relation；layout binding 在发射该 row-major relation 前必须通过 Plan verifier；
+- parameter、region argument 和 SSA result 的 source name 由 MLIR metadata 进入生成源码。
+
+不符合这一结构或含有尚未支持的 operation 时，translator 直接失败，不使用 Python fallback，也不换成另一种 softmax 算法。
+
+## 真实 baseline 与结果
+
+Baseline 来自未修改的上游文件：
 
 ```text
 source/triton/triton/normalization/softmax/02-fused-softmax.py
 ```
 
-它与 `doc/kernels/softmax.md` 使用同一 source algorithm：
+Repro 直接加载其中的原始 `softmax_kernel` 与 `softmax` wrapper，排除文件后部自运行测试和绘图 benchmark。比较条件为：
 
-```text
-full-row max
-  -> subtract
-  -> exp
-  -> full-row sum
-  -> divide
+- CUDA device 固定为 `cuda:0`，并在加载 baseline 前设为 active device；
+- 两边在同一显式 CUDA stream 上运行；
+- shape 均为 `(8192, 8192)`，dtype 均为 `f32`；
+- source algorithm 均为 full-row max → subtract → exp → full-row sum → divide；
+- 两边均测量会分配 output 的 wrapper，而不是纯 kernel latency；
+- 数值比较在计时外；
+- `triton.testing.do_bench` 使用 `warmup=100`、`rep=500`，报告 p50/p95。
+
+最终一次手动 repro 的结果：
+
+| 项目 | 原版 | 自动生成版 |
+|---|---:|---:|
+| max abs error vs `torch.softmax` | `1.862645149230957e-09` | `1.862645149230957e-09` |
+| wrapper p50 | `0.3695 ms` | `0.3695 ms` |
+| wrapper p95 | `0.3716 ms` | `0.3725 ms` |
+| generated/original | — | `1.0001x` (p50), `1.0023x` (p95) |
+
+这次测量中生成版与原版性能实质相同；约千分之几的差异不能据此解释为显著快慢。结果只代表当前 GPU、shape、dtype 与一次 benchmark run。
+
+生成 artifact 同时取得 Triton source、TTIR、TTGIR、LLVM IR 和 PTX；这些低层 IR 来自生成 source 的真实 Triton JIT，不是另一路手写产物。
+
+## 唯一手动 repro
+
+```bash
+bash examples/repro/run_frontend_softmax.sh
 ```
 
-Realizer 不得把它替换成 online softmax。首个 Plan 需要表达原版实现中的：
+该命令依次构建 `intent-opt` 与 `intent-translate`，验证 11 个 frontend module，打印 stable-softmax Kernel IR + Plan MLIR 和自动生成的 Triton source，执行数值比较并测量原版/生成版 wrapper。
 
-- row 到 persistent/grid-stride program 的 ownership；
-- `next_power_of_2(n_cols)` column tile；
-- `col < n_cols` masked tail；
-- max 与 sum reduction primitive；
-- numerator 的 register-local tensor flow；
-- `num_warps`、`num_stages` 与 program count；
-- global contiguous input/output layout。
+## 尚未完成
 
-其中算法依赖、reduction identity、row/column logical domain 从 Kernel IR 推导；tile、ownership、warps、stages 与 launch 属于 policy/search 空位。本轮可以使用与原版相同的确定性 policy 走通 demo，但必须把这些选择显式保存在 Plan MLIR，而不是写死在 emitter 中。
-
-## 对照与性能口径
-
-原版和自动生成版必须：
-
-- 使用同一个 upstream Triton kernel 文件作为 baseline，不修改其 kernel source；
-- 使用相同 GPU、dtype、shape、stream 和算法；
-- 在计时前完成 JIT 与 warmup；
-- 将数值比较放在计时外；
-- 使用重复测量并报告稳定统计量，而不是一次 CUDA event；
-- 明确计时是否包含 output allocation，并保证两边边界一致。
-
-主 workload 采用现有 runtime 的模型级形状 `(8192, 8192)`。由于 DSL canonical contract 当前是 f32，正式横向比较使用双方均为 f32；原版 kernel 本身支持该 dtype。若保留原版 `softmax(x)` wrapper，则自动生成版也用相同的 output-allocation wrapper；若比较纯 kernel latency，则双方都预分配 output 并直接 launch kernel，不能混用两种边界。
-
-## 本轮成功条件
-
-唯一手动 repro 最终必须同时证明：
-
-1. 文档 Core 的 frontend/Kernel IR/Intent MLIR schema 闭合；
-2. stable-softmax DSL 生成的 Kernel IR 保留与原版一致的算法顺序；
-3. Physical Plan 作为 MLIR 被解析并验证；
-4. Triton source 由 Kernel IR + Plan MLIR 自动生成，而非按名称或旁路 Python plan；
-5. 自动生成版与原版在同一模型级输入上数值一致；
-6. 输出原版与生成版的性能结果，并展示生成的 Triton source 与 Plan MLIR。
-
-在这些条件满足前，不再使用“完整前端里程碑”或“后端闭环完成”的表述。
+- 50-opcode 存在性覆盖不是组合语义穷举，也不是“覆盖所有算法逻辑”的证明；
+- ODS 的 per-op 强类型约束仍需逐步替代部分 `AnyType + metadata`；
+- realizer 搜索、cost model、候选剪枝与自动调优尚未建立；
+- Physical Plan 目前只有 stable-softmax 可执行实例；
+- Triton translator 尚未覆盖 GEMM、attention、MoE、通用 reduction、ragged、atomic、state stream 或一般控制流；
+- TileLang、cuTile、CPU/RVV backend 尚未实现；
+- 当前性能结果不是跨 shape、dtype、GPU 的完整评测。

@@ -3,10 +3,17 @@
 ## Canonical kernel
 
 ```python
+ROW_MAJOR = I.constraints(
+    strides=(None, 1),
+    layout="row_major",
+    noalias=True,
+)
+
+
 @intent.kernel
 def stable_softmax(
-    x: I.In[I.f32, ("M", "N")],
-    y: I.Out[I.f32, ("M", "N")],
+    x: I.In[I.f32, ("M", "N"), ROW_MAJOR],
+    y: I.Out[I.f32, ("M", "N"), ROW_MAJOR],
 ):
     M, N = x.shape
     cols = I.domain(0, N)

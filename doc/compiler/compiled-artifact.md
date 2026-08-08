@@ -3,7 +3,7 @@
 ## Compile result
 
 ```python
-compiled = intent.compile(kernel, target=device)
+compiled = intent.compile(kernel, target=device, translator=intent_translate)
 
 print(compiled.source)
 print(compiled.ir)
@@ -19,11 +19,15 @@ print(compiled.ir)
 当前 Triton target 的调用形式为：
 
 ```python
-compiled = intent.compile(kernel, target=intent.TritonTarget(device=0))
-compiled(lhs, rhs, output)
+compiled = intent.compile(
+    stable_softmax,
+    target=intent.TritonTarget(device=0),
+    translator="/path/to/intent-translate",
+)
+compiled(input, output)
 ```
 
-`source` 与 Intent MLIR 在 compile 返回时即可读取。Triton 的 TTIR、TTGIR、LLVM IR、PTX 等 backend IR 由第一次真实 launch 触发 JIT 后写入同一个 artifact；artifact 不用第二套编译路径伪造这些结果。
+`source` 与包含 Kernel IR/Physical Plan 的 MLIR 在 compile 返回时即可读取。Triton source 必须由 `intent-translate` 解析这份 MLIR 后产生。Triton 的 TTIR、TTGIR、LLVM IR、PTX 等 backend IR 由第一次真实 launch 触发 JIT 后写入同一个 artifact；artifact 不用第二套编译路径伪造这些结果。
 
 ## Generated code 是正式输出
 
@@ -41,7 +45,7 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 
 调用 Intent kernel 时，用户不提供 `[grid]`。Runtime 根据 compiled artifact 的 entry 与 launch configuration，在当前 device/stream 提交一次 invocation。
 
-Runtime 不负责：
+底层 `compiled(input, output)` launch 不负责：
 
 - framework graph partition；
 - 输出或 workspace 分配；
@@ -49,7 +53,7 @@ Runtime 不负责：
 - 自动融合或拆分 kernels；
 - source variant 的 library policy。
 
-这些仍属于普通 Python wrapper。
+这些仍属于普通 Python wrapper。当前 artifact 额外提供的 `compiled.run(input)` 是一个会执行 `empty_like` 的 convenience wrapper；它用于与同样包含 output allocation 的上游 softmax wrapper 做公平比较，不改变底层 launch 边界。
 
 ## Single-kernel invariant
 

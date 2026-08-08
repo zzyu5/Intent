@@ -1,6 +1,6 @@
 # 后端 lowering
 
-Backend emitter 接收 Kernel IR 与 Physical Plan，构造一个具体目标 kernel program。
+Backend translator 接收同一 MLIR module 中的 Intent Kernel IR 与 Physical Plan，构造一个具体目标 kernel program。
 
 ## 对应关系
 
@@ -27,20 +27,20 @@ Backend emitter 接收 Kernel IR 与 Physical Plan，构造一个具体目标 ke
 
 Emitter 不选择新的 source algorithm。它实现 Physical Plan 已经选择的 realization。
 
-Emitter 开始前必须验证 Kernel IR 与 Physical Plan。生成过程只按稳定 node ID 读取 Plan binding，并按 IR 的 def-use 与 region 结构发射代码；禁止根据 kernel 名称套用模板，也禁止重新猜测 Python AST 中已经 lowering 的语义。Plan 缺失 binding、binding 指向错误 region，或目标尚未支持某个结构时，编译立即失败。
+Translator 开始前必须由 MLIR parser 读取 module，并验证 Kernel IR 与 Physical Plan。生成过程只按稳定 node ID 读取 Plan binding，并按 IR 的 def-use 与 region 结构发射代码；禁止接收旁路 Python Plan、根据 kernel 名称套用模板，或重新猜测 Python AST 中已经 lowering 的语义。Plan 缺失 binding、binding 指向错误 region，或目标尚未支持某个结构时，编译立即失败。
 
 ## 首个 Triton lowering
 
-一维 pointwise realization 将 Plan 映射为一个 Triton entry：
+首个 stable-softmax realization 将 Plan 映射为一个 Triton entry：
 
-- Plan program ownership 生成 `tl.program_id(0)`；
-- extent 与 launch block 生成 `program * BLOCK_SIZE + tl.arange(...)`；
-- masked boundary 生成 `offsets < N_ELEMENTS`，并传给每个 load/store；
-- global contiguous storage 与 source index relation生成 pointer offset；
-- pointwise primitive binding 生成对应的 `+`、`-`、`*` 或 `/`；
-- Plan launch 保存 grid、block size、warp 数和 stage 数，用户调用 artifact 时不再传 grid。
+- persistent ownership 生成 `program_id(0)`、`num_programs(0)` 与 grid-stride row traversal；
+- column extent 生成 `next_power_of_2(n_cols)` 和 `tl.arange`；
+- boundary binding 生成 `column < n_cols`、negative-infinity masked load 与 masked store；
+- reduction/pointwise bindings按 Kernel IR def-use 生成 `tl.max`、subtract、`tl.exp`、`tl.sum` 与 divide；
+- pipeline/launch binding 生成 stage policy、warps 与 occupancy-based program count；
+- storage/layout binding 决定 row-major pointer relation 与 ABI read/write direction。
 
-Emitter 输出独立、可读的 Triton Python source，并将其编译成 callable entry。当前没有 Plan binding 的 reduce、contract、ragged、atomic、state stream 或多维 address lowering 不会静默退回 Python 实现。
+Translator 输出独立、可读的 Triton Python source，并将其编译成 callable entry。首个 translator 只接受上述 stable-softmax structure；其他 reduce、contract、ragged、atomic、state stream 或 control-flow realization 不会静默退回 Python 实现。
 
 ## 与下层 kernel 系统的关系
 

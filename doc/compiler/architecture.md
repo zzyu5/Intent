@@ -9,11 +9,15 @@ Source Frontend
           ↓
 Kernel IR
           ↓
+Intent Kernel MLIR
+          ↓
 Realizer
           ↓
-Physical Plan
+Physical Plan MLIR
           ↓
-Backend Emitter
+MLIR verifier + Backend Translator
+          ↓
+Generated target source
           ↓
 Compiled Artifact
           ↓
@@ -33,11 +37,11 @@ Frontend 读取受限 Python eDSL，解析：
 - domain/region、tensor expressions、控制流、structured primitives；
 - logical buffers 与 effects。
 
-Frontend 的输出是保持 source algorithm 的 Kernel IR。它不选择 tile、worker mapping、storage 或 target primitive。
+Frontend 的输出是保持 source algorithm 的 Kernel IR，并将其序列化为注册过的 Intent MLIR dialect。Python IR builder 可以作为 AST lowering 的内部构造器，但 MLIR 进入 backend boundary 后，后端不得绕回 Python object 重新解释算法。
 
 ## Kernel IR
 
-Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、logical workset、tensor-flow、state、control、structured nodes、index relation 与 effects。
+Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、logical workset、tensor-flow、state、control、structured nodes、index relation 与 effects。Intent Kernel MLIR 保存稳定 operation/value node ID、结构化 region、类型和 metadata，并由 MLIR parser 与 Kernel IR verifier 守住 backend boundary。
 
 详见 [Kernel IR](kernel-ir.md)。
 
@@ -49,13 +53,13 @@ Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也
 
 ## Physical Plan
 
-Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 compiler IR。它可以被验证、比较、搜索与交给 backend lowering。
+Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node ID 绑定 Kernel IR，可以被验证、比较、搜索与交给 backend lowering；Python dataclass 只能是构造 Plan 的临时对象，不能成为 backend 的旁路输入。
 
 详见 [Physical Plan](physical-plan.md)。
 
 ## Backend Emitter
 
-Emitter 将 `Kernel IR + Physical Plan` 具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program，并生成 target entry 与 launch configuration。
+Translator 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Triton backend 的正式输出是可读 Python source，不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 

@@ -4,6 +4,8 @@ Kernel IR 表示一个完整、runtime-visible 的 source kernel algorithm。它
 
 每个 operation 与 SSA value 都有 module 内稳定的非负 node id。Physical Plan 只能通过这些 id 引用 Kernel IR，不复制或按 source 文本重新猜测算法节点。
 
+Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function parameter、operation result 与 nested-region block argument 的 value ID，以及每个 operation 的 node ID，都显式进入 MLIR metadata；SSA 打印名称不承担 identity。MLIR consumer 必须验证 function metadata、node/value ID 唯一性、result schema、region-argument schema、structured-region terminator、effect/index metadata 与 operation 所需属性。
+
 ## 必须保存的内容
 
 ### Entry 与 ABI
