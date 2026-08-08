@@ -32,6 +32,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.pointwise[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::ContractOp>(operation))
       index.contracts[value.getNode()] = value;
+    else if (auto value = dyn_cast<plan::StreamOp>(operation))
+      index.streams[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
       index.boundaries[value.getNode()] = value;
   }
@@ -84,8 +86,22 @@ LogicalResult SourceEmitter::indexABI() {
   views.reserve(kernel.abi.arguments.size());
   for (const target::ABIArgument &argument : kernel.abi.arguments) {
     auto view = dyn_cast<intent::ViewType>(argument.type);
-    if (!view)
+    if (!view) {
+      auto kind = argument.metadata.getAs<StringAttr>("kind");
+      if (!kind)
+        return kernel.entry.emitOpError()
+               << "ABI value " << argument.valueID << " has no parameter kind";
+      if (kind.getValue() == "constexpr")
+        continue;
+      if (kind.getValue() != "runtime_scalar" ||
+          !isa<FloatType, IntegerType, IndexType>(argument.type))
+        return kernel.entry.emitOpError()
+               << "ABI value " << argument.valueID
+               << " has no cuTile runtime-scalar binding";
+      scalars.push_back(ABIScalar{&argument, argument.type, argument.name});
+      valueNames[argument.value] = argument.name;
       continue;
+    }
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("cuTile emitter requires ranked views");
@@ -127,9 +143,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
-  if (planIndex.program.getWorkerAxes().size() != 1)
+  bool multiAxis = planIndex.program.getMapping() == "multi_axis_stream";
+  if ((!multiAxis && planIndex.program.getWorkerAxes().size() != 1) ||
+      (multiAxis && planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
-        "current cuTile mappings require one block axis");
+        "block-axis count does not match the cuTile program mapping");
   for (auto &entry : planIndex.axes) {
     Operation *domain = kernel.nodes.lookup(entry.first);
     if (!domain || domain->getName().getStringRef() != "intent.domain")
@@ -138,6 +156,44 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (failed(dimension))
       return entry.second.emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.second.getRole()] = *dimension;
+  }
+  for (const target::RegionNode &region : kernel.regions.nodes) {
+    Operation *operation = region.operation;
+    StringRef name = operation->getName().getStringRef();
+    if (name != "intent.parallel" && name != "intent.state_stream")
+      continue;
+    Operation *domain = nullptr;
+    if (name == "intent.state_stream") {
+      domain = operation->getNumOperands() > 0
+                   ? operation->getOperand(0).getDefiningOp()
+                   : nullptr;
+    } else if (operation->getNumOperands() > 0) {
+      Operation *source = operation->getOperand(0).getDefiningOp();
+      if (source && source->getName().getStringRef() == "intent.partition" &&
+          source->getNumOperands() == 1)
+        source = source->getOperand(0).getDefiningOp();
+      domain = source;
+    }
+    FailureOr<int64_t> domainNode =
+        domain ? target::getNodeID(*domain, "region tile indexing")
+               : FailureOr<int64_t>(failure());
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    auto regions = operation->getAttrOfType<ArrayAttr>(
+        "intent.region_argument_nodes");
+    auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
+                                              : ArrayAttr();
+    auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
+                                               : ArrayAttr();
+    auto argument = arguments && !arguments.empty()
+                        ? dyn_cast<IntegerAttr>(arguments[0])
+                        : IntegerAttr();
+    if (failed(domainNode) || !axis || !argument)
+      return operation->emitOpError(
+          "cannot index its region shape against the cuTile plan");
+    regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
+        axis.getTile().str();
   }
 
   if (planIndex.program.getMapping() == "persistent_rows") {
@@ -183,6 +239,36 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program/reduction roles");
+  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+      return realization.emitOpError(
+          "ordered cuTile stream requires backend autotune candidates");
+    if (planIndex.launch || planIndex.streams.size() != 1)
+      return realization.emitOpError(
+          "ordered cuTile stream requires one stream and no fixed launch");
+    for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ordered cuTile stream lacks " << role << " axis";
+    SmallVector<StringRef> expectedKeys = {
+        roleDimensions.lookup("program_2"),
+        roleDimensions.lookup("stream_0")};
+    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
+      return searchIndex.autotune.emitOpError(
+          "does not specialize the tiled program and stream dimensions");
+    for (auto [attribute, expected] :
+         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
+      if (cast<StringAttr>(attribute).getValue() != expected)
+        return searchIndex.autotune.emitOpError(
+            "key order does not match program_2/stream_0");
+    kernelConstants.push_back(roleDimensions.lookup("program_1"));
+    for (const std::string &dimension : dimensionOrder) {
+      bool physicalDimension = llvm::any_of(
+          roleDimensions,
+          [&](const auto &binding) { return binding.getValue() == dimension; });
+      if (!physicalDimension)
+        kernelConstants.push_back(dimension);
+    }
   } else {
     return planIndex.program.emitOpError("has no cuTile program emitter");
   }
@@ -223,15 +309,22 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   };
   for (ABIView &view : views)
     emitParameter(view.argument->name);
+  for (ABIScalar &scalar : scalars) {
+    StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
+    emitParameter(scalar.name + ": " + annotation.str());
+  }
   if (planIndex.program.getMapping() == "persistent_rows") {
     for (StringRef parameter : {"N_ROWS: ConstInt", "TILE_SIZE: ConstInt",
                                 "DIM_COLS: ConstInt"})
       emitParameter(parameter);
   } else {
-    for (StringRef parameter : {"TILE_SIZE_M: ConstInt",
-                                "TILE_SIZE_N: ConstInt",
-                                "TILE_SIZE_K: ConstInt"})
-      emitParameter(parameter);
+    for (const std::string &dimension : kernelConstants)
+      emitParameter(dimension + ": ConstInt");
+    if (searchIndex.configs.empty())
+      return realization.emitOpError(
+          "autotuned cuTile emission has no physical configurations");
+    for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+      emitParameter(parameter.getName().getValue().str() + ": ConstInt");
   }
   output << "):\n";
   return success();
@@ -331,10 +424,10 @@ LogicalResult SourceEmitter::emitWrapper() {
       outputView = &view;
     else
       return kernel.entry.emitOpError(
-          "grouped cuTile wrapper supports inputs and one output");
+          "autotuned cuTile wrapper supports inputs and one output");
   }
   if (!outputView)
-    return kernel.entry.emitOpError("grouped cuTile wrapper has no output view");
+    return kernel.entry.emitOpError("autotuned cuTile wrapper has no output view");
 
   output << "_CONFIGS = (\n";
   for (plan::ConfigOp config : searchIndex.configs) {
@@ -347,10 +440,18 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   output << ")\n_TUNE_CACHE = {}\n\n\n";
   output << "def launch(";
-  for (auto [index, view] : llvm::enumerate(views)) {
-    if (index)
+  bool firstParameter = true;
+  for (ABIView &view : views) {
+    if (!firstParameter)
       output << ", ";
     output << view.argument->name;
+    firstParameter = false;
+  }
+  for (ABIScalar &scalar : scalars) {
+    if (!firstParameter)
+      output << ", ";
+    output << scalar.name;
+    firstParameter = false;
   }
   output << "):\n";
   for (ABIView &view : views) {
@@ -392,38 +493,77 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   output << ", " << inputs.front()->argument->name << ".dtype, str(_DEVICE))\n";
   output << "    if cache_key not in _TUNE_CACHE:\n";
-  output << "        with ct.compiler_timeout(5):\n";
+  output << "        with ct.compiler_timeout("
+         << (planIndex.program.getMapping() == "multi_axis_stream" ? 10 : 5)
+         << "):\n";
   output << "            result = exhaustive_search(\n";
   output << "                _CONFIGS,\n                stream,\n";
-  output << "                lambda cfg: (ceil("
-         << roleDimensions.lookup("program_0")
-         << " / cfg.TILE_SIZE_M) * ceil("
-         << roleDimensions.lookup("program_1")
-         << " / cfg.TILE_SIZE_N), 1, 1),\n";
+  if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+    output << "                lambda cfg: (ceil("
+           << roleDimensions.lookup("program_0")
+           << " / cfg.TILE_SIZE_M) * ceil("
+           << roleDimensions.lookup("program_1")
+           << " / cfg.TILE_SIZE_N), 1, 1),\n";
+  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+    output << "                lambda cfg: (ceil("
+           << roleDimensions.lookup("program_2")
+           << " / cfg.TILE_SIZE_M), "
+           << roleDimensions.lookup("program_0") << " * "
+           << roleDimensions.lookup("program_1") << ", 1),\n";
+  } else {
+    return planIndex.program.emitOpError(
+        "has no autotuned cuTile grid emitter");
+  }
   output << "                " << kernelName << ",\n";
   output << "                lambda cfg: (";
   for (ABIView &view : views)
     output << view.argument->name << ", ";
-  output << "cfg.TILE_SIZE_M, cfg.TILE_SIZE_N, cfg.TILE_SIZE_K),\n";
+  for (ABIScalar &scalar : scalars)
+    output << scalar.name << ", ";
+  for (const std::string &dimension : kernelConstants)
+    output << dimension << ", ";
+  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+    output << "cfg." << parameter.getName().getValue() << ", ";
+  output << "),\n";
   output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
   output << "            )\n";
   output << "        best = result.best.config\n";
   output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
          << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
   output << "    best, tuned_kernel = _TUNE_CACHE[cache_key]\n";
-  output << "    grid = (ceil(" << roleDimensions.lookup("program_0")
-         << " / best.TILE_SIZE_M) * ceil("
-         << roleDimensions.lookup("program_1")
-         << " / best.TILE_SIZE_N), 1, 1)\n";
+  if (planIndex.program.getMapping() == "grouped_2d_tiles")
+    output << "    grid = (ceil(" << roleDimensions.lookup("program_0")
+           << " / best.TILE_SIZE_M) * ceil("
+           << roleDimensions.lookup("program_1")
+           << " / best.TILE_SIZE_N), 1, 1)\n";
+  else
+    output << "    grid = (ceil(" << roleDimensions.lookup("program_2")
+           << " / best.TILE_SIZE_M), "
+           << roleDimensions.lookup("program_0") << " * "
+           << roleDimensions.lookup("program_1") << ", 1)\n";
   output << "    return ct.launch(stream, grid, tuned_kernel, (";
   for (ABIView &view : views)
     output << view.argument->name << ", ";
-  output << "best.TILE_SIZE_M, best.TILE_SIZE_N, best.TILE_SIZE_K))\n\n\n";
+  for (ABIScalar &scalar : scalars)
+    output << scalar.name << ", ";
+  for (const std::string &dimension : kernelConstants)
+    output << dimension << ", ";
+  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+    output << "best." << parameter.getName().getValue() << ", ";
+  output << "))\n\n\n";
   output << "def run(";
-  for (auto [index, view] : llvm::enumerate(inputs)) {
-    if (index)
+  firstParameter = true;
+  for (ABIView *view : inputs) {
+    if (!firstParameter)
       output << ", ";
     output << view->argument->name;
+    firstParameter = false;
+  }
+  for (ABIScalar &scalar : scalars) {
+    if (!firstParameter)
+      output << ", ";
+    output << scalar.name;
+    firstParameter = false;
   }
   output << "):\n";
   for (const std::string &dimension : dimensionOrder)
@@ -443,6 +583,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << ", ";
     output << view.argument->name;
   }
+  for (ABIScalar &scalar : scalars)
+    output << ", " << scalar.name;
   output << ")\n    return " << outputView->argument->name << "\n";
   return success();
 }
@@ -479,6 +621,14 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
       return definition;
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
+  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
+      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
+    Operation *domain = owner->getOperand(0).getDefiningOp();
+    if (domain && domain->getName().getStringRef() == "intent.domain")
+      return domain;
+    consumer.emitOpError("cannot resolve a cuTile stream source domain");
+    return failure();
+  }
   if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
       owner->getNumOperands() != 1) {
     consumer.emitOpError("cannot resolve index ownership during cuTile emission");
@@ -536,21 +686,41 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     return failure();
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
-    if (term.operands.size() != 1 || !term.operands.front()) {
-      operation.emitOpError("cuTile access requires value-bound index terms");
-      return failure();
+    if (term.kind == "full_slice") {
+      indices.push_back("0");
+      continue;
     }
+    if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError(
+            "static cuTile index has no canonical value");
+      indices.push_back(std::to_string(*term.staticValues.front()));
+      continue;
+    }
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "cuTile access has no mechanical index relation");
     FailureOr<plan::AxisOp> axis =
         resolveAxis(operation.getOperand(*term.operands.front()), operation);
     if (failed(axis))
       return failure();
     StringRef role = axis->getRole();
     if (role == "program_0")
-      indices.push_back(planIndex.program.getMapping() == "persistent_rows"
-                            ? programIndex
-                            : "bid_m");
+      indices.push_back(
+          planIndex.program.getMapping() == "persistent_rows"
+              ? programIndex
+              : planIndex.program.getMapping() == "multi_axis_stream"
+                    ? "index_program_0"
+                    : "bid_m");
     else if (role == "program_1")
-      indices.push_back("bid_n");
+      indices.push_back(planIndex.program.getMapping() == "multi_axis_stream"
+                            ? "index_program_1"
+                            : "bid_n");
+    else if (role == "program_2")
+      indices.push_back("bid_program_2");
+    else if (role == "stream_0")
+      indices.push_back("stream_tile");
     else if (role == "lane_0")
       indices.push_back(vectorIndex);
     else if (role == "reduction_0" && reductionLoop)
@@ -577,17 +747,36 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(view) || relation->size() != (*view)->shape.size())
+    return failure();
   SmallVector<std::string> extents;
-  for (const target::IndexTerm &term : *relation) {
-    if (term.operands.size() != 1 || !term.operands.front())
-      return failure();
+  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+    if (term.kind == "full_slice") {
+      extents.push_back((*view)->shape[axisNumber]);
+      continue;
+    }
+    if (term.kind == "static_index") {
+      extents.push_back("1");
+      continue;
+    }
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "cuTile tile has no mechanical shape relation");
     FailureOr<plan::AxisOp> axis =
         resolveAxis(operation.getOperand(*term.operands.front()), operation);
     if (failed(axis))
       return failure();
-    if (axis->getRole() == "program_0")
+    if (axis->getTile() == "one")
+      extents.push_back("1");
+    else if (axis->getRole() == "program_0")
       extents.push_back("TILE_SIZE_M");
     else if (axis->getRole() == "program_1")
+      extents.push_back("TILE_SIZE_N");
+    else if (axis->getRole() == "program_2")
+      extents.push_back("TILE_SIZE_M");
+    else if (axis->getRole() == "stream_0")
       extents.push_back("TILE_SIZE_N");
     else if (axis->getRole() == "reduction_0")
       extents.push_back("TILE_SIZE_K");
@@ -606,6 +795,62 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
     tuple += ",";
   tuple += ")";
   return tuple;
+}
+
+FailureOr<std::string>
+SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
+  auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
+  auto shape = shapes && resultIndex < shapes.size()
+                   ? dyn_cast<ArrayAttr>(shapes[resultIndex])
+                   : ArrayAttr();
+  if (!shape)
+    return operation.emitOpError("has no canonical tensor shape metadata");
+  SmallVector<std::string> extents;
+  for (Attribute attribute : shape) {
+    auto label = dyn_cast<StringAttr>(attribute);
+    if (!label)
+      return operation.emitOpError(
+          "tensor shape contains a non-symbolic extent");
+    auto tile = regionTiles.find(label.getValue());
+    if (tile != regionTiles.end())
+      extents.push_back(tile->getValue());
+    else if (label.getValue().starts_with("?region_"))
+      return operation.emitOpError(
+          "tensor shape region has no cuTile tile binding");
+    else
+      extents.push_back(label.getValue().str());
+  }
+  if (planIndex.program.getMapping() == "multi_axis_stream" &&
+      extents.size() == 1 && extents.front() == "TILE_SIZE_M")
+    extents.push_back("1");
+  std::string result = "(";
+  for (auto [index, extent] : llvm::enumerate(extents)) {
+    if (index)
+      result += ", ";
+    result += extent;
+  }
+  if (extents.size() == 1)
+    result += ",";
+  return result + ")";
+}
+
+FailureOr<unsigned> SourceEmitter::emittedTensorRank(Operation &operation,
+                                                     bool store) {
+  Type type;
+  if (store) {
+    auto valueIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    if (!valueIndex || valueIndex.getInt() < 0 ||
+        static_cast<unsigned>(valueIndex.getInt()) >= operation.getNumOperands())
+      return operation.emitOpError("store has no canonical value operand");
+    type = operation.getOperand(valueIndex.getInt()).getType();
+  } else if (operation.getNumResults() == 1) {
+    type = operation.getResult(0).getType();
+  }
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor)
+    return operation.emitOpError("boundary value is not a ranked tensor");
+  return static_cast<unsigned>(tensor.getRank());
 }
 
 std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {

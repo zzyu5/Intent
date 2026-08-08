@@ -27,6 +27,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
+  llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
 };
 
@@ -40,6 +41,12 @@ struct ABIView {
   intent::ViewType view;
   mlir::RankedTensorType tensor;
   llvm::SmallVector<std::string> shape;
+};
+
+struct ABIScalar {
+  const intent::target::ABIArgument *argument;
+  mlir::Type type;
+  std::string name;
 };
 
 class SourceEmitter {
@@ -60,6 +67,11 @@ public:
   mlir::LogicalResult emitUnary(mlir::Operation &operation);
   mlir::LogicalResult emitBinary(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
+  mlir::LogicalResult emitFull(mlir::Operation &operation);
+  mlir::LogicalResult emitZeros(mlir::Operation &operation);
+  mlir::LogicalResult emitGather(mlir::Operation &operation);
+  mlir::LogicalResult enterStateStream(mlir::Operation &operation);
+  mlir::LogicalResult leaveStateStream(mlir::Operation &operation);
   mlir::LogicalResult emitContract(mlir::Operation &operation);
   mlir::LogicalResult emitStore(mlir::Operation &operation);
 
@@ -82,6 +94,10 @@ private:
   mlir::FailureOr<std::string>
   indexTuple(mlir::Operation &operation, bool reductionLoop);
   mlir::FailureOr<std::string> tileShape(mlir::Operation &operation);
+  mlir::FailureOr<std::string>
+  emitTensorShape(mlir::Operation &operation, unsigned resultIndex);
+  mlir::FailureOr<unsigned> emittedTensorRank(mlir::Operation &operation,
+                                             bool store);
   std::string dtypeName(mlir::Type type, mlir::Operation &consumer);
   std::string makeResultName(mlir::Operation &operation, unsigned index);
   std::string makeRegionArgumentName(mlir::Operation &operation,
@@ -96,13 +112,18 @@ private:
   SearchIndex searchIndex;
   llvm::raw_ostream &output;
   llvm::SmallVector<ABIView> views;
+  llvm::SmallVector<ABIScalar> scalars;
   llvm::DenseMap<mlir::Value, unsigned> viewPositions;
   llvm::DenseMap<mlir::Value, std::string> valueNames;
   llvm::DenseMap<mlir::Value, mlir::Operation *> deferredLoads;
   llvm::StringSet<> usedNames;
   llvm::StringMap<std::string> dimensionOwners;
   llvm::StringMap<std::string> roleDimensions;
+  llvm::StringMap<std::string> regionTiles;
   llvm::SmallVector<std::string> dimensionOrder;
+  llvm::SmallVector<std::string> kernelConstants;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
+      streamCarriers;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;

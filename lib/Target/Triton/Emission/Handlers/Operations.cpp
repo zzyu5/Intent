@@ -44,6 +44,16 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                         [&](Operation &op) { return emitter.emitBinary(op); })) ||
       failed(addHandler(registry, "intent.cast",
                         [&](Operation &op) { return emitter.emitCast(op); })) ||
+      failed(addHandler(registry, "intent.full",
+                        [&](Operation &op) { return emitter.emitFull(op); })) ||
+      failed(addHandler(registry, "intent.zeros",
+                        [&](Operation &op) { return emitter.emitZeros(op); })) ||
+      failed(addHandler(registry, "intent.gather",
+                        [&](Operation &op) { return emitter.emitGather(op); })) ||
+      failed(addHandler(
+          registry, "intent.state_stream",
+          [&](Operation &op) { return emitter.enterStateStream(op); },
+          [&](Operation &op) { return emitter.leaveStateStream(op); })) ||
       failed(addHandler(registry, "intent.contract",
                         [&](Operation &op) { return emitter.emitContract(op); })) ||
       failed(addHandler(registry, "intent.view_store",
@@ -69,7 +79,10 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     else
       expression = std::to_string(number);
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
-    expression = std::to_string(integer.getInt());
+    if (operation.getResult(0).getType().isInteger(1))
+      expression = integer.getValue().isZero() ? "False" : "True";
+    else
+      expression = std::to_string(integer.getInt());
   } else {
     return operation.emitOpError("has an unsupported Triton constant value");
   }
@@ -90,6 +103,43 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
          "num_stages=num_stages):");
     ++indentation;
     line(vectorIndex + " = tl.arange(0, BLOCK_SIZE)");
+    return success();
+  }
+  if (planIndex.program.getMapping() == "multi_axis_stream") {
+    if (&operation == programRoot) {
+      line("pid_program_2 = tl.program_id(axis=" +
+           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
+      line("pid_program_01 = tl.program_id(axis=" +
+           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
+      line("index_program_0 = pid_program_01 // " +
+           roleDimensions.lookup("program_1"));
+      line("index_program_1 = pid_program_01 % " +
+           roleDimensions.lookup("program_1"));
+      line("offs_program_2 = pid_program_2 * BLOCK_SIZE_Q + "
+           "tl.arange(0, BLOCK_SIZE_Q)");
+    }
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "multi-axis mapping requires one parallel region argument");
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getRegion(0).front().getArgument(0), operation);
+    if (failed(axis))
+      return failure();
+    StringRef role = axis->getRole();
+    if (role == "program_0")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "index_program_0";
+    else if (role == "program_1")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "index_program_1";
+    else if (role == "program_2")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "offs_program_2";
+    else
+      return operation.emitOpError(
+          "parallel region has no multi-axis program role");
     return success();
   }
   if (&operation != programRoot)
@@ -128,7 +178,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                                      return user->getName().getStringRef() ==
                                             "intent.contract";
                                    });
-  if (feedsContract) {
+  if (feedsContract &&
+      planIndex.program.getMapping() == "grouped_2d_tiles") {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
@@ -256,6 +307,141 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitFull(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "full emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> fill = lookupValue(operation, 0);
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "tl.full" ||
+      failed(fill) || !resultType || failed(shape))
+    return operation.emitOpError("lacks a mechanical Triton full binding");
+  StringRef dtype;
+  if (resultType.getElementType().isF32())
+    dtype = "tl.float32";
+  else if (resultType.getElementType().isF16())
+    dtype = "tl.float16";
+  else
+    return operation.emitOpError("uses an unsupported Triton full dtype");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.full(" + *shape + ", " + fill->str() +
+       ", dtype=" + dtype.str() + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitZeros(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "zeros emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "tl.zeros" ||
+      !resultType || failed(shape))
+    return operation.emitOpError("lacks a mechanical Triton zeros binding");
+  StringRef dtype;
+  if (resultType.getElementType().isF32())
+    dtype = "tl.float32";
+  else if (resultType.getElementType().isF16())
+    dtype = "tl.float16";
+  else
+    return operation.emitOpError("uses an unsupported Triton zeros dtype");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.zeros(" + *shape + ", dtype=" + dtype.str() + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitGather(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "gather emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<StringRef> source = lookupValue(operation, 0);
+  auto validIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
+  auto fillIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
+  FailureOr<StringRef> valid =
+      validIndex ? lookupValue(operation, validIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  FailureOr<StringRef> fill =
+      fillIndex ? lookupValue(operation, fillIndex.getInt())
+                : FailureOr<StringRef>(failure());
+  if (failed(node) || !binding || binding.getLowering() != "expand_dims" ||
+      failed(relation) || relation->size() != 2 ||
+      (*relation)[0].kind != "full_slice" ||
+      (*relation)[1].kind != "new_axis" || failed(source) || failed(valid) ||
+      failed(fill))
+    return operation.emitOpError("lacks a mechanical Triton gather binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.where(" + valid->str() + ", " + source->str() +
+       "[:, None], " + fill->str() + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
+  plan::StreamOp binding =
+      succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
+  if (failed(node) || !binding || binding.getOrder() != "forward" ||
+      binding.getCarrySpace() != "register" || operation.getNumRegions() != 1 ||
+      !llvm::hasSingleElement(operation.getRegion(0)))
+    return operation.emitOpError("lacks a mechanical Triton stream binding");
+  Block &body = operation.getRegion(0).front();
+  if (operation.getNumOperands() != operation.getNumResults() + 1 ||
+      body.getNumArguments() != operation.getNumResults() + 1)
+    return operation.emitOpError("has inconsistent stream carried state");
+
+  SmallVector<std::string> carriers;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> initial = lookupValue(operation, index + 1);
+    if (failed(initial))
+      return failure();
+    std::string carrier =
+        uniqueName("stream_state_" + std::to_string(index), *node);
+    line(carrier + " = " + initial->str());
+    carriers.push_back(carrier);
+    valueNames[body.getArgument(index + 1)] = carrier;
+  }
+  streamCarriers[&operation] = carriers;
+  line("for stream_block in range(0, tl.cdiv(" +
+       roleDimensions.lookup("stream_0") + ", " + binding.getTile().str() +
+       ")):");
+  ++indentation;
+  line("offs_stream_0 = stream_block * " + binding.getTile().str() +
+       " + tl.arange(0, " + binding.getTile().str() + ")");
+  valueNames[body.getArgument(0)] = "offs_stream_0";
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
+  auto carriers = streamCarriers.find(&operation);
+  if (carriers == streamCarriers.end())
+    return operation.emitOpError("has no active Triton stream state");
+  Operation &terminator = operation.getRegion(0).front().back();
+  if (terminator.getName().getStringRef() != "intent.yield" ||
+      terminator.getNumOperands() != operation.getNumResults())
+    return operation.emitOpError("does not yield every Triton stream state");
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> yielded = lookupValue(terminator, index);
+    if (failed(yielded))
+      return failure();
+    line(carriers->second[index] + " = " + yielded->str());
+  }
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    valueNames[operation.getResult(index)] = carriers->second[index];
+  return success();
+}
+
 LogicalResult SourceEmitter::emitContract(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "contract emission");
   plan::ContractOp binding =
@@ -266,9 +452,27 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     return operation.emitOpError("Triton contraction requires two operands");
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
-  if (!lhsLoad || !rhsLoad)
+  if (!lhsLoad && !rhsLoad) {
+    FailureOr<StringRef> lhs = lookupValue(operation, 0);
+    FailureOr<StringRef> rhs = lookupValue(operation, 1);
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    std::string lhsExpression = lhs->str();
+    std::string rhsExpression = rhs->str();
+    if (binding.getLhsTranspose())
+      lhsExpression = "tl.trans(" + lhsExpression + ")";
+    if (binding.getRhsTranspose())
+      rhsExpression = "tl.trans(" + rhsExpression + ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression +
+         ", out_dtype=tl.float32)");
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
+  if (!lhsLoad || !rhsLoad || binding.getLhsTranspose() ||
+      binding.getRhsTranspose())
     return operation.emitOpError(
-        "Triton contraction operands must be mechanically deferred view loads");
+        "deferred Triton contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
   if (failed(lhsView) || failed(rhsView))

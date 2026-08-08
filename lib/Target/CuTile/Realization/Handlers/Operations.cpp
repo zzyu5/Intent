@@ -257,8 +257,7 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
-                         "intent.cast", "intent.full", "intent.zeros",
-                         "intent.gather"})
+                         "intent.cast", "intent.full", "intent.zeros"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =
@@ -271,6 +270,22 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
               return success();
             })))
       return failure();
+
+  if (failed(addHandler(
+          registry, "intent.gather", [&](Operation &operation) -> LogicalResult {
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "primitive binding");
+            if (failed(node))
+              return failure();
+            StringRef lowering = policy.mapping == "multi_axis_stream"
+                                     ? "alias_column"
+                                     : facts.primitiveLowerings.lookup(&operation);
+            builder.create<plan::PointwiseOp>(
+                operation.getLoc(), i64(builder, *node),
+                string(builder, lowering));
+            return success();
+          })))
+    return failure();
 
   if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {

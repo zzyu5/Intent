@@ -36,6 +36,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.pointwise[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::ContractOp>(operation))
       index.contracts[value.getNode()] = value;
+    else if (auto value = dyn_cast<plan::StreamOp>(operation))
+      index.streams[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
       index.boundaries[value.getNode()] = value;
   }
@@ -93,8 +95,22 @@ LogicalResult SourceEmitter::indexABI() {
   views.reserve(kernel.abi.arguments.size());
   for (const target::ABIArgument &argument : kernel.abi.arguments) {
     auto view = dyn_cast<intent::ViewType>(argument.type);
-    if (!view)
+    if (!view) {
+      auto kind = argument.metadata.getAs<StringAttr>("kind");
+      if (!kind)
+        return kernel.entry.emitOpError()
+               << "ABI value " << argument.valueID << " has no parameter kind";
+      if (kind.getValue() == "constexpr")
+        continue;
+      if (kind.getValue() != "runtime_scalar" ||
+          !isa<FloatType, IntegerType, IndexType>(argument.type))
+        return kernel.entry.emitOpError()
+               << "ABI value " << argument.valueID
+               << " has no Triton runtime-scalar binding";
+      scalars.push_back(ABIScalar{&argument, argument.type, argument.name});
+      valueNames[argument.value] = argument.name;
       continue;
+    }
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("Triton emitter requires ranked views");
@@ -140,9 +156,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
-  if (planIndex.program.getWorkerAxes().size() != 1)
+  bool multiAxis = planIndex.program.getMapping() == "multi_axis_stream";
+  if ((!multiAxis && planIndex.program.getWorkerAxes().size() != 1) ||
+      (multiAxis && planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
-        "current Triton program mappings require exactly one worker axis");
+        "worker-axis count does not match the Triton program mapping");
   for (auto &entry : planIndex.axes) {
     Operation *domain = kernel.nodes.lookup(entry.first);
     if (!domain || domain->getName().getStringRef() != "intent.domain")
@@ -151,6 +169,44 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (failed(dimension))
       return entry.second.emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.second.getRole()] = *dimension;
+  }
+  for (const target::RegionNode &region : kernel.regions.nodes) {
+    Operation *operation = region.operation;
+    StringRef name = operation->getName().getStringRef();
+    if (name != "intent.parallel" && name != "intent.state_stream")
+      continue;
+    Operation *domain = nullptr;
+    if (name == "intent.state_stream") {
+      domain = operation->getNumOperands() > 0
+                   ? operation->getOperand(0).getDefiningOp()
+                   : nullptr;
+    } else if (operation->getNumOperands() > 0) {
+      Operation *source = operation->getOperand(0).getDefiningOp();
+      if (source && source->getName().getStringRef() == "intent.partition" &&
+          source->getNumOperands() == 1)
+        source = source->getOperand(0).getDefiningOp();
+      domain = source;
+    }
+    FailureOr<int64_t> domainNode =
+        domain ? target::getNodeID(*domain, "region tile indexing")
+               : FailureOr<int64_t>(failure());
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    auto regions = operation->getAttrOfType<ArrayAttr>(
+        "intent.region_argument_nodes");
+    auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
+                                              : ArrayAttr();
+    auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
+                                               : ArrayAttr();
+    auto argument = arguments && !arguments.empty()
+                        ? dyn_cast<IntegerAttr>(arguments[0])
+                        : IntegerAttr();
+    if (failed(domainNode) || !axis || !argument)
+      return operation->emitOpError(
+          "cannot index its region shape against the physical plan");
+    regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
+        axis.getTile().str();
   }
   if (planIndex.program.getMapping() == "grid_stride") {
     auto program = planIndex.axesByRole.find("program_0");
@@ -202,6 +258,28 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program_0/program_1/reduction_0");
+  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+    if (!searchSpace || !searchIndex.autotune || searchIndex.configs.empty())
+      return realization.emitOpError(
+          "ordered stream requires a backend autotune search space");
+    if (planIndex.pipeline || planIndex.launch || planIndex.streams.size() != 1)
+      return realization.emitOpError(
+          "ordered stream requires one stream binding and no fixed launch");
+    for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ordered stream lacks " << role << " axis";
+    SmallVector<StringRef> expectedKeys = {
+        roleDimensions.lookup("program_2"),
+        roleDimensions.lookup("stream_0")};
+    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
+      return searchIndex.autotune.emitOpError(
+          "does not specialize the tiled program and stream dimensions");
+    for (auto [attribute, expected] :
+         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
+      if (cast<StringAttr>(attribute).getValue() != expected)
+        return searchIndex.autotune.emitOpError(
+            "key order does not match program_2/stream_0");
   } else {
     return planIndex.program.emitOpError("has no Triton program emitter");
   }
@@ -257,6 +335,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     };
     for (ABIView &view : views)
       emitParameter(view.pointer);
+    for (ABIScalar &scalar : scalars)
+      emitParameter(scalar.name);
     for (ABIView &view : views)
       emitParameter(view.strides[0]);
     for (StringRef parameter :
@@ -277,16 +357,23 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   };
   for (ABIView &view : views)
     emitParameter(view.pointer);
-  for (const std::string &dimension : dimensionOrder)
-    emitParameter(dimension);
+  for (ABIScalar &scalar : scalars)
+    emitParameter(scalar.name);
+  for (const std::string &dimension : dimensionOrder) {
+    bool physicalDimension = llvm::any_of(
+        roleDimensions,
+        [&](const auto &binding) { return binding.getValue() == dimension; });
+    emitParameter(dimension +
+                  (physicalDimension ? "" : ": tl.constexpr"));
+  }
   for (ABIView &view : views)
     for (const std::string &stride : view.strides)
       emitParameter(stride);
-  for (StringRef meta : {"BLOCK_SIZE_M: tl.constexpr",
-                         "BLOCK_SIZE_N: tl.constexpr",
-                         "BLOCK_SIZE_K: tl.constexpr",
-                         "GROUP_SIZE_M: tl.constexpr"})
-    emitParameter(meta);
+  if (searchIndex.configs.empty())
+    return realization.emitOpError(
+        "autotuned Triton emission has no physical configurations");
+  for (NamedAttribute parameter : searchIndex.configs.front().getParameters())
+    emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
   output << "):\n";
   return success();
 }
@@ -432,18 +519,26 @@ LogicalResult SourceEmitter::emitWrapper() {
       outputView = &view;
     else
       return kernel.entry.emitOpError(
-          "grouped tiled wrapper supports input views and one output view");
+          "autotuned wrapper supports input views and one output view");
   }
   if (!outputView)
-    return kernel.entry.emitOpError("grouped tiled wrapper has no output view");
+    return kernel.entry.emitOpError("autotuned wrapper has no output view");
 
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n\n\n";
   output << "def launch(";
-  for (auto [index, view] : llvm::enumerate(views)) {
-    if (index)
+  bool firstParameter = true;
+  for (ABIView &view : views) {
+    if (!firstParameter)
       output << ", ";
     output << view.argument->name;
+    firstParameter = false;
+  }
+  for (ABIScalar &scalar : scalars) {
+    if (!firstParameter)
+      output << ", ";
+    output << scalar.name;
+    firstParameter = false;
   }
   output << "):\n";
   for (ABIView &view : views) {
@@ -477,11 +572,31 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
-  std::string gridExtent =
-      "triton.cdiv(" + roleDimensions.lookup("program_0") +
-      ", META['BLOCK_SIZE_M']) * triton.cdiv(" +
-      roleDimensions.lookup("program_1") + ", META['BLOCK_SIZE_N'])";
-  output << "    grid = lambda META: " << programGrid(gridExtent) << "\n";
+  if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+    std::string gridExtent =
+        "triton.cdiv(" + roleDimensions.lookup("program_0") +
+        ", META['BLOCK_SIZE_M']) * triton.cdiv(" +
+        roleDimensions.lookup("program_1") + ", META['BLOCK_SIZE_N'])";
+    output << "    grid = lambda META: " << programGrid(gridExtent) << "\n";
+  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+    SmallVector<std::string> grid = {"1", "1", "1"};
+    int64_t tiledWorker = planIndex.program.getWorkerAxes()[0];
+    int64_t outerWorker = planIndex.program.getWorkerAxes()[1];
+    if (tiledWorker < 0 || tiledWorker >= 3 || outerWorker < 0 ||
+        outerWorker >= 3 || tiledWorker == outerWorker)
+      return planIndex.program.emitOpError(
+          "has invalid multi-axis Triton grid dimensions");
+    grid[tiledWorker] =
+        "triton.cdiv(" + roleDimensions.lookup("program_2") +
+        ", META['BLOCK_SIZE_Q'])";
+    grid[outerWorker] = roleDimensions.lookup("program_0") + " * " +
+                        roleDimensions.lookup("program_1");
+    output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
+           << ", " << grid[2] << ")\n";
+  } else {
+    return planIndex.program.emitOpError(
+        "has no autotuned Triton grid emitter");
+  }
   output << "    return " << kernelName << "[grid](";
   bool first = true;
   auto emitArgument = [&](StringRef argument) {
@@ -492,6 +607,8 @@ LogicalResult SourceEmitter::emitWrapper() {
   };
   for (ABIView &view : views)
     emitArgument(view.argument->name);
+  for (ABIScalar &scalar : scalars)
+    emitArgument(scalar.name);
   for (const std::string &dimension : dimensionOrder)
     emitArgument(dimension);
   for (ABIView &view : views)
@@ -499,10 +616,18 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
   output << ")\n\n\n";
   output << "def run(";
-  for (auto [index, view] : llvm::enumerate(inputs)) {
-    if (index)
+  firstParameter = true;
+  for (ABIView *view : inputs) {
+    if (!firstParameter)
       output << ", ";
     output << view->argument->name;
+    firstParameter = false;
+  }
+  for (ABIScalar &scalar : scalars) {
+    if (!firstParameter)
+      output << ", ";
+    output << scalar.name;
+    firstParameter = false;
   }
   output << "):\n";
   for (const std::string &dimension : dimensionOrder)
@@ -524,6 +649,12 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (!first)
       output << ", ";
     output << view.argument->name;
+    first = false;
+  }
+  for (ABIScalar &scalar : scalars) {
+    if (!first)
+      output << ", ";
+    output << scalar.name;
     first = false;
   }
   output << ")\n    return " << outputView->argument->name << "\n";
@@ -563,6 +694,14 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
   }
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
+  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
+      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
+    Operation *domain = owner->getOperand(0).getDefiningOp();
+    if (domain && domain->getName().getStringRef() == "intent.domain")
+      return domain;
+    consumer.emitOpError("cannot resolve a stream to its source domain");
+    return failure();
+  }
   if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
       owner->getNumOperands() != 1) {
     consumer.emitOpError("cannot resolve index ownership during emission");
@@ -625,7 +764,21 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
         << "has no grid-stride index expression for axis role " << role;
     return failure();
   }
-  if (role == "program_0")
+  if (planIndex.program.getMapping() == "multi_axis_stream") {
+    if (role == "program_0")
+      base = "index_program_0";
+    else if (role == "program_1")
+      base = "index_program_1";
+    else if (role == "program_2")
+      base = "offs_program_2";
+    else if (role == "stream_0")
+      base = "offs_stream_0";
+    else {
+      consumer.emitOpError()
+          << "has no streamed index expression for axis role " << role;
+      return failure();
+    }
+  } else if (role == "program_0")
     base = store ? "offs_program_0" : "load_program_0";
   else if (role == "program_1")
     base = store ? "offs_program_1" : "load_program_1";
@@ -637,12 +790,13 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
     consumer.emitOpError() << "has no index expression for axis role " << role;
     return failure();
   }
-  if (tensorRank != 2) {
-    consumer.emitOpError(
-        "grouped tiled pointer emission currently requires rank-two views");
+  if (axis.getTile() == "one")
+    return base;
+  if (tensorAxis >= tensorRank) {
+    consumer.emitOpError("physical vector axis exceeds the emitted tensor rank");
     return failure();
   }
-  return base + (tensorAxis == 0 ? "[:, None]" : "[None, :]");
+  return broadcastIndex(base, tensorAxis, tensorRank);
 }
 
 FailureOr<std::string>
@@ -652,27 +806,50 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
       target::parseIndexRelation(operation);
   if (failed(relation) || relation->size() != view.strides.size())
     return failure();
+  FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
+  if (failed(tensorRank))
+    return failure();
   std::string expression = view.pointer;
+  unsigned vectorAxis = 0;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
-    if (term.operands.size() != 1 || !term.operands.front()) {
-      operation.emitOpError(
-          "Triton pointer emission requires value-bound index terms");
-      return failure();
+    std::string index;
+    if (term.kind == "full_slice") {
+      index = broadcastIndex("tl.arange(0, " + view.shape[axisNumber] + ")",
+                             vectorAxis++, *tensorRank);
+    } else if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError(
+            "static pointer index has no canonical value");
+      index = std::to_string(*term.staticValues.front());
+    } else {
+      if (term.kind != "region_index" && term.kind != "value_index")
+        return operation.emitOpError(
+            "has no mechanical Triton pointer relation");
+      if (term.operands.size() != 1 || !term.operands.front())
+        return operation.emitOpError(
+            "dynamic pointer index has no canonical operand");
+      FailureOr<plan::AxisOp> axis =
+          resolveAxis(operation.getOperand(*term.operands.front()), operation);
+      if (failed(axis))
+        return failure();
+      bool vector = axis->getTile() != "one";
+      FailureOr<std::string> resolved =
+          indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
+      if (failed(resolved))
+        return failure();
+      index = *resolved;
+      if (vector)
+        ++vectorAxis;
     }
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
-    if (failed(axis))
-      return failure();
-    FailureOr<std::string> index = indexExpression(
-        *axis, store, axisNumber, view.tensor.getRank(), operation);
-    if (failed(index))
-      return failure();
     StringRef stride = planIndex.program.getMapping() == "grid_stride" &&
                                axisNumber == 1
                            ? StringRef("1")
                            : StringRef(view.strides[axisNumber]);
-    expression += " + " + *index + " * " + stride.str();
+    expression += " + " + index + " * " + stride.str();
   }
+  if (vectorAxis != *tensorRank)
+    return operation.emitOpError(
+        "pointer relation does not cover every emitted tensor axis");
   return expression;
 }
 
@@ -682,8 +859,18 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
+  if (failed(tensorRank))
+    return failure();
   SmallVector<std::string> predicates;
+  unsigned vectorAxis = 0;
   for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "full_slice") {
+      ++vectorAxis;
+      continue;
+    }
+    if (term.kind == "static_index")
+      continue;
     if (term.operands.size() != 1 || !term.operands.front()) {
       operation.emitOpError(
           "Triton mask emission requires value-bound index terms");
@@ -695,6 +882,9 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
         resolveAxis(operation.getOperand(*term.operands.front()), operation);
     if (failed(domain) || failed(axis))
       return failure();
+    bool vector = axis->getTile() != "one";
+    if (!vector)
+      continue;
     bool gridStride = planIndex.program.getMapping() == "grid_stride";
     FailureOr<std::string> extent = gridStride && axis->getRole() == "program_0"
                                         ? FailureOr<std::string>(std::string("n_rows"))
@@ -703,29 +893,19 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
                                         : dimensionName(**domain);
     if (failed(extent))
       return failure();
-    if ((gridStride && axis->getRole() == "program_0") ||
-        (!gridStride && !store &&
+    if ((!gridStride &&
+         planIndex.program.getMapping() == "grouped_2d_tiles" && !store &&
          (axis->getRole() == "program_0" ||
-          axis->getRole() == "program_1")))
+          axis->getRole() == "program_1"))) {
+      ++vectorAxis;
       continue;
-    std::string index;
-    if (gridStride && axis->getRole() == "lane_0")
-      index = vectorIndex;
-    else if (axis->getRole() == "program_0")
-      index = "offs_program_0[:, None]";
-    else if (axis->getRole() == "program_1")
-      index = "offs_program_1[None, :]";
-    else if (axis->getRole() == "reduction_0") {
-      bool firstTensorAxis = &term == &relation->front();
-      index = std::string("offs_reduction_0") +
-              (firstTensorAxis ? "[:, None]" : "[None, :]");
-    } else if (axis->getRole() == "lane_0")
-      index = vectorIndex;
-    else {
-      operation.emitOpError("has no mask expression for physical axis");
-      return failure();
     }
-    predicates.push_back("(" + index + " < " + *extent + ")");
+    FailureOr<std::string> index =
+        indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
+    if (failed(index))
+      return failure();
+    ++vectorAxis;
+    predicates.push_back("(" + *index + " < " + *extent + ")");
   }
   if (predicates.empty())
     return std::string("True");
@@ -733,6 +913,72 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   for (StringRef predicate : llvm::drop_begin(predicates))
     combined += " & " + predicate.str();
   return combined;
+}
+
+FailureOr<unsigned> SourceEmitter::emittedTensorRank(Operation &operation,
+                                                     bool store) {
+  Type type;
+  if (store) {
+    auto valueIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    if (!valueIndex || valueIndex.getInt() < 0 ||
+        static_cast<unsigned>(valueIndex.getInt()) >= operation.getNumOperands())
+      return operation.emitOpError("store has no canonical value operand");
+    type = operation.getOperand(valueIndex.getInt()).getType();
+  } else if (operation.getNumResults() == 1) {
+    type = operation.getResult(0).getType();
+  }
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor)
+    return operation.emitOpError("boundary value is not a ranked tensor");
+  return static_cast<unsigned>(tensor.getRank());
+}
+
+FailureOr<std::string>
+SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
+  auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
+  auto shape = shapes && resultIndex < shapes.size()
+                   ? dyn_cast<ArrayAttr>(shapes[resultIndex])
+                   : ArrayAttr();
+  if (!shape)
+    return operation.emitOpError("has no canonical tensor shape metadata");
+  SmallVector<std::string> extents;
+  for (Attribute attribute : shape) {
+    auto label = dyn_cast<StringAttr>(attribute);
+    if (!label)
+      return operation.emitOpError(
+          "tensor shape contains a non-symbolic extent");
+    auto tile = regionTiles.find(label.getValue());
+    if (tile != regionTiles.end())
+      extents.push_back(tile->getValue());
+    else if (label.getValue().starts_with("?region_"))
+      return operation.emitOpError(
+          "tensor shape region has no physical tile binding");
+    else
+      extents.push_back(label.getValue().str());
+  }
+  std::string result = "(";
+  for (auto [index, extent] : llvm::enumerate(extents)) {
+    if (index)
+      result += ", ";
+    result += extent;
+  }
+  if (extents.size() == 1)
+    result += ",";
+  return result + ")";
+}
+
+std::string SourceEmitter::broadcastIndex(StringRef base, unsigned axis,
+                                          unsigned rank) {
+  if (rank <= 1)
+    return base.str();
+  std::string result = base.str() + "[";
+  for (unsigned index = 0; index < rank; ++index) {
+    if (index)
+      result += ", ";
+    result += index == axis ? ":" : "None";
+  }
+  return result + "]";
 }
 
 std::string SourceEmitter::uniqueName(StringRef candidate, int64_t node) {

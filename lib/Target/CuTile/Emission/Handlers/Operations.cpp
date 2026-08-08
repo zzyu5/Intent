@@ -1,5 +1,6 @@
 #include "Support/Model.h"
 
+#include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -43,6 +44,16 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                         [&](Operation &op) { return emitter.emitBinary(op); })) ||
       failed(addHandler(registry, "intent.cast",
                         [&](Operation &op) { return emitter.emitCast(op); })) ||
+      failed(addHandler(registry, "intent.full",
+                        [&](Operation &op) { return emitter.emitFull(op); })) ||
+      failed(addHandler(registry, "intent.zeros",
+                        [&](Operation &op) { return emitter.emitZeros(op); })) ||
+      failed(addHandler(registry, "intent.gather",
+                        [&](Operation &op) { return emitter.emitGather(op); })) ||
+      failed(addHandler(
+          registry, "intent.state_stream",
+          [&](Operation &op) { return emitter.enterStateStream(op); },
+          [&](Operation &op) { return emitter.leaveStateStream(op); })) ||
       failed(addHandler(registry, "intent.contract",
                         [&](Operation &op) { return emitter.emitContract(op); })) ||
       failed(addHandler(registry, "intent.view_store",
@@ -68,7 +79,10 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     else
       expression = std::to_string(number);
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
-    expression = std::to_string(integer.getInt());
+    if (operation.getResult(0).getType().isInteger(1))
+      expression = integer.getValue().isZero() ? "False" : "True";
+    else
+      expression = std::to_string(integer.getInt());
   } else {
     return operation.emitOpError("has an unsupported cuTile constant value");
   }
@@ -78,6 +92,41 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
+  if (planIndex.program.getMapping() == "multi_axis_stream") {
+    if (&operation == programRoot) {
+      line("bid_program_2 = ct.bid(" +
+           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
+      line("bid_program_01 = ct.bid(" +
+           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
+      line("index_program_0 = bid_program_01 // " +
+           roleDimensions.lookup("program_1"));
+      line("index_program_1 = bid_program_01 % " +
+           roleDimensions.lookup("program_1"));
+    }
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "multi-axis mapping requires one parallel region argument");
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getRegion(0).front().getArgument(0), operation);
+    if (failed(axis))
+      return failure();
+    StringRef role = axis->getRole();
+    if (role == "program_0")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "index_program_0";
+    else if (role == "program_1")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "index_program_1";
+    else if (role == "program_2")
+      valueNames[operation.getRegion(0).front().getArgument(0)] =
+          "bid_program_2";
+    else
+      return operation.emitOpError(
+          "parallel region has no multi-axis cuTile role");
+    return success();
+  }
   if (&operation != programRoot)
     return success();
   int64_t workerAxis = planIndex.program.getWorkerAxes().front();
@@ -121,15 +170,16 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                                      return user->getName().getStringRef() ==
                                             "intent.contract";
                                    });
-  if (feedsContract) {
+  if (feedsContract &&
+      planIndex.program.getMapping() == "grouped_2d_tiles") {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
-  if (failed(node) || !boundary || boundary.getAccess() != "gather")
-    return operation.emitOpError("lacks a cuTile gather boundary");
+  if (failed(node) || !boundary)
+    return operation.emitOpError("lacks a cuTile load boundary");
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   FailureOr<std::string> indices = indexTuple(operation, false);
   if (failed(view) || failed(indices))
@@ -138,8 +188,21 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                           ? "-math.inf"
                           : "0.0";
   std::string result = makeResultName(operation, 0);
-  line(result + " = ct.gather(" + (*view)->argument->name + ", " + *indices +
-       ", check_bounds=True, padding_value=" + padding.str() + ")");
+  if (boundary.getAccess() == "gather") {
+    line(result + " = ct.gather(" + (*view)->argument->name + ", " +
+         *indices + ", check_bounds=True, padding_value=" + padding.str() +
+         ")");
+  } else if (boundary.getAccess() == "load") {
+    FailureOr<std::string> shape = tileShape(operation);
+    FailureOr<std::string> resultShape = emitTensorShape(operation, 0);
+    if (failed(shape) || failed(resultShape))
+      return failure();
+    line(result + " = ct.load(" + (*view)->argument->name + ", index=" +
+         *indices + ", shape=" + *shape +
+         ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *resultShape + ")");
+  } else {
+    return boundary.emitOpError("is not a load-like cuTile access");
+  }
   valueNames[operation.getResult(0)] = result;
   return success();
 }
@@ -239,6 +302,131 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitFull(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "full emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> fill = lookupValue(operation, 0);
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "ct.full" ||
+      failed(fill) || !resultType || failed(shape))
+    return operation.emitOpError("lacks a mechanical cuTile full binding");
+  std::string dtype = dtypeName(resultType.getElementType(), operation);
+  if (dtype.empty())
+    return failure();
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.full(" + *shape + ", " + fill->str() +
+       ", dtype=" + dtype + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitZeros(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "zeros emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "ct.zeros" ||
+      !resultType || failed(shape))
+    return operation.emitOpError("lacks a mechanical cuTile zeros binding");
+  std::string dtype = dtypeName(resultType.getElementType(), operation);
+  if (dtype.empty())
+    return failure();
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.zeros(" + *shape + ", dtype=" + dtype + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitGather(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "gather emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<StringRef> source = lookupValue(operation, 0);
+  auto validIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
+  auto fillIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
+  FailureOr<StringRef> valid =
+      validIndex ? lookupValue(operation, validIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  FailureOr<StringRef> fill =
+      fillIndex ? lookupValue(operation, fillIndex.getInt())
+                : FailureOr<StringRef>(failure());
+  if (failed(node) || !binding || binding.getLowering() != "alias_column" ||
+      failed(relation) || relation->size() != 2 ||
+      (*relation)[0].kind != "full_slice" ||
+      (*relation)[1].kind != "new_axis" || failed(source) || failed(valid) ||
+      failed(fill))
+    return operation.emitOpError("lacks a mechanical cuTile gather binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.where(" + valid->str() + ", " + source->str() + ", " +
+       fill->str() + ")");
+  valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
+  plan::StreamOp binding =
+      succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
+  if (failed(node) || !binding || binding.getOrder() != "forward" ||
+      binding.getCarrySpace() != "register" || operation.getNumRegions() != 1 ||
+      !llvm::hasSingleElement(operation.getRegion(0)))
+    return operation.emitOpError("lacks a mechanical cuTile stream binding");
+  Block &body = operation.getRegion(0).front();
+  if (operation.getNumOperands() != operation.getNumResults() + 1 ||
+      body.getNumArguments() != operation.getNumResults() + 1)
+    return operation.emitOpError("has inconsistent cuTile stream state");
+  SmallVector<std::string> carriers;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> initial = lookupValue(operation, index + 1);
+    if (failed(initial))
+      return failure();
+    std::string carrier =
+        uniqueName("stream_state_" + std::to_string(index), *node);
+    line(carrier + " = " + initial->str());
+    carriers.push_back(carrier);
+    valueNames[body.getArgument(index + 1)] = carrier;
+  }
+  streamCarriers[&operation] = carriers;
+  std::string streamDimension = roleDimensions.lookup("stream_0");
+  line("for stream_tile in range(ct.cdiv(" +
+       dimensionOwners.lookup(streamDimension) + ", " + binding.getTile().str() +
+       ")):");
+  ++indentation;
+  valueNames[body.getArgument(0)] = "stream_tile";
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
+  auto carriers = streamCarriers.find(&operation);
+  if (carriers == streamCarriers.end())
+    return operation.emitOpError("has no active cuTile stream state");
+  Operation &terminator = operation.getRegion(0).front().back();
+  if (terminator.getName().getStringRef() != "intent.yield" ||
+      terminator.getNumOperands() != operation.getNumResults())
+    return operation.emitOpError("does not yield every cuTile stream state");
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> yielded = lookupValue(terminator, index);
+    if (failed(yielded))
+      return failure();
+    line(carriers->second[index] + " = " + yielded->str());
+  }
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    valueNames[operation.getResult(index)] = carriers->second[index];
+  return success();
+}
+
 LogicalResult SourceEmitter::emitContract(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "contract emission");
   plan::ContractOp binding =
@@ -248,9 +436,30 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     return operation.emitOpError("lacks a cuTile contraction binding");
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
-  if (!lhsLoad || !rhsLoad)
+  if (!lhsLoad && !rhsLoad) {
+    FailureOr<StringRef> lhs = lookupValue(operation, 0);
+    FailureOr<StringRef> rhs = lookupValue(operation, 1);
+    FailureOr<std::string> shape = emitTensorShape(operation, 0);
+    if (failed(lhs) || failed(rhs) || failed(shape))
+      return failure();
+    std::string lhsExpression = lhs->str();
+    std::string rhsExpression = rhs->str();
+    if (binding.getLhsTranspose())
+      lhsExpression = "ct.transpose(" + lhsExpression + ")";
+    if (binding.getRhsTranspose())
+      rhsExpression = "ct.transpose(" + rhsExpression + ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.full(" + *shape +
+         ", 0.0, dtype=ct.float32)");
+    line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression +
+         ", " + result + ")");
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
+  if (!lhsLoad || !rhsLoad || binding.getLhsTranspose() ||
+      binding.getRhsTranspose())
     return operation.emitOpError(
-        "cuTile contraction operands must be deferred view loads");
+        "deferred cuTile contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
   FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, true);
@@ -301,10 +510,20 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (boundary.getAccess() == "scatter")
     line("ct.scatter(" + (*view)->argument->name + ", " + *indices + ", " +
          stored->str() + ", check_bounds=True)");
-  else if (boundary.getAccess() == "store")
+  else if (boundary.getAccess() == "store") {
+    FailureOr<unsigned> storedRank = emittedTensorRank(operation, true);
+    if (failed(storedRank))
+      return failure();
+    std::string tile = stored->str();
+    if (*storedRank != static_cast<unsigned>((*view)->tensor.getRank())) {
+      FailureOr<std::string> physicalShape = tileShape(operation);
+      if (failed(physicalShape))
+        return failure();
+      tile += ".reshape(" + *physicalShape + ")";
+    }
     line("ct.store(" + (*view)->argument->name + ", index=" + *indices +
-         ", tile=" + stored->str() + ")");
-  else
+         ", tile=" + tile + ")");
+  } else
     return boundary.emitOpError("is not a store-like cuTile access");
   return success();
 }
