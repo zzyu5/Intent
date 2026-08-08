@@ -11,6 +11,7 @@ from .diagnostics import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_mlir
 from .runtime import CompiledArtifact
+from .targets import CuTileTarget
 from .targets import TritonTarget
 
 
@@ -26,6 +27,7 @@ __all__ = [
     "kernel",
     "compile",
     "CompiledArtifact",
+    "CuTileTarget",
     "TritonTarget",
     "FrontendError",
     "lower_to_mlir",

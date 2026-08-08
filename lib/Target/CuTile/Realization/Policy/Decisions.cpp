@@ -5,7 +5,8 @@
 
 using namespace mlir;
 
-namespace intent::triton::realization {
+namespace intent::cutile::realization {
+
 FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
   const target::KernelFacts &semantics = facts.semantics;
   FailureOr<target::ScheduleStructure> structure =
@@ -14,15 +15,17 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
     return failure();
 
   PolicyDecision policy;
-  policy.workerAxes = {0};
   policy.programRoot = structure->programRoot;
+  policy.workerAxes = {0};
+  policy.groupSize = 1;
+  policy.fixedOccupancy = 0;
 
-  static constexpr StringLiteral programTiles[] = {"BLOCK_SIZE_M",
-                                                    "BLOCK_SIZE_N"};
+  static constexpr StringLiteral programTiles[] = {"TILE_SIZE_M",
+                                                    "TILE_SIZE_N"};
   for (auto [index, domain] : llvm::enumerate(structure->programDomains)) {
     if (index >= std::size(programTiles) &&
         structure->tiledProgramDomains.contains(domain)) {
-      domain->emitOpError("exceeds the supported Triton tiled program rank");
+      domain->emitOpError("exceeds the supported cuTile program rank");
       return failure();
     }
     policy.axes.push_back(AxisDecision{
@@ -36,7 +39,7 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
     policy.axes.push_back(AxisDecision{
         domain, semantics.domainSourceAxes.lookup(domain),
         "reduction_" + std::to_string(index),
-        index == 0 ? "BLOCK_SIZE_K" : "BLOCK_SIZE_REDUCTION"});
+        index == 0 ? "TILE_SIZE_K" : "TILE_SIZE_REDUCTION"});
   for (Operation *domain : structure->vectorDomains) {
     if (semantics.streamedReductionDomains.contains(domain))
       continue;
@@ -45,7 +48,7 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
     });
     policy.axes.push_back(AxisDecision{
         domain, semantics.domainSourceAxes.lookup(domain),
-        "lane_" + std::to_string(index), "next_power_of_two"});
+        "lane_" + std::to_string(index), "TILE_SIZE"});
   }
 
   if (structure->tiledProgramDomains.empty()) {
@@ -53,11 +56,12 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
         structure->vectorDomains.size() != 1 ||
         !structure->streamedReductionDomains.empty()) {
       semantics.kernel.entry.emitOpError(
-          "persistent grid-stride requires one program and one vector domain");
+          "persistent rows require one program and one vector domain");
       return failure();
     }
     policy.traversal = "persistent";
-    policy.mapping = "grid_stride";
+    policy.mapping = "persistent_rows";
+    policy.fixedOccupancy = 4;
     policy.usesAutotuner = false;
     return policy;
   }
@@ -66,12 +70,12 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
       structure->tiledProgramDomains.size() != 2 ||
       structure->streamedReductionDomains.size() != 1) {
     semantics.kernel.entry.emitOpError(
-        "grouped tiled scheduling requires two tiled program axes and one "
-        "streamed reduction axis");
+        "grouped tiles require two program axes and one reduction axis");
     return failure();
   }
   policy.traversal = "grouped";
   policy.mapping = "grouped_2d_tiles";
+  policy.groupSize = 8;
   for (Operation *domain :
        {structure->programDomains[0], structure->programDomains[1],
         structure->streamedReductionDomains[0]}) {
@@ -85,4 +89,4 @@ FailureOr<PolicyDecision> decidePolicy(const OperationFacts &facts) {
   return policy;
 }
 
-} // namespace intent::triton::realization
+} // namespace intent::cutile::realization
