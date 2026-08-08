@@ -4,7 +4,6 @@ import ast
 from typing import TYPE_CHECKING
 
 from intent.api import HelperDefinition
-from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import ValueType
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
@@ -12,7 +11,6 @@ from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import dims_compatible
-from intent.language import DType
 from intent.language.builtins import Intrinsic
 
 from ..ast.expressions import compile_time_value

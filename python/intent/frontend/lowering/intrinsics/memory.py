@@ -7,7 +7,6 @@ from intent.frontend.semantics import AtomicOrdering
 from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
-from intent.frontend.semantics import IndexRelation
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import MemoryScope
 from intent.frontend.semantics import OperationKind

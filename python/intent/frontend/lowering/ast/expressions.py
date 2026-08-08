@@ -7,12 +7,10 @@ from enum import IntEnum
 from intent.api import HelperDefinition
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import ComparePredicate
-from intent.frontend.semantics import ConstexprType
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RaggedType
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
-from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.language import DType

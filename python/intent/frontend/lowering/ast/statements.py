@@ -7,7 +7,6 @@ from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
-from intent.frontend.mlir import FunctionState
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import PartitionMode
@@ -19,7 +18,6 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.language import bool as intent_bool
 from intent.language import DType
-from intent.language import index as intent_index
 from intent.language import f64
 from intent.language import i64
 

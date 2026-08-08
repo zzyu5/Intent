@@ -26,8 +26,6 @@ from intent.frontend.semantics.types import is_integer
 from intent.language import bool as intent_bool
 from intent.language import DTypeCategory
 
-from .model import Literal
-from .model import ShapeDimension
 from .model import ShapeValue
 from .model import StaticTuple
 

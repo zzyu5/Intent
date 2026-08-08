@@ -11,7 +11,6 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
-from intent.language import DType
 from intent.language import bool as intent_bool
 
 from ..ast.model import Literal

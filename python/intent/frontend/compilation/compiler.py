@@ -11,7 +11,6 @@ from intent.frontend.mlir import FunctionKind
 from intent.frontend.mlir import MlirBuilder
 from intent.frontend.mlir import canonicalize_mlir
 from intent.frontend.semantics import ValueType
-from intent.frontend.mlir import ParameterSpec
 
 from ..diagnostics.errors import FrontendError
 from ..lowering.ast.context import FunctionLowerer
