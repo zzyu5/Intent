@@ -701,7 +701,8 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   line("for member_i in T.Parallel(TILE_SIZE_M):");
   ++indentation;
   line(*result + "[member_i] = T.if_then_else(member_start + member_i < "
-       "route_end, member_routes[member_start + member_i], 0)");
+       "route_end, " + raggedIndices->argument->name +
+       "[member_start + member_i], 0)");
   --indentation;
   bindResult(operation, 0, *result);
   return success();

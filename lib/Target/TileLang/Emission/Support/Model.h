@@ -164,6 +164,9 @@ private:
   mlir::Operation *raggedOuter = nullptr;
   mlir::Operation *raggedMember = nullptr;
   mlir::Operation *membersOperation = nullptr;
+  ABIView *raggedOffsets = nullptr;
+  ABIView *raggedIndices = nullptr;
+  std::string raggedMemberDimension;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;

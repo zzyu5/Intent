@@ -301,6 +301,26 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
   if (!membersOperation)
     return raggedRelation->emitOpError("has no member enumeration operation");
 
+  auto relationView = [&](unsigned operandIndex) -> FailureOr<ABIView *> {
+    Operation *load = raggedRelation->getOperand(operandIndex).getDefiningOp();
+    if (!load || load->getName().getStringRef() != "intent.view_load" ||
+        load->getNumOperands() != 1) {
+      raggedRelation->emitOpError(
+          "requires offsets and indices from canonical view loads");
+      return failure();
+    }
+    return lookupView(load->getOperand(0), *raggedRelation);
+  };
+  FailureOr<ABIView *> offsets = relationView(1);
+  FailureOr<ABIView *> indices = relationView(2);
+  if (failed(offsets) || failed(indices) || (*offsets)->tensor.getRank() != 1 ||
+      (*indices)->tensor.getRank() != 1 || (*indices)->shape.size() != 1)
+    return raggedRelation->emitOpError(
+        "requires rank-one offsets and member-index views");
+  raggedOffsets = *offsets;
+  raggedIndices = *indices;
+  raggedMemberDimension = raggedIndices->shape.front();
+
   llvm::sort(planIndex.stages, [](plan::StageOp lhs, plan::StageOp rhs) {
     return lhs.getOrdinal() < rhs.getOrdinal();
   });
@@ -500,7 +520,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                                    : std::string();
         if (!tensor || tensor.getRank() != 2 || dtype.empty())
           return stage.emitOpError("has an unsupported TileLang workspace");
-        parameter(workspaceNames.lookup(value) + ": T.Tensor((R, " +
+        parameter(workspaceNames.lookup(value) + ": T.Tensor((" +
+                  raggedMemberDimension + ", " +
                   stageFeatureDimensions.lookup(stage.getOrdinal()) + "), " +
                   dtype + ")");
       }
@@ -526,15 +547,18 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source << "):\n";
       std::string feature = stageFeatureDimensions.lookup(stage);
       source << "        with T.Kernel(T.ceildiv(" << feature
-             << ", TILE_SIZE_N), E * T.ceildiv(MAX_ROUTES, TILE_SIZE_M), "
+             << ", TILE_SIZE_N), " << roleDimensions.lookup("program_0")
+             << " * T.ceildiv(MAX_ROUTES, TILE_SIZE_M), "
                 "threads=threads) as (bid_feature, bid_expert_route):\n";
       source.flush();
       stageLine(stage,
                 "num_route_tiles = T.ceildiv(MAX_ROUTES, TILE_SIZE_M)");
       stageLine(stage, "expert = bid_expert_route // num_route_tiles");
       stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
-      stageLine(stage, "route_begin = route_offsets[expert]");
-      stageLine(stage, "route_end = route_offsets[expert + 1]");
+      stageLine(stage, "route_begin = " + raggedOffsets->argument->name +
+                           "[expert]");
+      stageLine(stage, "route_end = " + raggedOffsets->argument->name +
+                           "[expert + 1]");
       stageLine(stage,
                 "member_start = route_begin + route_tile * TILE_SIZE_M");
     }
@@ -724,7 +748,8 @@ LogicalResult SourceEmitter::emitWrapper() {
             tensor ? torchDtype(tensor.getElementType()) : StringRef();
         if (!tensor || tensor.getRank() != 2 || dtype.empty())
           return stage.emitOpError("has an unsupported TileLang workspace");
-        output << "    " << workspaceNames.lookup(value) << " = torch.empty((R, "
+        output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
+               << raggedMemberDimension << ", "
                << stageFeatureDimensions.lookup(stage.getOrdinal())
                << "), device=_DEVICE, dtype=" << dtype << ")\n";
       }
