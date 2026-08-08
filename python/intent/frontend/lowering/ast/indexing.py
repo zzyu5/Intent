@@ -32,7 +32,7 @@ from .model import ShapeValue
 from .model import StaticTuple
 
 if TYPE_CHECKING:
-    from .lowering import FunctionLowerer
+    from .context import FunctionLowerer
 
 
 @dataclass(frozen=True, slots=True)

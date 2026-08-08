@@ -15,9 +15,9 @@ from intent.ir.types import dims_compatible
 from intent.language import DType
 from intent.language.builtins import Intrinsic
 
-from ..expressions import compile_time_value
-from ..model import Literal
-from ..model import StaticTuple
+from ..ast.expressions import compile_time_value
+from ..ast.model import Literal
+from ..ast.model import StaticTuple
 from .common import bind_call
 from .common import require_axes
 from .common import require_dtype
@@ -25,7 +25,7 @@ from .common import require_static_bool
 from .common import normalize_axes
 
 if TYPE_CHECKING:
-    from ..lowering import FunctionLowerer
+    from ..ast.context import FunctionLowerer
 
 
 def lower_structured_intrinsic(

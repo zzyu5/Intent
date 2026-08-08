@@ -317,7 +317,7 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
             return _lower_stream_yield(lowerer, base, node)
     callee = lowerer.lower_expression(node.func)
     if isinstance(callee, (Intrinsic, IntrinsicNamespace)):
-        from .intrinsics import lower_intrinsic
+        from ..intrinsics import lower_intrinsic
 
         return lower_intrinsic(lowerer, callee.name, node)
     if isinstance(callee, HelperDefinition):

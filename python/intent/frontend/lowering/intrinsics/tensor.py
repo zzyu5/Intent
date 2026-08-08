@@ -14,7 +14,7 @@ from intent.ir import broadcast_shape
 from intent.language import DType
 from intent.language import bool as intent_bool
 
-from ..model import Literal
+from ..ast.model import Literal
 from .common import bind_call
 from .common import lower_shape
 from .common import normalize_axes
@@ -22,7 +22,7 @@ from .common import require_axes
 from .common import require_dtype
 
 if TYPE_CHECKING:
-    from ..lowering import FunctionLowerer
+    from ..ast.context import FunctionLowerer
 
 
 def lower_tensor_intrinsic(

@@ -435,7 +435,7 @@ def _lower_iteration_expression(lowerer: object, node: ast.AST) -> Expression:
             keywords=[],
         )
         ast.copy_location(call, node)
-        from .intrinsics.control import _domain
+        from ..intrinsics.control import _domain
 
         return _domain(lowerer, call)
     return lowerer.lower_expression(node)

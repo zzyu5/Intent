@@ -8,7 +8,7 @@ from intent.api import Definition
 from intent.ir import Location
 from intent.ir import SourceSpan
 
-from .diagnostics import FrontendError
+from ..diagnostics.errors import FrontendError
 
 
 @dataclass(frozen=True, slots=True)

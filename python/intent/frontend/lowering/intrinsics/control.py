@@ -17,15 +17,15 @@ from intent.ir import Value
 from intent.ir.types import is_integer
 from intent.language import index as intent_index
 
-from ..expressions import compile_time_value
-from ..model import IterationSpec
-from ..model import Literal
-from ..model import StaticTuple
-from ..model import StreamSpec
+from ..ast.expressions import compile_time_value
+from ..ast.model import IterationSpec
+from ..ast.model import Literal
+from ..ast.model import StaticTuple
+from ..ast.model import StreamSpec
 from .common import bind_call
 
 if TYPE_CHECKING:
-    from ..lowering import FunctionLowerer
+    from ..ast.context import FunctionLowerer
 
 
 def lower_control_intrinsic(

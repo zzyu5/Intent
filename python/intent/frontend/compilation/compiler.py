@@ -14,11 +14,11 @@ from intent.ir import Module
 from intent.ir import ParameterSpec
 from intent.ir import verify
 
-from .diagnostics import FrontendError
-from .lowering import FunctionLowerer
-from .signature import lower_helper_parameters
-from .signature import lower_kernel_signature
-from .source import SourceUnit
+from ..diagnostics.errors import FrontendError
+from ..lowering.ast.context import FunctionLowerer
+from ..source.signature import lower_helper_parameters
+from ..source.signature import lower_kernel_signature
+from ..source.unit import SourceUnit
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,3 +19,9 @@ class FrontendError(IntentError):
     def __init__(self, message: str, location: Location) -> None:
         self.diagnostic = FrontendDiagnostic(message, location)
         super().__init__(self.diagnostic.format())
+
+
+__all__ = [
+    "FrontendDiagnostic",
+    "FrontendError",
+]

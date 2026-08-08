@@ -11,13 +11,13 @@ from intent.ir import SymbolDim
 from intent.ir import Value
 from intent.language import DType
 
-from ..expressions import compile_time_value
-from ..model import Literal
-from ..model import ShapeDimension
-from ..model import StaticTuple
+from ..ast.expressions import compile_time_value
+from ..ast.model import Literal
+from ..ast.model import ShapeDimension
+from ..ast.model import StaticTuple
 
 if TYPE_CHECKING:
-    from ..lowering import FunctionLowerer
+    from ..ast.context import FunctionLowerer
 
 
 def bind_call(

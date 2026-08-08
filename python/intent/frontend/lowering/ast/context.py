@@ -33,17 +33,17 @@ from intent.language import index as intent_index
 from intent.ir import EffectKind
 from intent.ir import ResourceKind
 
-from .diagnostics import FrontendError
+from ...diagnostics.errors import FrontendError
 from .model import ConstexprBinding
 from .model import Expression
 from .model import Literal
 from .model import LoopContext
 from .model import ShapeDimension
 from .model import ShapeValue
-from .source import SourceUnit
+from ...source.unit import SourceUnit
 
 if TYPE_CHECKING:
-    from .compiler import FrontendCompiler
+    from ...compilation.compiler import FrontendCompiler
 
 
 class FunctionLowerer:

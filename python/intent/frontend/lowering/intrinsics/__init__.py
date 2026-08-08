@@ -19,3 +19,6 @@ def lower_intrinsic(lowerer: object, name: str, node: ast.Call) -> object:
         if result is not NotImplemented:
             return result
     lowerer.error(node, f"Intent intrinsic I.{name} is not implemented by the frontend")
+
+
+__all__ = ["lower_intrinsic"]

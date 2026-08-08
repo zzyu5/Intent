@@ -73,3 +73,16 @@ class LoopContext:
     carried_names: tuple[str, ...]
     stream: StreamSpec | None = None
     pending_stream_state: tuple[Value, ...] | None = None
+
+
+__all__ = [
+    "ConstexprBinding",
+    "Expression",
+    "IterationSpec",
+    "Literal",
+    "LoopContext",
+    "ShapeDimension",
+    "ShapeValue",
+    "StaticTuple",
+    "StreamSpec",
+]

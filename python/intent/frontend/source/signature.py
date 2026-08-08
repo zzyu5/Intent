@@ -17,8 +17,8 @@ from intent.language import ConstexprSpec
 from intent.language import DType
 from intent.language import ViewSpec
 
-from .diagnostics import FrontendError
-from .source import SourceUnit
+from ..diagnostics.errors import FrontendError
+from .unit import SourceUnit
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,17 +21,17 @@ from intent.language import f32
 from intent.language import bool as intent_bool
 from intent.language import index as intent_index
 
-from ..indexing import lower_index
-from ..indexing import validate_indexed_value
-from ..model import Literal
-from ..model import StaticTuple
+from ..ast.indexing import lower_index
+from ..ast.indexing import validate_indexed_value
+from ..ast.model import Literal
+from ..ast.model import StaticTuple
 from .common import bind_call
 from .common import lower_shape
 from .common import require_dtype
 from .structured import _callable_symbol
 
 if TYPE_CHECKING:
-    from ..lowering import FunctionLowerer
+    from ..ast.context import FunctionLowerer
 
 
 def lower_memory_intrinsic(

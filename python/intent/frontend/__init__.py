@@ -1,5 +1,5 @@
-from .compiler import FrontendCompiler
-from .compiler import lower_to_kernel_ir
+from .compilation import FrontendCompiler
+from .compilation import lower_to_kernel_ir
 from .diagnostics import FrontendDiagnostic
 from .diagnostics import FrontendError
 
