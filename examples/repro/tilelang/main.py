@@ -23,10 +23,18 @@ from kernels.gemm import K
 from kernels.gemm import M
 from kernels.gemm import N
 from kernels.gemm import gemm
+from kernels.moe import EXPERTS
+from kernels.moe import HIDDEN
+from kernels.moe import INTERMEDIATE
+from kernels.moe import TOKENS
+from kernels.moe import TOP_K
+from kernels.moe import moe_expert_ffn
 from kernels.softmax import COLUMNS
 from kernels.softmax import ROWS
 from kernels.softmax import stable_softmax
 from repro.common.support import benchmark
+from repro.common.support import make_moe_routes
+from repro.common.support import moe_reference
 from repro.common.support import print_artifact
 
 
@@ -203,9 +211,153 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
     )
 
 
+def _tilelang_moe_baseline(
+    grouped_gemm,
+    x,
+    member_routes,
+    route_token,
+    route_weights,
+    w1,
+    w2,
+    batch_sizes,
+    batch_offsets,
+    batch_padded_offsets,
+    batch_sizes_list,
+):
+    sorted_routes = member_routes.long()
+    sorted_tokens = route_token[sorted_routes].long()
+    routed_x = x[sorted_tokens]
+    hidden = grouped_gemm(
+        routed_x,
+        w1,
+        batch_sizes,
+        batch_offsets,
+        batch_padded_offsets,
+        batch_sizes_list,
+        128,
+        128,
+        32,
+        False,
+        2,
+        256,
+    )
+    route_output = grouped_gemm(
+        torch.relu(hidden),
+        w2,
+        batch_sizes,
+        batch_offsets,
+        batch_padded_offsets,
+        batch_sizes_list,
+        128,
+        128,
+        32,
+        False,
+        2,
+        256,
+    )
+    merged = torch.zeros((TOKENS, HIDDEN), device=x.device, dtype=torch.float32)
+    merged.index_add_(
+        0,
+        sorted_tokens,
+        route_weights[sorted_routes, None] * route_output.float(),
+    )
+    return merged
+
+
+def _run_moe(compiler: str, baseline_source: Path) -> None:
+    upstream = _load_module(baseline_source, "intent_upstream_tilelang_moe")
+    artifact = intent.compile(
+        moe_expert_ffn,
+        target=intent.TileLangTarget(device=0),
+        compiler=compiler,
+    )
+    device = torch.device("cuda", 0)
+    route_offsets, member_routes, route_token, route_weights, _ = make_moe_routes(
+        device
+    )
+    batch_sizes = route_offsets[1:] - route_offsets[:-1]
+    batch_offsets = route_offsets[:-1].contiguous()
+    batch_sizes_list = tuple(int(size) for size in batch_sizes.tolist())
+    padded_sizes = [math.ceil(size / 128) * 128 for size in batch_sizes_list]
+    padded_offsets = [0]
+    for size in padded_sizes[:-1]:
+        padded_offsets.append(padded_offsets[-1] + size)
+    batch_padded_offsets = torch.tensor(
+        padded_offsets,
+        device=device,
+        dtype=torch.int32,
+    )
+    x = torch.randn((TOKENS, HIDDEN), device=device, dtype=torch.float16)
+    x /= math.sqrt(HIDDEN)
+    w1 = torch.randn(
+        (EXPERTS, HIDDEN, INTERMEDIATE), device=device, dtype=torch.float16
+    )
+    w1 /= math.sqrt(HIDDEN)
+    w2 = torch.randn(
+        (EXPERTS, INTERMEDIATE, HIDDEN), device=device, dtype=torch.float16
+    )
+    w2 /= math.sqrt(INTERMEDIATE)
+    generated = artifact.run(
+        x, route_offsets, member_routes, route_token, route_weights, w1, w2
+    )
+    baseline = lambda: _tilelang_moe_baseline(
+        upstream.grouped_gemm,
+        x,
+        member_routes,
+        route_token,
+        route_weights,
+        w1,
+        w2,
+        batch_sizes,
+        batch_offsets,
+        batch_padded_offsets,
+        batch_sizes_list,
+    )
+    upstream_result = baseline()
+    reference = moe_reference(
+        x, route_offsets, member_routes, route_token, route_weights, w1, w2
+    )
+    torch.cuda.synchronize()
+    generated_error = (generated - reference).abs().max().item()
+    upstream_error = (upstream_result - reference).abs().max().item()
+    generated_upstream_error = (generated - upstream_result).abs().max().item()
+    if generated_error > 2.0e-3 or upstream_error > 2.0e-3:
+        raise RuntimeError(
+            "TileLang MoE numerical comparison failed: "
+            f"generated/reference={generated_error}, "
+            f"upstream/reference={upstream_error}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        lambda: artifact.run(
+            x, route_offsets, member_routes, route_token, route_weights, w1, w2
+        ),
+        warmup=5,
+        repetitions=20,
+    )
+    upstream_p50, upstream_p95 = benchmark(
+        baseline,
+        warmup=5,
+        repetitions=20,
+    )
+    print_artifact(artifact, "TileLang")
+    print(
+        "TileLang MoE numerical comparison: PASS "
+        f"(T={TOKENS}, D={HIDDEN}, F={INTERMEDIATE}, E={EXPERTS}, top_k={TOP_K}, "
+        f"generated/reference={generated_error}, upstream/reference={upstream_error}, "
+        f"generated/upstream={generated_upstream_error})"
+    )
+    print(
+        "TileLang MoE end-to-end performance: "
+        f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
+        f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
+        f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
+    )
+
+
 RUNNERS = {
     "attention": _run_attention,
     "gemm": _run_gemm,
+    "moe": _run_moe,
     "softmax": _run_softmax,
 }
 

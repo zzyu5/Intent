@@ -61,6 +61,9 @@ case "${backend}:${kernel}" in
   tilelang:attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_bshd/example_mha_fwd_bshd.py
     ;;
+  tilelang:moe)
+    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
+    ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2
     exit 2
