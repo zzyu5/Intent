@@ -152,7 +152,8 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   StringRef role = axis->getRole();
   StringRef mapping = programMapping;
   if (role == "program_0")
-    valueNames[argument] = mapping == "persistent_rows" ? "program_index"
+    valueNames[argument] = (mapping == "persistent_rows" ||
+                            mapping == "row_stream") ? "program_index"
                            : mapping == "multi_axis_stream"
                                ? "index_program_0"
                            : mapping == "ragged_stages" ? "expert"
@@ -728,12 +729,26 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
         operation.getResult(index).getType())
       return operation.emitOpError(
           "has a TileLang stream carrier type mismatch");
-    carriers.push_back(initial->str());
-    valueNames[body.getArgument(index + 1)] = initial->str();
+    Type carrierType = operation.getResult(index).getType();
+    if (carrierType.isIntOrIndexOrFloat()) {
+      std::string dtype = dtypeName(carrierType, operation);
+      if (dtype.empty())
+        return failure();
+      std::string carrier = uniqueName("stream_state_" + std::to_string(index),
+                                       *node);
+      line(carrier + " = T.alloc_local((1,), " + dtype + ")");
+      line(carrier + "[0] = " + initial->str());
+      carriers.push_back(carrier);
+      valueNames[body.getArgument(index + 1)] = carrier + "[0]";
+    } else {
+      carriers.push_back(initial->str());
+      valueNames[body.getArgument(index + 1)] = initial->str();
+    }
   }
   streamCarriers[&operation] = carriers;
-  line("for stream_tile in T.Pipelined(T.ceildiv(K, TILE_SIZE_N), "
-       "num_stages=num_stages):");
+  line("for stream_tile in T.Pipelined(T.ceildiv(" +
+       roleDimensions.lookup("stream_0") + ", " + binding.getTile().str() +
+       "), num_stages=num_stages):");
   ++indentation;
   valueNames[body.getArgument(0)] = "stream_tile";
   return success();
@@ -751,12 +766,20 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     FailureOr<StringRef> yielded = lookupValue(terminator, index);
     if (failed(yielded))
       return failure();
-    if (*yielded != carriers->second[index])
+    if (operation.getResult(index).getType().isIntOrIndexOrFloat()) {
+      std::string destination = carriers->second[index] + "[0]";
+      if (*yielded != destination)
+        line(destination + " = " + yielded->str());
+    } else if (*yielded != carriers->second[index]) {
       line("T.copy(" + yielded->str() + ", " + carriers->second[index] + ")");
+    }
   }
   --indentation;
-  for (unsigned index = 0; index < operation.getNumResults(); ++index)
-    valueNames[operation.getResult(index)] = carriers->second[index];
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    bool scalar = operation.getResult(index).getType().isIntOrIndexOrFloat();
+    valueNames[operation.getResult(index)] =
+        carriers->second[index] + (scalar ? "[0]" : "");
+  }
   return success();
 }
 

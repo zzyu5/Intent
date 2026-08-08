@@ -60,7 +60,7 @@ FailureOr<ScheduleDecision> decideGpuSchedule(const KernelFacts &facts) {
       }
     }
     decision.workerAxes = {0, 1};
-    decision.raggedRelation = ownership.relation;
+    decision.raggedRelations.push_back(ownership.relation);
     decision.stages = std::move(*stages);
     decision.traversal = "expert_major";
     decision.mapping = "ragged_stages";
@@ -70,32 +70,35 @@ FailureOr<ScheduleDecision> decideGpuSchedule(const KernelFacts &facts) {
   }
 
   if (!structure->orderedStreamDomains.empty()) {
+    bool rowStream = structure->programDomains.size() == 1 &&
+                     structure->tiledProgramDomains.empty() &&
+                     structure->contractionDomains.empty();
+    bool tiledStream = structure->programDomains.size() == 3 &&
+                       structure->tiledProgramDomains.size() == 1 &&
+                       structure->contractionDomains.size() == 1 &&
+                       structure->contractionDomains.front() ==
+                           structure->orderedStreamDomains.front();
     if (structure->orderedStreamDomains.size() != 1 ||
-        structure->programDomains.size() != 3 ||
-        structure->tiledProgramDomains.size() != 1 ||
-        structure->contractionDomains.size() != 1 ||
-        structure->contractionDomains.front() !=
-            structure->orderedStreamDomains.front()) {
+        (!rowStream && !tiledStream)) {
       facts.kernel.entry.emitOpError(
-          "multi-axis streamed scheduling requires three program domains, one tiled program domain, and one ordered contraction domain");
+          "streamed scheduling requires either row ownership or a tiled contraction stream");
       return failure();
     }
     Operation *streamDomain = structure->orderedStreamDomains.front();
     for (const auto &binding : facts.stateStreams)
-      if (binding.second.axisDomain == streamDomain) {
-        if (decision.stateStream) {
-          facts.kernel.entry.emitOpError(
-              "physical scheduling requires one ordered state stream");
-          return failure();
-        }
-        decision.stateStream = binding.first;
-      }
-    if (!decision.stateStream) {
+      if (binding.second.axisDomain == streamDomain)
+        decision.stateStreams.push_back(binding.first);
+    llvm::sort(decision.stateStreams, [](Operation *lhs, Operation *rhs) {
+      return lhs->getAttrOfType<IntegerAttr>("intent.node").getInt() <
+             rhs->getAttrOfType<IntegerAttr>("intent.node").getInt();
+    });
+    if (decision.stateStreams.empty()) {
       facts.kernel.entry.emitOpError(
           "ordered stream domain has no state-stream operation");
       return failure();
     }
-    decision.workerAxes = {0, 1};
+    decision.workerAxes = rowStream ? SmallVector<int64_t>{0}
+                                    : SmallVector<int64_t>{0, 1};
     for (auto [index, domain] : llvm::enumerate(structure->programDomains)) {
       bool tiled = structure->tiledProgramDomains.contains(domain);
       decision.axes.push_back(AxisDecision{
@@ -117,9 +120,11 @@ FailureOr<ScheduleDecision> decideGpuSchedule(const KernelFacts &facts) {
     if (failed(streamKey))
       return failure();
     decision.autotuneKeys.push_back(*streamKey);
-    decision.traversal = "forward";
-    decision.mapping = "multi_axis_stream";
-    decision.autotuneParameters = {"query", "stream"};
+    decision.traversal = rowStream ? "row_major_forward" : "forward";
+    decision.mapping = rowStream ? "row_stream" : "multi_axis_stream";
+    decision.autotuneParameters = rowStream
+                                      ? SmallVector<std::string>{"stream"}
+                                      : SmallVector<std::string>{"query", "stream"};
     decision.usesAutotuner = true;
     return decision;
   }

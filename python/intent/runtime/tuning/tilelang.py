@@ -19,7 +19,13 @@ def _configuration(
 
 def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int]]:
     roles = frozenset(parameter_map.values())
-    if roles == {"query", "stream"}:
+    if roles == {"stream"}:
+        choices = (
+            ({"stream": 256}, 1, 128),
+            ({"stream": 512}, 1, 128),
+            ({"stream": 1024}, 2, 256),
+        )
+    elif roles == {"query", "stream"}:
         choices = (
             ({"query": 64, "stream": 64}, 1, 128),
             ({"query": 128, "stream": 64}, 1, 128),

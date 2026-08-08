@@ -33,7 +33,7 @@ indexRealization(intent::plan::RealizationOp realization) {
     else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
       index.boundaries[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::RaggedOp>(operation))
-      index.ragged = value;
+      index.ragged.push_back(value);
     else if (auto value = dyn_cast<plan::StageOp>(operation))
       index.stages.push_back(value);
     else if (auto value = dyn_cast<plan::AtomicOp>(operation))
@@ -270,9 +270,22 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (!physicalDimension)
         kernelConstants.push_back(dimension);
     }
+  } else if (planIndex.program.getMapping() == "row_stream") {
+    if (!searchSpace || !searchIndex.autotune || planIndex.streams.empty())
+      return realization.emitOpError(
+          "row stream requires stream bindings and a delegated backend tuner");
+    for (StringRef role : {"program_0", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "row stream lacks " << role << " axis";
+    if (searchIndex.autotune.getKey().size() != 1 ||
+        cast<StringAttr>(searchIndex.autotune.getKey()[0]).getValue() !=
+            roleDimensions.lookup("stream_0"))
+      return searchIndex.autotune.emitOpError(
+          "must specialize the row stream dimension");
   } else if (raggedStages) {
     if (!searchSpace || !searchIndex.autotune ||
-        !planIndex.ragged || planIndex.stages.empty() ||
+        planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
         planIndex.atomics.empty())
       return realization.emitOpError(
           "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
@@ -287,16 +300,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
 }
 
 LogicalResult SourceEmitter::prepareRaggedStages() {
-  raggedRelation = kernel.nodes.lookup(planIndex.ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(planIndex.ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(planIndex.ragged.getMemberNode());
+  plan::RaggedOp ragged = planIndex.ragged.front();
+  raggedRelation = kernel.nodes.lookup(ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
+  raggedMember = kernel.nodes.lookup(ragged.getMemberNode());
   if (!raggedRelation ||
       raggedRelation->getName().getStringRef() != "intent.ragged" ||
       !raggedOuter ||
       raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
       !raggedMember ||
       raggedMember->getName().getStringRef() != "intent.ragged_member")
-    return planIndex.ragged.emitOpError(
+    return ragged.emitOpError(
         "does not resolve to canonical ragged operations");
 
   kernel.entry.walk([&](Operation *operation) {
@@ -956,6 +970,9 @@ LogicalResult SourceEmitter::emitWrapper() {
            << " / cfg.TILE_SIZE_M), "
            << roleDimensions.lookup("program_0") << " * "
            << roleDimensions.lookup("program_1") << ", 1),\n";
+  } else if (planIndex.program.getMapping() == "row_stream") {
+    output << "                lambda cfg: ("
+           << roleDimensions.lookup("program_0") << ", 1, 1),\n";
   } else {
     return planIndex.program.emitOpError(
         "has no autotuned cuTile grid emitter");
@@ -982,11 +999,14 @@ LogicalResult SourceEmitter::emitWrapper() {
            << " / best.TILE_SIZE_M) * ceil("
            << roleDimensions.lookup("program_1")
            << " / best.TILE_SIZE_N), 1, 1)\n";
-  else
+  else if (planIndex.program.getMapping() == "multi_axis_stream")
     output << "    grid = (ceil(" << roleDimensions.lookup("program_2")
            << " / best.TILE_SIZE_M), "
            << roleDimensions.lookup("program_0") << " * "
            << roleDimensions.lookup("program_1") << ", 1)\n";
+  else
+    output << "    grid = (" << roleDimensions.lookup("program_0")
+           << ", 1, 1)\n";
   output << "    return ct.launch(stream, grid, tuned_kernel, (";
   for (ABIView &view : views)
     output << view.argument->name << ", ";
@@ -1186,6 +1206,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       indices.push_back(
           planIndex.program.getMapping() == "persistent_rows"
               ? programIndex
+              : planIndex.program.getMapping() == "row_stream"
+                    ? "program_index"
               : planIndex.program.getMapping() == "multi_axis_stream"
                     ? "index_program_0"
                     : "bid_m");

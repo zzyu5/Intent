@@ -312,7 +312,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   if (failed(addHandler(
           registry, "intent.state_stream",
           [&](Operation &operation) -> LogicalResult {
-            if (&operation != schedule.stateStream)
+            if (!llvm::is_contained(schedule.stateStreams, &operation))
               return operation.emitOpError("is not the resolved ordered stream");
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "stream binding");

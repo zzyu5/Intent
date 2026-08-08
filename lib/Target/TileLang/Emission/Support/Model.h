@@ -29,7 +29,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
-  plan::RaggedOp ragged;
+  llvm::SmallVector<plan::RaggedOp> ragged;
   llvm::SmallVector<plan::StageOp> stages;
   llvm::DenseMap<int64_t, plan::AtomicOp> atomics;
 };

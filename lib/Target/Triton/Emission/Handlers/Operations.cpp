@@ -169,6 +169,17 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       return operation.emitOpError("has no ragged program-axis role");
     return success();
   }
+  if (planIndex.program.getMapping() == "row_stream") {
+    if (&operation != programRoot || operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "row stream requires one root ownership argument");
+    int64_t workerAxis = planIndex.program.getWorkerAxes().front();
+    line("program_index = tl.program_id(" + std::to_string(workerAxis) + ")");
+    valueNames[operation.getRegion(0).front().getArgument(0)] = "program_index";
+    return success();
+  }
   if (planIndex.program.getMapping() == "grid_stride") {
     if (&operation != programRoot)
       return operation.emitOpError("is not owned by the resolved program");
@@ -357,21 +368,24 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
-  auto resultType = operation.getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
-                        : RankedTensorType();
+  Type resultType = operation.getNumResults() == 1
+                        ? operation.getResult(0).getType()
+                        : Type();
   if (failed(node) || !binding || binding.getLowering() != "tl.cast" ||
       failed(operand) || !resultType)
     return operation.emitOpError("lacks a mechanical Triton cast binding");
+  Type elementType = resultType;
+  if (auto tensor = dyn_cast<RankedTensorType>(resultType))
+    elementType = tensor.getElementType();
   StringRef targetType;
-  if (resultType.getElementType().isF16())
+  if (elementType.isF16())
     targetType = "tl.float16";
-  else if (resultType.getElementType().isF32())
+  else if (elementType.isF32())
     targetType = "tl.float32";
   else
     return operation.emitOpError("casts to an unsupported Triton type");
   std::string result = makeResultName(operation, 0);
-  line(result + " = " + operand->str() + ".to(" + targetType.str() + ")");
+  line(result + " = tl.cast(" + operand->str() + ", " + targetType.str() + ")");
   bindResult(operation, 0, result);
   return success();
 }

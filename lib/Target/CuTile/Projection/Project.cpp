@@ -31,11 +31,12 @@ FailureOr<StringRef> tileSpelling(Operation *operation, StringRef role) {
 }
 
 FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
-                                       StringRef mapping) {
+                                       StringRef resultSpace, StringRef mapping) {
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
-    return StringRef("ct.astype");
+    return resultSpace == "private_scalar" ? StringRef("ct.full_cast")
+                                            : StringRef("ct.astype");
   if (role == "unary_exp")
     return StringRef("ct.exp");
   if (role == "unary_exp2")
@@ -152,6 +153,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   for (intent::plan::PointwiseOp pointwise : indexed->pointwise) {
     FailureOr<StringRef> lowering =
         pointwiseSpelling(pointwise, pointwise.getRole(),
+                          pointwise.getResultSpace(),
                           indexed->program.getMapping());
     if (failed(lowering))
       return failure();
@@ -164,21 +166,20 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         contract.getLoc(), contract.getNodeAttr(),
         gpu::stringAttr(builder, "ct.mma"), contract.getAccumulatorTypeAttr(),
         contract.getLhsTransposeAttr(), contract.getRhsTransposeAttr());
-  if (indexed->stream) {
+  for (intent::plan::StreamOp stream : indexed->streams) {
     FailureOr<StringRef> tile =
-        tileSpelling(indexed->stream, indexed->stream.getTile());
+        tileSpelling(stream, stream.getTile());
     if (failed(tile))
       return failure();
     builder.create<plan::StreamOp>(
-        indexed->stream.getLoc(), indexed->stream.getNodeAttr(),
-        indexed->stream.getAxisNodeAttr(), gpu::stringAttr(builder, *tile),
-        indexed->stream.getOrderAttr(), gpu::stringAttr(builder, "register"));
+        stream.getLoc(), stream.getNodeAttr(), stream.getAxisNodeAttr(),
+        gpu::stringAttr(builder, *tile), stream.getOrderAttr(),
+        gpu::stringAttr(builder, "register"));
   }
-  if (indexed->ragged)
+  for (intent::plan::RaggedOp ragged : indexed->ragged)
     builder.create<plan::RaggedOp>(
-        indexed->ragged.getLoc(), indexed->ragged.getNodeAttr(),
-        indexed->ragged.getOuterNodeAttr(), indexed->ragged.getMemberNodeAttr(),
-        indexed->ragged.getTraversalAttr());
+        ragged.getLoc(), ragged.getNodeAttr(), ragged.getOuterNodeAttr(),
+        ragged.getMemberNodeAttr(), ragged.getTraversalAttr());
   for (intent::plan::StageOp stage : indexed->stages)
     builder.create<plan::StageOp>(
         stage.getLoc(), stage.getOrdinalAttr(), stage.getNodeAttr(),

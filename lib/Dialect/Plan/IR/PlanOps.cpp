@@ -227,8 +227,8 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   unsigned devices = 0;
   unsigned programs = 0;
   ProgramOp program;
-  StreamOp stream;
-  RaggedOp ragged;
+  llvm::DenseSet<int64_t> streams;
+  llvm::DenseSet<int64_t> ragged;
   llvm::DenseSet<int64_t> axes;
   llvm::StringSet<> roles;
   llvm::DenseSet<int64_t> storage;
@@ -266,13 +266,11 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
     } else if (auto binding = dyn_cast<StreamOp>(operation)) {
-      if (stream)
-        return binding.emitOpError("duplicates the ordered stream decision");
-      stream = binding;
+      if (!streams.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates an ordered stream decision");
     } else if (auto binding = dyn_cast<RaggedOp>(operation)) {
-      if (ragged)
-        return binding.emitOpError("duplicates the ragged traversal decision");
-      ragged = binding;
+      if (!ragged.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates a ragged traversal decision");
     } else if (auto binding = dyn_cast<StageOp>(operation)) {
       if (!stageOrdinals.insert(binding.getOrdinal()).second)
         return binding.emitOpError("duplicates a physical stage ordinal");
@@ -281,19 +279,24 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   }
   if (devices != 1 || programs != 1)
     return realization.emitOpError("requires one GPU device and one program mapping");
-  if (program.getMapping() == "multi_axis_stream" && !stream)
-    return realization.emitOpError("stream mapping requires one stream decision");
+  if ((program.getMapping() == "multi_axis_stream" ||
+       program.getMapping() == "row_stream") &&
+      streams.empty())
+    return realization.emitOpError("stream mapping requires stream decisions");
   if (program.getMapping() == "ragged_stages" &&
-      (!ragged || stageOrdinals.empty()))
+      (ragged.empty() || stageOrdinals.empty()))
     return realization.emitOpError(
         "ragged mapping requires a traversal and explicit stages");
   if (program.getMapping() != "row_strided" &&
       program.getMapping() != "grouped_2d_tiles" &&
       program.getMapping() != "multi_axis_stream" &&
+      program.getMapping() != "row_stream" &&
       program.getMapping() != "ragged_stages")
     return program.emitOpError("contains an unsupported GPU ownership mapping");
-  if (stream && !axes.contains(stream.getAxisNode()))
-    return stream.emitOpError("references an unbound stream axis");
+  for (Operation &operation : realization.getBody().front())
+    if (auto stream = dyn_cast<StreamOp>(operation);
+        stream && !axes.contains(stream.getAxisNode()))
+      return stream.emitOpError("references an unbound stream axis");
   return success();
 }
 

@@ -192,22 +192,20 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         gpu::stringAttr(builder, rhsSpace),
         gpu::stringAttr(builder, accumulatorSpace));
   }
-  if (indexed->stream) {
+  for (intent::plan::StreamOp stream : indexed->streams) {
     FailureOr<StringRef> tile =
-        tileSpelling(indexed->stream, indexed->stream.getTile());
+        tileSpelling(stream, stream.getTile());
     if (failed(tile))
       return failure();
     builder.create<plan::StreamOp>(
-        indexed->stream.getLoc(), indexed->stream.getNodeAttr(),
-        indexed->stream.getAxisNodeAttr(), gpu::stringAttr(builder, *tile),
-        indexed->stream.getOrderAttr(), gpu::stringAttr(builder, "fragment"),
-        indexed->stream.getReuseInitialAttr());
+        stream.getLoc(), stream.getNodeAttr(), stream.getAxisNodeAttr(),
+        gpu::stringAttr(builder, *tile), stream.getOrderAttr(),
+        gpu::stringAttr(builder, "fragment"), stream.getReuseInitialAttr());
   }
-  if (indexed->ragged)
+  for (intent::plan::RaggedOp ragged : indexed->ragged)
     builder.create<plan::RaggedOp>(
-        indexed->ragged.getLoc(), indexed->ragged.getNodeAttr(),
-        indexed->ragged.getOuterNodeAttr(), indexed->ragged.getMemberNodeAttr(),
-        indexed->ragged.getTraversalAttr());
+        ragged.getLoc(), ragged.getNodeAttr(), ragged.getOuterNodeAttr(),
+        ragged.getMemberNodeAttr(), ragged.getTraversalAttr());
   for (intent::plan::StageOp stage : indexed->stages)
     builder.create<plan::StageOp>(
         stage.getLoc(), stage.getOrdinalAttr(), stage.getNodeAttr(),

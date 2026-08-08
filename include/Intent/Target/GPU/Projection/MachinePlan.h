@@ -17,8 +17,8 @@ struct MachinePlanIndex {
   llvm::SmallVector<intent::plan::ReductionOp> reductions;
   llvm::SmallVector<intent::plan::PointwiseOp> pointwise;
   llvm::SmallVector<intent::plan::ContractOp> contracts;
-  intent::plan::StreamOp stream;
-  intent::plan::RaggedOp ragged;
+  llvm::SmallVector<intent::plan::StreamOp> streams;
+  llvm::SmallVector<intent::plan::RaggedOp> ragged;
   llvm::SmallVector<intent::plan::StageOp> stages;
   llvm::SmallVector<intent::plan::AtomicOp> atomics;
 };

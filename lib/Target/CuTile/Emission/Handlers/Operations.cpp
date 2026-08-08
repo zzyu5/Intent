@@ -169,6 +169,17 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       return operation.emitOpError("has no ragged program-axis role");
     return success();
   }
+  if (planIndex.program.getMapping() == "row_stream") {
+    if (&operation != programRoot || operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "row stream requires one root ownership argument");
+    int64_t workerAxis = planIndex.program.getWorkerAxes().front();
+    line("program_index = ct.bid(" + std::to_string(workerAxis) + ")");
+    valueNames[operation.getRegion(0).front().getArgument(0)] = "program_index";
+    return success();
+  }
   if (planIndex.program.getMapping() == "multi_axis_stream") {
     if (&operation == programRoot) {
       line("bid_program_2 = ct.bid(" +
@@ -265,9 +276,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     FailureOr<std::string> resultShape = emitTensorShape(operation, 0);
     if (failed(shape) || failed(resultShape))
       return failure();
+    StringRef paddingMode = boundary.getPadding() == "negative_infinity"
+                                ? "ct.PaddingMode.NEG_INF"
+                                : "ct.PaddingMode.ZERO";
     line(result + " = ct.load(" + (*view)->argument->name + ", index=" +
          *indices + ", shape=" + *shape +
-         ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *resultShape + ")");
+         ", padding_mode=" + paddingMode.str() + ").reshape(" + *resultShape +
+         ")");
   } else {
     return boundary.emitOpError("is not a load-like cuTile access");
   }
@@ -355,17 +370,26 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
-  auto resultType = operation.getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
-                        : RankedTensorType();
-  if (failed(node) || !binding || binding.getLowering() != "ct.astype" ||
+  Type resultType = operation.getNumResults() == 1
+                        ? operation.getResult(0).getType()
+                        : Type();
+  if (failed(node) || !binding ||
+      (binding.getLowering() != "ct.astype" &&
+       binding.getLowering() != "ct.full_cast") ||
       failed(operand) || !resultType)
     return operation.emitOpError("lacks a mechanical cuTile cast binding");
-  std::string targetType = dtypeName(resultType.getElementType(), operation);
+  Type elementType = resultType;
+  if (auto tensor = dyn_cast<RankedTensorType>(resultType))
+    elementType = tensor.getElementType();
+  std::string targetType = dtypeName(elementType, operation);
   if (targetType.empty())
     return failure();
   std::string result = makeResultName(operation, 0);
-  line(result + " = ct.astype(" + operand->str() + ", " + targetType + ")");
+  if (binding.getLowering() == "ct.full_cast")
+    line(result + " = ct.full((1,), " + operand->str() + ", dtype=" +
+         targetType + ")");
+  else
+    line(result + " = ct.astype(" + operand->str() + ", " + targetType + ")");
   bindResult(operation, 0, result);
   return success();
 }

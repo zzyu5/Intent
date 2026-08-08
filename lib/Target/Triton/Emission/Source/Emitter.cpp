@@ -35,7 +35,7 @@ indexRealization(intent::plan::RealizationOp realization) {
     else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
       index.boundaries[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::RaggedOp>(operation))
-      index.ragged = value;
+      index.ragged.push_back(value);
     else if (auto value = dyn_cast<plan::StageOp>(operation))
       index.stages.push_back(value);
     else if (auto value = dyn_cast<plan::AtomicOp>(operation))
@@ -270,9 +270,22 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program_2/stream_0");
+  } else if (planIndex.program.getMapping() == "row_stream") {
+    if (!searchSpace || !searchIndex.autotune || planIndex.streams.empty())
+      return realization.emitOpError(
+          "row stream requires stream bindings and a delegated backend tuner");
+    for (StringRef role : {"program_0", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "row stream lacks " << role << " axis";
+    if (searchIndex.autotune.getKey().size() != 1 ||
+        cast<StringAttr>(searchIndex.autotune.getKey()[0]).getValue() !=
+            roleDimensions.lookup("stream_0"))
+      return searchIndex.autotune.emitOpError(
+          "must specialize the row stream dimension");
   } else if (raggedStages) {
     if (!searchSpace || !searchIndex.autotune ||
-        !planIndex.ragged || planIndex.stages.empty() ||
+        planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
         planIndex.atomics.empty())
       return realization.emitOpError(
           "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
@@ -287,16 +300,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
 }
 
 LogicalResult SourceEmitter::prepareRaggedStages() {
-  raggedRelation = kernel.nodes.lookup(planIndex.ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(planIndex.ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(planIndex.ragged.getMemberNode());
+  plan::RaggedOp ragged = planIndex.ragged.front();
+  raggedRelation = kernel.nodes.lookup(ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
+  raggedMember = kernel.nodes.lookup(ragged.getMemberNode());
   if (!raggedRelation ||
       raggedRelation->getName().getStringRef() != "intent.ragged" ||
       !raggedOuter ||
       raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
       !raggedMember ||
       raggedMember->getName().getStringRef() != "intent.ragged_member")
-    return planIndex.ragged.emitOpError(
+    return ragged.emitOpError(
         "does not resolve to canonical ragged operations");
 
   kernel.entry.walk([&](Operation *operation) {
@@ -1026,6 +1040,9 @@ LogicalResult SourceEmitter::emitWrapper() {
                         roleDimensions.lookup("program_1");
     output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
            << ", " << grid[2] << ")\n";
+  } else if (planIndex.program.getMapping() == "row_stream") {
+    output << "    grid = lambda META: "
+           << programGrid(roleDimensions.lookup("program_0")) << "\n";
   } else {
     return planIndex.program.emitOpError(
         "has no autotuned Triton grid emitter");
@@ -1227,7 +1244,17 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
         << "has no grid-stride index expression for axis role " << role;
     return failure();
   }
-  if (planIndex.program.getMapping() == "multi_axis_stream") {
+  if (planIndex.program.getMapping() == "row_stream") {
+    if (role == "program_0")
+      base = "program_index";
+    else if (role == "stream_0")
+      base = "offs_stream_0";
+    else {
+      consumer.emitOpError()
+          << "has no row-stream index expression for axis role " << role;
+      return failure();
+    }
+  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
     if (role == "program_0")
       base = "index_program_0";
     else if (role == "program_1")

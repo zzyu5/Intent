@@ -13,7 +13,13 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     import triton
 
     roles = frozenset(parameter_map.values())
-    if roles == {"query", "stream"}:
+    if roles == {"stream"}:
+        choices = (
+            ({"stream": 256}, 4, 4),
+            ({"stream": 512}, 3, 8),
+            ({"stream": 1024}, 2, 8),
+        )
+    elif roles == {"query", "stream"}:
         choices = (
             ({"query": 64, "stream": 32}, 3, 4),
             ({"query": 64, "stream": 64}, 3, 4),

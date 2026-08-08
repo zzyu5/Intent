@@ -26,8 +26,8 @@ struct AxisDecision {
 
 struct ScheduleDecision {
   mlir::Operation *programRoot = nullptr;
-  mlir::Operation *stateStream = nullptr;
-  mlir::Operation *raggedRelation = nullptr;
+  llvm::SmallVector<mlir::Operation *> stateStreams;
+  llvm::SmallVector<mlir::Operation *> raggedRelations;
   llvm::SmallVector<ContractionStage> stages;
   llvm::SmallVector<AxisDecision> axes;
   std::string traversal;

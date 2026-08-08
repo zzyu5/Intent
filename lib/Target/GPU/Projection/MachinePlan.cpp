@@ -27,9 +27,9 @@ indexMachinePlan(intent::plan::RealizationOp realization) {
     else if (auto value = dyn_cast<intent::plan::ContractOp>(operation))
       index.contracts.push_back(value);
     else if (auto value = dyn_cast<intent::plan::StreamOp>(operation))
-      index.stream = value;
+      index.streams.push_back(value);
     else if (auto value = dyn_cast<intent::plan::RaggedOp>(operation))
-      index.ragged = value;
+      index.ragged.push_back(value);
     else if (auto value = dyn_cast<intent::plan::StageOp>(operation))
       index.stages.push_back(value);
     else if (auto value = dyn_cast<intent::plan::AtomicOp>(operation))
