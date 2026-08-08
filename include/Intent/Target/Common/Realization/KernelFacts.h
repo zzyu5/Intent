@@ -32,6 +32,21 @@ struct StateStreamFact {
   llvm::SmallVector<mlir::Value> yieldedState;
 };
 
+struct RaggedRelationFact {
+  mlir::Operation *relation = nullptr;
+  mlir::Operation *outerSource = nullptr;
+  mlir::Operation *outerDomain = nullptr;
+  mlir::Value offsets;
+  mlir::Value indices;
+  llvm::SmallVector<mlir::Operation *> memberDomains;
+};
+
+struct RaggedMemberFact {
+  mlir::Operation *relation = nullptr;
+  mlir::Operation *domain = nullptr;
+  mlir::Value selector;
+};
+
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
@@ -49,6 +64,12 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> contractionDomains;
   llvm::DenseSet<mlir::Operation *> orderedStreamDomains;
   llvm::DenseMap<mlir::Operation *, StateStreamFact> stateStreams;
+  llvm::DenseMap<mlir::Operation *, RaggedRelationFact> raggedRelations;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> raggedOuterRelations;
+  llvm::DenseMap<mlir::Operation *, RaggedMemberFact> raggedMembers;
+  llvm::DenseMap<mlir::Value, mlir::Operation *> memberValues;
+  llvm::DenseSet<mlir::Operation *> wholeViewLoads;
+  llvm::DenseSet<mlir::Operation *> scatterReductions;
 };
 
 mlir::LogicalResult analyzeKernelFacts(KernelFacts &facts);

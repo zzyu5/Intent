@@ -76,6 +76,29 @@ analyzeScheduleStructure(const KernelFacts &facts) {
   structure.vectorDomains = orderedDomains(facts.vectorDomains);
   structure.contractionDomains = orderedDomains(facts.contractionDomains);
   structure.orderedStreamDomains = orderedDomains(facts.orderedStreamDomains);
+  for (const auto &entry : facts.raggedRelations) {
+    const RaggedRelationFact &fact = entry.second;
+    if (!fact.outerDomain || fact.memberDomains.empty()) {
+      entry.first->emitOpError("has incomplete ragged ownership facts");
+      return failure();
+    }
+    structure.raggedOwnerships.push_back(
+        RaggedOwnership{entry.first, fact.outerDomain, fact.memberDomains});
+  }
+  llvm::sort(structure.raggedOwnerships,
+             [](const RaggedOwnership &lhs, const RaggedOwnership &rhs) {
+               return lhs.relation->getAttrOfType<IntegerAttr>("intent.node")
+                          .getInt() <
+                      rhs.relation->getAttrOfType<IntegerAttr>("intent.node")
+                          .getInt();
+             });
+  structure.scatterReductions.assign(facts.scatterReductions.begin(),
+                                     facts.scatterReductions.end());
+  llvm::sort(structure.scatterReductions,
+             [](Operation *lhs, Operation *rhs) {
+               return lhs->getAttrOfType<IntegerAttr>("intent.node").getInt() <
+                      rhs->getAttrOfType<IntegerAttr>("intent.node").getInt();
+             });
 
   llvm::DenseSet<Operation *> classified = programDomainSet;
   classified.insert(facts.vectorDomains.begin(), facts.vectorDomains.end());

@@ -30,8 +30,15 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
     if (term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "boundary analysis requires one value per dynamic index term");
-    FailureOr<Operation *> domain = resolveDomain(
-        operation.getOperand(*term.operands.front()), facts, operation);
+    Value indexed = operation.getOperand(*term.operands.front());
+    auto indexedAxes = facts.valueAxes.find(indexed);
+    if (term.kind == "value_index" && indexedAxes != facts.valueAxes.end()) {
+      for (const LogicalAxis &axis : indexedAxes->second)
+        if (axis.domain && !llvm::is_contained(domains, axis.domain))
+          domains.push_back(axis.domain);
+      continue;
+    }
+    FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
     if (failed(domain))
       return failure();
     domains.push_back(*domain);
@@ -41,6 +48,18 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
   facts.boundaryDomains[&operation] = std::move(domains);
   facts.boundaryFills[&operation] = fill.str();
   return success();
+}
+
+FailureOr<Value> backingView(Value tensor, const KernelFacts &facts,
+                             Operation &consumer) {
+  Operation *load = tensor.getDefiningOp();
+  if (!load || !facts.wholeViewLoads.contains(load) ||
+      load->getNumOperands() != 1 ||
+      !isa<intent::ViewType>(load->getOperand(0).getType())) {
+    consumer.emitOpError("ragged metadata is not a canonical whole-view load");
+    return failure();
+  }
+  return load->getOperand(0);
 }
 
 FailureOr<LogicalAxis> axisFromView(Value source, unsigned sourceAxis,
@@ -211,6 +230,65 @@ LogicalResult recordLoadAxes(Operation &operation, KernelFacts &facts) {
   return bindResultAxes(operation, 0, std::move(axes), facts);
 }
 
+FailureOr<SmallVector<LogicalAxis>>
+inferIndexedAxes(Operation &operation, Value source, KernelFacts &facts) {
+  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  SmallVector<LogicalAxis> resultAxes;
+  auto sourceAxes = facts.valueAxes.find(source);
+  bool sourceIsView = isa<intent::ViewType>(source.getType());
+  unsigned sourceAxis = 0;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      resultAxes.push_back(LogicalAxis{nullptr, "1"});
+      continue;
+    }
+    if (term.kind == "full_slice" || term.kind == "slice") {
+      if (sourceIsView) {
+        FailureOr<LogicalAxis> axis =
+            axisFromView(source, sourceAxis, facts, operation);
+        if (failed(axis))
+          return failure();
+        resultAxes.push_back(*axis);
+      } else {
+        if (sourceAxes == facts.valueAxes.end() ||
+            sourceAxis >= sourceAxes->second.size())
+          return operation.emitOpError(
+              "indexed source axis has no logical provenance");
+        resultAxes.push_back(sourceAxes->second[sourceAxis]);
+      }
+      ++sourceAxis;
+      continue;
+    }
+    if (term.kind == "static_index") {
+      ++sourceAxis;
+      continue;
+    }
+    if (term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError("index requires one dynamic operand");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "region_index") {
+      FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
+      if (failed(domain))
+        return failure();
+      FailureOr<LogicalAxis> axis =
+          axisFromDomain(**domain, facts, operation);
+      if (failed(axis))
+        return failure();
+      resultAxes.push_back(*axis);
+    } else if (term.kind == "value_index") {
+      auto indexedAxes = facts.valueAxes.find(indexed);
+      if (indexedAxes != facts.valueAxes.end())
+        resultAxes.append(indexedAxes->second);
+    } else {
+      return operation.emitOpError("has an unsupported index relation");
+    }
+    ++sourceAxis;
+  }
+  return resultAxes;
+}
+
 LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("pointwise provenance requires one result");
@@ -296,12 +374,132 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   if (failed(addHandler(
+          registry, "intent.ragged", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 3 ||
+                operation.getNumResults() != 1 ||
+                !isa<intent::RaggedType>(operation.getResult(0).getType()))
+              return operation.emitOpError("has no canonical ragged schema");
+            Operation *outer = operation.getOperand(0).getDefiningOp();
+            auto offsets = dyn_cast<RankedTensorType>(
+                operation.getOperand(1).getType());
+            auto indices = dyn_cast<RankedTensorType>(
+                operation.getOperand(2).getType());
+            if (!outer || !facts.domainSourceAxes.count(outer) || !offsets ||
+                offsets.getRank() != 1 || !indices || indices.getRank() != 1 ||
+                !isa<IntegerType, IndexType>(offsets.getElementType()) ||
+                !isa<IntegerType, IndexType>(indices.getElementType()))
+              return operation.emitOpError(
+                  "ragged relation requires one outer domain and rank-one integer metadata");
+            if (failed(backingView(operation.getOperand(1), facts, operation)) ||
+                failed(backingView(operation.getOperand(2), facts, operation)))
+              return failure();
+            facts.raggedRelations[&operation] =
+                RaggedRelationFact{&operation, outer, nullptr,
+                                   operation.getOperand(1),
+                                   operation.getOperand(2), {}};
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.ragged_outer",
+          [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 ||
+                operation.getNumResults() != 1)
+              return operation.emitOpError(
+                  "has no canonical ragged-outer schema");
+            Operation *relation = operation.getOperand(0).getDefiningOp();
+            auto found = facts.raggedRelations.find(relation);
+            if (found == facts.raggedRelations.end() ||
+                found->second.outerDomain)
+              return operation.emitOpError(
+                  "does not reference one unresolved ragged relation");
+            Operation *source = found->second.outerSource;
+            facts.domainSources[&operation] = facts.domainSources.lookup(source);
+            facts.domainSourceAxes[&operation] =
+                facts.domainSourceAxes.lookup(source);
+            found->second.outerDomain = &operation;
+            facts.raggedOuterRelations[&operation] = relation;
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.ragged_member",
+          [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 2 ||
+                operation.getNumResults() != 1)
+              return operation.emitOpError(
+                  "has no canonical ragged-member schema");
+            Operation *relation = operation.getOperand(0).getDefiningOp();
+            auto found = facts.raggedRelations.find(relation);
+            if (found == facts.raggedRelations.end() ||
+                !found->second.outerDomain)
+              return operation.emitOpError(
+                  "does not reference a resolved ragged relation");
+            FailureOr<Operation *> selector = resolveDomain(
+                operation.getOperand(1), facts, operation);
+            if (failed(selector) || *selector != found->second.outerDomain)
+              return operation.emitOpError(
+                  "member selector is not owned by the ragged outer domain");
+            FailureOr<Value> indices =
+                backingView(found->second.indices, facts, operation);
+            if (failed(indices))
+              return failure();
+            facts.domainSources[&operation] = *indices;
+            facts.domainSourceAxes[&operation] = 0;
+            facts.raggedMembers[&operation] =
+                RaggedMemberFact{relation, &operation, operation.getOperand(1)};
+            found->second.memberDomains.push_back(&operation);
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.members", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 ||
+                operation.getNumResults() != 1)
+              return operation.emitOpError("has no canonical members schema");
+            FailureOr<Operation *> domain =
+                resolveDomain(operation.getOperand(0), facts, operation);
+            if (failed(domain) || !facts.raggedMembers.count(*domain))
+              return operation.emitOpError(
+                  "members requires a ragged-member region");
+            auto result = dyn_cast<RankedTensorType>(
+                operation.getResult(0).getType());
+            if (!result || result.getRank() != 1 ||
+                !isa<IntegerType, IndexType>(result.getElementType()))
+              return operation.emitOpError(
+                  "members must produce a rank-one index tensor");
+            FailureOr<LogicalAxis> axis =
+                axisFromDomain(**domain, facts, operation);
+            if (failed(axis) ||
+                failed(bindResultAxes(operation, 0, {*axis}, facts)))
+              return failure();
+            facts.memberValues[operation.getResult(0)] = *domain;
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.view_load", [&](Operation &operation) -> LogicalResult {
-            if (operation.getNumOperands() < 2 ||
+            if (operation.getNumOperands() < 1 ||
                 operation.getNumResults() != 1 ||
                 !isa<intent::ViewType>(operation.getOperand(0).getType()))
               return operation.emitOpError(
                   "has no canonical external-view load schema");
+            FailureOr<SmallVector<IndexTerm>> relation =
+                parseIndexRelation(operation);
+            if (failed(relation))
+              return failure();
+            bool wholeView = !relation->empty() && llvm::all_of(
+                *relation, [](const IndexTerm &term) {
+                  return term.kind == "full_slice";
+                });
+            if (wholeView) {
+              facts.wholeViewLoads.insert(&operation);
+              return recordLoadAxes(operation, facts);
+            }
             bool feedsContract = llvm::any_of(
                 operation.getResult(0).getUsers(), [](Operation *user) {
                   return user->getName().getStringRef() == "intent.contract";
@@ -401,65 +599,40 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.gather", [&](Operation &operation) -> LogicalResult {
             if (operation.getNumOperands() < 1 || operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical gather schema");
-            FailureOr<SmallVector<IndexTerm>> relation =
-                parseIndexRelation(operation);
-            if (failed(relation))
+            FailureOr<SmallVector<LogicalAxis>> resultAxes = inferIndexedAxes(
+                operation, operation.getOperand(0), facts);
+            if (failed(resultAxes))
               return failure();
-            SmallVector<LogicalAxis> resultAxes;
-            auto sourceAxes = facts.valueAxes.find(operation.getOperand(0));
-            bool sourceIsView =
-                isa<intent::ViewType>(operation.getOperand(0).getType());
-            unsigned sourceAxis = 0;
-            for (const IndexTerm &term : *relation) {
-              if (term.kind == "new_axis") {
-                resultAxes.push_back(LogicalAxis{nullptr, "1"});
-                continue;
-              }
-              if (term.kind == "full_slice" || term.kind == "slice") {
-                if (sourceIsView) {
-                  FailureOr<LogicalAxis> axis = axisFromView(
-                      operation.getOperand(0), sourceAxis, facts, operation);
-                  if (failed(axis))
-                    return failure();
-                  resultAxes.push_back(*axis);
-                } else {
-                  if (sourceAxes == facts.valueAxes.end() ||
-                      sourceAxis >= sourceAxes->second.size())
-                    return operation.emitOpError(
-                        "gather source axis has no logical provenance");
-                  resultAxes.push_back(sourceAxes->second[sourceAxis]);
-                }
-                ++sourceAxis;
-                continue;
-              }
-              if (term.kind == "static_index") {
-                ++sourceAxis;
-                continue;
-              }
-              if (term.operands.size() != 1 || !term.operands.front())
-                return operation.emitOpError(
-                    "gather index requires one dynamic operand");
-              Value indexed = operation.getOperand(*term.operands.front());
-              if (term.kind == "region_index") {
-                FailureOr<Operation *> domain =
-                    resolveDomain(indexed, facts, operation);
-                if (failed(domain))
-                  return failure();
-                FailureOr<LogicalAxis> axis =
-                    axisFromDomain(**domain, facts, operation);
-                if (failed(axis))
-                  return failure();
-                resultAxes.push_back(*axis);
-              } else if (term.kind == "value_index") {
-                auto indexedAxes = facts.valueAxes.find(indexed);
-                if (indexedAxes != facts.valueAxes.end())
-                  resultAxes.append(indexedAxes->second);
-              } else {
-                return operation.emitOpError("has an unsupported gather relation");
-              }
-              ++sourceAxis;
-            }
-            return bindResultAxes(operation, 0, std::move(resultAxes), facts);
+            return bindResultAxes(operation, 0, std::move(*resultAxes), facts);
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.scatter_reduce",
+          [&](Operation &operation) -> LogicalResult {
+            auto valueIndex = operation.getAttrOfType<IntegerAttr>(
+                "intent.value_operand_index");
+            auto combine =
+                operation.getAttrOfType<StringAttr>("intent.combine");
+            if (!valueIndex || valueIndex.getInt() <= 0 ||
+                static_cast<unsigned>(valueIndex.getInt()) >=
+                    operation.getNumOperands() ||
+                !combine || combine.getValue() != "add" ||
+                !isa<intent::ViewType>(operation.getOperand(0).getType()))
+              return operation.emitOpError(
+                  "has no canonical additive scatter-reduction schema");
+            FailureOr<SmallVector<LogicalAxis>> indexedAxes = inferIndexedAxes(
+                operation, operation.getOperand(0), facts);
+            auto valueAxes =
+                facts.valueAxes.find(operation.getOperand(valueIndex.getInt()));
+            if (failed(indexedAxes) || valueAxes == facts.valueAxes.end() ||
+                *indexedAxes != valueAxes->second)
+              return operation.emitOpError(
+                  "scatter-reduction value does not match its indexed destination");
+            if (failed(analyzeBoundary(operation, facts, "none")))
+              return failure();
+            facts.scatterReductions.insert(&operation);
+            return success();
           })))
     return failure();
 
