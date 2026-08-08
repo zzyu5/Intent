@@ -12,10 +12,11 @@ from intent.realizer.model import PhysicalPlan
 @dataclass(slots=True)
 class CompiledArtifact:
     source: str
-    intent_ir: str
+    mlir: str
     plan: PhysicalPlan
     launch: LaunchSpec
     _launcher: Callable[..., object] = field(repr=False)
+    _runner: Callable[..., object] = field(repr=False)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
 
     @property
@@ -24,7 +25,10 @@ class CompiledArtifact:
 
     @property
     def ir(self) -> dict[str, str]:
-        return {"intent": self.intent_ir, **self.backend_ir}
+        return {"intent_plan": self.mlir, **self.backend_ir}
+
+    def run(self, *arguments: Any) -> object:
+        return self._runner(*arguments)
 
     def __call__(self, *arguments: Any) -> None:
         compiled_kernel = self._launcher(*arguments)

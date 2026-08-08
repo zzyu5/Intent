@@ -30,11 +30,6 @@ def Intent_ConstexprType : Intent_LogicalType<
     "Constexpr", "constexpr", "A compile-time kernel parameter">;
 def Intent_EnumType : Intent_LogicalType<
     "Enum", "enum", "A closed compile-time enumeration">;
-def Intent_StreamType : Intent_LogicalType<
-    "Stream", "stream", "A structured state stream handle">;
-def Intent_UnitType : Intent_LogicalType<
-    "Unit", "unit", "The unit value type">;
-
 def Intent_ViewType : TypeDef<Intent_Dialect, "View"> {
   let mnemonic = "view";
   let summary = "An external strided kernel view with an explicit access mode";

@@ -5,15 +5,15 @@ from dataclasses import field
 
 from intent.ir import Block
 from intent.ir import Function
-from intent.ir import FunctionKind
 from intent.ir import Module
 from intent.ir import Operation
 from intent.ir import ParameterKind
 from intent.ir import Region
 from intent.ir import Value
 from intent.ir import verify
+from intent.realizer import PhysicalPlan
+from intent.realizer import verify_plan
 
-from .attributes import emit_attribute
 from .attributes import emit_dictionary
 from .attributes import emit_effect
 from .types import emit_shape_metadata
@@ -21,11 +21,13 @@ from .types import emit_type
 from .types import emit_type_metadata
 from .types import emit_view_type
 from .types import quote
+from .plan import emit_physical_plan
 
 
 @dataclass(slots=True)
 class MlirEmitter:
     module: Module
+    plan: PhysicalPlan | None = None
     _block_names: dict[Block, str] = field(default_factory=dict, init=False)
     _next_block: int = field(default=0, init=False)
     _view_types: dict[Value, str] = field(default_factory=dict, init=False)
@@ -42,6 +44,8 @@ class MlirEmitter:
         lines = ["module attributes " + emit_dictionary(attributes) + " {"]
         for function in self.module.functions:
             lines.extend(self._emit_function(function, 1))
+        if self.plan is not None:
+            lines.extend(emit_physical_plan(self.plan, 1))
         lines.append("}")
         return "\n".join(lines) + "\n"
 
@@ -59,6 +63,9 @@ class MlirEmitter:
             "intent.kind": function.kind.value,
             "intent.parameters": [
                 self._parameter_metadata(parameter.spec) for parameter in function.parameters
+            ],
+            "intent.parameter_nodes": [
+                parameter.value.id for parameter in function.parameters
             ],
             "intent.results": [
                 self._type_metadata(result_type) for result_type in function.result_types
@@ -123,6 +130,22 @@ class MlirEmitter:
             f"intent.{key}": value for key, value in operation.attributes.items()
         }
         attributes["intent.node"] = operation.id
+        attributes["intent.result_nodes"] = [value.id for value in operation.results]
+        attributes["intent.result_names"] = [
+            value.name_hint or f"v{value.id}" for value in operation.results
+        ]
+        if operation.regions:
+            attributes["intent.region_argument_nodes"] = [
+                [[value.id for value in block.arguments] for block in region.blocks]
+                for region in operation.regions
+            ]
+            attributes["intent.region_argument_names"] = [
+                [
+                    [value.name_hint or f"v{value.id}" for value in block.arguments]
+                    for block in region.blocks
+                ]
+                for region in operation.regions
+            ]
         if operation.effects:
             attributes["intent.effects"] = [
                 emit_effect(effect, operation.operands) for effect in operation.effects
@@ -203,6 +226,8 @@ class MlirEmitter:
         )
 
 
-def emit_mlir(module: Module) -> str:
+def emit_mlir(module: Module, plan: PhysicalPlan | None = None) -> str:
     verify(module)
-    return MlirEmitter(module).emit()
+    if plan is not None:
+        verify_plan(module, plan)
+    return MlirEmitter(module, plan).emit()

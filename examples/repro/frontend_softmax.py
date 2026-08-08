@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import subprocess
+from pathlib import Path
 
 import torch
+import triton
 
 import intent
 import intent.language as I
@@ -13,6 +16,13 @@ from intent.ir import walk_operations
 
 POINTS = 1_000_003
 CONTIGUOUS_NOALIAS = I.constraints(layout="contiguous", noalias=True)
+ROW_MAJOR_NOALIAS = I.constraints(
+    strides=(None, 1),
+    layout="row_major",
+    noalias=True,
+)
+SOFTMAX_ROWS = 8192
+SOFTMAX_COLUMNS = 8192
 
 
 @intent.fn
@@ -190,8 +200,8 @@ def gemm(
 
 @intent.kernel
 def stable_softmax(
-    x: I.In[I.f32, ("M", "N")],
-    y: I.Out[I.f32, ("M", "N")],
+    x: I.In[I.f32, ("M", "N"), ROW_MAJOR_NOALIAS],
+    y: I.Out[I.f32, ("M", "N"), ROW_MAJOR_NOALIAS],
 ):
     M, N = x.shape
     columns = I.domain(0, N)
@@ -376,7 +386,7 @@ def _lower_all(intent_opt: str) -> set[OpCode]:
         )
         mlir = intent.emit_mlir(module)
         subprocess.run(
-            [intent_opt],
+            [intent_opt, "--verify-intent-kernel"],
             input=mlir,
             text=True,
             stdout=subprocess.DEVNULL,
@@ -391,22 +401,81 @@ def _lower_all(intent_opt: str) -> set[OpCode]:
     return covered
 
 
-def _run_triton() -> None:
-    artifact = intent.compile(vector_add, target=intent.TritonTarget(device=0))
+def _load_original_softmax(source_path: Path):
+    tree = ast.parse(source_path.read_text(), filename=str(source_path))
+    tree.body = [node for node in tree.body if node.end_lineno <= 175]
+    namespace = {
+        "__file__": str(source_path),
+        "__name__": "intent_original_triton_softmax",
+    }
+    exec(compile(tree, str(source_path), "exec"), namespace)
+    return namespace["softmax"]
+
+
+def _run_softmax(intent_translate: str, baseline_source: Path) -> None:
     device = torch.device("cuda", 0)
-    lhs = torch.randn(POINTS, device=device, dtype=torch.float32)
-    rhs = torch.randn(POINTS, device=device, dtype=torch.float32)
-    output = torch.empty_like(lhs)
-    artifact(lhs, rhs, output)
-    reference = lhs + rhs
-    maximum_error = torch.max(torch.abs(output - reference)).item()
-    if maximum_error != 0.0:
-        raise RuntimeError(f"Triton numerical comparison failed: max error {maximum_error}")
+    torch.cuda.set_device(device)
+    comparison_stream = torch.cuda.Stream(device=device)
+    torch.cuda.set_stream(comparison_stream)
+    artifact = intent.compile(
+        stable_softmax,
+        target=intent.TritonTarget(device=0),
+        translator=intent_translate,
+    )
+    original_softmax = _load_original_softmax(baseline_source)
+    source = torch.randn(
+        (SOFTMAX_ROWS, SOFTMAX_COLUMNS),
+        device=device,
+        dtype=torch.float32,
+    )
+    generated_output = torch.empty_like(source)
+    artifact(source, generated_output)
+    original_output = original_softmax(source)
+    reference = torch.softmax(source, dim=1)
+    comparison_stream.synchronize()
+
+    generated_error = torch.max(torch.abs(generated_output - reference)).item()
+    original_error = torch.max(torch.abs(original_output - reference)).item()
+    generated_original_error = torch.max(
+        torch.abs(generated_output - original_output)
+    ).item()
+    if generated_error > 1.0e-5 or generated_original_error > 1.0e-6:
+        raise RuntimeError(
+            "stable softmax numerical comparison failed: "
+            f"generated/reference={generated_error}, "
+            f"generated/original={generated_original_error}"
+        )
+
+    original_p50, original_p95 = triton.testing.do_bench(
+        lambda: original_softmax(source),
+        warmup=100,
+        rep=500,
+        quantiles=[0.5, 0.95],
+    )
+    generated_p50, generated_p95 = triton.testing.do_bench(
+        lambda: artifact.run(source),
+        warmup=100,
+        rep=500,
+        quantiles=[0.5, 0.95],
+    )
+
+    print("=== Intent Kernel IR + Physical Plan MLIR ===")
+    print(artifact.mlir, end="")
     print("=== Generated Triton source ===")
     print(artifact.source, end="")
     print("backend IR levels: " + ", ".join(sorted(artifact.backend_ir)))
     print(
-        f"Triton numerical comparison: PASS ({POINTS} f32 elements, max error {maximum_error})"
+        "stable softmax numerical comparison: PASS "
+        f"(shape=({SOFTMAX_ROWS}, {SOFTMAX_COLUMNS}), dtype=f32, "
+        f"generated/reference={generated_error}, original/reference={original_error}, "
+        f"generated/original={generated_original_error})"
+    )
+    print(
+        "stable softmax wrapper performance (includes output allocation, cuda:0, one stream): "
+        f"original_p50={original_p50:.4f} ms, original_p95={original_p95:.4f} ms, "
+        f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
+        f"generated/original_p50={generated_p50 / original_p50:.4f}x, "
+        f"generated/original_p95={generated_p95 / original_p95:.4f}x"
     )
 
 
@@ -416,9 +485,14 @@ def main() -> None:
         "--intent-opt",
         default="/tmp/intentdsl-build/tools/intent-opt/intent-opt",
     )
+    parser.add_argument(
+        "--intent-translate",
+        default="/tmp/intentdsl-build/tools/intent-translate/intent-translate",
+    )
+    parser.add_argument("--baseline-source", type=Path, required=True)
     arguments = parser.parse_args()
     _lower_all(arguments.intent_opt)
-    _run_triton()
+    _run_softmax(arguments.intent_translate, arguments.baseline_source)
 
 
 if __name__ == "__main__":

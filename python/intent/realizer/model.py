@@ -19,6 +19,11 @@ class TraversalKind(Enum):
     SWIZZLED = "swizzled"
 
 
+class TileKind(Enum):
+    ONE = "one"
+    NEXT_POWER_OF_TWO = "next_power_of_two"
+
+
 class StorageSpace(Enum):
     GLOBAL = "global"
     REGISTER = "register"
@@ -34,17 +39,23 @@ class AccessMode(Enum):
 
 
 class LayoutKind(Enum):
-    CONTIGUOUS = "contiguous"
+    ROW_MAJOR = "row_major"
 
 
 class PrimitiveKind(Enum):
     POINTWISE = "pointwise"
+    REDUCTION = "reduction"
 
 
 class TailKind(Enum):
     EXACT = "exact"
     MASKED = "masked"
     LOOP = "tail_loop"
+
+
+class GridPolicy(Enum):
+    STATIC = "static"
+    PERSISTENT_OCCUPANCY = "persistent_occupancy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +68,10 @@ class TargetInfo:
 
 @dataclass(frozen=True, slots=True)
 class ExtentBinding:
-    loop_node_id: int
-    domain_value_id: int
-    tile_size: int
+    node_id: int
+    axis: int
+    logical_extent: str
+    tile: TileKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +80,7 @@ class OwnershipBinding:
     worker: WorkerKind
     worker_axis: int
     traversal: TraversalKind
+    mapping: TraversalKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,27 +102,32 @@ class PrimitiveBinding:
     node_id: int
     kind: PrimitiveKind
     operator: str
+    axis: int = -1
+    identity: str = "none"
 
 
 @dataclass(frozen=True, slots=True)
 class PipelineSpec:
-    stages: int
+    low_stages: int
+    high_stages: int
+    smem_threshold: int
     prefetch: bool
     async_copy: bool
 
 
 @dataclass(frozen=True, slots=True)
 class BoundaryBinding:
-    loop_node_id: int
-    logical_extent: int
+    node_id: int
+    logical_extent: str
     tail: TailKind
+    predicate: str
+    load_fill: str
 
 
 @dataclass(frozen=True, slots=True)
 class LaunchSpec:
     loop_node_id: int
-    grid: tuple[int, ...]
-    block_size: int
+    grid_policy: GridPolicy
     num_warps: int
 
 

@@ -7,6 +7,7 @@ add_llvm_executable(intent-opt
 llvm_update_compile_flags(intent-opt)
 target_link_libraries(intent-opt PRIVATE
   ${dialect_libs}
+  MLIRIntentTransforms
   MLIROptLib
 )
 

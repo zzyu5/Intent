@@ -37,11 +37,8 @@ from .types import RecordType
 from .types import RegionType
 from .types import ScalarType
 from .types import StaticDim
-from .types import StreamType
 from .types import SymbolDim
 from .types import TensorType
-from .types import UNIT
-from .types import UnitType
 from .types import broadcast_shape
 from .types import normalize_shape
 from .types import type_from_annotation
@@ -99,12 +96,9 @@ __all__ = [
     "ScalarType",
     "SourceSpan",
     "StaticDim",
-    "StreamType",
     "SymbolDim",
     "TensorType",
-    "UNIT",
     "UnaryOperator",
-    "UnitType",
     "Value",
     "walk_blocks",
     "walk_operations",

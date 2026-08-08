@@ -296,30 +296,6 @@ class RecordType(IRType):
         return f"record<{body}>"
 
 
-@dataclass(frozen=True, slots=True)
-class StreamType(IRType):
-    state: tuple[IRType, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "state", tuple(self.state))
-        if not self.state:
-            raise ValueError("state stream requires at least one carried value")
-        if any(not isinstance(value_type, IRType) for value_type in self.state):
-            raise TypeError("state stream values must be IRType values")
-
-    def format(self) -> str:
-        return "stream<" + ",".join(str(value) for value in self.state) + ">"
-
-
-@dataclass(frozen=True, slots=True)
-class UnitType(IRType):
-    def format(self) -> str:
-        return "unit"
-
-
-UNIT = UnitType()
-
-
 def type_from_annotation(annotation: object) -> IRType:
     if isinstance(annotation, ViewSpec):
         return TensorType(annotation.dtype, normalize_shape(annotation.shape))
@@ -410,10 +386,6 @@ def types_compatible(lhs: IRType, rhs: IRType) -> bool:
                 types_compatible(a, b)
                 for (_, a), (_, b) in zip(lhs.fields, rhs.fields)
             )
-        )
-    if isinstance(lhs, StreamType) and isinstance(rhs, StreamType):
-        return len(lhs.state) == len(rhs.state) and all(
-            types_compatible(a, b) for a, b in zip(lhs.state, rhs.state)
         )
     return False
 

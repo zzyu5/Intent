@@ -13,10 +13,8 @@ from intent.ir import RecordType
 from intent.ir import RegionType
 from intent.ir import ScalarType
 from intent.ir import StaticDim
-from intent.ir import StreamType
 from intent.ir import SymbolDim
 from intent.ir import TensorType
-from intent.ir import UnitType
 from intent.language import DType
 
 
@@ -62,8 +60,6 @@ def emit_type(value_type: IRType) -> str:
         (RecordType, "record"),
         (ConstexprType, "constexpr"),
         (EnumType, "enum"),
-        (StreamType, "stream"),
-        (UnitType, "unit"),
     )
     for python_type, mnemonic in logical_types:
         if isinstance(value_type, python_type):
