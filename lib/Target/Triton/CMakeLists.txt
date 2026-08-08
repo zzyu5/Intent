@@ -1,13 +1,3 @@
-add_mlir_library(MLIRIntentTritonTarget
-  StableSoftmax.cpp
-  Translate.cpp
-
-  LINK_LIBS PUBLIC
-  MLIRFuncDialect
-  MLIRIR
-  MLIRIntentAnalysis
-  MLIRIntentDialect
-  MLIRIntentPlanDialect
-  MLIRIntentTransforms
-  MLIRSupport
-)
+add_subdirectory(IR)
+add_subdirectory(Realization)
+add_subdirectory(Emission)

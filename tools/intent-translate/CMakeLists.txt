@@ -9,8 +9,9 @@ target_link_libraries(intent-translate PRIVATE
   ${dialect_libs}
   MLIRIntentDialect
   MLIRIntentPlanDialect
-  MLIRIntentTritonTarget
   MLIRIntentTransforms
+  MLIRIntentTritonDialect
+  MLIRIntentTritonEmission
   MLIRParser
   MLIRIR
   MLIRSupport

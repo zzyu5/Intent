@@ -1,7 +1,7 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
-#include "Intent/Target/Triton/Target.h"
-#include "Intent/Transforms/RealizeStableSoftmax.h"
+#include "Intent/Target/Triton/IR/TritonDialect.h"
+#include "Intent/Target/Triton/Realization/Realize.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
@@ -28,12 +28,14 @@ int main(int argc, char **argv) {
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect>();
+  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect,
+                  intent::triton::plan::IntentTritonDialect>();
   mlir::MLIRContext context(registry);
-  context.loadDialect<intent::IntentDialect, intent::plan::IntentPlanDialect>();
+  context.loadDialect<intent::IntentDialect, intent::plan::IntentPlanDialect,
+                      intent::triton::plan::IntentTritonDialect>();
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
   intent::triton::TargetOptions target{architecture, device, warpSize};
-  if (!module || mlir::failed(intent::realizeStableSoftmax(*module, target)) ||
+  if (!module || mlir::failed(intent::triton::realizeKernel(*module, target)) ||
       mlir::failed(mlir::verify(*module)))
     return 1;
   mlir::OpPrintingFlags flags;

@@ -9,6 +9,5 @@ add_mlir_dialect_library(MLIRIntentPlanDialect
   MLIRFuncDialect
   MLIRBytecodeOpInterface
   MLIRIR
-  MLIRIntentAnalysis
   MLIRSupport
 )

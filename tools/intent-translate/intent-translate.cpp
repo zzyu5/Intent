@@ -1,6 +1,7 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
-#include "Intent/Target/Triton/Translate.h"
+#include "Intent/Target/Triton/Emission/Translate.h"
+#include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Parser/Parser.h"
@@ -18,7 +19,8 @@ int main(int argc, char **argv) {
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect>();
+  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect,
+                  intent::triton::plan::IntentTritonDialect>();
   mlir::MLIRContext context(registry);
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
   if (!module)

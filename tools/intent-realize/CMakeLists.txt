@@ -10,6 +10,8 @@ target_link_libraries(intent-realize PRIVATE
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTransforms
+  MLIRIntentTritonDialect
+  MLIRIntentTritonRealization
   MLIRParser
   MLIRIR
   MLIRSupport

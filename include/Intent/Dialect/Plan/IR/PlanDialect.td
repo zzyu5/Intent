@@ -6,11 +6,11 @@ include "mlir/IR/DialectBase.td"
 def IntentPlan_Dialect : Dialect {
   let name = "intent_plan";
   let cppNamespace = "::intent::plan";
-  let summary = "Compiler-owned physical realization of Intent Kernel IR";
+  let summary = "Target-neutral realization envelopes for Intent Kernel IR";
   let description = [{
-    IntentPlan binds logical Kernel IR nodes to physical extents, ownership,
-    storage, layouts, target primitives, boundaries, pipelines and launch.
-    It never changes the source-visible algorithm or ABI.
+    IntentPlan separates a resolved realization, which target emission may
+    consume, from a search space, which realization may explore. Concrete
+    physical choices live in the selected target dialect.
   }];
 }
 
