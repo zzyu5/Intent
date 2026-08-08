@@ -216,13 +216,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "out" && !fixedOutput)
         fixedOutput = &view;
-      if (view.tensor.getRank() != 2)
-        return kernel.entry.emitOpError(
-            "persistent-row cuTile views must be rank two");
     }
-    if (!fixedOutput || searchSpace)
+    if (!fixedOutput || fixedOutput->tensor.getRank() != 2 || searchSpace)
       return realization.emitOpError(
-          "fixed persistent rows require one output and no search space");
+          "fixed persistent rows require one rank-two output and no search space");
   } else if (planIndex.program.getMapping() == "grouped_2d_tiles") {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
@@ -785,14 +782,18 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (inputs.empty())
       return kernel.entry.emitOpError(
           "persistent-row wrapper requires an input view");
-    ABIView *shapeOwner = inputs.front();
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
         output << ", ";
       output << view.argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << "):\n";
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
     for (ABIView &view : views) {
       StringRef dtype = torchDtype(view.tensor.getElementType());
       if (dtype.empty())
@@ -804,16 +805,28 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
-      output << "    if " << view.argument->name << ".ndim != 2";
-      if (&view != shapeOwner)
-        output << " or " << view.argument->name << ".shape != "
-               << shapeOwner->argument->name << ".shape";
-      output << ":\n";
-      output << "        raise ValueError('persistent-row views require one rank-two shape')\n";
+      output << "    if " << view.argument->name << ".ndim != "
+             << view.tensor.getRank() << ":\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " has the wrong rank')\n";
+      output << "    if tuple(" << view.argument->name << ".shape) != (";
+      for (auto [axis, extent] : llvm::enumerate(view.shape)) {
+        if (axis)
+          output << ", ";
+        output << extent;
+      }
+      if (view.shape.size() == 1)
+        output << ",";
+      output << "):\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " shape violates the kernel symbols')\n";
       output << "    if not " << view.argument->name << ".is_contiguous():\n";
       output << "        raise ValueError('persistent-row views must be contiguous')\n";
     }
-    output << "    n_rows, n_cols = " << shapeOwner->argument->name << ".shape\n";
+    output << "    n_rows = "
+           << dimensionOwners.lookup(roleDimensions.lookup("program_0")) << "\n";
+    output << "    n_cols = "
+           << dimensionOwners.lookup(roleDimensions.lookup("lane_0")) << "\n";
     output << "    configuration = row_configuration(n_cols)\n";
     output << "    num_programs = row_program_count(n_rows, _DEVICE, configuration.occupancy)\n";
     output << "    return ct.launch(torch.cuda.current_stream(), (num_programs, 1, 1), "
@@ -823,6 +836,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << view.argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << ", n_rows, configuration.tile_size, n_cols))\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {
@@ -830,16 +845,28 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << view->argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << "):\n";
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
     StringRef outputDtype = torchDtype(fixedOutput->tensor.getElementType());
-    output << "    " << fixedOutput->argument->name << " = torch.empty_like("
-           << shapeOwner->argument->name << ", dtype=" << outputDtype << ")\n";
+    output << "    " << fixedOutput->argument->name << " = torch.empty((";
+    for (auto [axis, extent] : llvm::enumerate(fixedOutput->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     output << "    launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
         output << ", ";
       output << view.argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << ")\n    return " << fixedOutput->argument->name << "\n";
     return success();
   }

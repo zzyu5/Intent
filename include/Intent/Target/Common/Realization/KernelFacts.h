@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <string>
+#include <optional>
 
 namespace intent::target {
 
@@ -88,7 +89,7 @@ mlir::FailureOr<mlir::Operation *>
 resolveDomain(mlir::Value indexedValue, const KernelFacts &facts,
               mlir::Operation &consumer);
 
-bool proveMaskedLaneNeutrality(mlir::Value loaded);
+std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded);
 
 } // namespace intent::target
 

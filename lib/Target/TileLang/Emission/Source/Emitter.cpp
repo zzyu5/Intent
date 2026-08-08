@@ -238,13 +238,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "out" && !fixedOutput)
         fixedOutput = &view;
-      if (view.tensor.getRank() != 2)
-        return kernel.entry.emitOpError(
-            "fixed-row TileLang views must be rank two");
     }
-    if (!fixedOutput)
+    if (!fixedOutput || fixedOutput->tensor.getRank() != 2)
       return kernel.entry.emitOpError(
-          "fixed-row TileLang program requires one output view");
+          "fixed-row TileLang program requires one rank-two output view");
   } else if (mapping == "grouped_2d_tiles") {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(

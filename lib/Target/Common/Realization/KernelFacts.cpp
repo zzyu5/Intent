@@ -504,13 +504,14 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 operation.getResult(0).getUsers(), [](Operation *user) {
                   return user->getName().getStringRef() == "intent.contract";
                 });
-            if (!feedsContract &&
-                !proveMaskedLaneNeutrality(operation.getResult(0)))
+            std::optional<std::string> fill =
+                feedsContract ? std::optional<std::string>("zero")
+                              : inferMaskedLaneFill(operation.getResult(0));
+            if (!fill)
               return operation.emitOpError(
                   "cannot prove a semantics-preserving masked-load fill");
             if (failed(analyzeBoundary(
-                    operation, facts,
-                    feedsContract ? "zero" : "negative_infinity")))
+                    operation, facts, *fill)))
               return failure();
             return recordLoadAxes(operation, facts);
           })))

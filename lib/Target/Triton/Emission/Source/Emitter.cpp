@@ -221,13 +221,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "out" && !fixedOutput)
         fixedOutput = &view;
-      if (view.tensor.getRank() != 2)
-        return kernel.entry.emitOpError(
-            "grid-stride Triton views must be rank two");
     }
-    if (!fixedOutput)
+    if (!fixedOutput || fixedOutput->tensor.getRank() != 2)
       return kernel.entry.emitOpError(
-          "grid-stride Triton program requires one output view");
+          "grid-stride Triton program requires one rank-two output view");
     if (searchSpace)
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
@@ -800,7 +797,6 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (inputs.empty())
       return kernel.entry.emitOpError(
           "fixed grid-stride wrapper requires an input view");
-    ABIView *shapeOwner = inputs.front();
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
     output << "_PROPERTIES = driver.active.utils.get_device_properties(_DEVICE.index)\n";
@@ -811,7 +807,12 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << view.argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << "):\n";
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
     for (ABIView &view : views) {
       StringRef dtype = view.tensor.getElementType().isF16() ? "torch.float16"
                                                              : "torch.float32";
@@ -822,14 +823,23 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
-      output << "    if " << view.argument->name << ".ndim != 2";
-      if (&view != shapeOwner)
-        output << " or " << view.argument->name << ".shape != "
-               << shapeOwner->argument->name << ".shape";
-      output << ":\n";
-      output << "        raise ValueError('grid-stride views require one rank-two shape')\n";
-      output << "    if " << view.argument->name << ".stride(1) != 1:\n";
-      output << "        raise ValueError('grid-stride views require contiguous rows')\n";
+      output << "    if " << view.argument->name << ".ndim != "
+             << view.tensor.getRank() << ":\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " has the wrong rank')\n";
+      output << "    if tuple(" << view.argument->name << ".shape) != (";
+      for (auto [axis, extent] : llvm::enumerate(view.shape)) {
+        if (axis)
+          output << ", ";
+        output << extent;
+      }
+      if (view.shape.size() == 1)
+        output << ",";
+      output << "):\n";
+      output << "        raise ValueError('" << view.argument->name
+             << " shape violates the kernel symbols')\n";
+      output << "    if not " << view.argument->name << ".is_contiguous():\n";
+      output << "        raise ValueError('grid-stride views must be contiguous')\n";
     }
     SmallVector<ABIView *> noaliasViews;
     for (ABIView &view : views) {
@@ -854,7 +864,10 @@ LogicalResult SourceEmitter::emitWrapper() {
                << "_end, " << noaliasViews[rhs]->argument->name << "_end):\n";
         output << "        raise ValueError('realized views violate noalias')\n";
       }
-    output << "    n_rows, n_cols = " << shapeOwner->argument->name << ".shape\n";
+    output << "    n_rows = "
+           << dimensionOwners.lookup(roleDimensions.lookup("program_0")) << "\n";
+    output << "    n_cols = "
+           << dimensionOwners.lookup(roleDimensions.lookup("lane_0")) << "\n";
     output << "    configuration = row_configuration(n_cols, _PROPERTIES)\n";
     output << "    kernel = " << kernelName << ".warmup(";
     bool first = true;
@@ -866,6 +879,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     };
     for (ABIView &view : views)
       emitArgument(view.argument->name);
+    for (ABIScalar &scalar : scalars)
+      emitArgument(scalar.name);
     for (ABIView &view : views)
       emitArgument(view.argument->name + ".stride(0)");
     for (StringRef argument : {"n_rows", "n_cols"})
@@ -882,6 +897,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     first = true;
     for (ABIView &view : views)
       emitArgument(view.argument->name);
+    for (ABIScalar &scalar : scalars)
+      emitArgument(scalar.name);
     for (ABIView &view : views)
       emitArgument(view.argument->name + ".stride(0)");
     for (StringRef argument : {"n_rows", "n_cols", "configuration.tile_size",
@@ -894,9 +911,19 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << view->argument->name;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << "):\n";
-    output << "    " << fixedOutput->argument->name << " = torch.empty_like("
-           << shapeOwner->argument->name << ", dtype="
+    for (const std::string &dimension : dimensionOrder)
+      output << "    " << dimension << " = "
+             << dimensionOwners.lookup(dimension) << "\n";
+    output << "    " << fixedOutput->argument->name << " = torch.empty((";
+    for (auto [axis, extent] : llvm::enumerate(fixedOutput->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    output << "), device=_DEVICE, dtype="
            << (fixedOutput->tensor.getElementType().isF16() ? "torch.float16"
                                                             : "torch.float32")
            << ")\n";
@@ -908,6 +935,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << view.argument->name;
       first = false;
     }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
     output << ")\n";
     output << "    return " << fixedOutput->argument->name << "\n";
     return success();
