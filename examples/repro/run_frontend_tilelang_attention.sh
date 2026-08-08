@@ -18,8 +18,8 @@ cmake --build "${build_root}" \
   cd /tmp
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH="${project_root}/python" \
-  "${python_bin}" "${project_root}/examples/repro/frontend_tilelang_softmax.py" \
+  "${python_bin}" "${project_root}/examples/repro/frontend_tilelang_attention.py" \
     --intent-realize "${build_root}/tools/intent-tilelang-realize/intent-tilelang-realize" \
     --intent-translate "${build_root}/tools/intent-tilelang-translate/intent-tilelang-translate" \
-    --baseline-source "${project_root}/source/tilelang/tilelang/normalization/online_softmax/online_softmax.py"
+    --baseline-source "${project_root}/source/tilelang/tilelang/attention/flash_forward_bshd/example_mha_fwd_bshd.py"
 )

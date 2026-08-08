@@ -14,9 +14,12 @@ cmake \
 cmake --build "${build_root}" \
   --target intent-tilelang-realize intent-tilelang-translate
 
-PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH="${project_root}/python" \
-"${python_bin}" "${project_root}/examples/repro/frontend_tilelang_gemm.py" \
-  --intent-realize "${build_root}/tools/intent-tilelang-realize/intent-tilelang-realize" \
-  --intent-translate "${build_root}/tools/intent-tilelang-translate/intent-tilelang-translate" \
-  --baseline-source "${project_root}/source/tilelang/tilelang/gemm/dense/example_gemm.py"
+(
+  cd /tmp
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="${project_root}/python" \
+  "${python_bin}" "${project_root}/examples/repro/frontend_tilelang_gemm.py" \
+    --intent-realize "${build_root}/tools/intent-tilelang-realize/intent-tilelang-realize" \
+    --intent-translate "${build_root}/tools/intent-tilelang-translate/intent-tilelang-translate" \
+    --baseline-source "${project_root}/source/tilelang/tilelang/gemm/dense/example_gemm.py"
+)

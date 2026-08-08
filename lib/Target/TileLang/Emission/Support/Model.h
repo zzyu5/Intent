@@ -109,6 +109,9 @@ private:
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation,
                                              bool reductionLoop);
+  mlir::FailureOr<std::string>
+  elementAccessIndices(mlir::Operation &operation,
+                       llvm::ArrayRef<std::string> tileIndices);
   mlir::FailureOr<llvm::SmallVector<std::string>>
   tensorExtents(mlir::Operation &operation, unsigned resultIndex);
   mlir::FailureOr<std::string> tensorShape(mlir::Operation &operation,

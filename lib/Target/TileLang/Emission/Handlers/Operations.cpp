@@ -187,12 +187,54 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> indices = accessIndices(operation, false);
   FailureOr<std::string> result =
       allocateResult(operation, 0, feedsContract ? "shared" : "fragment");
-  if (failed(node) || !boundary || failed(view) || failed(indices) ||
-      failed(result))
+  if (failed(node) || !boundary || failed(view) || failed(result))
     return operation.emitOpError("lacks a mechanical TileLang load binding");
+  if (boundary.getTransfer() == "parallel_elements") {
+    FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+    if (failed(extents) || extents->empty() || boundary.getCheckBounds() ||
+        boundary.getPadding() != "zero")
+      return operation.emitOpError(
+          "has an invalid parallel TileLang load transfer");
+    SmallVector<std::string> tileIndices;
+    std::string loop = "for ";
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
+      if (axis)
+        loop += ", ";
+      tileIndices.push_back("transfer_i" + std::to_string(axis));
+      loop += tileIndices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    FailureOr<std::string> indices =
+        elementAccessIndices(operation, tileIndices);
+    if (failed(indices))
+      return failure();
+    line(loop + "):");
+    ++indentation;
+    std::string target = *result + "[";
+    for (auto [axis, index] : llvm::enumerate(tileIndices)) {
+      if (axis)
+        target += ", ";
+      target += index;
+    }
+    line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
+    --indentation;
+    if (feedsContract)
+      line("T.sync_threads()");
+    bindResult(operation, 0, *result);
+    return success();
+  }
+  if (boundary.getTransfer() != "bulk_copy")
+    return operation.emitOpError("has no TileLang load transfer emitter");
+  FailureOr<std::string> indices = accessIndices(operation, false);
+  if (failed(indices))
+    return failure();
   if (boundary.getPadding() == "negative_infinity")
     line("T.fill(" + *result + ", -T.infinity(T.float32))");
   else
@@ -238,6 +280,7 @@ LogicalResult SourceEmitter::emitBroadcast(Operation &operation) {
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
   if (failed(node) || !binding || binding.getLowering() != "alias" ||
+      binding.getReuseOperandAttr().getInt() != -1 ||
       failed(result) || failed(extents))
     return operation.emitOpError("lacks a TileLang broadcast binding");
   SmallVector<std::string> indices;
@@ -277,9 +320,42 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "unary emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(node) || !binding || operation.getNumResults() != 1 ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local") ||
+      (!tensorResult && binding.getReuseOperandAttr().getInt() != -1) ||
+      (tensorResult && binding.getReuseOperandAttr().getInt() != -1 &&
+       binding.getReuseOperandAttr().getInt() != 0))
+    return operation.emitOpError("lacks a TileLang unary binding");
+  if (!tensorResult) {
+    FailureOr<StringRef> operand = lookupValue(operation, 0);
+    if (failed(operand))
+      return failure();
+    std::string expression =
+        binding.getLowering() == "python_negate"
+            ? "-(" + operand->str() + ")"
+            : binding.getLowering().str() + "(" + operand->str() + ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + expression);
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
+  std::string result;
+  if (binding.getReuseOperandAttr().getInt() == 0) {
+    FailureOr<StringRef> reused = lookupValue(operation, 0);
+    if (failed(reused))
+      return failure();
+    result = reused->str();
+  } else {
+    FailureOr<std::string> allocated =
+        allocateResult(operation, 0, "fragment");
+    if (failed(allocated))
+      return failure();
+    result = *allocated;
+  }
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
-  if (failed(node) || !binding || failed(result) || failed(extents))
+  if (failed(extents))
     return failure();
   SmallVector<std::string> indices;
   std::string loop = "for ";
@@ -304,7 +380,7 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   std::string expression = binding.getLowering() == "python_negate"
                                ? "-(" + *operand + ")"
                                : binding.getLowering().str() + "(" + *operand + ")";
-  std::string target = *result + "[";
+  std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {
     if (axis)
       target += ", ";
@@ -312,7 +388,7 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   }
   line(target + "] = " + expression);
   --indentation;
-  bindResult(operation, 0, *result);
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -320,9 +396,62 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "binary emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(node) || !binding || operation.getNumResults() != 1 ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local") ||
+      (!tensorResult && binding.getReuseOperandAttr().getInt() != -1) ||
+      (tensorResult &&
+       (binding.getReuseOperandAttr().getInt() < -1 || binding.getReuseOperandAttr().getInt() > 1)))
+    return operation.emitOpError("lacks a TileLang binary binding");
+  auto makeExpression = [&](StringRef lhs,
+                            StringRef rhs) -> FailureOr<std::string> {
+    if (binding.getLowering() == "T.max")
+      return "T.max(" + lhs.str() + ", " + rhs.str() + ")";
+    StringRef symbol;
+    if (binding.getLowering() == "python_add")
+      symbol = "+";
+    else if (binding.getLowering() == "python_subtract")
+      symbol = "-";
+    else if (binding.getLowering() == "python_multiply")
+      symbol = "*";
+    else if (binding.getLowering() == "python_true_divide")
+      symbol = "/";
+    else {
+      operation.emitOpError("uses an unsupported TileLang binary lowering");
+      return failure();
+    }
+    return lhs.str() + " " + symbol.str() + " " + rhs.str();
+  };
+  if (!tensorResult) {
+    FailureOr<StringRef> lhs = lookupValue(operation, 0);
+    FailureOr<StringRef> rhs = lookupValue(operation, 1);
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    FailureOr<std::string> expression = makeExpression(*lhs, *rhs);
+    if (failed(expression))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + *expression);
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
+  std::string result;
+  if (binding.getReuseOperandAttr().getInt() >= 0) {
+    FailureOr<StringRef> reused =
+        lookupValue(operation, binding.getReuseOperandAttr().getInt());
+    if (failed(reused))
+      return failure();
+    result = reused->str();
+  } else {
+    FailureOr<std::string> allocated =
+        allocateResult(operation, 0, "fragment");
+    if (failed(allocated))
+      return failure();
+    result = *allocated;
+  }
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
-  if (failed(node) || !binding || failed(result) || failed(extents))
+  if (failed(extents))
     return failure();
   SmallVector<std::string> indices;
   std::string loop = "for ";
@@ -346,32 +475,18 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       tensorElement(operation.getOperand(1), indices, operation);
   if (failed(lhs) || failed(rhs))
     return failure();
-  std::string expression;
-  if (binding.getLowering() == "T.max")
-    expression = "T.max(" + *lhs + ", " + *rhs + ")";
-  else {
-    StringRef symbol;
-    if (binding.getLowering() == "python_add")
-      symbol = "+";
-    else if (binding.getLowering() == "python_subtract")
-      symbol = "-";
-    else if (binding.getLowering() == "python_multiply")
-      symbol = "*";
-    else if (binding.getLowering() == "python_true_divide")
-      symbol = "/";
-    else
-      return operation.emitOpError("uses an unsupported TileLang binary lowering");
-    expression = *lhs + " " + symbol.str() + " " + *rhs;
-  }
-  std::string target = *result + "[";
+  FailureOr<std::string> expression = makeExpression(*lhs, *rhs);
+  if (failed(expression))
+    return failure();
+  std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {
     if (axis)
       target += ", ";
     target += index;
   }
-  line(target + "] = " + expression);
+  line(target + "] = " + *expression);
   --indentation;
-  bindResult(operation, 0, *result);
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -379,17 +494,45 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "cast emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(node) || !binding ||
+      (binding.getLowering() != "T.cast" &&
+       binding.getLowering() != "T.copy_cast") ||
+      operation.getNumResults() != 1 ||
+      binding.getReuseOperandAttr().getInt() != -1 ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local"))
+    return operation.emitOpError("lacks a TileLang cast binding");
+  if (!tensorResult) {
+    if (binding.getLowering() != "T.cast")
+      return operation.emitOpError("cannot copy-cast a scalar TileLang value");
+    FailureOr<StringRef> operand = lookupValue(operation, 0);
+    std::string dtype = dtypeName(operation.getResult(0).getType(), operation);
+    if (failed(operand) || dtype.empty())
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = T.cast(" + operand->str() + ", " + dtype + ")");
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
   auto tensor = operation.getNumResults() == 1
                     ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
                     : RankedTensorType();
-  if (failed(node) || !binding || binding.getLowering() != "T.cast" ||
-      failed(result) || failed(extents) || !tensor)
+  if (failed(result) || failed(extents) || !tensor)
     return operation.emitOpError("lacks a TileLang cast binding");
   std::string dtype = dtypeName(tensor.getElementType(), operation);
   if (dtype.empty())
     return failure();
+  if (binding.getLowering() == "T.copy_cast") {
+    FailureOr<StringRef> operand = lookupValue(operation, 0);
+    if (failed(operand))
+      return failure();
+    line("T.copy(" + operand->str() + ", " + *result + ")");
+    bindResult(operation, 0, *result);
+    return success();
+  }
   SmallVector<std::string> indices;
   std::string loop = "for ";
   for (unsigned axis = 0; axis < extents->size(); ++axis) {
@@ -429,7 +572,7 @@ LogicalResult SourceEmitter::emitFull(Operation &operation) {
   FailureOr<StringRef> fill = lookupValue(operation, 0);
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(node) || !binding || binding.getLowering() != "T.fill" ||
-      failed(fill) || failed(result))
+      binding.getReuseOperandAttr().getInt() != -1 || failed(fill) || failed(result))
     return operation.emitOpError("lacks a TileLang full binding");
   line("T.fill(" + *result + ", " + fill->str() + ")");
   bindResult(operation, 0, *result);
@@ -442,7 +585,7 @@ LogicalResult SourceEmitter::emitZeros(Operation &operation) {
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(node) || !binding || binding.getLowering() != "T.clear" ||
-      failed(result))
+      binding.getReuseOperandAttr().getInt() != -1 || failed(result))
     return operation.emitOpError("lacks a TileLang zeros binding");
   line("T.clear(" + *result + ")");
   bindResult(operation, 0, *result);
@@ -459,7 +602,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
-  if (failed(node) || !binding || failed(relation) || !validIndex || !fillIndex)
+  if (failed(node) || !binding || binding.getReuseOperandAttr().getInt() != -1 ||
+      failed(relation) || !validIndex || !fillIndex)
     return operation.emitOpError("lacks a TileLang gather binding");
   if (isRaggedStages() && binding.getLowering() == "T.indirect_gather") {
     bool feedsContract = llvm::any_of(operation.getResult(0).getUsers(),
@@ -530,7 +674,8 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "members emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
-  if (failed(node) || !binding || binding.getLowering() != "T.members")
+  if (failed(node) || !binding || binding.getLowering() != "T.members" ||
+      binding.getReuseOperandAttr().getInt() != -1)
     return operation.emitOpError("lacks a staged TileLang members binding");
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(result))
@@ -549,7 +694,8 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
   if (failed(node) || !binding || binding.getOrder() != "forward" ||
-      binding.getCarrySpace() != "fragment" || operation.getNumRegions() != 1 ||
+      binding.getCarrySpace() != "fragment" || !binding.getReuseInitial() ||
+      operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang stream binding");
   Block &body = operation.getRegion(0).front();
@@ -559,12 +705,14 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   SmallVector<std::string> carriers;
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
     FailureOr<StringRef> initial = lookupValue(operation, index + 1);
-    FailureOr<std::string> carrier = allocateResult(operation, index, "fragment");
-    if (failed(initial) || failed(carrier))
+    if (failed(initial))
       return failure();
-    line("T.copy(" + initial->str() + ", " + *carrier + ")");
-    carriers.push_back(*carrier);
-    valueNames[body.getArgument(index + 1)] = *carrier;
+    if (operation.getOperand(index + 1).getType() !=
+        operation.getResult(index).getType())
+      return operation.emitOpError(
+          "has a TileLang stream carrier type mismatch");
+    carriers.push_back(initial->str());
+    valueNames[body.getArgument(index + 1)] = initial->str();
   }
   streamCarriers[&operation] = carriers;
   line("for stream_tile in T.Pipelined(T.ceildiv(K, TILE_SIZE_N), "
@@ -586,7 +734,8 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     FailureOr<StringRef> yielded = lookupValue(terminator, index);
     if (failed(yielded))
       return failure();
-    line("T.copy(" + yielded->str() + ", " + carriers->second[index] + ")");
+    if (*yielded != carriers->second[index])
+      line("T.copy(" + yielded->str() + ", " + carriers->second[index] + ")");
   }
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
@@ -601,7 +750,19 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "T.gemm" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a TileLang contraction binding");
+  StringRef warpPolicy;
+  if (binding.getWarpPolicy() == "square")
+    warpPolicy = "T.GemmWarpPolicy.Square";
+  else if (binding.getWarpPolicy() == "full_row")
+    warpPolicy = "T.GemmWarpPolicy.FullRow";
+  else
+    return operation.emitOpError("has no TileLang GEMM warp policy");
   if (isRaggedStages()) {
+    if (binding.getLhsSpace() != "shared" ||
+        binding.getRhsSpace() != "shared" ||
+        binding.getAccumulatorSpace() != "fragment")
+      return operation.emitOpError(
+          "staged TileLang contraction has inconsistent operand spaces");
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");
@@ -686,7 +847,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "TILE_SIZE_N + load_j], T.float32), 0.0)");
       --indentation;
     }
-    line("T.gemm(" + lhs + ", " + rhs + ", " + result + ")");
+    line("T.gemm(" + lhs + ", " + rhs + ", " + result +
+         ", policy=" + warpPolicy.str() + ")");
     --indentation;
     bindResult(operation, 0, result);
     return success();
@@ -698,6 +860,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     if (!lhsLoad || !rhsLoad)
       return operation.emitOpError(
           "deferred TileLang contraction has inconsistent operand residency");
+    if (binding.getLhsSpace() != "shared" ||
+        binding.getRhsSpace() != "shared" ||
+        binding.getAccumulatorSpace() != "fragment")
+      return operation.emitOpError(
+          "deferred TileLang contraction has inconsistent plan spaces");
     FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
     FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad, true);
@@ -728,6 +895,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       call += ", transpose_A=True";
     if (binding.getRhsTranspose())
       call += ", transpose_B=True";
+    call += ", policy=" + warpPolicy.str();
     line(call + ")");
     --indentation;
     bindResult(operation, 0, *result);
@@ -736,6 +904,18 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
 
   FailureOr<StringRef> lhs = lookupValue(operation, 0);
   FailureOr<StringRef> rhs = lookupValue(operation, 1);
+  auto emittedOperandSpace = [](Value value) -> StringRef {
+    Operation *definition = value.getDefiningOp();
+    return definition &&
+                   definition->getName().getStringRef() == "intent.view_load"
+               ? StringRef("shared")
+               : StringRef("fragment");
+  };
+  if (binding.getLhsSpace() != emittedOperandSpace(operation.getOperand(0)) ||
+      binding.getRhsSpace() != emittedOperandSpace(operation.getOperand(1)) ||
+      binding.getAccumulatorSpace() != "fragment")
+    return operation.emitOpError(
+        "direct TileLang contraction has inconsistent plan spaces");
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(lhs) || failed(rhs) || failed(result))
     return failure();
@@ -746,6 +926,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     call += ", transpose_A=True";
   if (binding.getRhsTranspose())
     call += ", transpose_B=True";
+  call += ", policy=" + warpPolicy.str();
   line(call + ")");
   bindResult(operation, 0, *result);
   return success();
@@ -761,10 +942,55 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> indices = accessIndices(operation, false);
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
-      failed(view) || failed(indices))
+      failed(view))
     return operation.emitOpError("lacks a TileLang store binding");
+  if (boundary.getTransfer() == "parallel_elements") {
+    Value storedValue = operation.getOperand(valueIndex.getInt());
+    auto result = dyn_cast<OpResult>(storedValue);
+    Operation *definition = result ? result.getOwner() : nullptr;
+    FailureOr<SmallVector<std::string>> extents =
+        definition ? tensorExtents(*definition, result.getResultNumber())
+                   : FailureOr<SmallVector<std::string>>(failure());
+    if (failed(extents) || extents->empty() || boundary.getCheckBounds() ||
+        boundary.getPadding() != "none")
+      return operation.emitOpError(
+          "has an invalid parallel TileLang store transfer");
+    SmallVector<std::string> tileIndices;
+    std::string loop = "for ";
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
+      if (axis)
+        loop += ", ";
+      tileIndices.push_back("transfer_i" + std::to_string(axis));
+      loop += tileIndices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    FailureOr<std::string> indices =
+        elementAccessIndices(operation, tileIndices);
+    if (failed(indices))
+      return failure();
+    line(loop + "):");
+    ++indentation;
+    std::string source = stored->str() + "[";
+    for (auto [axis, index] : llvm::enumerate(tileIndices)) {
+      if (axis)
+        source += ", ";
+      source += index;
+    }
+    line((*view)->argument->name + "[" + *indices + "] = " + source + "]");
+    --indentation;
+    return success();
+  }
+  if (boundary.getTransfer() != "bulk_copy")
+    return operation.emitOpError("has no TileLang store transfer emitter");
+  FailureOr<std::string> indices = accessIndices(operation, false);
+  if (failed(indices))
+    return failure();
   line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
        *indices + "])");
   return success();

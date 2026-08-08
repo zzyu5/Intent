@@ -66,7 +66,12 @@ def IntentTileLang_ReductionOp : IntentTileLang_Op<"reduction"> {
 }
 
 def IntentTileLang_PointwiseOp : IntentTileLang_Op<"pointwise"> {
-  let arguments = (ins I64Attr:$node, StrAttr:$lowering, StrAttr:$space);
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$lowering,
+    StrAttr:$space,
+    I64Attr:$reuse_operand
+  );
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -75,6 +80,7 @@ def IntentTileLang_ContractOp : IntentTileLang_Op<"contract"> {
   let arguments = (ins
     I64Attr:$node,
     StrAttr:$lowering,
+    StrAttr:$warp_policy,
     StrAttr:$accumulator_type,
     BoolAttr:$lhs_transpose,
     BoolAttr:$rhs_transpose,
@@ -92,7 +98,8 @@ def IntentTileLang_StreamOp : IntentTileLang_Op<"stream"> {
     I64Attr:$axis_node,
     StrAttr:$tile,
     StrAttr:$order,
-    StrAttr:$carry_space
+    StrAttr:$carry_space,
+    BoolAttr:$reuse_initial
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -131,6 +138,7 @@ def IntentTileLang_BoundaryOp : IntentTileLang_Op<"boundary"> {
     I64Attr:$node,
     DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$access,
+    StrAttr:$transfer,
     StrAttr:$padding,
     BoolAttr:$check_bounds
   );

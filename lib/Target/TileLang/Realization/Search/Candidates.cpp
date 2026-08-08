@@ -42,8 +42,7 @@ LogicalResult emitAutotuneSpace(ModuleOp module, func::FuncOp entry,
   builder.create<plan::AutotuneOp>(entry.getLoc(), builder.getArrayAttr(keys));
   if (policy.stateStream) {
     SmallVector<StreamConfig> configs = {
-        {64, 64, 1, 128}, {128, 64, 2, 128},
-        {128, 128, 2, 256}, {64, 128, 1, 256}};
+        {64, 64, 1, 128}, {128, 64, 1, 128}, {128, 128, 1, 128}};
     for (const StreamConfig &config : configs)
       builder.create<plan::ConfigOp>(
           entry.getLoc(),

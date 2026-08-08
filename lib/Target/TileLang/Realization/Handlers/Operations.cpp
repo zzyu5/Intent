@@ -34,8 +34,16 @@ StringRef pointwiseLowering(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
   if (name == "intent.broadcast")
     return "alias";
-  if (name == "intent.cast")
-    return "T.cast";
+  if (name == "intent.cast") {
+    bool feedsContraction = operation.getNumResults() == 1 &&
+                            llvm::any_of(operation.getResult(0).getUsers(),
+                                         [](Operation *user) {
+                                           return user->getName().getStringRef() ==
+                                                  "intent.contract";
+                                         });
+    return feedsContraction ? StringRef("T.copy_cast")
+                            : StringRef("T.cast");
+  }
   auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
   if (!logical)
     return {};
@@ -287,6 +295,9 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
     builder.create<plan::BoundaryOp>(
         operation.getLoc(), i64(builder, *node),
         builder.getDenseI64ArrayAttr(domains), string(builder, access),
+        string(builder, policy.mapping == "multi_axis_stream"
+                            ? "parallel_elements"
+                            : "bulk_copy"),
         string(builder, fill->second), builder.getBoolAttr(persistent));
     return success();
   };
@@ -325,9 +336,53 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
               auto lowering = facts.primitiveLowerings.find(&operation);
               if (failed(node) || lowering == facts.primitiveLowerings.end())
                 return failure();
+              StringRef space =
+                  operation.getNumResults() == 1 &&
+                          isa<RankedTensorType>(operation.getResult(0).getType())
+                      ? StringRef("fragment")
+                      : StringRef("local");
+              int64_t reuseOperand = -1;
+              if (space == "fragment" && operation.getNumResults() == 1) {
+                Value result = operation.getResult(0);
+                auto isStateCarrier = [&](Value operand) {
+                  auto argument = dyn_cast<BlockArgument>(operand);
+                  Operation *owner =
+                      argument ? argument.getOwner()->getParentOp() : nullptr;
+                  return owner &&
+                         owner->getName().getStringRef() ==
+                             "intent.state_stream" &&
+                         argument.getArgNumber() > 0;
+                };
+                auto reusable = [&](Value operand) {
+                  if (operand.getType() != result.getType() ||
+                      operand.getParentBlock() != operation.getBlock() ||
+                      (!operand.getDefiningOp() && !isStateCarrier(operand)))
+                    return false;
+                  bool lastUse = llvm::all_of(operand.getUsers(),
+                                              [&](Operation *user) {
+                    return user == &operation ||
+                           (user->getBlock() == operation.getBlock() &&
+                            user->isBeforeInBlock(&operation));
+                  });
+                  return lastUse;
+                };
+                for (bool requireCarrier : {true, false}) {
+                  for (auto [index, operand] :
+                       llvm::enumerate(operation.getOperands())) {
+                    if (isStateCarrier(operand) != requireCarrier ||
+                        !reusable(operand))
+                      continue;
+                    reuseOperand = index;
+                    break;
+                  }
+                  if (reuseOperand >= 0)
+                    break;
+                }
+              }
               builder.create<plan::PointwiseOp>(
                   operation.getLoc(), i64(builder, *node),
-                  string(builder, lowering->second), string(builder, "fragment"));
+                  string(builder, lowering->second), string(builder, space),
+                  i64(builder, reuseOperand));
               return success();
             })))
       return failure();
@@ -344,7 +399,8 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
                                      : StringRef(found->second);
             builder.create<plan::PointwiseOp>(
                 operation.getLoc(), i64(builder, *node),
-                string(builder, lowering), string(builder, "fragment"));
+                string(builder, lowering), string(builder, "fragment"),
+                i64(builder, -1));
             return success();
           })))
     return failure();
@@ -377,11 +433,28 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
                                : IntegerAttr();
             if (!rhsAxis)
               return operation.emitOpError("has no canonical contraction pair");
+            bool staged = llvm::any_of(policy.stages, [&](const auto &stage) {
+              return stage.contraction == &operation;
+            });
+            auto operandSpace = [&](Value operand) -> StringRef {
+              if (staged)
+                return "shared";
+              Operation *definition = operand.getDefiningOp();
+              return definition &&
+                             definition->getName().getStringRef() ==
+                                 "intent.view_load"
+                         ? StringRef("shared")
+                         : StringRef("fragment");
+            };
             builder.create<plan::ContractOp>(
                 operation.getLoc(), i64(builder, *node), string(builder, "T.gemm"),
+                string(builder, policy.mapping == "multi_axis_stream"
+                                    ? "full_row"
+                                    : "square"),
                 string(builder, "f32"), builder.getBoolAttr(false),
                 builder.getBoolAttr(rhsAxis.getInt() == 1),
-                string(builder, "shared"), string(builder, "shared"),
+                string(builder, operandSpace(operation.getOperand(0))),
+                string(builder, operandSpace(operation.getOperand(1))),
                 string(builder, "fragment"));
             return success();
           })))
@@ -403,7 +476,7 @@ LogicalResult registerBindingHandlers(target::OperationHandlerRegistry &registry
             builder.create<plan::StreamOp>(
                 operation.getLoc(), i64(builder, *node), i64(builder, *axisNode),
                 string(builder, "TILE_SIZE_N"), string(builder, "forward"),
-                string(builder, "fragment"));
+                string(builder, "fragment"), builder.getBoolAttr(true));
             return success();
           })))
     return failure();

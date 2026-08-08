@@ -1003,7 +1003,7 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "full_slice") {
-      indices.push_back("0");
+      indices.push_back(programMapping == "multi_axis_stream" ? ":" : "0");
       continue;
     }
     if (term.kind == "static_index") {
@@ -1032,9 +1032,15 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
                             ? "index_program_1"
                             : "bid_n * TILE_SIZE_N");
     else if (role == "program_2")
-      indices.push_back("bid_program_2 * TILE_SIZE_M");
+      indices.push_back(programMapping == "multi_axis_stream"
+                            ? "bid_program_2 * TILE_SIZE_M : "
+                              "(bid_program_2 + 1) * TILE_SIZE_M"
+                            : "bid_program_2 * TILE_SIZE_M");
     else if (role == "stream_0")
-      indices.push_back("stream_tile * TILE_SIZE_N");
+      indices.push_back(programMapping == "multi_axis_stream"
+                            ? "stream_tile * TILE_SIZE_N : "
+                              "(stream_tile + 1) * TILE_SIZE_N"
+                            : "stream_tile * TILE_SIZE_N");
     else if (role == "lane_0")
       indices.push_back("0");
     else if (role == "reduction_0" && reductionLoop)
@@ -1044,6 +1050,69 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
       return failure();
     }
   }
+  std::string result;
+  for (auto [index, value] : llvm::enumerate(indices)) {
+    if (index)
+      result += ", ";
+    result += value;
+  }
+  return result;
+}
+
+FailureOr<std::string>
+SourceEmitter::elementAccessIndices(Operation &operation,
+                                    ArrayRef<std::string> tileIndices) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  SmallVector<std::string> indices;
+  unsigned tileAxis = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "full_slice") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "parallel TileLang transfer has too few tile indices");
+      indices.push_back(tileIndices[tileAxis++]);
+      continue;
+    }
+    if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError(
+            "parallel TileLang transfer has an invalid static index");
+      indices.push_back(std::to_string(*term.staticValues.front()));
+      continue;
+    }
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "parallel TileLang transfer has no mechanical index relation");
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getOperand(*term.operands.front()), operation);
+    if (failed(axis))
+      return failure();
+    StringRef role = axis->getRole();
+    if (role == "program_0")
+      indices.push_back("index_program_0");
+    else if (role == "program_1")
+      indices.push_back("index_program_1");
+    else if (role == "program_2" || role == "stream_0") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "parallel TileLang transfer has too few tile indices");
+      std::string base = role == "program_2"
+                             ? "bid_program_2 * TILE_SIZE_M"
+                             : "stream_tile * TILE_SIZE_N";
+      indices.push_back(base + " + " + tileIndices[tileAxis++]);
+    } else {
+      operation.emitOpError()
+          << "has no parallel TileLang transfer index for role " << role;
+      return failure();
+    }
+  }
+  if (tileAxis != tileIndices.size())
+    return operation.emitOpError(
+        "parallel TileLang transfer has unused tile indices");
   std::string result;
   for (auto [index, value] : llvm::enumerate(indices)) {
     if (index)

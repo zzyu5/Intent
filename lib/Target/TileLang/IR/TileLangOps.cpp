@@ -90,7 +90,8 @@ LogicalResult ReductionOp::verify() {
 LogicalResult PointwiseOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
-  if (getLowering().empty() || !isBufferSpace(getSpace()))
+  if (getLowering().empty() || !isBufferSpace(getSpace()) ||
+      getReuseOperandAttr().getInt() < -1)
     return emitOpError("requires a lowering and explicit TileLang value space");
   return success();
 }
@@ -100,10 +101,15 @@ LogicalResult ContractOp::verify() {
     return failure();
   if (getLowering() != "T.gemm" || getAccumulatorType() != "f32")
     return emitOpError("requires T.gemm with f32 accumulation");
-  if (getLhsSpace() != "shared" || getRhsSpace() != "shared" ||
+  if (getWarpPolicy() != "square" && getWarpPolicy() != "full_row")
+    return emitOpError("contains an unsupported TileLang GEMM warp policy");
+  auto isOperandSpace = [](StringRef space) {
+    return space == "shared" || space == "fragment";
+  };
+  if (!isOperandSpace(getLhsSpace()) || !isOperandSpace(getRhsSpace()) ||
       getAccumulatorSpace() != "fragment")
     return emitOpError(
-        "requires shared operands and a fragment accumulator");
+        "requires shared/fragment operands and a fragment accumulator");
   return success();
 }
 
@@ -112,9 +118,9 @@ LogicalResult StreamOp::verify() {
       failed(requireNode(*this, getAxisNode())))
     return failure();
   if (getTile().empty() || getOrder() != "forward" ||
-      getCarrySpace() != "fragment")
+      getCarrySpace() != "fragment" || !getReuseInitial())
     return emitOpError(
-        "requires a forward tile stream with fragment-carried state");
+        "requires a forward tile stream that reuses fragment initial state");
   return success();
 }
 
@@ -157,6 +163,9 @@ LogicalResult BoundaryOp::verify() {
   if (getAccess() != "gather" && getAccess() != "scatter" &&
       getAccess() != "load" && getAccess() != "store")
     return emitOpError("contains an unsupported TileLang memory access");
+  if (getTransfer() != "bulk_copy" &&
+      getTransfer() != "parallel_elements")
+    return emitOpError("contains an unsupported TileLang transfer mechanism");
   if (getPadding() != "negative_infinity" && getPadding() != "zero" &&
       getPadding() != "none")
     return emitOpError("contains an unsupported TileLang padding mode");
