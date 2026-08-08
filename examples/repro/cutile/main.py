@@ -11,26 +11,28 @@ import torch
 import torch.nn.functional as F
 
 import intent
-from kernels.attention import BATCH
-from kernels.attention import HEAD_DIMENSION
-from kernels.attention import HEADS
-from kernels.attention import SCALE
-from kernels.attention import SEQUENCE
-from kernels.attention import flash_attention_fwd
-from kernels.gemm import Activation
-from kernels.gemm import K
-from kernels.gemm import M
-from kernels.gemm import N
-from kernels.gemm import gemm
-from kernels.moe import EXPERTS
-from kernels.moe import HIDDEN
-from kernels.moe import INTERMEDIATE
-from kernels.moe import TOKENS
-from kernels.moe import TOP_K
-from kernels.moe import moe_expert_ffn
-from kernels.softmax import COLUMNS
-from kernels.softmax import ROWS
-from kernels.softmax import stable_softmax
+from kernels.streaming.attention import BATCH
+from kernels.streaming.attention import HEAD_DIMENSION
+from kernels.streaming.attention import HEADS
+from kernels.streaming.attention import SCALE
+from kernels.streaming.attention import SEQUENCE
+from kernels.streaming.attention import flash_attention_fwd
+from kernels.contraction.gemm import Activation
+from kernels.contraction.gemm import K
+from kernels.contraction.gemm import M
+from kernels.contraction.gemm import N
+from kernels.contraction.gemm import gemm
+from kernels.ragged.moe import EXPERTS
+from kernels.ragged.moe import HIDDEN
+from kernels.ragged.moe import INTERMEDIATE
+from kernels.ragged.moe import TOKENS
+from kernels.ragged.moe import TOP_K
+from kernels.ragged.moe import moe_expert_ffn
+from kernels.normalization.softmax import COLUMNS
+from kernels.normalization.softmax import ROWS
+from kernels.normalization.softmax import stable_softmax
+from repro.common.extended import EXTENDED_RUNNERS
+from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
@@ -43,6 +45,55 @@ def _load_module(source_path: Path, module_name: str):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "layer_norm":
+        layer_norm = _load_module(
+            source_path, "intent_upstream_cutile_layer_norm"
+        ).cutile_layer_norm
+        return lambda arguments: layer_norm(
+            arguments[0], arguments[1], arguments[2], arguments[4]
+        )
+    if kernel == "dual_gemm":
+        matmul = _load_module(
+            source_path, "intent_upstream_cutile_dual_gemm"
+        ).matmul
+        return lambda arguments: (
+            torch.relu(matmul(arguments[0], arguments[1]).float())
+            * matmul(arguments[0], arguments[2]).float()
+        ).half()
+    if kernel == "grouped_gemm":
+        grouped = _load_module(
+            source_path, "intent_upstream_cutile_grouped_gemm"
+        ).group_gemm
+
+        def run(arguments):
+            x, offsets, members, weight = arguments
+            rows = [
+                members[offsets[group] : offsets[group + 1]].long()
+                for group in range(weight.shape[0])
+            ]
+            values = grouped(
+                [x[group_rows] for group_rows in rows],
+                [weight[group] for group in range(weight.shape[0])],
+            )
+            result = torch.zeros(
+                (x.shape[0], weight.shape[2]), device=x.device, dtype=torch.float32
+            )
+            for group_rows, group_values in zip(rows, values):
+                result.index_add_(0, group_rows, group_values.float())
+            return result
+
+        return run
+    if kernel == "online_softmax":
+        utils_path = source_path.parents[2] / "support" / "utils.py"
+        _load_module(utils_path, "tilegym.ops.cutile.utils")
+        softmax = _load_module(
+            source_path, "tilegym.ops.cutile._intent_online_softmax"
+        ).softmax
+        return lambda arguments: softmax(arguments[0])
+    raise NotImplementedError(f"no cuTile upstream adapter for {kernel}")
 
 
 def _run_softmax(compiler: str, baseline_source: Path) -> None:
@@ -363,13 +414,29 @@ RUNNERS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=sorted(RUNNERS))
+    parser.add_argument("kernel", choices=sorted(RUNNERS | EXTENDED_RUNNERS))
     parser.add_argument("--compiler", required=True)
-    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument("--baseline-source", type=Path)
     arguments = parser.parse_args()
     torch.cuda.set_device(0)
     torch.manual_seed(0)
-    RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    if arguments.kernel in RUNNERS:
+        if arguments.baseline_source is None:
+            parser.error("the selected upstream comparison requires --baseline-source")
+        RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    else:
+        upstream = (
+            _load_extended_upstream(arguments.kernel, arguments.baseline_source)
+            if arguments.baseline_source is not None
+            else None
+        )
+        run_extended(
+            arguments.kernel,
+            arguments.compiler,
+            intent.CuTileTarget(device=0),
+            "cuTile",
+            upstream,
+        )
 
 
 if __name__ == "__main__":

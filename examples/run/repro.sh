@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|gemm|attention|moe>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|dual_gemm|attention|online_softmax|moe|grouped_gemm>" >&2
   exit 2
 fi
 
@@ -27,6 +27,7 @@ case "${backend}" in
     ;;
 esac
 
+baseline=
 case "${backend}:${kernel}" in
   triton:softmax)
     baseline=source/triton/triton/normalization/softmax/02-fused-softmax.py
@@ -40,6 +41,21 @@ case "${backend}:${kernel}" in
   triton:moe)
     baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
     ;;
+  triton:layer_norm)
+    baseline=source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py
+    ;;
+  triton:rms_norm)
+    baseline=source/triton/liger-kernel/normalization/rms_norm/rms_norm_runtime.py
+    ;;
+  triton:dual_gemm)
+    baseline=source/triton/triton/gemm/dense/03-matrix-multiplication.py
+    ;;
+  triton:grouped_gemm)
+    baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
+    ;;
+  triton:online_softmax)
+    baseline=source/triton/triton/normalization/softmax/02-fused-softmax.py
+    ;;
   cutile:softmax)
     baseline=source/cutile/tilegym/normalization/softmax/softmax.py
     ;;
@@ -52,6 +68,18 @@ case "${backend}:${kernel}" in
   cutile:moe)
     baseline=source/cutile/cutile-python/moe/fused/MoE.py
     ;;
+  cutile:layer_norm)
+    baseline=source/cutile/cutile-python/normalization/layer_norm/LayerNorm.py
+    ;;
+  cutile:dual_gemm)
+    baseline=source/cutile/tilegym/gemm/dense/matmul.py
+    ;;
+  cutile:grouped_gemm)
+    baseline=source/cutile/tilegym/gemm/grouped/group_gemm.py
+    ;;
+  cutile:online_softmax)
+    baseline=source/cutile/tilegym/normalization/softmax/softmax.py
+    ;;
   tilelang:softmax)
     baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
     ;;
@@ -63,6 +91,21 @@ case "${backend}:${kernel}" in
     ;;
   tilelang:moe)
     baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
+    ;;
+  tilelang:rms_norm)
+    baseline=source/tilelang/tilelang/normalization/rms_norm/rms_norm.py
+    ;;
+  tilelang:dual_gemm)
+    baseline=source/tilelang/tilelang/gemm/dense/example_gemm.py
+    ;;
+  tilelang:grouped_gemm)
+    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
+    ;;
+  tilelang:online_softmax)
+    baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
+    ;;
+  triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
+  tilelang:layer_norm | tilelang:logsumexp)
     ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2
@@ -79,11 +122,18 @@ cmake \
   -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
 cmake --build "${build_root}" --target intent-compile
 
+runner_arguments=(
+  "${kernel}"
+  --compiler "${build_root}/tools/intent-compile/intent-compile"
+)
+if [[ -n "${baseline}" ]]; then
+  runner_arguments+=(--baseline-source "${project_root}/${baseline}")
+fi
+
 (
   cd /tmp
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH="${project_root}/python:${project_root}/examples" \
-  "${python_bin}" "${project_root}/examples/repro/${backend}/main.py" "${kernel}" \
-    --compiler "${build_root}/tools/intent-compile/intent-compile" \
-    --baseline-source "${project_root}/${baseline}"
+  "${python_bin}" "${project_root}/examples/repro/${backend}/main.py" \
+    "${runner_arguments[@]}"
 )

@@ -5,10 +5,10 @@ from collections.abc import Callable
 import torch
 
 from intent.runtime import CompiledArtifact
-from kernels.moe import EXPERTS
-from kernels.moe import HIDDEN
-from kernels.moe import TOKENS
-from kernels.moe import TOP_K
+from kernels.ragged.moe import EXPERTS
+from kernels.ragged.moe import HIDDEN
+from kernels.ragged.moe import TOKENS
+from kernels.ragged.moe import TOP_K
 
 
 def benchmark(

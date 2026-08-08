@@ -12,26 +12,28 @@ import torch.nn.functional as F
 import tilelang.language as T
 
 import intent
-from kernels.attention import BATCH
-from kernels.attention import HEAD_DIMENSION
-from kernels.attention import HEADS
-from kernels.attention import SCALE
-from kernels.attention import SEQUENCE
-from kernels.attention import flash_attention_fwd
-from kernels.gemm import Activation
-from kernels.gemm import K
-from kernels.gemm import M
-from kernels.gemm import N
-from kernels.gemm import gemm
-from kernels.moe import EXPERTS
-from kernels.moe import HIDDEN
-from kernels.moe import INTERMEDIATE
-from kernels.moe import TOKENS
-from kernels.moe import TOP_K
-from kernels.moe import moe_expert_ffn
-from kernels.softmax import COLUMNS
-from kernels.softmax import ROWS
-from kernels.softmax import stable_softmax
+from kernels.streaming.attention import BATCH
+from kernels.streaming.attention import HEAD_DIMENSION
+from kernels.streaming.attention import HEADS
+from kernels.streaming.attention import SCALE
+from kernels.streaming.attention import SEQUENCE
+from kernels.streaming.attention import flash_attention_fwd
+from kernels.contraction.gemm import Activation
+from kernels.contraction.gemm import K
+from kernels.contraction.gemm import M
+from kernels.contraction.gemm import N
+from kernels.contraction.gemm import gemm
+from kernels.ragged.moe import EXPERTS
+from kernels.ragged.moe import HIDDEN
+from kernels.ragged.moe import INTERMEDIATE
+from kernels.ragged.moe import TOKENS
+from kernels.ragged.moe import TOP_K
+from kernels.ragged.moe import moe_expert_ffn
+from kernels.normalization.softmax import COLUMNS
+from kernels.normalization.softmax import ROWS
+from kernels.normalization.softmax import stable_softmax
+from repro.common.extended import EXTENDED_RUNNERS
+from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
@@ -46,21 +48,129 @@ def _load_module(source_path: Path, module_name: str):
     return module
 
 
-def _run_softmax(compiler: str, baseline_source: Path) -> None:
-    tree = ast.parse(baseline_source.read_text(), filename=str(baseline_source))
+def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
+    tree = ast.parse(source_path.read_text(), filename=str(source_path))
     tree.body = [node for node in tree.body if node.end_lineno <= 45]
     namespace = {
-        "__file__": str(baseline_source),
+        "__file__": str(source_path),
         "__name__": "intent_upstream_tilelang_softmax",
-        "M": ROWS,
-        "N": COLUMNS,
+        "M": rows,
+        "N": columns,
     }
-    exec(compile(tree, str(baseline_source), "exec"), namespace)
-    baseline = namespace["softmax_kernel"].compile(
+    exec(compile(tree, str(source_path), "exec"), namespace)
+    return namespace["softmax_kernel"].compile(
         BLOCK_M=1,
-        BLOCK_N=COLUMNS,
+        BLOCK_N=columns,
         dtype=T.float32,
     )
+
+
+def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "rms_norm":
+        source = _load_module(source_path, "intent_upstream_tilelang_rms_norm")
+        compiled = {}
+
+        def run(arguments):
+            x, weight, _, _ = arguments
+            shape = tuple(x.shape)
+            if shape not in compiled:
+                compiled[shape] = source.rms_norm.compile(
+                    M=shape[0], N=shape[1], blk_m=1
+                )
+            return compiled[shape](x) * weight
+
+        return run
+    if kernel == "dual_gemm":
+        source = _load_module(source_path, "intent_upstream_tilelang_dual_gemm")
+        compiled = {}
+
+        def run(arguments):
+            x, gate_weight, value_weight = arguments
+            shape = (x.shape[0], gate_weight.shape[1], x.shape[1])
+            if shape not in compiled:
+                compiled[shape] = source.matmul.compile(
+                    M=shape[0],
+                    N=shape[1],
+                    K=shape[2],
+                    block_M=128,
+                    block_N=128,
+                    block_K=32,
+                )
+            matmul = compiled[shape]
+            return (
+                torch.relu(matmul(x, gate_weight).float())
+                * matmul(x, value_weight).float()
+            ).half()
+
+        return run
+    if kernel == "grouped_gemm":
+        grouped = _load_module(
+            source_path, "intent_upstream_tilelang_grouped_gemm"
+        ).grouped_gemm
+
+        def run(arguments):
+            x, offsets, members, weight = arguments
+            rows = [
+                members[offsets[group] : offsets[group + 1]].long()
+                for group in range(weight.shape[0])
+            ]
+            packed = torch.cat([x[group_rows] for group_rows in rows])
+            batch_sizes = offsets[1:] - offsets[:-1]
+            batch_offsets = offsets[:-1].contiguous()
+            batch_sizes_list = tuple(int(size) for size in batch_sizes.tolist())
+            padded_sizes = [
+                math.ceil(size / 128) * 128 for size in batch_sizes_list
+            ]
+            padded_offsets = [0]
+            for size in padded_sizes[:-1]:
+                padded_offsets.append(padded_offsets[-1] + size)
+            batch_padded_offsets = torch.tensor(
+                padded_offsets, device=x.device, dtype=torch.int32
+            )
+            values = grouped(
+                packed,
+                weight,
+                batch_sizes,
+                batch_offsets,
+                batch_padded_offsets,
+                batch_sizes_list,
+                128,
+                128,
+                32,
+                False,
+                2,
+                256,
+            )
+            result = torch.zeros(
+                (x.shape[0], weight.shape[2]), device=x.device, dtype=torch.float32
+            )
+            for group, group_rows in enumerate(rows):
+                result.index_add_(
+                    0,
+                    group_rows,
+                    values[offsets[group] : offsets[group + 1]].float(),
+                )
+            return result
+
+        return run
+    if kernel == "online_softmax":
+        compiled = {}
+
+        def run(arguments):
+            x = arguments[0]
+            shape = tuple(x.shape)
+            if shape not in compiled:
+                compiled[shape] = _load_softmax_baseline(
+                    source_path, shape[0], shape[1]
+                )
+            return compiled[shape](x)
+
+        return run
+    raise NotImplementedError(f"no TileLang upstream adapter for {kernel}")
+
+
+def _run_softmax(compiler: str, baseline_source: Path) -> None:
+    baseline = _load_softmax_baseline(baseline_source, ROWS, COLUMNS)
     artifact = intent.compile(
         stable_softmax,
         target=intent.TileLangTarget(device=0),
@@ -364,13 +474,29 @@ RUNNERS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=sorted(RUNNERS))
+    parser.add_argument("kernel", choices=sorted(RUNNERS | EXTENDED_RUNNERS))
     parser.add_argument("--compiler", required=True)
-    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument("--baseline-source", type=Path)
     arguments = parser.parse_args()
     torch.cuda.set_device(0)
     torch.manual_seed(0)
-    RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    if arguments.kernel in RUNNERS:
+        if arguments.baseline_source is None:
+            parser.error("the selected upstream comparison requires --baseline-source")
+        RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    else:
+        upstream = (
+            _load_extended_upstream(arguments.kernel, arguments.baseline_source)
+            if arguments.baseline_source is not None
+            else None
+        )
+        run_extended(
+            arguments.kernel,
+            arguments.compiler,
+            intent.TileLangTarget(device=0),
+            "TileLang",
+            upstream,
+        )
 
 
 if __name__ == "__main__":

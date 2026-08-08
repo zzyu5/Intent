@@ -2,33 +2,37 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import math
+import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 import intent
-from kernels.attention import BATCH
-from kernels.attention import HEAD_DIMENSION
-from kernels.attention import HEADS
-from kernels.attention import SCALE
-from kernels.attention import SEQUENCE
-from kernels.attention import flash_attention_fwd
-from kernels.gemm import Activation
-from kernels.gemm import K
-from kernels.gemm import M
-from kernels.gemm import N
-from kernels.gemm import gemm
-from kernels.moe import EXPERTS
-from kernels.moe import HIDDEN
-from kernels.moe import INTERMEDIATE
-from kernels.moe import TOKENS
-from kernels.moe import TOP_K
-from kernels.moe import moe_expert_ffn
-from kernels.softmax import COLUMNS
-from kernels.softmax import ROWS
-from kernels.softmax import stable_softmax
+from kernels.streaming.attention import BATCH
+from kernels.streaming.attention import HEAD_DIMENSION
+from kernels.streaming.attention import HEADS
+from kernels.streaming.attention import SCALE
+from kernels.streaming.attention import SEQUENCE
+from kernels.streaming.attention import flash_attention_fwd
+from kernels.contraction.gemm import Activation
+from kernels.contraction.gemm import K
+from kernels.contraction.gemm import M
+from kernels.contraction.gemm import N
+from kernels.contraction.gemm import gemm
+from kernels.ragged.moe import EXPERTS
+from kernels.ragged.moe import HIDDEN
+from kernels.ragged.moe import INTERMEDIATE
+from kernels.ragged.moe import TOKENS
+from kernels.ragged.moe import TOP_K
+from kernels.ragged.moe import moe_expert_ffn
+from kernels.normalization.softmax import COLUMNS
+from kernels.normalization.softmax import ROWS
+from kernels.normalization.softmax import stable_softmax
+from repro.common.extended import EXTENDED_RUNNERS
+from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
@@ -41,6 +45,70 @@ def _load_prefix(source_path: Path, last_line: int, symbol: str, module_name: st
     namespace = {"__file__": str(source_path), "__name__": module_name}
     exec(compile(tree, str(source_path), "exec"), namespace)
     return namespace[symbol]
+
+
+def _load_module(source_path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, source_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "layer_norm":
+        module = _load_module(source_path, "intent_upstream_triton_layer_norm")
+        return lambda arguments: module.source.layer_norm_fn(
+            arguments[0], arguments[1], arguments[2], eps=arguments[4]
+        )
+    if kernel == "rms_norm":
+        module = _load_module(source_path, "intent_upstream_triton_rms_norm")
+        return lambda arguments: module.rms_norm_forward(
+            arguments[0], arguments[1], arguments[3], 0.0, "none", None
+        )[0]
+    if kernel == "dual_gemm":
+        matmul = _load_prefix(
+            source_path, 352, "matmul", "intent_upstream_triton_dual_gemm"
+        )
+        return lambda arguments: (
+            torch.relu(matmul(arguments[0], arguments[1]).float())
+            * matmul(arguments[0], arguments[2]).float()
+        ).half()
+    if kernel == "grouped_gemm":
+        grouped = _load_prefix(
+            source_path,
+            213,
+            "group_gemm_fn",
+            "intent_upstream_triton_grouped_gemm",
+        )
+
+        def run(arguments):
+            x, offsets, members, weight = arguments
+            rows = [
+                members[offsets[group] : offsets[group + 1]].long()
+                for group in range(weight.shape[0])
+            ]
+            values = grouped(
+                [x[group_rows] for group_rows in rows],
+                [weight[group] for group in range(weight.shape[0])],
+            )
+            result = torch.zeros(
+                (x.shape[0], weight.shape[2]), device=x.device, dtype=torch.float32
+            )
+            for group_rows, group_values in zip(rows, values):
+                result.index_add_(0, group_rows, group_values.float())
+            return result
+
+        return run
+    if kernel == "online_softmax":
+        softmax = _load_prefix(
+            source_path,
+            175,
+            "softmax",
+            "intent_upstream_triton_online_softmax",
+        )
+        return lambda arguments: softmax(arguments[0])
+    raise NotImplementedError(f"no Triton upstream adapter for {kernel}")
 
 
 def _run_softmax(compiler: str, baseline_source: Path) -> None:
@@ -301,13 +369,29 @@ RUNNERS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=sorted(RUNNERS))
+    parser.add_argument("kernel", choices=sorted(RUNNERS | EXTENDED_RUNNERS))
     parser.add_argument("--compiler", required=True)
-    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument("--baseline-source", type=Path)
     arguments = parser.parse_args()
     torch.cuda.set_device(0)
     torch.manual_seed(0)
-    RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    if arguments.kernel in RUNNERS:
+        if arguments.baseline_source is None:
+            parser.error("the selected upstream comparison requires --baseline-source")
+        RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
+    else:
+        upstream = (
+            _load_extended_upstream(arguments.kernel, arguments.baseline_source)
+            if arguments.baseline_source is not None
+            else None
+        )
+        run_extended(
+            arguments.kernel,
+            arguments.compiler,
+            intent.TritonTarget(device=0),
+            "Triton",
+            upstream,
+        )
 
 
 if __name__ == "__main__":
