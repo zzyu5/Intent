@@ -25,53 +25,9 @@ Triton Python source
 callable kernel + TTIR/TTGIR/LLVM IR/PTX
 ```
 
-后端语义已经收敛到 C++/MLIR：Python 中不存在 Physical Plan 数据模型、Plan verifier、Plan serializer、stable-softmax realizer 或 Triton source emitter。Python 仍然存在，因为当前 source language 是 Python eDSL，而且 Triton 的目标语言和 JIT host API 本身也是 Python；这两件事不等于“用 Python 决定后端 realization”。
+后端语义由 C++/MLIR 实现。Python 负责承载 eDSL、构造 logical Kernel IR、调用 C++ toolchain，并通过 Triton JIT host API 物化已经生成的目标源码；Physical Plan 构造、Plan legality 和 Triton source emission 都位于 C++ 编译链。
 
 当前只有 canonical stable softmax 从 DSL 真正走到 GPU 并与原始高性能实现比较。其余 frontend 构造只证明能够形成并验证 Kernel MLIR，不代表已有 Triton lowering。
-
-## 冗余代码审计
-
-### 原有重复不是什么
-
-旧代码中并没有第二份 Python Triton source emitter。原 `python/intent/backend/triton/translator.py` 只是调用 C++ `intent-translate` 的 subprocess wrapper，原 runtime 只是执行生成源码。
-
-真正重复的是 stable-softmax 后端语义被分散在两种语言中：
-
-- Python `realizer/triton/softmax.py` 匹配算法并构造 `PhysicalPlan`；
-- Python `realizer/verify.py` 验证同一 Plan；
-- Python `mlir/plan.py` 把 Plan 再序列化为 MLIR；
-- C++ `PlanOp::verify()` 和旧 `Translate.cpp` 又重新检查同一算法、ABI 与 Plan；
-- 旧 `Translate.cpp` 同时承担 matcher、Plan legality 与源码发射，形成单文件多职责。
-
-### 删除的 Python 后端语义
-
-下列实现已经删除，没有保留兼容 shim：
-
-| 删除路径 | 原职责 | 删除原因 |
-|---|---|---|
-| `python/intent/realizer/model.py` | `PhysicalPlan`、launch、tile、storage 等 Python 数据模型 | Plan 的唯一正式表示改为 MLIR dialect |
-| `python/intent/realizer/triton/softmax.py` | Python stable-softmax matcher 与固定 Plan 构造 | realization 迁入 C++ |
-| `python/intent/realizer/verify.py` | Python Plan verifier | Plan legality 由 C++ MLIR verifier 守住 |
-| `python/intent/mlir/plan.py` | Python Plan → MLIR serializer | C++ realizer直接构造 MLIR operation |
-| `python/intent/backend/triton/translator.py` | C++ translator 进程桥接 | 统一迁入 `compiler/toolchain.py`，不再伪装成 backend implementation |
-| `python/intent/backend/triton/target.py` | target host object | 移到中立的 `targets/` 层 |
-| `python/intent/backend/triton/runtime.py` | 目标源码物化 | 移到明确的 `runtime/` 层 |
-| `python/intent/backend/artifact.py` | artifact 数据结构 | 移到 `runtime/`，并去掉 Python Plan/launch 对象依赖 |
-| `python/intent/driver.py` | 混放在包根的端到端编排 | 移到 `compiler/pipeline.py` |
-| `python/intent/definitions.py` | DSL public definitions | 移到 `api/definitions.py` |
-| `python/intent/errors.py` | 跨层错误类型 | 移到 `diagnostics/errors.py` |
-
-全仓库当前没有旧路径 `intent.backend`、`intent.realizer`、`intent.driver`、`intent.definitions`、`intent.errors`、`intent.mlir.plan` 的导入，也没有 `PhysicalPlan`、`LaunchSpec` 或 Python Plan serializer 的实现引用。
-
-### C++ 中保留的重复调用与重复实现之别
-
-`matchStableSoftmax()` 会在 realization、`PlanOp::verify()` 和 translation 边界被调用。这是同一个 `lib/Analysis/StableSoftmax.cpp` 实现被多个不可信 IR 边界复用，不是三份 matcher 代码：
-
-- realizer 在生成 Plan 前确认 Kernel IR 是支持的算法；
-- Plan verifier 在任意组合 MLIR 被解析时确认 Plan 没有改变算法；
-- translator 需要 matcher 返回的 operation 指针与 value/node 信息才能发射。
-
-`intent-translate` CLI 原来在调用 library emitter 前额外执行一次 `mlir::verify()`；library 本身已经完成该验证，这个重复执行已经删除。当前 `lib/Target/Triton/Translate.cpp` 只保留薄入口，算法分析只有一份，目标源码发射只有一份。
 
 ## 目录边界
 
@@ -88,14 +44,28 @@ python/intent/
 ├── diagnostics/
 │   └── errors.py            # 跨阶段异常类型
 ├── frontend/
-│   ├── compiler.py          # source function/module lowering
-│   ├── lowering.py          # FunctionLowerer 与环境/SSA 操作
-│   ├── expressions.py       # Python AST expression lowering
-│   ├── statements.py        # Python AST statement lowering
-│   ├── signature.py         # kernel/helper ABI lowering
-│   └── intrinsics/          # control/tensor/structured/memory 分类
+│   ├── compilation/
+│   │   └── compiler.py      # module/function 构造与 helper specialization
+│   ├── diagnostics/
+│   │   └── errors.py        # frontend location-aware diagnostics
+│   ├── source/
+│   │   ├── unit.py          # Python definition、AST、closure 与 source location
+│   │   └── signature.py     # kernel/helper ABI lowering
+│   └── lowering/
+│       ├── ast/
+│       │   ├── context.py   # FunctionLowerer、SSA environment 与 IRBuilder 接口
+│       │   ├── expressions.py
+│       │   ├── statements.py
+│       │   ├── indexing.py
+│       │   └── model.py     # frontend-only lowering values
+│       └── intrinsics/
+│           ├── common.py
+│           ├── control.py
+│           ├── tensor.py
+│           ├── structured.py
+│           └── memory.py
 ├── ir/
-│   ├── module.py ops.py types.py values.py effects.py
+│   ├── module.py ops.py types.py values.py effects.py locations.py
 │   ├── builder.py
 │   └── verifier.py          # typed Kernel IR semantic verifier
 ├── language/                # 用户可见 annotation、dtype、builtins
@@ -110,7 +80,20 @@ python/intent/
     └── triton.py            # 执行已生成源码并连接 Triton JIT
 ```
 
-根包只有 `__init__.py`，其余实现按职责进入目录。`frontend/` 与 `ir/` 没有为了追求目录外观而继续拆碎：两者分别是 AST lowering 和 typed logical IR，内部文件已经按表达式、语句、签名、intrinsic、type、value、effect、verifier 分工。
+除必要的 `__init__.py` façade 外，目录层只放子目录，叶子层只放同类实现文件。Frontend 的运行时依赖保持为单向 DAG：
+
+```text
+compilation.compiler
+  ├── source.unit + source.signature
+  ├── diagnostics.errors
+  └── lowering.ast.context
+        ├── lowering.ast.statements
+        └── lowering.ast.expressions
+              ├── lowering.ast.indexing
+              └── lowering.intrinsics
+```
+
+`lowering.ast.model` 只保存 frontend lowering 期间的 `Literal`、`ShapeValue`、`StreamSpec`、`LoopContext` 等中间对象；它们不会进入 Kernel IR。`lowering.intrinsics` 按 control、tensor、structured、memory 四个语义域分发。产生实际计算或 memory effect 的 handler 通过同一个 `FunctionLowerer.emit()` 构造 typed Kernel IR operation；`I.auto`、`I.parallel`、`I.ordered`、state stream 等先形成 frontend descriptor，再由 statement lowering 消费并构造对应 region operation。
 
 ### C++/MLIR
 
@@ -146,8 +129,6 @@ tools/
 └── intent-translate/        # Kernel+Plan MLIR → Triton source
 ```
 
-旧的空 `include/Intent/Conversion`、`lib/Conversion/IntentToSCF` 与无实际构建作用的 header-only Target CMake 空壳已经删除。构建目录仍在 `/tmp/intentdsl-build`，没有写入仓库。
-
 ## Python DSL 到 typed Kernel IR
 
 ### Definition 与源码身份
@@ -163,7 +144,7 @@ tools/
 
 ### Signature lowering
 
-`frontend/signature.py` 将 Python annotation 转成 ABI：
+`frontend/source/signature.py` 将 Python annotation 转成 ABI：
 
 - kernel 参数只能是 view、runtime scalar 或 constexpr；
 - view 保存 `In`/`Out`/`InOut`、dtype、symbolic/static shape 与 constraints；
@@ -188,12 +169,13 @@ Helper 不是运行时 Python 调用。它以 `(HelperDefinition, 实参 IRType 
 
 `FunctionLowerer` 把职责分给：
 
-- `statements.lower_statement()`：assignment、expression statement、return、if/for/while、break/continue 等；
-- `expressions.lower_expression()`：name、constant、unary/binary/compare、subscript、call、intrinsic 等；
-- `intrinsics/control.py`：logical control primitives；
-- `intrinsics/tensor.py`：broadcast/reshape/transpose/reduce/scan/contract 等；
-- `intrinsics/structured.py`：domain、parallel、ordered、state stream 等；
-- `intrinsics/memory.py`：view/buffer/gather/scatter/atomic/fence。
+- `lowering/ast/statements.py`：assignment、return、if/for/while、stream block、break/continue；
+- `lowering/ast/expressions.py`：name、constant、unary/binary/compare、subscript、call；
+- `lowering/ast/indexing.py`：view/tensor/buffer/ragged 的 structured index relation；
+- `lowering/intrinsics/control.py`：auto extent、domain、partition、parallel、ordered、state stream、indices/members 与 ragged region；
+- `lowering/intrinsics/tensor.py`：reshape、transpose、full/zeros、record、cast、mask、exp/exp2/log/rsqrt、min/max/add 与 logical reduction；
+- `lowering/intrinsics/structured.py`：reduce、scan、contract 与 combiner helper；
+- `lowering/intrinsics/memory.py`：gather/scatter、logical buffer、store/mutable load、atomic、fence 与 logical RNG。
 
 Kernel 正常走到函数尾会产生 `intent.return`。Helper 必须显式 return，并形成稳定 result schema。Region operation 产生 block argument 与显式 terminator，不能用 Python 控制流对象绕过 IR。
 
@@ -571,8 +553,8 @@ frontend opcode representation coverage: 50/50 PASS
 
 | wrapper latency | 原始上游 | 自动生成 | generated/original |
 |---|---:|---:|---:|
-| p50 | `0.3686 ms` | `0.3686 ms` | `0.9999x` |
-| p95 | `0.3707 ms` | `0.3707 ms` | `1.0000x` |
+| p50 | `0.3693 ms` | `0.3686 ms` | `0.9983x` |
+| p95 | `0.3716 ms` | `0.3707 ms` | `0.9978x` |
 
 这些键和数值是这一次 repro stdout 的观测结果，不是 artifact 对所有 Triton 版本承诺的固定 IR 集合，也没有另外保存 benchmark 日志。这次运行中二者性能实质相同。千分之一量级差异不能解释为稳定加速或回退；当前只做了一次 run，没有跨运行方差、置信区间、cache 清理对照，也没有跨 shape/dtype/GPU 矩阵。
 
