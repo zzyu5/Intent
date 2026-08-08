@@ -68,18 +68,18 @@ SourceEmitter::SourceEmitter(target::KernelModel kernel,
       searchIndex(std::move(searchIndex)), output(output) {}
 
 LogicalResult SourceEmitter::emit() {
-  if (failed(indexABI()) || failed(resolvePhysicalBindings()))
+  return target::emitSource(*this);
+}
+
+LogicalResult SourceEmitter::prepare() {
+  if (failed(indexABI()))
     return failure();
-  emitImports();
-  if (failed(emitKernelHeader()))
-    return failure();
-  target::OperationHandlerRegistry registry;
-  if (failed(registerEmissionHandlers(registry, *this)) ||
-      failed(target::traverseKernel(kernel.entry, registry,
-                                    "cuTile target emission")))
-    return failure();
-  output << "\n\n";
-  return emitWrapper();
+  return resolvePhysicalBindings();
+}
+
+LogicalResult SourceEmitter::registerOperationHandlers(
+    target::OperationHandlerRegistry &registry) {
+  return registerEmissionHandlers(registry, *this);
 }
 
 LogicalResult SourceEmitter::indexABI() {

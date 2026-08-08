@@ -4,6 +4,7 @@
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
+#include "Intent/Target/Common/Emission/Lifecycle.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "llvm/ADT/DenseMap.h"
@@ -49,7 +50,7 @@ struct ABIScalar {
   std::string name;
 };
 
-class SourceEmitter {
+class SourceEmitter : public intent::target::TargetSourceEmitter {
 public:
   SourceEmitter(intent::target::KernelModel kernel,
                 intent::plan::RealizationOp realization,
@@ -76,11 +77,18 @@ public:
   mlir::LogicalResult emitStore(mlir::Operation &operation);
 
 private:
+  mlir::LogicalResult prepare() override;
+  mlir::LogicalResult registerOperationHandlers(
+      intent::target::OperationHandlerRegistry &registry) override;
+  mlir::func::FuncOp entry() const override { return kernel.entry; }
+  llvm::StringRef stage() const override { return "cuTile target emission"; }
+  llvm::raw_ostream &stream() override { return output; }
+
   mlir::LogicalResult indexABI();
   mlir::LogicalResult resolvePhysicalBindings();
-  void emitImports();
-  mlir::LogicalResult emitKernelHeader();
-  mlir::LogicalResult emitWrapper();
+  void emitImports() override;
+  mlir::LogicalResult emitKernelHeader() override;
+  mlir::LogicalResult emitWrapper() override;
 
   mlir::FailureOr<llvm::StringRef> lookupValue(mlir::Operation &consumer,
                                                 unsigned operandIndex);
