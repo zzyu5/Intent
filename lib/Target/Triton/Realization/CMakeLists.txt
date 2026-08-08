@@ -1,5 +1,9 @@
 add_mlir_library(MLIRIntentTritonRealization
-  Rowwise.cpp
+  Driver/Realize.cpp
+  Handlers/Operations.cpp
+  Policy/Decisions.cpp
+  Proof/Semantics.cpp
+  Search/Candidates.cpp
 
   LINK_LIBS PUBLIC
   MLIRFuncDialect
@@ -8,5 +12,10 @@ add_mlir_library(MLIRIntentTritonRealization
   MLIRIntentPlanDialect
   MLIRIntentTransforms
   MLIRIntentTritonDialect
+  MLIRIntentTargetCommon
   MLIRSupport
+)
+
+target_include_directories(MLIRIntentTritonRealization PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
 )

@@ -1,0 +1,56 @@
+#ifndef INTENT_TARGET_COMMON_ANALYSIS_KERNEL_H
+#define INTENT_TARGET_COMMON_ANALYSIS_KERNEL_H
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+
+#include <string>
+
+namespace intent::target {
+
+struct ABIArgument {
+  unsigned index;
+  int64_t valueID;
+  std::string name;
+  mlir::Value value;
+  mlir::Type type;
+  mlir::DictionaryAttr metadata;
+};
+
+struct KernelABI {
+  mlir::func::FuncOp entry;
+  llvm::SmallVector<ABIArgument> arguments;
+};
+
+struct RegionNode {
+  mlir::Operation *operation;
+  mlir::Operation *parent;
+};
+
+struct RegionStructure {
+  llvm::SmallVector<RegionNode> nodes;
+  llvm::DenseMap<mlir::Operation *, unsigned> positions;
+};
+
+struct KernelModel {
+  mlir::func::FuncOp entry;
+  KernelABI abi;
+  RegionStructure regions;
+  llvm::DenseMap<int64_t, mlir::Operation *> nodes;
+};
+
+mlir::FailureOr<int64_t> getNodeID(mlir::Operation &operation,
+                                   llvm::StringRef consumer);
+
+mlir::FailureOr<KernelABI> analyzeKernelABI(mlir::func::FuncOp entry);
+
+mlir::FailureOr<RegionStructure>
+analyzeRegionStructure(mlir::func::FuncOp entry);
+
+mlir::FailureOr<KernelModel> analyzeKernel(mlir::ModuleOp module);
+
+} // namespace intent::target
+
+#endif

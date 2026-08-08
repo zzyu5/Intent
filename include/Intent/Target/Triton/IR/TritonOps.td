@@ -27,7 +27,7 @@ def IntentTriton_AxisOp : IntentTriton_Op<"axis"> {
 def IntentTriton_ProgramOp : IntentTriton_Op<"program"> {
   let arguments = (ins
     I64Attr:$loop_node,
-    I64Attr:$worker_axis,
+    DenseI64ArrayAttr:$worker_axes,
     StrAttr:$traversal,
     StrAttr:$mapping
   );
@@ -59,10 +59,20 @@ def IntentTriton_PointwiseOp : IntentTriton_Op<"pointwise"> {
   let hasVerifier = 1;
 }
 
+def IntentTriton_ContractOp : IntentTriton_Op<"contract"> {
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$lowering,
+    StrAttr:$accumulator_type
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentTriton_BoundaryOp : IntentTriton_Op<"boundary"> {
   let arguments = (ins
     I64Attr:$node,
-    I64Attr:$domain_node,
+    DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$predicate,
     StrAttr:$load_fill,
     StrAttr:$store_mask
@@ -88,6 +98,22 @@ def IntentTriton_LaunchOp : IntentTriton_Op<"launch"> {
   let arguments = (ins
     I64Attr:$loop_node,
     StrAttr:$grid_policy,
+    I64Attr:$num_warps
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTriton_AutotuneOp : IntentTriton_Op<"autotune"> {
+  let arguments = (ins ArrayAttr:$key);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentTriton_ConfigOp : IntentTriton_Op<"config"> {
+  let arguments = (ins
+    DictionaryAttr:$parameters,
+    I64Attr:$num_stages,
     I64Attr:$num_warps
   );
   let results = (outs);

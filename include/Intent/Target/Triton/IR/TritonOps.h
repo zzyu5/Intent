@@ -14,6 +14,9 @@ namespace intent::triton::plan {
 mlir::LogicalResult
 verifyTritonRealization(intent::plan::RealizationOp realization);
 
+mlir::LogicalResult
+verifyTritonSearchSpace(intent::plan::SearchSpaceOp searchSpace);
+
 } // namespace intent::triton::plan
 
 #endif

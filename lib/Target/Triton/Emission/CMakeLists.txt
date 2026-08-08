@@ -1,6 +1,7 @@
 add_mlir_library(MLIRIntentTritonEmission
-  Emitter.cpp
-  Translate.cpp
+  Driver/Translate.cpp
+  Handlers/Operations.cpp
+  Source/Emitter.cpp
 
   LINK_LIBS PUBLIC
   MLIRFuncDialect
@@ -9,5 +10,10 @@ add_mlir_library(MLIRIntentTritonEmission
   MLIRIntentPlanDialect
   MLIRIntentTransforms
   MLIRIntentTritonDialect
+  MLIRIntentTargetCommon
   MLIRSupport
+)
+
+target_include_directories(MLIRIntentTritonEmission PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
 )
