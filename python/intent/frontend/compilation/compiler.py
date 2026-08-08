@@ -6,13 +6,12 @@ from dataclasses import dataclass
 from intent.api import Definition
 from intent.api import HelperDefinition
 from intent.api import KernelDefinition
-from intent.ir import Function
-from intent.ir import FunctionKind
-from intent.ir import IRBuilder
-from intent.ir import IRType
-from intent.ir import Module
-from intent.ir import ParameterSpec
-from intent.ir import verify
+from intent.frontend.mlir import FunctionState
+from intent.frontend.mlir import FunctionKind
+from intent.frontend.mlir import MlirBuilder
+from intent.frontend.mlir import canonicalize_mlir
+from intent.frontend.semantics import ValueType
+from intent.frontend.mlir import ParameterSpec
 
 from ..diagnostics.errors import FrontendError
 from ..lowering.ast.context import FunctionLowerer
@@ -24,7 +23,7 @@ from ..source.unit import SourceUnit
 @dataclass(frozen=True, slots=True)
 class HelperKey:
     definition: HelperDefinition[object, object]
-    argument_types: tuple[IRType, ...]
+    argument_types: tuple[ValueType, ...]
 
 
 class FrontendCompiler:
@@ -36,11 +35,11 @@ class FrontendCompiler:
         self.definition = definition
         self.source = SourceUnit.from_definition(definition)
         self.signature = lower_kernel_signature(definition, self.source, constexprs)
-        self.builder = IRBuilder(definition.__name__, self.source.location(self.source.function))
-        self.helper_cache: dict[HelperKey, Function] = {}
+        self.builder = MlirBuilder(definition.__name__, self.source.location(self.source.function))
+        self.helper_cache: dict[HelperKey, FunctionState] = {}
         self.active_helpers: set[HelperKey] = set()
 
-    def lower(self) -> Module:
+    def lower(self) -> str:
         function = self.builder.function(
             self.definition.__name__,
             FunctionKind.KERNEL,
@@ -56,15 +55,14 @@ class FrontendCompiler:
             constexpr_values=self.signature.constexpr_values,
         )
         lowerer.lower()
-        verify(self.builder.module)
-        return self.builder.module
+        return canonicalize_mlir(self.builder.emit_module())
 
     def lower_helper(
         self,
         definition: HelperDefinition[object, object],
-        argument_types: tuple[IRType, ...],
+        argument_types: tuple[ValueType, ...],
         call_location: object,
-    ) -> Function:
+    ) -> FunctionState:
         key = HelperKey(definition, argument_types)
         cached = self.helper_cache.get(key)
         if cached is not None and key not in self.active_helpers:
@@ -100,7 +98,7 @@ class FrontendCompiler:
     def _helper_symbol(
         self,
         definition: Definition[object, object],
-        argument_types: tuple[IRType, ...],
+        argument_types: tuple[ValueType, ...],
     ) -> str:
         suffix = "__".join(self._sanitize(value_type.format()) for value_type in argument_types)
         base = self._sanitize(definition.__name__)
@@ -112,11 +110,11 @@ class FrontendCompiler:
         return sanitized or "value"
 
 
-def lower_to_kernel_ir(
+def lower_to_mlir(
     definition: KernelDefinition[object, object],
     *,
     constexprs: dict[str, object] | None = None,
-) -> Module:
+) -> str:
     if not isinstance(definition, KernelDefinition):
-        raise TypeError("lower_to_kernel_ir expects an @intent.kernel definition")
+        raise TypeError("lower_to_mlir expects an @intent.kernel definition")
     return FrontendCompiler(definition, dict(constexprs or {})).lower()

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class OpCode(Enum):
+class OperationKind(Enum):
     CONSTANT = "constant"
     DIM = "dim"
 
@@ -67,42 +67,42 @@ class OpCode(Enum):
 
 
 TERMINATORS = {
-    OpCode.YIELD,
-    OpCode.CONDITION,
-    OpCode.BREAK,
-    OpCode.CONTINUE,
-    OpCode.RETURN,
+    OperationKind.YIELD,
+    OperationKind.CONDITION,
+    OperationKind.BREAK,
+    OperationKind.CONTINUE,
+    OperationKind.RETURN,
 }
 
 REGION_OPS = {
-    OpCode.PARALLEL,
-    OpCode.ORDERED,
-    OpCode.STATE_STREAM,
-    OpCode.IF,
-    OpCode.FOR,
-    OpCode.WHILE,
+    OperationKind.PARALLEL,
+    OperationKind.ORDERED,
+    OperationKind.STATE_STREAM,
+    OperationKind.IF,
+    OperationKind.FOR,
+    OperationKind.WHILE,
 }
 
 STRUCTURED_OPS = {
-    OpCode.REDUCE,
-    OpCode.SCAN,
-    OpCode.CONTRACT,
-    OpCode.PARALLEL,
-    OpCode.ORDERED,
-    OpCode.STATE_STREAM,
+    OperationKind.REDUCE,
+    OperationKind.SCAN,
+    OperationKind.CONTRACT,
+    OperationKind.PARALLEL,
+    OperationKind.ORDERED,
+    OperationKind.STATE_STREAM,
 }
 
 EFFECTFUL_OPS = {
-    OpCode.VIEW_LOAD,
-    OpCode.VIEW_STORE,
-    OpCode.SCATTER_UNIQUE,
-    OpCode.SCATTER_REDUCE,
-    OpCode.BUFFER_LOAD,
-    OpCode.BUFFER_STORE,
-    OpCode.ATOMIC_ADD,
-    OpCode.ATOMIC_CAS,
-    OpCode.FENCE,
-    OpCode.RANDOM,
+    OperationKind.VIEW_LOAD,
+    OperationKind.VIEW_STORE,
+    OperationKind.SCATTER_UNIQUE,
+    OperationKind.SCATTER_REDUCE,
+    OperationKind.BUFFER_LOAD,
+    OperationKind.BUFFER_STORE,
+    OperationKind.ATOMIC_ADD,
+    OperationKind.ATOMIC_CAS,
+    OperationKind.FENCE,
+    OperationKind.RANDOM,
 }
 
 

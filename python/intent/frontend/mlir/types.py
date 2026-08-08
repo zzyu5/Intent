@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-from intent.ir import BufferType
-from intent.ir import ConstexprType
-from intent.ir import DomainType
-from intent.ir import DynamicDim
-from intent.ir import EnumType
-from intent.ir import IRType
-from intent.ir import LogicalIndexType
-from intent.ir import PartitionType
-from intent.ir import RaggedType
-from intent.ir import RecordType
-from intent.ir import RegionType
-from intent.ir import ScalarType
-from intent.ir import StaticDim
-from intent.ir import SymbolDim
-from intent.ir import TensorType
 from intent.language import DType
+
+from ..semantics.types import BufferType
+from ..semantics.types import ConstexprType
+from ..semantics.types import DomainType
+from ..semantics.types import DynamicDim
+from ..semantics.types import EnumType
+from ..semantics.types import LogicalIndexType
+from ..semantics.types import PartitionType
+from ..semantics.types import RaggedType
+from ..semantics.types import RecordType
+from ..semantics.types import RegionType
+from ..semantics.types import ScalarType
+from ..semantics.types import StaticDim
+from ..semantics.types import SymbolDim
+from ..semantics.types import TensorType
+from ..semantics.types import ValueType
 
 
 _DTYPE_TYPES = {
@@ -40,7 +41,7 @@ _DTYPE_TYPES = {
 }
 
 
-def emit_type(value_type: IRType) -> str:
+def emit_type(value_type: ValueType) -> str:
     if isinstance(value_type, ScalarType):
         return emit_dtype(value_type.dtype)
     if isinstance(value_type, TensorType):
@@ -80,14 +81,14 @@ def emit_view_type(value_type: TensorType, access: str) -> str:
     return f"!intent.view<{emit_type(value_type)}, {quote(access)}>"
 
 
-def emit_type_metadata(value_type: IRType) -> str:
+def emit_type_metadata(value_type: ValueType) -> str:
     if isinstance(value_type, EnumType):
         members = ",".join(f"{name}={value}" for name, value in value_type.members)
         return f"enum<{value_type.name};{members}>"
     return value_type.format()
 
 
-def emit_shape_metadata(value_type: IRType) -> list[str] | None:
+def emit_shape_metadata(value_type: ValueType) -> list[str] | None:
     if not isinstance(value_type, (TensorType, BufferType)):
         return None
     result: list[str] = []

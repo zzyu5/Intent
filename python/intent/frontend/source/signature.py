@@ -6,13 +6,13 @@ from dataclasses import dataclass
 
 from intent.api import Definition
 from intent.api import DefinitionKind
-from intent.ir import ConstexprType
-from intent.ir import FunctionKind
-from intent.ir import IRType
-from intent.ir import ParameterKind
-from intent.ir import ParameterSpec
-from intent.ir import TensorType
-from intent.ir import type_from_annotation
+from intent.frontend.semantics import ConstexprType
+from intent.frontend.mlir import FunctionKind
+from intent.frontend.semantics import ValueType
+from intent.frontend.mlir import ParameterKind
+from intent.frontend.mlir import ParameterSpec
+from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import type_from_annotation
 from intent.language import ConstexprSpec
 from intent.language import DType
 from intent.language import ViewSpec
@@ -120,7 +120,7 @@ def lower_kernel_signature(
 
 def lower_helper_parameters(
     source: SourceUnit,
-    argument_types: tuple[IRType, ...],
+    argument_types: tuple[ValueType, ...],
 ) -> tuple[ParameterSpec, ...]:
     if source.function.args.kwonlyargs:
         raise FrontendError(

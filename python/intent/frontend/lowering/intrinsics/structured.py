@@ -4,14 +4,14 @@ import ast
 from typing import TYPE_CHECKING
 
 from intent.api import HelperDefinition
-from intent.ir import BinaryOperator
-from intent.ir import IRType
-from intent.ir import OpCode
-from intent.ir import RecordType
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import Value
-from intent.ir.types import dims_compatible
+from intent.frontend.semantics import BinaryOperator
+from intent.frontend.semantics import ValueType
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import RecordType
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics.types import dims_compatible
 from intent.language import DType
 from intent.language.builtins import Intrinsic
 
@@ -42,7 +42,7 @@ def lower_structured_intrinsic(
     return NotImplemented
 
 
-def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> Value:
+def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -72,8 +72,8 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> Value:
             for axis, dimension in enumerate(source.type.shape)
             if axis not in normalized
         )
-        result_type: IRType = lowerer.value_result_type(acc_dtype, result_shape)
-        accumulator_type: IRType = ScalarType(acc_dtype)
+        result_type: ValueType = lowerer.value_result_type(acc_dtype, result_shape)
+        accumulator_type: ValueType = ScalarType(acc_dtype)
         attributes: dict[str, object] = {"axes": axes, "acc_dtype": acc_dtype}
     elif isinstance(source.type, RecordType):
         if "acc_dtype" in bound:
@@ -104,7 +104,7 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> Value:
         )
     attributes["combine"] = combine
     operation = lowerer.emit(
-        OpCode.REDUCE,
+        OperationKind.REDUCE,
         lowerer.location(node),
         operands=(source, identity),
         result_types=(result_type,),
@@ -113,7 +113,7 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _scan(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -140,8 +140,8 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> Value:
             bound["identity"],
             ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
         )
-        accumulator_type: IRType = ScalarType(acc_dtype)
-        result_type: IRType = TensorType(acc_dtype, source.type.shape)
+        accumulator_type: ValueType = ScalarType(acc_dtype)
+        result_type: ValueType = TensorType(acc_dtype, source.type.shape)
         attributes: dict[str, object] = {
             "axis": axes[0],
             "inclusive": inclusive,
@@ -169,7 +169,7 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         (accumulator_type,),
     )
     operation = lowerer.emit(
-        OpCode.SCAN,
+        OperationKind.SCAN,
         lowerer.location(node),
         operands=(source, identity),
         result_types=(result_type,),
@@ -178,7 +178,7 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _contract(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -234,7 +234,7 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> Value:
             (accumulator_type,),
         )
     operation = lowerer.emit(
-        OpCode.CONTRACT,
+        OperationKind.CONTRACT,
         lowerer.location(node),
         operands=(lhs, rhs),
         result_types=(TensorType(acc_dtype, result_shape),),
@@ -251,8 +251,8 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> Value:
 def _callable_symbol(
     lowerer: FunctionLowerer,
     node: ast.AST,
-    operand_types: tuple[IRType, ...],
-    result_types: tuple[IRType, ...],
+    operand_types: tuple[ValueType, ...],
+    result_types: tuple[ValueType, ...],
 ) -> object:
     expression = lowerer.lower_expression(node)
     if isinstance(expression, Intrinsic):
@@ -313,13 +313,13 @@ def _record_result_type(
     result_shape = shape if scan else tuple(
         dimension for axis, dimension in enumerate(shape) if axis not in normalized
     )
-    fields: list[tuple[str, IRType]] = []
+    fields: list[tuple[str, ValueType]] = []
     for (name, source_type), (_, identity_type) in zip(source.fields, identity.fields):
         if not isinstance(source_type, TensorType) or not isinstance(identity_type, ScalarType):
             lowerer.error(node, "record identity fields must be scalars")
         if source_type.dtype != identity_type.dtype:
             lowerer.error(node, "record accumulation dtype changes require explicit field casts")
-        result_type: IRType = identity_type
+        result_type: ValueType = identity_type
         if result_shape:
             result_type = TensorType(identity_type.dtype, result_shape)
         fields.append((name, result_type))

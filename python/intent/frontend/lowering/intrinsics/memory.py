@@ -3,20 +3,20 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.ir import AtomicOrdering
-from intent.ir import BufferType
-from intent.ir import Effect
-from intent.ir import EffectKind
-from intent.ir import IndexRelation
-from intent.ir import LogicalIndexType
-from intent.ir import MemoryScope
-from intent.ir import OpCode
-from intent.ir import ResourceKind
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import Value
-from intent.ir import broadcast_shape
-from intent.ir.types import is_integer
+from intent.frontend.semantics import AtomicOrdering
+from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import Effect
+from intent.frontend.semantics import EffectKind
+from intent.frontend.semantics import IndexRelation
+from intent.frontend.semantics import LogicalIndexType
+from intent.frontend.semantics import MemoryScope
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import ResourceKind
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics.types import is_integer
 from intent.language import f32
 from intent.language import bool as intent_bool
 from intent.language import index as intent_index
@@ -57,7 +57,7 @@ def lower_memory_intrinsic(
     return handler(lowerer, node)
 
 
-def _gather(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -113,7 +113,7 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     }
     attributes.update(_optional_ordering(lowerer, bound, node))
     operation = lowerer.emit(
-        OpCode.GATHER,
+        OperationKind.GATHER,
         lowerer.location(node),
         operands=operands,
         result_types=(lowerer.value_result_type(source.type.dtype, result_shape),),
@@ -162,7 +162,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
         )
     attributes.update(_optional_ordering(lowerer, bound, node))
     lowerer.emit(
-        OpCode.SCATTER_REDUCE if reduce else OpCode.SCATTER_UNIQUE,
+        OperationKind.SCATTER_REDUCE if reduce else OperationKind.SCATTER_UNIQUE,
         lowerer.location(node),
         operands=operands,
         attributes=attributes,
@@ -171,7 +171,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
     return StaticTuple(())
 
 
-def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -180,7 +180,7 @@ def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     )
     dtype = require_dtype(lowerer, bound["dtype"])
     shape = lower_shape(lowerer, bound["shape"])
-    operands: tuple[Value, ...] = ()
+    operands: tuple[MlirValue, ...] = ()
     if "init" in bound:
         expression = lowerer.lower_expression(bound["init"])
         initializer = lowerer.materialize(
@@ -190,7 +190,7 @@ def _buffer(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         )
         operands = (initializer,)
     operation = lowerer.emit(
-        OpCode.BUFFER,
+        OperationKind.BUFFER,
         lowerer.location(node),
         operands=operands,
         result_types=(BufferType(dtype, shape),),
@@ -225,13 +225,13 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     }
     attributes.update(_optional_ordering(lowerer, bound, node))
     if isinstance(target.type, BufferType):
-        opcode = OpCode.BUFFER_STORE
+        opcode = OperationKind.BUFFER_STORE
         effect = Effect(EffectKind.WRITE, ResourceKind.LOGICAL_BUFFER, target)
     else:
         if target not in lowerer.view_kinds:
             lowerer.error(node, "pure tensor SSA cannot be mutated")
         lowerer.require_writable_view(target, node)
-        opcode = OpCode.VIEW_STORE
+        opcode = OperationKind.VIEW_STORE
         effect = Effect(EffectKind.WRITE, ResourceKind.EXTERNAL_VIEW, target)
     lowerer.emit(
         opcode,
@@ -243,7 +243,7 @@ def _store(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     return StaticTuple(())
 
 
-def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -257,13 +257,13 @@ def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     attributes: dict[str, object] = {"index": lowered.relation}
     attributes.update(_optional_ordering(lowerer, bound, node))
     if isinstance(target.type, BufferType):
-        opcode = OpCode.BUFFER_LOAD
+        opcode = OperationKind.BUFFER_LOAD
         resource = ResourceKind.LOGICAL_BUFFER
     else:
         if target not in lowerer.view_kinds:
             lowerer.error(node, "mutable_load tensor target must be an external view")
         lowerer.require_readable_view(target, node)
-        opcode = OpCode.VIEW_LOAD
+        opcode = OperationKind.VIEW_LOAD
         resource = ResourceKind.EXTERNAL_VIEW
     operation = lowerer.emit(
         opcode,
@@ -291,7 +291,7 @@ def _atomic_add(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         **_required_ordering(lowerer, bound, node),
     }
     lowerer.emit(
-        OpCode.ATOMIC_ADD,
+        OperationKind.ATOMIC_ADD,
         lowerer.location(node),
         operands=operands,
         attributes=attributes,
@@ -300,7 +300,7 @@ def _atomic_add(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     return StaticTuple(())
 
 
-def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -335,7 +335,7 @@ def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         lowerer.error(node, "atomic_cas compare and value types must match exactly")
     operands = (target, *lowered.operands, compare, value)
     operation = lowerer.emit(
-        OpCode.ATOMIC_CAS,
+        OperationKind.ATOMIC_CAS,
         lowerer.location(node),
         operands=operands,
         result_types=(value.type,),
@@ -353,7 +353,7 @@ def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> Value:
 def _fence(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     bound = bind_call(lowerer, node, ("ordering", "scope"))
     lowerer.emit(
-        OpCode.FENCE,
+        OperationKind.FENCE,
         lowerer.location(node),
         attributes=_required_ordering(lowerer, bound, node),
         effects=(Effect(EffectKind.FENCE, ResourceKind.ORDERING),),
@@ -361,7 +361,7 @@ def _fence(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     return StaticTuple(())
 
 
-def _random(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("seed", "index", "dtype"), required=("seed", "index"))
     seed = lowerer.materialize(lowerer.lower_expression(bound["seed"]), bound["seed"])
     identity = lowerer.materialize(lowerer.lower_expression(bound["index"]), bound["index"])
@@ -379,7 +379,7 @@ def _random(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     else:
         lowerer.error(node, "random identity must be logical index/index tensor")
     operation = lowerer.emit(
-        OpCode.RANDOM,
+        OperationKind.RANDOM,
         lowerer.location(node),
         operands=(seed, identity),
         result_types=(lowerer.value_result_type(dtype, shape),),
@@ -394,7 +394,7 @@ def _atomic_inputs(
     node: ast.Call,
     *,
     first_position: int,
-) -> tuple[Value, object, Value]:
+) -> tuple[MlirValue, object, MlirValue]:
     target = lowerer.materialize(lowerer.lower_expression(bound["target"]), bound["target"])
     if not isinstance(target.type, (TensorType, BufferType)):
         lowerer.error(node, "atomic target must be view or buffer")
@@ -413,7 +413,7 @@ def _atomic_inputs(
     return target, lowered, value
 
 
-def _atomic_effect(target: Value) -> Effect:
+def _atomic_effect(target: MlirValue) -> Effect:
     resource = (
         ResourceKind.LOGICAL_BUFFER
         if isinstance(target.type, BufferType)

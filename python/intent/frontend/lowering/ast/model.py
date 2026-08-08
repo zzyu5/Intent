@@ -4,10 +4,10 @@ import ast
 from dataclasses import dataclass
 from typing import TypeAlias
 
-from intent.ir import AutoExtent
-from intent.ir import DimExpr
-from intent.ir import OpCode
-from intent.ir import Value
+from intent.frontend.semantics import AutoExtent
+from intent.frontend.semantics import DimExpr
+from intent.frontend.semantics import OperationKind
+from intent.frontend.mlir import MlirValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,13 +18,13 @@ class Literal:
 @dataclass(frozen=True, slots=True)
 class ConstexprBinding:
     python_value: object
-    ir_value: Value
+    ir_value: MlirValue
 
 
 @dataclass(frozen=True, slots=True)
 class ShapeDimension:
     dimension: DimExpr
-    source: Value
+    source: MlirValue
     axis: int
 
 
@@ -35,17 +35,17 @@ class ShapeValue:
 
 @dataclass(frozen=True, slots=True)
 class IterationSpec:
-    opcode: OpCode
-    source: Value
+    opcode: OperationKind
+    source: MlirValue
 
 
 @dataclass(slots=True)
 class StreamSpec:
-    axis: Value
-    initial_state: tuple[Value, ...]
-    extent: AutoExtent | Value
+    axis: MlirValue
+    initial_state: tuple[MlirValue, ...]
+    extent: AutoExtent | MlirValue
     ast_node: ast.AST
-    results: tuple[Value, ...] | None = None
+    results: tuple[MlirValue, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +54,7 @@ class StaticTuple:
 
 
 Expression: TypeAlias = (
-    Value
+    MlirValue
     | Literal
     | ConstexprBinding
     | ShapeDimension
@@ -69,10 +69,10 @@ Expression: TypeAlias = (
 
 @dataclass(slots=True)
 class LoopContext:
-    opcode: OpCode
+    opcode: OperationKind
     carried_names: tuple[str, ...]
     stream: StreamSpec | None = None
-    pending_stream_state: tuple[Value, ...] | None = None
+    pending_stream_state: tuple[MlirValue, ...] | None = None
 
 
 __all__ = [

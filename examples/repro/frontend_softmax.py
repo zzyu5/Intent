@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,8 +11,7 @@ import triton
 
 import intent
 import intent.language as I
-from intent.ir import OpCode
-from intent.ir import walk_operations
+from intent.frontend.semantics import OperationKind
 
 
 POINTS = 1_000_003
@@ -362,7 +362,7 @@ def moe_expert_ffn(
             )
 
 
-def _lower_all(intent_opt: str) -> set[OpCode]:
+def _lower_all(intent_opt: str) -> set[OperationKind]:
     definitions = (
         (vector_add, None),
         (tensor_showcase, None),
@@ -376,15 +376,13 @@ def _lower_all(intent_opt: str) -> set[OpCode]:
         (reduction_pass2, None),
         (moe_expert_ffn, None),
     )
-    covered: set[OpCode] = set()
+    covered: set[OperationKind] = set()
     for definition, constexprs in definitions:
-        module = intent.lower_to_kernel_ir(definition, constexprs=constexprs)
+        mlir = intent.lower_to_mlir(definition, constexprs=constexprs)
         covered.update(
-            operation.opcode
-            for function in module.functions
-            for operation in walk_operations(function.body)
+            OperationKind(name)
+            for name in re.findall(r'"intent\.([a-z_]+)"\(', mlir)
         )
-        mlir = intent.emit_mlir(module)
         subprocess.run(
             [intent_opt, "--verify-intent-kernel"],
             input=mlir,
@@ -393,7 +391,7 @@ def _lower_all(intent_opt: str) -> set[OpCode]:
             check=True,
         )
         print(f"frontend MLIR: {definition.__name__}: PASS")
-    missing = set(OpCode) - covered
+    missing = set(OperationKind) - covered
     if missing:
         names = ", ".join(sorted(opcode.value for opcode in missing))
         raise RuntimeError(f"frontend opcode coverage is incomplete: {names}")

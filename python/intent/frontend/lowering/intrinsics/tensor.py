@@ -3,14 +3,14 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.ir import BinaryOperator
-from intent.ir import OpCode
-from intent.ir import RecordType
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import UnaryOperator
-from intent.ir import Value
-from intent.ir import broadcast_shape
+from intent.frontend.semantics import BinaryOperator
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import RecordType
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import UnaryOperator
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics import broadcast_shape
 from intent.language import DType
 from intent.language import bool as intent_bool
 
@@ -54,14 +54,14 @@ def lower_tensor_intrinsic(
     return handler(lowerer, node)
 
 
-def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("value", "shape"), required=("value", "shape"))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     if not isinstance(source.type, TensorType):
         lowerer.error(node, "I.reshape input must be a tensor")
     shape = lower_shape(lowerer, bound["shape"])
     operation = lowerer.emit(
-        OpCode.RESHAPE,
+        OperationKind.RESHAPE,
         lowerer.location(node),
         operands=(source,),
         result_types=(TensorType(source.type.dtype, shape),),
@@ -69,7 +69,7 @@ def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _transpose(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _transpose(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("value", "permutation"), required=("value",))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     if not isinstance(source.type, TensorType):
@@ -82,7 +82,7 @@ def _transpose(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         lowerer.error(node, "transpose permutation must cover every axis")
     result_shape = tuple(source.type.shape[axis] for axis in permutation)
     operation = lowerer.emit(
-        OpCode.TRANSPOSE,
+        OperationKind.TRANSPOSE,
         lowerer.location(node),
         operands=(source,),
         result_types=(TensorType(source.type.dtype, result_shape),),
@@ -91,7 +91,7 @@ def _transpose(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _full(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _full(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -106,7 +106,7 @@ def _full(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         ScalarType(dtype),
     )
     operation = lowerer.emit(
-        OpCode.FULL,
+        OperationKind.FULL,
         lowerer.location(node),
         operands=(fill,),
         result_types=(TensorType(dtype, shape),),
@@ -114,23 +114,23 @@ def _full(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _zeros(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _zeros(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("shape", "dtype"), required=("shape", "dtype"))
     dtype = require_dtype(lowerer, bound["dtype"])
     shape = lower_shape(lowerer, bound["shape"])
     operation = lowerer.emit(
-        OpCode.ZEROS,
+        OperationKind.ZEROS,
         lowerer.location(node),
         result_types=(TensorType(dtype, shape),),
     )
     return operation.results[0]
 
 
-def _record(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _record(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     if node.args or not node.keywords:
         lowerer.error(node, "I.record requires one or more named fields")
     names: list[str] = []
-    values: list[Value] = []
+    values: list[MlirValue] = []
     for keyword in node.keywords:
         if keyword.arg is None:
             lowerer.error(keyword, "record does not support **field expansion")
@@ -138,7 +138,7 @@ def _record(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         values.append(lowerer.materialize(lowerer.lower_expression(keyword.value), keyword.value))
     result_type = RecordType(tuple((name, value.type) for name, value in zip(names, values)))
     operation = lowerer.emit(
-        OpCode.MAKE_RECORD,
+        OperationKind.MAKE_RECORD,
         lowerer.location(node),
         operands=tuple(values),
         result_types=(result_type,),
@@ -147,13 +147,13 @@ def _record(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _cast(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("value", "dtype"), required=("value", "dtype"))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     dtype = require_dtype(lowerer, bound["dtype"])
     _, shape = lowerer.dtype_and_shape(source.type, node)
     operation = lowerer.emit(
-        OpCode.CAST,
+        OperationKind.CAST,
         lowerer.location(node),
         operands=(source,),
         result_types=(lowerer.value_result_type(dtype, shape),),
@@ -161,7 +161,7 @@ def _cast(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _mask(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _mask(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -194,7 +194,7 @@ def _mask(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     predicate = lowerer.broadcast_value(predicate, result_shape, node)
     fill = lowerer.broadcast_value(fill, result_shape, node)
     operation = lowerer.emit(
-        OpCode.MASK,
+        OperationKind.MASK,
         lowerer.location(node),
         operands=(value, predicate, fill),
         result_types=(result_type,),
@@ -206,11 +206,11 @@ def _unary(
     lowerer: FunctionLowerer,
     node: ast.Call,
     operator: UnaryOperator,
-) -> Value:
+) -> MlirValue:
     bound = bind_call(lowerer, node, ("value",), required=("value",))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     operation = lowerer.emit(
-        OpCode.UNARY,
+        OperationKind.UNARY,
         lowerer.location(node),
         operands=(source,),
         result_types=(source.type,),
@@ -223,7 +223,7 @@ def _binary(
     lowerer: FunctionLowerer,
     node: ast.Call,
     operator: BinaryOperator,
-) -> Value:
+) -> MlirValue:
     bound = bind_call(lowerer, node, ("lhs", "rhs"), required=("lhs", "rhs"))
     lhs_expression = lowerer.lower_expression(bound["lhs"])
     rhs_expression = lowerer.lower_expression(bound["rhs"])
@@ -233,7 +233,7 @@ def _binary(
     lhs = lowerer.broadcast_value(lhs, result_shape, node)
     rhs = lowerer.broadcast_value(rhs, result_shape, node)
     operation = lowerer.emit(
-        OpCode.BINARY,
+        OperationKind.BINARY,
         lowerer.location(node),
         operands=(lhs, rhs),
         result_types=(result_type,),
@@ -247,7 +247,7 @@ def _logical_reduce(
     node: ast.Call,
     *,
     any_value: bool,
-) -> Value:
+) -> MlirValue:
     bound = bind_call(lowerer, node, ("value", "axis"), required=("value",))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     if not isinstance(source.type, TensorType) or source.type.dtype != intent_bool:
@@ -261,7 +261,7 @@ def _logical_reduce(
     )
     result_type = lowerer.value_result_type(intent_bool, result_shape)
     operation = lowerer.emit(
-        OpCode.REDUCE,
+        OperationKind.REDUCE,
         lowerer.location(node),
         operands=(source, identity),
         result_types=(result_type,),

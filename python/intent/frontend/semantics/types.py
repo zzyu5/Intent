@@ -78,7 +78,7 @@ def normalize_shape(shape: Iterable[int | str | DimExpr]) -> Shape:
     return tuple(normalize_dim(dim) for dim in shape)
 
 
-class IRType:
+class ValueType:
     __slots__ = ()
 
     def format(self) -> str:
@@ -89,7 +89,7 @@ class IRType:
 
 
 @dataclass(frozen=True, slots=True)
-class ScalarType(IRType):
+class ScalarType(ValueType):
     dtype: DType
 
     def __post_init__(self) -> None:
@@ -101,7 +101,7 @@ class ScalarType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class EnumType(IRType):
+class EnumType(ValueType):
     name: str
     members: tuple[tuple[str, int], ...]
 
@@ -130,19 +130,19 @@ class EnumType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class ConstexprType(IRType):
-    value_type: IRType
+class ConstexprType(ValueType):
+    value_type: ValueType
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value_type, IRType):
-            raise TypeError("constexpr value type must be an IRType")
+        if not isinstance(self.value_type, ValueType):
+            raise TypeError("constexpr value type must be an ValueType")
 
     def format(self) -> str:
         return f"constexpr<{self.value_type}>"
 
 
 @dataclass(frozen=True, slots=True)
-class TensorType(IRType):
+class TensorType(ValueType):
     dtype: DType
     shape: Shape
 
@@ -161,7 +161,7 @@ class TensorType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class LogicalIndexType(IRType):
+class LogicalIndexType(ValueType):
     relation: str
 
     def __post_init__(self) -> None:
@@ -182,7 +182,7 @@ class DomainFlavor(Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class DomainType(IRType):
+class DomainType(ValueType):
     flavor: DomainFlavor = DomainFlavor.DENSE
     rank: int = 1
 
@@ -199,7 +199,7 @@ class DomainType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class RegionType(IRType):
+class RegionType(ValueType):
     rank: int = 1
     relation: str = "domain"
 
@@ -221,7 +221,7 @@ class PartitionMode(Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class PartitionType(IRType):
+class PartitionType(ValueType):
     mode: PartitionMode
     region_type: RegionType
 
@@ -236,7 +236,7 @@ class PartitionType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class RaggedType(IRType):
+class RaggedType(ValueType):
     outer: DomainType
     member: DomainType
 
@@ -255,7 +255,7 @@ class RaggedType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class BufferType(IRType):
+class BufferType(ValueType):
     dtype: DType
     shape: Shape
 
@@ -270,8 +270,8 @@ class BufferType(IRType):
 
 
 @dataclass(frozen=True, slots=True)
-class RecordType(IRType):
-    fields: tuple[tuple[str, IRType], ...]
+class RecordType(ValueType):
+    fields: tuple[tuple[str, ValueType], ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fields", tuple(self.fields))
@@ -281,10 +281,10 @@ class RecordType(IRType):
             not isinstance(field, tuple)
             or len(field) != 2
             or not isinstance(field[0], str)
-            or not isinstance(field[1], IRType)
+            or not isinstance(field[1], ValueType)
             for field in self.fields
         ):
-            raise TypeError("record fields must be (name, IRType) pairs")
+            raise TypeError("record fields must be (name, ValueType) pairs")
         names = [name for name, _ in self.fields]
         if any(not name or not name.isidentifier() for name in names):
             raise ValueError("record field names must be identifiers")
@@ -296,7 +296,7 @@ class RecordType(IRType):
         return f"record<{body}>"
 
 
-def type_from_annotation(annotation: object) -> IRType:
+def type_from_annotation(annotation: object) -> ValueType:
     if isinstance(annotation, ViewSpec):
         return TensorType(annotation.dtype, normalize_shape(annotation.shape))
     if isinstance(annotation, DType):
@@ -307,7 +307,7 @@ def type_from_annotation(annotation: object) -> IRType:
     return type_from_python_type(annotation)
 
 
-def type_from_python_type(value_type: object) -> IRType:
+def type_from_python_type(value_type: object) -> ValueType:
     from enum import IntEnum
 
     from intent.language import bool as intent_bool
@@ -328,7 +328,7 @@ def type_from_python_type(value_type: object) -> IRType:
     raise TypeError(f"unsupported Intent annotation: {value_type!r}")
 
 
-def is_boolean(value_type: IRType) -> bool:
+def is_boolean(value_type: ValueType) -> bool:
     if isinstance(value_type, ConstexprType):
         return is_boolean(value_type.value_type)
     return (
@@ -337,7 +337,7 @@ def is_boolean(value_type: IRType) -> bool:
     )
 
 
-def is_integer(value_type: IRType) -> bool:
+def is_integer(value_type: ValueType) -> bool:
     if isinstance(value_type, ConstexprType):
         return is_integer(value_type.value_type)
     return isinstance(value_type, (ScalarType, LogicalIndexType)) and (
@@ -351,7 +351,7 @@ def is_integer(value_type: IRType) -> bool:
     )
 
 
-def is_numeric(value_type: IRType) -> bool:
+def is_numeric(value_type: ValueType) -> bool:
     if isinstance(value_type, ConstexprType):
         return is_numeric(value_type.value_type)
     if isinstance(value_type, LogicalIndexType):
@@ -367,7 +367,7 @@ def dims_compatible(lhs: DimExpr, rhs: DimExpr) -> bool:
     return False
 
 
-def types_compatible(lhs: IRType, rhs: IRType) -> bool:
+def types_compatible(lhs: ValueType, rhs: ValueType) -> bool:
     if lhs == rhs:
         return True
     if isinstance(lhs, TensorType) and isinstance(rhs, TensorType):

@@ -5,16 +5,16 @@ import operator
 from enum import IntEnum
 
 from intent.api import HelperDefinition
-from intent.ir import BinaryOperator
-from intent.ir import ComparePredicate
-from intent.ir import ConstexprType
-from intent.ir import OpCode
-from intent.ir import RaggedType
-from intent.ir import RecordType
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import UnaryOperator
-from intent.ir import Value
+from intent.frontend.semantics import BinaryOperator
+from intent.frontend.semantics import ComparePredicate
+from intent.frontend.semantics import ConstexprType
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import RaggedType
+from intent.frontend.semantics import RecordType
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import UnaryOperator
+from intent.frontend.mlir import MlirValue
 from intent.language import DType
 from intent.language import bool as intent_bool
 from intent.language.builtins import Intrinsic
@@ -98,7 +98,7 @@ def compile_time_value(expression: Expression) -> tuple[bool, object]:
 
 def _lower_attribute(lowerer: object, node: ast.Attribute) -> Expression:
     base = lowerer.lower_expression(node.value)
-    if isinstance(base, Value):
+    if isinstance(base, MlirValue):
         if node.attr == "shape":
             return lowerer.shape_value(base, node)
         if isinstance(base.type, RecordType):
@@ -106,7 +106,7 @@ def _lower_attribute(lowerer: object, node: ast.Attribute) -> Expression:
             if field_type is None:
                 lowerer.error(node, f"record has no field {node.attr!r}")
             operation = lowerer.emit(
-                OpCode.EXTRACT,
+                OperationKind.EXTRACT,
                 lowerer.location(node),
                 operands=(base,),
                 result_types=(field_type,),
@@ -115,7 +115,7 @@ def _lower_attribute(lowerer: object, node: ast.Attribute) -> Expression:
             return operation.results[0]
         if isinstance(base.type, RaggedType) and node.attr == "outer":
             operation = lowerer.emit(
-                OpCode.RAGGED_OUTER,
+                OperationKind.RAGGED_OUTER,
                 lowerer.location(node),
                 operands=(base,),
                 result_types=(base.type.outer,),
@@ -160,7 +160,7 @@ def _lower_unary(lowerer: object, node: ast.UnaryOp) -> Expression:
     else:
         lowerer.error(node, f"unsupported runtime unary operator {type(node.op).__name__}")
     operation = lowerer.emit(
-        OpCode.UNARY,
+        OperationKind.UNARY,
         lowerer.location(node),
         operands=(operand_value,),
         result_types=(operand_value.type,),
@@ -197,7 +197,7 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
     lhs_value = lowerer.broadcast_value(lhs_value, result_shape, node)
     rhs_value = lowerer.broadcast_value(rhs_value, result_shape, node)
     operation = lowerer.emit(
-        OpCode.BINARY,
+        OperationKind.BINARY,
         lowerer.location(node),
         operands=(lhs_value, rhs_value),
         result_types=(result_type,),
@@ -222,7 +222,7 @@ def _lower_bool(lowerer: object, node: ast.BoolOp) -> Expression:
         lhs = lowerer.broadcast_value(lhs, result_shape, node)
         rhs = lowerer.broadcast_value(rhs, result_shape, node)
         operation = lowerer.emit(
-            OpCode.BINARY,
+            OperationKind.BINARY,
             lowerer.location(node),
             operands=(lhs, rhs),
             result_types=(result_type,),
@@ -257,7 +257,7 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
             rhs = lowerer.broadcast_value(rhs, shape, node)
             result_type = lowerer.value_result_type(intent_bool, shape)
             operation = lowerer.emit(
-                OpCode.COMPARE,
+                OperationKind.COMPARE,
                 lowerer.location(node),
                 operands=(lhs, rhs),
                 result_types=(result_type,),
@@ -277,7 +277,7 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
         lhs = lowerer.broadcast_value(lhs, result_shape, node)
         rhs = lowerer.broadcast_value(rhs, result_shape, node)
         operation = lowerer.emit(
-            OpCode.BINARY,
+            OperationKind.BINARY,
             lowerer.location(node),
             operands=(lhs, rhs),
             result_types=(result_type,),
@@ -302,7 +302,7 @@ def _lower_if_expression(lowerer: object, node: ast.IfExp) -> Expression:
     lhs = lowerer.broadcast_value(lhs, result_shape, node)
     rhs = lowerer.broadcast_value(rhs, result_shape, node)
     operation = lowerer.emit(
-        OpCode.SELECT,
+        OperationKind.SELECT,
         lowerer.location(node),
         operands=(condition_value, lhs, rhs),
         result_types=(result_type,),
@@ -333,7 +333,7 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
             lowerer.location(node),
         )
         operation = lowerer.emit(
-            OpCode.CALL,
+            OperationKind.CALL,
             lowerer.location(node),
             operands=arguments,
             result_types=helper.result_types,
@@ -353,7 +353,7 @@ def _lower_stream_yield(lowerer: object, stream: StreamSpec, node: ast.Call) -> 
         lowerer.error(node, "stream.yield_ accepts positional carried values")
     if not lowerer.loop_stack or lowerer.loop_stack[-1].stream is not stream:
         lowerer.error(node, "stream.yield_ is only legal in its stream body")
-    values: list[Value] = []
+    values: list[MlirValue] = []
     if len(node.args) == 1:
         expression = lowerer.lower_expression(node.args[0])
         if isinstance(expression, StaticTuple):

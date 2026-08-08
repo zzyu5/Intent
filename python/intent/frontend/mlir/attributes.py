@@ -4,13 +4,13 @@ import struct
 import re
 from enum import Enum
 
-from intent.ir import AutoExtent
-from intent.ir import Effect
-from intent.ir import IndexRelation
-from intent.ir import IndexTerm
-from intent.ir import Value
 from intent.language import DType
 
+from ..semantics.effects import Effect
+from ..semantics.operations import AutoExtent
+from ..semantics.operations import IndexRelation
+from ..semantics.operations import IndexTerm
+from .state import MlirValue
 from .types import quote
 
 
@@ -54,7 +54,7 @@ def _emit_key(key: str) -> str:
     return quote(key)
 
 
-def emit_effect(effect: Effect, operands: tuple[Value, ...]) -> dict[str, object]:
+def emit_effect(effect: Effect, operands: tuple[MlirValue, ...]) -> dict[str, object]:
     target = -1
     if effect.target is not None:
         target = operands.index(effect.target)

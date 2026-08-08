@@ -5,10 +5,10 @@ import inspect
 from dataclasses import dataclass
 
 from intent.api import Definition
-from intent.ir import Location
-from intent.ir import SourceSpan
 
 from ..diagnostics.errors import FrontendError
+from ..diagnostics.locations import Location
+from ..diagnostics.locations import SourceSpan
 
 
 @dataclass(frozen=True, slots=True)

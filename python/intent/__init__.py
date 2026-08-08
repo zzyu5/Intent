@@ -9,8 +9,7 @@ from .diagnostics import DefinitionError
 from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
 from .frontend import FrontendError
-from .frontend import lower_to_kernel_ir
-from .mlir import emit_mlir
+from .frontend import lower_to_mlir
 from .runtime import CompiledArtifact
 from .targets import TritonTarget
 
@@ -29,6 +28,5 @@ __all__ = [
     "CompiledArtifact",
     "TritonTarget",
     "FrontendError",
-    "lower_to_kernel_ir",
-    "emit_mlir",
+    "lower_to_mlir",
 ]

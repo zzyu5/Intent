@@ -3,12 +3,12 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.ir import DimExpr
-from intent.ir import DynamicDim
-from intent.ir import RegionType
-from intent.ir import StaticDim
-from intent.ir import SymbolDim
-from intent.ir import Value
+from intent.frontend.semantics import DimExpr
+from intent.frontend.semantics import DynamicDim
+from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import StaticDim
+from intent.frontend.semantics import SymbolDim
+from intent.frontend.mlir import MlirValue
 from intent.language import DType
 
 from ..ast.expressions import compile_time_value
@@ -108,7 +108,7 @@ def lower_shape(lowerer: FunctionLowerer, node: ast.AST) -> tuple[DimExpr, ...]:
     for element in elements:
         if isinstance(element, ShapeDimension):
             dimensions.append(element.dimension)
-        elif isinstance(element, Value) and isinstance(element.type, RegionType):
+        elif isinstance(element, MlirValue) and isinstance(element.type, RegionType):
             dimensions.extend(lowerer.dynamic_shape_for_region(element))
         elif isinstance(element, Literal) and isinstance(element.value, int) and not isinstance(
             element.value, bool

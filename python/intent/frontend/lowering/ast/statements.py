@@ -3,20 +3,20 @@ from __future__ import annotations
 import ast
 
 from intent.api import DefinitionKind
-from intent.ir import BufferType
-from intent.ir import DomainType
-from intent.ir import Effect
-from intent.ir import EffectKind
-from intent.ir import Function
-from intent.ir import LogicalIndexType
-from intent.ir import OpCode
-from intent.ir import PartitionMode
-from intent.ir import PartitionType
-from intent.ir import RegionType
-from intent.ir import ResourceKind
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import Value
+from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import DomainType
+from intent.frontend.semantics import Effect
+from intent.frontend.semantics import EffectKind
+from intent.frontend.mlir import FunctionState
+from intent.frontend.semantics import LogicalIndexType
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import PartitionMode
+from intent.frontend.semantics import PartitionType
+from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import ResourceKind
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
 from intent.language import bool as intent_bool
 from intent.language import DType
 from intent.language import index as intent_index
@@ -47,14 +47,11 @@ def lower_statement(lowerer: object, node: ast.stmt) -> None:
         _lower_augmented_assign(lowerer, node)
         return
     if isinstance(node, ast.Expr):
-        operation_count = len(lowerer.current_block.operations)
+        operation_count = lowerer.current_block.operation_count
         result = lowerer.lower_expression(node.value)
         if isinstance(result, StaticTuple) and not result.elements:
             return
-        if any(
-            operation.effects
-            for operation in lowerer.current_block.operations[operation_count:]
-        ):
+        if lowerer.current_block.has_effect_since(operation_count):
             return
         lowerer.error(node, "unused pure expression is not a valid Intent statement")
     if isinstance(node, ast.Return):
@@ -73,10 +70,10 @@ def lower_statement(lowerer: object, node: ast.stmt) -> None:
         _lower_with(lowerer, node)
         return
     if isinstance(node, ast.Break):
-        _lower_loop_exit(lowerer, node, OpCode.BREAK)
+        _lower_loop_exit(lowerer, node, OperationKind.BREAK)
         return
     if isinstance(node, ast.Continue):
-        _lower_loop_exit(lowerer, node, OpCode.CONTINUE)
+        _lower_loop_exit(lowerer, node, OperationKind.CONTINUE)
         return
     if isinstance(node, ast.Assert):
         _lower_assert(lowerer, node)
@@ -113,7 +110,7 @@ def _assign_target(lowerer: object, target: ast.AST, expression: Expression) -> 
     if isinstance(target, ast.Name):
         if target.id == "_":
             return
-        if isinstance(expression, Value) and expression.name_hint is None:
+        if isinstance(expression, MlirValue) and expression.name_hint is None:
             expression.name_hint = target.id
         lowerer.environment[target.id] = expression
         return
@@ -162,10 +159,10 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
     operands = (target, value, *lowered.operands)
     attributes = {"index": lowered.relation, "value_operand_index": 1}
     if isinstance(target.type, BufferType):
-        opcode = OpCode.BUFFER_STORE
+        opcode = OperationKind.BUFFER_STORE
         resource = ResourceKind.LOGICAL_BUFFER
     else:
-        opcode = OpCode.VIEW_STORE
+        opcode = OperationKind.VIEW_STORE
         resource = ResourceKind.EXTERNAL_VIEW
     lowerer.emit(
         opcode,
@@ -182,10 +179,10 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
     if lowerer.definition.kind is DefinitionKind.KERNEL:
         if node.value is not None:
             lowerer.error(node, "kernel returns through Out/InOut views")
-        lowerer.emit(OpCode.RETURN, lowerer.location(node))
+        lowerer.emit(OperationKind.RETURN, lowerer.location(node))
         return
     if node.value is None:
-        values: tuple[Value, ...] = ()
+        values: tuple[MlirValue, ...] = ()
     else:
         expression = lowerer.lower_expression(node.value)
         if isinstance(expression, StaticTuple):
@@ -197,7 +194,7 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
         lowerer.return_types = result_types
     elif lowerer.return_types != result_types:
         lowerer.error(node, "helper return schemas are inconsistent")
-    lowerer.emit(OpCode.RETURN, lowerer.location(node), operands=values)
+    lowerer.emit(OperationKind.RETURN, lowerer.location(node), operands=values)
 
 
 def _lower_if(lowerer: object, node: ast.If) -> None:
@@ -285,7 +282,7 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
                 merge_types[name] = branch_type
                 break
 
-    branch_yields: list[tuple[Value, ...] | None] = []
+    branch_yields: list[tuple[MlirValue, ...] | None] = []
     for region, environment, terminated in (
         (then_region, then_environment, then_terminated),
         (else_region, else_environment, else_terminated),
@@ -295,13 +292,13 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
             continue
         saved_block = lowerer.current_block
         lowerer.current_block = region.blocks[0]
-        values: list[Value] = []
+        values: list[MlirValue] = []
         for name in merge_names:
             expression = environment[name]
             expected = merge_types.get(name)
             value_result = lowerer.materialize(expression, node, expected)
             values.append(value_result)
-        lowerer.emit(OpCode.YIELD, lowerer.location(node), operands=tuple(values))
+        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=tuple(values))
         lowerer.current_block = saved_block
         branch_yields.append(tuple(values))
 
@@ -319,7 +316,7 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         ):
             lowerer.error(node, "runtime if branch result schemas differ")
     operation = lowerer.emit(
-        OpCode.IF,
+        OperationKind.IF,
         lowerer.location(node),
         operands=(condition,),
         result_types=result_types,
@@ -364,10 +361,10 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     if isinstance(iteration, IterationSpec):
         opcode = iteration.opcode
         source = iteration.source
-    elif isinstance(iteration, Value) and isinstance(
+    elif isinstance(iteration, MlirValue) and isinstance(
         iteration.type, (DomainType, RegionType, PartitionType)
     ):
-        opcode = OpCode.FOR
+        opcode = OperationKind.FOR
         source = iteration
     else:
         lowerer.error(node, "for iterator must be domain/partition/I.parallel/I.ordered")
@@ -376,12 +373,12 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     assigned_existing = (
         _assigned_names(node.body) & set(snapshot)
     ) - target_names
-    if opcode is OpCode.PARALLEL and assigned_existing:
+    if opcode is OperationKind.PARALLEL and assigned_existing:
         lowerer.error(
             node,
             f"parallel body cannot carry outer SSA value {sorted(assigned_existing)[0]!r}",
         )
-    carried_names = tuple(sorted(assigned_existing)) if opcode in (OpCode.ORDERED, OpCode.FOR) else ()
+    carried_names = tuple(sorted(assigned_existing)) if opcode in (OperationKind.ORDERED, OperationKind.FOR) else ()
     initial_values = tuple(
         lowerer.materialize(snapshot[name], node) for name in carried_names
     )
@@ -403,7 +400,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     lowerer.lower_statements(node.body)
     if not lowerer.is_terminated(block):
         yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
-        lowerer.emit(OpCode.YIELD, lowerer.location(node), operands=yielded)
+        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
     lowerer.loop_stack.pop()
     lowerer.current_block = saved_block
     lowerer.environment = snapshot
@@ -459,7 +456,7 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     condition_expression = lowerer.lower_expression(node.test)
     condition = lowerer.materialize(condition_expression, node.test, ScalarType(intent_bool))
     lowerer.emit(
-        OpCode.CONDITION,
+        OperationKind.CONDITION,
         lowerer.location(node.test),
         operands=(condition, *before.blocks[0].arguments),
     )
@@ -468,17 +465,17 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     lowerer.environment = dict(snapshot)
     for name, value in zip(carried_names, after.blocks[0].arguments):
         lowerer.environment[name] = value
-    lowerer.loop_stack.append(LoopContext(OpCode.WHILE, carried_names))
+    lowerer.loop_stack.append(LoopContext(OperationKind.WHILE, carried_names))
     lowerer.lower_statements(node.body)
     if not lowerer.is_terminated(after.blocks[0]):
         yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
-        lowerer.emit(OpCode.YIELD, lowerer.location(node), operands=yielded)
+        lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
     lowerer.loop_stack.pop()
 
     lowerer.current_block = saved_block
     lowerer.environment = snapshot
     operation = lowerer.emit(
-        OpCode.WHILE,
+        OperationKind.WHILE,
         lowerer.location(node),
         operands=initial_values,
         result_types=state_types,
@@ -528,14 +525,14 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
         _assign_target(lowerer, loop.target.elts[1], state_expression)
     else:
         _assign_iteration_target(lowerer, loop.target, arguments)
-    context = LoopContext(OpCode.STATE_STREAM, (), stream=stream)
+    context = LoopContext(OperationKind.STATE_STREAM, (), stream=stream)
     lowerer.loop_stack.append(context)
     lowerer.lower_statements(loop.body)
     if not lowerer.is_terminated(region.blocks[0]):
         if context.pending_stream_state is None:
             lowerer.error(loop, "every state_stream path must call stream.yield_(...)")
         lowerer.emit(
-            OpCode.YIELD,
+            OperationKind.YIELD,
             lowerer.location(loop),
             operands=context.pending_stream_state,
         )
@@ -544,13 +541,13 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
     lowerer.environment = snapshot
     operands = [stream.axis, *stream.initial_state]
     attributes: dict[str, object] = {"state_count": len(stream.initial_state)}
-    if isinstance(stream.extent, Value):
+    if isinstance(stream.extent, MlirValue):
         attributes["extent_operand_index"] = len(operands)
         operands.append(stream.extent)
     else:
         attributes["extent"] = stream.extent
     operation = lowerer.emit(
-        OpCode.STATE_STREAM,
+        OperationKind.STATE_STREAM,
         lowerer.location(node),
         operands=tuple(operands),
         result_types=tuple(value.type for value in stream.initial_state),
@@ -560,14 +557,14 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
     stream.results = operation.results
 
 
-def _lower_loop_exit(lowerer: object, node: ast.AST, opcode: OpCode) -> None:
+def _lower_loop_exit(lowerer: object, node: ast.AST, opcode: OperationKind) -> None:
     if not lowerer.loop_stack:
         lowerer.error(node, f"{opcode.value} is only legal inside a loop")
     context = lowerer.loop_stack[-1]
-    if context.opcode is OpCode.PARALLEL:
+    if context.opcode is OperationKind.PARALLEL:
         lowerer.error(node, "parallel logical work cannot use break/continue")
-    if context.opcode is OpCode.STATE_STREAM:
-        if opcode is OpCode.BREAK:
+    if context.opcode is OperationKind.STATE_STREAM:
+        if opcode is OperationKind.BREAK:
             lowerer.error(node, "state_stream fixes the full streamed axis and cannot break")
         if context.pending_stream_state is None:
             lowerer.error(node, "state_stream continue requires stream.yield_(...) first")
@@ -589,7 +586,7 @@ def _lower_assert(lowerer: object, node: ast.Assert) -> None:
         lowerer.error(node, "compile-time assertion failed")
 
 
-def _iteration_argument_types(lowerer: object, source: Value) -> tuple[object, ...]:
+def _iteration_argument_types(lowerer: object, source: MlirValue) -> tuple[object, ...]:
     if isinstance(source.type, PartitionType):
         if source.type.mode is PartitionMode.COUNT:
             return (LogicalIndexType("partition"), source.type.region_type)
@@ -609,7 +606,7 @@ def _iteration_argument_types(lowerer: object, source: Value) -> tuple[object, .
 def _assign_iteration_target(
     lowerer: object,
     target: ast.AST,
-    arguments: tuple[Value, ...],
+    arguments: tuple[MlirValue, ...],
 ) -> None:
     expression: Expression
     if len(arguments) == 1:
@@ -663,7 +660,7 @@ def _copy_loop_stack(stack: list[LoopContext]) -> list[LoopContext]:
 
 
 def _same_expression(lhs: Expression, rhs: Expression) -> bool:
-    if isinstance(lhs, Value) or isinstance(rhs, Value):
+    if isinstance(lhs, MlirValue) or isinstance(rhs, MlirValue):
         return lhs is rhs
     if isinstance(lhs, ConstexprBinding) or isinstance(rhs, ConstexprBinding):
         return lhs is rhs
@@ -671,7 +668,7 @@ def _same_expression(lhs: Expression, rhs: Expression) -> bool:
 
 
 def _expression_type(expression: Expression) -> object | None:
-    if isinstance(expression, Value):
+    if isinstance(expression, MlirValue):
         return expression.type
     if isinstance(expression, ConstexprBinding):
         return expression.ir_value.type

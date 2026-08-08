@@ -3,18 +3,18 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.ir import AutoExtent
-from intent.ir import DomainFlavor
-from intent.ir import DomainType
-from intent.ir import OpCode
-from intent.ir import PartitionMode
-from intent.ir import PartitionType
-from intent.ir import RaggedType
-from intent.ir import RegionType
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import Value
-from intent.ir.types import is_integer
+from intent.frontend.semantics import AutoExtent
+from intent.frontend.semantics import DomainFlavor
+from intent.frontend.semantics import DomainType
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import PartitionMode
+from intent.frontend.semantics import PartitionType
+from intent.frontend.semantics import RaggedType
+from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics.types import is_integer
 from intent.language import index as intent_index
 
 from ..ast.expressions import compile_time_value
@@ -59,7 +59,7 @@ def _auto(lowerer: FunctionLowerer, node: ast.Call) -> AutoExtent:
     return AutoExtent(value)
 
 
-def _domain(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("start", "stop", "step"), required=("start", "stop"))
     expressions = [lowerer.lower_expression(bound["start"]), lowerer.lower_expression(bound["stop"])]
     if "step" in bound:
@@ -70,7 +70,7 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         DomainFlavor.STRIDED if len(operands) == 3 else DomainFlavor.DENSE
     )
     operation = lowerer.emit(
-        OpCode.DOMAIN,
+        OperationKind.DOMAIN,
         lowerer.location(node),
         operands=operands,
         result_types=(DomainType(flavor, 1),),
@@ -78,7 +78,7 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _partition(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("axis", "extent", "count"), required=("axis",))
     if ("extent" in bound) == ("count" in bound):
         lowerer.error(node, "I.partition requires exactly one of extent= or count=")
@@ -112,7 +112,7 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         else:
             operands.append(_integer_value(lowerer, expression, bound["extent"]))
     operation = lowerer.emit(
-        OpCode.PARTITION,
+        OperationKind.PARTITION,
         lowerer.location(node),
         operands=tuple(operands),
         result_types=(PartitionType(mode, region_type),),
@@ -123,15 +123,15 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> Value:
 
 def _parallel(lowerer: FunctionLowerer, node: ast.Call) -> IterationSpec:
     source = _iteration_source(lowerer, node)
-    return IterationSpec(OpCode.PARALLEL, source)
+    return IterationSpec(OperationKind.PARALLEL, source)
 
 
 def _ordered(lowerer: FunctionLowerer, node: ast.Call) -> IterationSpec:
     source = _iteration_source(lowerer, node)
-    return IterationSpec(OpCode.ORDERED, source)
+    return IterationSpec(OperationKind.ORDERED, source)
 
 
-def _iteration_source(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _iteration_source(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("source",), required=("source",))
     expression = lowerer.lower_expression(bound["source"])
     if isinstance(expression, StaticTuple):
@@ -139,7 +139,7 @@ def _iteration_source(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         if not domains or any(not isinstance(value.type, DomainType) for value in domains):
             lowerer.error(node, "domain product requires one or more domains")
         operation = lowerer.emit(
-            OpCode.DOMAIN_PRODUCT,
+            OperationKind.DOMAIN_PRODUCT,
             lowerer.location(node),
             operands=domains,
             result_types=(DomainType(DomainFlavor.PRODUCT, sum(value.type.rank for value in domains)),),
@@ -163,7 +163,7 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
         lowerer.error(node, "state_stream axis must be domain or region")
     extent_expression = lowerer.lower_expression(bound["extent"])
     if isinstance(extent_expression, AutoExtent):
-        extent: AutoExtent | Value = extent_expression
+        extent: AutoExtent | MlirValue = extent_expression
     else:
         extent = _integer_value(lowerer, extent_expression, bound["extent"])
     initial_expression = lowerer.lower_expression(bound["init"])
@@ -179,13 +179,13 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
     return StreamSpec(axis, initial, extent, node)
 
 
-def _indices(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _indices(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("region",), required=("region",))
     region = lowerer.materialize(lowerer.lower_expression(bound["region"]), bound["region"])
     if not isinstance(region.type, RegionType):
         lowerer.error(node, "I.indices requires a logical region")
     operation = lowerer.emit(
-        OpCode.INDICES,
+        OperationKind.INDICES,
         lowerer.location(node),
         operands=(region,),
         result_types=(TensorType(intent_index, lowerer.dynamic_shape_for_region(region)),),
@@ -193,7 +193,7 @@ def _indices(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -210,7 +210,7 @@ def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> Value:
         DomainType(DomainFlavor.RAGGED_MEMBER, 1),
     )
     operation = lowerer.emit(
-        OpCode.RAGGED,
+        OperationKind.RAGGED,
         lowerer.location(node),
         operands=(outer, offsets, indices),
         result_types=(result_type,),
@@ -218,7 +218,7 @@ def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _members(lowerer: FunctionLowerer, node: ast.Call) -> Value:
+def _members(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("region",), required=("region",))
     region = lowerer.materialize(lowerer.lower_expression(bound["region"]), bound["region"])
     if not isinstance(region.type, (DomainType, RegionType)):
@@ -230,7 +230,7 @@ def _members(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     rank = getattr(region.type, "rank", 1)
     shape = tuple(lowerer.dynamic_shape_for_region(region))
     operation = lowerer.emit(
-        OpCode.MEMBERS,
+        OperationKind.MEMBERS,
         lowerer.location(node),
         operands=(region,),
         result_types=(TensorType(intent_index, shape[:rank]),),
@@ -238,7 +238,7 @@ def _members(lowerer: FunctionLowerer, node: ast.Call) -> Value:
     return operation.results[0]
 
 
-def _integer_value(lowerer: FunctionLowerer, expression: object, node: ast.AST) -> Value:
+def _integer_value(lowerer: FunctionLowerer, expression: object, node: ast.AST) -> MlirValue:
     if isinstance(expression, Literal):
         return lowerer.materialize(expression, node, ScalarType(intent_index))
     value = lowerer.materialize(expression, node)

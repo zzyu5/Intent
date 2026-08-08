@@ -5,7 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .values import Value
+    from ..mlir.state import MlirValue
 
 
 class EffectKind(Enum):
@@ -27,7 +27,7 @@ class ResourceKind(Enum):
 class Effect:
     kind: EffectKind
     resource: ResourceKind
-    target: Value | None = None
+    target: MlirValue | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, EffectKind):
@@ -35,10 +35,10 @@ class Effect:
         if not isinstance(self.resource, ResourceKind):
             raise TypeError("effect resource must be a ResourceKind")
         if self.target is not None:
-            from .values import Value
+            from ..mlir.state import MlirValue
 
-            if not isinstance(self.target, Value):
-                raise TypeError("effect target must be an SSA Value or None")
+            if not isinstance(self.target, MlirValue):
+                raise TypeError("effect target must be an SSA MlirValue or None")
 
 
 PURE: tuple[Effect, ...] = ()

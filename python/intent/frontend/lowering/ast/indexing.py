@@ -4,25 +4,25 @@ import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from intent.ir import BufferType
-from intent.ir import DynamicDim
-from intent.ir import DomainType
-from intent.ir import Effect
-from intent.ir import EffectKind
-from intent.ir import IndexRelation
-from intent.ir import IndexTerm
-from intent.ir import IndexTermKind
-from intent.ir import LogicalIndexType
-from intent.ir import OpCode
-from intent.ir import RaggedType
-from intent.ir import RegionType
-from intent.ir import ResourceKind
-from intent.ir import ScalarType
-from intent.ir import StaticDim
-from intent.ir import TensorType
-from intent.ir import Value
-from intent.ir import broadcast_shape
-from intent.ir.types import is_integer
+from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import DynamicDim
+from intent.frontend.semantics import DomainType
+from intent.frontend.semantics import Effect
+from intent.frontend.semantics import EffectKind
+from intent.frontend.semantics import IndexRelation
+from intent.frontend.semantics import IndexTerm
+from intent.frontend.semantics import IndexTermKind
+from intent.frontend.semantics import LogicalIndexType
+from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import RaggedType
+from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import ResourceKind
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import StaticDim
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics.types import is_integer
 from intent.language import bool as intent_bool
 from intent.language import DTypeCategory
 
@@ -38,18 +38,18 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class LoweredIndex:
     relation: IndexRelation
-    operands: tuple[Value, ...]
+    operands: tuple[MlirValue, ...]
     result_shape: tuple[object, ...]
 
 
 def validate_indexed_value(
     lowerer: FunctionLowerer,
-    value: Value,
+    value: MlirValue,
     indexed_shape: tuple[object, ...],
     node: ast.AST,
     *,
     expected_dtype: object | None = None,
-) -> Value:
+) -> MlirValue:
     value_dtype, value_shape = lowerer.dtype_and_shape(value.type, node)
     if expected_dtype is not None and value_dtype != expected_dtype:
         lowerer.error(node, "stored/scattered value dtype does not match destination")
@@ -71,7 +71,7 @@ def lower_subscript(
         return _subscript_shape(lowerer, source_expression, node)
     if isinstance(source_expression, StaticTuple):
         return _subscript_static_tuple(lowerer, source_expression, node)
-    if not isinstance(source_expression, Value):
+    if not isinstance(source_expression, MlirValue):
         lowerer.error(node, "subscript base must be tensor, buffer, ragged descriptor, or tuple")
     source = source_expression
     if isinstance(source.type, RaggedType):
@@ -79,7 +79,7 @@ def lower_subscript(
         if not is_integer(selector.type):
             lowerer.error(node.slice, "ragged member selector must be integer/index")
         operation = lowerer.emit(
-            OpCode.RAGGED_MEMBER,
+            OperationKind.RAGGED_MEMBER,
             lowerer.location(node),
             operands=(source, selector),
             result_types=(source.type.member,),
@@ -91,7 +91,7 @@ def lower_subscript(
     result_type = lowerer.value_result_type(source.type.dtype, lowered.result_shape)
     if isinstance(source.type, BufferType):
         operation = lowerer.emit(
-            OpCode.BUFFER_LOAD,
+            OperationKind.BUFFER_LOAD,
             lowerer.location(node),
             operands=(source, *lowered.operands),
             result_types=(result_type,),
@@ -102,7 +102,7 @@ def lower_subscript(
     if source in lowerer.view_kinds:
         lowerer.require_readable_view(source, node)
         operation = lowerer.emit(
-            OpCode.VIEW_LOAD,
+            OperationKind.VIEW_LOAD,
             lowerer.location(node),
             operands=(source, *lowered.operands),
             result_types=(result_type,),
@@ -114,7 +114,7 @@ def lower_subscript(
     fill = lowerer.emit_literal(False if source.type.dtype == intent_bool else 0, node, ScalarType(source.type.dtype))
     operands = (source, *lowered.operands, valid, fill)
     operation = lowerer.emit(
-        OpCode.GATHER,
+        OperationKind.GATHER,
         lowerer.location(node),
         operands=operands,
         result_types=(result_type,),
@@ -129,7 +129,7 @@ def lower_subscript(
 
 def lower_index(
     lowerer: FunctionLowerer,
-    source: Value,
+    source: MlirValue,
     slice_node: ast.AST,
     *,
     first_operand_position: int,
@@ -151,7 +151,7 @@ def lower_index(
         for _ in range(len(source_type.shape) - consuming)
     )
 
-    operands: list[Value] = []
+    operands: list[MlirValue] = []
     terms: list[IndexTerm] = []
     result_shape: list[object] = []
     source_axis = 0

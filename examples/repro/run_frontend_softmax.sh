@@ -3,6 +3,7 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build_root=/tmp/intentdsl-build
+python_bin=${INTENT_PYTHON:-/home/kingdom/.venvs/intentdsl-mlir20/bin/python}
 
 cmake \
   -S "${project_root}" \
@@ -14,7 +15,7 @@ cmake --build "${build_root}" --target intent-opt intent-realize intent-translat
 
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="${project_root}/python" \
-python "${project_root}/examples/repro/frontend_softmax.py" \
+"${python_bin}" "${project_root}/examples/repro/frontend_softmax.py" \
   --intent-opt "${build_root}/tools/intent-opt/intent-opt" \
   --intent-realize "${build_root}/tools/intent-realize/intent-realize" \
   --intent-translate "${build_root}/tools/intent-translate/intent-translate" \

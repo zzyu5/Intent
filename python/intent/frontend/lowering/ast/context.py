@@ -5,24 +5,24 @@ from typing import TYPE_CHECKING
 
 from intent.api import Definition
 from intent.api import DefinitionKind
-from intent.ir import Block
-from intent.ir import ConstexprType
-from intent.ir import DynamicDim
-from intent.ir import Effect
-from intent.ir import Function
-from intent.ir import IRType
-from intent.ir import Location
-from intent.ir import LogicalIndexType
-from intent.ir import IndexRelation
-from intent.ir import IndexTerm
-from intent.ir import IndexTermKind
-from intent.ir import OpCode
-from intent.ir import Operation
-from intent.ir import Region
-from intent.ir import ScalarType
-from intent.ir import TensorType
-from intent.ir import Value
-from intent.ir import broadcast_shape
+from intent.frontend.mlir import BlockState
+from intent.frontend.semantics import ConstexprType
+from intent.frontend.semantics import DynamicDim
+from intent.frontend.semantics import Effect
+from intent.frontend.mlir import FunctionState
+from intent.frontend.semantics import ValueType
+from intent.frontend.diagnostics import Location
+from intent.frontend.semantics import LogicalIndexType
+from intent.frontend.semantics import IndexRelation
+from intent.frontend.semantics import IndexTerm
+from intent.frontend.semantics import IndexTermKind
+from intent.frontend.semantics import OperationKind
+from intent.frontend.mlir import EmittedOperation
+from intent.frontend.mlir import RegionState
+from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import TensorType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics import broadcast_shape
 from intent.language import ViewKind
 from intent.language import DType
 from intent.language import DTypeCategory
@@ -30,8 +30,8 @@ from intent.language import bool as intent_bool
 from intent.language import f64
 from intent.language import i64
 from intent.language import index as intent_index
-from intent.ir import EffectKind
-from intent.ir import ResourceKind
+from intent.frontend.semantics import EffectKind
+from intent.frontend.semantics import ResourceKind
 
 from ...diagnostics.errors import FrontendError
 from .model import ConstexprBinding
@@ -53,7 +53,7 @@ class FunctionLowerer:
         compiler: FrontendCompiler,
         definition: Definition[object, object],
         source: SourceUnit,
-        function: Function,
+        function: FunctionState,
         constexpr_values: dict[str, object],
     ) -> None:
         self.compiler = compiler
@@ -63,8 +63,8 @@ class FunctionLowerer:
         self.environment: dict[str, Expression] = {}
         self.current_block = function.body.blocks[0]
         self.loop_stack: list[LoopContext] = []
-        self.view_kinds: dict[Value, ViewKind] = {}
-        self.return_types: tuple[IRType, ...] | None = None
+        self.view_kinds: dict[MlirValue, ViewKind] = {}
+        self.return_types: tuple[ValueType, ...] | None = None
         self._initialize_parameters(constexpr_values)
 
     def _initialize_parameters(self, constexpr_values: dict[str, object]) -> None:
@@ -82,7 +82,7 @@ class FunctionLowerer:
         self.lower_statements(self.source.function.body)
         if not self.is_terminated(self.current_block):
             if self.definition.kind is DefinitionKind.KERNEL:
-                self.emit(OpCode.RETURN, self.source.location(self.source.function))
+                self.emit(OperationKind.RETURN, self.source.location(self.source.function))
             else:
                 self.error(self.source.function, "@intent.fn must end with an explicit return")
         if self.definition.kind is DefinitionKind.HELPER:
@@ -105,16 +105,16 @@ class FunctionLowerer:
 
     def emit(
         self,
-        opcode: OpCode,
+        opcode: OperationKind,
         location: Location,
         *,
-        operands: tuple[Value, ...] = (),
-        result_types: tuple[IRType, ...] = (),
+        operands: tuple[MlirValue, ...] = (),
+        result_types: tuple[ValueType, ...] = (),
         attributes: dict[str, object] | None = None,
-        regions: tuple[Region, ...] = (),
+        regions: tuple[RegionState, ...] = (),
         effects: tuple[Effect, ...] = (),
         result_names: tuple[str | None, ...] = (),
-    ) -> Operation:
+    ) -> EmittedOperation:
         return self.compiler.builder.emit(
             self.current_block,
             opcode,
@@ -131,9 +131,9 @@ class FunctionLowerer:
         self,
         expression: Expression,
         node: ast.AST,
-        expected_type: IRType | None = None,
-    ) -> Value:
-        if isinstance(expression, Value):
+        expected_type: ValueType | None = None,
+    ) -> MlirValue:
+        if isinstance(expression, MlirValue):
             if expected_type is not None and not self.types_compatible_for_literal(
                 expression.type, expected_type
             ):
@@ -151,8 +151,8 @@ class FunctionLowerer:
         self,
         value: bool | int | float,
         node: ast.AST,
-        expected_type: IRType | None = None,
-    ) -> Value:
+        expected_type: ValueType | None = None,
+    ) -> MlirValue:
         if expected_type is None:
             if isinstance(value, bool):
                 expected_type = ScalarType(intent_bool)
@@ -178,16 +178,16 @@ class FunctionLowerer:
         ):
             self.error(node, "floating literal context requires int/float")
         operation = self.emit(
-            OpCode.CONSTANT,
+            OperationKind.CONSTANT,
             self.location(node),
             result_types=(expected_type,),
             attributes={"value": value},
         )
         return operation.results[0]
 
-    def materialize_dimension(self, dimension: ShapeDimension, node: ast.AST) -> Value:
+    def materialize_dimension(self, dimension: ShapeDimension, node: ast.AST) -> MlirValue:
         operation = self.emit(
-            OpCode.DIM,
+            OperationKind.DIM,
             self.location(node),
             operands=(dimension.source,),
             result_types=(ScalarType(intent_index),),
@@ -195,7 +195,7 @@ class FunctionLowerer:
         )
         return operation.results[0]
 
-    def read_value(self, expression: Expression, node: ast.AST) -> Value:
+    def read_value(self, expression: Expression, node: ast.AST) -> MlirValue:
         value = self.materialize(expression, node)
         if value not in self.view_kinds:
             return value
@@ -206,7 +206,7 @@ class FunctionLowerer:
             tuple(IndexTerm(IndexTermKind.FULL_SLICE) for _ in value.type.shape)
         )
         operation = self.emit(
-            OpCode.VIEW_LOAD,
+            OperationKind.VIEW_LOAD,
             self.location(node),
             operands=(value,),
             result_types=(value.type,),
@@ -215,21 +215,21 @@ class FunctionLowerer:
         )
         return operation.results[0]
 
-    def require_readable_view(self, value: Value, node: ast.AST) -> None:
+    def require_readable_view(self, value: MlirValue, node: ast.AST) -> None:
         kind = self.view_kinds.get(value)
         if kind not in (ViewKind.IN, ViewKind.INOUT):
             self.error(node, "Out-only view cannot be read")
 
-    def require_writable_view(self, value: Value, node: ast.AST) -> None:
+    def require_writable_view(self, value: MlirValue, node: ast.AST) -> None:
         kind = self.view_kinds.get(value)
         if kind not in (ViewKind.OUT, ViewKind.INOUT):
             self.error(node, "view write requires Out or InOut ABI")
 
-    def require_atomic_view(self, value: Value, node: ast.AST) -> None:
+    def require_atomic_view(self, value: MlirValue, node: ast.AST) -> None:
         if self.view_kinds.get(value) is not ViewKind.INOUT:
             self.error(node, "external atomic target requires InOut ABI")
 
-    def shape_value(self, value: Value, node: ast.AST) -> ShapeValue:
+    def shape_value(self, value: MlirValue, node: ast.AST) -> ShapeValue:
         if not isinstance(value.type, TensorType):
             self.error(node, ".shape is only valid on a tensor/view")
         return ShapeValue(
@@ -243,10 +243,10 @@ class FunctionLowerer:
         self,
         dtype: DType,
         shape: tuple[object, ...],
-    ) -> IRType:
+    ) -> ValueType:
         return TensorType(dtype, shape) if shape else ScalarType(dtype)
 
-    def broadcast_result_type(self, lhs: IRType, rhs: IRType, node: ast.AST) -> IRType:
+    def broadcast_result_type(self, lhs: ValueType, rhs: ValueType, node: ast.AST) -> ValueType:
         lhs_dtype, lhs_shape = self.dtype_and_shape(lhs, node)
         rhs_dtype, rhs_shape = self.dtype_and_shape(rhs, node)
         if lhs_dtype != rhs_dtype:
@@ -259,10 +259,10 @@ class FunctionLowerer:
 
     def broadcast_value(
         self,
-        value: Value,
+        value: MlirValue,
         result_shape: tuple[object, ...],
         node: ast.AST,
-    ) -> Value:
+    ) -> MlirValue:
         dtype, source_shape = self.dtype_and_shape(value.type, node)
         target_shape = tuple(result_shape)
         if tuple(source_shape) == target_shape:
@@ -276,7 +276,7 @@ class FunctionLowerer:
         if broadcasted != target_shape:
             self.error(node, "value cannot broadcast to the required result shape")
         operation = self.emit(
-            OpCode.BROADCAST,
+            OperationKind.BROADCAST,
             self.location(node),
             operands=(value,),
             result_types=(TensorType(dtype, target_shape),),
@@ -285,7 +285,7 @@ class FunctionLowerer:
 
     def dtype_and_shape(
         self,
-        value_type: IRType,
+        value_type: ValueType,
         node: ast.AST,
     ) -> tuple[DType, tuple[object, ...]]:
         if isinstance(value_type, ScalarType):
@@ -299,7 +299,7 @@ class FunctionLowerer:
         lhs: Expression,
         rhs: Expression,
         node: ast.AST,
-    ) -> tuple[Value, Value]:
+    ) -> tuple[MlirValue, MlirValue]:
         if isinstance(lhs, Literal) and not isinstance(rhs, Literal):
             rhs_value = self.materialize(rhs, node)
             dtype, _ = self.dtype_and_shape(rhs_value.type, node)
@@ -310,15 +310,15 @@ class FunctionLowerer:
             return lhs_value, self.materialize(rhs, node, ScalarType(dtype))
         return self.materialize(lhs, node), self.materialize(rhs, node)
 
-    def types_compatible_for_literal(self, actual: IRType, expected: IRType) -> bool:
-        from intent.ir.types import types_compatible
+    def types_compatible_for_literal(self, actual: ValueType, expected: ValueType) -> bool:
+        from intent.frontend.semantics.types import types_compatible
 
         return types_compatible(actual, expected)
 
-    def is_terminated(self, block: Block) -> bool:
-        from intent.ir.ops import TERMINATORS
+    def is_terminated(self, block: BlockState) -> bool:
+        from intent.frontend.semantics import TERMINATORS
 
-        return bool(block.operations and block.operations[-1].opcode in TERMINATORS)
+        return block.last_operation in TERMINATORS
 
     def location(self, node: ast.AST) -> Location:
         return self.source.location(node)
@@ -326,7 +326,7 @@ class FunctionLowerer:
     def error(self, node: ast.AST, message: str) -> None:
         raise FrontendError(message, self.location(node))
 
-    def dynamic_shape_for_region(self, value: Value) -> tuple[DynamicDim, ...]:
+    def dynamic_shape_for_region(self, value: MlirValue) -> tuple[DynamicDim, ...]:
         rank = getattr(value.type, "rank", 1)
         return tuple(DynamicDim(f"region_{value.id}_{axis}") for axis in range(rank))
 
@@ -335,28 +335,21 @@ class FunctionLowerer:
 
     def helper_call_effects(
         self,
-        helper: Function,
-        arguments: tuple[Value, ...],
+        helper: FunctionState,
+        arguments: tuple[MlirValue, ...],
     ) -> tuple[Effect, ...]:
         parameter_values = tuple(parameter.value for parameter in helper.parameters)
         effects: list[Effect] = []
-        seen: set[tuple[object, object, Value | None]] = set()
+        seen: set[tuple[object, object, MlirValue | None]] = set()
 
-        def walk(region: Region) -> None:
-            for block in region.blocks:
-                for operation in block.operations:
-                    for effect in operation.effects:
-                        target: Value | None = None
-                        if effect.target is not None:
-                            if effect.target not in parameter_values:
-                                continue
-                            target = arguments[parameter_values.index(effect.target)]
-                        key = (effect.kind, effect.resource, target)
-                        if key not in seen:
-                            effects.append(Effect(effect.kind, effect.resource, target))
-                            seen.add(key)
-                    for nested in operation.regions:
-                        walk(nested)
-
-        walk(helper.body)
+        for effect in helper.body.effects:
+            target: MlirValue | None = None
+            if effect.target is not None:
+                if effect.target not in parameter_values:
+                    continue
+                target = arguments[parameter_values.index(effect.target)]
+            key = (effect.kind, effect.resource, target)
+            if key not in seen:
+                effects.append(Effect(effect.kind, effect.resource, target))
+                seen.add(key)
         return tuple(effects)

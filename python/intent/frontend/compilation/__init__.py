@@ -1,8 +1,8 @@
 from .compiler import FrontendCompiler
-from .compiler import lower_to_kernel_ir
+from .compiler import lower_to_mlir
 
 
 __all__ = [
     "FrontendCompiler",
-    "lower_to_kernel_ir",
+    "lower_to_mlir",
 ]
