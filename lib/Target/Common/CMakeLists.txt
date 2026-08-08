@@ -6,6 +6,7 @@ add_mlir_library(MLIRIntentTargetCommon
   Realization/Driver.cpp
   Realization/KernelFacts.cpp
   Realization/Proofs.cpp
+  Realization/SchedulePolicy.cpp
   Realization/ScheduleStructure.cpp
   Traversal/OperationRegistry.cpp
 
