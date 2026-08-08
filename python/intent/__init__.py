@@ -1,19 +1,18 @@
-from .definitions import Definition
-from .definitions import DefinitionKind
-from .definitions import HelperDefinition
-from .definitions import KernelDefinition
-from .definitions import fn
-from .definitions import kernel
-from .driver import compile
-from .backend import CompiledArtifact
-from .backend.triton import TritonTarget
-from .errors import DefinitionError
-from .errors import IntentError
-from .errors import LanguageUseError
+from .api import Definition
+from .api import DefinitionKind
+from .api import HelperDefinition
+from .api import KernelDefinition
+from .api import fn
+from .api import kernel
+from .compiler import compile
+from .diagnostics import DefinitionError
+from .diagnostics import IntentError
+from .diagnostics import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_kernel_ir
 from .mlir import emit_mlir
-from .mlir import lower_to_mlir
+from .runtime import CompiledArtifact
+from .targets import TritonTarget
 
 
 __all__ = [
@@ -32,5 +31,4 @@ __all__ = [
     "FrontendError",
     "lower_to_kernel_ir",
     "emit_mlir",
-    "lower_to_mlir",
 ]

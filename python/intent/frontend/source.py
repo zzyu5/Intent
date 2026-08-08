@@ -4,7 +4,7 @@ import ast
 import inspect
 from dataclasses import dataclass
 
-from intent.definitions import Definition
+from intent.api import Definition
 from intent.ir import Location
 from intent.ir import SourceSpan
 

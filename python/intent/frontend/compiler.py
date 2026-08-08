@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from intent.definitions import Definition
-from intent.definitions import HelperDefinition
-from intent.definitions import KernelDefinition
+from intent.api import Definition
+from intent.api import HelperDefinition
+from intent.api import KernelDefinition
 from intent.ir import Function
 from intent.ir import FunctionKind
 from intent.ir import IRBuilder

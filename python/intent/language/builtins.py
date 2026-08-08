@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..errors import LanguageUseError
+from intent.diagnostics import LanguageUseError
 
 
 @dataclass(frozen=True, slots=True)

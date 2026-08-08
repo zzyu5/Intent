@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.definitions import HelperDefinition
+from intent.api import HelperDefinition
 from intent.ir import BinaryOperator
 from intent.ir import IRType
 from intent.ir import OpCode

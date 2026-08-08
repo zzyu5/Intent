@@ -5,16 +5,11 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
-from intent.realizer.model import LaunchSpec
-from intent.realizer.model import PhysicalPlan
-
 
 @dataclass(slots=True)
 class CompiledArtifact:
     source: str
     mlir: str
-    plan: PhysicalPlan
-    launch: LaunchSpec
     _launcher: Callable[..., object] = field(repr=False)
     _runner: Callable[..., object] = field(repr=False)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
@@ -25,7 +20,7 @@ class CompiledArtifact:
 
     @property
     def ir(self) -> dict[str, str]:
-        return {"intent_plan": self.mlir, **self.backend_ir}
+        return {"intent": self.mlir, **self.backend_ir}
 
     def run(self, *arguments: Any) -> object:
         return self._runner(*arguments)

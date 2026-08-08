@@ -3,7 +3,6 @@
 #include "Intent/Target/Triton/Translate.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/InitAllDialects.h"
-#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
@@ -22,7 +21,7 @@ int main(int argc, char **argv) {
   registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect>();
   mlir::MLIRContext context(registry);
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
-  if (!module || mlir::failed(mlir::verify(*module)))
+  if (!module)
     return 1;
   return mlir::failed(intent::triton::emitTritonSource(*module, llvm::outs()));
 }

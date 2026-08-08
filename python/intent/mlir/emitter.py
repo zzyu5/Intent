@@ -11,8 +11,6 @@ from intent.ir import ParameterKind
 from intent.ir import Region
 from intent.ir import Value
 from intent.ir import verify
-from intent.realizer import PhysicalPlan
-from intent.realizer import verify_plan
 
 from .attributes import emit_dictionary
 from .attributes import emit_effect
@@ -21,13 +19,11 @@ from .types import emit_type
 from .types import emit_type_metadata
 from .types import emit_view_type
 from .types import quote
-from .plan import emit_physical_plan
 
 
 @dataclass(slots=True)
 class MlirEmitter:
     module: Module
-    plan: PhysicalPlan | None = None
     _block_names: dict[Block, str] = field(default_factory=dict, init=False)
     _next_block: int = field(default=0, init=False)
     _view_types: dict[Value, str] = field(default_factory=dict, init=False)
@@ -44,8 +40,6 @@ class MlirEmitter:
         lines = ["module attributes " + emit_dictionary(attributes) + " {"]
         for function in self.module.functions:
             lines.extend(self._emit_function(function, 1))
-        if self.plan is not None:
-            lines.extend(emit_physical_plan(self.plan, 1))
         lines.append("}")
         return "\n".join(lines) + "\n"
 
@@ -226,8 +220,6 @@ class MlirEmitter:
         )
 
 
-def emit_mlir(module: Module, plan: PhysicalPlan | None = None) -> str:
+def emit_mlir(module: Module) -> str:
     verify(module)
-    if plan is not None:
-        verify_plan(module, plan)
-    return MlirEmitter(module, plan).emit()
+    return MlirEmitter(module).emit()

@@ -4,7 +4,7 @@ import ast
 import operator
 from enum import IntEnum
 
-from intent.definitions import HelperDefinition
+from intent.api import HelperDefinition
 from intent.ir import BinaryOperator
 from intent.ir import ComparePredicate
 from intent.ir import ConstexprType

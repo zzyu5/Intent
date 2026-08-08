@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from intent.errors import IntentError
+from intent.diagnostics import IntentError
 from intent.ir import Location
 
 

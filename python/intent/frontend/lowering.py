@@ -3,8 +3,8 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.definitions import Definition
-from intent.definitions import DefinitionKind
+from intent.api import Definition
+from intent.api import DefinitionKind
 from intent.ir import Block
 from intent.ir import ConstexprType
 from intent.ir import DynamicDim

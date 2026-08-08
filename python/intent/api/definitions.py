@@ -12,8 +12,8 @@ from typing import Generic
 from typing import ParamSpec
 from typing import TypeVar
 
-from .errors import DefinitionError
-from .errors import LanguageUseError
+from intent.diagnostics import DefinitionError
+from intent.diagnostics import LanguageUseError
 
 
 P = ParamSpec("P")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from intent.errors import IntentError
+from intent.diagnostics import IntentError
 from intent.language import DType
 from intent.language.dtypes import DTypeCategory
 from intent.language.annotations import ViewKind

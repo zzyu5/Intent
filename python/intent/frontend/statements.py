@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 
-from intent.definitions import DefinitionKind
+from intent.api import DefinitionKind
 from intent.ir import BufferType
 from intent.ir import DomainType
 from intent.ir import Effect

@@ -4,8 +4,8 @@ import inspect
 from enum import IntEnum
 from dataclasses import dataclass
 
-from intent.definitions import Definition
-from intent.definitions import DefinitionKind
+from intent.api import Definition
+from intent.api import DefinitionKind
 from intent.ir import ConstexprType
 from intent.ir import FunctionKind
 from intent.ir import IRType

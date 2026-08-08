@@ -412,7 +412,11 @@ def _load_original_softmax(source_path: Path):
     return namespace["softmax"]
 
 
-def _run_softmax(intent_translate: str, baseline_source: Path) -> None:
+def _run_softmax(
+    intent_realize: str,
+    intent_translate: str,
+    baseline_source: Path,
+) -> None:
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     comparison_stream = torch.cuda.Stream(device=device)
@@ -420,6 +424,7 @@ def _run_softmax(intent_translate: str, baseline_source: Path) -> None:
     artifact = intent.compile(
         stable_softmax,
         target=intent.TritonTarget(device=0),
+        realizer=intent_realize,
         translator=intent_translate,
     )
     original_softmax = _load_original_softmax(baseline_source)
@@ -486,13 +491,21 @@ def main() -> None:
         default="/tmp/intentdsl-build/tools/intent-opt/intent-opt",
     )
     parser.add_argument(
+        "--intent-realize",
+        default="/tmp/intentdsl-build/tools/intent-realize/intent-realize",
+    )
+    parser.add_argument(
         "--intent-translate",
         default="/tmp/intentdsl-build/tools/intent-translate/intent-translate",
     )
     parser.add_argument("--baseline-source", type=Path, required=True)
     arguments = parser.parse_args()
     _lower_all(arguments.intent_opt)
-    _run_softmax(arguments.intent_translate, arguments.baseline_source)
+    _run_softmax(
+        arguments.intent_realize,
+        arguments.intent_translate,
+        arguments.baseline_source,
+    )
 
 
 if __name__ == "__main__":
