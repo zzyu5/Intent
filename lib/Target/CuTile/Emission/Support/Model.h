@@ -111,6 +111,7 @@ private:
   emitTensorShape(mlir::Operation &operation, unsigned resultIndex);
   mlir::FailureOr<unsigned> emittedTensorRank(mlir::Operation &operation,
                                              bool store);
+  mlir::LogicalResult prepareRaggedMetadata();
   mlir::LogicalResult prepareRaggedStages();
   void collectStageValue(mlir::Value value, unsigned stage,
                          const llvm::DenseSet<mlir::Value> &inputs,
@@ -120,6 +121,8 @@ private:
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
   bool hasTraversal(llvm::StringRef traversal);
+  bool usesRaggedOwnership();
+  bool usesRaggedOrderedTraversal();
   bool usesStagedEmission();
   std::string dtypeName(mlir::Type type, mlir::Operation &consumer);
   std::string makeResultName(mlir::Operation &operation, unsigned index);
@@ -159,6 +162,8 @@ private:
   mlir::Operation *raggedOuter = nullptr;
   mlir::Operation *raggedMember = nullptr;
   mlir::Operation *membersOperation = nullptr;
+  ABIView *raggedOffsets = nullptr;
+  ABIView *raggedMembersView = nullptr;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;

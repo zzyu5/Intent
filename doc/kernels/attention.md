@@ -120,8 +120,18 @@ def flash_attention_fwd(
 - pipeline、prefetch、warp specialization 与 tail；
 - generated launch configuration。
 
+Packed varlen 形式不引入另一类 attention schedule。Source 用一个 ragged relation
+把 `sequence -> packed token range` 写进 Kernel IR；同一 relation 的 outer domain
+由 program ownership 拥有，query member domain 被分块，另一个 member domain 由
+`state_stream` 顺序遍历。Plan 因而组合 `ragged ownership + ordered_stream`，三个
+GPU surface 只把同一组合投影成各自的 grid、offset load 和 streamed loop。
+
 ## 边界
 
 `state_stream` 固定 K/V segment order 与 carry update，不允许替换为 parallel partial-state merge。
 
 `I.mask` 表达 logical validity。Realizer 可以消除能够整体证明无效的 physical region；不能凭空发明 block-sparse skipping。Sparse descriptor 必须由 wrapper/source 提供。
+
+Logical region 的尾块可以短于 physical tile。Transfer 的边界处理必须保证地址安全；
+该有效性若穿过 contraction 进入 reduction，还必须继续作为 value validity 传播，不能
+把 load 的 zero padding 当成 softmax score 的逻辑零值。

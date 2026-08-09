@@ -83,7 +83,11 @@ LogicalResult SourceEmitter::prepare() {
   if (!ownership || ownership.getValue().empty())
     return planIndex.program.emitOpError("has no resolved TileLang ownership");
   programOwnership = ownership.getValue().str();
-  if (failed(indexABI()) || failed(resolvePhysicalBindings()))
+  if (failed(indexABI()))
+    return failure();
+  if (usesRaggedOwnership() && failed(prepareRaggedMetadata()))
+    return failure();
+  if (failed(resolvePhysicalBindings()))
     return failure();
   if (usesStagedEmission())
     return prepareRaggedStages();
@@ -159,10 +163,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
   bool multiAxis = programOwnership == "block_tiles" &&
                    hasTraversal("ordered_stream");
+  bool raggedOrdered = usesRaggedOrderedTraversal();
   bool raggedStages = usesStagedEmission();
-  if ((!multiAxis && !raggedStages &&
+  if ((!multiAxis && !raggedOrdered && !raggedStages &&
        planIndex.program.getWorkerAxes().size() != 1) ||
-      ((multiAxis || raggedStages) &&
+      ((multiAxis || raggedOrdered || raggedStages) &&
        planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
         "grid-axis count does not match the TileLang program mapping");
@@ -270,6 +275,27 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
                << "row-streamed TileLang program lacks " << role << " axis";
+  } else if (raggedOrdered) {
+    if (!searchSpace || !searchIndex.autotune || planIndex.ragged.size() != 1 ||
+        planIndex.streams.size() != 1 || !planIndex.stages.empty())
+      return realization.emitOpError(
+          "ragged ordered traversal requires one relation, one stream, no stages, and a delegated tuner");
+    for (StringRef role : {"program_0", "program_1", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ragged ordered traversal lacks " << role << " axis";
+    SmallVector<StringRef> expectedKeys = {
+        roleDimensions.lookup("program_1")};
+    if (roleDimensions.lookup("stream_0") != expectedKeys.front())
+      expectedKeys.push_back(roleDimensions.lookup("stream_0"));
+    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
+      return searchIndex.autotune.emitOpError(
+          "does not specialize every distinct ragged query/stream dimension");
+    for (auto [attribute, expected] :
+         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
+      if (cast<StringAttr>(attribute).getValue() != expected)
+        return searchIndex.autotune.emitOpError(
+            "key order does not match the ragged query/stream dimensions");
   } else if (raggedStages) {
     unsigned uniqueStores = llvm::count_if(
         planIndex.boundaries, [&](const auto &binding) {
@@ -288,22 +314,67 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   return success();
 }
 
+LogicalResult SourceEmitter::prepareRaggedMetadata() {
+  if (planIndex.ragged.size() != 1)
+    return realization.emitOpError(
+        "ragged ownership requires one projected ragged relation");
+  plan::RaggedOp ragged = planIndex.ragged.front();
+  raggedRelation = kernel.nodes.lookup(ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
+  if (!raggedRelation ||
+      raggedRelation->getName().getStringRef() != "intent.ragged" ||
+      !raggedOuter ||
+      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
+      ragged.getMemberNodes().empty())
+    return ragged.emitOpError(
+        "does not resolve to canonical ragged ownership operations");
+  for (int64_t node : ragged.getMemberNodes()) {
+    Operation *member = kernel.nodes.lookup(node);
+    if (!member || member->getName().getStringRef() != "intent.ragged_member")
+      return ragged.emitOpError(
+          "references a non-canonical ragged member domain");
+    auto owned = planIndex.axes.find(node);
+    if (owned != planIndex.axes.end() && owned->second.getRole() == "program_1")
+      raggedMember = member;
+  }
+  if (!raggedMember)
+    return ragged.emitOpError("has no owned ragged member axis");
+  Operation *offsetsLoad = raggedRelation->getNumOperands() >= 3
+                               ? raggedRelation->getOperand(2).getDefiningOp()
+                               : nullptr;
+  FailureOr<ABIView *> offsets =
+      offsetsLoad && offsetsLoad->getName().getStringRef() == "intent.view_load" &&
+              offsetsLoad->getNumOperands() == 1
+          ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
+          : FailureOr<ABIView *>(failure());
+  if (failed(offsets) || (*offsets)->tensor.getRank() != 1)
+    return raggedRelation->emitOpError(
+        "requires a canonical rank-one offsets view");
+  raggedOffsets = *offsets;
+  if (raggedRelation->getNumOperands() == 4) {
+    Operation *indicesLoad = raggedRelation->getOperand(3).getDefiningOp();
+    FailureOr<ABIView *> indices =
+        indicesLoad &&
+                indicesLoad->getName().getStringRef() == "intent.view_load" &&
+                indicesLoad->getNumOperands() == 1
+            ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
+            : FailureOr<ABIView *>(failure());
+    if (failed(indices) || (*indices)->tensor.getRank() != 1)
+      return raggedRelation->emitOpError(
+          "requires a canonical rank-one member-index view");
+    raggedIndices = *indices;
+  }
+  if (usesRaggedOrderedTraversal() && raggedRelation->getNumOperands() != 3)
+    return raggedRelation->emitOpError(
+        "ordered ragged traversal cannot project an indirect member map");
+  return success();
+}
+
 LogicalResult SourceEmitter::prepareRaggedStages() {
   plan::RaggedOp ragged = planIndex.ragged.front();
   if (ragged.getMemberNodes().size() != 1)
     return ragged.emitOpError(
         "staged emission requires one owned ragged member domain");
-  raggedRelation = kernel.nodes.lookup(ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(ragged.getMemberNodes().front());
-  if (!raggedRelation ||
-      raggedRelation->getName().getStringRef() != "intent.ragged" ||
-      !raggedOuter ||
-      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
-      !raggedMember ||
-      raggedMember->getName().getStringRef() != "intent.ragged_member")
-    return ragged.emitOpError(
-        "does not resolve to canonical ragged operations");
   kernel.entry.walk([&](Operation *operation) {
     if (operation->getName().getStringRef() == "intent.members" &&
         !membersOperation)
@@ -312,27 +383,6 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
   if (!membersOperation)
     return raggedRelation->emitOpError("has no member enumeration operation");
 
-  auto relationView = [&](unsigned operandIndex) -> FailureOr<ABIView *> {
-    Operation *load = raggedRelation->getOperand(operandIndex).getDefiningOp();
-    if (!load || load->getName().getStringRef() != "intent.view_load" ||
-        load->getNumOperands() != 1) {
-      raggedRelation->emitOpError("requires ragged metadata from canonical view loads");
-      return failure();
-    }
-    return lookupView(load->getOperand(0), *raggedRelation);
-  };
-  FailureOr<ABIView *> offsets = relationView(2);
-  if (failed(offsets) || (*offsets)->tensor.getRank() != 1)
-    return raggedRelation->emitOpError("requires a rank-one offsets view");
-  raggedOffsets = *offsets;
-  if (raggedRelation->getNumOperands() == 4) {
-    FailureOr<ABIView *> indices = relationView(3);
-    if (failed(indices) || (*indices)->tensor.getRank() != 1 ||
-        (*indices)->shape.size() != 1)
-      return raggedRelation->emitOpError(
-          "requires a rank-one member-index view");
-    raggedIndices = *indices;
-  }
   raggedMemberDimension = roleDimensions.lookup("program_1");
   if (raggedMemberDimension.empty())
     return raggedRelation->emitOpError(
@@ -483,6 +533,7 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
+  bool raggedOrdered = usesRaggedOrderedTraversal();
   bool compact = usesStagedEmission() &&
                  planIndex.ragged.front().getTraversal() ==
                      "compact_offset_tiles";
@@ -498,6 +549,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       parameter(dimension);
     if (ragged)
       parameter(compact ? "ROUTE_LENGTHS" : "MAX_ROUTES");
+    if (raggedOrdered)
+      parameter("MAX_SEQUENCE_LENGTH");
     if (hasTraversal("persistent")) {
       parameter("TILE_SIZE");
       parameter("num_stages=DEFAULT_NUM_STAGES");
@@ -662,6 +715,11 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     output << "        with T.Kernel(T.ceildiv(Q, TILE_SIZE_M), H, B, "
               "threads=threads) as (bid_program_2, index_program_1, "
               "index_program_0):\n";
+  } else if (raggedOrdered) {
+    output << "        with T.Kernel(T.ceildiv(MAX_SEQUENCE_LENGTH, "
+              "TILE_SIZE_M), "
+           << roleDimensions.lookup("program_0")
+           << ", threads=threads) as (query_block, sequence_index):\n";
   } else if (hasTraversal("ordered_stream") &&
              programOwnership == "block_rows") {
     output << "        with T.Kernel("
@@ -776,6 +834,11 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (!first)
         output << ", ";
       output << (compact ? "route_lengths" : "max_routes");
+    }
+    if (usesRaggedOrderedTraversal()) {
+      if (!first)
+        output << ", ";
+      output << "max_sequence_length";
     }
   };
 
@@ -932,12 +995,18 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   if (!result)
     return kernel.entry.emitOpError("TileLang wrapper has no output view");
+  if (usesRaggedOrderedTraversal())
+    output << "    max_sequence_length = int(("
+           << raggedOffsets->argument->name << "[1:] - "
+           << raggedOffsets->argument->name << "[:-1]).max().item())\n";
   output << "    cache_key = (";
   for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
     if (index)
       output << ", ";
     output << dimension;
   }
+  if (usesRaggedOrderedTraversal())
+    output << ", max_sequence_length";
   output << ", " << inputs.front()->argument->name << ".dtype, str(_DEVICE))\n";
   output << "    if cache_key not in _KERNEL_CACHE:\n";
   if (searchSpace) {
@@ -1035,7 +1104,9 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
   if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
       argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
     Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain && domain->getName().getStringRef() == "intent.domain")
+    if (domain &&
+        (domain->getName().getStringRef() == "intent.domain" ||
+         domain->getName().getStringRef() == "intent.ragged_member"))
       return domain;
     consumer.emitOpError("cannot resolve a TileLang stream source domain");
     return failure();
@@ -1221,16 +1292,28 @@ SourceEmitter::elementAccessIndices(Operation &operation,
       return failure();
     StringRef role = axis->getRole();
     if (role == "program_0")
-      indices.push_back("index_program_0");
-    else if (role == "program_1")
-      indices.push_back("index_program_1");
+      indices.push_back(usesRaggedOrderedTraversal() ? "sequence_index"
+                                                    : "index_program_0");
+    else if (role == "program_1") {
+      if (usesRaggedOrderedTraversal()) {
+        if (tileAxis >= tileIndices.size())
+          return operation.emitOpError(
+              "parallel ragged transfer has too few tile indices");
+        indices.push_back("query_start + " + tileIndices[tileAxis++]);
+      } else {
+        indices.push_back("index_program_1");
+      }
+    }
     else if (role == "program_2" || role == "stream_0") {
       if (tileAxis >= tileIndices.size())
         return operation.emitOpError(
             "parallel TileLang transfer has too few tile indices");
-      std::string base = role == "program_2"
-                             ? "bid_program_2 * TILE_SIZE_M"
-                             : "stream_tile * TILE_SIZE_N";
+      std::string base =
+          role == "program_2"
+              ? "bid_program_2 * TILE_SIZE_M"
+              : usesRaggedOrderedTraversal()
+                    ? "stream_start"
+                    : "stream_tile * TILE_SIZE_N";
       indices.push_back(base + " + " + tileIndices[tileAxis++]);
     } else {
       operation.emitOpError()
@@ -1246,6 +1329,73 @@ SourceEmitter::elementAccessIndices(Operation &operation,
     if (index)
       result += ", ";
     result += value;
+  }
+  return result;
+}
+
+FailureOr<std::string>
+SourceEmitter::elementBoundsPredicate(Operation &operation,
+                                      ArrayRef<std::string> tileIndices) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  SmallVector<std::string> predicates;
+  unsigned tileAxis = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "full_slice") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "bounded TileLang transfer has too few tile indices");
+      ++tileAxis;
+      continue;
+    }
+    if (term.kind == "static_index")
+      continue;
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "bounded TileLang transfer has no mechanical index relation");
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getOperand(*term.operands.front()), operation);
+    if (failed(axis))
+      return failure();
+    StringRef role = axis->getRole();
+    if (role == "program_1" && usesRaggedOrderedTraversal()) {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "bounded ragged query transfer has too few tile indices");
+      predicates.push_back("query_start + " + tileIndices[tileAxis++] +
+                           " < sequence_end");
+    } else if (role == "stream_0") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "bounded stream transfer has too few tile indices");
+      if (usesRaggedOrderedTraversal())
+        predicates.push_back("stream_start + " + tileIndices[tileAxis] +
+                             " < sequence_end");
+      ++tileAxis;
+    } else if (role == "program_2") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "bounded program transfer has too few tile indices");
+      ++tileAxis;
+    } else if (role != "program_0" && role != "program_1") {
+      return operation.emitOpError()
+             << "has no bounded TileLang transfer index for role " << role;
+    }
+  }
+  if (tileAxis != tileIndices.size())
+    return operation.emitOpError(
+        "bounded TileLang transfer has unused tile indices");
+  if (predicates.empty())
+    return operation.emitOpError(
+        "bounded TileLang transfer has no dynamic boundary predicate");
+  std::string result;
+  for (auto [index, predicate] : llvm::enumerate(predicates)) {
+    if (index)
+      result += " and ";
+    result += predicate;
   }
   return result;
 }
@@ -1413,6 +1563,14 @@ bool SourceEmitter::hasTraversal(StringRef traversal) {
                                     return cast<StringAttr>(attribute).getValue() ==
                                            traversal;
                                   });
+}
+
+bool SourceEmitter::usesRaggedOwnership() {
+  return programOwnership == "block_ragged";
+}
+
+bool SourceEmitter::usesRaggedOrderedTraversal() {
+  return usesRaggedOwnership() && hasTraversal("ordered_stream");
 }
 
 bool SourceEmitter::usesStagedEmission() {

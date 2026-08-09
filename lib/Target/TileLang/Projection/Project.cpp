@@ -155,8 +155,11 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         gpu::stringAttr(builder, bufferSpace(storage.getSpace())));
   bool rowStrided = indexed->program.getOwnership() == "row" &&
                     hasTraversal(indexed->program, "persistent");
-  bool elementwiseTransfer = indexed->program.getOwnership() == "tiled" &&
-                             hasTraversal(indexed->program, "ordered_stream");
+  bool raggedOrdered = indexed->program.getOwnership() == "ragged" &&
+                       hasTraversal(indexed->program, "ordered_stream");
+  bool elementwiseTransfer =
+      (indexed->program.getOwnership() == "tiled" || raggedOrdered) &&
+      hasTraversal(indexed->program, "ordered_stream");
   for (intent::plan::TransferOp transfer : indexed->transfers) {
     bool load = transfer.getAccess() == "load";
     StringRef access = rowStrided ? (load ? "gather" : "scatter")
@@ -170,7 +173,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         gpu::stringAttr(builder,
                         elementwiseTransfer ? "parallel_elements" : "bulk_copy"),
         transfer.getFillAttr(),
-        builder.getBoolAttr(rowStrided ||
+        builder.getBoolAttr(rowStrided || raggedOrdered ||
                             (hasTraversal(indexed->program, "staged") &&
                              transfer.getAccess() == "store")),
         gpu::stringAttr(builder, resultSpace), transfer.getDeferAttr());

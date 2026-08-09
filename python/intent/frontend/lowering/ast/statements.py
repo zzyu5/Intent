@@ -4,6 +4,7 @@ import ast
 
 from intent.api import DefinitionKind
 from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import DomainFlavor
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
@@ -499,11 +500,14 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
     if loop.orelse:
         lowerer.error(loop, "state_stream loop does not support else")
     stream = stream_expression
-    segment_type = (
-        stream.axis.type
-        if isinstance(stream.axis.type, RegionType)
-        else RegionType(stream.axis.type.rank, "state_stream")
-    )
+    if isinstance(stream.axis.type, RegionType):
+        segment_type = stream.axis.type
+    elif stream.axis.type.flavor is DomainFlavor.RAGGED_MEMBER:
+        segment_type = RegionType(stream.axis.type.rank, "ragged_member")
+    elif stream.axis.type.flavor is DomainFlavor.RAGGED_OUTER:
+        segment_type = RegionType(stream.axis.type.rank, "ragged_outer")
+    else:
+        segment_type = RegionType(stream.axis.type.rank, "state_stream")
     region = lowerer.compiler.builder.region(
         lowerer.location(loop),
         (segment_type, *(value.type for value in stream.initial_state)),

@@ -66,6 +66,40 @@ def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "varlen_attention":
+        sys.path.insert(0, str(source_path.parent))
+        source = _load_module(
+            source_path, "intent_upstream_tilelang_varlen_attention"
+        )
+        compiled = {}
+
+        def run(arguments):
+            q, k, v, lengths, cu_seqlens, _ = arguments
+            key = (q.shape[0], q.shape[1], int(lengths.max().item()))
+            if key not in compiled:
+                compiled[key] = source.flashattn(
+                    lengths.numel(),
+                    1,
+                    q.shape[0],
+                    k.shape[0],
+                    1,
+                    q.shape[1],
+                    False,
+                    block_M=64,
+                    block_N=64,
+                    num_stages=2,
+                    threads=128,
+                )
+            return compiled[key](
+                q[:, None, :],
+                k[:, None, :],
+                v[:, None, :],
+                cu_seqlens,
+                cu_seqlens,
+                key[2],
+            )[:, 0, :]
+
+        return run
     if kernel == "rms_norm":
         source = _load_module(source_path, "intent_upstream_tilelang_rms_norm")
         compiled = {}

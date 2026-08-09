@@ -156,6 +156,38 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
+  if (usesRaggedOrderedTraversal()) {
+    if (&operation == programRoot) {
+      line("query_block = tl.program_id(axis=" +
+           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
+      line("sequence_index = tl.program_id(axis=" +
+           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
+      line("sequence_begin = tl.load(" + raggedOffsets->pointer +
+           " + sequence_index * " + raggedOffsets->strides[0] + ")");
+      line("sequence_end = tl.load(" + raggedOffsets->pointer +
+           " + (sequence_index + 1) * " + raggedOffsets->strides[0] + ")");
+      line("sequence_length = sequence_end - sequence_begin");
+      line("offs_program_1 = sequence_begin + query_block * BLOCK_SIZE_Q + "
+           "tl.arange(0, BLOCK_SIZE_Q)");
+    }
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "ragged ownership requires one parallel region argument");
+    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    if (axis->getRole() == "program_0")
+      valueNames[argument] = "sequence_index";
+    else if (axis->getRole() == "program_1")
+      valueNames[argument] = "offs_program_1";
+    else
+      return operation.emitOpError(
+          "parallel region has no ragged ownership role");
+    return success();
+  }
   if (usesStagedEmission()) {
     if (operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
@@ -269,6 +301,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a resolved Triton load projection");
+  if (boundary.getDomainNodes().empty() && boundary.getLoadFill() == "none") {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    if (failed(view))
+      return failure();
+    bindResult(operation, 0, (*view)->pointer);
+    return success();
+  }
   if (boundary.getDefer()) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
@@ -539,12 +578,16 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
-  line("for stream_block in range(0, tl.cdiv(" +
-       roleDimensions.lookup("stream_0") + ", " + binding.getTile().str() +
-       ")):");
+  std::string streamExtent = usesRaggedOrderedTraversal()
+                                 ? "sequence_length"
+                                 : roleDimensions.lookup("stream_0");
+  line("for stream_block in range(0, tl.cdiv(" + streamExtent + ", " +
+       binding.getTile().str() + ")):");
   ++indentation;
-  line("offs_stream_0 = stream_block * " + binding.getTile().str() +
-       " + tl.arange(0, " + binding.getTile().str() + ")");
+  line("offs_stream_0 = " +
+       std::string(usesRaggedOrderedTraversal() ? "sequence_begin + " : "") +
+       "stream_block * " + binding.getTile().str() + " + tl.arange(0, " +
+       binding.getTile().str() + ")");
   valueNames[body.getArgument(0)] = "offs_stream_0";
   return success();
 }

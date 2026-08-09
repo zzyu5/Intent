@@ -12,6 +12,14 @@ bool contains(ArrayRef<Operation *> operations, Operation *operation) {
   return llvm::is_contained(operations, operation);
 }
 
+unsigned terminalWriteCount(const KernelFacts &facts) {
+  return llvm::count_if(facts.boundaryDomains, [](const auto &binding) {
+    StringRef name = binding.first->getName().getStringRef();
+    return name == "intent.view_store" || name == "intent.scatter_unique" ||
+           name == "intent.scatter_reduce";
+  });
+}
+
 void appendUnique(SmallVectorImpl<std::string> &values, StringRef value) {
   if (!llvm::is_contained(values, value))
     values.push_back(value.str());
@@ -142,7 +150,7 @@ LogicalResult decideOrderedTraversal(ScheduleStructure &structure,
       return failure();
     if (!contains((*ownership)->memberDomains, streamDomain) ||
         contains(structure.programDomains, streamDomain) ||
-        structure.scatterWrites.size() != 1 ||
+        terminalWriteCount(facts) != 1 ||
         structure.contractionDomains.size() != 1 ||
         structure.contractionDomains.front() != streamDomain)
       return facts.kernel.entry.emitOpError(

@@ -9,6 +9,8 @@ HEADS = 32
 SEQUENCE = 4096
 HEAD_DIMENSION = 128
 SCALE = 1.0 / math.sqrt(HEAD_DIMENSION)
+VARLEN_BATCH = 8
+VARLEN_TOTAL_TOKENS = 29114
 
 
 @intent.kernel
@@ -84,3 +86,81 @@ def flash_attention_fwd(
                 output[batch, head, q_region, :] = I.cast(
                     accumulator / denominator[:, None], I.f16
                 )
+
+
+@intent.kernel
+def flash_varlen_attention_fwd(
+    q: I.In[I.f16, ("U", "D")],
+    k: I.In[I.f16, ("U", "D")],
+    v: I.In[I.f16, ("U", "DV")],
+    sequence_lengths: I.In[I.i32, ("B",)],
+    cu_seqlens: I.In[I.i32, ("B_PLUS_1",)],
+    output: I.Out[I.f16, ("U", "DV")],
+    scale: I.f32,
+    CAUSAL: I.Constexpr[bool],
+):
+    U, _ = q.shape
+    B = sequence_lengths.shape[0]
+    DV = v.shape[-1]
+    sequences = I.ragged(
+        outer=I.domain(0, B),
+        members=I.domain(0, U),
+        offsets=cu_seqlens,
+    )
+    for sequence in I.parallel(sequences.outer):
+        for q_region in I.parallel(
+            I.partition(sequences[sequence], extent=I.auto("Q_TILE"))
+        ):
+            q_block = q[q_region, :]
+            stream = I.state_stream(
+                sequences[sequence],
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((q_region,), -I.inf, dtype=I.f32),
+                    I.zeros((q_region,), dtype=I.f32),
+                    I.zeros((q_region, DV), dtype=I.f32),
+                ),
+            )
+            with stream:
+                for k_region, (maximum, denominator, accumulator) in stream:
+                    k_block = k[k_region, :]
+                    v_block = v[k_region, :]
+                    scores = I.contract(
+                        q_block,
+                        k_block,
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    scores = scores * (scale * I.LOG2E)
+                    if CAUSAL:
+                        q_index = I.indices(q_region)
+                        k_index = I.indices(k_region)
+                        valid = q_index[:, None] >= k_index[None, :]
+                        if not I.any(valid):
+                            stream.yield_(maximum, denominator, accumulator)
+                            continue
+                        scores = I.mask(scores, valid=valid, fill=-I.inf)
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    alpha = I.exp2(maximum - next_maximum)
+                    probability = I.exp2(scores - next_maximum[:, None])
+                    next_denominator = alpha * denominator + I.reduce.sum(
+                        probability, axis=1, identity=0.0
+                    )
+                    next_accumulator = alpha[:, None] * accumulator + I.contract(
+                        I.cast(probability, I.f16),
+                        v_block,
+                        reduce=((1, 0),),
+                        acc_dtype=I.f32,
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[q_region, :] = I.cast(
+                accumulator / denominator[:, None], I.f16
+            )

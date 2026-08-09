@@ -74,6 +74,8 @@ LogicalResult SourceEmitter::emit() {
 LogicalResult SourceEmitter::prepare() {
   if (failed(indexABI()))
     return failure();
+  if (usesRaggedOwnership() && failed(prepareRaggedMetadata()))
+    return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
   if (usesStagedEmission())
@@ -148,10 +150,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
   bool multiAxis = planIndex.program.getOwnership() == "block_tiles" &&
                    hasTraversal("ordered_stream");
+  bool raggedOrdered = usesRaggedOrderedTraversal();
   bool raggedStages = usesStagedEmission();
-  if ((!multiAxis && !raggedStages &&
+  if ((!multiAxis && !raggedOrdered && !raggedStages &&
        planIndex.program.getWorkerAxes().size() != 1) ||
-      ((multiAxis || raggedStages) &&
+      ((multiAxis || raggedOrdered || raggedStages) &&
        planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
         "block-axis count does not match the cuTile program mapping");
@@ -286,6 +289,34 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
             roleDimensions.lookup("stream_0"))
       return searchIndex.autotune.emitOpError(
           "must specialize the row stream dimension");
+  } else if (raggedOrdered) {
+    if (!searchSpace || !searchIndex.autotune || planIndex.ragged.size() != 1 ||
+        planIndex.streams.size() != 1 || !planIndex.stages.empty())
+      return realization.emitOpError(
+          "ragged ordered traversal requires one relation, one stream, no stages, and a delegated tuner");
+    for (StringRef role : {"program_0", "program_1", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ragged ordered traversal lacks " << role << " axis";
+    SmallVector<StringRef> expectedKeys = {
+        roleDimensions.lookup("program_1")};
+    if (roleDimensions.lookup("stream_0") != expectedKeys.front())
+      expectedKeys.push_back(roleDimensions.lookup("stream_0"));
+    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
+      return searchIndex.autotune.emitOpError(
+          "does not specialize every distinct ragged query/stream dimension");
+    for (auto [attribute, expected] :
+         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
+      if (cast<StringAttr>(attribute).getValue() != expected)
+        return searchIndex.autotune.emitOpError(
+            "key order does not match the ragged query/stream dimensions");
+    for (const std::string &dimension : dimensionOrder) {
+      bool physicalDimension = llvm::any_of(
+          roleDimensions,
+          [&](const auto &binding) { return binding.getValue() == dimension; });
+      if (!physicalDimension)
+        kernelConstants.push_back(dimension);
+    }
   } else if (raggedStages) {
     unsigned uniqueStores = llvm::count_if(
         planIndex.boundaries, [&](const auto &binding) {
@@ -308,23 +339,66 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   return success();
 }
 
+LogicalResult SourceEmitter::prepareRaggedMetadata() {
+  if (planIndex.ragged.size() != 1)
+    return realization.emitOpError(
+        "ragged ownership requires one projected ragged relation");
+  plan::RaggedOp ragged = planIndex.ragged.front();
+  raggedRelation = kernel.nodes.lookup(ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
+  if (!raggedRelation ||
+      raggedRelation->getName().getStringRef() != "intent.ragged" ||
+      !raggedOuter ||
+      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
+      ragged.getMemberNodes().empty())
+    return ragged.emitOpError(
+        "does not resolve to canonical ragged ownership operations");
+  for (int64_t node : ragged.getMemberNodes()) {
+    Operation *member = kernel.nodes.lookup(node);
+    if (!member ||
+        member->getName().getStringRef() != "intent.ragged_member")
+      return ragged.emitOpError(
+          "references a non-canonical ragged member domain");
+    auto owned = planIndex.axes.find(node);
+    if (owned != planIndex.axes.end() && owned->second.getRole() == "program_1")
+      raggedMember = member;
+  }
+  if (!raggedMember)
+    return ragged.emitOpError("has no owned ragged member axis");
+  Operation *offsetsLoad = raggedRelation->getNumOperands() >= 3
+                               ? raggedRelation->getOperand(2).getDefiningOp()
+                               : nullptr;
+  FailureOr<ABIView *> offsets =
+      offsetsLoad && offsetsLoad->getName().getStringRef() == "intent.view_load" &&
+              offsetsLoad->getNumOperands() == 1
+          ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
+          : FailureOr<ABIView *>(failure());
+  Operation *memberSource = raggedRelation->getOperand(1).getDefiningOp();
+  Operation *memberDim = memberSource && memberSource->getNumOperands() >= 2
+                             ? memberSource->getOperand(1).getDefiningOp()
+                             : nullptr;
+  FailureOr<ABIView *> membersView =
+      memberDim && memberDim->getName().getStringRef() == "intent.dim" &&
+              memberDim->getNumOperands() == 1
+          ? lookupView(memberDim->getOperand(0), *raggedRelation)
+          : FailureOr<ABIView *>(failure());
+  if (failed(offsets) || (*offsets)->tensor.getRank() != 1 ||
+      failed(membersView))
+    return raggedRelation->emitOpError(
+        "requires canonical offsets and member-source views");
+  raggedOffsets = *offsets;
+  raggedMembersView = *membersView;
+  if (usesRaggedOrderedTraversal() && raggedRelation->getNumOperands() != 3)
+    return raggedRelation->emitOpError(
+        "ordered ragged traversal cannot project an indirect member map");
+  return success();
+}
+
 LogicalResult SourceEmitter::prepareRaggedStages() {
   plan::RaggedOp ragged = planIndex.ragged.front();
   if (ragged.getMemberNodes().size() != 1)
     return ragged.emitOpError(
         "staged emission requires one owned ragged member domain");
-  raggedRelation = kernel.nodes.lookup(ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(ragged.getMemberNodes().front());
-  if (!raggedRelation ||
-      raggedRelation->getName().getStringRef() != "intent.ragged" ||
-      !raggedOuter ||
-      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
-      !raggedMember ||
-      raggedMember->getName().getStringRef() != "intent.ragged_member")
-    return ragged.emitOpError(
-        "does not resolve to canonical ragged operations");
-
   kernel.entry.walk([&](Operation *operation) {
     if (operation->getName().getStringRef() == "intent.members" &&
         !membersOperation)
@@ -1035,17 +1109,25 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << extent;
     }
+    if (view.shape.size() == 1)
+      output << ",";
     output << "):\n";
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
   output << "    stream = torch.cuda.current_stream()\n";
+  if (usesRaggedOrderedTraversal())
+    output << "    max_member_length = int(("
+           << raggedOffsets->argument->name << "[1:] - "
+           << raggedOffsets->argument->name << "[:-1]).max().item())\n";
   output << "    cache_key = (";
   for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
     if (index)
       output << ", ";
     output << dimension;
   }
+  if (usesRaggedOrderedTraversal())
+    output << ", max_member_length";
   output << ", " << inputs.front()->argument->name << ".dtype, str(_DEVICE))\n";
   output << "    if cache_key not in _TUNE_CACHE:\n";
   output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
@@ -1068,6 +1150,10 @@ LogicalResult SourceEmitter::emitWrapper() {
              planIndex.program.getOwnership() == "block_rows") {
     output << "                lambda cfg: ("
            << roleDimensions.lookup("program_0") << ", 1, 1),\n";
+  } else if (usesRaggedOrderedTraversal()) {
+    output << "                lambda cfg: (ceil(max_member_length / "
+              "cfg.TILE_SIZE_M), "
+           << roleDimensions.lookup("program_0") << ", 1),\n";
   } else {
     return planIndex.program.emitOpError(
         "has no autotuned cuTile grid emitter");
@@ -1100,6 +1186,9 @@ LogicalResult SourceEmitter::emitWrapper() {
            << " / best.TILE_SIZE_M), "
            << roleDimensions.lookup("program_0") << " * "
            << roleDimensions.lookup("program_1") << ", 1)\n";
+  else if (usesRaggedOrderedTraversal())
+    output << "    grid = (ceil(max_member_length / best.TILE_SIZE_M), "
+           << roleDimensions.lookup("program_0") << ", 1)\n";
   else
     output << "    grid = (" << roleDimensions.lookup("program_0")
            << ", 1, 1)\n";
@@ -1188,7 +1277,10 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
   if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
       argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
     Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain && domain->getName().getStringRef() == "intent.domain")
+    if (domain &&
+        (domain->getName().getStringRef() == "intent.domain" ||
+         domain->getName().getStringRef() == "intent.ragged_outer" ||
+         domain->getName().getStringRef() == "intent.ragged_member"))
       return domain;
     consumer.emitOpError("cannot resolve a cuTile stream source domain");
     return failure();
@@ -1276,6 +1368,32 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  if (usesRaggedOrderedTraversal()) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    if (failed(view) || (*view)->tensor.getRank() != 2 ||
+        relation->size() != 2 || (*relation)[1].kind != "full_slice" ||
+        ((*relation)[0].kind != "region_index" &&
+         (*relation)[0].kind != "value_index") ||
+        (*relation)[0].operands.size() != 1 ||
+        !(*relation)[0].operands.front())
+      return operation.emitOpError(
+          "ragged cuTile matrix access requires member rows and one full feature axis");
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getOperand(*(*relation)[0].operands.front()),
+                    operation);
+    if (failed(axis))
+      return failure();
+    StringRef rows = axis->getRole() == "program_1"
+                         ? StringRef("query_offsets")
+                     : axis->getRole() == "stream_0"
+                         ? StringRef("stream_offsets")
+                         : StringRef();
+    if (rows.empty())
+      return operation.emitOpError(
+          "ragged cuTile matrix access has no member-axis role");
+    return "(" + rows.str() + "[:, None], ct.arange(" +
+           (*view)->shape[1] + ", dtype=ct.int32)[None, :])";
+  }
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "full_slice") {
@@ -1414,9 +1532,8 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
     else
       extents.push_back(label.getValue().str());
   }
-  if (hasTraversal("ordered_stream") &&
-      planIndex.program.getOwnership() == "block_tiles" &&
-      extents.size() == 1 && extents.front() == "TILE_SIZE_M")
+  if (hasTraversal("ordered_stream") && extents.size() == 1 &&
+      extents.front() == "TILE_SIZE_M")
     extents.push_back("1");
   std::string result = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {
@@ -1510,10 +1627,17 @@ bool SourceEmitter::hasTraversal(StringRef traversal) {
                                   });
 }
 
-bool SourceEmitter::usesStagedEmission() {
+bool SourceEmitter::usesRaggedOwnership() {
   return planIndex.program &&
-         planIndex.program.getOwnership() == "block_ragged" &&
-         hasTraversal("staged");
+         planIndex.program.getOwnership() == "block_ragged";
+}
+
+bool SourceEmitter::usesRaggedOrderedTraversal() {
+  return usesRaggedOwnership() && hasTraversal("ordered_stream");
+}
+
+bool SourceEmitter::usesStagedEmission() {
+  return usesRaggedOwnership() && hasTraversal("staged");
 }
 
 LogicalResult emitRealizedKernelSource(

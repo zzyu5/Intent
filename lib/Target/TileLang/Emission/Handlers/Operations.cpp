@@ -145,6 +145,33 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
+  if (usesRaggedOrderedTraversal()) {
+    if (&operation == programRoot) {
+      line("sequence_begin = " + raggedOffsets->argument->name +
+           "[sequence_index]");
+      line("sequence_end = " + raggedOffsets->argument->name +
+           "[sequence_index + 1]");
+      line("sequence_length = sequence_end - sequence_begin");
+      line("query_start = sequence_begin + query_block * TILE_SIZE_M");
+    }
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "ragged ownership requires one parallel region argument");
+    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    if (axis->getRole() == "program_0")
+      valueNames[argument] = "sequence_index";
+    else if (axis->getRole() == "program_1")
+      valueNames[argument] = "query_start";
+    else
+      return operation.emitOpError(
+          "parallel region has no ragged ownership role");
+    return success();
+  }
   if (operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)) ||
       operation.getRegion(0).front().getNumArguments() != 1)
@@ -184,6 +211,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a TileLang load projection");
+  if (boundary.getDomainNodes().empty() && boundary.getPadding() == "none") {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    if (failed(view))
+      return failure();
+    bindResult(operation, 0, (*view)->argument->name);
+    return success();
+  }
   if (boundary.getDefer()) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
@@ -195,8 +229,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return operation.emitOpError("lacks a mechanical TileLang load binding");
   if (boundary.getTransfer() == "parallel_elements") {
     FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
-    if (failed(extents) || extents->empty() || boundary.getCheckBounds() ||
-        boundary.getPadding() != "zero")
+    if (failed(extents) || extents->empty() ||
+        (boundary.getCheckBounds() && !usesRaggedOrderedTraversal()) ||
+        (boundary.getPadding() != "zero" &&
+         boundary.getPadding() != "negative_infinity"))
       return operation.emitOpError(
           "has an invalid parallel TileLang load transfer");
     SmallVector<std::string> tileIndices;
@@ -217,6 +253,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         elementAccessIndices(operation, tileIndices);
     if (failed(indices))
       return failure();
+    FailureOr<std::string> predicate =
+        boundary.getCheckBounds()
+            ? elementBoundsPredicate(operation, tileIndices)
+            : FailureOr<std::string>(std::string());
+    if (failed(predicate))
+      return failure();
     line(loop + "):");
     ++indentation;
     std::string target = *result + "[";
@@ -225,7 +267,21 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         target += ", ";
       target += index;
     }
+    if (boundary.getCheckBounds()) {
+      line("if " + *predicate + ":");
+      ++indentation;
+    }
     line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
+    if (boundary.getCheckBounds()) {
+      --indentation;
+      line("else:");
+      ++indentation;
+      StringRef fill = boundary.getPadding() == "negative_infinity"
+                           ? "-T.infinity(T.float32)"
+                           : "0.0";
+      line(target + "] = " + fill.str());
+      --indentation;
+    }
     --indentation;
     if (boundary.getResultSpace() == "shared")
       line("T.sync_threads()");
@@ -757,10 +813,19 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   }
   streamCarriers[&operation] = carriers;
   line("for stream_tile in T.Pipelined(T.ceildiv(" +
-       roleDimensions.lookup("stream_0") + ", " + binding.getTile().str() +
+       (usesRaggedOrderedTraversal()
+            ? std::string("sequence_length")
+            : roleDimensions.lookup("stream_0")) +
+       ", " + binding.getTile().str() +
        "), num_stages=num_stages):");
   ++indentation;
-  valueNames[body.getArgument(0)] = "stream_tile";
+  if (usesRaggedOrderedTraversal()) {
+    line("stream_start = sequence_begin + stream_tile * " +
+         binding.getTile().str());
+    valueNames[body.getArgument(0)] = "stream_start";
+  } else {
+    valueNames[body.getArgument(0)] = "stream_tile";
+  }
   return success();
 }
 
@@ -1012,7 +1077,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
     FailureOr<SmallVector<std::string>> extents =
         definition ? tensorExtents(*definition, result.getResultNumber())
                    : FailureOr<SmallVector<std::string>>(failure());
-    if (failed(extents) || extents->empty() || boundary.getCheckBounds() ||
+    if (failed(extents) || extents->empty() ||
+        (boundary.getCheckBounds() && !usesRaggedOrderedTraversal()) ||
         boundary.getPadding() != "none")
       return operation.emitOpError(
           "has an invalid parallel TileLang store transfer");
@@ -1034,8 +1100,18 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
         elementAccessIndices(operation, tileIndices);
     if (failed(indices))
       return failure();
+    FailureOr<std::string> predicate =
+        boundary.getCheckBounds()
+            ? elementBoundsPredicate(operation, tileIndices)
+            : FailureOr<std::string>(std::string());
+    if (failed(predicate))
+      return failure();
     line(loop + "):");
     ++indentation;
+    if (boundary.getCheckBounds()) {
+      line("if " + *predicate + ":");
+      ++indentation;
+    }
     std::string source = stored->str() + "[";
     for (auto [axis, index] : llvm::enumerate(tileIndices)) {
       if (axis)
@@ -1043,6 +1119,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       source += index;
     }
     line((*view)->argument->name + "[" + *indices + "] = " + source + "]");
+    if (boundary.getCheckBounds())
+      --indentation;
     --indentation;
     return success();
   }

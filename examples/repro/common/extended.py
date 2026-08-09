@@ -29,6 +29,11 @@ from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.streaming.online_softmax import COLUMNS as ONLINE_COLUMNS
 from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from kernels.streaming.online_softmax import streamed_online_softmax
+from kernels.streaming.attention import HEAD_DIMENSION
+from kernels.streaming.attention import SCALE
+from kernels.streaming.attention import VARLEN_BATCH
+from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
+from kernels.streaming.attention import flash_varlen_attention_fwd
 
 from .support import benchmark
 from .support import print_artifact
@@ -247,6 +252,56 @@ def _run_online_softmax(
     )
 
 
+def _run_varlen_attention(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    lengths = torch.tensor(
+        [4093, 3961, 3833, 3701, 3571, 3449, 3319, 3187],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    if lengths.numel() != VARLEN_BATCH or lengths.sum().item() != VARLEN_TOTAL_TOKENS:
+        raise RuntimeError("varlen attention shape constants do not match its input")
+    cu_seqlens = torch.zeros(
+        (VARLEN_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    cu_seqlens[1:] = lengths.cumsum(0)
+    shape = (VARLEN_TOTAL_TOKENS, HEAD_DIMENSION)
+    q = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    k = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    v = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    artifact = intent.compile(
+        flash_varlen_attention_fwd,
+        constexprs={"CAUSAL": False},
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        result = torch.empty_like(v)
+        for begin, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            start = int(begin.item())
+            stop = int(end.item())
+            result[start:stop] = F.scaled_dot_product_attention(
+                q[start:stop][None, None],
+                k[start:stop][None, None],
+                v[start:stop][None, None],
+                is_causal=False,
+                scale=SCALE,
+            )[0, 0]
+        return result
+
+    _compare(
+        artifact=artifact,
+        arguments=(q, k, v, lengths, cu_seqlens, SCALE),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="packed varlen attention",
+        tolerance=2.0e-2,
+        upstream=upstream,
+    )
+
+
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "dual_gemm": _run_dual_gemm,
     "grouped_gemm": _run_grouped_gemm,
@@ -254,6 +309,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
     "rms_norm": _run_rms_norm,
+    "varlen_attention": _run_varlen_attention,
 }
 
 

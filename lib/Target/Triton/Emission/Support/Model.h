@@ -122,6 +122,7 @@ private:
                                              bool store);
   std::string broadcastIndex(llvm::StringRef base, unsigned axis,
                              unsigned rank);
+  mlir::LogicalResult prepareRaggedMetadata();
   mlir::LogicalResult prepareRaggedStages();
   void collectStageValue(mlir::Value value, unsigned stage,
                          const llvm::DenseSet<mlir::Value> &inputs,
@@ -131,6 +132,8 @@ private:
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
   bool hasTraversal(llvm::StringRef traversal);
+  bool usesRaggedOwnership();
+  bool usesRaggedOrderedTraversal();
   bool usesStagedEmission();
 
   std::string makeResultName(mlir::Operation &operation, unsigned index);
@@ -170,6 +173,7 @@ private:
   mlir::Operation *raggedOuter = nullptr;
   mlir::Operation *raggedMember = nullptr;
   mlir::Operation *membersOperation = nullptr;
+  ABIView *raggedOffsets = nullptr;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;

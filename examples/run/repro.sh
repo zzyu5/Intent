@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|dual_gemm|attention|online_softmax|moe|grouped_gemm>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm>" >&2
   exit 2
 fi
 
@@ -104,8 +104,12 @@ case "${backend}:${kernel}" in
   tilelang:online_softmax)
     baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
     ;;
+  tilelang:varlen_attention)
+    baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
+    ;;
   triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
-  tilelang:layer_norm | tilelang:logsumexp)
+  tilelang:layer_norm | tilelang:logsumexp | \
+  triton:varlen_attention | cutile:varlen_attention)
     ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2

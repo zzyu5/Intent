@@ -139,6 +139,8 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
                                     gpu::stringAttr(builder, "global"));
   bool rowStrided = indexed->program.getOwnership() == "row" &&
                     hasTraversal(indexed->program, "persistent");
+  bool raggedOrdered = indexed->program.getOwnership() == "ragged" &&
+                       hasTraversal(indexed->program, "ordered_stream");
   for (intent::plan::TransferOp transfer : indexed->transfers) {
     bool load = transfer.getAccess() == "load";
     bool vectorized = llvm::any_of(
@@ -148,13 +150,13 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
           });
           return axis != indexed->axes.end() && axis->getTile() != "one";
         });
-    StringRef access = rowStrided && vectorized
+    StringRef access = (rowStrided || raggedOrdered) && vectorized
                            ? (load ? "gather" : "scatter")
                            : (load ? "load" : "store");
     builder.create<plan::BoundaryOp>(
         transfer.getLoc(), transfer.getNodeAttr(), transfer.getDomainNodesAttr(),
         gpu::stringAttr(builder, access), transfer.getFillAttr(),
-        builder.getBoolAttr(rowStrided ||
+        builder.getBoolAttr(rowStrided || raggedOrdered ||
                             (hasTraversal(indexed->program, "staged") &&
                              transfer.getAccess() == "store")),
         transfer.getDeferAttr());

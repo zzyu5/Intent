@@ -156,6 +156,41 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
+  if (usesRaggedOrderedTraversal()) {
+    if (&operation == programRoot) {
+      line("query_block = ct.bid(" +
+           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
+      line("sequence_index = ct.bid(" +
+           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
+      line("sequence_begin = ct.gather(" + raggedOffsets->argument->name +
+           ", sequence_index, padding_value=0)");
+      line("sequence_end = ct.gather(" + raggedOffsets->argument->name +
+           ", sequence_index + 1, padding_value=0)");
+      line("sequence_length = sequence_end - sequence_begin");
+      line("query_offsets = sequence_begin + query_block * TILE_SIZE_M + "
+           "ct.arange(TILE_SIZE_M, dtype=ct.int32)");
+      line("query_offsets = ct.where(query_offsets < sequence_end, "
+           "query_offsets, " + raggedMembersView->argument->name +
+           ".shape[0])");
+    }
+    if (operation.getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation.getRegion(0)) ||
+        operation.getRegion(0).front().getNumArguments() != 1)
+      return operation.emitOpError(
+          "ragged ownership requires one parallel region argument");
+    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    if (axis->getRole() == "program_0")
+      valueNames[argument] = "sequence_index";
+    else if (axis->getRole() == "program_1")
+      valueNames[argument] = "query_offsets";
+    else
+      return operation.emitOpError(
+          "parallel region has no ragged ownership role");
+    return success();
+  }
   if (usesStagedEmission()) {
     if (operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
@@ -261,6 +296,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a cuTile load boundary");
+  if (boundary.getDomainNodes().empty() && boundary.getPadding() == "none") {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    if (failed(view))
+      return failure();
+    bindResult(operation, 0, (*view)->argument->name);
+    return success();
+  }
   if (boundary.getDefer()) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
@@ -540,11 +582,21 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
-  std::string streamDimension = roleDimensions.lookup("stream_0");
-  line("for stream_tile in range(ct.cdiv(" +
-       dimensionOwners.lookup(streamDimension) + ", " + binding.getTile().str() +
-       ")):");
+  std::string streamExtent =
+      usesRaggedOrderedTraversal()
+          ? "sequence_length"
+          : dimensionOwners.lookup(roleDimensions.lookup("stream_0"));
+  line("for stream_tile in range(ct.cdiv(" + streamExtent + ", " +
+       binding.getTile().str() + ")):");
   ++indentation;
+  if (usesRaggedOrderedTraversal()) {
+    line("stream_offsets = sequence_begin + stream_tile * " +
+         binding.getTile().str() + " + ct.arange(" + binding.getTile().str() +
+         ", dtype=ct.int32)");
+    line("stream_offsets = ct.where(stream_offsets < sequence_end, "
+         "stream_offsets, " + raggedMembersView->argument->name +
+         ".shape[0])");
+  }
   valueNames[body.getArgument(0)] = "stream_tile";
   return success();
 }

@@ -109,6 +109,9 @@ private:
   mlir::FailureOr<std::string>
   elementAccessIndices(mlir::Operation &operation,
                        llvm::ArrayRef<std::string> tileIndices);
+  mlir::FailureOr<std::string>
+  elementBoundsPredicate(mlir::Operation &operation,
+                         llvm::ArrayRef<std::string> tileIndices);
   mlir::FailureOr<llvm::SmallVector<std::string>>
   tensorExtents(mlir::Operation &operation, unsigned resultIndex);
   mlir::FailureOr<std::string> tensorShape(mlir::Operation &operation,
@@ -123,6 +126,7 @@ private:
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
 
+  mlir::LogicalResult prepareRaggedMetadata();
   mlir::LogicalResult prepareRaggedStages();
   void collectStageValue(mlir::Value value, unsigned stage,
                          const llvm::DenseSet<mlir::Value> &inputs,
@@ -130,6 +134,8 @@ private:
   void stageLine(unsigned stage, llvm::StringRef text,
                  unsigned indent = 3);
   bool hasTraversal(llvm::StringRef traversal);
+  bool usesRaggedOwnership();
+  bool usesRaggedOrderedTraversal();
   bool usesStagedEmission();
 
   std::string makeResultName(mlir::Operation &operation, unsigned index);

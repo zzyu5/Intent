@@ -76,6 +76,8 @@ LogicalResult SourceEmitter::emit() {
 LogicalResult SourceEmitter::prepare() {
   if (failed(indexABI()))
     return failure();
+  if (usesRaggedOwnership() && failed(prepareRaggedMetadata()))
+    return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
   if (usesStagedEmission())
@@ -154,10 +156,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
   bool multiAxis = planIndex.program.getOwnership() == "program_tiles" &&
                    hasTraversal("ordered_stream");
+  bool raggedOrdered = usesRaggedOrderedTraversal();
   bool raggedStages = usesStagedEmission();
-  if ((!multiAxis && !raggedStages &&
+  if ((!multiAxis && !raggedOrdered && !raggedStages &&
        planIndex.program.getWorkerAxes().size() != 1) ||
-      ((multiAxis || raggedStages) &&
+      ((multiAxis || raggedOrdered || raggedStages) &&
        planIndex.program.getWorkerAxes().size() != 2))
     return planIndex.program.emitOpError(
         "worker-axis count does not match the Triton program mapping");
@@ -286,6 +289,27 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
             roleDimensions.lookup("stream_0"))
       return searchIndex.autotune.emitOpError(
           "must specialize the row stream dimension");
+  } else if (raggedOrdered) {
+    if (!searchSpace || !searchIndex.autotune || planIndex.ragged.size() != 1 ||
+        planIndex.streams.size() != 1 || !planIndex.stages.empty())
+      return realization.emitOpError(
+          "ragged ordered traversal requires one relation, one stream, no stages, and a delegated tuner");
+    for (StringRef role : {"program_0", "program_1", "stream_0"})
+      if (!planIndex.axesByRole.count(role))
+        return realization.emitOpError()
+               << "ragged ordered traversal lacks " << role << " axis";
+    SmallVector<StringRef> expectedKeys = {
+        roleDimensions.lookup("program_1")};
+    if (roleDimensions.lookup("stream_0") != expectedKeys.front())
+      expectedKeys.push_back(roleDimensions.lookup("stream_0"));
+    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
+      return searchIndex.autotune.emitOpError(
+          "does not specialize every distinct ragged query/stream dimension");
+    for (auto [attribute, expected] :
+         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
+      if (cast<StringAttr>(attribute).getValue() != expected)
+        return searchIndex.autotune.emitOpError(
+            "key order does not match the ragged query/stream dimensions");
   } else if (raggedStages) {
     unsigned uniqueStores = llvm::count_if(
         planIndex.boundaries, [&](const auto &binding) {
@@ -308,23 +332,55 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   return success();
 }
 
+LogicalResult SourceEmitter::prepareRaggedMetadata() {
+  if (planIndex.ragged.size() != 1)
+    return realization.emitOpError(
+        "ragged ownership requires one projected ragged relation");
+  plan::RaggedOp ragged = planIndex.ragged.front();
+  raggedRelation = kernel.nodes.lookup(ragged.getNode());
+  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
+  if (!raggedRelation ||
+      raggedRelation->getName().getStringRef() != "intent.ragged" ||
+      !raggedOuter ||
+      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
+      ragged.getMemberNodes().empty())
+    return ragged.emitOpError(
+        "does not resolve to canonical ragged ownership operations");
+  for (int64_t node : ragged.getMemberNodes()) {
+    Operation *member = kernel.nodes.lookup(node);
+    if (!member ||
+        member->getName().getStringRef() != "intent.ragged_member")
+      return ragged.emitOpError(
+          "references a non-canonical ragged member domain");
+    auto owned = planIndex.axes.find(node);
+    if (owned != planIndex.axes.end() && owned->second.getRole() == "program_1")
+      raggedMember = member;
+  }
+  if (!raggedMember)
+    return ragged.emitOpError("has no owned ragged member axis");
+  Operation *offsetsLoad = raggedRelation->getNumOperands() >= 3
+                               ? raggedRelation->getOperand(2).getDefiningOp()
+                               : nullptr;
+  FailureOr<ABIView *> offsets =
+      offsetsLoad && offsetsLoad->getName().getStringRef() == "intent.view_load" &&
+              offsetsLoad->getNumOperands() == 1
+          ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
+          : FailureOr<ABIView *>(failure());
+  if (failed(offsets) || (*offsets)->tensor.getRank() != 1)
+    return raggedRelation->emitOpError(
+        "requires a canonical rank-one offsets view");
+  raggedOffsets = *offsets;
+  if (usesRaggedOrderedTraversal() && raggedRelation->getNumOperands() != 3)
+    return raggedRelation->emitOpError(
+        "ordered ragged traversal cannot project an indirect member map");
+  return success();
+}
+
 LogicalResult SourceEmitter::prepareRaggedStages() {
   plan::RaggedOp ragged = planIndex.ragged.front();
   if (ragged.getMemberNodes().size() != 1)
     return ragged.emitOpError(
         "staged emission requires one owned ragged member domain");
-  raggedRelation = kernel.nodes.lookup(ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(ragged.getMemberNodes().front());
-  if (!raggedRelation ||
-      raggedRelation->getName().getStringRef() != "intent.ragged" ||
-      !raggedOuter ||
-      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
-      !raggedMember ||
-      raggedMember->getName().getStringRef() != "intent.ragged_member")
-    return ragged.emitOpError(
-        "does not resolve to canonical ragged operations");
-
   kernel.entry.walk([&](Operation *operation) {
     if (operation->getName().getStringRef() == "intent.members" &&
         !membersOperation)
@@ -1095,8 +1151,14 @@ LogicalResult SourceEmitter::emitWrapper() {
            << view.tensor.getRank() << ":\n";
     output << "        raise ValueError('" << view.argument->name
            << " has the wrong rank')\n";
-    StringRef dtype = view.tensor.getElementType().isF16() ? "torch.float16"
-                                                           : "torch.float32";
+    Type elementType = view.tensor.getElementType();
+    StringRef dtype = elementType.isF16()    ? "torch.float16"
+                      : elementType.isF32()  ? "torch.float32"
+                      : elementType.isBF16() ? "torch.bfloat16"
+                      : elementType.isInteger(32) ? "torch.int32"
+                                                  : StringRef();
+    if (dtype.empty())
+      return kernel.entry.emitOpError("has an unsupported Triton ABI dtype");
     output << "    if " << view.argument->name << ".dtype != " << dtype
            << ":\n";
     output << "        raise ValueError('" << view.argument->name
@@ -1144,6 +1206,22 @@ LogicalResult SourceEmitter::emitWrapper() {
              planIndex.program.getOwnership() == "program_rows") {
     output << "    grid = lambda META: "
            << programGrid(roleDimensions.lookup("program_0")) << "\n";
+  } else if (usesRaggedOrderedTraversal()) {
+    SmallVector<std::string> grid = {"1", "1", "1"};
+    int64_t tiledWorker = planIndex.program.getWorkerAxes()[0];
+    int64_t outerWorker = planIndex.program.getWorkerAxes()[1];
+    if (tiledWorker < 0 || tiledWorker >= 3 || outerWorker < 0 ||
+        outerWorker >= 3 || tiledWorker == outerWorker)
+      return planIndex.program.emitOpError(
+          "has invalid ragged Triton grid dimensions");
+    output << "    max_member_length = int(("
+           << raggedOffsets->argument->name << "[1:] - "
+           << raggedOffsets->argument->name << "[:-1]).max().item())\n";
+    grid[tiledWorker] =
+        "triton.cdiv(max_member_length, META['BLOCK_SIZE_Q'])";
+    grid[outerWorker] = roleDimensions.lookup("program_0");
+    output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
+           << ", " << grid[2] << ")\n";
   } else {
     return planIndex.program.emitOpError(
         "has no autotuned Triton grid emitter");
@@ -1250,7 +1328,10 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
   if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
       argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
     Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain && domain->getName().getStringRef() == "intent.domain")
+    if (domain &&
+        (domain->getName().getStringRef() == "intent.domain" ||
+         domain->getName().getStringRef() == "intent.ragged_outer" ||
+         domain->getName().getStringRef() == "intent.ragged_member"))
       return domain;
     consumer.emitOpError("cannot resolve a stream to its source domain");
     return failure();
@@ -1345,7 +1426,19 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
         << "has no grid-stride index expression for axis role " << role;
     return failure();
   }
-  if (hasTraversal("ordered_stream") &&
+  if (usesRaggedOrderedTraversal()) {
+    if (role == "program_0")
+      base = "sequence_index";
+    else if (role == "program_1")
+      base = "offs_program_1";
+    else if (role == "stream_0")
+      base = "offs_stream_0";
+    else {
+      consumer.emitOpError()
+          << "has no ragged-stream index expression for axis role " << role;
+      return failure();
+    }
+  } else if (hasTraversal("ordered_stream") &&
       planIndex.program.getOwnership() == "program_rows") {
     if (role == "program_0")
       base = "program_index";
@@ -1479,7 +1572,12 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
     if (!vector)
       continue;
     bool gridStride = hasTraversal("persistent");
-    FailureOr<std::string> extent = gridStride && axis->getRole() == "program_0"
+    FailureOr<std::string> extent =
+        usesRaggedOrderedTraversal() &&
+                (axis->getRole() == "program_1" ||
+                 axis->getRole() == "stream_0")
+            ? FailureOr<std::string>(std::string("sequence_end"))
+        : gridStride && axis->getRole() == "program_0"
                                         ? FailureOr<std::string>(std::string("n_rows"))
                                     : gridStride && axis->getRole() == "lane_0"
                                         ? FailureOr<std::string>(std::string("n_cols"))
@@ -1627,10 +1725,17 @@ bool SourceEmitter::hasTraversal(StringRef traversal) {
                                   });
 }
 
-bool SourceEmitter::usesStagedEmission() {
+bool SourceEmitter::usesRaggedOwnership() {
   return planIndex.program &&
-         planIndex.program.getOwnership() == "program_ragged" &&
-         hasTraversal("staged");
+         planIndex.program.getOwnership() == "program_ragged";
+}
+
+bool SourceEmitter::usesRaggedOrderedTraversal() {
+  return usesRaggedOwnership() && hasTraversal("ordered_stream");
+}
+
+bool SourceEmitter::usesStagedEmission() {
+  return usesRaggedOwnership() && hasTraversal("staged");
 }
 
 LogicalResult emitRealizedKernelSource(
