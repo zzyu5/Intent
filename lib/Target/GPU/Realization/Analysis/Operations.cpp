@@ -15,34 +15,27 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
                       target::OperationHandler{std::move(enter), {}});
 }
 
-FailureOr<std::string> reductionRole(Operation &operation) {
+LogicalResult validateReduction(Operation &operation) {
   auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
   auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
   if (!combine || !axes || axes.size() != 1 ||
       !isa<IntegerAttr>(axes[0]))
     return operation.emitOpError("has no canonical single-axis reduction");
-  if (combine.getValue() == "maximum")
-    return std::string("reduce_maximum");
-  if (combine.getValue() == "add")
-    return std::string("reduce_add");
+  if (combine.getValue() == "maximum" || combine.getValue() == "add")
+    return success();
   return operation.emitOpError("has no supported GPU reduction role");
 }
 
-FailureOr<std::string> pointwiseRole(Operation &operation) {
+LogicalResult validatePointwise(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
-  if (name == "intent.indices")
-    return std::string("indices");
-  if (name == "intent.broadcast")
-    return std::string("broadcast");
-  if (name == "intent.cast")
-    return std::string("cast");
-  if (name == "intent.mask")
-    return std::string("mask");
+  if (name == "intent.indices" || name == "intent.broadcast" ||
+      name == "intent.cast" || name == "intent.mask")
+    return success();
   if (name == "intent.compare") {
     auto predicate =
         operation.getAttrOfType<StringAttr>("intent.predicate");
     if (predicate && predicate.getValue() == "ge")
-      return std::string("compare_greater_equal");
+      return success();
     return operation.emitOpError("has no supported GPU comparison predicate");
   }
   auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
@@ -53,18 +46,17 @@ FailureOr<std::string> pointwiseRole(Operation &operation) {
                           StringRef("log"), StringRef("rsqrt"),
                           StringRef("negate")},
                          logical.getValue()))
-    return ("unary_" + logical.getValue()).str();
+    return success();
   if (name == "intent.binary" &&
       llvm::is_contained({StringRef("add"), StringRef("subtract"),
                           StringRef("multiply"), StringRef("true_divide"),
                           StringRef("maximum")},
                          logical.getValue()))
-    return ("binary_" + logical.getValue()).str();
+    return success();
   return operation.emitOpError("has no supported GPU pointwise role");
 }
 
-LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
-                               OperationFacts &facts) {
+LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
                          "intent.region_end",
@@ -77,37 +69,18 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
       return failure();
 
   if (failed(addHandler(
-          registry, "intent.reduce", [&](Operation &operation) -> LogicalResult {
-            FailureOr<std::string> role = reductionRole(operation);
-            if (failed(role))
-              return failure();
-            facts.primitiveRoles[&operation] = std::move(*role);
-            return success();
-          })))
+          registry, "intent.reduce", validateReduction)))
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast"})
     if (failed(addHandler(
-            registry, name, [&](Operation &operation) -> LogicalResult {
-              FailureOr<std::string> role = pointwiseRole(operation);
-              if (failed(role))
-                return failure();
-              facts.primitiveRoles[&operation] = std::move(*role);
-              return success();
-            })))
+            registry, name, validatePointwise)))
       return failure();
 
-  for (auto [name, role] :
-       {std::pair<StringRef, StringRef>{"intent.full", "full"},
-        {"intent.zeros", "zeros"}, {"intent.members", "members"}})
-    if (failed(addHandler(
-            registry, name,
-            [&, role](Operation &operation) -> LogicalResult {
-              facts.primitiveRoles[&operation] = role.str();
-              return success();
-            })))
+  for (StringRef name : {"intent.full", "intent.zeros", "intent.members"})
+    if (failed(addHandler(registry, name, noOp)))
       return failure();
 
   if (failed(addHandler(
@@ -129,8 +102,6 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
             if (!expand && !indirect)
               return operation.emitOpError(
                   "has no mechanical GPU gather realization");
-            facts.primitiveRoles[&operation] =
-                expand ? "expand_dims" : "indirect_gather";
             return success();
           })))
     return failure();
@@ -148,7 +119,6 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
                 (scope && scope.getValue() != "device"))
               return operation.emitOpError(
                   "has no relaxed device-scoped additive GPU merge");
-            facts.primitiveRoles[&operation] = "atomic_add";
             return success();
           })))
     return failure();
@@ -180,7 +150,6 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
                 (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1))
               return operation.emitOpError(
                   "has no semantics-preserving GPU matrix-unit realization");
-            facts.primitiveRoles[&operation] = "matrix_multiply";
             return success();
           })))
     return failure();
@@ -189,14 +158,14 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
 
 } // namespace
 
-LogicalResult analyzeOperations(OperationFacts &facts) {
-  if (failed(target::analyzeKernelFacts(facts.semantics)))
+LogicalResult analyzeOperations(KernelFacts &facts) {
+  if (failed(target::analyzeKernelFacts(facts)))
     return failure();
   target::OperationHandlerRegistry registry;
-  if (failed(registerHandlers(registry, facts)))
-    return facts.semantics.kernel.entry.emitOpError(
+  if (failed(registerHandlers(registry)))
+    return facts.kernel.entry.emitOpError(
         "failed to construct GPU operation handlers");
-  return target::traverseKernel(facts.semantics.kernel.entry, registry,
+  return target::traverseKernel(facts.kernel.entry, registry,
                                 "GPU realization analysis");
 }
 

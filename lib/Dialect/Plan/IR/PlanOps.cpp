@@ -77,10 +77,10 @@ LogicalResult verifyStringArray(Operation *operation, ArrayAttr values,
   return success();
 }
 
-bool hasString(ArrayAttr values, StringRef expected) {
-  return llvm::any_of(values, [&](Attribute attribute) {
-    auto value = dyn_cast<StringAttr>(attribute);
-    return value && value.getValue() == expected;
+bool axisHasRole(AxisOp axis, StringRef expected) {
+  return llvm::any_of(axis.getRoles(), [&](Attribute attribute) {
+    auto role = dyn_cast<StringAttr>(attribute);
+    return role && role.getValue() == expected;
   });
 }
 
@@ -95,48 +95,47 @@ LogicalResult SearchSpaceOp::verify() {
 }
 
 LogicalResult DeviceOp::verify() {
-  if (getDeviceAttr().getInt() < 0 || getComputeUnits() <= 0 ||
-      getSharedMemoryPerUnit() <= 0 || getRegistersPerUnit() <= 0)
-    return emitOpError("requires a device and positive algorithm-visible capacities");
-  return success();
+  return requireNonNegative(*this, getDevice(), "device index");
 }
 
 LogicalResult AxisOp::verify() {
-  if (failed(requireNode(*this, getNode())) ||
-      getSourceAxisAttr().getInt() < 0)
+  if (failed(requireNode(*this, getNode())))
     return failure();
-  if (getRole().empty() || getTile().empty())
-    return emitOpError("requires a physical role and canonical tile role");
+  if (failed(verifyStringArray(*this, getRoles(), "axis role")) ||
+      getTile().empty())
+    return failure();
+  for (Attribute attribute : getRoles()) {
+    StringRef role = cast<StringAttr>(attribute).getValue();
+    if (role != "parallel" && role != "ordered" && role != "reduction" &&
+        role != "ragged_member" && role != "lane")
+      return emitOpError() << "contains unsupported axis role " << role;
+  }
+  bool parallel = axisHasRole(*this, "parallel");
+  if (parallel) {
+    if (!getProgramOrderAttr() || !getWorkerAxisAttr() || !getFoldOrderAttr())
+      return emitOpError(
+          "parallel axes require program-order, worker-axis, and fold-order decisions");
+    if (getProgramOrderAttr().getInt() < 0 || getWorkerAxisAttr().getInt() < 0 ||
+        getWorkerAxisAttr().getInt() > 2 ||
+        getFoldOrderAttr().getInt() < 0)
+      return emitOpError("contains an invalid program-space assignment");
+    if (getGroupAttr() && getGroup()->empty())
+      return emitOpError("contains an empty program grouping role");
+  } else if (getProgramOrderAttr() || getWorkerAxisAttr() ||
+             getFoldOrderAttr() || getReuseWorker() || getGroupAttr()) {
+    return emitOpError(
+        "non-parallel axes cannot own program-space assignment fields");
+  }
   return success();
 }
 
 LogicalResult ProgramOp::verify() {
-  if (failed(requireNode(*this, getLoopNode())) || getWorkerAxes().empty() ||
-      getWorkerAxes().size() > 3)
-    return failure();
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : getWorkerAxes())
-    if (axis < 0 || axis > 2 || !axes.insert(axis).second)
-      return emitOpError("worker axes must be unique values in [0, 2]");
-  if (getOwnership().empty() ||
-      failed(verifyStringArray(*this, getTraversals(),
-                               "program traversal component")))
-    return failure();
-  return success();
-}
-
-LogicalResult StorageOp::verify() {
-  if (failed(requireNonNegative(*this, getValue(), "Kernel IR value ID")))
-    return failure();
-  if (getSpace() != "external" && getSpace() != "workspace")
-    return emitOpError("contains an unsupported machine storage class");
-  return success();
+  return requireNode(*this, getLoopNode());
 }
 
 LogicalResult intent::plan::verifyPaddingFields(
     Operation *operation, int64_t value, ArrayRef<int64_t> tensorAxes,
-    ArrayRef<int64_t> domainNodes, StringRef fill,
-    StringRef materialization) {
+    ArrayRef<int64_t> domainNodes, StringRef fill) {
   if (failed(requireNonNegative(operation, value, "Kernel IR value ID")) ||
       tensorAxes.empty() ||
       failed(verifyValidityBinding(operation, tensorAxes, domainNodes, "value")))
@@ -144,15 +143,12 @@ LogicalResult intent::plan::verifyPaddingFields(
   if (fill != "negative_infinity" && fill != "zero")
     return operation->emitOpError(
         "contains an unsupported physical padding value");
-  if (materialization != "producer")
-    return operation->emitOpError(
-        "requires producer-fused padding materialization");
   return success();
 }
 
 LogicalResult PaddingOp::verify() {
   return verifyPaddingFields(*this, getValue(), getTensorAxes(),
-                             getDomainNodes(), getFill(), getMaterialization());
+                             getDomainNodes(), getFill());
 }
 
 LogicalResult TransferOp::verify() {
@@ -161,58 +157,35 @@ LogicalResult TransferOp::verify() {
   for (int64_t domain : getDomainNodes())
     if (failed(requireNode(*this, domain)))
       return failure();
-  if (getAccess() != "load" && getAccess() != "store")
-    return emitOpError("requires a logical load or store access");
   if (getFill() != "negative_infinity" && getFill() != "zero" &&
       getFill() != "none")
     return emitOpError("contains an unsupported boundary fill");
-  if (getMaterialization() != "direct" &&
-      getMaterialization() != "contract_operand")
-    return emitOpError("contains an unsupported materialization role");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
       !isPrivateSpace(getResultSpace()))
     return emitOpError("contains an unsupported result residency");
-  if (getAccess() == "load" && getFill() == "none" &&
-      !getDomainNodes().empty())
-    return emitOpError("bounded loads require an explicit fill");
-  if (getAccess() == "store" && getFill() != "none")
-    return emitOpError("stores cannot carry a load fill");
-  if (getDefer() && (getAccess() != "load" ||
-                     getMaterialization() != "contract_operand"))
-    return emitOpError("only contraction-operand loads may be deferred");
   return success();
 }
 
 LogicalResult ReductionOp::verify() {
-  if (failed(requireNode(*this, getNode())) || getRole().empty() ||
-      getAxisAttr().getInt() < 0)
+  if (failed(requireNode(*this, getNode())))
     return failure();
-  if (!isPrivateSpace(getInputSpace()) || !isPrivateSpace(getResultSpace()))
-    return emitOpError("requires private reduction input and result residency");
+  if (!isPrivateSpace(getResultSpace()))
+    return emitOpError("requires private reduction result residency");
   return success();
 }
 
 LogicalResult PointwiseOp::verify() {
-  if (failed(requireNode(*this, getNode())) || getRole().empty() ||
+  if (failed(requireNode(*this, getNode())) ||
       getReuseOperandAttr().getInt() < -1)
     return failure();
   if (!isPrivateSpace(getResultSpace()))
     return emitOpError("requires private pointwise result residency");
-  if (getMaterialization() != "elementwise" &&
-      getMaterialization() != "contract_operand")
-    return emitOpError("contains an unsupported pointwise materialization");
-  if (getDefer() && getMaterialization() != "contract_operand")
-    return emitOpError("only contraction operands may be deferred");
   return success();
 }
 
 LogicalResult ContractOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
-  if (getPrimitive() != "matrix_multiply" || getAccumulatorType() != "f32")
-    return emitOpError("requires matrix multiplication with f32 accumulation");
-  if (getWarpPolicy() != "square" && getWarpPolicy() != "full_row")
-    return emitOpError("contains an unsupported matrix-unit warp policy");
   auto validOperand = [](StringRef space) {
     return space == "shared" || space == "private_fragment";
   };
@@ -222,34 +195,8 @@ LogicalResult ContractOp::verify() {
   return success();
 }
 
-LogicalResult StreamOp::verify() {
-  if (failed(requireNode(*this, getNode())) ||
-      failed(requireNode(*this, getAxisNode())) || getTile().empty())
-    return failure();
-  if (getStopNodeAttr() && failed(requireNode(*this, getStopNodeAttr().getInt())))
-    return failure();
-  if (getOrder() != "forward" || getCarrySpace() != "private_fragment" ||
-      !getReuseInitial())
-    return emitOpError("requires forward traversal with reused private state");
-  return success();
-}
-
-LogicalResult RaggedOp::verify() {
-  if (failed(requireNode(*this, getNode())) ||
-      failed(requireNode(*this, getOuterNode())) || getMemberNodes().empty())
-    return failure();
-  llvm::DenseSet<int64_t> members;
-  for (int64_t member : getMemberNodes())
-    if (failed(requireNode(*this, member)) || !members.insert(member).second)
-      return emitOpError("member nodes must be unique Kernel IR domains");
-  if (getTraversal() != "expert_offset_ranges" &&
-      getTraversal() != "compact_offset_tiles")
-    return emitOpError("contains an unsupported ragged traversal");
-  return success();
-}
-
 LogicalResult StageOp::verify() {
-  if (getOrdinalAttr().getInt() < 0 || failed(requireNode(*this, getNode())))
+  if (failed(requireNode(*this, getNode())))
     return failure();
   for (int64_t value : getInputs())
     if (failed(requireNonNegative(*this, value, "stage input value ID")))
@@ -257,15 +204,31 @@ LogicalResult StageOp::verify() {
   for (int64_t value : getOutputs())
     if (failed(requireNonNegative(*this, value, "stage output value ID")))
       return failure();
+  if (getOperations().empty())
+    return emitOpError("requires an explicit physical operation slice");
+  llvm::DenseSet<int64_t> operations;
+  for (int64_t operation : getOperations())
+    if (failed(requireNode(*this, operation)) ||
+        !operations.insert(operation).second)
+      return emitOpError("stage operation nodes must be unique");
+  llvm::DenseSet<int64_t> terminals;
+  for (int64_t terminal : getTerminals())
+    if (failed(requireNode(*this, terminal)) ||
+        !operations.contains(terminal) || !terminals.insert(terminal).second)
+      return emitOpError(
+          "stage terminals must be unique members of its operation slice");
   return success();
 }
 
-LogicalResult AtomicOp::verify() {
-  if (failed(requireNode(*this, getNode())))
+LogicalResult StageAxisOp::verify() {
+  if (failed(requireNode(*this, getStageNode())) || getRole().empty() ||
+      getExtent().empty() || getTile().empty())
     return failure();
-  if (getCombine() != "add" || getMemoryOrder() != "relaxed" ||
-      getMemoryScope() != "device")
-    return emitOpError("requires a relaxed device-scoped additive merge");
+  if (getAxisNodeAttr() && failed(requireNode(*this, getAxisNodeAttr().getInt())))
+    return failure();
+  if (getWorkerAxisAttr() &&
+      (getWorkerAxisAttr().getInt() < 0 || getWorkerAxisAttr().getInt() > 2))
+    return emitOpError("contains an invalid stage worker axis");
   return success();
 }
 
@@ -282,15 +245,14 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   unsigned devices = 0;
   unsigned programs = 0;
   ProgramOp program;
-  llvm::DenseSet<int64_t> streams;
-  llvm::DenseSet<int64_t> ragged;
-  llvm::DenseSet<int64_t> axes;
-  llvm::StringSet<> roles;
-  llvm::DenseSet<int64_t> storage;
+  llvm::DenseMap<int64_t, AxisOp> axes;
+  llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
   SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
-  llvm::DenseSet<int64_t> stageOrdinals;
+  llvm::DenseSet<int64_t> stageNodes;
+  llvm::StringSet<> stageAxisRoles;
+  SmallVector<StageAxisOp> stageAxes;
   for (Operation &operation : realization.getBody().front()) {
     if (isa<YieldOp>(operation) ||
         operation.getName().getDialectNamespace() != "intent_plan")
@@ -298,15 +260,14 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     if (isa<DeviceOp>(operation))
       ++devices;
     else if (auto axis = dyn_cast<AxisOp>(operation)) {
-      if (!axes.insert(axis.getNode()).second ||
-          !roles.insert(axis.getRole()).second)
-        return axis.emitOpError("duplicates a machine axis node or role");
+      if (!axes.try_emplace(axis.getNode(), axis).second)
+        return axis.emitOpError("duplicates a logical-axis physical decision");
+      if (axisHasRole(axis, "parallel") &&
+          !programOrders.insert(axis.getProgramOrderAttr().getInt()).second)
+        return axis.emitOpError("duplicates a program-axis order");
     } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       program = choice;
-    } else if (auto binding = dyn_cast<StorageOp>(operation)) {
-      if (!storage.insert(binding.getValue()).second)
-        return binding.emitOpError("duplicates a storage binding");
     } else if (auto binding = dyn_cast<PaddingOp>(operation)) {
       if (!paddedValues.insert(binding.getValue()).second)
         return binding.emitOpError("duplicates a value padding decision");
@@ -323,64 +284,32 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<ContractOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
-    } else if (auto binding = dyn_cast<AtomicOp>(operation)) {
-      if (!operations.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates an operation decision");
-    } else if (auto binding = dyn_cast<StreamOp>(operation)) {
-      if (!streams.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates an ordered stream decision");
-    } else if (auto binding = dyn_cast<RaggedOp>(operation)) {
-      if (!ragged.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates a ragged traversal decision");
     } else if (auto binding = dyn_cast<StageOp>(operation)) {
-      if (!stageOrdinals.insert(binding.getOrdinal()).second)
-        return binding.emitOpError("duplicates a physical stage ordinal");
+      if (!stageNodes.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates a physical stage decision");
+    } else if (auto binding = dyn_cast<StageAxisOp>(operation)) {
+      std::string key = std::to_string(binding.getStageNode()) + ":" +
+                        binding.getRole().str();
+      if (!stageAxisRoles.insert(key).second)
+        return binding.emitOpError("duplicates a stage-axis role");
+      stageAxes.push_back(binding);
     } else
       return operation.emitOpError("is not legal inside a GPU realization");
   }
   if (devices != 1 || programs != 1)
     return realization.emitOpError("requires one GPU device and one program mapping");
-  if (program.getOwnership() != "row" && program.getOwnership() != "tiled" &&
-      program.getOwnership() != "ragged")
-    return program.emitOpError("contains an unsupported GPU ownership family");
-  for (Attribute attribute : program.getTraversals()) {
-    StringRef traversal = cast<StringAttr>(attribute).getValue();
-    if (traversal != "persistent" && traversal != "grouped" &&
-        traversal != "ordered_stream" && traversal != "staged")
-      return program.emitOpError("contains an unsupported traversal component");
-  }
-  bool ordered = hasString(program.getTraversals(), "ordered_stream");
-  bool staged = hasString(program.getTraversals(), "staged");
-  if (ordered != !streams.empty())
-    return realization.emitOpError(
-        "ordered-stream traversal and stream decisions must appear together");
-  if (staged != !stageOrdinals.empty())
-    return realization.emitOpError(
-        "staged traversal and physical stages must appear together");
-  if ((program.getOwnership() == "ragged") != !ragged.empty())
-    return realization.emitOpError(
-        "ragged ownership and ragged relation decisions must appear together");
-  if (hasString(program.getTraversals(), "persistent") &&
-      program.getOwnership() != "row")
-    return program.emitOpError("persistent traversal requires row ownership");
-  if (hasString(program.getTraversals(), "grouped") &&
-      program.getOwnership() != "tiled")
-    return program.emitOpError("grouped traversal requires tiled ownership");
-  if (staged && program.getOwnership() != "ragged")
-    return program.emitOpError("staged traversal requires ragged ownership");
-  for (Operation &operation : realization.getBody().front())
-    if (auto stream = dyn_cast<StreamOp>(operation);
-        stream && !axes.contains(stream.getAxisNode()))
-      return stream.emitOpError("references an unbound stream axis");
-  for (Operation &operation : realization.getBody().front())
-    if (auto relation = dyn_cast<RaggedOp>(operation))
-      for (int64_t member : relation.getMemberNodes())
-        if (!axes.contains(member))
-          return relation.emitOpError("references an unbound ragged member axis");
+  if (programOrders.empty())
+    return program.emitOpError("has no per-axis program-space assignment");
   for (PaddingOp padding : paddings)
     for (int64_t domain : padding.getDomainNodes())
-      if (!axes.contains(domain))
+      if (!axes.count(domain))
         return padding.emitOpError("references an unbound validity domain");
+  for (StageAxisOp axis : stageAxes) {
+    if (!stageNodes.contains(axis.getStageNode()))
+      return axis.emitOpError("references an unknown physical stage");
+    if (axis.getAxisNodeAttr() && !axes.count(axis.getAxisNodeAttr().getInt()))
+      return axis.emitOpError("references an unbound logical axis");
+  }
   return success();
 }
 

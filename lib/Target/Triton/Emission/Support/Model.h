@@ -5,8 +5,8 @@
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
 #include "Intent/Target/Common/Emission/Lifecycle.h"
+#include "Intent/Target/Common/Emission/SurfacePlan.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
-#include "Intent/Target/Triton/IR/TritonOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -17,6 +17,22 @@
 #include <optional>
 #include <string>
 
+namespace intent::triton::plan {
+using TargetOp = target::emission::TargetBinding;
+using AxisOp = target::emission::AxisBinding;
+using ProgramOp = target::emission::ProgramBinding;
+using PaddingOp = target::emission::PaddingBinding;
+using ReductionOp = target::emission::ReductionBinding;
+using PointwiseOp = target::emission::PointwiseBinding;
+using ContractOp = target::emission::ContractBinding;
+using StreamOp = target::emission::StreamBinding;
+using RaggedOp = target::emission::RaggedBinding;
+using StageOp = target::emission::StageBinding;
+using StageAxisOp = target::emission::StageAxisBinding;
+using BoundaryOp = target::emission::BoundaryBinding;
+using AutotuneOp = target::emission::AutotuneBinding;
+} // namespace intent::triton::plan
+
 namespace intent::triton::emission {
 
 struct RealizationIndex {
@@ -24,16 +40,16 @@ struct RealizationIndex {
   plan::ProgramOp program;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
-  llvm::DenseMap<int64_t, plan::StorageOp> storage;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
-  llvm::SmallVector<plan::RaggedOp> ragged;
+  llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StageOp> stages;
-  llvm::DenseMap<int64_t, plan::AtomicOp> atomics;
+  llvm::DenseMap<int64_t, llvm::StringMap<plan::StageAxisOp>> stageAxes;
+  target::emission::PhysicalComponents components;
 };
 
 struct SearchIndex {
@@ -53,6 +69,16 @@ struct ABIScalar {
   const intent::target::ABIArgument *argument;
   mlir::Type type;
   std::string name;
+};
+
+struct RaggedRuntime {
+  plan::RaggedOp binding;
+  mlir::Operation *relation = nullptr;
+  mlir::Operation *outer = nullptr;
+  llvm::SmallVector<mlir::Operation *> members;
+  llvm::SmallVector<mlir::Operation *> ownedMembers;
+  ABIView *offsets = nullptr;
+  ABIView *indices = nullptr;
 };
 
 class SourceEmitter : public intent::target::TargetSourceEmitter {
@@ -134,18 +160,11 @@ private:
                              unsigned rank);
   mlir::LogicalResult prepareRaggedMetadata();
   mlir::LogicalResult prepareRaggedStages();
-  void collectStageValue(mlir::Value value, unsigned stage,
-                         const llvm::DenseSet<mlir::Value> &inputs,
-                         llvm::DenseSet<mlir::Value> &visited);
+  mlir::LogicalResult emitProgramBindings();
   void stageLine(unsigned stage, llvm::StringRef text,
                  unsigned indent = 1);
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
-  bool hasTraversal(llvm::StringRef traversal);
-  bool usesRaggedOwnership();
-  bool usesRaggedOrderedTraversal();
-  bool usesStagedEmission();
-
   std::string makeResultName(mlir::Operation &operation, unsigned index);
   std::string makeRegionArgumentName(mlir::Operation &operation,
                                      unsigned argumentIndex);
@@ -168,6 +187,8 @@ private:
   llvm::StringMap<std::string> dimensionOwners;
   llvm::StringMap<std::string> roleDimensions;
   llvm::StringMap<std::string> regionTiles;
+  llvm::DenseMap<int64_t, std::string> axisIndices;
+  llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
@@ -178,18 +199,21 @@ private:
   llvm::SmallVector<std::string> stageBodies;
   llvm::SmallVector<unsigned> activeStages;
   llvm::DenseMap<unsigned, std::string> stageFeatureDimensions;
+  llvm::DenseMap<unsigned, std::string> stageMemberDimensions;
   llvm::DenseMap<unsigned, std::string> stageReductionDimensions;
-  mlir::Operation *raggedRelation = nullptr;
-  mlir::Operation *raggedOuter = nullptr;
-  mlir::Operation *raggedMember = nullptr;
-  mlir::Operation *membersOperation = nullptr;
-  ABIView *raggedOffsets = nullptr;
+  llvm::DenseMap<unsigned, int64_t> stageFeatureWorkers;
+  llvm::DenseMap<unsigned, int64_t> stageMemberWorkers;
+  llvm::SmallVector<RaggedRuntime, 0> raggedRuntimes;
+  llvm::DenseMap<int64_t, unsigned> raggedRuntimeByRelation;
+  llvm::DenseMap<int64_t, llvm::SmallVector<unsigned>> raggedRuntimesByAxis;
+  llvm::DenseMap<unsigned, unsigned> stageRaggedRuntime;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;
   std::string kernelName;
   std::string programIndex;
   std::string vectorIndex;
+  bool programBindingsEmitted = false;
   unsigned indentation = 1;
 };
 
@@ -198,7 +222,8 @@ registerEmissionHandlers(intent::target::OperationHandlerRegistry &registry,
                          SourceEmitter &emitter);
 
 mlir::FailureOr<RealizationIndex>
-indexRealization(intent::plan::RealizationOp realization);
+indexRealization(intent::plan::RealizationOp realization,
+                 const intent::target::KernelModel &kernel);
 
 mlir::FailureOr<SearchIndex>
 indexSearchSpace(intent::plan::SearchSpaceOp searchSpace);

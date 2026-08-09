@@ -10,8 +10,7 @@ namespace intent::target {
 
 LogicalResult emitTargetSource(ModuleOp module, llvm::raw_ostream &output,
                                const EmissionTarget &target) {
-  if (!target.verifyRealization || !target.verifySearchSpace ||
-      !target.emitKernelSource)
+  if (!target.emitKernelSource)
     return module.emitError("target emission has an incomplete implementation");
   if (failed(verifyKernelModule(module)) || failed(verify(module)))
     return failure();
@@ -24,7 +23,7 @@ LogicalResult emitTargetSource(ModuleOp module, llvm::raw_ostream &output,
     return module.emitError()
            << target.displayName
            << " emission requires one realization and at most one search space";
-  if (failed(target.verifyRealization(realizations.front())))
+  if (failed(plan::verifyGpuRealization(realizations.front())))
     return failure();
 
   plan::SearchSpaceOp searchSpace =
@@ -33,7 +32,7 @@ LogicalResult emitTargetSource(ModuleOp module, llvm::raw_ostream &output,
       (searchSpace.getEntry() != realizations.front().getEntry() ||
        searchSpace.getTarget() != realizations.front().getTarget()))
     return searchSpace.emitOpError("does not match the resolved realization");
-  if (searchSpace && failed(target.verifySearchSpace(searchSpace)))
+  if (searchSpace && failed(plan::verifyGpuSearchSpace(searchSpace)))
     return failure();
 
   FailureOr<KernelModel> kernel = analyzeKernel(module);

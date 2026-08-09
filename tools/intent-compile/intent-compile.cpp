@@ -1,15 +1,9 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
 #include "Intent/Target/CuTile/Emission/Translate.h"
-#include "Intent/Target/CuTile/IR/CuTileDialect.h"
-#include "Intent/Target/CuTile/Projection/Project.h"
 #include "Intent/Target/GPU/Realization/Realize.h"
 #include "Intent/Target/TileLang/Emission/Translate.h"
-#include "Intent/Target/TileLang/IR/TileLangDialect.h"
-#include "Intent/Target/TileLang/Projection/Project.h"
 #include "Intent/Target/Triton/Emission/Translate.h"
-#include "Intent/Target/Triton/IR/TritonDialect.h"
-#include "Intent/Target/Triton/Projection/Project.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
@@ -25,19 +19,10 @@ namespace {
 
 enum class TargetKind { Triton, CuTile, TileLang };
 
-mlir::LogicalResult realize(mlir::ModuleOp module, TargetKind target,
-                            const intent::gpu::DeviceCapabilities &device) {
-  if (mlir::failed(intent::gpu::realizeKernel(module, device)))
-    return mlir::failure();
-  switch (target) {
-  case TargetKind::Triton:
-    return intent::triton::projectSurface(module);
-  case TargetKind::CuTile:
-    return intent::cutile::projectSurface(module);
-  case TargetKind::TileLang:
-    return intent::tilelang::projectSurface(module);
-  }
-  llvm_unreachable("unknown Intent target");
+mlir::LogicalResult realize(
+    mlir::ModuleOp module,
+    const intent::gpu::DeviceCapabilities &device) {
+  return intent::gpu::realizeKernel(module, device);
 }
 
 mlir::LogicalResult emit(mlir::ModuleOp module, TargetKind target,
@@ -101,15 +86,9 @@ int main(int argc, char **argv) {
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect,
-                  intent::cutile::plan::IntentCuTileDialect,
-                  intent::tilelang::plan::IntentTileLangDialect,
-                  intent::triton::plan::IntentTritonDialect>();
+  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect>();
   mlir::MLIRContext context(registry);
-  context.loadDialect<intent::IntentDialect, intent::plan::IntentPlanDialect,
-                      intent::cutile::plan::IntentCuTileDialect,
-                      intent::tilelang::plan::IntentTileLangDialect,
-                      intent::triton::plan::IntentTritonDialect>();
+  context.loadDialect<intent::IntentDialect, intent::plan::IntentPlanDialect>();
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
   intent::gpu::DeviceCapabilities capabilities{
@@ -117,8 +96,8 @@ int main(int argc, char **argv) {
       dynamicVectorWidth};
   if (!module)
     return 1;
-  if (mlir::failed(realize(*module, target, capabilities))) {
-    llvm::errs() << "Intent realization or surface projection failed\n";
+  if (mlir::failed(realize(*module, capabilities))) {
+    llvm::errs() << "Intent realization failed\n";
     return 1;
   }
   if (mlir::failed(mlir::verify(*module))) {

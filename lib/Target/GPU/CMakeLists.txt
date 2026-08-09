@@ -1,2 +1,1 @@
-add_subdirectory(Projection)
 add_subdirectory(Realization)

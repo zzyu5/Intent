@@ -1,7 +1,6 @@
 #include "Intent/Target/GPU/Realization/Realize.h"
 
 #include "Intent/Target/Common/Realization/Driver.h"
-#include "Intent/Target/Common/Realization/SchedulePolicy.h"
 #include "Support/Model.h"
 
 using namespace mlir;
@@ -16,14 +15,10 @@ LogicalResult realizeKernel(ModuleOp module,
         "GPU realization requires positive algorithm-visible capacities");
   return intent::target::realizeTarget(
       module, [&](intent::target::KernelModel &kernel) {
-        realization::OperationFacts facts(kernel);
+        realization::KernelFacts facts(kernel);
         if (failed(realization::analyzeOperations(facts)))
           return failure();
-        FailureOr<target::ScheduleDecision> schedule =
-            target::decideGpuSchedule(facts.semantics);
-        if (failed(schedule))
-          return failure();
-        return realization::emitMachinePlan(module, device, facts, *schedule);
+        return realization::emitMachinePlan(module, device, facts);
       });
 }
 

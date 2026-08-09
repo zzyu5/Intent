@@ -6,7 +6,6 @@ add_mlir_library(MLIRIntentTileLangEmission
   LINK_LIBS PUBLIC
   MLIRFuncDialect
   MLIRIR
-  MLIRIntentTileLangDialect
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTargetCommon

@@ -6,40 +6,250 @@
 using namespace mlir;
 
 namespace intent::cutile::emission {
+namespace {
+
+FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
+  if (role == "one")
+    return std::string("1");
+  if (role == "row_vector")
+    return std::string("TILE_SIZE");
+  if (role.starts_with("row_vector_"))
+    return "TILE_SIZE_V" + role.drop_front(11).str();
+  if (role == "program_m" || role == "ragged_member" || role == "query")
+    return std::string("TILE_SIZE_M");
+  if (role.starts_with("ragged_member_"))
+    return "TILE_SIZE_R" + role.drop_front(14).str();
+  if (role.starts_with("query_"))
+    return "TILE_SIZE_Q" + role.drop_front(6).str();
+  if (role == "program_n" || role == "stream")
+    return std::string("TILE_SIZE_N");
+  if (role.starts_with("stream_"))
+    return "TILE_SIZE_S" + role.drop_front(7).str();
+  if (role.starts_with("program_"))
+    return "TILE_SIZE_P" + role.drop_front(8).str();
+  if (role == "reduction")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("reduction_"))
+    return "TILE_SIZE_K" + role.drop_front(10).str();
+  operation->emitOpError("has no cuTile tile spelling for role ") << role;
+  return failure();
+}
+
+FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
+                                       StringRef resultSpace) {
+  if (role == "indices")
+    return StringRef("logical_indices");
+  if (role == "broadcast")
+    return StringRef("alias");
+  if (role == "cast")
+    return resultSpace == "private_scalar" ? StringRef("ct.full_cast")
+                                            : StringRef("ct.astype");
+  if (role == "unary_exp")
+    return StringRef("ct.exp");
+  if (role == "unary_exp2")
+    return StringRef("ct.exp2");
+  if (role == "unary_log")
+    return StringRef("ct.log");
+  if (role == "unary_rsqrt")
+    return StringRef("ct.rsqrt");
+  if (role == "unary_negate")
+    return StringRef("python_negate");
+  if (role == "binary_add")
+    return StringRef("python_add");
+  if (role == "binary_subtract")
+    return StringRef("python_subtract");
+  if (role == "binary_multiply")
+    return StringRef("python_multiply");
+  if (role == "binary_true_divide")
+    return StringRef("python_true_divide");
+  if (role == "binary_maximum")
+    return StringRef("ct.maximum");
+  if (role == "compare_greater_equal")
+    return StringRef("python_greater_equal");
+  if (role == "mask")
+    return StringRef("ct.where");
+  if (role == "full")
+    return StringRef("ct.full");
+  if (role == "zeros")
+    return StringRef("ct.zeros");
+  if (role == "members")
+    return StringRef("ct.members");
+  if (role == "expand_dims")
+    return StringRef("expand_dims");
+  if (role == "indirect_gather")
+    return StringRef("ct.indirect_gather");
+  operation->emitOpError("has no cuTile pointwise spelling for role ") << role;
+  return failure();
+}
+
+FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
+  if (role == "program_m" || role == "ragged_member" || role == "query")
+    return std::string("TILE_SIZE_M");
+  if (role.starts_with("ragged_member_"))
+    return "TILE_SIZE_R" + role.drop_front(14).str();
+  if (role.starts_with("query_"))
+    return "TILE_SIZE_Q" + role.drop_front(6).str();
+  if (role == "program_n" || role == "feature" || role == "stream")
+    return std::string("TILE_SIZE_N");
+  if (role.starts_with("stream_"))
+    return "TILE_SIZE_S" + role.drop_front(7).str();
+  if (role.starts_with("program_"))
+    return "TILE_SIZE_P" + role.drop_front(8).str();
+  if (role == "reduction")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("reduction_"))
+    return "TILE_SIZE_K" + role.drop_front(10).str();
+  if (role == "group_m")
+    return std::string("GROUP_SIZE_M");
+  if (role.starts_with("group_"))
+    return "GROUP_SIZE_G" + role.drop_front(6).str();
+  operation->emitOpError("has no cuTile tuner parameter for role ") << role;
+  return failure();
+}
+
+bool workerReuse(const RealizationIndex &index) {
+  return llvm::any_of(index.axesByRole, [](const auto &binding) {
+    return binding.getValue().getReuseWorker();
+  });
+}
+
+} // namespace
 
 FailureOr<RealizationIndex>
-indexRealization(intent::plan::RealizationOp realization) {
+indexRealization(intent::plan::RealizationOp realization,
+                 const target::KernelModel &kernel) {
   RealizationIndex index;
+  SmallVector<intent::plan::ReductionOp> reductions;
+  SmallVector<intent::plan::PointwiseOp> pointwise;
+  SmallVector<intent::plan::TransferOp> transfers;
   for (Operation &operation : realization.getBody().front()) {
     if (isa<intent::plan::YieldOp>(operation))
       continue;
-    if (auto value = dyn_cast<plan::TargetOp>(operation))
-      index.target = value;
-    else if (auto value = dyn_cast<plan::AxisOp>(operation)) {
-      index.axes[value.getNode()] = value;
-      index.axesByRole[value.getRole()] = value;
-    } else if (auto value = dyn_cast<plan::ProgramOp>(operation))
-      index.program = value;
-    else if (auto value = dyn_cast<plan::StorageOp>(operation))
-      index.storage[value.getValue()] = value;
-    else if (auto value = dyn_cast<plan::PaddingOp>(operation))
-      index.paddings[value.getValue()] = value;
-    else if (auto value = dyn_cast<plan::ReductionOp>(operation))
-      index.reductions[value.getNode()] = value;
-    else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
-      index.pointwise[value.getNode()] = value;
-    else if (auto value = dyn_cast<plan::ContractOp>(operation))
-      index.contracts[value.getNode()] = value;
-    else if (auto value = dyn_cast<plan::StreamOp>(operation))
-      index.streams[value.getNode()] = value;
-    else if (auto value = dyn_cast<plan::BoundaryOp>(operation))
-      index.boundaries[value.getNode()] = value;
-    else if (auto value = dyn_cast<plan::RaggedOp>(operation))
-      index.ragged.push_back(value);
-    else if (auto value = dyn_cast<plan::StageOp>(operation))
-      index.stages.push_back(value);
-    else if (auto value = dyn_cast<plan::AtomicOp>(operation))
-      index.atomics[value.getNode()] = value;
+    if (auto value = dyn_cast<intent::plan::DeviceOp>(operation)) {
+      index.target.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::AxisOp>(operation)) {
+      FailureOr<std::string> tile = tileSpelling(value, value.getTile());
+      if (failed(tile))
+        return failure();
+      plan::AxisOp binding;
+      binding.operation = value;
+      binding.tile = *tile;
+      if (std::optional<StringRef> group = value.getGroup()) {
+        FailureOr<std::string> spelling = parameterSpelling(value, *group);
+        if (failed(spelling))
+          return failure();
+        binding.group = *spelling;
+      }
+      index.axes.try_emplace(value.getNode(), binding);
+    } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
+      index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation)) {
+      plan::PaddingOp binding;
+      binding.operation = value;
+      index.paddings[value.getValue()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::ReductionOp>(operation)) {
+      reductions.push_back(value);
+    } else if (auto value = dyn_cast<intent::plan::PointwiseOp>(operation)) {
+      pointwise.push_back(value);
+    } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
+      plan::ContractOp binding;
+      binding.operation = value;
+      binding.lowering = "ct.mma";
+      binding.lhsSpace = value.getLhsSpace().str();
+      binding.rhsSpace = value.getRhsSpace().str();
+      binding.accumulatorSpace = value.getAccumulatorSpace().str();
+      index.contracts[value.getNode()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::TransferOp>(operation)) {
+      transfers.push_back(value);
+    } else if (auto value = dyn_cast<intent::plan::StageOp>(operation)) {
+      plan::StageOp binding;
+      binding.operation = value;
+      binding.position = index.stages.size();
+      index.stages.push_back(binding);
+    } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
+      plan::StageAxisOp binding;
+      binding.operation = value;
+      index.stageAxes[value.getStageNode()][value.getRole()] = binding;
+    }
+  }
+  if (failed(target::emission::indexCanonicalStructure(index, kernel)))
+    return failure();
+  target::emission::indexAxisRoles(index);
+  for (auto &entry : index.streams) {
+    plan::StreamOp &binding = entry.second;
+    plan::AxisOp axis = index.axes.lookup(binding.getAxisNode());
+    FailureOr<std::string> tile =
+        axis ? tileSpelling(binding.operation, axis.getTileRole())
+             : FailureOr<std::string>(failure());
+    if (failed(tile))
+      return binding.emitOpError("does not bind an ordered physical axis");
+    binding.tile = *tile;
+  }
+  index.components = target::emission::indexPhysicalComponents(index);
+  bool rowStrided = workerReuse(index);
+  for (intent::plan::ReductionOp value : reductions) {
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    FailureOr<std::string> role =
+        operation ? target::emission::reductionRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<int64_t> axis =
+        operation ? target::emission::reductionAxis(*operation)
+                  : FailureOr<int64_t>(failure());
+    if (failed(role) || failed(axis))
+      return value.emitOpError("does not bind a canonical reduction");
+    plan::ReductionOp binding;
+    binding.operation = value;
+    binding.lowering = *role == "reduce_maximum" ? "ct.max" : "ct.sum";
+    binding.resultSpace = value.getResultSpace().str();
+    binding.axis = *axis;
+    index.reductions[value.getNode()] = binding;
+  }
+  for (intent::plan::PointwiseOp value : pointwise) {
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    FailureOr<std::string> role =
+        operation ? target::emission::pointwiseRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<StringRef> lowering =
+        succeeded(role)
+            ? pointwiseSpelling(value, *role, value.getResultSpace())
+            : FailureOr<StringRef>(failure());
+    if (failed(lowering))
+      return value.emitOpError("does not bind canonical pointwise semantics");
+    plan::PointwiseOp binding;
+    binding.operation = value;
+    binding.lowering = lowering->str();
+    binding.resultSpace = value.getResultSpace().str();
+    binding.defer = target::emission::feedsStagedContraction(index, *operation);
+    index.pointwise[value.getNode()] = binding;
+  }
+  for (intent::plan::TransferOp value : transfers) {
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    bool load = operation &&
+                operation->getName().getStringRef() == "intent.view_load";
+    bool store = operation &&
+                 (operation->getName().getStringRef() == "intent.view_store" ||
+                  operation->getName().getStringRef() == "intent.scatter_unique");
+    if (!load && !store)
+      return value.emitOpError("does not bind a canonical transfer");
+    bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
+      auto axis = index.axes.find(node);
+      return axis != index.axes.end() && !axis->second.isScalar();
+    });
+    bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
+      return target::emission::isRaggedBoundAxis(index.components, axis);
+    });
+    plan::BoundaryOp binding;
+    binding.operation = value;
+    binding.access = (rowStrided || raggedBound) && vectorized
+                         ? (load ? "gather" : "scatter")
+                         : (load ? "load" : "store");
+    binding.resultSpace = value.getResultSpace().str();
+    binding.defer = load && target::emission::feedsContraction(*operation) &&
+                    (!index.components.groups.empty() ||
+                     target::emission::feedsStagedContraction(index, *operation));
+    binding.explicitBounds =
+        rowStrided || raggedBound || (!index.stages.empty() && store);
+    index.boundaries[value.getNode()] = binding;
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks cuTile target or program choices");
@@ -54,8 +264,20 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
   if (!searchSpace)
     return index;
   for (Operation &operation : searchSpace.getBody().front()) {
-    if (auto autotune = dyn_cast<plan::AutotuneOp>(operation))
-      index.autotune = autotune;
+    if (auto autotune = dyn_cast<intent::plan::AutotuneOp>(operation)) {
+      SmallVector<NamedAttribute> mappings;
+      OpBuilder builder(searchSpace.getContext());
+      for (Attribute attribute : autotune.getParameters()) {
+        StringRef role = cast<StringAttr>(attribute).getValue();
+        FailureOr<std::string> spelling = parameterSpelling(autotune, role);
+        if (failed(spelling))
+          return failure();
+        mappings.push_back(builder.getNamedAttr(*spelling,
+                                               builder.getStringAttr(role)));
+      }
+      index.autotune.operation = autotune;
+      index.autotune.parameterMap = builder.getDictionaryAttr(mappings);
+    }
   }
   return index;
 }
@@ -76,11 +298,11 @@ LogicalResult SourceEmitter::emit() {
 LogicalResult SourceEmitter::prepare() {
   if (failed(indexABI()))
     return failure();
-  if (usesRaggedOwnership() && failed(prepareRaggedMetadata()))
+  if (!planIndex.ragged.empty() && failed(prepareRaggedMetadata()))
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (usesStagedEmission())
+  if (!planIndex.stages.empty())
     return prepareRaggedStages();
   return success();
 }
@@ -113,10 +335,6 @@ LogicalResult SourceEmitter::indexABI() {
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("cuTile emitter requires ranked views");
-    if (!planIndex.storage.count(argument.valueID))
-      return kernel.entry.emitOpError()
-             << "ABI value " << argument.valueID
-             << " lacks global cuTile storage realization";
     ABIView emitted{&argument, view, tensor, {}};
     auto shape = argument.metadata.getAs<ArrayAttr>("shape");
     if (!shape || shape.size() != static_cast<size_t>(tensor.getRank()))
@@ -150,27 +368,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
-  bool multiAxis = planIndex.program.getOwnership() == "block_tiles" &&
-                   hasTraversal("ordered_stream");
-  bool raggedOrdered = usesRaggedOrderedTraversal();
-  bool raggedStages = usesStagedEmission();
-  if ((!multiAxis && !raggedOrdered && !raggedStages &&
-       planIndex.program.getWorkerAxes().size() != 1) ||
-      ((multiAxis || raggedOrdered || raggedStages) &&
-       planIndex.program.getWorkerAxes().size() != 2))
-    return planIndex.program.emitOpError(
-        "block-axis count does not match the cuTile program mapping");
-  for (auto &entry : planIndex.axes) {
-    Operation *domain = kernel.nodes.lookup(entry.first);
+  for (auto &entry : planIndex.axesByRole) {
+    Operation *domain = kernel.nodes.lookup(entry.getValue().getNode());
     if (!domain ||
         (domain->getName().getStringRef() != "intent.domain" &&
          domain->getName().getStringRef() != "intent.ragged_outer" &&
          domain->getName().getStringRef() != "intent.ragged_member"))
-      return entry.second.emitOpError("does not bind a logical domain op");
+      return entry.getValue().emitOpError("does not bind a logical domain op");
     FailureOr<std::string> dimension = dimensionName(*domain);
     if (failed(dimension))
-      return entry.second.emitOpError("cannot resolve its source dimension");
-    roleDimensions[entry.second.getRole()] = *dimension;
+      return entry.getValue().emitOpError("cannot resolve its source dimension");
+    roleDimensions[entry.getValue().getRole()] = *dimension;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -221,7 +429,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         axis.getTile().str();
   }
 
-  if (hasTraversal("persistent")) {
+  if (!planIndex.components.reusedAxes.empty()) {
     auto program = planIndex.axesByRole.find("program_0");
     auto lane = planIndex.axesByRole.find("lane_0");
     if (program == planIndex.axesByRole.end() ||
@@ -237,49 +445,13 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         fixedOutput->tensor.getRank() > 2 || searchSpace)
       return realization.emitOpError(
           "fixed persistent rows require one rank-one or rank-two output and no search space");
-  } else if (hasTraversal("grouped")) {
-    if (!searchSpace || !searchIndex.autotune)
-      return realization.emitOpError(
-          "grouped cuTile program requires a delegated backend tuner");
-    for (StringRef role : {"program_0", "program_1", "reduction_0"})
-      if (!planIndex.axesByRole.count(role))
-        return realization.emitOpError()
-               << "grouped cuTile program lacks " << role << " axis";
-    SmallVector<StringRef> expectedKeys = {
-        roleDimensions.lookup("program_0"), roleDimensions.lookup("program_1"),
-        roleDimensions.lookup("reduction_0")};
-    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
-      return searchIndex.autotune.emitOpError(
-          "does not specialize every tiled dimension");
-    for (auto [attribute, expected] :
-         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
-      if (cast<StringAttr>(attribute).getValue() != expected)
-        return searchIndex.autotune.emitOpError(
-            "key order does not match program/reduction roles");
-  } else if (hasTraversal("ordered_stream") &&
-             planIndex.program.getOwnership() == "block_tiles") {
-    if (!searchSpace || !searchIndex.autotune)
-      return realization.emitOpError(
-          "ordered cuTile stream requires a delegated backend tuner");
-    if (planIndex.streams.size() != 1)
-      return realization.emitOpError(
-          "ordered cuTile stream requires one stream");
-    for (StringRef role : {"program_0", "program_1", "program_2", "stream_0"})
-      if (!planIndex.axesByRole.count(role))
-        return realization.emitOpError()
-               << "ordered cuTile stream lacks " << role << " axis";
-    SmallVector<StringRef> expectedKeys = {
-        roleDimensions.lookup("program_2"),
-        roleDimensions.lookup("stream_0")};
-    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
-      return searchIndex.autotune.emitOpError(
-          "does not specialize the tiled program and stream dimensions");
-    for (auto [attribute, expected] :
-         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
-      if (cast<StringAttr>(attribute).getValue() != expected)
-        return searchIndex.autotune.emitOpError(
-            "key order does not match program_2/stream_0");
-    kernelConstants.push_back(roleDimensions.lookup("program_1"));
+  }
+  if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
+       !planIndex.stages.empty()) &&
+      (!searchSpace || !searchIndex.autotune))
+    return realization.emitOpError(
+        "tiled physical components require a delegated cuTile tuner");
+  if (planIndex.components.reusedAxes.empty()) {
     for (const std::string &dimension : dimensionOrder) {
       bool physicalDimension = llvm::any_of(
           roleDimensions,
@@ -287,165 +459,92 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (!physicalDimension)
         kernelConstants.push_back(dimension);
     }
-  } else if (hasTraversal("ordered_stream") &&
-             planIndex.program.getOwnership() == "block_rows") {
-    if (!searchSpace || !searchIndex.autotune || planIndex.streams.empty())
-      return realization.emitOpError(
-          "row stream requires stream bindings and a delegated backend tuner");
-    for (StringRef role : {"program_0", "stream_0"})
-      if (!planIndex.axesByRole.count(role))
-        return realization.emitOpError()
-               << "row stream lacks " << role << " axis";
-    if (searchIndex.autotune.getKey().size() != 1 ||
-        cast<StringAttr>(searchIndex.autotune.getKey()[0]).getValue() !=
-            roleDimensions.lookup("stream_0"))
-      return searchIndex.autotune.emitOpError(
-          "must specialize the row stream dimension");
-  } else if (raggedOrdered) {
-    if (!searchSpace || !searchIndex.autotune || planIndex.ragged.size() != 1 ||
-        planIndex.streams.size() != 1 || !planIndex.stages.empty())
-      return realization.emitOpError(
-          "ragged ordered traversal requires one relation, one stream, no stages, and a delegated tuner");
-    for (StringRef role : {"program_0", "program_1", "stream_0"})
-      if (!planIndex.axesByRole.count(role))
-        return realization.emitOpError()
-               << "ragged ordered traversal lacks " << role << " axis";
-    SmallVector<StringRef> expectedKeys = {
-        roleDimensions.lookup("program_1")};
-    if (roleDimensions.lookup("stream_0") != expectedKeys.front())
-      expectedKeys.push_back(roleDimensions.lookup("stream_0"));
-    if (searchIndex.autotune.getKey().size() != expectedKeys.size())
-      return searchIndex.autotune.emitOpError(
-          "does not specialize every distinct ragged query/stream dimension");
-    for (auto [attribute, expected] :
-         llvm::zip(searchIndex.autotune.getKey(), expectedKeys))
-      if (cast<StringAttr>(attribute).getValue() != expected)
-        return searchIndex.autotune.emitOpError(
-            "key order does not match the ragged query/stream dimensions");
-    for (const std::string &dimension : dimensionOrder) {
-      bool physicalDimension = llvm::any_of(
-          roleDimensions,
-          [&](const auto &binding) { return binding.getValue() == dimension; });
-      if (!physicalDimension)
-        kernelConstants.push_back(dimension);
-    }
-  } else if (raggedStages) {
-    unsigned uniqueStores = llvm::count_if(
-        planIndex.boundaries, [&](const auto &binding) {
-          Operation *operation = kernel.nodes.lookup(binding.first);
-          return operation && operation->getName().getStringRef() ==
-                                  "intent.scatter_unique";
-        });
-    if (!searchSpace || !searchIndex.autotune ||
-        planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
-        planIndex.atomics.size() + uniqueStores != 1)
-      return realization.emitOpError(
-          "ragged staging requires traversal, stages, one terminal write, and a delegated tuner");
-    for (StringRef role : {"program_0", "program_1"})
-      if (!planIndex.axesByRole.count(role))
-        return realization.emitOpError()
-               << "ragged staging lacks " << role << " axis";
-  } else {
-    return planIndex.program.emitOpError("has no cuTile program emitter");
   }
   return success();
 }
 
 LogicalResult SourceEmitter::prepareRaggedMetadata() {
-  if (planIndex.ragged.size() != 1)
-    return realization.emitOpError(
-        "ragged ownership requires one projected ragged relation");
-  plan::RaggedOp ragged = planIndex.ragged.front();
-  raggedRelation = kernel.nodes.lookup(ragged.getNode());
-  raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  if (!raggedRelation ||
-      raggedRelation->getName().getStringRef() != "intent.ragged" ||
-      !raggedOuter ||
-      raggedOuter->getName().getStringRef() != "intent.ragged_outer" ||
-      ragged.getMemberNodes().empty())
-    return ragged.emitOpError(
-        "does not resolve to canonical ragged ownership operations");
-  for (int64_t node : ragged.getMemberNodes()) {
-    Operation *member = kernel.nodes.lookup(node);
-    if (!member ||
-        member->getName().getStringRef() != "intent.ragged_member")
+  raggedRuntimes.reserve(planIndex.ragged.size());
+  for (plan::RaggedOp ragged : planIndex.ragged) {
+    RaggedRuntime runtime;
+    runtime.binding = ragged;
+    runtime.relation = kernel.nodes.lookup(ragged.getNode());
+    runtime.outer = kernel.nodes.lookup(ragged.getOuterNode());
+    if (!runtime.relation ||
+        runtime.relation->getName().getStringRef() != "intent.ragged" ||
+        !runtime.outer ||
+        runtime.outer->getName().getStringRef() != "intent.ragged_outer" ||
+        ragged.getMemberNodes().empty())
       return ragged.emitOpError(
-          "references a non-canonical ragged member domain");
-    auto owned = planIndex.axes.find(node);
-    if (owned != planIndex.axes.end() && owned->second.getRole() == "program_1")
-      raggedMember = member;
-  }
-  if (!raggedMember)
-    return ragged.emitOpError("has no owned ragged member axis");
-  Operation *offsetsLoad = raggedRelation->getNumOperands() >= 3
-                               ? raggedRelation->getOperand(2).getDefiningOp()
+          "does not resolve to canonical ragged ownership operations");
+    for (int64_t memberNode : ragged.getMemberNodes()) {
+      Operation *member = kernel.nodes.lookup(memberNode);
+      plan::AxisOp axis = planIndex.axes.lookup(memberNode);
+      if (!member ||
+          member->getName().getStringRef() != "intent.ragged_member" || !axis)
+        return ragged.emitOpError(
+            "references a non-canonical ragged member domain");
+      runtime.members.push_back(member);
+      if (axis.hasRole("parallel"))
+        runtime.ownedMembers.push_back(member);
+    }
+    Operation *offsetsLoad = runtime.relation->getNumOperands() >= 3
+                                 ? runtime.relation->getOperand(2).getDefiningOp()
+                                 : nullptr;
+    FailureOr<ABIView *> offsets =
+        offsetsLoad &&
+                offsetsLoad->getName().getStringRef() == "intent.view_load" &&
+                offsetsLoad->getNumOperands() == 1
+            ? lookupView(offsetsLoad->getOperand(0), *runtime.relation)
+            : FailureOr<ABIView *>(failure());
+    Operation *memberSource = runtime.relation->getOperand(1).getDefiningOp();
+    Operation *memberDim = memberSource && memberSource->getNumOperands() >= 2
+                               ? memberSource->getOperand(1).getDefiningOp()
                                : nullptr;
-  FailureOr<ABIView *> offsets =
-      offsetsLoad && offsetsLoad->getName().getStringRef() == "intent.view_load" &&
-              offsetsLoad->getNumOperands() == 1
-          ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
-          : FailureOr<ABIView *>(failure());
-  Operation *memberSource = raggedRelation->getOperand(1).getDefiningOp();
-  Operation *memberDim = memberSource && memberSource->getNumOperands() >= 2
-                             ? memberSource->getOperand(1).getDefiningOp()
-                             : nullptr;
-  FailureOr<ABIView *> membersView =
-      memberDim && memberDim->getName().getStringRef() == "intent.dim" &&
-              memberDim->getNumOperands() == 1
-          ? lookupView(memberDim->getOperand(0), *raggedRelation)
-          : FailureOr<ABIView *>(failure());
-  if (failed(offsets) || (*offsets)->tensor.getRank() != 1 ||
-      failed(membersView))
-    return raggedRelation->emitOpError(
-        "requires canonical offsets and member-source views");
-  raggedOffsets = *offsets;
-  raggedMembersView = *membersView;
-  if (usesRaggedOrderedTraversal() && raggedRelation->getNumOperands() != 3)
-    return raggedRelation->emitOpError(
-        "ordered ragged traversal cannot project an indirect member map");
+    FailureOr<ABIView *> membersView =
+        memberDim && memberDim->getName().getStringRef() == "intent.dim" &&
+                memberDim->getNumOperands() == 1
+            ? lookupView(memberDim->getOperand(0), *runtime.relation)
+            : FailureOr<ABIView *>(failure());
+    if (failed(offsets) || (*offsets)->tensor.getRank() != 1 ||
+        failed(membersView))
+      return runtime.relation->emitOpError(
+          "requires canonical offsets and member-source views");
+    runtime.offsets = *offsets;
+    runtime.membersView = *membersView;
+    if (runtime.relation->getNumOperands() == 4) {
+      Operation *indicesLoad = runtime.relation->getOperand(3).getDefiningOp();
+      FailureOr<ABIView *> indices =
+          indicesLoad && indicesLoad->getNumOperands() == 1
+              ? lookupView(indicesLoad->getOperand(0), *runtime.relation)
+              : FailureOr<ABIView *>(failure());
+      if (failed(indices) || (*indices)->tensor.getRank() != 1)
+        return runtime.relation->emitOpError(
+            "requires a canonical rank-one member-index view");
+      runtime.indices = *indices;
+    }
+    bool ordered = llvm::any_of(ragged.getMemberNodes(), [&](int64_t node) {
+      return planIndex.components.orderedRaggedAxes.contains(node);
+    });
+    if (ordered && runtime.indices)
+      return runtime.relation->emitOpError(
+          "ordered ragged traversal cannot project an indirect member map");
+    unsigned position = raggedRuntimes.size();
+    raggedRuntimeByRelation[ragged.getNode()] = position;
+    raggedRuntimesByAxis[ragged.getOuterNode()].push_back(position);
+    for (int64_t member : ragged.getMemberNodes())
+      raggedRuntimesByAxis[member].push_back(position);
+    raggedRuntimes.push_back(std::move(runtime));
+  }
   return success();
 }
 
 LogicalResult SourceEmitter::prepareRaggedStages() {
-  plan::RaggedOp ragged = planIndex.ragged.front();
-  if (ragged.getMemberNodes().size() != 1)
-    return ragged.emitOpError(
-        "staged emission requires one owned ragged member domain");
-  kernel.entry.walk([&](Operation *operation) {
-    if (operation->getName().getStringRef() == "intent.members" &&
-        !membersOperation)
-      membersOperation = operation;
-  });
-  if (!membersOperation)
-    return raggedRelation->emitOpError("has no member enumeration operation");
-
-  llvm::sort(planIndex.stages, [](plan::StageOp lhs, plan::StageOp rhs) {
-    return lhs.getOrdinal() < rhs.getOrdinal();
-  });
+  if (failed(target::emission::indexStageOperations(
+          kernel, planIndex, operationStages)))
+    return failure();
   stageBodies.resize(planIndex.stages.size());
-  auto shapeLabel = [&](Value value, unsigned axis,
-                        Operation &consumer) -> FailureOr<std::string> {
-    auto result = dyn_cast<OpResult>(value);
-    Operation *definition = result ? result.getOwner() : nullptr;
-    auto shapes = definition
-                      ? definition->getAttrOfType<ArrayAttr>(
-                            "intent.result_shapes")
-                      : ArrayAttr();
-    auto shape = shapes && result.getResultNumber() < shapes.size()
-                     ? dyn_cast<ArrayAttr>(shapes[result.getResultNumber()])
-                     : ArrayAttr();
-    auto label = shape && axis < shape.size() ? dyn_cast<StringAttr>(shape[axis])
-                                             : StringAttr();
-    if (!label || label.getValue().empty()) {
-      consumer.emitOpError("stage axis has no canonical symbolic extent");
-      return failure();
-    }
-    return label.getValue().str();
-  };
-
   for (auto [position, stage] : llvm::enumerate(planIndex.stages)) {
-    if (stage.getOrdinal() != position)
-      return stage.emitOpError("stage ordinals must be contiguous from zero");
     Operation *contract = kernel.nodes.lookup(stage.getNode());
     if (!contract || contract->getName().getStringRef() != "intent.contract" ||
         contract->getNumResults() != 1)
@@ -453,65 +552,63 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     auto resultType = dyn_cast<RankedTensorType>(contract->getResult(0).getType());
     if (!resultType || resultType.getRank() != 2)
       return stage.emitOpError("requires a rank-two staged contraction result");
-    FailureOr<std::string> feature =
-        shapeLabel(contract->getResult(0), 1, *contract);
-    auto reduce = contract->getAttrOfType<ArrayAttr>("intent.reduce");
-    auto pair = reduce && reduce.size() == 1
-                    ? dyn_cast<ArrayAttr>(reduce[0])
-                    : ArrayAttr();
-    auto lhsAxis = pair && pair.size() == 2
-                       ? dyn_cast<IntegerAttr>(pair[0])
-                       : IntegerAttr();
-    FailureOr<std::string> reduction =
-        lhsAxis && lhsAxis.getInt() >= 0
-            ? shapeLabel(contract->getOperand(0), lhsAxis.getInt(), *contract)
-            : FailureOr<std::string>(failure());
-    if (failed(feature) || failed(reduction))
-      return failure();
-    stageFeatureDimensions[position] = *feature;
-    stageReductionDimensions[position] = *reduction;
-
-    llvm::DenseSet<Value> inputs;
-    for (int64_t valueID : stage.getInputs()) {
-      auto found = kernel.values.find(valueID);
-      if (found == kernel.values.end())
-        return stage.emitOpError("references an unknown stage input value");
-      inputs.insert(found->second);
+    auto axes = planIndex.stageAxes.find(stage.getNode());
+    plan::StageAxisOp feature =
+        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
+                                         : axes->second.lookup("feature");
+    plan::StageAxisOp reduction =
+        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
+                                         : axes->second.lookup("reduction");
+    plan::StageAxisOp member =
+        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
+                                         : axes->second.lookup("member");
+    if (!feature || !reduction || !member || !feature.getWorkerAxisAttr() ||
+        !member.getWorkerAxisAttr() || !member.getAxisNodeAttr())
+      return stage.emitOpError("has incomplete physical stage-axis decisions");
+    auto runtimes =
+        raggedRuntimesByAxis.find(member.getAxisNodeAttr().getInt());
+    if (runtimes == raggedRuntimesByAxis.end() ||
+        runtimes->second.size() != 1)
+      return stage.emitOpError(
+          "does not resolve one ragged relation for its member axis");
+    unsigned runtimeIndex = runtimes->second.front();
+    RaggedRuntime &runtime = raggedRuntimes[runtimeIndex];
+    bool owned = llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
+      auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
+      return node && node.getInt() == member.getAxisNodeAttr().getInt();
+    });
+    if (!owned)
+      return stage.emitOpError("uses a ragged member without program ownership");
+    Operation *members = nullptr;
+    for (int64_t operationNode : stage.getOperations()) {
+      Operation *candidate = kernel.nodes.lookup(operationNode);
+      if (!candidate ||
+          candidate->getName().getStringRef() != "intent.members")
+        continue;
+      if (members)
+        return stage.emitOpError("contains multiple member enumeration ops");
+      members = candidate;
     }
-    if (!stage.getOutputs().empty()) {
-      for (int64_t valueID : stage.getOutputs()) {
-        auto found = kernel.values.find(valueID);
-        if (found == kernel.values.end() ||
-            !isa<RankedTensorType>(found->second.getType()) ||
-            !stageOutputOwners.try_emplace(found->second, position).second)
-          return stage.emitOpError("has an invalid stage output value");
-        workspaceNames[found->second] =
-            "workspace_" + std::to_string(valueID);
-        llvm::DenseSet<Value> visited;
-        collectStageValue(found->second, position, inputs, visited);
-      }
-    } else {
-      auto collectTerminal = [&](Operation *terminal) -> LogicalResult {
-        if (!terminal)
-          return raggedRelation->emitOpError(
-              "has a terminal plan write without a canonical operation");
-        operationStages[terminal].push_back(position);
-        for (Value operand : terminal->getOperands()) {
-          llvm::DenseSet<Value> visited;
-          collectStageValue(operand, position, inputs, visited);
-        }
-        return success();
-      };
-      for (const auto &binding : planIndex.atomics)
-        if (failed(collectTerminal(kernel.nodes.lookup(binding.first))))
-          return failure();
-      for (const auto &binding : planIndex.boundaries) {
-        Operation *terminal = kernel.nodes.lookup(binding.first);
-        if (terminal && terminal->getName().getStringRef() ==
-                            "intent.scatter_unique" &&
-            failed(collectTerminal(terminal)))
-          return failure();
-      }
+    if (!members)
+      return stage.emitOpError("has no member enumeration operation");
+    stageRaggedRuntime[position] = runtimeIndex;
+    stageFeatureDimensions[position] = feature.getExtent().str();
+    stageMemberDimensions[position] = member.getExtent().str();
+    stageReductionDimensions[position] = reduction.getExtent().str();
+    stageFeatureWorkers[position] = feature.getWorkerAxisAttr().getInt();
+    stageMemberWorkers[position] = member.getWorkerAxisAttr().getInt();
+
+    for (int64_t valueID : stage.getInputs())
+      if (!kernel.values.count(valueID))
+        return stage.emitOpError("references an unknown stage input value");
+    for (int64_t valueID : stage.getOutputs()) {
+      auto found = kernel.values.find(valueID);
+      if (found == kernel.values.end() ||
+          !isa<RankedTensorType>(found->second.getType()) ||
+          !stageOutputOwners.try_emplace(found->second, position).second)
+        return stage.emitOpError("has an invalid stage output value");
+      workspaceNames[found->second] =
+          "workspace_" + std::to_string(valueID);
     }
     if (!llvm::is_contained(operationStages.lookup(contract), position))
       return stage.emitOpError("stage roots do not depend on its contraction");
@@ -519,23 +616,8 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
   return success();
 }
 
-void SourceEmitter::collectStageValue(Value value, unsigned stage,
-                                      const llvm::DenseSet<Value> &inputs,
-                                      llvm::DenseSet<Value> &visited) {
-  if (inputs.contains(value) || !visited.insert(value).second)
-    return;
-  Operation *definition = value.getDefiningOp();
-  if (!definition)
-    return;
-  auto &stages = operationStages[definition];
-  if (!llvm::is_contained(stages, stage))
-    stages.push_back(stage);
-  for (Value operand : definition->getOperands())
-    collectStageValue(operand, stage, inputs, visited);
-}
-
 bool SourceEmitter::selectOperation(Operation &operation) {
-  if (!usesStagedEmission())
+  if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
   return !activeStages.empty();
@@ -552,7 +634,7 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   Value value = operation.getResult(index);
   valueNames[value] = name.str();
   auto outputStage = stageOutputOwners.find(value);
-  if (!usesStagedEmission() || outputStage == stageOutputOwners.end())
+  if (planIndex.stages.empty() || outputStage == stageOutputOwners.end())
     return;
   line("ct.scatter(" + workspaceNames.lookup(value) +
        ", (safe_member_offsets[:, None], offs_feature[None, :]), " +
@@ -563,7 +645,7 @@ void SourceEmitter::emitImports() {
   output << "import math\n";
   output << "import cuda.tile as ct\n";
   output << "import torch\n";
-  if (hasTraversal("persistent"))
+  if (!planIndex.components.reusedAxes.empty())
     output << "from intent.runtime.tuning.cutile import ROW_OCCUPANCY, row_configuration, row_program_count\n";
   if (searchSpace) {
     output << "from math import ceil\n";
@@ -585,31 +667,19 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  if (usesStagedEmission()) {
-    bool compact =
-        planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
-    Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
-    FailureOr<ABIView *> offsets =
-        offsetsLoad && offsetsLoad->getNumOperands() == 1
-            ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
-            : FailureOr<ABIView *>(failure());
-    ABIView *indices = nullptr;
-    if (raggedRelation->getNumOperands() == 4) {
-      Operation *indicesLoad = raggedRelation->getOperand(3).getDefiningOp();
-      FailureOr<ABIView *> resolved =
-          indicesLoad && indicesLoad->getNumOperands() == 1
-              ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
-              : FailureOr<ABIView *>(failure());
-      if (failed(resolved))
-        return raggedRelation->emitOpError(
-            "cannot resolve the staged ragged index map");
-      indices = *resolved;
-    }
-    if (failed(offsets) || !searchIndex.autotune)
-      return raggedRelation->emitOpError(
-          "cannot resolve staged ragged metadata or delegated tuner");
-
+  if (!planIndex.stages.empty()) {
+    if (!searchIndex.autotune)
+      return realization.emitOpError(
+          "cannot resolve the delegated staged tuner");
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
+      auto runtime = stageRaggedRuntime.find(stage);
+      if (runtime == stageRaggedRuntime.end())
+        return planIndex.stages[stage].emitOpError(
+            "has no staged ragged runtime binding");
+      RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+      bool compact = !ragged.indices;
+      ABIView *offsets = ragged.offsets;
+      ABIView *indices = ragged.indices;
       llvm::raw_string_ostream source(stageBodies[stage]);
       source << "@ct.kernel\ndef " << kernelName << "_stage_" << stage << "(";
       bool first = true;
@@ -638,20 +708,33 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source.flush();
 
       std::string feature = stageFeatureDimensions.lookup(stage);
-      stageLine(stage, "bid_feature = ct.bid(0)");
-      stageLine(stage, "bid_expert_route = ct.bid(1)");
+      stageLine(stage, "bid_feature = ct.bid(" +
+                           std::to_string(stageFeatureWorkers.lookup(stage)) +
+                           ")");
+      stageLine(stage, "bid_expert_route = ct.bid(" +
+                           std::to_string(stageMemberWorkers.lookup(stage)) +
+                           ")");
       if (compact) {
-        std::string experts = roleDimensions.lookup("program_0");
+        plan::AxisOp outerAxis =
+            planIndex.axes.lookup(ragged.binding.getOuterNode());
+        std::string experts =
+            outerAxis ? roleDimensions.lookup(
+                            "program_" +
+                            std::to_string(outerAxis.getProgramOrder()))
+                      : std::string();
+        if (experts.empty())
+          return ragged.binding.emitOpError(
+              "has no program-owned outer-axis dimension");
         stageLine(stage, "expert = 0");
         stageLine(stage, "route_tile = 0");
         stageLine(stage, "tile_cursor = 0");
         stageLine(stage, "for candidate in range(" + experts + "):");
         stageLine(stage, "candidate_begin = ct.load(" +
-                             (*offsets)->argument->name +
+                             offsets->argument->name +
                              ", index=candidate, shape=())",
                   2);
         stageLine(stage, "candidate_end = ct.load(" +
-                             (*offsets)->argument->name +
+                             offsets->argument->name +
                              ", index=candidate + 1, shape=())",
                   2);
         stageLine(stage,
@@ -675,10 +758,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
       }
       stageLine(stage, "route_begin = ct.load(" +
-                           (*offsets)->argument->name +
+                           offsets->argument->name +
                            ", index=expert, shape=())");
       stageLine(stage, "route_end = ct.load(" +
-                           (*offsets)->argument->name +
+                           offsets->argument->name +
                            ", index=expert + 1, shape=())");
       stageLine(stage,
                 "member_offsets = route_begin + route_tile * TILE_SIZE_M + "
@@ -686,7 +769,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       stageLine(stage, "member_mask = member_offsets < route_end");
       stageLine(stage,
                 "safe_member_offsets = ct.where(member_mask, member_offsets, " +
-                    roleDimensions.lookup("program_1") + ")");
+                    stageMemberDimensions.lookup(stage) + ")");
       if (indices) {
         stageLine(stage, "routes = ct.gather(" + indices->argument->name +
                              ", member_offsets, check_bounds=True, "
@@ -702,12 +785,15 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     }
     return success();
   }
-  if (hasTraversal("persistent")) {
+  if (!planIndex.components.reusedAxes.empty()) {
     output << "@ct.kernel(occupancy=ROW_OCCUPANCY)\n";
     programIndex = makeRegionArgumentName(*programRoot, 0);
     vectorIndex = makeResultName(*vectorDomain, 0);
     valueNames[programRoot->getRegion(0).front().getArgument(0)] = programIndex;
     valueNames[vectorDomain->getResult(0)] = vectorIndex;
+    plan::AxisOp lane = planIndex.axesByRole.lookup("lane_0");
+    if (lane)
+      axisIndices[lane.getNode()] = vectorIndex;
   } else {
     output << "@ct.kernel\n";
   }
@@ -725,7 +811,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
     emitParameter(scalar.name + ": " + annotation.str());
   }
-  if (hasTraversal("persistent")) {
+  if (!planIndex.components.reusedAxes.empty()) {
     for (StringRef parameter : {"N_ROWS: ConstInt", "TILE_SIZE: ConstInt",
                                 "DIM_COLS: ConstInt"})
       emitParameter(parameter);
@@ -755,9 +841,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
 
-  if (usesStagedEmission()) {
-    bool compact =
-        planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
+  if (!planIndex.stages.empty()) {
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
@@ -825,21 +909,23 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "        raise ValueError('" << view.argument->name
              << " shape violates the kernel symbols')\n";
     }
-    Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
-    FailureOr<ABIView *> offsets =
-        offsetsLoad && offsetsLoad->getNumOperands() == 1
-            ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
-            : FailureOr<ABIView *>(failure());
-    if (failed(offsets))
-      return failure();
-    if (compact)
-      output << "    route_lengths = tuple(int(length) for length in ("
-             << (*offsets)->argument->name << "[1:] - "
-             << (*offsets)->argument->name << "[:-1]).tolist())\n";
-    else
-      output << "    max_routes = int((" << (*offsets)->argument->name
-             << "[1:] - " << (*offsets)->argument->name
-             << "[:-1]).max().item())\n";
+    llvm::DenseSet<unsigned> preparedRagged;
+    for (const auto &entry : stageRaggedRuntime) {
+      if (!preparedRagged.insert(entry.second).second)
+        continue;
+      RaggedRuntime &ragged = raggedRuntimes[entry.second];
+      std::string suffix = std::to_string(ragged.binding.getNode());
+      if (!ragged.indices)
+        output << "    route_lengths_" << suffix
+               << " = tuple(int(length) for length in ("
+               << ragged.offsets->argument->name << "[1:] - "
+               << ragged.offsets->argument->name << "[:-1]).tolist())\n";
+      else
+        output << "    max_routes_" << suffix << " = int(("
+               << ragged.offsets->argument->name << "[1:] - "
+               << ragged.offsets->argument->name
+               << "[:-1]).max().item())\n";
+    }
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
         Value value = kernel.values.lookup(valueID);
@@ -849,21 +935,33 @@ LogicalResult SourceEmitter::emitWrapper() {
         if (!tensor || tensor.getRank() != 2 || dtype.empty())
           return stage.emitOpError("has an unsupported workspace tensor");
         output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
-               << roleDimensions.lookup("program_1") << ", "
+               << stageMemberDimensions.lookup(stage.getOrdinal()) << ", "
                << stageFeatureDimensions.lookup(stage.getOrdinal())
                << "), device=_DEVICE, dtype=" << dtype << ")\n";
       }
     output << "    stream = torch.cuda.current_stream()\n";
-    std::string experts = roleDimensions.lookup("program_0");
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
+      RaggedRuntime &ragged =
+          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
+      bool compact = !ragged.indices;
+      std::string suffix = std::to_string(ragged.binding.getNode());
+      plan::AxisOp outerAxis = planIndex.axes.lookup(ragged.binding.getOuterNode());
+      std::string experts =
+          outerAxis ? roleDimensions.lookup(
+                          "program_" + std::to_string(outerAxis.getProgramOrder()))
+                    : std::string();
+      if (experts.empty())
+        return ragged.binding.emitOpError(
+            "has no program-owned outer-axis dimension");
       std::string feature = stageFeatureDimensions.lookup(stage);
       output << "    cache_key_" << stage << " = (" << stage;
       for (const std::string &dimension : dimensionOrder)
         output << ", " << dimension;
       if (compact)
-        output << ", route_lengths";
-      output << ", " << inputs.front()->argument->name
-             << ".dtype, str(_DEVICE))\n";
+        output << ", route_lengths_" << suffix;
+      for (ABIView *input : inputs)
+        output << ", " << input->argument->name << ".dtype";
+      output << ", str(_DEVICE))\n";
       output << "    if cache_key_" << stage << " not in _TUNE_CACHE:\n";
       output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
       output << "            result = exhaustive_search(\n";
@@ -872,17 +970,21 @@ LogicalResult SourceEmitter::emitWrapper() {
              << " / cfg.TILE_SIZE_N), ";
       if (compact)
         output << "sum(ceil(length / cfg.TILE_SIZE_M) for length in "
-                  "route_lengths)";
+                  "route_lengths_"
+               << suffix << ")";
       else
-        output << experts << " * ceil(max_routes / cfg.TILE_SIZE_M)";
+        output << experts << " * ceil(max_routes_" << suffix
+               << " / cfg.TILE_SIZE_M)";
       output << ", 1),\n";
       output << "                " << kernelName << "_stage_" << stage
              << ",\n";
       output << "                lambda cfg: (";
       for (ABIView &view : views) {
         if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
-          output << (planIndex.atomics.empty() ? "torch.empty_like("
-                                              : "torch.zeros_like(")
+          output << (target::emission::stageUsesScatterReduction(
+                         planIndex.stages[stage], kernel)
+                         ? "torch.zeros_like("
+                         : "torch.empty_like(")
                  << view.argument->name << "), ";
         else
           output << view.argument->name << ", ";
@@ -895,7 +997,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       if (!compact)
-        output << "max_routes, ";
+        output << "max_routes_" << suffix << ", ";
       for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
         output << "cfg." << parameter.getName().getValue() << ", ";
       output << "),\n";
@@ -911,9 +1013,11 @@ LogicalResult SourceEmitter::emitWrapper() {
              << " / best.TILE_SIZE_N), ";
       if (compact)
         output << "sum(ceil(length / best.TILE_SIZE_M) for length in "
-                  "route_lengths)";
+                  "route_lengths_"
+               << suffix << ")";
       else
-        output << experts << " * ceil(max_routes / best.TILE_SIZE_M)";
+        output << experts << " * ceil(max_routes_" << suffix
+               << " / best.TILE_SIZE_M)";
       output << ", 1)\n";
       output << "    ct.launch(stream, grid, tuned_kernel, (";
       for (ABIView &view : views)
@@ -926,7 +1030,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       if (!compact)
-        output << "max_routes, ";
+        output << "max_routes_" << suffix << ", ";
       for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
         output << "best." << parameter.getName().getValue() << ", ";
       output << "))\n";
@@ -943,7 +1047,10 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
     output << "    " << merge->argument->name << " = torch."
-           << (planIndex.atomics.empty() ? "empty" : "zeros") << "((";
+           << (target::emission::planUsesScatterReduction(planIndex, kernel)
+                   ? "zeros"
+                   : "empty")
+           << "((";
     for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
       if (axis)
         output << ", ";
@@ -965,7 +1072,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     return success();
   }
 
-  if (hasTraversal("persistent")) {
+  if (!planIndex.components.reusedAxes.empty()) {
     SmallVector<ABIView *> inputs;
     for (ABIView &view : views)
       if (view.view.getAccess() == "in")
@@ -1128,48 +1235,58 @@ LogicalResult SourceEmitter::emitWrapper() {
            << " shape violates the kernel symbols')\n";
   }
   output << "    stream = torch.cuda.current_stream()\n";
-  if (usesRaggedOrderedTraversal())
-    output << "    max_member_length = int(("
-           << raggedOffsets->argument->name << "[1:] - "
-           << raggedOffsets->argument->name << "[:-1]).max().item())\n";
+  SmallVector<plan::AxisOp> programAxes =
+      target::emission::orderedProgramAxes(planIndex);
+  SmallVector<plan::AxisOp> dynamicRaggedAxes;
+  for (plan::AxisOp axis : programAxes) {
+    if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
+      continue;
+    FailureOr<plan::RaggedOp> relation =
+        target::emission::uniqueRaggedRelation(
+            planIndex, axis.getNode(), *axis.operation.getOperation());
+    auto runtime = succeeded(relation)
+                       ? raggedRuntimeByRelation.find(relation->getNode())
+                       : raggedRuntimeByRelation.end();
+    if (failed(relation) || runtime == raggedRuntimeByRelation.end())
+      return axis.emitOpError("has no ordered ragged runtime metadata");
+    ABIView *offsets = raggedRuntimes[runtime->second].offsets;
+    output << "    max_member_length_" << axis.getNode() << " = int(("
+           << offsets->argument->name << "[1:] - "
+           << offsets->argument->name << "[:-1]).max().item())\n";
+    dynamicRaggedAxes.push_back(axis);
+  }
   output << "    cache_key = (";
   for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
     if (index)
       output << ", ";
     output << dimension;
   }
-  if (usesRaggedOrderedTraversal())
-    output << ", max_member_length";
-  output << ", " << inputs.front()->argument->name << ".dtype, str(_DEVICE))\n";
+  for (plan::AxisOp axis : dynamicRaggedAxes)
+    output << ", max_member_length_" << axis.getNode();
+  for (ABIView *input : inputs)
+    output << ", " << input->argument->name << ".dtype";
+  output << ", str(_DEVICE))\n";
   output << "    if cache_key not in _TUNE_CACHE:\n";
   output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
   output << "            result = exhaustive_search(\n";
   output << "                _CONFIGS,\n                stream,\n";
-  if (hasTraversal("grouped")) {
-    output << "                lambda cfg: (ceil("
-           << roleDimensions.lookup("program_0")
-           << " / cfg.TILE_SIZE_M) * ceil("
-           << roleDimensions.lookup("program_1")
-           << " / cfg.TILE_SIZE_N), 1, 1),\n";
-  } else if (hasTraversal("ordered_stream") &&
-             planIndex.program.getOwnership() == "block_tiles") {
-    output << "                lambda cfg: (ceil("
-           << roleDimensions.lookup("program_2")
-           << " / cfg.TILE_SIZE_M), "
-           << roleDimensions.lookup("program_0") << " * "
-           << roleDimensions.lookup("program_1") << ", 1),\n";
-  } else if (hasTraversal("ordered_stream") &&
-             planIndex.program.getOwnership() == "block_rows") {
-    output << "                lambda cfg: ("
-           << roleDimensions.lookup("program_0") << ", 1, 1),\n";
-  } else if (usesRaggedOrderedTraversal()) {
-    output << "                lambda cfg: (ceil(max_member_length / "
-              "cfg.TILE_SIZE_M), "
-           << roleDimensions.lookup("program_0") << ", 1),\n";
-  } else {
-    return planIndex.program.emitOpError(
-        "has no autotuned cuTile grid emitter");
-  }
+  std::array<std::string, 3> candidateGrid =
+      target::emission::projectProgramGrid(
+          planIndex, [&](plan::AxisOp axis) {
+            std::string role =
+                "program_" + std::to_string(axis.getProgramOrder());
+            std::string extent =
+                planIndex.components.orderedRaggedProgramAxes.contains(
+                    axis.getNode())
+                    ? "max_member_length_" + std::to_string(axis.getNode())
+                    : roleDimensions.lookup(role);
+            return axis.isScalar()
+                       ? extent
+                       : "ceil(" + extent + " / cfg." +
+                             axis.getTile().str() + ")";
+          });
+  output << "                lambda cfg: (" << candidateGrid[0] << ", "
+         << candidateGrid[1] << ", " << candidateGrid[2] << "),\n";
   output << "                " << kernelName << ",\n";
   output << "                lambda cfg: (";
   for (ABIView &view : views)
@@ -1187,23 +1304,23 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
          << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
   output << "    best, tuned_kernel = _TUNE_CACHE[cache_key]\n";
-  if (hasTraversal("grouped"))
-    output << "    grid = (ceil(" << roleDimensions.lookup("program_0")
-           << " / best.TILE_SIZE_M) * ceil("
-           << roleDimensions.lookup("program_1")
-           << " / best.TILE_SIZE_N), 1, 1)\n";
-  else if (hasTraversal("ordered_stream") &&
-           planIndex.program.getOwnership() == "block_tiles")
-    output << "    grid = (ceil(" << roleDimensions.lookup("program_2")
-           << " / best.TILE_SIZE_M), "
-           << roleDimensions.lookup("program_0") << " * "
-           << roleDimensions.lookup("program_1") << ", 1)\n";
-  else if (usesRaggedOrderedTraversal())
-    output << "    grid = (ceil(max_member_length / best.TILE_SIZE_M), "
-           << roleDimensions.lookup("program_0") << ", 1)\n";
-  else
-    output << "    grid = (" << roleDimensions.lookup("program_0")
-           << ", 1, 1)\n";
+  std::array<std::string, 3> selectedGrid =
+      target::emission::projectProgramGrid(
+          planIndex, [&](plan::AxisOp axis) {
+            std::string role =
+                "program_" + std::to_string(axis.getProgramOrder());
+            std::string extent =
+                planIndex.components.orderedRaggedProgramAxes.contains(
+                    axis.getNode())
+                    ? "max_member_length_" + std::to_string(axis.getNode())
+                    : roleDimensions.lookup(role);
+            return axis.isScalar()
+                       ? extent
+                       : "ceil(" + extent + " / best." +
+                             axis.getTile().str() + ")";
+          });
+  output << "    grid = (" << selectedGrid[0] << ", " << selectedGrid[1]
+         << ", " << selectedGrid[2] << ")\n";
   output << "    return ct.launch(stream, grid, tuned_kernel, (";
   for (ABIView &view : views)
     output << view.argument->name << ", ";
@@ -1380,7 +1497,19 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
-  if (usesRaggedOrderedTraversal()) {
+  bool raggedMatrix = false;
+  if (relation->size() == 2 &&
+      ((*relation)[0].kind == "region_index" ||
+       (*relation)[0].kind == "value_index") &&
+      (*relation)[0].operands.size() == 1 &&
+      (*relation)[0].operands.front()) {
+    FailureOr<plan::AxisOp> axis =
+        resolveAxis(operation.getOperand(*(*relation)[0].operands.front()),
+                    operation);
+    raggedMatrix = succeeded(axis) && target::emission::isRaggedBoundAxis(
+                                          planIndex.components, axis->getNode());
+  }
+  if (raggedMatrix) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || (*view)->tensor.getRank() != 2 ||
         relation->size() != 2 || (*relation)[1].kind != "full_slice" ||
@@ -1395,15 +1524,11 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
                     operation);
     if (failed(axis))
       return failure();
-    StringRef rows = axis->getRole() == "program_1"
-                         ? StringRef("query_offsets")
-                     : axis->getRole() == "stream_0"
-                         ? StringRef("stream_offsets")
-                         : StringRef();
+    std::string rows = axisIndices.lookup(axis->getNode());
     if (rows.empty())
       return operation.emitOpError(
           "ragged cuTile matrix access has no member-axis role");
-    return "(" + rows.str() + "[:, None], ct.arange(" +
+    return "(" + rows + "[:, None], ct.arange(" +
            (*view)->shape[1] + ", dtype=ct.int32)[None, :])";
   }
   SmallVector<std::string> indices;
@@ -1427,32 +1552,17 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
         resolveAxis(operation.getOperand(*term.operands.front()), operation);
     if (failed(axis))
       return failure();
-    StringRef role = axis->getRole();
-    if (role == "program_0")
-      indices.push_back(
-          hasTraversal("persistent")
-              ? programIndex
-              : planIndex.program.getOwnership() == "block_rows"
-                    ? "program_index"
-              : hasTraversal("ordered_stream")
-                    ? "index_program_0"
-                    : "bid_m");
-    else if (role == "program_1")
-      indices.push_back(hasTraversal("ordered_stream")
-                            ? "index_program_1"
-                            : "bid_n");
-    else if (role == "program_2")
-      indices.push_back("bid_program_2");
-    else if (role == "stream_0")
-      indices.push_back("stream_tile");
-    else if (role == "lane_0")
-      indices.push_back(vectorIndex);
-    else if (role == "reduction_0" && reductionLoop)
-      indices.push_back("k_tile");
-    else {
-      operation.emitOpError() << "has no cuTile index for role " << role;
+    std::string index = axisIndices.lookup(axis->getNode());
+    if (index.empty()) {
+      operation.emitOpError()
+          << "has no active cuTile index for logical axis " << axis->getNode()
+          << " (parallel=" << axis->hasRole("parallel")
+          << ", ordered=" << axis->hasRole("ordered")
+          << ", reduction=" << axis->hasRole("reduction")
+          << ", lane=" << axis->hasRole("lane") << ")";
       return failure();
     }
+    indices.push_back(std::move(index));
   }
   std::string tuple = "(";
   for (auto [index, value] : llvm::enumerate(indices)) {
@@ -1522,36 +1632,21 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
       return consumer.emitOpError(
           "references an unresolved cuTile validity axis");
     plan::AxisOp axis = physical->second;
-    if (axis.getTile() == "one")
+    if (axis.isScalar())
       continue;
-    StringRef role = axis.getRole();
-    std::string index;
-    if (usesRaggedOrderedTraversal() && role == "program_1")
-      index = "query_offsets";
-    else if (usesRaggedOrderedTraversal() && role == "stream_0")
-      index = "stream_offsets";
-    else if (hasTraversal("persistent") && role == "program_0")
-      index = "program_index";
-    else if (hasTraversal("persistent") && role == "lane_0")
-      index = vectorIndex;
-    else {
-      std::string start;
-      if (role == "program_0")
-        start = "bid_m * " + axis.getTile().str();
-      else if (role == "program_1")
-        start = "bid_n * " + axis.getTile().str();
-      else if (role == "program_2")
-        start = "bid_program_2 * " + axis.getTile().str();
-      else if (role == "stream_0")
-        start = "stream_tile * " + axis.getTile().str();
-      else if (role == "reduction_0")
-        start = "k_tile * " + axis.getTile().str();
-      else
-        return consumer.emitOpError(
-            "has no cuTile index for its planned validity axis");
-      index = start + " + ct.arange(" + axis.getTile().str() +
-              ", dtype=ct.int32)";
-    }
+    std::string base = axisIndices.lookup(axis.getNode());
+    if (base.empty())
+      return consumer.emitOpError(
+          "has no active cuTile index for its planned validity axis");
+    bool direct = target::emission::isRaggedBoundAxis(
+                      planIndex.components, axis.getNode()) ||
+                  (!planIndex.components.reusedAxes.empty() &&
+                   kernel.nodes.lookup(axis.getNode()) == vectorDomain);
+    std::string index = direct
+                            ? base
+                            : base + " * " + axis.getTile().str() +
+                                  " + ct.arange(" + axis.getTile().str() +
+                                  ", dtype=ct.int32)";
     if (tensor.getRank() > 1) {
       std::string broadcast = index + "[";
       for (int64_t axisNumber = 0; axisNumber < tensor.getRank(); ++axisNumber) {
@@ -1561,13 +1656,20 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
       }
       index = broadcast + "]";
     }
-    FailureOr<std::string> extent =
-        usesRaggedOrderedTraversal() &&
-                (role == "program_1" || role == "stream_0")
-            ? FailureOr<std::string>(std::string("sequence_end"))
-            : dimensionName(*domain->second);
+    FailureOr<std::string> extent = dimensionName(*domain->second);
+    if (target::emission::isRaggedBoundAxis(planIndex.components,
+                                            axis.getNode())) {
+      FailureOr<int64_t> ordered = target::emission::representativeOrderedAxis(
+          planIndex, axis.getNode(), consumer);
+      if (failed(ordered))
+        return failure();
+      extent = "sequence_end_" + std::to_string(*ordered);
+    }
     if (failed(extent))
       return failure();
+    if (!target::emission::isRaggedBoundAxis(planIndex.components,
+                                             axis.getNode()))
+      *extent = dimensionOwners.lookup(*extent);
     predicates.push_back("(" + index + " < " + *extent + ")");
   }
   if (predicates.empty())
@@ -1621,7 +1723,7 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
     else
       extents.push_back(label.getValue().str());
   }
-  if (hasTraversal("ordered_stream") && extents.size() == 1 &&
+  if (target::emission::touchesStateStream(operation) && extents.size() == 1 &&
       extents.front() == "TILE_SIZE_M")
     extents.push_back("1");
   std::string result = "(";
@@ -1699,7 +1801,7 @@ std::string SourceEmitter::makeRegionArgumentName(Operation &operation,
 }
 
 void SourceEmitter::line(StringRef text) {
-  if (usesStagedEmission()) {
+  if (!planIndex.stages.empty()) {
     for (unsigned stage : activeStages)
       stageLine(stage, text, indentation);
     return;
@@ -1707,32 +1809,10 @@ void SourceEmitter::line(StringRef text) {
   output.indent(indentation * 4) << text << "\n";
 }
 
-bool SourceEmitter::hasTraversal(StringRef traversal) {
-  return planIndex.program && llvm::any_of(
-                                  planIndex.program.getTraversals(),
-                                  [&](Attribute attribute) {
-                                    return cast<StringAttr>(attribute).getValue() ==
-                                           traversal;
-                                  });
-}
-
-bool SourceEmitter::usesRaggedOwnership() {
-  return planIndex.program &&
-         planIndex.program.getOwnership() == "block_ragged";
-}
-
-bool SourceEmitter::usesRaggedOrderedTraversal() {
-  return usesRaggedOwnership() && hasTraversal("ordered_stream");
-}
-
-bool SourceEmitter::usesStagedEmission() {
-  return usesRaggedOwnership() && hasTraversal("staged");
-}
-
 LogicalResult emitRealizedKernelSource(
     target::KernelModel kernel, intent::plan::RealizationOp realization,
     intent::plan::SearchSpaceOp searchSpace, raw_ostream &output) {
-  FailureOr<RealizationIndex> indexed = indexRealization(realization);
+  FailureOr<RealizationIndex> indexed = indexRealization(realization, kernel);
   FailureOr<SearchIndex> indexedSearch = indexSearchSpace(searchSpace);
   if (failed(indexed) || failed(indexedSearch))
     return failure();

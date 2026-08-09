@@ -6,7 +6,6 @@ add_mlir_library(MLIRIntentCuTileEmission
   LINK_LIBS PUBLIC
   MLIRFuncDialect
   MLIRIR
-  MLIRIntentCuTileDialect
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTargetCommon

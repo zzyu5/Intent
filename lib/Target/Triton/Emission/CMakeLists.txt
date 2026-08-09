@@ -9,7 +9,6 @@ add_mlir_library(MLIRIntentTritonEmission
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTransforms
-  MLIRIntentTritonDialect
   MLIRIntentTargetCommon
   MLIRSupport
 )

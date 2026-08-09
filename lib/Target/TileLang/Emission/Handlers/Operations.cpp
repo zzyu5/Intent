@@ -34,8 +34,14 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
       })) ||
       failed(addHandler(
           registry, "intent.parallel",
-          [&](Operation &op) { return emitter.enterParallel(op); },
-          [&](Operation &op) { return emitter.leaveParallel(op); })) ||
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterParallel(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveParallel(op)
+                                               : success();
+          })) ||
       failed(addHandler(registry, "intent.view_load", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -103,8 +109,14 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
       })) ||
       failed(addHandler(
           registry, "intent.state_stream",
-          [&](Operation &op) { return emitter.enterStateStream(op); },
-          [&](Operation &op) { return emitter.leaveStateStream(op); })) ||
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterStateStream(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveStateStream(op)
+                                               : success();
+          })) ||
       failed(addHandler(registry, "intent.contract", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -160,33 +172,6 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
-  if (usesRaggedOrderedTraversal()) {
-    if (&operation == programRoot) {
-      line("sequence_begin = " + raggedOffsets->argument->name +
-           "[sequence_index]");
-      line("sequence_end = " + raggedOffsets->argument->name +
-           "[sequence_index + 1]");
-      line("sequence_length = sequence_end - sequence_begin");
-      line("query_start = sequence_begin + query_block * TILE_SIZE_M");
-    }
-    if (operation.getNumRegions() != 1 ||
-        !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getRegion(0).front().getNumArguments() != 1)
-      return operation.emitOpError(
-          "ragged ownership requires one parallel region argument");
-    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-    if (failed(axis))
-      return failure();
-    if (axis->getRole() == "program_0")
-      valueNames[argument] = "sequence_index";
-    else if (axis->getRole() == "program_1")
-      valueNames[argument] = "query_start";
-    else
-      return operation.emitOpError(
-          "parallel region has no ragged ownership role");
-    return success();
-  }
   if (operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)) ||
       operation.getRegion(0).front().getNumArguments() != 1)
@@ -196,25 +181,71 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
   if (failed(axis))
     return failure();
-  StringRef role = axis->getRole();
-  if (role == "program_0")
-    valueNames[argument] =
-        programOwnership == "block_rows"
-            ? "program_index"
-            : usesStagedEmission()
-                  ? "expert"
-                  : hasTraversal("ordered_stream") ? "index_program_0"
-                                                    : "bid_m";
-  else if (role == "program_1")
-    valueNames[argument] = usesStagedEmission()
-                               ? "member_start"
-                               : hasTraversal("ordered_stream")
-                                     ? "index_program_1"
-                                     : "bid_n";
-  else if (role == "program_2")
-    valueNames[argument] = "bid_program_2";
-  else
-    return operation.emitOpError("has no TileLang program-axis role");
+
+  if (!planIndex.stages.empty()) {
+    bool outer = false;
+    bool member = false;
+    for (const auto &entry : stageRaggedRuntime) {
+      const RaggedRuntime &runtime = raggedRuntimes[entry.second];
+      outer |= runtime.binding.getOuterNode() == axis->getNode();
+      member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
+        auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
+        return node && node.getInt() == axis->getNode();
+      });
+    }
+    if (outer == member)
+      return operation.emitOpError("has no staged program-axis binding");
+    valueNames[argument] = outer ? "expert" : "member_start";
+    return success();
+  }
+
+  if (&operation == programRoot &&
+      !planIndex.components.orderedRaggedProgramAxes.empty()) {
+    for (int64_t memberNode :
+         planIndex.components.orderedRaggedProgramAxes) {
+      FailureOr<plan::RaggedOp> relation =
+          target::emission::uniqueRaggedRelation(planIndex, memberNode, operation);
+      std::string outer = succeeded(relation)
+                              ? axisIndices.lookup(relation->getOuterNode())
+                              : std::string();
+      std::string block = programBlocks.lookup(memberNode);
+      auto runtime = succeeded(relation)
+                         ? raggedRuntimeByRelation.find(relation->getNode())
+                         : raggedRuntimeByRelation.end();
+      if (failed(relation) || outer.empty() || block.empty() ||
+          runtime == raggedRuntimeByRelation.end())
+        return operation.emitOpError(
+            "ordered ragged axis has no physical metadata binding");
+      RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+      auto ordered =
+          planIndex.components.orderedAxesByRelation.find(relation->getNode());
+      if (ordered == planIndex.components.orderedAxesByRelation.end() ||
+          ordered->second.empty())
+        return operation.emitOpError(
+            "ordered ragged relation has no stream axis");
+      for (int64_t orderedAxis : ordered->second) {
+        std::string suffix = std::to_string(orderedAxis);
+        line("sequence_begin_" + suffix + " = " +
+             ragged.offsets->argument->name + "[" + outer + "]");
+        line("sequence_end_" + suffix + " = " +
+             ragged.offsets->argument->name + "[" + outer + " + 1]");
+        line("sequence_length_" + suffix + " = sequence_end_" + suffix +
+             " - sequence_begin_" + suffix);
+      }
+      std::string suffix = std::to_string(ordered->second.front());
+      std::string query = std::to_string(memberNode);
+      line("query_start_" + query + " = sequence_begin_" + suffix + " + " +
+           block + " * " + planIndex.axes.lookup(memberNode).getTile().str());
+      axisIndices[memberNode] = "query_start_" + query;
+    }
+  }
+  std::string value =
+      planIndex.components.orderedRaggedProgramAxes.contains(axis->getNode())
+          ? axisIndices.lookup(axis->getNode())
+          : programBlocks.lookup(axis->getNode());
+  if (value.empty())
+    return axis->emitOpError("has no emitted per-axis program index");
+  valueNames[argument] = value;
   return success();
 }
 
@@ -225,7 +256,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   plan::BoundaryOp boundary =
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
-    return operation.emitOpError("lacks a TileLang load projection");
+    return operation.emitOpError("lacks a TileLang load binding");
   if (boundary.getDomainNodes().empty() && boundary.getPadding() == "none") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
@@ -245,7 +276,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   if (boundary.getTransfer() == "parallel_elements") {
     FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
     if (failed(extents) || extents->empty() ||
-        (boundary.getCheckBounds() && !usesRaggedOrderedTraversal()) ||
         (boundary.getPadding() != "zero" &&
          boundary.getPadding() != "negative_infinity"))
       return operation.emitOpError(
@@ -336,21 +366,8 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       !isa<IntegerType, IndexType>(resultType.getElementType()) ||
       failed(result) || failed(extents) || extents->size() != 1)
     return operation.emitOpError("lacks a mechanical TileLang indices binding");
-  StringRef role = axis->getRole();
-  std::string base;
-  if (usesRaggedOrderedTraversal() && role == "program_1")
-    base = "query_start";
-  else if (usesRaggedOrderedTraversal() && role == "stream_0")
-    base = "stream_start";
-  else if (role == "program_2")
-    base = "bid_program_2 * " + axis->getTile().str();
-  else if (role == "stream_0")
-    base = "stream_tile * " + axis->getTile().str();
-  else if (role == "program_0" && axis->getTile() != "one")
-    base = "bid_m * " + axis->getTile().str();
-  else if (role == "program_1" && axis->getTile() != "one")
-    base = "bid_n * " + axis->getTile().str();
-  else
+  std::string base = axisIndices.lookup(axis->getNode());
+  if (base.empty() || axis->isScalar())
     return operation.emitOpError("has no TileLang vector index realization");
   line("for indices_i in T.Parallel(" + extents->front() + "):");
   ++indentation;
@@ -713,14 +730,6 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   std::string dtype = dtypeName(tensor.getElementType(), operation);
   if (dtype.empty())
     return failure();
-  if (binding.getLowering() == "T.copy_cast") {
-    FailureOr<StringRef> operand = lookupValue(operation, 0);
-    if (failed(operand))
-      return failure();
-    line("T.copy(" + operand->str() + ", " + *result + ")");
-    bindResult(operation, 0, *result);
-    return success();
-  }
   SmallVector<std::string> indices;
   std::string loop = "for ";
   for (unsigned axis = 0; axis < extents->size(); ++axis) {
@@ -804,7 +813,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return failure();
     return reused->str();
   };
-  if (usesStagedEmission() && binding.getLowering() == "T.indirect_gather") {
+  if (!planIndex.stages.empty() && binding.getLowering() == "T.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -857,8 +866,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   bool prependAxis = relation->size() == 2 &&
                      (*relation)[0].kind == "new_axis" &&
                      (*relation)[1].kind == "full_slice";
-  if ((binding.getLowering() != "expand_dims" &&
-       binding.getLowering() != "alias_column") ||
+  if (binding.getLowering() != "expand_dims" ||
       (!appendAxis && !prependAxis))
     return operation.emitOpError("has no mechanical TileLang gather relation");
   FailureOr<StringRef> source = lookupValue(operation, 0);
@@ -892,15 +900,35 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   if (failed(node) || !binding || binding.getLowering() != "T.members" ||
-      binding.getReuseOperandAttr().getInt() != -1)
+      binding.getReuseOperandAttr().getInt() != -1 ||
+      operation.getNumOperands() != 1 || operation.getNumResults() != 1)
     return operation.emitOpError("lacks a staged TileLang members binding");
+  FailureOr<plan::AxisOp> memberAxis =
+      resolveAxis(operation.getOperand(0), operation);
+  FailureOr<plan::RaggedOp> relation =
+      succeeded(memberAxis)
+          ? target::emission::uniqueRaggedRelation(
+                planIndex, memberAxis->getNode(), operation)
+          : FailureOr<plan::RaggedOp>(failure());
+  auto runtime = succeeded(relation)
+                     ? raggedRuntimeByRelation.find(relation->getNode())
+                     : raggedRuntimeByRelation.end();
+  if (failed(memberAxis) || failed(relation) ||
+      runtime == raggedRuntimeByRelation.end())
+    return operation.emitOpError("has no ragged runtime for its member axis");
+  for (unsigned stage : activeStages)
+    if (!stageRaggedRuntime.count(stage) ||
+        stageRaggedRuntime.lookup(stage) != runtime->second)
+      return operation.emitOpError(
+          "is shared by stages with inconsistent ragged ownership");
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(result))
     return failure();
   line("for member_i in T.Parallel(TILE_SIZE_M):");
   ++indentation;
-  std::string member = raggedIndices
-                           ? raggedIndices->argument->name +
+  RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+  std::string member = ragged.indices
+                           ? ragged.indices->argument->name +
                                  "[member_start + member_i]"
                            : "member_start + member_i";
   line(*result + "[member_i] = T.if_then_else(member_start + member_i < "
@@ -914,9 +942,7 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
-  if (failed(node) || !binding || binding.getOrder() != "forward" ||
-      binding.getCarrySpace() != "fragment" || !binding.getReuseInitial() ||
-      operation.getNumRegions() != 1 ||
+  if (failed(node) || !binding || operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang stream binding");
   Block &body = operation.getRegion(0).front();
@@ -954,9 +980,17 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     }
   }
   streamCarriers[&operation] = carriers;
-  std::string streamExtent = usesRaggedOrderedTraversal()
-                                 ? "sequence_length"
-                                 : roleDimensions.lookup("stream_0");
+  bool raggedStream =
+      planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
+  Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
+  FailureOr<std::string> logicalExtent =
+      streamDomain ? dimensionName(*streamDomain)
+                   : FailureOr<std::string>(failure());
+  if (failed(logicalExtent))
+    return binding.emitOpError("has no logical ordered-axis extent");
+  std::string raggedSuffix = std::to_string(binding.getAxisNode());
+  std::string streamExtent =
+      raggedStream ? "sequence_length_" + raggedSuffix : *logicalExtent;
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
@@ -976,31 +1010,28 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
         resolveAxis(stopOperation->getOperand(0), operation);
     if (failed(stopAxis))
       return failure();
-    if (usesRaggedOrderedTraversal() &&
-        stopAxis->getRole() == "program_1") {
-      streamExtent = "T.min((query_block + 1) * " +
-                     stopAxis->getTile().str() + ", sequence_length)";
-    } else if (hasTraversal("ordered_stream") &&
-               programOwnership == "block_tiles" &&
-               stopAxis->getRole() == "program_2") {
-      streamExtent = "T.min((bid_program_2 + 1) * " +
+    if (stopAxis->hasRole("parallel") && !stopAxis->isScalar()) {
+      std::string block = programBlocks.lookup(stopAxis->getNode());
+      if (block.empty())
+        return stopAxis->emitOpError("has no physical program block index");
+      streamExtent = "T.min((" + block + " + 1) * " +
                      stopAxis->getTile().str() + ", " + streamExtent + ")";
-    } else if (stopAxis->getRole() != "stream_0") {
+    } else if (stopAxis->getNode() != binding.getAxisNode()) {
       return operation.emitOpError(
           "has no TileLang spelling for its planned logical stream stop");
     }
   }
-  line("for stream_tile in T.Pipelined(T.ceildiv(" + streamExtent +
+  std::string streamTile = "stream_tile_" + std::to_string(*node);
+  line("for " + streamTile + " in T.Pipelined(T.ceildiv(" + streamExtent +
        ", " + binding.getTile().str() +
        "), num_stages=num_stages):");
   ++indentation;
-  if (usesRaggedOrderedTraversal()) {
-    line("stream_start = sequence_begin + stream_tile * " +
-         binding.getTile().str());
-    valueNames[body.getArgument(0)] = "stream_start";
-  } else {
-    valueNames[body.getArgument(0)] = "stream_tile";
-  }
+  std::string streamStart = "axis_index_" + std::to_string(binding.getAxisNode());
+  line(streamStart + " = " +
+       std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
+       streamTile + " * " + binding.getTile().str());
+  axisIndices[binding.getAxisNode()] = streamStart;
+  valueNames[body.getArgument(0)] = streamStart;
   return success();
 }
 
@@ -1040,14 +1071,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "T.gemm" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a TileLang contraction binding");
-  StringRef warpPolicy;
-  if (binding.getWarpPolicy() == "square")
-    warpPolicy = "T.GemmWarpPolicy.Square";
-  else if (binding.getWarpPolicy() == "full_row")
-    warpPolicy = "T.GemmWarpPolicy.FullRow";
-  else
-    return operation.emitOpError("has no TileLang GEMM warp policy");
-  if (usesStagedEmission()) {
+  FailureOr<target::emission::ContractionOrientation> orientation =
+      target::emission::contractionOrientation(operation);
+  if (failed(orientation))
+    return failure();
+  if (!planIndex.stages.empty()) {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
         binding.getAccumulatorSpace() != "fragment")
@@ -1064,7 +1092,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
     if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        binding.getLhsTranspose() || binding.getRhsTranspose())
+        orientation->lhsTranspose || orientation->rhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     auto operandElementType = [](Value value) -> Type {
@@ -1153,7 +1181,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       --indentation;
     }
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
-         ", policy=" + warpPolicy.str() + ")");
+         ", policy=T.GemmWarpPolicy.FullRow)");
     --indentation;
     bindResult(operation, 0, result);
     return success();
@@ -1172,6 +1200,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           "deferred TileLang contraction has inconsistent plan spaces");
     FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
     FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
+    plan::AxisOp reductionAxis = planIndex.axesByRole.lookup("reduction_0");
+    if (!reductionAxis)
+      return operation.emitOpError("has no reduction-axis physical binding");
+    axisIndices[reductionAxis.getNode()] =
+        "k_tile * " + reductionAxis.getTile().str();
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad, true);
     FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad, true);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
@@ -1196,12 +1229,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     line("T.copy(" + (*rhsView)->argument->name + "[" + *rhsIndices + "], " +
          rhs + ")");
     std::string call = "T.gemm(" + lhs + ", " + rhs + ", " + *result;
-    if (binding.getLhsTranspose())
+    if (orientation->lhsTranspose)
       call += ", transpose_A=True";
-    if (binding.getRhsTranspose())
+    if (orientation->rhsTranspose)
       call += ", transpose_B=True";
-    call += ", policy=" + warpPolicy.str();
-    line(call + ")");
+    line(call + ", policy=T.GemmWarpPolicy.FullRow)");
     --indentation;
     bindResult(operation, 0, *result);
     return success();
@@ -1222,12 +1254,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   line("T.clear(" + *result + ")");
   std::string call = "T.gemm(" + lhs->str() + ", " + rhs->str() + ", " +
                      *result;
-  if (binding.getLhsTranspose())
+  if (orientation->lhsTranspose)
     call += ", transpose_A=True";
-  if (binding.getRhsTranspose())
+  if (orientation->rhsTranspose)
     call += ", transpose_B=True";
-  call += ", policy=" + warpPolicy.str();
-  line(call + ")");
+  line(call + ", policy=T.GemmWarpPolicy.FullRow)");
   bindResult(operation, 0, *result);
   return success();
 }
@@ -1253,7 +1284,6 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
         definition ? tensorExtents(*definition, result.getResultNumber())
                    : FailureOr<SmallVector<std::string>>(failure());
     if (failed(extents) || extents->empty() ||
-        (boundary.getCheckBounds() && !usesRaggedOrderedTraversal()) ||
         boundary.getPadding() != "none")
       return operation.emitOpError(
           "has an invalid parallel TileLang store transfer");
@@ -1353,9 +1383,6 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
-  FailureOr<int64_t> node = target::getNodeID(operation, "atomic emission");
-  plan::AtomicOp binding =
-      succeeded(node) ? planIndex.atomics.lookup(*node) : plan::AtomicOp();
   auto valueIndex =
       operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -1364,8 +1391,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
-  if (failed(node) || !binding || binding.getLowering() != "T.atomic_add" ||
-      !valueIndex || failed(relation) || relation->size() != 2 ||
+  if (!valueIndex || failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||
       !(*relation)[0].operands.front() ||

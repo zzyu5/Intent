@@ -35,8 +35,14 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                         })) ||
       failed(addHandler(
           registry, "intent.parallel",
-          [&](Operation &op) { return emitter.enterParallel(op); },
-          [&](Operation &op) { return emitter.leaveParallel(op); })) ||
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterParallel(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveParallel(op)
+                                               : success();
+          })) ||
       failed(addHandler(registry, "intent.view_load",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -113,8 +119,14 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                         })) ||
       failed(addHandler(
           registry, "intent.state_stream",
-          [&](Operation &op) { return emitter.enterStateStream(op); },
-          [&](Operation &op) { return emitter.leaveStateStream(op); })) ||
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterStateStream(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveStateStream(op)
+                                               : success();
+          })) ||
       failed(addHandler(registry, "intent.contract",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -170,137 +182,178 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitProgramBindings() {
+  if (programBindingsEmitted)
+    return success();
+  programBindingsEmitted = true;
+
+  for (const auto &entry : planIndex.components.groups) {
+    SmallVector<plan::AxisOp> axes(entry.getValue().begin(), entry.getValue().end());
+    llvm::sort(axes, [](plan::AxisOp lhs, plan::AxisOp rhs) {
+      return lhs.getProgramOrder() < rhs.getProgramOrder();
+    });
+    if (axes.size() != 2 ||
+        axes.front().getWorkerAxis() != axes.back().getWorkerAxis())
+      return axes.front().emitOpError(
+          "cuTile supports two-axis program grouping on one worker axis");
+    StringRef group = axes.front().getGroupSpelling();
+    if (group.empty())
+      return axes.front().emitOpError("has no cuTile group spelling");
+    plan::AxisOp lhs = axes[0];
+    plan::AxisOp rhs = axes[1];
+    std::string lhsRole =
+        "program_" + std::to_string(lhs.getProgramOrder());
+    std::string rhsRole =
+        "program_" + std::to_string(rhs.getProgramOrder());
+    std::string pid = "group_bid_" + std::to_string(lhs.getNode());
+    std::string lhsCount = "group_count_" + std::to_string(lhs.getNode());
+    std::string rhsCount = "group_count_" + std::to_string(rhs.getNode());
+    std::string span = "group_span_" + std::to_string(lhs.getNode());
+    std::string id = "group_id_" + std::to_string(lhs.getNode());
+    std::string first = "group_first_" + std::to_string(lhs.getNode());
+    std::string size = "group_size_" + std::to_string(lhs.getNode());
+    std::string lhsBlock = "block_axis_" + std::to_string(lhs.getNode());
+    std::string rhsBlock = "block_axis_" + std::to_string(rhs.getNode());
+    line(pid + " = ct.bid(" + std::to_string(lhs.getWorkerAxis()) + ")");
+    line(lhsCount + " = ct.cdiv(" +
+         dimensionOwners.lookup(roleDimensions.lookup(lhsRole)) + ", " +
+         lhs.getTile().str() + ")");
+    line(rhsCount + " = ct.cdiv(" +
+         dimensionOwners.lookup(roleDimensions.lookup(rhsRole)) + ", " +
+         rhs.getTile().str() + ")");
+    line(span + " = " + group.str() + " * " + rhsCount);
+    line(id + " = " + pid + " // " + span);
+    line(first + " = " + id + " * " + group.str());
+    line(size + " = min(" + lhsCount + " - " + first + ", " + group.str() +
+         ")");
+    line(lhsBlock + " = " + first + " + (" + pid + " % " + size + ")");
+    line(rhsBlock + " = (" + pid + " % " + span + ") // " + size);
+    programBlocks[lhs.getNode()] = lhsBlock;
+    programBlocks[rhs.getNode()] = rhsBlock;
+    axisIndices[lhs.getNode()] = lhsBlock;
+    axisIndices[rhs.getNode()] = rhsBlock;
+  }
+
+  auto axisExtent = [&](plan::AxisOp axis) {
+    std::string role =
+        "program_" + std::to_string(axis.getProgramOrder());
+    std::string extent =
+        dimensionOwners.lookup(roleDimensions.lookup(role));
+    return axis.isScalar()
+               ? extent
+               : "ct.cdiv(" + extent + ", " + axis.getTile().str() + ")";
+  };
+  SmallVector<target::emission::ProgramIndexProjection> projections =
+      target::emission::projectProgramIndices(
+          planIndex, axisExtent, [](unsigned worker) {
+            return "ct.bid(" + std::to_string(worker) + ")";
+          });
+  for (const target::emission::ProgramIndexProjection &projection : projections) {
+    plan::AxisOp axis = projection.axis;
+    std::string block = "block_axis_" + std::to_string(axis.getNode());
+    line(block + " = " + projection.expression);
+    programBlocks[axis.getNode()] = block;
+    axisIndices[axis.getNode()] = block;
+    if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
+      continue;
+    FailureOr<plan::RaggedOp> relation =
+        target::emission::uniqueRaggedRelation(planIndex, axis.getNode(),
+                                                *axis.operation.getOperation());
+    std::string outer = succeeded(relation)
+                            ? axisIndices.lookup(relation->getOuterNode())
+                            : std::string();
+    auto runtime = succeeded(relation)
+                       ? raggedRuntimeByRelation.find(relation->getNode())
+                       : raggedRuntimeByRelation.end();
+    if (failed(relation) || outer.empty() ||
+        runtime == raggedRuntimeByRelation.end())
+      return axis.emitOpError(
+          "ordered ragged axis has no outer-axis or metadata binding");
+    RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+    auto ordered =
+        planIndex.components.orderedAxesByRelation.find(relation->getNode());
+    if (ordered == planIndex.components.orderedAxesByRelation.end() ||
+        ordered->second.empty())
+      return axis.emitOpError("has no ordered axis in its ragged relation");
+    for (int64_t orderedAxis : ordered->second) {
+      std::string suffix = std::to_string(orderedAxis);
+      line("sequence_begin_" + suffix + " = ct.gather(" +
+           ragged.offsets->argument->name + ", " + outer +
+           ", padding_value=0)");
+      line("sequence_end_" + suffix + " = ct.gather(" +
+           ragged.offsets->argument->name + ", " + outer +
+           " + 1, padding_value=0)");
+      line("sequence_length_" + suffix + " = sequence_end_" + suffix +
+           " - sequence_begin_" + suffix);
+    }
+    std::string suffix = std::to_string(ordered->second.front());
+    std::string values = "axis_index_" + std::to_string(axis.getNode());
+    line(values + " = sequence_begin_" + suffix + " + " + block + " * " +
+         axis.getTile().str() + " + ct.arange(" + axis.getTile().str() +
+         ", dtype=ct.int32)");
+    line(values + " = ct.where(" + values + " < sequence_end_" + suffix +
+         ", " + values + ", " + ragged.membersView->argument->name +
+         ".shape[0])");
+    axisIndices[axis.getNode()] = values;
+  }
+  return success();
+}
+
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
-  if (usesRaggedOrderedTraversal()) {
-    if (&operation == programRoot) {
-      line("query_block = ct.bid(" +
-           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
-      line("sequence_index = ct.bid(" +
-           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
-      line("sequence_begin = ct.gather(" + raggedOffsets->argument->name +
-           ", sequence_index, padding_value=0)");
-      line("sequence_end = ct.gather(" + raggedOffsets->argument->name +
-           ", sequence_index + 1, padding_value=0)");
-      line("sequence_length = sequence_end - sequence_begin");
-      line("query_offsets = sequence_begin + query_block * TILE_SIZE_M + "
-           "ct.arange(TILE_SIZE_M, dtype=ct.int32)");
-      line("query_offsets = ct.where(query_offsets < sequence_end, "
-           "query_offsets, " + raggedMembersView->argument->name +
-           ".shape[0])");
+  if (operation.getNumRegions() != 1 ||
+      !llvm::hasSingleElement(operation.getRegion(0)) ||
+      operation.getRegion(0).front().getNumArguments() != 1)
+    return operation.emitOpError(
+        "parallel ownership requires one region argument");
+  BlockArgument argument = operation.getRegion(0).front().getArgument(0);
+  FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+  if (failed(axis))
+    return failure();
+
+  if (!planIndex.stages.empty()) {
+    bool outer = false;
+    bool member = false;
+    for (const auto &entry : stageRaggedRuntime) {
+      const RaggedRuntime &runtime = raggedRuntimes[entry.second];
+      outer |= runtime.binding.getOuterNode() == axis->getNode();
+      member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
+        auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
+        return node && node.getInt() == axis->getNode();
+      });
     }
-    if (operation.getNumRegions() != 1 ||
-        !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getRegion(0).front().getNumArguments() != 1)
-      return operation.emitOpError(
-          "ragged ownership requires one parallel region argument");
-    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-    if (failed(axis))
-      return failure();
-    if (axis->getRole() == "program_0")
-      valueNames[argument] = "sequence_index";
-    else if (axis->getRole() == "program_1")
-      valueNames[argument] = "query_offsets";
-    else
-      return operation.emitOpError(
-          "parallel region has no ragged ownership role");
+    if (outer == member)
+      return operation.emitOpError("has no staged program-axis binding");
+    valueNames[argument] = outer ? "expert" : "member_offsets";
     return success();
   }
-  if (usesStagedEmission()) {
-    if (operation.getNumRegions() != 1 ||
-        !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getRegion(0).front().getNumArguments() != 1)
-      return operation.emitOpError(
-          "ragged program ownership requires one region argument");
-    BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-    if (failed(axis))
-      return failure();
-    if (axis->getRole() == "program_0")
-      valueNames[argument] = "expert";
-    else if (axis->getRole() == "program_1")
-      valueNames[argument] = "member_offsets";
-    else
-      return operation.emitOpError("has no ragged program-axis role");
-    return success();
-  }
-  if (hasTraversal("ordered_stream") &&
-      planIndex.program.getOwnership() == "block_rows") {
-    if (&operation != programRoot || operation.getNumRegions() != 1 ||
-        !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getRegion(0).front().getNumArguments() != 1)
-      return operation.emitOpError(
-          "row stream requires one root ownership argument");
-    int64_t workerAxis = planIndex.program.getWorkerAxes().front();
-    line("program_index = ct.bid(" + std::to_string(workerAxis) + ")");
-    valueNames[operation.getRegion(0).front().getArgument(0)] = "program_index";
-    return success();
-  }
-  if (hasTraversal("ordered_stream") &&
-      planIndex.program.getOwnership() == "block_tiles") {
-    if (&operation == programRoot) {
-      line("bid_program_2 = ct.bid(" +
-           std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
-      line("bid_program_01 = ct.bid(" +
-           std::to_string(planIndex.program.getWorkerAxes()[1]) + ")");
-      line("index_program_0 = bid_program_01 // " +
-           roleDimensions.lookup("program_1"));
-      line("index_program_1 = bid_program_01 % " +
-           roleDimensions.lookup("program_1"));
-    }
-    if (operation.getNumRegions() != 1 ||
-        !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getRegion(0).front().getNumArguments() != 1)
-      return operation.emitOpError(
-          "multi-axis mapping requires one parallel region argument");
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getRegion(0).front().getArgument(0), operation);
-    if (failed(axis))
-      return failure();
-    StringRef role = axis->getRole();
-    if (role == "program_0")
-      valueNames[operation.getRegion(0).front().getArgument(0)] =
-          "index_program_0";
-    else if (role == "program_1")
-      valueNames[operation.getRegion(0).front().getArgument(0)] =
-          "index_program_1";
-    else if (role == "program_2")
-      valueNames[operation.getRegion(0).front().getArgument(0)] =
-          "bid_program_2";
-    else
-      return operation.emitOpError(
-          "parallel region has no multi-axis cuTile role");
-    return success();
-  }
-  if (&operation != programRoot)
-    return success();
-  int64_t workerAxis = planIndex.program.getWorkerAxes().front();
-  if (hasTraversal("persistent")) {
+
+  if (!planIndex.components.reusedAxes.empty()) {
+    if (&operation != programRoot ||
+        axis->getNode() != planIndex.components.reusedAxes.front().getNode())
+      return operation.emitOpError("is not the worker-reused program axis");
+    int64_t workerAxis = axis->getWorkerAxis();
     line("program_start = ct.bid(" + std::to_string(workerAxis) + ")");
     line("program_step = ct.num_blocks(" + std::to_string(workerAxis) + ")");
     line(vectorIndex + " = ct.arange(TILE_SIZE, dtype=ct.int32)");
     line("for " + programIndex +
          " in range(program_start, N_ROWS, program_step):");
     ++indentation;
+    axisIndices[axis->getNode()] = programIndex;
+    valueNames[argument] = programIndex;
     return success();
   }
 
-  line("M = " + dimensionOwners.lookup(roleDimensions.lookup("program_0")));
-  line("N = " + dimensionOwners.lookup(roleDimensions.lookup("program_1")));
-  line("bid = ct.bid(" + std::to_string(workerAxis) + ")");
-  line("num_bid_m = ct.cdiv(M, TILE_SIZE_M)");
-  line("num_bid_n = ct.cdiv(N, TILE_SIZE_N)");
-  line("num_bid_in_group = GROUP_SIZE_M * num_bid_n");
-  line("group_id = bid // num_bid_in_group");
-  line("first_bid_m = group_id * GROUP_SIZE_M");
-  line("group_size_m = min(num_bid_m - first_bid_m, GROUP_SIZE_M)");
-  line("bid_m = first_bid_m + (bid % group_size_m)");
-  line("bid_n = (bid % num_bid_in_group) // group_size_m");
+  if (&operation == programRoot && failed(emitProgramBindings()))
+    return failure();
+  std::string value = axisIndices.lookup(axis->getNode());
+  if (value.empty())
+    return axis->emitOpError("has no emitted per-axis program index");
+  valueNames[argument] = value;
   return success();
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
-  if (&operation == programRoot && hasTraversal("persistent"))
+  if (&operation == programRoot && !planIndex.components.reusedAxes.empty())
     --indentation;
   return success();
 }
@@ -368,28 +421,15 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(axis) || !result || result.getRank() != 1 ||
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
-  StringRef role = axis->getRole();
-  std::string expression;
-  if (usesRaggedOrderedTraversal() && role == "program_1")
-    expression = "query_offsets";
-  else if (usesRaggedOrderedTraversal() && role == "stream_0")
-    expression = "stream_offsets";
-  else if (role == "program_2")
-    expression = "bid_program_2 * " + axis->getTile().str() +
-                 " + ct.arange(" + axis->getTile().str() +
-                 ", dtype=ct.int32)";
-  else if (role == "stream_0")
-    expression = "stream_tile * " + axis->getTile().str() +
-                 " + ct.arange(" + axis->getTile().str() +
-                 ", dtype=ct.int32)";
-  else if (role == "program_0" && axis->getTile() != "one")
-    expression = "bid_m * " + axis->getTile().str() + " + ct.arange(" +
-                 axis->getTile().str() + ", dtype=ct.int32)";
-  else if (role == "program_1" && axis->getTile() != "one")
-    expression = "bid_n * " + axis->getTile().str() + " + ct.arange(" +
-                 axis->getTile().str() + ", dtype=ct.int32)";
-  else
+  std::string base = axisIndices.lookup(axis->getNode());
+  if (base.empty() || axis->isScalar())
     return operation.emitOpError("has no cuTile vector index realization");
+  std::string expression =
+      target::emission::isRaggedBoundAxis(planIndex.components,
+                                          axis->getNode())
+          ? base
+          : base + " * " + axis->getTile().str() + " + ct.arange(" +
+                axis->getTile().str() + ", dtype=ct.int32)";
   bindResult(operation, 0, expression);
   return success();
 }
@@ -586,7 +626,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  if (usesStagedEmission() && binding &&
+  if (!planIndex.stages.empty() && binding &&
       binding.getLowering() == "ct.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation) || failed(valid) || failed(fill))
@@ -620,17 +660,15 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   bool prependAxis = succeeded(relation) && relation->size() == 2 &&
                      (*relation)[0].kind == "new_axis" &&
                      (*relation)[1].kind == "full_slice";
-  if (failed(node) || !binding ||
-      (binding.getLowering() != "alias_column" &&
-       binding.getLowering() != "expand_dims") ||
+  if (failed(node) || !binding || binding.getLowering() != "expand_dims" ||
       failed(relation) || (!appendAxis && !prependAxis) || failed(source) ||
       failed(valid) || failed(fill))
     return operation.emitOpError("lacks a mechanical cuTile gather binding");
   std::string result = makeResultName(operation, 0);
   Operation *definition = operation.getOperand(0).getDefiningOp();
   bool alreadyKeptDimension =
-      binding.getLowering() == "alias_column" && definition &&
-      definition->getName().getStringRef() != "intent.indices";
+      target::emission::touchesStateStream(operation) &&
+      (!definition || definition->getName().getStringRef() != "intent.indices");
   std::string expanded = alreadyKeptDimension
                              ? source->str()
                              : source->str() +
@@ -656,8 +694,7 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
-  if (failed(node) || !binding || binding.getOrder() != "forward" ||
-      binding.getCarrySpace() != "register" || operation.getNumRegions() != 1 ||
+  if (failed(node) || !binding || operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical cuTile stream binding");
   Block &body = operation.getRegion(0).front();
@@ -681,10 +718,18 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
-  std::string streamExtent =
-      usesRaggedOrderedTraversal()
-          ? "sequence_length"
-          : dimensionOwners.lookup(roleDimensions.lookup("stream_0"));
+  bool raggedStream =
+      planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
+  Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
+  FailureOr<std::string> logicalExtent =
+      streamDomain ? dimensionName(*streamDomain)
+                   : FailureOr<std::string>(failure());
+  if (failed(logicalExtent))
+    return binding.emitOpError("has no logical ordered-axis extent");
+  std::string raggedSuffix = std::to_string(binding.getAxisNode());
+  std::string streamExtent = raggedStream
+                                 ? "sequence_length_" + raggedSuffix
+                                 : dimensionOwners.lookup(*logicalExtent);
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
@@ -704,32 +749,41 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
         resolveAxis(stopOperation->getOperand(0), operation);
     if (failed(stopAxis))
       return failure();
-    if (usesRaggedOrderedTraversal() &&
-        stopAxis->getRole() == "program_1") {
-      streamExtent = "min((query_block + 1) * " +
-                     stopAxis->getTile().str() + ", sequence_length)";
-    } else if (hasTraversal("ordered_stream") &&
-               planIndex.program.getOwnership() == "block_tiles" &&
-               stopAxis->getRole() == "program_2") {
-      streamExtent = "min((bid_program_2 + 1) * " +
+    if (stopAxis->hasRole("parallel") && !stopAxis->isScalar()) {
+      std::string block = programBlocks.lookup(stopAxis->getNode());
+      if (block.empty())
+        return stopAxis->emitOpError("has no physical program block index");
+      streamExtent = "min((" + block + " + 1) * " +
                      stopAxis->getTile().str() + ", " + streamExtent + ")";
-    } else if (stopAxis->getRole() != "stream_0") {
+    } else if (stopAxis->getNode() != binding.getAxisNode()) {
       return operation.emitOpError(
           "has no cuTile spelling for its planned logical stream stop");
     }
   }
-  line("for stream_tile in range(ct.cdiv(" + streamExtent + ", " +
+  std::string streamTile = "stream_tile_" + std::to_string(*node);
+  line("for " + streamTile + " in range(ct.cdiv(" + streamExtent + ", " +
        binding.getTile().str() + ")):");
   ++indentation;
-  if (usesRaggedOrderedTraversal()) {
-    line("stream_offsets = sequence_begin + stream_tile * " +
+  if (raggedStream) {
+    auto runtimes = raggedRuntimesByAxis.find(binding.getAxisNode());
+    if (runtimes == raggedRuntimesByAxis.end() ||
+        runtimes->second.size() != 1)
+      return binding.emitOpError("has no unique ragged stream runtime");
+    RaggedRuntime &ragged = raggedRuntimes[runtimes->second.front()];
+    std::string offsets = "axis_index_" + std::to_string(binding.getAxisNode());
+    line(offsets + " = sequence_begin_" + raggedSuffix + " + " + streamTile +
+         " * " +
          binding.getTile().str() + " + ct.arange(" + binding.getTile().str() +
          ", dtype=ct.int32)");
-    line("stream_offsets = ct.where(stream_offsets < sequence_end, "
-         "stream_offsets, " + raggedMembersView->argument->name +
+    line(offsets + " = ct.where(" + offsets + " < sequence_end_" +
+         raggedSuffix + ", " + offsets + ", " +
+         ragged.membersView->argument->name +
          ".shape[0])");
+    axisIndices[binding.getAxisNode()] = offsets;
+  } else {
+    axisIndices[binding.getAxisNode()] = streamTile;
   }
-  valueNames[body.getArgument(0)] = "stream_tile";
+  valueNames[body.getArgument(0)] = streamTile;
   return success();
 }
 
@@ -760,7 +814,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "ct.mma" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a cuTile contraction binding");
-  if (usesStagedEmission()) {
+  FailureOr<target::emission::ContractionOrientation> orientation =
+      target::emission::contractionOrientation(operation);
+  if (failed(orientation))
+    return failure();
+  if (!planIndex.stages.empty()) {
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");
@@ -772,7 +830,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
     if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        binding.getLhsTranspose() || binding.getRhsTranspose())
+        orientation->lhsTranspose || orientation->rhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     auto operandElementType = [](Value value) -> Type {
@@ -856,9 +914,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       return failure();
     std::string lhsExpression = lhs->str();
     std::string rhsExpression = rhs->str();
-    if (binding.getLhsTranspose())
+    if (orientation->lhsTranspose)
       lhsExpression = "ct.transpose(" + lhsExpression + ")";
-    if (binding.getRhsTranspose())
+    if (orientation->rhsTranspose)
       rhsExpression = "ct.transpose(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
     line(result + " = ct.full(" + *shape +
@@ -868,12 +926,16 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!lhsLoad || !rhsLoad || binding.getLhsTranspose() ||
-      binding.getRhsTranspose())
+  if (!lhsLoad || !rhsLoad || orientation->lhsTranspose ||
+      orientation->rhsTranspose)
     return operation.emitOpError(
         "deferred cuTile contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
+  plan::AxisOp reductionAxis = planIndex.axesByRole.lookup("reduction_0");
+  if (!reductionAxis)
+    return operation.emitOpError("has no reduction-axis physical binding");
+  axisIndices[reductionAxis.getNode()] = "k_tile";
   FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, true);
   FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, true);
   FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
@@ -977,9 +1039,6 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
-  FailureOr<int64_t> node = target::getNodeID(operation, "atomic emission");
-  plan::AtomicOp binding =
-      succeeded(node) ? planIndex.atomics.lookup(*node) : plan::AtomicOp();
   auto valueIndex =
       operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -988,10 +1047,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
-  if (failed(node) || !binding || binding.getLowering() != "ct.atomic_add" ||
-      binding.getMemoryOrder() != "relaxed" ||
-      binding.getMemoryScope() != "device" || !valueIndex ||
-      failed(relation) || relation->size() != 2 ||
+  if (!valueIndex || failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||
       !(*relation)[0].operands.front() ||

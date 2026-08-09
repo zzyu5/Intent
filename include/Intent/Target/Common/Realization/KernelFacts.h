@@ -24,14 +24,9 @@ struct LogicalAxis {
 };
 
 struct StateStreamFact {
-  mlir::Operation *axisDomain;
-  mlir::Operation *stopBound;
   int64_t stateCount;
-  std::string tile;
   mlir::Block *body;
   llvm::SmallVector<mlir::Value> initialState;
-  llvm::SmallVector<mlir::Value> bodyState;
-  llvm::SmallVector<mlir::Value> yieldedState;
 };
 
 struct RaggedRelationFact {

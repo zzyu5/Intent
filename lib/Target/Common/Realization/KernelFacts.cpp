@@ -725,14 +725,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         static_cast<unsigned>(stateCount.getInt() + 1))
       return operation.emitOpError(
           "state stream body does not match carried state");
-    StateStreamFact fact{axisDomain, stopBound, stateCount.getInt(),
-                         namedExtent ? tile.getValue().str() : std::string(),
-                         &body, {}, {}, {}};
+    StateStreamFact fact{stateCount.getInt(), &body, {}};
     for (int64_t index = 0; index < stateCount.getInt(); ++index) {
       Value initial = operation.getOperand(index + 1);
       Value argument = body.getArgument(index + 1);
       fact.initialState.push_back(initial);
-      fact.bodyState.push_back(argument);
       auto axes = facts.valueAxes.find(initial);
       if (isa<RankedTensorType>(initial.getType()) &&
           axes == facts.valueAxes.end())
@@ -756,7 +753,6 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           "state stream must yield every carried value");
     for (int64_t index = 0; index < fact.stateCount; ++index) {
       Value yielded = terminator.getOperand(index);
-      fact.yieldedState.push_back(yielded);
       auto initialAxes = facts.valueAxes.find(fact.initialState[index]);
       auto yieldedAxes = facts.valueAxes.find(yielded);
       if (initialAxes != facts.valueAxes.end() &&
