@@ -122,7 +122,8 @@ def Intent_ScanOp : Intent_BinaryOneResultOp<"scan">;
 def Intent_ContractOp : Intent_BinaryOneResultOp<"contract">;
 
 def Intent_RaggedOp : Intent_Op<"ragged", [Pure]> {
-  let arguments = (ins AnyType:$outer, AnyType:$offsets, AnyType:$indices);
+  let arguments = (ins AnyType:$outer, AnyType:$members, AnyType:$offsets,
+                       Optional<AnyType>:$indices);
   let results = (outs AnyType:$result);
 }
 def Intent_RaggedOuterOp : Intent_UnaryOneResultOp<"ragged_outer">;

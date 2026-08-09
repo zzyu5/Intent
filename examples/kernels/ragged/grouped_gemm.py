@@ -12,15 +12,15 @@ GROUPS = 8
 def ragged_grouped_gemm(
     x: I.In[I.f16, ("R", "K")],
     group_offsets: I.In[I.i32, ("G_PLUS_1",)],
-    member_rows: I.In[I.i32, ("R",)],
     weight: I.In[I.f16, ("G", "K", "N")],
     y: I.Out[I.f16, ("R", "N")],
 ):
+    R, _ = x.shape
     G, _, N = weight.shape
     groups = I.ragged(
         outer=I.domain(0, G),
+        members=I.domain(0, R),
         offsets=group_offsets,
-        indices=member_rows,
     )
     for group in I.parallel(groups.outer):
         for member_region in I.parallel(

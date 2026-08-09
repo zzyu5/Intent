@@ -109,12 +109,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         ).grouped_gemm
 
         def run(arguments):
-            x, offsets, members, weight = arguments
-            rows = [
-                members[offsets[group] : offsets[group + 1]].long()
-                for group in range(weight.shape[0])
-            ]
-            packed = torch.cat([x[group_rows] for group_rows in rows])
+            x, offsets, weight = arguments
             batch_sizes = offsets[1:] - offsets[:-1]
             batch_offsets = offsets[:-1].contiguous()
             batch_sizes_list = tuple(int(size) for size in batch_sizes.tolist())
@@ -128,7 +123,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
                 padded_offsets, device=x.device, dtype=torch.int32
             )
             values = grouped(
-                packed,
+                x,
                 weight,
                 batch_sizes,
                 batch_offsets,
@@ -141,16 +136,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
                 2,
                 256,
             )
-            result = torch.zeros(
-                (x.shape[0], weight.shape[2]), device=x.device, dtype=torch.float32
-            )
-            for group, group_rows in enumerate(rows):
-                result.index_add_(
-                    0,
-                    group_rows,
-                    values[offsets[group] : offsets[group + 1]].float(),
-                )
-            return result
+            return values.float()
 
         return run
     if kernel == "online_softmax":

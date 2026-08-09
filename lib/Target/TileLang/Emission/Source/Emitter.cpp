@@ -311,21 +311,27 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     Operation *load = raggedRelation->getOperand(operandIndex).getDefiningOp();
     if (!load || load->getName().getStringRef() != "intent.view_load" ||
         load->getNumOperands() != 1) {
-      raggedRelation->emitOpError(
-          "requires offsets and indices from canonical view loads");
+      raggedRelation->emitOpError("requires ragged metadata from canonical view loads");
       return failure();
     }
     return lookupView(load->getOperand(0), *raggedRelation);
   };
-  FailureOr<ABIView *> offsets = relationView(1);
-  FailureOr<ABIView *> indices = relationView(2);
-  if (failed(offsets) || failed(indices) || (*offsets)->tensor.getRank() != 1 ||
-      (*indices)->tensor.getRank() != 1 || (*indices)->shape.size() != 1)
-    return raggedRelation->emitOpError(
-        "requires rank-one offsets and member-index views");
+  FailureOr<ABIView *> offsets = relationView(2);
+  if (failed(offsets) || (*offsets)->tensor.getRank() != 1)
+    return raggedRelation->emitOpError("requires a rank-one offsets view");
   raggedOffsets = *offsets;
-  raggedIndices = *indices;
-  raggedMemberDimension = raggedIndices->shape.front();
+  if (raggedRelation->getNumOperands() == 4) {
+    FailureOr<ABIView *> indices = relationView(3);
+    if (failed(indices) || (*indices)->tensor.getRank() != 1 ||
+        (*indices)->shape.size() != 1)
+      return raggedRelation->emitOpError(
+          "requires a rank-one member-index view");
+    raggedIndices = *indices;
+  }
+  raggedMemberDimension = roleDimensions.lookup("program_1");
+  if (raggedMemberDimension.empty())
+    return raggedRelation->emitOpError(
+        "has no physical member-dimension binding");
 
   llvm::sort(planIndex.stages, [](plan::StageOp lhs, plan::StageOp rhs) {
     return lhs.getOrdinal() < rhs.getOrdinal();
@@ -472,6 +478,9 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
+  bool compact = isRaggedStages() &&
+                 planIndex.ragged.front().getTraversal() ==
+                     "compact_offset_tiles";
   auto emitBuilderParameters = [&](raw_ostream &stream, bool ragged) {
     bool first = true;
     auto parameter = [&](StringRef value) {
@@ -483,7 +492,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     for (const std::string &dimension : dimensionOrder)
       parameter(dimension);
     if (ragged)
-      parameter("MAX_ROUTES");
+      parameter(compact ? "ROUTE_LENGTHS" : "MAX_ROUTES");
     if (programMapping == "persistent_rows") {
       parameter("TILE_SIZE");
       parameter("num_stages=DEFAULT_NUM_STAGES");
@@ -557,20 +566,62 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       emitDecorator(source);
       source << "def " << kernelName << "_stage_" << stage << "(";
       emitBuilderParameters(source, true);
-      source << "):\n    @T.prim_func\n    def main(";
+      source << "):\n";
+      if (compact)
+        source << "    total_route_tiles = sum((length + TILE_SIZE_M - 1) "
+                  "// TILE_SIZE_M for length in ROUTE_LENGTHS)\n";
+      source << "    @T.prim_func\n    def main(";
       if (failed(emitMainParameters(source)))
         return failure();
       source << "):\n";
       std::string feature = stageFeatureDimensions.lookup(stage);
       source << "        with T.Kernel(T.ceildiv(" << feature
-             << ", TILE_SIZE_N), " << roleDimensions.lookup("program_0")
-             << " * T.ceildiv(MAX_ROUTES, TILE_SIZE_M), "
-                "threads=threads) as (bid_feature, bid_expert_route):\n";
+             << ", TILE_SIZE_N), ";
+      if (compact)
+        source << "total_route_tiles";
+      else
+        source << roleDimensions.lookup("program_0")
+               << " * T.ceildiv(MAX_ROUTES, TILE_SIZE_M)";
+      source << ", threads=threads) as (bid_feature, bid_expert_route):\n";
       source.flush();
-      stageLine(stage,
-                "num_route_tiles = T.ceildiv(MAX_ROUTES, TILE_SIZE_M)");
-      stageLine(stage, "expert = bid_expert_route // num_route_tiles");
-      stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
+      if (compact) {
+        stageLine(stage, "expert = T.alloc_var(dtype=T.int32)");
+        stageLine(stage, "route_tile = T.alloc_var(dtype=T.int32)");
+        stageLine(stage, "tile_cursor = T.alloc_var(dtype=T.int32)");
+        stageLine(stage, "expert = 0");
+        stageLine(stage, "route_tile = 0");
+        stageLine(stage, "tile_cursor = 0");
+        stageLine(stage,
+                  "for candidate in range(" +
+                      roleDimensions.lookup("program_0") + "):");
+        stageLine(stage, "candidate_begin = " +
+                             raggedOffsets->argument->name + "[candidate]",
+                  4);
+        stageLine(stage, "candidate_end = " +
+                             raggedOffsets->argument->name +
+                             "[candidate + 1]",
+                  4);
+        stageLine(stage,
+                  "candidate_tiles = T.ceildiv(candidate_end - "
+                  "candidate_begin, TILE_SIZE_M)",
+                  4);
+        stageLine(stage,
+                  "owns_tile = bid_expert_route >= tile_cursor and "
+                  "bid_expert_route < tile_cursor + candidate_tiles",
+                  4);
+        stageLine(stage,
+                  "expert = T.if_then_else(owns_tile, candidate, expert)", 4);
+        stageLine(stage,
+                  "route_tile = T.if_then_else(owns_tile, bid_expert_route - "
+                  "tile_cursor, route_tile)",
+                  4);
+        stageLine(stage, "tile_cursor = tile_cursor + candidate_tiles", 4);
+      } else {
+        stageLine(stage,
+                  "num_route_tiles = T.ceildiv(MAX_ROUTES, TILE_SIZE_M)");
+        stageLine(stage, "expert = bid_expert_route // num_route_tiles");
+        stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
+      }
       stageLine(stage, "route_begin = " + raggedOffsets->argument->name +
                            "[expert]");
       stageLine(stage, "route_end = " + raggedOffsets->argument->name +
@@ -617,6 +668,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 }
 
 LogicalResult SourceEmitter::emitWrapper() {
+  bool compact = isRaggedStages() &&
+                 planIndex.ragged.front().getTraversal() ==
+                     "compact_offset_tiles";
   auto torchDtype = [&](Type type) -> StringRef {
     if (type.isF16())
       return "torch.float16";
@@ -715,7 +769,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (ragged) {
       if (!first)
         output << ", ";
-      output << "max_routes";
+      output << (compact ? "route_lengths" : "max_routes");
     }
   };
 
@@ -748,16 +802,21 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     if (!merge)
       return kernel.entry.emitOpError("ragged TileLang stages have no merge view");
-    Operation *offsetsLoad = raggedRelation->getOperand(1).getDefiningOp();
+    Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
     FailureOr<ABIView *> offsets =
         offsetsLoad && offsetsLoad->getNumOperands() == 1
             ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
             : FailureOr<ABIView *>(failure());
     if (failed(offsets))
       return failure();
-    output << "    max_routes = int((" << (*offsets)->argument->name
-           << "[1:] - " << (*offsets)->argument->name
-           << "[:-1]).max().item())\n";
+    if (compact)
+      output << "    route_lengths = tuple(int(length) for length in ("
+             << (*offsets)->argument->name << "[1:] - "
+             << (*offsets)->argument->name << "[:-1]).tolist())\n";
+    else
+      output << "    max_routes = int((" << (*offsets)->argument->name
+             << "[1:] - " << (*offsets)->argument->name
+             << "[:-1]).max().item())\n";
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
         Value value = kernel.values.lookup(valueID);
@@ -775,7 +834,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    cache_key = (" << stage;
       for (const std::string &dimension : dimensionOrder)
         output << ", " << dimension;
-      output << ", max_routes, " << inputs.front()->argument->name
+      output << ", " << (compact ? "route_lengths" : "max_routes") << ", "
+             << inputs.front()->argument->name
              << ".dtype, str(_DEVICE))\n";
       output << "    if cache_key not in _KERNEL_CACHE:\n";
       output << "        with set_autotune_inputs(";
@@ -1016,7 +1076,9 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   StringRef name = domain.getName().getStringRef();
   if (name == "intent.ragged_outer") {
     Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation && relation->getNumOperands() == 3
+    Operation *source = relation &&
+                                (relation->getNumOperands() == 3 ||
+                                 relation->getNumOperands() == 4)
                             ? relation->getOperand(0).getDefiningOp()
                             : nullptr;
     if (!source)
@@ -1025,16 +1087,14 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   }
   if (name == "intent.ragged_member") {
     Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *indices = relation && relation->getNumOperands() == 3
-                             ? relation->getOperand(2).getDefiningOp()
-                             : nullptr;
-    if (!indices || indices->getName().getStringRef() != "intent.view_load" ||
-        indices->getNumOperands() != 1)
+    Operation *source = relation &&
+                                (relation->getNumOperands() == 3 ||
+                                 relation->getNumOperands() == 4)
+                            ? relation->getOperand(1).getDefiningOp()
+                            : nullptr;
+    if (!source)
       return failure();
-    FailureOr<ABIView *> view = lookupView(indices->getOperand(0), domain);
-    if (failed(view) || (*view)->shape.empty())
-      return failure();
-    return (*view)->shape.front();
+    return dimensionName(*source);
   }
   if (domain.getNumOperands() < 2)
     return failure();

@@ -36,6 +36,7 @@ struct StateStreamFact {
 struct RaggedRelationFact {
   mlir::Operation *relation = nullptr;
   mlir::Operation *outerSource = nullptr;
+  mlir::Operation *memberSource = nullptr;
   mlir::Operation *outerDomain = nullptr;
   mlir::Value offsets;
   mlir::Value indices;

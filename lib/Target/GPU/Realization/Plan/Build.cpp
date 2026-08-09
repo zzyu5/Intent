@@ -102,7 +102,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     if (choice == schedule.axes.end()) {
       bool raggedSource = llvm::any_of(
           facts.semantics.raggedRelations, [&](const auto &entry) {
-            return entry.second.outerSource == &operation;
+            return entry.second.outerSource == &operation ||
+                   entry.second.memberSource == &operation;
           });
       if (raggedSource)
         return success();
@@ -156,7 +157,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             builder.create<intent::plan::RaggedOp>(
                 operation.getLoc(), i64(builder, *node), i64(builder, *outer),
                 i64(builder, *member),
-                string(builder, "expert_offset_ranges"));
+                string(builder, found->second.indices
+                                    ? "expert_offset_ranges"
+                                    : "compact_offset_tiles"));
             return success();
           })))
     return failure();

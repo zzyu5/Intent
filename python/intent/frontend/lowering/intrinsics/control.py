@@ -197,22 +197,32 @@ def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
-        ("outer", "offsets", "indices"),
-        required=("outer", "offsets", "indices"),
+        ("outer", "members", "offsets", "indices"),
+        required=("outer", "members", "offsets"),
     )
     outer = lowerer.materialize(lowerer.lower_expression(bound["outer"]), bound["outer"])
+    members = lowerer.materialize(
+        lowerer.lower_expression(bound["members"]), bound["members"]
+    )
     offsets = lowerer.read_value(lowerer.lower_expression(bound["offsets"]), bound["offsets"])
-    indices = lowerer.read_value(lowerer.lower_expression(bound["indices"]), bound["indices"])
     if not isinstance(outer.type, DomainType):
         lowerer.error(node, "ragged outer must be a domain")
+    if not isinstance(members.type, DomainType) or members.type.rank != 1:
+        lowerer.error(node, "ragged members must be a rank-one domain")
+    operands = [outer, members, offsets]
+    if "indices" in bound:
+        indices = lowerer.read_value(
+            lowerer.lower_expression(bound["indices"]), bound["indices"]
+        )
+        operands.append(indices)
     result_type = RaggedType(
         DomainType(DomainFlavor.RAGGED_OUTER, outer.type.rank),
-        DomainType(DomainFlavor.RAGGED_MEMBER, 1),
+        DomainType(DomainFlavor.RAGGED_MEMBER, members.type.rank),
     )
     operation = lowerer.emit(
         OperationKind.RAGGED,
         lowerer.location(node),
-        operands=(outer, offsets, indices),
+        operands=tuple(operands),
         result_types=(result_type,),
     )
     return operation.results[0]

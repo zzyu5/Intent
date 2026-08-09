@@ -133,7 +133,8 @@ LogicalResult RaggedOp::verify() {
       failed(requireNode(*this, getOuterNode())) ||
       failed(requireNode(*this, getMemberNode())))
     return failure();
-  if (getTraversal() != "expert_offset_ranges")
+  if (getTraversal() != "expert_offset_ranges" &&
+      getTraversal() != "compact_offset_tiles")
     return emitOpError("contains an unsupported cuTile ragged spelling");
   return success();
 }

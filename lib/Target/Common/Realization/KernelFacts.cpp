@@ -375,28 +375,40 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   if (failed(addHandler(
           registry, "intent.ragged", [&](Operation &operation) -> LogicalResult {
-            if (operation.getNumOperands() != 3 ||
+            if ((operation.getNumOperands() != 3 &&
+                 operation.getNumOperands() != 4) ||
                 operation.getNumResults() != 1 ||
                 !isa<intent::RaggedType>(operation.getResult(0).getType()))
               return operation.emitOpError("has no canonical ragged schema");
             Operation *outer = operation.getOperand(0).getDefiningOp();
+            Operation *members = operation.getOperand(1).getDefiningOp();
             auto offsets = dyn_cast<RankedTensorType>(
-                operation.getOperand(1).getType());
-            auto indices = dyn_cast<RankedTensorType>(
                 operation.getOperand(2).getType());
-            if (!outer || !facts.domainSourceAxes.count(outer) || !offsets ||
-                offsets.getRank() != 1 || !indices || indices.getRank() != 1 ||
+            auto indices = operation.getNumOperands() == 4
+                               ? dyn_cast<RankedTensorType>(
+                                     operation.getOperand(3).getType())
+                               : RankedTensorType();
+            if (!outer || !facts.domainSourceAxes.count(outer) || !members ||
+                !facts.domainSourceAxes.count(members) || !offsets ||
+                offsets.getRank() != 1 ||
                 !isa<IntegerType, IndexType>(offsets.getElementType()) ||
-                !isa<IntegerType, IndexType>(indices.getElementType()))
+                (operation.getNumOperands() == 4 &&
+                 (!indices || indices.getRank() != 1 ||
+                  !isa<IntegerType, IndexType>(indices.getElementType()))))
               return operation.emitOpError(
-                  "ragged relation requires one outer domain and rank-one integer metadata");
-            if (failed(backingView(operation.getOperand(1), facts, operation)) ||
-                failed(backingView(operation.getOperand(2), facts, operation)))
+                  "ragged relation requires outer/member domains, rank-one integer offsets, and an optional rank-one integer index map");
+            if (failed(backingView(operation.getOperand(2), facts, operation)) ||
+                (operation.getNumOperands() == 4 &&
+                 failed(backingView(operation.getOperand(3), facts,
+                                    operation))))
               return failure();
             facts.raggedRelations[&operation] =
-                RaggedRelationFact{&operation, outer, nullptr,
-                                   operation.getOperand(1),
-                                   operation.getOperand(2), {}};
+                RaggedRelationFact{
+                    &operation, outer, members, nullptr,
+                    operation.getOperand(2),
+                    operation.getNumOperands() == 4 ? operation.getOperand(3)
+                                                    : Value(),
+                    {}};
             return success();
           })))
     return failure();
@@ -442,12 +454,15 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (failed(selector) || *selector != found->second.outerDomain)
               return operation.emitOpError(
                   "member selector is not owned by the ragged outer domain");
-            FailureOr<Value> indices =
-                backingView(found->second.indices, facts, operation);
-            if (failed(indices))
-              return failure();
-            facts.domainSources[&operation] = *indices;
-            facts.domainSourceAxes[&operation] = 0;
+            Operation *memberSource = found->second.memberSource;
+            if (!memberSource || !facts.domainSources.count(memberSource) ||
+                !facts.domainSourceAxes.count(memberSource))
+              return operation.emitOpError(
+                  "ragged relation has no canonical member source domain");
+            facts.domainSources[&operation] =
+                facts.domainSources.lookup(memberSource);
+            facts.domainSourceAxes[&operation] =
+                facts.domainSourceAxes.lookup(memberSource);
             facts.raggedMembers[&operation] =
                 RaggedMemberFact{relation, &operation, operation.getOperand(1)};
             found->second.memberDomains.push_back(&operation);

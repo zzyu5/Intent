@@ -705,9 +705,12 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
     return failure();
   line("for member_i in T.Parallel(TILE_SIZE_M):");
   ++indentation;
+  std::string member = raggedIndices
+                           ? raggedIndices->argument->name +
+                                 "[member_start + member_i]"
+                           : "member_start + member_i";
   line(*result + "[member_i] = T.if_then_else(member_start + member_i < "
-       "route_end, " + raggedIndices->argument->name +
-       "[member_start + member_i], 0)");
+       "route_end, " + member + ", 0)");
   --indentation;
   bindResult(operation, 0, *result);
   return success();

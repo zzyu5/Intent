@@ -204,22 +204,21 @@ def _run_grouped_gemm(
         device="cuda",
         dtype=torch.int32,
     )
-    members = torch.randperm(GROUPED_ROWS, device="cuda", dtype=torch.int32)
     artifact = intent.compile(ragged_grouped_gemm, target=target, compiler=compiler)
 
     def reference() -> torch.Tensor:
-        result = torch.zeros(
+        result = torch.empty(
             (GROUPED_ROWS, GROUPED_N), device="cuda", dtype=torch.float32
         )
         for group in range(GROUPS):
-            rows = members[offsets[group] : offsets[group + 1]].long()
-            values = x[rows].float() @ weight[group].float()
-            result.index_add_(0, rows, values)
+            begin = offsets[group]
+            end = offsets[group + 1]
+            result[begin:end] = x[begin:end].float() @ weight[group].float()
         return result
 
     _compare(
         artifact=artifact,
-        arguments=(x, offsets, members, weight),
+        arguments=(x, offsets, weight),
         reference=reference,
         target_name=target_name,
         kernel_name="ragged grouped GEMM",

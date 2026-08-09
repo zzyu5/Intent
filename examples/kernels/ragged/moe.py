@@ -22,8 +22,10 @@ def moe_expert_ffn(
 ):
     T, D = x.shape
     E, _, F = w1.shape
+    R = member_routes.shape[0]
     groups = I.ragged(
         outer=I.domain(0, E),
+        members=I.domain(0, R),
         offsets=route_offsets,
         indices=member_routes,
     )

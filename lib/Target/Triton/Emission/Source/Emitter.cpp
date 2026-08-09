@@ -496,17 +496,26 @@ void SourceEmitter::emitImports() {
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
   if (isRaggedStages()) {
-    Operation *offsetsLoad = raggedRelation->getOperand(1).getDefiningOp();
-    Operation *indicesLoad = raggedRelation->getOperand(2).getDefiningOp();
+    bool compact =
+        planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
+    Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
     FailureOr<ABIView *> offsets =
         offsetsLoad && offsetsLoad->getNumOperands() == 1
             ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
             : FailureOr<ABIView *>(failure());
-    FailureOr<ABIView *> indices =
-        indicesLoad && indicesLoad->getNumOperands() == 1
-            ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
-            : FailureOr<ABIView *>(failure());
-    if (failed(offsets) || failed(indices) || !searchIndex.autotune)
+    ABIView *indices = nullptr;
+    if (raggedRelation->getNumOperands() == 4) {
+      Operation *indicesLoad = raggedRelation->getOperand(3).getDefiningOp();
+      FailureOr<ABIView *> resolved =
+          indicesLoad && indicesLoad->getNumOperands() == 1
+              ? lookupView(indicesLoad->getOperand(0), *raggedRelation)
+              : FailureOr<ABIView *>(failure());
+      if (failed(resolved))
+        return raggedRelation->emitOpError(
+            "cannot resolve the staged ragged index map");
+      indices = *resolved;
+    }
+    if (failed(offsets) || !searchIndex.autotune)
       return raggedRelation->emitOpError(
           "cannot resolve staged ragged metadata or delegated tuner");
     ABIView *terminalDestination = nullptr;
@@ -563,15 +572,18 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         parameter(view.pointer);
       for (ABIScalar &scalar : scalars)
         parameter(scalar.name);
+      std::string experts = roleDimensions.lookup("program_0");
       for (const std::string &dimension : dimensionOrder)
-        parameter(dimension);
+        parameter(dimension +
+                  (compact && dimension == experts ? ": tl.constexpr" : ""));
       for (ABIView &view : views)
         for (const std::string &stride : view.strides)
           parameter(stride);
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
-      parameter("MAX_ROUTES");
+      if (!compact)
+        parameter("MAX_ROUTES");
       for (NamedAttribute config : searchIndex.autotune.getParameterMap())
         parameter(config.getName().getValue().str() + ": tl.constexpr");
       source << "):\n";
@@ -580,10 +592,38 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       std::string feature = stageFeatureDimensions.lookup(stage);
       stageLine(stage, "pid_feature = tl.program_id(axis=0)");
       stageLine(stage, "pid_expert_route = tl.program_id(axis=1)");
-      stageLine(stage,
-                "num_route_tiles = tl.cdiv(MAX_ROUTES, BLOCK_SIZE_M)");
-      stageLine(stage, "expert = pid_expert_route // num_route_tiles");
-      stageLine(stage, "route_tile = pid_expert_route % num_route_tiles");
+      if (compact) {
+        stageLine(stage, "expert = 0");
+        stageLine(stage, "route_tile = 0");
+        stageLine(stage, "tile_cursor = 0");
+        stageLine(stage, "for candidate in range(0, " + experts + "):");
+        stageLine(stage, "candidate_begin = tl.load(" + (*offsets)->pointer +
+                             " + candidate * " + (*offsets)->strides[0] + ")",
+                  2);
+        stageLine(stage, "candidate_end = tl.load(" + (*offsets)->pointer +
+                             " + (candidate + 1) * " +
+                             (*offsets)->strides[0] + ")",
+                  2);
+        stageLine(stage,
+                  "candidate_tiles = tl.cdiv(candidate_end - candidate_begin, "
+                  "BLOCK_SIZE_M)",
+                  2);
+        stageLine(stage,
+                  "owns_tile = (pid_expert_route >= tile_cursor) & "
+                  "(pid_expert_route < tile_cursor + candidate_tiles)",
+                  2);
+        stageLine(stage, "expert = tl.where(owns_tile, candidate, expert)", 2);
+        stageLine(stage,
+                  "route_tile = tl.where(owns_tile, pid_expert_route - "
+                  "tile_cursor, route_tile)",
+                  2);
+        stageLine(stage, "tile_cursor += candidate_tiles", 2);
+      } else {
+        stageLine(stage,
+                  "num_route_tiles = tl.cdiv(MAX_ROUTES, BLOCK_SIZE_M)");
+        stageLine(stage, "expert = pid_expert_route // num_route_tiles");
+        stageLine(stage, "route_tile = pid_expert_route % num_route_tiles");
+      }
       stageLine(stage, "route_begin = tl.load(" + (*offsets)->pointer +
                            " + expert * " + (*offsets)->strides[0] + ")");
       stageLine(stage, "route_end = tl.load(" + (*offsets)->pointer +
@@ -593,9 +633,12 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                 "member_offsets = route_begin + route_tile * BLOCK_SIZE_M + "
                 "tl.arange(0, BLOCK_SIZE_M)");
       stageLine(stage, "member_mask = member_offsets < route_end");
-      stageLine(stage, "routes = tl.load(" + (*indices)->pointer +
-                           " + member_offsets * " + (*indices)->strides[0] +
-                           ", mask=member_mask, other=0)");
+      if (indices)
+        stageLine(stage, "routes = tl.load(" + indices->pointer +
+                             " + member_offsets * " + indices->strides[0] +
+                             ", mask=member_mask, other=0)");
+      else
+        stageLine(stage, "routes = member_offsets");
       stageLine(stage,
                 "offs_feature = pid_feature * BLOCK_SIZE_N + "
                 "tl.arange(0, BLOCK_SIZE_N)");
@@ -671,6 +714,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 
 LogicalResult SourceEmitter::emitWrapper() {
   if (isRaggedStages()) {
+    bool compact =
+        planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
     for (const std::string &body : stageBodies)
       output << body << "\n";
     auto torchDtype = [&](Type type) -> StringRef {
@@ -750,16 +795,21 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "        raise ValueError('" << view.argument->name
              << " shape violates the kernel symbols')\n";
     }
-    Operation *offsetsLoad = raggedRelation->getOperand(1).getDefiningOp();
+    Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
     FailureOr<ABIView *> offsets =
         offsetsLoad && offsetsLoad->getNumOperands() == 1
             ? lookupView(offsetsLoad->getOperand(0), *raggedRelation)
             : FailureOr<ABIView *>(failure());
     if (failed(offsets))
       return failure();
-    output << "    max_routes = int((" << (*offsets)->argument->name
-           << "[1:] - " << (*offsets)->argument->name
-           << "[:-1]).max().item())\n";
+    if (compact)
+      output << "    route_lengths = tuple(int(length) for length in ("
+             << (*offsets)->argument->name << "[1:] - "
+             << (*offsets)->argument->name << "[:-1]).tolist())\n";
+    else
+      output << "    max_routes = int((" << (*offsets)->argument->name
+             << "[1:] - " << (*offsets)->argument->name
+             << "[:-1]).max().item())\n";
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
         Value value = kernel.values.lookup(valueID);
@@ -767,7 +817,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         StringRef dtype = tensor ? torchDtype(tensor.getElementType()) : StringRef();
         if (!tensor || tensor.getRank() != 2 || dtype.empty())
           return stage.emitOpError("has an unsupported workspace tensor");
-        output << "    " << workspaceNames.lookup(value) << " = torch.empty((R, "
+        output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
+               << roleDimensions.lookup("program_1") << ", "
                << stageFeatureDimensions.lookup(stage.getOrdinal())
                << "), device=_DEVICE, dtype=" << dtype << ")\n";
       }
@@ -776,8 +827,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       std::string feature = stageFeatureDimensions.lookup(stage);
       output << "    grid_stage_" << stage
              << " = lambda META: (triton.cdiv(" << feature
-             << ", META['BLOCK_SIZE_N']), " << experts
-             << " * triton.cdiv(max_routes, META['BLOCK_SIZE_M']), 1)\n";
+             << ", META['BLOCK_SIZE_N']), ";
+      if (compact)
+        output << "sum(triton.cdiv(length, META['BLOCK_SIZE_M']) for length "
+                  "in route_lengths)";
+      else
+        output << experts
+               << " * triton.cdiv(max_routes, META['BLOCK_SIZE_M'])";
+      output << ", 1)\n";
       output << "    compiled_stage_" << stage << " = " << kernelName
              << "_stage_" << stage << "[grid_stage_" << stage << "](";
       bool first = true;
@@ -799,7 +856,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           argument(workspaceNames.lookup(kernel.values.lookup(valueID)));
-      argument("max_routes");
+      if (!compact)
+        argument("max_routes");
       output << ")\n";
     }
     output << "    return compiled_stage_" << planIndex.stages.size() - 1
@@ -1230,7 +1288,9 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   StringRef name = domain.getName().getStringRef();
   if (name == "intent.ragged_outer") {
     Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation && relation->getNumOperands() == 3
+    Operation *source = relation &&
+                                (relation->getNumOperands() == 3 ||
+                                 relation->getNumOperands() == 4)
                             ? relation->getOperand(0).getDefiningOp()
                             : nullptr;
     if (!source)
@@ -1239,16 +1299,14 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   }
   if (name == "intent.ragged_member") {
     Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *indices = relation && relation->getNumOperands() == 3
-                             ? relation->getOperand(2).getDefiningOp()
-                             : nullptr;
-    if (!indices || indices->getName().getStringRef() != "intent.view_load" ||
-        indices->getNumOperands() != 1)
+    Operation *source = relation &&
+                                (relation->getNumOperands() == 3 ||
+                                 relation->getNumOperands() == 4)
+                            ? relation->getOperand(1).getDefiningOp()
+                            : nullptr;
+    if (!source)
       return failure();
-    FailureOr<ABIView *> view = lookupView(indices->getOperand(0), domain);
-    if (failed(view) || (*view)->shape.empty())
-      return failure();
-    return (*view)->shape.front();
+    return dimensionName(*source);
   }
   if (domain.getNumOperands() < 2)
     return failure();

@@ -83,21 +83,17 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         )
 
         def run(arguments):
-            x, offsets, members, weight = arguments
-            rows = [
-                members[offsets[group] : offsets[group + 1]].long()
-                for group in range(weight.shape[0])
-            ]
+            x, offsets, weight = arguments
             values = grouped(
-                [x[group_rows] for group_rows in rows],
+                [
+                    x[offsets[group] : offsets[group + 1]]
+                    for group in range(weight.shape[0])
+                ],
                 [weight[group] for group in range(weight.shape[0])],
             )
-            result = torch.zeros(
-                (x.shape[0], weight.shape[2]), device=x.device, dtype=torch.float32
+            return torch.cat(
+                [group_values.float() for group_values in values], dim=0
             )
-            for group_rows, group_values in zip(rows, values):
-                result.index_add_(0, group_rows, group_values.float())
-            return result
 
         return run
     if kernel == "online_softmax":
