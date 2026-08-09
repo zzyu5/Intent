@@ -134,8 +134,7 @@ private:
   mlir::FailureOr<plan::AxisOp> resolveAxis(mlir::Value indexedValue,
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
-  mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation,
-                                             bool reductionLoop);
+  mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   elementAccessIndices(mlir::Operation &operation,
                        llvm::ArrayRef<std::string> tileIndices);

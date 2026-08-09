@@ -631,12 +631,14 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   if (!planIndex.stages.empty() && binding &&
       binding.getLowering() == "tl.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-    if (failed(view) || failed(relation) || failed(valid) || failed(fill))
+    if (failed(view) || failed(relation))
       return failure();
     if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
+    if (failed(valid) || failed(fill))
+      return failure();
     if ((*view)->tensor.getRank() != 1 || relation->size() != 1 ||
         (*relation)[0].kind != "value_index" ||
         (*relation)[0].operands.size() != 1 ||

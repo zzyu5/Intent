@@ -9,6 +9,7 @@
 
 #include <optional>
 #include <array>
+#include <functional>
 #include <string>
 #include <utility>
 
@@ -431,6 +432,39 @@ bool feedsStagedContraction(const PlanIndex &index, mlir::Operation &operation) 
                       [&](mlir::Operation *user) {
                         return isStagedContraction(index, user);
                       });
+}
+
+template <typename PlanIndex>
+bool isAbsorbedStagedAccessMetadata(const PlanIndex &index,
+                                    mlir::Operation &operation) {
+  if (index.stages.empty() || operation.getNumResults() == 0)
+    return false;
+  llvm::DenseSet<mlir::Value> visited;
+  std::function<bool(mlir::Value)> absorbed = [&](mlir::Value value) {
+    if (!visited.insert(value).second || value.use_empty())
+      return false;
+    for (mlir::Operation *user : value.getUsers()) {
+      bool consumed = false;
+      if (user->getName().getStringRef() == "intent.gather" &&
+          feedsStagedContraction(index, *user)) {
+        auto valid =
+            user->getAttrOfType<mlir::IntegerAttr>("intent.valid_operand_index");
+        auto fill =
+            user->getAttrOfType<mlir::IntegerAttr>("intent.fill_operand_index");
+        for (auto [operand, candidate] : llvm::enumerate(user->getOperands()))
+          if (candidate == value &&
+              ((valid && valid.getInt() == static_cast<int64_t>(operand)) ||
+               (fill && fill.getInt() == static_cast<int64_t>(operand))))
+            consumed = true;
+      } else if (user->getNumResults() == 1) {
+        consumed = absorbed(user->getResult(0));
+      }
+      if (!consumed)
+        return false;
+    }
+    return true;
+  };
+  return llvm::all_of(operation.getResults(), absorbed);
 }
 
 template <typename PlanIndex>

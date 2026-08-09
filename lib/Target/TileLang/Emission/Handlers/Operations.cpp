@@ -335,7 +335,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   }
   if (boundary.getTransfer() != "bulk_copy")
     return operation.emitOpError("has no TileLang load transfer emitter");
-  FailureOr<std::string> indices = accessIndices(operation, false);
+  FailureOr<std::string> indices = accessIndices(operation);
   if (failed(indices))
     return failure();
   if (boundary.getPadding() == "negative_infinity")
@@ -1134,6 +1134,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           target::parseIndexRelation(*lhsAccess);
       FailureOr<ABIView *> lhsView =
           lookupView(lhsAccess->getOperand(0), *lhsAccess);
+      auto runtime = stageRaggedRuntime.find(stage);
+      bool contiguous =
+          runtime != stageRaggedRuntime.end() &&
+          runtime->second < raggedRuntimes.size() &&
+          !raggedRuntimes[runtime->second].indices;
       if (failed(relation) || failed(lhsView) || relation->size() != 2 ||
           (*relation)[0].kind != "value_index" ||
           (*relation)[0].operands.size() != 1 ||
@@ -1145,13 +1150,20 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           lookupValue(*lhsAccess, *(*relation)[0].operands.front());
       if (failed(rows))
         return failure();
-      line("for load_i, load_k in T.Parallel(TILE_SIZE_M, TILE_SIZE_K):");
-      ++indentation;
-      line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
-           "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
-           ", " + (*lhsView)->argument->name + "[" + rows->str() +
-           "[load_i], k_tile * TILE_SIZE_K + load_k], 0.0)");
-      --indentation;
+      if (contiguous) {
+        line("T.copy(" + (*lhsView)->argument->name +
+             "[member_start : member_start + TILE_SIZE_M, "
+             "k_tile * TILE_SIZE_K : (k_tile + 1) * TILE_SIZE_K], " +
+             lhs + ")");
+      } else {
+        line("for load_i, load_k in T.Parallel(TILE_SIZE_M, TILE_SIZE_K):");
+        ++indentation;
+        line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
+             "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
+             ", " + (*lhsView)->argument->name + "[" + rows->str() +
+             "[load_i], k_tile * TILE_SIZE_K + load_k], 0.0)");
+        --indentation;
+      }
     } else {
       auto workspace = workspaceNames.find(operation.getOperand(0));
       if (workspace == workspaceNames.end())
@@ -1165,21 +1177,10 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "[member_start + load_i, k_tile * TILE_SIZE_K + load_k], 0.0)");
       --indentation;
     }
-    if (!promoteToF32 || rhsElement.isF32()) {
-      line("T.copy(" + (*rhsView)->argument->name +
-           "[expert, k_tile * TILE_SIZE_K, bid_feature * TILE_SIZE_N], " +
-           rhs + ")");
-    } else {
-      line("for load_k, load_j in T.Parallel(TILE_SIZE_K, TILE_SIZE_N):");
-      ++indentation;
-      line(rhs + "[load_k, load_j] = T.if_then_else(k_tile * TILE_SIZE_K + "
-           "load_k < " + reduction + " and bid_feature * TILE_SIZE_N + "
-           "load_j < " + stageFeatureDimensions.lookup(stage) + ", T.cast(" +
-           (*rhsView)->argument->name +
-           "[expert, k_tile * TILE_SIZE_K + load_k, bid_feature * "
-           "TILE_SIZE_N + load_j], " + matrixDtype + "), 0.0)");
-      --indentation;
-    }
+    line("T.copy(" + (*rhsView)->argument->name +
+         "[expert, k_tile * TILE_SIZE_K : (k_tile + 1) * TILE_SIZE_K, "
+         "bid_feature * TILE_SIZE_N : (bid_feature + 1) * TILE_SIZE_N], " +
+         rhs + ")");
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
          ", policy=T.GemmWarpPolicy.FullRow)");
     --indentation;
@@ -1207,8 +1208,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       return failure();
     axisIndices[reductionAxis->getNode()] =
         "k_tile * " + reductionAxis->getTile().str();
-    FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad, true);
-    FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad, true);
+    FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad);
+    FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
     FailureOr<std::string> rhsShape = tensorShape(*rhsLoad, 0);
     FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
@@ -1334,7 +1335,7 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   }
   if (boundary.getTransfer() != "bulk_copy")
     return operation.emitOpError("has no TileLang store transfer emitter");
-  FailureOr<std::string> indices = accessIndices(operation, false);
+  FailureOr<std::string> indices = accessIndices(operation);
   if (failed(indices))
     return failure();
   if (!isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) {

@@ -597,7 +597,9 @@ bool SourceEmitter::selectOperation(Operation &operation) {
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty();
+  return !activeStages.empty() &&
+         !target::emission::isAbsorbedStagedAccessMetadata(planIndex,
+                                                           operation);
 }
 
 void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {

@@ -652,7 +652,9 @@ bool SourceEmitter::selectOperation(Operation &operation) {
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty();
+  return !activeStages.empty() &&
+         !target::emission::isAbsorbedStagedAccessMetadata(planIndex,
+                                                           operation);
 }
 
 void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {
@@ -1475,8 +1477,7 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   return (*view)->shape[axis.getInt()];
 }
 
-FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
-                                                    bool reductionLoop) {
+FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   if (failed(relation))
@@ -1508,12 +1509,9 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
           << "has no active TileLang index for logical axis " << axis->getNode();
       return failure();
     }
-    bool slice = planIndex.components.orderedRaggedProgramAxes.contains(
-                     axis->getNode()) ||
-                 (axis->hasRole("ordered") &&
-                  !planIndex.components.orderedRaggedAxes.contains(axis->getNode()));
-    indices.push_back(slice ? base + " : " + base + " + " + axis->getTile().str()
-                            : base);
+    indices.push_back(axis->isScalar()
+                          ? base
+                          : base + " : " + base + " + " + axis->getTile().str());
   }
   std::string result;
   for (auto [index, value] : llvm::enumerate(indices)) {

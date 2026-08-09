@@ -96,6 +96,22 @@ def _compare(
         )
 
 
+def run_gemm_tail_case(artifact, target_name: str) -> None:
+    m, k, n = 4093, 4080, 14320
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    a /= math.sqrt(k)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+    _compare(
+        artifact=artifact,
+        arguments=(a, b),
+        reference=lambda: torch.matmul(a, b),
+        target_name=target_name,
+        kernel_name="GEMM M/N/K tail",
+        tolerance=2.0e-2,
+        upstream=None,
+    )
+
+
 def _run_layer_norm(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -187,48 +203,68 @@ def _run_dual_gemm(
 def _run_grouped_gemm(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    x = torch.randn(
-        (GROUPED_ROWS, GROUPED_K), device="cuda", dtype=torch.float16
-    )
-    x /= math.sqrt(GROUPED_K)
-    weight = torch.randn(
-        (GROUPS, GROUPED_K, GROUPED_N), device="cuda", dtype=torch.float16
-    )
-    offsets = torch.tensor(
-        [
-            0,
-            GROUPED_ROWS // 32,
-            GROUPED_ROWS // 16,
-            GROUPED_ROWS // 8,
-            GROUPED_ROWS // 4,
-            GROUPED_ROWS // 2,
-            3 * GROUPED_ROWS // 4,
-            7 * GROUPED_ROWS // 8,
-            GROUPED_ROWS,
-        ],
-        device="cuda",
-        dtype=torch.int32,
-    )
     artifact = intent.compile(ragged_grouped_gemm, target=target, compiler=compiler)
 
-    def reference() -> torch.Tensor:
-        result = torch.empty(
-            (GROUPED_ROWS, GROUPED_N), device="cuda", dtype=torch.float32
+    def run_case(
+        rows: int,
+        k: int,
+        n: int,
+        *,
+        kernel_name: str,
+        case_upstream: Upstream | None,
+    ) -> None:
+        x = torch.randn((rows, k), device="cuda", dtype=torch.float16)
+        x /= math.sqrt(k)
+        weight = torch.randn(
+            (GROUPS, k, n), device="cuda", dtype=torch.float16
         )
-        for group in range(GROUPS):
-            begin = offsets[group]
-            end = offsets[group + 1]
-            result[begin:end] = x[begin:end].float() @ weight[group].float()
-        return result
+        offsets = torch.tensor(
+            [
+                0,
+                rows // 32,
+                rows // 16,
+                rows // 8,
+                rows // 4,
+                rows // 2,
+                3 * rows // 4,
+                7 * rows // 8,
+                rows,
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
 
-    _compare(
-        artifact=artifact,
-        arguments=(x, offsets, weight),
-        reference=reference,
-        target_name=target_name,
+        def reference() -> torch.Tensor:
+            result = torch.empty((rows, n), device="cuda", dtype=torch.float32)
+            for group in range(GROUPS):
+                begin = offsets[group]
+                end = offsets[group + 1]
+                result[begin:end] = x[begin:end].float() @ weight[group].float()
+            return result
+
+        _compare(
+            artifact=artifact,
+            arguments=(x, offsets, weight),
+            reference=reference,
+            target_name=target_name,
+            kernel_name=kernel_name,
+            tolerance=5.0e-2,
+            upstream=case_upstream,
+        )
+
+    run_case(
+        GROUPED_ROWS,
+        GROUPED_K,
+        GROUPED_N,
         kernel_name="ragged grouped GEMM",
-        tolerance=5.0e-2,
-        upstream=upstream,
+        case_upstream=upstream,
+    )
+    run_case(
+        8191,
+        4080,
+        4080,
+        kernel_name="ragged grouped GEMM member/K/N tail",
+        case_upstream=None,
     )
 
 
