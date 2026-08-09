@@ -57,6 +57,14 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "swiglu_backward":
+        module = _load_module(source_path, "intent_upstream_triton_swiglu_backward")
+
+        def run(arguments):
+            dc, a, b = arguments
+            return module.source.swiglu_backward(a.clone(), b.clone(), dc)
+
+        return run
     if kernel == "layer_norm":
         module = _load_module(source_path, "intent_upstream_triton_layer_norm")
         return lambda arguments: module.source.layer_norm_fn(

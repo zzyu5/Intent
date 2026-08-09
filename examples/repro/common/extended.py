@@ -8,6 +8,9 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.backward.swiglu import FEATURES as SWIGLU_FEATURES
+from kernels.backward.swiglu import TOKENS as SWIGLU_TOKENS
+from kernels.backward.swiglu import swiglu_backward
 from kernels.contraction.dual_gemm import K as DUAL_K
 from kernels.contraction.dual_gemm import M as DUAL_M
 from kernels.contraction.dual_gemm import N as DUAL_N
@@ -43,7 +46,7 @@ from .support import benchmark
 from .support import print_artifact
 
 
-Upstream = Callable[[tuple[object, ...]], torch.Tensor]
+Upstream = Callable[[tuple[object, ...]], object]
 Runner = Callable[[str, Target, str, Upstream | None], None]
 
 
@@ -144,6 +147,78 @@ def _run_bf16_gemm(
         upstream=upstream,
         expected_dtype=torch.bfloat16,
     )
+
+
+def _run_swiglu_backward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape = (SWIGLU_TOKENS, SWIGLU_FEATURES)
+    dc = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    a = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    b = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    artifact = intent.compile(swiglu_backward, target=target, compiler=compiler)
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        dc_f32 = dc.float()
+        a_f32 = a.float()
+        b_f32 = b.float()
+        sigmoid = torch.sigmoid(a_f32)
+        silu = a_f32 * sigmoid
+        da = dc_f32 * (silu * (1.0 - sigmoid) + sigmoid) * b_f32
+        db = dc_f32 * silu
+        return da.to(torch.bfloat16), db.to(torch.bfloat16)
+
+    generated = artifact.run(dc, a, b)
+    if not isinstance(generated, tuple) or len(generated) != 2:
+        raise RuntimeError(f"{target_name} SwiGLU backward did not return two gradients")
+    expected = reference()
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if any(value > 5.0e-2 for value in errors):
+        raise RuntimeError(
+            f"{target_name} SwiGLU backward numerical comparison failed: {errors}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        lambda: artifact.run(dc, a, b), warmup=3, repetitions=10
+    )
+    upstream_output = upstream((dc, a, b)) if upstream is not None else None
+    if upstream_output is not None:
+        if not isinstance(upstream_output, tuple) or len(upstream_output) != 2:
+            raise RuntimeError(
+                f"{target_name} SwiGLU backward upstream did not return two gradients"
+            )
+        upstream_errors = tuple(
+            (actual - wanted).abs().max().item()
+            for actual, wanted in zip(upstream_output, expected)
+        )
+        if any(value > 5.0e-2 for value in upstream_errors):
+            raise RuntimeError(
+                f"{target_name} SwiGLU backward upstream comparison failed: "
+                f"{upstream_errors}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream((dc, a, b)), warmup=3, repetitions=10
+        )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} SwiGLU backward numerical comparison: PASS "
+        f"(da/db errors={errors})"
+    )
+    print(
+        f"{target_name} SwiGLU backward generated performance: "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_output is None:
+        print(f"{target_name} SwiGLU backward upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} SwiGLU backward upstream comparison: PASS "
+            f"(da/db errors={upstream_errors}, upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
 
 
 def _run_layer_norm(
@@ -381,6 +456,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
     "rms_norm": _run_rms_norm,
+    "swiglu_backward": _run_swiglu_backward,
     "varlen_attention": _run_varlen_attention,
 }
 

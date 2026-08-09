@@ -864,8 +864,25 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
   if (failed(registerFactHandlers(registry, facts)))
     return facts.kernel.entry.emitOpError(
         "failed to construct canonical realization handlers");
-  return traverseKernel(facts.kernel.entry, registry,
-                        "canonical realization analysis");
+  if (failed(traverseKernel(facts.kernel.entry, registry,
+                            "canonical realization analysis")))
+    return failure();
+
+  llvm::DenseSet<Operation *> programDomains;
+  for (Operation *parallel : facts.parallels) {
+    Operation *source = parallel->getOperand(0).getDefiningOp();
+    auto partition = facts.partitionDomains.find(source);
+    programDomains.insert(partition == facts.partitionDomains.end()
+                              ? source
+                              : partition->second);
+  }
+  for (const auto &entry : facts.valueAxes)
+    for (const LogicalAxis &axis : entry.second)
+      if (axis.domain && !programDomains.contains(axis.domain) &&
+          !facts.orderedStreamDomains.contains(axis.domain) &&
+          !facts.contractionDomains.contains(axis.domain))
+        facts.vectorDomains.insert(axis.domain);
+  return success();
 }
 
 } // namespace intent::target

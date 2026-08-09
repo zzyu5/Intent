@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|bf16_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|bf16_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_backward>" >&2
   exit 2
 fi
 
@@ -55,6 +55,9 @@ case "${backend}:${kernel}" in
     ;;
   triton:online_softmax)
     baseline=source/triton/triton/normalization/softmax/02-fused-softmax.py
+    ;;
+  triton:swiglu_backward)
+    baseline=source/triton/liger-kernel/activation/swiglu/swiglu_runtime.py
     ;;
   cutile:softmax)
     baseline=source/cutile/tilegym/normalization/softmax/softmax.py
@@ -114,7 +117,8 @@ case "${backend}:${kernel}" in
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
   triton:bf16_gemm | triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
-  tilelang:layer_norm | tilelang:logsumexp | \
+  cutile:swiglu_backward | tilelang:layer_norm | tilelang:logsumexp | \
+  tilelang:swiglu_backward | \
   triton:varlen_attention | cutile:varlen_attention)
     ;;
   *)

@@ -1254,18 +1254,18 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
 
   SmallVector<ABIView *> inputs;
-  ABIView *result = nullptr;
+  SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
     if (view.view.getAccess() == "in")
       inputs.push_back(&view);
-    else if (view.view.getAccess() == "out" && !result)
-      result = &view;
+    else if (view.view.getAccess() == "out")
+      outputs.push_back(&view);
     else
       return kernel.entry.emitOpError(
-          "TileLang wrapper supports inputs and one output view");
+          "TileLang wrapper supports input and output views");
   }
-  if (!result)
-    return kernel.entry.emitOpError("TileLang wrapper has no output view");
+  if (outputs.empty())
+    return kernel.entry.emitOpError("TileLang wrapper has no output views");
   for (int64_t axis : planIndex.components.orderedRaggedProgramAxes) {
     FailureOr<plan::RaggedOp> relation =
         target::emission::uniqueRaggedRelation(
@@ -1335,14 +1335,21 @@ LogicalResult SourceEmitter::emitWrapper() {
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = "
            << dimensionOwners.lookup(dimension) << "\n";
-  output << "    " << result->argument->name << " = torch.empty((";
-  for (auto [axis, extent] : llvm::enumerate(result->shape)) {
-    if (axis)
-      output << ", ";
-    output << extent;
+  for (ABIView *result : outputs) {
+    StringRef outputDtype = torchDtype(result->tensor.getElementType());
+    if (outputDtype.empty())
+      return kernel.entry.emitOpError("has an unsupported TileLang output dtype");
+    output << "    " << result->argument->name << " = torch.empty((";
+    for (auto [axis, extent] : llvm::enumerate(result->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    if (result->shape.size() == 1)
+      output << ",";
+    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   }
-  output << "), device=_DEVICE, dtype="
-         << torchDtype(result->tensor.getElementType()) << ")\n    launch(";
+  output << "    launch(";
   first = true;
   for (ABIView &view : views) {
     if (!first)
@@ -1352,7 +1359,19 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   for (ABIScalar &scalar : scalars)
     output << ", " << scalar.name;
-  output << ")\n    return " << result->argument->name << "\n";
+  output << ")\n    return ";
+  if (outputs.size() == 1) {
+    output << outputs.front()->argument->name;
+  } else {
+    output << "(";
+    for (auto [index, result] : llvm::enumerate(outputs)) {
+      if (index)
+        output << ", ";
+      output << result->argument->name;
+    }
+    output << ")";
+  }
+  output << "\n";
   return success();
 }
 

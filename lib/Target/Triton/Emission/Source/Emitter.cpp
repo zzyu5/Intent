@@ -1069,15 +1069,22 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   if (!planIndex.components.reusedAxes.empty()) {
     SmallVector<ABIView *> inputs;
-    for (ABIView &view : views)
+    SmallVector<ABIView *> outputs;
+    for (ABIView &view : views) {
       if (view.view.getAccess() == "in")
         inputs.push_back(&view);
-      else if (view.view.getAccess() != "out" || &view != fixedOutput)
+      else if (view.view.getAccess() == "out")
+        outputs.push_back(&view);
+      else
         return kernel.entry.emitOpError(
-            "fixed grid-stride wrapper supports inputs and one output");
+            "fixed grid-stride wrapper supports input and output views");
+    }
     if (inputs.empty())
       return kernel.entry.emitOpError(
           "fixed grid-stride wrapper requires an input view");
+    if (outputs.empty())
+      return kernel.entry.emitOpError(
+          "fixed grid-stride wrapper requires an output view");
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
     output << "_PROPERTIES = driver.active.utils.get_device_properties(_DEVICE.index)\n";
@@ -1199,16 +1206,20 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
-    output << "    " << fixedOutput->argument->name << " = torch.empty((";
-    for (auto [axis, extent] : llvm::enumerate(fixedOutput->shape)) {
-      if (axis)
-        output << ", ";
-      output << extent;
+    for (ABIView *result : outputs) {
+      StringRef outputDtype = torchDtype(result->tensor.getElementType());
+      if (outputDtype.empty())
+        return kernel.entry.emitOpError("has an unsupported fixed output dtype");
+      output << "    " << result->argument->name << " = torch.empty((";
+      for (auto [axis, extent] : llvm::enumerate(result->shape)) {
+        if (axis)
+          output << ", ";
+        output << extent;
+      }
+      if (result->shape.size() == 1)
+        output << ",";
+      output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     }
-    StringRef outputDtype = torchDtype(fixedOutput->tensor.getElementType());
-    if (outputDtype.empty())
-      return kernel.entry.emitOpError("has an unsupported fixed output dtype");
-    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     output << "    launch(";
     first = true;
     for (ABIView &view : views) {
@@ -1219,24 +1230,35 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     for (ABIScalar &scalar : scalars)
       output << ", " << scalar.name;
-    output << ")\n";
-    output << "    return " << fixedOutput->argument->name << "\n";
+    output << ")\n    return ";
+    if (outputs.size() == 1) {
+      output << outputs.front()->argument->name;
+    } else {
+      output << "(";
+      for (auto [index, result] : llvm::enumerate(outputs)) {
+        if (index)
+          output << ", ";
+        output << result->argument->name;
+      }
+      output << ")";
+    }
+    output << "\n";
     return success();
   }
 
   SmallVector<ABIView *> inputs;
-  ABIView *outputView = nullptr;
+  SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
     if (view.view.getAccess() == "in")
       inputs.push_back(&view);
-    else if (view.view.getAccess() == "out" && !outputView)
-      outputView = &view;
+    else if (view.view.getAccess() == "out")
+      outputs.push_back(&view);
     else
       return kernel.entry.emitOpError(
-          "autotuned wrapper supports input views and one output view");
+          "autotuned wrapper supports input and output views");
   }
-  if (!outputView)
-    return kernel.entry.emitOpError("autotuned wrapper has no output view");
+  if (outputs.empty())
+    return kernel.entry.emitOpError("autotuned wrapper has no output views");
 
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n\n\n";
@@ -1355,16 +1377,20 @@ LogicalResult SourceEmitter::emitWrapper() {
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
            << "\n";
-  output << "    " << outputView->argument->name << " = torch.empty((";
-  for (auto [axis, extent] : llvm::enumerate(outputView->shape)) {
-    if (axis)
-      output << ", ";
-    output << extent;
+  for (ABIView *result : outputs) {
+    StringRef outputDtype = torchDtype(result->tensor.getElementType());
+    if (outputDtype.empty())
+      return kernel.entry.emitOpError("has an unsupported Triton output dtype");
+    output << "    " << result->argument->name << " = torch.empty((";
+    for (auto [axis, extent] : llvm::enumerate(result->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    if (result->shape.size() == 1)
+      output << ",";
+    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   }
-  StringRef outputDtype = torchDtype(outputView->tensor.getElementType());
-  if (outputDtype.empty())
-    return kernel.entry.emitOpError("has an unsupported Triton output dtype");
-  output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   output << "    launch(";
   first = true;
   for (ABIView &view : views) {
@@ -1379,7 +1405,19 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << scalar.name;
     first = false;
   }
-  output << ")\n    return " << outputView->argument->name << "\n";
+  output << ")\n    return ";
+  if (outputs.size() == 1) {
+    output << outputs.front()->argument->name;
+  } else {
+    output << "(";
+    for (auto [index, result] : llvm::enumerate(outputs)) {
+      if (index)
+        output << ", ";
+      output << result->argument->name;
+    }
+    output << ")";
+  }
+  output << "\n";
   return success();
 }
 

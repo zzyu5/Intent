@@ -1076,15 +1076,22 @@ LogicalResult SourceEmitter::emitWrapper() {
 
   if (!planIndex.components.reusedAxes.empty()) {
     SmallVector<ABIView *> inputs;
-    for (ABIView &view : views)
+    SmallVector<ABIView *> outputs;
+    for (ABIView &view : views) {
       if (view.view.getAccess() == "in")
         inputs.push_back(&view);
-      else if (view.view.getAccess() != "out" || &view != fixedOutput)
+      else if (view.view.getAccess() == "out")
+        outputs.push_back(&view);
+      else
         return kernel.entry.emitOpError(
-            "persistent-row wrapper supports inputs and one output");
+            "persistent-row wrapper supports input and output views");
+    }
     if (inputs.empty())
       return kernel.entry.emitOpError(
           "persistent-row wrapper requires an input view");
+    if (outputs.empty())
+      return kernel.entry.emitOpError(
+          "persistent-row wrapper requires an output view");
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -1154,14 +1161,20 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
-    StringRef outputDtype = torchDtype(fixedOutput->tensor.getElementType());
-    output << "    " << fixedOutput->argument->name << " = torch.empty((";
-    for (auto [axis, extent] : llvm::enumerate(fixedOutput->shape)) {
-      if (axis)
-        output << ", ";
-      output << extent;
+    for (ABIView *result : outputs) {
+      StringRef outputDtype = torchDtype(result->tensor.getElementType());
+      if (outputDtype.empty())
+        return kernel.entry.emitOpError("has an unsupported cuTile output dtype");
+      output << "    " << result->argument->name << " = torch.empty((";
+      for (auto [axis, extent] : llvm::enumerate(result->shape)) {
+        if (axis)
+          output << ", ";
+        output << extent;
+      }
+      if (result->shape.size() == 1)
+        output << ",";
+      output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     }
-    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     output << "    launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -1170,23 +1183,35 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     for (ABIScalar &scalar : scalars)
       output << ", " << scalar.name;
-    output << ")\n    return " << fixedOutput->argument->name << "\n";
+    output << ")\n    return ";
+    if (outputs.size() == 1) {
+      output << outputs.front()->argument->name;
+    } else {
+      output << "(";
+      for (auto [index, result] : llvm::enumerate(outputs)) {
+        if (index)
+          output << ", ";
+        output << result->argument->name;
+      }
+      output << ")";
+    }
+    output << "\n";
     return success();
   }
 
   SmallVector<ABIView *> inputs;
-  ABIView *outputView = nullptr;
+  SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
     if (view.view.getAccess() == "in")
       inputs.push_back(&view);
-    else if (view.view.getAccess() == "out" && !outputView)
-      outputView = &view;
+    else if (view.view.getAccess() == "out")
+      outputs.push_back(&view);
     else
       return kernel.entry.emitOpError(
-          "autotuned cuTile wrapper supports inputs and one output");
+          "autotuned cuTile wrapper supports input and output views");
   }
-  if (!outputView)
-    return kernel.entry.emitOpError("autotuned cuTile wrapper has no output view");
+  if (outputs.empty())
+    return kernel.entry.emitOpError("autotuned cuTile wrapper has no output views");
 
   output << "_TUNE_CACHE = {}\n\n\n";
   output << "def launch(";
@@ -1351,14 +1376,20 @@ LogicalResult SourceEmitter::emitWrapper() {
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
            << "\n";
-  StringRef outputDtype = torchDtype(outputView->tensor.getElementType());
-  output << "    " << outputView->argument->name << " = torch.empty((";
-  for (auto [axis, extent] : llvm::enumerate(outputView->shape)) {
-    if (axis)
-      output << ", ";
-    output << extent;
+  for (ABIView *result : outputs) {
+    StringRef outputDtype = torchDtype(result->tensor.getElementType());
+    if (outputDtype.empty())
+      return kernel.entry.emitOpError("has an unsupported cuTile output dtype");
+    output << "    " << result->argument->name << " = torch.empty((";
+    for (auto [axis, extent] : llvm::enumerate(result->shape)) {
+      if (axis)
+        output << ", ";
+      output << extent;
+    }
+    if (result->shape.size() == 1)
+      output << ",";
+    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   }
-  output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   output << "    launch(";
   for (auto [index, view] : llvm::enumerate(views)) {
     if (index)
@@ -1367,7 +1398,19 @@ LogicalResult SourceEmitter::emitWrapper() {
   }
   for (ABIScalar &scalar : scalars)
     output << ", " << scalar.name;
-  output << ")\n    return " << outputView->argument->name << "\n";
+  output << ")\n    return ";
+  if (outputs.size() == 1) {
+    output << outputs.front()->argument->name;
+  } else {
+    output << "(";
+    for (auto [index, result] : llvm::enumerate(outputs)) {
+      if (index)
+        output << ", ";
+      output << result->argument->name;
+    }
+    output << ")";
+  }
+  output << "\n";
   return success();
 }
 
