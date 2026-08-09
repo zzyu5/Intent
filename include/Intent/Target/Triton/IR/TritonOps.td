@@ -51,8 +51,24 @@ def IntentTriton_StorageOp : IntentTriton_Op<"storage"> {
   let hasVerifier = 1;
 }
 
+def IntentTriton_PaddingOp : IntentTriton_Op<"padding"> {
+  let arguments = (ins
+    I64Attr:$value,
+    DenseI64ArrayAttr:$tensor_axes,
+    DenseI64ArrayAttr:$domain_nodes,
+    StrAttr:$fill,
+    StrAttr:$materialization
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentTriton_ReductionOp : IntentTriton_Op<"reduction"> {
-  let arguments = (ins I64Attr:$node, StrAttr:$lowering, I64Attr:$axis);
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$lowering,
+    I64Attr:$axis
+  );
   let results = (outs);
   let hasVerifier = 1;
 }

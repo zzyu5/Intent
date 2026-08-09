@@ -22,6 +22,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.program = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
+    else if (auto value = dyn_cast<plan::PaddingOp>(operation))
+      index.paddings[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -169,6 +171,16 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (failed(dimension))
       return entry.second.emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.second.getRole()] = *dimension;
+  }
+  for (auto &entry : planIndex.paddings) {
+    Value value = kernel.values.lookup(entry.first);
+    Operation *definition = value ? value.getDefiningOp() : nullptr;
+    if (!definition || definition->getNumResults() != 1 ||
+        definition->getResult(0) != value ||
+        (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.mask"))
+      return entry.second.emitOpError(
+          "does not bind a producer-fusible pointwise value");
   }
   for (const target::RegionNode &region : kernel.regions.nodes) {
     Operation *operation = region.operation;
@@ -1480,22 +1492,7 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
         resolveAxis(operation.getOperand(*term.operands.front()), operation);
     if (failed(axis))
       return failure();
-    if (axis->getTile() == "one")
-      extents.push_back("1");
-    else if (axis->getRole() == "program_0")
-      extents.push_back("TILE_SIZE_M");
-    else if (axis->getRole() == "program_1")
-      extents.push_back("TILE_SIZE_N");
-    else if (axis->getRole() == "program_2")
-      extents.push_back("TILE_SIZE_M");
-    else if (axis->getRole() == "stream_0")
-      extents.push_back("TILE_SIZE_N");
-    else if (axis->getRole() == "reduction_0")
-      extents.push_back("TILE_SIZE_K");
-    else {
-      operation.emitOpError("has no cuTile tile extent for physical axis");
-      return failure();
-    }
+    extents.push_back(axis->getTile().str());
   }
   std::string tuple = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {
@@ -1507,6 +1504,98 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
     tuple += ",";
   tuple += ")";
   return tuple;
+}
+
+FailureOr<std::string> SourceEmitter::emitValidityExpression(
+    ArrayRef<int64_t> tensorAxes, ArrayRef<int64_t> domainNodes, Value value,
+    Operation &consumer) {
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor || tensorAxes.size() != domainNodes.size())
+    return consumer.emitOpError(
+        "has no ranked cuTile value-validity binding");
+  SmallVector<std::string> predicates;
+  for (auto [tensorAxis, domainNode] : llvm::zip(tensorAxes, domainNodes)) {
+    auto domain = kernel.nodes.find(domainNode);
+    auto physical = planIndex.axes.find(domainNode);
+    if (tensorAxis < 0 || tensorAxis >= tensor.getRank() ||
+        domain == kernel.nodes.end() || physical == planIndex.axes.end())
+      return consumer.emitOpError(
+          "references an unresolved cuTile validity axis");
+    plan::AxisOp axis = physical->second;
+    if (axis.getTile() == "one")
+      continue;
+    StringRef role = axis.getRole();
+    std::string index;
+    if (usesRaggedOrderedTraversal() && role == "program_1")
+      index = "query_offsets";
+    else if (usesRaggedOrderedTraversal() && role == "stream_0")
+      index = "stream_offsets";
+    else if (hasTraversal("persistent") && role == "program_0")
+      index = "program_index";
+    else if (hasTraversal("persistent") && role == "lane_0")
+      index = vectorIndex;
+    else {
+      std::string start;
+      if (role == "program_0")
+        start = "bid_m * " + axis.getTile().str();
+      else if (role == "program_1")
+        start = "bid_n * " + axis.getTile().str();
+      else if (role == "program_2")
+        start = "bid_program_2 * " + axis.getTile().str();
+      else if (role == "stream_0")
+        start = "stream_tile * " + axis.getTile().str();
+      else if (role == "reduction_0")
+        start = "k_tile * " + axis.getTile().str();
+      else
+        return consumer.emitOpError(
+            "has no cuTile index for its planned validity axis");
+      index = start + " + ct.arange(" + axis.getTile().str() +
+              ", dtype=ct.int32)";
+    }
+    if (tensor.getRank() > 1) {
+      std::string broadcast = index + "[";
+      for (int64_t axisNumber = 0; axisNumber < tensor.getRank(); ++axisNumber) {
+        if (axisNumber)
+          broadcast += ", ";
+        broadcast += axisNumber == tensorAxis ? ":" : "None";
+      }
+      index = broadcast + "]";
+    }
+    FailureOr<std::string> extent =
+        usesRaggedOrderedTraversal() &&
+                (role == "program_1" || role == "stream_0")
+            ? FailureOr<std::string>(std::string("sequence_end"))
+            : dimensionName(*domain->second);
+    if (failed(extent))
+      return failure();
+    predicates.push_back("(" + index + " < " + *extent + ")");
+  }
+  if (predicates.empty())
+    return std::string("True");
+  std::string result = predicates.front();
+  for (StringRef predicate : llvm::drop_begin(predicates))
+    result += " & " + predicate.str();
+  return result;
+}
+
+FailureOr<std::string> SourceEmitter::padExpression(
+    Value value, StringRef expression, Operation &consumer) {
+  FailureOr<int64_t> valueID =
+      target::getValueID(value, kernel, consumer, "cuTile padding lookup");
+  if (failed(valueID))
+    return failure();
+  plan::PaddingOp padding = planIndex.paddings.lookup(*valueID);
+  if (!padding)
+    return expression.str();
+  FailureOr<std::string> predicate = emitValidityExpression(
+      padding.getTensorAxes(), padding.getDomainNodes(), value, consumer);
+  if (failed(predicate))
+    return failure();
+  StringRef fill = padding.getFill() == "negative_infinity"
+                       ? StringRef("-math.inf")
+                       : StringRef("0.0");
+  return "ct.where(" + *predicate + ", " + expression.str() + ", " +
+         fill.str() + ")";
 }
 
 FailureOr<std::string>

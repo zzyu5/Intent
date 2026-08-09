@@ -29,6 +29,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.program = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
+    else if (auto value = dyn_cast<plan::PaddingOp>(operation))
+      index.paddings[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -190,6 +192,16 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return failure();
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
         entry.second.getTile().str();
+  }
+  for (auto &entry : planIndex.paddings) {
+    Value value = kernel.values.lookup(entry.first);
+    Operation *definition = value ? value.getDefiningOp() : nullptr;
+    if (!definition || definition->getNumResults() != 1 ||
+        definition->getResult(0) != value ||
+        (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.mask"))
+      return entry.second.emitOpError(
+          "does not bind a producer-fusible pointwise value");
   }
   for (const target::RegionNode &region : kernel.regions.nodes) {
     Operation *operation = region.operation;
@@ -1224,26 +1236,28 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation,
                             ? "program_index"
                         : hasTraversal("ordered_stream")
                             ? "index_program_0"
-                            : "bid_m * TILE_SIZE_M");
+                            : "bid_m * " + axis->getTile().str());
     else if (role == "program_1")
       indices.push_back(hasTraversal("ordered_stream")
                             ? "index_program_1"
-                            : "bid_n * TILE_SIZE_N");
+                            : "bid_n * " + axis->getTile().str());
     else if (role == "program_2")
       indices.push_back(hasTraversal("ordered_stream")
-                            ? "bid_program_2 * TILE_SIZE_M : "
-                              "(bid_program_2 + 1) * TILE_SIZE_M"
-                            : "bid_program_2 * TILE_SIZE_M");
+                            ? "bid_program_2 * " + axis->getTile().str() +
+                                  " : (bid_program_2 + 1) * " +
+                                  axis->getTile().str()
+                            : "bid_program_2 * " + axis->getTile().str());
     else if (role == "stream_0")
       indices.push_back(hasTraversal("ordered_stream") &&
                                 programOwnership == "block_tiles"
-                            ? "stream_tile * TILE_SIZE_N : "
-                              "(stream_tile + 1) * TILE_SIZE_N"
-                            : "stream_tile * TILE_SIZE_N");
+                            ? "stream_tile * " + axis->getTile().str() +
+                                  " : (stream_tile + 1) * " +
+                                  axis->getTile().str()
+                            : "stream_tile * " + axis->getTile().str());
     else if (role == "lane_0")
       indices.push_back("0");
     else if (role == "reduction_0" && reductionLoop)
-      indices.push_back("k_tile * TILE_SIZE_K");
+      indices.push_back("k_tile * " + axis->getTile().str());
     else {
       operation.emitOpError() << "has no TileLang index for role " << role;
       return failure();
@@ -1310,10 +1324,10 @@ SourceEmitter::elementAccessIndices(Operation &operation,
             "parallel TileLang transfer has too few tile indices");
       std::string base =
           role == "program_2"
-              ? "bid_program_2 * TILE_SIZE_M"
+              ? "bid_program_2 * " + axis->getTile().str()
               : usesRaggedOrderedTraversal()
                     ? "stream_start"
-                    : "stream_tile * TILE_SIZE_N";
+                    : "stream_tile * " + axis->getTile().str();
       indices.push_back(base + " + " + tileIndices[tileAxis++]);
     } else {
       operation.emitOpError()
@@ -1398,6 +1412,94 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     result += predicate;
   }
   return result;
+}
+
+FailureOr<std::string> SourceEmitter::elementValidityPredicate(
+    ArrayRef<int64_t> tensorAxes, ArrayRef<int64_t> domainNodes,
+    ArrayRef<std::string> elementIndices, Operation &consumer) {
+  if (tensorAxes.size() != domainNodes.size())
+    return consumer.emitOpError(
+        "has no TileLang value-validity binding");
+  SmallVector<std::string> predicates;
+  for (auto [tensorAxis, domainNode] : llvm::zip(tensorAxes, domainNodes)) {
+    auto domain = kernel.nodes.find(domainNode);
+    auto physical = planIndex.axes.find(domainNode);
+    if (tensorAxis < 0 ||
+        static_cast<size_t>(tensorAxis) >= elementIndices.size() ||
+        domain == kernel.nodes.end() || physical == planIndex.axes.end())
+      return consumer.emitOpError(
+          "references an unresolved TileLang validity axis");
+    plan::AxisOp axis = physical->second;
+    if (axis.getTile() == "one")
+      continue;
+    StringRef role = axis.getRole();
+    std::string base;
+    if (usesRaggedOrderedTraversal() && role == "program_1")
+      base = "query_start";
+    else if (usesRaggedOrderedTraversal() && role == "stream_0")
+      base = "stream_start";
+    else if (hasTraversal("persistent") && role == "program_0")
+      base = "program_index";
+    else if (hasTraversal("persistent") && role == "lane_0")
+      base = "0";
+    else if (role == "program_0")
+      base = "bid_m * " + axis.getTile().str();
+    else if (role == "program_1")
+      base = "bid_n * " + axis.getTile().str();
+    else if (role == "program_2")
+      base = "bid_program_2 * " + axis.getTile().str();
+    else if (role == "stream_0")
+      base = "stream_tile * " + axis.getTile().str();
+    else if (role == "reduction_0")
+      base = "k_tile * " + axis.getTile().str();
+    else
+      return consumer.emitOpError(
+          "has no TileLang index for its planned validity axis");
+    FailureOr<std::string> extent =
+        usesRaggedOrderedTraversal() &&
+                (role == "program_1" || role == "stream_0")
+            ? FailureOr<std::string>(std::string("sequence_end"))
+            : dimensionName(*domain->second);
+    if (failed(extent))
+      return failure();
+    predicates.push_back(base + " + " + elementIndices[tensorAxis] + " < " +
+                         *extent);
+  }
+  if (predicates.empty())
+    return std::string("True");
+  std::string result = predicates.front();
+  for (StringRef predicate : llvm::drop_begin(predicates))
+    result += " and " + predicate.str();
+  return result;
+}
+
+FailureOr<std::string> SourceEmitter::padElementExpression(
+    Value value, StringRef expression, ArrayRef<std::string> elementIndices,
+    Operation &consumer) {
+  FailureOr<int64_t> valueID =
+      target::getValueID(value, kernel, consumer, "TileLang padding lookup");
+  if (failed(valueID))
+    return failure();
+  plan::PaddingOp padding = planIndex.paddings.lookup(*valueID);
+  if (!padding)
+    return expression.str();
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor)
+    return consumer.emitOpError(
+        "cannot apply TileLang padding to a non-tensor value");
+  std::string dtype = dtypeName(tensor.getElementType(), consumer);
+  if (dtype.empty())
+    return failure();
+  FailureOr<std::string> predicate = elementValidityPredicate(
+      padding.getTensorAxes(), padding.getDomainNodes(), elementIndices,
+      consumer);
+  if (failed(predicate))
+    return failure();
+  std::string fill = padding.getFill() == "negative_infinity"
+                         ? "-T.infinity(" + dtype + ")"
+                         : "0.0";
+  return "T.if_then_else(" + *predicate + ", " + expression.str() + ", " +
+         fill + ")";
 }
 
 FailureOr<SmallVector<std::string>>

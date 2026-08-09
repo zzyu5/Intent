@@ -18,6 +18,8 @@ indexMachinePlan(intent::plan::RealizationOp realization) {
       index.axes.push_back(value);
     else if (auto value = dyn_cast<intent::plan::StorageOp>(operation))
       index.storage.push_back(value);
+    else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation))
+      index.paddings.push_back(value);
     else if (auto value = dyn_cast<intent::plan::TransferOp>(operation))
       index.transfers.push_back(value);
     else if (auto value = dyn_cast<intent::plan::ReductionOp>(operation))

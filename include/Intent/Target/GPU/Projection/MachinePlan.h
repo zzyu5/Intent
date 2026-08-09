@@ -13,6 +13,7 @@ struct MachinePlanIndex {
   intent::plan::ProgramOp program;
   llvm::SmallVector<intent::plan::AxisOp> axes;
   llvm::SmallVector<intent::plan::StorageOp> storage;
+  llvm::SmallVector<intent::plan::PaddingOp> paddings;
   llvm::SmallVector<intent::plan::TransferOp> transfers;
   llvm::SmallVector<intent::plan::ReductionOp> reductions;
   llvm::SmallVector<intent::plan::PointwiseOp> pointwise;

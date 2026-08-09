@@ -116,6 +116,12 @@ LogicalResult StorageOp::verify() {
   return success();
 }
 
+LogicalResult PaddingOp::verify() {
+  return intent::plan::verifyPaddingFields(
+      *this, getValue(), getTensorAxes(), getDomainNodes(), getFill(),
+      getMaterialization());
+}
+
 LogicalResult ReductionOp::verify() {
   if (failed(requireNode(*this, getNode())) || getAxisAttr().getInt() < 0)
     return failure();
@@ -231,6 +237,8 @@ LogicalResult intent::tilelang::plan::verifyTileLangRealization(
   llvm::DenseSet<int64_t> machineAxes;
   llvm::DenseSet<int64_t> surfaceAxes;
   llvm::DenseMap<int64_t, intent::plan::TransferOp> transfers;
+  llvm::DenseMap<int64_t, intent::plan::PaddingOp> machinePaddings;
+  llvm::DenseMap<int64_t, PaddingOp> surfacePaddings;
   for (Operation &operation : realization.getBody().front()) {
     if (auto value = dyn_cast<intent::plan::ProgramOp>(operation))
       machineProgram = value;
@@ -238,6 +246,8 @@ LogicalResult intent::tilelang::plan::verifyTileLangRealization(
       machineAxes.insert(value.getNode());
     else if (auto value = dyn_cast<intent::plan::TransferOp>(operation))
       transfers[value.getNode()] = value;
+    else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation))
+      machinePaddings[value.getValue()] = value;
     if (operation.getName().getDialectNamespace() != "intent_tilelang")
       continue;
     if (isa<TargetOp>(operation))
@@ -249,8 +259,12 @@ LogicalResult intent::tilelang::plan::verifyTileLangRealization(
     else if (auto value = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       surfaceProgram = value;
-    } else if (isa<StorageOp, ReductionOp, PointwiseOp, ContractOp,
-                   StreamOp, RaggedOp, StageOp, AtomicOp>(operation)) {
+    } else if (auto value = dyn_cast<PaddingOp>(operation)) {
+      if (surfacePaddings.count(value.getValue()))
+        return value.emitOpError("duplicates a projected padding decision");
+      surfacePaddings[value.getValue()] = value;
+    } else if (isa<StorageOp, ReductionOp, PointwiseOp, ContractOp, StreamOp,
+                   RaggedOp, StageOp, AtomicOp>(operation)) {
     } else if (auto value = dyn_cast<BoundaryOp>(operation)) {
       auto transfer = transfers.find(value.getNode());
       if (transfer == transfers.end() ||
@@ -267,6 +281,20 @@ LogicalResult intent::tilelang::plan::verifyTileLangRealization(
         return !surfaceAxes.contains(node);
       }))
     return realization.emitOpError("TileLang axes do not project the GPU axes");
+  if (machinePaddings.size() != surfacePaddings.size())
+    return realization.emitOpError(
+        "TileLang padding does not project every GPU padding decision");
+  for (auto &entry : machinePaddings) {
+    auto projected = surfacePaddings.find(entry.first);
+    if (projected == surfacePaddings.end() ||
+        projected->second.getTensorAxes() != entry.second.getTensorAxes() ||
+        projected->second.getDomainNodes() != entry.second.getDomainNodes() ||
+        projected->second.getFill() != entry.second.getFill() ||
+        projected->second.getMaterialization() !=
+            entry.second.getMaterialization())
+      return realization.emitOpError(
+          "TileLang padding changes a GPU padding decision");
+  }
   if (surfaceProgram.getLoopNode() != machineProgram.getLoopNode() ||
       surfaceProgram.getWorkerAxes() != machineProgram.getWorkerAxes() ||
       surfaceProgram.getTraversals() != machineProgram.getTraversals() ||

@@ -11,6 +11,12 @@
 
 namespace intent::plan {
 
+mlir::LogicalResult verifyPaddingFields(mlir::Operation *operation,
+                                        int64_t value,
+                                        llvm::ArrayRef<int64_t> tensorAxes,
+                                        llvm::ArrayRef<int64_t> domainNodes,
+                                        llvm::StringRef fill,
+                                        llvm::StringRef materialization);
 mlir::LogicalResult verifyGpuRealization(RealizationOp realization);
 mlir::LogicalResult verifyGpuSearchSpace(SearchSpaceOp searchSpace);
 

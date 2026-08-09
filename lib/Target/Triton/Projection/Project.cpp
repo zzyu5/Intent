@@ -141,6 +141,11 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
     builder.create<plan::StorageOp>(
         storage.getLoc(), storage.getValueAttr(),
         gpu::stringAttr(builder, "global"));
+  for (intent::plan::PaddingOp padding : indexed->paddings)
+    builder.create<plan::PaddingOp>(
+        padding.getLoc(), padding.getValueAttr(), padding.getTensorAxesAttr(),
+        padding.getDomainNodesAttr(), padding.getFillAttr(),
+        padding.getMaterializationAttr());
   for (intent::plan::TransferOp transfer : indexed->transfers)
     builder.create<plan::BoundaryOp>(
         transfer.getLoc(), transfer.getNodeAttr(), transfer.getDomainNodesAttr(),

@@ -159,6 +159,11 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
     builder.create<plan::StorageOp>(
         storage.getLoc(), storage.getValueAttr(),
         gpu::stringAttr(builder, bufferSpace(storage.getSpace())));
+  for (intent::plan::PaddingOp padding : indexed->paddings)
+    builder.create<plan::PaddingOp>(
+        padding.getLoc(), padding.getValueAttr(), padding.getTensorAxesAttr(),
+        padding.getDomainNodesAttr(), padding.getFillAttr(),
+        padding.getMaterializationAttr());
   bool rowStrided = indexed->program.getOwnership() == "row" &&
                     hasTraversal(indexed->program, "persistent");
   bool raggedOrdered = indexed->program.getOwnership() == "ragged" &&

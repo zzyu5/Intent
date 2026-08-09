@@ -595,13 +595,17 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   FailureOr<std::string> expression = makeExpression(*lhs, *rhs);
   if (failed(expression))
     return failure();
+  FailureOr<std::string> padded = padElementExpression(
+      operation.getResult(0), *expression, indices, operation);
+  if (failed(padded))
+    return failure();
   std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {
     if (axis)
       target += ", ";
     target += index;
   }
-  line(target + "] = " + *expression);
+  line(target + "] = " + *padded);
   --indentation;
   bindResult(operation, 0, result);
   return success();
@@ -662,8 +666,13 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
       target += ", ";
     target += index;
   }
-  line(target + "] = T.if_then_else(" + *predicate + ", " + *value + ", " +
-       *fill + ")");
+  std::string expression = "T.if_then_else(" + *predicate + ", " + *value +
+                           ", " + *fill + ")";
+  FailureOr<std::string> padded = padElementExpression(
+      operation.getResult(0), expression, indices, operation);
+  if (failed(padded))
+    return failure();
+  line(target + "] = " + *padded);
   --indentation;
   bindResult(operation, 0, result);
   return success();

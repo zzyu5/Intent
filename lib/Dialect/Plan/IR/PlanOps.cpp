@@ -23,6 +23,24 @@ LogicalResult requireNode(Operation *operation, int64_t value) {
   return requireNonNegative(operation, value, "Kernel IR node ID");
 }
 
+LogicalResult verifyValidityBinding(Operation *operation, ArrayRef<int64_t> axes,
+                                    ArrayRef<int64_t> nodes,
+                                    StringRef operand) {
+  if (axes.size() != nodes.size())
+    return operation->emitOpError()
+           << operand << " validity axes and nodes must have equal length";
+  llvm::DenseSet<int64_t> uniqueAxes;
+  for (auto [axis, node] : llvm::zip(axes, nodes)) {
+    if (failed(requireNonNegative(operation, axis, "validity tensor axis")) ||
+        failed(requireNode(operation, node)))
+      return failure();
+    if (!uniqueAxes.insert(axis).second)
+      return operation->emitOpError()
+             << operand << " validity tensor axes must be unique";
+  }
+  return success();
+}
+
 LogicalResult verifyEnvelope(Operation *operation, FlatSymbolRefAttr entry,
                              StringRef target, Region &body) {
   if (target.empty())
@@ -113,6 +131,28 @@ LogicalResult StorageOp::verify() {
   if (getSpace() != "external" && getSpace() != "workspace")
     return emitOpError("contains an unsupported machine storage class");
   return success();
+}
+
+LogicalResult intent::plan::verifyPaddingFields(
+    Operation *operation, int64_t value, ArrayRef<int64_t> tensorAxes,
+    ArrayRef<int64_t> domainNodes, StringRef fill,
+    StringRef materialization) {
+  if (failed(requireNonNegative(operation, value, "Kernel IR value ID")) ||
+      tensorAxes.empty() ||
+      failed(verifyValidityBinding(operation, tensorAxes, domainNodes, "value")))
+    return failure();
+  if (fill != "negative_infinity" && fill != "zero")
+    return operation->emitOpError(
+        "contains an unsupported physical padding value");
+  if (materialization != "producer")
+    return operation->emitOpError(
+        "requires producer-fused padding materialization");
+  return success();
+}
+
+LogicalResult PaddingOp::verify() {
+  return verifyPaddingFields(*this, getValue(), getTensorAxes(),
+                             getDomainNodes(), getFill(), getMaterialization());
 }
 
 LogicalResult TransferOp::verify() {
@@ -247,6 +287,8 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseSet<int64_t> axes;
   llvm::StringSet<> roles;
   llvm::DenseSet<int64_t> storage;
+  llvm::DenseSet<int64_t> paddedValues;
+  SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> stageOrdinals;
   for (Operation &operation : realization.getBody().front()) {
@@ -265,6 +307,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<StorageOp>(operation)) {
       if (!storage.insert(binding.getValue()).second)
         return binding.emitOpError("duplicates a storage binding");
+    } else if (auto binding = dyn_cast<PaddingOp>(operation)) {
+      if (!paddedValues.insert(binding.getValue()).second)
+        return binding.emitOpError("duplicates a value padding decision");
+      paddings.push_back(binding);
     } else if (auto binding = dyn_cast<TransferOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
@@ -331,6 +377,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       for (int64_t member : relation.getMemberNodes())
         if (!axes.contains(member))
           return relation.emitOpError("references an unbound ragged member axis");
+  for (PaddingOp padding : paddings)
+    for (int64_t domain : padding.getDomainNodes())
+      if (!axes.contains(domain))
+        return padding.emitOpError("references an unbound validity domain");
   return success();
 }
 

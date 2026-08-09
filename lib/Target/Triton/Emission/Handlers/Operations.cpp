@@ -444,7 +444,11 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     expression = lhs->str() + " " + symbol.str() + " " + rhs->str();
   }
   std::string result = makeResultName(operation, 0);
-  line(result + " = " + expression);
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), expression, operation);
+  if (failed(padded))
+    return failure();
+  line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
 }
@@ -461,8 +465,13 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
       failed(fill))
     return operation.emitOpError("lacks a mechanical Triton mask binding");
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.where(" + predicate->str() + ", " + value->str() +
-       ", " + fill->str() + ")");
+  std::string expression = "tl.where(" + predicate->str() + ", " +
+                           value->str() + ", " + fill->str() + ")";
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), expression, operation);
+  if (failed(padded))
+    return failure();
+  line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
 }

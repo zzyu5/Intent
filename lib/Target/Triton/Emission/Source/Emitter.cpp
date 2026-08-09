@@ -24,6 +24,8 @@ indexRealization(intent::plan::RealizationOp realization) {
       index.program = value;
     else if (auto value = dyn_cast<plan::StorageOp>(operation))
       index.storage[value.getValue()] = value;
+    else if (auto value = dyn_cast<plan::PaddingOp>(operation))
+      index.paddings[value.getValue()] = value;
     else if (auto value = dyn_cast<plan::ReductionOp>(operation))
       index.reductions[value.getNode()] = value;
     else if (auto value = dyn_cast<plan::PointwiseOp>(operation))
@@ -175,6 +177,16 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (failed(dimension))
       return entry.second.emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.second.getRole()] = *dimension;
+  }
+  for (auto &entry : planIndex.paddings) {
+    Value value = kernel.values.lookup(entry.first);
+    Operation *definition = value ? value.getDefiningOp() : nullptr;
+    if (!definition || definition->getNumResults() != 1 ||
+        definition->getResult(0) != value ||
+        (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.mask"))
+      return entry.second.emitOpError(
+          "does not bind a producer-fusible pointwise value");
   }
   for (const target::RegionNode &region : kernel.regions.nodes) {
     Operation *operation = region.operation;
@@ -1597,6 +1609,68 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   for (StringRef predicate : llvm::drop_begin(predicates))
     combined += " & " + predicate.str();
   return combined;
+}
+
+FailureOr<std::string> SourceEmitter::emitValidityExpression(
+    ArrayRef<int64_t> tensorAxes, ArrayRef<int64_t> domainNodes, Value value,
+    Operation &consumer) {
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor || tensorAxes.size() != domainNodes.size())
+    return consumer.emitOpError(
+        "has no ranked Triton value-validity binding");
+  SmallVector<std::string> predicates;
+  for (auto [tensorAxis, domainNode] : llvm::zip(tensorAxes, domainNodes)) {
+    auto domain = kernel.nodes.find(domainNode);
+    auto physical = planIndex.axes.find(domainNode);
+    if (tensorAxis < 0 || tensorAxis >= tensor.getRank() ||
+        domain == kernel.nodes.end() || physical == planIndex.axes.end())
+      return consumer.emitOpError(
+          "references an unresolved Triton validity axis");
+    plan::AxisOp axis = physical->second;
+    if (axis.getTile() == "one")
+      continue;
+    FailureOr<std::string> extent =
+        usesRaggedOrderedTraversal() &&
+                (axis.getRole() == "program_1" ||
+                 axis.getRole() == "stream_0")
+            ? FailureOr<std::string>(std::string("sequence_end"))
+        : hasTraversal("persistent") && axis.getRole() == "program_0"
+            ? FailureOr<std::string>(std::string("n_rows"))
+        : hasTraversal("persistent") && axis.getRole() == "lane_0"
+            ? FailureOr<std::string>(std::string("n_cols"))
+            : dimensionName(*domain->second);
+    FailureOr<std::string> index = indexExpression(
+        axis, false, tensorAxis, tensor.getRank(), consumer);
+    if (failed(extent) || failed(index))
+      return failure();
+    predicates.push_back("(" + *index + " < " + *extent + ")");
+  }
+  if (predicates.empty())
+    return std::string("True");
+  std::string result = predicates.front();
+  for (StringRef predicate : llvm::drop_begin(predicates))
+    result += " & " + predicate.str();
+  return result;
+}
+
+FailureOr<std::string> SourceEmitter::padExpression(
+    Value value, StringRef expression, Operation &consumer) {
+  FailureOr<int64_t> valueID =
+      target::getValueID(value, kernel, consumer, "Triton padding lookup");
+  if (failed(valueID))
+    return failure();
+  plan::PaddingOp padding = planIndex.paddings.lookup(*valueID);
+  if (!padding)
+    return expression.str();
+  FailureOr<std::string> predicate = emitValidityExpression(
+      padding.getTensorAxes(), padding.getDomainNodes(), value, consumer);
+  if (failed(predicate))
+    return failure();
+  StringRef fill = padding.getFill() == "negative_infinity"
+                       ? StringRef("-float('inf')")
+                       : StringRef("0.0");
+  return "tl.where(" + *predicate + ", " + expression.str() + ", " +
+         fill.str() + ")";
 }
 
 FailureOr<unsigned> SourceEmitter::emittedTensorRank(Operation &operation,

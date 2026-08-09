@@ -113,6 +113,12 @@ LogicalResult StorageOp::verify() {
   return success();
 }
 
+LogicalResult PaddingOp::verify() {
+  return intent::plan::verifyPaddingFields(
+      *this, getValue(), getTensorAxes(), getDomainNodes(), getFill(),
+      getMaterialization());
+}
+
 LogicalResult ReductionOp::verify() {
   if (failed(requireNode(*this, getNode())) || getAxisAttr().getInt() < 0)
     return failure();
@@ -214,6 +220,8 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
   llvm::DenseSet<int64_t> machineAxes;
   llvm::DenseSet<int64_t> surfaceAxes;
   llvm::DenseMap<int64_t, intent::plan::TransferOp> transfers;
+  llvm::DenseMap<int64_t, intent::plan::PaddingOp> machinePaddings;
+  llvm::DenseMap<int64_t, PaddingOp> surfacePaddings;
   llvm::DenseSet<int64_t> surfaceOperations;
   for (Operation &operation : realization.getBody().front()) {
     if (auto value = dyn_cast<intent::plan::ProgramOp>(operation))
@@ -222,6 +230,8 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
       machineAxes.insert(value.getNode());
     else if (auto value = dyn_cast<intent::plan::TransferOp>(operation))
       transfers[value.getNode()] = value;
+    else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation))
+      machinePaddings[value.getValue()] = value;
     if (operation.getName().getDialectNamespace() != "intent_triton")
       continue;
     if (isa<TargetOp>(operation))
@@ -233,6 +243,10 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
     else if (auto value = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       surfaceProgram = value;
+    } else if (auto value = dyn_cast<PaddingOp>(operation)) {
+      if (surfacePaddings.count(value.getValue()))
+        return value.emitOpError("duplicates a projected padding decision");
+      surfacePaddings[value.getValue()] = value;
     } else if (isa<StorageOp, StreamOp, RaggedOp, StageOp>(operation)) {
     } else if (auto value = dyn_cast<ReductionOp>(operation))
       surfaceOperations.insert(value.getNode());
@@ -258,6 +272,20 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
         return !surfaceAxes.contains(node);
       }))
     return realization.emitOpError("Triton axes do not project the GPU axes");
+  if (machinePaddings.size() != surfacePaddings.size())
+    return realization.emitOpError(
+        "Triton padding does not project every GPU padding decision");
+  for (auto &entry : machinePaddings) {
+    auto projected = surfacePaddings.find(entry.first);
+    if (projected == surfacePaddings.end() ||
+        projected->second.getTensorAxes() != entry.second.getTensorAxes() ||
+        projected->second.getDomainNodes() != entry.second.getDomainNodes() ||
+        projected->second.getFill() != entry.second.getFill() ||
+        projected->second.getMaterialization() !=
+            entry.second.getMaterialization())
+      return realization.emitOpError(
+          "Triton padding changes a GPU padding decision");
+  }
   if (surfaceProgram.getLoopNode() != machineProgram.getLoopNode() ||
       surfaceProgram.getWorkerAxes() != machineProgram.getWorkerAxes() ||
       surfaceProgram.getTraversals() != machineProgram.getTraversals() ||

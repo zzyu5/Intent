@@ -1,6 +1,10 @@
 #include "Intent/Target/Common/Realization/KernelFacts.h"
 
+#include "Intent/Dialect/Intent/IR/IntentTypes.h"
+
 #include "llvm/ADT/DenseMap.h"
+
+#include <cmath>
 
 using namespace mlir;
 
@@ -8,7 +12,7 @@ namespace intent::target {
 namespace {
 
 enum class PaddedValue {
-  unknown,
+  arbitrary,
   zero,
   negativeInfinity,
 };
@@ -34,8 +38,16 @@ bool provePaddedUses(Value value, PaddedValue padded,
         return false;
       continue;
     }
+    if (name == "intent.contract" && padded == PaddedValue::zero) {
+      auto multiply = user->getAttrOfType<StringAttr>("intent.multiply");
+      auto combine = user->getAttrOfType<StringAttr>("intent.combine");
+      if (multiply && multiply.getValue() == "multiply" && combine &&
+          combine.getValue() == "add")
+        continue;
+      return false;
+    }
 
-    PaddedValue result = PaddedValue::unknown;
+    PaddedValue result = PaddedValue::arbitrary;
     if (name == "intent.cast") {
       result = padded;
     } else if (name == "intent.unary") {
@@ -50,7 +62,8 @@ bool provePaddedUses(Value value, PaddedValue padded,
     } else if (name == "intent.binary") {
       auto logical = user->getAttrOfType<StringAttr>("intent.operator");
       if (logical && logical.getValue() == "multiply" &&
-          padded == PaddedValue::zero)
+          padded == PaddedValue::zero && user->getOperand(0) == value &&
+          user->getOperand(1) == value)
         result = PaddedValue::zero;
       else if (logical && logical.getValue() == "subtract" &&
                user->getOperand(0) == value &&
@@ -72,6 +85,95 @@ bool proveFill(Value loaded, PaddedValue padded) {
   return provePaddedUses(loaded, padded, visited);
 }
 
+std::optional<std::string> literalPadding(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getName().getStringRef() != "intent.constant")
+    return std::nullopt;
+  Attribute literal = definition->getAttr("intent.value");
+  if (auto floating = dyn_cast<FloatAttr>(literal)) {
+    double number = floating.getValueAsDouble();
+    if (number == 0.0)
+      return std::string("zero");
+    if (std::isinf(number) && number < 0.0)
+      return std::string("negative_infinity");
+  }
+  if (auto integer = dyn_cast<IntegerAttr>(literal))
+    if (integer.getValue().isZero())
+      return std::string("zero");
+  return std::nullopt;
+}
+
+std::optional<std::string> inferPadding(
+    Value value, const KernelFacts &facts,
+    const llvm::DenseMap<Value, std::string> &assumedPadding) {
+  auto assumed = assumedPadding.find(value);
+  if (assumed != assumedPadding.end())
+    return assumed->second;
+  if (std::optional<std::string> literal = literalPadding(value))
+    return literal;
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return std::nullopt;
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.view_load") {
+    auto fill = facts.boundaryFills.find(definition);
+    return fill == facts.boundaryFills.end()
+               ? std::nullopt
+               : std::optional<std::string>(fill->second);
+  }
+  if (name == "intent.zeros")
+    return std::string("zero");
+  if (name == "intent.full" && definition->getNumOperands() == 1)
+    return inferPadding(definition->getOperand(0), facts, assumedPadding);
+  if ((name == "intent.cast" || name == "intent.broadcast") &&
+      definition->getNumOperands() >= 1)
+    return inferPadding(definition->getOperand(0), facts, assumedPadding);
+  if (name == "intent.gather" && definition->getNumOperands() >= 1) {
+    if (!isa<intent::ViewType>(definition->getOperand(0).getType()))
+      return inferPadding(definition->getOperand(0), facts, assumedPadding);
+    auto fillIndex =
+        definition->getAttrOfType<IntegerAttr>("intent.fill_operand_index");
+    if (fillIndex && fillIndex.getInt() >= 0 &&
+        static_cast<unsigned>(fillIndex.getInt()) < definition->getNumOperands())
+      return inferPadding(definition->getOperand(fillIndex.getInt()), facts,
+                          assumedPadding);
+    return std::nullopt;
+  }
+  if (name == "intent.unary" && definition->getNumOperands() == 1) {
+    std::optional<std::string> operand =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    if (operand && *operand == "negative_infinity" && logical &&
+        (logical.getValue() == "exp" || logical.getValue() == "exp2"))
+      return std::string("zero");
+    if (operand && *operand == "zero" && logical &&
+        logical.getValue() == "negate")
+      return std::string("zero");
+  }
+  if (name == "intent.binary" && definition->getNumOperands() == 2) {
+    std::optional<std::string> lhs =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    std::optional<std::string> rhs =
+        inferPadding(definition->getOperand(1), facts, assumedPadding);
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    if (logical && logical.getValue() == "multiply" && lhs && rhs &&
+        *lhs == "zero" && *rhs == "zero")
+      return std::string("zero");
+    if (logical && logical.getValue() == "subtract" && lhs &&
+        *lhs == "negative_infinity")
+      return std::string("negative_infinity");
+  }
+  if (name == "intent.mask" && definition->getNumOperands() == 3) {
+    std::optional<std::string> valuePadding =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    std::optional<std::string> fillPadding =
+        inferPadding(definition->getOperand(2), facts, assumedPadding);
+    if (valuePadding && fillPadding && *valuePadding == *fillPadding)
+      return valuePadding;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 std::optional<std::string> inferMaskedLaneFill(Value loaded) {
@@ -80,6 +182,12 @@ std::optional<std::string> inferMaskedLaneFill(Value loaded) {
   if (proveFill(loaded, PaddedValue::negativeInfinity))
     return std::string("negative_infinity");
   return std::nullopt;
+}
+
+std::optional<std::string> inferValuePadding(
+    Value value, const KernelFacts &facts,
+    const llvm::DenseMap<Value, std::string> &assumedPadding) {
+  return inferPadding(value, facts, assumedPadding);
 }
 
 } // namespace intent::target

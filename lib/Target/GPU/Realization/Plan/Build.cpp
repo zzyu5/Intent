@@ -65,6 +65,115 @@ int64_t reusableOperand(Operation &operation) {
   return -1;
 }
 
+struct ValidityBinding {
+  SmallVector<int64_t> axes;
+  SmallVector<int64_t> nodes;
+};
+
+struct PaddingDecision {
+  Value value;
+  int64_t valueID;
+  ValidityBinding validity;
+  std::string fill;
+};
+
+FailureOr<ValidityBinding>
+validityBinding(Value value, ArrayRef<unsigned> requiredAxes,
+                const target::KernelFacts &facts, Operation &consumer) {
+  ValidityBinding binding;
+  auto axes = facts.valueAxes.find(value);
+  if (axes == facts.valueAxes.end()) {
+    if (isa<RankedTensorType>(value.getType())) {
+      consumer.emitOpError("tensor operand has no logical validity provenance");
+      return failure();
+    }
+    return binding;
+  }
+  for (unsigned position : requiredAxes) {
+    if (position >= axes->second.size()) {
+      consumer.emitOpError("logical validity axis is outside its tensor rank");
+      return failure();
+    }
+    const target::LogicalAxis &axis = axes->second[position];
+    if (!axis.domain)
+      continue;
+    FailureOr<int64_t> node =
+        target::getNodeID(*axis.domain, "logical validity binding");
+    if (failed(node))
+      return failure();
+    binding.axes.push_back(position);
+    binding.nodes.push_back(*node);
+  }
+  return binding;
+}
+
+struct PaddingState {
+  const target::KernelFacts &facts;
+  SmallVectorImpl<PaddingDecision> &decisions;
+  llvm::DenseMap<Value, std::string> assumed;
+
+  PaddingState(const target::KernelFacts &facts,
+               SmallVectorImpl<PaddingDecision> &decisions)
+      : facts(facts), decisions(decisions) {}
+
+  std::optional<std::string> paddingOf(Value value) const {
+    return target::inferValuePadding(value, facts, assumed);
+  }
+
+  LogicalResult require(Value value, ArrayRef<unsigned> requiredAxes,
+                        StringRef fill, Operation &consumer) {
+    FailureOr<ValidityBinding> validity =
+        validityBinding(value, requiredAxes, facts, consumer);
+    if (failed(validity))
+      return failure();
+    if (validity->nodes.empty())
+      return success();
+    std::optional<std::string> safeFill = target::inferMaskedLaneFill(value);
+    if (!safeFill || *safeFill != fill)
+      return consumer.emitOpError()
+             << "cannot choose one semantics-preserving padding for value; "
+                "required "
+             << fill;
+    Operation *definition = value.getDefiningOp();
+    if (!definition ||
+        (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.mask"))
+      return consumer.emitOpError(
+          "producer-fused padding requires a pointwise binary or mask value");
+    FailureOr<int64_t> valueID = target::getValueID(
+        value, facts.kernel, consumer, "padding binding");
+    if (failed(valueID))
+      return failure();
+    auto existing =
+        llvm::find_if(decisions, [&](const PaddingDecision &decision) {
+          return decision.value == value;
+        });
+    if (existing == decisions.end()) {
+      decisions.push_back(
+          PaddingDecision{value, *valueID, std::move(*validity), fill.str()});
+    } else {
+      if (existing->fill != fill)
+        return consumer.emitOpError(
+            "requires incompatible physical padding values");
+      for (auto [axis, node] : llvm::zip(validity->axes, validity->nodes)) {
+        auto found = llvm::find(existing->validity.axes, axis);
+        if (found == existing->validity.axes.end()) {
+          existing->validity.axes.push_back(axis);
+          existing->validity.nodes.push_back(node);
+          continue;
+        }
+        unsigned position =
+            std::distance(existing->validity.axes.begin(), found);
+        if (existing->validity.nodes[position] != node)
+          return consumer.emitOpError(
+              "binds one tensor axis to incompatible validity domains");
+      }
+    }
+    assumed[value] = fill.str();
+    return success();
+  }
+};
+
 LogicalResult emitStorage(OpBuilder &builder, const target::KernelModel &kernel,
                           const ScheduleDecision &schedule) {
   func::FuncOp entry = kernel.entry;
@@ -99,7 +208,8 @@ LogicalResult emitStorage(OpBuilder &builder, const target::KernelModel &kernel,
 LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                                    const OperationFacts &facts,
                                    const ScheduleDecision &schedule,
-                                   OpBuilder &builder) {
+                                   OpBuilder &builder,
+                                   PaddingState &paddingState) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.region_end",
                          "intent.partition", "intent.yield", "intent.return"})
@@ -245,13 +355,33 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                             : IntegerAttr();
             if (failed(node) || !axis)
               return failure();
+            if (axis.getInt() < 0)
+              return operation.emitOpError("has a negative reduction axis");
             auto role = facts.primitiveRoles.find(&operation);
             if (role == facts.primitiveRoles.end())
               return operation.emitOpError("has no resolved GPU reduction role");
+            std::optional<std::string> inputPadding =
+                paddingState.paddingOf(operation.getOperand(0));
+            std::optional<std::string> identityPadding =
+                operation.getNumOperands() > 1
+                    ? paddingState.paddingOf(operation.getOperand(1))
+                    : std::nullopt;
+            if (!inputPadding || !identityPadding ||
+                *inputPadding != *identityPadding) {
+              if (!identityPadding)
+                return operation.emitOpError(
+                    "cannot realize reduction-lane padding without an identity");
+              if (failed(paddingState.require(
+                      operation.getOperand(0),
+                      {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+                      operation)))
+                return failure();
+            }
             builder.create<intent::plan::ReductionOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, role->second),
-                i64(builder, axis.getInt()), builder.getBoolAttr(true),
+                i64(builder, axis.getInt()),
+                builder.getBoolAttr(true),
                 string(builder, "private_fragment"),
                 string(builder, "private_fragment"));
             return success();
@@ -306,6 +436,23 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             bool staged = llvm::any_of(schedule.stages, [&](const auto &stage) {
               return stage.contraction == &operation;
             });
+            auto contraction = facts.semantics.contractions.find(&operation);
+            if (contraction == facts.semantics.contractions.end())
+              return operation.emitOpError("has no canonical contraction facts");
+            auto zeroPadded = [&](Value value) {
+              std::optional<std::string> padding = paddingState.paddingOf(value);
+              return padding && *padding == "zero";
+            };
+            if (!staged && !zeroPadded(operation.getOperand(0)) &&
+                failed(paddingState.require(
+                    operation.getOperand(0),
+                    contraction->second.lhsReductionAxes, "zero", operation)))
+              return failure();
+            if (!staged && !zeroPadded(operation.getOperand(1)) &&
+                failed(paddingState.require(
+                    operation.getOperand(1),
+                    contraction->second.rhsReductionAxes, "zero", operation)))
+              return failure();
             auto operandSpace = [&](Value operand) -> StringRef {
               if (staged)
                 return "shared";
@@ -382,6 +529,17 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   return success();
 }
 
+void emitPaddings(OpBuilder &builder, ArrayRef<PaddingDecision> paddings) {
+  for (const PaddingDecision &padding : paddings) {
+    Operation *definition = padding.value.getDefiningOp();
+    builder.create<intent::plan::PaddingOp>(
+        definition->getLoc(), i64(builder, padding.valueID),
+        builder.getDenseI64ArrayAttr(padding.validity.axes),
+        builder.getDenseI64ArrayAttr(padding.validity.nodes),
+        string(builder, padding.fill), string(builder, "producer"));
+  }
+}
+
 LogicalResult emitStages(OpBuilder &builder, const target::KernelModel &kernel,
                          const ScheduleDecision &schedule) {
   for (auto [ordinal, stage] : llvm::enumerate(schedule.stages)) {
@@ -440,11 +598,15 @@ LogicalResult emitMachinePlan(ModuleOp module, const DeviceCapabilities &device,
   if (failed(emitStorage(builder, kernel, schedule)))
     return failure();
   target::OperationHandlerRegistry registry;
-  if (failed(registerPlanHandlers(registry, facts, schedule, builder)) ||
+  SmallVector<PaddingDecision> paddings;
+  PaddingState paddingState(facts.semantics, paddings);
+  if (failed(registerPlanHandlers(registry, facts, schedule, builder,
+                                  paddingState)) ||
       failed(target::traverseKernel(entry, registry,
                                     "GPU machine-plan construction")))
     return failure();
   builder.setInsertionPointToEnd(&body);
+  emitPaddings(builder, paddings);
   if (failed(emitStages(builder, kernel, schedule)))
     return failure();
   builder.create<intent::plan::YieldOp>(entry.getLoc());

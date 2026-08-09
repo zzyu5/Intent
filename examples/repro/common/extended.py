@@ -270,36 +270,37 @@ def _run_varlen_attention(
     q = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
     k = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
     v = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
-    artifact = intent.compile(
-        flash_varlen_attention_fwd,
-        constexprs={"CAUSAL": True},
-        target=target,
-        compiler=compiler,
-    )
+    for causal in (False, True):
+        artifact = intent.compile(
+            flash_varlen_attention_fwd,
+            constexprs={"CAUSAL": causal},
+            target=target,
+            compiler=compiler,
+        )
 
-    def reference() -> torch.Tensor:
-        result = torch.empty_like(v)
-        for begin, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-            start = int(begin.item())
-            stop = int(end.item())
-            result[start:stop] = F.scaled_dot_product_attention(
-                q[start:stop][None, None],
-                k[start:stop][None, None],
-                v[start:stop][None, None],
-                is_causal=True,
-                scale=SCALE,
-            )[0, 0]
-        return result
+        def reference() -> torch.Tensor:
+            result = torch.empty_like(v)
+            for begin, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+                start = int(begin.item())
+                stop = int(end.item())
+                result[start:stop] = F.scaled_dot_product_attention(
+                    q[start:stop][None, None],
+                    k[start:stop][None, None],
+                    v[start:stop][None, None],
+                    is_causal=causal,
+                    scale=SCALE,
+                )[0, 0]
+            return result
 
-    _compare(
-        artifact=artifact,
-        arguments=(q, k, v, lengths, cu_seqlens, SCALE),
-        reference=reference,
-        target_name=target_name,
-        kernel_name="packed varlen attention",
-        tolerance=2.0e-2,
-        upstream=upstream,
-    )
+        _compare(
+            artifact=artifact,
+            arguments=(q, k, v, lengths, cu_seqlens, SCALE),
+            reference=reference,
+            target_name=target_name,
+            kernel_name=f"packed varlen attention causal={causal}",
+            tolerance=2.0e-2,
+            upstream=upstream if causal else None,
+        )
 
 
 EXTENDED_RUNNERS: dict[str, Runner] = {

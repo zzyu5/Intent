@@ -93,6 +93,10 @@ resolveDomain(mlir::Value indexedValue, const KernelFacts &facts,
 
 std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded);
 
+std::optional<std::string> inferValuePadding(
+    mlir::Value value, const KernelFacts &facts,
+    const llvm::DenseMap<mlir::Value, std::string> &assumedPadding);
+
 } // namespace intent::target
 
 #endif

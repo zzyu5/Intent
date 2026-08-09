@@ -24,6 +24,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::StorageOp> storage;
+  llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
@@ -114,6 +115,15 @@ private:
   mlir::FailureOr<std::string>
   elementBoundsPredicate(mlir::Operation &operation,
                          llvm::ArrayRef<std::string> tileIndices);
+  mlir::FailureOr<std::string>
+  elementValidityPredicate(llvm::ArrayRef<int64_t> tensorAxes,
+                           llvm::ArrayRef<int64_t> domainNodes,
+                           llvm::ArrayRef<std::string> elementIndices,
+                           mlir::Operation &consumer);
+  mlir::FailureOr<std::string>
+  padElementExpression(mlir::Value value, llvm::StringRef expression,
+                       llvm::ArrayRef<std::string> elementIndices,
+                       mlir::Operation &consumer);
   mlir::FailureOr<llvm::SmallVector<std::string>>
   tensorExtents(mlir::Operation &operation, unsigned resultIndex);
   mlir::FailureOr<std::string> tensorShape(mlir::Operation &operation,

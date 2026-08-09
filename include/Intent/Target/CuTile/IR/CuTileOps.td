@@ -51,6 +51,18 @@ def IntentCuTile_StorageOp : IntentCuTile_Op<"storage"> {
   let hasVerifier = 1;
 }
 
+def IntentCuTile_PaddingOp : IntentCuTile_Op<"padding"> {
+  let arguments = (ins
+    I64Attr:$value,
+    DenseI64ArrayAttr:$tensor_axes,
+    DenseI64ArrayAttr:$domain_nodes,
+    StrAttr:$fill,
+    StrAttr:$materialization
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentCuTile_ReductionOp : IntentCuTile_Op<"reduction"> {
   let arguments = (ins
     I64Attr:$node,
