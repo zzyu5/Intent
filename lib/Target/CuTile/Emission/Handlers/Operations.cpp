@@ -487,8 +487,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   if (failed(node) || !binding || failed(lhs) || failed(rhs))
     return failure();
   std::string expression;
-  if (binding.getLowering() == "ct.maximum")
-    expression = "ct.maximum(" + lhs->str() + ", " + rhs->str() + ")";
+  if (binding.getLowering() == "ct.maximum" ||
+      binding.getLowering() == "ct.minimum")
+    expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
+                 rhs->str() + ")";
   else {
     StringRef symbol;
     if (binding.getLowering() == "python_add")

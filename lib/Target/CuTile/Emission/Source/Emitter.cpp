@@ -64,6 +64,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_true_divide");
   if (role == "binary_maximum")
     return StringRef("ct.maximum");
+  if (role == "binary_minimum")
+    return StringRef("ct.minimum");
   if (role == "compare_greater_equal")
     return StringRef("python_greater_equal");
   if (role == "mask")
@@ -835,6 +837,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.float32";
     if (type.isBF16())
       return "torch.bfloat16";
+    if (type.isInteger(8))
+      return "torch.int8";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 32)
       return "torch.int32";
@@ -1806,6 +1810,8 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "ct.float32";
   if (type.isBF16())
     return "ct.bfloat16";
+  if (type.isInteger(8))
+    return "ct.int8";
   consumer.emitOpError("uses an unsupported cuTile dtype");
   return {};
 }

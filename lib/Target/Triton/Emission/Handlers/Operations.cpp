@@ -26,6 +26,8 @@ StringRef tritonDtype(Type type) {
     return "tl.float32";
   if (type.isBF16())
     return "tl.bfloat16";
+  if (type.isInteger(8))
+    return "tl.int8";
   return {};
 }
 
@@ -495,8 +497,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   if (failed(node) || !binding || failed(lhs) || failed(rhs))
     return failure();
   std::string expression;
-  if (binding.getLowering() == "tl.maximum")
-    expression = "tl.maximum(" + lhs->str() + ", " + rhs->str() + ")";
+  if (binding.getLowering() == "tl.maximum" ||
+      binding.getLowering() == "tl.minimum")
+    expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
+                 rhs->str() + ")";
   else {
     StringRef symbol;
     if (binding.getLowering() == "python_add")

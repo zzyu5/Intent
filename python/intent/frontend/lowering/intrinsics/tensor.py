@@ -11,6 +11,7 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
 
 from ..ast.model import Literal
@@ -150,12 +151,19 @@ def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("value", "dtype"), required=("value", "dtype"))
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     dtype = require_dtype(lowerer, bound["dtype"])
-    _, shape = lowerer.dtype_and_shape(source.type, node)
+    source_dtype, shape = lowerer.dtype_and_shape(source.type, node)
+    attributes = {}
+    if source_dtype.category in (DTypeCategory.FLOAT, DTypeCategory.BFLOAT) and (
+        dtype.category
+        in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.UNSIGNED_INTEGER)
+    ):
+        attributes["rounding"] = "toward_zero"
     operation = lowerer.emit(
         OperationKind.CAST,
         lowerer.location(node),
         operands=(source,),
         result_types=(lowerer.value_result_type(dtype, shape),),
+        attributes=attributes,
     )
     return operation.results[0]
 

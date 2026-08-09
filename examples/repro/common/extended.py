@@ -23,6 +23,7 @@ from kernels.contraction.gemm import K as GEMM_K
 from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
+from kernels.contraction.gemm import quantized_gemm
 from kernels.normalization.layer_norm import FEATURES as LAYER_FEATURES
 from kernels.normalization.layer_norm import ROWS as LAYER_ROWS
 from kernels.normalization.layer_norm import weighted_layer_norm
@@ -151,6 +152,60 @@ def _run_bf16_gemm(
         upstream=upstream,
         expected_dtype=torch.bfloat16,
     )
+
+
+def _run_quantized_gemm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    a = torch.randn((GEMM_M, GEMM_K), device="cuda", dtype=torch.float16)
+    a /= math.sqrt(GEMM_K)
+    b = torch.randn((GEMM_K, GEMM_N), device="cuda", dtype=torch.float16)
+    bias = torch.randn((GEMM_N,), device="cuda", dtype=torch.float32) * 0.25
+    residual = (
+        torch.randn((GEMM_M, GEMM_N), device="cuda", dtype=torch.float16) * 0.25
+    )
+    output_scale = torch.linspace(
+        1.0 / 48.0,
+        1.0 / 24.0,
+        GEMM_N,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    artifact = intent.compile(quantized_gemm, target=target, compiler=compiler)
+    arguments = (a, b, bias, residual, output_scale)
+
+    def reference() -> torch.Tensor:
+        accumulator = a.float() @ b.float()
+        activated = torch.relu(accumulator + bias)
+        fused = activated + residual.float()
+        return torch.clamp(fused / output_scale, -128.0, 127.0).to(torch.int8)
+
+    generated = artifact.run(*arguments)
+    if generated.dtype != torch.int8:
+        raise RuntimeError(
+            f"{target_name} quantized GEMM returned {generated.dtype}, expected int8"
+        )
+    expected = reference()
+    error = (
+        generated.to(torch.int16) - expected.to(torch.int16)
+    ).abs().max().item()
+    if error > 2:
+        raise RuntimeError(
+            f"{target_name} quantized GEMM numerical comparison failed: {error}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        lambda: artifact.run(*arguments), warmup=3, repetitions=10
+    )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} fused quantized GEMM numerical comparison: PASS "
+        f"(max_int8_error={error})"
+    )
+    print(
+        f"{target_name} fused quantized GEMM generated performance: "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    print(f"{target_name} fused quantized GEMM upstream baseline: unavailable")
 
 
 def _run_swiglu_backward(
@@ -569,6 +624,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
+    "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "swiglu_backward": _run_swiglu_backward,
     "varlen_attention": _run_varlen_attention,

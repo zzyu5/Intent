@@ -29,8 +29,29 @@ LogicalResult validateReduction(Operation &operation) {
 LogicalResult validatePointwise(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
   if (name == "intent.indices" || name == "intent.broadcast" ||
-      name == "intent.cast" || name == "intent.mask")
+      name == "intent.mask")
     return success();
+  if (name == "intent.cast") {
+    if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
+      return operation.emitOpError("has no canonical cast schema");
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    Type source = elementType(operation.getOperand(0).getType());
+    Type result = elementType(operation.getResult(0).getType());
+    auto rounding = operation.getAttrOfType<StringAttr>("intent.rounding");
+    bool floatToInteger = isa<FloatType>(source) && isa<IntegerType>(result);
+    if (floatToInteger &&
+        (!rounding || rounding.getValue() != "toward_zero"))
+      return operation.emitOpError(
+          "float-to-integer cast requires toward-zero rounding semantics");
+    if (!floatToInteger && rounding)
+      return operation.emitOpError(
+          "rounding semantics only apply to float-to-integer casts");
+    return success();
+  }
   if (name == "intent.compare") {
     auto predicate =
         operation.getAttrOfType<StringAttr>("intent.predicate");
@@ -50,7 +71,7 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.binary" &&
       llvm::is_contained({StringRef("add"), StringRef("subtract"),
                           StringRef("multiply"), StringRef("true_divide"),
-                          StringRef("maximum")},
+                          StringRef("maximum"), StringRef("minimum")},
                          logical.getValue()))
     return success();
   return operation.emitOpError("has no supported GPU pointwise role");

@@ -17,6 +17,8 @@ StringRef torchDtype(Type type) {
     return "torch.float32";
   if (type.isBF16())
     return "torch.bfloat16";
+  if (type.isInteger(8))
+    return "torch.int8";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
     return "torch.int32";
@@ -81,6 +83,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_true_divide");
   if (role == "binary_maximum")
     return StringRef("tl.maximum");
+  if (role == "binary_minimum")
+    return StringRef("tl.minimum");
   if (role == "compare_greater_equal")
     return StringRef("python_greater_equal");
   if (role == "mask")

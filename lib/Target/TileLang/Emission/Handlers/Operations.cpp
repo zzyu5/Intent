@@ -538,8 +538,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     return operation.emitOpError("lacks a TileLang binary binding");
   auto makeExpression = [&](StringRef lhs,
                             StringRef rhs) -> FailureOr<std::string> {
-    if (binding.getLowering() == "T.max")
-      return "T.max(" + lhs.str() + ", " + rhs.str() + ")";
+    if (binding.getLowering() == "T.max" ||
+        binding.getLowering() == "T.min")
+      return binding.getLowering().str() + "(" + lhs.str() + ", " +
+             rhs.str() + ")";
     StringRef symbol;
     if (binding.getLowering() == "python_add")
       symbol = "+";

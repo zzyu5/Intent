@@ -48,7 +48,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
     }
 
     PaddedValue result = PaddedValue::arbitrary;
-    if (name == "intent.cast") {
+    if (name == "intent.cast" || name == "intent.broadcast") {
       result = padded;
     } else if (name == "intent.unary") {
       auto logical = user->getAttrOfType<StringAttr>("intent.operator");
