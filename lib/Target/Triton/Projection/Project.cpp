@@ -89,6 +89,16 @@ FailureOr<StringRef> parameterSpelling(Operation *operation, StringRef role) {
   return failure();
 }
 
+StringRef ownershipSpelling(StringRef ownership) {
+  if (ownership == "row")
+    return "program_rows";
+  if (ownership == "tiled")
+    return "program_tiles";
+  if (ownership == "ragged")
+    return "program_ragged";
+  return {};
+}
+
 LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   FailureOr<gpu::MachinePlanIndex> indexed = gpu::indexMachinePlan(realization);
   if (failed(indexed))
@@ -113,13 +123,14 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         axis.getLoc(), axis.getNodeAttr(), axis.getSourceAxisAttr(),
         axis.getRoleAttr(), gpu::stringAttr(builder, *tile));
   }
-  StringRef mapping = indexed->program.getMapping() == "row_strided"
-                          ? StringRef("grid_stride")
-                          : indexed->program.getMapping();
+  StringRef ownership = ownershipSpelling(indexed->program.getOwnership());
+  if (ownership.empty())
+    return indexed->program.emitOpError(
+        "has no Triton ownership projection");
   builder.create<plan::ProgramOp>(
       indexed->program.getLoc(), indexed->program.getLoopNodeAttr(),
-      indexed->program.getWorkerAxesAttr(), indexed->program.getTraversalAttr(),
-      gpu::stringAttr(builder, mapping));
+      indexed->program.getWorkerAxesAttr(), gpu::stringAttr(builder, ownership),
+      indexed->program.getTraversalsAttr());
   for (intent::plan::StorageOp storage : indexed->storage)
     builder.create<plan::StorageOp>(
         storage.getLoc(), storage.getValueAttr(),
@@ -171,7 +182,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   for (intent::plan::RaggedOp ragged : indexed->ragged)
     builder.create<plan::RaggedOp>(
         ragged.getLoc(), ragged.getNodeAttr(), ragged.getOuterNodeAttr(),
-        ragged.getMemberNodeAttr(), ragged.getTraversalAttr());
+        ragged.getMemberNodesAttr(), ragged.getTraversalAttr());
   for (intent::plan::StageOp stage : indexed->stages)
     builder.create<plan::StageOp>(
         stage.getLoc(), stage.getOrdinalAttr(), stage.getNodeAttr(),

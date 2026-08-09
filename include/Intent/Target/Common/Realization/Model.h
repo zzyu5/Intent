@@ -30,8 +30,8 @@ struct ScheduleDecision {
   llvm::SmallVector<mlir::Operation *> raggedRelations;
   llvm::SmallVector<ContractionStage> stages;
   llvm::SmallVector<AxisDecision> axes;
-  std::string traversal;
-  std::string mapping;
+  std::string ownership;
+  llvm::SmallVector<std::string> traversals;
   llvm::SmallVector<int64_t> workerAxes;
   llvm::SmallVector<std::string> autotuneKeys;
   llvm::SmallVector<std::string> autotuneParameters;

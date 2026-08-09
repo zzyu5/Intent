@@ -31,7 +31,8 @@ FailureOr<StringRef> tileSpelling(Operation *operation, StringRef role) {
 }
 
 FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
-                                       StringRef resultSpace, StringRef mapping) {
+                                       StringRef resultSpace,
+                                       bool orderedStream) {
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -64,8 +65,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
   if (role == "members")
     return StringRef("ct.members");
   if (role == "expand_dims")
-    return mapping == "multi_axis_stream" ? StringRef("alias_column")
-                                            : StringRef("expand_dims");
+    return orderedStream ? StringRef("alias_column")
+                         : StringRef("expand_dims");
   if (role == "indirect_gather")
     return StringRef("ct.indirect_gather");
   operation->emitOpError("has no cuTile pointwise spelling for role ") << role;
@@ -83,6 +84,22 @@ FailureOr<StringRef> parameterSpelling(Operation *operation, StringRef role) {
     return StringRef("GROUP_SIZE_M");
   operation->emitOpError("has no cuTile tuner parameter for role ") << role;
   return failure();
+}
+
+bool hasTraversal(intent::plan::ProgramOp program, StringRef expected) {
+  return llvm::any_of(program.getTraversals(), [&](Attribute attribute) {
+    return cast<StringAttr>(attribute).getValue() == expected;
+  });
+}
+
+StringRef ownershipSpelling(StringRef ownership) {
+  if (ownership == "row")
+    return "block_rows";
+  if (ownership == "tiled")
+    return "block_tiles";
+  if (ownership == "ragged")
+    return "block_ragged";
+  return {};
 }
 
 LogicalResult projectRealization(intent::plan::RealizationOp realization) {
@@ -109,17 +126,19 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         axis.getLoc(), axis.getNodeAttr(), axis.getSourceAxisAttr(),
         axis.getRoleAttr(), gpu::stringAttr(builder, *tile));
   }
-  StringRef mapping = indexed->program.getMapping() == "row_strided"
-                          ? StringRef("persistent_rows")
-                          : indexed->program.getMapping();
+  StringRef ownership = ownershipSpelling(indexed->program.getOwnership());
+  if (ownership.empty())
+    return indexed->program.emitOpError(
+        "has no cuTile ownership projection");
   builder.create<plan::ProgramOp>(
       indexed->program.getLoc(), indexed->program.getLoopNodeAttr(),
-      indexed->program.getWorkerAxesAttr(), indexed->program.getTraversalAttr(),
-      gpu::stringAttr(builder, mapping));
+      indexed->program.getWorkerAxesAttr(), gpu::stringAttr(builder, ownership),
+      indexed->program.getTraversalsAttr());
   for (intent::plan::StorageOp storage : indexed->storage)
     builder.create<plan::StorageOp>(storage.getLoc(), storage.getValueAttr(),
                                     gpu::stringAttr(builder, "global"));
-  bool rowStrided = indexed->program.getMapping() == "row_strided";
+  bool rowStrided = indexed->program.getOwnership() == "row" &&
+                    hasTraversal(indexed->program, "persistent");
   for (intent::plan::TransferOp transfer : indexed->transfers) {
     bool load = transfer.getAccess() == "load";
     bool vectorized = llvm::any_of(
@@ -136,7 +155,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         transfer.getLoc(), transfer.getNodeAttr(), transfer.getDomainNodesAttr(),
         gpu::stringAttr(builder, access), transfer.getFillAttr(),
         builder.getBoolAttr(rowStrided ||
-                            (indexed->program.getMapping() == "ragged_stages" &&
+                            (hasTraversal(indexed->program, "staged") &&
                              transfer.getAccess() == "store")),
         transfer.getDeferAttr());
   }
@@ -157,7 +176,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
     FailureOr<StringRef> lowering =
         pointwiseSpelling(pointwise, pointwise.getRole(),
                           pointwise.getResultSpace(),
-                          indexed->program.getMapping());
+                          hasTraversal(indexed->program, "ordered_stream"));
     if (failed(lowering))
       return failure();
     builder.create<plan::PointwiseOp>(
@@ -182,7 +201,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   for (intent::plan::RaggedOp ragged : indexed->ragged)
     builder.create<plan::RaggedOp>(
         ragged.getLoc(), ragged.getNodeAttr(), ragged.getOuterNodeAttr(),
-        ragged.getMemberNodeAttr(), ragged.getTraversalAttr());
+        ragged.getMemberNodesAttr(), ragged.getTraversalAttr());
   for (intent::plan::StageOp stage : indexed->stages)
     builder.create<plan::StageOp>(
         stage.getLoc(), stage.getOrdinalAttr(), stage.getNodeAttr(),

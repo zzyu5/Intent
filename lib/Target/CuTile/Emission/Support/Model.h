@@ -119,7 +119,8 @@ private:
                  unsigned indent = 1);
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
-  bool isRaggedStages();
+  bool hasTraversal(llvm::StringRef traversal);
+  bool usesStagedEmission();
   std::string dtypeName(mlir::Type type, mlir::Operation &consumer);
   std::string makeResultName(mlir::Operation &operation, unsigned index);
   std::string makeRegionArgumentName(mlir::Operation &operation,

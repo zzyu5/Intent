@@ -156,7 +156,7 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     if (operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
         operation.getRegion(0).front().getNumArguments() != 1)
@@ -174,7 +174,8 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       return operation.emitOpError("has no ragged program-axis role");
     return success();
   }
-  if (planIndex.program.getMapping() == "row_stream") {
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "program_rows") {
     if (&operation != programRoot || operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
         operation.getRegion(0).front().getNumArguments() != 1)
@@ -185,7 +186,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     valueNames[operation.getRegion(0).front().getArgument(0)] = "program_index";
     return success();
   }
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     if (&operation != programRoot)
       return operation.emitOpError("is not owned by the resolved program");
     int64_t workerAxis = planIndex.program.getWorkerAxes().front();
@@ -198,7 +199,8 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     line(vectorIndex + " = tl.arange(0, BLOCK_SIZE)");
     return success();
   }
-  if (planIndex.program.getMapping() == "multi_axis_stream") {
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "program_tiles") {
     if (&operation == programRoot) {
       line("pid_program_2 = tl.program_id(axis=" +
            std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
@@ -255,7 +257,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
-  if (planIndex.program.getMapping() == "grid_stride" &&
+  if (hasTraversal("persistent") &&
       &operation == programRoot)
     --indentation;
   return success();
@@ -462,7 +464,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  if (isRaggedStages() && binding &&
+  if (usesStagedEmission() && binding &&
       binding.getLowering() == "tl.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation) || failed(valid) || failed(fill))
@@ -575,7 +577,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     return operation.emitOpError("lacks a Triton contraction binding");
   if (operation.getNumOperands() != 2)
     return operation.emitOpError("Triton contraction requires two operands");
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");

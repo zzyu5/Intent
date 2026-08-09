@@ -38,8 +38,8 @@ def IntentTileLang_ProgramOp : IntentTileLang_Op<"program"> {
   let arguments = (ins
     I64Attr:$loop_node,
     DenseI64ArrayAttr:$worker_axes,
-    StrAttr:$traversal,
-    StrAttr:$mapping
+    StrAttr:$ownership,
+    ArrayAttr:$traversals
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -109,7 +109,7 @@ def IntentTileLang_RaggedOp : IntentTileLang_Op<"ragged"> {
   let arguments = (ins
     I64Attr:$node,
     I64Attr:$outer_node,
-    I64Attr:$member_node,
+    DenseI64ArrayAttr:$member_nodes,
     StrAttr:$traversal
   );
   let results = (outs);

@@ -155,19 +155,20 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   if (failed(axis))
     return failure();
   StringRef role = axis->getRole();
-  StringRef mapping = programMapping;
   if (role == "program_0")
-    valueNames[argument] = (mapping == "persistent_rows" ||
-                            mapping == "row_stream") ? "program_index"
-                           : mapping == "multi_axis_stream"
-                               ? "index_program_0"
-                           : mapping == "ragged_stages" ? "expert"
-                                                         : "bid_m";
+    valueNames[argument] =
+        programOwnership == "block_rows"
+            ? "program_index"
+            : usesStagedEmission()
+                  ? "expert"
+                  : hasTraversal("ordered_stream") ? "index_program_0"
+                                                    : "bid_m";
   else if (role == "program_1")
-    valueNames[argument] = mapping == "multi_axis_stream"
-                               ? "index_program_1"
-                           : mapping == "ragged_stages" ? "member_start"
-                                                         : "bid_n";
+    valueNames[argument] = usesStagedEmission()
+                               ? "member_start"
+                               : hasTraversal("ordered_stream")
+                                     ? "index_program_1"
+                                     : "bid_n";
   else if (role == "program_2")
     valueNames[argument] = "bid_program_2";
   else
@@ -617,7 +618,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return failure();
     return reused->str();
   };
-  if (isRaggedStages() && binding.getLowering() == "T.indirect_gather") {
+  if (usesStagedEmission() && binding.getLowering() == "T.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -806,7 +807,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     warpPolicy = "T.GemmWarpPolicy.FullRow";
   else
     return operation.emitOpError("has no TileLang GEMM warp policy");
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
         binding.getAccumulatorSpace() != "fragment")

@@ -18,6 +18,17 @@ StringAttr string(OpBuilder &builder, StringRef value) {
   return builder.getStringAttr(value);
 }
 
+ArrayAttr strings(OpBuilder &builder, ArrayRef<std::string> values) {
+  SmallVector<Attribute> attributes;
+  for (const std::string &value : values)
+    attributes.push_back(string(builder, value));
+  return builder.getArrayAttr(attributes);
+}
+
+bool hasTraversal(const ScheduleDecision &schedule, StringRef traversal) {
+  return llvm::is_contained(schedule.traversals, traversal);
+}
+
 LogicalResult addHandler(target::OperationHandlerRegistry &registry,
                          StringRef name, target::OperationCallback enter) {
   return registry.add(name,
@@ -134,8 +145,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             builder.create<intent::plan::ProgramOp>(
                 operation.getLoc(), i64(builder, *node),
                 builder.getDenseI64ArrayAttr(schedule.workerAxes),
-                string(builder, schedule.traversal),
-                string(builder, schedule.mapping));
+                string(builder, schedule.ownership),
+                strings(builder, schedule.traversals));
             return success();
           })))
     return failure();
@@ -144,19 +155,25 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           registry, "intent.ragged", [&](Operation &operation) -> LogicalResult {
             auto found = facts.semantics.raggedRelations.find(&operation);
             if (found == facts.semantics.raggedRelations.end() ||
-                found->second.memberDomains.size() != 1)
+                found->second.memberDomains.empty())
               return operation.emitOpError("has no resolved GPU ragged ownership");
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "ragged binding");
             FailureOr<int64_t> outer = target::getNodeID(
                 *found->second.outerDomain, "ragged outer binding");
-            FailureOr<int64_t> member = target::getNodeID(
-                *found->second.memberDomains.front(), "ragged member binding");
-            if (failed(node) || failed(outer) || failed(member))
+            SmallVector<int64_t> members;
+            for (Operation *memberDomain : found->second.memberDomains) {
+              FailureOr<int64_t> member = target::getNodeID(
+                  *memberDomain, "ragged member binding");
+              if (failed(member))
+                return failure();
+              members.push_back(*member);
+            }
+            if (failed(node) || failed(outer))
               return failure();
             builder.create<intent::plan::RaggedOp>(
                 operation.getLoc(), i64(builder, *node), i64(builder, *outer),
-                i64(builder, *member),
+                builder.getDenseI64ArrayAttr(members),
                 string(builder, found->second.indices
                                     ? "expert_offset_ranges"
                                     : "compact_offset_tiles"));
@@ -175,8 +192,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           return user->getName().getStringRef() == "intent.contract";
         });
     bool defer = contractOperand &&
-                 (schedule.mapping == "grouped_2d_tiles" ||
-                  schedule.mapping == "ragged_stages");
+                 (hasTraversal(schedule, "grouped") ||
+                  hasTraversal(schedule, "staged"));
     SmallVector<int64_t> domains;
     for (Operation *domain : facts.semantics.boundaryDomains.lookup(&operation)) {
       FailureOr<int64_t> domainNode =
@@ -266,8 +283,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   i64(builder, reusableOperand(operation)),
                   string(builder,
                          feedsContract ? "contract_operand" : "elementwise"),
-                  builder.getBoolAttr(
-                      feedsContract && schedule.mapping == "ragged_stages"));
+                  builder.getBoolAttr(feedsContract &&
+                                      hasTraversal(schedule, "staged")));
               return success();
             })))
       return failure();
@@ -301,7 +318,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             builder.create<intent::plan::ContractOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, "matrix_multiply"),
-                string(builder, schedule.mapping == "multi_axis_stream"
+                string(builder, hasTraversal(schedule, "ordered_stream")
                                     ? "full_row"
                                     : "square"),
                 string(builder, "f32"), builder.getBoolAttr(false),

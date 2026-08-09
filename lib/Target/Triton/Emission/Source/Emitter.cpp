@@ -78,7 +78,7 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (isRaggedStages())
+  if (usesStagedEmission())
     return prepareRaggedStages();
   return success();
 }
@@ -152,8 +152,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
-  bool multiAxis = planIndex.program.getMapping() == "multi_axis_stream";
-  bool raggedStages = isRaggedStages();
+  bool multiAxis = planIndex.program.getOwnership() == "program_tiles" &&
+                   hasTraversal("ordered_stream");
+  bool raggedStages = usesStagedEmission();
   if ((!multiAxis && !raggedStages &&
        planIndex.program.getWorkerAxes().size() != 1) ||
       ((multiAxis || raggedStages) &&
@@ -210,7 +211,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
         axis.getTile().str();
   }
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     auto program = planIndex.axesByRole.find("program_0");
     auto lane = planIndex.axesByRole.find("lane_0");
     if (program == planIndex.axesByRole.end() ||
@@ -229,7 +230,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (searchSpace)
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
-  } else if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+  } else if (hasTraversal("grouped")) {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
           "grouped tiled program requires a delegated backend tuner");
@@ -248,7 +249,8 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program_0/program_1/reduction_0");
-  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "program_tiles") {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
           "ordered stream requires a delegated backend tuner");
@@ -270,7 +272,8 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program_2/stream_0");
-  } else if (planIndex.program.getMapping() == "row_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "program_rows") {
     if (!searchSpace || !searchIndex.autotune || planIndex.streams.empty())
       return realization.emitOpError(
           "row stream requires stream bindings and a delegated backend tuner");
@@ -307,9 +310,12 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
 
 LogicalResult SourceEmitter::prepareRaggedStages() {
   plan::RaggedOp ragged = planIndex.ragged.front();
+  if (ragged.getMemberNodes().size() != 1)
+    return ragged.emitOpError(
+        "staged emission requires one owned ragged member domain");
   raggedRelation = kernel.nodes.lookup(ragged.getNode());
   raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(ragged.getMemberNode());
+  raggedMember = kernel.nodes.lookup(ragged.getMemberNodes().front());
   if (!raggedRelation ||
       raggedRelation->getName().getStringRef() != "intent.ragged" ||
       !raggedOuter ||
@@ -443,7 +449,7 @@ void SourceEmitter::collectStageValue(Value value, unsigned stage,
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
-  if (!isRaggedStages())
+  if (!usesStagedEmission())
     return true;
   activeStages = operationStages.lookup(&operation);
   return !activeStages.empty();
@@ -460,7 +466,7 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   Value value = operation.getResult(index);
   valueNames[value] = name.str();
   auto outputStage = stageOutputOwners.find(value);
-  if (!isRaggedStages() || outputStage == stageOutputOwners.end())
+  if (!usesStagedEmission() || outputStage == stageOutputOwners.end())
     return;
   unsigned stage = outputStage->second;
   std::string feature = stageFeatureDimensions.lookup(stage);
@@ -474,7 +480,7 @@ void SourceEmitter::emitImports() {
   output << "import torch\n";
   output << "import triton\n";
   output << "import triton.language as tl\n";
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     output << "from triton.runtime import driver\n";
     output << "from intent.runtime.tuning.triton import row_configuration, row_program_count\n";
   }
@@ -495,7 +501,7 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     bool compact =
         planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
     Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
@@ -657,7 +663,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     output << "],\n)\n";
   }
   output << "@triton.jit\n";
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     programIndex = makeRegionArgumentName(*programRoot, 0);
     vectorIndex = makeResultName(*vectorDomain, 0);
     valueNames[programRoot->getRegion(0).front().getArgument(0)] = programIndex;
@@ -713,7 +719,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 }
 
 LogicalResult SourceEmitter::emitWrapper() {
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     bool compact =
         planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
     for (const std::string &body : stageBodies)
@@ -894,7 +900,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << ")\n    return " << merge->argument->name << "\n";
     return success();
   }
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     SmallVector<ABIView *> inputs;
     for (ABIView &view : views)
       if (view.view.getAccess() == "in")
@@ -1112,13 +1118,14 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
-  if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+  if (hasTraversal("grouped")) {
     std::string gridExtent =
         "triton.cdiv(" + roleDimensions.lookup("program_0") +
         ", META['BLOCK_SIZE_M']) * triton.cdiv(" +
         roleDimensions.lookup("program_1") + ", META['BLOCK_SIZE_N'])";
     output << "    grid = lambda META: " << programGrid(gridExtent) << "\n";
-  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "program_tiles") {
     SmallVector<std::string> grid = {"1", "1", "1"};
     int64_t tiledWorker = planIndex.program.getWorkerAxes()[0];
     int64_t outerWorker = planIndex.program.getWorkerAxes()[1];
@@ -1133,7 +1140,8 @@ LogicalResult SourceEmitter::emitWrapper() {
                         roleDimensions.lookup("program_1");
     output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
            << ", " << grid[2] << ")\n";
-  } else if (planIndex.program.getMapping() == "row_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "program_rows") {
     output << "    grid = lambda META: "
            << programGrid(roleDimensions.lookup("program_0")) << "\n";
   } else {
@@ -1328,7 +1336,7 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
                                Operation &consumer) {
   StringRef role = axis.getRole();
   std::string base;
-  if (planIndex.program.getMapping() == "grid_stride") {
+  if (hasTraversal("persistent")) {
     if (role == "program_0")
       return programIndex;
     if (role == "lane_0")
@@ -1337,7 +1345,8 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
         << "has no grid-stride index expression for axis role " << role;
     return failure();
   }
-  if (planIndex.program.getMapping() == "row_stream") {
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "program_rows") {
     if (role == "program_0")
       base = "program_index";
     else if (role == "stream_0")
@@ -1347,7 +1356,8 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
           << "has no row-stream index expression for axis role " << role;
       return failure();
     }
-  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "program_tiles") {
     if (role == "program_0")
       base = "index_program_0";
     else if (role == "program_1")
@@ -1424,7 +1434,7 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
       if (vector)
         ++vectorAxis;
     }
-    StringRef stride = planIndex.program.getMapping() == "grid_stride" &&
+    StringRef stride = hasTraversal("persistent") &&
                                axisNumber == 1
                            ? StringRef("1")
                            : StringRef(view.strides[axisNumber]);
@@ -1468,7 +1478,7 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
     bool vector = axis->getTile() != "one";
     if (!vector)
       continue;
-    bool gridStride = planIndex.program.getMapping() == "grid_stride";
+    bool gridStride = hasTraversal("persistent");
     FailureOr<std::string> extent = gridStride && axis->getRole() == "program_0"
                                         ? FailureOr<std::string>(std::string("n_rows"))
                                     : gridStride && axis->getRole() == "lane_0"
@@ -1600,7 +1610,7 @@ std::string SourceEmitter::programGrid(StringRef extent) {
 }
 
 void SourceEmitter::line(StringRef text) {
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     for (unsigned stage : activeStages)
       stageLine(stage, text, indentation);
     return;
@@ -1608,9 +1618,19 @@ void SourceEmitter::line(StringRef text) {
   output.indent(indentation * 4) << text << "\n";
 }
 
-bool SourceEmitter::isRaggedStages() {
+bool SourceEmitter::hasTraversal(StringRef traversal) {
+  return planIndex.program && llvm::any_of(
+                                  planIndex.program.getTraversals(),
+                                  [&](Attribute attribute) {
+                                    return cast<StringAttr>(attribute).getValue() ==
+                                           traversal;
+                                  });
+}
+
+bool SourceEmitter::usesStagedEmission() {
   return planIndex.program &&
-         planIndex.program.getMapping() == "ragged_stages";
+         planIndex.program.getOwnership() == "program_ragged" &&
+         hasTraversal("staged");
 }
 
 LogicalResult emitRealizedKernelSource(

@@ -156,7 +156,7 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     if (operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
         operation.getRegion(0).front().getNumArguments() != 1)
@@ -174,7 +174,8 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       return operation.emitOpError("has no ragged program-axis role");
     return success();
   }
-  if (planIndex.program.getMapping() == "row_stream") {
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "block_rows") {
     if (&operation != programRoot || operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
         operation.getRegion(0).front().getNumArguments() != 1)
@@ -185,7 +186,8 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     valueNames[operation.getRegion(0).front().getArgument(0)] = "program_index";
     return success();
   }
-  if (planIndex.program.getMapping() == "multi_axis_stream") {
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "block_tiles") {
     if (&operation == programRoot) {
       line("bid_program_2 = ct.bid(" +
            std::to_string(planIndex.program.getWorkerAxes()[0]) + ")");
@@ -223,7 +225,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   if (&operation != programRoot)
     return success();
   int64_t workerAxis = planIndex.program.getWorkerAxes().front();
-  if (planIndex.program.getMapping() == "persistent_rows") {
+  if (hasTraversal("persistent")) {
     line("program_start = ct.bid(" + std::to_string(workerAxis) + ")");
     line("program_step = ct.num_blocks(" + std::to_string(workerAxis) + ")");
     line(vectorIndex + " = ct.arange(TILE_SIZE, dtype=ct.int32)");
@@ -248,8 +250,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
-  if (&operation == programRoot &&
-      planIndex.program.getMapping() == "persistent_rows")
+  if (&operation == programRoot && hasTraversal("persistent"))
     --indentation;
   return success();
 }
@@ -458,7 +459,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  if (isRaggedStages() && binding &&
+  if (usesStagedEmission() && binding &&
       binding.getLowering() == "ct.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation) || failed(valid) || failed(fill))
@@ -575,7 +576,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "ct.mma" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a cuTile contraction binding");
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");

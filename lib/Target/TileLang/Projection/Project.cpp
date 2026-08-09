@@ -3,6 +3,8 @@
 #include "Intent/Target/GPU/Projection/MachinePlan.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 
+#include "llvm/ADT/STLExtras.h"
+
 using namespace mlir;
 
 namespace intent::tilelang {
@@ -45,7 +47,7 @@ StringRef bufferSpace(StringRef space) {
 
 FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
                                        StringRef materialization,
-                                       StringRef mapping) {
+                                       bool orderedStream) {
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -78,8 +80,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
   if (role == "members")
     return StringRef("T.members");
   if (role == "expand_dims")
-    return mapping == "multi_axis_stream" ? StringRef("alias_column")
-                                            : StringRef("expand_dims");
+    return orderedStream ? StringRef("alias_column")
+                         : StringRef("expand_dims");
   if (role == "indirect_gather")
     return StringRef("T.indirect_gather");
   operation->emitOpError("has no TileLang pointwise spelling for role ") << role;
@@ -97,6 +99,22 @@ FailureOr<StringRef> parameterSpelling(Operation *operation, StringRef role) {
     return StringRef("GROUP_SIZE_M");
   operation->emitOpError("has no TileLang tuner parameter for role ") << role;
   return failure();
+}
+
+bool hasTraversal(intent::plan::ProgramOp program, StringRef expected) {
+  return llvm::any_of(program.getTraversals(), [&](Attribute attribute) {
+    return cast<StringAttr>(attribute).getValue() == expected;
+  });
+}
+
+StringRef ownershipSpelling(StringRef ownership) {
+  if (ownership == "row")
+    return "block_rows";
+  if (ownership == "tiled")
+    return "block_tiles";
+  if (ownership == "ragged")
+    return "block_ragged";
+  return {};
 }
 
 LogicalResult projectRealization(intent::plan::RealizationOp realization) {
@@ -123,20 +141,22 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         axis.getLoc(), axis.getNodeAttr(), axis.getSourceAxisAttr(),
         axis.getRoleAttr(), gpu::stringAttr(builder, *tile));
   }
-  StringRef mapping = indexed->program.getMapping() == "row_strided"
-                          ? StringRef("persistent_rows")
-                          : indexed->program.getMapping();
+  StringRef ownership = ownershipSpelling(indexed->program.getOwnership());
+  if (ownership.empty())
+    return indexed->program.emitOpError(
+        "has no TileLang ownership projection");
   builder.create<plan::ProgramOp>(
       indexed->program.getLoc(), indexed->program.getLoopNodeAttr(),
-      indexed->program.getWorkerAxesAttr(), indexed->program.getTraversalAttr(),
-      gpu::stringAttr(builder, mapping));
+      indexed->program.getWorkerAxesAttr(), gpu::stringAttr(builder, ownership),
+      indexed->program.getTraversalsAttr());
   for (intent::plan::StorageOp storage : indexed->storage)
     builder.create<plan::StorageOp>(
         storage.getLoc(), storage.getValueAttr(),
         gpu::stringAttr(builder, bufferSpace(storage.getSpace())));
-  bool rowStrided = indexed->program.getMapping() == "row_strided";
-  bool elementwiseTransfer =
-      indexed->program.getMapping() == "multi_axis_stream";
+  bool rowStrided = indexed->program.getOwnership() == "row" &&
+                    hasTraversal(indexed->program, "persistent");
+  bool elementwiseTransfer = indexed->program.getOwnership() == "tiled" &&
+                             hasTraversal(indexed->program, "ordered_stream");
   for (intent::plan::TransferOp transfer : indexed->transfers) {
     bool load = transfer.getAccess() == "load";
     StringRef access = rowStrided ? (load ? "gather" : "scatter")
@@ -151,7 +171,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
                         elementwiseTransfer ? "parallel_elements" : "bulk_copy"),
         transfer.getFillAttr(),
         builder.getBoolAttr(rowStrided ||
-                            (indexed->program.getMapping() == "ragged_stages" &&
+                            (hasTraversal(indexed->program, "staged") &&
                              transfer.getAccess() == "store")),
         gpu::stringAttr(builder, resultSpace), transfer.getDeferAttr());
   }
@@ -172,7 +192,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   for (intent::plan::PointwiseOp pointwise : indexed->pointwise) {
     FailureOr<StringRef> lowering = pointwiseSpelling(
         pointwise, pointwise.getRole(), pointwise.getMaterialization(),
-        indexed->program.getMapping());
+        hasTraversal(indexed->program, "ordered_stream"));
     StringRef space = bufferSpace(pointwise.getResultSpace());
     if (failed(lowering) || space.empty())
       return failure();
@@ -208,7 +228,7 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
   for (intent::plan::RaggedOp ragged : indexed->ragged)
     builder.create<plan::RaggedOp>(
         ragged.getLoc(), ragged.getNodeAttr(), ragged.getOuterNodeAttr(),
-        ragged.getMemberNodeAttr(), ragged.getTraversalAttr());
+        ragged.getMemberNodesAttr(), ragged.getTraversalAttr());
   for (intent::plan::StageOp stage : indexed->stages)
     builder.create<plan::StageOp>(
         stage.getLoc(), stage.getOrdinalAttr(), stage.getNodeAttr(),

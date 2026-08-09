@@ -76,7 +76,7 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (isRaggedStages())
+  if (usesStagedEmission())
     return prepareRaggedStages();
   return success();
 }
@@ -146,8 +146,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
   if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
     return planIndex.program.emitOpError("does not bind an intent.parallel op");
-  bool multiAxis = planIndex.program.getMapping() == "multi_axis_stream";
-  bool raggedStages = isRaggedStages();
+  bool multiAxis = planIndex.program.getOwnership() == "block_tiles" &&
+                   hasTraversal("ordered_stream");
+  bool raggedStages = usesStagedEmission();
   if ((!multiAxis && !raggedStages &&
        planIndex.program.getWorkerAxes().size() != 1) ||
       ((multiAxis || raggedStages) &&
@@ -205,7 +206,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         axis.getTile().str();
   }
 
-  if (planIndex.program.getMapping() == "persistent_rows") {
+  if (hasTraversal("persistent")) {
     auto program = planIndex.axesByRole.find("program_0");
     auto lane = planIndex.axesByRole.find("lane_0");
     if (program == planIndex.axesByRole.end() ||
@@ -221,7 +222,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         fixedOutput->tensor.getRank() > 2 || searchSpace)
       return realization.emitOpError(
           "fixed persistent rows require one rank-one or rank-two output and no search space");
-  } else if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+  } else if (hasTraversal("grouped")) {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
           "grouped cuTile program requires a delegated backend tuner");
@@ -240,7 +241,8 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (cast<StringAttr>(attribute).getValue() != expected)
         return searchIndex.autotune.emitOpError(
             "key order does not match program/reduction roles");
-  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "block_tiles") {
     if (!searchSpace || !searchIndex.autotune)
       return realization.emitOpError(
           "ordered cuTile stream requires a delegated backend tuner");
@@ -270,7 +272,8 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       if (!physicalDimension)
         kernelConstants.push_back(dimension);
     }
-  } else if (planIndex.program.getMapping() == "row_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "block_rows") {
     if (!searchSpace || !searchIndex.autotune || planIndex.streams.empty())
       return realization.emitOpError(
           "row stream requires stream bindings and a delegated backend tuner");
@@ -307,9 +310,12 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
 
 LogicalResult SourceEmitter::prepareRaggedStages() {
   plan::RaggedOp ragged = planIndex.ragged.front();
+  if (ragged.getMemberNodes().size() != 1)
+    return ragged.emitOpError(
+        "staged emission requires one owned ragged member domain");
   raggedRelation = kernel.nodes.lookup(ragged.getNode());
   raggedOuter = kernel.nodes.lookup(ragged.getOuterNode());
-  raggedMember = kernel.nodes.lookup(ragged.getMemberNode());
+  raggedMember = kernel.nodes.lookup(ragged.getMemberNodes().front());
   if (!raggedRelation ||
       raggedRelation->getName().getStringRef() != "intent.ragged" ||
       !raggedOuter ||
@@ -443,7 +449,7 @@ void SourceEmitter::collectStageValue(Value value, unsigned stage,
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
-  if (!isRaggedStages())
+  if (!usesStagedEmission())
     return true;
   activeStages = operationStages.lookup(&operation);
   return !activeStages.empty();
@@ -460,7 +466,7 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   Value value = operation.getResult(index);
   valueNames[value] = name.str();
   auto outputStage = stageOutputOwners.find(value);
-  if (!isRaggedStages() || outputStage == stageOutputOwners.end())
+  if (!usesStagedEmission() || outputStage == stageOutputOwners.end())
     return;
   line("ct.scatter(" + workspaceNames.lookup(value) +
        ", (safe_member_offsets[:, None], offs_feature[None, :]), " +
@@ -471,7 +477,7 @@ void SourceEmitter::emitImports() {
   output << "import math\n";
   output << "import cuda.tile as ct\n";
   output << "import torch\n";
-  if (planIndex.program.getMapping() == "persistent_rows")
+  if (hasTraversal("persistent"))
     output << "from intent.runtime.tuning.cutile import ROW_OCCUPANCY, row_configuration, row_program_count\n";
   if (searchSpace) {
     output << "from math import ceil\n";
@@ -493,7 +499,7 @@ void SourceEmitter::emitImports() {
 
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     bool compact =
         planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
     Operation *offsetsLoad = raggedRelation->getOperand(2).getDefiningOp();
@@ -610,7 +616,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     }
     return success();
   }
-  if (planIndex.program.getMapping() == "persistent_rows") {
+  if (hasTraversal("persistent")) {
     output << "@ct.kernel(occupancy=ROW_OCCUPANCY)\n";
     programIndex = makeRegionArgumentName(*programRoot, 0);
     vectorIndex = makeResultName(*vectorDomain, 0);
@@ -633,7 +639,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
     emitParameter(scalar.name + ": " + annotation.str());
   }
-  if (planIndex.program.getMapping() == "persistent_rows") {
+  if (hasTraversal("persistent")) {
     for (StringRef parameter : {"N_ROWS: ConstInt", "TILE_SIZE: ConstInt",
                                 "DIM_COLS: ConstInt"})
       emitParameter(parameter);
@@ -663,7 +669,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
 
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     bool compact =
         planIndex.ragged.front().getTraversal() == "compact_offset_tiles";
     SmallVector<ABIView *> inputs;
@@ -873,7 +879,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     return success();
   }
 
-  if (planIndex.program.getMapping() == "persistent_rows") {
+  if (hasTraversal("persistent")) {
     SmallVector<ABIView *> inputs;
     for (ABIView &view : views)
       if (view.view.getAccess() == "in")
@@ -1045,19 +1051,21 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
   output << "            result = exhaustive_search(\n";
   output << "                _CONFIGS,\n                stream,\n";
-  if (planIndex.program.getMapping() == "grouped_2d_tiles") {
+  if (hasTraversal("grouped")) {
     output << "                lambda cfg: (ceil("
            << roleDimensions.lookup("program_0")
            << " / cfg.TILE_SIZE_M) * ceil("
            << roleDimensions.lookup("program_1")
            << " / cfg.TILE_SIZE_N), 1, 1),\n";
-  } else if (planIndex.program.getMapping() == "multi_axis_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "block_tiles") {
     output << "                lambda cfg: (ceil("
            << roleDimensions.lookup("program_2")
            << " / cfg.TILE_SIZE_M), "
            << roleDimensions.lookup("program_0") << " * "
            << roleDimensions.lookup("program_1") << ", 1),\n";
-  } else if (planIndex.program.getMapping() == "row_stream") {
+  } else if (hasTraversal("ordered_stream") &&
+             planIndex.program.getOwnership() == "block_rows") {
     output << "                lambda cfg: ("
            << roleDimensions.lookup("program_0") << ", 1, 1),\n";
   } else {
@@ -1081,12 +1089,13 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
          << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
   output << "    best, tuned_kernel = _TUNE_CACHE[cache_key]\n";
-  if (planIndex.program.getMapping() == "grouped_2d_tiles")
+  if (hasTraversal("grouped"))
     output << "    grid = (ceil(" << roleDimensions.lookup("program_0")
            << " / best.TILE_SIZE_M) * ceil("
            << roleDimensions.lookup("program_1")
            << " / best.TILE_SIZE_N), 1, 1)\n";
-  else if (planIndex.program.getMapping() == "multi_axis_stream")
+  else if (hasTraversal("ordered_stream") &&
+           planIndex.program.getOwnership() == "block_tiles")
     output << "    grid = (ceil(" << roleDimensions.lookup("program_2")
            << " / best.TILE_SIZE_M), "
            << roleDimensions.lookup("program_0") << " * "
@@ -1291,15 +1300,15 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     StringRef role = axis->getRole();
     if (role == "program_0")
       indices.push_back(
-          planIndex.program.getMapping() == "persistent_rows"
+          hasTraversal("persistent")
               ? programIndex
-              : planIndex.program.getMapping() == "row_stream"
+              : planIndex.program.getOwnership() == "block_rows"
                     ? "program_index"
-              : planIndex.program.getMapping() == "multi_axis_stream"
+              : hasTraversal("ordered_stream")
                     ? "index_program_0"
                     : "bid_m");
     else if (role == "program_1")
-      indices.push_back(planIndex.program.getMapping() == "multi_axis_stream"
+      indices.push_back(hasTraversal("ordered_stream")
                             ? "index_program_1"
                             : "bid_n");
     else if (role == "program_2")
@@ -1405,7 +1414,8 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
     else
       extents.push_back(label.getValue().str());
   }
-  if (planIndex.program.getMapping() == "multi_axis_stream" &&
+  if (hasTraversal("ordered_stream") &&
+      planIndex.program.getOwnership() == "block_tiles" &&
       extents.size() == 1 && extents.front() == "TILE_SIZE_M")
     extents.push_back("1");
   std::string result = "(";
@@ -1483,7 +1493,7 @@ std::string SourceEmitter::makeRegionArgumentName(Operation &operation,
 }
 
 void SourceEmitter::line(StringRef text) {
-  if (isRaggedStages()) {
+  if (usesStagedEmission()) {
     for (unsigned stage : activeStages)
       stageLine(stage, text, indentation);
     return;
@@ -1491,9 +1501,19 @@ void SourceEmitter::line(StringRef text) {
   output.indent(indentation * 4) << text << "\n";
 }
 
-bool SourceEmitter::isRaggedStages() {
+bool SourceEmitter::hasTraversal(StringRef traversal) {
+  return planIndex.program && llvm::any_of(
+                                  planIndex.program.getTraversals(),
+                                  [&](Attribute attribute) {
+                                    return cast<StringAttr>(attribute).getValue() ==
+                                           traversal;
+                                  });
+}
+
+bool SourceEmitter::usesStagedEmission() {
   return planIndex.program &&
-         planIndex.program.getMapping() == "ragged_stages";
+         planIndex.program.getOwnership() == "block_ragged" &&
+         hasTraversal("staged");
 }
 
 LogicalResult emitRealizedKernelSource(

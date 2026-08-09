@@ -1,71 +1,50 @@
 # Physical Plan
 
-Physical Plan 是 compiler-owned target realization，不是用户需要填写的 schedule DSL 或 approval contract。
+Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 schedule DSL，也不复制 Kernel IR 中的算法。
 
-## Plan 内容
+## 两类对象
 
-```text
-Extent
-    auto region/subtile binding
-
-Ownership
-    region → program/CTA/thread/task
-    static / grid-stride / persistent / swizzled
-
-Storage
-    register / shared / local / cache / hidden scratch
-
-Layout
-    tensor layout / fragment layout / packed representation
-
-Primitive
-    MMA / tl.dot / T.gemm / ct.mma / vector FMA / target collective
-
-Pipeline
-    prefetch / async copy / stage count / overlap
-
-Boundary
-    predicate / tail loop / padding / vsetvl
-
-Launch
-    grid / worker count / target attributes
-```
-
-Extent、ownership、storage、layout、primitive、pipeline 与 launch 相互耦合，realizer 可以联合生成和搜索候选。Cost model、搜索和剪枝是 compiler implementation，不属于 source semantics。
-
-## Plan IR
-
-Physical Plan 使用 Kernel IR 的稳定 operation/value ID 引用逻辑节点，不复制 source algorithm，也不依赖函数名或变量名识别 kernel：
+`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：
 
 ```text
-intent_plan.plan
-    entry_name
-    target: backend / architecture / device / warp_size
-    extents: node / logical axis / logical extent / tile expression
-    ownership: loop_node / worker_kind / worker_axis / traversal / mapping
-    storage: value_node / storage_space / access_mode
-    layouts: value_node / layout_kind / axis_order
-    primitives: operation_node / primitive_kind / operator / axis / identity
-    pipeline: stage policy / prefetch / async_copy
-    boundaries: extent_node / logical_extent / tail / predicate / load fill
-    launch: loop_node / grid policy / num_warps
+device       算法层可用的机器能力与资源上限
+axis         logical domain → physical role / tile role
+program      ownership + traversals[]
+storage      value → machine storage class
+transfer     access / boundary fill / materialization / defer
+reduction    target-independent reduction role与物理存储
+pointwise    operation role、复用和物化位置
+contract     primitive role、累加语义、转置与 operand storage
+stream       ordered axis、tile、carry storage
+ragged       relation、outer domain、member domains、ragged traversal
+stage        跨 kernel 的物理阶段和 workspace 边界
+atomic       terminal combine mechanism
 ```
 
-这是一份 compiler IR，而不是开放字典。每类 binding 都必须能回指一个存在且种类相符的 Kernel IR 节点；backend emitter 只消费经过 Kernel IR verifier 与 Plan verifier 共同验证的组合。
+`intent_plan.search_space` 保存尚未选择、明确委托给目标后端 tuner 的合法轴和参数角色。Realizer 负责证明候选的结构合法性并给出参数关系；候选值、排序和赢家由 Triton、cuTile 或 TileLang 自带 tuner 决定。源码结构选择不进入 search space。
 
-Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 到 Kernel MLIR 为止；同一 C++ 进程验证组合 MLIR后再交给选定 target emitter。项目中不保留 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
+两类对象不能混用：realization 中不存在“运行时再猜”的字段，search space 也不能改变 ownership、遍历顺序、边界语义或数值语义。
 
-完整 Plan verifier 的长期合法性边界是：
+## 组合式 program 决策
 
-- entry 与 ABI view 集合不变，storage/layout binding 完整覆盖这些 view；
-- extent 的 source region 正是被绑定 loop 的迭代 region；
-- boundary extent 等于 source domain extent，launch realization 完整覆盖该 extent；
-- ownership 与 launch 指向同一个 loop，不能把另一个 region 的 worker identity 注入当前 loop；
-- primitive binding 精确覆盖被实现 loop 内的 target primitive 候选，不能引用 helper 或其他 loop 中同名操作；
-- storage access mode 不弱化 source view 的读写权限，layout 不改变 logical axes；
-- pipeline 不重排违反 effect、ordered 或 state-stream 依赖的操作。
+`intent_plan.program` 把两件正交的事分开保存：
 
-当前首个 stable-softmax verifier 已具体实现其中与该 kernel 有关的部分：ABI/storage/layout 完整覆盖、`M/N` source domain、row-major index relation、primitive def-use/axis/identity、masked boundary、persistent grid-stride ownership，以及 pipeline/launch policy 的一致性。该结构没有 `ordered`、state stream 或可重排 effectful intermediate；包含这些结构的 Plan 当前不会被接受，而不是假装已经完成通用依赖证明。动态 program count 由 translator 按 Plan 的 persistent-occupancy policy 和 JIT resource usage 计算，再以 grid-stride loop 覆盖全部 row extent。
+- `ownership`：哪类 physical program 拥有 logical work，当前 GPU machine schema 为 `row`、`tiled` 或 `ragged`；
+- `traversals[]`：program 内部如何推进，可组合地记录 `persistent`、`grouped`、`ordered_stream`、`staged` 等机制。
+
+因此 row + ordered stream、tiled + ordered stream、ragged + ordered stream 是同一组部件的不同组合，不是三个 kernel 类别。Verifier 检查组合关系：例如 `ordered_stream` 必须有对应 `stream`，`staged` 必须有 stages，ragged ownership 必须有 ragged relation；它不根据 kernel 名称选择模式。
+
+`intent_plan.ragged.member_nodes` 是一个 domain 集合。同一 ragged relation 可以同时约束被 program 拥有的 member domain 与被 ordered stream 遍历的 member domain；是否 owned 或 streamed 由 axis role 和 program/stream binding 决定，而不是由 relation 本身硬编码。
+
+## 稳定引用与验证
+
+Physical Plan 使用 Kernel IR 的稳定 operation/value ID 引用逻辑节点，不依赖函数名、Python 变量名或整-kernel matcher。每个 binding 必须满足三层约束：
+
+- 被引用的 Kernel IR 节点存在且种类相符；
+- machine realization 保持 logical workset、def-use、effect、state 与 ABI；
+- target projection 只使用该表面真实能表达的 realization 子集。
+
+Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 到 canonical Kernel MLIR 为止；项目中没有 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
 
 ## Ownership 与 physical identity
 
@@ -87,37 +66,10 @@ W=\{\text{program / CTA / thread / task}\}
 \operatorname{own}:W\rightarrow\operatorname{Seq}(R)
 \]
 
-因此同一 Kernel IR 可以采用 ordinary grid、grid-stride traversal、persistent worker、grouped swizzle、CPU thread ownership 或 RVV task + strip-mine。
+`program_id`、`ct.bid` 或 `T.Kernel` block binding 是 target surface 对这份 ownership 的拼写，不是 portable source identity。Grouped ordering、persistent traversal 和 ordered state stream 同理：决定在 machine plan 中只做一次，各 surface 只投影与渲染。
 
-`program_id` 是 emitter 对 ownership 的实现，不是 portable source identity。
+## 数值与实现边界
 
-## GEMM 中的 Plan 信息
+Kernel IR 保存数学角色、dtype、累加语义、logical validity、state transition 与 effect。Plan 可以选择 tile、ownership、遍历、storage、target primitive、stage 和合法搜索轴；不能改变 tensor-flow、logical workset、wrapper-visible ABI 或数值角色。
 
-GEMM source 保留 M/N region algorithm、K contraction、source dtype、accumulator 与 epilogue。Plan 保存：
-
-- M/N/K tile；
-- program mapping 与 grouped ordering；
-- worker hierarchy；
-- packing 与 storage；
-- MMA/microkernel 与 fragment layout；
-- pipeline 与 prefetch。
-
-Triton 中的 `BLOCK_SIZE_M/N/K`、`GROUP_SIZE_M`、`num_warps` 与 `num_stages` 都属于这一层。
-
-## 首个 Triton stable-softmax Plan
-
-首个可执行 realization 对应 canonical stable softmax，并产生：
-
-- row extent 每次处理一行，column tile 为 `next_power_of_two(N)`；
-- row loop 由 program axis 0 persistent ownership，并以 `num_programs(0)` grid-stride 遍历；
-- input/output 位于 global storage，保持 row-major logical axes；
-- 两个 reduction、两个 broadcast、subtract、exp 与 divide 分别绑定回 Kernel IR node；
-- column boundary 使用 `column < N` mask，load fill 为 negative infinity，store 使用同一 predicate；
-- stage policy 为 shared-memory threshold 上的 2/4 stages，`num_warps = 8`；
-- grid policy 使用 target resource/occupancy 计算，并限制 program count 不超过 row extent。
-
-Realizer 的共享 C++ analysis 按 operation 数量、region、ABI、index relation 与 def-use 识别 `load → max → broadcast → subtract → exp → sum → broadcast → divide → store`，不检查函数名。它随后采用确定 policy 构造上述 Plan；当前没有候选枚举、搜索或 cost model。该 Plan 只是第一份可执行实例，不代表其他 traversal 或通用 reduction realization 已完成。
-
-## 合法性边界
-
-Plan 可以改变物理树、工作分配、storage 与 target-native floating-point mechanism，并产生正常浮点差异；不能改变 Kernel IR 保存的 tensor-flow、logical workset、state、effect、ABI 或 wrapper-visible partition。
+Layout 推断、寄存器分配、指令选择以及给定参数后的低层流水线尽量委托给下层。某个 surface 中不存在的概念不会为“字段对齐”而被抬到共享 Plan；它要求显式打印的机器决定则必须来自同一份 realization，不能在 emitter 中重新选择。

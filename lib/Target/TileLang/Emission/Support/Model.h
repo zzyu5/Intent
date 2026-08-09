@@ -129,7 +129,8 @@ private:
                          llvm::DenseSet<mlir::Value> &visited);
   void stageLine(unsigned stage, llvm::StringRef text,
                  unsigned indent = 3);
-  bool isRaggedStages();
+  bool hasTraversal(llvm::StringRef traversal);
+  bool usesStagedEmission();
 
   std::string makeResultName(mlir::Operation &operation, unsigned index);
   std::string uniqueName(llvm::StringRef candidate, int64_t node);
@@ -172,7 +173,7 @@ private:
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;
   std::string kernelName;
-  std::string programMapping;
+  std::string programOwnership;
   unsigned indentation = 3;
 };
 

@@ -59,6 +59,13 @@ LogicalResult verifyStringArray(Operation *operation, ArrayAttr values,
   return success();
 }
 
+bool hasString(ArrayAttr values, StringRef expected) {
+  return llvm::any_of(values, [&](Attribute attribute) {
+    auto value = dyn_cast<StringAttr>(attribute);
+    return value && value.getValue() == expected;
+  });
+}
+
 } // namespace
 
 LogicalResult RealizationOp::verify() {
@@ -93,8 +100,10 @@ LogicalResult ProgramOp::verify() {
   for (int64_t axis : getWorkerAxes())
     if (axis < 0 || axis > 2 || !axes.insert(axis).second)
       return emitOpError("worker axes must be unique values in [0, 2]");
-  if (getTraversal().empty() || getMapping().empty())
-    return emitOpError("requires traversal and ownership mapping choices");
+  if (getOwnership().empty() ||
+      failed(verifyStringArray(*this, getTraversals(),
+                               "program traversal component")))
+    return failure();
   return success();
 }
 
@@ -185,9 +194,12 @@ LogicalResult StreamOp::verify() {
 
 LogicalResult RaggedOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
-      failed(requireNode(*this, getOuterNode())) ||
-      failed(requireNode(*this, getMemberNode())))
+      failed(requireNode(*this, getOuterNode())) || getMemberNodes().empty())
     return failure();
+  llvm::DenseSet<int64_t> members;
+  for (int64_t member : getMemberNodes())
+    if (failed(requireNode(*this, member)) || !members.insert(member).second)
+      return emitOpError("member nodes must be unique Kernel IR domains");
   if (getTraversal() != "expert_offset_ranges" &&
       getTraversal() != "compact_offset_tiles")
     return emitOpError("contains an unsupported ragged traversal");
@@ -280,24 +292,43 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   }
   if (devices != 1 || programs != 1)
     return realization.emitOpError("requires one GPU device and one program mapping");
-  if ((program.getMapping() == "multi_axis_stream" ||
-       program.getMapping() == "row_stream") &&
-      streams.empty())
-    return realization.emitOpError("stream mapping requires stream decisions");
-  if (program.getMapping() == "ragged_stages" &&
-      (ragged.empty() || stageOrdinals.empty()))
+  if (program.getOwnership() != "row" && program.getOwnership() != "tiled" &&
+      program.getOwnership() != "ragged")
+    return program.emitOpError("contains an unsupported GPU ownership family");
+  for (Attribute attribute : program.getTraversals()) {
+    StringRef traversal = cast<StringAttr>(attribute).getValue();
+    if (traversal != "persistent" && traversal != "grouped" &&
+        traversal != "ordered_stream" && traversal != "staged")
+      return program.emitOpError("contains an unsupported traversal component");
+  }
+  bool ordered = hasString(program.getTraversals(), "ordered_stream");
+  bool staged = hasString(program.getTraversals(), "staged");
+  if (ordered != !streams.empty())
     return realization.emitOpError(
-        "ragged mapping requires a traversal and explicit stages");
-  if (program.getMapping() != "row_strided" &&
-      program.getMapping() != "grouped_2d_tiles" &&
-      program.getMapping() != "multi_axis_stream" &&
-      program.getMapping() != "row_stream" &&
-      program.getMapping() != "ragged_stages")
-    return program.emitOpError("contains an unsupported GPU ownership mapping");
+        "ordered-stream traversal and stream decisions must appear together");
+  if (staged != !stageOrdinals.empty())
+    return realization.emitOpError(
+        "staged traversal and physical stages must appear together");
+  if ((program.getOwnership() == "ragged") != !ragged.empty())
+    return realization.emitOpError(
+        "ragged ownership and ragged relation decisions must appear together");
+  if (hasString(program.getTraversals(), "persistent") &&
+      program.getOwnership() != "row")
+    return program.emitOpError("persistent traversal requires row ownership");
+  if (hasString(program.getTraversals(), "grouped") &&
+      program.getOwnership() != "tiled")
+    return program.emitOpError("grouped traversal requires tiled ownership");
+  if (staged && program.getOwnership() != "ragged")
+    return program.emitOpError("staged traversal requires ragged ownership");
   for (Operation &operation : realization.getBody().front())
     if (auto stream = dyn_cast<StreamOp>(operation);
         stream && !axes.contains(stream.getAxisNode()))
       return stream.emitOpError("references an unbound stream axis");
+  for (Operation &operation : realization.getBody().front())
+    if (auto relation = dyn_cast<RaggedOp>(operation))
+      for (int64_t member : relation.getMemberNodes())
+        if (!axes.contains(member))
+          return relation.emitOpError("references an unbound ragged member axis");
   return success();
 }
 

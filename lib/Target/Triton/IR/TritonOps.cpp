@@ -36,8 +36,14 @@ LogicalResult verifyStringKeys(Operation *operation, ArrayAttr keys) {
   return success();
 }
 
-StringRef projectedMapping(StringRef mapping) {
-  return mapping == "row_strided" ? StringRef("grid_stride") : mapping;
+StringRef projectedOwnership(StringRef ownership) {
+  if (ownership == "row")
+    return "program_rows";
+  if (ownership == "tiled")
+    return "program_tiles";
+  if (ownership == "ragged")
+    return "program_ragged";
+  return {};
 }
 
 } // namespace
@@ -83,8 +89,18 @@ LogicalResult ProgramOp::verify() {
   for (int64_t axis : getWorkerAxes())
     if (axis < 0 || axis > 2 || !axes.insert(axis).second)
       return emitOpError("program axes must be unique values in [0, 2]");
-  if (getTraversal().empty() || getMapping().empty())
-    return emitOpError("requires traversal and program mapping spellings");
+  if (getOwnership() != "program_rows" && getOwnership() != "program_tiles" &&
+      getOwnership() != "program_ragged")
+    return emitOpError("contains an unsupported Triton ownership spelling");
+  if (getTraversals().empty())
+    return emitOpError("requires program traversal spellings");
+  llvm::StringSet<> traversals;
+  for (Attribute attribute : getTraversals()) {
+    auto traversal = dyn_cast<StringAttr>(attribute);
+    if (!traversal || traversal.getValue().empty() ||
+        !traversals.insert(traversal.getValue()).second)
+      return emitOpError("program traversal spellings must be unique strings");
+  }
   return success();
 }
 
@@ -131,9 +147,11 @@ LogicalResult StreamOp::verify() {
 
 LogicalResult RaggedOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
-      failed(requireNode(*this, getOuterNode())) ||
-      failed(requireNode(*this, getMemberNode())))
+      failed(requireNode(*this, getOuterNode())) || getMemberNodes().empty())
     return failure();
+  for (int64_t member : getMemberNodes())
+    if (failed(requireNode(*this, member)))
+      return failure();
   if (getTraversal() != "expert_offset_ranges" &&
       getTraversal() != "compact_offset_tiles")
     return emitOpError("contains an unsupported Triton ragged spelling");
@@ -240,8 +258,9 @@ LogicalResult intent::triton::plan::verifyTritonRealization(
     return realization.emitOpError("Triton axes do not project the GPU axes");
   if (surfaceProgram.getLoopNode() != machineProgram.getLoopNode() ||
       surfaceProgram.getWorkerAxes() != machineProgram.getWorkerAxes() ||
-      surfaceProgram.getTraversal() != machineProgram.getTraversal() ||
-      surfaceProgram.getMapping() != projectedMapping(machineProgram.getMapping()))
+      surfaceProgram.getTraversals() != machineProgram.getTraversals() ||
+      surfaceProgram.getOwnership() !=
+          projectedOwnership(machineProgram.getOwnership()))
     return surfaceProgram.emitOpError("does not project the GPU program decision");
   return success();
 }
