@@ -667,14 +667,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       failed(valid) || failed(fill))
     return operation.emitOpError("lacks a mechanical cuTile gather binding");
   std::string result = makeResultName(operation, 0);
-  Operation *definition = operation.getOperand(0).getDefiningOp();
-  bool alreadyKeptDimension =
-      target::emission::touchesStateStream(operation) &&
-      (!definition || definition->getName().getStringRef() != "intent.indices");
-  std::string expanded = alreadyKeptDimension
-                             ? source->str()
-                             : source->str() +
-                                   (appendAxis ? "[:, None]" : "[None, :]");
+  std::string expanded =
+      source->str() + (appendAxis ? "[:, None]" : "[None, :]");
   line(result + " = ct.where(" + valid->str() + ", " + expanded + ", " +
        fill->str() + ")");
   bindResult(operation, 0, result);

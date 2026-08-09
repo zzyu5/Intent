@@ -8,6 +8,10 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.backward.layer_norm import FEATURES as BWD_LAYER_FEATURES
+from kernels.backward.layer_norm import ROWS as BWD_LAYER_ROWS
+from kernels.backward.layer_norm import layer_norm_backward_reduce
+from kernels.backward.layer_norm import layer_norm_backward_rows
 from kernels.backward.swiglu import FEATURES as SWIGLU_FEATURES
 from kernels.backward.swiglu import TOKENS as SWIGLU_TOKENS
 from kernels.backward.swiglu import swiglu_backward
@@ -216,6 +220,115 @@ def _run_swiglu_backward(
         print(
             f"{target_name} SwiGLU backward upstream comparison: PASS "
             f"(da/db errors={upstream_errors}, upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
+
+
+def _run_layer_norm_backward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    epsilon = 1.0e-5
+    inverse_features = 1.0 / BWD_LAYER_FEATURES
+    shape = (BWD_LAYER_ROWS, BWD_LAYER_FEATURES)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    dy = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.05
+    weight = torch.randn(
+        (BWD_LAYER_FEATURES,), device="cuda", dtype=torch.bfloat16
+    )
+    bias = torch.randn_like(weight)
+    rows_artifact = intent.compile(
+        layer_norm_backward_rows, target=target, compiler=compiler
+    )
+    reduce_artifact = intent.compile(
+        layer_norm_backward_reduce, target=target, compiler=compiler
+    )
+
+    def generated_pipeline() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dx, dw_partial, db_partial = rows_artifact.run(
+            x, dy, weight, inverse_features, epsilon
+        )
+        dw, db = reduce_artifact.run(dw_partial, db_partial)
+        return dx, dw, db
+
+    x_f32 = x.float()
+    dy_f32 = dy.float()
+    weight_f32 = weight.float()
+    mean = x_f32.mean(dim=1, keepdim=True)
+    centered = x_f32 - mean
+    rstd = torch.rsqrt(centered.square().mean(dim=1, keepdim=True) + epsilon)
+    normalized = centered * rstd
+    weighted_dy = weight_f32 * dy_f32
+    expected = (
+        (
+            (
+                weighted_dy
+                - weighted_dy.mean(dim=1, keepdim=True)
+                - normalized * (weighted_dy * normalized).mean(dim=1, keepdim=True)
+            )
+            * rstd
+        ).to(torch.bfloat16),
+        (dy_f32 * normalized).sum(dim=0),
+        dy_f32.sum(dim=0),
+    )
+    generated = generated_pipeline()
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if any(value > 5.0e-2 for value in errors):
+        raise RuntimeError(
+            f"{target_name} LayerNorm backward numerical comparison failed: {errors}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        generated_pipeline, warmup=3, repetitions=10
+    )
+    upstream_output = (
+        upstream((x, dy, weight, bias, epsilon)) if upstream is not None else None
+    )
+    if upstream_output is not None:
+        if not isinstance(upstream_output, tuple) or len(upstream_output) != 3:
+            raise RuntimeError(
+                f"{target_name} LayerNorm backward upstream did not return three gradients"
+            )
+        upstream_expected = (
+            expected[0],
+            expected[1].to(torch.bfloat16).float(),
+            expected[2].to(torch.bfloat16).float(),
+        )
+        upstream_errors = tuple(
+            (actual - wanted).abs().max().item()
+            for actual, wanted in zip(upstream_output, upstream_expected)
+        )
+        if upstream_errors[0] > 5.0e-2 or any(
+            value > 1.25e-1 for value in upstream_errors[1:]
+        ):
+            raise RuntimeError(
+                f"{target_name} LayerNorm backward upstream comparison failed: "
+                f"{upstream_errors}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream((x, dy, weight, bias, epsilon)),
+            warmup=3,
+            repetitions=10,
+        )
+    print_artifact(rows_artifact, target_name)
+    print_artifact(reduce_artifact, target_name)
+    print(
+        f"{target_name} LayerNorm backward pipeline numerical comparison: PASS "
+        f"(dx/dw/db errors={errors})"
+    )
+    print(
+        f"{target_name} LayerNorm backward pipeline performance: "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_output is None:
+        print(f"{target_name} LayerNorm backward upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} LayerNorm backward upstream comparison: PASS "
+            f"(dx/dw/db errors={upstream_errors}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
             f"upstream_p95={upstream_p95:.4f} ms, "
             f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
         )
@@ -453,6 +566,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "dual_gemm": _run_dual_gemm,
     "grouped_gemm": _run_grouped_gemm,
     "layer_norm": _run_layer_norm,
+    "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
     "rms_norm": _run_rms_norm,

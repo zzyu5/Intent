@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|bf16_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_backward>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|logsumexp|gemm|bf16_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_backward>" >&2
   exit 2
 fi
 
@@ -43,6 +43,9 @@ case "${backend}:${kernel}" in
     ;;
   triton:layer_norm)
     baseline=source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py
+    ;;
+  triton:layer_norm_backward)
+    baseline=source/triton/triton/normalization/layer_norm/05-layer-norm.py
     ;;
   triton:rms_norm)
     baseline=source/triton/liger-kernel/normalization/rms_norm/rms_norm_runtime.py
@@ -117,7 +120,8 @@ case "${backend}:${kernel}" in
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
   triton:bf16_gemm | triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
-  cutile:swiglu_backward | tilelang:layer_norm | tilelang:logsumexp | \
+  cutile:layer_norm_backward | cutile:swiglu_backward | \
+  tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:logsumexp | \
   tilelang:swiglu_backward | \
   triton:varlen_attention | cutile:varlen_attention)
     ;;

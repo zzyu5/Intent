@@ -57,6 +57,37 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "layer_norm_backward":
+        layer_norm = _load_prefix(
+            source_path,
+            297,
+            "layer_norm",
+            "intent_upstream_triton_layer_norm_backward",
+        )
+        state = {}
+
+        def run(arguments):
+            x, dy, weight, bias, epsilon = arguments
+            if not state:
+                state["x"] = x.detach().clone().requires_grad_(True)
+                state["weight"] = weight.detach().clone().requires_grad_(True)
+                state["bias"] = bias.detach().clone().requires_grad_(True)
+                state["y"] = layer_norm(
+                    state["x"],
+                    (x.shape[1],),
+                    state["weight"],
+                    state["bias"],
+                    epsilon,
+                )
+            dx, dw, db = torch.autograd.grad(
+                state["y"],
+                (state["x"], state["weight"], state["bias"]),
+                dy,
+                retain_graph=True,
+            )
+            return dx, dw.float(), db.float()
+
+        return run
     if kernel == "swiglu_backward":
         module = _load_module(source_path, "intent_upstream_triton_swiglu_backward")
 

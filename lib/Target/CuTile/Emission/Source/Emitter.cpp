@@ -1768,9 +1768,6 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
     else
       extents.push_back(label.getValue().str());
   }
-  if (target::emission::touchesStateStream(operation) && extents.size() == 1 &&
-      extents.front() == "TILE_SIZE_M")
-    extents.push_back("1");
   std::string result = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {
     if (index)

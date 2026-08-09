@@ -62,8 +62,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
     } else if (name == "intent.binary") {
       auto logical = user->getAttrOfType<StringAttr>("intent.operator");
       if (logical && logical.getValue() == "multiply" &&
-          padded == PaddedValue::zero && user->getOperand(0) == value &&
-          user->getOperand(1) == value)
+          padded == PaddedValue::zero)
         result = PaddedValue::zero;
       else if (logical && logical.getValue() == "subtract" &&
                user->getOperand(0) == value &&

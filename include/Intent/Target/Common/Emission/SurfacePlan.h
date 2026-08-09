@@ -233,7 +233,7 @@ struct ReductionBinding : Binding<intent::plan::ReductionOp> {
   std::string lowering;
   std::string resultSpace;
   int64_t axis = -1;
-  bool keepDims = true;
+  bool keepDims = false;
 
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getLowering() const { return lowering; }

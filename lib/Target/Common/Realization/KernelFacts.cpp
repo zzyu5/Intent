@@ -104,6 +104,23 @@ FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
   return axis;
 }
 
+LogicalResult bindRegionArgumentAxis(Operation &owner, unsigned argumentIndex,
+                                     Operation &domain, KernelFacts &facts) {
+  auto regions = owner.getAttrOfType<ArrayAttr>("intent.region_argument_nodes");
+  auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
+                                            : ArrayAttr();
+  auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
+                                             : ArrayAttr();
+  auto node = arguments && argumentIndex < arguments.size()
+                  ? dyn_cast<IntegerAttr>(arguments[argumentIndex])
+                  : IntegerAttr();
+  FailureOr<LogicalAxis> axis = axisFromDomain(domain, facts, owner);
+  if (!node || failed(axis))
+    return owner.emitOpError("has no canonical region-axis identity");
+  facts.axisLabels["?region_" + std::to_string(node.getInt()) + "_0"] = *axis;
+  return success();
+}
+
 FailureOr<SmallVector<StringRef>> resultShapeLabels(Operation &operation,
                                                     unsigned resultIndex) {
   auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
@@ -368,6 +385,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                             !facts.partitionDomains.count(source)))
               return operation.emitOpError(
                   "parallel ownership requires a domain or partition");
+            Operation *domain = facts.domainSourceAxes.count(source)
+                                    ? source
+                                    : facts.partitionDomains.lookup(source);
+            if (failed(bindRegionArgumentAxis(operation, 0, *domain, facts)))
+              return failure();
             facts.parallels.push_back(&operation);
             return success();
           })))
@@ -522,9 +544,14 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             std::optional<std::string> fill =
                 feedsContract ? std::optional<std::string>("zero")
                               : inferMaskedLaneFill(operation.getResult(0));
-            if (!fill)
-              return operation.emitOpError(
+            if (!fill) {
+              InFlightDiagnostic diagnostic = operation.emitOpError(
                   "cannot prove a semantics-preserving masked-load fill");
+              if (auto names = operation.getAttrOfType<ArrayAttr>(
+                      "intent.result_names"))
+                diagnostic << " for " << names;
+              return failure();
+            }
             if (failed(analyzeBoundary(
                     operation, facts, *fill)))
               return failure();
@@ -712,6 +739,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     if (!axisDomain || !facts.domainSourceAxes.count(axisDomain))
       return operation.emitOpError(
           "state stream requires a canonical source domain");
+    if (failed(bindRegionArgumentAxis(operation, 0, *axisDomain, facts)))
+      return failure();
     Operation *stopBound = nullptr;
     if (stopIndex) {
       stopBound = operation.getOperand(stopIndex.getInt()).getDefiningOp();
