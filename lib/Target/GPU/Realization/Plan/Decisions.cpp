@@ -49,7 +49,8 @@ FailureOr<Operation *> programRoot(const target::KernelFacts &facts) {
   }
   if (roots.size() != 1) {
     facts.kernel.entry.emitOpError(
-        "GPU realization currently requires one outer program region");
+        "one GPU kernel function must contain exactly one outer program region; "
+        "multiple launches require separate kernel functions");
     return failure();
   }
   return roots.front();
@@ -133,7 +134,7 @@ bool hasRole(ArrayRef<std::string> roles, StringRef role) {
 
 struct AxisChoice {
   Operation *domain = nullptr;
-  Operation *parallel = nullptr;
+  SmallVector<Operation *> parallels;
   SmallVector<std::string> roles;
   bool tiled = false;
   std::string tile;
@@ -146,22 +147,25 @@ struct AxisChoice {
 
 bool hasIndependentLane(const AxisChoice &choice,
                         const target::KernelFacts &facts) {
-  if (!choice.parallel)
+  if (choice.parallels.empty())
     return false;
+  auto isOwnedByChoice = [&](Operation *operation) {
+    return llvm::is_contained(choice.parallels, nearestParallel(operation));
+  };
   auto usable = [&](Operation *domain) {
     return domain != choice.domain && facts.vectorDomains.contains(domain) &&
            !facts.orderedStreamDomains.contains(domain) &&
            !facts.contractionDomains.contains(domain);
   };
   for (const auto &entry : facts.boundaryDomains) {
-    if (nearestParallel(entry.first) != choice.parallel)
+    if (!isOwnedByChoice(entry.first))
       continue;
     if (llvm::any_of(entry.second, usable))
       return true;
   }
   for (const auto &entry : facts.valueAxes) {
     Operation *definition = entry.first.getDefiningOp();
-    if (!definition || nearestParallel(definition) != choice.parallel)
+    if (!definition || !isOwnedByChoice(definition))
       continue;
     if (llvm::any_of(entry.second, [&](const target::LogicalAxis &axis) {
           return usable(axis.domain);
@@ -171,9 +175,10 @@ bool hasIndependentLane(const AxisChoice &choice,
   return false;
 }
 
-bool ownsOrderedStream(Operation *parallel, const target::KernelFacts &facts) {
+bool ownsOrderedStream(const AxisChoice &choice,
+                       const target::KernelFacts &facts) {
   return llvm::any_of(facts.stateStreams, [&](const auto &entry) {
-    return nearestParallel(entry.first) == parallel;
+    return llvm::is_contained(choice.parallels, nearestParallel(entry.first));
   });
 }
 
@@ -213,15 +218,15 @@ assignAxes(const target::KernelFacts &facts) {
   };
 
   int64_t programOrder = 0;
-  llvm::DenseSet<Operation *> seenPrograms;
   for (Operation *parallel : facts.parallels) {
     FailureOr<Operation *> domain = ownedDomain(*parallel, facts);
     if (failed(domain))
       return failure();
-    if (!seenPrograms.insert(*domain).second)
-      continue;
     AxisChoice &choice = ensure(*domain);
-    choice.parallel = parallel;
+    if (!llvm::is_contained(choice.parallels, parallel))
+      choice.parallels.push_back(parallel);
+    if (choice.programOrder)
+      continue;
     choice.programOrder = programOrder++;
     Operation *source = parallel->getOperand(0).getDefiningOp();
     choice.tiled = facts.partitionDomains.count(source) != 0;
@@ -257,7 +262,7 @@ assignAxes(const target::KernelFacts &facts) {
     if (choice.programOrder) {
       if (!choice.tiled) {
         choice.tile = "one";
-      } else if (ownsOrderedStream(choice.parallel, facts)) {
+      } else if (ownsOrderedStream(choice, facts)) {
         choice.tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {
         choice.tile = indexedTile("ragged_member", raggedTile);

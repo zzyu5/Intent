@@ -916,20 +916,23 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         "deferred Triton contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-  if (failed(lhsView) || failed(rhsView))
+  FailureOr<plan::AxisOp> reductionAxis =
+      target::emission::contractionReductionAxis(planIndex, *lhsLoad, *rhsLoad,
+                                                 operation);
+  if (failed(lhsView) || failed(rhsView) || failed(reductionAxis))
     return failure();
 
+  std::string reductionRole = reductionAxis->getRole().str();
+  std::string reductionTile = reductionAxis->getTile().str();
+  std::string reductionOffset = "offs_" + reductionRole;
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)");
   line("for reduction_block in range(0, tl.cdiv(" +
-       roleDimensions.lookup("reduction_0") + ", BLOCK_SIZE_K)):");
+       roleDimensions.lookup(reductionRole) + ", " + reductionTile + ")):");
   ++indentation;
-  line("offs_reduction_0 = reduction_block * BLOCK_SIZE_K + "
-       "tl.arange(0, BLOCK_SIZE_K)");
-  plan::AxisOp reductionAxis = planIndex.axesByRole.lookup("reduction_0");
-  if (!reductionAxis)
-    return operation.emitOpError("has no reduction-axis physical binding");
-  axisIndices[reductionAxis.getNode()] = "offs_reduction_0";
+  line(reductionOffset + " = reduction_block * " + reductionTile +
+       " + tl.arange(0, " + reductionTile + ")");
+  axisIndices[reductionAxis->getNode()] = reductionOffset;
   FailureOr<std::string> lhsPointers =
       emitPointerExpression(*lhsLoad, **lhsView, false);
   FailureOr<std::string> rhsPointers =

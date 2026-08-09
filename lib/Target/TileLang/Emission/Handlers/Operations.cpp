@@ -1200,11 +1200,13 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           "deferred TileLang contraction has inconsistent plan spaces");
     FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
     FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-    plan::AxisOp reductionAxis = planIndex.axesByRole.lookup("reduction_0");
-    if (!reductionAxis)
-      return operation.emitOpError("has no reduction-axis physical binding");
-    axisIndices[reductionAxis.getNode()] =
-        "k_tile * " + reductionAxis.getTile().str();
+    FailureOr<plan::AxisOp> reductionAxis =
+        target::emission::contractionReductionAxis(planIndex, *lhsLoad,
+                                                   *rhsLoad, operation);
+    if (failed(reductionAxis))
+      return failure();
+    axisIndices[reductionAxis->getNode()] =
+        "k_tile * " + reductionAxis->getTile().str();
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad, true);
     FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad, true);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
@@ -1221,8 +1223,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     line(rhs + " = T.alloc_shared(" + *rhsShape + ", " +
          dtypeName((*rhsView)->tensor.getElementType(), *rhsLoad) + ")");
     line("T.clear(" + *result + ")");
-    line("for k_tile in T.Pipelined(T.ceildiv(K, TILE_SIZE_K), "
-         "num_stages=num_stages):");
+    line("for k_tile in T.Pipelined(T.ceildiv(" +
+         roleDimensions.lookup(reductionAxis->getRole()) + ", " +
+         reductionAxis->getTile().str() + "), num_stages=num_stages):");
     ++indentation;
     line("T.copy(" + (*lhsView)->argument->name + "[" + *lhsIndices + "], " +
          lhs + ")");

@@ -593,12 +593,44 @@ void indexAxisRoles(PlanIndex &index) {
       bind("stream_" + std::to_string(ordinal), axis->second);
   }
 
-  for (llvm::StringRef role : {"reduction", "lane"}) {
+  for (llvm::StringRef role : {"reduction", "ragged_member", "lane"}) {
     unsigned ordinal = 0;
     for (AxisBinding axis : axes)
       if (axis.hasRole(role))
         bind(role.str() + "_" + std::to_string(ordinal++), axis);
   }
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<AxisBinding>
+contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
+                         mlir::Operation &rhsLoad,
+                         mlir::Operation &consumer) {
+  mlir::FailureOr<int64_t> lhsNode =
+      target::getNodeID(lhsLoad, "contraction lhs transfer");
+  mlir::FailureOr<int64_t> rhsNode =
+      target::getNodeID(rhsLoad, "contraction rhs transfer");
+  if (mlir::failed(lhsNode) || mlir::failed(rhsNode))
+    return mlir::failure();
+  auto lhs = index.boundaries.find(*lhsNode);
+  auto rhs = index.boundaries.find(*rhsNode);
+  if (lhs == index.boundaries.end() || rhs == index.boundaries.end())
+    return consumer.emitOpError(
+        "has no physical transfer binding for its contraction operands");
+
+  llvm::SmallVector<AxisBinding> candidates;
+  for (const auto &entry : index.axesByRole) {
+    AxisBinding axis = entry.getValue();
+    if (!entry.getKey().starts_with("reduction_") ||
+        !llvm::is_contained(lhs->second.getDomainNodes(), axis.getNode()) ||
+        !llvm::is_contained(rhs->second.getDomainNodes(), axis.getNode()))
+      continue;
+    candidates.push_back(axis);
+  }
+  if (candidates.size() != 1)
+    return consumer.emitOpError(
+        "does not resolve exactly one shared physical reduction axis");
+  return candidates.front();
 }
 
 template <typename PlanIndex>
@@ -730,6 +762,35 @@ mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
             "references a terminal outside its physical operation slice");
     }
   }
+  if (index.stages.empty())
+    return mlir::success();
+
+  mlir::Operation *program =
+      kernel.nodes.lookup(index.program.getLoopNode());
+  if (!program)
+    return index.program.emitOpError("references an unknown program root");
+  auto nestedInProgram = [&](mlir::Operation *operation) {
+    for (mlir::Operation *parent = operation; parent;
+         parent = parent->getParentOp())
+      if (parent == program)
+        return true;
+    return false;
+  };
+  auto requireCovered = [&](const auto &bindings) -> mlir::LogicalResult {
+    for (const auto &entry : bindings) {
+      mlir::Operation *operation = kernel.nodes.lookup(entry.first);
+      if (operation && nestedInProgram(operation) &&
+          operationStages.lookup(operation).empty())
+        return entry.second.emitOpError(
+            "is inside a staged program but absent from every physical stage");
+    }
+    return mlir::success();
+  };
+  if (mlir::failed(requireCovered(index.boundaries)) ||
+      mlir::failed(requireCovered(index.reductions)) ||
+      mlir::failed(requireCovered(index.pointwise)) ||
+      mlir::failed(requireCovered(index.contracts)))
+    return mlir::failure();
   return mlir::success();
 }
 

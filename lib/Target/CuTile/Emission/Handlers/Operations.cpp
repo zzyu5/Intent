@@ -932,10 +932,12 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         "deferred cuTile contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-  plan::AxisOp reductionAxis = planIndex.axesByRole.lookup("reduction_0");
-  if (!reductionAxis)
-    return operation.emitOpError("has no reduction-axis physical binding");
-  axisIndices[reductionAxis.getNode()] = "k_tile";
+  FailureOr<plan::AxisOp> reductionAxis =
+      target::emission::contractionReductionAxis(planIndex, *lhsLoad, *rhsLoad,
+                                                 operation);
+  if (failed(reductionAxis))
+    return failure();
+  axisIndices[reductionAxis->getNode()] = "k_tile";
   FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, true);
   FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, true);
   FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
