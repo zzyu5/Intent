@@ -1,739 +1,437 @@
-# Intent Kernel 编译器：10 Kernel 性能实现与共享 Ragged Realization 报告
+# Intent Kernel 编译器当前能力与缺口审计
 
-## 1. 本报告的范围
+> 审计代码基线：650b710
+>
+> 审计日期：2026-08-09
+>
+> 本文只描述当前实现事实。doc/ 中的文档是目标规范；文档写到了某个能力，不等于代码已经端到端兑现。
 
-本报告覆盖从 4 个代表性 kernel 扩展到 10 个 kernel，并进一步把这 10 个 kernel 的性能与上游高性能源码对齐的阶段。
+## 结论
 
-当前覆盖：
+要求没有全部完成，而且还差很多。
 
-| 结构 | Kernel |
-|---|---|
-| row reduction / normalization | softmax、LayerNorm、RMSNorm、logsumexp |
-| tiled contraction | GEMM、dual GEMM |
-| stateful streaming | attention、online softmax |
-| ragged / irregular | MoE、grouped GEMM |
+当前系统已经不是 stable-softmax 的专用链路：Python frontend 会直接构造唯一的 canonical Intent Kernel MLIR；C++ realizer、Machine Plan、三个 target dialect 和共享 emission driver 已经存在；softmax、contraction、streaming、ragged 等多种前向结构能够生成真实的 Triton、cuTile、TileLang 代码并运行。实现中没有按 kernel 名字分派的 realizer，也没有每个 kernel 一套 emitter。
 
-每个 kernel 都经过同一条编译链：
+但它目前更准确的定位仍是：
 
-```text
-Python Intent DSL
-  → canonical Intent Kernel MLIR
-  → KernelFacts / ScheduleStructure
-  → shared GPU realization + search-space schema
-  → Triton / cuTile / TileLang target projection
-  → per-op source emission
-  → target compiler / target tuner
-  → real CUDA execution
-```
+**一个覆盖多种前向结构的 GPU 算子编译器原型，而不是一门已经完备、可用于训练和部署的算子编译器。**
 
-本轮最终状态：
+最核心的未完成点不是再缺几个示例，而是：
 
-- 10 × 3 = 30 条公开 repro 全部数值 PASS；
-- 三个 provider 都从同一份 canonical Kernel MLIR 和 GPU Plan 发射；
-- realization 与 emission 中没有 kernel 名称分支；
-- grouped GEMM 的 generated 最优 p50 为 `1.3129 ms`，上游三者最优为 `1.4260 ms`；
-- MoE 的 generated 最优 p50 为 `8.8470 ms`，上游三者最优为 `9.3524 ms`；
-- generated 的逐 kernel 赢家分布在 Triton、cuTile、TileLang 三者，而不是一个 provider 包办；
-- 除没有任何等价上游 baseline 的 logsumexp 外，每个 kernel 的最佳 generated 均与最佳 upstream 同水平或更快；
-- 工作树中没有额外 benchmark 结果文件、测试目录或隐藏验证链。
+1. realizer 仍然是有限结构模式的组合，不是可任意叠加的调度部件；
+2. emitter 仍会从 traversal、role 和逻辑维度重新推导部分物理索引，不完全是对已确定物理计划的机械打印；
+3. frontend 和 Kernel IR 的语言面大于当前 GPU 后端真正可 lowering 的子集；
+4. 多输出、optional runtime 参数、训练反向、作者主导的多 kernel 编排、BF16/FP8/量化等基本能力尚未贯通；
+5. 最近的共享实现改动以后，没有重新取得 10 个旧 kernel × 3 个后端的完整数值与性能矩阵，因此不能继续引用此前的 30 项性能结论。
 
-本阶段的两个核心提交是：
+## 一、逐项验收
 
-| Commit | 核心作用 |
-|---|---|
-| `a382e4a` | 保留 ragged stage 的真实 dtype、workspace 和终端写入语义 |
-| `0f9e56c` | 建立 contiguous/indexed canonical ragged 关系，并实现 compact offset-tile traversal |
+状态含义：
 
-## 2. 性能工作的判断方法
+- **完成**：当前代码中已经形成端到端机制，并有实际 repro。
+- **部分完成**：已有真实路径，但只覆盖了需求的一部分，或最新代码没有完成全量复验。
+- **未完成**：只有设计、局部语法或上游参考，尚无端到端能力。
 
-这次没有从 kernel 名称出发添加优化，而是将 generated source 与上游同语言源码并排比较，并把差异分成三类。
-
-### 2.1 算法不同
-
-如果上游本身使用另一种算法，差异应进入 DSL 源码，而不是 target emitter。
-
-本轮最重要的例子是 grouped GEMM。原来的 DSL 实际表达的是：
-
-```text
-任意 member permutation
-  → indirect gather x
-  → per-group contraction
-  → scatter 回原始 row
-```
-
-而三个上游 grouped GEMM 的核心输入都是按 group 连续排列的矩阵段。它们不是同一个算法接口。继续用 permutation workload 比较，会把“真正 grouped GEMM”和“任意 indexed ragged GEMM”混在一起。
-
-因此 grouped GEMM DSL 被改成连续 ragged 段；任意 index-map 语义仍由 MoE 保留。
-
-### 2.2 同一算法，但 generated 缺少结构特化
-
-这类差异应由共享 realization 从结构性质推出。
-
-本轮真正产生决定性收益的是 ragged program grid。原 generated grid 使用：
-
-```text
-group_count × ceil(max_group_rows / M_tile)
-```
-
-每个 group 都按最大 group 的 tile 数启动 program。短 group 多出来的 program 虽然 member mask 全假，仍会进入完整 K-loop，并执行无效 contraction。
-
-当前 grouped GEMM 的 group sizes 为：
-
-```text
-256, 256, 512, 1024, 2048, 2048, 1024, 1024
-```
-
-当 `M_tile = 128` 时：
-
-```text
-旧矩形 grid：8 × ceil(2048 / 128) = 128 个 M tile
-真实有效量：sum(ceil(group_size / 128)) = 64 个 M tile
-```
-
-一半 program 都是空 work。这是从 offsets/ragged ownership 推导出的普遍结构问题，不是 grouped GEMM 名称特例。
-
-### 2.3 结构相同，只是 tile 参数不同
-
-这类差异继续交给 Triton、cuTile、TileLang 自己的 tuner。
-
-realizer 只产生：
-
-```text
-合法 tuning key
-合法参数 role
-源码结构已经确定的 traversal
-```
-
-它不选择 winner，也没有自建 cost model。
-
-## 3. 从 FlashAttention 源码中学到了什么
-
-本轮重点阅读了：
-
-```text
-source/triton/flash-attention/attention/fused/flash_attn_triton.py
-```
-
-它的 forward kernel 集中展示了三类内容。
-
-### 3.1 应属于 DSL 的算法语义
-
-- online maximum / denominator / accumulator recurrence；
-- causal mask；
-- optional vector/matrix bias；
-- mixed QKV/bias dtype；
-- output 与 log-sum-exp 多输出；
-- query/key traversal 的算法次序。
-
-当前非 causal attention DSL 已经表达了 online state stream 与 QK/PV 两次 contraction。当前 repro 使用 `causal=False`，因此 causal control flow、bias 和多输出没有被本轮性能数字覆盖，不能把它们写成已经验证。
-
-### 3.2 应属于 realization 的结构特化
-
-- 已知整除时收紧 boundary；
-- causal 时缩短 stream 上界，不启动必然无效迭代；
-- program ownership 与 stream tile 的组合；
-- 根据结构消除空 work。
-
-本轮曾验证 shape-divisibility boundary specialization 是否能直接改善现有 Triton attention。生成代码数值正确，但 attention p50 从约 `4.95 ms` 变为约 `5.00 ms`。当前 Triton 下层已经能更好地处理原 masked form，因此没有保留会让 emitter 变厚且使性能退化的实现。
-
-最终保留的优化是有明确结构收益的 compact ragged traversal。
-
-### 3.3 不应复制的上游 workaround
-
-- 为编译器 bug 增加的临时 buffer；
-- store 后立即 load 的 workaround；
-- 手工传入的大量 stride/cache-key 参数；
-- 为特定编译器版本凑指令融合的表达重排；
-- 下层应负责的寄存器分配、layout、指令选择。
-
-这些没有上移进 Kernel IR 或 GPU Plan。
-
-## 4. Canonical Ragged 语义为什么必须重做
-
-### 4.1 原来的欠缺
-
-原 `intent.ragged` 固定接收：
-
-```text
-outer + offsets + indices
-```
-
-这里把两件不同的事混在一起：
-
-1. ragged member position 的完整 domain；
-2. position 到真实数据 row 的可选映射。
-
-没有 `indices` 时，原 schema 不仅失去映射，还失去 member 总 extent，因此无法正确表达连续 grouped GEMM。
-
-### 4.2 当前 canonical schema
-
-当前 canonical operation 为：
-
-```text
-intent.ragged(
-  outer,
-  members,
-  offsets,
-  optional indices
-)
-```
-
-四部分语义分别是：
-
-| 字段 | 语义 |
-|---|---|
-| `outer` | group/expert 的逻辑 domain |
-| `members` | 所有 ragged position 的逻辑 universe 和总 extent |
-| `offsets` | 每个 outer entity 拥有的 position 区间 |
-| `indices` | 可选的 position → 数据 row 映射 |
-
-因此同一个 Kernel IR 概念现在能表达两种关系。
-
-MoE 使用 indexed ragged：
-
-```python
-R = member_routes.shape[0]
-groups = I.ragged(
-    outer=I.domain(0, E),
-    members=I.domain(0, R),
-    offsets=route_offsets,
-    indices=member_routes,
-)
-```
-
-grouped GEMM 使用 contiguous ragged：
-
-```python
-R, _ = x.shape
-groups = I.ragged(
-    outer=I.domain(0, G),
-    members=I.domain(0, R),
-    offsets=group_offsets,
-)
-```
-
-`I.members(member_region)` 的语义随 canonical relation 自然确定：
-
-- 有 index map：读取 `indices[position]`；
-- 无 index map：直接使用 `position`。
-
-这不是 target 决定，而是 Kernel IR 的逻辑关系。
-
-### 4.3 Common facts 如何保留这个关系
-
-`RaggedRelationFact` 当前分别保存：
-
-```text
-outerSource
-memberSource
-outerDomain
-offsets
-optional indices
-memberDomains
-```
-
-member physical axis 的 shape symbol 来自显式 `memberSource`，不再由某个 target emitter 猜 `indices.shape[0]`。
-
-这也修正了旧 surface emitter 中把 offsets shape `G_PLUS_1` 错当成 member extent 的可能性。MoE 两 stage workspace 和 grouped GEMM member tile 现在都从同一 canonical `R` 绑定获得。
-
-## 5. Ragged Stage 语义如何被完整保留
-
-### 5.1 Stage dtype 由 Kernel IR 决定
-
-MoE 的第一 stage 为：
-
-```text
-f16 input × f16 W1
-  → f32 accumulator
-  → ReLU
-  → explicit f16 cast
-  → f16 stage workspace
-```
-
-第二 stage 再读取该 f16 workspace，与 f16 W2 contraction，并以 f32 累加。
-
-三后端 emitter 不再使用“第一 stage f16、后续 stage f32”之类的 ordinal 规则，而是读取 canonical contraction operand/result element type。
-
-### 5.2 TileLang allocation 使用物理 tile extent
-
-TileLang 原 ragged path 会把 stage-local fragment/shared allocation 写成完整逻辑 feature `F`，造成远超 tile 的局部 buffer。
-
-当前 stage-local allocation 使用：
-
-```text
-TILE_SIZE_M × TILE_SIZE_N
-TILE_SIZE_M × TILE_SIZE_K
-TILE_SIZE_K × TILE_SIZE_N
-```
-
-逻辑 workspace 的全局 shape 仍为 `R × F`；局部 tile shape 和全局逻辑 shape 不再混淆。
-
-### 5.3 Unique write 与 reduction write 分离
-
-grouped GEMM 的每个连续 member 只写一次，因此 DSL 使用：
-
-```python
-I.scatter_unique(...)
-```
-
-realization 将其变成 direct unique store。三后端分别发射普通 store/scatter，不使用 atomic。
-
-MoE 的多个 route 可以累加到同一 token，因此继续使用：
-
-```python
-I.scatter_reduce(..., combine=I.add)
-```
-
-它才被 GPU Plan 兑现为 relaxed device-scoped atomic add。
-
-这项区分来自 Kernel IR 的写入语义，不来自 kernel 名称。
-
-### 5.4 Stage wrapper 由 terminal semantics 决定输出初始化
-
-- unique store 输出使用 `empty`；
-- additive atomic 输出使用 `zeros`；
-- stage workspace dtype/shape 来自 canonical value；
-- 每个 stage 只 materialize Plan 中明确列出的输入和输出。
-
-## 6. Compact Offset-Tile Traversal
-
-### 6.1 Plan 中只决定一次
-
-GPU Plan 的 `ragged` operation 当前允许两种 traversal：
-
-| Traversal | 适用 canonical relation | 物理意义 |
+| 要求 | 状态 | 当前事实 |
 |---|---|---|
-| `expert_offset_ranges` | indexed ragged | outer-major rectangular offset ranges |
-| `compact_offset_tiles` | contiguous ragged | 把各 group 的有效 member tiles 压成连续 worklist |
+| Python 不保留独立 typed Kernel IR，直接构造 canonical Kernel MLIR | 完成 | Python 只保存解析/lowering 临时状态；唯一语义 IR 是 Intent Kernel MLIR |
+| C++ Kernel IR 有正式 dialect、解析和 verifier | 完成 | Intent ops/types 已注册；进入 realization 和 emission 前会执行 Kernel IR 与 MLIR 验证 |
+| Kernel IR、realization、target emission 职责分层 | 部分完成 | 大边界已经成立；但 emitter 仍重建部分物理索引，realizer 仍带有限模式机 |
+| 三个 GPU 表面语言共享机器决策 | 部分完成 | 共享 Machine Plan 和 driver 已成立；target 叶子没有按 kernel 裂变，但投影层仍承担少量结构推导 |
+| 不按 kernel 名字分支 | 完成 | 分析以 op、region、role、domain 为依据，没有 softmax/gemm/attention/moe 名字分派 |
+| realization 是可自由组合的部件 | 部分完成 | ragged ownership 与 ordered stream 已成功组合一次；多 ragged、多 stream、staged 与 ordered 的一般组合仍不成立 |
+| 10 个前向 kernel 覆盖三个后端 | 部分完成 | 旧阶段曾全部跑通；最新共享改动后只完整复验了 10 个 Triton 路径和 varlen attention 的三个后端 |
+| 变长 attention 同时组合 irregular ownership 与 stateful stream | 部分完成 | 一个 ragged relation + 一个 ordered stream 已端到端跑通；不能据此声称机制可任意叠加 |
+| 作者能表达“只读到当前位置” | 完成 | DSL 的逻辑 I.end 进入 intent.region_end，再进入 stream stop_node，三个后端按同一语义发射 |
+| 非整除形状由编译器处理 | 部分完成 | 已处理 varlen attention 的 sequence 尾块；任意 GEMM M/N/K 尾块、staged contract 尾块和更多 producer 仍未覆盖 |
+| 多输出 | 未完成 | kernel 只能通过 Out/InOut view 写出；没有多结果 return ABI，也没有多输出 repro |
+| optional runtime 参数 | 未完成 | runtime/view 默认参数会被 frontend 拒绝；只允许 constexpr 默认值 |
+| 低秩输入沿另一轴广播 | 部分完成 | frontend/IR/当前 handler 有 broadcast；尚无专门压实该接口形态的端到端 repro |
+| 混合 dtype | 部分完成 | 支持显式 cast 和 reduce/contract 累加 dtype；没有通用类型提升，也没有 f32 bias + f16 QKV 这类接口 repro |
+| 反向 kernel | 未完成 | 当前示例全部是前向 |
+| 作者主导的多 kernel 编排 | 未完成 | 现有多阶段来自编译器内部，不是 DSL 作者显式组织多个 kernel |
+| 自动微分接入 | 未完成 | 没有 autograd 注册或 backward artifact 接口 |
+| BF16、FP8、INT8/INT4 | 未完成 | 当前实际示例只覆盖 f16、f32、i32 |
+| GEMM + bias + activation + residual + output quantization | 部分完成 | 已有 GEMM+ReLU、dual-GEMM gating；完整部署 epilogue 未走通 |
+| 普通 Python 库调用 | 部分完成 | 有 intent.compile、CompiledArtifact 和可调用 runner；仍依赖源码树/PYTHONPATH 和显式外部编译器路径 |
+| 编译产物缓存与 shape specialization key | 部分完成 | 下层各自有局部缓存；没有统一的 Intent 编译/专门化缓存 |
+| 对作者友好的诊断 | 部分完成 | frontend 有源码位置；后端编译失败仍主要暴露原始 subprocess stderr/stdout |
+| 全程数值与性能不退化 | 未完成验收 | 最新代码没有完成全部旧 kernel × 三后端的全量数值和性能复验 |
 
-当前 MoE 仍使用 indexed `expert_offset_ranges`，grouped GEMM 使用 `compact_offset_tiles`。
+## 二、当前架构真正成立的部分
 
-三个 target projector 只复制这一物理决定；surface emitter 不能重新选择 traversal。
+### 2.1 唯一 canonical Kernel MLIR
 
-### 6.2 Compact grid 的计算
+当前 frontend 的主链路是：
 
-wrapper 从 offsets 得到：
+    Python DSL
+      -> AST/constexpr/symbol/shape/region 临时状态
+      -> canonical Intent Kernel MLIR
+      -> C++ Kernel IR verifier
+      -> GPU realization
+      -> Machine Plan
+      -> target realization dialect
+      -> target emitter
+      -> Triton / cuTile / TileLang artifact
 
-```python
-route_lengths = tuple(
-    int(length)
-    for length in (offsets[1:] - offsets[:-1]).tolist()
-)
-```
+Python 中没有另一套长期存在、与 MLIR 平行的 typed Kernel IR。frontend 在构造 MLIR 时完成语义检查和带源码位置的报错。
 
-对于 target tuner 选中的 `M_TILE`：
+Intent dialect 也不是字符串协议。include/Intent/Dialect/Intent/IR/IntentOps.td 注册了控制流、shape、broadcast、reduce、scan、contract、ragged、buffer、atomic、fence、RNG、call/return 等 op；lib/Transforms/VerifyKernelIR.cpp 对函数 metadata、节点 ID、schema、属性和 region 结构做 C++ 侧验证。realization 和 emission driver 都在进入后续阶段前调用 verifier。
 
-```text
-total_route_tiles = sum(ceil(length / M_TILE) for length in route_lengths)
-```
+### 2.2 没有按 kernel 名字裂变
 
-grid 变成：
+当前 realizer 读取的是：
 
-```text
-feature_tiles × total_route_tiles
-```
+- ABI 和 view；
+- domain、parallel、ordered、ragged 等 region 结构；
+- reduce、contract、load/store、pointwise 等 op role；
+- shape、dtype、axis 和逻辑依赖；
+- target capability。
 
-不再使用：
+它不读取 “这是 softmax” 或 “这是 MoE” 来选择整条路径。三个 emitter 也使用 per-op handler，不存在一个 softmax emitter、一个 GEMM emitter、一个 attention emitter。
 
-```text
-feature_tiles × group_count × max_route_tiles
-```
+这证明当前系统已经越过“根据 kernel 名称套模板”的阶段。
 
-`M_TILE` 仍由各 target tuner 选择。realizer 只决定 grid 必须使用 compact worklist，不固定 tile winner。
+### 2.3 三个 target 是一个框架中的叶子
 
-### 6.3 Kernel 内如何恢复 group ownership
+Triton、cuTile、TileLang 都经过相同的 Kernel IR 遍历、共享 realization 框架和 emission driver。各 target dialect 只保存自身确实需要显式表达的字段，没有强行把三门语言做成同一个字段表。
 
-每个 program 收到一个扁平 `route_tile_id`。它扫描很小的 group prefix：
+因此，当前代码已经具备“第四个 GPU 表面语言应新增 capability、target projection、target dialect 和 leaf handler，而不改 kernel 分析入口”的基本形状。
 
-```text
-tile_cursor = 0
-for candidate_group:
-    group_tiles = ceil(group_length / M_TILE)
-    if route_tile_id in [tile_cursor, tile_cursor + group_tiles):
-        expert = candidate_group
-        local_route_tile = route_tile_id - tile_cursor
-    tile_cursor += group_tiles
-```
+## 三、当前架构尚未成立的部分
 
-然后恢复：
+### 3.1 SchedulePolicy 仍是有限模式机
 
-```text
-route_begin
-route_end
-member position
-feature tile
-```
+lib/Target/Common/Realization/SchedulePolicy.cpp 当前不是把 ownership、traversal、streaming、staging 等部件任意组合，而是枚举并约束了几种已知结构：
 
-再执行完全相同的 contraction 和 terminal store。
+- ragged 路径要求恰好一个 ragged relation；
+- ragged ownership 固定为一个 outer member 加一个 tiled member；
+- ordered 路径要求恰好一个 ordered stream domain；
+- ordered-row、ordered-tiled、ordered-ragged 依赖固定的 domain/cardinality 组合；
+- 没有 ordered stream 时，再分别进入 ragged、row、tiled 分支；
+- staged 与 ordered 仍位于互斥分支，而不是两种可叠加机制。
 
-### 6.4 三个 surface 如何打印同一决定
+varlen attention 的价值在于，它证明了“一个 ragged ownership + 一个 ordered stream”可以从现有部件组合出来；但它没有证明：
 
-Triton：
+- 两个 ragged relation 可以共存；
+- 两个独立 stream 可以共存；
+- staged contraction 与 ordered stream 可以组合；
+- ragged、staged、ordered 三者可以同时作用；
+- 新结构只增加 op handler 而完全不改 policy。
 
-- `G` 作为该结构的 `tl.constexpr`；
-- 使用 `tl.program_id`、`tl.load`、`tl.cdiv`、`tl.where`；
-- grid lambda 根据 target config 的 `BLOCK_SIZE_M` 计算 compact tile 数。
+所以“十个 kernel 恰好被已有 mapping 覆盖”不能等价为“调度机制已经可组合”。
 
-cuTile：
+### 3.2 emitter 还不够机械
 
-- group count 和 shape 为 `ConstInt`；
-- 使用 `ct.bid`、`ct.load`、`ct.cdiv`、`ct.where`；
-- exhaustive tuner 的每个 config 使用自己的 `TILE_SIZE_M` 计算 grid。
+三个 emitter 已经不做 kernel 级匹配，但它们仍根据 traversal、role、logical dimension 等信息构造 target 侧索引表达式。换言之，Machine Plan 已经提供了决策的大部分事实，却还没有把所有需要打印的物理事实显式化。
 
-TileLang：
+真正达到目标边界时，target emitter 应只做：
 
-- `ROUTE_LENGTHS` 作为 builder-time tuple；
-- builder 根据每个 autotune config 的 `TILE_SIZE_M` 计算 `total_route_tiles`；
-- TIR body 使用显式 local scalar 和 `T.if_then_else` 恢复 group ownership。
+1. capability 检查；
+2. 已确定概念到目标语法的映射；
+3. 明确委托给下层的部分；
+4. 对不支持的单个 op/概念就地报错。
 
-三条代码的语法不同，但没有三份 traversal 决策。
+当前实现接近这个方向，但尚未完全退化到纯机械投影。
 
-## 7. 共享编译架构没有被性能工作破坏
+### 3.3 frontend/Kernel IR 的语言面大于后端子集
 
-### 7.1 Python frontend
+语言表面和 canonical Kernel IR 已经定义或构造了很多能力，但 GPU realization/emission 只真正支持其中一部分。
 
-Python 仍只负责：
+| 能力 | frontend / Kernel IR | 当前 GPU 端到端 |
+|---|---|---|
+| runtime if / for / while | 已有 | 未形成一般 realization/emission |
+| @intent.fn、call、return | 已有 | helper lowering 有基础；一般 call 不是当前 GPU 主路径 |
+| reduce max/add | 已有 | 支持有限轴结构 |
+| scan | 已有 | 未进入当前 plan/emitter 主子集 |
+| reshape / transpose / broadcast | 已有 | broadcast 有 handler；reshape/transpose 未形成一般后端能力 |
+| record / extract / select | 已有 | 未形成一般后端能力 |
+| buffer / alloc / atomic / fence | 已有 | scatter-add 有特定支持；一般 buffer/atomic/fence 未贯通 |
+| RNG | 已有 | 未贯通 |
+| pointwise | 已有 | 只支持当前登记的一组 unary/binary/compare |
+| contract | 已有 | 当前矩阵收缩路径要求特定 axis 和 f32 累加语义 |
+| ordered state stream | 已有 | 支持当前单 stream 形态 |
+| ragged ownership | 已有 | 支持当前单 ragged relation 形态 |
 
-- Python AST、closure 和 constexpr；
-- dtype、symbol、shape、domain、region 的 lowering 临时状态；
-- 带源码位置的诊断；
-- 直接构造 canonical Intent Kernel MLIR。
+因此，不能用“op 已在 ODS 或 frontend 中存在”来宣称“语言构造已经可以 lowering 到三个后端”。
 
-不存在独立 typed Python Kernel IR，也不存在 Python physical-plan emitter。
+## 四、当前 kernel 与 baseline 覆盖
 
-### 7.2 Common realization
+repro 入口当前接受 11 个 kernel：
 
-共享部分仍按 operation/region facts 工作：
+1. softmax
+2. layer_norm
+3. rms_norm
+4. logsumexp
+5. gemm
+6. dual_gemm
+7. attention
+8. varlen_attention
+9. online_softmax
+10. moe
+11. grouped_gemm
 
-```text
-ABI analysis
-domain and axis provenance
-region structure
-boundary proof
-contraction facts
-state-stream facts
-ragged relation facts
-schedule structure
-physical schedule decision
-Plan construction
-```
+其中前十个是上一阶段的固定前向集合，varlen_attention 是本轮新增的组合性样本。
 
-没有 `if kernel == "moe"` 或 `if kernel == "grouped_gemm"`。
+### 4.1 最新代码上的复验范围
 
-### 7.3 GPU Plan 与 search space
-
-resolved realization 保存：
-
-- ownership；
-- mapping；
-- traversal；
-- storage/residency；
-- boundary semantics；
-- stream/ragged/stage 结构；
-- matrix primitive role；
-- unique/atomic terminal mechanism。
-
-search space 只保存：
-
-```text
-shape-dependent key
-target-neutral parameter roles
-```
-
-候选值、排序和 winner 继续由三个下层 tuner 负责。
-
-### 7.4 Target emission
-
-三个 emitter 仍只负责：
-
-- capability/binding 检查；
-- Plan concept 到目标语法的映射；
-- target 要求显式写出的 buffer/scalar/tile materialization；
-- per-op emission；
-- target runtime 编译与运行接线。
-
-本轮没有新增 kernel 专用 realizer、emitter 或 tool。
-
-## 8. 统一 Repro 与计时口径
-
-公开入口为：
-
-```bash
-./examples/run/repro.sh \
-  <triton|cutile|tilelang> \
-  <softmax|layer_norm|rms_norm|logsumexp|gemm|dual_gemm|attention|online_softmax|moe|grouped_gemm>
-```
-
-每条命令都会：
-
-1. 从 DSL 重新 lower canonical MLIR；
-2. 调用唯一 C++ 工具 `intent-compile`；
-3. 构造 shared GPU realization；
-4. 投影并打印 target source；
-5. 由对应 target 环境编译/JIT；
-6. 实际 launch CUDA work；
-7. 对 generated、upstream 和 PyTorch reference；
-8. 输出数值误差与 p50/p95。
-
-公共 benchmark 使用 CUDA Events：
-
-- 普通 kernel：25 次 warmup、100 次采样；
-- MoE：5 次 warmup、20 次采样；
-- p50/p95 是 GPU event elapsed time 的分位数；
-- 初次源码生成、JIT 和 autotune 不在稳定采样中；
-- callable 内排入 GPU stream 的额外 gather、cat、index-add、merge 会被计入；
-- Python/CPU wall-clock 开销不会被 CUDA Events 完整反映。
-
-所以这些数字是 wrapper 所排入 GPU 的工作时间，不应一概解释为单一 kernel body 时间。
-
-## 9. 30 条数值结果
-
-下表为 generated 与 PyTorch reference 的最大绝对误差。
-
-| Kernel | Triton | cuTile | TileLang |
+| 范围 | Triton | cuTile | TileLang |
 |---|---:|---:|---:|
-| softmax | `2.7939677e-09` | `1.8626451e-09` | `2.7939677e-09` |
-| LayerNorm | `1.9073486e-06` | `1.9073486e-06` | `2.8610229e-06` |
-| RMSNorm | `2.8610229e-06` | `1.9073486e-06` | `1.9073486e-06` |
-| logsumexp | `9.5367432e-07` | `9.5367432e-07` | `9.5367432e-07` |
-| GEMM | `0.0` | `0.0` | `0.0` |
-| dual GEMM | `7.8125e-03` | `7.8125e-03` | `7.8125e-03` |
-| attention | `3.0517578e-05` | `3.0517578e-05` | `3.0517578e-05` |
-| online softmax | `3.7252903e-09` | `1.8626451e-09` | `1.8626451e-09` |
-| MoE | `9.0594403e-06` | `9.0594403e-06` | `9.0594403e-06` |
-| grouped GEMM | `1.9679070e-03` | `1.9679070e-03` | `1.9679070e-03` |
+| 原十个 kernel 数值复验 | 最新代码已通过 | 最近共享改动后未全量重跑 | 最近共享改动后未全量重跑 |
+| varlen attention，causal=False | 通过 | 通过 | 通过 |
+| varlen attention，causal=True | 通过 | 通过 | 通过 |
+| 原十个 kernel 的最新完整性能矩阵 | 未重新取得 | 未重新取得 | 未重新取得 |
 
-结果为 30/30 PASS。
+此前报告中的 30 项时延、赢家和比值来自更早代码状态。它们可以证明当时三条路径能运行，但不能作为 650b710 的当前性能验收结果。
 
-dual GEMM、MoE、grouped GEMM 最终包含 f16 输出或 f16 stage handoff，因此误差尺度不能与全 f32 row reduction 直接比较。
+### 4.2 上游 baseline 的真实性
 
-## 10. 完整性能矩阵
+“生成代码可运行”和“存在公平的上游 baseline”是两件事。当前 baseline 状态如下：
 
-表中每项为：
+| kernel | 上游 baseline | 比较限制 |
+|---|---|---|
+| softmax | Triton / cuTile / TileLang | 三者都有直接参考 |
+| layer_norm | Triton / cuTile | TileLang 缺失 |
+| rms_norm | Triton / TileLang | cuTile 缺失 |
+| logsumexp | 无 | 只能做 reference 数值校验 |
+| gemm | Triton / cuTile / TileLang | 三者都有直接参考 |
+| dual_gemm | 三者都有 | 上游是组合 baseline，不完全等同单个融合 kernel |
+| attention | 三者都有 | 算法、外层包装和计时边界需要逐项核对 |
+| online_softmax | 三者都有 | 存在算法结构不完全一致的情况 |
+| moe | 三者都有 | 上游常含排序、分组、多 kernel 或 wrapper，不能直接把比值当单 kernel 结论 |
+| grouped_gemm | 三者都有 | adapter 和输入组织可能不同 |
+| varlen_attention | 仅 TileLang causal=True | Triton/cuTile 没有当前可比上游；causal=False 也无上游数值 |
 
-```text
-generated p50/p95；upstream p50/p95
-```
+没有上游 baseline 不表示生成 kernel 不可运行，只表示不能得出性能对齐结论。
 
-单位均为毫秒。`—` 表示当前 source 中没有等价 upstream baseline。
+## 五、本轮 varlen attention 到底证明了什么
 
-| Kernel | Triton | cuTile | TileLang |
-|---|---:|---:|---:|
-| softmax | `0.3540/0.3569；0.3558/0.3581` | `0.3579/0.3602；0.3580/0.3601` | `0.3492/0.3519；0.3638/0.3676` |
-| LayerNorm | `0.1758/0.1778；0.1725/0.1737` | `0.1799/0.1821；0.3427/0.3455` | `0.1739/0.1758；—` |
-| RMSNorm | `0.1768/0.1796；0.1747/0.1785` | `0.1799/0.1806；—` | `0.1737/0.1771；0.3499/0.3508` |
-| logsumexp | `0.1635/0.1642；—` | `0.1696/0.1708；—` | `0.1614/0.1616；—` |
-| GEMM | `2.1216/2.1244；2.1060/2.1101` | `2.3088/2.3127；2.2966/2.3057` | `2.1265/2.1421；2.3651/2.3729` |
-| dual GEMM | `0.6977/0.6986；0.7740/0.7755` | `0.7205/0.7211；0.8092/0.8107` | `0.7349/0.7356；0.9212/0.9241` |
-| attention | `4.9558/4.9599；4.9766/4.9845` | `5.0011/5.0130；66.7623/71.0124` | `4.8971/4.9087；6.6958/6.7171` |
-| online softmax | `0.3826/0.3860；0.3560/0.3567` | `0.3499/0.3526；0.3580/0.3601` | `0.3806/0.3828；0.3649/0.3668` |
-| MoE | `8.8470/8.8823；10.2980/10.3131` | `10.2704/10.3705；9.6117/9.6193` | `11.7792/11.8270；9.3524/9.3619` |
-| grouped GEMM | `1.3129/1.3175；1.8848/1.9239` | `1.4552/1.4619；1.8720/1.8815` | `1.3756/1.3852；1.4260/1.4314` |
+### 5.1 两种已有机制确实组合了一次
 
-## 11. 每个 Kernel 的跨 Provider 最优值
+varlen attention 同时需要：
 
-最佳值按 p50 选择。
+- ragged ownership：不同 sequence 的 token 区间不规则；
+- ordered state stream：沿 key block 推进 online-softmax 状态；
+- logical read stop：causal 情况下只读到当前 query block 可见的位置；
+- 非整除尾块：每条 sequence 的长度不是 BLOCK_SIZE_K 的整数倍。
 
-| Kernel | 最佳 generated | 最佳 upstream | generated / upstream | 结论 |
-|---|---:|---:|---:|---|
-| softmax | TileLang `0.3492` | Triton `0.3558` | `0.9815×` | generated 更快约 1.9% |
-| LayerNorm | TileLang `0.1739` | Triton `0.1725` | `1.0081×` | 同一水平，generated 慢约 0.8% |
-| RMSNorm | TileLang `0.1737` | Triton `0.1747` | `0.9943×` | generated 更快约 0.6% |
-| logsumexp | TileLang `0.1614` | — | — | 无 upstream，不能给相对结论 |
-| GEMM | Triton `2.1216` | Triton `2.1060` | `1.0074×` | 同一水平，generated 慢约 0.7% |
-| dual GEMM | Triton `0.6977` | Triton `0.7740` | `0.9014×` | generated 更快约 9.9% |
-| attention | TileLang `4.8971` | Triton `4.9766` | `0.9840×` | generated 更快约 1.6% |
-| online softmax | cuTile `0.3499` | Triton `0.3560` | `0.9829×` | generated 更快约 1.7% |
-| MoE | Triton `8.8470` | TileLang `9.3524` | `0.9460×` | generated 更快约 5.4% |
-| grouped GEMM | Triton `1.3129` | TileLang `1.4260` | `0.9207×` | generated 更快约 7.9% |
+这不是新增一个 “varlen_attention schedule”。它复用了现有 ragged relation、ordered stream、state、contract、reduce 和 mask/padding 概念，因而是当前架构通用性的一次真实正证。
 
-generated 赢家分布：
+### 5.2 causal 上界来自作者语义，不是 kernel 猜测
 
-| Provider | 赢得的 kernel |
-|---|---|
-| Triton | GEMM、dual GEMM、MoE、grouped GEMM |
-| cuTile | online softmax |
-| TileLang | softmax、LayerNorm、RMSNorm、logsumexp、attention |
+DSL 用 I.end 表达逻辑读取终点。它被 lowering 为 intent.region_end，realizer 将其绑定到 stream stop_node，Triton 投影后的循环上界为：
 
-这说明三条 surface 不是只做到“都能运行”；下层工具的不同强项确实进入了最终结果。
+    range(
+        0,
+        tl.cdiv(
+            tl.minimum((query_block + 1) * BLOCK_SIZE_Q, sequence_length),
+            BLOCK_SIZE_K,
+        ),
+    )
 
-## 12. 两个共享机制的实际收益
+它与上游 flash_attn_triton.py 中“把 causal key 循环上界收紧到当前 query 可见范围”的结构相同。无效的 key block 不会启动，而不是启动后只靠 mask 丢弃。
 
-### 12.1 Ragged stage semantics 对 MoE 的收益
+这项能力属于作者的算法陈述：作者知道读取范围，编译器负责把它保持到物理循环。
 
-相对于上一份报告中的 generated p50：
+### 5.3 非整除尾块的当前覆盖
 
-| Provider | 旧值 | 当前值 | 降低 |
-|---|---:|---:|---:|
-| Triton | `13.0976` | `8.8470` | 约 32.5% |
-| cuTile | `16.1568` | `10.2704` | 约 36.4% |
-| TileLang | `21.6398` | `11.7792` | 约 45.6% |
+本轮输入 sequence lengths 为：
 
-收益来自正确的 stage dtype handoff、tile-local allocation、workspace shape 和 terminal write 语义，而不是 MoE 专用 emitter。
+    [4093, 3961, 3833, 3701, 3571, 3449, 3319, 3187]
 
-### 12.2 Compact traversal 对连续 grouped GEMM 的收益
+总 token 数 29114，所有 sequence length 都不能被 64 整除。三个后端实际走过 packed Q/K 的 ragged 尾块以及 softmax/PV 的有效性约束。
 
-在 canonical contiguous grouped GEMM 已经跑通、但尚未加入 compact traversal 时，generated p50 为：
+当前 Machine Plan 中的 intent_plan.padding 不是 target emitter 临时猜 mask，而是：
 
-```text
-Triton  2.3570 ms
-cuTile  2.6591 ms
-TileLang 2.4847 ms
-```
+1. 从逻辑 iteration domain 得到有效区间；
+2. 把有效性绑定到产生该值的 producer；
+3. 在 producer 处融合 predicate；
+4. 按消费语义选择填充值；
+5. 三个 target 只投影同一 padding 决策。
 
-加入 compact traversal 后：
+reduce max 使用负无穷填充，add/contract 的无效贡献使用零填充。
 
-| Provider | rectangular grid | compact grid | 降低 |
-|---|---:|---:|---:|
-| Triton | `2.3570` | `1.3129` | 约 44.3% |
-| cuTile | `2.6591` | `1.4552` | 约 45.3% |
-| TileLang | `2.4847` | `1.3756` | 约 44.6% |
+但当前 padding 机制仍然很窄：
 
-三条路径同时获得约 44%–45% 的收益，符合“同一个机器决策只做一次”的预期。
+- 只会物化到 binary 或 mask producer；
+- 只支持 zero 和 negative-infinity 两种 fill；
+- staged contract 暂时跳过；
+- block argument、load、unary、broadcast、contract、reduce、gather 等 producer 不能普遍承接 padding；
+- 本次 head dimension 为 128，收缩维仍是整数倍；
+- 没有证明任意 GEMM M/N/K 尾块。
 
-## 13. Baseline 的来源与公平性边界
+所以它证明的是“真实的 ragged sequence 尾块路径”，不是“一般非整除形状已经解决”。
 
-| Kernel | Triton baseline | cuTile baseline | TileLang baseline | 口径说明 |
-|---|---|---|---|---|
-| softmax | standalone fused softmax | standalone softmax | online-softmax source adapter | 接近等价 |
-| LayerNorm | FlashAttention LayerNorm | NVIDIA cuTile LayerNorm | unavailable | TileLang 无 baseline |
-| RMSNorm | Liger Triton RMSNorm | unavailable | normalization kernel + 外部 weight multiply | TileLang 是组合 baseline |
-| logsumexp | unavailable | unavailable | unavailable | 只能报告 generated |
-| GEMM | standalone matmul | standalone matmul | standalone matmul | 接近等价 |
-| dual GEMM | 两次 matmul + epilogue | 同类组合 | 同类组合 | generated 是 fused kernel，fusion 粒度不同 |
-| attention | fused attention | FMHA wrapper | TileLang MHA | cuTile wrapper 开销污染严重 |
-| online softmax | fused/整行 softmax | softmax | online-softmax adapter | 算法结构不完全一致 |
-| MoE | grouped GEMM 组合 + merge | fused-MoE 组合 | grouped GEMM 组合 + merge | 不是统一的 standalone kernel 边界 |
-| grouped GEMM | list views + grouped kernel + cat | list views + grouped kernel + cat | packed contiguous A + offsets kernel | TileLang 最接近 canonical contiguous ABI |
+### 5.4 当前可引用的实测数据
 
-必须保留的解释边界：
+输入是 8 条变长 sequence、总 token 29114、head dimension 128。以下是 650b710 上当前 varlen attention 的真实结果：
 
-1. cuTile attention upstream p50 为 `66.7623 ms`，主要受 source wrapper 影响，不能解释为 generated kernel 快 13 倍；
-2. dual GEMM generated 把两个 contraction 和 epilogue 融合，baseline 是两个上游调用的组合；
-3. online softmax 的两遍 state-stream 算法与部分整行 baseline 不相同；
-4. MoE baseline 的排序、分组、多个 kernel 和 merge 边界在三个 provider 中不同；
-5. grouped GEMM 当前算法已统一为 contiguous ragged，但 Triton/cuTile 的上游 API 返回 matrix list，因此仍需要 `torch.cat` 适配；
-6. logsumexp 三个 provider 都没有等价上游 source，不能用 PyTorch reference 代替“高性能 baseline”做性能结论。
+| provider | causal | 数值 | generated p50 / p95 | upstream p50 / p95 |
+|---|---:|---|---:|---:|
+| Triton | False | PASS，max error 3.0518e-05 | 0.4260 / 0.4312 ms | 无 |
+| Triton | True | PASS，max error 1.2207e-04 | 0.3211 / 0.3262 ms | 无 |
+| cuTile | False | PASS | 0.3820 / 0.3879 ms | 无 |
+| cuTile | True | PASS | 0.2860 / 0.2978 ms | 无 |
+| TileLang | False | PASS | 0.4883 / 0.4992 ms | 无 |
+| TileLang | True | PASS，max error 1.2207e-04 | 0.3476 / 0.3550 ms | 0.2919 / 0.3037 ms |
 
-当前 unavailable 的 5 个组合是：
+唯一可做直接上游比较的 TileLang causal=True 中，generated/upstream p50 为 1.1908，即当前生成实现慢约 19.08%。它已经处于相近量级，但尚未达到“同水平或更好”。
 
-```text
-Triton  + logsumexp
-cuTile  + RMSNorm
-cuTile  + logsumexp
-TileLang + LayerNorm
-TileLang + logsumexp
-```
+## 六、为什么离“能用的算子编译器”还远
 
-## 14. 为什么这些结果证明编译器在发射
+### 6.1 训练链路为空
 
-### 14.1 Kernel IR 仍是唯一算法 IR
+当前没有：
 
-normalization、contraction、stream、ragged 的算法差异都在 DSL 与 canonical Kernel MLIR 中表达。Python 没有第二份 typed kernel graph，target emitter 也不识别 kernel 名称。
+- 任意一个 backward kernel；
+- 由作者陈述的多 kernel backward orchestration；
+- 跨并行边界的归约编排；
+- recompute 与 saved intermediate 的接口；
+- autograd 注册；
+- forward artifact 与 backward artifact 的连接。
 
-### 14.2 物理机制由 facts 组合产生
+source 中已有可对照的 FlashAttention backward、LayerNorm backward、SiLU-and-mul backward、split-K reduce、fused add RMSNorm backward 等上游实现。它们目前只是参考源，尚未变成 DSL 和编译器能力。
 
-| 结构事实 | Shared physical mechanism |
-|---|---|
-| one program + one vector domain | persistent row-strided mapping |
-| two tiled program axes + contraction axis | grouped 2D tile mapping |
-| query ownership + ordered contraction stream | multi-axis stream |
-| row ownership + ordered state stream | row stream |
-| indexed ragged + contraction stages | expert offset ranges |
-| contiguous ragged + contraction stages | compact offset tiles |
+### 6.2 ABI 还不够表达真实算子
 
-这些是结构判定，不是 kernel 枚举。
+当前 kernel 不允许返回 SSA/Python 值，写出依赖 Out/InOut view。这个模型可以继续承载多个输出 buffer，但代码尚未把“一个 kernel 同时写 output 与 log-sum-exp”压成正式 repro。
 
-### 14.3 新增机制没有新增 kernel 专用文件
+runtime tensor 参数不能带默认值，因此无法自然表达：
 
-本轮修改发生在已有的：
+- bias=None；
+- residual 可选；
+- 某种配置下才存在的 scale/metadata；
+- 向量 bias 与矩阵 bias 两种 ABI。
 
-```text
-frontend lowering
-canonical Intent op schema
-common KernelFacts
-GPU Plan build
-target ragged dialect verifier
-三个既有 source emitter 的 ragged concept spelling
-统一 repro adapter
-```
+constexpr 默认值已经支持，但它不能替代 runtime optional ABI。
 
-没有产生：
+### 6.3 dtype 基本盘缺失
 
-```text
-GroupedGemmRealizer.cpp
-MoeEmitter.cpp
-FlashAttentionMatcher.cpp
-```
+当前示例的实际 dtype 是 f16、f32、i32。训练常用 BF16，推理常用 FP8、INT8、INT4 和混合 scale/zero-point metadata，这些均未端到端进入 DSL、Kernel IR、realizer、target capability、emitter 和 runner。
 
-### 14.4 第五个同类 kernel 的验收方式仍成立
+已有 explicit cast 和 accumulation dtype 只是必要基础，不等于具备混合精度算子能力。
 
-再增加一个 kernel 时：
+### 6.4 部署 epilogue 只覆盖了片段
 
-- realization/emission 不应新增 kernel 文件；
-- 只有在出现新 op 或新物理 concept 时增加 handler/capability；
-- 若只是已有 domain、stream、contract、ragged、store 的新组合，应自然走现有路径。
+GEMM+ReLU 和 dual-GEMM gating 已证明同一调度中可以容纳收缩与融合点运算，但还没有覆盖真正部署常见的：
 
-## 15. 当前准确边界
+    GEMM -> bias -> activation -> residual -> output quantization
 
-| 边界 | 当前状态 |
-|---|---|
-| causal attention | Kernel DSL 中存在相关算法表达，但当前 10×3 repro 固定 `causal=False`，未形成完整性能闭环 |
-| attention bias / LSE 多输出 | 从上游源码确认是需要的语言能力，当前 benchmark kernel 尚未要求，未提前造接口 |
-| 多 ragged relation | facts/Plan 容器可索引多个；当前 GPU ragged staging 明确接受一个 canonical relation |
-| indexed ragged compact traversal | 当前 compact 机制由 contiguous relation 触发；indexed MoE 保持 expert-offset traversal |
-| provider-local MoE parity | 跨 provider 最佳 generated 已快于最佳 upstream，但 cuTile/TileLang generated 仍慢于各自 provider baseline |
-| logsumexp baseline | 三个 provider 都缺少 standalone source，因此只有 generated/reference 数据 |
-| CPU / RVV | 当前报告只覆盖 GPU 和三个 GPU surface |
-| layout / register / instruction selection | 继续委托给下层 compiler，不在上层复制 |
-| cost model | 不存在；winner 由目标 tuner 选择 |
+这里会同时压到不同 rank 输入、广播、混合 dtype、量化参数和输出存储语义，当前尚无完整路径。
 
-## 16. 最小复现
+### 6.5 还不是正常可安装、可缓存、可接框架的库
 
-任意单条：
+现在已经有可导入的 Python API、intent.compile、CompiledArtifact、launcher 和 callable runner；这比只有 shell repro 更进一步。
 
-```bash
-./examples/run/repro.sh triton grouped_gemm
-./examples/run/repro.sh cutile moe
-./examples/run/repro.sh tilelang attention
-```
+但仍缺：
 
-完整矩阵的合法 kernel 名称为：
+- 标准 Python packaging/install 入口；
+- 统一的 artifact cache；
+- 明确的 shape/dtype/constexpr/target specialization key；
+- framework/custom-op/autograd 接入；
+- cuTile、TileLang 与 Triton 对等的后端 IR/编译信息采集；
+- 将 backend 原始错误转换为 DSL 作者可理解诊断的边界。
 
-```text
-softmax
-layer_norm
-rms_norm
-logsumexp
-gemm
-dual_gemm
-attention
-online_softmax
-moe
-grouped_gemm
-```
+各下层自己的 JIT/tuner cache 不能替代 Intent 编译器层的 artifact cache。
 
-每条命令都从 DSL 重新生成目标代码并实际运行，没有 test 目录、pytest fixture 或预生成结果兜底。
+## 七、当前最准确的完成边界
 
-## 17. 最终结论
+可以确认已经完成的是：
 
-这一阶段真正形成的不是 10 份 kernel 模板，而是一组能被不同算法组合的编译机制：
+1. Python frontend 直接构造 canonical Intent Kernel MLIR；
+2. 正式 Intent dialect、C++ verifier、Machine Plan 和三 target dialect；
+3. 不依赖 kernel 名字的 per-op realization/emission 主框架；
+4. 10 种前向结构曾经在三个 GPU 表面语言上端到端运行；
+5. varlen attention 把单 ragged ownership、单 ordered stream、logical stop 和 sequence tail 组合起来；
+6. causal loop 上界确实收紧，三个后端当前 varlen 路径数值通过；
+7. target 叶子已经主要表现为 capability、projection 和 per-op emission，而不是整 kernel 模板。
 
-```text
-canonical logical domains
-explicit member universe
-optional ragged index map
-row/tiled/stream/ragged ownership
-boundary proof
-state carry
-contraction stages
-stage dtype and workspace semantics
-unique versus reducing terminal writes
-compact ragged tile traversal
-target-neutral tuning roles
-three target projections
-```
+不能声称完成的是：
 
-性能工作的核心收益也来自这些机制：MoE 三后端的 generated p50 相比旧报告降低约 32%–46%，连续 grouped GEMM 三后端通过同一个 compact traversal 同时降低约 44%–45%。
+1. realization 的一般可组合性；
+2. emitter 已经完全不做物理推导；
+3. Kernel IR 中全部语言构造都能进入三个 GPU 后端；
+4. 一般非整除 shape；
+5. 多输出和 optional runtime ABI；
+6. backward、多 kernel orchestration 和 autograd；
+7. BF16/FP8/INT8/INT4 与量化 epilogue；
+8. 当前代码下 10/11 kernel × 3 backend 的完整性能不退化；
+9. 可安装、统一缓存、可直接接训练框架的产品级 Python 库。
 
-当前 30 条 repro 已经证明：同一份算法 IR 与同一份 GPU physical decision 可以由 Triton、cuTile、TileLang 分别渲染，并让三个下层工具各自在不同 kernel 上成为赢家。没有 baseline 的组合和不公平的 wrapper/composition 比较仍被明确标出，没有用比值掩盖。
+## 八、后续工作的正确顺序
+
+继续堆第十二、第十三个前向 kernel 不能解决当前主要问题。合理顺序是：
+
+### 第一优先级：把有限模式变成可组合 realization
+
+- 将 ownership、traversal、ordered stream、staging、ragged relation、boundary/padding 从互斥 pattern 分支中拆成有明确输入输出的独立决策；
+- 允许同一 kernel 出现多个 relation/stream；
+- 让 plan 显式携带 emitter 当前仍在重建的物理索引事实；
+- 先用 staged + ordered、multi-ragged 等组合样本验证，而不是新增 kernel 名字分支；
+- 补全 staged contract 和一般 producer 的尾块语义。
+
+### 第二优先级：用一个真实 backward 压实接口和编排
+
+- 从 source 中选择有三后端或至少一个高质量上游 baseline 的 backward；
+- 同时压到多输出、recompute、跨并行归约和作者主导的多 kernel orchestration；
+- 保持逻辑语义在 DSL/Kernel IR，物理分解在 realization；
+- 不把 backward 做成一个 kernel family matcher。
+
+### 第三优先级：补基本 dtype 与部署接口
+
+- 先贯通 BF16；
+- 再选择一个真实 FP8 或 W4A8 上游 kernel；
+- 用 GEMM+bias+activation+residual+quantization 压实低秩广播、mixed dtype 和输出量化；
+- target 不支持时由 capability 明确拒绝，不做静默降级。
+
+### 第四优先级：把编译器变成可复用库
+
+- 定义统一 specialization/cache key；
+- 让 compile 不必每次重复 frontend 和外部编译；
+- 建立可安装入口；
+- 接一个 framework custom op 与 autograd；
+- 将 target 编译诊断映射回 DSL 源码位置。
+
+每完成一个共享机制，都应使用现有的单条 repro 入口实际 emit、运行并做数值比较；性能变更则重新取得受影响 kernel 的三后端数据。不能再用早期代码的性能表替代当前代码验收。
+
+## 九、可直接复核的入口
+
+当前唯一应使用的活体入口是：
+
+    ./examples/run/repro.sh triton varlen_attention
+    ./examples/run/repro.sh cutile varlen_attention
+    ./examples/run/repro.sh tilelang varlen_attention
+
+原十个 kernel 也通过相同入口，把最后一个参数替换为：
+
+    softmax
+    layer_norm
+    rms_norm
+    logsumexp
+    gemm
+    dual_gemm
+    attention
+    online_softmax
+    moe
+    grouped_gemm
+
+关键实现证据位于：
+
+- doc/compiler/architecture.md：规范中的层次边界；
+- doc/compiler/kernel-ir.md：规范中的 canonical Kernel IR；
+- doc/compiler/physical-plan.md：规范中的 realization 与 search space；
+- python/intent/frontend/source/signature.py：当前 ABI/default/return 限制；
+- include/Intent/Dialect/Intent/IR/IntentOps.td：正式 Intent op schema；
+- lib/Transforms/VerifyKernelIR.cpp：Kernel IR verifier；
+- lib/Target/Common/Realization/SchedulePolicy.cpp：当前有限 schedule policy；
+- lib/Target/GPU/Realization/Analysis/Operations.cpp：当前可分析 op 子集；
+- lib/Target/GPU/Realization/Plan/Build.cpp：当前 plan handler 与 padding 物化；
+- lib/Target/Common/Emission/Driver.cpp：共享 emission driver；
+- lib/Target/Triton/Emission/Handlers/Operations.cpp：Triton per-op 投影；
+- 对应的 cuTile、TileLang Emission/Handlers/Operations.cpp：另外两个 target 叶子。
+
+## 最终判断
+
+这轮工作证明了架构已经具有真实的通用骨架，也证明了一次 ragged + streaming + causal stop + tail padding 的组合，不是软最大值模板的改名。
+
+但“能覆盖一组前向 kernel”和“是一门完备可用的算子编译器”之间仍有明显距离。当前最应该解决的是组合模型、后端兑现边界和训练/ABI 基本盘；在这些完成前，不能把项目描述为已完成。
