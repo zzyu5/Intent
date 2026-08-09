@@ -12,6 +12,10 @@ from kernels.contraction.dual_gemm import K as DUAL_K
 from kernels.contraction.dual_gemm import M as DUAL_M
 from kernels.contraction.dual_gemm import N as DUAL_N
 from kernels.contraction.dual_gemm import gated_dual_gemm
+from kernels.contraction.gemm import K as GEMM_K
+from kernels.contraction.gemm import M as GEMM_M
+from kernels.contraction.gemm import N as GEMM_N
+from kernels.contraction.gemm import bf16_gemm
 from kernels.normalization.layer_norm import FEATURES as LAYER_FEATURES
 from kernels.normalization.layer_norm import ROWS as LAYER_ROWS
 from kernels.normalization.layer_norm import weighted_layer_norm
@@ -52,11 +56,17 @@ def _compare(
     kernel_name: str,
     tolerance: float,
     upstream: Upstream | None,
+    expected_dtype: torch.dtype | None = None,
 ) -> None:
     generated = artifact.run(*arguments)
     expected = reference()
     upstream_output = upstream(arguments) if upstream is not None else None
     torch.cuda.synchronize()
+    if expected_dtype is not None and generated.dtype != expected_dtype:
+        raise RuntimeError(
+            f"{target_name} {kernel_name} returned {generated.dtype}, "
+            f"expected {expected_dtype}"
+        )
     error = (generated - expected).abs().max().item()
     if error > tolerance:
         raise RuntimeError(
@@ -66,6 +76,11 @@ def _compare(
         lambda: artifact.run(*arguments), warmup=3, repetitions=10
     )
     if upstream_output is not None:
+        if expected_dtype is not None and upstream_output.dtype != expected_dtype:
+            raise RuntimeError(
+                f"{target_name} {kernel_name} upstream returned "
+                f"{upstream_output.dtype}, expected {expected_dtype}"
+            )
         upstream_error = (upstream_output - expected).abs().max().item()
         if upstream_error > tolerance:
             raise RuntimeError(
@@ -109,6 +124,25 @@ def run_gemm_tail_case(artifact, target_name: str) -> None:
         kernel_name="GEMM M/N/K tail",
         tolerance=2.0e-2,
         upstream=None,
+    )
+
+
+def _run_bf16_gemm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    a = torch.randn((GEMM_M, GEMM_K), device="cuda", dtype=torch.bfloat16)
+    a /= math.sqrt(GEMM_K)
+    b = torch.randn((GEMM_K, GEMM_N), device="cuda", dtype=torch.bfloat16)
+    artifact = intent.compile(bf16_gemm, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(a, b),
+        reference=lambda: (a.float() @ b.float()).to(torch.bfloat16),
+        target_name=target_name,
+        kernel_name="BF16 GEMM",
+        tolerance=5.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.bfloat16,
     )
 
 
@@ -340,6 +374,7 @@ def _run_varlen_attention(
 
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
+    "bf16_gemm": _run_bf16_gemm,
     "dual_gemm": _run_dual_gemm,
     "grouped_gemm": _run_grouped_gemm,
     "layer_norm": _run_layer_norm,

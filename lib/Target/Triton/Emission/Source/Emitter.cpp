@@ -10,6 +10,19 @@ using namespace mlir;
 namespace intent::triton::emission {
 namespace {
 
+StringRef torchDtype(Type type) {
+  if (type.isF16())
+    return "torch.float16";
+  if (type.isF32())
+    return "torch.float32";
+  if (type.isBF16())
+    return "torch.bfloat16";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 32)
+    return "torch.int32";
+  return {};
+}
+
 FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
   if (role == "one")
     return std::string("1");
@@ -872,18 +885,6 @@ LogicalResult SourceEmitter::emitWrapper() {
   if (!planIndex.stages.empty()) {
     for (const std::string &body : stageBodies)
       output << body << "\n";
-    auto torchDtype = [&](Type type) -> StringRef {
-      if (type.isF16())
-        return "torch.float16";
-      if (type.isF32())
-        return "torch.float32";
-      if (type.isBF16())
-        return "torch.bfloat16";
-      if (auto integer = dyn_cast<IntegerType>(type);
-          integer && integer.getWidth() == 32)
-        return "torch.int32";
-      return {};
-    };
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
@@ -1094,8 +1095,9 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
     for (ABIView &view : views) {
-      StringRef dtype = view.tensor.getElementType().isF16() ? "torch.float16"
-                                                             : "torch.float32";
+      StringRef dtype = torchDtype(view.tensor.getElementType());
+      if (dtype.empty())
+        return kernel.entry.emitOpError("has an unsupported fixed ABI dtype");
       output << "    if " << view.argument->name << ".device != _DEVICE:\n";
       output << "        raise ValueError('" << view.argument->name
              << " must reside on the realized CUDA device')\n";
@@ -1203,10 +1205,10 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << extent;
     }
-    output << "), device=_DEVICE, dtype="
-           << (fixedOutput->tensor.getElementType().isF16() ? "torch.float16"
-                                                            : "torch.float32")
-           << ")\n";
+    StringRef outputDtype = torchDtype(fixedOutput->tensor.getElementType());
+    if (outputDtype.empty())
+      return kernel.entry.emitOpError("has an unsupported fixed output dtype");
+    output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     output << "    launch(";
     first = true;
     for (ABIView &view : views) {
@@ -1261,12 +1263,7 @@ LogicalResult SourceEmitter::emitWrapper() {
            << view.tensor.getRank() << ":\n";
     output << "        raise ValueError('" << view.argument->name
            << " has the wrong rank')\n";
-    Type elementType = view.tensor.getElementType();
-    StringRef dtype = elementType.isF16()    ? "torch.float16"
-                      : elementType.isF32()  ? "torch.float32"
-                      : elementType.isBF16() ? "torch.bfloat16"
-                      : elementType.isInteger(32) ? "torch.int32"
-                                                  : StringRef();
+    StringRef dtype = torchDtype(view.tensor.getElementType());
     if (dtype.empty())
       return kernel.entry.emitOpError("has an unsupported Triton ABI dtype");
     output << "    if " << view.argument->name << ".dtype != " << dtype
@@ -1364,10 +1361,10 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << ", ";
     output << extent;
   }
-  output << "), device=_DEVICE, dtype="
-         << (outputView->tensor.getElementType().isF16() ? "torch.float16"
-                                                         : "torch.float32")
-         << ")\n";
+  StringRef outputDtype = torchDtype(outputView->tensor.getElementType());
+  if (outputDtype.empty())
+    return kernel.entry.emitOpError("has an unsupported Triton output dtype");
+  output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   output << "    launch(";
   first = true;
   for (ABIView &view : views) {

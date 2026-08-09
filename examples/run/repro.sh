@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|rms_norm|logsumexp|gemm|bf16_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm>" >&2
   exit 2
 fi
 
@@ -62,6 +62,9 @@ case "${backend}:${kernel}" in
   cutile:gemm)
     baseline=source/cutile/tilegym/gemm/dense/matmul.py
     ;;
+  cutile:bf16_gemm)
+    baseline=source/cutile/tilegym/gemm/dense/matmul.py
+    ;;
   cutile:attention)
     baseline=source/cutile/cutile-python/attention/fmha/AttentionFMHA.py
     ;;
@@ -86,6 +89,9 @@ case "${backend}:${kernel}" in
   tilelang:gemm)
     baseline=source/tilelang/tilelang/gemm/dense/example_gemm.py
     ;;
+  tilelang:bf16_gemm)
+    baseline=source/tilelang/tilelang/gemm/dense/example_gemm.py
+    ;;
   tilelang:attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_bshd/example_mha_fwd_bshd.py
     ;;
@@ -107,7 +113,7 @@ case "${backend}:${kernel}" in
   tilelang:varlen_attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
-  triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
+  triton:bf16_gemm | triton:logsumexp | cutile:rms_norm | cutile:logsumexp | \
   tilelang:layer_norm | tilelang:logsumexp | \
   triton:varlen_attention | cutile:varlen_attention)
     ;;

@@ -49,6 +49,9 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "bf16_gemm":
+        matmul = _load_module(source_path, "intent_upstream_cutile_bf16_gemm").matmul
+        return lambda arguments: matmul(arguments[0], arguments[1])
     if kernel == "layer_norm":
         layer_norm = _load_module(
             source_path, "intent_upstream_cutile_layer_norm"

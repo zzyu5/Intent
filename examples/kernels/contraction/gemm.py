@@ -35,3 +35,25 @@ def gemm(
             if ACTIVATION == Activation.RELU:
                 accumulator = I.maximum(accumulator, 0.0)
             c[mr, nr] = I.cast(accumulator, I.f16)
+
+
+@intent.kernel
+def bf16_gemm(
+    a: I.In[I.bf16, ("M", "K")],
+    b: I.In[I.bf16, ("K", "N")],
+    c: I.Out[I.bf16, ("M", "N")],
+):
+    M, K = a.shape
+    _, N = b.shape
+    m_axis = I.domain(0, M)
+    n_axis = I.domain(0, N)
+    k_axis = I.domain(0, K)
+    for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
+        for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
+            accumulator = I.contract(
+                a[mr, k_axis],
+                b[k_axis, nr],
+                reduce=((1, 0),),
+                acc_dtype=I.f32,
+            )
+            c[mr, nr] = I.cast(accumulator, I.bf16)

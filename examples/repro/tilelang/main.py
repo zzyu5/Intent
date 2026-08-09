@@ -67,6 +67,26 @@ def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "bf16_gemm":
+        source = _load_module(source_path, "intent_upstream_tilelang_bf16_gemm")
+        compiled = {}
+
+        def run(arguments):
+            a, b = arguments
+            shape = (a.shape[0], b.shape[1], a.shape[1])
+            if shape not in compiled:
+                compiled[shape] = source.matmul.compile(
+                    M=shape[0],
+                    N=shape[1],
+                    K=shape[2],
+                    block_M=128,
+                    block_N=128,
+                    block_K=32,
+                    dtype=T.bfloat16,
+                )
+            return compiled[shape](a, b)
+
+        return run
     if kernel == "varlen_attention":
         sys.path.insert(0, str(source_path.parent))
         source = _load_module(

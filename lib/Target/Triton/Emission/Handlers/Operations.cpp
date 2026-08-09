@@ -17,6 +17,18 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
                       target::OperationHandler{std::move(enter), std::move(leave)});
 }
 
+StringRef tritonDtype(Type type) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    type = tensor.getElementType();
+  if (type.isF16())
+    return "tl.float16";
+  if (type.isF32())
+    return "tl.float32";
+  if (type.isBF16())
+    return "tl.bfloat16";
+  return {};
+}
+
 } // namespace
 
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
@@ -545,15 +557,8 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "tl.cast" ||
       failed(operand) || !resultType)
     return operation.emitOpError("lacks a mechanical Triton cast binding");
-  Type elementType = resultType;
-  if (auto tensor = dyn_cast<RankedTensorType>(resultType))
-    elementType = tensor.getElementType();
-  StringRef targetType;
-  if (elementType.isF16())
-    targetType = "tl.float16";
-  else if (elementType.isF32())
-    targetType = "tl.float32";
-  else
+  StringRef targetType = tritonDtype(resultType);
+  if (targetType.empty())
     return operation.emitOpError("casts to an unsupported Triton type");
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.cast(" + operand->str() + ", " + targetType.str() + ")");
@@ -573,12 +578,8 @@ LogicalResult SourceEmitter::emitFull(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "tl.full" ||
       failed(fill) || !resultType || failed(shape))
     return operation.emitOpError("lacks a mechanical Triton full binding");
-  StringRef dtype;
-  if (resultType.getElementType().isF32())
-    dtype = "tl.float32";
-  else if (resultType.getElementType().isF16())
-    dtype = "tl.float16";
-  else
+  StringRef dtype = tritonDtype(resultType);
+  if (dtype.empty())
     return operation.emitOpError("uses an unsupported Triton full dtype");
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.full(" + *shape + ", " + fill->str() +
@@ -598,12 +599,8 @@ LogicalResult SourceEmitter::emitZeros(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "tl.zeros" ||
       !resultType || failed(shape))
     return operation.emitOpError("lacks a mechanical Triton zeros binding");
-  StringRef dtype;
-  if (resultType.getElementType().isF32())
-    dtype = "tl.float32";
-  else if (resultType.getElementType().isF16())
-    dtype = "tl.float16";
-  else
+  StringRef dtype = tritonDtype(resultType);
+  if (dtype.empty())
     return operation.emitOpError("uses an unsupported Triton zeros dtype");
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.zeros(" + *shape + ", dtype=" + dtype.str() + ")");
