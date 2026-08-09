@@ -52,6 +52,7 @@ def Intent_DomainOp : Intent_VariadicOneResultOp<"domain">;
 def Intent_DomainProductOp : Intent_VariadicOneResultOp<"domain_product">;
 def Intent_PartitionOp : Intent_VariadicOneResultOp<"partition">;
 def Intent_IndicesOp : Intent_UnaryOneResultOp<"indices">;
+def Intent_RegionEndOp : Intent_UnaryOneResultOp<"region_end">;
 
 def Intent_ParallelOp : Intent_Op<"parallel", [RecursiveMemoryEffects]> {
   let arguments = (ins AnyType:$source);

@@ -101,8 +101,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                                    const ScheduleDecision &schedule,
                                    OpBuilder &builder) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.constant", "intent.dim", "intent.partition",
-                         "intent.yield", "intent.return"})
+  for (StringRef name : {"intent.constant", "intent.dim", "intent.region_end",
+                         "intent.partition", "intent.yield", "intent.return"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
 
@@ -258,7 +258,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
+  for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
+                         "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast", "intent.full", "intent.zeros",
                          "intent.members", "intent.gather"})
     if (failed(addHandler(
@@ -343,9 +344,23 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                        : FailureOr<int64_t>(failure());
             if (failed(node) || failed(axisNode))
               return failure();
+            auto fact = facts.semantics.stateStreams.find(&operation);
+            if (fact == facts.semantics.stateStreams.end())
+              return operation.emitOpError("has no canonical stream facts");
+            if (fact->second.tile.empty())
+              return operation.emitOpError(
+                  "GPU realization requires a named auto stream extent");
+            IntegerAttr stopNode;
+            if (fact->second.stopBound) {
+              FailureOr<int64_t> resolvedStop = target::getNodeID(
+                  *fact->second.stopBound, "stream logical-stop binding");
+              if (failed(resolvedStop))
+                return failure();
+              stopNode = i64(builder, *resolvedStop);
+            }
             builder.create<intent::plan::StreamOp>(
                 operation.getLoc(), i64(builder, *node), i64(builder, *axisNode),
-                string(builder, "stream"), string(builder, "forward"),
+                stopNode, string(builder, "stream"), string(builder, "forward"),
                 string(builder, "private_fragment"), builder.getBoolAttr(true));
             return success();
           })))

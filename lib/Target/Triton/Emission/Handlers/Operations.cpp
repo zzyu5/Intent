@@ -22,8 +22,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.dim", "intent.domain", "intent.partition",
-                         "intent.yield", "intent.return", "intent.ragged",
+  for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
+                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -43,6 +43,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitLoad(op);
                         })) ||
+      failed(addHandler(registry, "intent.indices", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitIndices(op);
+      })) ||
       failed(addHandler(registry, "intent.reduce",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -67,6 +72,16 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitBinary(op);
                         })) ||
+      failed(addHandler(registry, "intent.compare", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitBinary(op);
+      })) ||
+      failed(addHandler(registry, "intent.mask", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitMask(op);
+      })) ||
       failed(addHandler(registry, "intent.cast",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -332,6 +347,29 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitIndices(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "indices emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<plan::AxisOp> axis =
+      operation.getNumOperands() == 1
+          ? resolveAxis(operation.getOperand(0), operation)
+          : FailureOr<plan::AxisOp>(failure());
+  auto result = operation.getNumResults() == 1
+                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                    : RankedTensorType();
+  if (failed(node) || !binding || binding.getLowering() != "logical_indices" ||
+      failed(axis) || !result || result.getRank() != 1 ||
+      !isa<IntegerType, IndexType>(result.getElementType()))
+    return operation.emitOpError("lacks a mechanical Triton indices binding");
+  FailureOr<std::string> expression =
+      indexExpression(*axis, false, 0, 1, operation);
+  if (failed(expression))
+    return failure();
+  bindResult(operation, 0, *expression);
+  return success();
+}
+
 LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "reduction emission");
   plan::ReductionOp binding =
@@ -399,12 +437,32 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_greater_equal")
+      symbol = ">=";
     else
       return operation.emitOpError("uses an unsupported binary lowering");
     expression = lhs->str() + " " + symbol.str() + " " + rhs->str();
   }
   std::string result = makeResultName(operation, 0);
   line(result + " = " + expression);
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitMask(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> value = lookupValue(operation, 0);
+  FailureOr<StringRef> predicate = lookupValue(operation, 1);
+  FailureOr<StringRef> fill = lookupValue(operation, 2);
+  if (failed(node) || !binding || binding.getLowering() != "tl.where" ||
+      operation.getNumResults() != 1 || failed(value) || failed(predicate) ||
+      failed(fill))
+    return operation.emitOpError("lacks a mechanical Triton mask binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.where(" + predicate->str() + ", " + value->str() +
+       ", " + fill->str() + ")");
   bindResult(operation, 0, result);
   return success();
 }
@@ -529,15 +587,20 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
+  bool appendAxis = succeeded(relation) && relation->size() == 2 &&
+                    (*relation)[0].kind == "full_slice" &&
+                    (*relation)[1].kind == "new_axis";
+  bool prependAxis = succeeded(relation) && relation->size() == 2 &&
+                     (*relation)[0].kind == "new_axis" &&
+                     (*relation)[1].kind == "full_slice";
   if (failed(node) || !binding || binding.getLowering() != "expand_dims" ||
-      failed(relation) || relation->size() != 2 ||
-      (*relation)[0].kind != "full_slice" ||
-      (*relation)[1].kind != "new_axis" || failed(source) || failed(valid) ||
-      failed(fill))
+      failed(relation) || (!appendAxis && !prependAxis) || failed(source) ||
+      failed(valid) || failed(fill))
     return operation.emitOpError("lacks a mechanical Triton gather binding");
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.where(" + valid->str() + ", " + source->str() +
-       "[:, None], " + fill->str() + ")");
+  std::string expanded = source->str() + (appendAxis ? "[:, None]" : "[None, :]");
+  line(result + " = tl.where(" + valid->str() + ", " + expanded + ", " +
+       fill->str() + ")");
   bindResult(operation, 0, result);
   return success();
 }
@@ -562,7 +625,12 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical Triton stream binding");
   Block &body = operation.getRegion(0).front();
-  if (operation.getNumOperands() != operation.getNumResults() + 1 ||
+  bool hasStop = static_cast<bool>(binding.getStopNodeAttr());
+  bool hasRuntimeExtent = static_cast<bool>(
+      operation.getAttrOfType<IntegerAttr>("intent.extent_operand_index"));
+  if (operation.getNumOperands() !=
+          operation.getNumResults() + 1 + (hasRuntimeExtent ? 1 : 0) +
+              (hasStop ? 1 : 0) ||
       body.getNumArguments() != operation.getNumResults() + 1)
     return operation.emitOpError("has inconsistent stream carried state");
 
@@ -581,6 +649,39 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   std::string streamExtent = usesRaggedOrderedTraversal()
                                  ? "sequence_length"
                                  : roleDimensions.lookup("stream_0");
+  if (hasStop) {
+    auto stopIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
+    int64_t expectedStop = operation.getNumResults() + 1 +
+                           (hasRuntimeExtent ? 1 : 0);
+    auto stop = kernel.nodes.find(binding.getStopNodeAttr().getInt());
+    Operation *stopOperation =
+        stop == kernel.nodes.end() ? nullptr : stop->second;
+    if (!stopIndex || stopIndex.getInt() != expectedStop ||
+        !stopOperation ||
+        stopOperation->getName().getStringRef() != "intent.region_end" ||
+        stopOperation->getNumOperands() != 1 ||
+        operation.getOperand(stopIndex.getInt()).getDefiningOp() != stopOperation)
+      return operation.emitOpError(
+          "does not match its planned logical stream stop");
+    FailureOr<plan::AxisOp> stopAxis =
+        resolveAxis(stopOperation->getOperand(0), operation);
+    if (failed(stopAxis))
+      return failure();
+    if (usesRaggedOrderedTraversal() &&
+        stopAxis->getRole() == "program_1") {
+      streamExtent = "tl.minimum((query_block + 1) * " +
+                     stopAxis->getTile().str() + ", sequence_length)";
+    } else if (hasTraversal("ordered_stream") &&
+               planIndex.program.getOwnership() == "program_tiles" &&
+               stopAxis->getRole() == "program_2") {
+      streamExtent = "tl.minimum((pid_program_2 + 1) * " +
+                     stopAxis->getTile().str() + ", " + streamExtent + ")";
+    } else if (stopAxis->getRole() != "stream_0") {
+      return operation.emitOpError(
+          "has no Triton spelling for its planned logical stream stop");
+    }
+  }
   line("for stream_block in range(0, tl.cdiv(" + streamExtent + ", " +
        binding.getTile().str() + ")):");
   ++indentation;

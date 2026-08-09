@@ -41,6 +41,7 @@ def flash_attention_fwd(
                         I.zeros((q_region,), dtype=I.f32),
                         I.zeros((q_region, DV), dtype=I.f32),
                     ),
+                    stop=I.end(q_region) if CAUSAL else I.end(k_axis),
                 )
                 with stream:
                     for k_region, (maximum, denominator, accumulator) in stream:
@@ -57,9 +58,6 @@ def flash_attention_fwd(
                             q_index = I.indices(q_region)
                             k_index = I.indices(k_region)
                             valid = q_index[:, None] >= k_index[None, :]
-                            if not I.any(valid):
-                                stream.yield_(maximum, denominator, accumulator)
-                                continue
                             scores = I.mask(scores, valid=valid, fill=-I.inf)
                         local_maximum = I.reduce.max(
                             scores, axis=1, identity=-I.inf
@@ -112,14 +110,16 @@ def flash_varlen_attention_fwd(
             I.partition(sequences[sequence], extent=I.auto("Q_TILE"))
         ):
             q_block = q[q_region, :]
+            k_axis = sequences[sequence]
             stream = I.state_stream(
-                sequences[sequence],
+                k_axis,
                 extent=I.auto("K_TILE"),
                 init=(
                     I.full((q_region,), -I.inf, dtype=I.f32),
                     I.zeros((q_region,), dtype=I.f32),
                     I.zeros((q_region, DV), dtype=I.f32),
                 ),
+                stop=I.end(q_region) if CAUSAL else I.end(k_axis),
             )
             with stream:
                 for k_region, (maximum, denominator, accumulator) in stream:
@@ -136,9 +136,6 @@ def flash_varlen_attention_fwd(
                         q_index = I.indices(q_region)
                         k_index = I.indices(k_region)
                         valid = q_index[:, None] >= k_index[None, :]
-                        if not I.any(valid):
-                            stream.yield_(maximum, denominator, accumulator)
-                            continue
                         scores = I.mask(scores, valid=valid, fill=-I.inf)
                     local_maximum = I.reduce.max(
                         scores, axis=1, identity=-I.inf

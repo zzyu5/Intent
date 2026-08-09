@@ -272,7 +272,7 @@ def _run_varlen_attention(
     v = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
     artifact = intent.compile(
         flash_varlen_attention_fwd,
-        constexprs={"CAUSAL": False},
+        constexprs={"CAUSAL": True},
         target=target,
         compiler=compiler,
     )
@@ -286,7 +286,7 @@ def _run_varlen_attention(
                 q[start:stop][None, None],
                 k[start:stop][None, None],
                 v[start:stop][None, None],
-                is_causal=False,
+                is_causal=True,
                 scale=SCALE,
             )[0, 0]
         return result

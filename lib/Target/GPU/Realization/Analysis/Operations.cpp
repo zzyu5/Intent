@@ -30,10 +30,21 @@ FailureOr<std::string> reductionRole(Operation &operation) {
 
 FailureOr<std::string> pointwiseRole(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
+  if (name == "intent.indices")
+    return std::string("indices");
   if (name == "intent.broadcast")
     return std::string("broadcast");
   if (name == "intent.cast")
     return std::string("cast");
+  if (name == "intent.mask")
+    return std::string("mask");
+  if (name == "intent.compare") {
+    auto predicate =
+        operation.getAttrOfType<StringAttr>("intent.predicate");
+    if (predicate && predicate.getValue() == "ge")
+      return std::string("compare_greater_equal");
+    return operation.emitOpError("has no supported GPU comparison predicate");
+  }
   auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
   if (!logical)
     return operation.emitOpError("has no canonical pointwise operator");
@@ -56,6 +67,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
                                OperationFacts &facts) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
+                         "intent.region_end",
                          "intent.partition", "intent.parallel",
                          "intent.view_load", "intent.view_store", "intent.yield",
                          "intent.return", "intent.state_stream", "intent.ragged",
@@ -74,7 +86,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
+  for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
+                         "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
@@ -103,9 +116,12 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
                 target::parseIndexRelation(operation);
             if (failed(relation))
               return failure();
-            bool expand = relation->size() == 2 &&
-                          (*relation)[0].kind == "full_slice" &&
-                          (*relation)[1].kind == "new_axis";
+            bool expand =
+                relation->size() == 2 &&
+                (((*relation)[0].kind == "full_slice" &&
+                  (*relation)[1].kind == "new_axis") ||
+                 ((*relation)[0].kind == "new_axis" &&
+                  (*relation)[1].kind == "full_slice"));
             bool indirect = llvm::any_of(
                 *relation, [](const target::IndexTerm &term) {
                   return term.kind == "value_index";

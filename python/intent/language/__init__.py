@@ -21,6 +21,7 @@ from .builtins import buffer
 from .builtins import cast
 from .builtins import contract
 from .builtins import domain
+from .builtins import end
 from .builtins import exp
 from .builtins import exp2
 from .builtins import fence
@@ -102,6 +103,7 @@ __all__ = [
     "contract",
     "domain",
     "dtype",
+    "end",
     "exp",
     "exp2",
     "f8e4m3fn",

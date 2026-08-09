@@ -612,6 +612,22 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   if (failed(addHandler(
+          registry, "intent.region_end",
+          [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 ||
+                operation.getNumResults() != 1 ||
+                !isa<IntegerType, IndexType>(operation.getResult(0).getType()))
+              return operation.emitOpError(
+                  "has no canonical logical range-end schema");
+            FailureOr<Operation *> domain =
+                resolveDomain(operation.getOperand(0), facts, operation);
+            if (failed(domain))
+              return failure();
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.gather", [&](Operation &operation) -> LogicalResult {
             if (operation.getNumOperands() < 1 || operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical gather schema");
@@ -656,26 +672,61 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   auto enterStateStream = [&](Operation &operation) -> LogicalResult {
     auto stateCount = operation.getAttrOfType<IntegerAttr>("intent.state_count");
+    auto extentIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.extent_operand_index");
+    auto stopIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
     auto extent = operation.getAttrOfType<DictionaryAttr>("intent.extent");
     auto tile = extent ? extent.getAs<StringAttr>("name") : StringAttr();
-    if (!stateCount || stateCount.getInt() <= 0 || !tile ||
-        tile.getValue().empty() || operation.getNumRegions() != 1 ||
+    if (!stateCount || stateCount.getInt() <= 0 || operation.getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation.getRegion(0)) ||
-        operation.getNumOperands() !=
-            static_cast<unsigned>(stateCount.getInt() + 1) ||
         operation.getNumResults() !=
             static_cast<unsigned>(stateCount.getInt()))
       return operation.emitOpError("has no canonical state-stream schema");
+    bool namedExtent = tile && !tile.getValue().empty();
+    if (namedExtent == static_cast<bool>(extentIndex))
+      return operation.emitOpError(
+          "state stream requires exactly one named or runtime extent");
+    int64_t trailingIndex = stateCount.getInt() + 1;
+    if (extentIndex) {
+      if (extentIndex.getInt() != trailingIndex ||
+          extentIndex.getInt() < 0 ||
+          static_cast<unsigned>(extentIndex.getInt()) >=
+              operation.getNumOperands() ||
+          !isa<IntegerType, IndexType>(
+              operation.getOperand(extentIndex.getInt()).getType()))
+        return operation.emitOpError(
+            "state stream runtime extent is not the canonical trailing index");
+      ++trailingIndex;
+    }
+    if (stopIndex) {
+      if (stopIndex.getInt() != trailingIndex || stopIndex.getInt() < 0 ||
+          static_cast<unsigned>(stopIndex.getInt()) >= operation.getNumOperands())
+        return operation.emitOpError(
+            "state stream stop is not the canonical trailing operand");
+      ++trailingIndex;
+    }
+    if (operation.getNumOperands() != static_cast<unsigned>(trailingIndex))
+      return operation.emitOpError("has no canonical state-stream operand layout");
     Operation *axisDomain = operation.getOperand(0).getDefiningOp();
     if (!axisDomain || !facts.domainSourceAxes.count(axisDomain))
       return operation.emitOpError(
           "state stream requires a canonical source domain");
+    Operation *stopBound = nullptr;
+    if (stopIndex) {
+      stopBound = operation.getOperand(stopIndex.getInt()).getDefiningOp();
+      if (!stopBound ||
+          stopBound->getName().getStringRef() != "intent.region_end")
+        return operation.emitOpError(
+            "state stream stop must come from I.end(domain_or_region)");
+    }
     Block &body = operation.getRegion(0).front();
     if (body.getNumArguments() !=
         static_cast<unsigned>(stateCount.getInt() + 1))
       return operation.emitOpError(
           "state stream body does not match carried state");
-    StateStreamFact fact{axisDomain, stateCount.getInt(), tile.getValue().str(),
+    StateStreamFact fact{axisDomain, stopBound, stateCount.getInt(),
+                         namedExtent ? tile.getValue().str() : std::string(),
                          &body, {}, {}, {}};
     for (int64_t index = 0; index < stateCount.getInt(); ++index) {
       Value initial = operation.getOperand(index + 1);

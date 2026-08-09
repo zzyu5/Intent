@@ -34,6 +34,7 @@ def flash_attention_fwd(
                         I.zeros((qr,), dtype=I.f32),
                         I.zeros((qr, DV), dtype=I.f32),
                     ),
+                    stop=I.end(qr) if CAUSAL else I.end(k_axis),
                 )
 
                 with stream:
@@ -54,11 +55,6 @@ def flash_attention_fwd(
                             q_idx = I.indices(qr)
                             k_idx = I.indices(kr)
                             valid = q_idx[:, None] >= k_idx[None, :]
-
-                            if not I.any(valid):
-                                stream.yield_(m, l, acc)
-                                continue
-
                             scores = I.mask(
                                 scores,
                                 valid=valid,
@@ -129,6 +125,8 @@ GPU surface 只把同一组合投影成各自的 grid、offset load 和 streamed
 ## 边界
 
 `state_stream` 固定 K/V segment order 与 carry update，不允许替换为 parallel partial-state merge。
+`I.end(...)` 是作者声明的 exclusive logical read bound；Plan 保存该 logical node，
+物理层再把 owner end 与 stream tile 组合成循环上界。它不从 causal mask 反推读取范围。
 
 `I.mask` 表达 logical validity。Realizer 可以消除能够整体证明无效的 physical region；不能凭空发明 block-sparse skipping。Sparse descriptor 必须由 wrapper/source 提供。
 

@@ -138,6 +138,8 @@ LogicalResult StreamOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
       failed(requireNode(*this, getAxisNode())))
     return failure();
+  if (getStopNodeAttr() && failed(requireNode(*this, getStopNodeAttr().getInt())))
+    return failure();
   if (getTile().empty() || getOrder() != "forward" ||
       getCarrySpace() != "register")
     return emitOpError("requires a forward register-carried stream spelling");

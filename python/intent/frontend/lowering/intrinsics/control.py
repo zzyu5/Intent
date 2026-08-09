@@ -41,6 +41,7 @@ def lower_control_intrinsic(
         "ordered": _ordered,
         "state_stream": _state_stream,
         "indices": _indices,
+        "end": _region_end,
         "ragged": _ragged,
         "members": _members,
     }
@@ -155,7 +156,7 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
     bound = bind_call(
         lowerer,
         node,
-        ("axis", "extent", "init"),
+        ("axis", "extent", "init", "stop"),
         required=("axis", "extent", "init"),
     )
     axis = lowerer.materialize(lowerer.lower_expression(bound["axis"]), bound["axis"])
@@ -176,7 +177,14 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
         initial = (lowerer.materialize(initial_expression, bound["init"]),)
     if not initial:
         lowerer.error(node, "state_stream requires at least one carried value")
-    return StreamSpec(axis, initial, extent, node)
+    stop = None
+    if "stop" in bound:
+        stop = lowerer.materialize(
+            lowerer.lower_expression(bound["stop"]), bound["stop"]
+        )
+        if not isinstance(stop.type, ScalarType) or not is_integer(stop.type):
+            lowerer.error(bound["stop"], "state_stream stop must be an integer index")
+    return StreamSpec(axis, initial, extent, stop, node)
 
 
 def _indices(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
@@ -189,6 +197,22 @@ def _indices(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         lowerer.location(node),
         operands=(region,),
         result_types=(TensorType(intent_index, lowerer.dynamic_shape_for_region(region)),),
+    )
+    return operation.results[0]
+
+
+def _region_end(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(lowerer, node, ("region",), required=("region",))
+    region = lowerer.materialize(
+        lowerer.lower_expression(bound["region"]), bound["region"]
+    )
+    if not isinstance(region.type, (DomainType, RegionType)) or region.type.rank != 1:
+        lowerer.error(node, "I.end requires a rank-one logical domain or region")
+    operation = lowerer.emit(
+        OperationKind.REGION_END,
+        lowerer.location(node),
+        operands=(region,),
+        result_types=(ScalarType(intent_index),),
     )
     return operation.results[0]
 

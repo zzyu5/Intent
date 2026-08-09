@@ -45,6 +45,7 @@ parallel = Intrinsic("parallel")
 ordered = Intrinsic("ordered")
 state_stream = Intrinsic("state_stream")
 indices = Intrinsic("indices")
+end = Intrinsic("end")
 
 reshape = Intrinsic("reshape")
 transpose = Intrinsic("transpose")
@@ -97,6 +98,7 @@ INTRINSICS = {
         ordered,
         state_stream,
         indices,
+        end,
         reshape,
         transpose,
         full,

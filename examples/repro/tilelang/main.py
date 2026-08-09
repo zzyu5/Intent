@@ -84,7 +84,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
                     k.shape[0],
                     1,
                     q.shape[1],
-                    False,
+                    True,
                     block_M=64,
                     block_N=64,
                     num_stages=2,

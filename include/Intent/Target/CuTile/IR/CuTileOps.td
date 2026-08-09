@@ -84,6 +84,7 @@ def IntentCuTile_StreamOp : IntentCuTile_Op<"stream"> {
   let arguments = (ins
     I64Attr:$node,
     I64Attr:$axis_node,
+    OptionalAttr<I64Attr>:$stop_node,
     StrAttr:$tile,
     StrAttr:$order,
     StrAttr:$carry_space

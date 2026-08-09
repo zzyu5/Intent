@@ -68,10 +68,12 @@ public:
   mlir::LogicalResult enterParallel(mlir::Operation &operation);
   mlir::LogicalResult leaveParallel(mlir::Operation &operation);
   mlir::LogicalResult emitLoad(mlir::Operation &operation);
+  mlir::LogicalResult emitIndices(mlir::Operation &operation);
   mlir::LogicalResult emitReduction(mlir::Operation &operation);
   mlir::LogicalResult emitBroadcast(mlir::Operation &operation);
   mlir::LogicalResult emitUnary(mlir::Operation &operation);
   mlir::LogicalResult emitBinary(mlir::Operation &operation);
+  mlir::LogicalResult emitMask(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
   mlir::LogicalResult emitFull(mlir::Operation &operation);
   mlir::LogicalResult emitZeros(mlir::Operation &operation);

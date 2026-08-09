@@ -22,8 +22,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.dim", "intent.domain", "intent.partition",
-                         "intent.yield", "intent.return", "intent.ragged",
+  for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
+                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -40,6 +40,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitLoad(op);
+      })) ||
+      failed(addHandler(registry, "intent.indices", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitIndices(op);
       })) ||
       failed(addHandler(registry, "intent.reduce", [&](Operation &op) {
         if (!emitter.selectOperation(op))
@@ -60,6 +65,16 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitBinary(op);
+      })) ||
+      failed(addHandler(registry, "intent.compare", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitBinary(op);
+      })) ||
+      failed(addHandler(registry, "intent.mask", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitMask(op);
       })) ||
       failed(addHandler(registry, "intent.cast", [&](Operation &op) {
         if (!emitter.selectOperation(op))
@@ -303,6 +318,48 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitIndices(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "indices emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<plan::AxisOp> axis =
+      operation.getNumOperands() == 1
+          ? resolveAxis(operation.getOperand(0), operation)
+          : FailureOr<plan::AxisOp>(failure());
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "logical_indices" ||
+      failed(axis) || !resultType || resultType.getRank() != 1 ||
+      !isa<IntegerType, IndexType>(resultType.getElementType()) ||
+      failed(result) || failed(extents) || extents->size() != 1)
+    return operation.emitOpError("lacks a mechanical TileLang indices binding");
+  StringRef role = axis->getRole();
+  std::string base;
+  if (usesRaggedOrderedTraversal() && role == "program_1")
+    base = "query_start";
+  else if (usesRaggedOrderedTraversal() && role == "stream_0")
+    base = "stream_start";
+  else if (role == "program_2")
+    base = "bid_program_2 * " + axis->getTile().str();
+  else if (role == "stream_0")
+    base = "stream_tile * " + axis->getTile().str();
+  else if (role == "program_0" && axis->getTile() != "one")
+    base = "bid_m * " + axis->getTile().str();
+  else if (role == "program_1" && axis->getTile() != "one")
+    base = "bid_n * " + axis->getTile().str();
+  else
+    return operation.emitOpError("has no TileLang vector index realization");
+  line("for indices_i in T.Parallel(" + extents->front() + "):");
+  ++indentation;
+  line(*result + "[indices_i] = " + base + " + indices_i");
+  --indentation;
+  bindResult(operation, 0, *result);
+  return success();
+}
+
 LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "reduction emission");
   plan::ReductionOp binding =
@@ -475,6 +532,8 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_greater_equal")
+      symbol = ">=";
     else {
       operation.emitOpError("uses an unsupported TileLang binary lowering");
       return failure();
@@ -543,6 +602,68 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     target += index;
   }
   line(target + "] = " + *expression);
+  --indentation;
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitMask(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  int64_t reuse = binding ? binding.getReuseOperandAttr().getInt() : -2;
+  if (failed(node) || !binding || binding.getLowering() != "T.if_then_else" ||
+      !tensorResult || (reuse != -1 && reuse != 0))
+    return operation.emitOpError("lacks a mechanical TileLang mask binding");
+  std::string result;
+  if (reuse == 0) {
+    FailureOr<StringRef> value = lookupValue(operation, 0);
+    if (failed(value))
+      return failure();
+    result = value->str();
+  } else {
+    FailureOr<std::string> allocated = allocateResult(operation, 0, "fragment");
+    if (failed(allocated))
+      return failure();
+    result = *allocated;
+  }
+  FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+  if (failed(extents) || extents->empty())
+    return failure();
+  SmallVector<std::string> indices;
+  std::string loop = "for ";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    indices.push_back("mask_i" + std::to_string(axis));
+    loop += indices.back();
+  }
+  loop += " in T.Parallel(";
+  for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    if (axis)
+      loop += ", ";
+    loop += extent;
+  }
+  line(loop + "):");
+  ++indentation;
+  FailureOr<std::string> value =
+      tensorElement(operation.getOperand(0), indices, operation);
+  FailureOr<std::string> predicate =
+      tensorElement(operation.getOperand(1), indices, operation);
+  FailureOr<std::string> fill =
+      tensorElement(operation.getOperand(2), indices, operation);
+  if (failed(value) || failed(predicate) || failed(fill))
+    return failure();
+  std::string target = result + "[";
+  for (auto [axis, index] : llvm::enumerate(indices)) {
+    if (axis)
+      target += ", ";
+    target += index;
+  }
+  line(target + "] = T.if_then_else(" + *predicate + ", " + *value + ", " +
+       *fill + ")");
   --indentation;
   bindResult(operation, 0, result);
   return success();
@@ -721,10 +842,15 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
+  bool appendAxis = relation->size() == 2 &&
+                    (*relation)[0].kind == "full_slice" &&
+                    (*relation)[1].kind == "new_axis";
+  bool prependAxis = relation->size() == 2 &&
+                     (*relation)[0].kind == "new_axis" &&
+                     (*relation)[1].kind == "full_slice";
   if ((binding.getLowering() != "expand_dims" &&
        binding.getLowering() != "alias_column") ||
-      relation->size() != 2 || (*relation)[0].kind != "full_slice" ||
-      (*relation)[1].kind != "new_axis")
+      (!appendAxis && !prependAxis))
     return operation.emitOpError("has no mechanical TileLang gather relation");
   FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
@@ -739,7 +865,9 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
        (*extents)[1] + "):");
   ++indentation;
   std::string sourceElement = sourceTensor && sourceTensor.getRank() == 1
-                                  ? source->str() + "[gather_i]"
+                                  ? source->str() +
+                                        (appendAxis ? "[gather_i]"
+                                                    : "[gather_j]")
                                   : sourceTensor
                                         ? source->str() + "[gather_i, gather_j]"
                                         : source->str();
@@ -783,7 +911,12 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang stream binding");
   Block &body = operation.getRegion(0).front();
-  if (operation.getNumOperands() != operation.getNumResults() + 1 ||
+  bool hasStop = static_cast<bool>(binding.getStopNodeAttr());
+  bool hasRuntimeExtent = static_cast<bool>(
+      operation.getAttrOfType<IntegerAttr>("intent.extent_operand_index"));
+  if (operation.getNumOperands() !=
+          operation.getNumResults() + 1 + (hasRuntimeExtent ? 1 : 0) +
+              (hasStop ? 1 : 0) ||
       body.getNumArguments() != operation.getNumResults() + 1)
     return operation.emitOpError("has inconsistent TileLang stream state");
   SmallVector<std::string> carriers;
@@ -812,10 +945,43 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     }
   }
   streamCarriers[&operation] = carriers;
-  line("for stream_tile in T.Pipelined(T.ceildiv(" +
-       (usesRaggedOrderedTraversal()
-            ? std::string("sequence_length")
-            : roleDimensions.lookup("stream_0")) +
+  std::string streamExtent = usesRaggedOrderedTraversal()
+                                 ? "sequence_length"
+                                 : roleDimensions.lookup("stream_0");
+  if (hasStop) {
+    auto stopIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
+    int64_t expectedStop = operation.getNumResults() + 1 +
+                           (hasRuntimeExtent ? 1 : 0);
+    auto stop = kernel.nodes.find(binding.getStopNodeAttr().getInt());
+    Operation *stopOperation =
+        stop == kernel.nodes.end() ? nullptr : stop->second;
+    if (!stopIndex || stopIndex.getInt() != expectedStop ||
+        !stopOperation ||
+        stopOperation->getName().getStringRef() != "intent.region_end" ||
+        stopOperation->getNumOperands() != 1 ||
+        operation.getOperand(stopIndex.getInt()).getDefiningOp() != stopOperation)
+      return operation.emitOpError(
+          "does not match its planned logical stream stop");
+    FailureOr<plan::AxisOp> stopAxis =
+        resolveAxis(stopOperation->getOperand(0), operation);
+    if (failed(stopAxis))
+      return failure();
+    if (usesRaggedOrderedTraversal() &&
+        stopAxis->getRole() == "program_1") {
+      streamExtent = "T.min((query_block + 1) * " +
+                     stopAxis->getTile().str() + ", sequence_length)";
+    } else if (hasTraversal("ordered_stream") &&
+               programOwnership == "block_tiles" &&
+               stopAxis->getRole() == "program_2") {
+      streamExtent = "T.min((bid_program_2 + 1) * " +
+                     stopAxis->getTile().str() + ", " + streamExtent + ")";
+    } else if (stopAxis->getRole() != "stream_0") {
+      return operation.emitOpError(
+          "has no TileLang spelling for its planned logical stream stop");
+    }
+  }
+  line("for stream_tile in T.Pipelined(T.ceildiv(" + streamExtent +
        ", " + binding.getTile().str() +
        "), num_stages=num_stages):");
   ++indentation;

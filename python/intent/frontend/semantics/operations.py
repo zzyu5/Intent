@@ -12,6 +12,7 @@ class OperationKind(Enum):
     DOMAIN_PRODUCT = "domain_product"
     PARTITION = "partition"
     INDICES = "indices"
+    REGION_END = "region_end"
 
     PARALLEL = "parallel"
     ORDERED = "ordered"

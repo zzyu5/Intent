@@ -44,6 +44,7 @@ class StreamSpec:
     axis: MlirValue
     initial_state: tuple[MlirValue, ...]
     extent: AutoExtent | MlirValue
+    stop: MlirValue | None
     ast_node: ast.AST
     results: tuple[MlirValue, ...] | None = None
 

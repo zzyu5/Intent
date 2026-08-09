@@ -548,6 +548,9 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
         operands.append(stream.extent)
     else:
         attributes["extent"] = stream.extent
+    if stream.stop is not None:
+        attributes["stop_operand_index"] = len(operands)
+        operands.append(stream.stop)
     operation = lowerer.emit(
         OperationKind.STATE_STREAM,
         lowerer.location(node),

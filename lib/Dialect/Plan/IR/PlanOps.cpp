@@ -186,6 +186,8 @@ LogicalResult StreamOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
       failed(requireNode(*this, getAxisNode())) || getTile().empty())
     return failure();
+  if (getStopNodeAttr() && failed(requireNode(*this, getStopNodeAttr().getInt())))
+    return failure();
   if (getOrder() != "forward" || getCarrySpace() != "private_fragment" ||
       !getReuseInitial())
     return emitOpError("requires forward traversal with reused private state");

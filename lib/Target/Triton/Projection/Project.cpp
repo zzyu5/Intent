@@ -34,6 +34,8 @@ FailureOr<StringRef> tileSpelling(Operation *operation, StringRef role) {
 }
 
 FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
+  if (role == "indices")
+    return StringRef("logical_indices");
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -58,6 +60,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_true_divide");
   if (role == "binary_maximum")
     return StringRef("tl.maximum");
+  if (role == "compare_greater_equal")
+    return StringRef("python_greater_equal");
+  if (role == "mask")
+    return StringRef("tl.where");
   if (role == "full")
     return StringRef("tl.full");
   if (role == "zeros")
@@ -176,7 +182,8 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
       return failure();
     builder.create<plan::StreamOp>(
         stream.getLoc(), stream.getNodeAttr(), stream.getAxisNodeAttr(),
-        gpu::stringAttr(builder, *tile), stream.getOrderAttr(),
+        stream.getStopNodeAttr(), gpu::stringAttr(builder, *tile),
+        stream.getOrderAttr(),
         gpu::stringAttr(builder, "register"));
   }
   for (intent::plan::RaggedOp ragged : indexed->ragged)
