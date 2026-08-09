@@ -204,12 +204,7 @@ def _run_grouped_gemm(
         device="cuda",
         dtype=torch.int32,
     )
-    members = torch.randint(
-        GROUPED_ROWS,
-        (GROUPED_ROWS,),
-        device="cuda",
-        dtype=torch.int32,
-    )
+    members = torch.randperm(GROUPED_ROWS, device="cuda", dtype=torch.int32)
     artifact = intent.compile(ragged_grouped_gemm, target=target, compiler=compiler)
 
     def reference() -> torch.Tensor:

@@ -135,7 +135,10 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
     builder.create<plan::BoundaryOp>(
         transfer.getLoc(), transfer.getNodeAttr(), transfer.getDomainNodesAttr(),
         gpu::stringAttr(builder, access), transfer.getFillAttr(),
-        builder.getBoolAttr(rowStrided), transfer.getDeferAttr());
+        builder.getBoolAttr(rowStrided ||
+                            (indexed->program.getMapping() == "ragged_stages" &&
+                             transfer.getAccess() == "store")),
+        transfer.getDeferAttr());
   }
   for (intent::plan::ReductionOp reduction : indexed->reductions) {
     StringRef lowering = reduction.getRole() == "reduce_maximum"

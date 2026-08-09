@@ -284,11 +284,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return searchIndex.autotune.emitOpError(
           "must specialize the row stream dimension");
   } else if (raggedStages) {
+    unsigned uniqueStores = llvm::count_if(
+        planIndex.boundaries, [&](const auto &binding) {
+          Operation *operation = kernel.nodes.lookup(binding.first);
+          return operation && operation->getName().getStringRef() ==
+                                  "intent.scatter_unique";
+        });
     if (!searchSpace || !searchIndex.autotune ||
         planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
-        planIndex.atomics.empty())
+        planIndex.atomics.size() + uniqueStores != 1)
       return realization.emitOpError(
-          "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
+          "ragged staging requires traversal, stages, one terminal write, and a delegated tuner");
     for (StringRef role : {"program_0", "program_1"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -393,16 +399,26 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
         collectStageValue(found->second, position, inputs, visited);
       }
     } else {
-      for (const auto &binding : planIndex.atomics) {
-        Operation *atomic = kernel.nodes.lookup(binding.first);
-        if (!atomic)
+      auto collectTerminal = [&](Operation *terminal) -> LogicalResult {
+        if (!terminal)
           return raggedRelation->emitOpError(
-              "has a plan atomic without a canonical operation");
-        operationStages[atomic].push_back(position);
-        for (Value operand : atomic->getOperands()) {
+              "has a terminal plan write without a canonical operation");
+        operationStages[terminal].push_back(position);
+        for (Value operand : terminal->getOperands()) {
           llvm::DenseSet<Value> visited;
           collectStageValue(operand, position, inputs, visited);
         }
+        return success();
+      };
+      for (const auto &binding : planIndex.atomics)
+        if (failed(collectTerminal(kernel.nodes.lookup(binding.first))))
+          return failure();
+      for (const auto &binding : planIndex.boundaries) {
+        Operation *terminal = kernel.nodes.lookup(binding.first);
+        if (terminal && terminal->getName().getStringRef() ==
+                            "intent.scatter_unique" &&
+            failed(collectTerminal(terminal)))
+          return failure();
       }
     }
     if (!llvm::is_contained(operationStages.lookup(contract), position))
@@ -493,17 +509,32 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     if (failed(offsets) || failed(indices) || !searchIndex.autotune)
       return raggedRelation->emitOpError(
           "cannot resolve staged ragged metadata or delegated tuner");
-    ABIView *atomicDestination = nullptr;
+    ABIView *terminalDestination = nullptr;
+    bool restoreDestination = false;
+    auto bindTerminalDestination = [&](Operation *terminal,
+                                       bool restore) -> LogicalResult {
+      FailureOr<ABIView *> destination =
+          terminal && terminal->getNumOperands() > 0
+              ? lookupView(terminal->getOperand(0), *terminal)
+              : FailureOr<ABIView *>(failure());
+      if (failed(destination) || terminalDestination)
+        return raggedRelation->emitOpError(
+            "requires exactly one staged terminal destination");
+      terminalDestination = *destination;
+      restoreDestination = restore;
+      return success();
+    };
     for (const auto &binding : planIndex.atomics) {
       Operation *atomic = kernel.nodes.lookup(binding.first);
-      FailureOr<ABIView *> destination =
-          atomic && atomic->getNumOperands() > 0
-              ? lookupView(atomic->getOperand(0), *atomic)
-              : FailureOr<ABIView *>(failure());
-      if (failed(destination) || atomicDestination)
-        return raggedRelation->emitOpError(
-            "requires exactly one staged atomic destination");
-      atomicDestination = *destination;
+      if (failed(bindTerminalDestination(atomic, true)))
+        return failure();
+    }
+    for (const auto &binding : planIndex.boundaries) {
+      Operation *terminal = kernel.nodes.lookup(binding.first);
+      if (terminal && terminal->getName().getStringRef() ==
+                          "intent.scatter_unique" &&
+          failed(bindTerminalDestination(terminal, false)))
+        return failure();
     }
 
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
@@ -516,8 +547,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         source << "'" << cast<StringAttr>(attribute).getValue() << "'";
       }
       source << "]";
-      if (planIndex.stages[stage].getOutputs().empty())
-        source << ",\n    restore_value=['" << atomicDestination->pointer << "']";
+      if (planIndex.stages[stage].getOutputs().empty() && restoreDestination)
+        source << ",\n    restore_value=['" << terminalDestination->pointer
+               << "']";
       source << ",\n)\n@triton.jit\ndef " << kernelName << "_stage_"
              << stage << "(";
       bool first = true;
@@ -658,7 +690,9 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "in")
         inputs.push_back(&view);
-      else if (view.view.getAccess() == "inout" && !merge)
+      else if ((view.view.getAccess() == "out" ||
+                view.view.getAccess() == "inout") &&
+               !merge)
         merge = &view;
       else
         return kernel.entry.emitOpError(
@@ -781,7 +815,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
     StringRef mergeDtype = torchDtype(merge->tensor.getElementType());
-    output << "    " << merge->argument->name << " = torch.zeros((";
+    output << "    " << merge->argument->name << " = torch."
+           << (planIndex.atomics.empty() ? "empty" : "zeros") << "((";
     for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
       if (axis)
         output << ", ";

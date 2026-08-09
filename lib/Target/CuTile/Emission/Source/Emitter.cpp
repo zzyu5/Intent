@@ -284,11 +284,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return searchIndex.autotune.emitOpError(
           "must specialize the row stream dimension");
   } else if (raggedStages) {
+    unsigned uniqueStores = llvm::count_if(
+        planIndex.boundaries, [&](const auto &binding) {
+          Operation *operation = kernel.nodes.lookup(binding.first);
+          return operation && operation->getName().getStringRef() ==
+                                  "intent.scatter_unique";
+        });
     if (!searchSpace || !searchIndex.autotune ||
         planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
-        planIndex.atomics.empty())
+        planIndex.atomics.size() + uniqueStores != 1)
       return realization.emitOpError(
-          "ragged staging requires traversal, stages, atomic merge, and a delegated tuner");
+          "ragged staging requires traversal, stages, one terminal write, and a delegated tuner");
     for (StringRef role : {"program_0", "program_1"})
       if (!planIndex.axesByRole.count(role))
         return realization.emitOpError()
@@ -393,16 +399,26 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
         collectStageValue(found->second, position, inputs, visited);
       }
     } else {
-      for (const auto &binding : planIndex.atomics) {
-        Operation *atomic = kernel.nodes.lookup(binding.first);
-        if (!atomic)
+      auto collectTerminal = [&](Operation *terminal) -> LogicalResult {
+        if (!terminal)
           return raggedRelation->emitOpError(
-              "has a plan atomic without a canonical operation");
-        operationStages[atomic].push_back(position);
-        for (Value operand : atomic->getOperands()) {
+              "has a terminal plan write without a canonical operation");
+        operationStages[terminal].push_back(position);
+        for (Value operand : terminal->getOperands()) {
           llvm::DenseSet<Value> visited;
           collectStageValue(operand, position, inputs, visited);
         }
+        return success();
+      };
+      for (const auto &binding : planIndex.atomics)
+        if (failed(collectTerminal(kernel.nodes.lookup(binding.first))))
+          return failure();
+      for (const auto &binding : planIndex.boundaries) {
+        Operation *terminal = kernel.nodes.lookup(binding.first);
+        if (terminal && terminal->getName().getStringRef() ==
+                            "intent.scatter_unique" &&
+            failed(collectTerminal(terminal)))
+          return failure();
       }
     }
     if (!llvm::is_contained(operationStages.lookup(contract), position))
@@ -609,7 +625,9 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "in")
         inputs.push_back(&view);
-      else if (view.view.getAccess() == "inout" && !merge)
+      else if ((view.view.getAccess() == "out" ||
+                view.view.getAccess() == "inout") &&
+               !merge)
         merge = &view;
       else
         return kernel.entry.emitOpError(
@@ -712,7 +730,9 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "                lambda cfg: (";
       for (ABIView &view : views) {
         if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
-          output << "torch.zeros_like(" << view.argument->name << "), ";
+          output << (planIndex.atomics.empty() ? "torch.empty_like("
+                                              : "torch.zeros_like(")
+                 << view.argument->name << "), ";
         else
           output << view.argument->name << ", ";
       }
@@ -764,7 +784,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
-    output << "    " << merge->argument->name << " = torch.zeros((";
+    output << "    " << merge->argument->name << " = torch."
+           << (planIndex.atomics.empty() ? "empty" : "zeros") << "((";
     for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
       if (axis)
         output << ", ";

@@ -79,7 +79,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, RaggedMemberFact> raggedMembers;
   llvm::DenseMap<mlir::Value, mlir::Operation *> memberValues;
   llvm::DenseSet<mlir::Operation *> wholeViewLoads;
-  llvm::DenseSet<mlir::Operation *> scatterReductions;
+  llvm::DenseSet<mlir::Operation *> scatterWrites;
   llvm::DenseMap<mlir::Operation *, ContractionFact> contractions;
 };
 

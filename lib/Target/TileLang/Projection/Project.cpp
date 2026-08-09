@@ -149,7 +149,10 @@ LogicalResult projectRealization(intent::plan::RealizationOp realization) {
         gpu::stringAttr(builder, access),
         gpu::stringAttr(builder,
                         elementwiseTransfer ? "parallel_elements" : "bulk_copy"),
-        transfer.getFillAttr(), builder.getBoolAttr(rowStrided),
+        transfer.getFillAttr(),
+        builder.getBoolAttr(rowStrided ||
+                            (indexed->program.getMapping() == "ragged_stages" &&
+                             transfer.getAccess() == "store")),
         gpu::stringAttr(builder, resultSpace), transfer.getDeferAttr());
   }
   for (intent::plan::ReductionOp reduction : indexed->reductions) {

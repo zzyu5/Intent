@@ -269,11 +269,17 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         return realization.emitOpError()
                << "row-streamed TileLang program lacks " << role << " axis";
   } else if (raggedStages) {
+    unsigned uniqueStores = llvm::count_if(
+        planIndex.boundaries, [&](const auto &binding) {
+          Operation *operation = kernel.nodes.lookup(binding.first);
+          return operation && operation->getName().getStringRef() ==
+                                  "intent.scatter_unique";
+        });
     if (!searchSpace || !searchIndex.autotune ||
         planIndex.ragged.size() != 1 || planIndex.stages.empty() ||
-        planIndex.atomics.empty())
+        planIndex.atomics.size() + uniqueStores != 1)
       return realization.emitOpError(
-          "ragged TileLang staging requires traversal, stages, atomic merge, and a delegated tuner");
+          "ragged TileLang staging requires traversal, stages, one terminal write, and a delegated tuner");
   } else {
     return planIndex.program.emitOpError("has no TileLang program emitter");
   }
@@ -387,16 +393,26 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
         collectStageValue(found->second, position, inputs, visited);
       }
     } else {
-      for (const auto &binding : planIndex.atomics) {
-        Operation *atomic = kernel.nodes.lookup(binding.first);
-        if (!atomic)
+      auto collectTerminal = [&](Operation *terminal) -> LogicalResult {
+        if (!terminal)
           return raggedRelation->emitOpError(
-              "has a plan atomic without a canonical operation");
-        operationStages[atomic].push_back(position);
-        for (Value operand : atomic->getOperands()) {
+              "has a terminal plan write without a canonical operation");
+        operationStages[terminal].push_back(position);
+        for (Value operand : terminal->getOperands()) {
           llvm::DenseSet<Value> visited;
           collectStageValue(operand, position, inputs, visited);
         }
+        return success();
+      };
+      for (const auto &binding : planIndex.atomics)
+        if (failed(collectTerminal(kernel.nodes.lookup(binding.first))))
+          return failure();
+      for (const auto &binding : planIndex.boundaries) {
+        Operation *terminal = kernel.nodes.lookup(binding.first);
+        if (terminal && terminal->getName().getStringRef() ==
+                            "intent.scatter_unique" &&
+            failed(collectTerminal(terminal)))
+          return failure();
       }
     }
     if (!llvm::is_contained(operationStages.lookup(contract), position))
@@ -722,7 +738,9 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (ABIView &view : views) {
       if (view.view.getAccess() == "in")
         inputs.push_back(&view);
-      else if (view.view.getAccess() == "inout" && !merge)
+      else if ((view.view.getAccess() == "out" ||
+                view.view.getAccess() == "inout") &&
+               !merge)
         merge = &view;
       else
         return kernel.entry.emitOpError(
@@ -766,7 +784,9 @@ LogicalResult SourceEmitter::emitWrapper() {
         if (!first)
           output << ", ";
         if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
-          output << "torch.zeros_like(" << view.argument->name << ")";
+          output << (planIndex.atomics.empty() ? "torch.empty_like("
+                                              : "torch.zeros_like(")
+                 << view.argument->name << ")";
         else
           output << view.argument->name;
         first = false;
@@ -811,7 +831,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
-    output << "    " << merge->argument->name << " = torch.zeros((";
+    output << "    " << merge->argument->name << " = torch."
+           << (planIndex.atomics.empty() ? "empty" : "zeros") << "((";
     for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
       if (axis)
         output << ", ";
@@ -1176,6 +1197,10 @@ SourceEmitter::tensorExtents(Operation &operation, unsigned resultIndex) {
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());
+    else if (isRaggedStages() && activeStages.size() == 1 &&
+             label.getValue() ==
+                 stageFeatureDimensions.lookup(activeStages.front()))
+      extents.push_back("TILE_SIZE_N");
     else if (label.getValue().starts_with("?region_"))
       return operation.emitOpError(
           "tensor shape region has no TileLang tile binding");

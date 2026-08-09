@@ -211,7 +211,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     return success();
   };
   if (failed(addHandler(registry, "intent.view_load", bindTransfer)) ||
-      failed(addHandler(registry, "intent.view_store", bindTransfer)))
+      failed(addHandler(registry, "intent.view_store", bindTransfer)) ||
+      failed(addHandler(registry, "intent.scatter_unique", bindTransfer)))
     return failure();
 
   if (failed(addHandler(

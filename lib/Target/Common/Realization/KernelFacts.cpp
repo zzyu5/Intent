@@ -608,33 +608,35 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.scatter_reduce",
-          [&](Operation &operation) -> LogicalResult {
-            auto valueIndex = operation.getAttrOfType<IntegerAttr>(
-                "intent.value_operand_index");
-            auto combine =
-                operation.getAttrOfType<StringAttr>("intent.combine");
-            if (!valueIndex || valueIndex.getInt() <= 0 ||
-                static_cast<unsigned>(valueIndex.getInt()) >=
-                    operation.getNumOperands() ||
-                !combine || combine.getValue() != "add" ||
-                !isa<intent::ViewType>(operation.getOperand(0).getType()))
-              return operation.emitOpError(
-                  "has no canonical additive scatter-reduction schema");
-            FailureOr<SmallVector<LogicalAxis>> indexedAxes = inferIndexedAxes(
-                operation, operation.getOperand(0), facts);
-            auto valueAxes =
-                facts.valueAxes.find(operation.getOperand(valueIndex.getInt()));
-            if (failed(indexedAxes) || valueAxes == facts.valueAxes.end() ||
-                *indexedAxes != valueAxes->second)
-              return operation.emitOpError(
-                  "scatter-reduction value does not match its indexed destination");
-            if (failed(analyzeBoundary(operation, facts, "none")))
-              return failure();
-            facts.scatterReductions.insert(&operation);
-            return success();
-          })))
+  auto bindScatterWrite = [&](Operation &operation) -> LogicalResult {
+    auto valueIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    bool reduction =
+        operation.getName().getStringRef() == "intent.scatter_reduce";
+    auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
+    if (!valueIndex || valueIndex.getInt() <= 0 ||
+        static_cast<unsigned>(valueIndex.getInt()) >=
+            operation.getNumOperands() ||
+        (reduction && (!combine || combine.getValue() != "add")) ||
+        (!reduction && combine) ||
+        !isa<intent::ViewType>(operation.getOperand(0).getType()))
+      return operation.emitOpError(
+          "has no canonical unique or additive scatter schema");
+    FailureOr<SmallVector<LogicalAxis>> indexedAxes =
+        inferIndexedAxes(operation, operation.getOperand(0), facts);
+    auto valueAxes =
+        facts.valueAxes.find(operation.getOperand(valueIndex.getInt()));
+    if (failed(indexedAxes) || valueAxes == facts.valueAxes.end() ||
+        *indexedAxes != valueAxes->second)
+      return operation.emitOpError(
+          "scatter value does not match its indexed destination");
+    if (failed(analyzeBoundary(operation, facts, "none")))
+      return failure();
+    facts.scatterWrites.insert(&operation);
+    return success();
+  };
+  if (failed(addHandler(registry, "intent.scatter_unique", bindScatterWrite)) ||
+      failed(addHandler(registry, "intent.scatter_reduce", bindScatterWrite)))
     return failure();
 
   auto enterStateStream = [&](Operation &operation) -> LogicalResult {

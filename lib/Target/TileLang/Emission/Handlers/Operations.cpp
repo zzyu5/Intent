@@ -100,6 +100,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitStore(op);
       })) ||
+      failed(addHandler(registry, "intent.scatter_unique", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitUniqueStore(op);
+      })) ||
       failed(addHandler(registry, "intent.scatter_reduce", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -818,16 +823,31 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         binding.getLhsTranspose() || binding.getRhsTranspose())
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
+    auto operandElementType = [](Value value) -> Type {
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      return tensor ? tensor.getElementType() : Type();
+    };
+    Type lhsElement = operandElementType(operation.getOperand(0));
+    Type rhsElement = operandElementType(operation.getOperand(1));
+    bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
+    if (!lhsElement || !rhsElement ||
+        (!promoteToF32 && lhsElement != rhsElement) ||
+        (!lhsElement.isF16() && !lhsElement.isBF16() && !lhsElement.isF32()) ||
+        (!rhsElement.isF16() && !rhsElement.isBF16() && !rhsElement.isF32()))
+      return operation.emitOpError(
+          "has unsupported staged matrix operand types");
     std::string reduction = stageReductionDimensions.lookup(stage);
-    std::string lhsDtype = lhsAccess ? "T.float16" : "T.float32";
-    std::string rhsDtype = lhsAccess ? "T.float16" : "T.float32";
+    std::string matrixDtype =
+        promoteToF32 ? "T.float32" : dtypeName(lhsElement, operation);
+    if (matrixDtype.empty())
+      return failure();
     std::string lhs = makeResultName(operation, 0) + "_lhs";
     std::string rhs = makeResultName(*rhsLoad, 0) + "_shared";
     std::string result = makeResultName(operation, 0);
     line(lhs + " = T.alloc_shared((TILE_SIZE_M, TILE_SIZE_K), " +
-         lhsDtype + ")");
+         matrixDtype + ")");
     line(rhs + " = T.alloc_shared((TILE_SIZE_K, TILE_SIZE_N), " +
-         rhsDtype + ")");
+         matrixDtype + ")");
     line(result +
          " = T.alloc_fragment((TILE_SIZE_M, TILE_SIZE_N), T.float32)");
     line("T.clear(" + result + ")");
@@ -873,7 +893,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "[member_start + load_i, k_tile * TILE_SIZE_K + load_k], 0.0)");
       --indentation;
     }
-    if (lhsAccess) {
+    if (!promoteToF32 || rhsElement.isF32()) {
       line("T.copy(" + (*rhsView)->argument->name +
            "[expert, k_tile * TILE_SIZE_K, bid_feature * TILE_SIZE_N], " +
            rhs + ")");
@@ -885,7 +905,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "load_j < " + stageFeatureDimensions.lookup(stage) + ", T.cast(" +
            (*rhsView)->argument->name +
            "[expert, k_tile * TILE_SIZE_K + load_k, bid_feature * "
-           "TILE_SIZE_N + load_j], T.float32), 0.0)");
+           "TILE_SIZE_N + load_j], " + matrixDtype + "), 0.0)");
       --indentation;
     }
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
@@ -1033,6 +1053,45 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   }
   line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
        *indices + "])");
+  return success();
+}
+
+LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "unique-store emission");
+  plan::BoundaryOp binding =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  auto valueIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<StringRef> stored =
+      valueIndex ? lookupValue(operation, valueIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  if (failed(node) || !binding || binding.getAccess() != "store" ||
+      !binding.getCheckBounds() || binding.getDefer() || !valueIndex ||
+      failed(relation) || relation->size() != 2 ||
+      (*relation)[0].kind != "value_index" ||
+      (*relation)[0].operands.size() != 1 ||
+      !(*relation)[0].operands.front() ||
+      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored))
+    return operation.emitOpError("lacks a mechanical TileLang unique store");
+  FailureOr<StringRef> rows =
+      lookupValue(operation, *(*relation)[0].operands.front());
+  if (failed(rows))
+    return failure();
+  line("for store_i, store_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+  ++indentation;
+  line("if member_start + store_i < route_end and bid_feature * "
+       "TILE_SIZE_N + store_j < " +
+       stageFeatureDimensions.lookup(activeStages.front()) + ":");
+  ++indentation;
+  line((*view)->argument->name + "[" + rows->str() +
+       "[store_i], bid_feature * TILE_SIZE_N + store_j] = " + stored->str() +
+       "[store_i, store_j]");
+  --indentation;
+  --indentation;
   return success();
 }
 

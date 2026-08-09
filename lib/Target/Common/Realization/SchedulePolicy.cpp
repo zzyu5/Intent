@@ -19,12 +19,12 @@ FailureOr<ScheduleDecision> decideGpuSchedule(const KernelFacts &facts) {
   if (!structure->raggedOwnerships.empty()) {
     if (structure->raggedOwnerships.size() != 1 ||
         structure->raggedOwnerships.front().memberDomains.size() != 1 ||
-        structure->scatterReductions.size() != 1 ||
+        structure->scatterWrites.size() != 1 ||
         !structure->orderedStreamDomains.empty() ||
         structure->programDomains.size() != 2 ||
         structure->tiledProgramDomains.size() != 1) {
       facts.kernel.entry.emitOpError(
-          "ragged staging requires one outer/member ownership, one additive merge, and one tiled member domain");
+          "ragged staging requires one outer/member ownership, one terminal scatter write, and one tiled member domain");
       return failure();
     }
     const RaggedOwnership &ownership = structure->raggedOwnerships.front();

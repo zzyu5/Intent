@@ -106,9 +106,9 @@ analyzeScheduleStructure(const KernelFacts &facts) {
                       rhs.relation->getAttrOfType<IntegerAttr>("intent.node")
                           .getInt();
              });
-  structure.scatterReductions.assign(facts.scatterReductions.begin(),
-                                     facts.scatterReductions.end());
-  llvm::sort(structure.scatterReductions,
+  structure.scatterWrites.assign(facts.scatterWrites.begin(),
+                                 facts.scatterWrites.end());
+  llvm::sort(structure.scatterWrites,
              [](Operation *lhs, Operation *rhs) {
                return lhs->getAttrOfType<IntegerAttr>("intent.node").getInt() <
                       rhs->getAttrOfType<IntegerAttr>("intent.node").getInt();

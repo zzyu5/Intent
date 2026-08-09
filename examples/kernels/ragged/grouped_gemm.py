@@ -14,7 +14,7 @@ def ragged_grouped_gemm(
     group_offsets: I.In[I.i32, ("G_PLUS_1",)],
     member_rows: I.In[I.i32, ("R",)],
     weight: I.In[I.f16, ("G", "K", "N")],
-    y: I.InOut[I.f32, ("R", "N")],
+    y: I.Out[I.f16, ("R", "N")],
 ):
     G, _, N = weight.shape
     groups = I.ragged(
@@ -34,9 +34,8 @@ def ragged_grouped_gemm(
                 reduce=((1, 0),),
                 acc_dtype=I.f32,
             )
-            I.scatter_reduce(
+            I.scatter_unique(
                 y,
                 index=(rows, slice(None)),
-                value=result,
-                combine=I.add,
+                value=I.cast(result, I.f16),
             )

@@ -112,6 +112,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitStore(op);
                         })) ||
+      failed(addHandler(registry, "intent.scatter_unique", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitUniqueStore(op);
+      })) ||
       failed(addHandler(registry, "intent.scatter_reduce", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -585,6 +590,19 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         binding.getLhsTranspose() || binding.getRhsTranspose())
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
+    auto operandElementType = [](Value value) -> Type {
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      return tensor ? tensor.getElementType() : Type();
+    };
+    Type lhsElement = operandElementType(operation.getOperand(0));
+    Type rhsElement = operandElementType(operation.getOperand(1));
+    bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
+    if (!lhsElement || !rhsElement ||
+        (!promoteToF32 && lhsElement != rhsElement) ||
+        (!lhsElement.isF16() && !lhsElement.isBF16() && !lhsElement.isF32()) ||
+        (!rhsElement.isF16() && !rhsElement.isBF16() && !rhsElement.isF32()))
+      return operation.emitOpError(
+          "has unsupported staged matrix operand types");
     std::string feature = stageFeatureDimensions.lookup(stage);
     std::string reduction = stageReductionDimensions.lookup(stage);
     std::string result = makeResultName(operation, 0);
@@ -640,7 +658,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
          (*rhsView)->strides[2] +
          ", mask=(offs_reduction[:, None] < " + reduction +
          ") & feature_mask[None, :], other=0.0)");
-    if (!lhsAccess)
+    if (promoteToF32 && !lhsElement.isF32())
+      line(lhs + " = " + lhs + ".to(tl.float32)");
+    if (promoteToF32 && !rhsElement.isF32())
       line(rhs + " = " + rhs + ".to(tl.float32)");
     line(result + " = tl.dot(" + lhs + ", " + rhs + ", " + result + ")");
     --indentation;
@@ -722,6 +742,40 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
     return failure();
   line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" + *mask +
        ")");
+  return success();
+}
+
+LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "unique-store emission");
+  plan::BoundaryOp binding =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  auto valueIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<StringRef> stored =
+      valueIndex ? lookupValue(operation, valueIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  if (failed(node) || !binding || binding.getDefer() ||
+      binding.getStoreMask() != "predicate" || !valueIndex ||
+      failed(relation) || relation->size() != 2 ||
+      (*relation)[0].kind != "value_index" ||
+      (*relation)[0].operands.size() != 1 ||
+      !(*relation)[0].operands.front() ||
+      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored) ||
+      (*view)->tensor.getRank() != 2)
+    return operation.emitOpError("lacks a mechanical Triton unique store");
+  FailureOr<StringRef> rows =
+      lookupValue(operation, *(*relation)[0].operands.front());
+  if (failed(rows))
+    return failure();
+  std::string pointer = (*view)->pointer + " + " + rows->str() +
+                        "[:, None] * " + (*view)->strides[0] +
+                        " + offs_feature[None, :] * " + (*view)->strides[1];
+  line("tl.store(" + pointer + ", " + stored->str() +
+       ", mask=member_mask[:, None] & feature_mask[None, :])");
   return success();
 }
 

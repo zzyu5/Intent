@@ -24,7 +24,7 @@ struct ScheduleStructure {
   llvm::SmallVector<mlir::Operation *> contractionDomains;
   llvm::SmallVector<mlir::Operation *> orderedStreamDomains;
   llvm::SmallVector<RaggedOwnership> raggedOwnerships;
-  llvm::SmallVector<mlir::Operation *> scatterReductions;
+  llvm::SmallVector<mlir::Operation *> scatterWrites;
   mlir::Operation *programRoot = nullptr;
 };
 

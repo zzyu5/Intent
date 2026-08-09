@@ -41,7 +41,7 @@ def moe_expert_ffn(
                 reduce=((1, 0),),
                 acc_dtype=I.f32,
             )
-            hidden = I.maximum(hidden, 0.0)
+            hidden = I.cast(I.maximum(hidden, 0.0), I.f16)
             route_output = I.contract(
                 hidden,
                 w2[expert, :, :],

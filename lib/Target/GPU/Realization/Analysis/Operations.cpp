@@ -59,7 +59,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry,
                          "intent.partition", "intent.parallel",
                          "intent.view_load", "intent.view_store", "intent.yield",
                          "intent.return", "intent.state_stream", "intent.ragged",
-                         "intent.ragged_outer", "intent.ragged_member"})
+                         "intent.ragged_outer", "intent.ragged_member",
+                         "intent.scatter_unique"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
 
