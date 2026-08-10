@@ -581,8 +581,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return kernel.entry.emitOpError(
           "fixed-row TileLang program requires one ranked output view");
   }
-  if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
-       !planIndex.stages.empty()) &&
+  if (target::emission::requiresDelegatedTuning(planIndex) &&
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated TileLang tuner");

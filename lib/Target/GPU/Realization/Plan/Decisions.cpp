@@ -293,7 +293,10 @@ assignAxes(const target::KernelFacts &facts) {
         choice.tile = "program_" + std::to_string(ordinaryTile++);
       }
     } else if (hasRole(choice.roles, "ordered")) {
-      choice.tile = hasIndirectRaggedMembership(choice.domain, facts)
+      auto fixed = facts.orderedStreamFixedExtents.find(choice.domain);
+      choice.tile = fixed != facts.orderedStreamFixedExtents.end()
+                        ? "fixed_" + std::to_string(fixed->second)
+                    : hasIndirectRaggedMembership(choice.domain, facts)
                         ? "one"
                     : hasRole(choice.roles, "reduction")
                         ? indexedTile("stream_contract",

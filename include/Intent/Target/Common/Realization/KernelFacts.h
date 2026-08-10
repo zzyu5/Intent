@@ -77,6 +77,7 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> vectorDomains;
   llvm::DenseSet<mlir::Operation *> contractionDomains;
   llvm::DenseSet<mlir::Operation *> orderedStreamDomains;
+  llvm::DenseMap<mlir::Operation *, int64_t> orderedStreamFixedExtents;
   llvm::DenseMap<mlir::Operation *, StateStreamFact> stateStreams;
   llvm::DenseMap<mlir::Operation *, RaggedRelationFact> raggedRelations;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> raggedOuterRelations;

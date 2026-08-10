@@ -546,8 +546,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return realization.emitOpError(
           "fixed persistent rows require one ranked output and no search space");
   }
-  if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
-       !planIndex.stages.empty()) &&
+  if (target::emission::requiresDelegatedTuning(planIndex) &&
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated cuTile tuner");

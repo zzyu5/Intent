@@ -1206,6 +1206,24 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           "state stream requires a canonical source domain");
     if (failed(bindRegionArgumentAxis(operation, 0, *axisDomain, facts)))
       return failure();
+    if (extentIndex) {
+      Operation *extentValue =
+          operation.getOperand(extentIndex.getInt()).getDefiningOp();
+      auto constant = extentValue
+                          ? extentValue->getAttrOfType<IntegerAttr>("intent.value")
+                          : IntegerAttr();
+      if (!extentValue ||
+          extentValue->getName().getStringRef() != "intent.constant" ||
+          !constant || constant.getInt() <= 0)
+        return operation.emitOpError(
+            "state stream runtime extent must be a positive constant");
+      auto previous = facts.orderedStreamFixedExtents.find(axisDomain);
+      if (previous != facts.orderedStreamFixedExtents.end() &&
+          previous->second != constant.getInt())
+        return operation.emitOpError(
+            "assigns incompatible fixed extents to one ordered axis");
+      facts.orderedStreamFixedExtents[axisDomain] = constant.getInt();
+    }
     Operation *stopBound = nullptr;
     if (stopIndex) {
       stopBound = operation.getOperand(stopIndex.getInt()).getDefiningOp();

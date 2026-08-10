@@ -527,6 +527,14 @@ struct PhysicalComponents {
 };
 
 template <typename PlanIndex>
+bool requiresDelegatedTuning(const PlanIndex &index) {
+  return llvm::any_of(index.axes, [&](const auto &entry) {
+    llvm::StringRef tile = entry.second.getTileRole();
+    return tile != "one" && !tile.starts_with("fixed_");
+  });
+}
+
+template <typename PlanIndex>
 bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
   if (!operation || operation->getName().getStringRef() != "intent.contract")
     return false;

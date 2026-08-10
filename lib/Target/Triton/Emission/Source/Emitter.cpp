@@ -529,8 +529,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
   }
-  if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
-       !planIndex.stages.empty()) &&
+  if (target::emission::requiresDelegatedTuning(planIndex) &&
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated Triton tuner");

@@ -134,6 +134,9 @@ from kernels.streaming.paged_attention import QUERY_HEADS as PAGED_QUERY_HEADS
 from kernels.streaming.paged_attention import SCALE as PAGED_SCALE
 from kernels.streaming.paged_attention import SEQUENCE_LENGTHS as PAGED_SEQUENCE_LENGTHS
 from kernels.streaming.paged_attention import paged_gqa_decode_attention
+from kernels.streaming.selective_scan import BATCH as SELECTIVE_SCAN_BATCH
+from kernels.streaming.selective_scan import LENGTH as SELECTIVE_SCAN_LENGTH
+from kernels.streaming.selective_scan import selective_state_scan
 
 from .support import benchmark
 from .support import prepare_kernel_call
@@ -298,6 +301,47 @@ def _run_conv2d(
         tolerance=3.0e-3,
         upstream=upstream,
         expected_dtype=torch.float16,
+    )
+
+
+def _run_selective_scan(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    x = torch.randn(
+        (SELECTIVE_SCAN_BATCH, SELECTIVE_SCAN_LENGTH),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.05
+    decay = 0.9 + 0.09 * torch.rand_like(x)
+    drive = torch.randn_like(x) * 0.05
+    artifact = intent.compile(selective_state_scan, target=target, compiler=compiler)
+
+    def reference() -> torch.Tensor:
+        state = torch.zeros(
+            (SELECTIVE_SCAN_BATCH,), device="cuda", dtype=torch.float32
+        )
+        expected = torch.empty_like(x)
+        for position in range(SELECTIVE_SCAN_LENGTH):
+            state = (
+                decay[:, position] * state
+                + drive[:, position] * x[:, position]
+            )
+            expected[:, position] = state
+        return expected
+
+    _compare(
+        artifact=artifact,
+        arguments=(x, decay, drive),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="selective state scan",
+        tolerance=2.0e-5,
+        upstream=upstream,
+        expected_dtype=torch.float32,
+        cuda_graph=False,
     )
 
 
@@ -2183,6 +2227,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "scalar_table_lookup": _run_scalar_table_lookup,
+    "selective_scan": _run_selective_scan,
     "shifted_row_copy": _run_shifted_row_copy,
     "sorted_nucleus_cutoff": _run_sorted_nucleus_cutoff,
     "swiglu_backward": _run_swiglu_backward,
