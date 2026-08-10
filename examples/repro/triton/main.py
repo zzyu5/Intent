@@ -57,6 +57,16 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "attention_bias":
+        module = _load_module(source_path, "intent_upstream_triton_attention_bias")
+        return lambda arguments: module.source._flash_attn_forward(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            bias=arguments[3],
+            causal=False,
+            softmax_scale=arguments[4],
+        )[0].transpose(1, 2)
     if kernel == "layer_norm_backward":
         layer_norm = _load_prefix(
             source_path,

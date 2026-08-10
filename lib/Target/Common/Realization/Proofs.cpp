@@ -17,45 +17,28 @@ enum class PaddedValue {
   negativeInfinity,
 };
 
-Operation *rootViewLoad(Value value) {
-  Operation *definition = value.getDefiningOp();
-  while (definition && definition->getName().getStringRef() == "intent.cast" &&
-         definition->getNumOperands() == 1) {
-    value = definition->getOperand(0);
-    definition = value.getDefiningOp();
-  }
-  if (!definition ||
-      definition->getName().getStringRef() != "intent.view_load")
-    return nullptr;
-  return definition;
-}
-
-bool haveAlignedLoadMasks(Value lhs, Value rhs) {
-  Operation *lhsLoad = rootViewLoad(lhs);
-  Operation *rhsLoad = rootViewLoad(rhs);
-  if (!lhsLoad || !rhsLoad ||
-      lhsLoad->getAttr("intent.index") != rhsLoad->getAttr("intent.index") ||
-      lhsLoad->getAttr("intent.result_shapes") !=
-          rhsLoad->getAttr("intent.result_shapes") ||
-      lhsLoad->getNumOperands() != rhsLoad->getNumOperands())
+bool isShapeOnlyGather(Operation &operation) {
+  auto relation = operation.getAttrOfType<ArrayAttr>("intent.index");
+  if (!relation)
     return false;
-  for (unsigned index = 1; index < lhsLoad->getNumOperands(); ++index)
-    if (lhsLoad->getOperand(index) != rhsLoad->getOperand(index))
+  for (Attribute attribute : relation) {
+    auto term = dyn_cast<DictionaryAttr>(attribute);
+    auto kind = term ? term.getAs<StringAttr>("kind") : StringAttr();
+    if (!kind ||
+        (kind.getValue() != "full_slice" && kind.getValue() != "new_axis"))
       return false;
+  }
   return true;
 }
 
 bool provePaddedUses(Value value, PaddedValue padded,
-                     llvm::DenseMap<Value, PaddedValue> &visited,
-                     Operation *ignoredUser = nullptr) {
+                     llvm::DenseMap<Value, PaddedValue> &visited) {
   auto found = visited.find(value);
   if (found != visited.end())
     return found->second == padded;
   visited[value] = padded;
 
   for (Operation *user : value.getUsers()) {
-    if (user == ignoredUser)
-      continue;
     StringRef name = user->getName().getStringRef();
     if (name == "intent.view_store")
       continue;
@@ -81,6 +64,9 @@ bool provePaddedUses(Value value, PaddedValue padded,
     PaddedValue result = PaddedValue::arbitrary;
     if (name == "intent.cast" || name == "intent.broadcast") {
       result = padded;
+    } else if (name == "intent.gather" && user->getNumOperands() >= 1 &&
+               user->getOperand(0) == value && isShapeOnlyGather(*user)) {
+      result = padded;
     } else if (name == "intent.unary") {
       auto logical = user->getAttrOfType<StringAttr>("intent.operator");
       if (logical &&
@@ -97,24 +83,18 @@ bool provePaddedUses(Value value, PaddedValue padded,
         result = PaddedValue::zero;
       else if (logical && logical.getValue() == "add" &&
                padded == PaddedValue::zero) {
-        Value sibling = user->getOperand(0) == value ? user->getOperand(1)
-                                                     : user->getOperand(0);
-        Operation *siblingLoad = rootViewLoad(sibling);
-        llvm::DenseMap<Value, PaddedValue> siblingVisited;
-        if (siblingLoad && haveAlignedLoadMasks(value, sibling) &&
-            provePaddedUses(siblingLoad->getResult(0), PaddedValue::zero,
-                            siblingVisited, user))
-          result = PaddedValue::zero;
+        // This input is neutral; consumers realize the result's own padding.
+        continue;
       } else if (logical && logical.getValue() == "subtract" &&
-                 user->getOperand(0) == value &&
-                 padded == PaddedValue::negativeInfinity)
+               user->getOperand(0) == value &&
+               padded == PaddedValue::negativeInfinity)
         result = PaddedValue::negativeInfinity;
     } else {
       return false;
     }
 
     if (user->getNumResults() != 1 ||
-        !provePaddedUses(user->getResult(0), result, visited, ignoredUser))
+        !provePaddedUses(user->getResult(0), result, visited))
       return false;
   }
   return true;
@@ -169,7 +149,8 @@ std::optional<std::string> inferPadding(
       definition->getNumOperands() >= 1)
     return inferPadding(definition->getOperand(0), facts, assumedPadding);
   if (name == "intent.gather" && definition->getNumOperands() >= 1) {
-    if (!isa<intent::ViewType>(definition->getOperand(0).getType()))
+    if (!isa<intent::ViewType>(definition->getOperand(0).getType()) &&
+        isShapeOnlyGather(*definition))
       return inferPadding(definition->getOperand(0), facts, assumedPadding);
     auto fillIndex =
         definition->getAttrOfType<IntegerAttr>("intent.fill_operand_index");

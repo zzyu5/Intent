@@ -55,10 +55,14 @@ from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.streaming.online_softmax import COLUMNS as ONLINE_COLUMNS
 from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from kernels.streaming.online_softmax import streamed_online_softmax
+from kernels.streaming.attention import BATCH as ATTENTION_BATCH
+from kernels.streaming.attention import HEADS as ATTENTION_HEADS
 from kernels.streaming.attention import HEAD_DIMENSION
 from kernels.streaming.attention import SCALE
+from kernels.streaming.attention import SEQUENCE as ATTENTION_SEQUENCE
 from kernels.streaming.attention import VARLEN_BATCH
 from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
+from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 
 from .support import benchmark
@@ -798,7 +802,57 @@ def _run_varlen_attention(
         )
 
 
+def _run_attention_bias(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape = (
+        ATTENTION_BATCH,
+        ATTENTION_HEADS,
+        ATTENTION_SEQUENCE,
+        HEAD_DIMENSION,
+    )
+    q = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    k = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    v = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    bias = torch.randn(
+        (ATTENTION_BATCH, ATTENTION_HEADS, ATTENTION_SEQUENCE),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.125
+    artifact = intent.compile(
+        flash_attention_bias_fwd, target=target, compiler=compiler
+    )
+    arguments = (q, k, v, bias, SCALE)
+    source_arguments = (
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        bias[:, :, None, :],
+        SCALE,
+    )
+    adapted_upstream = (
+        (lambda _: upstream(source_arguments)) if upstream is not None else None
+    )
+    _compare(
+        artifact=artifact,
+        arguments=arguments,
+        reference=lambda: F.scaled_dot_product_attention(
+            q.float(),
+            k.float(),
+            v.float(),
+            attn_mask=bias[:, :, None, :],
+            scale=SCALE,
+        ).to(torch.float16),
+        target_name=target_name,
+        kernel_name="vector-bias attention",
+        tolerance=2.0e-2,
+        upstream=adapted_upstream,
+        expected_dtype=torch.float16,
+    )
+
+
 EXTENDED_RUNNERS: dict[str, Runner] = {
+    "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "dual_gemm": _run_dual_gemm,

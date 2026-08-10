@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward>" >&2
   exit 2
 fi
 
@@ -37,6 +37,9 @@ case "${backend}:${kernel}" in
     ;;
   triton:attention)
     baseline=source/triton/triton/attention/fused/06-fused-attention.py
+    ;;
+  triton:attention_bias)
+    baseline=source/triton/flash-attention/attention/fused/flash_attn_triton_runtime.py
     ;;
   triton:moe)
     baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
@@ -132,9 +135,9 @@ case "${backend}:${kernel}" in
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
   triton:bf16_gemm | triton:batched_gemm | triton:quantized_gemm | triton:logsumexp | \
-  cutile:quantized_gemm | cutile:rms_norm | cutile:fused_add_rms_norm | cutile:logsumexp | \
+  cutile:attention_bias | cutile:quantized_gemm | cutile:rms_norm | cutile:fused_add_rms_norm | cutile:logsumexp | \
   cutile:layer_norm_backward | cutile:swiglu_backward | \
-  tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:fused_add_rms_norm | tilelang:logsumexp | \
+  tilelang:attention_bias | tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:fused_add_rms_norm | tilelang:logsumexp | \
   tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | \
   triton:varlen_attention | cutile:varlen_attention)
     ;;
