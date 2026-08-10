@@ -20,6 +20,7 @@ namespace intent::tilelang::plan {
 using TargetOp = target::emission::TargetBinding;
 using AxisOp = target::emission::AxisBinding;
 using ProgramOp = target::emission::ProgramBinding;
+using BlockExtentOp = target::emission::BlockExtentBinding;
 using BufferOp = target::emission::BufferBinding;
 using PaddingOp = target::emission::PaddingBinding;
 using ReductionOp = target::emission::ReductionBinding;
@@ -39,6 +40,7 @@ namespace intent::tilelang::emission {
 struct RealizationIndex {
   plan::TargetOp target;
   plan::ProgramOp program;
+  llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
@@ -152,13 +154,18 @@ private:
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
+  std::string physicalExtent(llvm::StringRef logicalExtent) const;
+  mlir::FailureOr<std::string>
+  transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   elementAccessIndices(mlir::Operation &operation,
                        llvm::ArrayRef<std::string> tileIndices);
   mlir::FailureOr<std::string>
   elementBoundsPredicate(mlir::Operation &operation,
-                         llvm::ArrayRef<std::string> tileIndices);
+                         llvm::ArrayRef<std::string> tileIndices,
+                         bool physicalOnly = false,
+                         bool includePhysical = true);
   mlir::FailureOr<std::string>
   wholeTileBoundsPredicate(mlir::Operation &operation,
                            llvm::ArrayRef<std::string> tileExtents);
@@ -172,7 +179,8 @@ private:
                        llvm::ArrayRef<std::string> elementIndices,
                        mlir::Operation &consumer);
   mlir::FailureOr<llvm::SmallVector<std::string>>
-  tensorExtents(mlir::Operation &operation, unsigned resultIndex);
+  tensorExtents(mlir::Operation &operation, unsigned resultIndex,
+                bool physical = true);
   mlir::FailureOr<std::string> tensorShape(mlir::Operation &operation,
                                            unsigned resultIndex);
   mlir::FailureOr<std::string> tensorElement(mlir::Value value,
@@ -214,6 +222,7 @@ private:
   llvm::DenseMap<int64_t, std::string> axisIndices;
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
+  llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>

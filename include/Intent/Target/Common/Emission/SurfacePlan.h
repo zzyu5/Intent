@@ -265,11 +265,40 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
 struct ProgramBinding : Binding<intent::plan::ProgramOp> {
   int64_t getLoopNode() const { return operation.getLoopNode(); }
   bool getPersistent() const { return operation.getPersistent(); }
-  int64_t getIndexBits() const { return operation.getIndexBits(); }
   mlir::IntegerAttr getLoopNodeAttr() const {
     return operation.getLoopNodeAttr();
   }
 };
+
+struct BlockExtentBinding : Binding<intent::plan::BlockExtentOp> {
+  llvm::StringRef getLogicalExtent() const {
+    return operation.getLogicalExtent();
+  }
+  llvm::StringRef getRounding() const { return operation.getRounding(); }
+  llvm::StringRef getFill() const { return operation.getFill(); }
+};
+
+template <typename PlanIndex>
+mlir::FailureOr<std::string> transferPhysicalExtentFill(
+    const PlanIndex &index, llvm::ArrayRef<target::IndexTerm> relation,
+    llvm::ArrayRef<std::string> viewShape, mlir::Operation &operation) {
+  if (relation.size() != viewShape.size())
+    return operation.emitOpError(
+        "physical block-extent projection does not match the external view rank");
+  std::string fill;
+  for (auto [axis, term] : llvm::enumerate(relation)) {
+    if (term.kind != "full_slice")
+      continue;
+    auto extent = index.blockExtents.find(viewShape[axis]);
+    if (extent == index.blockExtents.end())
+      continue;
+    if (!fill.empty() && fill != extent->second.getFill())
+      return operation.emitOpError(
+          "uses incompatible physical block-extent fill rules");
+    fill = extent->second.getFill().str();
+  }
+  return fill;
+}
 
 struct BufferBinding : Binding<intent::plan::BufferOp> {
   int64_t getNode() const { return operation.getNode(); }

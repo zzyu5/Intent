@@ -122,9 +122,16 @@ def paged_gqa_decode_attention(
                                 token_maximum,
                                 local_maximum,
                             )
-                            alpha = I.exp2(token_maximum - next_maximum)
+                            normalization_maximum = I.mask(
+                                next_maximum,
+                                valid=next_maximum != -I.inf,
+                                fill=0.0,
+                            )
+                            alpha = I.exp2(
+                                token_maximum - normalization_maximum
+                            )
                             probability = I.exp2(
-                                scores - next_maximum[:, None]
+                                scores - normalization_maximum[:, None]
                             )
                             next_denominator = (
                                 alpha * token_denominator
@@ -157,9 +164,14 @@ def paged_gqa_decode_attention(
                         inner_accumulator,
                     )
             _, denominator, accumulator = page_stream.result
+            safe_denominator = I.mask(
+                denominator,
+                valid=denominator > 0.0,
+                fill=1.0,
+            )
             output[batch, query_head, :] = I.reshape(
                 I.cast(
-                    accumulator / denominator[:, None],
+                    accumulator / safe_denominator[:, None],
                     I.f16,
                 ),
                 (DV,),

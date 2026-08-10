@@ -1,6 +1,7 @@
 #include "Support/Decisions.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <array>
 #include <numeric>
@@ -608,7 +609,31 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     return failure();
   decisions.program = builder.create<intent::plan::ProgramOp>(
       (*root)->getLoc(), i64(builder, *rootNode),
-      builder.getBoolAttr(assignments->persistent), i64(builder, 64));
+      builder.getBoolAttr(assignments->persistent));
+
+  llvm::StringSet<> implicitContractionExtents;
+  auto collectImplicitExtent = [&](const target::LogicalAxis &axis) {
+    if (!axis.domain && axis.extent != "1")
+      implicitContractionExtents.insert(axis.extent);
+  };
+  for (const auto &entry : facts.contractions) {
+    const target::ContractionFact &contraction = entry.second;
+    for (const target::LogicalAxis &axis : contraction.lhsAxes)
+      collectImplicitExtent(axis);
+    for (const target::LogicalAxis &axis : contraction.rhsAxes)
+      collectImplicitExtent(axis);
+    for (const target::LogicalAxis &axis : contraction.resultAxes)
+      collectImplicitExtent(axis);
+  }
+  SmallVector<std::string> orderedImplicitExtents;
+  for (const auto &extent : implicitContractionExtents)
+    orderedImplicitExtents.push_back(extent.getKey().str());
+  llvm::sort(orderedImplicitExtents);
+  for (const std::string &extent : orderedImplicitExtents)
+    decisions.blockExtents.push_back(
+        builder.create<intent::plan::BlockExtentOp>(
+            facts.kernel.entry.getLoc(), string(builder, extent),
+            string(builder, "power_of_two"), string(builder, "zero")));
 
   for (const AxisChoice &choice : assignments->axes) {
     FailureOr<int64_t> domainNode = node(*choice.domain, "axis binding");
@@ -723,6 +748,8 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
     if (axis.getGroupAttr())
       appendUnique(parameters, *axis.getGroup());
   }
+  for (intent::plan::BlockExtentOp extent : decisions.blockExtents)
+    appendUnique(keys, extent.getLogicalExtent());
   for (intent::plan::StageAxisOp axis : decisions.stageAxes) {
     appendUnique(keys, axis.getExtent());
     appendUnique(parameters, axis.getTile());

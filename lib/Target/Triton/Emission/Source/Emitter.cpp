@@ -191,6 +191,10 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
+      plan::BlockExtentOp binding;
+      binding.operation = value;
+      index.blockExtents[value.getLogicalExtent()] = binding;
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
@@ -827,9 +831,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                                             stageMemberWorkers.lookup(stage)) +
                                         ")"));
       if (compact) {
-        stageLine(stage, "expert = 0");
-        stageLine(stage, "route_tile = 0");
-        stageLine(stage, "tile_cursor = 0");
+        stageLine(stage, "expert = " + addressIndex("0"));
+        stageLine(stage, "route_tile = " + addressIndex("0"));
+        stageLine(stage, "tile_cursor = " + addressIndex("0"));
         stageLine(stage, "for candidate in range(0, " + experts + "):");
         stageLine(stage, "candidate_begin = tl.load(" + offsets->pointer +
                              " + " + addressIndex("candidate") + " * " +
@@ -840,14 +844,18 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                              addressIndex(offsets->strides[0]) + ")",
                   2);
         stageLine(stage,
-                  "candidate_tiles = tl.cdiv(candidate_end - candidate_begin, "
-                  "BLOCK_SIZE_M)",
+                  "candidate_tiles = " +
+                      addressIndex("tl.cdiv(candidate_end - candidate_begin, "
+                                   "BLOCK_SIZE_M)"),
                   2);
         stageLine(stage,
                   "owns_tile = (pid_expert_route >= tile_cursor) & "
                   "(pid_expert_route < tile_cursor + candidate_tiles)",
                   2);
-        stageLine(stage, "expert = tl.where(owns_tile, candidate, expert)", 2);
+        stageLine(stage,
+                  "expert = tl.where(owns_tile, " + addressIndex("candidate") +
+                      ", expert)",
+                  2);
         stageLine(stage,
                   "route_tile = tl.where(owns_tile, pid_expert_route - "
                   "tile_cursor, route_tile)",
@@ -960,6 +968,12 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 }
 
 LogicalResult SourceEmitter::emitWrapper() {
+  auto emitViewCapabilityCheck = [&](const ABIView &view) {
+    output << "    if any(extent == 0 for extent in "
+           << view.argument->name << ".shape):\n";
+    output << "        raise NotImplementedError('Triton does not support "
+              "zero-extent external views in this compiler')\n";
+  };
   if (!planIndex.stages.empty()) {
     for (const std::string &body : stageBodies)
       output << body << "\n";
@@ -1016,6 +1030,7 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
+      emitViewCapabilityCheck(view);
     }
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
@@ -1202,6 +1217,7 @@ LogicalResult SourceEmitter::emitWrapper() {
              << view.tensor.getRank() << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong rank')\n";
+      emitViewCapabilityCheck(view);
       output << "    if tuple(" << view.argument->name << ".shape) != (";
       for (auto [axis, extent] : llvm::enumerate(view.shape)) {
         if (axis)
@@ -1393,6 +1409,7 @@ LogicalResult SourceEmitter::emitWrapper() {
            << ":\n";
     output << "        raise ValueError('" << view.argument->name
            << " has the wrong dtype')\n";
+    emitViewCapabilityCheck(view);
   }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
@@ -1684,8 +1701,25 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
 }
 
 std::string SourceEmitter::addressIndex(StringRef expression) const {
-  return "tl.cast((" + expression.str() + "), tl.int" +
-         std::to_string(planIndex.program.getIndexBits()) + ")";
+  return "tl.cast((" + expression.str() + "), tl.int64)";
+}
+
+std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
+  auto extent = planIndex.blockExtents.find(logicalExtent);
+  if (extent == planIndex.blockExtents.end())
+    return logicalExtent.str();
+  return "triton.next_power_of_2(" + logicalExtent.str() + ")";
+}
+
+FailureOr<std::string>
+SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(relation) || failed(view))
+    return failure();
+  return target::emission::transferPhysicalExtentFill(
+      planIndex, *relation, (*view)->shape, operation);
 }
 
 FailureOr<std::string>
@@ -1703,8 +1737,9 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     std::string index;
     if (term.kind == "full_slice") {
-      index = broadcastIndex("tl.arange(0, " + view.shape[axisNumber] + ")",
-                             vectorAxis++, *tensorRank);
+      index = broadcastIndex(
+          "tl.arange(0, " + physicalExtent(view.shape[axisNumber]) + ")",
+          vectorAxis++, *tensorRank);
     } else if (term.kind == "static_index") {
       if (term.staticValues.size() != 1 || !term.staticValues.front())
         return operation.emitOpError(
@@ -1783,6 +1818,13 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   unsigned vectorAxis = 0;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
+      if (planIndex.blockExtents.count((*view)->shape[axisNumber])) {
+        std::string index = broadcastIndex(
+            "tl.arange(0, " + physicalExtent((*view)->shape[axisNumber]) + ")",
+            vectorAxis, *tensorRank);
+        predicates.push_back("(" + index + " < " +
+                             (*view)->shape[axisNumber] + ")");
+      }
       ++vectorAxis;
       continue;
     }
@@ -1989,7 +2031,7 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
       return operation.emitOpError(
           "tensor shape region has no physical tile binding");
     else
-      extents.push_back(label.getValue().str());
+      extents.push_back(physicalExtent(label.getValue()));
   }
   std::string result = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {

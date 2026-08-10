@@ -8,6 +8,7 @@ namespace intent::gpu::realization {
 
 struct PhysicalDecisions {
   intent::plan::ProgramOp program;
+  llvm::SmallVector<intent::plan::BlockExtentOp> blockExtents;
   llvm::SmallVector<intent::plan::AxisOp> axes;
   llvm::SmallVector<intent::plan::StageOp> stages;
   llvm::SmallVector<intent::plan::StageAxisOp> stageAxes;

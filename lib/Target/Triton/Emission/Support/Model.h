@@ -21,6 +21,7 @@ namespace intent::triton::plan {
 using TargetOp = target::emission::TargetBinding;
 using AxisOp = target::emission::AxisBinding;
 using ProgramOp = target::emission::ProgramBinding;
+using BlockExtentOp = target::emission::BlockExtentBinding;
 using BufferOp = target::emission::BufferBinding;
 using PaddingOp = target::emission::PaddingBinding;
 using ReductionOp = target::emission::ReductionBinding;
@@ -40,6 +41,7 @@ namespace intent::triton::emission {
 struct RealizationIndex {
   plan::TargetOp target;
   plan::ProgramOp program;
+  llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
@@ -154,6 +156,9 @@ private:
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
+  std::string physicalExtent(llvm::StringRef logicalExtent) const;
+  mlir::FailureOr<std::string>
+  transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   indexExpression(plan::AxisOp axis, bool store,
                   unsigned tensorAxis, unsigned tensorRank,

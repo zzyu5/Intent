@@ -239,6 +239,36 @@ def run_gemm_tail_case(artifact, target_name: str) -> None:
         tolerance=2.0e-2,
         upstream=None,
     )
+    one = torch.randn((1, 1), device="cuda", dtype=torch.float16)
+    generated = artifact.run(one, one)
+    expected = one @ one
+    torch.cuda.synchronize()
+    error = (generated - expected).abs().max().item()
+    if error > 2.0e-2:
+        raise RuntimeError(
+            f"{target_name} 1x1x1 GEMM numerical comparison failed: {error}"
+        )
+    print(
+        f"{target_name} 1x1x1 GEMM numerical comparison: PASS "
+        f"(error={error})"
+    )
+    zero_extent_cases = (
+        (torch.empty((1, 0), device="cuda", dtype=torch.float16),
+         torch.empty((0, 1), device="cuda", dtype=torch.float16), "K=0"),
+        (torch.empty((0, 1), device="cuda", dtype=torch.float16),
+         torch.empty((1, 1), device="cuda", dtype=torch.float16), "M=0"),
+        (torch.empty((1, 1), device="cuda", dtype=torch.float16),
+         torch.empty((1, 0), device="cuda", dtype=torch.float16), "N=0"),
+    )
+    for lhs, rhs, label in zero_extent_cases:
+        try:
+            artifact.run(lhs, rhs)
+        except NotImplementedError as error:
+            if "zero-extent external views" not in str(error):
+                raise
+        else:
+            raise RuntimeError(f"{target_name} GEMM {label} was not rejected")
+    print(f"{target_name} GEMM zero-extent capability checks: PASS")
 
 
 def run_wide_attention_index_case(artifact, target_name: str) -> None:
@@ -287,6 +317,50 @@ def run_wide_attention_index_case(artifact, target_name: str) -> None:
         f"{target_name} >32-bit element-offset numerical comparison: PASS "
         f"(offset={wide_stride}, error={error})"
     )
+
+
+def run_attention_shape_cases(artifact, target_name: str) -> None:
+    cases = [(127, 131, dimension) for dimension in (64, 80, 96, 256)]
+    cases.append((1, 1, 80))
+    for query_length, key_length, dimension in cases:
+        query = torch.randn(
+            (1, 1, query_length, dimension),
+            device="cuda",
+            dtype=torch.float16,
+        ) * 0.5
+        key = torch.randn(
+            (1, 1, key_length, dimension),
+            device="cuda",
+            dtype=torch.float16,
+        ) * 0.5
+        value = torch.randn_like(key) * 0.5
+        scale = 1.0 / math.sqrt(dimension)
+        generated = artifact.run(query, key, value, scale)
+        expected = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=False,
+            scale=scale,
+        )
+        torch.cuda.synchronize()
+        if generated.shape != expected.shape or generated.dtype != expected.dtype:
+            raise RuntimeError(
+                f"{target_name} attention Q={query_length}, K={key_length}, "
+                f"D={dimension} returned shape={tuple(generated.shape)}, "
+                f"dtype={generated.dtype}; expected shape={tuple(expected.shape)}, "
+                f"dtype={expected.dtype}"
+            )
+        error = (generated - expected).abs().max().item()
+        if not torch.isfinite(generated).all().item() or error > 2.0e-2:
+            raise RuntimeError(
+                f"{target_name} attention Q={query_length}, K={key_length}, "
+                f"D={dimension} failed: {error}"
+            )
+        print(
+            f"{target_name} attention Q={query_length}, K={key_length}, "
+            f"D={dimension}: PASS (error={error})"
+        )
 
 
 def _run_bf16_gemm(
@@ -1145,6 +1219,7 @@ def _run_grouped_gemm(
         *,
         kernel_name: str,
         case_upstream: Upstream | None,
+        offset_values: list[int] | None = None,
     ) -> None:
         x = torch.randn((rows, k), device="cuda", dtype=torch.float16)
         x /= math.sqrt(k)
@@ -1152,7 +1227,9 @@ def _run_grouped_gemm(
             (GROUPS, k, n), device="cuda", dtype=torch.float16
         )
         offsets = torch.tensor(
-            [
+            offset_values
+            if offset_values is not None
+            else [
                 0,
                 rows // 32,
                 rows // 16,
@@ -1201,6 +1278,27 @@ def _run_grouped_gemm(
         kernel_name="ragged grouped GEMM member/K/N tail",
         case_upstream=None,
     )
+    run_case(
+        257,
+        80,
+        96,
+        kernel_name="ragged grouped GEMM with empty groups",
+        case_upstream=None,
+        offset_values=[0, 0, 1, 17, 65, 129, 193, 257, 257],
+    )
+    empty_x = torch.empty((0, 80), device="cuda", dtype=torch.float16)
+    empty_offsets = torch.zeros((GROUPS + 1,), device="cuda", dtype=torch.int32)
+    empty_weight = torch.empty(
+        (GROUPS, 80, 96), device="cuda", dtype=torch.float16
+    )
+    try:
+        artifact.run(empty_x, empty_offsets, empty_weight)
+    except NotImplementedError as error:
+        if "zero-extent external views" not in str(error):
+            raise
+    else:
+        raise RuntimeError(f"{target_name} accepted an all-empty ragged launch")
+    print(f"{target_name} all-empty ragged capability check: PASS")
 
 
 def _run_online_softmax(
@@ -1274,6 +1372,58 @@ def _run_varlen_attention(
             measurement_scope="runtime-metadata",
             cuda_graph=False,
         )
+
+    tail_dimension = 80
+    tail_scale = 1.0 / math.sqrt(tail_dimension)
+    tail_lengths = torch.tensor(
+        [0, 1, 79, 131], device="cuda", dtype=torch.int32
+    )
+    tail_offsets = torch.zeros(
+        (tail_lengths.numel() + 1,), device="cuda", dtype=torch.int32
+    )
+    tail_offsets[1:] = tail_lengths.cumsum(0)
+    tail_tokens = int(tail_offsets[-1].item())
+    tail_shape = (tail_tokens, tail_dimension)
+    tail_q = torch.randn(tail_shape, device="cuda", dtype=torch.float16) * 0.5
+    tail_k = torch.randn(tail_shape, device="cuda", dtype=torch.float16) * 0.5
+    tail_v = torch.randn(tail_shape, device="cuda", dtype=torch.float16) * 0.5
+    generated = artifact.run(
+        tail_q,
+        tail_k,
+        tail_v,
+        tail_lengths,
+        tail_offsets,
+        tail_scale,
+    )
+    expected = torch.empty_like(tail_v)
+    for begin, end in zip(tail_offsets[:-1], tail_offsets[1:]):
+        start = int(begin.item())
+        stop = int(end.item())
+        if start == stop:
+            continue
+        expected[start:stop] = F.scaled_dot_product_attention(
+            tail_q[start:stop][None, None],
+            tail_k[start:stop][None, None],
+            tail_v[start:stop][None, None],
+            is_causal=True,
+            scale=tail_scale,
+        )[0, 0]
+    torch.cuda.synchronize()
+    if generated.shape != expected.shape or generated.dtype != expected.dtype:
+        raise RuntimeError(
+            f"{target_name} packed varlen attention D=80 returned "
+            f"shape={tuple(generated.shape)}, dtype={generated.dtype}; expected "
+            f"shape={tuple(expected.shape)}, dtype={expected.dtype}"
+        )
+    error = (generated - expected).abs().max().item()
+    if not torch.isfinite(generated).all().item() or error > 2.0e-2:
+        raise RuntimeError(
+            f"{target_name} packed varlen attention D=80 failed: {error}"
+        )
+    print(
+        f"{target_name} packed varlen attention D=80 with an empty sequence: "
+        f"PASS (error={error})"
+    )
 
 
 def _run_varlen_gqa_prefill(
@@ -1600,6 +1750,47 @@ def _run_paged_attention(
         upstream=upstream,
         expected_dtype=torch.float16,
     )
+    masked_dimension = 80
+    masked_query_heads = PAGED_HEAD_GROUP
+    masked_query = torch.randn(
+        (1, masked_query_heads, masked_dimension),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    masked_key = torch.randn(
+        (1, PAGED_PAGE_SIZE, 1, masked_dimension),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    masked_value = torch.randn_like(masked_key) * 0.5
+    masked_page_offsets = torch.tensor(
+        [0, 1], device="cuda", dtype=torch.int32
+    )
+    masked_page_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    masked_sequence_lengths = torch.tensor(
+        [0], device="cuda", dtype=torch.int32
+    )
+    masked_output = artifact.run(
+        masked_query,
+        masked_key,
+        masked_value,
+        masked_page_offsets,
+        masked_page_indices,
+        masked_sequence_lengths,
+        1.0 / math.sqrt(masked_dimension),
+    )
+    torch.cuda.synchronize()
+    if not torch.isfinite(masked_output).all().item() or torch.count_nonzero(
+        masked_output
+    ).item():
+        raise RuntimeError(
+            f"{target_name} paged attention produced a nonzero or non-finite "
+            "fully masked row"
+        )
+    print(
+        f"{target_name} paged attention D=80 fully masked row: PASS "
+        "(defined output=0)"
+    )
 
 
 def _run_attention_bias(
@@ -1648,6 +1839,36 @@ def _run_attention_bias(
         tolerance=2.0e-2,
         upstream=adapted_upstream,
         expected_dtype=torch.float16,
+    )
+    masked_dimension = 80
+    masked_q = torch.randn(
+        (1, 1, 3, masked_dimension), device="cuda", dtype=torch.float16
+    ) * 0.5
+    masked_k = torch.randn(
+        (1, 1, 5, masked_dimension), device="cuda", dtype=torch.float16
+    ) * 0.5
+    masked_v = torch.randn_like(masked_k) * 0.5
+    masked_bias = torch.full(
+        (1, 1, 5), -math.inf, device="cuda", dtype=torch.float32
+    )
+    masked_output = artifact.run(
+        masked_q,
+        masked_k,
+        masked_v,
+        masked_bias,
+        1.0 / math.sqrt(masked_dimension),
+    )
+    torch.cuda.synchronize()
+    if not torch.isfinite(masked_output).all().item() or torch.count_nonzero(
+        masked_output
+    ).item():
+        raise RuntimeError(
+            f"{target_name} vector-bias attention produced a nonzero or "
+            "non-finite fully masked row"
+        )
+    print(
+        f"{target_name} vector-bias attention D=80 fully masked row: PASS "
+        "(defined output=0)"
     )
 
 

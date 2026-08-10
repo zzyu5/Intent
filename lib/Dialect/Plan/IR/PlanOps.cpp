@@ -130,10 +130,16 @@ LogicalResult AxisOp::verify() {
 }
 
 LogicalResult ProgramOp::verify() {
-  if (failed(requireNode(*this, getLoopNode())))
-    return failure();
-  if (getIndexBits() != 32 && getIndexBits() != 64)
-    return emitOpError("requires 32-bit or 64-bit physical index arithmetic");
+  return requireNode(*this, getLoopNode());
+}
+
+LogicalResult BlockExtentOp::verify() {
+  if (getLogicalExtent().empty())
+    return emitOpError("requires a logical extent");
+  if (getRounding() != "power_of_two")
+    return emitOpError("contains an unsupported block-extent rounding rule");
+  if (getFill() != "zero")
+    return emitOpError("contains an unsupported block-extent fill rule");
   return success();
 }
 
@@ -270,6 +276,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   unsigned devices = 0;
   unsigned programs = 0;
   ProgramOp program;
+  llvm::StringSet<> blockExtents;
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
@@ -294,6 +301,9 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       program = choice;
+    } else if (auto extent = dyn_cast<BlockExtentOp>(operation)) {
+      if (!blockExtents.insert(extent.getLogicalExtent()).second)
+        return extent.emitOpError("duplicates a logical block-extent decision");
     } else if (auto binding = dyn_cast<BufferOp>(operation)) {
       if (!buffers.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a logical-buffer decision");

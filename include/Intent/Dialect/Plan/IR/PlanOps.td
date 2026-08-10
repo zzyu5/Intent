@@ -62,8 +62,17 @@ def IntentPlan_AxisOp : IntentPlan_Op<"axis"> {
 def IntentPlan_ProgramOp : IntentPlan_Op<"program"> {
   let arguments = (ins
     I64Attr:$loop_node,
-    BoolAttr:$persistent,
-    I64Attr:$index_bits
+    BoolAttr:$persistent
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_BlockExtentOp : IntentPlan_Op<"block_extent"> {
+  let arguments = (ins
+    StrAttr:$logical_extent,
+    StrAttr:$rounding,
+    StrAttr:$fill
   );
   let results = (outs);
   let hasVerifier = 1;

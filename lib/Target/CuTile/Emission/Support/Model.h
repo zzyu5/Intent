@@ -20,6 +20,7 @@ namespace intent::cutile::plan {
 using TargetOp = target::emission::TargetBinding;
 using AxisOp = target::emission::AxisBinding;
 using ProgramOp = target::emission::ProgramBinding;
+using BlockExtentOp = target::emission::BlockExtentBinding;
 using BufferOp = target::emission::BufferBinding;
 using PaddingOp = target::emission::PaddingBinding;
 using ReductionOp = target::emission::ReductionBinding;
@@ -39,6 +40,7 @@ namespace intent::cutile::emission {
 struct RealizationIndex {
   plan::TargetOp target;
   plan::ProgramOp program;
+  llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
@@ -151,6 +153,9 @@ private:
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
+  std::string physicalExtent(llvm::StringRef logicalExtent) const;
+  mlir::FailureOr<std::string>
+  transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   indexTuple(mlir::Operation &operation, bool elementwiseAccess);
   mlir::FailureOr<std::string> tileShape(mlir::Operation &operation);
@@ -199,6 +204,7 @@ private:
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
   llvm::SmallVector<std::string> kernelConstants;
+  llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>

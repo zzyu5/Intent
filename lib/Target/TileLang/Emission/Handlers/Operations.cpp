@@ -620,8 +620,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<std::string> physicalFill = transferPhysicalExtentFill(operation);
   bool scalarResult = operation.getNumResults() == 1 &&
                       !isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(physicalFill))
+    return failure();
+  bool expanded = !physicalFill->empty();
   if (scalarResult) {
     FailureOr<std::string> indices = accessIndices(operation);
     if (failed(view) || failed(indices))
@@ -649,13 +653,45 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       allocateResult(operation, 0, boundary.getResultSpace());
   if (failed(view) || failed(result))
     return operation.emitOpError("lacks a mechanical TileLang load binding");
-  if (boundary.getTransfer() == "parallel_elements") {
-    FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+  if (boundary.getTransfer() == "parallel_elements" || expanded) {
+    StringRef padding = boundary.getPadding();
+    if (padding == "none" && expanded)
+      padding = *physicalFill;
+    FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
+    bool stagePhysicalPadding =
+        expanded && succeeded(tensorIndirect) && *tensorIndirect;
+    FailureOr<SmallVector<std::string>> extents =
+        tensorExtents(operation, 0, !stagePhysicalPadding);
     if (failed(extents) || extents->empty() ||
-        (boundary.getPadding() != "zero" &&
-         boundary.getPadding() != "negative_infinity"))
+        failed(tensorIndirect) ||
+        (padding != "zero" && padding != "negative_infinity"))
       return operation.emitOpError(
           "has an invalid parallel TileLang load transfer");
+    std::string elementResult = *result;
+    if (stagePhysicalPadding) {
+      auto resultType = cast<RankedTensorType>(operation.getResult(0).getType());
+      std::string dtype = dtypeName(resultType.getElementType(), operation);
+      StringRef allocator = boundary.getResultSpace() == "shared"
+                                ? "T.alloc_shared"
+                            : boundary.getResultSpace() == "fragment"
+                                ? "T.alloc_fragment"
+                                : StringRef();
+      if (dtype.empty() || allocator.empty())
+        return operation.emitOpError(
+            "cannot stage indirect TileLang physical padding");
+      std::string shape = "(";
+      for (auto [axis, extent] : llvm::enumerate(*extents)) {
+        if (axis)
+          shape += ", ";
+        shape += extent;
+      }
+      if (extents->size() == 1)
+        shape += ",";
+      shape += ")";
+      elementResult += "_logical";
+      line(elementResult + " = " + allocator.str() + "(" + shape + ", " +
+           dtype + ")");
+    }
     SmallVector<std::string> tileIndices;
     std::string loop = "for ";
     for (unsigned axis = 0; axis < extents->size(); ++axis) {
@@ -674,12 +710,14 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         elementAccessIndices(operation, tileIndices);
     if (failed(indices))
       return failure();
-    FailureOr<std::string> predicate =
+    FailureOr<std::string> logicalPredicate =
         boundary.getCheckBounds()
-            ? elementBoundsPredicate(operation, tileIndices)
+            ? elementBoundsPredicate(operation, tileIndices, false, false)
             : FailureOr<std::string>(std::string());
-    FailureOr<bool> tensorIndirect =
-        target::hasTensorIndirectIndex(operation);
+    FailureOr<std::string> physicalPredicate =
+        expanded && !stagePhysicalPadding
+            ? elementBoundsPredicate(operation, tileIndices, true)
+            : FailureOr<std::string>(std::string());
     FailureOr<std::string> wholeTile =
         boundary.getCheckBounds() && succeeded(tensorIndirect) &&
                 !*tensorIndirect
@@ -690,10 +728,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                 !*tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
-    if (failed(predicate) || failed(tensorIndirect) || failed(wholeTile) ||
-        failed(bulkIndices))
+    if (failed(logicalPredicate) || failed(physicalPredicate) ||
+        failed(tensorIndirect) || failed(wholeTile) || failed(bulkIndices))
       return failure();
-    bool hasBulkFastPath = !wholeTile->empty();
+    bool hasBulkFastPath = !expanded && !wholeTile->empty();
     if (hasBulkFastPath) {
       line("if " + *wholeTile + ":");
       ++indentation;
@@ -703,34 +741,77 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       line("else:");
       ++indentation;
     }
-    line(loop + "):");
-    ++indentation;
-    std::string target = *result + "[";
+    std::string target = elementResult + "[";
     for (auto [axis, index] : llvm::enumerate(tileIndices)) {
       if (axis)
         target += ", ";
       target += index;
     }
-    if (boundary.getCheckBounds()) {
-      line("if " + *predicate + ":");
+    StringRef fill = padding == "negative_infinity"
+                         ? "-T.infinity(T.float32)"
+                         : "0.0";
+    auto emitElementwise = [&](bool includePhysicalBounds) {
+      line(loop + "):");
       ++indentation;
-    }
-    line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
-    if (boundary.getCheckBounds()) {
+      if (boundary.getCheckBounds()) {
+        line("if " + *logicalPredicate + ":");
+        ++indentation;
+      }
+      if (includePhysicalBounds) {
+        line("if " + *physicalPredicate + ":");
+        ++indentation;
+      }
+      line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
+      if (includePhysicalBounds) {
+        --indentation;
+        line("else:");
+        ++indentation;
+        line(target + "] = " + fill.str());
+        --indentation;
+      }
+      if (boundary.getCheckBounds()) {
+        --indentation;
+        line("else:");
+        ++indentation;
+        line(target + "] = " + fill.str());
+        --indentation;
+      }
       --indentation;
-      line("else:");
+      if (boundary.getResultSpace() == "shared")
+        line("T.sync_threads()");
+    };
+    emitElementwise(expanded && !stagePhysicalPadding);
+    if (stagePhysicalPadding) {
+      line("T.clear(" + *result + ")");
+      if (boundary.getResultSpace() == "shared")
+        line("T.sync_threads()");
+      std::string copyLoop = "for ";
+      std::string resultIndices;
+      for (unsigned axis = 0; axis < extents->size(); ++axis) {
+        if (axis) {
+          copyLoop += ", ";
+          resultIndices += ", ";
+        }
+        std::string index = "physical_copy_i" + std::to_string(axis);
+        copyLoop += index;
+        resultIndices += index;
+      }
+      copyLoop += " in T.Parallel(";
+      for (auto [axis, extent] : llvm::enumerate(*extents)) {
+        if (axis)
+          copyLoop += ", ";
+        copyLoop += extent;
+      }
+      line(copyLoop + "):");
       ++indentation;
-      StringRef fill = boundary.getPadding() == "negative_infinity"
-                           ? "-T.infinity(T.float32)"
-                           : "0.0";
-      line(target + "] = " + fill.str());
+      line(*result + "[" + resultIndices + "] = " + elementResult + "[" +
+           resultIndices + "]");
       --indentation;
+      if (boundary.getResultSpace() == "shared")
+        line("T.sync_threads()");
     }
-    --indentation;
     if (hasBulkFastPath)
       --indentation;
-    if (boundary.getResultSpace() == "shared")
-      line("T.sync_threads()");
     bindResult(operation, 0, *result);
     return success();
   }
@@ -1255,11 +1336,11 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
                       isa<RankedTensorType>(operation.getResult(0).getType());
   int64_t reuse = binding ? binding.getReuseOperandAttr().getInt() : -2;
   if (failed(node) || !binding || binding.getLowering() != "T.if_then_else" ||
-      !tensorResult || (reuse != -1 && reuse != 0))
+      !tensorResult || (reuse != -1 && reuse != 0 && reuse != 2))
     return operation.emitOpError("lacks a mechanical TileLang mask binding");
   std::string result;
-  if (reuse == 0) {
-    FailureOr<StringRef> value = lookupValue(operation, 0);
+  if (reuse >= 0) {
+    FailureOr<StringRef> value = lookupValue(operation, reuse);
     if (failed(value))
       return failure();
     result = value->str();
@@ -2035,7 +2116,11 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
       failed(view))
     return operation.emitOpError("lacks a TileLang store binding");
-  if (boundary.getTransfer() == "parallel_elements") {
+  FailureOr<std::string> physicalFill = transferPhysicalExtentFill(operation);
+  if (failed(physicalFill))
+    return failure();
+  bool expanded = !physicalFill->empty();
+  if (boundary.getTransfer() == "parallel_elements" || expanded) {
     Value storedValue = operation.getOperand(valueIndex.getInt());
     auto result = dyn_cast<OpResult>(storedValue);
     Operation *definition = result ? result.getOwner() : nullptr;
@@ -2064,16 +2149,23 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
         elementAccessIndices(operation, tileIndices);
     if (failed(indices))
       return failure();
-    FailureOr<std::string> predicate =
+    FailureOr<std::string> logicalPredicate =
         boundary.getCheckBounds()
-            ? elementBoundsPredicate(operation, tileIndices)
+            ? elementBoundsPredicate(operation, tileIndices, false, false)
             : FailureOr<std::string>(std::string());
-    if (failed(predicate))
+    FailureOr<std::string> physicalPredicate =
+        expanded ? elementBoundsPredicate(operation, tileIndices, true)
+                 : FailureOr<std::string>(std::string());
+    if (failed(logicalPredicate) || failed(physicalPredicate))
       return failure();
     line(loop + "):");
     ++indentation;
     if (boundary.getCheckBounds()) {
-      line("if " + *predicate + ":");
+      line("if " + *logicalPredicate + ":");
+      ++indentation;
+    }
+    if (expanded) {
+      line("if " + *physicalPredicate + ":");
       ++indentation;
     }
     std::string source = stored->str() + "[";
@@ -2083,6 +2175,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       source += index;
     }
     line((*view)->argument->name + "[" + *indices + "] = " + source + "]");
+    if (expanded)
+      --indentation;
     if (boundary.getCheckBounds())
       --indentation;
     --indentation;

@@ -712,9 +712,14 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   FailureOr<std::string> indices =
       indexTuple(operation, boundary.getAccess() == "gather");
-  if (failed(view) || failed(indices))
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
+  if (failed(view) || failed(indices) || failed(physicalFill))
     return failure();
-  StringRef padding = boundary.getPadding() == "negative_infinity"
+  StringRef loadFill = boundary.getPadding();
+  if (loadFill == "none" && !physicalFill->empty())
+    loadFill = *physicalFill;
+  StringRef padding = loadFill == "negative_infinity"
                           ? "-math.inf"
                           : "0.0";
   std::string result = makeResultName(operation, 0);
@@ -731,13 +736,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                      : emitTensorShape(operation, 0);
     if (failed(shape) || failed(resultShape))
       return failure();
-    StringRef paddingMode = boundary.getPadding() == "negative_infinity"
+    StringRef paddingMode = loadFill == "negative_infinity"
                                 ? "ct.PaddingMode.NEG_INF"
                                 : "ct.PaddingMode.ZERO";
     std::string expression =
         "ct.load(" + (*view)->argument->name + ", index=" + *indices +
         ", shape=" + *shape;
-    if (boundary.getPadding() != "none")
+    if (loadFill != "none")
       expression += ", padding_mode=" + paddingMode.str();
     expression += ")";
     if (scalarResult)
@@ -770,10 +775,13 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
   std::string base = axisIndices.lookup(axis->getNode());
   if (base.empty())
     return operation.emitOpError("has no cuTile vector index realization");
-  std::string expression =
+  bool directVector =
       target::emission::isRaggedBoundAxis(planIndex.components,
                                           axis->getNode()) ||
-              axis->hasRole("lane")
+      (axis->hasRole("lane") &&
+       kernel.nodes.lookup(axis->getNode()) == vectorDomain);
+  std::string expression =
+      directVector
           ? addressIndex(base)
           : addressIndex(base) + " * " + axis->getTile().str() + " + " +
                 addressIndex("ct.arange(" + axis->getTile().str() +
@@ -1275,8 +1283,10 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     }
   }
   std::string streamTile = "stream_tile_" + std::to_string(*node);
-  line("for " + streamTile + " in range(ct.cdiv(" + streamExtent + ", " +
-       binding.getTile().str() + ")):");
+  line("for " + streamTile + " in range(" + addressIndex("0") + ", " +
+       addressIndex("ct.cdiv(" + streamExtent + ", " +
+                    binding.getTile().str() + ")") +
+       ", " + addressIndex("1") + "):");
   ++indentation;
   if (raggedStream) {
     auto runtimes = raggedRuntimesByAxis.find(binding.getAxisNode());
@@ -1565,12 +1575,16 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> indices =
-      indexTuple(operation, boundary.getAccess() == "scatter");
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
+  bool expanded = succeeded(physicalFill) && !physicalFill->empty();
+  bool scatter = boundary.getAccess() == "scatter" ||
+                 expanded;
+  FailureOr<std::string> indices = indexTuple(operation, scatter);
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
-      failed(view) || failed(indices))
+      failed(view) || failed(physicalFill) || failed(indices))
     return operation.emitOpError("lacks a cuTile store binding");
-  if (boundary.getAccess() == "scatter")
+  if (scatter)
     line("ct.scatter(" + (*view)->argument->name + ", " + *indices + ", " +
          stored->str() + ", check_bounds=True)");
   else if (boundary.getAccess() == "store") {

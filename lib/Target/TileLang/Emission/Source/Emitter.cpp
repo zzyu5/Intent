@@ -192,6 +192,10 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
+      plan::BlockExtentOp binding;
+      binding.operation = value;
+      index.blockExtents[value.getLogicalExtent()] = binding;
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
@@ -580,6 +584,14 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated TileLang tuner");
+  SmallVector<StringRef> logicalBlockExtents;
+  logicalBlockExtents.reserve(planIndex.blockExtents.size());
+  for (const auto &entry : planIndex.blockExtents)
+    logicalBlockExtents.push_back(entry.getKey());
+  llvm::sort(logicalBlockExtents);
+  for (StringRef logicalExtent : logicalBlockExtents)
+    blockExtentConstants.emplace_back(physicalExtent(logicalExtent),
+                                      dimensionSpelling(logicalExtent));
   return success();
 }
 
@@ -845,6 +857,11 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                 "timeout=100, skip_check=True)\n";
     stream << "@tilelang.jit\n";
   };
+  auto emitBlockExtentConstants = [&](raw_ostream &stream) {
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      stream << "    " << physicalExtent << " = 1 << (" << logicalExtent
+             << " - 1).bit_length()\n";
+  };
 
   if (!planIndex.stages.empty()) {
     for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
@@ -856,6 +873,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source << "def " << kernelName << "_stage_" << stage << "(";
       emitBuilderParameters(source, stage);
       source << "):\n";
+      emitBlockExtentConstants(source);
       if (compact)
         source << "    total_route_tiles = sum((length + TILE_SIZE_M - 1) "
                   "// TILE_SIZE_M for length in ROUTE_LENGTHS)\n";
@@ -944,7 +962,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   emitDecorator(output);
   output << "def " << kernelName << "(";
   emitBuilderParameters(output, -1);
-  output << "):\n    @T.prim_func\n    def main(";
+  output << "):\n";
+  emitBlockExtentConstants(output);
+  output << "    @T.prim_func\n    def main(";
   if (failed(emitMainParameters(output)))
     return failure();
   output << "):\n";
@@ -1140,6 +1160,10 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
+      output << "    if any(extent == 0 for extent in "
+             << view.argument->name << ".shape):\n";
+      output << "        raise NotImplementedError('TileLang does not support "
+                "zero-extent external views in this compiler')\n";
       output << "    if sum(max(0, extent - 1) * abs(stride) for extent, stride "
                 "in zip("
              << view.argument->name << ".shape, " << view.argument->name
@@ -1644,6 +1668,24 @@ std::string SourceEmitter::addressIndex(StringRef expression) const {
   return "(" + expression.str() + ")";
 }
 
+std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
+  auto extent = planIndex.blockExtents.find(logicalExtent);
+  if (extent == planIndex.blockExtents.end())
+    return dimensionSpelling(logicalExtent);
+  return "PHYSICAL_" + dimensionSpelling(logicalExtent);
+}
+
+FailureOr<std::string>
+SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(relation) || failed(view))
+    return failure();
+  return target::emission::transferPhysicalExtentFill(
+      planIndex, *relation, (*view)->shape, operation);
+}
+
 FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
@@ -1802,7 +1844,9 @@ SourceEmitter::elementAccessIndices(Operation &operation,
 
 FailureOr<std::string>
 SourceEmitter::elementBoundsPredicate(Operation &operation,
-                                      ArrayRef<std::string> tileIndices) {
+                                      ArrayRef<std::string> tileIndices,
+                                      bool physicalOnly,
+                                      bool includePhysical) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   if (failed(relation))
@@ -1817,6 +1861,10 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       if (tileAxis >= tileIndices.size())
         return operation.emitOpError(
             "bounded TileLang transfer has too few tile indices");
+      if (includePhysical &&
+          planIndex.blockExtents.count((*view)->shape[axisNumber]))
+        predicates.push_back(tileIndices[tileAxis] + " < " +
+                             (*view)->shape[axisNumber]);
       ++tileAxis;
       continue;
     }
@@ -1838,8 +1886,10 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
             "TileLang indirect bounds require one index-tile axis");
       std::string index =
           exact->str() + "[" + tileIndices[tileAxis++] + "]";
-      predicates.push_back("0 <= " + index);
-      predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+      if (!physicalOnly) {
+        predicates.push_back("0 <= " + index);
+        predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+      }
       continue;
     }
     if (term.kind == "value_index" &&
@@ -1848,7 +1898,7 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
           target::traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      if (source->domain && source->transformed) {
+      if (!physicalOnly && source->domain && source->transformed) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
@@ -1868,6 +1918,10 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     if (tileAxis >= tileIndices.size())
       return operation.emitOpError(
           "bounded TileLang transfer has too few tile indices");
+    if (physicalOnly) {
+      ++tileAxis;
+      continue;
+    }
     std::string base = axisIndices.lookup(axis->getNode());
     Operation *domain = kernel.nodes.lookup(axis->getNode());
     FailureOr<std::string> extent = failure();
@@ -2077,7 +2131,8 @@ FailureOr<std::string> SourceEmitter::padElementExpression(
 }
 
 FailureOr<SmallVector<std::string>>
-SourceEmitter::tensorExtents(Operation &operation, unsigned resultIndex) {
+SourceEmitter::tensorExtents(Operation &operation, unsigned resultIndex,
+                             bool physical) {
   auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
   auto shape = shapes && resultIndex < shapes.size()
                    ? dyn_cast<ArrayAttr>(shapes[resultIndex])
@@ -2101,7 +2156,8 @@ SourceEmitter::tensorExtents(Operation &operation, unsigned resultIndex) {
       return operation.emitOpError(
           "tensor shape region has no TileLang tile binding");
     else
-      extents.push_back(label.getValue().str());
+      extents.push_back(physical ? physicalExtent(label.getValue())
+                                 : dimensionSpelling(label.getValue()));
   }
   return extents;
 }

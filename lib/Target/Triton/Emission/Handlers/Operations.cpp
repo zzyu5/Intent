@@ -741,13 +741,18 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, false);
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
-  if (failed(pointers) || failed(mask))
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
+  if (failed(pointers) || failed(mask) || failed(physicalFill))
     return failure();
   std::string result = makeResultName(operation, 0);
-  if (boundary.getLoadFill() == "none") {
+  StringRef loadFill = boundary.getLoadFill();
+  if (loadFill == "none" && !physicalFill->empty())
+    loadFill = *physicalFill;
+  if (loadFill == "none") {
     line(result + " = tl.load(" + *pointers + ")");
   } else {
-    StringRef fill = boundary.getLoadFill() == "negative_infinity"
+    StringRef fill = loadFill == "negative_infinity"
                          ? "-float('inf')"
                          : "0.0";
     line(result + " = tl.load(" + *pointers + ", mask=" + *mask +

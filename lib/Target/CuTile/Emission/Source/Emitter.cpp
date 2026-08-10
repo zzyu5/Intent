@@ -174,6 +174,10 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
+      plan::BlockExtentOp binding;
+      binding.operation = value;
+      index.blockExtents[value.getLogicalExtent()] = binding;
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
@@ -552,6 +556,14 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!physicalDimension)
       kernelConstants.push_back(dimension);
   }
+  SmallVector<StringRef> logicalBlockExtents;
+  logicalBlockExtents.reserve(planIndex.blockExtents.size());
+  for (const auto &entry : planIndex.blockExtents)
+    logicalBlockExtents.push_back(entry.getKey());
+  llvm::sort(logicalBlockExtents);
+  for (StringRef logicalExtent : logicalBlockExtents)
+    blockExtentConstants.emplace_back(physicalExtent(logicalExtent),
+                                      logicalExtent.str());
   return success();
 }
 
@@ -751,7 +763,8 @@ void SourceEmitter::emitImports() {
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
     output << "_TUNE_TIMEOUT = autotune_timeout(_PARAMETER_MAP)\n";
   }
-  output << "\nConstInt = ct.Constant[int]\n\n\n";
+  output << "\nConstInt = ct.Constant[int]\n";
+  output << "\n\n";
 }
 
 LogicalResult SourceEmitter::emitKernelHeader() {
@@ -786,6 +799,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       }
       for (const std::string &dimension : dimensionOrder)
         parameter(dimension + ": ConstInt");
+      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+        parameter(physicalExtent + ": ConstInt");
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
@@ -818,9 +833,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         if (experts.empty())
           return ragged.binding.emitOpError(
               "has no program-owned outer-axis dimension");
-        stageLine(stage, "expert = 0");
-        stageLine(stage, "route_tile = 0");
-        stageLine(stage, "tile_cursor = 0");
+        stageLine(stage, "expert = " + addressIndex("0"));
+        stageLine(stage, "route_tile = " + addressIndex("0"));
+        stageLine(stage, "tile_cursor = " + addressIndex("0"));
         stageLine(stage, "for candidate in range(" + experts + "):");
         stageLine(stage, "candidate_begin = ct.load(" +
                              offsets->argument->name +
@@ -833,14 +848,18 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                              ", shape=())",
                   2);
         stageLine(stage,
-                  "candidate_tiles = ct.cdiv(candidate_end - candidate_begin, "
-                  "TILE_SIZE_M)",
+                  "candidate_tiles = " +
+                      addressIndex("ct.cdiv(candidate_end - candidate_begin, "
+                                   "TILE_SIZE_M)"),
                   2);
         stageLine(stage,
                   "owns_tile = (bid_expert_route >= tile_cursor) & "
                   "(bid_expert_route < tile_cursor + candidate_tiles)",
                   2);
-        stageLine(stage, "expert = ct.where(owns_tile, candidate, expert)", 2);
+        stageLine(stage,
+                  "expert = ct.where(owns_tile, " + addressIndex("candidate") +
+                      ", expert)",
+                  2);
         stageLine(stage,
                   "route_tile = ct.where(owns_tile, bid_expert_route - "
                   "tile_cursor, route_tile)",
@@ -914,12 +933,16 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   if (!planIndex.components.reusedAxes.empty()) {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      emitParameter(physicalExtent + ": ConstInt");
     for (StringRef parameter : {"N_ROWS: ConstInt", "TILE_SIZE: ConstInt",
                                 "DIM_COLS: ConstInt"})
       emitParameter(parameter);
   } else {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      emitParameter(physicalExtent + ": ConstInt");
     if (searchIndex.autotune)
       for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
         emitParameter(parameter.getName().getValue().str() + ": ConstInt");
@@ -943,7 +966,11 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.int32";
     return {};
   };
-  auto emitAddressCapabilityCheck = [&](const ABIView &view) {
+  auto emitViewCapabilityCheck = [&](const ABIView &view) {
+    output << "    if any(extent == 0 for extent in "
+           << view.argument->name << ".shape):\n";
+    output << "        raise NotImplementedError('cuTile does not support "
+              "zero-extent external views in this compiler')\n";
     output << "    if sum(max(0, extent - 1) * abs(stride) for extent, stride "
               "in zip("
            << view.argument->name << ".shape, " << view.argument->name
@@ -951,6 +978,11 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "        raise NotImplementedError('cuTile cannot encode this "
               "64-bit external-buffer address in its current tensor "
               "descriptor')\n";
+  };
+  auto emitBlockExtentConstants = [&]() {
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << "    " << physicalExtent << " = 1 << (" << logicalExtent
+             << " - 1).bit_length()\n";
   };
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
@@ -1011,11 +1043,12 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
-      emitAddressCapabilityCheck(view);
+      emitViewCapabilityCheck(view);
     }
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
+    emitBlockExtentConstants();
     for (ABIView &view : views) {
       output << "    if tuple(" << view.argument->name << ".shape) != (";
       for (auto [axis, extent] : llvm::enumerate(view.shape)) {
@@ -1113,6 +1146,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << scalar.name << ", ";
       for (const std::string &dimension : dimensionOrder)
         output << dimension << ", ";
+      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+        output << physicalExtent << ", ";
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
@@ -1146,6 +1181,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << scalar.name << ", ";
       for (const std::string &dimension : dimensionOrder)
         output << dimension << ", ";
+      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+        output << physicalExtent << ", ";
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
@@ -1225,6 +1262,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
+    emitBlockExtentConstants();
     for (ABIView &view : views) {
       StringRef dtype = torchDtype(view.tensor.getElementType());
       if (dtype.empty())
@@ -1251,7 +1289,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "):\n";
       output << "        raise ValueError('" << view.argument->name
              << " shape violates the kernel symbols')\n";
-      emitAddressCapabilityCheck(view);
+      emitViewCapabilityCheck(view);
       output << "    if not " << view.argument->name << ".is_contiguous():\n";
       output << "        raise ValueError('persistent-row views must be contiguous')\n";
     }
@@ -1276,6 +1314,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << ", " << scalar.name;
     for (const std::string &dimension : kernelConstants)
       output << ", " << dimension;
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << ", " << physicalExtent;
     output << ", n_rows, configuration.tile_size, n_cols))\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {
@@ -1376,11 +1416,12 @@ LogicalResult SourceEmitter::emitWrapper() {
            << ":\n";
     output << "        raise ValueError('" << view.argument->name
            << " has the wrong dtype')\n";
-    emitAddressCapabilityCheck(view);
+    emitViewCapabilityCheck(view);
   }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
            << "\n";
+  emitBlockExtentConstants();
   for (ABIView &view : views) {
     output << "    if tuple(" << view.argument->name << ".shape) != (";
     for (auto [axis, extent] : llvm::enumerate(view.shape)) {
@@ -1418,6 +1459,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << physicalExtent << ", ";
     output << "))\n\n\n";
   } else {
     SmallVector<plan::AxisOp> programAxes =
@@ -1495,6 +1538,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << physicalExtent << ", ";
     for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
       output << "cfg." << parameter.getName().getValue() << ", ";
     output << "),\n";
@@ -1543,6 +1588,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << physicalExtent << ", ";
     for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
       output << "best." << parameter.getName().getValue() << ", ";
     output << "))\n\n\n";
@@ -1732,8 +1779,25 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
 }
 
 std::string SourceEmitter::addressIndex(StringRef expression) const {
-  return "ct.astype((" + expression.str() + "), ct.int" +
-         std::to_string(planIndex.program.getIndexBits()) + ")";
+  return "ct.astype((" + expression.str() + "), ct.int32)";
+}
+
+std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
+  auto extent = planIndex.blockExtents.find(logicalExtent);
+  if (extent == planIndex.blockExtents.end())
+    return logicalExtent.str();
+  return "PHYSICAL_" + logicalExtent.str();
+}
+
+FailureOr<std::string>
+SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(relation) || failed(view))
+    return failure();
+  return target::emission::transferPhysicalExtentFill(
+      planIndex, *relation, (*view)->shape, operation);
 }
 
 FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
@@ -1780,7 +1844,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
               "indirect cuTile gather has too many vector axes");
         indices.push_back(broadcast(addressIndex(
                                         "ct.arange(" +
-                                        (*view)->shape[axisNumber] +
+                                        physicalExtent(
+                                            (*view)->shape[axisNumber]) +
                                         ", dtype=ct.int32)"),
                                     resultAxis++));
         continue;
@@ -1826,10 +1891,12 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       if (base.empty())
         return operation.emitOpError(
             "indirect cuTile gather has no active vector axis");
-      std::string exact =
+      bool directVector =
           target::emission::isRaggedBoundAxis(planIndex.components,
                                               axis->getNode()) ||
-                  axis->hasRole("lane")
+          (axis->hasRole("lane") &&
+           kernel.nodes.lookup(axis->getNode()) == vectorDomain);
+      std::string exact = directVector
               ? addressIndex(base)
               : addressIndex(base) + " * " + axis->getTile().str() + " + " +
                     addressIndex("ct.arange(" + axis->getTile().str() +
@@ -1881,7 +1948,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       return operation.emitOpError(
           "ragged cuTile matrix access has no member-axis role");
     return "(" + addressIndex(rows + "[:, None]") + ", " +
-           addressIndex("ct.arange(" + (*view)->shape[1] +
+           addressIndex("ct.arange(" + physicalExtent((*view)->shape[1]) +
                         ", dtype=ct.int32)[None, :]") +
            ")";
   }
@@ -1952,7 +2019,7 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
   SmallVector<std::string> extents;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
-      extents.push_back((*view)->shape[axisNumber]);
+      extents.push_back(physicalExtent((*view)->shape[axisNumber]));
       continue;
     }
     if (term.kind == "static_index") {
@@ -2094,7 +2161,7 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex,
       return operation.emitOpError(
           "tensor shape region has no cuTile tile binding");
     else
-      extents.push_back(label.getValue().str());
+      extents.push_back(physicalExtent(label.getValue()));
   }
   if (transposeLastTwo) {
     if (extents.size() < 2)

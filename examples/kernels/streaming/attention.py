@@ -138,8 +138,15 @@ def flash_attention_bias_fwd(
                             scores, axis=1, identity=-I.inf
                         )
                         next_maximum = I.maximum(maximum, local_maximum)
-                        alpha = I.exp2(maximum - next_maximum)
-                        probability = I.exp2(scores - next_maximum[:, None])
+                        normalization_maximum = I.mask(
+                            next_maximum,
+                            valid=next_maximum != -I.inf,
+                            fill=0.0,
+                        )
+                        alpha = I.exp2(maximum - normalization_maximum)
+                        probability = I.exp2(
+                            scores - normalization_maximum[:, None]
+                        )
                         next_denominator = alpha * denominator + I.reduce.sum(
                             probability, axis=1, identity=0.0
                         )
@@ -155,8 +162,13 @@ def flash_attention_bias_fwd(
                             next_accumulator,
                         )
                 _, denominator, accumulator = stream.result
+                safe_denominator = I.mask(
+                    denominator,
+                    valid=denominator > 0.0,
+                    fill=1.0,
+                )
                 output[batch, head, q_region, :] = I.cast(
-                    accumulator / denominator[:, None], I.f16
+                    accumulator / safe_denominator[:, None], I.f16
                 )
 
 
