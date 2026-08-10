@@ -19,6 +19,7 @@ def _configuration(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 512, 1024, 2048),
+        "stream_contract": (32, 64),
         "query": (64, 128),
         "ragged_member": (64, 128),
         "feature": (64, 128),
@@ -29,7 +30,14 @@ def _role_candidates(role: str) -> tuple[int, ...]:
     }.get(role)
     if candidates is not None:
         return candidates
-    for base in ("stream", "query", "ragged_member", "feature", "reduction"):
+    for base in (
+        "stream_contract",
+        "stream",
+        "query",
+        "ragged_member",
+        "feature",
+        "reduction",
+    ):
         if role.startswith(f"{base}_"):
             return _role_candidates(base)
     if role.startswith("program_"):
@@ -48,6 +56,10 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             ({"stream": 512}, 1, 4),
             ({"stream": 1024}, 1, 2),
             ({"stream": 2048}, 2, 1),
+        ),
+        (
+            ({"stream_contract": 32}, 1, 4),
+            ({"stream_contract": 64}, 1, 2),
         ),
         (
             ({"query": 128, "stream": 128}, 1, 2),

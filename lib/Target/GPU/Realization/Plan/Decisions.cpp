@@ -187,6 +187,16 @@ bool ownsOrderedStream(const AxisChoice &choice,
   });
 }
 
+bool hasIndirectRaggedMembership(Operation *domain,
+                                 const target::KernelFacts &facts) {
+  auto member = facts.raggedMembers.find(domain);
+  if (member == facts.raggedMembers.end())
+    return false;
+  auto relation = facts.raggedRelations.find(member->second.relation);
+  return relation != facts.raggedRelations.end() &&
+         static_cast<bool>(relation->second.indices);
+}
+
 SmallVector<unsigned> contractionProgramAxes(
     const target::ContractionFact &contraction,
     const llvm::DenseMap<Operation *, unsigned> &positions,
@@ -256,6 +266,7 @@ assignAxes(const target::KernelFacts &facts) {
   unsigned queryTile = 0;
   unsigned raggedTile = 0;
   unsigned streamTile = 0;
+  unsigned streamContractionTile = 0;
   unsigned reductionTile = 0;
   unsigned laneTile = 0;
   auto indexedTile = [](StringRef base, unsigned &ordinal) {
@@ -281,7 +292,12 @@ assignAxes(const target::KernelFacts &facts) {
         choice.tile = "program_" + std::to_string(ordinaryTile++);
       }
     } else if (hasRole(choice.roles, "ordered")) {
-      choice.tile = indexedTile("stream", streamTile);
+      choice.tile = hasIndirectRaggedMembership(choice.domain, facts)
+                        ? "one"
+                    : hasRole(choice.roles, "reduction")
+                        ? indexedTile("stream_contract",
+                                      streamContractionTile)
+                        : indexedTile("stream", streamTile);
     } else if (hasRole(choice.roles, "reduction")) {
       choice.tile = indexedTile("reduction", reductionTile);
     } else if (hasRole(choice.roles, "lane")) {

@@ -259,7 +259,8 @@ private:
     }
     if (name == "intent.full" && definition->getNumOperands() == 1)
       return paddingForDomain(definition->getOperand(0), domain);
-    if ((name == "intent.cast" || name == "intent.broadcast") &&
+    if ((name == "intent.cast" || name == "intent.broadcast" ||
+         name == "intent.reshape") &&
         definition->getNumOperands() >= 1)
       return paddingForDomain(definition->getOperand(0), domain);
     if (name == "intent.unary" && definition->getNumOperands() == 1) {
@@ -411,6 +412,7 @@ private:
         continue;
       }
       if (name != "intent.cast" && name != "intent.broadcast" &&
+          name != "intent.reshape" &&
           name != "intent.unary" && name != "intent.binary" &&
           name != "intent.compare" && name != "intent.select" &&
           name != "intent.mask")
@@ -529,7 +531,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast", "intent.full", "intent.zeros",
-                         "intent.members", "intent.gather"})
+                         "intent.members", "intent.gather", "intent.reshape"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =

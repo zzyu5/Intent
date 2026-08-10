@@ -76,6 +76,15 @@ from kernels.streaming.attention import VARLEN_BATCH
 from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
 from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
+from kernels.streaming.paged_attention import BATCH as PAGED_BATCH
+from kernels.streaming.paged_attention import HEAD_DIMENSION as PAGED_HEAD_DIMENSION
+from kernels.streaming.paged_attention import HEAD_GROUP as PAGED_HEAD_GROUP
+from kernels.streaming.paged_attention import KV_HEADS as PAGED_KV_HEADS
+from kernels.streaming.paged_attention import PAGE_SIZE as PAGED_PAGE_SIZE
+from kernels.streaming.paged_attention import QUERY_HEADS as PAGED_QUERY_HEADS
+from kernels.streaming.paged_attention import SCALE as PAGED_SCALE
+from kernels.streaming.paged_attention import SEQUENCE_LENGTHS as PAGED_SEQUENCE_LENGTHS
+from kernels.streaming.paged_attention import paged_gqa_decode_attention
 
 from .support import benchmark
 from .support import prepare_kernel_call
@@ -99,6 +108,16 @@ def _compare(
     measurement_scope: str = "kernel-only",
     cuda_graph: bool = True,
 ) -> None:
+    if measurement_scope not in {
+        "kernel-only",
+        "end-to-end",
+        "runtime-metadata",
+    }:
+        raise RuntimeError(f"unknown measurement scope: {measurement_scope}")
+    if measurement_scope != "kernel-only" and cuda_graph:
+        raise RuntimeError(
+            f"{measurement_scope} measurement cannot use CUDA Graph replay"
+        )
     generated = artifact.run(*arguments)
     expected = reference()
     upstream_output = upstream(arguments) if upstream is not None else None
@@ -115,7 +134,7 @@ def _compare(
         )
     generated_call = (
         prepare_kernel_call(artifact, arguments, generated)
-        if measurement_scope != "end-to-end"
+        if measurement_scope == "kernel-only"
         else lambda: artifact.run(*arguments)
     )
     generated_p50, generated_p95 = benchmark(
@@ -483,6 +502,7 @@ def _run_layer_norm_backward(
         generated_pipeline,
         warmup=3,
         repetitions=100,
+        cuda_graph=False,
     )
     upstream_output = (
         upstream((x, dy, weight, bias, epsilon)) if upstream is not None else None
@@ -508,6 +528,12 @@ def _run_layer_norm_backward(
                 f"{target_name} LayerNorm backward upstream comparison failed: "
                 f"{upstream_errors}"
             )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream((x, dy, weight, bias, epsilon)),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+        )
     print_artifact(rows_artifact, target_name)
     print_artifact(reduce_artifact, target_name)
     print(
@@ -524,9 +550,10 @@ def _run_layer_norm_backward(
     else:
         print(
             f"{target_name} LayerNorm backward upstream comparison: PASS "
-            f"(dx/dw/db errors={upstream_errors}, timing=unavailable: "
-            f"the autograd wrapper cannot expose or CUDA-Graph-capture its "
-            f"inner kernels)"
+            f"(dx/dw/db errors={upstream_errors}, "
+            f"end-to-end upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
         )
 
 
@@ -577,6 +604,7 @@ def _run_rms_norm(
             if target_name == "TileLang" and upstream is not None
             else "kernel-only"
         ),
+        cuda_graph=not (target_name == "TileLang" and upstream is not None),
     )
 
 
@@ -725,6 +753,7 @@ def _run_dual_gemm(
         tolerance=5.0e-2,
         upstream=upstream,
         measurement_scope="end-to-end",
+        cuda_graph=False,
     )
 
 
@@ -866,11 +895,106 @@ def _run_varlen_attention(
             kernel_name=f"packed varlen attention causal={causal}",
             tolerance=2.0e-2,
             upstream=upstream if causal else None,
-            measurement_scope=(
-                "kernel-only" if target_name == "TileLang" else "runtime-launch"
-            ),
-            cuda_graph=target_name == "TileLang",
+            measurement_scope="runtime-metadata",
+            cuda_graph=False,
         )
+
+
+def _run_paged_attention(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    sequence_lengths = torch.tensor(
+        PAGED_SEQUENCE_LENGTHS,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    if sequence_lengths.numel() != PAGED_BATCH:
+        raise RuntimeError("paged attention batch constant does not match lengths")
+    page_counts = torch.div(
+        sequence_lengths + PAGED_PAGE_SIZE - 1,
+        PAGED_PAGE_SIZE,
+        rounding_mode="floor",
+    )
+    page_offsets = torch.zeros(
+        (PAGED_BATCH + 1,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    page_offsets[1:] = page_counts.cumsum(0)
+    total_pages = int(page_offsets[-1].item())
+    page_indices = torch.randperm(total_pages, device="cuda", dtype=torch.int64).to(
+        torch.int32
+    )
+    q = torch.randn(
+        (PAGED_BATCH, PAGED_QUERY_HEADS, PAGED_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    key_cache = torch.randn(
+        (
+            total_pages,
+            PAGED_PAGE_SIZE,
+            PAGED_KV_HEADS,
+            PAGED_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    value_cache = torch.randn_like(key_cache) * 0.5
+    artifact = intent.compile(
+        paged_gqa_decode_attention,
+        constexprs={
+            "PAGE_SIZE": PAGED_PAGE_SIZE,
+            "HEAD_GROUP": PAGED_HEAD_GROUP,
+        },
+        target=target,
+        compiler=compiler,
+    )
+    arguments = (
+        q,
+        key_cache,
+        value_cache,
+        page_offsets,
+        page_indices,
+        sequence_lengths,
+        PAGED_SCALE,
+    )
+
+    def reference() -> torch.Tensor:
+        result = torch.empty_like(q)
+        key_heads = torch.arange(PAGED_QUERY_HEADS, device="cuda") // PAGED_HEAD_GROUP
+        for batch in range(PAGED_BATCH):
+            begin = int(page_offsets[batch].item())
+            end = int(page_offsets[batch + 1].item())
+            length = int(sequence_lengths[batch].item())
+            physical_pages = page_indices[begin:end].long()
+            key = key_cache[physical_pages].reshape(
+                -1, PAGED_KV_HEADS, PAGED_HEAD_DIMENSION
+            )[:length]
+            value = value_cache[physical_pages].reshape(
+                -1, PAGED_KV_HEADS, PAGED_HEAD_DIMENSION
+            )[:length]
+            expanded_key = key[:, key_heads, :].permute(1, 0, 2)[None]
+            expanded_value = value[:, key_heads, :].permute(1, 0, 2)[None]
+            result[batch] = F.scaled_dot_product_attention(
+                q[batch][None, :, None, :],
+                expanded_key,
+                expanded_value,
+                is_causal=False,
+                scale=PAGED_SCALE,
+            )[0, :, 0, :]
+        return result
+
+    _compare(
+        artifact=artifact,
+        arguments=arguments,
+        reference=reference,
+        target_name=target_name,
+        kernel_name="paged GQA causal decode attention",
+        tolerance=3.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
 
 
 def _run_attention_bias(
@@ -1014,6 +1138,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
+    "paged_attention": _run_paged_attention,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "scalar_table_lookup": _run_scalar_table_lookup,

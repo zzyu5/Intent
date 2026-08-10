@@ -27,6 +27,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "program_n" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "stream_contract")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "TILE_SIZE_S" + role.drop_front(7).str();
   if (role.starts_with("program_"))
@@ -62,6 +66,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
   if (role == "cast")
     return materialization == "contract_operand" ? StringRef("T.copy_cast")
                                                    : StringRef("T.cast");
+  if (role == "reshape")
+    return StringRef("T.reshape");
   if (role == "unary_exp")
     return StringRef("T.exp");
   if (role == "unary_exp2")
@@ -127,6 +133,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "program_n" || role == "feature" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "stream_contract")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "TILE_SIZE_S" + role.drop_front(7).str();
   if (role.starts_with("program_"))
@@ -229,7 +239,6 @@ indexRealization(intent::plan::RealizationOp realization,
   }
   index.components = target::emission::indexPhysicalComponents(index);
   bool rowStrided = workerReuse(index);
-  unsigned programAxes = index.components.programAxes.size();
   for (intent::plan::ReductionOp value : reductions) {
     Operation *operation = kernel.nodes.lookup(value.getNode());
     FailureOr<std::string> role =
@@ -294,13 +303,9 @@ indexRealization(intent::plan::RealizationOp realization,
     });
     bool materializeLogicalBounds =
         raggedBound && !value.getConsumerNeutralized();
-    binding.transfer =
-        *derivedScalar ||
-                (programAxes > 1 &&
-                 target::emission::touchesStateStream(*operation) &&
-                 !value.getConsumerNeutralized())
-            ? "parallel_elements"
-            : "bulk_copy";
+    binding.transfer = *derivedScalar || materializeLogicalBounds
+                           ? "parallel_elements"
+                           : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
     binding.defer = load && target::emission::feedsContraction(*operation) &&
                     (!index.components.groups.empty() ||
@@ -584,12 +589,6 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
             "requires a canonical rank-one member-index view");
       runtime.indices = *indices;
     }
-    bool ordered = llvm::any_of(ragged.getMemberNodes(), [&](int64_t node) {
-      return planIndex.components.orderedRaggedAxes.contains(node);
-    });
-    if (ordered && runtime.indices)
-      return runtime.relation->emitOpError(
-          "ordered ragged traversal cannot project an indirect member map");
     unsigned position = raggedRuntimes.size();
     raggedRuntimeByRelation[ragged.getNode()] = position;
     raggedRuntimesByAxis[ragged.getOuterNode()].push_back(position);
@@ -1595,7 +1594,23 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
           "TileLang access has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
     if (term.kind == "value_index" &&
-        !isa<RankedTensorType>(indexed.getType())) {
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      auto result = dyn_cast<OpResult>(indexed);
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      FailureOr<SmallVector<std::string>> extents =
+          result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+                 : FailureOr<SmallVector<std::string>>(failure());
+      if (tensor.getRank() != 1 || failed(exact) || failed(extents) ||
+          extents->size() != 1 || extents->front() != "1")
+        return operation.emitOpError(
+            "TileLang bulk indirect access requires one singleton index tile");
+      auto assumed = assumedIndexNames.find(indexed);
+      indices.push_back(assumed == assumedIndexNames.end()
+                            ? exact->str() + "[0]"
+                            : assumed->second);
+    } else if (term.kind == "value_index") {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -1657,7 +1672,20 @@ SourceEmitter::elementAccessIndices(Operation &operation,
           "parallel TileLang transfer has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
     if (term.kind == "value_index" &&
-        !isa<RankedTensorType>(indexed.getType())) {
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (tensor.getRank() != 1 || failed(exact) ||
+          tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "TileLang indirect element access requires one index-tile axis");
+      auto assumed = assumedIndexNames.find(indexed);
+      indices.push_back(assumed == assumedIndexNames.end()
+                            ? exact->str() + "[" + tileIndices[tileAxis] + "]"
+                            : assumed->second);
+      ++tileAxis;
+    } else if (term.kind == "value_index") {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -1720,6 +1748,21 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       return operation.emitOpError(
           "bounded TileLang transfer has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (tensor.getRank() != 1 || failed(exact) ||
+          tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "TileLang indirect bounds require one index-tile axis");
+      std::string index =
+          exact->str() + "[" + tileIndices[tileAxis++] + "]";
+      predicates.push_back("0 <= " + index);
+      predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+      continue;
+    }
     if (term.kind == "value_index" &&
         !isa<RankedTensorType>(indexed.getType())) {
       FailureOr<target::ScalarIndexSource> source =
@@ -1806,6 +1849,21 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
       return operation.emitOpError(
           "whole-tile TileLang transfer has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (tensor.getRank() != 1 || failed(exact) ||
+          tileAxis >= tileExtents.size() || tileExtents[tileAxis] != "1")
+        return operation.emitOpError(
+            "TileLang bulk bounds require one singleton indirect index tile");
+      ++tileAxis;
+      std::string index = exact->str() + "[0]";
+      predicates.push_back("0 <= " + index);
+      predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+      continue;
+    }
     if (term.kind == "value_index" &&
         !isa<RankedTensorType>(indexed.getType())) {
       FailureOr<target::ScalarIndexSource> source =

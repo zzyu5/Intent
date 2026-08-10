@@ -50,6 +50,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
     return std::string("BLOCK_SIZE_K");
+  if (role == "stream_contract")
+    return std::string("BLOCK_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "BLOCK_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "BLOCK_SIZE_S" + role.drop_front(7).str();
   operation->emitOpError("has no Triton tile spelling for role ") << role;
@@ -63,6 +67,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("alias");
   if (role == "cast")
     return StringRef("tl.cast");
+  if (role == "reshape")
+    return StringRef("tl.reshape");
   if (role == "unary_exp")
     return StringRef("tl.exp");
   if (role == "unary_exp2")
@@ -142,6 +148,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
     return std::string("BLOCK_SIZE_K");
+  if (role == "stream_contract")
+    return std::string("BLOCK_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "BLOCK_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "BLOCK_SIZE_S" + role.drop_front(7).str();
   operation->emitOpError("has no Triton tuner parameter for role ") << role;
@@ -533,12 +543,6 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
             "requires a canonical rank-one member-index view");
       runtime.indices = *indices;
     }
-    bool ordered = llvm::any_of(ragged.getMemberNodes(), [&](int64_t node) {
-      return planIndex.components.orderedRaggedAxes.contains(node);
-    });
-    if (ordered && runtime.indices)
-      return runtime.relation->emitOpError(
-          "ordered ragged traversal cannot project an indirect member map");
     unsigned position = raggedRuntimes.size();
     raggedRuntimeByRelation[ragged.getNode()] = position;
     raggedRuntimesByAxis[ragged.getOuterNode()].push_back(position);
@@ -913,15 +917,20 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
+      StringRef access = view.view.getAccess();
+      if (access == "in") {
         inputs.push_back(&view);
-      else if ((view.view.getAccess() == "out" ||
-                view.view.getAccess() == "inout") &&
-               !merge)
+        continue;
+      }
+      if (access == "out" || access == "inout") {
+        if (merge)
+          return kernel.entry.emitOpError(
+              "ragged stages require input views and one inout merge view");
         merge = &view;
-      else
-        return kernel.entry.emitOpError(
-            "ragged stages require input views and one inout merge view");
+        continue;
+      }
+      return kernel.entry.emitOpError(
+          "ragged stages require input views and one inout merge view");
     }
     if (!merge)
       return kernel.entry.emitOpError("ragged stages have no merge destination");
@@ -1645,13 +1654,20 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
         return operation.emitOpError(
             "dynamic pointer index has no canonical operand");
       Value indexed = operation.getOperand(*term.operands.front());
-      if (term.kind == "value_index" &&
-          !isa<RankedTensorType>(indexed.getType())) {
+      if (term.kind == "value_index") {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
           return failure();
-        index = "(" + exact->str() + ")";
+        auto tensor = dyn_cast<RankedTensorType>(indexed.getType());
+        if (!tensor) {
+          index = "(" + exact->str() + ")";
+        } else {
+          if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
+            return operation.emitOpError(
+                "Triton indirect tensor indices currently require one logical axis");
+          index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+        }
       } else {
         FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
         if (failed(axis))
@@ -1705,6 +1721,20 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
       return failure();
     }
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (tensor.getRank() != 1 || failed(exact) || vectorAxis >= *tensorRank)
+        return operation.emitOpError(
+            "Triton indirect tensor bounds require one logical axis");
+      std::string index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+      predicates.push_back("(" + index + " >= 0)");
+      predicates.push_back("(" + index + " < " +
+                           (*view)->shape[axisNumber] + ")");
+      continue;
+    }
     if (term.kind == "value_index" &&
         !isa<RankedTensorType>(indexed.getType())) {
       FailureOr<target::ScalarIndexSource> source =

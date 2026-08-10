@@ -45,6 +45,8 @@ pointwiseRole(mlir::Operation &operation) {
     return std::string("broadcast");
   if (name == "intent.cast")
     return std::string("cast");
+  if (name == "intent.reshape")
+    return std::string("reshape");
   if (name == "intent.mask")
     return std::string("mask");
   if (name == "intent.full")

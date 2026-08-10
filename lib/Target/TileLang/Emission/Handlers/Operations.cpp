@@ -23,7 +23,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
-                         "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
+                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -42,6 +42,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
             return emitter.selectOperation(op) ? emitter.leaveParallel(op)
                                                : success();
           })) ||
+      failed(addHandler(registry, "intent.assume_in_bounds", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAssumeInBounds(op);
+      })) ||
       failed(addHandler(registry, "intent.view_load", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -86,6 +91,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitCast(op);
+      })) ||
+      failed(addHandler(registry, "intent.reshape", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitReshape(op);
       })) ||
       failed(addHandler(registry, "intent.full", [&](Operation &op) {
         if (!emitter.selectOperation(op))
@@ -168,6 +178,53 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   }
   line(result + " = " + expression);
   valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
+  auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  FailureOr<StringRef> index = lookupValue(operation, 0);
+  FailureOr<ABIView *> view =
+      operation.getNumOperands() == 2
+          ? lookupView(operation.getOperand(1), operation)
+          : FailureOr<ABIView *>(failure());
+  if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
+      !axis || axis.getInt() < 0 || failed(index) || failed(view) ||
+      axis.getInt() >= (*view)->tensor.getRank())
+    return operation.emitOpError(
+        "lacks a mechanical TileLang in-bounds assumption binding");
+
+  Type indexType = operation.getOperand(0).getType();
+  std::string expression = index->str();
+  if (auto tensor = dyn_cast<RankedTensorType>(indexType)) {
+    auto result = dyn_cast<OpResult>(operation.getOperand(0));
+    FailureOr<SmallVector<std::string>> extents =
+        result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+               : FailureOr<SmallVector<std::string>>(failure());
+    if (tensor.getRank() != 1 || failed(extents) || extents->size() != 1 ||
+        extents->front() != "1")
+      return operation.emitOpError(
+          "TileLang can project only singleton tensor index assumptions");
+    auto assumed = assumedIndexNames.find(operation.getOperand(0));
+    if (assumed == assumedIndexNames.end()) {
+      auto node = operation.getAttrOfType<IntegerAttr>("intent.node");
+      if (!node)
+        return operation.emitOpError(
+            "TileLang in-bounds assumption has no canonical node identity");
+      expression = uniqueName("assumed_index", node.getInt());
+      line(expression + " = " + index->str() + "[0]");
+      assumedIndexNames[operation.getOperand(0)] = expression;
+    } else {
+      expression = assumed->second;
+    }
+  } else if (!isa<IntegerType, IndexType, intent::LogicalIndexType>(indexType)) {
+    return operation.emitOpError(
+        "TileLang in-bounds assumptions require an integer index");
+  }
+
+  line("T.assume(0 <= " + expression + ")");
+  line("T.assume(" + expression + " < " +
+       (*view)->shape[axis.getInt()] + ")");
   return success();
 }
 
@@ -415,7 +472,7 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(result) || failed(extents) || extents->size() != 1)
     return operation.emitOpError("lacks a mechanical TileLang indices binding");
   std::string base = axisIndices.lookup(axis->getNode());
-  if (base.empty() || axis->isScalar())
+  if (base.empty())
     return operation.emitOpError("has no TileLang vector index realization");
   line("for indices_i in T.Parallel(" + extents->front() + "):");
   ++indentation;
@@ -826,6 +883,24 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitReshape(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "reshape emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  FailureOr<std::string> shape = tensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "T.reshape" ||
+      binding.getReuseOperandAttr().getInt() != -1 ||
+      binding.getSpace() != "fragment" || failed(operand) || failed(shape) ||
+      operation.getNumResults() != 1 ||
+      !isa<RankedTensorType>(operation.getResult(0).getType()))
+    return operation.emitOpError("lacks a TileLang reshape binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = T.reshape(" + operand->str() + ", " + *shape + ")");
+  bindResult(operation, 0, result);
+  return success();
+}
+
 LogicalResult SourceEmitter::emitFull(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "full emission");
   plan::PointwiseOp binding =
@@ -980,6 +1055,35 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   if (failed(memberAxis) || failed(relation) ||
       runtime == raggedRuntimeByRelation.end())
     return operation.emitOpError("has no ragged runtime for its member axis");
+  RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+  if (planIndex.components.orderedRaggedAxes.contains(memberAxis->getNode())) {
+    if (!activeStages.empty())
+      return operation.emitOpError(
+          "cannot mix ordered and staged ragged member projection");
+    std::string position = axisIndices.lookup(memberAxis->getNode());
+    if (position.empty())
+      return operation.emitOpError("has no ordered ragged runtime position");
+    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+    if (failed(result))
+      return failure();
+    std::string memberIndex = "ordered_member_i_" + std::to_string(*node);
+    std::string absolute = position + " + " + memberIndex;
+    std::string suffix = std::to_string(memberAxis->getNode());
+    line("for " + memberIndex + " in T.Parallel(" +
+         memberAxis->getTile().str() + "):");
+    ++indentation;
+    std::string member = ragged.indices
+                             ? ragged.indices->argument->name + "[" + absolute + "]"
+                             : absolute;
+    line(*result + "[" + memberIndex + "] = T.if_then_else(" + absolute +
+         " < sequence_end_" + suffix + ", " + member + ", 0)");
+    --indentation;
+    bindResult(operation, 0, *result);
+    return success();
+  }
+  if (activeStages.empty())
+    return operation.emitOpError(
+        "has neither ordered traversal nor staged ragged ownership");
   for (unsigned stage : activeStages)
     if (!stageRaggedRuntime.count(stage) ||
         stageRaggedRuntime.lookup(stage) != runtime->second)
@@ -990,7 +1094,6 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
     return failure();
   line("for member_i in T.Parallel(TILE_SIZE_M):");
   ++indentation;
-  RaggedRuntime &ragged = raggedRuntimes[runtime->second];
   std::string member = ragged.indices
                            ? ragged.indices->argument->name +
                                  "[member_start + member_i]"
@@ -1047,12 +1150,34 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
+  std::string raggedSuffix = std::to_string(binding.getAxisNode());
+  if (raggedStream) {
+    FailureOr<plan::RaggedOp> relation =
+        target::emission::uniqueRaggedRelation(
+            planIndex, binding.getAxisNode(), operation);
+    auto runtime = succeeded(relation)
+                       ? raggedRuntimeByRelation.find(relation->getNode())
+                       : raggedRuntimeByRelation.end();
+    std::string outer = succeeded(relation)
+                            ? axisIndices.lookup(relation->getOuterNode())
+                            : std::string();
+    if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
+        outer.empty())
+      return operation.emitOpError(
+          "ordered ragged stream has no outer-axis metadata binding");
+    RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+    line("sequence_begin_" + raggedSuffix + " = " +
+         ragged.offsets->argument->name + "[" + outer + "]");
+    line("sequence_end_" + raggedSuffix + " = " +
+         ragged.offsets->argument->name + "[" + outer + " + 1]");
+    line("sequence_length_" + raggedSuffix + " = sequence_end_" +
+         raggedSuffix + " - sequence_begin_" + raggedSuffix);
+  }
   FailureOr<std::string> logicalExtent =
       streamDomain ? dimensionName(*streamDomain)
                    : FailureOr<std::string>(failure());
   if (failed(logicalExtent))
     return binding.emitOpError("has no logical ordered-axis extent");
-  std::string raggedSuffix = std::to_string(binding.getAxisNode());
   std::string streamExtent =
       raggedStream ? "sequence_length_" + raggedSuffix : *logicalExtent;
   if (hasStop) {
@@ -1320,6 +1445,61 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (failed(lhs) || failed(rhs) || failed(result))
     return failure();
   line("T.clear(" + *result + ")");
+  auto valueExtents = [&](Value value)
+      -> FailureOr<SmallVector<std::string>> {
+    auto opResult = dyn_cast<OpResult>(value);
+    if (!opResult)
+      return failure();
+    return tensorExtents(*opResult.getOwner(), opResult.getResultNumber());
+  };
+  FailureOr<SmallVector<std::string>> lhsExtents =
+      valueExtents(operation.getOperand(0));
+  FailureOr<SmallVector<std::string>> rhsExtents =
+      valueExtents(operation.getOperand(1));
+  FailureOr<SmallVector<std::string>> resultExtents =
+      tensorExtents(operation, 0);
+  auto reduction = operation.getAttrOfType<ArrayAttr>("intent.reduce");
+  auto pair = reduction && reduction.size() == 1
+                  ? dyn_cast<ArrayAttr>(reduction[0])
+                  : ArrayAttr();
+  auto lhsReduction = pair && pair.size() == 2
+                          ? dyn_cast<IntegerAttr>(pair[0])
+                          : IntegerAttr();
+  auto rhsReduction = pair && pair.size() == 2
+                          ? dyn_cast<IntegerAttr>(pair[1])
+                          : IntegerAttr();
+  bool unitRow = succeeded(lhsExtents) && succeeded(rhsExtents) &&
+                 succeeded(resultExtents) && lhsExtents->size() == 2 &&
+                 rhsExtents->size() == 2 && resultExtents->size() == 2 &&
+                 (*resultExtents)[0] == "1" && lhsReduction && rhsReduction &&
+                 lhsReduction.getInt() == 1 &&
+                 (rhsReduction.getInt() == 0 || rhsReduction.getInt() == 1);
+  if (unitRow) {
+    auto resultTensor =
+        dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+    std::string accumulatorDtype =
+        resultTensor ? dtypeName(resultTensor.getElementType(), operation) : "";
+    if (accumulatorDtype.empty())
+      return failure();
+    std::string reductionExtent = (*lhsExtents)[1];
+    std::string outputExtent =
+        (*rhsExtents)[rhsReduction.getInt() == 0 ? 1 : 0];
+    line("for contract_j in T.Parallel(" + outputExtent + "):");
+    ++indentation;
+    line("for contract_k in T.serial(" + reductionExtent + "):");
+    ++indentation;
+    std::string rhsElement = rhsReduction.getInt() == 0
+                                 ? rhs->str() + "[contract_k, contract_j]"
+                                 : rhs->str() + "[contract_j, contract_k]";
+    line(*result + "[0, contract_j] = " + *result +
+         "[0, contract_j] + T.cast(" + lhs->str() +
+         "[0, contract_k], " + accumulatorDtype + ") * T.cast(" +
+         rhsElement + ", " + accumulatorDtype + ")");
+    --indentation;
+    --indentation;
+    bindResult(operation, 0, *result);
+    return success();
+  }
   std::string call = "T.gemm(" + lhs->str() + ", " + rhs->str() + ", " +
                      *result;
   if (orientation->lhsTranspose)

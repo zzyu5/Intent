@@ -24,20 +24,33 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
     return failure();
   SmallVector<Operation *> domains;
   bool hasOpaqueScalarIndex = false;
+  bool hasInBoundsIndex = false;
+  unsigned sourceAxis = 0;
   for (const IndexTerm &term : *relation) {
-    if (term.kind == "full_slice" || term.kind == "new_axis" ||
-        term.kind == "static_index" || term.kind == "slice")
+    if (term.kind == "new_axis")
       continue;
+    if (term.kind == "full_slice" || term.kind == "static_index" ||
+        term.kind == "slice") {
+      ++sourceAxis;
+      continue;
+    }
     if (term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "boundary analysis requires one value per dynamic index term");
     Value indexed = operation.getOperand(*term.operands.front());
     auto indexedAxes = facts.valueAxes.find(indexed);
     if (term.kind == "value_index") {
+      if (hasInBoundsPrecondition(indexed, operation.getOperand(0), sourceAxis,
+                                  operation)) {
+        hasInBoundsIndex = true;
+        ++sourceAxis;
+        continue;
+      }
       if (indexedAxes != facts.valueAxes.end()) {
         for (const LogicalAxis &axis : indexedAxes->second)
           if (axis.domain && !llvm::is_contained(domains, axis.domain))
             domains.push_back(axis.domain);
+        ++sourceAxis;
         continue;
       }
       FailureOr<ScalarIndexSource> source =
@@ -50,28 +63,20 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
       } else if (source->opaque) {
         hasOpaqueScalarIndex = true;
       }
+      ++sourceAxis;
       continue;
     }
     FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
     if (failed(domain))
       return failure();
     domains.push_back(*domain);
+    ++sourceAxis;
   }
-  if (domains.empty() && !hasOpaqueScalarIndex)
+  if (domains.empty() && !hasOpaqueScalarIndex && !hasInBoundsIndex)
     return operation.emitOpError("has no domain-bound index for realization");
   facts.boundaryDomains[&operation] = std::move(domains);
   facts.boundaryFills[&operation] = fill.str();
   return success();
-}
-
-bool hasInBoundsPrecondition(Value index, Value view, unsigned axis,
-                             Operation &access, const KernelFacts &facts) {
-  return llvm::any_of(facts.indexPreconditions,
-                      [&](const IndexPreconditionFact &fact) {
-    return fact.index == index && fact.view == view && fact.axis == axis &&
-           fact.declaration && fact.declaration->getBlock() == access.getBlock() &&
-           fact.declaration->isBeforeInBlock(&access);
-  });
 }
 
 FailureOr<Value> backingView(Value tensor, const KernelFacts &facts,
@@ -147,21 +152,21 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
       return operation.emitOpError(
           "boundary classification requires one dynamic index operand");
     Value indexed = operation.getOperand(*term.operands.front());
-    if (term.kind == "value_index" &&
-        isa<RankedTensorType>(indexed.getType()))
-      return true;
     if (term.kind == "value_index") {
+      if (hasInBoundsPrecondition(indexed, operation.getOperand(0), sourceAxis,
+                                  operation)) {
+        ++sourceAxis;
+        continue;
+      }
+      if (isa<RankedTensorType>(indexed.getType()))
+        return true;
       FailureOr<ScalarIndexSource> source =
           traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
       if (source->opaque && !source->domain) {
-        if (!hasInBoundsPrecondition(indexed, operation.getOperand(0),
-                                     sourceAxis, operation, facts))
-          return operation.emitOpError(
-              "opaque scalar index requires a preceding I.assume_in_bounds declaration");
-        ++sourceAxis;
-        continue;
+        return operation.emitOpError(
+            "opaque scalar index requires a preceding I.assume_in_bounds declaration");
       }
       if (source->transformed)
         return true;
@@ -424,6 +429,71 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   return bindResultAxes(operation, 0, std::move(*axes), facts);
 }
 
+bool isUnitAxis(const LogicalAxis &axis, const KernelFacts &facts) {
+  if (axis.extent == "1")
+    return true;
+  if (!axis.domain)
+    return false;
+  return llvm::any_of(facts.stateStreams, [&](const auto &entry) {
+    Operation *stream = entry.first;
+    if (stream->getNumOperands() == 0 ||
+        stream->getOperand(0).getDefiningOp() != axis.domain)
+      return false;
+    auto extentIndex =
+        stream->getAttrOfType<IntegerAttr>("intent.extent_operand_index");
+    if (!extentIndex || extentIndex.getInt() < 0 ||
+        static_cast<unsigned>(extentIndex.getInt()) >= stream->getNumOperands())
+      return false;
+    Operation *extent =
+        stream->getOperand(extentIndex.getInt()).getDefiningOp();
+    auto value = extent
+                     ? extent->getAttrOfType<IntegerAttr>("intent.value")
+                     : IntegerAttr();
+    return extent && extent->getName().getStringRef() == "intent.constant" &&
+           value && value.getInt() == 1;
+  });
+}
+
+LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
+  if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
+    return operation.emitOpError("has no canonical reshape schema");
+  auto source = facts.valueAxes.find(operation.getOperand(0));
+  FailureOr<SmallVector<LogicalAxis>> result =
+      axesFromResultShape(operation, 0, facts);
+  if (source == facts.valueAxes.end() || failed(result))
+    return operation.emitOpError("reshape has no logical-axis provenance");
+
+  size_t sourceIndex = 0;
+  size_t resultIndex = 0;
+  while (sourceIndex < source->second.size() && resultIndex < result->size()) {
+    if (source->second[sourceIndex] == (*result)[resultIndex]) {
+      ++sourceIndex;
+      ++resultIndex;
+      continue;
+    }
+    if (isUnitAxis(source->second[sourceIndex], facts)) {
+      ++sourceIndex;
+      continue;
+    }
+    if (isUnitAxis((*result)[resultIndex], facts)) {
+      ++resultIndex;
+      continue;
+    }
+    return operation.emitOpError(
+        "reshape currently supports only unit-axis insertion or removal");
+  }
+  while (sourceIndex < source->second.size() &&
+         isUnitAxis(source->second[sourceIndex], facts))
+    ++sourceIndex;
+  while (resultIndex < result->size() &&
+         isUnitAxis((*result)[resultIndex], facts))
+    ++resultIndex;
+  if (sourceIndex != source->second.size() || resultIndex != result->size())
+    return operation.emitOpError(
+        "reshape currently supports only unit-axis insertion or removal");
+  return bindResultAxes(operation, 0, std::move(*result), facts);
+}
+
 LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                    KernelFacts &facts) {
   auto noOp = [](Operation &) { return success(); };
@@ -436,10 +506,16 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.assume_in_bounds",
           [&](Operation &operation) -> LogicalResult {
             auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+            Type indexType = operation.getNumOperands() > 0
+                                 ? operation.getOperand(0).getType()
+                                 : Type();
+            auto tensorIndex = dyn_cast_or_null<RankedTensorType>(indexType);
+            bool integerIndex =
+                isa<IntegerType, IndexType, intent::LogicalIndexType>(indexType) ||
+                (tensorIndex &&
+                 isa<IntegerType, IndexType>(tensorIndex.getElementType()));
             if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
-                !axis || axis.getInt() < 0 ||
-                !isa<IntegerType, IndexType, intent::LogicalIndexType>(
-                    operation.getOperand(0).getType()) ||
+                !axis || axis.getInt() < 0 || !integerIndex ||
                 !isa<intent::ViewType>(operation.getOperand(1).getType()))
               return operation.emitOpError(
                   "has no canonical in-bounds precondition schema");
@@ -448,9 +524,6 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (!tensor || axis.getInt() >= tensor.getRank())
               return operation.emitOpError(
                   "in-bounds precondition axis exceeds its view rank");
-            facts.indexPreconditions.push_back(IndexPreconditionFact{
-                operation.getOperand(0), operation.getOperand(1), axis.getInt(),
-                &operation});
             return success();
           })))
     return failure();
@@ -742,6 +815,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return propagatePointwiseAxes(operation, facts);
             })))
       return failure();
+
+  if (failed(addHandler(
+          registry, "intent.reshape", [&](Operation &operation) -> LogicalResult {
+            return propagateReshapeAxes(operation, facts);
+          })))
+    return failure();
 
   for (StringRef name : {"intent.full", "intent.zeros"})
     if (failed(addHandler(

@@ -89,6 +89,7 @@ public:
 
   mlir::LogicalResult emit();
   mlir::LogicalResult emitConstant(mlir::Operation &operation);
+  mlir::LogicalResult emitAssumeInBounds(mlir::Operation &operation);
   mlir::LogicalResult enterParallel(mlir::Operation &operation);
   mlir::LogicalResult leaveParallel(mlir::Operation &operation);
   mlir::LogicalResult emitLoad(mlir::Operation &operation);
@@ -99,6 +100,7 @@ public:
   mlir::LogicalResult emitBinary(mlir::Operation &operation);
   mlir::LogicalResult emitMask(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
+  mlir::LogicalResult emitReshape(mlir::Operation &operation);
   mlir::LogicalResult emitFull(mlir::Operation &operation);
   mlir::LogicalResult emitZeros(mlir::Operation &operation);
   mlir::LogicalResult emitGather(mlir::Operation &operation);
@@ -185,6 +187,7 @@ private:
   llvm::SmallVector<ABIScalar> scalars;
   llvm::DenseMap<mlir::Value, unsigned> viewPositions;
   llvm::DenseMap<mlir::Value, std::string> valueNames;
+  llvm::DenseMap<mlir::Value, std::string> assumedIndexNames;
   llvm::DenseMap<mlir::Value, mlir::Operation *> deferredLoads;
   llvm::StringSet<> usedNames;
   llvm::StringMap<std::string> dimensionOwners;

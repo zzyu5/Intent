@@ -17,6 +17,7 @@ from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import is_integer
 from intent.language import index as intent_index
+from intent.language.dtypes import DTypeCategory
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import IterationSpec
@@ -233,10 +234,16 @@ def _assume_in_bounds(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     view = lowerer.materialize(
         lowerer.lower_expression(bound["view"]), bound["view"]
     )
-    if not isinstance(index.type, (ScalarType, LogicalIndexType)) or not is_integer(
+    scalar_index = isinstance(index.type, (ScalarType, LogicalIndexType)) and is_integer(
         index.type
-    ):
-        lowerer.error(bound["index"], "assumed index must be an integer scalar")
+    )
+    tensor_index = isinstance(index.type, TensorType) and index.type.dtype.category in (
+        DTypeCategory.SIGNED_INTEGER,
+        DTypeCategory.UNSIGNED_INTEGER,
+        DTypeCategory.INDEX,
+    )
+    if not scalar_index and not tensor_index:
+        lowerer.error(bound["index"], "assumed index must be an integer scalar or tensor")
     if view not in lowerer.view_kinds or not isinstance(view.type, TensorType):
         lowerer.error(bound["view"], "assumed bound must reference an ABI view")
     axis = require_static_int(lowerer, bound["axis"])

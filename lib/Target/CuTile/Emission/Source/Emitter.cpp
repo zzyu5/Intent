@@ -23,6 +23,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "program_n" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "stream_contract")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "TILE_SIZE_S" + role.drop_front(7).str();
   if (role.starts_with("program_"))
@@ -44,6 +48,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
   if (role == "cast")
     return resultSpace == "private_scalar" ? StringRef("ct.full_cast")
                                             : StringRef("ct.astype");
+  if (role == "reshape")
+    return StringRef("ct.reshape");
   if (role == "unary_exp")
     return StringRef("ct.exp");
   if (role == "unary_exp2")
@@ -109,6 +115,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "program_n" || role == "feature" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "stream_contract")
+    return std::string("TILE_SIZE_K");
+  if (role.starts_with("stream_contract_"))
+    return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
     return "TILE_SIZE_S" + role.drop_front(7).str();
   if (role.starts_with("program_"))
@@ -247,11 +257,16 @@ indexRealization(intent::plan::RealizationOp realization,
     bool store = operation &&
                  (operation->getName().getStringRef() == "intent.view_store" ||
                   operation->getName().getStringRef() == "intent.scatter_unique");
+    bool uniqueStore = operation &&
+                       operation->getName().getStringRef() ==
+                           "intent.scatter_unique";
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
         target::hasDerivedScalarIndex(*operation);
-    if (failed(derivedScalar))
+    FailureOr<bool> tensorIndirect =
+        target::hasTensorIndirectIndex(*operation);
+    if (failed(derivedScalar) || failed(tensorIndirect))
       return failure();
     bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
       auto axis = index.axes.find(node);
@@ -262,7 +277,9 @@ indexRealization(intent::plan::RealizationOp realization,
     });
     plan::BoundaryOp binding;
     binding.operation = value;
-    binding.access = (rowStrided || raggedBound) && vectorized
+    binding.access = !uniqueStore &&
+                             (*tensorIndirect ||
+                              ((rowStrided || raggedBound) && vectorized))
                          ? (load ? "gather" : "scatter")
                          : (load ? "load" : "store");
     binding.resultSpace = value.getResultSpace().str();
@@ -561,12 +578,6 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
             "requires a canonical rank-one member-index view");
       runtime.indices = *indices;
     }
-    bool ordered = llvm::any_of(ragged.getMemberNodes(), [&](int64_t node) {
-      return planIndex.components.orderedRaggedAxes.contains(node);
-    });
-    if (ordered && runtime.indices)
-      return runtime.relation->emitOpError(
-          "ordered ragged traversal cannot project an indirect member map");
     unsigned position = raggedRuntimes.size();
     raggedRuntimeByRelation[ragged.getNode()] = position;
     raggedRuntimesByAxis[ragged.getOuterNode()].push_back(position);
@@ -888,15 +899,20 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
+      StringRef access = view.view.getAccess();
+      if (access == "in") {
         inputs.push_back(&view);
-      else if ((view.view.getAccess() == "out" ||
-                view.view.getAccess() == "inout") &&
-               !merge)
+        continue;
+      }
+      if (access == "out" || access == "inout") {
+        if (merge)
+          return kernel.entry.emitOpError(
+              "ragged stages require input views and one inout merge view");
         merge = &view;
-      else
-        return kernel.entry.emitOpError(
-            "ragged stages require input views and one inout merge view");
+        continue;
+      }
+      return kernel.entry.emitOpError(
+          "ragged stages require input views and one inout merge view");
     }
     if (!merge)
       return kernel.entry.emitOpError("ragged stages have no merge destination");
@@ -1619,6 +1635,104 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  bool tensorIndirect = llvm::any_of(*relation, [&](const target::IndexTerm &term) {
+    return term.kind == "value_index" && term.operands.size() == 1 &&
+           term.operands.front() &&
+           isa<RankedTensorType>(
+               operation.getOperand(*term.operands.front()).getType());
+  });
+  if (tensorIndirect) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    auto result = operation.getNumResults() == 1
+                      ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                      : RankedTensorType();
+    if (failed(view) || !result || relation->size() != (*view)->shape.size())
+      return operation.emitOpError(
+          "indirect cuTile gather has no ranked access schema");
+    unsigned resultAxis = 0;
+    auto broadcast = [&](StringRef value, unsigned axis) {
+      if (result.getRank() == 1)
+        return value.str();
+      std::string expression = value.str() + "[";
+      for (unsigned position = 0; position <
+                                  static_cast<unsigned>(result.getRank());
+           ++position) {
+        if (position)
+          expression += ", ";
+        expression += position == axis ? ":" : "None";
+      }
+      return expression + "]";
+    };
+    SmallVector<std::string> indices;
+    for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+      if (term.kind == "full_slice") {
+        if (resultAxis >= static_cast<unsigned>(result.getRank()))
+          return operation.emitOpError(
+              "indirect cuTile gather has too many vector axes");
+        indices.push_back(broadcast(
+            "ct.arange(" + (*view)->shape[axisNumber] + ", dtype=ct.int32)",
+            resultAxis++));
+        continue;
+      }
+      if (term.kind == "static_index") {
+        if (term.staticValues.size() != 1 || !term.staticValues.front())
+          return operation.emitOpError(
+              "indirect cuTile gather has an invalid static index");
+        indices.push_back(std::to_string(*term.staticValues.front()));
+        continue;
+      }
+      if ((term.kind != "region_index" && term.kind != "value_index") ||
+          term.operands.size() != 1 || !term.operands.front())
+        return operation.emitOpError(
+            "indirect cuTile gather has no mechanical index relation");
+      Value indexed = operation.getOperand(*term.operands.front());
+      if (auto tensor = dyn_cast<RankedTensorType>(indexed.getType())) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (term.kind != "value_index" || tensor.getRank() != 1 ||
+            failed(exact) || resultAxis >= static_cast<unsigned>(result.getRank()))
+          return operation.emitOpError(
+              "cuTile indirect tensor indices require one logical axis");
+        indices.push_back(broadcast(*exact, resultAxis++));
+        continue;
+      }
+      if (isa<IntegerType, IndexType, intent::LogicalIndexType>(
+              indexed.getType())) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        indices.push_back("(" + exact->str() + ")");
+        continue;
+      }
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis) || resultAxis >= static_cast<unsigned>(result.getRank()))
+        return failure();
+      std::string base = axisIndices.lookup(axis->getNode());
+      if (base.empty())
+        return operation.emitOpError(
+            "indirect cuTile gather has no active vector axis");
+      std::string exact =
+          target::emission::isRaggedBoundAxis(planIndex.components,
+                                              axis->getNode())
+              ? base
+              : base + " * " + axis->getTile().str() + " + ct.arange(" +
+                    axis->getTile().str() + ", dtype=ct.int32)";
+      indices.push_back(broadcast(exact, resultAxis++));
+    }
+    if (resultAxis != static_cast<unsigned>(result.getRank()))
+      return operation.emitOpError(
+          "indirect cuTile gather does not cover every result axis");
+    std::string tuple = "(";
+    for (auto [index, value] : llvm::enumerate(indices)) {
+      if (index)
+        tuple += ", ";
+      tuple += value;
+    }
+    if (indices.size() == 1)
+      tuple += ",";
+    return tuple + ")";
+  }
   bool raggedMatrix = false;
   if (relation->size() == 2 &&
       ((*relation)[0].kind == "region_index" ||
@@ -1906,6 +2020,8 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "ct.bfloat16";
   if (type.isInteger(8))
     return "ct.int8";
+  if (type.isInteger(32) || isa<IndexType>(type))
+    return "ct.int32";
   consumer.emitOpError("uses an unsupported cuTile dtype");
   return {};
 }

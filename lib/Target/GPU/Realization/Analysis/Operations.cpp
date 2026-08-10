@@ -31,6 +31,13 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.indices" || name == "intent.broadcast" ||
       name == "intent.mask")
     return success();
+  if (name == "intent.reshape") {
+    if (operation.getNumOperands() != 1 || operation.getNumResults() != 1 ||
+        !isa<RankedTensorType>(operation.getOperand(0).getType()) ||
+        !isa<RankedTensorType>(operation.getResult(0).getType()))
+      return operation.emitOpError("has no canonical tensor reshape schema");
+    return success();
+  }
   if (name == "intent.cast") {
     if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
       return operation.emitOpError("has no canonical cast schema");
@@ -100,7 +107,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.cast"})
+                         "intent.cast", "intent.reshape"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();

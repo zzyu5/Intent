@@ -58,6 +58,9 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "paged_attention":
+        module = _load_module(source_path, "intent_upstream_triton_paged_attention")
+        return module.paged_decode
     if kernel == "attention_bias":
         module = _load_module(source_path, "intent_upstream_triton_attention_bias")
         return lambda arguments: module.source._flash_attn_forward(

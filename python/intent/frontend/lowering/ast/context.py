@@ -302,6 +302,14 @@ class FunctionLowerer:
         rhs: Expression,
         node: ast.AST,
     ) -> tuple[MlirValue, MlirValue]:
+        from .expressions import compile_time_value
+
+        lhs_known, lhs_static = compile_time_value(lhs)
+        rhs_known, rhs_static = compile_time_value(rhs)
+        if lhs_known and not rhs_known:
+            lhs = Literal(lhs_static)
+        if rhs_known and not lhs_known:
+            rhs = Literal(rhs_static)
         if isinstance(lhs, Literal) and not isinstance(rhs, Literal):
             rhs_value = self.materialize(rhs, node)
             dtype, _ = self.dtype_and_shape(rhs_value.type, node)

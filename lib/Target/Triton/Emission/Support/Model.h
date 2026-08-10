@@ -102,6 +102,7 @@ public:
   mlir::LogicalResult emitBinary(mlir::Operation &operation);
   mlir::LogicalResult emitMask(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
+  mlir::LogicalResult emitReshape(mlir::Operation &operation);
   mlir::LogicalResult emitFull(mlir::Operation &operation);
   mlir::LogicalResult emitZeros(mlir::Operation &operation);
   mlir::LogicalResult emitGather(mlir::Operation &operation);

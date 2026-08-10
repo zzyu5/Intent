@@ -134,7 +134,60 @@ traceScalarIndexSource(Value value, Operation &consumer) {
   return traceScalarIndexSourceImpl(value, consumer, active);
 }
 
+bool hasInBoundsPrecondition(Value index, Value view, unsigned axis,
+                             Operation &access) {
+  Operation *position = &access;
+  while (Block *block = position->getBlock()) {
+    for (Operation &candidate : *block) {
+      if (&candidate == position)
+        break;
+      if (candidate.getName().getStringRef() != "intent.assume_in_bounds" ||
+          candidate.getNumOperands() != 2 || candidate.getOperand(0) != index ||
+          candidate.getOperand(1) != view)
+        continue;
+      auto candidateAxis =
+          candidate.getAttrOfType<IntegerAttr>("intent.axis");
+      if (candidateAxis && candidateAxis.getInt() == axis)
+        return true;
+    }
+    Operation *parent = block->getParentOp();
+    if (!parent)
+      break;
+    position = parent;
+  }
+  return false;
+}
+
 FailureOr<bool> hasDerivedScalarIndex(Operation &operation) {
+  FailureOr<llvm::SmallVector<IndexTerm>> relation =
+      parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  unsigned sourceAxis = 0;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
+    unsigned currentAxis = sourceAxis++;
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (hasInBoundsPrecondition(indexed, operation.getOperand(0), currentAxis,
+                                operation))
+      continue;
+    if (isa<RankedTensorType>(indexed.getType()))
+      continue;
+    FailureOr<ScalarIndexSource> source =
+        traceScalarIndexSource(indexed, operation);
+    if (failed(source))
+      return failure();
+    if (source->domain && source->transformed)
+      return true;
+  }
+  return false;
+}
+
+FailureOr<bool> hasTensorIndirectIndex(Operation &operation) {
   FailureOr<llvm::SmallVector<IndexTerm>> relation =
       parseIndexRelation(operation);
   if (failed(relation))
@@ -143,14 +196,8 @@ FailureOr<bool> hasDerivedScalarIndex(Operation &operation) {
     if (term.kind != "value_index" || term.operands.size() != 1 ||
         !term.operands.front())
       continue;
-    Value indexed = operation.getOperand(*term.operands.front());
-    if (isa<RankedTensorType>(indexed.getType()))
-      continue;
-    FailureOr<ScalarIndexSource> source =
-        traceScalarIndexSource(indexed, operation);
-    if (failed(source))
-      return failure();
-    if (source->domain && source->transformed)
+    if (isa<RankedTensorType>(
+            operation.getOperand(*term.operands.front()).getType()))
       return true;
   }
   return false;

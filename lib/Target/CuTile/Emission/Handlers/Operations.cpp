@@ -95,6 +95,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitCast(op);
                         })) ||
+      failed(addHandler(registry, "intent.reshape",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitReshape(op);
+                        })) ||
       failed(addHandler(registry, "intent.full",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -475,7 +481,7 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
   std::string base = axisIndices.lookup(axis->getNode());
-  if (base.empty() || axis->isScalar())
+  if (base.empty())
     return operation.emitOpError("has no cuTile vector index realization");
   std::string expression =
       target::emission::isRaggedBoundAxis(planIndex.components,
@@ -639,6 +645,23 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::emitReshape(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "reshape emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "ct.reshape" ||
+      binding.getReuseOperandAttr().getInt() != -1 || failed(operand) ||
+      failed(shape) || operation.getNumResults() != 1 ||
+      !isa<RankedTensorType>(operation.getResult(0).getType()))
+    return operation.emitOpError("lacks a mechanical cuTile reshape binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.reshape(" + operand->str() + ", " + *shape + ")");
+  bindResult(operation, 0, result);
+  return success();
+}
+
 LogicalResult SourceEmitter::emitFull(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "full emission");
   plan::PointwiseOp binding =
@@ -687,17 +710,10 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
-  FailureOr<StringRef> source = lookupValue(operation, 0);
   auto validIndex =
       operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
-  FailureOr<StringRef> valid =
-      validIndex ? lookupValue(operation, validIndex.getInt())
-                 : FailureOr<StringRef>(failure());
-  FailureOr<StringRef> fill =
-      fillIndex ? lookupValue(operation, fillIndex.getInt())
-                : FailureOr<StringRef>(failure());
   if (!planIndex.stages.empty() && binding &&
       binding.getLowering() == "ct.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
@@ -707,6 +723,12 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
+    FailureOr<StringRef> valid =
+        validIndex ? lookupValue(operation, validIndex.getInt())
+                   : FailureOr<StringRef>(failure());
+    FailureOr<StringRef> fill =
+        fillIndex ? lookupValue(operation, fillIndex.getInt())
+                  : FailureOr<StringRef>(failure());
     if (failed(valid) || failed(fill))
       return failure();
     if ((*view)->tensor.getRank() != 1 || relation->size() != 1 ||
@@ -728,6 +750,13 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
+  FailureOr<StringRef> source = lookupValue(operation, 0);
+  FailureOr<StringRef> valid =
+      validIndex ? lookupValue(operation, validIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  FailureOr<StringRef> fill =
+      fillIndex ? lookupValue(operation, fillIndex.getInt())
+                : FailureOr<StringRef>(failure());
   bool appendAxis = succeeded(relation) && relation->size() == 2 &&
                     (*relation)[0].kind == "full_slice" &&
                     (*relation)[1].kind == "new_axis";
@@ -753,8 +782,42 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   if (failed(node) || !binding || binding.getLowering() != "ct.members" ||
       operation.getNumResults() != 1)
-    return operation.emitOpError("lacks a staged cuTile members binding");
-  bindResult(operation, 0, "routes");
+    return operation.emitOpError("lacks a cuTile members binding");
+  FailureOr<plan::AxisOp> memberAxis =
+      operation.getNumOperands() == 1
+          ? resolveAxis(operation.getOperand(0), operation)
+          : FailureOr<plan::AxisOp>(failure());
+  if (failed(memberAxis))
+    return operation.emitOpError("has no physical ragged-member axis");
+  if (!planIndex.components.orderedRaggedAxes.contains(memberAxis->getNode())) {
+    if (activeStages.empty())
+      return operation.emitOpError(
+          "has neither ordered traversal nor staged ragged ownership");
+    bindResult(operation, 0, "routes");
+    return success();
+  }
+  FailureOr<plan::RaggedOp> relation =
+      target::emission::uniqueRaggedRelation(planIndex, memberAxis->getNode(),
+                                              operation);
+  auto runtime = succeeded(relation)
+                     ? raggedRuntimeByRelation.find(relation->getNode())
+                     : raggedRuntimeByRelation.end();
+  std::string position = axisIndices.lookup(memberAxis->getNode());
+  if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
+      position.empty())
+    return operation.emitOpError("has no ordered ragged runtime position");
+  RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+  std::string suffix = std::to_string(memberAxis->getNode());
+  std::string valid = position + " < sequence_end_" + suffix;
+  std::string result = makeResultName(operation, 0);
+  if (ragged.indices) {
+    line(result + " = ct.gather(" + ragged.indices->argument->name + ", " +
+         position + ", check_bounds=True, padding_value=0)");
+    line(result + " = ct.where(" + valid + ", " + result + ", 0)");
+  } else {
+    line(result + " = ct.where(" + valid + ", " + position + ", 0)");
+  }
+  bindResult(operation, 0, result);
   return success();
 }
 
@@ -789,12 +852,36 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
+  std::string raggedSuffix = std::to_string(binding.getAxisNode());
+  if (raggedStream) {
+    FailureOr<plan::RaggedOp> relation =
+        target::emission::uniqueRaggedRelation(
+            planIndex, binding.getAxisNode(), operation);
+    auto runtime = succeeded(relation)
+                       ? raggedRuntimeByRelation.find(relation->getNode())
+                       : raggedRuntimeByRelation.end();
+    std::string outer = succeeded(relation)
+                            ? axisIndices.lookup(relation->getOuterNode())
+                            : std::string();
+    if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
+        outer.empty())
+      return operation.emitOpError(
+          "ordered ragged stream has no outer-axis metadata binding");
+    RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+    line("sequence_begin_" + raggedSuffix + " = ct.gather(" +
+         ragged.offsets->argument->name + ", " + outer +
+         ", padding_value=0)");
+    line("sequence_end_" + raggedSuffix + " = ct.gather(" +
+         ragged.offsets->argument->name + ", " + outer +
+         " + 1, padding_value=0)");
+    line("sequence_length_" + raggedSuffix + " = sequence_end_" +
+         raggedSuffix + " - sequence_begin_" + raggedSuffix);
+  }
   FailureOr<std::string> logicalExtent =
       streamDomain ? dimensionName(*streamDomain)
                    : FailureOr<std::string>(failure());
   if (failed(logicalExtent))
     return binding.emitOpError("has no logical ordered-axis extent");
-  std::string raggedSuffix = std::to_string(binding.getAxisNode());
   std::string streamExtent = raggedStream
                                  ? "sequence_length_" + raggedSuffix
                                  : dimensionOwners.lookup(*logicalExtent);

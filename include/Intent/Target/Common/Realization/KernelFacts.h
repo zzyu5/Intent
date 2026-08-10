@@ -54,13 +54,6 @@ struct ContractionFact {
   llvm::SmallVector<unsigned> rhsReductionAxes;
 };
 
-struct IndexPreconditionFact {
-  mlir::Value index;
-  mlir::Value view;
-  int64_t axis;
-  mlir::Operation *declaration = nullptr;
-};
-
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
@@ -73,7 +66,6 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       boundaryDomains;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<LogicalAxis>> valueAxes;
-  llvm::SmallVector<IndexPreconditionFact> indexPreconditions;
   llvm::StringMap<LogicalAxis> axisLabels;
   llvm::DenseSet<mlir::Operation *> vectorDomains;
   llvm::DenseSet<mlir::Operation *> contractionDomains;
