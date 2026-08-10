@@ -130,7 +130,11 @@ LogicalResult AxisOp::verify() {
 }
 
 LogicalResult ProgramOp::verify() {
-  return requireNode(*this, getLoopNode());
+  if (failed(requireNode(*this, getLoopNode())))
+    return failure();
+  if (getIndexBits() != 32 && getIndexBits() != 64)
+    return emitOpError("requires 32-bit or 64-bit physical index arithmetic");
+  return success();
 }
 
 LogicalResult intent::plan::verifyPaddingFields(

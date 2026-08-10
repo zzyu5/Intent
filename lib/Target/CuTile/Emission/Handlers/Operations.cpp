@@ -286,8 +286,8 @@ LogicalResult SourceEmitter::emitProgramBindings() {
   if (persistent) {
     line("total_program_tiles = " +
          target::emission::projectProgramVolume(planIndex, axisExtent));
-    line("program_start = ct.bid(0)");
-    line("program_step = ct.num_blocks(0)");
+    line("program_start = " + addressIndex("ct.bid(0)"));
+    line("program_step = " + addressIndex("ct.num_blocks(0)"));
     line("for " + linear +
          " in range(program_start, total_program_tiles, program_step):");
     ++indentation;
@@ -329,14 +329,18 @@ LogicalResult SourceEmitter::emitProgramBindings() {
         return failure();
       line(pid + " = " + *groupIndex);
     } else {
-      line(pid + " = ct.bid(" + std::to_string(lhs.getWorkerAxis()) + ")");
+      line(pid + " = " + addressIndex("ct.bid(" +
+                                       std::to_string(lhs.getWorkerAxis()) +
+                                       ")"));
     }
-    line(lhsCount + " = ct.cdiv(" +
-         dimensionOwners.lookup(roleDimensions.lookup(lhsRole)) + ", " +
-         lhs.getTile().str() + ")");
-    line(rhsCount + " = ct.cdiv(" +
-         dimensionOwners.lookup(roleDimensions.lookup(rhsRole)) + ", " +
-         rhs.getTile().str() + ")");
+    line(lhsCount + " = " +
+         addressIndex("ct.cdiv(" +
+                      dimensionOwners.lookup(roleDimensions.lookup(lhsRole)) +
+                      ", " + lhs.getTile().str() + ")"));
+    line(rhsCount + " = " +
+         addressIndex("ct.cdiv(" +
+                      dimensionOwners.lookup(roleDimensions.lookup(rhsRole)) +
+                      ", " + rhs.getTile().str() + ")"));
     line(span + " = " + group.str() + " * " + rhsCount);
     line(id + " = " + pid + " // " + span);
     line(first + " = " + id + " * " + group.str());
@@ -355,8 +359,8 @@ LogicalResult SourceEmitter::emitProgramBindings() {
           ? target::emission::projectLinearProgramIndices(
                 planIndex, axisExtent, linear)
           : target::emission::projectProgramIndices(
-                planIndex, axisExtent, [](unsigned worker) {
-                  return "ct.bid(" + std::to_string(worker) + ")";
+                planIndex, axisExtent, [&](unsigned worker) {
+                  return addressIndex("ct.bid(" + std::to_string(worker) + ")");
                 });
   for (const target::emission::ProgramIndexProjection &projection : projections) {
     plan::AxisOp axis = projection.axis;
@@ -388,19 +392,20 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     for (int64_t orderedAxis : ordered->second) {
       std::string suffix = std::to_string(orderedAxis);
       line("sequence_begin_" + suffix + " = ct.gather(" +
-           ragged.offsets->argument->name + ", " + outer +
+           ragged.offsets->argument->name + ", " + addressIndex(outer) +
            ", padding_value=0)");
       line("sequence_end_" + suffix + " = ct.gather(" +
-           ragged.offsets->argument->name + ", " + outer +
-           " + 1, padding_value=0)");
+           ragged.offsets->argument->name + ", " + addressIndex(outer + " + 1") +
+           ", padding_value=0)");
       line("sequence_length_" + suffix + " = sequence_end_" + suffix +
            " - sequence_begin_" + suffix);
     }
     std::string suffix = std::to_string(ordered->second.front());
     std::string values = "axis_index_" + std::to_string(axis.getNode());
     line(values + " = sequence_begin_" + suffix + " + " + block + " * " +
-         axis.getTile().str() + " + ct.arange(" + axis.getTile().str() +
-         ", dtype=ct.int32)");
+         axis.getTile().str() + " + " +
+         addressIndex("ct.arange(" + axis.getTile().str() +
+                      ", dtype=ct.int32)"));
     line(values + " = ct.where(" + values + " < sequence_end_" + suffix +
          ", " + values + ", " + ragged.membersView->argument->name +
          ".shape[0])");
@@ -442,9 +447,12 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
         axis->getNode() != planIndex.components.reusedAxes.front().getNode())
       return operation.emitOpError("is not the worker-reused program axis");
     int64_t workerAxis = axis->getWorkerAxis();
-    line("program_start = ct.bid(" + std::to_string(workerAxis) + ")");
-    line("program_step = ct.num_blocks(" + std::to_string(workerAxis) + ")");
-    line(vectorIndex + " = ct.arange(TILE_SIZE, dtype=ct.int32)");
+    line("program_start = " +
+         addressIndex("ct.bid(" + std::to_string(workerAxis) + ")"));
+    line("program_step = " +
+         addressIndex("ct.num_blocks(" + std::to_string(workerAxis) + ")"));
+    line(vectorIndex + " = " +
+         addressIndex("ct.arange(TILE_SIZE, dtype=ct.int32)"));
     line("for " + programIndex +
          " in range(program_start, N_ROWS, program_step):");
     ++indentation;
@@ -766,9 +774,10 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       target::emission::isRaggedBoundAxis(planIndex.components,
                                           axis->getNode()) ||
               axis->hasRole("lane")
-          ? base
-          : base + " * " + axis->getTile().str() + " + ct.arange(" +
-                axis->getTile().str() + ", dtype=ct.int32)";
+          ? addressIndex(base)
+          : addressIndex(base) + " * " + axis->getTile().str() + " + " +
+                addressIndex("ct.arange(" + axis->getTile().str() +
+                             ", dtype=ct.int32)");
   bindResult(operation, 0, expression);
   return success();
 }
@@ -1093,8 +1102,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return failure();
     std::string result = makeResultName(operation, 0);
     line(result + " = ct.gather(" + (*view)->argument->name + ", " +
-         index->str() + ", check_bounds=True, padding_value=" + fill->str() +
-         ")");
+         addressIndex(*index) + ", check_bounds=True, padding_value=" +
+         fill->str() + ")");
     line(result + " = ct.where(member_mask & " + valid->str() + ", " +
          result + ", " + fill->str() + ")");
     bindResult(operation, 0, result);
@@ -1162,7 +1171,7 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   if (ragged.indices) {
     line(result + " = ct.gather(" + ragged.indices->argument->name + ", " +
-         position + ", check_bounds=True, padding_value=0)");
+         addressIndex(position) + ", check_bounds=True, padding_value=0)");
     line(result + " = ct.where(" + valid + ", " + result + ", 0)");
   } else {
     line(result + " = ct.where(" + valid + ", " + position + ", 0)");
@@ -1219,11 +1228,11 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
           "ordered ragged stream has no outer-axis metadata binding");
     RaggedRuntime &ragged = raggedRuntimes[runtime->second];
     line("sequence_begin_" + raggedSuffix + " = ct.gather(" +
-         ragged.offsets->argument->name + ", " + outer +
+         ragged.offsets->argument->name + ", " + addressIndex(outer) +
          ", padding_value=0)");
     line("sequence_end_" + raggedSuffix + " = ct.gather(" +
-         ragged.offsets->argument->name + ", " + outer +
-         " + 1, padding_value=0)");
+         ragged.offsets->argument->name + ", " + addressIndex(outer + " + 1") +
+         ", padding_value=0)");
     line("sequence_length_" + raggedSuffix + " = sequence_end_" +
          raggedSuffix + " - sequence_begin_" + raggedSuffix);
   }
@@ -1277,9 +1286,9 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     RaggedRuntime &ragged = raggedRuntimes[runtimes->second.front()];
     std::string offsets = "axis_index_" + std::to_string(binding.getAxisNode());
     line(offsets + " = sequence_begin_" + raggedSuffix + " + " + streamTile +
-         " * " +
-         binding.getTile().str() + " + ct.arange(" + binding.getTile().str() +
-         ", dtype=ct.int32)");
+         " * " + binding.getTile().str() + " + " +
+         addressIndex("ct.arange(" + binding.getTile().str() +
+                      ", dtype=ct.int32)"));
     line(offsets + " = ct.where(" + offsets + " < sequence_end_" +
          raggedSuffix + ", " + offsets + ", " +
          ragged.membersView->argument->name +
@@ -1357,8 +1366,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
          " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
     line("for k_tile in range(ct.cdiv(" + reduction + ", TILE_SIZE_K)):");
     ++indentation;
-    line("offs_reduction = k_tile * TILE_SIZE_K + "
-         "ct.arange(TILE_SIZE_K, dtype=ct.int32)");
+    line("offs_reduction = " + addressIndex("k_tile") +
+         " * TILE_SIZE_K + " +
+         addressIndex("ct.arange(TILE_SIZE_K, dtype=ct.int32)"));
 
     std::string lhs;
     if (lhsAccess) {
@@ -1382,7 +1392,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         return failure();
       lhs = makeResultName(*lhsAccess, 0);
       line(lhs + " = ct.gather(" + (*lhsView)->argument->name + ", (" +
-           rows->str() + "[:, None], offs_reduction[None, :]), "
+           addressIndex(rows->str() + "[:, None]") + ", " +
+           addressIndex("offs_reduction[None, :]") + "), "
            "check_bounds=True, padding_value=0.0)");
       line(lhs + " = ct.where(member_mask[:, None], " + lhs + ", 0.0)");
     } else {
@@ -1392,12 +1403,15 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             "staged contraction input has no materialized workspace");
       lhs = "stage_input";
       line(lhs + " = ct.gather(" + workspace->second +
-           ", (safe_member_offsets[:, None], offs_reduction[None, :]), "
+           ", (" + addressIndex("safe_member_offsets[:, None]") + ", " +
+           addressIndex("offs_reduction[None, :]") + "), "
            "check_bounds=True, padding_value=0.0)");
     }
     std::string rhs = makeResultName(*rhsLoad, 0);
     line(rhs + " = ct.load(" + (*rhsView)->argument->name +
-         ", index=(expert, k_tile, bid_feature), shape=(1, TILE_SIZE_K, "
+         ", index=(" + addressIndex("expert") + ", " +
+         addressIndex("k_tile") + ", " + addressIndex("bid_feature") +
+         "), shape=(1, TILE_SIZE_K, "
          "TILE_SIZE_N), padding_mode=ct.PaddingMode.ZERO).reshape((TILE_SIZE_K, "
          "TILE_SIZE_N))");
     if (promoteToF32 && !lhsElement.isF32())
@@ -1647,7 +1661,8 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
   line("unique_rows = ct.where(member_mask, " + rows->str() + ", " +
        (*view)->argument->name + ".shape[0])");
   line("ct.scatter(" + (*view)->argument->name +
-       ", (unique_rows[:, None], offs_feature[None, :]), " + stored->str() +
+       ", (" + addressIndex("unique_rows[:, None]") + ", " +
+       addressIndex("offs_feature[None, :]") + "), " + stored->str() +
        ", check_bounds=True)");
   return success();
 }
@@ -1687,7 +1702,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   line("atomic_rows = ct.where(member_mask, " + rows->str() + ", " +
        (*view)->argument->name + ".shape[0])");
   line("ct.atomic_add(" + (*view)->argument->name +
-       ", (atomic_rows[:, None], offs_feature[None, :]), " + stored->str() +
+       ", (" + addressIndex("atomic_rows[:, None]") + ", " +
+       addressIndex("offs_feature[None, :]") + "), " + stored->str() +
        ", check_bounds=True, memory_order=ct.MemoryOrder.RELAXED, "
        "memory_scope=ct.MemoryScope.DEVICE)");
   return success();

@@ -265,6 +265,7 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
 struct ProgramBinding : Binding<intent::plan::ProgramOp> {
   int64_t getLoopNode() const { return operation.getLoopNode(); }
   bool getPersistent() const { return operation.getPersistent(); }
+  int64_t getIndexBits() const { return operation.getIndexBits(); }
   mlir::IntegerAttr getLoopNodeAttr() const {
     return operation.getLoopNodeAttr();
   }

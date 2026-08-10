@@ -151,6 +151,7 @@ private:
   mlir::FailureOr<plan::AxisOp> resolveAxis(mlir::Value indexedValue,
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
+  std::string addressIndex(llvm::StringRef expression) const;
   mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   elementAccessIndices(mlir::Operation &operation,

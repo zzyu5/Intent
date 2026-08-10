@@ -725,8 +725,9 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   if (planIndex.stages.empty() || outputStage == stageOutputOwners.end())
     return;
   line("ct.scatter(" + workspaceNames.lookup(value) +
-       ", (safe_member_offsets[:, None], offs_feature[None, :]), " +
-       name.str() + ", check_bounds=True)");
+       ", (" + addressIndex("safe_member_offsets[:, None]") + ", " +
+       addressIndex("offs_feature[None, :]") + "), " + name.str() +
+       ", check_bounds=True)");
 }
 
 void SourceEmitter::emitImports() {
@@ -796,12 +797,16 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source.flush();
 
       std::string feature = stageFeatureDimensions.lookup(stage);
-      stageLine(stage, "bid_feature = ct.bid(" +
-                           std::to_string(stageFeatureWorkers.lookup(stage)) +
-                           ")");
-      stageLine(stage, "bid_expert_route = ct.bid(" +
-                           std::to_string(stageMemberWorkers.lookup(stage)) +
-                           ")");
+      stageLine(stage, "bid_feature = " +
+                           addressIndex("ct.bid(" +
+                                        std::to_string(
+                                            stageFeatureWorkers.lookup(stage)) +
+                                        ")"));
+      stageLine(stage, "bid_expert_route = " +
+                           addressIndex("ct.bid(" +
+                                        std::to_string(
+                                            stageMemberWorkers.lookup(stage)) +
+                                        ")"));
       if (compact) {
         plan::AxisOp outerAxis =
             planIndex.axes.lookup(ragged.binding.getOuterNode());
@@ -819,11 +824,13 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "for candidate in range(" + experts + "):");
         stageLine(stage, "candidate_begin = ct.load(" +
                              offsets->argument->name +
-                             ", index=candidate, shape=())",
+                             ", index=" + addressIndex("candidate") +
+                             ", shape=())",
                   2);
         stageLine(stage, "candidate_end = ct.load(" +
                              offsets->argument->name +
-                             ", index=candidate + 1, shape=())",
+                             ", index=" + addressIndex("candidate + 1") +
+                             ", shape=())",
                   2);
         stageLine(stage,
                   "candidate_tiles = ct.cdiv(candidate_end - candidate_begin, "
@@ -847,28 +854,33 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       }
       stageLine(stage, "route_begin = ct.load(" +
                            offsets->argument->name +
-                           ", index=expert, shape=())");
+                           ", index=" + addressIndex("expert") +
+                           ", shape=())");
       stageLine(stage, "route_end = ct.load(" +
                            offsets->argument->name +
-                           ", index=expert + 1, shape=())");
+                           ", index=" + addressIndex("expert + 1") +
+                           ", shape=())");
       stageLine(stage,
-                "member_offsets = route_begin + route_tile * TILE_SIZE_M + "
-                "ct.arange(TILE_SIZE_M, dtype=ct.int32)");
+                "member_offsets = " + addressIndex("route_begin") + " + " +
+                    addressIndex("route_tile") + " * TILE_SIZE_M + " +
+                    addressIndex("ct.arange(TILE_SIZE_M, dtype=ct.int32)"));
       stageLine(stage, "member_mask = member_offsets < route_end");
       stageLine(stage,
                 "safe_member_offsets = ct.where(member_mask, member_offsets, " +
                     stageMemberDimensions.lookup(stage) + ")");
       if (indices) {
         stageLine(stage, "routes = ct.gather(" + indices->argument->name +
-                             ", member_offsets, check_bounds=True, "
+                             ", " + addressIndex("member_offsets") +
+                             ", check_bounds=True, "
                              "padding_value=0)");
         stageLine(stage, "routes = ct.where(member_mask, routes, 0)");
       } else {
         stageLine(stage, "routes = member_offsets");
       }
       stageLine(stage,
-                "offs_feature = bid_feature * TILE_SIZE_N + "
-                "ct.arange(TILE_SIZE_N, dtype=ct.int32)");
+                "offs_feature = " + addressIndex("bid_feature") +
+                    " * TILE_SIZE_N + " +
+                    addressIndex("ct.arange(TILE_SIZE_N, dtype=ct.int32)"));
       stageLine(stage, "feature_mask = offs_feature < " + feature);
     }
     return success();
@@ -931,6 +943,15 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.int32";
     return {};
   };
+  auto emitAddressCapabilityCheck = [&](const ABIView &view) {
+    output << "    if sum(max(0, extent - 1) * abs(stride) for extent, stride "
+              "in zip("
+           << view.argument->name << ".shape, " << view.argument->name
+           << ".stride())) > 2147483647:\n";
+    output << "        raise NotImplementedError('cuTile cannot encode this "
+              "64-bit external-buffer address in its current tensor "
+              "descriptor')\n";
+  };
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
 
@@ -990,6 +1011,7 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
+      emitAddressCapabilityCheck(view);
     }
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
@@ -1229,6 +1251,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "):\n";
       output << "        raise ValueError('" << view.argument->name
              << " shape violates the kernel symbols')\n";
+      emitAddressCapabilityCheck(view);
       output << "    if not " << view.argument->name << ".is_contiguous():\n";
       output << "        raise ValueError('persistent-row views must be contiguous')\n";
     }
@@ -1353,6 +1376,7 @@ LogicalResult SourceEmitter::emitWrapper() {
            << ":\n";
     output << "        raise ValueError('" << view.argument->name
            << " has the wrong dtype')\n";
+    emitAddressCapabilityCheck(view);
   }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
@@ -1707,6 +1731,11 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   return (*view)->shape[axis.getInt()];
 }
 
+std::string SourceEmitter::addressIndex(StringRef expression) const {
+  return "ct.astype((" + expression.str() + "), ct.int" +
+         std::to_string(planIndex.program.getIndexBits()) + ")";
+}
+
 FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
                                                  bool elementwiseAccess) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -1749,9 +1778,11 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
         if (resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return operation.emitOpError(
               "indirect cuTile gather has too many vector axes");
-        indices.push_back(broadcast(
-            "ct.arange(" + (*view)->shape[axisNumber] + ", dtype=ct.int32)",
-            resultAxis++));
+        indices.push_back(broadcast(addressIndex(
+                                        "ct.arange(" +
+                                        (*view)->shape[axisNumber] +
+                                        ", dtype=ct.int32)"),
+                                    resultAxis++));
         continue;
       }
       if (term.kind == "static_index") {
@@ -1774,7 +1805,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
             resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return operation.emitOpError(
               "cuTile indirect tensor indices require one logical axis");
-        indices.push_back(broadcast(*exact, resultAxis++));
+        indices.push_back(
+            broadcast(addressIndex(*exact), resultAxis++));
         continue;
       }
       if (isa<IntegerType, IndexType, intent::LogicalIndexType>(
@@ -1783,7 +1815,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
           return failure();
-        indices.push_back("(" + exact->str() + ")");
+        indices.push_back(addressIndex(*exact));
         continue;
       }
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
@@ -1798,9 +1830,10 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
           target::emission::isRaggedBoundAxis(planIndex.components,
                                               axis->getNode()) ||
                   axis->hasRole("lane")
-              ? base
-              : base + " * " + axis->getTile().str() + " + ct.arange(" +
-                    axis->getTile().str() + ", dtype=ct.int32)";
+              ? addressIndex(base)
+              : addressIndex(base) + " * " + axis->getTile().str() + " + " +
+                    addressIndex("ct.arange(" + axis->getTile().str() +
+                                 ", dtype=ct.int32)");
       indices.push_back(broadcast(exact, resultAxis++));
     }
     if (resultAxis != static_cast<unsigned>(projectedTensor.getRank()))
@@ -1847,8 +1880,10 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     if (rows.empty())
       return operation.emitOpError(
           "ragged cuTile matrix access has no member-axis role");
-    return "(" + rows + "[:, None], ct.arange(" +
-           (*view)->shape[1] + ", dtype=ct.int32)[None, :])";
+    return "(" + addressIndex(rows + "[:, None]") + ", " +
+           addressIndex("ct.arange(" + (*view)->shape[1] +
+                        ", dtype=ct.int32)[None, :]") +
+           ")";
   }
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
@@ -1876,7 +1911,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
         return failure();
-      indices.push_back("(" + exact->str() + ")");
+      indices.push_back(addressIndex(*exact));
     } else {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
@@ -1891,7 +1926,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
             << ", lane=" << axis->hasRole("lane") << ")";
         return failure();
       }
-      indices.push_back(std::move(index));
+      indices.push_back(addressIndex(index));
     }
   }
   std::string tuple = "(";
@@ -1979,11 +2014,11 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
                       planIndex.components, axis.getNode()) ||
                   (!planIndex.components.reusedAxes.empty() &&
                    kernel.nodes.lookup(axis.getNode()) == vectorDomain);
-    std::string index = direct
-                            ? base
-                            : base + " * " + axis.getTile().str() +
-                                  " + ct.arange(" + axis.getTile().str() +
-                                  ", dtype=ct.int32)";
+    std::string index =
+        direct ? addressIndex(base)
+               : addressIndex(base) + " * " + axis.getTile().str() + " + " +
+                     addressIndex("ct.arange(" + axis.getTile().str() +
+                                  ", dtype=ct.int32)");
     if (tensor.getRank() > 1) {
       std::string broadcast = index + "[";
       for (int64_t axisNumber = 0; axisNumber < tensor.getRank(); ++axisNumber) {
@@ -2107,8 +2142,10 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "ct.bfloat16";
   if (type.isInteger(8))
     return "ct.int8";
-  if (type.isInteger(32) || isa<IndexType>(type))
+  if (type.isInteger(32))
     return "ct.int32";
+  if (isa<IndexType>(type))
+    return "ct.int64";
   consumer.emitOpError("uses an unsupported cuTile dtype");
   return {};
 }

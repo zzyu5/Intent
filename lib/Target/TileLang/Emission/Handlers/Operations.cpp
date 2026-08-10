@@ -354,16 +354,18 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       for (int64_t orderedAxis : ordered->second) {
         std::string suffix = std::to_string(orderedAxis);
         line("sequence_begin_" + suffix + " = " +
-             ragged.offsets->argument->name + "[" + outer + "]");
+             ragged.offsets->argument->name + "[" + addressIndex(outer) + "]");
         line("sequence_end_" + suffix + " = " +
-             ragged.offsets->argument->name + "[" + outer + " + 1]");
+             ragged.offsets->argument->name + "[" +
+             addressIndex(outer + " + 1") + "]");
         line("sequence_length_" + suffix + " = sequence_end_" + suffix +
              " - sequence_begin_" + suffix);
       }
       std::string suffix = std::to_string(ordered->second.front());
       std::string query = std::to_string(memberNode);
       line("query_start_" + query + " = sequence_begin_" + suffix + " + " +
-           block + " * " + planIndex.axes.lookup(memberNode).getTile().str());
+           addressIndex(block) + " * " +
+           planIndex.axes.lookup(memberNode).getTile().str());
       axisIndices[memberNode] = "query_start_" + query;
     }
   }
@@ -1489,7 +1491,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     ++indentation;
     line(result + "[gather_i] = T.if_then_else(member_start + gather_i < "
          "route_end and " + *valid + ", " +
-         (*view)->argument->name + "[" + indices->str() + "[gather_i]], " +
+         (*view)->argument->name + "[" +
+         addressIndex(indices->str() + "[gather_i]") + "], " +
          *fill + ")");
     --indentation;
     bindResult(operation, 0, result);
@@ -1569,7 +1572,8 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
          memberAxis->getTile().str() + "):");
     ++indentation;
     std::string member = ragged.indices
-                             ? ragged.indices->argument->name + "[" + absolute + "]"
+                             ? ragged.indices->argument->name + "[" +
+                                   addressIndex(absolute) + "]"
                              : absolute;
     line(*result + "[" + memberIndex + "] = T.if_then_else(" + absolute +
          " < sequence_end_" + suffix + ", " + member + ", 0)");
@@ -1592,7 +1596,8 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   ++indentation;
   std::string member = ragged.indices
                            ? ragged.indices->argument->name +
-                                 "[member_start + member_i]"
+                                 "[" + addressIndex("member_start + member_i") +
+                                 "]"
                            : "member_start + member_i";
   line(*result + "[member_i] = T.if_then_else(member_start + member_i < "
        "route_end, " + member + ", 0)");
@@ -1663,9 +1668,10 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
           "ordered ragged stream has no outer-axis metadata binding");
     RaggedRuntime &ragged = raggedRuntimes[runtime->second];
     line("sequence_begin_" + raggedSuffix + " = " +
-         ragged.offsets->argument->name + "[" + outer + "]");
+         ragged.offsets->argument->name + "[" + addressIndex(outer) + "]");
     line("sequence_end_" + raggedSuffix + " = " +
-         ragged.offsets->argument->name + "[" + outer + " + 1]");
+         ragged.offsets->argument->name + "[" +
+         addressIndex(outer + " + 1") + "]");
     line("sequence_length_" + raggedSuffix + " = sequence_end_" +
          raggedSuffix + " - sequence_begin_" + raggedSuffix);
   }
@@ -1714,7 +1720,7 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   std::string streamStart = "axis_index_" + std::to_string(binding.getAxisNode());
   line(streamStart + " = " +
        std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
-       streamTile + " * " + binding.getTile().str());
+       addressIndex(streamTile) + " * " + binding.getTile().str());
   axisIndices[binding.getAxisNode()] = streamStart;
   valueNames[body.getArgument(0)] = streamStart;
   return success();
@@ -1837,16 +1843,19 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         return failure();
       if (contiguous) {
         line("T.copy(" + (*lhsView)->argument->name +
-             "[member_start : member_start + TILE_SIZE_M, "
-             "k_tile * TILE_SIZE_K : (k_tile + 1) * TILE_SIZE_K], " +
+             "[" + addressIndex("member_start") + " : " +
+             addressIndex("member_start") + " + TILE_SIZE_M, " +
+             addressIndex("k_tile") + " * TILE_SIZE_K : " +
+             addressIndex("k_tile + 1") + " * TILE_SIZE_K], " +
              lhs + ")");
       } else {
         line("for load_i, load_k in T.Parallel(TILE_SIZE_M, TILE_SIZE_K):");
         ++indentation;
         line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
              "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
-             ", " + (*lhsView)->argument->name + "[" + rows->str() +
-             "[load_i], k_tile * TILE_SIZE_K + load_k], 0.0)");
+             ", " + (*lhsView)->argument->name + "[" +
+             addressIndex(rows->str() + "[load_i]") + ", " +
+             addressIndex("k_tile * TILE_SIZE_K + load_k") + "], 0.0)");
         --indentation;
       }
     } else {
@@ -1858,13 +1867,17 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       ++indentation;
       line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
            "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
-           ", " + workspace->second +
-           "[member_start + load_i, k_tile * TILE_SIZE_K + load_k], 0.0)");
+           ", " + workspace->second + "[" +
+           addressIndex("member_start + load_i") + ", " +
+           addressIndex("k_tile * TILE_SIZE_K + load_k") + "], 0.0)");
       --indentation;
     }
     line("T.copy(" + (*rhsView)->argument->name +
-         "[expert, k_tile * TILE_SIZE_K : (k_tile + 1) * TILE_SIZE_K, "
-         "bid_feature * TILE_SIZE_N : (bid_feature + 1) * TILE_SIZE_N], " +
+         "[" + addressIndex("expert") + ", " + addressIndex("k_tile") +
+         " * TILE_SIZE_K : " + addressIndex("k_tile + 1") +
+         " * TILE_SIZE_K, " + addressIndex("bid_feature") +
+         " * TILE_SIZE_N : " + addressIndex("bid_feature + 1") +
+         " * TILE_SIZE_N], " +
          rhs + ")");
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
          ", policy=T.GemmWarpPolicy.FullRow)");
@@ -1892,7 +1905,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     if (failed(reductionAxis))
       return failure();
     axisIndices[reductionAxis->getNode()] =
-        "k_tile * " + reductionAxis->getTile().str();
+        addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad);
     FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
@@ -2121,7 +2134,8 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
        stageFeatureDimensions.lookup(activeStages.front()) + ":");
   ++indentation;
   line((*view)->argument->name + "[" + rows->str() +
-       "[store_i], bid_feature * TILE_SIZE_N + store_j] = " + stored->str() +
+       "[store_i], " + addressIndex("bid_feature * TILE_SIZE_N + store_j") +
+       "] = " + stored->str() +
        "[store_i, store_j]");
   --indentation;
   --indentation;
@@ -2222,7 +2236,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
        ":");
   ++indentation;
   line("T.atomic_add(" + (*view)->argument->name + "[" + rows->str() +
-       "[atomic_i], bid_feature * TILE_SIZE_N + atomic_j], " + stored->str() +
+       "[atomic_i], " + addressIndex("bid_feature * TILE_SIZE_N + atomic_j") +
+       "], " + stored->str() +
        "[atomic_i, atomic_j], memory_order=\"relaxed\")");
   --indentation;
   --indentation;

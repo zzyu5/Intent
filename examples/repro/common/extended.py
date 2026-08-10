@@ -241,6 +241,54 @@ def run_gemm_tail_case(artifact, target_name: str) -> None:
     )
 
 
+def run_wide_attention_index_case(artifact, target_name: str) -> None:
+    wide_stride = 1 << 31
+    storage = torch.empty(
+        (wide_stride + 64,), device="cuda", dtype=torch.float16
+    )
+    query = torch.as_strided(
+        storage, (2, 1, 1, 64), (wide_stride, 64, 64, 1)
+    )
+    query[0] = torch.linspace(
+        -0.5, 0.5, 64, device="cuda", dtype=torch.float16
+    )
+    query[1] = torch.linspace(
+        0.75, -0.25, 64, device="cuda", dtype=torch.float16
+    )
+    key = torch.randn((2, 1, 2, 64), device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    scale = 1.0 / math.sqrt(64)
+    if target_name in {"cuTile", "TileLang"}:
+        try:
+            artifact.run(query, key, value, scale)
+        except NotImplementedError as error:
+            if "64-bit external-buffer address" not in str(error):
+                raise
+            print(
+                f"{target_name} >32-bit element-offset capability check: PASS "
+                f"(offset={wide_stride}, explicitly unsupported)"
+            )
+            return
+        raise RuntimeError(
+            f"{target_name} accepted an external address beyond its declared "
+            "32-bit surface capability"
+        )
+    generated = artifact.run(query, key, value, scale)
+    expected = F.scaled_dot_product_attention(
+        query, key, value, is_causal=False, scale=scale
+    )
+    torch.cuda.synchronize()
+    error = (generated - expected).abs().max().item()
+    if error > 2.0e-2:
+        raise RuntimeError(
+            f"{target_name} >32-bit element-offset comparison failed: {error}"
+        )
+    print(
+        f"{target_name} >32-bit element-offset numerical comparison: PASS "
+        f"(offset={wide_stride}, error={error})"
+    )
+
+
 def _run_bf16_gemm(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:

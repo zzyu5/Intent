@@ -694,8 +694,9 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   unsigned stage = outputStage->second;
   std::string feature = stageFeatureDimensions.lookup(stage);
   line("tl.store(" + workspaceNames.lookup(value) +
-       " + member_offsets[:, None] * " + feature +
-       " + offs_feature[None, :], " + name.str() +
+       " + " + addressIndex("member_offsets[:, None]") + " * " +
+       addressIndex(feature) + " + " + addressIndex("offs_feature[None, :]") +
+       ", " + name.str() +
        ", mask=member_mask[:, None] & feature_mask[None, :])");
 }
 
@@ -815,23 +816,28 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source.flush();
 
       std::string feature = stageFeatureDimensions.lookup(stage);
-      stageLine(stage, "pid_feature = tl.program_id(axis=" +
-                           std::to_string(stageFeatureWorkers.lookup(stage)) +
-                           ")");
-      stageLine(stage, "pid_expert_route = tl.program_id(axis=" +
-                           std::to_string(stageMemberWorkers.lookup(stage)) +
-                           ")");
+      stageLine(stage, "pid_feature = " +
+                           addressIndex("tl.program_id(axis=" +
+                                        std::to_string(
+                                            stageFeatureWorkers.lookup(stage)) +
+                                        ")"));
+      stageLine(stage, "pid_expert_route = " +
+                           addressIndex("tl.program_id(axis=" +
+                                        std::to_string(
+                                            stageMemberWorkers.lookup(stage)) +
+                                        ")"));
       if (compact) {
         stageLine(stage, "expert = 0");
         stageLine(stage, "route_tile = 0");
         stageLine(stage, "tile_cursor = 0");
         stageLine(stage, "for candidate in range(0, " + experts + "):");
         stageLine(stage, "candidate_begin = tl.load(" + offsets->pointer +
-                             " + candidate * " + offsets->strides[0] + ")",
+                             " + " + addressIndex("candidate") + " * " +
+                             addressIndex(offsets->strides[0]) + ")",
                   2);
         stageLine(stage, "candidate_end = tl.load(" + offsets->pointer +
-                             " + (candidate + 1) * " +
-                             offsets->strides[0] + ")",
+                             " + " + addressIndex("candidate + 1") + " * " +
+                             addressIndex(offsets->strides[0]) + ")",
                   2);
         stageLine(stage,
                   "candidate_tiles = tl.cdiv(candidate_end - candidate_begin, "
@@ -853,24 +859,28 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "expert = pid_expert_route // num_route_tiles");
         stageLine(stage, "route_tile = pid_expert_route % num_route_tiles");
       }
-      stageLine(stage, "route_begin = tl.load(" + offsets->pointer +
-                           " + expert * " + offsets->strides[0] + ")");
+      stageLine(stage, "route_begin = tl.load(" + offsets->pointer + " + " +
+                           addressIndex("expert") + " * " +
+                           addressIndex(offsets->strides[0]) + ")");
       stageLine(stage, "route_end = tl.load(" + offsets->pointer +
-                           " + (expert + 1) * " + offsets->strides[0] +
-                           ")");
+                           " + " + addressIndex("expert + 1") + " * " +
+                           addressIndex(offsets->strides[0]) + ")");
       stageLine(stage,
-                "member_offsets = route_begin + route_tile * BLOCK_SIZE_M + "
-                "tl.arange(0, BLOCK_SIZE_M)");
+                "member_offsets = " + addressIndex("route_begin") + " + " +
+                    addressIndex("route_tile") + " * BLOCK_SIZE_M + " +
+                    addressIndex("tl.arange(0, BLOCK_SIZE_M)"));
       stageLine(stage, "member_mask = member_offsets < route_end");
       if (indices)
-        stageLine(stage, "routes = tl.load(" + indices->pointer +
-                             " + member_offsets * " + indices->strides[0] +
+        stageLine(stage, "routes = tl.load(" + indices->pointer + " + " +
+                             addressIndex("member_offsets") + " * " +
+                             addressIndex(indices->strides[0]) +
                              ", mask=member_mask, other=0)");
       else
         stageLine(stage, "routes = member_offsets");
       stageLine(stage,
-                "offs_feature = pid_feature * BLOCK_SIZE_N + "
-                "tl.arange(0, BLOCK_SIZE_N)");
+                "offs_feature = " + addressIndex("pid_feature") +
+                    " * BLOCK_SIZE_N + " +
+                    addressIndex("tl.arange(0, BLOCK_SIZE_N)"));
       stageLine(stage,
                 "feature_mask = offs_feature < " + feature);
     }
@@ -1673,6 +1683,11 @@ SourceEmitter::indexExpression(plan::AxisOp axis, bool store,
   return broadcastIndex(base, tensorAxis, tensorRank);
 }
 
+std::string SourceEmitter::addressIndex(StringRef expression) const {
+  return "tl.cast((" + expression.str() + "), tl.int" +
+         std::to_string(planIndex.program.getIndexBits()) + ")";
+}
+
 FailureOr<std::string>
 SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
                                      bool store) {
@@ -1739,12 +1754,12 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
     }
     std::string stride = view.strides[axisNumber];
     if (!planIndex.components.reusedAxes.empty() && axisNumber > 0) {
-      stride = "1";
+      stride = addressIndex("1");
       for (unsigned trailing = axisNumber + 1; trailing < view.shape.size();
            ++trailing)
-        stride += " * " + view.shape[trailing];
+        stride += " * " + addressIndex(view.shape[trailing]);
     }
-    expression += " + " + index + " * (" + stride + ")";
+    expression += " + " + addressIndex(index) + " * " + addressIndex(stride);
   }
   if (vectorAxis != *tensorRank)
     return operation.emitOpError(

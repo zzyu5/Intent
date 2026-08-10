@@ -33,6 +33,7 @@ from kernels.normalization.softmax import ROWS
 from kernels.normalization.softmax import stable_softmax
 from repro.common.extended import EXTENDED_RUNNERS
 from repro.common.extended import run_gemm_tail_case
+from repro.common.extended import run_wide_attention_index_case
 from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
@@ -385,6 +386,7 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
     )
+    run_wide_attention_index_case(artifact, "Triton")
 
 
 def _triton_moe_baseline(

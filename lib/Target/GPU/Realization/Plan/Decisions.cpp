@@ -608,7 +608,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     return failure();
   decisions.program = builder.create<intent::plan::ProgramOp>(
       (*root)->getLoc(), i64(builder, *rootNode),
-      builder.getBoolAttr(assignments->persistent));
+      builder.getBoolAttr(assignments->persistent), i64(builder, 64));
 
   for (const AxisChoice &choice : assignments->axes) {
     FailureOr<int64_t> domainNode = node(*choice.domain, "axis binding");

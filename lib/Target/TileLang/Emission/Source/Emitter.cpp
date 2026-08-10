@@ -902,11 +902,12 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage,
                   "for candidate in range(" + experts + "):");
         stageLine(stage, "candidate_begin = " +
-                             ragged.offsets->argument->name + "[candidate]",
+                             ragged.offsets->argument->name + "[" +
+                             addressIndex("candidate") + "]",
                   4);
         stageLine(stage, "candidate_end = " +
                              ragged.offsets->argument->name +
-                             "[candidate + 1]",
+                             "[" + addressIndex("candidate + 1") + "]",
                   4);
         stageLine(stage,
                   "candidate_tiles = T.ceildiv(candidate_end - "
@@ -930,11 +931,12 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
       }
       stageLine(stage, "route_begin = " + ragged.offsets->argument->name +
-                           "[expert]");
+                           "[" + addressIndex("expert") + "]");
       stageLine(stage, "route_end = " + ragged.offsets->argument->name +
-                           "[expert + 1]");
+                           "[" + addressIndex("expert + 1") + "]");
       stageLine(stage,
-                "member_start = route_begin + route_tile * TILE_SIZE_M");
+                "member_start = " + addressIndex("route_begin") + " + " +
+                    addressIndex("route_tile") + " * TILE_SIZE_M");
     }
     return success();
   }
@@ -954,8 +956,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       return realization.emitOpError(
           "TileLang worker reuse requires one explicit program axis");
     plan::AxisOp reused = planIndex.components.reusedAxes.front();
-    programBlocks[reused.getNode()] = "program_index";
-    axisIndices[reused.getNode()] = "program_index";
+    programBlocks[reused.getNode()] = addressIndex("program_index");
+    axisIndices[reused.getNode()] = addressIndex("program_index");
     plan::AxisOp lane = planIndex.axesByRole.lookup("lane_0");
     if (lane)
       axisIndices[lane.getNode()] = "0";
@@ -1015,7 +1017,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   if (persistent) {
     output << "            for persistent_wave in T.serial(T.ceildiv(total_program_tiles, persistent_programs)):\n";
     output << "                " << linear
-           << " = persistent_wave * persistent_programs + pid_worker_0\n";
+           << " = " << addressIndex("persistent_wave") << " * "
+           << addressIndex("persistent_programs") << " + "
+           << addressIndex("pid_worker_0") << "\n";
     output << "                if " << linear << " < total_program_tiles:\n";
     programIndent = "                    ";
     indentation = 5;
@@ -1057,13 +1061,19 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         return failure();
       output << programIndent << pid << " = " << *groupIndex << "\n";
     } else {
-      output << programIndent << pid << " = pid_worker_"
-             << lhs.getWorkerAxis() << "\n";
+      output << programIndent << pid << " = "
+             << addressIndex("pid_worker_" +
+                             std::to_string(lhs.getWorkerAxis()))
+             << "\n";
     }
-    output << programIndent << lhsCount << " = T.ceildiv("
-           << roleDimensions.lookup(lhsRole) << ", " << lhs.getTile() << ")\n";
-    output << programIndent << rhsCount << " = T.ceildiv("
-           << roleDimensions.lookup(rhsRole) << ", " << rhs.getTile() << ")\n";
+    output << programIndent << lhsCount << " = "
+           << addressIndex("T.ceildiv(" + roleDimensions.lookup(lhsRole) +
+                           ", " + lhs.getTile().str() + ")")
+           << "\n";
+    output << programIndent << rhsCount << " = "
+           << addressIndex("T.ceildiv(" + roleDimensions.lookup(rhsRole) +
+                           ", " + rhs.getTile().str() + ")")
+           << "\n";
     output << programIndent << span << " = " << group << " * " << rhsCount
            << "\n";
     output << programIndent << id << " = " << pid << " // " << span << "\n";
@@ -1084,13 +1094,14 @@ LogicalResult SourceEmitter::emitKernelHeader() {
           ? target::emission::projectLinearProgramIndices(
                 planIndex, axisExtent, linear)
           : target::emission::projectProgramIndices(
-                planIndex, axisExtent, [](unsigned worker) {
-                  return "pid_worker_" + std::to_string(worker);
+                planIndex, axisExtent, [&](unsigned worker) {
+                  return addressIndex("pid_worker_" + std::to_string(worker));
                 });
   for (const target::emission::ProgramIndexProjection &projection : projections) {
     plan::AxisOp axis = projection.axis;
     std::string block = "block_axis_" + std::to_string(axis.getNode());
-    output << programIndent << block << " = " << projection.expression << "\n";
+    output << programIndent << block << " = "
+           << addressIndex(projection.expression) << "\n";
     programBlocks[axis.getNode()] = block;
     axisIndices[axis.getNode()] =
         axis.isScalar() ? block : block + " * " + axis.getTile().str();
@@ -1129,6 +1140,13 @@ LogicalResult SourceEmitter::emitWrapper() {
              << ":\n";
       output << "        raise ValueError('" << view.argument->name
              << " has the wrong dtype')\n";
+      output << "    if sum(max(0, extent - 1) * abs(stride) for extent, stride "
+                "in zip("
+             << view.argument->name << ".shape, " << view.argument->name
+             << ".stride())) > 2147483647:\n";
+      output << "        raise NotImplementedError('TileLang cannot project this "
+                "64-bit external-buffer address through its current bulk-copy "
+                "lowering')\n";
     }
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
@@ -1622,6 +1640,10 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   return (*view)->shape[axis.getInt()];
 }
 
+std::string SourceEmitter::addressIndex(StringRef expression) const {
+  return "(" + expression.str() + ")";
+}
+
 FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
@@ -1660,15 +1682,15 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
             "TileLang bulk indirect access requires one singleton index tile");
       auto assumed = assumedIndexNames.find(indexed);
       indices.push_back(assumed == assumedIndexNames.end()
-                            ? exact->str() + "[0]"
-                            : assumed->second);
+                            ? addressIndex(exact->str() + "[0]")
+                            : addressIndex(assumed->second));
     } else if (term.kind == "value_index" ||
                target::emission::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
         return failure();
-      indices.push_back("(" + exact->str() + ")");
+      indices.push_back(addressIndex(*exact));
     } else {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
@@ -1680,10 +1702,11 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
             << axis->getNode();
         return failure();
       }
-      indices.push_back(
-          axis->isScalar()
-              ? base
-              : base + " : " + base + " + " + axis->getTile().str());
+      std::string wideBase = addressIndex(base);
+      indices.push_back(axis->isScalar()
+                            ? wideBase
+                            : wideBase + " : " + wideBase + " + " +
+                                  axis->getTile().str());
     }
   }
   std::string result;
@@ -1735,8 +1758,9 @@ SourceEmitter::elementAccessIndices(Operation &operation,
             "TileLang indirect element access requires one index-tile axis");
       auto assumed = assumedIndexNames.find(indexed);
       indices.push_back(assumed == assumedIndexNames.end()
-                            ? exact->str() + "[" + tileIndices[tileAxis] + "]"
-                            : assumed->second);
+                            ? addressIndex(exact->str() + "[" +
+                                           tileIndices[tileAxis] + "]")
+                            : addressIndex(assumed->second));
       ++tileAxis;
     } else if (term.kind == "value_index" ||
                target::emission::isSequentialIterator(indexed)) {
@@ -1744,7 +1768,7 @@ SourceEmitter::elementAccessIndices(Operation &operation,
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
         return failure();
-      indices.push_back("(" + exact->str() + ")");
+      indices.push_back(addressIndex(*exact));
     } else {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
@@ -1757,9 +1781,10 @@ SourceEmitter::elementAccessIndices(Operation &operation,
         if (tileAxis >= tileIndices.size())
           return operation.emitOpError(
               "parallel TileLang transfer has too few tile indices");
-        indices.push_back(base + " + " + tileIndices[tileAxis++]);
+        indices.push_back(addressIndex(base) + " + " +
+                          addressIndex(tileIndices[tileAxis++]));
       } else {
-        indices.push_back(base);
+        indices.push_back(addressIndex(base));
       }
     }
   }
@@ -2177,7 +2202,8 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
        "bid_feature * TILE_SIZE_N + store_j < " + feature + ":");
   ++indentation;
   line(workspaceNames.lookup(value) +
-       "[member_start + store_i, bid_feature * TILE_SIZE_N + store_j] = " +
+       "[" + addressIndex("member_start + store_i") + ", " +
+       addressIndex("bid_feature * TILE_SIZE_N + store_j") + "] = " +
        name.str() + "[store_i, store_j]");
   --indentation;
   --indentation;

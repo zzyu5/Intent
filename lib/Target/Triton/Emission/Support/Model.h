@@ -153,6 +153,7 @@ private:
   mlir::FailureOr<plan::AxisOp> resolveAxis(mlir::Value indexedValue,
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
+  std::string addressIndex(llvm::StringRef expression) const;
   mlir::FailureOr<std::string>
   indexExpression(plan::AxisOp axis, bool store,
                   unsigned tensorAxis, unsigned tensorRank,
