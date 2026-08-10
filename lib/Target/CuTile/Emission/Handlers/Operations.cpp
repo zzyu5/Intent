@@ -23,12 +23,17 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.region_end",
                          "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
-  if (failed(addHandler(registry, "intent.constant",
+  if (failed(addHandler(registry, "intent.dim", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitDimension(op);
+      })) ||
+      failed(addHandler(registry, "intent.constant",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
                             return success();
@@ -54,6 +59,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitIndices(op);
+      })) ||
+      failed(addHandler(registry, "intent.random", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitRandom(op);
       })) ||
       failed(addHandler(registry, "intent.reduce",
                         [&](Operation &op) {
@@ -192,6 +202,27 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   }
   line(result + " = " + expression);
   bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitDimension(Operation &operation) {
+  auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  FailureOr<ABIView *> view =
+      operation.getNumOperands() == 1
+          ? lookupView(operation.getOperand(0), operation)
+          : FailureOr<ABIView *>(failure());
+  if (operation.getNumResults() != 1 || !axis || axis.getInt() < 0 ||
+      failed(view) ||
+      static_cast<size_t>(axis.getInt()) >= (*view)->shape.size())
+    return operation.emitOpError("lacks a mechanical cuTile dimension binding");
+  std::string dimension = (*view)->shape[axis.getInt()];
+  if (!planIndex.components.reusedAxes.empty()) {
+    if (dimension == roleDimensions.lookup("program_0"))
+      dimension = "N_ROWS";
+    else if (dimension == roleDimensions.lookup("lane_0"))
+      dimension = "DIM_COLS";
+  }
+  bindResult(operation, 0, dimension);
   return success();
 }
 
@@ -498,6 +529,34 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
           : base + " * " + axis->getTile().str() + " + ct.arange(" +
                 axis->getTile().str() + ", dtype=ct.int32)";
   bindResult(operation, 0, expression);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitRandom(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "random emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> seed = lookupValue(operation, 0);
+  FailureOr<StringRef> counter = lookupValue(operation, 1);
+  if (failed(node) || !binding ||
+      binding.getLowering() != "counter_xorshift32" || failed(seed) ||
+      failed(counter) || operation.getNumResults() != 1)
+    return operation.emitOpError(
+        "lacks a mechanical cuTile counter RNG binding");
+  std::string result = makeResultName(operation, 0);
+  std::string bits = result + "_bits";
+  line(bits + " = ct.bitwise_xor(ct.bitwise_xor(ct.astype(" +
+       counter->str() + ", ct.uint32), ct.astype(" + seed->str() +
+       ", ct.uint32)), ct.astype(1831565813, ct.uint32))");
+  line(bits + " = ct.bitwise_xor(" + bits + ", ct.bitwise_lshift(" + bits +
+       ", 13))");
+  line(bits + " = ct.bitwise_xor(" + bits + ", ct.bitwise_rshift(" + bits +
+       ", 17))");
+  line(bits + " = ct.bitwise_xor(" + bits + ", ct.bitwise_lshift(" + bits +
+       ", 5))");
+  line(result + " = ct.astype(ct.bitwise_rshift(" + bits +
+       ", 8), ct.float32) * 5.960464477539063e-08");
+  bindResult(operation, 0, result);
   return success();
 }
 

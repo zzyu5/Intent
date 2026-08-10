@@ -163,5 +163,7 @@ def row_program_count(
     occupancy = properties["max_num_regs"] // (
         compiled_kernel.n_regs * warp_size * configuration.num_warps
     )
-    occupancy = min(occupancy, properties["max_shared_mem"] // compiled_kernel.metadata.shared)
+    shared = compiled_kernel.metadata.shared
+    if shared:
+        occupancy = min(occupancy, properties["max_shared_mem"] // shared)
     return min(properties["multiprocessor_count"] * occupancy, n_rows)

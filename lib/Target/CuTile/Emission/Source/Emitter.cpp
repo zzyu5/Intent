@@ -43,6 +43,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
                                        StringRef resultSpace) {
   if (role == "indices")
     return StringRef("logical_indices");
+  if (role == "counter_random_f32")
+    return StringRef("counter_xorshift32");
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -509,14 +511,12 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated cuTile tuner");
-  if (planIndex.components.reusedAxes.empty()) {
-    for (const std::string &dimension : dimensionOrder) {
-      bool physicalDimension = llvm::any_of(
-          roleDimensions,
-          [&](const auto &binding) { return binding.getValue() == dimension; });
-      if (!physicalDimension)
-        kernelConstants.push_back(dimension);
-    }
+  for (const std::string &dimension : dimensionOrder) {
+    bool physicalDimension = llvm::any_of(
+        roleDimensions,
+        [&](const auto &binding) { return binding.getValue() == dimension; });
+    if (!physicalDimension)
+      kernelConstants.push_back(dimension);
   }
   return success();
 }
@@ -866,6 +866,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     emitParameter(scalar.name + ": " + annotation.str());
   }
   if (!planIndex.components.reusedAxes.empty()) {
+    for (const std::string &dimension : kernelConstants)
+      emitParameter(dimension + ": ConstInt");
     for (StringRef parameter : {"N_ROWS: ConstInt", "TILE_SIZE: ConstInt",
                                 "DIM_COLS: ConstInt"})
       emitParameter(parameter);
@@ -1208,6 +1210,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     for (ABIScalar &scalar : scalars)
       output << ", " << scalar.name;
+    for (const std::string &dimension : kernelConstants)
+      output << ", " << dimension;
     output << ", n_rows, configuration.tile_size, n_cols))\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {

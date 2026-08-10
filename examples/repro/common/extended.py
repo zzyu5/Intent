@@ -55,6 +55,22 @@ from kernels.loss.cross_entropy import cross_entropy_forward
 from kernels.normalization.fused_add_rms_norm import FEATURES as FUSED_RMS_FEATURES
 from kernels.normalization.fused_add_rms_norm import ROWS as FUSED_RMS_ROWS
 from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
+from kernels.normalization.dropout_residual_rms_norm import (
+    FEATURES as DROPOUT_RMS_FEATURES,
+)
+from kernels.normalization.dropout_residual_rms_norm import (
+    KEEP_PROBABILITY as DROPOUT_KEEP_PROBABILITY,
+)
+from kernels.normalization.dropout_residual_rms_norm import (
+    ROWS as DROPOUT_RMS_ROWS,
+)
+from kernels.normalization.dropout_residual_rms_norm import SEED as DROPOUT_SEED
+from kernels.normalization.dropout_residual_rms_norm import (
+    dropout_residual_rms_norm_backward_data,
+)
+from kernels.normalization.dropout_residual_rms_norm import (
+    dropout_residual_rms_norm_forward,
+)
 from kernels.normalization.layer_norm import FEATURES as LAYER_FEATURES
 from kernels.normalization.layer_norm import ROWS as LAYER_ROWS
 from kernels.normalization.layer_norm import weighted_layer_norm
@@ -86,6 +102,7 @@ from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
 from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 from kernels.streaming.attention import flash_varlen_gqa_prefill
+from kernels.position.rope import rotary_embedding_flat
 from kernels.streaming.paged_attention import BATCH as PAGED_BATCH
 from kernels.streaming.paged_attention import HEAD_DIMENSION as PAGED_HEAD_DIMENSION
 from kernels.streaming.paged_attention import HEAD_GROUP as PAGED_HEAD_GROUP
@@ -99,6 +116,9 @@ from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from .support import benchmark
 from .support import prepare_kernel_call
 from .support import print_artifact
+
+
+ROPE_HALF_DIMENSION = HEAD_DIMENSION // 2
 
 
 Upstream = Callable[[tuple[object, ...]], object]
@@ -861,6 +881,153 @@ def _run_fused_add_rms_norm(
         )
 
 
+def _run_dropout_residual_rms_norm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("dropout residual RMSNorm has no algorithm-matched baseline")
+    inverse_features = 1.0 / DROPOUT_RMS_FEATURES
+    inverse_keep_probability = 1.0 / DROPOUT_KEEP_PROBABILITY
+    epsilon = 1.0e-6
+    weight_offset = 1.0
+    shape = (DROPOUT_RMS_ROWS, DROPOUT_RMS_FEATURES)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    residual = torch.randn_like(x) * 0.5
+    weight = torch.randn(
+        (DROPOUT_RMS_FEATURES,), device="cuda", dtype=torch.bfloat16
+    )
+    dnormalized = torch.randn_like(x) * 0.25
+    dresidual_out = torch.randn_like(x) * 0.25
+    forward = intent.compile(
+        dropout_residual_rms_norm_forward,
+        target=target,
+        compiler=compiler,
+    )
+    backward = intent.compile(
+        dropout_residual_rms_norm_backward_data,
+        target=target,
+        compiler=compiler,
+    )
+
+    counters = torch.arange(
+        DROPOUT_RMS_ROWS * DROPOUT_RMS_FEATURES,
+        device="cuda",
+        dtype=torch.int64,
+    ).reshape(shape)
+    bit_mask = (1 << 32) - 1
+    random_bits = (counters ^ DROPOUT_SEED ^ 1831565813) & bit_mask
+    random_bits = (random_bits ^ (random_bits << 13)) & bit_mask
+    random_bits = (random_bits ^ (random_bits >> 17)) & bit_mask
+    random_bits = (random_bits ^ (random_bits << 5)) & bit_mask
+    uniform = (random_bits >> 8).float() * 5.960464477539063e-08
+    keep = uniform < DROPOUT_KEEP_PROBABILITY
+    keep_f32 = keep.float()
+    summed = (
+        x.float() * keep_f32 / DROPOUT_KEEP_PROBABILITY + residual.float()
+    ).to(torch.bfloat16)
+    summed_f32 = summed.float()
+    inverse_rms = torch.rsqrt(
+        summed_f32.square().sum(dim=1, keepdim=True) * inverse_features + epsilon
+    )
+    expected_normalized = (
+        summed_f32 * inverse_rms * (weight.float() + weight_offset)
+    ).to(torch.bfloat16)
+    normalized_gradient = dnormalized.float() * (weight.float() + weight_offset)
+    projection = (
+        (normalized_gradient * summed_f32).sum(dim=1, keepdim=True)
+        * inverse_features
+    )
+    summed_gradient = (
+        normalized_gradient * inverse_rms
+        - summed_f32 * inverse_rms.pow(3) * projection
+        + dresidual_out.float()
+    )
+    expected_dx = (
+        summed_gradient * keep_f32 / DROPOUT_KEEP_PROBABILITY
+    ).to(torch.bfloat16)
+    expected_dresidual = summed_gradient.to(torch.bfloat16)
+
+    forward_arguments = (
+        x,
+        residual,
+        weight,
+        DROPOUT_SEED,
+        DROPOUT_KEEP_PROBABILITY,
+        inverse_keep_probability,
+        inverse_features,
+        epsilon,
+        weight_offset,
+    )
+    backward_arguments = (
+        x,
+        residual,
+        weight,
+        dnormalized,
+        dresidual_out,
+        DROPOUT_SEED,
+        DROPOUT_KEEP_PROBABILITY,
+        inverse_keep_probability,
+        inverse_features,
+        epsilon,
+        weight_offset,
+    )
+    generated_forward = forward.run(*forward_arguments)
+    generated_backward = backward.run(*backward_arguments)
+    if not isinstance(generated_forward, tuple) or len(generated_forward) != 2:
+        raise RuntimeError(
+            f"{target_name} dropout residual RMSNorm forward returned wrong ABI"
+        )
+    if not isinstance(generated_backward, tuple) or len(generated_backward) != 2:
+        raise RuntimeError(
+            f"{target_name} dropout residual RMSNorm backward returned wrong ABI"
+        )
+    expected = (
+        expected_normalized,
+        summed,
+        expected_dx,
+        expected_dresidual,
+    )
+    actual = (*generated_forward, *generated_backward)
+    errors = tuple(
+        (value.float() - wanted.float()).abs().max().item()
+        for value, wanted in zip(actual, expected)
+    )
+    if any(error > 6.5e-2 for error in errors):
+        raise RuntimeError(
+            f"{target_name} dropout residual RMSNorm comparison failed: {errors}"
+        )
+
+    forward_call = prepare_kernel_call(
+        forward, forward_arguments, generated_forward
+    )
+    backward_call = prepare_kernel_call(
+        backward, backward_arguments, generated_backward
+    )
+
+    def generated_pipeline():
+        forward_call()
+        backward_call()
+
+    generated_p50, generated_p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=True,
+    )
+    print_artifact(forward, target_name)
+    print_artifact(backward, target_name)
+    print(
+        f"{target_name} dropout residual RMSNorm forward/backward-data "
+        f"numerical comparison: PASS (errors={errors})"
+    )
+    print(
+        f"{target_name} dropout residual RMSNorm end-to-end performance "
+        f"(CUDA Graph): p50={generated_p50:.4f} ms, "
+        f"p95={generated_p95:.4f} ms"
+    )
+    print(f"{target_name} dropout residual RMSNorm upstream baseline: unavailable")
+
+
 def _run_logsumexp(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -1119,6 +1286,165 @@ def _run_varlen_gqa_prefill(
     )
 
 
+def _run_varlen_gqa_rope_prefill(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("varlen GQA RoPE prefill has no algorithm-matched baseline")
+    lengths = torch.tensor(
+        [4096, 3968, 3840, 3712, 3584, 3456, 3328, 3200],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    if (
+        lengths.numel() != VARLEN_BATCH
+        or lengths.sum().item() != VARLEN_GQA_TOTAL_TOKENS
+    ):
+        raise RuntimeError("varlen GQA RoPE prefill constants do not match its input")
+    cu_seqlens = torch.zeros(
+        (VARLEN_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    cu_seqlens[1:] = lengths.cumsum(0)
+    q = torch.randn(
+        (VARLEN_GQA_TOTAL_TOKENS, VARLEN_GQA_QUERY_HEADS, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    k = torch.randn(
+        (VARLEN_GQA_TOTAL_TOKENS, VARLEN_GQA_KV_HEADS, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    positions = torch.cat(
+        [
+            torch.arange(int(length.item()), device="cuda", dtype=torch.float32)
+            for length in lengths
+        ]
+    )
+    frequency = torch.arange(
+        ROPE_HALF_DIMENSION, device="cuda", dtype=torch.float32
+    )
+    inverse_frequency = 1.0 / (10000.0 ** (frequency / ROPE_HALF_DIMENSION))
+    angles = positions[:, None] * inverse_frequency[None, :]
+    cosine = torch.cos(angles).to(torch.float16)
+    sine = torch.sin(angles).to(torch.float16)
+    q_rope = intent.compile(
+        rotary_embedding_flat,
+        constexprs={"HEADS": VARLEN_GQA_QUERY_HEADS},
+        target=target,
+        compiler=compiler,
+    )
+    k_rope = intent.compile(
+        rotary_embedding_flat,
+        constexprs={"HEADS": VARLEN_GQA_KV_HEADS},
+        target=target,
+        compiler=compiler,
+    )
+    attention = intent.compile(
+        flash_varlen_gqa_prefill,
+        constexprs={"HEAD_GROUP": VARLEN_GQA_HEAD_GROUP},
+        target=target,
+        compiler=compiler,
+    )
+
+    def rotate(values: torch.Tensor) -> torch.Tensor:
+        paired = torch.cat(
+            (
+                -values[..., ROPE_HALF_DIMENSION:],
+                values[..., :ROPE_HALF_DIMENSION],
+            ),
+            dim=-1,
+        )
+        cosine_full = torch.cat((cosine, cosine), dim=-1)
+        sine_full = torch.cat((sine, sine), dim=-1)
+        return values * cosine_full[:, None, :] + paired * sine_full[:, None, :]
+
+    expected_q = rotate(q)
+    expected_k = rotate(k)
+
+    def attention_reference() -> torch.Tensor:
+        result = torch.empty_like(q)
+        key_heads = torch.arange(
+            VARLEN_GQA_QUERY_HEADS, device="cuda"
+        ) // VARLEN_GQA_HEAD_GROUP
+        for begin, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            start = int(begin.item())
+            stop = int(end.item())
+            query = expected_q[start:stop].permute(1, 0, 2)[None]
+            key = expected_k[start:stop, key_heads, :].permute(1, 0, 2)[None]
+            value = v[start:stop, key_heads, :].permute(1, 0, 2)[None]
+            result[start:stop] = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                is_causal=True,
+                scale=SCALE,
+            )[0].permute(1, 0, 2)
+        return result
+
+    q_flat = q.reshape(-1, HEAD_DIMENSION)
+    k_flat = k.reshape(-1, HEAD_DIMENSION)
+    generated_q_flat = q_rope.run(q_flat, cosine, sine)
+    generated_k_flat = k_rope.run(k_flat, cosine, sine)
+    generated_q = generated_q_flat.reshape_as(q)
+    generated_k = generated_k_flat.reshape_as(k)
+    attention_arguments = (
+        generated_q,
+        generated_k,
+        v,
+        lengths,
+        cu_seqlens,
+        SCALE,
+    )
+    generated_output = attention.run(*attention_arguments)
+    expected_output = attention_reference()
+    errors = (
+        (generated_q - expected_q).abs().max().item(),
+        (generated_k - expected_k).abs().max().item(),
+        (generated_output - expected_output).abs().max().item(),
+    )
+    if errors[0] > 2.0e-3 or errors[1] > 2.0e-3 or errors[2] > 4.0e-2:
+        raise RuntimeError(
+            f"{target_name} varlen GQA RoPE prefill comparison failed: {errors}"
+        )
+
+    q_call = prepare_kernel_call(
+        q_rope, (q_flat, cosine, sine), generated_q_flat
+    )
+    k_call = prepare_kernel_call(
+        k_rope, (k_flat, cosine, sine), generated_k_flat
+    )
+    attention_call = prepare_kernel_call(
+        attention, attention_arguments, generated_output
+    )
+
+    def generated_pipeline():
+        q_call()
+        k_call()
+        attention_call()
+
+    generated_p50, generated_p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    print_artifact(q_rope, target_name)
+    print_artifact(k_rope, target_name)
+    print_artifact(attention, target_name)
+    print(
+        f"{target_name} packed varlen GQA causal prefill with RoPE "
+        f"numerical comparison: PASS (q/k/output errors={errors})"
+    )
+    print(
+        f"{target_name} packed varlen GQA causal prefill with RoPE "
+        f"end-to-end performance (CUDA Event): p50={generated_p50:.4f} ms, "
+        f"p95={generated_p95:.4f} ms"
+    )
+    print(f"{target_name} packed varlen GQA RoPE upstream baseline: unavailable")
+
+
 def _run_paged_attention(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -1350,6 +1676,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "cross_entropy": _run_cross_entropy,
+    "dropout_residual_rms_norm": _run_dropout_residual_rms_norm,
     "dual_gemm": _run_dual_gemm,
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
@@ -1367,6 +1694,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "swiglu_forward": _run_swiglu_forward,
     "varlen_attention": _run_varlen_attention,
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
+    "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,
 }
 
 

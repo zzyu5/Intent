@@ -38,12 +38,17 @@ StringRef tritonDtype(Type type) {
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.region_end",
                          "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
-  if (failed(addHandler(registry, "intent.constant",
+  if (failed(addHandler(registry, "intent.dim", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitDimension(op);
+      })) ||
+      failed(addHandler(registry, "intent.constant",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
                             return success();
@@ -69,6 +74,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitIndices(op);
+      })) ||
+      failed(addHandler(registry, "intent.random", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitRandom(op);
       })) ||
       failed(addHandler(registry, "intent.reduce",
                         [&](Operation &op) {
@@ -207,6 +217,27 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   }
   line(result + " = " + expression);
   bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitDimension(Operation &operation) {
+  auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  FailureOr<ABIView *> view =
+      operation.getNumOperands() == 1
+          ? lookupView(operation.getOperand(0), operation)
+          : FailureOr<ABIView *>(failure());
+  if (operation.getNumResults() != 1 || !axis || axis.getInt() < 0 ||
+      failed(view) ||
+      static_cast<size_t>(axis.getInt()) >= (*view)->shape.size())
+    return operation.emitOpError("lacks a mechanical Triton dimension binding");
+  std::string dimension = (*view)->shape[axis.getInt()];
+  if (!planIndex.components.reusedAxes.empty()) {
+    if (dimension == roleDimensions.lookup("program_0"))
+      dimension = "n_rows";
+    else if (dimension == roleDimensions.lookup("lane_0"))
+      dimension = "n_cols";
+  }
+  bindResult(operation, 0, dimension);
   return success();
 }
 
@@ -495,6 +526,31 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
   if (failed(expression))
     return failure();
   bindResult(operation, 0, *expression);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitRandom(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "random emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> seed = lookupValue(operation, 0);
+  FailureOr<StringRef> counter = lookupValue(operation, 1);
+  if (failed(node) || !binding ||
+      binding.getLowering() != "counter_xorshift32" || failed(seed) ||
+      failed(counter) || operation.getNumResults() != 1)
+    return operation.emitOpError(
+        "lacks a mechanical Triton counter RNG binding");
+  std::string result = makeResultName(operation, 0);
+  std::string bits = result + "_bits";
+  line(bits + " = tl.cast(" + counter->str() +
+       ", tl.uint32) ^ tl.cast(" + seed->str() +
+       ", tl.uint32) ^ tl.cast(1831565813, tl.uint32)");
+  line(bits + " = " + bits + " ^ (" + bits + " << 13)");
+  line(bits + " = " + bits + " ^ (" + bits + " >> 17)");
+  line(bits + " = " + bits + " ^ (" + bits + " << 5)");
+  line(result + " = tl.cast(" + bits +
+       " >> 8, tl.float32) * 5.960464477539063e-08");
+  bindResult(operation, 0, result);
   return success();
 }
 

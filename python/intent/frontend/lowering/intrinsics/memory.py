@@ -361,14 +361,23 @@ def _fence(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
 
 
 def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
-    bound = bind_call(lowerer, node, ("seed", "index", "dtype"), required=("seed", "index"))
-    seed = lowerer.materialize(lowerer.lower_expression(bound["seed"]), bound["seed"])
-    identity = lowerer.materialize(lowerer.lower_expression(bound["index"]), bound["index"])
+    bound = bind_call(
+        lowerer,
+        node,
+        ("seed", "index", "dtype"),
+        required=("seed", "index"),
+    )
+    seed = lowerer.materialize(
+        lowerer.lower_expression(bound["seed"]), bound["seed"]
+    )
+    identity = lowerer.materialize(
+        lowerer.lower_expression(bound["index"]), bound["index"]
+    )
     if not is_integer(seed.type):
         lowerer.error(bound["seed"], "random seed must be integer/index")
     dtype = require_dtype(lowerer, bound["dtype"]) if "dtype" in bound else f32
-    if dtype == intent_bool:
-        lowerer.error(node, "I.random result dtype must be numeric")
+    if dtype != f32:
+        lowerer.error(node, "I.random currently produces f32 uniform values")
     if isinstance(identity.type, LogicalIndexType):
         shape: tuple[object, ...] = ()
     elif isinstance(identity.type, TensorType):
@@ -382,7 +391,7 @@ def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         lowerer.location(node),
         operands=(seed, identity),
         result_types=(lowerer.value_result_type(dtype, shape),),
-        effects=(Effect(EffectKind.RNG, ResourceKind.RNG_STATE),),
+        attributes={"algorithm": "counter_xorshift32"},
     )
     return operation.results[0]
 

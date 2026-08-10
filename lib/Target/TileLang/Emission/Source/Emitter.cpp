@@ -61,6 +61,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
                                        StringRef materialization) {
   if (role == "indices")
     return StringRef("logical_indices");
+  if (role == "counter_random_f32")
+    return StringRef("counter_xorshift32");
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -294,7 +296,9 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
         target::hasDerivedScalarIndex(*operation);
-    if (failed(derivedScalar))
+    FailureOr<bool> tensorIndirect =
+        target::hasTensorIndirectIndex(*operation);
+    if (failed(derivedScalar) || failed(tensorIndirect))
       return failure();
     plan::BoundaryOp binding;
     binding.operation = value;
@@ -305,7 +309,8 @@ indexRealization(intent::plan::RealizationOp realization,
     });
     bool materializeLogicalBounds =
         raggedBound && !value.getConsumerNeutralized();
-    binding.transfer = *derivedScalar || materializeLogicalBounds
+    binding.transfer = *derivedScalar || *tensorIndirect ||
+                               materializeLogicalBounds
                            ? "parallel_elements"
                            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
@@ -314,7 +319,7 @@ indexRealization(intent::plan::RealizationOp realization,
                      target::emission::feedsStagedContraction(index, *operation));
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
-        (!index.stages.empty() && store) || *derivedScalar;
+        (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect;
     if (binding.resultSpace.empty()) {
       value.emitOpError("has no TileLang transfer residency spelling");
       return failure();

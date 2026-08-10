@@ -46,6 +46,13 @@ pointwiseRole(mlir::Operation &operation) {
   llvm::StringRef name = operation.getName().getStringRef();
   if (name == "intent.indices")
     return std::string("indices");
+  if (name == "intent.random") {
+    auto algorithm =
+        operation.getAttrOfType<mlir::StringAttr>("intent.algorithm");
+    if (algorithm && algorithm.getValue() == "counter_xorshift32")
+      return std::string("counter_random_f32");
+    return operation.emitOpError("has no supported counter RNG semantics");
+  }
   if (name == "intent.broadcast")
     return std::string("broadcast");
   if (name == "intent.cast")

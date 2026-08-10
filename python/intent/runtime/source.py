@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import builtins as python_builtins
+from itertools import count
 import linecache
 
 from .artifact import BackendIRCollector
 from .artifact import CompiledArtifact
+
+
+_MATERIALIZATION_IDS = count()
 
 
 def materialize_python_source(
@@ -15,11 +19,15 @@ def materialize_python_source(
     entry_name: str,
     backend_ir_collector: BackendIRCollector | None,
 ) -> CompiledArtifact:
-    filename = f"<intent-{target_name}:{entry_name}>"
+    materialization_id = next(_MATERIALIZATION_IDS)
+    module_name = (
+        f"intent.generated.{target_name}.{entry_name}.{materialization_id}"
+    )
+    filename = f"<{module_name}>"
     source_lines = source.splitlines(keepends=True)
     linecache.cache[filename] = (len(source), None, source_lines, filename)
     namespace: dict[str, object] = {
-        "__name__": f"intent.generated.{target_name}.{entry_name}",
+        "__name__": module_name,
     }
     code = python_builtins.compile(source, filename, "exec", dont_inherit=True)
     exec(code, namespace)

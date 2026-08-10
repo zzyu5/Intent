@@ -63,6 +63,8 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
 FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
   if (role == "indices")
     return StringRef("logical_indices");
+  if (role == "counter_random_f32")
+    return StringRef("counter_xorshift32");
   if (role == "broadcast")
     return StringRef("alias");
   if (role == "cast")
@@ -1733,9 +1735,15 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
         return operation.emitOpError(
             "Triton indirect tensor bounds require one logical axis");
       std::string index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+      std::string extent = (*view)->shape[axisNumber];
+      if (!planIndex.components.reusedAxes.empty()) {
+        if (roleDimensions.lookup("program_0") == extent)
+          extent = "n_rows";
+        else if (roleDimensions.lookup("lane_0") == extent)
+          extent = "n_cols";
+      }
       predicates.push_back("(" + index + " >= 0)");
-      predicates.push_back("(" + index + " < " +
-                           (*view)->shape[axisNumber] + ")");
+      predicates.push_back("(" + index + " < " + extent + ")");
       continue;
     }
     if (term.kind == "value_index" &&

@@ -531,7 +531,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast", "intent.full", "intent.zeros",
-                         "intent.members", "intent.gather", "intent.reshape"})
+                         "intent.members", "intent.gather", "intent.reshape",
+                         "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =

@@ -89,10 +89,12 @@ public:
 
   mlir::LogicalResult emit();
   mlir::LogicalResult emitConstant(mlir::Operation &operation);
+  mlir::LogicalResult emitDimension(mlir::Operation &operation);
   mlir::LogicalResult enterParallel(mlir::Operation &operation);
   mlir::LogicalResult leaveParallel(mlir::Operation &operation);
   mlir::LogicalResult emitLoad(mlir::Operation &operation);
   mlir::LogicalResult emitIndices(mlir::Operation &operation);
+  mlir::LogicalResult emitRandom(mlir::Operation &operation);
   mlir::LogicalResult emitReduction(mlir::Operation &operation);
   mlir::LogicalResult emitBroadcast(mlir::Operation &operation);
   mlir::LogicalResult emitUnary(mlir::Operation &operation);

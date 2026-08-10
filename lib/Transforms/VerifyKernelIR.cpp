@@ -1,5 +1,6 @@
 #include "Intent/Transforms/Passes.h"
 
+#include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -190,11 +191,9 @@ LogicalResult verifyEffects(Operation *operation) {
     auto resource = effect.getAs<StringAttr>("resource");
     if (!kind || !resource ||
         (kind.getValue() != "read" && kind.getValue() != "write" &&
-         kind.getValue() != "atomic" && kind.getValue() != "fence" &&
-         kind.getValue() != "rng") ||
+         kind.getValue() != "atomic" && kind.getValue() != "fence") ||
         (resource.getValue() != "external_view" &&
          resource.getValue() != "logical_buffer" &&
-         resource.getValue() != "rng_state" &&
          resource.getValue() != "ordering"))
       return operation->emitOpError("effect metadata contains an unknown kind/resource");
     auto target = effect.getAs<IntegerAttr>("target");
@@ -351,6 +350,30 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
     return requireAttribute<StringAttr>(operation, "intent.operator");
   if (name == "intent.compare")
     return requireAttribute<StringAttr>(operation, "intent.predicate");
+  if (name == "intent.random") {
+    if (operation->getNumOperands() != 2 || operation->getNumResults() != 1)
+      return operation->emitOpError(
+          "requires seed/counter operands and one uniform result");
+    auto algorithm =
+        operation->getAttrOfType<StringAttr>("intent.algorithm");
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    Type seedType = elementType(operation->getOperand(0).getType());
+    Type counterType = elementType(operation->getOperand(1).getType());
+    Type resultType = operation->getResult(0).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(resultType))
+      resultType = tensor.getElementType();
+    if (!algorithm || algorithm.getValue() != "counter_xorshift32" ||
+        !isa<IntegerType, IndexType>(seedType) ||
+        !isa<IntegerType, IndexType, intent::LogicalIndexType>(counterType) ||
+        !resultType.isF32())
+      return operation->emitOpError(
+          "requires integer seed/counter and counter_xorshift32 f32 output");
+    return success();
+  }
   if (name == "intent.reduce") {
     if (failed(requireAttribute<ArrayAttr>(operation, "intent.axes")))
       return failure();

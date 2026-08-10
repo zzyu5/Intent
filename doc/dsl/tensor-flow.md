@@ -154,3 +154,9 @@ r = I.random(seed, logical_index)
 ```
 
 Counter identity 来自 source logical index，不来自 `program_id` 或 auto-region ordinal。
+
+`I.random` 是纯函数，不持有隐式 RNG 状态。当前 canonical 合同为
+`counter_xorshift32(seed, logical_index)`：计数器与 seed 先转成 `u32`，与
+`1831565813` 异或后依次执行 `x ^= x << 13`、`x ^= x >> 17`、
+`x ^= x << 5`，最终用高 24 bit 生成 `[0, 1)` 的 `f32`。相同 seed 与逻辑
+坐标在前向、反向以及不同表面语言中必须得到同一个值。

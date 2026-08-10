@@ -152,7 +152,7 @@ def Intent_FenceOp : Intent_Op<"fence", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins);
   let results = (outs);
 }
-def Intent_RandomOp : Intent_Op<"random", [MemoryEffects<[MemWrite]>]> {
+def Intent_RandomOp : Intent_Op<"random", [Pure]> {
   let arguments = (ins AnyType:$seed, AnyType:$logical_index);
   let results = (outs AnyType:$result);
 }

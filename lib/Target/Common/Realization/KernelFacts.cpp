@@ -811,7 +811,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
                          "intent.cast", "intent.compare", "intent.select",
-                         "intent.mask"})
+                         "intent.mask", "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               return propagatePointwiseAxes(operation, facts);

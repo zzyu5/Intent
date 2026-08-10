@@ -1,5 +1,6 @@
 #include "Support/Model.h"
 
+#include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
@@ -35,6 +36,24 @@ LogicalResult validateReduction(Operation &operation) {
 
 LogicalResult validatePointwise(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
+  if (name == "intent.random") {
+    auto algorithm =
+        operation.getAttrOfType<StringAttr>("intent.algorithm");
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    if (operation.getNumOperands() == 2 && operation.getNumResults() == 1 &&
+        algorithm && algorithm.getValue() == "counter_xorshift32" &&
+        isa<IntegerType, IndexType>(
+            elementType(operation.getOperand(0).getType())) &&
+        isa<IntegerType, IndexType, intent::LogicalIndexType>(
+            elementType(operation.getOperand(1).getType())) &&
+        elementType(operation.getResult(0).getType()).isF32())
+      return success();
+    return operation.emitOpError("has no supported GPU counter RNG schema");
+  }
   if (name == "intent.indices" || name == "intent.broadcast" ||
       name == "intent.mask")
     return success();
@@ -117,7 +136,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.cast", "intent.reshape"})
+                         "intent.cast", "intent.reshape", "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();

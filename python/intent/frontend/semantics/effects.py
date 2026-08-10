@@ -13,13 +13,11 @@ class EffectKind(Enum):
     WRITE = "write"
     ATOMIC = "atomic"
     FENCE = "fence"
-    RNG = "rng"
 
 
 class ResourceKind(Enum):
     EXTERNAL_VIEW = "external_view"
     LOGICAL_BUFFER = "logical_buffer"
-    RNG_STATE = "rng_state"
     ORDERING = "ordering"
 
 

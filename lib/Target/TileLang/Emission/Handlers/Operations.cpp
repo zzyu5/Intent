@@ -22,12 +22,17 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.region_end",
                          "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
-  if (failed(addHandler(registry, "intent.constant", [&](Operation &op) {
+  if (failed(addHandler(registry, "intent.dim", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitDimension(op);
+      })) ||
+      failed(addHandler(registry, "intent.constant", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitConstant(op);
@@ -56,6 +61,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitIndices(op);
+      })) ||
+      failed(addHandler(registry, "intent.random", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitRandom(op);
       })) ||
       failed(addHandler(registry, "intent.reduce", [&](Operation &op) {
         if (!emitter.selectOperation(op))
@@ -183,6 +193,21 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   }
   line(result + " = " + expression);
   valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitDimension(Operation &operation) {
+  auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  FailureOr<ABIView *> view =
+      operation.getNumOperands() == 1
+          ? lookupView(operation.getOperand(0), operation)
+          : FailureOr<ABIView *>(failure());
+  if (operation.getNumResults() != 1 || !axis || axis.getInt() < 0 ||
+      failed(view) ||
+      static_cast<size_t>(axis.getInt()) >= (*view)->shape.size())
+    return operation.emitOpError(
+        "lacks a mechanical TileLang dimension binding");
+  bindResult(operation, 0, (*view)->shape[axis.getInt()]);
   return success();
 }
 
@@ -397,14 +422,20 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         boundary.getCheckBounds()
             ? elementBoundsPredicate(operation, tileIndices)
             : FailureOr<std::string>(std::string());
+    FailureOr<bool> tensorIndirect =
+        target::hasTensorIndirectIndex(operation);
     FailureOr<std::string> wholeTile =
-        boundary.getCheckBounds()
+        boundary.getCheckBounds() && succeeded(tensorIndirect) &&
+                !*tensorIndirect
             ? wholeTileBoundsPredicate(operation, *extents)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> bulkIndices =
-        boundary.getCheckBounds() ? accessIndices(operation)
-                                  : FailureOr<std::string>(std::string());
-    if (failed(predicate) || failed(wholeTile) || failed(bulkIndices))
+        boundary.getCheckBounds() && succeeded(tensorIndirect) &&
+                !*tensorIndirect
+            ? accessIndices(operation)
+            : FailureOr<std::string>(std::string());
+    if (failed(predicate) || failed(tensorIndirect) || failed(wholeTile) ||
+        failed(bulkIndices))
       return failure();
     bool hasBulkFastPath = !wholeTile->empty();
     if (hasBulkFastPath) {
@@ -484,6 +515,82 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
   line(*result + "[indices_i] = " + base + " + indices_i");
   --indentation;
   bindResult(operation, 0, *result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitRandom(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "random emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(node) || !binding ||
+      binding.getLowering() != "counter_xorshift32" ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local") ||
+      operation.getNumOperands() != 2 || operation.getNumResults() != 1)
+    return operation.emitOpError(
+        "lacks a mechanical TileLang counter RNG binding");
+
+  std::string result = makeResultName(operation, 0);
+  SmallVector<std::string> indices;
+  if (tensorResult) {
+    FailureOr<std::string> storage = allocateResult(operation, 0, "fragment");
+    FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+    if (failed(storage) || failed(extents))
+      return failure();
+    result = *storage;
+    std::string loop = "for ";
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
+      if (axis)
+        loop += ", ";
+      indices.push_back("random_i" + std::to_string(axis));
+      loop += indices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    line(loop + "):");
+    ++indentation;
+  }
+
+  FailureOr<std::string> seed =
+      tensorElement(operation.getOperand(0), indices, operation);
+  FailureOr<std::string> counter =
+      tensorElement(operation.getOperand(1), indices, operation);
+  if (failed(seed) || failed(counter))
+    return failure();
+  std::string bits0 = makeResultName(operation, 0) + "_bits0";
+  std::string bits1 = makeResultName(operation, 0) + "_bits1";
+  std::string bits2 = makeResultName(operation, 0) + "_bits2";
+  std::string bits3 = makeResultName(operation, 0) + "_bits3";
+  line(bits0 + " = T.bitwise_xor(T.bitwise_xor(T.cast(" + *counter +
+       ", T.uint32), T.cast(" + *seed +
+       ", T.uint32)), T.cast(1831565813, T.uint32))");
+  line(bits1 + " = T.bitwise_xor(" + bits0 + ", T.shift_left(" + bits0 +
+       ", 13))");
+  line(bits2 + " = T.bitwise_xor(" + bits1 + ", T.shift_right(" + bits1 +
+       ", 17))");
+  line(bits3 + " = T.bitwise_xor(" + bits2 + ", T.shift_left(" + bits2 +
+       ", 5))");
+  std::string uniform = "T.cast(T.shift_right(" + bits3 +
+                        ", 8), T.float32) * 5.960464477539063e-08";
+  if (tensorResult) {
+    std::string target = result + "[";
+    for (auto [axis, index] : llvm::enumerate(indices)) {
+      if (axis)
+        target += ", ";
+      target += index;
+    }
+    line(target + "] = " + uniform);
+    --indentation;
+    bindResult(operation, 0, result);
+  } else {
+    line(result + " = " + uniform);
+    valueNames[operation.getResult(0)] = result;
+  }
   return success();
 }
 
