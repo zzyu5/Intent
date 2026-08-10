@@ -42,6 +42,7 @@ def lower_tensor_intrinsic(
         "exp2": lambda context, call: _unary(context, call, UnaryOperator.EXP2),
         "log": lambda context, call: _unary(context, call, UnaryOperator.LOG),
         "rsqrt": lambda context, call: _unary(context, call, UnaryOperator.RSQRT),
+        "sigmoid": lambda context, call: _unary(context, call, UnaryOperator.SIGMOID),
         "maximum": lambda context, call: _binary(context, call, BinaryOperator.MAXIMUM),
         "minimum": lambda context, call: _binary(context, call, BinaryOperator.MINIMUM),
         "add": lambda context, call: _binary(context, call, BinaryOperator.ADD),

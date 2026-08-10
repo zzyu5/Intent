@@ -70,6 +70,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("T.log");
   if (role == "unary_rsqrt")
     return StringRef("T.rsqrt");
+  if (role == "unary_sigmoid")
+    return StringRef("T.sigmoid");
   if (role == "unary_negate")
     return StringRef("python_negate");
   if (role == "binary_add")

@@ -59,6 +59,7 @@ exp = Intrinsic("exp")
 exp2 = Intrinsic("exp2")
 log = Intrinsic("log")
 rsqrt = Intrinsic("rsqrt")
+sigmoid = Intrinsic("sigmoid")
 maximum = Intrinsic("maximum")
 minimum = Intrinsic("minimum")
 any = Intrinsic("any")
@@ -110,6 +111,7 @@ INTRINSICS = {
         exp2,
         log,
         rsqrt,
+        sigmoid,
         maximum,
         minimum,
         any,

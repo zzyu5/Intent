@@ -20,7 +20,7 @@ def swiglu_backward(
         dc_values = I.cast(dc[row, columns], I.f32)
         a_values = I.cast(a[row, columns], I.f32)
         b_values = I.cast(b[row, columns], I.f32)
-        sigmoid = 1.0 / (1.0 + I.exp(-a_values))
+        sigmoid = I.sigmoid(a_values)
         silu = a_values * sigmoid
         da[row, columns] = I.cast(
             dc_values * (silu * (1.0 - sigmoid) + sigmoid) * b_values,

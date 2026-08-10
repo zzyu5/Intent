@@ -123,6 +123,7 @@ class UnaryOperator(Enum):
     EXP2 = "exp2"
     LOG = "log"
     RSQRT = "rsqrt"
+    SIGMOID = "sigmoid"
 
 
 class BinaryOperator(Enum):

@@ -470,10 +470,13 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   if (failed(node) || !binding || failed(operand))
     return failure();
   std::string result = makeResultName(operation, 0);
-  std::string expression = binding.getLowering() == "python_negate"
-                               ? "-(" + operand->str() + ")"
-                               : binding.getLowering().str() + "(" +
-                                     operand->str() + ")";
+  std::string expression;
+  if (binding.getLowering() == "python_negate")
+    expression = "-(" + operand->str() + ")";
+  else if (binding.getLowering() == "python_sigmoid")
+    expression = "1.0 / (1.0 + ct.exp(-(" + operand->str() + ")))";
+  else
+    expression = binding.getLowering().str() + "(" + operand->str() + ")";
   line(result + " = " + expression);
   bindResult(operation, 0, result);
   return success();

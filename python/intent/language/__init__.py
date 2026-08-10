@@ -44,6 +44,7 @@ from .builtins import record
 from .builtins import reduce
 from .builtins import reshape
 from .builtins import rsqrt
+from .builtins import sigmoid
 from .builtins import scan
 from .builtins import scatter_reduce
 from .builtins import scatter_unique
@@ -137,6 +138,7 @@ __all__ = [
     "reduce",
     "reshape",
     "rsqrt",
+    "sigmoid",
     "scan",
     "scatter_reduce",
     "scatter_unique",
