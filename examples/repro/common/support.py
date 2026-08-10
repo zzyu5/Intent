@@ -35,10 +35,27 @@ def benchmark(
     else:
         for _ in range(warmup):
             function()
+    flush_buffer = None
+    if cuda_graph:
+        l2_bytes = torch.cuda.get_device_properties(
+            measurement_stream.device
+        ).L2_cache_size
+        if l2_bytes <= 0:
+            raise RuntimeError("CUDA device does not report a positive L2 cache size")
+        flush_buffer = torch.empty(
+            (2 * l2_bytes) // 4,
+            device=measurement_stream.device,
+            dtype=torch.int32,
+        )
+        with torch.cuda.stream(measurement_stream):
+            flush_buffer.add_(1)
+        measurement_stream.synchronize()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(repetitions)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(repetitions)]
     with torch.cuda.stream(measurement_stream):
         for start, end in zip(starts, ends):
+            if flush_buffer is not None:
+                flush_buffer.add_(1)
             start.record()
             measured()
             end.record()
