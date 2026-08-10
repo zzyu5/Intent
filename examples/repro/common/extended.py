@@ -35,6 +35,9 @@ from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import quantized_gemm
+from kernels.normalization.fused_add_rms_norm import FEATURES as FUSED_RMS_FEATURES
+from kernels.normalization.fused_add_rms_norm import ROWS as FUSED_RMS_ROWS
+from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
 from kernels.normalization.layer_norm import FEATURES as LAYER_FEATURES
 from kernels.normalization.layer_norm import ROWS as LAYER_ROWS
 from kernels.normalization.layer_norm import weighted_layer_norm
@@ -516,6 +519,103 @@ def _run_rms_norm(
     )
 
 
+def _run_fused_add_rms_norm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    inverse_features = 1.0 / FUSED_RMS_FEATURES
+    epsilon = 1.0e-6
+    weight_offset = 1.0
+    shape = (FUSED_RMS_ROWS, FUSED_RMS_FEATURES)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    residual = torch.randn_like(x) * 0.5
+    weight = torch.randn(
+        (FUSED_RMS_FEATURES,), device="cuda", dtype=torch.bfloat16
+    )
+    artifact = intent.compile(fused_add_rms_norm, target=target, compiler=compiler)
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        summed = (x.float() + residual.float()).to(torch.bfloat16)
+        summed_f32 = summed.float()
+        inverse_rms = torch.rsqrt(
+            summed_f32.square().sum(dim=1, keepdim=True) * inverse_features
+            + epsilon
+        )
+        normalized = (
+            summed_f32 * inverse_rms * (weight.float() + weight_offset)
+        ).to(torch.bfloat16)
+        return normalized, summed
+
+    arguments = (x, residual, weight, inverse_features, epsilon, weight_offset)
+    generated = artifact.run(*arguments)
+    if not isinstance(generated, tuple) or len(generated) != 2:
+        raise RuntimeError(
+            f"{target_name} fused add RMSNorm did not return two outputs"
+        )
+    expected = reference()
+    for actual, wanted in zip(generated, expected):
+        if actual.shape != wanted.shape or actual.dtype != wanted.dtype:
+            raise RuntimeError(
+                f"{target_name} fused add RMSNorm returned "
+                f"shape={tuple(actual.shape)}, dtype={actual.dtype}; expected "
+                f"shape={tuple(wanted.shape)}, dtype={wanted.dtype}"
+            )
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if any(value > 5.0e-2 for value in errors):
+        raise RuntimeError(
+            f"{target_name} fused add RMSNorm numerical comparison failed: {errors}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        lambda: artifact.run(*arguments), warmup=3, repetitions=10
+    )
+    upstream_output = upstream(arguments) if upstream is not None else None
+    if upstream_output is not None:
+        if not isinstance(upstream_output, tuple) or len(upstream_output) != 2:
+            raise RuntimeError(
+                f"{target_name} fused add RMSNorm upstream did not return two outputs"
+            )
+        for actual, wanted in zip(upstream_output, expected):
+            if actual.shape != wanted.shape or actual.dtype != wanted.dtype:
+                raise RuntimeError(
+                    f"{target_name} fused add RMSNorm upstream returned "
+                    f"shape={tuple(actual.shape)}, dtype={actual.dtype}; expected "
+                    f"shape={tuple(wanted.shape)}, dtype={wanted.dtype}"
+                )
+        upstream_errors = tuple(
+            (actual - wanted).abs().max().item()
+            for actual, wanted in zip(upstream_output, expected)
+        )
+        if any(value > 5.0e-2 for value in upstream_errors):
+            raise RuntimeError(
+                f"{target_name} fused add RMSNorm upstream comparison failed: "
+                f"{upstream_errors}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(arguments), warmup=3, repetitions=10
+        )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} fused add RMSNorm numerical comparison: PASS "
+        f"(normalized/residual errors={errors})"
+    )
+    print(
+        f"{target_name} fused add RMSNorm generated performance: "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_output is None:
+        print(f"{target_name} fused add RMSNorm upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} fused add RMSNorm upstream comparison: PASS "
+            f"(normalized/residual errors={upstream_errors}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
+
+
 def _run_logsumexp(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -702,6 +802,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "dual_gemm": _run_dual_gemm,
+    "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "layer_norm": _run_layer_norm,
     "layer_norm_backward": _run_layer_norm_backward,

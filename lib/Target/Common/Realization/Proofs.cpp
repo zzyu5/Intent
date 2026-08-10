@@ -17,14 +17,45 @@ enum class PaddedValue {
   negativeInfinity,
 };
 
+Operation *rootViewLoad(Value value) {
+  Operation *definition = value.getDefiningOp();
+  while (definition && definition->getName().getStringRef() == "intent.cast" &&
+         definition->getNumOperands() == 1) {
+    value = definition->getOperand(0);
+    definition = value.getDefiningOp();
+  }
+  if (!definition ||
+      definition->getName().getStringRef() != "intent.view_load")
+    return nullptr;
+  return definition;
+}
+
+bool haveAlignedLoadMasks(Value lhs, Value rhs) {
+  Operation *lhsLoad = rootViewLoad(lhs);
+  Operation *rhsLoad = rootViewLoad(rhs);
+  if (!lhsLoad || !rhsLoad ||
+      lhsLoad->getAttr("intent.index") != rhsLoad->getAttr("intent.index") ||
+      lhsLoad->getAttr("intent.result_shapes") !=
+          rhsLoad->getAttr("intent.result_shapes") ||
+      lhsLoad->getNumOperands() != rhsLoad->getNumOperands())
+    return false;
+  for (unsigned index = 1; index < lhsLoad->getNumOperands(); ++index)
+    if (lhsLoad->getOperand(index) != rhsLoad->getOperand(index))
+      return false;
+  return true;
+}
+
 bool provePaddedUses(Value value, PaddedValue padded,
-                     llvm::DenseMap<Value, PaddedValue> &visited) {
+                     llvm::DenseMap<Value, PaddedValue> &visited,
+                     Operation *ignoredUser = nullptr) {
   auto found = visited.find(value);
   if (found != visited.end())
     return found->second == padded;
   visited[value] = padded;
 
   for (Operation *user : value.getUsers()) {
+    if (user == ignoredUser)
+      continue;
     StringRef name = user->getName().getStringRef();
     if (name == "intent.view_store")
       continue;
@@ -64,16 +95,26 @@ bool provePaddedUses(Value value, PaddedValue padded,
       if (logical && logical.getValue() == "multiply" &&
           padded == PaddedValue::zero)
         result = PaddedValue::zero;
-      else if (logical && logical.getValue() == "subtract" &&
-               user->getOperand(0) == value &&
-               padded == PaddedValue::negativeInfinity)
+      else if (logical && logical.getValue() == "add" &&
+               padded == PaddedValue::zero) {
+        Value sibling = user->getOperand(0) == value ? user->getOperand(1)
+                                                     : user->getOperand(0);
+        Operation *siblingLoad = rootViewLoad(sibling);
+        llvm::DenseMap<Value, PaddedValue> siblingVisited;
+        if (siblingLoad && haveAlignedLoadMasks(value, sibling) &&
+            provePaddedUses(siblingLoad->getResult(0), PaddedValue::zero,
+                            siblingVisited, user))
+          result = PaddedValue::zero;
+      } else if (logical && logical.getValue() == "subtract" &&
+                 user->getOperand(0) == value &&
+                 padded == PaddedValue::negativeInfinity)
         result = PaddedValue::negativeInfinity;
     } else {
       return false;
     }
 
     if (user->getNumResults() != 1 ||
-        !provePaddedUses(user->getResult(0), result, visited))
+        !provePaddedUses(user->getResult(0), result, visited, ignoredUser))
       return false;
   }
   return true;

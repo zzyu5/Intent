@@ -111,6 +111,23 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         return lambda arguments: module.rms_norm_forward(
             arguments[0], arguments[1], arguments[3], 0.0, "none", None
         )[0]
+    if kernel == "fused_add_rms_norm":
+        module = _load_module(
+            source_path, "intent_upstream_triton_fused_add_rms_norm"
+        )
+
+        def run(arguments):
+            outputs = module.source.fused_add_rms_norm_forward(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[4],
+                arguments[5],
+                "gemma",
+            )
+            return outputs[0], outputs[1]
+
+        return run
     if kernel == "dual_gemm":
         matmul = _load_prefix(
             source_path, 352, "matmul", "intent_upstream_triton_dual_gemm"
