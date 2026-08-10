@@ -61,6 +61,13 @@ def _load_extended_upstream(kernel: str, source_path: Path):
     if kernel == "bf16_gemm":
         matmul = _load_module(source_path, "intent_upstream_cutile_bf16_gemm").matmul
         return lambda arguments: matmul(arguments[0], arguments[1])
+    if kernel == "swiglu_forward":
+        utils_path = source_path.parents[2] / "support" / "utils.py"
+        _load_module(utils_path, "tilegym.ops.cutile.utils")
+        silu_and_mul = _load_module(
+            source_path, "tilegym.ops.cutile._intent_silu_and_mul"
+        ).silu_and_mul
+        return lambda arguments: silu_and_mul(arguments[2])
     if kernel == "layer_norm":
         layer_norm = _load_module(
             source_path, "intent_upstream_cutile_layer_norm"

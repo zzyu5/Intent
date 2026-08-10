@@ -8,6 +8,9 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.activation.swiglu import FEATURES as SWIGLU_FORWARD_FEATURES
+from kernels.activation.swiglu import TOKENS as SWIGLU_FORWARD_TOKENS
+from kernels.activation.swiglu import swiglu_forward
 from kernels.contraction.batched_gemm import BATCH as BMM_BATCH
 from kernels.contraction.batched_gemm import K as BMM_K
 from kernels.contraction.batched_gemm import M as BMM_M
@@ -334,6 +337,29 @@ def _run_swiglu_backward(
             f"upstream_p95={upstream_p95:.4f} ms, "
             f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
         )
+
+
+def _run_swiglu_forward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape = (SWIGLU_FORWARD_TOKENS, SWIGLU_FORWARD_FEATURES)
+    gate = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    up = torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.5
+    artifact = intent.compile(swiglu_forward, target=target, compiler=compiler)
+    packed = torch.cat((gate, up), dim=1) if upstream is not None else None
+    adapted_upstream = (
+        (lambda _: upstream((gate, up, packed))) if upstream is not None else None
+    )
+    _compare(
+        artifact=artifact,
+        arguments=(gate, up),
+        reference=lambda: (F.silu(gate.float()) * up.float()).to(torch.bfloat16),
+        target_name=target_name,
+        kernel_name="SwiGLU forward",
+        tolerance=5.0e-2,
+        upstream=adapted_upstream,
+        expected_dtype=torch.bfloat16,
+    )
 
 
 def _run_layer_norm_backward(
@@ -684,6 +710,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "swiglu_backward": _run_swiglu_backward,
+    "swiglu_forward": _run_swiglu_forward,
     "varlen_attention": _run_varlen_attention,
 }
 

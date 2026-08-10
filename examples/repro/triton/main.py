@@ -96,6 +96,11 @@ def _load_extended_upstream(kernel: str, source_path: Path):
             return module.source.swiglu_backward(a.clone(), b.clone(), dc)
 
         return run
+    if kernel == "swiglu_forward":
+        module = _load_module(source_path, "intent_upstream_triton_swiglu_forward")
+        return lambda arguments: module.source.swiglu_forward(
+            arguments[0], arguments[1]
+        )[2]
     if kernel == "layer_norm":
         module = _load_module(source_path, "intent_upstream_triton_layer_norm")
         return lambda arguments: module.source.layer_norm_fn(
