@@ -144,6 +144,14 @@ inline bool isNestedInStateStream(mlir::Operation *operation) {
   return false;
 }
 
+inline bool isSequentialIterator(mlir::Value value) {
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  mlir::Operation *owner =
+      argument ? argument.getOwner()->getParentOp() : nullptr;
+  return owner && owner->getName().getStringRef() == "intent.for" &&
+         argument.getArgNumber() == 0;
+}
+
 inline bool dependsOnStateStream(mlir::Value value,
                                  llvm::DenseSet<mlir::Value> &visited) {
   if (!visited.insert(value).second)
@@ -260,6 +268,11 @@ struct ProgramBinding : Binding<intent::plan::ProgramOp> {
   mlir::IntegerAttr getLoopNodeAttr() const {
     return operation.getLoopNodeAttr();
   }
+};
+
+struct BufferBinding : Binding<intent::plan::BufferOp> {
+  int64_t getNode() const { return operation.getNode(); }
+  llvm::StringRef getSpace() const { return operation.getSpace(); }
 };
 
 struct PaddingBinding : Binding<intent::plan::PaddingOp> {

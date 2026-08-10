@@ -1,6 +1,7 @@
 #include "Support/Model.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -24,7 +25,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.domain", "intent.region_end",
-                         "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
+                         "intent.assume_in_bounds", "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -49,6 +50,36 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
             return emitter.selectOperation(op) ? emitter.leaveParallel(op)
                                                : success();
           })) ||
+      failed(addHandler(
+          registry, "intent.for",
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveFor(op) : success();
+          })) ||
+      failed(addHandler(
+          registry, "intent.if",
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterIf(op) : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveIf(op) : success();
+          })) ||
+      failed(addHandler(registry, "intent.yield", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitYield(op) : success();
+      })) ||
+      failed(addHandler(registry, "intent.buffer", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitBuffer(op) : success();
+      })) ||
+      failed(addHandler(registry, "intent.buffer_load", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitBufferLoad(op)
+                                           : success();
+      })) ||
+      failed(addHandler(registry, "intent.buffer_store", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitBufferStore(op)
+                                           : success();
+      })) ||
       failed(addHandler(registry, "intent.view_load",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -449,6 +480,206 @@ LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::enterFor(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "for emission");
+  Operation *domain = operation.getNumOperands() > 0
+                          ? operation.getOperand(0).getDefiningOp()
+                          : nullptr;
+  if (failed(node) || !domain ||
+      domain->getName().getStringRef() != "intent.domain" ||
+      domain->getNumOperands() < 2 || operation.getNumRegions() != 1 ||
+      !llvm::hasSingleElement(operation.getRegion(0)))
+    return operation.emitOpError("lacks a mechanical cuTile sequential loop");
+  Block &body = operation.getRegion(0).front();
+  std::string stop;
+  Operation *stopDefinition = domain->getOperand(1).getDefiningOp();
+  auto stopLiteral = stopDefinition
+                         ? stopDefinition->getAttrOfType<IntegerAttr>("intent.value")
+                         : IntegerAttr();
+  if (stopDefinition &&
+      stopDefinition->getName().getStringRef() == "intent.constant" &&
+      stopLiteral)
+    stop = std::to_string(stopLiteral.getInt());
+  else {
+    auto found = valueNames.find(domain->getOperand(1));
+    if (found == valueNames.end())
+      return operation.emitOpError("has no emitted cuTile loop bound");
+    stop = found->second;
+  }
+  SmallVector<std::string> carriers;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> initial = lookupValue(operation, index + 1);
+    if (failed(initial))
+      return failure();
+    std::string carrier =
+        uniqueName("loop_state_" + std::to_string(index), *node);
+    line(carrier + " = " + initial->str());
+    carriers.push_back(carrier);
+    valueNames[body.getArgument(index + 1)] = carrier;
+  }
+  loopCarriers[&operation] = carriers;
+  std::string iterator = makeRegionArgumentName(operation, 0);
+  valueNames[body.getArgument(0)] = iterator;
+  line("for " + iterator + " in range(" + stop + "):");
+  ++indentation;
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveFor(Operation &operation) {
+  auto carriers = loopCarriers.find(&operation);
+  if (carriers == loopCarriers.end())
+    return operation.emitOpError("has no active cuTile sequential loop");
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    bindResult(operation, index, carriers->second[index]);
+  return success();
+}
+
+LogicalResult SourceEmitter::enterIf(Operation &operation) {
+  FailureOr<StringRef> condition = lookupValue(operation, 0);
+  if (failed(condition) || operation.getNumRegions() != 2)
+    return operation.emitOpError("lacks a mechanical cuTile scalar branch");
+  SmallVector<std::string> results;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    results.push_back(makeResultName(operation, index));
+  ifResults[&operation] = std::move(results);
+  line("if " + condition->str() + ":");
+  ++indentation;
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveIf(Operation &operation) {
+  auto results = ifResults.find(&operation);
+  if (results == ifResults.end())
+    return operation.emitOpError("has no active cuTile scalar branch");
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    bindResult(operation, index, results->second[index]);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitYield(Operation &operation) {
+  Operation *owner = operation.getParentOp();
+  if (!owner)
+    return operation.emitOpError("has no structured-control owner");
+  StringRef name = owner->getName().getStringRef();
+  if (name == "intent.for") {
+    auto carriers = loopCarriers.find(owner);
+    if (carriers == loopCarriers.end() ||
+        carriers->second.size() != operation.getNumOperands())
+      return operation.emitOpError("does not match its cuTile loop state");
+    for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
+      FailureOr<StringRef> yielded = lookupValue(operation, index);
+      if (failed(yielded))
+        return failure();
+      line(carriers->second[index] + " = " + yielded->str());
+    }
+    return success();
+  }
+  if (name != "intent.if")
+    return success();
+  auto results = ifResults.find(owner);
+  if (results == ifResults.end() ||
+      results->second.size() != operation.getNumOperands())
+    return operation.emitOpError("does not match its cuTile branch results");
+  if (operation.getNumOperands() == 0)
+    line("pass");
+  for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
+    FailureOr<StringRef> yielded = lookupValue(operation, index);
+    if (failed(yielded))
+      return failure();
+    line(results->second[index] + " = " + yielded->str());
+  }
+  if (operation.getParentRegion() == &owner->getRegion(0)) {
+    --indentation;
+    line("else:");
+    ++indentation;
+  }
+  return success();
+}
+
+LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "buffer emission");
+  plan::BufferOp binding =
+      succeeded(node) ? planIndex.buffers.lookup(*node) : plan::BufferOp();
+  FailureOr<target::LogicalBufferInfo> info =
+      target::getLogicalBufferInfo(operation);
+  FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (failed(node) || !binding ||
+      binding.getSpace() != "private_scalar_array" || failed(info) ||
+      info->shape.size() != 1 || failed(initializer))
+    return operation.emitOpError(
+        "lacks a private scalar-array cuTile buffer binding");
+  std::string base = makeResultName(operation, 0);
+  SmallVector<std::string> elements;
+  for (int64_t index = 0; index < info->shape.front(); ++index) {
+    std::string element = base + "_" + std::to_string(index);
+    line(element + " = " + initializer->str());
+    elements.push_back(std::move(element));
+  }
+  scalarBuffers[operation.getResult(0)] = std::move(elements);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto buffer = operation.getNumOperands() > 0
+                    ? scalarBuffers.find(operation.getOperand(0))
+                    : scalarBuffers.end();
+  FailureOr<target::LogicalBufferIndex> index =
+      target::getLogicalBufferIndex(operation);
+  if (buffer == scalarBuffers.end() || failed(index) ||
+      buffer->second.empty() || operation.getNumResults() != 1)
+    return operation.emitOpError("lacks a scalarized cuTile buffer load");
+  std::string expression;
+  if (index->constant) {
+    if (*index->constant < 0 ||
+        static_cast<size_t>(*index->constant) >= buffer->second.size())
+      return operation.emitOpError("indexes outside its private buffer");
+    expression = buffer->second[*index->constant];
+  } else {
+    FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+    if (failed(dynamic))
+      return failure();
+    expression = buffer->second.back();
+    for (int64_t position = static_cast<int64_t>(buffer->second.size()) - 2;
+         position >= 0; --position)
+      expression = "ct.where(" + dynamic->str() + " == " +
+                   std::to_string(position) + ", " + buffer->second[position] +
+                   ", " + expression + ")";
+  }
+  std::string result = makeResultName(operation, 0);
+  line(result + " = " + expression);
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
+  auto buffer = operation.getNumOperands() > 0
+                    ? scalarBuffers.find(operation.getOperand(0))
+                    : scalarBuffers.end();
+  FailureOr<target::LogicalBufferIndex> index =
+      target::getLogicalBufferIndex(operation);
+  FailureOr<StringRef> stored = lookupValue(operation, 1);
+  if (buffer == scalarBuffers.end() || failed(index) || failed(stored) ||
+      buffer->second.empty())
+    return operation.emitOpError("lacks a scalarized cuTile buffer store");
+  if (index->constant) {
+    if (*index->constant < 0 ||
+        static_cast<size_t>(*index->constant) >= buffer->second.size())
+      return operation.emitOpError("indexes outside its private buffer");
+    line(buffer->second[*index->constant] + " = " + stored->str());
+    return success();
+  }
+  FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+  if (failed(dynamic))
+    return failure();
+  for (auto [position, element] : llvm::enumerate(buffer->second))
+    line(element + " = ct.where(" + dynamic->str() + " == " +
+         std::to_string(position) + ", " + stored->str() + ", " + element +
+         ")");
+  return success();
+}
+
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
@@ -756,7 +987,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
     return failure();
   std::string result = makeResultName(operation, 0);
   if (binding.getLowering() == "ct.full_cast")
-    line(result + " = ct.full((1,), " + operand->str() + ", dtype=" +
+    line(result + " = ct.full((), " + operand->str() + ", dtype=" +
          targetType + ")");
   else
     line(result + " = ct.astype(" + operand->str() + ", " + targetType + ")");

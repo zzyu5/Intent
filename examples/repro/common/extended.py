@@ -93,6 +93,10 @@ from kernels.sampling.nucleus import CANDIDATES as NUCLEUS_CANDIDATES
 from kernels.sampling.nucleus import ROWS as NUCLEUS_ROWS
 from kernels.sampling.nucleus import THRESHOLD as NUCLEUS_THRESHOLD
 from kernels.sampling.nucleus import sorted_nucleus_cutoff
+from kernels.sampling.top_k import ROWS as TOP_K_ROWS
+from kernels.sampling.top_k import TOP_K
+from kernels.sampling.top_k import VOCABULARY as TOP_K_VOCABULARY
+from kernels.sampling.top_k import insertion_top_k
 from kernels.streaming.online_softmax import COLUMNS as ONLINE_COLUMNS
 from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from kernels.streaming.online_softmax import streamed_online_softmax
@@ -1726,6 +1730,42 @@ def _run_sorted_nucleus_cutoff(
     print(f"{target_name} sorted nucleus cutoff upstream baseline: unavailable")
 
 
+def _run_insertion_top_k(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("insertion top-k has no algorithm-matched baseline")
+    logits = torch.randn(
+        (TOP_K_ROWS, TOP_K_VOCABULARY), device="cuda", dtype=torch.float32
+    )
+    artifact = intent.compile(insertion_top_k, target=target, compiler=compiler)
+    generated_values, generated_indices = artifact.run(logits)
+    expected_values, expected_indices = torch.topk(
+        logits, TOP_K, dim=1, largest=True, sorted=True
+    )
+    value_error = (generated_values - expected_values).abs().max().item()
+    index_matches = torch.equal(generated_indices.long(), expected_indices.long())
+    if value_error != 0.0 or not index_matches:
+        raise RuntimeError(
+            f"{target_name} insertion top-k comparison failed: "
+            f"values={value_error}, indices={index_matches}"
+        )
+    call = prepare_kernel_call(
+        artifact, (logits,), (generated_values, generated_indices)
+    )
+    p50, p95 = benchmark(call, warmup=3, repetitions=100, cuda_graph=True)
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} insertion top-k numerical comparison: PASS "
+        f"(value error={value_error}, indices={index_matches})"
+    )
+    print(
+        f"{target_name} insertion top-k kernel-only performance (CUDA Graph): "
+        f"p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} insertion top-k upstream baseline: unavailable")
+
+
 def _run_embedding_backward_atomic(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -1787,6 +1827,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "grouped_query_head_add": _run_grouped_query_head_add,
+    "insertion_top_k": _run_insertion_top_k,
     "layer_norm": _run_layer_norm,
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,

@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -16,6 +17,14 @@ namespace {
 LogicalResult addHandler(OperationHandlerRegistry &registry, StringRef name,
                          OperationCallback enter) {
   return registry.add(name, OperationHandler{std::move(enter), {}});
+}
+
+Operation *nearestParallelOwner(Operation &operation) {
+  for (Operation *parent = operation.getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->getName().getStringRef() == "intent.parallel")
+      return parent;
+  return nullptr;
 }
 
 LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
@@ -119,6 +128,9 @@ FailureOr<LogicalAxis> axisFromView(Value source, unsigned sourceAxis,
 FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
                                       const KernelFacts &facts,
                                       Operation &consumer) {
+  auto staticExtent = facts.staticDomainExtents.find(&domain);
+  if (staticExtent != facts.staticDomainExtents.end())
+    return LogicalAxis{&domain, std::to_string(staticExtent->second)};
   auto source = facts.domainSources.find(&domain);
   auto sourceAxis = facts.domainSourceAxes.find(&domain);
   if (source == facts.domainSources.end() ||
@@ -569,7 +581,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   if (failed(addHandler(
           registry, "intent.domain", [&](Operation &operation) -> LogicalResult {
-            if (operation.getNumOperands() < 2 || operation.getNumResults() != 1)
+            if ((operation.getNumOperands() != 2 &&
+                 operation.getNumOperands() != 3) ||
+                operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical domain schema");
             Operation *start = operation.getOperand(0).getDefiningOp();
             Operation *stop = operation.getOperand(1).getDefiningOp();
@@ -578,12 +592,30 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                       : IntegerAttr();
             auto axis = stop ? stop->getAttrOfType<IntegerAttr>("intent.axis")
                              : IntegerAttr();
+            Operation *step = operation.getNumOperands() == 3
+                                  ? operation.getOperand(2).getDefiningOp()
+                                  : nullptr;
+            auto stepValue =
+                step ? step->getAttrOfType<IntegerAttr>("intent.value")
+                     : IntegerAttr();
             if (!start || start->getName().getStringRef() != "intent.constant" ||
-                !startValue || startValue.getInt() != 0 || !stop ||
-                stop->getName().getStringRef() != "intent.dim" || !axis ||
+                !startValue || startValue.getInt() != 0 ||
+                (step && (step->getName().getStringRef() != "intent.constant" ||
+                          !stepValue || stepValue.getInt() != 1)))
+              return operation.emitOpError(
+                  "realization requires a zero-based unit-step domain");
+            auto stopValue =
+                stop ? stop->getAttrOfType<IntegerAttr>("intent.value")
+                     : IntegerAttr();
+            if (stop && stop->getName().getStringRef() == "intent.constant" &&
+                stopValue && stopValue.getInt() > 0) {
+              facts.staticDomainExtents[&operation] = stopValue.getInt();
+              return success();
+            }
+            if (!stop || stop->getName().getStringRef() != "intent.dim" || !axis ||
                 stop->getNumOperands() != 1)
               return operation.emitOpError(
-                  "realization currently requires zero-based ABI dimensions");
+                  "domain stop must be a positive constant or ABI dimension");
             facts.domainSources[&operation] = stop->getOperand(0);
             facts.domainSourceAxes[&operation] = axis.getInt();
             return success();
@@ -633,6 +665,148 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             facts.parallels.push_back(&operation);
             return success();
           })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.for", [&](Operation &operation) -> LogicalResult {
+            Operation *domain = operation.getNumOperands() > 0
+                                    ? operation.getOperand(0).getDefiningOp()
+                                    : nullptr;
+            if (!domain ||
+                (!facts.domainSourceAxes.count(domain) &&
+                 !facts.staticDomainExtents.count(domain)) ||
+                operation.getNumRegions() != 1 ||
+                !llvm::hasSingleElement(operation.getRegion(0)) ||
+                operation.getNumOperands() != operation.getNumResults() + 1 ||
+                operation.getRegion(0).front().getNumArguments() !=
+                    operation.getNumResults() + 1 ||
+                !isa<intent::LogicalIndexType>(
+                    operation.getRegion(0).front().getArgument(0).getType()))
+              return operation.emitOpError(
+                  "has no canonical sequential-for schema");
+            Operation &terminator = operation.getRegion(0).front().back();
+            if (terminator.getName().getStringRef() != "intent.yield" ||
+                terminator.getNumOperands() != operation.getNumResults())
+              return operation.emitOpError(
+                  "sequential for must yield every carried value");
+            for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+              Type initial = operation.getOperand(index + 1).getType();
+              Type argument = operation.getRegion(0).front()
+                                  .getArgument(index + 1)
+                                  .getType();
+              Type result = operation.getResult(index).getType();
+              if (!initial.isIntOrIndexOrFloat() || initial != argument ||
+                  initial != result ||
+                  terminator.getOperand(index).getType() != result)
+                return operation.emitOpError(
+                    "sequential for currently requires scalar type-stable carried values");
+            }
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.if", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 ||
+                !operation.getOperand(0).getType().isInteger(1) ||
+                operation.getNumRegions() != 2)
+              return operation.emitOpError("has no canonical scalar-if schema");
+            for (Region &branch : operation.getRegions()) {
+              if (!llvm::hasSingleElement(branch) || branch.front().empty() ||
+                  branch.front().getNumArguments() != 0)
+                return operation.emitOpError(
+                    "scalar if requires two single-block branches");
+              Operation &terminator = branch.front().back();
+              if (terminator.getName().getStringRef() != "intent.yield" ||
+                  terminator.getNumOperands() != operation.getNumResults())
+                return operation.emitOpError(
+                    "scalar if branches must yield every result");
+              for (auto [yielded, result] :
+                   llvm::zip(terminator.getOperands(), operation.getResults()))
+                if (!result.getType().isIntOrIndexOrFloat() ||
+                    yielded.getType() != result.getType())
+                  return operation.emitOpError(
+                      "scalar if currently requires scalar type-stable results");
+            }
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.buffer", [&](Operation &operation) -> LogicalResult {
+            FailureOr<LogicalBufferInfo> info = getLogicalBufferInfo(operation);
+            Operation *owner = nearestParallelOwner(operation);
+            if (failed(info) || !owner || operation.getParentOp() != owner ||
+                info->shape.size() != 1)
+              return operation.emitOpError(
+                  "private logical buffer must be a rank-one direct child of one parallel owner");
+            facts.logicalBuffers[&operation] =
+                LogicalBufferFact{owner, std::move(*info)};
+            return success();
+          })))
+    return failure();
+
+  auto validateBufferAccess = [&](Operation &operation) -> LogicalResult {
+    Operation *buffer = operation.getNumOperands() > 0
+                            ? operation.getOperand(0).getDefiningOp()
+                            : nullptr;
+    auto found = facts.logicalBuffers.find(buffer);
+    FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+    if (found == facts.logicalBuffers.end() || failed(relation) ||
+        relation->size() != 1 ||
+        ((*relation)[0].kind != "value_index" &&
+         (*relation)[0].kind != "static_index") ||
+        nearestParallelOwner(operation) != found->second.owner)
+      return operation.emitOpError(
+          "private logical buffer access must use one scalar index under its owner");
+    if ((*relation)[0].kind == "value_index" &&
+        ((*relation)[0].operands.size() != 1 ||
+         !(*relation)[0].operands.front()))
+      return operation.emitOpError(
+          "private logical buffer dynamic index is not canonical");
+    if ((*relation)[0].kind == "value_index") {
+      unsigned operandIndex = *(*relation)[0].operands.front();
+      auto iterator = operandIndex < operation.getNumOperands()
+                          ? dyn_cast<BlockArgument>(
+                                operation.getOperand(operandIndex))
+                          : BlockArgument();
+      Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
+      Operation *domain = loop && loop->getName().getStringRef() == "intent.for" &&
+                                  iterator.getArgNumber() == 0 &&
+                                  loop->getNumOperands() > 0
+                              ? loop->getOperand(0).getDefiningOp()
+                              : nullptr;
+      auto extent = facts.staticDomainExtents.find(domain);
+      if (!domain || extent == facts.staticDomainExtents.end() ||
+          extent->second > found->second.info.shape.front())
+        return operation.emitOpError(
+            "private logical buffer dynamic index must be a bounded static sequential iterator");
+    } else {
+      std::optional<int64_t> index = (*relation)[0].staticValues.size() == 1
+                                         ? (*relation)[0].staticValues.front()
+                                         : std::nullopt;
+      if (!index || *index < 0 || *index >= found->second.info.shape.front())
+        return operation.emitOpError(
+            "private logical buffer static index is outside its extent");
+    }
+    bool load = operation.getName().getStringRef() == "intent.buffer_load";
+    if (load &&
+        (operation.getNumResults() != 1 ||
+         operation.getResult(0).getType() != found->second.info.elementType))
+      return operation.emitOpError(
+          "private logical buffer load must produce one matching scalar");
+    auto valueIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    if (!load &&
+        (operation.getNumResults() != 0 || !valueIndex ||
+         valueIndex.getInt() != 1 || operation.getNumOperands() < 2 ||
+         operation.getOperand(1).getType() != found->second.info.elementType))
+      return operation.emitOpError(
+          "private logical buffer store must consume one matching scalar value");
+    return success();
+  };
+  if (failed(addHandler(registry, "intent.buffer_load", validateBufferAccess)) ||
+      failed(addHandler(registry, "intent.buffer_store", validateBufferAccess)))
     return failure();
 
   if (failed(addHandler(
@@ -1149,6 +1323,15 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
     if (domain && facts.domainSourceAxes.count(domain))
       return domain;
     consumer.emitOpError("cannot resolve a state stream to its source domain");
+    return failure();
+  }
+  if (owner && owner->getName().getStringRef() == "intent.for" &&
+      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
+    Operation *domain = owner->getOperand(0).getDefiningOp();
+    if (domain && (facts.domainSourceAxes.count(domain) ||
+                   facts.staticDomainExtents.count(domain)))
+      return domain;
+    consumer.emitOpError("cannot resolve a sequential for to its source domain");
     return failure();
   }
   if (!owner || owner->getName().getStringRef() != "intent.parallel" ||

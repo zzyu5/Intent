@@ -192,6 +192,15 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
+      Operation *buffer = kernel.nodes.lookup(value.getNode());
+      if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
+          value.getSpace() != "private_scalar_array")
+        return value.emitOpError(
+            "does not bind a private scalar-array logical buffer");
+      plan::BufferOp binding;
+      binding.operation = value;
+      index.buffers[value.getNode()] = binding;
     } else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation)) {
       plan::PaddingOp binding;
       binding.operation = value;
@@ -1406,7 +1415,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "):\n            compiled = " << kernelName << "(";
     emitBuilderArguments(-1);
     output << ")\n";
-  } else {
+  } else if (!planIndex.components.reusedAxes.empty()) {
     std::string rowDimension = roleDimensions.lookup("lane_0");
     if (rowDimension.empty())
       return kernel.entry.emitOpError(
@@ -1419,6 +1428,10 @@ LogicalResult SourceEmitter::emitWrapper() {
            << "num_stages=row_configuration(" << rowDimension
            << ").num_stages, threads=row_configuration(" << rowDimension
            << ").threads)\n";
+  } else {
+    output << "        compiled = " << kernelName << "(";
+    emitBuilderArguments(-1);
+    output << ")\n";
   }
   output << "        _KERNEL_CACHE[cache_key] = compiled\n";
   output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";
@@ -1649,7 +1662,8 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
       indices.push_back(assumed == assumedIndexNames.end()
                             ? exact->str() + "[0]"
                             : assumed->second);
-    } else if (term.kind == "value_index") {
+    } else if (term.kind == "value_index" ||
+               target::emission::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -1724,7 +1738,8 @@ SourceEmitter::elementAccessIndices(Operation &operation,
                             ? exact->str() + "[" + tileIndices[tileAxis] + "]"
                             : assumed->second);
       ++tileAxis;
-    } else if (term.kind == "value_index") {
+    } else if (term.kind == "value_index" ||
+               target::emission::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -2183,6 +2198,21 @@ std::string SourceEmitter::makeResultName(Operation &operation, unsigned index) 
                                            : StringAttr();
   FailureOr<int64_t> node = target::getNodeID(operation, "result naming");
   return uniqueName(name ? name.getValue() : "value", *node);
+}
+
+std::string SourceEmitter::makeRegionArgumentName(Operation &operation,
+                                                  unsigned argumentIndex) {
+  auto regions =
+      operation.getAttrOfType<ArrayAttr>("intent.region_argument_names");
+  auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
+                                            : ArrayAttr();
+  auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
+                                             : ArrayAttr();
+  auto name = arguments && argumentIndex < arguments.size()
+                  ? dyn_cast<StringAttr>(arguments[argumentIndex])
+                  : StringAttr();
+  FailureOr<int64_t> node = target::getNodeID(operation, "region naming");
+  return uniqueName(name ? name.getValue() : "region", *node);
 }
 
 void SourceEmitter::line(StringRef text) {

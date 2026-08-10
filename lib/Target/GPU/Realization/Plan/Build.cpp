@@ -438,9 +438,24 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                          "intent.parallel", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member",
                          "intent.state_stream", "intent.scatter_reduce",
-                         "intent.yield", "intent.return"})
+                         "intent.for", "intent.if", "intent.buffer_load",
+                         "intent.buffer_store", "intent.yield", "intent.return"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
+
+  if (failed(addHandler(
+          registry, "intent.buffer", [&](Operation &operation) -> LogicalResult {
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "logical-buffer binding");
+            if (failed(node) || !facts.logicalBuffers.count(&operation))
+              return operation.emitOpError(
+                  "has no canonical private logical-buffer facts");
+            builder.create<intent::plan::BufferOp>(
+                operation.getLoc(), i64(builder, *node),
+                string(builder, "private_scalar_array"));
+            return success();
+          })))
+    return failure();
 
   auto bindTransfer = [&](Operation &operation) -> LogicalResult {
     FailureOr<int64_t> node = target::getNodeID(operation, "transfer binding");

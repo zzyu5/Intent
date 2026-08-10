@@ -65,6 +65,12 @@ def IntentPlan_ProgramOp : IntentPlan_Op<"program"> {
   let hasVerifier = 1;
 }
 
+def IntentPlan_BufferOp : IntentPlan_Op<"buffer"> {
+  let arguments = (ins I64Attr:$node, StrAttr:$space);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentPlan_PaddingOp : IntentPlan_Op<"padding"> {
   let arguments = (ins
     I64Attr:$value,

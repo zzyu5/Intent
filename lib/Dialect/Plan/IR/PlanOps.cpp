@@ -146,6 +146,14 @@ LogicalResult intent::plan::verifyPaddingFields(
   return success();
 }
 
+LogicalResult BufferOp::verify() {
+  if (failed(requireNode(*this, getNode())))
+    return failure();
+  if (getSpace() != "private_scalar_array")
+    return emitOpError("requires private scalar-array residency");
+  return success();
+}
+
 LogicalResult PaddingOp::verify() {
   return verifyPaddingFields(*this, getValue(), getTensorAxes(),
                              getDomainNodes(), getFill());
@@ -261,6 +269,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
+  llvm::DenseSet<int64_t> buffers;
   SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> stageNodes;
@@ -281,6 +290,9 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       program = choice;
+    } else if (auto binding = dyn_cast<BufferOp>(operation)) {
+      if (!buffers.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates a logical-buffer decision");
     } else if (auto binding = dyn_cast<PaddingOp>(operation)) {
       if (!paddedValues.insert(binding.getValue()).second)
         return binding.emitOpError("duplicates a value padding decision");

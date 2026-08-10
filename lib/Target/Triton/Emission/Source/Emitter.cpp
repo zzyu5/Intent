@@ -191,6 +191,15 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
+      Operation *buffer = kernel.nodes.lookup(value.getNode());
+      if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
+          value.getSpace() != "private_scalar_array")
+        return value.emitOpError(
+            "does not bind a private scalar-array logical buffer");
+      plan::BufferOp binding;
+      binding.operation = value;
+      index.buffers[value.getNode()] = binding;
     } else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation)) {
       plan::PaddingOp binding;
       binding.operation = value;
@@ -1708,6 +1717,12 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
                 "Triton indirect tensor indices currently require one logical axis");
           index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
         }
+      } else if (target::emission::isSequentialIterator(indexed)) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        index = "(" + exact->str() + ")";
       } else {
         FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
         if (failed(axis))
@@ -1808,6 +1823,9 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
       }
       continue;
     }
+    if (term.kind == "region_index" &&
+        target::emission::isSequentialIterator(indexed))
+      continue;
     FailureOr<Operation *> domain =
         resolveDomain(indexed, operation);
     FailureOr<plan::AxisOp> axis =

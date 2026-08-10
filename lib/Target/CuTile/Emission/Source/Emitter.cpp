@@ -174,6 +174,15 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
+    } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
+      Operation *buffer = kernel.nodes.lookup(value.getNode());
+      if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
+          value.getSpace() != "private_scalar_array")
+        return value.emitOpError(
+            "does not bind a private scalar-array logical buffer");
+      plan::BufferOp binding;
+      binding.operation = value;
+      index.buffers[value.getNode()] = binding;
     } else if (auto value = dyn_cast<intent::plan::PaddingOp>(operation)) {
       plan::PaddingOp binding;
       binding.operation = value;
@@ -1362,132 +1371,158 @@ LogicalResult SourceEmitter::emitWrapper() {
            << " shape violates the kernel symbols')\n";
   }
   output << "    stream = torch.cuda.current_stream()\n";
-  SmallVector<plan::AxisOp> programAxes =
-      target::emission::orderedProgramAxes(planIndex);
-  SmallVector<plan::AxisOp> dynamicRaggedAxes;
-  for (plan::AxisOp axis : programAxes) {
-    if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
-      continue;
-    FailureOr<plan::RaggedOp> relation =
-        target::emission::uniqueRaggedRelation(
-            planIndex, axis.getNode(), *axis.operation.getOperation());
-    auto runtime = succeeded(relation)
-                       ? raggedRuntimeByRelation.find(relation->getNode())
-                       : raggedRuntimeByRelation.end();
-    if (failed(relation) || runtime == raggedRuntimeByRelation.end())
-      return axis.emitOpError("has no ordered ragged runtime metadata");
-    ABIView *offsets = raggedRuntimes[runtime->second].offsets;
-    output << "    max_member_length_" << axis.getNode() << " = int(("
-           << offsets->argument->name << "[1:] - "
-           << offsets->argument->name << "[:-1]).max().item())\n";
-    dynamicRaggedAxes.push_back(axis);
-  }
-  output << "    cache_key = (";
-  for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
-    if (index)
-      output << ", ";
-    output << dimension;
-  }
-  for (plan::AxisOp axis : dynamicRaggedAxes)
-    output << ", max_member_length_" << axis.getNode();
-  for (ABIView *input : inputs)
-    output << ", " << input->argument->name << ".dtype";
-  output << ", str(_DEVICE))\n";
-  output << "    if cache_key not in _TUNE_CACHE:\n";
-  output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
-  output << "            result = exhaustive_search(\n";
-  output << "                _CONFIGS,\n                stream,\n";
-  std::array<std::string, 3> candidateGrid =
-      target::emission::projectProgramGrid(
+  if (!searchIndex.autotune) {
+    SmallVector<plan::AxisOp> axes =
+        target::emission::orderedProgramAxes(planIndex);
+    if (planIndex.program.getPersistent() ||
+        llvm::any_of(axes, [](plan::AxisOp axis) { return !axis.isScalar(); }))
+      return realization.emitOpError(
+          "untuned cuTile launch requires scalar non-persistent program axes");
+    std::array<std::string, 3> grid =
+        target::emission::projectProgramGrid(
+            planIndex, [&](plan::AxisOp axis) {
+              std::string role =
+                  "program_" + std::to_string(axis.getProgramOrder());
+              return roleDimensions.lookup(role);
+            });
+    output << "    grid = (" << grid[0] << ", " << grid[1] << ", "
+           << grid[2] << ")\n";
+    output << "    return ct.launch(stream, grid, " << kernelName << ", (";
+    for (ABIView &view : views)
+      output << view.argument->name << ", ";
+    for (ABIScalar &scalar : scalars)
+      output << scalar.name << ", ";
+    for (const std::string &dimension : kernelConstants)
+      output << dimension << ", ";
+    output << "))\n\n\n";
+  } else {
+    SmallVector<plan::AxisOp> programAxes =
+        target::emission::orderedProgramAxes(planIndex);
+    SmallVector<plan::AxisOp> dynamicRaggedAxes;
+    for (plan::AxisOp axis : programAxes) {
+      if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
+        continue;
+      FailureOr<plan::RaggedOp> relation =
+          target::emission::uniqueRaggedRelation(
+              planIndex, axis.getNode(), *axis.operation.getOperation());
+      auto runtime = succeeded(relation)
+                         ? raggedRuntimeByRelation.find(relation->getNode())
+                         : raggedRuntimeByRelation.end();
+      if (failed(relation) || runtime == raggedRuntimeByRelation.end())
+        return axis.emitOpError("has no ordered ragged runtime metadata");
+      ABIView *offsets = raggedRuntimes[runtime->second].offsets;
+      output << "    max_member_length_" << axis.getNode() << " = int(("
+             << offsets->argument->name << "[1:] - "
+             << offsets->argument->name << "[:-1]).max().item())\n";
+      dynamicRaggedAxes.push_back(axis);
+    }
+    output << "    cache_key = (";
+    for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
+      if (index)
+        output << ", ";
+      output << dimension;
+    }
+    for (plan::AxisOp axis : dynamicRaggedAxes)
+      output << ", max_member_length_" << axis.getNode();
+    for (ABIView *input : inputs)
+      output << ", " << input->argument->name << ".dtype";
+    output << ", str(_DEVICE))\n";
+    output << "    if cache_key not in _TUNE_CACHE:\n";
+    output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
+    output << "            result = exhaustive_search(\n";
+    output << "                _CONFIGS,\n                stream,\n";
+    std::array<std::string, 3> candidateGrid =
+        target::emission::projectProgramGrid(
+            planIndex, [&](plan::AxisOp axis) {
+              std::string role =
+                  "program_" + std::to_string(axis.getProgramOrder());
+              std::string extent =
+                  planIndex.components.orderedRaggedProgramAxes.contains(
+                      axis.getNode())
+                      ? "max_member_length_" + std::to_string(axis.getNode())
+                      : roleDimensions.lookup(role);
+              return axis.isScalar()
+                         ? extent
+                         : "ceil(" + extent + " / cfg." +
+                               axis.getTile().str() + ")";
+            });
+    if (planIndex.program.getPersistent()) {
+      std::string total = target::emission::projectProgramVolume(
           planIndex, [&](plan::AxisOp axis) {
             std::string role =
                 "program_" + std::to_string(axis.getProgramOrder());
-            std::string extent =
-                planIndex.components.orderedRaggedProgramAxes.contains(
-                    axis.getNode())
-                    ? "max_member_length_" + std::to_string(axis.getNode())
-                    : roleDimensions.lookup(role);
+            std::string extent = roleDimensions.lookup(role);
             return axis.isScalar()
                        ? extent
                        : "ceil(" + extent + " / cfg." +
                              axis.getTile().str() + ")";
           });
-  if (planIndex.program.getPersistent()) {
-    std::string total = target::emission::projectProgramVolume(
-        planIndex, [&](plan::AxisOp axis) {
-          std::string role =
-              "program_" + std::to_string(axis.getProgramOrder());
-          std::string extent = roleDimensions.lookup(role);
-          return axis.isScalar()
-                     ? extent
-                     : "ceil(" + extent + " / cfg." +
-                           axis.getTile().str() + ")";
-        });
-    output << "                lambda cfg: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // cfg.num_ctas, "
-           << total << ") * cfg.occupancy, 1, 1),\n";
-  } else {
-    output << "                lambda cfg: (" << candidateGrid[0] << ", "
-           << candidateGrid[1] << ", " << candidateGrid[2] << "),\n";
-  }
-  output << "                " << kernelName << ",\n";
-  output << "                lambda cfg: (";
-  for (ABIView &view : views)
-    output << view.argument->name << ", ";
-  for (ABIScalar &scalar : scalars)
-    output << scalar.name << ", ";
-  for (const std::string &dimension : kernelConstants)
-    output << dimension << ", ";
-  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-    output << "cfg." << parameter.getName().getValue() << ", ";
-  output << "),\n";
-  output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
-  output << "            )\n";
-  output << "        best = result.best.config\n";
-  output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
-         << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
-  output << "    best, tuned_kernel = _TUNE_CACHE[cache_key]\n";
-  std::array<std::string, 3> selectedGrid =
-      target::emission::projectProgramGrid(
+      output << "                lambda cfg: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // cfg.num_ctas, "
+             << total << ") * cfg.occupancy, 1, 1),\n";
+    } else {
+      output << "                lambda cfg: (" << candidateGrid[0] << ", "
+             << candidateGrid[1] << ", " << candidateGrid[2] << "),\n";
+    }
+    output << "                " << kernelName << ",\n";
+    output << "                lambda cfg: (";
+    for (ABIView &view : views)
+      output << view.argument->name << ", ";
+    for (ABIScalar &scalar : scalars)
+      output << scalar.name << ", ";
+    for (const std::string &dimension : kernelConstants)
+      output << dimension << ", ";
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+      output << "cfg." << parameter.getName().getValue() << ", ";
+    output << "),\n";
+    output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
+    output << "            )\n";
+    output << "        best = result.best.config\n";
+    output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
+           << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
+    output << "    best, tuned_kernel = _TUNE_CACHE[cache_key]\n";
+    std::array<std::string, 3> selectedGrid =
+        target::emission::projectProgramGrid(
+            planIndex, [&](plan::AxisOp axis) {
+              std::string role =
+                  "program_" + std::to_string(axis.getProgramOrder());
+              std::string extent =
+                  planIndex.components.orderedRaggedProgramAxes.contains(
+                      axis.getNode())
+                      ? "max_member_length_" + std::to_string(axis.getNode())
+                      : roleDimensions.lookup(role);
+              return axis.isScalar()
+                         ? extent
+                         : "ceil(" + extent + " / best." +
+                               axis.getTile().str() + ")";
+            });
+    if (planIndex.program.getPersistent()) {
+      std::string total = target::emission::projectProgramVolume(
           planIndex, [&](plan::AxisOp axis) {
             std::string role =
                 "program_" + std::to_string(axis.getProgramOrder());
-            std::string extent =
-                planIndex.components.orderedRaggedProgramAxes.contains(
-                    axis.getNode())
-                    ? "max_member_length_" + std::to_string(axis.getNode())
-                    : roleDimensions.lookup(role);
+            std::string extent = roleDimensions.lookup(role);
             return axis.isScalar()
                        ? extent
                        : "ceil(" + extent + " / best." +
                              axis.getTile().str() + ")";
           });
-  if (planIndex.program.getPersistent()) {
-    std::string total = target::emission::projectProgramVolume(
-        planIndex, [&](plan::AxisOp axis) {
-          std::string role =
-              "program_" + std::to_string(axis.getProgramOrder());
-          std::string extent = roleDimensions.lookup(role);
-          return axis.isScalar()
-                     ? extent
-                     : "ceil(" + extent + " / best." +
-                           axis.getTile().str() + ")";
-        });
-    output << "    grid = (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // best.num_ctas, "
-           << total << ") * best.occupancy, 1, 1)\n";
-  } else {
-    output << "    grid = (" << selectedGrid[0] << ", " << selectedGrid[1]
-           << ", " << selectedGrid[2] << ")\n";
+      output << "    grid = (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // best.num_ctas, "
+             << total << ") * best.occupancy, 1, 1)\n";
+    } else {
+      output << "    grid = (" << selectedGrid[0] << ", " << selectedGrid[1]
+             << ", " << selectedGrid[2] << ")\n";
+    }
+    output << "    return ct.launch(stream, grid, tuned_kernel, (";
+    for (ABIView &view : views)
+      output << view.argument->name << ", ";
+    for (ABIScalar &scalar : scalars)
+      output << scalar.name << ", ";
+    for (const std::string &dimension : kernelConstants)
+      output << dimension << ", ";
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+      output << "best." << parameter.getName().getValue() << ", ";
+    output << "))\n\n\n";
   }
-  output << "    return ct.launch(stream, grid, tuned_kernel, (";
-  for (ABIView &view : views)
-    output << view.argument->name << ", ";
-  for (ABIScalar &scalar : scalars)
-    output << scalar.name << ", ";
-  for (const std::string &dimension : kernelConstants)
-    output << dimension << ", ";
-  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-    output << "best." << parameter.getName().getValue() << ", ";
-  output << "))\n\n\n";
   output << "def run(";
   firstParameter = true;
   for (ABIView *view : inputs) {
@@ -1833,8 +1868,10 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       return operation.emitOpError(
           "cuTile access has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
-    if (term.kind == "value_index" &&
-        !isa<RankedTensorType>(indexed.getType())) {
+    if ((term.kind == "value_index" &&
+         !isa<RankedTensorType>(indexed.getType())) ||
+        (term.kind == "region_index" &&
+         target::emission::isSequentialIterator(indexed))) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -1892,8 +1929,10 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
       return operation.emitOpError(
           "cuTile tile has no mechanical shape relation");
     Value indexed = operation.getOperand(*term.operands.front());
-    if (term.kind == "value_index" &&
-        !isa<RankedTensorType>(indexed.getType())) {
+    if ((term.kind == "value_index" &&
+         !isa<RankedTensorType>(indexed.getType())) ||
+        (term.kind == "region_index" &&
+         target::emission::isSequentialIterator(indexed))) {
       extents.push_back("1");
     } else {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);

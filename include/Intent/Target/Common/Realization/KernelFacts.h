@@ -2,6 +2,7 @@
 #define INTENT_TARGET_COMMON_REALIZATION_KERNELFACTS_H
 
 #include "Intent/Target/Common/Analysis/Kernel.h"
+#include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -54,12 +55,18 @@ struct ContractionFact {
   llvm::SmallVector<unsigned> rhsReductionAxes;
 };
 
+struct LogicalBufferFact {
+  mlir::Operation *owner = nullptr;
+  LogicalBufferInfo info;
+};
+
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
   KernelModel &kernel;
   llvm::DenseMap<mlir::Operation *, mlir::Value> domainSources;
   llvm::DenseMap<mlir::Operation *, int64_t> domainSourceAxes;
+  llvm::DenseMap<mlir::Operation *, int64_t> staticDomainExtents;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
   llvm::SmallVector<mlir::Operation *> parallels;
   llvm::DenseMap<mlir::Operation *, std::string> boundaryFills;
@@ -78,6 +85,7 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> wholeViewLoads;
   llvm::DenseSet<mlir::Operation *> scatterWrites;
   llvm::DenseMap<mlir::Operation *, ContractionFact> contractions;
+  llvm::DenseMap<mlir::Operation *, LogicalBufferFact> logicalBuffers;
 };
 
 mlir::LogicalResult analyzeKernelFacts(KernelFacts &facts);

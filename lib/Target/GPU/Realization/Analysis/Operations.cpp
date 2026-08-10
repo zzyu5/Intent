@@ -154,6 +154,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                          "intent.region_end",
                          "intent.assume_in_bounds",
                          "intent.partition", "intent.parallel",
+                         "intent.for", "intent.if", "intent.buffer",
+                         "intent.buffer_load", "intent.buffer_store",
                          "intent.view_load", "intent.view_store", "intent.yield",
                          "intent.return", "intent.state_stream", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member",

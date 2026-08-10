@@ -21,6 +21,7 @@ namespace intent::triton::plan {
 using TargetOp = target::emission::TargetBinding;
 using AxisOp = target::emission::AxisBinding;
 using ProgramOp = target::emission::ProgramBinding;
+using BufferOp = target::emission::BufferBinding;
 using PaddingOp = target::emission::PaddingBinding;
 using ReductionOp = target::emission::ReductionBinding;
 using ScanOp = target::emission::ScanBinding;
@@ -42,6 +43,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
+  llvm::DenseMap<int64_t, plan::BufferOp> buffers;
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::ScanOp> scans;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
@@ -97,6 +99,14 @@ public:
   mlir::LogicalResult emitDimension(mlir::Operation &operation);
   mlir::LogicalResult enterParallel(mlir::Operation &operation);
   mlir::LogicalResult leaveParallel(mlir::Operation &operation);
+  mlir::LogicalResult enterFor(mlir::Operation &operation);
+  mlir::LogicalResult leaveFor(mlir::Operation &operation);
+  mlir::LogicalResult enterIf(mlir::Operation &operation);
+  mlir::LogicalResult leaveIf(mlir::Operation &operation);
+  mlir::LogicalResult emitYield(mlir::Operation &operation);
+  mlir::LogicalResult emitBuffer(mlir::Operation &operation);
+  mlir::LogicalResult emitBufferLoad(mlir::Operation &operation);
+  mlir::LogicalResult emitBufferStore(mlir::Operation &operation);
   mlir::LogicalResult emitLoad(mlir::Operation &operation);
   mlir::LogicalResult emitIndices(mlir::Operation &operation);
   mlir::LogicalResult emitRandom(mlir::Operation &operation);
@@ -198,6 +208,10 @@ private:
   llvm::SmallVector<std::string> dimensionOrder;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
+      loopCarriers;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string>> scalarBuffers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>
       operationStages;
   llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;

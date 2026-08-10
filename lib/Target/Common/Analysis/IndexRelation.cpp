@@ -24,6 +24,9 @@ Operation *structuralDomain(Value value) {
   if (name == "intent.state_stream" && argument.getArgNumber() == 0 &&
       owner->getNumOperands() > 0)
     return owner->getOperand(0).getDefiningOp();
+  if (name == "intent.for" && argument.getArgNumber() == 0 &&
+      owner->getNumOperands() > 0)
+    return owner->getOperand(0).getDefiningOp();
   if (name != "intent.parallel" || owner->getNumOperands() != 1)
     return nullptr;
   Operation *source = owner->getOperand(0).getDefiningOp();
