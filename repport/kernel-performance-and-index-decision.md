@@ -1,314 +1,346 @@
-# Intent Kernel 编译器关键机制与当前实测报告
+# Intent Kernel 编译器全量 Kernel、三后端与测量审计报告
 
 ## 结论
 
-当前编译主链已经稳定为：
+本报告对应实现提交 `00c0c41 compose paged attention across gpu targets`，数据来自该实现完成后的同一轮真实 GPU repro，不混用旧报告数字。原始运行日志位于本机 `/tmp/intentdsl-matrix-*.log`，不是提交进仓库的永久 artifact；本报告是这轮外部运行证据的结构化快照，复现仍以文末唯一 repro 命令为准。
+
+当前状态可以压缩成五个结论：
+
+1. 当前有 **23 个公开 repro 入口**。三个后端各执行一次，共运行 **69 条 repro 命令**。
+2. GEMM、batched GEMM、grouped GEMM 和 varlen attention 会在一次入口内展开多个 case，因此实际得到 **29 个 case × 3 个后端 = 87 组数值与性能记录**；**87/87 数值 PASS**。
+3. 全量测量已经按当前口径重新执行，不是从几轮旧报告中拼表。日志中只存在 `kernel-only`、`end-to-end`、`runtime-metadata` 三种 scope，旧的 `runtime-launch` 和 `timing=unavailable` 已不存在。
+4. 分页 KV-cache decode attention 已把间接 ragged ownership、有状态流、GQA 多对一头映射、逻辑读取终点和尾块同时压到同一条 canonical Kernel MLIR → GPU Physical Plan → shared traversal → target projection 链路中。没有新增 paged-attention analyzer 或 emitter。
+5. **TileLang 目前应保留，但不应作为默认性能后端。**它在 29 个 case 中有真实胜出项，并且是检查显式存储、流水线和 buffer 语义的最强 surface；但 paged attention 仍比 Triton 慢约 `17.6×`，说明它目前更适合作为表达力与分层验证后端，而不是性能 headline。
+
+当前主链仍是：
 
 ```text
 Python DSL
   -> canonical Intent Kernel MLIR
-  -> GPU Physical Plan
-  -> shared op traversal
-  -> Triton / cuTile / TileLang source
+  -> shared GPU realization / Physical Plan
+  -> shared operation traversal
+  -> Triton / cuTile / TileLang capability projection and source emission
 ```
 
-本轮闭环的不是若干 kernel 专用补丁，而是四组共享能力：
+## 1. 本轮测量是否真的全部重跑
 
-1. CUDA Graph 短 kernel 的 L2 隔离测量；
-2. 动态索引表达式的精确地址保留、来源轴追踪和边界条件；
-3. 由同一份 Physical Plan 驱动的 persistent 程序映射；
-4. 可证明的消费者中和事实，使 TileLang 能安全采用整块搬运。
+### 1.1 运行规模
 
-同时，LayerNorm backward 的 DSL 算法改为与高性能上游一致的分组部分和结构。上述路径都通过同一个 canonical Kernel MLIR、同一个 GPU realization 和同一个 emitter 框架，没有新增按 kernel 名字分派的分析器或发射器。
-
-本报告只列当前代码树上重新执行过的受影响路径，不把更早报告中的全量 corpus 数字混入同一张表。
-
-## 1. 表示和职责边界
-
-### 1.1 Python frontend
-
-Python 只负责语法、constexpr、符号和 region lowering，以及带源码位置的诊断。标量索引表达式直接 lowering 成普通 SSA 运算；Python 中没有与 MLIR 平行的 typed Kernel IR。
-
-### 1.2 Canonical Kernel MLIR
-
-Kernel MLIR 是算法语义的唯一真理，保存：
-
-- parallel、ordered、reduction、contraction、state stream 等算法结构；
-- view、index relation、effect 和数值语义；
-- 作者明确写下的前置条件，例如 tensor-derived scalar index 的 in-bounds 合同。
-
-本轮新增的 `intent.assume_in_bounds` 是算法接口前置条件，不是目标实现提示。它不被标为 pure，因此不能被死代码消除提前删掉。
-
-### 1.3 GPU Physical Plan
-
-Physical Plan 只保留必须从多个合法物理方案中选择的事实。本轮涉及两项：
-
-- `intent_plan.program.persistent`：程序空间是否映射为固定 worker 集合，再由 worker 线性遍历 tile；
-- `intent_plan.transfer.consumer_neutralized`：某次带逻辑边界的读取，其无效 lane 是否已被后续消费者链可证明地中和。
-
-来源轴、边界域和 use-def 等分析结果只是从 Kernel MLIR 重算的派生索引，不构成独立 schema，也不是 emitter 的第三个事实来源。
-
-### 1.4 Target emission
-
-三个 emitter 都从 Kernel MLIR 与同一份 Physical Plan 取事实。共享遍历决定“发射哪个 op”，target leaf 只负责：
-
-- 能力检查；
-- 概念到目标 API/语法的映射；
-- 把明确委托给下层的事项留给 Triton、cuTile 或 TileLang。
-
-Persistent 的 tile 数、线性 worker 映射和程序索引不是三个 emitter 各算一遍；consumer neutralization 也不是 TileLang 根据 attention 名字猜出来的。
-
-## 2. CUDA Graph 测量口径
-
-### 2.1 问题
-
-CUDA event 会统计区间内排入 stream 的全部 GPU 工作。对于 CUDA Graph，反复 replay 同一批地址还会形成稳定的 L2 驻留状态。
-
-SwiGLU backward 的上游实现原地写回、主要触碰三个缓冲；生成实现保留独立输出、触碰五个缓冲。在 96 MiB L2 的 RTX 5090 D 上，不冲刷缓存会让上游工作集获得不对称的重放驻留优势，旧的约 `2.9x` 差距甚至违反按显存带宽估算的物理下限。
-
-### 2.2 当前做法
-
-所有 `cuda_graph=True` 的测量统一分配大于两倍 L2 容量的 flush buffer。每次测量在 start event 之前读取该缓冲，从而冲掉上一次 replay 的驻留数据；冲刷本身不进入计时区间。
-
-输入、输出和 workspace 仍在计时区外预分配。计时区间只保留为了得到结果必须发生的 GPU launch。
-
-### 2.3 重测结果
-
-| Kernel | Generated Triton p50 | Upstream p50 | Generated / upstream | 数值 |
-|---|---:|---:|---:|---|
-| SwiGLU backward | 0.1121 ms | 0.1085 ms | 1.0327x | PASS |
-
-结论：旧的约 `2.9x` 不是编译器性能缺口，而是图重放缓存驻留造成的测量偏差。修正后两者相差约 3.3%，generated 已处于同一带宽水平。
-
-## 3. 动态索引：保留作者已经写下的表达式
-
-### 3.1 原错误路径
-
-偏移、整除等索引表达式在 frontend 和 Kernel MLIR 中原本已经是完整 SSA。错误发生在后段：分析没有沿标量 SSA 回溯来源轴，emitter 又把动态索引重新解释为一个物理轴并打印轴基址，导致 `row + 1` 中的 `+ 1` 被静默丢失。
-
-### 3.2 当前实现
-
-当前路径分成两个互补事实：
-
-1. **地址值**直接使用已经发射的精确 SSA 表达式，不再由逻辑轴重建；
-2. **所有权/来源轴**沿 cast、unary、binary 等标量 SSA 操作数回溯，只有能归到唯一逻辑循环轴时才建立来源关系。
-
-对 derived exact address，三个 emitter 都机械生成：
-
-```text
-address >= 0 && address < logical_extent
-```
-
-恒真的比较交给下层常量折叠，不再额外建立 quasi-affine 求值器。
-
-索引来自张量标量读取时，use-def 中不存在可推导的结构范围。作者必须用 `I.assume_in_bounds(index, view, axis=...)` 声明调用前置条件；编译器验证声明位于访问前、同一 block 且绑定正确 view/axis，目标代码不再额外钳制。
-
-### 3.3 同时补全的表面映射
-
-三个 GPU target 都已覆盖：
-
-- 比较：`eq`、`ne`、`lt`、`le`、`gt`、`ge`；
-- 整数索引运算：floor divide、remainder；
-- 精确 derived scalar address 与相应边界谓词。
-
-这只是补全已有 IR 到目标语法的映射，没有新增索引表达式 IR。
-
-### 3.4 三种独立结构的实测
-
-| 结构 | DSL 表达 | Triton p50 | cuTile p50 | TileLang p50 | 数值 |
-|---|---|---:|---:|---:|---|
-| 带偏移仿射索引 | `row + 1` | 0.0220 ms | 0.0221 ms | 0.0220 ms | 3/3 PASS |
-| 多对一头映射 | `query_head // 4` | 0.0036 ms | 0.0037 ms | 0.0034 ms | 3/3 PASS |
-| tensor-derived scalar gather | 标量读取 + `assume_in_bounds` | 0.0405 ms | 0.0566 ms | 0.0430 ms | 3/3 PASS |
-
-这 9 次运行验证了三件不同的事，没有用一个“索引 kernel 模式”把它们合并处理。
-
-## 4. LayerNorm backward：修改 DSL 算法，而不是伪造编译器优化
-
-### 4.1 原算法差异
-
-旧 DSL 第一阶段为每一行各写一份 `dw/db` 部分和，部分缓冲规模约为 `4096 × 4096`。高性能上游使用固定数量的分组，让多行先原子合并到小得多的部分和缓冲，再做第二阶段归约。
-
-这是作者选择的算法编排，不是 realizer 能从 tile 大小自动推出的特化，因此修改发生在 DSL 源码。
-
-### 4.2 当前算法
-
-```text
-group = row % 128
-
-stage 1:
-  计算 dx
-  scatter-reduce atomic_add 到 partial_dw[group, feature]
-  scatter-reduce atomic_add 到 partial_db[group, feature]
-
-stage 2:
-  沿 128 个 group 做 state-stream reduction
-  写出最终 dw、db
-```
-
-运行接线在计时前分配并清零两个 `(128, 4096)` f32 workspace。多输出、作者主导的多 kernel 编排、跨并行边界的原子合并和第二阶段有序归约都通过现有 IR/Plan/emitter 机制表达。
-
-### 4.3 当前结果
-
-| Provider | Generated p50 | 数值 |
-|---|---:|---|
-| Triton | 0.1157 ms | PASS |
-| cuTile | 0.0972 ms | PASS |
-| TileLang | 0.1121 ms | PASS |
-
-最大观测误差约为：`dx=0.001953125`、`dw≈2e-6`、`db≈1e-6`。
-
-上游 Triton autograd wrapper 可以完成数值对照，但当前 adapter 无法把其内部 kernel 与 wrapper 拆开并纳入 graph capture，因此没有填写虚假的 kernel-only 延迟或比值。
-
-## 5. 共享 persistent 程序映射与 batched GEMM
-
-### 5.1 物理决策
-
-Persistent mapping 是 GPU Physical Plan 的共享机器决策：
-
-- 原逻辑程序轴折叠到固定 worker 轴；
-- worker 以线性编号遍历总 tile 空间；
-- 共享投影负责计算 program volume、线性 tile 到多轴索引的反解，以及 group index；
-- target 只把相同映射打印成各自的 launch/grid 和循环语法。
-
-当前结构条件是：contraction 位于至少三个 parallel 轴之下，并且至少两个轴需要分块。判断只读结构和轴角色，不读取 kernel 名称。
-
-Ragged member 轴暂不进入 persistent 映射，因为其动态每序列最大 extent 尚未成为 Plan 合同的一部分。当前行为是保守地不选 persistent，而不是用静态 tensor shape 猜测总工作量。
-
-### 5.2 三个 target 的机械投影
-
-- Triton：固定 grid 上限为 SM 数，worker 在 kernel 内遍历后续 wave；
-- cuTile：wrapper 根据 SM 数、`num_ctas` 和 occupancy 形成固定 grid，候选仍交给下层 tuner；
-- TileLang：固定 worker grid，加串行 wave 遍历。
-
-Emitter 没有为 batched GEMM 新增入口或整 kernel matcher。
-
-### 5.3 cuTile 转置访问修正
-
-Rank > 2 的转置 load 现在按真实物理顺序处理：
-
-```text
-ct.load
-  -> ct.permute(last_two_axes)
-  -> reshape(using permuted extents)
-```
-
-原路径先按未转置 extent reshape，方形 tile 会掩盖错误；非方形候选暴露出 18/24 个配置失败。修正后，NN/TN/NT/TT 每种布局都是 24/24 候选成功。
-
-### 5.4 cuTile 与上游 BMM
-
-| Layout | Generated / upstream p50 | 候选成功 | 数值 |
-|---|---:|---:|---|
-| NN | 1.0167x | 24/24 | PASS |
-| TN | 1.0024x | 24/24 | PASS |
-| NT | 0.9946x | 24/24 | PASS |
-| TT | 1.0201x | 24/24 | PASS |
-
-四种布局都进入上游约 ±2% 的范围，剩余差异不再支持“批量矩阵乘存在约一成通用编译器缺口”的旧判断。
-
-同一物理机制也在 Triton 和 TileLang 上实际运行。Triton 四种布局全部数值通过，已记录的 TN/NT/TT p50 分别为 `0.1229/0.1020/0.1311 ms`；TileLang 四种布局全部数值通过，已记录的 NN/NT/TT p50 分别为 `0.1058/0.1079/0.1055 ms`。这两组当前没有同 scope 的上游 BMM 数字，因此不计算比值。
-
-## 6. Consumer neutralization 与 TileLang 变长 attention
-
-### 6.1 下层真实语义
-
-TileLang 0.1.13 的 `T.copy` 会按完整 `Buffer.shape` 防止物理越界，源端越界 lane 安全填零。但 packed varlen attention 中，“越过当前 sequence_end、仍在 packed buffer 总 shape 内”的 lane 会实际读到下一序列；这不是物理越界，只能由后续逻辑有效性消除。
-
-因此不能简单把所有有界 load 改成 bulk copy，也不该在 emitter 里写 attention 特判。
-
-### 6.2 共享证明
-
-GPU realization 为 transfer 计算 `consumer_neutralized`。证明以某个读取的每个边界 domain 为起点，沿全部 use-def 路径检查：
-
-- materialized padding 必须同时匹配 value、logical axis 和 domain；
-- pointwise 运算必须保持已知 padding 语义，不能把任意 unary/binary/compare/select 当成安全；
-- contraction 中，仍存活的污染轴继续传播；被收缩的污染轴只有在配对 operand 对同一 domain 可证明为 zero 时才能停止；
-- store/scatter 必须确认当前值就是 `value_operand_index` 指向的真实写入值，不能把作为地址索引的值误判为已消费；
-- 无 user、轴关系不唯一、未知 op、重复 contraction pair 或无法证明的路径一律返回 false；
-- 两个原始 load 不能仅凭各自期望的 fill 互相证明安全。
-
-证明成立后，Plan 记录事实；TileLang emitter 只消费该事实：成立时选择 bulk `T.copy`，不成立时保持 full-tile fast path 与逐元素 guarded tail。
-
-### 6.3 不重复下层工作
-
-Bulk copy 前不再额外 `T.clear/T.fill`。物理 Buffer 边界由 TileLang 自身负责；我们只负责 packed sequence 的逻辑有效性。曾尝试保留 redundant clear，但它与流水化 copy 交互后使 noncausal 数值误差达到约 `0.039`，因此该做法没有进入当前实现。
-
-### 6.4 当前结果
-
-| TileLang varlen attention | Generated p50 | Upstream p50 | Generated / upstream | 数值 |
-|---|---:|---:|---:|---|
-| causal | 0.2323 ms | 0.2555 ms | 0.9092x | PASS |
-| noncausal | 0.3925 ms | — | — | PASS |
-
-同一形状上，旧逐元素谓词与同步路径的 causal 比值约为 `1.1064x`；共享合法性事实落地后，generated 比上游约快 9.1%。性能提升来自消除不必要的逐元素搬运与同步，不来自更换算法或把边界检查静默删掉。
-
-## 7. 活体约束与相关回归
-
-### 7.1 Stable softmax
-
-形状为 `8192 × 8192`、dtype 为 f32。三个 provider 都数值通过：
-
-| Provider | Generated p50 | Upstream p50 | Generated / upstream | 数值 |
-|---|---:|---:|---:|---|
-| Triton | 0.3659 ms | 0.3661 ms | 0.9994x | PASS |
-| cuTile | 0.3686 ms | 0.3689 ms | 0.9993x | PASS |
-| TileLang | 0.3535 ms | 0.3707 ms | 0.9536x | PASS |
-
-这证明索引、persistent mapping 和 transfer 合法性重构没有破坏最早的 stable-softmax 活体约束。
-
-### 7.2 TileLang ragged 与 grouped contraction
-
-| Kernel | Generated p50 | Upstream p50 | 比值 | 数值与口径 |
-|---|---:|---:|---:|---|
-| MoE | 11.4183 ms | 9.3368 ms | 1.2229x | PASS；E2E 算法/ABI 不同，不作 compiler-kernel 结论 |
-| grouped GEMM | 1.2747 ms | — | — | PASS |
-| grouped GEMM tail | 1.2808 ms | — | — | PASS |
-
-MoE 重跑用于确认 TileLang InOut wrapper 仍采用正确的 staged 语义。它当前的比值包含外层工作且两边算法/ABI 不同，只能作为功能回归和端到端观测，不能冒充 kernel-only 性能差距。
-
-## 8. 当前仍明确存在的边界
-
-### 8.1 Ragged 与 persistent 的组合
-
-代码结构已经允许 ragged、有序流和 contraction 的轴角色共存，但 persistent program volume 尚不能从 Plan 读取动态的 per-sequence 最大 extent。为避免静默少算或多算，realizer 对该组合保守不选 persistent。现有 ragged kernel 正确运行，不受阻塞。
-
-### 8.2 动态负整数的 floor/mod 语义
-
-当前索引样本使用非负逻辑索引。动态负整数在 Python、C/C++ 以及三个目标语言中的 floor-division/remainder 精确语义尚未形成跨 target 合同，因此不能把当前非负结果外推为对任意负动态索引的证明。
-
-### 8.3 不可拆分的上游 wrapper
-
-LayerNorm backward 的上游入口无法在现有 adapter 中取得独立 kernel-only graph 时间。报告保留空值，没有用 wrapper 时间与 generated kernel 时间混比。
-
-这些是被显式拒绝或明确留空的证据边界；本轮已运行路径没有通过默认值、异常吞噬或 kernel 名字特判绕过它们。
-
-## 9. 可复现入口
-
-所有验证共用唯一入口：
+统一入口为：
 
 ```bash
 ./examples/run/repro.sh <triton|cutile|tilelang> <kernel>
 ```
 
-本轮关键实例可直接按同一入口执行：
+入口集合共 23 个：
 
-```bash
-./examples/run/repro.sh triton swiglu_backward
-./examples/run/repro.sh cutile batched_gemm
-./examples/run/repro.sh tilelang varlen_attention
-./examples/run/repro.sh triton shifted_row_copy
-./examples/run/repro.sh cutile grouped_query_head_add
-./examples/run/repro.sh tilelang scalar_table_lookup
-./examples/run/repro.sh triton layer_norm_backward
-./examples/run/repro.sh cutile layer_norm_backward
-./examples/run/repro.sh tilelang layer_norm_backward
+```text
+softmax
+layer_norm
+layer_norm_backward
+rms_norm
+fused_add_rms_norm
+logsumexp
+gemm
+bf16_gemm
+batched_gemm
+quantized_gemm
+dual_gemm
+attention
+attention_bias
+varlen_attention
+paged_attention
+online_softmax
+moe
+grouped_gemm
+swiglu_forward
+swiglu_backward
+shifted_row_copy
+grouped_query_head_add
+scalar_table_lookup
 ```
 
-入口统一完成 DSL lowering、`intent-compile` 构建、目标源码发射、真实 GPU 执行、数值对照和可取得时的上游性能对照；没有新增 test 目录、fixture 或另一套验证脚手架。
+展开关系为：
 
-## 10. 对应实现提交
+- `gemm`：规则形状、M/N/K 三轴尾块；
+- `batched_gemm`：NN、TN、NT、TT；
+- `grouped_gemm`：规则 grouped case、member/K/N 尾块；
+- `varlen_attention`：noncausal、causal；
+- 其余入口各一个 case。
 
-- `f0d2f22 fix cuda graph cache isolation`
-- `ec41ee0 generalize indexed boundaries and gpu realization`
+因此计数是：
 
-第一项修正短 kernel 的测量物理条件；第二项包含精确索引边界、显式 index 前置条件、比较映射、LayerNorm backward 分组算法、共享 persistent mapping、cuTile 转置 load，以及 consumer-neutralized transfer 的共享证明和三个 target 投影。
+```text
+23 entries × 3 backends = 69 manual repro commands
+29 cases   × 3 backends = 87 numerical/performance rows
+```
+
+69 条命令在本轮外部运行中全部退出成功；87 个 case-provider 组合全部完成真实 GPU 执行并通过 reference 数值对照。仓库本身不保存测试结果数据库，因此这些数字应理解为 `00c0c41` 在上述机器上的一次完整测量快照，而不是仅靠 checkout 即可静态证明的属性。
+
+### 1.2 当前机器与环境
+
+- GPU：NVIDIA GeForce RTX 5090 D，32607 MiB；
+- Driver：580.95.05；
+- Triton：3.6.0；
+- cuTile：`cuda-tile 1.5.0`，TileGym 1.4.0；
+- TileLang：0.1.13。
+
+### 1.3 三种测量 scope
+
+| Scope | 计时 callable | 计时器 | 用途 |
+|---|---|---|---|
+| `kernel-only` | 输出和 workspace 已在区间外准备，只重放实际 launch | CUDA Graph | 双方算法和 kernel 边界可对应的短核或稳定内核对比 |
+| `end-to-end` | 为得到最终用户结果必须发生的完整 GPU pipeline | CUDA Event | 融合改变 kernel 数量、作者主导多 kernel 编排或上游只能整体调用 |
+| `runtime-metadata` | 保留运行时 shape/sequence metadata 路径，不做 graph capture | CUDA Event | varlen 等必须在运行时兑现 metadata 的结构 |
+
+所有 CUDA Graph 测量在每次 start event 前访问超过两倍 L2 容量的 flush buffer。冲刷本身不进入计时区间，避免同一地址反复 replay 造成不对称的 L2 驻留优势。
+
+报告中的 event 时间只统计排入 GPU stream 的工作，不把 Python CPU 调度时间伪装成 GPU kernel 时间。
+
+## 2. 全量 generated 性能表
+
+表中数字为 `p50 / p95`，单位 ms；所有单元格均已数值 PASS。`K/E/R` 分别对应 `kernel-only/end-to-end/runtime-metadata`。
+
+| Case | Scope（T/C/L） | Triton p50/p95 | cuTile p50/p95 | TileLang p50/p95 | 当前最低 p50 |
+|---|---|---:|---:|---:|---|
+| softmax | K/K/K | 0.3653 / 0.3684 | 0.3686 / 0.3707 | 0.3537 / 0.3559 | TileLang |
+| weighted LayerNorm | K/K/K | 0.1848 / 0.1878 | 0.1907 / 0.1927 | 0.1755 / 0.1777 | TileLang |
+| LayerNorm backward pipeline | E/E/E | 0.1163 / 0.1185 | 0.0971 / 0.0980 | 0.1120 / 0.1125 | cuTile |
+| weighted RMSNorm | K/K/E | 0.1855 / 0.1876 | 0.1898 / 0.1911 | 0.1737 / 0.1759 | scope 不同，不横比 |
+| fused add RMSNorm | K/K/K | 0.1879 / 0.1900 | 0.1884 / 0.1907 | 0.1793 / 0.1814 | TileLang |
+| row logsumexp | K/K/K | 0.1836 / 0.1879 | 0.1900 / 0.1921 | 0.1754 / 0.1794 | TileLang |
+| GEMM | K/K/K | 2.1166 / 2.1207 | 2.0756 / 2.0900 | 2.1242 / 2.1367 | cuTile |
+| GEMM M/N/K tail | K/K/K | 2.1264 / 2.1406 | 2.0653 / 2.0791 | 2.1283 / 2.1386 | cuTile |
+| BF16 GEMM | K/K/K | 2.0565 / 2.0696 | 2.0260 / 2.0511 | 2.0711 / 2.0920 | cuTile |
+| BF16 batched GEMM NN | K/K/K | 0.1071 / 0.1089 | 0.0938 / 0.0956 | 0.1060 / 0.1085 | cuTile |
+| BF16 batched GEMM TN | K/K/K | 0.1229 / 0.1249 | 0.0924 / 0.0939 | 0.1085 / 0.1096 | cuTile |
+| BF16 batched GEMM NT | K/K/K | 0.1019 / 0.1046 | 0.0917 / 0.0928 | 0.1081 / 0.1101 | cuTile |
+| BF16 batched GEMM TT | K/K/K | 0.1311 / 0.1331 | 0.0930 / 0.0945 | 0.1065 / 0.1071 | cuTile |
+| fused quantized GEMM | K/K/K | 2.1428 / 2.1489 | 2.2175 / 2.2350 | 2.1640 / 2.1937 | Triton |
+| gated dual GEMM | E/E/E | 0.6984 / 0.7006 | 0.6831 / 0.6851 | 0.7391 / 0.7423 | cuTile |
+| dense attention | K/K/K | 5.4016 / 5.4084 | 6.0477 / 6.0580 | 6.1281 / 6.1384 | Triton |
+| vector-bias attention | K/K/K | 5.6066 / 5.6167 | 6.4107 / 6.4333 | 6.2097 / 6.2290 | Triton |
+| varlen attention noncausal | R/R/R | 0.4306 / 0.4348 | 0.4994 / 0.5025 | 0.4462 / 0.4492 | Triton |
+| varlen attention causal | R/R/R | 0.3235 / 0.3271 | 0.3658 / 0.3704 | 0.2619 / 0.2660 | TileLang |
+| paged GQA decode attention | K/K/K | 0.2621 / 0.2638 | 0.3651 / 0.3687 | 4.6236 / 4.6358 | Triton |
+| streamed online softmax | K/K/K | 0.3926 / 0.4030 | 0.3557 / 0.3578 | 0.3915 / 0.4029 | cuTile |
+| MoE | E/E/E | 8.8516 / 8.8749 | 10.1480 / 10.2805 | 11.4572 / 11.4985 | Triton |
+| ragged grouped GEMM | E/E/E | 1.3104 / 1.3227 | 1.4620 / 1.4811 | 1.2776 / 1.2879 | TileLang |
+| grouped GEMM member/K/N tail | E/E/E | 1.3329 / 1.3370 | 1.4588 / 1.4957 | 1.2838 / 1.2942 | TileLang |
+| SwiGLU forward | K/K/K | 0.2329 / 0.2371 | 0.2412 / 0.2453 | 0.2882 / 0.2914 | Triton |
+| SwiGLU backward | K/K/K | 0.1121 / 0.1141 | 0.1163 / 0.1184 | 0.1121 / 0.1141 | Triton / TileLang |
+| shifted row copy | K/K/K | 0.0220 / 0.0241 | 0.0220 / 0.0241 | 0.0235 / 0.0239 | Triton / cuTile |
+| grouped-query head add | K/K/K | 0.0036 / 0.0057 | 0.0036 / 0.0050 | 0.0033 / 0.0053 | TileLang |
+| scalar table lookup | K/K/K | 0.0405 / 0.0445 | 0.0565 / 0.0584 | 0.0426 / 0.0446 | Triton |
+
+除 RMSNorm 的 TileLang cell 使用不同 scope 外，剩余 28 个可横向观察的 case 中：
+
+- Triton 单独最低 8 项；
+- cuTile 单独最低 10 项；
+- TileLang 单独最低 8 项；
+- 另有 2 项并列。
+
+这说明三个 provider 并非三条“恰好能运行”的重复路径；当前设备和形状下，它们确实在不同结构上形成不同赢家。
+
+## 3. 上游 baseline 覆盖与可比性
+
+87 个 case-provider cell 中，39 个取得了上游性能数字，48 个明确记录 `upstream baseline: unavailable`。没有 baseline 不等于 generated 失败，也不能用 PyTorch reference 时间代替高性能上游。
+
+表中数字为 `generated / upstream p50`：小于 1 表示 generated 更快。
+
+| Entry / case | Triton | cuTile | TileLang | 解释 |
+|---|---:|---:|---:|---|
+| softmax | 0.9972× K | 0.9998× K | 0.9542× K-D | TileLang 上游采用 online 写法；同任务单核，但内部算法不同 |
+| LayerNorm | 1.0742× K | 0.5509× K | — | TileLang 无上游 |
+| LayerNorm backward | 0.5557× E-D | — | — | 上游只能通过 autograd wrapper 调完整 backward；不是 kernel-only 结论 |
+| RMSNorm | 1.0653× K | — | 0.4968× E | TileLang 只能按完整 callable 对比，不能与另两列横比 |
+| fused add RMSNorm | 1.0633× K | — | — | 仅 Triton 有上游 |
+| logsumexp | — | — | — | 三者均无上游 |
+| GEMM | 1.0307× K | 0.9240× K | 0.9142× K | 同形状单核对比；tail case 三者均无上游 |
+| BF16 GEMM | — | 0.9198× K | 0.9090× K | Triton 无上游 |
+| batched GEMM NN/TN/NT/TT | — | 1.0175 / 1.0024 / 0.9951 / 1.0136× K | — | 只有 cuTile 有四布局上游；四者均在约 ±2% |
+| quantized GEMM | — | — | — | 三者均无同融合边界上游 |
+| dual GEMM | 0.9002× E-F | 0.8446× E-F | 0.8004× E-F | generated 融合双 contraction；上游由普通 GEMM 组合，优势属于 E2E fusion |
+| dense attention | 1.0912× K | 1.2594× K | 0.9158× K | 同任务、同 kernel 数；目标调度不同 |
+| vector-bias attention | 0.7927× K | — | — | 仅 Triton 有上游；上游数值误差更大但仍在既定 tolerance 内 |
+| varlen attention causal | — | — | 1.0331× R | 仅 TileLang causal case 有上游；noncausal 无上游 |
+| paged attention | 0.8951× K-D | — | — | xFormers 内层 paged kernel；算法/布局不同但计时区均只含 kernel |
+| streamed online softmax | 1.0711× K | 0.9643× K | 1.0545× K | 三者均有上游 |
+| MoE | 0.8694× E-D | 1.0618× E-D | 1.2163× E-D | routing、分组与 merge 编排不同，只作端到端观察 |
+| grouped GEMM | 0.6987× E | 0.7820× E | 0.8953× E | 基础 case 有上游；尾块 case均无上游 |
+| SwiGLU forward | 1.0246× K | 0.9897× K | — | cuTile adapter 的 packed ABI 在计时前准备 |
+| SwiGLU backward | 1.0324× K | — | — | 仅 Triton 有上游 |
+| shifted row copy | — | — | — | 索引机制 repro，无高性能上游 |
+| grouped-query head add | — | — | — | 索引机制 repro，无高性能上游 |
+| scalar table lookup | — | — | — | tensor-derived index 机制 repro，无高性能上游 |
+
+标记含义：
+
+- `K`：kernel-level scope，可用于同任务 kernel 性能判断；
+- `E`：完整 GPU pipeline，可用于用户结果的端到端判断；
+- `R`：包含必须兑现的运行时 metadata 路径；
+- `D`：算法编排、布局或 adapter 形态不同，只能观察，不能归因成某个 emitter 更优；
+- `F`：generated 改变了融合边界，优势是合法的端到端 fusion 优势，不是单 GEMM 更快。
+
+分页上游来自未修改的 xFormers `splitk_kernels.py`。项目只在相邻 runtime adapter 中完成当前 ABI、页表、输出和调用参数接线；adapter 的准备发生在 graph capture 前，steady-state 数字只包含 xFormers 内层 kernel。这是项目定义的 steady-state adapter 边界，不是原始 xFormers Python callable 的端到端时间。cuTile 和 TileLang source 中没有找到任务与接口都足够接近的通用 paged-GQA baseline，因此明确留空，没有拼接伪 baseline。
+
+## 4. 分页 KV cache single-query decode 如何从现有机制组合出来
+
+### 4.1 DSL 写下的算法事实
+
+分页 decode kernel 在 DSL 中直接表达：
+
+1. `page_offsets + page_indices` 组成带索引映射的 ragged page ownership；
+2. query head 通过 `query_head // HEAD_GROUP` 映射到 KV head；
+3. 外层 state stream 每次推进一个逻辑 page；
+4. 内层 state stream 在 page 内沿 token 轴推进；
+5. logical token 由 `page_ordinal * PAGE_SIZE + token_in_page` 计算；
+6. `logical_token < sequence_length` 决定最后一页的有效 lane；
+7. online maximum、denominator、accumulator 跨 page 保持状态；
+8. 输出为每个 `(batch, query_head)` 的单个 decode vector。
+
+当前 query 代表序列末端的单个 decode token，因此它可以读取 `sequence_length` 以内的全部历史 KV。DSL/reference 使用 `is_causal=False` 表达“单个末端 query 对全部历史可见”，xFormers 内层 kernel 使用 causal flag；在这个 single-query decode 形态下两者语义等价。该结论不能外推到多 query prefill。
+
+这些都是作者知道的算法结构，没有让 realizer 从 kernel 名称反推“这是 paged attention”。
+
+### 4.2 共享 realization 承担的事实
+
+共享层只补算法无法自行决定、但三个目标都需要的事实：
+
+- indirect ragged member 的 ownership；
+- page member 轴取 one-page tile，使页内访问恢复连续；
+- ordered + reduction 轴统一取得 `stream_contract` 角色；
+- GQA 的 floor-divide 索引沿 SSA 保留精确值和来源轴；
+- `assume_in_bounds` 直接从 Kernel IR 读取，不再复制成独立 precondition cache；
+- tensor-valued indirect index 与“还要不要边界谓词”分开建模；
+- contraction 消费前已被逻辑 mask 中和的 K/V 尾 lane，可标记 `consumer_neutralized`；
+- store 的 ragged 逻辑边界不能被 consumer neutralization 抵消，必须真实兑现。
+
+这最后一点在全量回归中暴露并修复了一个真实错误：TileLang 原先会用 bulk store 把某条变长序列的 query 尾块写进下一条序列。当前投影在未中和的 ragged store 上机械选择逐元素谓词，不再依赖 attention 特判。
+
+### 4.3 三个 target 只做投影
+
+- Triton：把同一 tensor-indirect relation 投影为精确 pointer expression、broadcast index 和 mask；
+- cuTile：把 tensor-valued index 投影为 `ct.gather` index tuple；间接性决定 gather，边界事实只决定 check-bounds；
+- TileLang：把 singleton page index 投影为 `T.assume` 和 page-local bulk copy；不能由 `T.gemm` 表达的 `M=1` contraction 走通用 unit-row lowering。
+
+没有一个 target emitter 重新决定 page tile、GQA ownership、逻辑 stop 或 token validity。三个 leaf 仍然复用既有的 ragged/staged 结构化 handlers；“没有 paged 专属 emitter”不等于“没有通用 ragged lowering”。
+
+### 4.4 当前性能结论
+
+| Provider | Generated p50 | Upstream p50 | 结论 |
+|---|---:|---:|---|
+| Triton | 0.2621 ms | 0.2929 ms | 与 xFormers 内层 paged kernel 同量级，generated 为 0.8951× |
+| cuTile | 0.3651 ms | — | 正确运行；无可比上游 |
+| TileLang | 4.6236 ms | — | 正确运行，但当前不是可接受的性能主力 |
+
+TileLang 的差距不是页表或流机制又做了一遍，而是 0.1.13 的通用矩阵原语不能直接覆盖该 `M=1` contraction。当前 unit-row fallback 保持正确的 f32 accumulation，但其串行 reduction 使它比 Triton 慢约 `17.6×`、比 cuTile 慢约 `12.7×`。
+
+## 5. 后端是否已经分裂成三套编译器
+
+结论：**当前没有。**三个 leaf 的代码量不小，但本轮新增的算法理解、索引事实和机器决策仍在共享层；leaf 增长主要来自不同 API、ABI、buffer 和语法的投影。
+
+| 问题 | 唯一 owner | Target leaf 允许做什么 | 当前审计 |
+|---|---|---|---|
+| 算法结构、state、ragged、contract 数值语义 | Kernel MLIR | 逐 op 读取并发射 | 共享 |
+| logical axis roles、ownership、tile role、stream stop | GPU Physical Plan | 把已选 role 映射为参数和循环语法 | 共享 |
+| index use-def、来源轴、in-bounds 前置条件 | Common analysis | 打印精确目标地址/索引 | 共享 |
+| consumer neutralization、fill、store validity | Common proofs + Plan | 选择目标支持的 bulk/guarded spelling | 共享 |
+| op 遍历与 unsupported 诊断 | Common emission lifecycle | 注册 leaf handler | 共享框架 |
+| `tl.load` / `ct.gather` / `T.copy` | Target leaf | 能力检查与语法映射 | 合法差异 |
+| target runtime、ABI wrapper、autotuner API | Target leaf | 接入真实下层工具 | 合法差异 |
+
+验收层面：
+
+- realization/emission 中没有 `if kernel_name == paged_attention`；
+- paged attention 没有新增专属 analyzer、realizer 或 emitter 文件；
+- staged gather 的 valid/fill 延迟发射、InOut merge ABI、ragged store boundary 等修复都按 op/SSA/ABI 语义生效；
+- cuTile 的 `scatter_unique` 保留自身 op handler，不再被 generic tensor-indirect 分类误写成普通 scatter；
+- TileLang 的 singleton indirect index 和 unit-row contract 是能力子集投影，没有回写或修改共享 Physical Plan。
+
+仍需诚实保留一个架构观察：TileLang 的 singleton indirect-index 限制目前是 emitter 内显式 capability check，而不是一张独立声明式 capability 表。它仍然只“拒绝或拼写”已有决定，因此还没有成为第二个编译器；但以后不能在这里继续堆逻辑分析或机器选择。
+
+## 6. TileLang 还需不需要保留
+
+### 6.1 为什么现在不应删除
+
+TileLang 29/29 case 数值通过，而且不是全面落后：
+
+- softmax：三者最低，0.3537 ms；
+- LayerNorm：三者最低，0.1755 ms；
+- logsumexp：三者最低，0.1754 ms；
+- grouped GEMM：三者最低，1.2776 ms；
+- varlen causal attention：三者最低，0.2619 ms；
+- dense attention 对自身上游为 0.9158×；
+- GEMM 对自身上游为 0.9142×。
+
+更重要的是，TileLang 要求显式表达 shared/local/fragment buffer、`T.copy`、`T.Pipelined`、同步和 `T.gemm`。从本项目的分层方法看，我们把它视作抽象线最低的 surface，因此用它检查 Physical Plan 是否漏掉存储、边界或流水结构；这是保留它的设计理由，不是由代码自动推出的定理。此次变长 store 覆盖错误就是在这条 surface 的本轮运行中首先暴露。
+
+### 6.2 为什么它不应成为默认性能后端
+
+- paged attention：4.6236 ms，对 Triton 为约 17.6×；
+- MoE：11.4572 ms，对 Triton 为约 1.29×，对自身上游为 1.2163×；
+- SwiGLU forward：0.2882 ms，慢于 Triton 0.2329 ms 和 cuTile 0.2412 ms。
+
+当前最优策略不是“为了三后端齐全而强行让 TileLang 活着”，也不是立即删除，而是：
+
+> 保留 TileLang 作为独立 surface、表达力验证后端和候选 provider；默认性能选择由逐 kernel 实测决定，paged attention 暂不把 TileLang 当性能候选赢家。
+
+### 6.3 保留边界
+
+TileLang 只有在以下边界内才值得继续存在：
+
+1. 新结构继续从共享 Kernel IR + Physical Plan 自然投影；
+2. TileLang leaf 只增加 capability check、target spelling、ABI/runtime 接线或 op handler；
+3. 表达不了时允许明确 unsupported，不为它新增专属机器决策；
+4. 若以后必须在 TileLang 路径里重新推 ownership、tile、stream stop、layout policy 或算法结构，应优先放弃该 backend，而不是接受第二套编译器。
+
+按当前代码，尚未触发删除条件。
+
+## 7. 当前完整能力与仍存在的缺口
+
+### 7.1 已由真实 kernel 压到的结构
+
+- 行归约、稳定 softmax、在线 softmax、logsumexp；
+- affine normalization、weighted normalization、residual fusion；
+- 2D/3D contraction、四种转置布局、双 contraction、三轴尾块；
+- BF16 accumulation、混合精度、int8 输出量化；
+- dense、bias、varlen、paged-GQA 四种 attention 结构；
+- ragged ownership、indirect membership、stateful streaming、logical stop；
+- MoE 两阶段 contraction、scatter-reduce、grouped GEMM；
+- 多输出、作者主导多 kernel backward pipeline；
+- 偏移索引、floor-divide 多对一映射、tensor-derived scalar index。
+
+### 7.2 当前证据缺口
+
+1. **上游覆盖不足。**48/87 case-provider cell 没有可比高性能上游，尤其 cuTile/TileLang paged attention、量化融合和三个索引机制 repro。
+2. **部分比值只能作端到端观察。**MoE、dual GEMM、LayerNorm backward 等两侧算法或 kernel 数不同，不能当作 emitter 单核优劣。
+3. **TileLang paged contraction 性能不成立。**功能与分层成立，但当前 unit-row fallback 慢一个数量级。
+4. **能力声明仍部分隐式。**TileLang singleton indirect-index 等限制目前由 leaf handler 直接检查；只要它不承担决定仍是合法的，但继续增长会使能力边界难审计。
+
+这些缺口没有被默认值、异常吞噬、伪 baseline 或 kernel 名特判掩盖。
+
+## 8. 对应实现与复现
+
+本报告对应：
+
+- `00c0c41 compose paged attention across gpu targets`
+
+关键源码位置：
+
+- 分页 DSL：`examples/kernels/streaming/paged_attention.py`；
+- 全量 repro 与测量 scope：`examples/repro/common/extended.py`；
+- 唯一执行入口：`examples/run/repro.sh`；
+- 共享 index/precondition：`lib/Target/Common/Analysis/IndexRelation.cpp`；
+- 共享 Kernel facts/proofs：`lib/Target/Common/Realization/`；
+- 共享 GPU 物理决策：`lib/Target/GPU/Realization/`；
+- 三个 surface：`lib/Target/{Triton,CuTile,TileLang}/Emission/`；
+- xFormers paged baseline 与相邻 runtime：`source/triton/xformers/attention/splitk/`。
+
+任一结果都可通过同一条命令手工复现：
+
+```bash
+./examples/run/repro.sh <triton|cutile|tilelang> <kernel>
+```
+
+该入口完成 DSL lowering、`intent-compile` 构建、目标源码发射、真实 GPU 执行、reference 数值检查，以及存在时的上游性能对照；没有新增 test 目录、fixture 或另一套验证脚手架。
