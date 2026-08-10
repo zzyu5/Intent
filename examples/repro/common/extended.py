@@ -73,9 +73,14 @@ from kernels.streaming.attention import HEAD_DIMENSION
 from kernels.streaming.attention import SCALE
 from kernels.streaming.attention import SEQUENCE as ATTENTION_SEQUENCE
 from kernels.streaming.attention import VARLEN_BATCH
+from kernels.streaming.attention import VARLEN_GQA_HEAD_GROUP
+from kernels.streaming.attention import VARLEN_GQA_KV_HEADS
+from kernels.streaming.attention import VARLEN_GQA_QUERY_HEADS
+from kernels.streaming.attention import VARLEN_GQA_TOTAL_TOKENS
 from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
 from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
+from kernels.streaming.attention import flash_varlen_gqa_prefill
 from kernels.streaming.paged_attention import BATCH as PAGED_BATCH
 from kernels.streaming.paged_attention import HEAD_DIMENSION as PAGED_HEAD_DIMENSION
 from kernels.streaming.paged_attention import HEAD_GROUP as PAGED_HEAD_GROUP
@@ -900,6 +905,76 @@ def _run_varlen_attention(
         )
 
 
+def _run_varlen_gqa_prefill(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    lengths = torch.tensor(
+        [4096, 3968, 3840, 3712, 3584, 3456, 3328, 3200],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    if (
+        lengths.numel() != VARLEN_BATCH
+        or lengths.sum().item() != VARLEN_GQA_TOTAL_TOKENS
+    ):
+        raise RuntimeError("varlen GQA prefill shape constants do not match its input")
+    cu_seqlens = torch.zeros(
+        (VARLEN_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    cu_seqlens[1:] = lengths.cumsum(0)
+    q = torch.randn(
+        (VARLEN_GQA_TOTAL_TOKENS, VARLEN_GQA_QUERY_HEADS, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    k = torch.randn(
+        (VARLEN_GQA_TOTAL_TOKENS, VARLEN_GQA_KV_HEADS, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    artifact = intent.compile(
+        flash_varlen_gqa_prefill,
+        constexprs={"HEAD_GROUP": VARLEN_GQA_HEAD_GROUP},
+        target=target,
+        compiler=compiler,
+    )
+    arguments = (q, k, v, lengths, cu_seqlens, SCALE)
+
+    def reference() -> torch.Tensor:
+        result = torch.empty_like(q)
+        key_heads = torch.arange(
+            VARLEN_GQA_QUERY_HEADS, device="cuda"
+        ) // VARLEN_GQA_HEAD_GROUP
+        for begin, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            start = int(begin.item())
+            stop = int(end.item())
+            query = q[start:stop].permute(1, 0, 2)[None]
+            key = k[start:stop, key_heads, :].permute(1, 0, 2)[None]
+            value = v[start:stop, key_heads, :].permute(1, 0, 2)[None]
+            result[start:stop] = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                is_causal=True,
+                scale=SCALE,
+            )[0].permute(1, 0, 2)
+        return result
+
+    _compare(
+        artifact=artifact,
+        arguments=arguments,
+        reference=reference,
+        target_name=target_name,
+        kernel_name="packed varlen GQA causal prefill",
+        tolerance=3.0e-2,
+        upstream=upstream,
+        measurement_scope="runtime-metadata",
+        cuda_graph=False,
+        expected_dtype=torch.float16,
+    )
+
+
 def _run_paged_attention(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -1146,6 +1221,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "swiglu_backward": _run_swiglu_backward,
     "swiglu_forward": _run_swiglu_forward,
     "varlen_attention": _run_varlen_attention,
+    "varlen_gqa_prefill": _run_varlen_gqa_prefill,
 }
 
 

@@ -136,7 +136,7 @@ private:
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   mlir::FailureOr<std::string>
-  indexTuple(mlir::Operation &operation, bool reductionLoop);
+  indexTuple(mlir::Operation &operation, bool elementwiseAccess);
   mlir::FailureOr<std::string> tileShape(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   emitValidityExpression(llvm::ArrayRef<int64_t> tensorAxes,

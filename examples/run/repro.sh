@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|varlen_gqa_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
   exit 2
 fi
 
@@ -137,12 +137,15 @@ case "${backend}:${kernel}" in
   tilelang:varlen_attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
+  tilelang:varlen_gqa_prefill)
+    baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
+    ;;
   triton:bf16_gemm | triton:batched_gemm | triton:quantized_gemm | triton:logsumexp | \
   cutile:attention_bias | cutile:paged_attention | cutile:quantized_gemm | cutile:rms_norm | cutile:fused_add_rms_norm | cutile:logsumexp | \
   cutile:layer_norm_backward | cutile:swiglu_backward | \
   tilelang:attention_bias | tilelang:paged_attention | tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:fused_add_rms_norm | tilelang:logsumexp | \
   tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | \
-  triton:varlen_attention | cutile:varlen_attention)
+  triton:varlen_attention | cutile:varlen_attention | triton:varlen_gqa_prefill | cutile:varlen_gqa_prefill)
     ;;
   triton:shifted_row_copy | cutile:shifted_row_copy | tilelang:shifted_row_copy | \
   triton:grouped_query_head_add | cutile:grouped_query_head_add | tilelang:grouped_query_head_add | \

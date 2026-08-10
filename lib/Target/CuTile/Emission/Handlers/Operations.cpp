@@ -424,7 +424,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> indices = indexTuple(operation, false);
+  FailureOr<std::string> indices =
+      indexTuple(operation, boundary.getAccess() == "gather");
   if (failed(view) || failed(indices))
     return failure();
   StringRef padding = boundary.getPadding() == "negative_infinity"
@@ -1119,8 +1120,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   };
   FailureOr<int64_t> lhsReductionDimension = physicalReductionAxis(*lhsLoad);
   axisIndices[reductionAxis->getNode()] = "k_tile";
-  FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, true);
-  FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, true);
+  FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, false);
+  FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, false);
   FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
   FailureOr<std::string> rhsShape = tileShape(*rhsLoad);
   bool permuteLhs =
@@ -1201,7 +1202,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> indices = indexTuple(operation, false);
+  FailureOr<std::string> indices =
+      indexTuple(operation, boundary.getAccess() == "scatter");
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
       failed(view) || failed(indices))
     return operation.emitOpError("lacks a cuTile store binding");
@@ -1313,7 +1315,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   if (!valueIndex || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical cuTile atomic merge");
   if (planIndex.stages.empty()) {
-    FailureOr<std::string> indices = indexTuple(operation, false);
+    FailureOr<std::string> indices = indexTuple(operation, true);
     if (failed(indices))
       return failure();
     line("ct.atomic_add(" + (*view)->argument->name + ", " + *indices + ", " +

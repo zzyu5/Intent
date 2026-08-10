@@ -88,7 +88,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
             return compiled[shape](a, b)
 
         return run
-    if kernel == "varlen_attention":
+    if kernel in {"varlen_attention", "varlen_gqa_prefill"}:
         sys.path.insert(0, str(source_path.parent))
         source = _load_module(
             source_path, "intent_upstream_tilelang_varlen_attention"
@@ -99,27 +99,31 @@ def _load_extended_upstream(kernel: str, source_path: Path):
             q, k, v, lengths, cu_seqlens, _ = arguments
             if not prepared:
                 prepared["max_sequence_length"] = int(lengths.max().item())
+                query_heads = 1 if q.ndim == 2 else q.shape[1]
+                key_value_heads = 1 if k.ndim == 2 else k.shape[1]
+                groups = query_heads // key_value_heads
                 prepared["compiled"] = source.flashattn(
                     lengths.numel(),
-                    1,
+                    groups,
                     q.shape[0],
                     k.shape[0],
-                    1,
-                    q.shape[1],
+                    query_heads,
+                    q.shape[-1],
                     True,
                     block_M=64,
                     block_N=64,
                     num_stages=2,
                     threads=128,
                 )
-            return prepared["compiled"](
-                q[:, None, :],
-                k[:, None, :],
-                v[:, None, :],
+            output = prepared["compiled"](
+                q[:, None, :] if q.ndim == 2 else q,
+                k[:, None, :] if k.ndim == 2 else k,
+                v[:, None, :] if v.ndim == 2 else v,
                 cu_seqlens,
                 cu_seqlens,
                 prepared["max_sequence_length"],
-            )[:, 0, :]
+            )
+            return output[:, 0, :] if q.ndim == 2 else output
 
         return run
     if kernel == "rms_norm":

@@ -1630,32 +1630,34 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
 }
 
 FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
-                                                 bool reductionLoop) {
+                                                 bool elementwiseAccess) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
-  bool tensorIndirect = llvm::any_of(*relation, [&](const target::IndexTerm &term) {
-    return term.kind == "value_index" && term.operands.size() == 1 &&
-           term.operands.front() &&
-           isa<RankedTensorType>(
-               operation.getOperand(*term.operands.front()).getType());
-  });
-  if (tensorIndirect) {
+  RankedTensorType projectedTensor;
+  if (operation.getNumResults() == 1)
+    projectedTensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  if (!projectedTensor) {
+    auto valueIndex =
+        operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    if (valueIndex && valueIndex.getInt() >= 0 &&
+        static_cast<unsigned>(valueIndex.getInt()) < operation.getNumOperands())
+      projectedTensor = dyn_cast<RankedTensorType>(
+          operation.getOperand(valueIndex.getInt()).getType());
+  }
+  if (elementwiseAccess && projectedTensor) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-    auto result = operation.getNumResults() == 1
-                      ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
-                      : RankedTensorType();
-    if (failed(view) || !result || relation->size() != (*view)->shape.size())
+    if (failed(view) || relation->size() != (*view)->shape.size())
       return operation.emitOpError(
           "indirect cuTile gather has no ranked access schema");
     unsigned resultAxis = 0;
     auto broadcast = [&](StringRef value, unsigned axis) {
-      if (result.getRank() == 1)
+      if (projectedTensor.getRank() == 1)
         return value.str();
       std::string expression = value.str() + "[";
       for (unsigned position = 0; position <
-                                  static_cast<unsigned>(result.getRank());
+                                  static_cast<unsigned>(projectedTensor.getRank());
            ++position) {
         if (position)
           expression += ", ";
@@ -1666,7 +1668,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     SmallVector<std::string> indices;
     for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
       if (term.kind == "full_slice") {
-        if (resultAxis >= static_cast<unsigned>(result.getRank()))
+        if (resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return operation.emitOpError(
               "indirect cuTile gather has too many vector axes");
         indices.push_back(broadcast(
@@ -1690,7 +1692,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (term.kind != "value_index" || tensor.getRank() != 1 ||
-            failed(exact) || resultAxis >= static_cast<unsigned>(result.getRank()))
+            failed(exact) ||
+            resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return operation.emitOpError(
               "cuTile indirect tensor indices require one logical axis");
         indices.push_back(broadcast(*exact, resultAxis++));
@@ -1706,7 +1709,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
         continue;
       }
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
-      if (failed(axis) || resultAxis >= static_cast<unsigned>(result.getRank()))
+      if (failed(axis) ||
+          resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
         return failure();
       std::string base = axisIndices.lookup(axis->getNode());
       if (base.empty())
@@ -1720,7 +1724,7 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
                     axis->getTile().str() + ", dtype=ct.int32)";
       indices.push_back(broadcast(exact, resultAxis++));
     }
-    if (resultAxis != static_cast<unsigned>(result.getRank()))
+    if (resultAxis != static_cast<unsigned>(projectedTensor.getRank()))
       return operation.emitOpError(
           "indirect cuTile gather does not cover every result axis");
     std::string tuple = "(";
