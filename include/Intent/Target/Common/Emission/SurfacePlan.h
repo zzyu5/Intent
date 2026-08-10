@@ -530,7 +530,8 @@ template <typename PlanIndex>
 bool requiresDelegatedTuning(const PlanIndex &index) {
   return llvm::any_of(index.axes, [&](const auto &entry) {
     llvm::StringRef tile = entry.second.getTileRole();
-    return tile != "one" && !tile.starts_with("fixed_");
+    return tile != "one" && !tile.starts_with("row_vector") &&
+           !tile.starts_with("fixed_");
   });
 }
 
