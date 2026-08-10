@@ -623,6 +623,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> physicalFill = transferPhysicalExtentFill(operation);
   bool scalarResult = operation.getNumResults() == 1 &&
                       !isa<RankedTensorType>(operation.getResult(0).getType());
+  Type resultElementType = scalarResult
+                               ? operation.getResult(0).getType()
+                               : cast<RankedTensorType>(
+                                     operation.getResult(0).getType())
+                                     .getElementType();
+  StringRef zeroFill = isa<IntegerType, IndexType>(resultElementType) ? "0"
+                                                                      : "0.0";
   if (failed(physicalFill))
     return failure();
   if (!scalarResult) {
@@ -659,7 +666,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         return failure();
       StringRef fill = boundary.getPadding() == "negative_infinity"
                            ? "-T.infinity(T.float32)"
-                           : "0.0";
+                           : zeroFill;
       expression = "T.if_then_else(" + *predicate + ", " + expression +
                    ", " + fill.str() + ")";
     }
@@ -768,7 +775,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     }
     StringRef fill = padding == "negative_infinity"
                          ? "-T.infinity(T.float32)"
-                         : "0.0";
+                         : zeroFill;
     auto emitElementwise = [&](bool includePhysicalBounds) {
       line(loop + "):");
       ++indentation;
@@ -1239,14 +1246,18 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
         binding.getLowering() == "T.min")
       return binding.getLowering().str() + "(" + lhs.str() + ", " +
              rhs.str() + ")";
+    if (binding.getLowering().starts_with("T.bitwise_") ||
+        binding.getLowering().starts_with("T.shift_"))
+      return binding.getLowering().str() + "(" + lhs.str() + ", " +
+             rhs.str() + ")";
     if (binding.getLowering() == "python_floor_divide" ||
         binding.getLowering() == "python_remainder") {
       std::string quotient = resultName + "_quotient";
       std::string remainder = resultName + "_remainder";
       std::string adjust = resultName + "_adjust";
-      line(quotient + " = " + lhs.str() + " // " + rhs.str());
-      line(remainder + " = " + lhs.str() + " - " + quotient + " * " +
-           rhs.str());
+      line(quotient + " = (" + lhs.str() + ") // (" + rhs.str() + ")");
+      line(remainder + " = (" + lhs.str() + ") - " + quotient + " * (" +
+           rhs.str() + ")");
       line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
            " < 0) != (" + rhs.str() + " < 0))");
       return binding.getLowering() == "python_floor_divide"
@@ -1279,7 +1290,7 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       operation.emitOpError("uses an unsupported TileLang binary lowering");
       return failure();
     }
-    return lhs.str() + " " + symbol.str() + " " + rhs.str();
+    return "(" + lhs.str() + ") " + symbol.str() + " (" + rhs.str() + ")";
   };
   if (!tensorResult) {
     FailureOr<StringRef> lhs = lookupValue(operation, 0);

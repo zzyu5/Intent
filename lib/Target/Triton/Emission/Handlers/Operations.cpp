@@ -908,9 +908,9 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     std::string quotient = result + "_quotient";
     std::string remainder = result + "_remainder";
     std::string adjust = result + "_adjust";
-    line(quotient + " = " + lhs->str() + " // " + rhs->str());
-    line(remainder + " = " + lhs->str() + " - " + quotient + " * " +
-         rhs->str());
+    line(quotient + " = (" + lhs->str() + ") // (" + rhs->str() + ")");
+    line(remainder + " = (" + lhs->str() + ") - " + quotient + " * (" +
+         rhs->str() + ")");
     line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
          " < 0) != (" + rhs->str() + " < 0))");
     expression = binding.getLowering() == "python_floor_divide"
@@ -927,6 +927,16 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_bitwise_and")
+      symbol = "&";
+    else if (binding.getLowering() == "python_bitwise_or")
+      symbol = "|";
+    else if (binding.getLowering() == "python_bitwise_xor")
+      symbol = "^";
+    else if (binding.getLowering() == "python_left_shift")
+      symbol = "<<";
+    else if (binding.getLowering() == "python_right_shift")
+      symbol = ">>";
     else if (binding.getLowering() == "python_equal")
       symbol = "==";
     else if (binding.getLowering() == "python_not_equal")
@@ -941,7 +951,8 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = ">=";
     else
       return operation.emitOpError("uses an unsupported binary lowering");
-    expression = lhs->str() + " " + symbol.str() + " " + rhs->str();
+    expression = "(" + lhs->str() + ") " + symbol.str() + " (" +
+                 rhs->str() + ")";
   }
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);

@@ -90,6 +90,14 @@ bool provePaddedUses(Value value, PaddedValue padded,
       if (logical && logical.getValue() == "multiply" &&
           padded == PaddedValue::zero)
         result = PaddedValue::zero;
+      else if (logical && logical.getValue() == "bitwise_and" &&
+               padded == PaddedValue::zero)
+        result = PaddedValue::zero;
+      else if (logical &&
+               (logical.getValue() == "left_shift" ||
+                logical.getValue() == "right_shift") &&
+               user->getOperand(0) == value && padded == PaddedValue::zero)
+        result = PaddedValue::zero;
       else if (logical && logical.getValue() == "add" &&
                padded == PaddedValue::zero) {
         // This input is neutral; consumers realize the result's own padding.
@@ -189,6 +197,14 @@ std::optional<std::string> inferPadding(
     auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
     if (logical && logical.getValue() == "multiply" && lhs && rhs &&
         *lhs == "zero" && *rhs == "zero")
+      return std::string("zero");
+    if (logical && logical.getValue() == "bitwise_and" &&
+        ((lhs && *lhs == "zero") || (rhs && *rhs == "zero")))
+      return std::string("zero");
+    if (logical &&
+        (logical.getValue() == "left_shift" ||
+         logical.getValue() == "right_shift") &&
+        lhs && *lhs == "zero")
       return std::string("zero");
     if (logical && logical.getValue() == "subtract" && lhs &&
         *lhs == "negative_infinity")

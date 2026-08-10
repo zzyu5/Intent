@@ -719,9 +719,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   StringRef loadFill = boundary.getPadding();
   if (loadFill == "none" && !physicalFill->empty())
     loadFill = *physicalFill;
+  Type elementType = (*view)->tensor.getElementType();
   StringRef padding = loadFill == "negative_infinity"
                           ? "-math.inf"
-                          : "0.0";
+                      : isa<IntegerType, IndexType>(elementType) ? "0"
+                                                                : "0.0";
   std::string result = makeResultName(operation, 0);
   if (boundary.getAccess() == "gather") {
     line(result + " = ct.gather(" + (*view)->argument->name + ", " +
@@ -916,14 +918,17 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       binding.getLowering() == "ct.minimum")
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
+  else if (binding.getLowering().starts_with("ct.bitwise_"))
+    expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
+                 rhs->str() + ")";
   else if (binding.getLowering() == "python_floor_divide" ||
            binding.getLowering() == "python_remainder") {
     std::string quotient = result + "_quotient";
     std::string remainder = result + "_remainder";
     std::string adjust = result + "_adjust";
-    line(quotient + " = " + lhs->str() + " // " + rhs->str());
-    line(remainder + " = " + lhs->str() + " - " + quotient + " * " +
-         rhs->str());
+    line(quotient + " = (" + lhs->str() + ") // (" + rhs->str() + ")");
+    line(remainder + " = (" + lhs->str() + ") - " + quotient + " * (" +
+         rhs->str() + ")");
     line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
          " < 0) != (" + rhs->str() + " < 0))");
     expression = binding.getLowering() == "python_floor_divide"
@@ -953,7 +958,8 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = ">=";
     else
       return operation.emitOpError("uses an unsupported cuTile binary lowering");
-    expression = lhs->str() + " " + symbol.str() + " " + rhs->str();
+    expression = "(" + lhs->str() + ") " + symbol.str() + " (" +
+                 rhs->str() + ")";
   }
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);

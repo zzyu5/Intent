@@ -142,6 +142,9 @@ LogicalResult validatePointwise(Operation &operation) {
       llvm::is_contained({StringRef("add"), StringRef("subtract"),
                           StringRef("multiply"), StringRef("true_divide"),
                           StringRef("floor_divide"), StringRef("remainder"),
+                          StringRef("bitwise_and"), StringRef("bitwise_or"),
+                          StringRef("bitwise_xor"), StringRef("left_shift"),
+                          StringRef("right_shift"),
                           StringRef("maximum"), StringRef("minimum")},
                          logical.getValue()))
     return success();

@@ -457,7 +457,36 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  auto bindTransfer = [&](Operation &operation) -> LogicalResult {
+  auto isStagedContract = [&decisions](Operation &operation) {
+    auto node = operation.getAttrOfType<IntegerAttr>("intent.node");
+    return node && llvm::any_of(decisions.stages, [&](intent::plan::StageOp stage) {
+             return static_cast<int64_t>(stage.getNode()) == node.getInt();
+           });
+  };
+  auto nestedInStateStream = [](Operation &operation) {
+    for (Operation *parent = operation.getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (parent->getName().getStringRef() == "intent.state_stream")
+        return true;
+    return false;
+  };
+  auto isDirectViewLoad = [](Value value) {
+    Operation *definition = value.getDefiningOp();
+    return definition &&
+           definition->getName().getStringRef() == "intent.view_load";
+  };
+  auto sharedContractOperand =
+      [isStagedContract, nestedInStateStream,
+       isDirectViewLoad](Value operand, Operation &contract) {
+    if (!isDirectViewLoad(operand))
+      return false;
+    if (isStagedContract(contract))
+      return true;
+    return !nestedInStateStream(contract) &&
+           llvm::all_of(contract.getOperands(), isDirectViewLoad);
+  };
+
+  auto bindTransfer = [&, sharedContractOperand](Operation &operation) -> LogicalResult {
     FailureOr<int64_t> node = target::getNodeID(operation, "transfer binding");
     if (failed(node))
       return failure();
@@ -467,6 +496,12 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {
           return user->getName().getStringRef() == "intent.contract";
         });
+    Operation *soleUser = nullptr;
+    if (contractOperand &&
+        llvm::hasSingleElement(operation.getResult(0).getUsers()))
+      soleUser = *operation.getResult(0).user_begin();
+    bool sharedOperand =
+        soleUser && sharedContractOperand(operation.getResult(0), *soleUser);
     SmallVector<int64_t> domains;
     for (Operation *domain : facts.boundaryDomains.lookup(&operation)) {
       FailureOr<int64_t> domainNode =
@@ -489,7 +524,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     }
     StringRef resultSpace = "none";
     if (load) {
-      resultSpace = contractOperand
+      resultSpace = sharedOperand
                         ? StringRef("shared")
                         : isa<RankedTensorType>(operation.getResult(0).getType())
                               ? StringRef("private_fragment")
@@ -596,15 +631,14 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       return failure();
 
   if (failed(addHandler(
-          registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
+          registry, "intent.contract",
+          [&, sharedContractOperand,
+           isStagedContract](Operation &operation) -> LogicalResult {
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "contract binding");
             if (failed(node))
               return failure();
-            bool staged = succeeded(node) && llvm::any_of(
-                decisions.stages, [&](intent::plan::StageOp stage) {
-                  return static_cast<int64_t>(stage.getNode()) == *node;
-                });
+            bool staged = isStagedContract(operation);
             auto contraction = facts.contractions.find(&operation);
             if (contraction == facts.contractions.end())
               return operation.emitOpError("has no canonical contraction facts");
@@ -623,12 +657,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                     contraction->second.rhsReductionAxes, "zero", operation)))
               return failure();
             auto operandSpace = [&](Value operand) -> StringRef {
-              if (staged)
-                return "shared";
-              Operation *definition = operand.getDefiningOp();
-              return definition &&
-                             definition->getName().getStringRef() ==
-                                 "intent.view_load"
+              return sharedContractOperand(operand, operation)
                          ? StringRef("shared")
                          : StringRef("private_fragment");
             };

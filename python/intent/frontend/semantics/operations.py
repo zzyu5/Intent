@@ -141,6 +141,11 @@ class BinaryOperator(Enum):
     MINIMUM = "minimum"
     LOGICAL_AND = "logical_and"
     LOGICAL_OR = "logical_or"
+    BITWISE_AND = "bitwise_and"
+    BITWISE_OR = "bitwise_or"
+    BITWISE_XOR = "bitwise_xor"
+    LEFT_SHIFT = "left_shift"
+    RIGHT_SHIFT = "right_shift"
 
 
 class ComparePredicate(Enum):

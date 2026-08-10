@@ -21,12 +21,14 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))
     return "TILE_SIZE_V" + role.drop_front(11).str();
-  if (role == "program_m" || role == "ragged_member" || role == "query")
+  if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))
     return "TILE_SIZE_R" + role.drop_front(14).str();
   if (role.starts_with("query_"))
     return "TILE_SIZE_Q" + role.drop_front(6).str();
+  if (role == "query")
+    return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "stream")
     return std::string("TILE_SIZE_N");
   if (role == "stream_contract")
@@ -96,6 +98,16 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_floor_divide");
   if (role == "binary_remainder")
     return StringRef("python_remainder");
+  if (role == "binary_bitwise_and")
+    return StringRef("T.bitwise_and");
+  if (role == "binary_bitwise_or")
+    return StringRef("T.bitwise_or");
+  if (role == "binary_bitwise_xor")
+    return StringRef("T.bitwise_xor");
+  if (role == "binary_left_shift")
+    return StringRef("T.shift_left");
+  if (role == "binary_right_shift")
+    return StringRef("T.shift_right");
   if (role == "binary_maximum")
     return StringRef("T.max");
   if (role == "binary_minimum")
@@ -129,12 +141,14 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
 }
 
 FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
-  if (role == "program_m" || role == "ragged_member" || role == "query")
+  if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))
     return "TILE_SIZE_R" + role.drop_front(14).str();
   if (role.starts_with("query_"))
     return "TILE_SIZE_Q" + role.drop_front(6).str();
+  if (role == "query")
+    return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "feature" || role == "stream")
     return std::string("TILE_SIZE_N");
   if (role == "stream_contract")
@@ -352,9 +366,7 @@ indexRealization(intent::plan::RealizationOp realization,
                            ? "parallel_elements"
                            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
-    binding.defer = load && target::emission::feedsContraction(*operation) &&
-                    (!index.components.groups.empty() ||
-                     target::emission::feedsStagedContraction(index, *operation));
+    binding.defer = load && value.getResultSpace() == "shared";
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
         (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect;

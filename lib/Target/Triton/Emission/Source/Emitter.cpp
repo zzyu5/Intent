@@ -97,6 +97,16 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_floor_divide");
   if (role == "binary_remainder")
     return StringRef("python_remainder");
+  if (role == "binary_bitwise_and")
+    return StringRef("python_bitwise_and");
+  if (role == "binary_bitwise_or")
+    return StringRef("python_bitwise_or");
+  if (role == "binary_bitwise_xor")
+    return StringRef("python_bitwise_xor");
+  if (role == "binary_left_shift")
+    return StringRef("python_left_shift");
+  if (role == "binary_right_shift")
+    return StringRef("python_right_shift");
   if (role == "binary_maximum")
     return StringRef("tl.maximum");
   if (role == "binary_minimum")
@@ -319,9 +329,7 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.operation = value;
     binding.access = load ? "load" : "store";
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer = load && target::emission::feedsContraction(*operation) &&
-                    (!index.components.groups.empty() ||
-                     target::emission::feedsStagedContraction(index, *operation));
+    binding.defer = load && value.getResultSpace() == "shared";
     index.boundaries[value.getNode()] = binding;
   }
   if (!index.target || !index.program) {

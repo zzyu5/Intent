@@ -137,6 +137,12 @@ from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from kernels.streaming.selective_scan import BATCH as SELECTIVE_SCAN_BATCH
 from kernels.streaming.selective_scan import LENGTH as SELECTIVE_SCAN_LENGTH
 from kernels.streaming.selective_scan import selective_state_scan
+from kernels.contraction.weight_only_int4 import GROUP_SIZE as W4_GROUP_SIZE
+from kernels.contraction.weight_only_int4 import K as W4_K
+from kernels.contraction.weight_only_int4 import M as W4_M
+from kernels.contraction.weight_only_int4 import N as W4_N
+from kernels.contraction.weight_only_int4 import PACK_FACTOR as W4_PACK_FACTOR
+from kernels.contraction.weight_only_int4 import weight_only_int4_matmul
 
 from .support import benchmark
 from .support import prepare_kernel_call
@@ -341,6 +347,65 @@ def _run_selective_scan(
         tolerance=2.0e-5,
         upstream=upstream,
         expected_dtype=torch.float32,
+        cuda_graph=False,
+    )
+
+
+def _run_weight_only_int4(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    activation = torch.randn(
+        (W4_M, W4_K), device="cuda", dtype=torch.float16
+    ) * 0.05
+    quantized = torch.randint(
+        0,
+        16,
+        (W4_K, W4_N),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    packed = torch.zeros(
+        (W4_K // W4_PACK_FACTOR, W4_N),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    unsigned = quantized
+    for lane in range(W4_PACK_FACTOR):
+        packed |= unsigned[lane::W4_PACK_FACTOR] << (4 * lane)
+    scales = (
+        0.01
+        + 0.02
+        * torch.rand(
+            (W4_K // W4_GROUP_SIZE, W4_N),
+            device="cuda",
+            dtype=torch.float16,
+        )
+    )
+    artifact = intent.compile(
+        weight_only_int4_matmul,
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        dequantized = quantized.float() * scales.float().repeat_interleave(
+            W4_GROUP_SIZE,
+            dim=0,
+        )
+        return (activation.float() @ dequantized).to(torch.float16)
+
+    _compare(
+        artifact=artifact,
+        arguments=(activation, packed, scales),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="W4A16 groupwise matmul",
+        tolerance=4.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.float16,
         cuda_graph=False,
     )
 
@@ -2235,6 +2300,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "varlen_attention": _run_varlen_attention,
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
     "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,
+    "weight_only_int4": _run_weight_only_int4,
 }
 
 

@@ -14,6 +14,7 @@ from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import UnaryOperator
 from intent.frontend.mlir import MlirValue
 from intent.language import DType
+from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
 from intent.language.builtins import Intrinsic
 from intent.language.builtins import IntrinsicNamespace
@@ -35,6 +36,19 @@ _BINARY_OPERATORS = {
     ast.FloorDiv: (BinaryOperator.FLOOR_DIVIDE, operator.floordiv),
     ast.Mod: (BinaryOperator.REMAINDER, operator.mod),
     ast.Pow: (BinaryOperator.POWER, operator.pow),
+    ast.BitAnd: (BinaryOperator.BITWISE_AND, operator.and_),
+    ast.BitOr: (BinaryOperator.BITWISE_OR, operator.or_),
+    ast.BitXor: (BinaryOperator.BITWISE_XOR, operator.xor),
+    ast.LShift: (BinaryOperator.LEFT_SHIFT, operator.lshift),
+    ast.RShift: (BinaryOperator.RIGHT_SHIFT, operator.rshift),
+}
+
+_BITWISE_OPERATORS = {
+    BinaryOperator.BITWISE_AND,
+    BinaryOperator.BITWISE_OR,
+    BinaryOperator.BITWISE_XOR,
+    BinaryOperator.LEFT_SHIFT,
+    BinaryOperator.RIGHT_SHIFT,
 }
 
 _COMPARE_PREDICATES = {
@@ -177,6 +191,11 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
     lhs_known, lhs_static = compile_time_value(lhs)
     rhs_known, rhs_static = compile_time_value(rhs)
     if lhs_known and rhs_known:
+        if ir_operator in _BITWISE_OPERATORS and any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (lhs_static, rhs_static)
+        ):
+            lowerer.error(node, "compile-time bitwise operations require integer scalars")
         if any(
             isinstance(value, bool) or not isinstance(value, (int, float))
             for value in (lhs_static, rhs_static)
@@ -191,7 +210,13 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
         return Literal(result)
     lhs_value, rhs_value = lowerer.coerce_pair(lhs, rhs, node)
     result_type = lowerer.broadcast_result_type(lhs_value.type, rhs_value.type, node)
-    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    result_dtype, result_shape = lowerer.dtype_and_shape(result_type, node)
+    if ir_operator in _BITWISE_OPERATORS and result_dtype.category not in (
+        DTypeCategory.SIGNED_INTEGER,
+        DTypeCategory.UNSIGNED_INTEGER,
+        DTypeCategory.INDEX,
+    ):
+        lowerer.error(node, "runtime bitwise operations require integer operands")
     lhs_value = lowerer.broadcast_value(lhs_value, result_shape, node)
     rhs_value = lowerer.broadcast_value(rhs_value, result_shape, node)
     operation = lowerer.emit(
