@@ -37,7 +37,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
-                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
+                         "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -201,6 +201,26 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     return success();
   programBindingsEmitted = true;
 
+  auto axisExtent = [&](plan::AxisOp axis) {
+    std::string role =
+        "program_" + std::to_string(axis.getProgramOrder());
+    std::string extent = roleDimensions.lookup(role);
+    return axis.isScalar()
+               ? extent
+               : "tl.cdiv(" + extent + ", " + axis.getTile().str() + ")";
+  };
+  bool persistent = planIndex.program.getPersistent();
+  std::string linear = "persistent_program";
+  if (persistent) {
+    line("total_program_tiles = " +
+         target::emission::projectProgramVolume(planIndex, axisExtent));
+    line("program_start = tl.program_id(0)");
+    line("program_step = tl.num_programs(0)");
+    line("for " + linear +
+         " in tl.range(program_start, total_program_tiles, program_step):");
+    ++indentation;
+  }
+
   for (const auto &entry : planIndex.components.groups) {
     SmallVector<plan::AxisOp> axes(entry.getValue().begin(), entry.getValue().end());
     llvm::sort(axes, [](plan::AxisOp lhs, plan::AxisOp rhs) {
@@ -228,8 +248,18 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     std::string size = "group_size_" + std::to_string(lhs.getNode());
     std::string lhsBlock = "block_axis_" + std::to_string(lhs.getNode());
     std::string rhsBlock = "block_axis_" + std::to_string(rhs.getNode());
-    line(pid + " = tl.program_id(axis=" +
-         std::to_string(lhs.getWorkerAxis()) + ")");
+    if (persistent) {
+      FailureOr<std::string> groupIndex =
+          target::emission::projectLinearGroupIndex(
+              planIndex, axes, axisExtent, linear,
+              *lhs.operation.getOperation());
+      if (failed(groupIndex))
+        return failure();
+      line(pid + " = " + *groupIndex);
+    } else {
+      line(pid + " = tl.program_id(axis=" +
+           std::to_string(lhs.getWorkerAxis()) + ")");
+    }
     line(lhsCount + " = tl.cdiv(" + roleDimensions.lookup(lhsRole) + ", " +
          lhs.getTile().str() + ")");
     line(rhsCount + " = tl.cdiv(" + roleDimensions.lookup(rhsRole) + ", " +
@@ -256,19 +286,14 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     axisIndices[rhs.getNode()] = "axis_index_" + std::to_string(rhs.getNode());
   }
 
-  auto axisExtent = [&](plan::AxisOp axis) {
-    std::string role =
-        "program_" + std::to_string(axis.getProgramOrder());
-    std::string extent = roleDimensions.lookup(role);
-    return axis.isScalar()
-               ? extent
-               : "tl.cdiv(" + extent + ", " + axis.getTile().str() + ")";
-  };
   SmallVector<target::emission::ProgramIndexProjection> projections =
-      target::emission::projectProgramIndices(
-          planIndex, axisExtent, [](unsigned worker) {
-            return "tl.program_id(axis=" + std::to_string(worker) + ")";
-          });
+      persistent
+          ? target::emission::projectLinearProgramIndices(
+                planIndex, axisExtent, linear)
+          : target::emission::projectProgramIndices(
+                planIndex, axisExtent, [](unsigned worker) {
+                  return "tl.program_id(axis=" + std::to_string(worker) + ")";
+                });
   for (const target::emission::ProgramIndexProjection &projection : projections) {
     plan::AxisOp axis = projection.axis;
     std::string block = "block_axis_" + std::to_string(axis.getNode());
@@ -366,6 +391,16 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     return success();
   }
 
+  if (planIndex.program.getPersistent()) {
+    if (&operation == programRoot && failed(emitProgramBindings()))
+      return failure();
+    std::string value = axisIndices.lookup(axis->getNode());
+    if (value.empty())
+      return axis->emitOpError("has no persistent Triton program index");
+    valueNames[argument] = value;
+    return success();
+  }
+
   if (&operation == programRoot && failed(emitProgramBindings()))
     return failure();
   std::string value = axisIndices.lookup(axis->getNode());
@@ -376,8 +411,9 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
-  if (!planIndex.components.reusedAxes.empty() &&
-      &operation == programRoot)
+  if (&operation == programRoot &&
+      (!planIndex.components.reusedAxes.empty() ||
+       planIndex.program.getPersistent()))
     --indentation;
   return success();
 }
@@ -388,7 +424,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a resolved Triton load binding");
-  if (boundary.getDomainNodes().empty() && boundary.getLoadFill() == "none") {
+  FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
+  if (failed(wholeView))
+    return failure();
+  if (*wholeView && boundary.getDomainNodes().empty() &&
+      boundary.getLoadFill() == "none") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -399,8 +439,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
-  if (boundary.getLoadFill() == "none")
-    return operation.emitOpError("lacks a semantics-preserving load boundary");
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(view))
     return failure();
@@ -409,12 +447,16 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
   if (failed(pointers) || failed(mask))
     return failure();
-  StringRef fill = boundary.getLoadFill() == "negative_infinity"
-                       ? "-float('inf')"
-                       : "0.0";
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
-       ", other=" + fill.str() + ")");
+  if (boundary.getLoadFill() == "none") {
+    line(result + " = tl.load(" + *pointers + ")");
+  } else {
+    StringRef fill = boundary.getLoadFill() == "negative_infinity"
+                         ? "-float('inf')"
+                         : "0.0";
+    line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
+         ", other=" + fill.str() + ")");
+  }
   bindResult(operation, 0, result);
   return success();
 }
@@ -511,6 +553,20 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_floor_divide")
+      symbol = "//";
+    else if (binding.getLowering() == "python_remainder")
+      symbol = "%";
+    else if (binding.getLowering() == "python_equal")
+      symbol = "==";
+    else if (binding.getLowering() == "python_not_equal")
+      symbol = "!=";
+    else if (binding.getLowering() == "python_less")
+      symbol = "<";
+    else if (binding.getLowering() == "python_less_equal")
+      symbol = "<=";
+    else if (binding.getLowering() == "python_greater")
+      symbol = ">";
     else if (binding.getLowering() == "python_greater_equal")
       symbol = ">=";
     else
@@ -1028,6 +1084,18 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
+  if (!valueIndex || failed(view) || failed(stored))
+    return operation.emitOpError("lacks a mechanical Triton atomic merge");
+  if (planIndex.stages.empty()) {
+    FailureOr<std::string> pointer =
+        emitPointerExpression(operation, **view, true);
+    FailureOr<std::string> mask = emitMaskExpression(operation, true);
+    if (failed(pointer) || failed(mask))
+      return failure();
+    line("tl.atomic_add(" + *pointer + ", " + stored->str() + ", mask=" +
+         *mask + ", scope='gpu')");
+    return success();
+  }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||

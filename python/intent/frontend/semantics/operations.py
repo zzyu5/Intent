@@ -13,6 +13,7 @@ class OperationKind(Enum):
     PARTITION = "partition"
     INDICES = "indices"
     REGION_END = "region_end"
+    ASSUME_IN_BOUNDS = "assume_in_bounds"
 
     PARALLEL = "parallel"
     ORDERED = "ordered"

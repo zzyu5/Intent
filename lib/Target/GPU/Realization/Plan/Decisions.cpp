@@ -145,6 +145,11 @@ struct AxisChoice {
   std::string group;
 };
 
+struct AxisAssignments {
+  SmallVector<AxisChoice> axes;
+  bool persistent = false;
+};
+
 bool hasIndependentLane(const AxisChoice &choice,
                         const target::KernelFacts &facts) {
   if (choice.parallels.empty())
@@ -202,7 +207,7 @@ SmallVector<unsigned> contractionProgramAxes(
   return result;
 }
 
-FailureOr<SmallVector<AxisChoice>>
+FailureOr<AxisAssignments>
 assignAxes(const target::KernelFacts &facts) {
   SmallVector<AxisChoice> choices;
   llvm::DenseMap<Operation *, unsigned> positions;
@@ -361,7 +366,47 @@ assignAxes(const target::KernelFacts &facts) {
   for (AxisChoice &choice : choices)
     choice.reuse = choice.programOrder && !choice.tiled &&
                    hasIndependentLane(choice, facts);
-  return choices;
+
+  bool persistent = llvm::any_of(facts.contractions, [&](const auto &entry) {
+    llvm::DenseSet<unsigned> owned;
+    unsigned parallel = 0;
+    unsigned tiled = 0;
+    bool ragged = false;
+    for (Operation *parent = entry.first->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (parent->getName().getStringRef() != "intent.parallel" ||
+          parent->getNumOperands() != 1)
+        continue;
+      Operation *source = parent->getOperand(0).getDefiningOp();
+      Operation *domain = facts.domainSourceAxes.count(source)
+                              ? source
+                              : facts.partitionDomains.lookup(source);
+      auto found = positions.find(domain);
+      if (found == positions.end() ||
+          !choices[found->second].programOrder ||
+          !owned.insert(found->second).second)
+        continue;
+      ragged |= facts.raggedMembers.count(domain);
+      ++parallel;
+      tiled += choices[found->second].tiled;
+    }
+    return !ragged && parallel >= 3 && tiled >= 2;
+  });
+  if (persistent) {
+    SmallVector<unsigned> programAxes;
+    for (auto [position, choice] : llvm::enumerate(choices))
+      if (choice.programOrder)
+        programAxes.push_back(position);
+    llvm::sort(programAxes, [&](unsigned lhs, unsigned rhs) {
+      return *choices[lhs].programOrder < *choices[rhs].programOrder;
+    });
+    for (auto [fold, position] : llvm::enumerate(programAxes)) {
+      choices[position].worker = 0;
+      choices[position].fold = fold;
+      choices[position].reuse = false;
+    }
+  }
+  return AxisAssignments{std::move(choices), persistent};
 }
 
 struct StageDecision {
@@ -538,17 +583,18 @@ FailureOr<PhysicalDecisions>
 emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
   PhysicalDecisions decisions;
   FailureOr<Operation *> root = programRoot(facts);
-  FailureOr<SmallVector<AxisChoice>> axes = assignAxes(facts);
-  if (failed(root) || failed(axes))
+  FailureOr<AxisAssignments> assignments = assignAxes(facts);
+  if (failed(root) || failed(assignments))
     return failure();
 
   FailureOr<int64_t> rootNode = node(**root, "program mapping");
   if (failed(rootNode))
     return failure();
   decisions.program = builder.create<intent::plan::ProgramOp>(
-      (*root)->getLoc(), i64(builder, *rootNode));
+      (*root)->getLoc(), i64(builder, *rootNode),
+      builder.getBoolAttr(assignments->persistent));
 
-  for (const AxisChoice &choice : *axes) {
+  for (const AxisChoice &choice : assignments->axes) {
     FailureOr<int64_t> domainNode = node(*choice.domain, "axis binding");
     if (failed(domainNode))
       return failure();

@@ -23,7 +23,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
-                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
+                         "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -249,7 +249,11 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   return success();
 }
 
-LogicalResult SourceEmitter::leaveParallel(Operation &) { return success(); }
+LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
+  if (&operation == programRoot && planIndex.program.getPersistent())
+    indentation -= 2;
+  return success();
+}
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
@@ -257,7 +261,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a TileLang load binding");
-  if (boundary.getDomainNodes().empty() && boundary.getPadding() == "none") {
+  FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
+  if (failed(wholeView))
+    return failure();
+  if (*wholeView && boundary.getDomainNodes().empty() &&
+      boundary.getPadding() == "none") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -269,6 +277,31 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  bool scalarResult = operation.getNumResults() == 1 &&
+                      !isa<RankedTensorType>(operation.getResult(0).getType());
+  if (scalarResult) {
+    FailureOr<std::string> indices = accessIndices(operation);
+    if (failed(view) || failed(indices))
+      return operation.emitOpError(
+          "lacks a mechanical TileLang scalar load binding");
+    std::string expression =
+        (*view)->argument->name + "[" + *indices + "]";
+    if (boundary.getCheckBounds() && boundary.getPadding() != "none") {
+      FailureOr<std::string> predicate =
+          elementBoundsPredicate(operation, {});
+      if (failed(predicate))
+        return failure();
+      StringRef fill = boundary.getPadding() == "negative_infinity"
+                           ? "-T.infinity(T.float32)"
+                           : "0.0";
+      expression = "T.if_then_else(" + *predicate + ", " + expression +
+                   ", " + fill.str() + ")";
+    }
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + expression);
+    bindResult(operation, 0, result);
+    return success();
+  }
   FailureOr<std::string> result =
       allocateResult(operation, 0, boundary.getResultSpace());
   if (failed(view) || failed(result))
@@ -289,10 +322,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       loop += tileIndices.back();
     }
     loop += " in T.Parallel(";
-    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
       if (axis)
         loop += ", ";
-      loop += extent;
+      loop += (*extents)[axis];
     }
     FailureOr<std::string> indices =
         elementAccessIndices(operation, tileIndices);
@@ -302,8 +335,25 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         boundary.getCheckBounds()
             ? elementBoundsPredicate(operation, tileIndices)
             : FailureOr<std::string>(std::string());
-    if (failed(predicate))
+    FailureOr<std::string> wholeTile =
+        boundary.getCheckBounds()
+            ? wholeTileBoundsPredicate(operation, *extents)
+            : FailureOr<std::string>(std::string());
+    FailureOr<std::string> bulkIndices =
+        boundary.getCheckBounds() ? accessIndices(operation)
+                                  : FailureOr<std::string>(std::string());
+    if (failed(predicate) || failed(wholeTile) || failed(bulkIndices))
       return failure();
+    bool hasBulkFastPath = !wholeTile->empty();
+    if (hasBulkFastPath) {
+      line("if " + *wholeTile + ":");
+      ++indentation;
+      line("T.copy(" + (*view)->argument->name + "[" + *bulkIndices + "], " +
+           *result + ")");
+      --indentation;
+      line("else:");
+      ++indentation;
+    }
     line(loop + "):");
     ++indentation;
     std::string target = *result + "[";
@@ -328,6 +378,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       --indentation;
     }
     --indentation;
+    if (hasBulkFastPath)
+      --indentation;
     if (boundary.getResultSpace() == "shared")
       line("T.sync_threads()");
     bindResult(operation, 0, *result);
@@ -338,10 +390,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> indices = accessIndices(operation);
   if (failed(indices))
     return failure();
-  if (boundary.getPadding() == "negative_infinity")
-    line("T.fill(" + *result + ", -T.infinity(T.float32))");
-  else
-    line("T.clear(" + *result + ")");
   line("T.copy(" + (*view)->argument->name + "[" + *indices + "], " +
        *result + ")");
   bindResult(operation, 0, *result);
@@ -551,6 +599,20 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_floor_divide")
+      symbol = "//";
+    else if (binding.getLowering() == "python_remainder")
+      symbol = "%";
+    else if (binding.getLowering() == "python_equal")
+      symbol = "==";
+    else if (binding.getLowering() == "python_not_equal")
+      symbol = "!=";
+    else if (binding.getLowering() == "python_less")
+      symbol = "<";
+    else if (binding.getLowering() == "python_less_equal")
+      symbol = "<=";
+    else if (binding.getLowering() == "python_greater")
+      symbol = ">";
     else if (binding.getLowering() == "python_greater_equal")
       symbol = ">=";
     else {
@@ -1302,10 +1364,10 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       loop += tileIndices.back();
     }
     loop += " in T.Parallel(";
-    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
       if (axis)
         loop += ", ";
-      loop += extent;
+      loop += (*extents)[axis];
     }
     FailureOr<std::string> indices =
         elementAccessIndices(operation, tileIndices);
@@ -1397,6 +1459,74 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
+  if (!valueIndex || failed(view) || failed(stored))
+    return operation.emitOpError("lacks a mechanical TileLang atomic merge");
+  if (planIndex.stages.empty()) {
+    Value storedValue = operation.getOperand(valueIndex.getInt());
+    if (!isa<RankedTensorType>(storedValue.getType())) {
+      FailureOr<int64_t> node =
+          target::getNodeID(operation, "atomic emission");
+      plan::BoundaryOp boundary =
+          succeeded(node) ? planIndex.boundaries.lookup(*node)
+                          : plan::BoundaryOp();
+      FailureOr<std::string> indices = elementAccessIndices(operation, {});
+      if (failed(node) || !boundary || failed(indices))
+        return operation.emitOpError(
+            "lacks a mechanical scalar TileLang atomic merge");
+      if (boundary.getCheckBounds()) {
+        FailureOr<std::string> predicate =
+            elementBoundsPredicate(operation, {});
+        if (failed(predicate))
+          return failure();
+        line("if " + *predicate + ":");
+        ++indentation;
+      }
+      line("T.atomic_add(" + (*view)->argument->name + "[" + *indices +
+           "], " + stored->str() + ")");
+      if (boundary.getCheckBounds())
+        --indentation;
+      return success();
+    }
+    auto result = dyn_cast<OpResult>(storedValue);
+    FailureOr<SmallVector<std::string>> extents =
+        result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+               : FailureOr<SmallVector<std::string>>(failure());
+    if (failed(extents) || extents->empty())
+      return operation.emitOpError(
+          "regular TileLang atomic merge requires a ranked value");
+    SmallVector<std::string> tileIndices;
+    std::string loop = "for ";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      tileIndices.push_back("atomic_i" + std::to_string(axis));
+      loop += tileIndices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    loop += "):";
+    FailureOr<std::string> indices =
+        elementAccessIndices(operation, tileIndices);
+    FailureOr<std::string> predicate =
+        elementBoundsPredicate(operation, tileIndices);
+    FailureOr<std::string> value =
+        tensorElement(storedValue, tileIndices, operation);
+    if (failed(indices) || failed(predicate) || failed(value))
+      return failure();
+    line(loop);
+    ++indentation;
+    line("if " + *predicate + ":");
+    ++indentation;
+    line("T.atomic_add(" + (*view)->argument->name + "[" + *indices + "], " +
+         *value + ")");
+    --indentation;
+    --indentation;
+    return success();
+  }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||

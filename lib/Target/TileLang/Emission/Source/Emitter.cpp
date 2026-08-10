@@ -82,10 +82,24 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_multiply");
   if (role == "binary_true_divide")
     return StringRef("python_true_divide");
+  if (role == "binary_floor_divide")
+    return StringRef("python_floor_divide");
+  if (role == "binary_remainder")
+    return StringRef("python_remainder");
   if (role == "binary_maximum")
     return StringRef("T.max");
   if (role == "binary_minimum")
     return StringRef("T.min");
+  if (role == "compare_equal")
+    return StringRef("python_equal");
+  if (role == "compare_not_equal")
+    return StringRef("python_not_equal");
+  if (role == "compare_less")
+    return StringRef("python_less");
+  if (role == "compare_less_equal")
+    return StringRef("python_less_equal");
+  if (role == "compare_greater")
+    return StringRef("python_greater");
   if (role == "compare_greater_equal")
     return StringRef("python_greater_equal");
   if (role == "mask")
@@ -267,23 +281,33 @@ indexRealization(intent::plan::RealizationOp realization,
                   operation->getName().getStringRef() == "intent.scatter_unique");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
+    FailureOr<bool> derivedScalar =
+        target::hasDerivedScalarIndex(*operation);
+    if (failed(derivedScalar))
+      return failure();
     plan::BoundaryOp binding;
     binding.operation = value;
     binding.access = rowStrided ? (load ? "gather" : "scatter")
                                 : (load ? "load" : "store");
-    binding.transfer = programAxes > 1 &&
-                               target::emission::touchesStateStream(*operation)
-                           ? "parallel_elements"
-                           : "bulk_copy";
+    bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
+      return target::emission::isRaggedBoundAxis(index.components, axis);
+    });
+    bool materializeLogicalBounds =
+        raggedBound && !value.getConsumerNeutralized();
+    binding.transfer =
+        *derivedScalar ||
+                (programAxes > 1 &&
+                 target::emission::touchesStateStream(*operation) &&
+                 !value.getConsumerNeutralized())
+            ? "parallel_elements"
+            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
     binding.defer = load && target::emission::feedsContraction(*operation) &&
                     (!index.components.groups.empty() ||
                      target::emission::feedsStagedContraction(index, *operation));
-    bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
-      return target::emission::isRaggedBoundAxis(index.components, axis);
-    });
     binding.explicitBounds =
-        rowStrided || raggedBound || (!index.stages.empty() && store);
+        rowStrided || materializeLogicalBounds ||
+        (!index.stages.empty() && store) || *derivedScalar;
     if (binding.resultSpace.empty()) {
       value.emitOpError("has no TileLang transfer residency spelling");
       return failure();
@@ -672,6 +696,9 @@ void SourceEmitter::emitImports() {
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
   output << "from intent.runtime.tuning.tilelang import DEFAULT_NUM_STAGES, DEFAULT_THREADS, row_configuration\n";
+  if (planIndex.program.getPersistent())
+    output << "_NUM_SMS = torch.cuda.get_device_properties("
+           << planIndex.target.getDevice() << ").multi_processor_count\n";
   if (searchSpace) {
     output << "from tilelang.autotuner import autotune, set_autotune_inputs\n";
     output << "from intent.runtime.tuning.tilelang import autotune_configurations\n";
@@ -712,8 +739,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       parameter("num_stages=DEFAULT_NUM_STAGES");
       parameter("threads=DEFAULT_THREADS");
     } else {
-      for (NamedAttribute config : searchIndex.autotune.getParameterMap())
-        parameter(config.getName().getValue().str() + "=1");
+      if (searchIndex.autotune)
+        for (NamedAttribute config : searchIndex.autotune.getParameterMap())
+          parameter(config.getName().getValue().str() + "=1");
       parameter("num_stages=DEFAULT_NUM_STAGES");
       parameter("threads=DEFAULT_THREADS");
     }
@@ -904,15 +932,28 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   };
   std::array<std::string, 3> grid =
       target::emission::projectProgramGrid(planIndex, axisExtent);
+  bool persistent = planIndex.program.getPersistent();
+  std::string linear = "persistent_program";
   unsigned workers = 0;
   for (plan::AxisOp axis : programAxes)
     workers = std::max(workers,
                        static_cast<unsigned>(axis.getWorkerAxis() + 1));
+  if (persistent) {
+    output << "        total_program_tiles = "
+           << target::emission::projectProgramVolume(planIndex, axisExtent)
+           << "\n";
+    output << "        persistent_programs = T.min(_NUM_SMS, total_program_tiles)\n";
+    workers = 1;
+  }
   output << "        with T.Kernel(";
-  for (unsigned worker = 0; worker < workers; ++worker) {
-    if (worker)
-      output << ", ";
-    output << grid[worker];
+  if (persistent) {
+    output << "persistent_programs";
+  } else {
+    for (unsigned worker = 0; worker < workers; ++worker) {
+      if (worker)
+        output << ", ";
+      output << grid[worker];
+    }
   }
   output << ", threads=threads) as ";
   if (workers == 1)
@@ -925,6 +966,15 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       output << "pid_worker_" << worker;
     }
     output << "):\n";
+  }
+  std::string programIndent = "            ";
+  if (persistent) {
+    output << "            for persistent_wave in T.serial(T.ceildiv(total_program_tiles, persistent_programs)):\n";
+    output << "                " << linear
+           << " = persistent_wave * persistent_programs + pid_worker_0\n";
+    output << "                if " << linear << " < total_program_tiles:\n";
+    programIndent = "                    ";
+    indentation = 5;
   }
 
   for (const auto &entry : planIndex.components.groups) {
@@ -954,21 +1004,31 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     std::string size = "group_size_" + std::to_string(lhs.getNode());
     std::string lhsBlock = "block_axis_" + std::to_string(lhs.getNode());
     std::string rhsBlock = "block_axis_" + std::to_string(rhs.getNode());
-    output << "            " << pid << " = pid_worker_" << lhs.getWorkerAxis()
-           << "\n";
-    output << "            " << lhsCount << " = T.ceildiv("
+    if (persistent) {
+      FailureOr<std::string> groupIndex =
+          target::emission::projectLinearGroupIndex(
+              planIndex, axes, axisExtent, linear,
+              *lhs.operation.getOperation());
+      if (failed(groupIndex))
+        return failure();
+      output << programIndent << pid << " = " << *groupIndex << "\n";
+    } else {
+      output << programIndent << pid << " = pid_worker_"
+             << lhs.getWorkerAxis() << "\n";
+    }
+    output << programIndent << lhsCount << " = T.ceildiv("
            << roleDimensions.lookup(lhsRole) << ", " << lhs.getTile() << ")\n";
-    output << "            " << rhsCount << " = T.ceildiv("
+    output << programIndent << rhsCount << " = T.ceildiv("
            << roleDimensions.lookup(rhsRole) << ", " << rhs.getTile() << ")\n";
-    output << "            " << span << " = " << group << " * " << rhsCount
+    output << programIndent << span << " = " << group << " * " << rhsCount
            << "\n";
-    output << "            " << id << " = " << pid << " // " << span << "\n";
-    output << "            " << first << " = " << id << " * " << group << "\n";
-    output << "            " << size << " = T.min(" << lhsCount << " - "
+    output << programIndent << id << " = " << pid << " // " << span << "\n";
+    output << programIndent << first << " = " << id << " * " << group << "\n";
+    output << programIndent << size << " = T.min(" << lhsCount << " - "
            << first << ", " << group << ")\n";
-    output << "            " << lhsBlock << " = " << first << " + (" << pid
+    output << programIndent << lhsBlock << " = " << first << " + (" << pid
            << " % " << size << ")\n";
-    output << "            " << rhsBlock << " = (" << pid << " % " << span
+    output << programIndent << rhsBlock << " = (" << pid << " % " << span
            << ") // " << size << "\n";
     programBlocks[lhs.getNode()] = lhsBlock;
     programBlocks[rhs.getNode()] = rhsBlock;
@@ -976,14 +1036,17 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     axisIndices[rhs.getNode()] = rhsBlock + " * " + rhs.getTile().str();
   }
   SmallVector<target::emission::ProgramIndexProjection> projections =
-      target::emission::projectProgramIndices(
-          planIndex, axisExtent, [](unsigned worker) {
-            return "pid_worker_" + std::to_string(worker);
-          });
+      persistent
+          ? target::emission::projectLinearProgramIndices(
+                planIndex, axisExtent, linear)
+          : target::emission::projectProgramIndices(
+                planIndex, axisExtent, [](unsigned worker) {
+                  return "pid_worker_" + std::to_string(worker);
+                });
   for (const target::emission::ProgramIndexProjection &projection : projections) {
     plan::AxisOp axis = projection.axis;
     std::string block = "block_axis_" + std::to_string(axis.getNode());
-    output << "            " << block << " = " << projection.expression << "\n";
+    output << programIndent << block << " = " << projection.expression << "\n";
     programBlocks[axis.getNode()] = block;
     axisIndices[axis.getNode()] =
         axis.isScalar() ? block : block + " * " + axis.getTile().str();
@@ -1262,7 +1325,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   SmallVector<ABIView *> inputs;
   SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
-    if (view.view.getAccess() == "in")
+    if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
       inputs.push_back(&view);
     else if (view.view.getAccess() == "out")
       outputs.push_back(&view);
@@ -1408,6 +1471,12 @@ FailureOr<ABIView *> SourceEmitter::lookupView(Value value,
 
 FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
                                                     Operation &consumer) {
+  FailureOr<target::ScalarIndexSource> scalarSource =
+      target::traceScalarIndexSource(indexedValue, consumer);
+  if (failed(scalarSource))
+    return failure();
+  if (scalarSource->domain)
+    return scalarSource->domain;
   if (Operation *definition = indexedValue.getDefiningOp())
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
@@ -1524,19 +1593,30 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
         term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "TileLang access has no mechanical index relation");
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
-    if (failed(axis))
-      return failure();
-    std::string base = axisIndices.lookup(axis->getNode());
-    if (base.empty()) {
-      operation.emitOpError()
-          << "has no active TileLang index for logical axis " << axis->getNode();
-      return failure();
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (failed(exact))
+        return failure();
+      indices.push_back("(" + exact->str() + ")");
+    } else {
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis))
+        return failure();
+      std::string base = axisIndices.lookup(axis->getNode());
+      if (base.empty()) {
+        operation.emitOpError()
+            << "has no active TileLang index for logical axis "
+            << axis->getNode();
+        return failure();
+      }
+      indices.push_back(
+          axis->isScalar()
+              ? base
+              : base + " : " + base + " + " + axis->getTile().str());
     }
-    indices.push_back(axis->isScalar()
-                          ? base
-                          : base + " : " + base + " + " + axis->getTile().str());
   }
   std::string result;
   for (auto [index, value] : llvm::enumerate(indices)) {
@@ -1575,21 +1655,30 @@ SourceEmitter::elementAccessIndices(Operation &operation,
         term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "parallel TileLang transfer has no mechanical index relation");
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
-    if (failed(axis))
-      return failure();
-    std::string base = axisIndices.lookup(axis->getNode());
-    if (base.empty())
-      return operation.emitOpError(
-          "has no active TileLang element index for its logical axis");
-    if (!axis->isScalar()) {
-      if (tileAxis >= tileIndices.size())
-        return operation.emitOpError(
-            "parallel TileLang transfer has too few tile indices");
-      indices.push_back(base + " + " + tileIndices[tileAxis++]);
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (failed(exact))
+        return failure();
+      indices.push_back("(" + exact->str() + ")");
     } else {
-      indices.push_back(base);
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis))
+        return failure();
+      std::string base = axisIndices.lookup(axis->getNode());
+      if (base.empty())
+        return operation.emitOpError(
+            "has no active TileLang element index for its logical axis");
+      if (!axis->isScalar()) {
+        if (tileAxis >= tileIndices.size())
+          return operation.emitOpError(
+              "parallel TileLang transfer has too few tile indices");
+        indices.push_back(base + " + " + tileIndices[tileAxis++]);
+      } else {
+        indices.push_back(base);
+      }
     }
   }
   if (tileAxis != tileIndices.size())
@@ -1611,9 +1700,12 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(view) || relation->size() != (*view)->shape.size())
+    return failure();
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
-  for (const target::IndexTerm &term : *relation) {
+  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
       if (tileAxis >= tileIndices.size())
         return operation.emitOpError(
@@ -1627,8 +1719,26 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
         term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "bounded TileLang transfer has no mechanical index relation");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<target::ScalarIndexSource> source =
+          target::traceScalarIndexSource(indexed, operation);
+      if (failed(source))
+        return failure();
+      if (source->domain && source->transformed) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        std::string extent = (*view)->shape[axisNumber];
+        predicates.push_back("0 <= (" + exact->str() + ")");
+        predicates.push_back("(" + exact->str() + ") < " + extent);
+      }
+      continue;
+    }
     FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
+        resolveAxis(indexed, operation);
     if (failed(axis))
       return failure();
     if (axis->isScalar())
@@ -1668,6 +1778,88 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       result += " and ";
     result += predicate;
   }
+  return result;
+}
+
+FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
+    Operation &operation, ArrayRef<std::string> tileExtents) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(relation) || failed(view) ||
+      relation->size() != (*view)->shape.size())
+    return failure();
+  SmallVector<std::string> predicates;
+  unsigned tileAxis = 0;
+  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+    if (term.kind == "full_slice") {
+      if (tileAxis >= tileExtents.size())
+        return operation.emitOpError(
+            "whole-tile TileLang transfer has too few tile extents");
+      ++tileAxis;
+      continue;
+    }
+    if (term.kind == "static_index")
+      continue;
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "whole-tile TileLang transfer has no mechanical index relation");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<target::ScalarIndexSource> source =
+          target::traceScalarIndexSource(indexed, operation);
+      if (failed(source))
+        return failure();
+      if (source->domain && source->transformed) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        predicates.push_back("0 <= (" + exact->str() + ")");
+        predicates.push_back("(" + exact->str() + ") < " +
+                             (*view)->shape[axisNumber]);
+      }
+      continue;
+    }
+    FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+    if (failed(axis))
+      return failure();
+    if (axis->isScalar())
+      continue;
+    if (tileAxis >= tileExtents.size())
+      return operation.emitOpError(
+          "whole-tile TileLang transfer has too few tile extents");
+    std::string base = axisIndices.lookup(axis->getNode());
+    FailureOr<std::string> extent = failure();
+    if (target::emission::isRaggedBoundAxis(planIndex.components,
+                                            axis->getNode())) {
+      FailureOr<int64_t> orderedAxis =
+          target::emission::representativeOrderedAxis(planIndex,
+                                                      axis->getNode(), operation);
+      if (failed(orderedAxis))
+        return failure();
+      extent = "sequence_end_" + std::to_string(*orderedAxis);
+    } else {
+      Operation *domain = kernel.nodes.lookup(axis->getNode());
+      if (domain)
+        extent = dimensionName(*domain);
+    }
+    if (base.empty() || failed(extent))
+      return operation.emitOpError(
+          "whole-tile TileLang transfer has no active axis interval");
+    predicates.push_back(base + " + " + tileExtents[tileAxis++] + " <= " +
+                         *extent);
+  }
+  if (tileAxis != tileExtents.size())
+    return operation.emitOpError(
+        "whole-tile TileLang transfer has unused tile extents");
+  if (predicates.empty())
+    return std::string();
+  std::string result = predicates.front();
+  for (StringRef predicate : llvm::drop_begin(predicates))
+    result += " and " + predicate.str();
   return result;
 }
 

@@ -337,6 +337,8 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
                : operation->emitOpError("requires intent.value");
   if (name == "intent.dim")
     return requireAttribute<IntegerAttr>(operation, "intent.axis");
+  if (name == "intent.assume_in_bounds")
+    return requireAttribute<IntegerAttr>(operation, "intent.axis");
   if (name == "intent.partition")
     return requireAttribute<StringAttr>(operation, "intent.mode");
   if (name == "intent.transpose")

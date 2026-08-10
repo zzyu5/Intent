@@ -24,7 +24,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.dim", "intent.domain", "intent.region_end",
-                         "intent.partition", "intent.yield", "intent.return", "intent.ragged",
+                         "intent.assume_in_bounds", "intent.partition", "intent.yield", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
@@ -188,6 +188,27 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     return success();
   programBindingsEmitted = true;
 
+  auto axisExtent = [&](plan::AxisOp axis) {
+    std::string role =
+        "program_" + std::to_string(axis.getProgramOrder());
+    std::string extent =
+        dimensionOwners.lookup(roleDimensions.lookup(role));
+    return axis.isScalar()
+               ? extent
+               : "ct.cdiv(" + extent + ", " + axis.getTile().str() + ")";
+  };
+  bool persistent = planIndex.program.getPersistent();
+  std::string linear = "persistent_program";
+  if (persistent) {
+    line("total_program_tiles = " +
+         target::emission::projectProgramVolume(planIndex, axisExtent));
+    line("program_start = ct.bid(0)");
+    line("program_step = ct.num_blocks(0)");
+    line("for " + linear +
+         " in range(program_start, total_program_tiles, program_step):");
+    ++indentation;
+  }
+
   for (const auto &entry : planIndex.components.groups) {
     SmallVector<plan::AxisOp> axes(entry.getValue().begin(), entry.getValue().end());
     llvm::sort(axes, [](plan::AxisOp lhs, plan::AxisOp rhs) {
@@ -215,7 +236,17 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     std::string size = "group_size_" + std::to_string(lhs.getNode());
     std::string lhsBlock = "block_axis_" + std::to_string(lhs.getNode());
     std::string rhsBlock = "block_axis_" + std::to_string(rhs.getNode());
-    line(pid + " = ct.bid(" + std::to_string(lhs.getWorkerAxis()) + ")");
+    if (persistent) {
+      FailureOr<std::string> groupIndex =
+          target::emission::projectLinearGroupIndex(
+              planIndex, axes, axisExtent, linear,
+              *lhs.operation.getOperation());
+      if (failed(groupIndex))
+        return failure();
+      line(pid + " = " + *groupIndex);
+    } else {
+      line(pid + " = ct.bid(" + std::to_string(lhs.getWorkerAxis()) + ")");
+    }
     line(lhsCount + " = ct.cdiv(" +
          dimensionOwners.lookup(roleDimensions.lookup(lhsRole)) + ", " +
          lhs.getTile().str() + ")");
@@ -235,20 +266,14 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     axisIndices[rhs.getNode()] = rhsBlock;
   }
 
-  auto axisExtent = [&](plan::AxisOp axis) {
-    std::string role =
-        "program_" + std::to_string(axis.getProgramOrder());
-    std::string extent =
-        dimensionOwners.lookup(roleDimensions.lookup(role));
-    return axis.isScalar()
-               ? extent
-               : "ct.cdiv(" + extent + ", " + axis.getTile().str() + ")";
-  };
   SmallVector<target::emission::ProgramIndexProjection> projections =
-      target::emission::projectProgramIndices(
-          planIndex, axisExtent, [](unsigned worker) {
-            return "ct.bid(" + std::to_string(worker) + ")";
-          });
+      persistent
+          ? target::emission::projectLinearProgramIndices(
+                planIndex, axisExtent, linear)
+          : target::emission::projectProgramIndices(
+                planIndex, axisExtent, [](unsigned worker) {
+                  return "ct.bid(" + std::to_string(worker) + ")";
+                });
   for (const target::emission::ProgramIndexProjection &projection : projections) {
     plan::AxisOp axis = projection.axis;
     std::string block = "block_axis_" + std::to_string(axis.getNode());
@@ -344,6 +369,16 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     return success();
   }
 
+  if (planIndex.program.getPersistent()) {
+    if (&operation == programRoot && failed(emitProgramBindings()))
+      return failure();
+    std::string value = axisIndices.lookup(axis->getNode());
+    if (value.empty())
+      return axis->emitOpError("has no persistent cuTile program index");
+    valueNames[argument] = value;
+    return success();
+  }
+
   if (&operation == programRoot && failed(emitProgramBindings()))
     return failure();
   std::string value = axisIndices.lookup(axis->getNode());
@@ -354,7 +389,9 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
-  if (&operation == programRoot && !planIndex.components.reusedAxes.empty())
+  if (&operation == programRoot &&
+      (!planIndex.components.reusedAxes.empty() ||
+       planIndex.program.getPersistent()))
     --indentation;
   return success();
 }
@@ -365,7 +402,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a cuTile load boundary");
-  if (boundary.getDomainNodes().empty() && boundary.getPadding() == "none") {
+  FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
+  if (failed(wholeView))
+    return failure();
+  if (*wholeView && boundary.getDomainNodes().empty() &&
+      boundary.getPadding() == "none") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -390,16 +431,27 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
          ")");
   } else if (boundary.getAccess() == "load") {
     FailureOr<std::string> shape = tileShape(operation);
-    FailureOr<std::string> resultShape = emitTensorShape(operation, 0);
+    bool scalarResult = operation.getNumResults() == 1 &&
+                        !isa<RankedTensorType>(operation.getResult(0).getType());
+    FailureOr<std::string> resultShape =
+        scalarResult ? FailureOr<std::string>(std::string())
+                     : emitTensorShape(operation, 0);
     if (failed(shape) || failed(resultShape))
       return failure();
     StringRef paddingMode = boundary.getPadding() == "negative_infinity"
                                 ? "ct.PaddingMode.NEG_INF"
                                 : "ct.PaddingMode.ZERO";
-    line(result + " = ct.load(" + (*view)->argument->name + ", index=" +
-         *indices + ", shape=" + *shape +
-         ", padding_mode=" + paddingMode.str() + ").reshape(" + *resultShape +
-         ")");
+    std::string expression =
+        "ct.load(" + (*view)->argument->name + ", index=" + *indices +
+        ", shape=" + *shape;
+    if (boundary.getPadding() != "none")
+      expression += ", padding_mode=" + paddingMode.str();
+    expression += ")";
+    if (scalarResult)
+      expression += ".item()";
+    else
+      expression += ".reshape(" + *resultShape + ")";
+    line(result + " = " + expression);
   } else {
     return boundary.emitOpError("is not a load-like cuTile access");
   }
@@ -505,6 +557,20 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_floor_divide")
+      symbol = "//";
+    else if (binding.getLowering() == "python_remainder")
+      symbol = "%";
+    else if (binding.getLowering() == "python_equal")
+      symbol = "==";
+    else if (binding.getLowering() == "python_not_equal")
+      symbol = "!=";
+    else if (binding.getLowering() == "python_less")
+      symbol = "<";
+    else if (binding.getLowering() == "python_less_equal")
+      symbol = "<=";
+    else if (binding.getLowering() == "python_greater")
+      symbol = ">";
     else if (binding.getLowering() == "python_greater_equal")
       symbol = ">=";
     else
@@ -970,8 +1036,14 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, true);
   FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
   FailureOr<std::string> rhsShape = tileShape(*rhsLoad);
-  FailureOr<std::string> lhsResultShape = emitTensorShape(*lhsLoad, 0);
-  FailureOr<std::string> rhsResultShape = emitTensorShape(*rhsLoad, 0);
+  bool permuteLhs =
+      orientation->lhsTranspose && (*lhsView)->tensor.getRank() > 2;
+  bool permuteRhs =
+      orientation->rhsTranspose && (*rhsView)->tensor.getRank() > 2;
+  FailureOr<std::string> lhsResultShape =
+      emitTensorShape(*lhsLoad, 0, permuteLhs);
+  FailureOr<std::string> rhsResultShape =
+      emitTensorShape(*rhsLoad, 0, permuteRhs);
   if (failed(lhsView) || failed(rhsView) || failed(lhsIndex) ||
       failed(rhsIndex) || failed(lhsShape) || failed(rhsShape) ||
       failed(lhsResultShape) || failed(rhsResultShape) ||
@@ -992,19 +1064,38 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   ++indentation;
   std::string lhs = makeResultName(*lhsLoad, 0);
   std::string rhs = makeResultName(*rhsLoad, 0);
-  line(lhs + " = ct.load(" + (*lhsView)->argument->name + ", index=" +
-       *lhsIndex + ", shape=" + *lhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *lhsResultShape +
-       ").astype(" + operandDtype + ")");
-  line(rhs + " = ct.load(" + (*rhsView)->argument->name + ", index=" +
-       *rhsIndex + ", shape=" + *rhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *rhsResultShape +
-       ").astype(" + operandDtype + ")");
+  auto emitOperand = [&](StringRef name, ABIView &view, StringRef index,
+                         StringRef shape, StringRef resultShape,
+                         bool transpose) {
+    std::string physical = name.str() + "_physical";
+    line(physical + " = ct.load(" + view.argument->name + ", index=" +
+         index.str() + ", shape=" + shape.str() +
+         ", padding_mode=ct.PaddingMode.ZERO)");
+    if (transpose && view.tensor.getRank() > 2) {
+      std::string permutation = "(";
+      for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis) {
+        if (axis)
+          permutation += ", ";
+        int64_t projected = axis;
+        if (axis == view.tensor.getRank() - 2)
+          projected = axis + 1;
+        else if (axis == view.tensor.getRank() - 1)
+          projected = axis - 1;
+        permutation += std::to_string(projected);
+      }
+      permutation += ")";
+      line(physical + " = ct.permute(" + physical + ", " + permutation + ")");
+    }
+    line(name.str() + " = " + physical + ".reshape(" + resultShape.str() +
+         ").astype(" + operandDtype + ")");
+  };
+  emitOperand(lhs, **lhsView, *lhsIndex, *lhsShape, *lhsResultShape, permuteLhs);
+  emitOperand(rhs, **rhsView, *rhsIndex, *rhsShape, *rhsResultShape, permuteRhs);
   std::string lhsExpression = lhs;
   std::string rhsExpression = rhs;
-  if (orientation->lhsTranspose)
+  if (orientation->lhsTranspose && (*lhsView)->tensor.getRank() == 2)
     lhsExpression = "ct.transpose(" + lhsExpression + ")";
-  if (orientation->rhsTranspose)
+  if (orientation->rhsTranspose && (*rhsView)->tensor.getRank() == 2)
     rhsExpression = "ct.transpose(" + rhsExpression + ")";
   line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression + ", " +
        result + ")");
@@ -1041,8 +1132,49 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
         return failure();
       tile += ".reshape(" + *physicalShape + ")";
     }
+    SmallVector<std::string> scalarBounds;
+    if (boundary.getCheckBounds()) {
+      FailureOr<SmallVector<target::IndexTerm>> relation =
+          target::parseIndexRelation(operation);
+      if (failed(relation) || relation->size() != (*view)->shape.size())
+        return failure();
+      for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+        if (term.kind != "value_index" || term.operands.size() != 1 ||
+            !term.operands.front())
+          continue;
+        Value indexed = operation.getOperand(*term.operands.front());
+        if (isa<RankedTensorType>(indexed.getType()))
+          continue;
+        FailureOr<target::ScalarIndexSource> source =
+            target::traceScalarIndexSource(indexed, operation);
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(source) || failed(exact))
+          return failure();
+        if (source->domain && source->transformed) {
+          std::string extent = (*view)->shape[axisNumber];
+          if (!planIndex.components.reusedAxes.empty()) {
+            if (roleDimensions.lookup("program_0") == extent)
+              extent = "N_ROWS";
+            else if (roleDimensions.lookup("lane_0") == extent)
+              extent = "DIM_COLS";
+          }
+          scalarBounds.push_back("(0 <= (" + exact->str() + ") < " +
+                                 extent + ")");
+        }
+      }
+    }
+    if (!scalarBounds.empty()) {
+      std::string predicate = scalarBounds.front();
+      for (StringRef next : llvm::drop_begin(scalarBounds))
+        predicate += " and " + next.str();
+      line("if " + predicate + ":");
+      ++indentation;
+    }
     line("ct.store(" + (*view)->argument->name + ", index=" + *indices +
          ", tile=" + tile + ")");
+    if (!scalarBounds.empty())
+      --indentation;
   } else
     return boundary.emitOpError("is not a store-like cuTile access");
   return success();
@@ -1091,6 +1223,18 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
+  if (!valueIndex || failed(view) || failed(stored))
+    return operation.emitOpError("lacks a mechanical cuTile atomic merge");
+  if (planIndex.stages.empty()) {
+    FailureOr<std::string> indices = indexTuple(operation, false);
+    if (failed(indices))
+      return failure();
+    line("ct.atomic_add(" + (*view)->argument->name + ", " + *indices + ", " +
+         stored->str() +
+         ", check_bounds=True, memory_order=ct.MemoryOrder.RELAXED, "
+         "memory_scope=ct.MemoryScope.DEVICE)");
+    return success();
+  }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||

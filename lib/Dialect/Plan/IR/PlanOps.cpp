@@ -160,6 +160,11 @@ LogicalResult TransferOp::verify() {
   if (getFill() != "negative_infinity" && getFill() != "zero" &&
       getFill() != "none")
     return emitOpError("contains an unsupported boundary fill");
+  if (getConsumerNeutralized() &&
+      (getDomainNodes().empty() || getFill() == "none" ||
+       getResultSpace() == "none"))
+    return emitOpError(
+        "consumer-neutralized transfer requires a bounded load with a fill");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
       !isPrivateSpace(getResultSpace()))
     return emitOpError("contains an unsupported result residency");
@@ -300,6 +305,15 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     return realization.emitOpError("requires one GPU device and one program mapping");
   if (programOrders.empty())
     return program.emitOpError("has no per-axis program-space assignment");
+  if (program.getPersistent())
+    for (const auto &entry : axes) {
+      AxisOp axis = entry.second;
+      if (!axisHasRole(axis, "parallel"))
+        continue;
+      if (axis.getWorkerAxis() != 0 || axis.getReuseWorker())
+        return axis.emitOpError(
+            "persistent program axes must share worker axis zero without nested reuse");
+    }
   for (PaddingOp padding : paddings)
     for (int64_t domain : padding.getDomainNodes())
       if (!axes.count(domain))

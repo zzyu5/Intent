@@ -55,7 +55,10 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.compare") {
     auto predicate =
         operation.getAttrOfType<StringAttr>("intent.predicate");
-    if (predicate && predicate.getValue() == "ge")
+    if (predicate &&
+        llvm::is_contained({StringRef("eq"), StringRef("ne"), StringRef("lt"),
+                            StringRef("le"), StringRef("gt"), StringRef("ge")},
+                           predicate.getValue()))
       return success();
     return operation.emitOpError("has no supported GPU comparison predicate");
   }
@@ -71,6 +74,7 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.binary" &&
       llvm::is_contained({StringRef("add"), StringRef("subtract"),
                           StringRef("multiply"), StringRef("true_divide"),
+                          StringRef("floor_divide"), StringRef("remainder"),
                           StringRef("maximum"), StringRef("minimum")},
                          logical.getValue()))
     return success();
@@ -81,6 +85,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
                          "intent.region_end",
+                         "intent.assume_in_bounds",
                          "intent.partition", "intent.parallel",
                          "intent.view_load", "intent.view_store", "intent.yield",
                          "intent.return", "intent.state_stream", "intent.ragged",

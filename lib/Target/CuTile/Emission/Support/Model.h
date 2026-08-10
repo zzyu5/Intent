@@ -145,7 +145,8 @@ private:
   padExpression(mlir::Value value, llvm::StringRef expression,
                 mlir::Operation &consumer);
   mlir::FailureOr<std::string>
-  emitTensorShape(mlir::Operation &operation, unsigned resultIndex);
+  emitTensorShape(mlir::Operation &operation, unsigned resultIndex,
+                  bool transposeLastTwo = false);
   mlir::FailureOr<unsigned> emittedTensorRank(mlir::Operation &operation,
                                              bool store);
   mlir::LogicalResult prepareRaggedMetadata();

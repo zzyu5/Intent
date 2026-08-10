@@ -13,6 +13,7 @@ from .annotations import constraints
 from .builtins import LOG2E
 from .builtins import add
 from .builtins import all
+from .builtins import assume_in_bounds
 from .builtins import any
 from .builtins import atomic_add
 from .builtins import atomic_cas
@@ -92,6 +93,7 @@ __all__ = [
     "ViewSpec",
     "add",
     "all",
+    "assume_in_bounds",
     "any",
     "atomic_add",
     "atomic_cas",

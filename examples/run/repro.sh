@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
   exit 2
 fi
 
@@ -140,6 +140,10 @@ case "${backend}:${kernel}" in
   tilelang:attention_bias | tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:fused_add_rms_norm | tilelang:logsumexp | \
   tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | \
   triton:varlen_attention | cutile:varlen_attention)
+    ;;
+  triton:shifted_row_copy | cutile:shifted_row_copy | tilelang:shifted_row_copy | \
+  triton:grouped_query_head_add | cutile:grouped_query_head_add | tilelang:grouped_query_head_add | \
+  triton:scalar_table_lookup | cutile:scalar_table_lookup | tilelang:scalar_table_lookup)
     ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2

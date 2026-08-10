@@ -15,8 +15,23 @@ struct IndexTerm {
   llvm::SmallVector<std::optional<int64_t>> staticValues;
 };
 
+struct ScalarIndexSource {
+  mlir::Operation *domain = nullptr;
+  bool opaque = false;
+  bool transformed = false;
+
+  bool isStatic() const { return !domain && !opaque; }
+};
+
 mlir::FailureOr<llvm::SmallVector<IndexTerm>>
 parseIndexRelation(mlir::Operation &operation);
+
+mlir::FailureOr<ScalarIndexSource>
+traceScalarIndexSource(mlir::Value value, mlir::Operation &consumer);
+
+mlir::FailureOr<bool> hasDerivedScalarIndex(mlir::Operation &operation);
+
+mlir::FailureOr<bool> isWholeViewAccess(mlir::Operation &operation);
 
 } // namespace intent::target
 

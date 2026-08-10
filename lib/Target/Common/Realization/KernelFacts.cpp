@@ -23,6 +23,7 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
   if (failed(relation))
     return failure();
   SmallVector<Operation *> domains;
+  bool hasOpaqueScalarIndex = false;
   for (const IndexTerm &term : *relation) {
     if (term.kind == "full_slice" || term.kind == "new_axis" ||
         term.kind == "static_index" || term.kind == "slice")
@@ -32,10 +33,23 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
           "boundary analysis requires one value per dynamic index term");
     Value indexed = operation.getOperand(*term.operands.front());
     auto indexedAxes = facts.valueAxes.find(indexed);
-    if (term.kind == "value_index" && indexedAxes != facts.valueAxes.end()) {
-      for (const LogicalAxis &axis : indexedAxes->second)
-        if (axis.domain && !llvm::is_contained(domains, axis.domain))
-          domains.push_back(axis.domain);
+    if (term.kind == "value_index") {
+      if (indexedAxes != facts.valueAxes.end()) {
+        for (const LogicalAxis &axis : indexedAxes->second)
+          if (axis.domain && !llvm::is_contained(domains, axis.domain))
+            domains.push_back(axis.domain);
+        continue;
+      }
+      FailureOr<ScalarIndexSource> source =
+          traceScalarIndexSource(indexed, operation);
+      if (failed(source))
+        return failure();
+      if (source->domain) {
+        if (!llvm::is_contained(domains, source->domain))
+          domains.push_back(source->domain);
+      } else if (source->opaque) {
+        hasOpaqueScalarIndex = true;
+      }
       continue;
     }
     FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
@@ -43,11 +57,21 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
       return failure();
     domains.push_back(*domain);
   }
-  if (domains.empty())
+  if (domains.empty() && !hasOpaqueScalarIndex)
     return operation.emitOpError("has no domain-bound index for realization");
   facts.boundaryDomains[&operation] = std::move(domains);
   facts.boundaryFills[&operation] = fill.str();
   return success();
+}
+
+bool hasInBoundsPrecondition(Value index, Value view, unsigned axis,
+                             Operation &access, const KernelFacts &facts) {
+  return llvm::any_of(facts.indexPreconditions,
+                      [&](const IndexPreconditionFact &fact) {
+    return fact.index == index && fact.view == view && fact.axis == axis &&
+           fact.declaration && fact.declaration->getBlock() == access.getBlock() &&
+           fact.declaration->isBeforeInBlock(&access);
+  });
 }
 
 FailureOr<Value> backingView(Value tensor, const KernelFacts &facts,
@@ -102,6 +126,76 @@ FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
     return failure();
   axis->domain = &domain;
   return axis;
+}
+
+FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
+                                        KernelFacts &facts) {
+  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  unsigned sourceAxis = 0;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
+    if (term.kind == "full_slice" || term.kind == "static_index") {
+      ++sourceAxis;
+      continue;
+    }
+    if (term.kind == "slice")
+      return true;
+    if (term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "boundary classification requires one dynamic index operand");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType()))
+      return true;
+    if (term.kind == "value_index") {
+      FailureOr<ScalarIndexSource> source =
+          traceScalarIndexSource(indexed, operation);
+      if (failed(source))
+        return failure();
+      if (source->opaque && !source->domain) {
+        if (!hasInBoundsPrecondition(indexed, operation.getOperand(0),
+                                     sourceAxis, operation, facts))
+          return operation.emitOpError(
+              "opaque scalar index requires a preceding I.assume_in_bounds declaration");
+        ++sourceAxis;
+        continue;
+      }
+      if (source->transformed)
+        return true;
+      if (!source->domain) {
+        ++sourceAxis;
+        continue;
+      }
+      FailureOr<LogicalAxis> logical =
+          axisFromDomain(*source->domain, facts, operation);
+      FailureOr<LogicalAxis> destination =
+          axisFromView(operation.getOperand(0), sourceAxis++, facts, operation);
+      if (failed(logical) || failed(destination))
+        return failure();
+      if (logical->extent != destination->extent)
+        return true;
+      continue;
+    }
+    if (term.kind != "region_index")
+      return operation.emitOpError("has an unsupported boundary index relation");
+    if (!isa<intent::LogicalIndexType, IntegerType, IndexType>(
+            indexed.getType()))
+      return true;
+    FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
+    FailureOr<LogicalAxis> logical =
+        succeeded(domain) ? axisFromDomain(**domain, facts, operation)
+                          : FailureOr<LogicalAxis>(failure());
+    FailureOr<LogicalAxis> destination =
+        axisFromView(operation.getOperand(0), sourceAxis++, facts, operation);
+    if (failed(domain) || failed(logical) || failed(destination))
+      return failure();
+    if (logical->extent != destination->extent)
+      return true;
+  }
+  return false;
 }
 
 LogicalResult bindRegionArgumentAxis(Operation &owner, unsigned argumentIndex,
@@ -231,10 +325,13 @@ LogicalResult recordLoadAxes(Operation &operation, KernelFacts &facts) {
       FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
       if (failed(domain))
         return failure();
-      FailureOr<LogicalAxis> axis = axisFromDomain(**domain, facts, operation);
-      if (failed(axis))
-        return failure();
-      axes.push_back(*axis);
+      if (!isa<intent::LogicalIndexType, IntegerType, IndexType>(
+              indexed.getType())) {
+        FailureOr<LogicalAxis> axis = axisFromDomain(**domain, facts, operation);
+        if (failed(axis))
+          return failure();
+        axes.push_back(*axis);
+      }
     } else if (term.kind == "value_index") {
       auto indexedAxes = facts.valueAxes.find(indexed);
       if (indexedAxes != facts.valueAxes.end())
@@ -289,11 +386,14 @@ inferIndexedAxes(Operation &operation, Value source, KernelFacts &facts) {
       FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
       if (failed(domain))
         return failure();
-      FailureOr<LogicalAxis> axis =
-          axisFromDomain(**domain, facts, operation);
-      if (failed(axis))
-        return failure();
-      resultAxes.push_back(*axis);
+      if (!isa<intent::LogicalIndexType, IntegerType, IndexType>(
+              indexed.getType())) {
+        FailureOr<LogicalAxis> axis =
+            axisFromDomain(**domain, facts, operation);
+        if (failed(axis))
+          return failure();
+        resultAxes.push_back(*axis);
+      }
     } else if (term.kind == "value_index") {
       auto indexedAxes = facts.valueAxes.find(indexed);
       if (indexedAxes != facts.valueAxes.end())
@@ -310,8 +410,13 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("pointwise provenance requires one result");
   auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-  if (!result)
+  if (!result) {
+    FailureOr<ScalarIndexSource> source =
+        traceScalarIndexSource(operation.getResult(0), operation);
+    if (failed(source))
+      return failure();
     return success();
+  }
   FailureOr<SmallVector<LogicalAxis>> axes =
       axesFromResultShape(operation, 0, facts);
   if (failed(axes))
@@ -326,6 +431,29 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                          "intent.return"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
+
+  if (failed(addHandler(
+          registry, "intent.assume_in_bounds",
+          [&](Operation &operation) -> LogicalResult {
+            auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+            if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
+                !axis || axis.getInt() < 0 ||
+                !isa<IntegerType, IndexType, intent::LogicalIndexType>(
+                    operation.getOperand(0).getType()) ||
+                !isa<intent::ViewType>(operation.getOperand(1).getType()))
+              return operation.emitOpError(
+                  "has no canonical in-bounds precondition schema");
+            auto view = cast<intent::ViewType>(operation.getOperand(1).getType());
+            auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
+            if (!tensor || axis.getInt() >= tensor.getRank())
+              return operation.emitOpError(
+                  "in-bounds precondition axis exceeds its view rank");
+            facts.indexPreconditions.push_back(IndexPreconditionFact{
+                operation.getOperand(0), operation.getOperand(1), axis.getInt(),
+                &operation});
+            return success();
+          })))
+    return failure();
 
   if (failed(addHandler(
           registry, "intent.domain", [&](Operation &operation) -> LogicalResult {
@@ -541,9 +669,13 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 operation.getResult(0).getUsers(), [](Operation *user) {
                   return user->getName().getStringRef() == "intent.contract";
                 });
+            FailureOr<bool> masked = requiresRuntimeBoundary(operation, facts);
+            if (failed(masked))
+              return failure();
             std::optional<std::string> fill =
-                feedsContract ? std::optional<std::string>("zero")
-                              : inferMaskedLaneFill(operation.getResult(0));
+                !*masked ? std::optional<std::string>("none")
+                : feedsContract ? std::optional<std::string>("zero")
+                                : inferMaskedLaneFill(operation.getResult(0));
             if (!fill) {
               InFlightDiagnostic diagnostic = operation.emitOpError(
                   "cannot prove a semantics-preserving masked-load fill");

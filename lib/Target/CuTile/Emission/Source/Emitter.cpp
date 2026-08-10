@@ -64,10 +64,24 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_multiply");
   if (role == "binary_true_divide")
     return StringRef("python_true_divide");
+  if (role == "binary_floor_divide")
+    return StringRef("python_floor_divide");
+  if (role == "binary_remainder")
+    return StringRef("python_remainder");
   if (role == "binary_maximum")
     return StringRef("ct.maximum");
   if (role == "binary_minimum")
     return StringRef("ct.minimum");
+  if (role == "compare_equal")
+    return StringRef("python_equal");
+  if (role == "compare_not_equal")
+    return StringRef("python_not_equal");
+  if (role == "compare_less")
+    return StringRef("python_less");
+  if (role == "compare_less_equal")
+    return StringRef("python_less_equal");
+  if (role == "compare_greater")
+    return StringRef("python_greater");
   if (role == "compare_greater_equal")
     return StringRef("python_greater_equal");
   if (role == "mask")
@@ -235,6 +249,10 @@ indexRealization(intent::plan::RealizationOp realization,
                   operation->getName().getStringRef() == "intent.scatter_unique");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
+    FailureOr<bool> derivedScalar =
+        target::hasDerivedScalarIndex(*operation);
+    if (failed(derivedScalar))
+      return failure();
     bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
       auto axis = index.axes.find(node);
       return axis != index.axes.end() && !axis->second.isScalar();
@@ -252,7 +270,8 @@ indexRealization(intent::plan::RealizationOp realization,
                     (!index.components.groups.empty() ||
                      target::emission::feedsStagedContraction(index, *operation));
     binding.explicitBounds =
-        rowStrided || raggedBound || (!index.stages.empty() && store);
+        rowStrided || raggedBound || (!index.stages.empty() && store) ||
+        *derivedScalar;
     index.boundaries[value.getNode()] = binding;
   }
   if (!index.target || !index.program) {
@@ -839,8 +858,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   } else {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
-    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-      emitParameter(parameter.getName().getValue().str() + ": ConstInt");
+    if (searchIndex.autotune)
+      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+        emitParameter(parameter.getName().getValue().str() + ": ConstInt");
   }
   output << "):\n";
   return success();
@@ -868,7 +888,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in")
+      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
         inputs.push_back(&view);
       else if ((view.view.getAccess() == "out" ||
                 view.view.getAccess() == "inout") &&
@@ -1099,7 +1119,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     SmallVector<ABIView *> outputs;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in")
+      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
         inputs.push_back(&view);
       else if (view.view.getAccess() == "out")
         outputs.push_back(&view);
@@ -1223,7 +1243,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   SmallVector<ABIView *> inputs;
   SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
-    if (view.view.getAccess() == "in")
+    if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
       inputs.push_back(&view);
     else if (view.view.getAccess() == "out")
       outputs.push_back(&view);
@@ -1333,8 +1353,23 @@ LogicalResult SourceEmitter::emitWrapper() {
                        : "ceil(" + extent + " / cfg." +
                              axis.getTile().str() + ")";
           });
-  output << "                lambda cfg: (" << candidateGrid[0] << ", "
-         << candidateGrid[1] << ", " << candidateGrid[2] << "),\n";
+  if (planIndex.program.getPersistent()) {
+    std::string total = target::emission::projectProgramVolume(
+        planIndex, [&](plan::AxisOp axis) {
+          std::string role =
+              "program_" + std::to_string(axis.getProgramOrder());
+          std::string extent = roleDimensions.lookup(role);
+          return axis.isScalar()
+                     ? extent
+                     : "ceil(" + extent + " / cfg." +
+                           axis.getTile().str() + ")";
+        });
+    output << "                lambda cfg: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // cfg.num_ctas, "
+           << total << ") * cfg.occupancy, 1, 1),\n";
+  } else {
+    output << "                lambda cfg: (" << candidateGrid[0] << ", "
+           << candidateGrid[1] << ", " << candidateGrid[2] << "),\n";
+  }
   output << "                " << kernelName << ",\n";
   output << "                lambda cfg: (";
   for (ABIView &view : views)
@@ -1367,8 +1402,23 @@ LogicalResult SourceEmitter::emitWrapper() {
                        : "ceil(" + extent + " / best." +
                              axis.getTile().str() + ")";
           });
-  output << "    grid = (" << selectedGrid[0] << ", " << selectedGrid[1]
-         << ", " << selectedGrid[2] << ")\n";
+  if (planIndex.program.getPersistent()) {
+    std::string total = target::emission::projectProgramVolume(
+        planIndex, [&](plan::AxisOp axis) {
+          std::string role =
+              "program_" + std::to_string(axis.getProgramOrder());
+          std::string extent = roleDimensions.lookup(role);
+          return axis.isScalar()
+                     ? extent
+                     : "ceil(" + extent + " / best." +
+                           axis.getTile().str() + ")";
+        });
+    output << "    grid = (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // best.num_ctas, "
+           << total << ") * best.occupancy, 1, 1)\n";
+  } else {
+    output << "    grid = (" << selectedGrid[0] << ", " << selectedGrid[1]
+           << ", " << selectedGrid[2] << ")\n";
+  }
   output << "    return ct.launch(stream, grid, tuned_kernel, (";
   for (ABIView &view : views)
     output << view.argument->name << ", ";
@@ -1462,6 +1512,12 @@ FailureOr<ABIView *> SourceEmitter::lookupView(Value value,
 
 FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
                                                     Operation &consumer) {
+  FailureOr<target::ScalarIndexSource> scalarSource =
+      target::traceScalarIndexSource(indexedValue, consumer);
+  if (failed(scalarSource))
+    return failure();
+  if (scalarSource->domain)
+    return scalarSource->domain;
   if (Operation *definition = indexedValue.getDefiningOp())
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
@@ -1614,21 +1670,30 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
         term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "cuTile access has no mechanical index relation");
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
-    if (failed(axis))
-      return failure();
-    std::string index = axisIndices.lookup(axis->getNode());
-    if (index.empty()) {
-      operation.emitOpError()
-          << "has no active cuTile index for logical axis " << axis->getNode()
-          << " (parallel=" << axis->hasRole("parallel")
-          << ", ordered=" << axis->hasRole("ordered")
-          << ", reduction=" << axis->hasRole("reduction")
-          << ", lane=" << axis->hasRole("lane") << ")";
-      return failure();
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (failed(exact))
+        return failure();
+      indices.push_back("(" + exact->str() + ")");
+    } else {
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis))
+        return failure();
+      std::string index = axisIndices.lookup(axis->getNode());
+      if (index.empty()) {
+        operation.emitOpError()
+            << "has no active cuTile index for logical axis " << axis->getNode()
+            << " (parallel=" << axis->hasRole("parallel")
+            << ", ordered=" << axis->hasRole("ordered")
+            << ", reduction=" << axis->hasRole("reduction")
+            << ", lane=" << axis->hasRole("lane") << ")";
+        return failure();
+      }
+      indices.push_back(std::move(index));
     }
-    indices.push_back(std::move(index));
   }
   std::string tuple = "(";
   for (auto [index, value] : llvm::enumerate(indices)) {
@@ -1664,11 +1729,16 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
         term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "cuTile tile has no mechanical shape relation");
-    FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
-    if (failed(axis))
-      return failure();
-    extents.push_back(axis->getTile().str());
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      extents.push_back("1");
+    } else {
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis))
+        return failure();
+      extents.push_back(axis->getTile().str());
+    }
   }
   std::string tuple = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {
@@ -1767,7 +1837,8 @@ FailureOr<std::string> SourceEmitter::padExpression(
 }
 
 FailureOr<std::string>
-SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
+SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex,
+                               bool transposeLastTwo) {
   auto shapes = operation.getAttrOfType<ArrayAttr>("intent.result_shapes");
   auto shape = shapes && resultIndex < shapes.size()
                    ? dyn_cast<ArrayAttr>(shapes[resultIndex])
@@ -1788,6 +1859,12 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
           "tensor shape region has no cuTile tile binding");
     else
       extents.push_back(label.getValue().str());
+  }
+  if (transposeLastTwo) {
+    if (extents.size() < 2)
+      return operation.emitOpError(
+          "cannot transpose a tensor result with fewer than two dimensions");
+    std::swap(extents[extents.size() - 2], extents.back());
   }
   std::string result = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {

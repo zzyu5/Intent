@@ -83,10 +83,24 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_multiply");
   if (role == "binary_true_divide")
     return StringRef("python_true_divide");
+  if (role == "binary_floor_divide")
+    return StringRef("python_floor_divide");
+  if (role == "binary_remainder")
+    return StringRef("python_remainder");
   if (role == "binary_maximum")
     return StringRef("tl.maximum");
   if (role == "binary_minimum")
     return StringRef("tl.minimum");
+  if (role == "compare_equal")
+    return StringRef("python_equal");
+  if (role == "compare_not_equal")
+    return StringRef("python_not_equal");
+  if (role == "compare_less")
+    return StringRef("python_less");
+  if (role == "compare_less_equal")
+    return StringRef("python_less_equal");
+  if (role == "compare_greater")
+    return StringRef("python_greater");
   if (role == "compare_greater_equal")
     return StringRef("python_greater_equal");
   if (role == "mask")
@@ -849,6 +863,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       emitParameter(view.pointer);
     for (ABIScalar &scalar : scalars)
       emitParameter(scalar.name);
+    for (const std::string &dimension : dimensionOrder)
+      if (dimension != roleDimensions.lookup("program_0") &&
+          dimension != roleDimensions.lookup("lane_0"))
+        emitParameter(dimension + ": tl.constexpr");
     for (ABIView &view : views)
       emitParameter(view.strides[0]);
     for (StringRef parameter :
@@ -881,8 +899,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   for (ABIView &view : views)
     for (const std::string &stride : view.strides)
       emitParameter(stride);
-  for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-    emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
+  if (searchIndex.autotune)
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+      emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
   output << "):\n";
   return success();
 }
@@ -894,7 +913,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     ABIView *merge = nullptr;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in")
+      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
         inputs.push_back(&view);
       else if ((view.view.getAccess() == "out" ||
                 view.view.getAccess() == "inout") &&
@@ -1077,7 +1096,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     SmallVector<ABIView *> inputs;
     SmallVector<ABIView *> outputs;
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "in")
+      if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
         inputs.push_back(&view);
       else if (view.view.getAccess() == "out")
         outputs.push_back(&view);
@@ -1176,6 +1195,10 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(view.argument->name);
     for (ABIScalar &scalar : scalars)
       emitArgument(scalar.name);
+    for (const std::string &dimension : dimensionOrder)
+      if (dimension != roleDimensions.lookup("program_0") &&
+          dimension != roleDimensions.lookup("lane_0"))
+        emitArgument(dimension);
     for (ABIView &view : views)
       emitArgument(view.argument->name + ".stride(0)");
     for (StringRef argument : {"n_rows", "n_cols"})
@@ -1194,6 +1217,10 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(view.argument->name);
     for (ABIScalar &scalar : scalars)
       emitArgument(scalar.name);
+    for (const std::string &dimension : dimensionOrder)
+      if (dimension != roleDimensions.lookup("program_0") &&
+          dimension != roleDimensions.lookup("lane_0"))
+        emitArgument(dimension);
     for (ABIView &view : views)
       emitArgument(view.argument->name + ".stride(0)");
     for (StringRef argument : {"n_rows", "n_cols", "configuration.tile_size",
@@ -1255,7 +1282,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   SmallVector<ABIView *> inputs;
   SmallVector<ABIView *> outputs;
   for (ABIView &view : views) {
-    if (view.view.getAccess() == "in")
+    if (view.view.getAccess() == "in" || view.view.getAccess() == "inout")
       inputs.push_back(&view);
     else if (view.view.getAccess() == "out")
       outputs.push_back(&view);
@@ -1345,8 +1372,23 @@ LogicalResult SourceEmitter::emitWrapper() {
                    : "triton.cdiv(" + extent + ", META['" +
                          axis.getTile().str() + "'])";
       });
-  output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
-         << ", " << grid[2] << ")\n";
+  if (planIndex.program.getPersistent()) {
+    std::string total = target::emission::projectProgramVolume(
+        planIndex, [&](plan::AxisOp axis) {
+          std::string role =
+              "program_" + std::to_string(axis.getProgramOrder());
+          std::string extent = roleDimensions.lookup(role);
+          return axis.isScalar()
+                     ? extent
+                     : "triton.cdiv(" + extent + ", META['" +
+                           axis.getTile().str() + "'])";
+        });
+    output << "    grid = lambda META: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count, "
+           << total << "), 1, 1)\n";
+  } else {
+    output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
+           << ", " << grid[2] << ")\n";
+  }
   output << "    return " << kernelName << "[grid](";
   bool first = true;
   auto emitArgument = [&](StringRef argument) {
@@ -1454,6 +1496,12 @@ FailureOr<ABIView *> SourceEmitter::lookupView(Value value,
 
 FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
                                                     Operation &consumer) {
+  FailureOr<target::ScalarIndexSource> scalarSource =
+      target::traceScalarIndexSource(indexedValue, consumer);
+  if (failed(scalarSource))
+    return failure();
+  if (scalarSource->domain)
+    return scalarSource->domain;
   if (Operation *definition = indexedValue.getDefiningOp()) {
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
@@ -1596,18 +1644,27 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
       if (term.operands.size() != 1 || !term.operands.front())
         return operation.emitOpError(
             "dynamic pointer index has no canonical operand");
-      FailureOr<plan::AxisOp> axis =
-          resolveAxis(operation.getOperand(*term.operands.front()), operation);
-      if (failed(axis))
-        return failure();
-      bool vector = !axis->isScalar();
-      FailureOr<std::string> resolved =
-          indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
-      if (failed(resolved))
-        return failure();
-      index = *resolved;
-      if (vector)
-        ++vectorAxis;
+      Value indexed = operation.getOperand(*term.operands.front());
+      if (term.kind == "value_index" &&
+          !isa<RankedTensorType>(indexed.getType())) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        index = "(" + exact->str() + ")";
+      } else {
+        FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+        if (failed(axis))
+          return failure();
+        bool vector = !axis->isScalar();
+        FailureOr<std::string> resolved =
+            indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
+        if (failed(resolved))
+          return failure();
+        index = *resolved;
+        if (vector)
+          ++vectorAxis;
+      }
     }
     StringRef stride = !planIndex.components.reusedAxes.empty() &&
                                axisNumber == 1
@@ -1627,12 +1684,15 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(view) || relation->size() != (*view)->shape.size())
+    return failure();
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
     return failure();
   SmallVector<std::string> predicates;
   unsigned vectorAxis = 0;
-  for (const target::IndexTerm &term : *relation) {
+  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
       ++vectorAxis;
       continue;
@@ -1644,10 +1704,35 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
           "Triton mask emission requires value-bound index terms");
       return failure();
     }
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        !isa<RankedTensorType>(indexed.getType())) {
+      FailureOr<target::ScalarIndexSource> source =
+          target::traceScalarIndexSource(indexed, operation);
+      if (failed(source))
+        return failure();
+      if (source->domain && source->transformed) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        std::string index = "(" + exact->str() + ")";
+        std::string extent = (*view)->shape[axisNumber];
+        if (!planIndex.components.reusedAxes.empty()) {
+          if (roleDimensions.lookup("program_0") == extent)
+            extent = "n_rows";
+          else if (roleDimensions.lookup("lane_0") == extent)
+            extent = "n_cols";
+        }
+        predicates.push_back("(" + index + " >= 0)");
+        predicates.push_back("(" + index + " < " + extent + ")");
+      }
+      continue;
+    }
     FailureOr<Operation *> domain =
-        resolveDomain(operation.getOperand(*term.operands.front()), operation);
+        resolveDomain(indexed, operation);
     FailureOr<plan::AxisOp> axis =
-        resolveAxis(operation.getOperand(*term.operands.front()), operation);
+        resolveAxis(indexed, operation);
     if (failed(domain) || failed(axis))
       return failure();
     bool vector = !axis->isScalar();

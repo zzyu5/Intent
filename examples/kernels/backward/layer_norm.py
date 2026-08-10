@@ -4,6 +4,7 @@ import intent.language as I
 
 ROWS = 4096
 FEATURES = 4096
+PARTIAL_GROUPS = 128
 
 
 @intent.kernel
@@ -12,8 +13,8 @@ def layer_norm_backward_rows(
     dy: I.In[I.bf16, ("M", "N")],
     weight: I.In[I.bf16, ("N",)],
     dx: I.Out[I.bf16, ("M", "N")],
-    dw_partial: I.Out[I.f32, ("M", "N")],
-    db_partial: I.Out[I.f32, ("M", "N")],
+    dw_partial: I.InOut[I.f32, ("G", "N")],
+    db_partial: I.InOut[I.f32, ("G", "N")],
     inverse_features: I.f32,
     epsilon: I.f32,
 ):
@@ -55,19 +56,30 @@ def layer_norm_backward_rows(
             * rstd,
             I.bf16,
         )
-        dw_partial[row, columns] = dy_values * normalized
-        db_partial[row, columns] = dy_values
+        group = row % PARTIAL_GROUPS
+        I.scatter_reduce(
+            dw_partial,
+            index=(group, columns),
+            value=dy_values * normalized,
+            combine=I.add,
+        )
+        I.scatter_reduce(
+            db_partial,
+            index=(group, columns),
+            value=dy_values,
+            combine=I.add,
+        )
 
 
 @intent.kernel
 def layer_norm_backward_reduce(
-    dw_partial: I.In[I.f32, ("M", "N")],
-    db_partial: I.In[I.f32, ("M", "N")],
+    dw_partial: I.In[I.f32, ("G", "N")],
+    db_partial: I.In[I.f32, ("G", "N")],
     dw: I.Out[I.f32, ("N",)],
     db: I.Out[I.f32, ("N",)],
 ):
-    M, N = dw_partial.shape
-    rows = I.domain(0, M)
+    G, N = dw_partial.shape
+    rows = I.domain(0, G)
     features = I.domain(0, N)
     for feature_region in I.parallel(
         I.partition(features, extent=I.auto("FEATURE_TILE"))

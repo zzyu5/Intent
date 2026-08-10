@@ -20,6 +20,7 @@ from kernels.contraction.batched_gemm import batched_gemm_nt
 from kernels.contraction.batched_gemm import batched_gemm_tn
 from kernels.contraction.batched_gemm import batched_gemm_tt
 from kernels.backward.layer_norm import FEATURES as BWD_LAYER_FEATURES
+from kernels.backward.layer_norm import PARTIAL_GROUPS as BWD_LAYER_PARTIAL_GROUPS
 from kernels.backward.layer_norm import ROWS as BWD_LAYER_ROWS
 from kernels.backward.layer_norm import layer_norm_backward_reduce
 from kernels.backward.layer_norm import layer_norm_backward_rows
@@ -35,6 +36,17 @@ from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import quantized_gemm
+from kernels.indexing.relations import GQA_KEY_HEADS
+from kernels.indexing.relations import GQA_QUERY_HEADS
+from kernels.indexing.relations import GQA_TOKENS
+from kernels.indexing.relations import LOOKUP_ENTRIES
+from kernels.indexing.relations import LOOKUP_FEATURES
+from kernels.indexing.relations import LOOKUP_ROWS
+from kernels.indexing.relations import OFFSET_FEATURES
+from kernels.indexing.relations import OFFSET_ROWS
+from kernels.indexing.relations import grouped_query_head_add
+from kernels.indexing.relations import scalar_table_lookup
+from kernels.indexing.relations import shifted_row_copy
 from kernels.normalization.fused_add_rms_norm import FEATURES as FUSED_RMS_FEATURES
 from kernels.normalization.fused_add_rms_norm import ROWS as FUSED_RMS_ROWS
 from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
@@ -414,11 +426,28 @@ def _run_layer_norm_backward(
         layer_norm_backward_reduce, target=target, compiler=compiler
     )
 
+    dx = torch.empty_like(x)
+    partial_shape = (BWD_LAYER_PARTIAL_GROUPS, BWD_LAYER_FEATURES)
+    dw_partial = torch.zeros(partial_shape, device="cuda", dtype=torch.float32)
+    db_partial = torch.zeros_like(dw_partial)
+    dw = torch.empty((BWD_LAYER_FEATURES,), device="cuda", dtype=torch.float32)
+    db = torch.empty_like(dw)
+    rows_call = prepare_kernel_call(
+        rows_artifact,
+        (x, dy, weight, dw_partial, db_partial, inverse_features, epsilon),
+        dx,
+    )
+    reduce_call = prepare_kernel_call(
+        reduce_artifact,
+        (dw_partial, db_partial),
+        (dw, db),
+    )
+
     def generated_pipeline() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dx, dw_partial, db_partial = rows_artifact.run(
-            x, dy, weight, inverse_features, epsilon
-        )
-        dw, db = reduce_artifact.run(dw_partial, db_partial)
+        dw_partial.zero_()
+        db_partial.zero_()
+        rows_call()
+        reduce_call()
         return dx, dw, db
 
     x_f32 = x.float()
@@ -893,6 +922,86 @@ def _run_attention_bias(
     )
 
 
+def _run_shifted_row_copy(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("shifted row copy has no upstream adapter")
+    x = torch.randn(
+        (OFFSET_ROWS, OFFSET_FEATURES), device="cuda", dtype=torch.float32
+    )
+    artifact = intent.compile(shifted_row_copy, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x,),
+        reference=lambda: torch.cat((x[1:], torch.zeros_like(x[:1])), dim=0),
+        target_name=target_name,
+        kernel_name="derived scalar offset index",
+        tolerance=0.0,
+        upstream=None,
+    )
+
+
+def _run_grouped_query_head_add(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("grouped query head mapping has no upstream adapter")
+    query = torch.randn(
+        (GQA_QUERY_HEADS, GQA_TOKENS),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    key = torch.randn(
+        (GQA_KEY_HEADS, GQA_TOKENS),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    artifact = intent.compile(
+        grouped_query_head_add, target=target, compiler=compiler
+    )
+    key_heads = torch.arange(GQA_QUERY_HEADS, device="cuda") // (
+        GQA_QUERY_HEADS // GQA_KEY_HEADS
+    )
+    _compare(
+        artifact=artifact,
+        arguments=(query, key),
+        reference=lambda: query + key[key_heads, :],
+        target_name=target_name,
+        kernel_name="many-to-one query head mapping",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_scalar_table_lookup(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("scalar table lookup has no upstream adapter")
+    labels = torch.randint(
+        0,
+        LOOKUP_ENTRIES,
+        (LOOKUP_ROWS,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    table = torch.randn(
+        (LOOKUP_ENTRIES, LOOKUP_FEATURES), device="cuda", dtype=torch.float32
+    )
+    artifact = intent.compile(scalar_table_lookup, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(labels, table),
+        reference=lambda: table[labels.long()],
+        target_name=target_name,
+        kernel_name="tensor-derived scalar index",
+        tolerance=0.0,
+        upstream=None,
+    )
+
+
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
@@ -900,12 +1009,15 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "dual_gemm": _run_dual_gemm,
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
+    "grouped_query_head_add": _run_grouped_query_head_add,
     "layer_norm": _run_layer_norm,
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
     "online_softmax": _run_online_softmax,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
+    "scalar_table_lookup": _run_scalar_table_lookup,
+    "shifted_row_copy": _run_shifted_row_copy,
     "swiglu_backward": _run_swiglu_backward,
     "swiglu_forward": _run_swiglu_forward,
     "varlen_attention": _run_varlen_attention,

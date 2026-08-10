@@ -56,7 +56,19 @@ pointwiseRole(mlir::Operation &operation) {
   if (name == "intent.compare") {
     auto predicate =
         operation.getAttrOfType<mlir::StringAttr>("intent.predicate");
-    if (predicate && predicate.getValue() == "ge")
+    if (!predicate)
+      return operation.emitOpError("has no comparison predicate");
+    if (predicate.getValue() == "eq")
+      return std::string("compare_equal");
+    if (predicate.getValue() == "ne")
+      return std::string("compare_not_equal");
+    if (predicate.getValue() == "lt")
+      return std::string("compare_less");
+    if (predicate.getValue() == "le")
+      return std::string("compare_less_equal");
+    if (predicate.getValue() == "gt")
+      return std::string("compare_greater");
+    if (predicate.getValue() == "ge")
       return std::string("compare_greater_equal");
     return operation.emitOpError("has no supported comparison semantics");
   }
@@ -213,6 +225,7 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
 
 struct ProgramBinding : Binding<intent::plan::ProgramOp> {
   int64_t getLoopNode() const { return operation.getLoopNode(); }
+  bool getPersistent() const { return operation.getPersistent(); }
   mlir::IntegerAttr getLoopNodeAttr() const {
     return operation.getLoopNodeAttr();
   }
@@ -402,6 +415,9 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   llvm::StringRef getStoreMask() const { return "predicate"; }
   llvm::StringRef getTransfer() const { return transfer; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
+  bool getConsumerNeutralized() const {
+    return operation.getConsumerNeutralized();
+  }
   bool getCheckBounds() const { return explicitBounds; }
   bool getDefer() const { return defer; }
 };
@@ -783,6 +799,84 @@ projectProgramIndices(const PlanIndex &index, AxisExpression axisExtent,
     return lhs.axis.getProgramOrder() < rhs.axis.getProgramOrder();
   });
   return result;
+}
+
+template <typename PlanIndex, typename AxisExpression>
+std::string projectProgramVolume(const PlanIndex &index,
+                                 AxisExpression axisExtent) {
+  std::string result;
+  for (AxisBinding axis : orderedProgramAxes(index)) {
+    if (!result.empty())
+      result += " * ";
+    result += axisExtent(axis);
+  }
+  return result.empty() ? std::string("1") : result;
+}
+
+template <typename PlanIndex, typename AxisExpression>
+llvm::SmallVector<ProgramIndexProjection>
+projectLinearProgramIndices(const PlanIndex &index, AxisExpression axisExtent,
+                            llvm::StringRef linearExpression) {
+  llvm::SmallVector<ProgramIndexProjection> result;
+  llvm::SmallVector<AxisBinding> axes = orderedProgramAxes(index);
+  for (auto [position, axis] : llvm::enumerate(axes)) {
+    if (axis.getGroupAttr())
+      continue;
+    std::string expression = linearExpression.str();
+    std::string divisor;
+    for (AxisBinding later : llvm::drop_begin(axes, position + 1)) {
+      if (!divisor.empty())
+        divisor += " * ";
+      divisor += axisExtent(later);
+    }
+    if (!divisor.empty())
+      expression += " // (" + divisor + ")";
+    if (position > 0)
+      expression = "(" + expression + ") % " + axisExtent(axis);
+    result.push_back(ProgramIndexProjection{axis, std::move(expression)});
+  }
+  return result;
+}
+
+template <typename PlanIndex, typename AxisExpression>
+mlir::FailureOr<std::string>
+projectLinearGroupIndex(const PlanIndex &index, llvm::ArrayRef<AxisBinding> group,
+                        AxisExpression axisExtent,
+                        llvm::StringRef linearExpression,
+                        mlir::Operation &consumer) {
+  llvm::SmallVector<AxisBinding> axes = orderedProgramAxes(index);
+  llvm::SmallVector<unsigned> positions;
+  for (AxisBinding member : group) {
+    auto found = llvm::find_if(axes, [&](AxisBinding axis) {
+      return axis.getNode() == member.getNode();
+    });
+    if (found == axes.end())
+      return consumer.emitOpError("program group references an unbound axis");
+    positions.push_back(static_cast<unsigned>(std::distance(axes.begin(), found)));
+  }
+  llvm::sort(positions);
+  if (positions.empty() ||
+      positions.back() - positions.front() + 1 != positions.size())
+    return consumer.emitOpError("persistent program groups must be contiguous");
+  std::string expression = linearExpression.str();
+  std::string laterVolume;
+  for (AxisBinding later : llvm::drop_begin(axes, positions.back() + 1)) {
+    if (!laterVolume.empty())
+      laterVolume += " * ";
+    laterVolume += axisExtent(later);
+  }
+  if (!laterVolume.empty())
+    expression += " // (" + laterVolume + ")";
+  if (positions.front() > 0) {
+    std::string groupVolume;
+    for (unsigned position : positions) {
+      if (!groupVolume.empty())
+        groupVolume += " * ";
+      groupVolume += axisExtent(axes[position]);
+    }
+    expression = "(" + expression + ") % (" + groupVolume + ")";
+  }
+  return expression;
 }
 
 template <typename PlanIndex, typename OperationStages>

@@ -1,8 +1,82 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "mlir/IR/BuiltinTypes.h"
+
 using namespace mlir;
 
 namespace intent::target {
+namespace {
+
+Operation *structuralDomain(Value value) {
+  if (Operation *definition = value.getDefiningOp()) {
+    StringRef name = definition->getName().getStringRef();
+    if (name == "intent.domain" || name == "intent.ragged_outer" ||
+        name == "intent.ragged_member")
+      return definition;
+  }
+  auto argument = dyn_cast<BlockArgument>(value);
+  Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
+  if (!owner)
+    return nullptr;
+  StringRef name = owner->getName().getStringRef();
+  if (name == "intent.state_stream" && argument.getArgNumber() == 0 &&
+      owner->getNumOperands() > 0)
+    return owner->getOperand(0).getDefiningOp();
+  if (name != "intent.parallel" || owner->getNumOperands() != 1)
+    return nullptr;
+  Operation *source = owner->getOperand(0).getDefiningOp();
+  if (source && source->getName().getStringRef() == "intent.partition" &&
+      source->getNumOperands() == 1)
+    source = source->getOperand(0).getDefiningOp();
+  return source;
+}
+
+FailureOr<ScalarIndexSource>
+traceScalarIndexSourceImpl(Value value, Operation &consumer,
+                           llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return consumer.emitOpError("contains a cyclic scalar index expression");
+  auto finish = [&](ScalarIndexSource source) -> FailureOr<ScalarIndexSource> {
+    active.erase(value);
+    return source;
+  };
+  if (Operation *domain = structuralDomain(value))
+    return finish(ScalarIndexSource{domain, false});
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return finish(ScalarIndexSource{nullptr, true});
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.constant")
+    return finish(ScalarIndexSource{});
+  bool transparent = name == "intent.binary" || name == "intent.unary" ||
+                     name == "intent.cast";
+  if (!transparent || isa<RankedTensorType>(value.getType()))
+    return finish(ScalarIndexSource{nullptr, true});
+  Operation *uniqueDomain = nullptr;
+  bool opaque = false;
+  for (Value operand : definition->getOperands()) {
+    FailureOr<ScalarIndexSource> source =
+        traceScalarIndexSourceImpl(operand, consumer, active);
+    if (failed(source)) {
+      active.erase(value);
+      return failure();
+    }
+    opaque |= source->opaque;
+    if (!source->domain)
+      continue;
+    if (uniqueDomain && uniqueDomain != source->domain) {
+      active.erase(value);
+      return definition->emitOpError(
+          "combines scalar indices owned by different logical axes");
+    }
+    uniqueDomain = source->domain;
+  }
+  return finish(ScalarIndexSource{uniqueDomain, opaque, true});
+}
+
+} // namespace
 
 FailureOr<llvm::SmallVector<IndexTerm>>
 parseIndexRelation(Operation &operation) {
@@ -52,6 +126,45 @@ parseIndexRelation(Operation &operation) {
     terms.push_back(std::move(term));
   }
   return terms;
+}
+
+FailureOr<ScalarIndexSource>
+traceScalarIndexSource(Value value, Operation &consumer) {
+  llvm::DenseSet<Value> active;
+  return traceScalarIndexSourceImpl(value, consumer, active);
+}
+
+FailureOr<bool> hasDerivedScalarIndex(Operation &operation) {
+  FailureOr<llvm::SmallVector<IndexTerm>> relation =
+      parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  for (const IndexTerm &term : *relation) {
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (isa<RankedTensorType>(indexed.getType()))
+      continue;
+    FailureOr<ScalarIndexSource> source =
+        traceScalarIndexSource(indexed, operation);
+    if (failed(source))
+      return failure();
+    if (source->domain && source->transformed)
+      return true;
+  }
+  return false;
+}
+
+FailureOr<bool> isWholeViewAccess(Operation &operation) {
+  FailureOr<llvm::SmallVector<IndexTerm>> relation =
+      parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  return !relation->empty() &&
+         llvm::all_of(*relation, [](const IndexTerm &term) {
+           return term.kind == "full_slice";
+         });
 }
 
 } // namespace intent::target

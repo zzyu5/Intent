@@ -142,6 +142,9 @@ private:
   elementBoundsPredicate(mlir::Operation &operation,
                          llvm::ArrayRef<std::string> tileIndices);
   mlir::FailureOr<std::string>
+  wholeTileBoundsPredicate(mlir::Operation &operation,
+                           llvm::ArrayRef<std::string> tileExtents);
+  mlir::FailureOr<std::string>
   elementValidityPredicate(llvm::ArrayRef<int64_t> tensorAxes,
                            llvm::ArrayRef<int64_t> domainNodes,
                            llvm::ArrayRef<std::string> elementIndices,

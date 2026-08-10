@@ -40,7 +40,8 @@ bool provePaddedUses(Value value, PaddedValue padded,
 
   for (Operation *user : value.getUsers()) {
     StringRef name = user->getName().getStringRef();
-    if (name == "intent.view_store")
+    if (name == "intent.view_store" || name == "intent.scatter_unique" ||
+        name == "intent.scatter_reduce")
       continue;
     if (name == "intent.reduce") {
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");

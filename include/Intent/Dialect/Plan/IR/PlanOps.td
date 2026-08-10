@@ -60,7 +60,7 @@ def IntentPlan_AxisOp : IntentPlan_Op<"axis"> {
 }
 
 def IntentPlan_ProgramOp : IntentPlan_Op<"program"> {
-  let arguments = (ins I64Attr:$loop_node);
+  let arguments = (ins I64Attr:$loop_node, BoolAttr:$persistent);
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -81,6 +81,7 @@ def IntentPlan_TransferOp : IntentPlan_Op<"transfer"> {
     I64Attr:$node,
     DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$fill,
+    BoolAttr:$consumer_neutralized,
     StrAttr:$result_space
   );
   let results = (outs);

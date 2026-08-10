@@ -13,6 +13,7 @@ from intent.frontend.semantics import RaggedType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import is_integer
 from intent.language import index as intent_index
@@ -23,6 +24,7 @@ from ..ast.model import Literal
 from ..ast.model import StaticTuple
 from ..ast.model import StreamSpec
 from .common import bind_call
+from .common import require_static_int
 
 if TYPE_CHECKING:
     from ..ast.context import FunctionLowerer
@@ -42,6 +44,7 @@ def lower_control_intrinsic(
         "state_stream": _state_stream,
         "indices": _indices,
         "end": _region_end,
+        "assume_in_bounds": _assume_in_bounds,
         "ragged": _ragged,
         "members": _members,
     }
@@ -215,6 +218,37 @@ def _region_end(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         result_types=(ScalarType(intent_index),),
     )
     return operation.results[0]
+
+
+def _assume_in_bounds(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("index", "view", "axis"),
+        required=("index", "view", "axis"),
+    )
+    index = lowerer.materialize(
+        lowerer.lower_expression(bound["index"]), bound["index"]
+    )
+    view = lowerer.materialize(
+        lowerer.lower_expression(bound["view"]), bound["view"]
+    )
+    if not isinstance(index.type, (ScalarType, LogicalIndexType)) or not is_integer(
+        index.type
+    ):
+        lowerer.error(bound["index"], "assumed index must be an integer scalar")
+    if view not in lowerer.view_kinds or not isinstance(view.type, TensorType):
+        lowerer.error(bound["view"], "assumed bound must reference an ABI view")
+    axis = require_static_int(lowerer, bound["axis"])
+    if not -len(view.type.shape) <= axis < len(view.type.shape):
+        lowerer.error(bound["axis"], "assumed bound axis is outside the view rank")
+    lowerer.emit(
+        OperationKind.ASSUME_IN_BOUNDS,
+        lowerer.location(node),
+        operands=(index, view),
+        attributes={"axis": axis % len(view.type.shape)},
+    )
+    return StaticTuple(())
 
 
 def _ragged(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

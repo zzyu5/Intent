@@ -290,6 +290,8 @@ class FunctionLowerer:
     ) -> tuple[DType, tuple[object, ...]]:
         if isinstance(value_type, ScalarType):
             return value_type.dtype, ()
+        if isinstance(value_type, LogicalIndexType):
+            return intent_index, ()
         if isinstance(value_type, TensorType):
             return value_type.dtype, tuple(value_type.shape)
         self.error(node, f"expected scalar/tensor value, got {value_type}")

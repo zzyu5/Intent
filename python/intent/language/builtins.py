@@ -46,6 +46,7 @@ ordered = Intrinsic("ordered")
 state_stream = Intrinsic("state_stream")
 indices = Intrinsic("indices")
 end = Intrinsic("end")
+assume_in_bounds = Intrinsic("assume_in_bounds")
 
 reshape = Intrinsic("reshape")
 transpose = Intrinsic("transpose")
@@ -100,6 +101,7 @@ INTRINSICS = {
         state_stream,
         indices,
         end,
+        assume_in_bounds,
         reshape,
         transpose,
         full,
