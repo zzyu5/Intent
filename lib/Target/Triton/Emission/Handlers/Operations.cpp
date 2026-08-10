@@ -191,6 +191,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitAtomic(op);
+      })) ||
+      failed(addHandler(registry, "intent.atomic_add", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAtomic(op);
       })))
     return failure();
   return success();
@@ -1288,7 +1293,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     if (failed(pointer) || failed(mask))
       return failure();
     line("tl.atomic_add(" + *pointer + ", " + stored->str() + ", mask=" +
-         *mask + ", scope='gpu')");
+         *mask + ", sem='relaxed', scope='gpu')");
     return success();
   }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||
@@ -1306,7 +1311,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
                         "[:, None] * " + (*view)->strides[0] +
                         " + offs_feature[None, :] * " + (*view)->strides[1];
   line("tl.atomic_add(" + pointer + ", " + stored->str() +
-       ", mask=member_mask[:, None] & feature_mask[None, :], scope='gpu')");
+       ", mask=member_mask[:, None] & feature_mask[None, :], "
+       "sem='relaxed', scope='gpu')");
   return success();
 }
 

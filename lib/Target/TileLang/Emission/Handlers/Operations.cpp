@@ -166,6 +166,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitAtomic(op);
+      })) ||
+      failed(addHandler(registry, "intent.atomic_add", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAtomic(op);
       })))
     return failure();
   return success();
@@ -1911,7 +1916,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
         ++indentation;
       }
       line("T.atomic_add(" + (*view)->argument->name + "[" + *indices +
-           "], " + stored->str() + ")");
+           "], " + stored->str() + ", memory_order=\"relaxed\")");
       if (boundary.getCheckBounds())
         --indentation;
       return success();
@@ -1951,7 +1956,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     line("if " + *predicate + ":");
     ++indentation;
     line("T.atomic_add(" + (*view)->argument->name + "[" + *indices + "], " +
-         *value + ")");
+         *value + ", memory_order=\"relaxed\")");
     --indentation;
     --indentation;
     return success();
@@ -1974,7 +1979,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   ++indentation;
   line("T.atomic_add(" + (*view)->argument->name + "[" + rows->str() +
        "[atomic_i], bid_feature * TILE_SIZE_N + atomic_j], " + stored->str() +
-       "[atomic_i, atomic_j])");
+       "[atomic_i, atomic_j], memory_order=\"relaxed\")");
   --indentation;
   --indentation;
   return success();

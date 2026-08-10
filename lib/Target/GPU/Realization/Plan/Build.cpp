@@ -391,7 +391,7 @@ private:
     for (Operation *user : value.getUsers()) {
       StringRef name = user->getName().getStringRef();
       if (name == "intent.view_store" || name == "intent.scatter_unique" ||
-          name == "intent.scatter_reduce") {
+          name == "intent.scatter_reduce" || name == "intent.atomic_add") {
         auto valueIndex =
             user->getAttrOfType<IntegerAttr>("intent.value_operand_index");
         auto bounded = facts.boundaryDomains.find(user);
@@ -489,7 +489,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   };
   if (failed(addHandler(registry, "intent.view_load", bindTransfer)) ||
       failed(addHandler(registry, "intent.view_store", bindTransfer)) ||
-      failed(addHandler(registry, "intent.scatter_unique", bindTransfer)))
+      failed(addHandler(registry, "intent.scatter_unique", bindTransfer)) ||
+      failed(addHandler(registry, "intent.atomic_add", bindTransfer)))
     return failure();
 
   auto bindReduction = [&](Operation &operation) -> LogicalResult {

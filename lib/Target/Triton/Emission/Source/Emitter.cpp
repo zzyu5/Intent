@@ -296,7 +296,8 @@ indexRealization(intent::plan::RealizationOp realization,
                 operation->getName().getStringRef() == "intent.view_load";
     bool store = operation &&
                  (operation->getName().getStringRef() == "intent.view_store" ||
-                  operation->getName().getStringRef() == "intent.scatter_unique");
+                  operation->getName().getStringRef() == "intent.scatter_unique" ||
+                  operation->getName().getStringRef() == "intent.atomic_add");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
     plan::BoundaryOp binding;
@@ -498,7 +499,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
           "grid-stride plan requires program_0 and lane_0 axes");
     vectorDomain = kernel.nodes.lookup(lane->second.getNode());
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "out" && !fixedOutput)
+      if ((view.view.getAccess() == "out" ||
+           view.view.getAccess() == "inout") &&
+          !fixedOutput)
         fixedOutput = &view;
     }
     if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
@@ -1141,9 +1144,12 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (inputs.empty())
       return kernel.entry.emitOpError(
           "fixed grid-stride wrapper requires an input view");
-    if (outputs.empty())
+    bool hasInOut = llvm::any_of(views, [](const ABIView &view) {
+      return view.view.getAccess() == "inout";
+    });
+    if (outputs.empty() && !hasInOut)
       return kernel.entry.emitOpError(
-          "fixed grid-stride wrapper requires an output view");
+          "fixed grid-stride wrapper requires a writable view");
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
     output << "_PROPERTIES = driver.active.utils.get_device_properties(_DEVICE.index)\n";
@@ -1324,8 +1330,11 @@ LogicalResult SourceEmitter::emitWrapper() {
       return kernel.entry.emitOpError(
           "autotuned wrapper supports input and output views");
   }
-  if (outputs.empty())
-    return kernel.entry.emitOpError("autotuned wrapper has no output views");
+  bool hasInOut = llvm::any_of(views, [](const ABIView &view) {
+    return view.view.getAccess() == "inout";
+  });
+  if (outputs.empty() && !hasInOut)
+    return kernel.entry.emitOpError("autotuned wrapper has no writable views");
 
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n\n\n";

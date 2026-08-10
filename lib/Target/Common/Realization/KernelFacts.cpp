@@ -896,7 +896,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  auto bindScatterWrite = [&](Operation &operation) -> LogicalResult {
+  auto bindIndexedWrite = [&](Operation &operation,
+                              bool recordScatter) -> LogicalResult {
     auto valueIndex =
         operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
     bool reduction =
@@ -909,7 +910,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         (!reduction && combine) ||
         !isa<intent::ViewType>(operation.getOperand(0).getType()))
       return operation.emitOpError(
-          "has no canonical unique or additive scatter schema");
+          "has no canonical indexed external-write schema");
     FailureOr<SmallVector<LogicalAxis>> indexedAxes =
         inferIndexedAxes(operation, operation.getOperand(0), facts);
     auto valueAxes =
@@ -917,14 +918,22 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     if (failed(indexedAxes) || valueAxes == facts.valueAxes.end() ||
         *indexedAxes != valueAxes->second)
       return operation.emitOpError(
-          "scatter value does not match its indexed destination");
+          "indexed write value does not match its destination");
     if (failed(analyzeBoundary(operation, facts, "none")))
       return failure();
-    facts.scatterWrites.insert(&operation);
+    if (recordScatter)
+      facts.scatterWrites.insert(&operation);
     return success();
   };
+  auto bindScatterWrite = [bindIndexedWrite](Operation &operation) {
+    return bindIndexedWrite(operation, true);
+  };
+  auto bindAtomicWrite = [bindIndexedWrite](Operation &operation) {
+    return bindIndexedWrite(operation, false);
+  };
   if (failed(addHandler(registry, "intent.scatter_unique", bindScatterWrite)) ||
-      failed(addHandler(registry, "intent.scatter_reduce", bindScatterWrite)))
+      failed(addHandler(registry, "intent.scatter_reduce", bindScatterWrite)) ||
+      failed(addHandler(registry, "intent.atomic_add", bindAtomicWrite)))
     return failure();
 
   auto enterStateStream = [&](Operation &operation) -> LogicalResult {

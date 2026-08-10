@@ -19,6 +19,10 @@ from kernels.contraction.batched_gemm import batched_gemm_nn
 from kernels.contraction.batched_gemm import batched_gemm_nt
 from kernels.contraction.batched_gemm import batched_gemm_tn
 from kernels.contraction.batched_gemm import batched_gemm_tt
+from kernels.backward.embedding import FEATURES as EMBEDDING_FEATURES
+from kernels.backward.embedding import TOKENS as EMBEDDING_TOKENS
+from kernels.backward.embedding import VOCABULARY as EMBEDDING_VOCABULARY
+from kernels.backward.embedding import embedding_backward_atomic
 from kernels.backward.layer_norm import FEATURES as BWD_LAYER_FEATURES
 from kernels.backward.layer_norm import PARTIAL_GROUPS as BWD_LAYER_PARTIAL_GROUPS
 from kernels.backward.layer_norm import ROWS as BWD_LAYER_ROWS
@@ -1722,6 +1726,56 @@ def _run_sorted_nucleus_cutoff(
     print(f"{target_name} sorted nucleus cutoff upstream baseline: unavailable")
 
 
+def _run_embedding_backward_atomic(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("embedding backward atomic has no algorithm-matched baseline")
+    token_ids = torch.arange(
+        EMBEDDING_TOKENS, device="cuda", dtype=torch.int32
+    )
+    indices = (token_ids * 17) % EMBEDDING_VOCABULARY
+    grad_output = torch.randn(
+        (EMBEDDING_TOKENS, EMBEDDING_FEATURES),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 1.0e-3
+    grad_weight = torch.zeros(
+        (EMBEDDING_VOCABULARY, EMBEDDING_FEATURES),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    expected = torch.zeros_like(grad_weight)
+    expected.index_add_(0, indices.long(), grad_output)
+
+    artifact = intent.compile(
+        embedding_backward_atomic, target=target, compiler=compiler
+    )
+    artifact.run(indices, grad_output, grad_weight)
+    torch.cuda.synchronize()
+    error = (grad_weight - expected).abs().max().item()
+    if error > 2.0e-6:
+        raise RuntimeError(
+            f"{target_name} embedding backward atomic comparison failed: {error}"
+        )
+    call = prepare_kernel_call(
+        artifact,
+        (indices, grad_output, grad_weight),
+        (),
+    )
+    p50, p95 = benchmark(call, warmup=3, repetitions=100, cuda_graph=True)
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} embedding backward atomic numerical comparison: PASS "
+        f"(max error={error})"
+    )
+    print(
+        f"{target_name} embedding backward atomic kernel-only performance "
+        f"(CUDA Graph): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} embedding backward atomic upstream baseline: unavailable")
+
+
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
@@ -1729,6 +1783,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "cross_entropy": _run_cross_entropy,
     "dropout_residual_rms_norm": _run_dropout_residual_rms_norm,
     "dual_gemm": _run_dual_gemm,
+    "embedding_backward_atomic": _run_embedding_backward_atomic,
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "grouped_query_head_add": _run_grouped_query_head_add,

@@ -222,6 +222,27 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
     return failure();
 
   if (failed(addHandler(
+          registry, "intent.atomic_add",
+          [&](Operation &operation) -> LogicalResult {
+            auto valueIndex = operation.getAttrOfType<IntegerAttr>(
+                "intent.value_operand_index");
+            auto ordering =
+                operation.getAttrOfType<StringAttr>("intent.ordering");
+            auto scope = operation.getAttrOfType<StringAttr>("intent.scope");
+            if (operation.getNumResults() != 0 || !valueIndex ||
+                valueIndex.getInt() <= 0 ||
+                static_cast<unsigned>(valueIndex.getInt()) >=
+                    operation.getNumOperands() ||
+                !isa<intent::ViewType>(operation.getOperand(0).getType()) ||
+                !ordering || ordering.getValue() != "relaxed" || !scope ||
+                scope.getValue() != "device")
+              return operation.emitOpError(
+                  "has no relaxed device-scoped external GPU atomic-add schema");
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto accType =

@@ -313,7 +313,8 @@ indexRealization(intent::plan::RealizationOp realization,
                 operation->getName().getStringRef() == "intent.view_load";
     bool store = operation &&
                  (operation->getName().getStringRef() == "intent.view_store" ||
-                  operation->getName().getStringRef() == "intent.scatter_unique");
+                  operation->getName().getStringRef() == "intent.scatter_unique" ||
+                  operation->getName().getStringRef() == "intent.atomic_add");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
@@ -551,7 +552,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
           "fixed TileLang rows require program_0 and lane_0 axes");
     vectorDomain = kernel.nodes.lookup(lane->second.getNode());
     for (ABIView &view : views) {
-      if (view.view.getAccess() == "out" && !fixedOutput)
+      if ((view.view.getAccess() == "out" ||
+           view.view.getAccess() == "inout") &&
+          !fixedOutput)
         fixedOutput = &view;
     }
     if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
@@ -1361,8 +1364,11 @@ LogicalResult SourceEmitter::emitWrapper() {
       return kernel.entry.emitOpError(
           "TileLang wrapper supports input and output views");
   }
-  if (outputs.empty())
-    return kernel.entry.emitOpError("TileLang wrapper has no output views");
+  bool hasInOut = llvm::any_of(views, [](const ABIView &view) {
+    return view.view.getAccess() == "inout";
+  });
+  if (outputs.empty() && !hasInOut)
+    return kernel.entry.emitOpError("TileLang wrapper has no writable views");
   for (int64_t axis : planIndex.components.orderedRaggedProgramAxes) {
     FailureOr<plan::RaggedOp> relation =
         target::emission::uniqueRaggedRelation(
