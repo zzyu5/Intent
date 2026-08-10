@@ -20,7 +20,7 @@ def _configuration(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 256, 512, 1024),
-        "stream_contract": (32, 64),
+        "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (64, 128),
         "feature": (64, 128),
@@ -62,11 +62,15 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
             ({"stream_contract": 32}, 1, 128),
             ({"stream_contract": 64}, 1, 128),
         ),
-        (
-            ({"query": 64, "stream": 64}, 1, 128),
-            ({"query": 64, "stream": 64}, 2, 128),
-            ({"query": 128, "stream": 64}, 1, 128),
-            ({"query": 128, "stream": 128}, 1, 128),
+        tuple(
+            ({"query": query, stream_role: stream}, num_stages, threads)
+            for stream_role in ("stream", "stream_contract")
+            for query, stream, num_stages, threads in (
+                (64, 64, 1, 128),
+                (64, 64, 2, 128),
+                (128, 64, 1, 128),
+                (128, 128, 1, 128),
+            )
         ),
         (
             ({"program_m": 128, "program_n": 64, "reduction": 64, "group_m": 8}, 2, 128),

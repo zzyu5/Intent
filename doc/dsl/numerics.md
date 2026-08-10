@@ -27,3 +27,7 @@ per-op determinism contracts
 Backend 在 f32 contraction 内选择 IEEE、TF32、TF32x3 或其他 target-native mechanism，与 source 显式把一个 f32 value cast 成 f16/bf16 是两件事。
 
 Logical validity 与数值 mask 分开。Realizer 可以依据 logical predicate 消除完全无效的 physical region；无法整体证明时生成 target predicate、tail loop 或 `vsetvl`。
+
+## 整数整除与余数
+
+`a // b` 使用向负无穷取整，`a % b` 定义为 `a - (a // b) * b`；`b` 必须非零，余数为零或与 `b` 同号。这是 Kernel IR 的跨目标语义，不继承某个表面语言对负整数的偶然行为。目标投影必须机械地规范化本地的整数除法结果。

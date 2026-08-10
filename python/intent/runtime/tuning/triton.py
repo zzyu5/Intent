@@ -12,7 +12,7 @@ def _target_parameters(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 256, 512, 1024),
-        "stream_contract": (32, 64),
+        "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (32, 64, 128),
         "feature": (64, 128, 256),
@@ -56,13 +56,17 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
             ({"stream_contract": 32}, 4, 4),
             ({"stream_contract": 64}, 3, 4),
         ),
-        (
-            ({"query": 64, "stream": 32}, 3, 4),
-            ({"query": 64, "stream": 64}, 3, 4),
-            ({"query": 128, "stream": 32}, 3, 4),
-            ({"query": 128, "stream": 64}, 3, 4),
-            ({"query": 128, "stream": 64}, 2, 8),
-            ({"query": 128, "stream": 128}, 2, 8),
+        tuple(
+            ({"query": query, stream_role: stream}, stages, warps)
+            for stream_role in ("stream", "stream_contract")
+            for query, stream, stages, warps in (
+                (64, 32, 3, 4),
+                (64, 64, 3, 4),
+                (128, 32, 3, 4),
+                (128, 64, 3, 4),
+                (128, 64, 2, 8),
+                (128, 128, 2, 8),
+            )
         ),
         (
             ({"ragged_member": 32, "feature": 64, "reduction": 32}, 4, 4),

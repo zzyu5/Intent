@@ -549,12 +549,26 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   FailureOr<StringRef> rhs = lookupValue(operation, 1);
   if (failed(node) || !binding || failed(lhs) || failed(rhs))
     return failure();
+  std::string result = makeResultName(operation, 0);
   std::string expression;
   if (binding.getLowering() == "ct.maximum" ||
       binding.getLowering() == "ct.minimum")
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
-  else {
+  else if (binding.getLowering() == "python_floor_divide" ||
+           binding.getLowering() == "python_remainder") {
+    std::string quotient = result + "_quotient";
+    std::string remainder = result + "_remainder";
+    std::string adjust = result + "_adjust";
+    line(quotient + " = " + lhs->str() + " // " + rhs->str());
+    line(remainder + " = " + lhs->str() + " - " + quotient + " * " +
+         rhs->str());
+    line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
+         " < 0) != (" + rhs->str() + " < 0))");
+    expression = binding.getLowering() == "python_floor_divide"
+                     ? quotient + " - " + adjust
+                     : remainder + " + " + adjust + " * " + rhs->str();
+  } else {
     StringRef symbol;
     if (binding.getLowering() == "python_add")
       symbol = "+";
@@ -564,10 +578,6 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
-    else if (binding.getLowering() == "python_floor_divide")
-      symbol = "//";
-    else if (binding.getLowering() == "python_remainder")
-      symbol = "%";
     else if (binding.getLowering() == "python_equal")
       symbol = "==";
     else if (binding.getLowering() == "python_not_equal")
@@ -584,7 +594,6 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       return operation.emitOpError("uses an unsupported cuTile binary lowering");
     expression = lhs->str() + " " + symbol.str() + " " + rhs->str();
   }
-  std::string result = makeResultName(operation, 0);
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);
   if (failed(padded))

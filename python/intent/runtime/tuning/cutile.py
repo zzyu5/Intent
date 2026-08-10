@@ -19,7 +19,7 @@ def _configuration(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 512, 1024, 2048),
-        "stream_contract": (32, 64),
+        "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (64, 128),
         "feature": (64, 128),
@@ -61,11 +61,15 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             ({"stream_contract": 32}, 1, 4),
             ({"stream_contract": 64}, 1, 2),
         ),
-        (
-            ({"query": 128, "stream": 128}, 1, 2),
-            ({"query": 128, "stream": 128}, 2, 2),
-            ({"query": 64, "stream": 64}, 1, 4),
-            ({"query": 64, "stream": 32}, 1, 2),
+        tuple(
+            ({"query": query, stream_role: stream}, num_ctas, occupancy)
+            for stream_role in ("stream", "stream_contract")
+            for query, stream, num_ctas, occupancy in (
+                (128, 128, 1, 2),
+                (128, 128, 2, 2),
+                (64, 64, 1, 4),
+                (64, 32, 1, 2),
+            )
         ),
         tuple(
             (
@@ -140,4 +144,8 @@ def row_program_count(n_rows: int, device: object, occupancy: int) -> int:
 
 def autotune_timeout(parameter_map: dict[str, str]) -> int:
     roles = frozenset(parameter_map.values())
-    return 10 if {"query", "stream"}.issubset(roles) else 5
+    return (
+        10
+        if "query" in roles and {"stream", "stream_contract"}.intersection(roles)
+        else 5
+    )

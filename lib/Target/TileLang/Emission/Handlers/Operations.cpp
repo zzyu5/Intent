@@ -641,12 +641,28 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       (tensorResult &&
        (binding.getReuseOperandAttr().getInt() < -1 || binding.getReuseOperandAttr().getInt() > 1)))
     return operation.emitOpError("lacks a TileLang binary binding");
+  std::string resultName = makeResultName(operation, 0);
   auto makeExpression = [&](StringRef lhs,
                             StringRef rhs) -> FailureOr<std::string> {
     if (binding.getLowering() == "T.max" ||
         binding.getLowering() == "T.min")
       return binding.getLowering().str() + "(" + lhs.str() + ", " +
              rhs.str() + ")";
+    if (binding.getLowering() == "python_floor_divide" ||
+        binding.getLowering() == "python_remainder") {
+      std::string quotient = resultName + "_quotient";
+      std::string remainder = resultName + "_remainder";
+      std::string adjust = resultName + "_adjust";
+      line(quotient + " = " + lhs.str() + " // " + rhs.str());
+      line(remainder + " = " + lhs.str() + " - " + quotient + " * " +
+           rhs.str());
+      line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
+           " < 0) != (" + rhs.str() + " < 0))");
+      return binding.getLowering() == "python_floor_divide"
+                 ? quotient + " - T.if_then_else(" + adjust + ", 1, 0)"
+                 : remainder + " + T.if_then_else(" + adjust + ", " +
+                       rhs.str() + ", 0)";
+    }
     StringRef symbol;
     if (binding.getLowering() == "python_add")
       symbol = "+";
@@ -656,10 +672,6 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
-    else if (binding.getLowering() == "python_floor_divide")
-      symbol = "//";
-    else if (binding.getLowering() == "python_remainder")
-      symbol = "%";
     else if (binding.getLowering() == "python_equal")
       symbol = "==";
     else if (binding.getLowering() == "python_not_equal")
@@ -686,9 +698,8 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     FailureOr<std::string> expression = makeExpression(*lhs, *rhs);
     if (failed(expression))
       return failure();
-    std::string result = makeResultName(operation, 0);
-    line(result + " = " + *expression);
-    valueNames[operation.getResult(0)] = result;
+    line(resultName + " = " + *expression);
+    valueNames[operation.getResult(0)] = resultName;
     return success();
   }
   std::string result;
@@ -1484,19 +1495,21 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     std::string reductionExtent = (*lhsExtents)[1];
     std::string outputExtent =
         (*rhsExtents)[rhsReduction.getInt() == 0 ? 1 : 0];
-    line("for contract_j in T.Parallel(" + outputExtent + "):");
-    ++indentation;
-    line("for contract_k in T.serial(" + reductionExtent + "):");
+    std::string products = makeResultName(operation, 0) + "_products";
+    line(products + " = T.alloc_fragment((1, " + outputExtent + ", " +
+         reductionExtent + "), " + accumulatorDtype + ")");
+    line("for contract_j, contract_k in T.Parallel(" + outputExtent + ", " +
+         reductionExtent + "):");
     ++indentation;
     std::string rhsElement = rhsReduction.getInt() == 0
                                  ? rhs->str() + "[contract_k, contract_j]"
                                  : rhs->str() + "[contract_j, contract_k]";
-    line(*result + "[0, contract_j] = " + *result +
-         "[0, contract_j] + T.cast(" + lhs->str() +
-         "[0, contract_k], " + accumulatorDtype + ") * T.cast(" +
-         rhsElement + ", " + accumulatorDtype + ")");
+    line(products + "[0, contract_j, contract_k] = T.cast(" + lhs->str() +
+         "[0, contract_k], " + accumulatorDtype + ") * T.cast(" + rhsElement +
+         ", " + accumulatorDtype + ")");
     --indentation;
-    --indentation;
+    line("T.reduce_sum(" + products + ", " + *result +
+         ", dim=2, clear=True)");
     bindResult(operation, 0, *result);
     return success();
   }
