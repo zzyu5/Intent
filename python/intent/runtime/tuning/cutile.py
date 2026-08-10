@@ -55,9 +55,21 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             ({"query": 64, "stream": 64}, 1, 4),
             ({"query": 64, "stream": 32}, 1, 2),
         ),
-        (
-            ({"program_m": 128, "program_n": 64, "reduction": 64, "group_m": 8}, 1, 1),
-            ({"program_m": 128, "program_n": 64, "reduction": 32, "group_m": 8}, 1, 2),
+        tuple(
+            (
+                {
+                    "program_m": program_m,
+                    "program_n": program_n,
+                    "reduction": reduction,
+                    "group_m": 8,
+                },
+                1,
+                occupancy,
+            )
+            for program_m in (64, 128)
+            for program_n in (64, 128)
+            for reduction in (32, 64)
+            for occupancy in (1, 2, 4)
         ),
         (
             ({"ragged_member": 128, "feature": 64, "reduction": 64}, 1, 1),

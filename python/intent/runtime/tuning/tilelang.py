@@ -52,6 +52,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
         ),
         (
             ({"query": 64, "stream": 64}, 1, 128),
+            ({"query": 64, "stream": 64}, 2, 128),
             ({"query": 128, "stream": 64}, 1, 128),
             ({"query": 128, "stream": 128}, 1, 128),
         ),
