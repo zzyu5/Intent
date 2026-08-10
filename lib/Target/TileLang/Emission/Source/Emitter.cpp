@@ -15,6 +15,8 @@ std::string dimensionSpelling(StringRef symbol) {
 FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
   if (role == "one")
     return std::string("1");
+  if (role.starts_with("fixed_"))
+    return role.drop_front(6).str();
   if (role == "row_vector")
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))
@@ -1652,6 +1654,11 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   if (domain.getNumOperands() < 2)
     return failure();
   Operation *dim = domain.getOperand(1).getDefiningOp();
+  auto constant = dim ? dim->getAttrOfType<IntegerAttr>("intent.value")
+                      : IntegerAttr();
+  if (dim && dim->getName().getStringRef() == "intent.constant" && constant &&
+      constant.getInt() > 0)
+    return std::to_string(constant.getInt());
   auto axis = dim ? dim->getAttrOfType<IntegerAttr>("intent.axis")
                   : IntegerAttr();
   if (!dim || dim->getName().getStringRef() != "intent.dim" || !axis ||
@@ -1767,8 +1774,16 @@ SourceEmitter::elementAccessIndices(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(
+      *relation, [&](const target::IndexTerm &term) {
+        return term.kind == "value_index" && term.operands.size() == 1 &&
+               term.operands.front() &&
+               isa<RankedTensorType>(
+                   operation.getOperand(*term.operands.front()).getType());
+      });
   SmallVector<std::string> indices;
   unsigned tileAxis = 0;
+  bool advancedTensorAxesCovered = false;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "full_slice") {
       if (tileAxis >= tileIndices.size())
@@ -1794,16 +1809,36 @@ SourceEmitter::elementAccessIndices(Operation &operation,
       auto tensor = cast<RankedTensorType>(indexed.getType());
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
-      if (tensor.getRank() != 1 || failed(exact) ||
-          tileAxis >= tileIndices.size())
-        return operation.emitOpError(
-            "TileLang indirect element access requires one index-tile axis");
-      auto assumed = assumedIndexNames.find(indexed);
-      indices.push_back(assumed == assumedIndexNames.end()
-                            ? addressIndex(exact->str() + "[" +
-                                           tileIndices[tileAxis] + "]")
-                            : addressIndex(assumed->second));
-      ++tileAxis;
+      if (failed(exact))
+        return failure();
+      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
+        if (tensor.getRank() != static_cast<int64_t>(tileIndices.size()) ||
+            (tileAxis != 0 && !advancedTensorAxesCovered))
+          return operation.emitOpError(
+              "TileLang broadcasted tensor indices must jointly cover the transfer rank");
+        std::string element = exact->str() + "[";
+        for (auto [axis, index] : llvm::enumerate(tileIndices)) {
+          if (axis)
+            element += ", ";
+          element += index;
+        }
+        element += "]";
+        indices.push_back(addressIndex(element));
+        if (!advancedTensorAxesCovered) {
+          tileAxis = tileIndices.size();
+          advancedTensorAxesCovered = true;
+        }
+      } else {
+        if (tensor.getRank() != 1 || tileAxis >= tileIndices.size())
+          return operation.emitOpError(
+              "TileLang indirect element access requires one index-tile axis");
+        auto assumed = assumedIndexNames.find(indexed);
+        indices.push_back(assumed == assumedIndexNames.end()
+                              ? addressIndex(exact->str() + "[" +
+                                             tileIndices[tileAxis] + "]")
+                              : addressIndex(assumed->second));
+        ++tileAxis;
+      }
     } else if (term.kind == "value_index" ||
                target::emission::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
@@ -1854,8 +1889,16 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(view) || relation->size() != (*view)->shape.size())
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(
+      *relation, [&](const target::IndexTerm &term) {
+        return term.kind == "value_index" && term.operands.size() == 1 &&
+               term.operands.front() &&
+               isa<RankedTensorType>(
+                   operation.getOperand(*term.operands.front()).getType());
+      });
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
+  bool advancedTensorAxesCovered = false;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
       if (tileAxis >= tileIndices.size())
@@ -1880,12 +1923,31 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       auto tensor = cast<RankedTensorType>(indexed.getType());
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
-      if (tensor.getRank() != 1 || failed(exact) ||
-          tileAxis >= tileIndices.size())
-        return operation.emitOpError(
-            "TileLang indirect bounds require one index-tile axis");
-      std::string index =
-          exact->str() + "[" + tileIndices[tileAxis++] + "]";
+      if (failed(exact))
+        return failure();
+      std::string index;
+      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
+        if (tensor.getRank() != static_cast<int64_t>(tileIndices.size()) ||
+            (tileAxis != 0 && !advancedTensorAxesCovered))
+          return operation.emitOpError(
+              "TileLang broadcasted tensor bounds must jointly cover the transfer rank");
+        index = exact->str() + "[";
+        for (auto [axis, tileIndex] : llvm::enumerate(tileIndices)) {
+          if (axis)
+            index += ", ";
+          index += tileIndex;
+        }
+        index += "]";
+        if (!advancedTensorAxesCovered) {
+          tileAxis = tileIndices.size();
+          advancedTensorAxesCovered = true;
+        }
+      } else {
+        if (tensor.getRank() != 1 || tileAxis >= tileIndices.size())
+          return operation.emitOpError(
+              "TileLang indirect bounds require one index-tile axis");
+        index = exact->str() + "[" + tileIndices[tileAxis++] + "]";
+      }
       if (!physicalOnly) {
         predicates.push_back("0 <= " + index);
         predicates.push_back(index + " < " + (*view)->shape[axisNumber]);

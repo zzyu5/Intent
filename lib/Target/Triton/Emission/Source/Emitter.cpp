@@ -28,6 +28,8 @@ StringRef torchDtype(Type type) {
 FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
   if (role == "one")
     return std::string("1");
+  if (role.starts_with("fixed_"))
+    return role.drop_front(6).str();
   if (role == "row_vector")
     return std::string("BLOCK_SIZE");
   if (role.starts_with("row_vector_"))
@@ -1670,6 +1672,11 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   if (domain.getNumOperands() < 2)
     return failure();
   Operation *dim = domain.getOperand(1).getDefiningOp();
+  auto constant = dim ? dim->getAttrOfType<IntegerAttr>("intent.value")
+                      : IntegerAttr();
+  if (dim && dim->getName().getStringRef() == "intent.constant" && constant &&
+      constant.getInt() > 0)
+    return std::to_string(constant.getInt());
   auto axis = dim ? dim->getAttrOfType<IntegerAttr>("intent.axis") : IntegerAttr();
   if (!dim || dim->getName().getStringRef() != "intent.dim" || !axis ||
       dim->getNumOperands() != 1)
@@ -1732,8 +1739,15 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(*relation, [&](const target::IndexTerm &term) {
+    return term.kind == "value_index" && term.operands.size() == 1 &&
+           term.operands.front() &&
+           isa<RankedTensorType>(
+               operation.getOperand(*term.operands.front()).getType());
+  });
   std::string expression = view.pointer;
   unsigned vectorAxis = 0;
+  bool advancedTensorAxesCovered = false;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     std::string index;
     if (term.kind == "full_slice") {
@@ -1762,10 +1776,22 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
         if (!tensor) {
           index = "(" + exact->str() + ")";
         } else {
-          if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
-            return operation.emitOpError(
-                "Triton indirect tensor indices currently require one logical axis");
-          index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+          if (tensorIndexCount > 1 || tensor.getRank() > 1) {
+            if (tensor.getRank() != static_cast<int64_t>(*tensorRank) ||
+                (vectorAxis != 0 && !advancedTensorAxesCovered))
+              return operation.emitOpError(
+                  "Triton broadcasted tensor indices must jointly cover the emitted tensor rank");
+            index = "(" + exact->str() + ")";
+            if (!advancedTensorAxesCovered) {
+              vectorAxis = *tensorRank;
+              advancedTensorAxesCovered = true;
+            }
+          } else {
+            if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
+              return operation.emitOpError(
+                  "Triton indirect tensor indices currently require one logical axis");
+            index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+          }
         }
       } else if (target::emission::isSequentialIterator(indexed)) {
         FailureOr<StringRef> exact =
@@ -1814,8 +1840,15 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(*relation, [&](const target::IndexTerm &term) {
+    return term.kind == "value_index" && term.operands.size() == 1 &&
+           term.operands.front() &&
+           isa<RankedTensorType>(
+               operation.getOperand(*term.operands.front()).getType());
+  });
   SmallVector<std::string> predicates;
   unsigned vectorAxis = 0;
+  bool advancedTensorAxesCovered = false;
   for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
     if (term.kind == "full_slice") {
       if (planIndex.blockExtents.count((*view)->shape[axisNumber])) {
@@ -1841,10 +1874,25 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
       auto tensor = cast<RankedTensorType>(indexed.getType());
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
-      if (tensor.getRank() != 1 || failed(exact) || vectorAxis >= *tensorRank)
-        return operation.emitOpError(
-            "Triton indirect tensor bounds require one logical axis");
-      std::string index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+      if (failed(exact))
+        return failure();
+      std::string index;
+      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
+        if (tensor.getRank() != static_cast<int64_t>(*tensorRank) ||
+            (vectorAxis != 0 && !advancedTensorAxesCovered))
+          return operation.emitOpError(
+              "Triton broadcasted tensor bounds must jointly cover the emitted tensor rank");
+        index = "(" + exact->str() + ")";
+        if (!advancedTensorAxesCovered) {
+          vectorAxis = *tensorRank;
+          advancedTensorAxesCovered = true;
+        }
+      } else {
+        if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
+          return operation.emitOpError(
+              "Triton indirect tensor bounds require one logical axis");
+        index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+      }
       std::string extent = (*view)->shape[axisNumber];
       if (!planIndex.components.reusedAxes.empty()) {
         if (roleDimensions.lookup("program_0") == extent)

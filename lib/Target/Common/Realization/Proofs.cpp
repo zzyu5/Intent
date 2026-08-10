@@ -202,6 +202,20 @@ std::optional<std::string> inferPadding(
     if (valuePadding && fillPadding && *valuePadding == *fillPadding)
       return valuePadding;
   }
+  if ((name == "intent.reduce" || name == "intent.scan") &&
+      definition->getNumOperands() == 2) {
+    std::optional<std::string> inputPadding =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    std::optional<std::string> identityPadding =
+        inferPadding(definition->getOperand(1), facts, assumedPadding);
+    auto combine = definition->getAttrOfType<StringAttr>("intent.combine");
+    if (inputPadding && identityPadding && *inputPadding == *identityPadding &&
+        combine &&
+        ((combine.getValue() == "add" && *inputPadding == "zero") ||
+         (combine.getValue() == "maximum" &&
+          *inputPadding == "negative_infinity")))
+      return inputPadding;
+  }
   return std::nullopt;
 }
 

@@ -625,6 +625,25 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                       !isa<RankedTensorType>(operation.getResult(0).getType());
   if (failed(physicalFill))
     return failure();
+  if (!scalarResult) {
+    auto resultType =
+        dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+    FailureOr<SmallVector<target::IndexTerm>> relation =
+        target::parseIndexRelation(operation);
+    if (!resultType || failed(relation))
+      return failure();
+    unsigned tensorIndices = llvm::count_if(
+        *relation, [&](const target::IndexTerm &term) {
+          return term.kind == "value_index" && term.operands.size() == 1 &&
+                 term.operands.front() &&
+                 isa<RankedTensorType>(
+                     operation.getOperand(*term.operands.front()).getType());
+        });
+    if (resultType.getRank() > 2 && tensorIndices > 1)
+      return operation.emitOpError(
+          "requires a multi-axis broadcasted indirect read footprint that "
+          "TileLang cannot project as one parallel fragment");
+  }
   bool expanded = !physicalFill->empty();
   if (scalarResult) {
     FailureOr<std::string> indices = accessIndices(operation);
@@ -845,6 +864,10 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(result) || failed(extents) || extents->size() != 1)
     return operation.emitOpError("lacks a mechanical TileLang indices binding");
   std::string base = axisIndices.lookup(axis->getNode());
+  if (base.empty() && axis->hasRole("lane")) {
+    base = "0";
+    axisIndices[axis->getNode()] = base;
+  }
   if (base.empty())
     return operation.emitOpError("has no TileLang vector index realization");
   line("for indices_i in T.Parallel(" + extents->front() + "):");

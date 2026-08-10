@@ -777,6 +777,9 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(axis) || !result || result.getRank() != 1 ||
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical Triton indices binding");
+  if (axisIndices.lookup(axis->getNode()).empty() && axis->hasRole("lane"))
+    axisIndices[axis->getNode()] =
+        "tl.arange(0, " + axis->getTile().str() + ")";
   FailureOr<std::string> expression =
       indexExpression(*axis, false, 0, 1, operation);
   if (failed(expression))

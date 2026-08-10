@@ -316,6 +316,19 @@ LogicalResult recordLoadAxes(Operation &operation, KernelFacts &facts) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(*relation, [&](const IndexTerm &term) {
+    return term.kind == "value_index" && term.operands.size() == 1 &&
+           term.operands.front() &&
+           isa<RankedTensorType>(
+               operation.getOperand(*term.operands.front()).getType());
+  });
+  if (tensorIndexCount > 1) {
+    FailureOr<SmallVector<LogicalAxis>> axes =
+        axesFromResultShape(operation, 0, facts);
+    if (failed(axes))
+      return failure();
+    return bindResultAxes(operation, 0, std::move(*axes), facts);
+  }
   SmallVector<LogicalAxis> axes;
   unsigned sourceAxis = 0;
   for (const IndexTerm &term : *relation) {
@@ -1313,7 +1326,8 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
                                      const KernelFacts &facts,
                                      Operation &consumer) {
   if (Operation *definition = indexedValue.getDefiningOp())
-    if (facts.domainSourceAxes.count(definition))
+    if (facts.domainSourceAxes.count(definition) ||
+        facts.staticDomainExtents.count(definition))
       return definition;
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;

@@ -302,7 +302,15 @@ assignAxes(const target::KernelFacts &facts) {
     } else if (hasRole(choice.roles, "reduction")) {
       choice.tile = indexedTile("reduction", reductionTile);
     } else if (hasRole(choice.roles, "lane")) {
-      choice.tile = indexedTile("row_vector", laneTile);
+      auto extent = facts.staticDomainExtents.find(choice.domain);
+      if (extent != facts.staticDomainExtents.end()) {
+        int64_t physical = 1;
+        while (physical < extent->second)
+          physical *= 2;
+        choice.tile = "fixed_" + std::to_string(physical);
+      } else {
+        choice.tile = indexedTile("row_vector", laneTile);
+      }
     } else {
       choice.tile = "one";
     }
@@ -732,7 +740,8 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
   SmallVector<std::string> keys;
   SmallVector<std::string> parameters;
   auto tunable = [](StringRef tile) {
-    return tile != "one" && !tile.starts_with("row_vector");
+    return tile != "one" && !tile.starts_with("row_vector") &&
+           !tile.starts_with("fixed_");
   };
   for (intent::plan::AxisOp axis : decisions.axes) {
     if (tunable(axis.getTile())) {

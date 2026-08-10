@@ -11,6 +11,8 @@ namespace {
 FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
   if (role == "one")
     return std::string("1");
+  if (role.starts_with("fixed_"))
+    return role.drop_front(6).str();
   if (role == "row_vector")
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))
@@ -1766,6 +1768,11 @@ FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
   if (domain.getNumOperands() < 2)
     return failure();
   Operation *dim = domain.getOperand(1).getDefiningOp();
+  auto constant = dim ? dim->getAttrOfType<IntegerAttr>("intent.value")
+                      : IntegerAttr();
+  if (dim && dim->getName().getStringRef() == "intent.constant" && constant &&
+      constant.getInt() > 0)
+    return std::to_string(constant.getInt());
   auto axis = dim ? dim->getAttrOfType<IntegerAttr>("intent.axis")
                   : IntegerAttr();
   if (!dim || dim->getName().getStringRef() != "intent.dim" || !axis ||
@@ -1822,7 +1829,15 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     if (failed(view) || relation->size() != (*view)->shape.size())
       return operation.emitOpError(
           "indirect cuTile gather has no ranked access schema");
+    unsigned tensorIndexCount = llvm::count_if(
+        *relation, [&](const target::IndexTerm &term) {
+          return term.kind == "value_index" && term.operands.size() == 1 &&
+                 term.operands.front() &&
+                 isa<RankedTensorType>(
+                     operation.getOperand(*term.operands.front()).getType());
+        });
     unsigned resultAxis = 0;
+    bool advancedTensorAxesCovered = false;
     auto broadcast = [&](StringRef value, unsigned axis) {
       if (projectedTensor.getRank() == 1)
         return value.str();
@@ -1865,13 +1880,26 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       if (auto tensor = dyn_cast<RankedTensorType>(indexed.getType())) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
-        if (term.kind != "value_index" || tensor.getRank() != 1 ||
-            failed(exact) ||
-            resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
+        if (term.kind != "value_index" || failed(exact))
           return operation.emitOpError(
-              "cuTile indirect tensor indices require one logical axis");
-        indices.push_back(
-            broadcast(addressIndex(*exact), resultAxis++));
+              "cuTile indirect tensor index has no canonical value");
+        if (tensorIndexCount > 1 || tensor.getRank() > 1) {
+          if (tensor.getRank() != projectedTensor.getRank() ||
+              (resultAxis != 0 && !advancedTensorAxesCovered))
+            return operation.emitOpError(
+                "cuTile broadcasted tensor indices must jointly cover the result rank");
+          indices.push_back(addressIndex(*exact));
+          if (!advancedTensorAxesCovered) {
+            resultAxis = projectedTensor.getRank();
+            advancedTensorAxesCovered = true;
+          }
+        } else {
+          if (tensor.getRank() != 1 ||
+              resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
+            return operation.emitOpError(
+                "cuTile indirect tensor indices require one logical axis");
+          indices.push_back(broadcast(addressIndex(*exact), resultAxis++));
+        }
         continue;
       }
       if (isa<IntegerType, IndexType, intent::LogicalIndexType>(

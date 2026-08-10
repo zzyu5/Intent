@@ -152,14 +152,22 @@ def lower_index(
     operands: list[MlirValue] = []
     terms: list[IndexTerm] = []
     result_shape: list[object] = []
+    advanced_shape: tuple[object, ...] = ()
+    advanced_position: int | None = None
+    advanced_indices_contiguous = True
+    saw_non_advanced_after_advanced = False
     source_axis = 0
     for raw_term in raw_terms:
         if _is_new_axis(raw_term):
+            if advanced_position is not None:
+                saw_non_advanced_after_advanced = True
             terms.append(IndexTerm(IndexTermKind.NEW_AXIS))
             result_shape.append(StaticDim(1))
             continue
         source_dimension = source_type.shape[source_axis]
         if isinstance(raw_term, ast.Slice):
+            if advanced_position is not None:
+                saw_non_advanced_after_advanced = True
             if raw_term.lower is None and raw_term.upper is None and raw_term.step is None:
                 terms.append(IndexTerm(IndexTermKind.FULL_SLICE))
                 result_shape.append(source_dimension)
@@ -194,6 +202,8 @@ def lower_index(
             continue
         static = _static_integer(raw_term)
         if static is not None:
+            if advanced_position is not None:
+                saw_non_advanced_after_advanced = True
             if isinstance(source_dimension, StaticDim) and not (
                 -source_dimension.value <= static < source_dimension.value
             ):
@@ -214,8 +224,26 @@ def lower_index(
                 DTypeCategory.INDEX,
             ):
                 lowerer.error(raw_term, "tensor index must have integer/index dtype")
+            if saw_non_advanced_after_advanced:
+                advanced_indices_contiguous = False
+            if not advanced_indices_contiguous:
+                lowerer.error(
+                    raw_term,
+                    "multiple tensor indices must be adjacent in one positional index relation",
+                )
             terms.append(IndexTerm(IndexTermKind.VALUE_INDEX, (position,)))
-            result_shape.extend(value.type.shape)
+            try:
+                merged_shape = broadcast_shape(advanced_shape, value.type.shape)
+            except ValueError as error:
+                lowerer.error(raw_term, str(error))
+            if advanced_position is None:
+                advanced_position = len(result_shape)
+            else:
+                del result_shape[
+                    advanced_position : advanced_position + len(advanced_shape)
+                ]
+            result_shape[advanced_position:advanced_position] = merged_shape
+            advanced_shape = tuple(merged_shape)
         elif isinstance(value.type, (ScalarType, LogicalIndexType)) and is_integer(value.type):
             terms.append(IndexTerm(IndexTermKind.VALUE_INDEX, (position,)))
         else:

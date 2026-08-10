@@ -773,6 +773,10 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
   std::string base = axisIndices.lookup(axis->getNode());
+  if (base.empty() && axis->hasRole("lane")) {
+    base = "0";
+    axisIndices[axis->getNode()] = base;
+  }
   if (base.empty())
     return operation.emitOpError("has no cuTile vector index realization");
   bool directVector =

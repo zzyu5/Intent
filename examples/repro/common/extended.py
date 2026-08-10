@@ -40,6 +40,16 @@ from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import quantized_gemm
+from kernels.convolution.direct import CONV1D_BATCH
+from kernels.convolution.direct import CONV1D_FILTER
+from kernels.convolution.direct import CONV1D_LENGTH
+from kernels.convolution.direct import CONV2D_BATCH
+from kernels.convolution.direct import CONV2D_FILTER_HEIGHT
+from kernels.convolution.direct import CONV2D_FILTER_WIDTH
+from kernels.convolution.direct import CONV2D_HEIGHT
+from kernels.convolution.direct import CONV2D_WIDTH
+from kernels.convolution.direct import conv1d_same
+from kernels.convolution.direct import conv2d_same
 from kernels.indexing.relations import GQA_KEY_HEADS
 from kernels.indexing.relations import GQA_QUERY_HEADS
 from kernels.indexing.relations import GQA_TOKENS
@@ -223,6 +233,72 @@ def _compare(
             f"upstream_p95={upstream_p95:.4f} ms, "
             f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
         )
+
+
+def _run_conv1d(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    x = torch.randn(
+        (CONV1D_BATCH, CONV1D_LENGTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    weight = torch.randn(
+        (CONV1D_FILTER,),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    artifact = intent.compile(conv1d_same, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x, weight),
+        reference=lambda: F.conv1d(
+            x[:, None, :],
+            weight[None, None, :],
+            padding=CONV1D_FILTER // 2,
+        )[:, 0, :],
+        target_name=target_name,
+        kernel_name="conv1d same-padding",
+        tolerance=2.0e-3,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_conv2d(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    x = torch.randn(
+        (CONV2D_BATCH, CONV2D_HEIGHT, CONV2D_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    weight = torch.randn(
+        (CONV2D_FILTER_HEIGHT, CONV2D_FILTER_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    artifact = intent.compile(conv2d_same, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x, weight),
+        reference=lambda: F.conv2d(
+            x[:, None, :, :],
+            weight[None, None, :, :],
+            padding=(CONV2D_FILTER_HEIGHT // 2, CONV2D_FILTER_WIDTH // 2),
+        )[:, 0, :, :],
+        target_name=target_name,
+        kernel_name="conv2d same-padding",
+        tolerance=3.0e-3,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
 
 
 def run_gemm_tail_case(artifact, target_name: str) -> None:
@@ -2089,6 +2165,8 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
+    "conv1d": _run_conv1d,
+    "conv2d": _run_conv2d,
     "cross_entropy": _run_cross_entropy,
     "dropout_residual_rms_norm": _run_dropout_residual_rms_norm,
     "dual_gemm": _run_dual_gemm,
