@@ -227,7 +227,10 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical reduction");
     plan::ReductionOp binding;
     binding.operation = value;
-    binding.lowering = *role == "reduce_maximum" ? "ct.max" : "ct.sum";
+    binding.lowering = *role == "reduce_argmax"
+                           ? "ct.max_with_index"
+                       : *role == "reduce_maximum" ? "ct.max"
+                                                    : "ct.sum";
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = *axis;
     index.reductions[value.getNode()] = binding;
@@ -1718,7 +1721,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
             "indirect cuTile gather has no active vector axis");
       std::string exact =
           target::emission::isRaggedBoundAxis(planIndex.components,
-                                              axis->getNode())
+                                              axis->getNode()) ||
+                  axis->hasRole("lane")
               ? base
               : base + " * " + axis->getTile().str() + " + ct.arange(" +
                     axis->getTile().str() + ", dtype=ct.int32)";

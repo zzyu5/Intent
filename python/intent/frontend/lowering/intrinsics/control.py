@@ -194,8 +194,8 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
 def _indices(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("region",), required=("region",))
     region = lowerer.materialize(lowerer.lower_expression(bound["region"]), bound["region"])
-    if not isinstance(region.type, RegionType):
-        lowerer.error(node, "I.indices requires a logical region")
+    if not isinstance(region.type, (DomainType, RegionType)):
+        lowerer.error(node, "I.indices requires a logical domain or region")
     operation = lowerer.emit(
         OperationKind.INDICES,
         lowerer.location(node),

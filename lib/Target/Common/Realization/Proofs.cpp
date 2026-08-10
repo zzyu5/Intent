@@ -43,7 +43,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
     if (name == "intent.view_store" || name == "intent.scatter_unique" ||
         name == "intent.scatter_reduce")
       continue;
-    if (name == "intent.reduce") {
+    if (name == "intent.reduce" || name == "intent.arg_reduce") {
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");
       if (!combine ||
           (combine.getValue() == "add" && padded != PaddedValue::zero) ||

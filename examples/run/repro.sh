@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|varlen_gqa_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|varlen_gqa_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
   exit 2
 fi
 
@@ -49,6 +49,9 @@ case "${backend}:${kernel}" in
     ;;
   triton:layer_norm)
     baseline=source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py
+    ;;
+  triton:cross_entropy)
+    baseline=source/triton/liger-kernel/loss/cross_entropy/cross_entropy_runtime.py
     ;;
   triton:layer_norm_backward)
     baseline=source/triton/triton/normalization/layer_norm/05-layer-norm.py
@@ -142,9 +145,9 @@ case "${backend}:${kernel}" in
     ;;
   triton:bf16_gemm | triton:batched_gemm | triton:quantized_gemm | triton:logsumexp | \
   cutile:attention_bias | cutile:paged_attention | cutile:quantized_gemm | cutile:rms_norm | cutile:fused_add_rms_norm | cutile:logsumexp | \
-  cutile:layer_norm_backward | cutile:swiglu_backward | \
+  cutile:layer_norm_backward | cutile:swiglu_backward | cutile:cross_entropy | \
   tilelang:attention_bias | tilelang:paged_attention | tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:fused_add_rms_norm | tilelang:logsumexp | \
-  tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | \
+  tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | tilelang:cross_entropy | \
   triton:varlen_attention | cutile:varlen_attention | triton:varlen_gqa_prefill | cutile:varlen_gqa_prefill)
     ;;
   triton:shifted_row_copy | cutile:shifted_row_copy | tilelang:shifted_row_copy | \

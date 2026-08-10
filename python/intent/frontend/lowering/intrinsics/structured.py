@@ -12,6 +12,7 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import dims_compatible
 from intent.language.builtins import Intrinsic
+from intent.language.dtypes import i32
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import Literal
@@ -33,6 +34,8 @@ def lower_structured_intrinsic(
 ) -> object:
     if name in ("reduce", "reduce.max", "reduce.sum"):
         return _reduce(lowerer, name, node)
+    if name == "arg_reduce.max":
+        return _arg_reduce_max(lowerer, node)
     if name == "scan":
         return _scan(lowerer, node)
     if name == "contract":
@@ -47,7 +50,9 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         ("value", "axis", "identity", "combine", "acc_dtype"),
         required=("value", "axis", "identity"),
     )
-    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    source = lowerer.read_value(
+        lowerer.lower_expression(bound["value"]), bound["value"]
+    )
     axes = require_axes(lowerer, bound["axis"])
     if isinstance(source.type, TensorType):
         axes = normalize_axes(lowerer, axes, source.type.rank, node)
@@ -109,6 +114,59 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         attributes=attributes,
     )
     return operation.results[0]
+
+
+def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("value", "axis", "identity", "acc_dtype"),
+        required=("value", "axis", "identity"),
+    )
+    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    if not isinstance(source.type, TensorType):
+        lowerer.error(node, "I.arg_reduce.max input must be a tensor")
+    axes = normalize_axes(
+        lowerer,
+        require_axes(lowerer, bound["axis"]),
+        source.type.rank,
+        node,
+    )
+    if len(axes) != 1:
+        lowerer.error(node, "I.arg_reduce.max requires exactly one axis")
+    acc_dtype = (
+        require_dtype(lowerer, bound["acc_dtype"])
+        if "acc_dtype" in bound
+        else source.type.dtype
+    )
+    identity_expression = lowerer.lower_expression(bound["identity"])
+    identity = lowerer.materialize(
+        identity_expression,
+        bound["identity"],
+        ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
+    )
+    if identity.type != ScalarType(acc_dtype):
+        lowerer.error(node, "arg-reduce identity must have accumulator dtype")
+    result_shape = tuple(
+        dimension
+        for axis, dimension in enumerate(source.type.shape)
+        if axis != axes[0]
+    )
+    value_type = lowerer.value_result_type(acc_dtype, result_shape)
+    index_type = lowerer.value_result_type(i32, result_shape)
+    operation = lowerer.emit(
+        OperationKind.ARG_REDUCE,
+        lowerer.location(node),
+        operands=(source, identity),
+        result_types=(value_type, index_type),
+        attributes={
+            "axes": axes,
+            "acc_dtype": acc_dtype,
+            "combine": "maximum",
+            "tie": "lowest_index",
+        },
+    )
+    return StaticTuple(operation.results)
 
 
 def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

@@ -777,34 +777,36 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.reduce", [&](Operation &operation) -> LogicalResult {
-            auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
-            auto input = operation.getNumOperands() > 0
-                             ? facts.valueAxes.find(operation.getOperand(0))
-                             : facts.valueAxes.end();
-            if (!axes || axes.empty() || input == facts.valueAxes.end())
-              return operation.emitOpError(
-                  "reduction axes have no logical-axis provenance");
-            SmallVector<unsigned> reducedAxes;
-            for (Attribute attribute : axes) {
-              auto axis = dyn_cast<IntegerAttr>(attribute);
-              if (!axis || axis.getInt() < 0 ||
-                  static_cast<size_t>(axis.getInt()) >= input->second.size())
-                return operation.emitOpError(
-                    "reduction axis has no logical-axis provenance");
-              reducedAxes.push_back(axis.getInt());
-              if (Operation *domain = input->second[axis.getInt()].domain)
-                facts.vectorDomains.insert(domain);
-            }
-            llvm::sort(reducedAxes, std::greater<unsigned>());
-            SmallVector<LogicalAxis> resultAxes = input->second;
-            for (unsigned axis : reducedAxes)
-              resultAxes.erase(resultAxes.begin() + axis);
-            if (operation.getNumResults() == 1)
-              return bindResultAxes(operation, 0, std::move(resultAxes), facts);
-            return success();
-          })))
+  auto bindReductionAxes = [&](Operation &operation) -> LogicalResult {
+    auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
+    auto input = operation.getNumOperands() > 0
+                     ? facts.valueAxes.find(operation.getOperand(0))
+                     : facts.valueAxes.end();
+    if (!axes || axes.empty() || input == facts.valueAxes.end())
+      return operation.emitOpError(
+          "reduction axes have no logical-axis provenance");
+    SmallVector<unsigned> reducedAxes;
+    for (Attribute attribute : axes) {
+      auto axis = dyn_cast<IntegerAttr>(attribute);
+      if (!axis || axis.getInt() < 0 ||
+          static_cast<size_t>(axis.getInt()) >= input->second.size())
+        return operation.emitOpError(
+            "reduction axis has no logical-axis provenance");
+      reducedAxes.push_back(axis.getInt());
+      if (Operation *domain = input->second[axis.getInt()].domain)
+        facts.vectorDomains.insert(domain);
+    }
+    llvm::sort(reducedAxes, std::greater<unsigned>());
+    SmallVector<LogicalAxis> resultAxes = input->second;
+    for (unsigned axis : reducedAxes)
+      resultAxes.erase(resultAxes.begin() + axis);
+    for (unsigned result = 0; result < operation.getNumResults(); ++result)
+      if (failed(bindResultAxes(operation, result, resultAxes, facts)))
+        return failure();
+    return success();
+  };
+  if (failed(addHandler(registry, "intent.reduce", bindReductionAxes)) ||
+      failed(addHandler(registry, "intent.arg_reduce", bindReductionAxes)))
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",

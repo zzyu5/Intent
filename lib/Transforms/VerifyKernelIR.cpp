@@ -356,6 +356,25 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
       return failure();
     return requireAttribute<StringAttr>(operation, "intent.combine");
   }
+  if (name == "intent.arg_reduce") {
+    if (operation->getNumOperands() != 2 || operation->getNumResults() != 2)
+      return operation->emitOpError(
+          "requires source/identity operands and value/index results");
+    if (failed(requireAttribute<ArrayAttr>(operation, "intent.axes")) ||
+        failed(requireAttribute<StringAttr>(operation, "intent.combine")) ||
+        failed(requireAttribute<StringAttr>(operation, "intent.tie")))
+      return failure();
+    auto combine = operation->getAttrOfType<StringAttr>("intent.combine");
+    auto tie = operation->getAttrOfType<StringAttr>("intent.tie");
+    Type indexType = operation->getResult(1).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(indexType))
+      indexType = tensor.getElementType();
+    if (!combine || combine.getValue() != "maximum" || !tie ||
+        tie.getValue() != "lowest_index" || !indexType.isInteger(32))
+      return operation->emitOpError(
+          "requires maximum with lowest-index tie breaking and i32 indices");
+    return success();
+  }
   if (name == "intent.scan") {
     if (failed(requireAttribute<IntegerAttr>(operation, "intent.axis")))
       return failure();

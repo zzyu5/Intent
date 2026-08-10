@@ -251,8 +251,10 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical reduction");
     plan::ReductionOp binding;
     binding.operation = value;
-    binding.lowering =
-        *role == "reduce_maximum" ? "T.reduce_max" : "T.reduce_sum";
+    binding.lowering = *role == "reduce_argmax"
+                           ? "T.reduce_max_with_index"
+                       : *role == "reduce_maximum" ? "T.reduce_max"
+                                                    : "T.reduce_sum";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
     binding.axis = *axis;
     if (binding.resultSpace.empty())

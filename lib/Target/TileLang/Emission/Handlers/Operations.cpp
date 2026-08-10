@@ -62,6 +62,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitReduction(op);
       })) ||
+      failed(addHandler(registry, "intent.arg_reduce", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitReduction(op);
+      })) ||
       failed(addHandler(registry, "intent.broadcast", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -487,9 +492,109 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   plan::ReductionOp binding =
       succeeded(node) ? planIndex.reductions.lookup(*node) : plan::ReductionOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
+  bool argReduction =
+      binding && binding.getLowering() == "T.reduce_max_with_index";
+  unsigned expectedResults = argReduction ? 2 : 1;
   if (failed(node) || !binding || failed(operand) ||
-      operation.getNumResults() != 1)
+      operation.getNumResults() != expectedResults)
     return operation.emitOpError("lacks a TileLang reduction binding");
+  if (argReduction) {
+    auto input = dyn_cast<OpResult>(operation.getOperand(0));
+    FailureOr<SmallVector<std::string>> inputExtents =
+        input ? tensorExtents(*input.getOwner(), input.getResultNumber())
+              : FailureOr<SmallVector<std::string>>(failure());
+    int64_t axis = binding.getAxis();
+    bool tensorResults = isa<RankedTensorType>(operation.getResult(0).getType());
+    if (failed(inputExtents) || axis < 0 ||
+        static_cast<size_t>(axis) >= inputExtents->size() ||
+        tensorResults !=
+            isa<RankedTensorType>(operation.getResult(1).getType()))
+      return operation.emitOpError(
+          "has no mechanical TileLang arg-reduction shape");
+
+    std::string valueStorage;
+    std::string indexStorage;
+    if (tensorResults) {
+      FailureOr<std::string> value = allocateResult(operation, 0, "fragment");
+      FailureOr<std::string> index = allocateResult(operation, 1, "fragment");
+      if (failed(value) || failed(index))
+        return failure();
+      valueStorage = *value;
+      indexStorage = *index;
+    } else {
+      std::string valueDtype =
+          dtypeName(operation.getResult(0).getType(), operation);
+      std::string indexDtype =
+          dtypeName(operation.getResult(1).getType(), operation);
+      if (valueDtype.empty() || indexDtype.empty())
+        return failure();
+      valueStorage = makeResultName(operation, 0) + "_fragment";
+      indexStorage = makeResultName(operation, 1) + "_fragment";
+      line(valueStorage + " = T.alloc_fragment((1,), " + valueDtype + ")");
+      line(indexStorage + " = T.alloc_fragment((1,), " + indexDtype + ")");
+    }
+    line("T.reduce_max(" + operand->str() + ", " + valueStorage + ", dim=" +
+         std::to_string(axis) + ", clear=True)");
+
+    std::string candidateShape = "(";
+    for (auto [position, extent] : llvm::enumerate(*inputExtents)) {
+      if (position)
+        candidateShape += ", ";
+      candidateShape += extent;
+    }
+    if (inputExtents->size() == 1)
+      candidateShape += ",";
+    candidateShape += ")";
+    std::string candidates = makeResultName(operation, 1) + "_candidates";
+    line(candidates + " = T.alloc_fragment(" + candidateShape + ", T.int32)");
+
+    SmallVector<std::string> inputIndices;
+    std::string loop = "for ";
+    for (unsigned dimension = 0; dimension < inputExtents->size(); ++dimension) {
+      if (dimension)
+        loop += ", ";
+      inputIndices.push_back("arg_reduce_i" + std::to_string(dimension));
+      loop += inputIndices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [position, extent] : llvm::enumerate(*inputExtents)) {
+      if (position)
+        loop += ", ";
+      loop += extent;
+    }
+    line(loop + "):");
+    ++indentation;
+    auto access = [](StringRef value, ArrayRef<std::string> indices) {
+      std::string expression = value.str() + "[";
+      for (auto [position, index] : llvm::enumerate(indices)) {
+        if (position)
+          expression += ", ";
+        expression += index;
+      }
+      return expression + "]";
+    };
+    SmallVector<std::string> resultIndices;
+    for (auto [dimension, index] : llvm::enumerate(inputIndices))
+      if (static_cast<int64_t>(dimension) != axis)
+        resultIndices.push_back(index);
+    std::string maximum = tensorResults
+                              ? access(valueStorage, resultIndices)
+                              : valueStorage + "[0]";
+    line(access(candidates, inputIndices) + " = T.if_then_else(" +
+         access(*operand, inputIndices) + " == " + maximum + ", " +
+         inputIndices[axis] + ", " + (*inputExtents)[axis] + ")");
+    --indentation;
+    line("T.reduce_min(" + candidates + ", " + indexStorage + ", dim=" +
+         std::to_string(axis) + ", clear=True)");
+    if (tensorResults) {
+      bindResult(operation, 0, valueStorage);
+      bindResult(operation, 1, indexStorage);
+    } else {
+      valueNames[operation.getResult(0)] = valueStorage + "[0]";
+      valueNames[operation.getResult(1)] = indexStorage + "[0]";
+    }
+    return success();
+  }
   if (isa<RankedTensorType>(operation.getResult(0).getType())) {
     FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
     if (failed(result))

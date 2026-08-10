@@ -61,6 +61,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitReduction(op);
                         })) ||
+      failed(addHandler(registry, "intent.arg_reduce",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitReduction(op);
+                        })) ||
       failed(addHandler(registry, "intent.broadcast",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -486,7 +492,8 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
     return operation.emitOpError("has no cuTile vector index realization");
   std::string expression =
       target::emission::isRaggedBoundAxis(planIndex.components,
-                                          axis->getNode())
+                                          axis->getNode()) ||
+              axis->hasRole("lane")
           ? base
           : base + " * " + axis->getTile().str() + " + ct.arange(" +
                 axis->getTile().str() + ", dtype=ct.int32)";
@@ -501,6 +508,24 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   FailureOr<StringRef> operand = lookupValue(operation, 0);
   if (failed(node) || !binding || failed(operand))
     return failure();
+  if (binding.getLowering() == "ct.max_with_index") {
+    if (operation.getNumResults() != 2)
+      return operation.emitOpError(
+          "cuTile arg-reduction requires value and index results");
+    std::string value = makeResultName(operation, 0);
+    std::string index = makeResultName(operation, 1);
+    std::string axis = std::to_string(binding.getAxis());
+    std::string keepDims = binding.getKeepDims() ? "True" : "False";
+    line(value + " = ct.max(" + operand->str() + ", " + axis +
+         ", keepdims=" + keepDims + ")");
+    line(index + " = ct.argmax(" + operand->str() + ", " + axis +
+         ", keepdims=" + keepDims + ")");
+    bindResult(operation, 0, value);
+    bindResult(operation, 1, index);
+    return success();
+  }
+  if (operation.getNumResults() != 1)
+    return operation.emitOpError("cuTile reduction requires one result");
   std::string result = makeResultName(operation, 0);
   line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
        ", " + std::to_string(binding.getAxis()) + ", keepdims=" +

@@ -492,40 +492,40 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       failed(addHandler(registry, "intent.scatter_unique", bindTransfer)))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.reduce", [&](Operation &operation) -> LogicalResult {
-            FailureOr<int64_t> node =
-                target::getNodeID(operation, "reduction binding");
-            auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
-            auto axis = axes && axes.size() == 1
-                            ? dyn_cast<IntegerAttr>(axes[0])
-                            : IntegerAttr();
-            if (failed(node) || !axis)
-              return failure();
-            if (axis.getInt() < 0)
-              return operation.emitOpError("has a negative reduction axis");
-            std::optional<std::string> inputPadding =
-                paddingState.paddingOf(operation.getOperand(0));
-            std::optional<std::string> identityPadding =
-                operation.getNumOperands() > 1
-                    ? paddingState.paddingOf(operation.getOperand(1))
-                    : std::nullopt;
-            if (!inputPadding || !identityPadding ||
-                *inputPadding != *identityPadding) {
-              if (!identityPadding)
-                return operation.emitOpError(
-                    "cannot realize reduction-lane padding without an identity");
-              if (failed(paddingState.require(
-                      operation.getOperand(0),
-                      {static_cast<unsigned>(axis.getInt())}, *identityPadding,
-                      operation)))
-                return failure();
-            }
-            builder.create<intent::plan::ReductionOp>(
-                operation.getLoc(), i64(builder, *node),
-                string(builder, "private_fragment"));
-            return success();
-          })))
+  auto bindReduction = [&](Operation &operation) -> LogicalResult {
+    FailureOr<int64_t> node =
+        target::getNodeID(operation, "reduction binding");
+    auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
+    auto axis = axes && axes.size() == 1 ? dyn_cast<IntegerAttr>(axes[0])
+                                         : IntegerAttr();
+    if (failed(node) || !axis)
+      return failure();
+    if (axis.getInt() < 0)
+      return operation.emitOpError("has a negative reduction axis");
+    std::optional<std::string> inputPadding =
+        paddingState.paddingOf(operation.getOperand(0));
+    std::optional<std::string> identityPadding =
+        operation.getNumOperands() > 1
+            ? paddingState.paddingOf(operation.getOperand(1))
+            : std::nullopt;
+    if (!inputPadding || !identityPadding ||
+        *inputPadding != *identityPadding) {
+      if (!identityPadding)
+        return operation.emitOpError(
+            "cannot realize reduction-lane padding without an identity");
+      if (failed(paddingState.require(
+              operation.getOperand(0),
+              {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+              operation)))
+        return failure();
+    }
+    builder.create<intent::plan::ReductionOp>(
+        operation.getLoc(), i64(builder, *node),
+        string(builder, "private_fragment"));
+    return success();
+  };
+  if (failed(addHandler(registry, "intent.reduce", bindReduction)) ||
+      failed(addHandler(registry, "intent.arg_reduce", bindReduction)))
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",

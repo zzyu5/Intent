@@ -15,6 +15,7 @@ from .builtins import add
 from .builtins import all
 from .builtins import assume_in_bounds
 from .builtins import any
+from .builtins import arg_reduce
 from .builtins import atomic_add
 from .builtins import atomic_cas
 from .builtins import auto
@@ -95,6 +96,7 @@ __all__ = [
     "all",
     "assume_in_bounds",
     "any",
+    "arg_reduce",
     "atomic_add",
     "atomic_cas",
     "auto",

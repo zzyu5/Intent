@@ -18,6 +18,11 @@ namespace intent::target::emission {
 inline mlir::FailureOr<std::string>
 reductionRole(mlir::Operation &operation) {
   auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
+  auto tie = operation.getAttrOfType<mlir::StringAttr>("intent.tie");
+  if (operation.getName().getStringRef() == "intent.arg_reduce" && combine &&
+      combine.getValue() == "maximum" && tie &&
+      tie.getValue() == "lowest_index")
+    return std::string("reduce_argmax");
   if (combine && combine.getValue() == "maximum")
     return std::string("reduce_maximum");
   if (combine && combine.getValue() == "add")

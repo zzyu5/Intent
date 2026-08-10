@@ -21,6 +21,13 @@ LogicalResult validateReduction(Operation &operation) {
   if (!combine || !axes || axes.size() != 1 ||
       !isa<IntegerAttr>(axes[0]))
     return operation.emitOpError("has no canonical single-axis reduction");
+  if (operation.getName().getStringRef() == "intent.arg_reduce") {
+    auto tie = operation.getAttrOfType<StringAttr>("intent.tie");
+    if (operation.getNumResults() == 2 && combine.getValue() == "maximum" &&
+        tie && tie.getValue() == "lowest_index")
+      return success();
+    return operation.emitOpError("has no supported GPU arg-reduction role");
+  }
   if (combine.getValue() == "maximum" || combine.getValue() == "add")
     return success();
   return operation.emitOpError("has no supported GPU reduction role");
@@ -103,6 +110,9 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   if (failed(addHandler(
           registry, "intent.reduce", validateReduction)))
+    return failure();
+  if (failed(addHandler(
+          registry, "intent.arg_reduce", validateReduction)))
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",

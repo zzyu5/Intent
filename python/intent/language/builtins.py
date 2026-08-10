@@ -68,6 +68,7 @@ all = Intrinsic("all")
 add = Intrinsic("add")
 
 reduce = IntrinsicNamespace("reduce", ("max", "sum"))
+arg_reduce = IntrinsicNamespace("arg_reduce", ("max",))
 scan = Intrinsic("scan")
 contract = Intrinsic("contract")
 
@@ -122,6 +123,8 @@ INTRINSICS = {
         reduce,
         reduce.max,
         reduce.sum,
+        arg_reduce,
+        arg_reduce.max,
         scan,
         contract,
         gather,

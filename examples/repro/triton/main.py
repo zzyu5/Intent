@@ -58,6 +58,60 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "cross_entropy":
+        source = _load_module(
+            source_path, "intent_upstream_triton_cross_entropy"
+        ).source
+        state = {}
+
+        def run(arguments):
+            logits, labels, _ = arguments
+            if not state:
+                state["logits"] = logits.clone()
+                state["loss"] = torch.empty(
+                    (logits.shape[0],), device=logits.device, dtype=torch.float32
+                )
+                state["prediction"] = torch.empty(
+                    (logits.shape[0],), device=logits.device, dtype=torch.int64
+                )
+            block_size = min(
+                source.MAX_FUSED_SIZE,
+                source.triton.next_power_of_2(logits.shape[1]),
+            )
+            source.liger_cross_entropy_kernel[(logits.shape[0],)](
+                X_ptr=state["logits"],
+                X_stride=state["logits"].stride(0),
+                Y_ptr=labels,
+                Y_stride=labels.stride(0),
+                weight_ptr=None,
+                loss_ptr=state["loss"],
+                z_loss_ptr=None,
+                loss_stride=state["loss"].stride(0),
+                token_accuracy_ptr=None,
+                token_accuracy_stride=0,
+                predicted_tokens_ptr=state["prediction"],
+                predicted_tokens_stride=state["prediction"].stride(0),
+                n_cols=logits.shape[1],
+                n_non_ignore=logits.shape[0],
+                sum_non_ignore_weight=logits.shape[0],
+                ignore_index=-100,
+                weight_sum=0.0,
+                lse_square_scale=0.0,
+                label_smoothing=0.0,
+                reduction="none",
+                softcap=0.0,
+                RETURN_Z_LOSS=False,
+                RETURN_TOKEN_ACCURACY=False,
+                RETURN_PREDICTED_TOKENS=True,
+                BLOCK_SIZE=block_size,
+                HAS_WEIGHT=False,
+                HAS_SOFTCAPPING=False,
+                HAS_GRADIENTS=True,
+                num_warps=32,
+            )
+            return state["loss"], state["prediction"], state["logits"]
+
+        return run
     if kernel == "paged_attention":
         module = _load_module(source_path, "intent_upstream_triton_paged_attention")
         return module.paged_decode

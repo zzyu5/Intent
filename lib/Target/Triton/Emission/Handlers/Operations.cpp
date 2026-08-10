@@ -76,6 +76,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitReduction(op);
                         })) ||
+      failed(addHandler(registry, "intent.arg_reduce",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitReduction(op);
+                        })) ||
       failed(addHandler(registry, "intent.broadcast",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -501,6 +507,21 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   FailureOr<StringRef> operand = lookupValue(operation, 0);
   if (failed(operand))
     return failure();
+  if (binding.getLowering() == "tl.max_with_index") {
+    if (operation.getNumResults() != 2)
+      return operation.emitOpError(
+          "Triton arg-reduction requires value and index results");
+    std::string value = makeResultName(operation, 0);
+    std::string index = makeResultName(operation, 1);
+    line(value + ", " + index + " = tl.max(" + operand->str() + ", axis=" +
+         std::to_string(binding.getAxis()) +
+         ", return_indices=True, return_indices_tie_break_left=True)");
+    bindResult(operation, 0, value);
+    bindResult(operation, 1, index);
+    return success();
+  }
+  if (operation.getNumResults() != 1)
+    return operation.emitOpError("Triton reduction requires one result");
   std::string result = makeResultName(operation, 0);
   line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
        ", axis=" + std::to_string(binding.getAxis()) + ")");
