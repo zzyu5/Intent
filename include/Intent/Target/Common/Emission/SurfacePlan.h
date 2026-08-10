@@ -278,6 +278,14 @@ struct ContractionOrientation {
 
 inline mlir::FailureOr<ContractionOrientation>
 contractionOrientation(mlir::Operation &operation) {
+  auto lhsType = operation.getNumOperands() == 2
+                     ? mlir::dyn_cast<mlir::RankedTensorType>(
+                           operation.getOperand(0).getType())
+                     : mlir::RankedTensorType();
+  auto rhsType = operation.getNumOperands() == 2
+                     ? mlir::dyn_cast<mlir::RankedTensorType>(
+                           operation.getOperand(1).getType())
+                     : mlir::RankedTensorType();
   auto reduce = operation.getAttrOfType<mlir::ArrayAttr>("intent.reduce");
   auto pair = reduce && reduce.size() == 1
                   ? mlir::dyn_cast<mlir::ArrayAttr>(reduce[0])
@@ -288,7 +296,9 @@ contractionOrientation(mlir::Operation &operation) {
   auto rhs = pair && pair.size() == 2
                  ? mlir::dyn_cast<mlir::IntegerAttr>(pair[1])
                  : mlir::IntegerAttr();
-  if (!lhs || !rhs || (lhs.getInt() != 0 && lhs.getInt() != 1) ||
+  if (!lhsType || lhsType.getRank() != 2 || !rhsType ||
+      rhsType.getRank() != 2 || !lhs || !rhs ||
+      (lhs.getInt() != 0 && lhs.getInt() != 1) ||
       (rhs.getInt() != 0 && rhs.getInt() != 1))
     return operation.emitOpError(
         "has no rank-two contraction orientation for target emission");

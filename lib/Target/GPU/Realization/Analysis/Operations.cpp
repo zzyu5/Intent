@@ -162,12 +162,27 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             auto rhsAxis = pair && pair.size() == 2
                                ? dyn_cast<IntegerAttr>(pair[1])
                                : IntegerAttr();
+            auto lhsType = operation.getNumOperands() == 2
+                               ? dyn_cast<RankedTensorType>(
+                                     operation.getOperand(0).getType())
+                               : RankedTensorType();
+            auto rhsType = operation.getNumOperands() == 2
+                               ? dyn_cast<RankedTensorType>(
+                                     operation.getOperand(1).getType())
+                               : RankedTensorType();
+            auto resultType = operation.getNumResults() == 1
+                                  ? dyn_cast<RankedTensorType>(
+                                        operation.getResult(0).getType())
+                                  : RankedTensorType();
             if (operation.getNumOperands() != 2 ||
                 operation.getNumResults() != 1 || !accType ||
                 accType.getValue() != "f32" || !multiply ||
                 multiply.getValue() != "multiply" || !combine ||
                 combine.getValue() != "add" || !lhsAxis || !rhsAxis ||
-                lhsAxis.getInt() != 1 ||
+                !lhsType || lhsType.getRank() != 2 || !rhsType ||
+                rhsType.getRank() != 2 || !resultType ||
+                resultType.getRank() != 2 ||
+                (lhsAxis.getInt() != 0 && lhsAxis.getInt() != 1) ||
                 (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1))
               return operation.emitOpError(
                   "has no semantics-preserving GPU matrix-unit realization");

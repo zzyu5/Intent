@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|logsumexp|gemm|bf16_gemm|quantized_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_backward>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|logsumexp|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|varlen_attention|online_softmax|moe|grouped_gemm|swiglu_backward>" >&2
   exit 2
 fi
 
@@ -71,6 +71,9 @@ case "${backend}:${kernel}" in
   cutile:bf16_gemm)
     baseline=source/cutile/tilegym/gemm/dense/matmul.py
     ;;
+  cutile:batched_gemm)
+    baseline=source/cutile/tilegym/gemm/batched/bmm.py
+    ;;
   cutile:attention)
     baseline=source/cutile/cutile-python/attention/fmha/AttentionFMHA.py
     ;;
@@ -119,10 +122,10 @@ case "${backend}:${kernel}" in
   tilelang:varlen_attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
-  triton:bf16_gemm | triton:quantized_gemm | triton:logsumexp | \
+  triton:bf16_gemm | triton:batched_gemm | triton:quantized_gemm | triton:logsumexp | \
   cutile:quantized_gemm | cutile:rms_norm | cutile:logsumexp | \
   cutile:layer_norm_backward | cutile:swiglu_backward | \
-  tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:logsumexp | \
+  tilelang:batched_gemm | tilelang:layer_norm | tilelang:layer_norm_backward | tilelang:logsumexp | \
   tilelang:quantized_gemm | tilelang:swiglu_backward | \
   triton:varlen_attention | cutile:varlen_attention)
     ;;

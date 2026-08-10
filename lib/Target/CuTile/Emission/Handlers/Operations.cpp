@@ -4,6 +4,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
+#include <optional>
 
 using namespace mlir;
 
@@ -924,8 +925,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!lhsLoad || !rhsLoad || orientation->lhsTranspose ||
-      orientation->rhsTranspose)
+  if (!lhsLoad || !rhsLoad)
     return operation.emitOpError(
         "deferred cuTile contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
@@ -935,18 +935,50 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
                                                  operation);
   if (failed(reductionAxis))
     return failure();
+  auto physicalReductionAxis = [&](Operation &load) -> FailureOr<int64_t> {
+    FailureOr<SmallVector<target::IndexTerm>> relation =
+        target::parseIndexRelation(load);
+    if (failed(relation))
+      return failure();
+    std::optional<int64_t> result;
+    for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+      if ((term.kind != "region_index" && term.kind != "value_index") ||
+          term.operands.size() != 1 || !term.operands.front())
+        continue;
+      FailureOr<plan::AxisOp> axis =
+          resolveAxis(load.getOperand(*term.operands.front()), load);
+      if (failed(axis))
+        return failure();
+      if (axis->getNode() != reductionAxis->getNode())
+        continue;
+      if (result)
+        return load.emitOpError(
+            "maps its contraction reduction axis more than once");
+      result = axisNumber;
+    }
+    if (!result)
+      return load.emitOpError(
+          "does not map its contraction reduction axis to a source dimension");
+    return *result;
+  };
+  FailureOr<int64_t> lhsReductionDimension = physicalReductionAxis(*lhsLoad);
   axisIndices[reductionAxis->getNode()] = "k_tile";
   FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, true);
   FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, true);
   FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
   FailureOr<std::string> rhsShape = tileShape(*rhsLoad);
+  FailureOr<std::string> lhsResultShape = emitTensorShape(*lhsLoad, 0);
+  FailureOr<std::string> rhsResultShape = emitTensorShape(*rhsLoad, 0);
   if (failed(lhsView) || failed(rhsView) || failed(lhsIndex) ||
-      failed(rhsIndex) || failed(lhsShape) || failed(rhsShape))
+      failed(rhsIndex) || failed(lhsShape) || failed(rhsShape) ||
+      failed(lhsResultShape) || failed(rhsResultShape) ||
+      failed(lhsReductionDimension))
     return failure();
 
   std::string result = makeResultName(operation, 0);
   line("num_tiles_k = ct.num_tiles(" + (*lhsView)->argument->name +
-       ", axis=1, shape=" + *lhsShape + ")");
+       ", axis=" + std::to_string(*lhsReductionDimension) +
+       ", shape=" + *lhsShape + ")");
   line(result +
        " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
   std::string operandDtype =
@@ -959,11 +991,20 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   std::string rhs = makeResultName(*rhsLoad, 0);
   line(lhs + " = ct.load(" + (*lhsView)->argument->name + ", index=" +
        *lhsIndex + ", shape=" + *lhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).astype(" + operandDtype + ")");
+       ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *lhsResultShape +
+       ").astype(" + operandDtype + ")");
   line(rhs + " = ct.load(" + (*rhsView)->argument->name + ", index=" +
        *rhsIndex + ", shape=" + *rhsShape +
-       ", padding_mode=ct.PaddingMode.ZERO).astype(" + operandDtype + ")");
-  line(result + " = ct.mma(" + lhs + ", " + rhs + ", " + result + ")");
+       ", padding_mode=ct.PaddingMode.ZERO).reshape(" + *rhsResultShape +
+       ").astype(" + operandDtype + ")");
+  std::string lhsExpression = lhs;
+  std::string rhsExpression = rhs;
+  if (orientation->lhsTranspose)
+    lhsExpression = "ct.transpose(" + lhsExpression + ")";
+  if (orientation->rhsTranspose)
+    rhsExpression = "ct.transpose(" + rhsExpression + ")";
+  line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression + ", " +
+       result + ")");
   --indentation;
   bindResult(operation, 0, result);
   return success();

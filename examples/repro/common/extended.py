@@ -8,6 +8,14 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.contraction.batched_gemm import BATCH as BMM_BATCH
+from kernels.contraction.batched_gemm import K as BMM_K
+from kernels.contraction.batched_gemm import M as BMM_M
+from kernels.contraction.batched_gemm import N as BMM_N
+from kernels.contraction.batched_gemm import batched_gemm_nn
+from kernels.contraction.batched_gemm import batched_gemm_nt
+from kernels.contraction.batched_gemm import batched_gemm_tn
+from kernels.contraction.batched_gemm import batched_gemm_tt
 from kernels.backward.layer_norm import FEATURES as BWD_LAYER_FEATURES
 from kernels.backward.layer_norm import ROWS as BWD_LAYER_ROWS
 from kernels.backward.layer_norm import layer_norm_backward_reduce
@@ -152,6 +160,54 @@ def _run_bf16_gemm(
         upstream=upstream,
         expected_dtype=torch.bfloat16,
     )
+
+
+def _run_batched_gemm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    logical_a = torch.randn(
+        (BMM_BATCH, BMM_M, BMM_K), device="cuda", dtype=torch.bfloat16
+    )
+    logical_a /= math.sqrt(BMM_K)
+    logical_b = torch.randn(
+        (BMM_BATCH, BMM_K, BMM_N), device="cuda", dtype=torch.bfloat16
+    )
+    variants = (
+        ("NN", False, False, batched_gemm_nn),
+        ("TN", True, False, batched_gemm_tn),
+        ("NT", False, True, batched_gemm_nt),
+        ("TT", True, True, batched_gemm_tt),
+    )
+    for label, transpose_a, transpose_b, kernel in variants:
+        a = (
+            logical_a.transpose(-1, -2).contiguous()
+            if transpose_a
+            else logical_a
+        )
+        b = (
+            logical_b.transpose(-1, -2).contiguous()
+            if transpose_b
+            else logical_b
+        )
+        artifact = intent.compile(kernel, target=target, compiler=compiler)
+        _compare(
+            artifact=artifact,
+            arguments=(a, b),
+            reference=lambda: torch.bmm(logical_a.float(), logical_b.float()).to(
+                torch.bfloat16
+            ),
+            target_name=target_name,
+            kernel_name=f"BF16 batched GEMM {label}",
+            tolerance=5.0e-2,
+            upstream=(
+                (lambda arguments, ta=transpose_a, tb=transpose_b: upstream(
+                    (*arguments, ta, tb)
+                ))
+                if upstream is not None
+                else None
+            ),
+            expected_dtype=torch.bfloat16,
+        )
 
 
 def _run_quantized_gemm(
@@ -617,6 +673,7 @@ def _run_varlen_attention(
 
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
+    "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "dual_gemm": _run_dual_gemm,
     "grouped_gemm": _run_grouped_gemm,

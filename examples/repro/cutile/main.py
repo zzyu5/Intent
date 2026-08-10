@@ -49,6 +49,15 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "batched_gemm":
+        bmm = _load_module(source_path, "intent_upstream_cutile_batched_gemm").bmm
+        return lambda arguments: bmm(
+            arguments[0],
+            arguments[1],
+            transpose_a=arguments[2],
+            transpose_b=arguments[3],
+            static_persistent=True,
+        )
     if kernel == "bf16_gemm":
         matmul = _load_module(source_path, "intent_upstream_cutile_bf16_gemm").matmul
         return lambda arguments: matmul(arguments[0], arguments[1])

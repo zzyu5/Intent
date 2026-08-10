@@ -913,8 +913,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!lhsLoad || !rhsLoad || orientation->lhsTranspose ||
-      orientation->rhsTranspose)
+  if (!lhsLoad || !rhsLoad)
     return operation.emitOpError(
         "deferred Triton contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
@@ -951,7 +950,14 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
        ", other=0.0)");
   line(rhs + " = tl.load(" + *rhsPointers + ", mask=" + *rhsMask +
        ", other=0.0)");
-  line(result + " = tl.dot(" + lhs + ", " + rhs + ", " + result + ")");
+  std::string lhsExpression = lhs;
+  std::string rhsExpression = rhs;
+  if (orientation->lhsTranspose)
+    lhsExpression = "tl.trans(" + lhsExpression + ")";
+  if (orientation->rhsTranspose)
+    rhsExpression = "tl.trans(" + rhsExpression + ")";
+  line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression + ", " +
+       result + ")");
   --indentation;
   bindResult(operation, 0, result);
   return success();

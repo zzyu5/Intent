@@ -382,6 +382,21 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       return entry.getValue().emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.getValue().getRole()] = *dimension;
   }
+  for (const auto &entry : planIndex.axes) {
+    plan::AxisOp axis = entry.second;
+    Operation *domain = kernel.nodes.lookup(axis.getNode());
+    auto resultNodes =
+        domain ? domain->getAttrOfType<ArrayAttr>("intent.result_nodes")
+               : ArrayAttr();
+    auto resultNode = resultNodes && resultNodes.size() == 1
+                          ? dyn_cast<IntegerAttr>(resultNodes[0])
+                          : IntegerAttr();
+    if (!domain || domain->getNumResults() != 1 || !resultNode)
+      return axis.emitOpError(
+          "cannot index its domain result shape against the cuTile plan");
+    regionTiles["?region_" + std::to_string(resultNode.getInt()) + "_0"] =
+        axis.getTile().str();
+  }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
     Operation *definition = value ? value.getDefiningOp() : nullptr;
