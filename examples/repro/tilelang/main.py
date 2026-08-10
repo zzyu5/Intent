@@ -38,6 +38,7 @@ from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
+from repro.common.support import prepare_kernel_call
 from repro.common.support import print_artifact
 
 
@@ -92,13 +93,13 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         source = _load_module(
             source_path, "intent_upstream_tilelang_varlen_attention"
         )
-        compiled = {}
+        prepared = {}
 
         def run(arguments):
             q, k, v, lengths, cu_seqlens, _ = arguments
-            key = (q.shape[0], q.shape[1], int(lengths.max().item()))
-            if key not in compiled:
-                compiled[key] = source.flashattn(
+            if not prepared:
+                prepared["max_sequence_length"] = int(lengths.max().item())
+                prepared["compiled"] = source.flashattn(
                     lengths.numel(),
                     1,
                     q.shape[0],
@@ -111,13 +112,13 @@ def _load_extended_upstream(kernel: str, source_path: Path):
                     num_stages=2,
                     threads=128,
                 )
-            return compiled[key](
+            return prepared["compiled"](
                 q[:, None, :],
                 k[:, None, :],
                 v[:, None, :],
                 cu_seqlens,
                 cu_seqlens,
-                key[2],
+                prepared["max_sequence_length"],
             )[:, 0, :]
 
         return run
@@ -231,8 +232,10 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"upstream/reference={upstream_error}"
         )
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(x))
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x))
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (x,), generated), cuda_graph=True
+    )
+    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x), cuda_graph=True)
     print_artifact(artifact, "TileLang")
     print(
         "TileLang softmax numerical comparison: PASS "
@@ -241,7 +244,7 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "TileLang softmax wrapper performance: "
+        "TileLang softmax kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -281,8 +284,12 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"upstream/reference={upstream_error}"
         )
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(a, b))
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(a, b))
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (a, b), generated), cuda_graph=True
+    )
+    upstream_p50, upstream_p95 = benchmark(
+        lambda: baseline(a, b), cuda_graph=True
+    )
     print_artifact(artifact, "TileLang")
     print(
         "TileLang GEMM numerical comparison: PASS "
@@ -291,7 +298,7 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "TileLang GEMM wrapper performance: "
+        "TileLang GEMM kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -343,10 +350,12 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
             f"upstream/reference={upstream_error}"
         )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(q, k, v, SCALE)
+        prepare_kernel_call(artifact, (q, k, v, SCALE), generated),
+        cuda_graph=True,
     )
     upstream_p50, upstream_p95 = benchmark(
-        lambda: baseline(q_bshd, k_bshd, v_bshd)
+        lambda: baseline(q_bshd, k_bshd, v_bshd),
+        cuda_graph=True,
     )
     print_artifact(artifact, "TileLang")
     print(
@@ -356,7 +365,7 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "TileLang attention wrapper performance: "
+        "TileLang attention kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"

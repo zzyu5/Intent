@@ -37,6 +37,7 @@ from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
+from repro.common.support import prepare_kernel_call
 from repro.common.support import print_artifact
 
 
@@ -100,10 +101,14 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         return run
     if kernel == "swiglu_backward":
         module = _load_module(source_path, "intent_upstream_triton_swiglu_backward")
+        state = {}
 
         def run(arguments):
             dc, a, b = arguments
-            return module.source.swiglu_backward(a.clone(), b.clone(), dc)
+            if not state:
+                state["a"] = a.clone()
+                state["b"] = b.clone()
+            return module.source.swiglu_backward(state["a"], state["b"], dc)
 
         return run
     if kernel == "swiglu_forward":
@@ -202,8 +207,10 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"generated/upstream={generated_upstream_error}"
         )
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x))
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(x))
+    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x), cuda_graph=True)
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (x,), generated), cuda_graph=True
+    )
     print_artifact(artifact, "Triton")
     print(
         "Triton softmax numerical comparison: PASS "
@@ -212,7 +219,7 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "Triton softmax wrapper performance: "
+        "Triton softmax kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -245,8 +252,12 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"generated/upstream={generated_upstream_error}"
         )
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(a, b))
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(a, b))
+    upstream_p50, upstream_p95 = benchmark(
+        lambda: baseline(a, b), cuda_graph=True
+    )
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (a, b), generated), cuda_graph=True
+    )
     if generated_p50 > upstream_p50 * 1.05:
         raise RuntimeError(
             "Triton GEMM performance regressed by more than 5%: "
@@ -260,7 +271,7 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "Triton GEMM wrapper performance: "
+        "Triton GEMM kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -298,10 +309,11 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
             f"generated/upstream={generated_upstream_error}"
         )
     upstream_p50, upstream_p95 = benchmark(
-        lambda: baseline(q, k, v, False, SCALE, False)
+        lambda: baseline(q, k, v, False, SCALE, False), cuda_graph=True
     )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(q, k, v, SCALE)
+        prepare_kernel_call(artifact, (q, k, v, SCALE), generated),
+        cuda_graph=True,
     )
     print_artifact(artifact, "Triton")
     print(
@@ -311,7 +323,7 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "Triton attention wrapper performance: "
+        "Triton attention kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"

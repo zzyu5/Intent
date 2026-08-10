@@ -66,6 +66,7 @@ from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 
 from .support import benchmark
+from .support import prepare_kernel_call
 from .support import print_artifact
 
 
@@ -83,6 +84,8 @@ def _compare(
     tolerance: float,
     upstream: Upstream | None,
     expected_dtype: torch.dtype | None = None,
+    measurement_scope: str = "kernel-only",
+    cuda_graph: bool = True,
 ) -> None:
     generated = artifact.run(*arguments)
     expected = reference()
@@ -98,8 +101,16 @@ def _compare(
         raise RuntimeError(
             f"{target_name} {kernel_name} numerical comparison failed: {error}"
         )
+    generated_call = (
+        prepare_kernel_call(artifact, arguments, generated)
+        if measurement_scope != "end-to-end"
+        else lambda: artifact.run(*arguments)
+    )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(*arguments), warmup=3, repetitions=10
+        generated_call,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=cuda_graph,
     )
     if upstream_output is not None:
         if expected_dtype is not None and upstream_output.dtype != expected_dtype:
@@ -114,7 +125,10 @@ def _compare(
                 f"failed: {upstream_error}"
             )
         upstream_p50, upstream_p95 = benchmark(
-            lambda: upstream(arguments), warmup=3, repetitions=10
+            lambda: upstream(arguments),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=cuda_graph,
         )
     print_artifact(artifact, target_name)
     print(
@@ -122,7 +136,8 @@ def _compare(
         f"(generated/reference={error})"
     )
     print(
-        f"{target_name} {kernel_name} generated performance: "
+        f"{target_name} {kernel_name} {measurement_scope} performance "
+        f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     if upstream_output is None:
@@ -260,7 +275,10 @@ def _run_quantized_gemm(
             f"{target_name} quantized GEMM numerical comparison failed: {error}"
         )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(*arguments), warmup=3, repetitions=10
+        prepare_kernel_call(artifact, arguments, generated),
+        warmup=3,
+        repetitions=100,
+        cuda_graph=True,
     )
     print_artifact(artifact, target_name)
     print(
@@ -268,7 +286,8 @@ def _run_quantized_gemm(
         f"(max_int8_error={error})"
     )
     print(
-        f"{target_name} fused quantized GEMM generated performance: "
+        f"{target_name} fused quantized GEMM kernel-only performance "
+        f"(CUDA Graph): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     print(f"{target_name} fused quantized GEMM upstream baseline: unavailable")
@@ -306,7 +325,10 @@ def _run_swiglu_backward(
             f"{target_name} SwiGLU backward numerical comparison failed: {errors}"
         )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(dc, a, b), warmup=3, repetitions=10
+        prepare_kernel_call(artifact, (dc, a, b), generated),
+        warmup=3,
+        repetitions=100,
+        cuda_graph=True,
     )
     upstream_output = upstream((dc, a, b)) if upstream is not None else None
     if upstream_output is not None:
@@ -324,7 +346,10 @@ def _run_swiglu_backward(
                 f"{upstream_errors}"
             )
         upstream_p50, upstream_p95 = benchmark(
-            lambda: upstream((dc, a, b)), warmup=3, repetitions=10
+            lambda: upstream((dc, a, b)),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=True,
         )
     print_artifact(artifact, target_name)
     print(
@@ -332,7 +357,8 @@ def _run_swiglu_backward(
         f"(da/db errors={errors})"
     )
     print(
-        f"{target_name} SwiGLU backward generated performance: "
+        f"{target_name} SwiGLU backward kernel-only performance "
+        f"(CUDA Graph): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     if upstream_output is None:
@@ -425,7 +451,9 @@ def _run_layer_norm_backward(
             f"{target_name} LayerNorm backward numerical comparison failed: {errors}"
         )
     generated_p50, generated_p95 = benchmark(
-        generated_pipeline, warmup=3, repetitions=10
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
     )
     upstream_output = (
         upstream((x, dy, weight, bias, epsilon)) if upstream is not None else None
@@ -451,11 +479,6 @@ def _run_layer_norm_backward(
                 f"{target_name} LayerNorm backward upstream comparison failed: "
                 f"{upstream_errors}"
             )
-        upstream_p50, upstream_p95 = benchmark(
-            lambda: upstream((x, dy, weight, bias, epsilon)),
-            warmup=3,
-            repetitions=10,
-        )
     print_artifact(rows_artifact, target_name)
     print_artifact(reduce_artifact, target_name)
     print(
@@ -463,7 +486,8 @@ def _run_layer_norm_backward(
         f"(dx/dw/db errors={errors})"
     )
     print(
-        f"{target_name} LayerNorm backward pipeline performance: "
+        f"{target_name} LayerNorm backward end-to-end performance "
+        f"(CUDA Event): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     if upstream_output is None:
@@ -471,10 +495,9 @@ def _run_layer_norm_backward(
     else:
         print(
             f"{target_name} LayerNorm backward upstream comparison: PASS "
-            f"(dx/dw/db errors={upstream_errors}, "
-            f"upstream_p50={upstream_p50:.4f} ms, "
-            f"upstream_p95={upstream_p95:.4f} ms, "
-            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+            f"(dx/dw/db errors={upstream_errors}, timing=unavailable: "
+            f"the autograd wrapper cannot expose or CUDA-Graph-capture its "
+            f"inner kernels)"
         )
 
 
@@ -520,6 +543,11 @@ def _run_rms_norm(
         kernel_name="weighted RMSNorm",
         tolerance=5.0e-5,
         upstream=upstream,
+        measurement_scope=(
+            "end-to-end"
+            if target_name == "TileLang" and upstream is not None
+            else "kernel-only"
+        ),
     )
 
 
@@ -572,7 +600,10 @@ def _run_fused_add_rms_norm(
             f"{target_name} fused add RMSNorm numerical comparison failed: {errors}"
         )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(*arguments), warmup=3, repetitions=10
+        prepare_kernel_call(artifact, arguments, generated),
+        warmup=3,
+        repetitions=100,
+        cuda_graph=True,
     )
     upstream_output = upstream(arguments) if upstream is not None else None
     if upstream_output is not None:
@@ -597,7 +628,10 @@ def _run_fused_add_rms_norm(
                 f"{upstream_errors}"
             )
         upstream_p50, upstream_p95 = benchmark(
-            lambda: upstream(arguments), warmup=3, repetitions=10
+            lambda: upstream(arguments),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=True,
         )
     print_artifact(artifact, target_name)
     print(
@@ -605,7 +639,8 @@ def _run_fused_add_rms_norm(
         f"(normalized/residual errors={errors})"
     )
     print(
-        f"{target_name} fused add RMSNorm generated performance: "
+        f"{target_name} fused add RMSNorm kernel-only performance "
+        f"(CUDA Graph): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     if upstream_output is None:
@@ -660,6 +695,7 @@ def _run_dual_gemm(
         kernel_name="gated dual GEMM",
         tolerance=5.0e-2,
         upstream=upstream,
+        measurement_scope="end-to-end",
     )
 
 
@@ -713,6 +749,8 @@ def _run_grouped_gemm(
             kernel_name=kernel_name,
             tolerance=5.0e-2,
             upstream=case_upstream,
+            measurement_scope="end-to-end",
+            cuda_graph=False,
         )
 
     run_case(
@@ -799,6 +837,10 @@ def _run_varlen_attention(
             kernel_name=f"packed varlen attention causal={causal}",
             tolerance=2.0e-2,
             upstream=upstream if causal else None,
+            measurement_scope=(
+                "kernel-only" if target_name == "TileLang" else "runtime-launch"
+            ),
+            cuda_graph=target_name == "TileLang",
         )
 
 

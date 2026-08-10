@@ -84,7 +84,7 @@ case "${backend}:${kernel}" in
     baseline=source/cutile/tilegym/gemm/batched/bmm.py
     ;;
   cutile:attention)
-    baseline=source/cutile/cutile-python/attention/fmha/AttentionFMHA.py
+    baseline=source/cutile/tilegym/attention/dense/attention_runtime.py
     ;;
   cutile:moe)
     baseline=source/cutile/cutile-python/moe/fused/MoE.py

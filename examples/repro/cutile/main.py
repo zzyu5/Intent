@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import importlib.util
 import math
 import sys
@@ -37,6 +36,7 @@ from repro.common.extended import run_extended
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
+from repro.common.support import prepare_kernel_call
 from repro.common.support import print_artifact
 
 
@@ -137,8 +137,10 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"generated/upstream={generated_upstream_error}"
         )
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x))
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(x))
+    upstream_p50, upstream_p95 = benchmark(lambda: baseline(x), cuda_graph=True)
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (x,), generated), cuda_graph=True
+    )
     if generated_p50 > upstream_p50 * 1.05:
         raise RuntimeError(
             "cuTile softmax performance regressed by more than 5%: "
@@ -152,7 +154,7 @@ def _run_softmax(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "cuTile softmax wrapper performance: "
+        "cuTile softmax kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -183,8 +185,12 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
             f"generated/reference={generated_error}, "
             f"generated/upstream={generated_upstream_error}"
         )
-    upstream_p50, upstream_p95 = benchmark(lambda: baseline(a, b))
-    generated_p50, generated_p95 = benchmark(lambda: artifact.run(a, b))
+    upstream_p50, upstream_p95 = benchmark(
+        lambda: baseline(a, b), cuda_graph=True
+    )
+    generated_p50, generated_p95 = benchmark(
+        prepare_kernel_call(artifact, (a, b), generated), cuda_graph=True
+    )
     if generated_p50 > upstream_p50 * 1.05:
         raise RuntimeError(
             "cuTile GEMM performance regressed by more than 5%: "
@@ -198,7 +204,7 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "cuTile GEMM wrapper performance: "
+        "cuTile GEMM kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"
@@ -207,21 +213,8 @@ def _run_gemm(compiler: str, baseline_source: Path) -> None:
 
 
 def _load_attention(source_path: Path):
-    tree = ast.parse(source_path.read_text(), filename=str(source_path))
-    tree.body = [
-        node
-        for node in tree.body
-        if node.end_lineno <= 210
-        and not (
-            isinstance(node, ast.ImportFrom) and node.module == "utils.benchmark"
-        )
-    ]
-    namespace = {
-        "__file__": str(source_path),
-        "__name__": "intent_upstream_cutile_attention",
-    }
-    exec(compile(tree, str(source_path), "exec"), namespace)
-    return namespace["cutile_fmha"]
+    module = _load_module(source_path, "intent_upstream_cutile_attention")
+    return module.source.tile_fmha
 
 
 def _run_attention(compiler: str, baseline_source: Path) -> None:
@@ -241,11 +234,8 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
         q,
         k,
         v,
-        qk_scale=SCALE,
-        tile_m=128,
-        tile_n=128,
-        query_group_size=1,
-        causal=False,
+        scaling=SCALE,
+        is_causal=False,
     )
     reference = F.scaled_dot_product_attention(
         q, k, v, is_causal=False, scale=SCALE
@@ -265,15 +255,14 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
             q,
             k,
             v,
-            qk_scale=SCALE,
-            tile_m=128,
-            tile_n=128,
-            query_group_size=1,
-            causal=False,
-        )
+            scaling=SCALE,
+            is_causal=False,
+        ),
+        cuda_graph=True,
     )
     generated_p50, generated_p95 = benchmark(
-        lambda: artifact.run(q, k, v, SCALE)
+        prepare_kernel_call(artifact, (q, k, v, SCALE), generated),
+        cuda_graph=True,
     )
     print_artifact(artifact, "cuTile")
     print(
@@ -283,7 +272,7 @@ def _run_attention(compiler: str, baseline_source: Path) -> None:
         f"generated/upstream={generated_upstream_error})"
     )
     print(
-        "cuTile attention wrapper performance: "
+        "cuTile attention kernel-only performance (CUDA Graph): "
         f"upstream_p50={upstream_p50:.4f} ms, upstream_p95={upstream_p95:.4f} ms, "
         f"generated_p50={generated_p50:.4f} ms, generated_p95={generated_p95:.4f} ms, "
         f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x"

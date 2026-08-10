@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 
 import torch
 
@@ -16,20 +17,58 @@ def benchmark(
     *,
     warmup: int = 25,
     repetitions: int = 100,
+    cuda_graph: bool = False,
 ) -> tuple[float, float]:
-    for _ in range(warmup):
-        function()
+    measured = function
+    measurement_stream = torch.cuda.current_stream()
+    if cuda_graph:
+        measurement_stream = torch.cuda.Stream()
+        measurement_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(measurement_stream):
+            for _ in range(warmup):
+                function()
+        measurement_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=measurement_stream):
+            function()
+        measured = graph.replay
+    else:
+        for _ in range(warmup):
+            function()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(repetitions)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(repetitions)]
-    for start, end in zip(starts, ends):
-        start.record()
-        function()
-        end.record()
-    torch.cuda.synchronize()
+    with torch.cuda.stream(measurement_stream):
+        for start, end in zip(starts, ends):
+            start.record()
+            measured()
+            end.record()
+    measurement_stream.synchronize()
     samples = torch.tensor(
         [start.elapsed_time(end) for start, end in zip(starts, ends)]
     )
     return samples.quantile(0.5).item(), samples.quantile(0.95).item()
+
+
+def prepare_kernel_call(
+    artifact: CompiledArtifact,
+    arguments: tuple[object, ...],
+    outputs: object,
+) -> Callable[[], object]:
+    run_arguments = inspect.signature(artifact._runner).bind(*arguments).arguments
+    launch_parameters = inspect.signature(artifact._launcher).parameters
+    output_values = outputs if isinstance(outputs, tuple) else (outputs,)
+    output_names = [name for name in launch_parameters if name not in run_arguments]
+    if len(output_names) != len(output_values):
+        raise RuntimeError(
+            "generated launch ABI does not match the prepared output buffers"
+        )
+    launch_arguments = dict(run_arguments)
+    launch_arguments.update(zip(output_names, output_values))
+    ordered = tuple(launch_arguments[name] for name in launch_parameters)
+    compiled = artifact._launcher(*ordered)
+    if callable(compiled):
+        return lambda: compiled(*ordered)
+    return lambda: artifact._launcher(*ordered)
 
 
 def print_artifact(artifact: CompiledArtifact, target: str) -> None:
