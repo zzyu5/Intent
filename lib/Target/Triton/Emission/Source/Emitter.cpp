@@ -404,6 +404,9 @@ LogicalResult SourceEmitter::indexABI() {
     for (auto [axis, extent] : llvm::enumerate(shape)) {
       if (auto symbol = dyn_cast<StringAttr>(extent)) {
         emitted.shape.push_back(symbol.getValue().str());
+        uint64_t staticExtent = 0;
+        if (!symbol.getValue().getAsInteger(10, staticExtent))
+          continue;
         if (!dimensionOwners.count(symbol.getValue())) {
           dimensionOwners[symbol.getValue()] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
@@ -504,10 +507,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
           !fixedOutput)
         fixedOutput = &view;
     }
-    if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
-        fixedOutput->tensor.getRank() > 2)
+    if (!fixedOutput || fixedOutput->tensor.getRank() < 1)
       return kernel.entry.emitOpError(
-          "grid-stride Triton program requires one rank-one or rank-two output view");
+          "grid-stride Triton program requires one ranked output view");
     if (searchSpace)
       return searchSpace.emitOpError(
           "fixed grid-stride scheduling cannot consume an autotune space");
@@ -1218,10 +1220,14 @@ LogicalResult SourceEmitter::emitWrapper() {
                << "_end, " << noaliasViews[rhs]->argument->name << "_end):\n";
         output << "        raise ValueError('realized views violate noalias')\n";
       }
-    output << "    n_rows = "
-           << dimensionOwners.lookup(roleDimensions.lookup("program_0")) << "\n";
+    std::string rowDimension = roleDimensions.lookup("program_0");
+    std::string columnDimension = roleDimensions.lookup("lane_0");
+    std::string rowOwner = dimensionOwners.lookup(rowDimension);
+    std::string columnOwner = dimensionOwners.lookup(columnDimension);
+    output << "    n_rows = " << (rowOwner.empty() ? rowDimension : rowOwner)
+           << "\n";
     output << "    n_cols = "
-           << dimensionOwners.lookup(roleDimensions.lookup("lane_0")) << "\n";
+           << (columnOwner.empty() ? columnDimension : columnOwner) << "\n";
     output << "    configuration = row_configuration(n_cols, _PROPERTIES)\n";
     output << "    kernel = " << kernelName << ".warmup(";
     bool first = true;
@@ -1716,11 +1722,14 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
           ++vectorAxis;
       }
     }
-    StringRef stride = !planIndex.components.reusedAxes.empty() &&
-                               axisNumber == 1
-                           ? StringRef("1")
-                           : StringRef(view.strides[axisNumber]);
-    expression += " + " + index + " * " + stride.str();
+    std::string stride = view.strides[axisNumber];
+    if (!planIndex.components.reusedAxes.empty() && axisNumber > 0) {
+      stride = "1";
+      for (unsigned trailing = axisNumber + 1; trailing < view.shape.size();
+           ++trailing)
+        stride += " * " + view.shape[trailing];
+    }
+    expression += " + " + index + " * (" + stride + ")";
   }
   if (vectorAxis != *tensorRank)
     return operation.emitOpError(

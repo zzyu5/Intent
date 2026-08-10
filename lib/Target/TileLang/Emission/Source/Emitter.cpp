@@ -440,6 +440,11 @@ LogicalResult SourceEmitter::indexABI() {
              << "view " << argument.name << " has incomplete shape metadata";
     for (auto [axis, extent] : llvm::enumerate(shape)) {
       if (auto symbol = dyn_cast<StringAttr>(extent)) {
+        uint64_t staticExtent = 0;
+        if (!symbol.getValue().getAsInteger(10, staticExtent)) {
+          emitted.shape.push_back(symbol.getValue().str());
+          continue;
+        }
         std::string spelling = dimensionSpelling(symbol.getValue());
         emitted.shape.push_back(spelling);
         if (!dimensionOwners.count(spelling)) {
@@ -557,10 +562,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
           !fixedOutput)
         fixedOutput = &view;
     }
-    if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
-        fixedOutput->tensor.getRank() > 2)
+    if (!fixedOutput || fixedOutput->tensor.getRank() < 1)
       return kernel.entry.emitOpError(
-          "fixed-row TileLang program requires one rank-one or rank-two output view");
+          "fixed-row TileLang program requires one ranked output view");
   }
   if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
        !planIndex.stages.empty()) &&

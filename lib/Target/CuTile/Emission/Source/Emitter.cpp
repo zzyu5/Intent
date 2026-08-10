@@ -409,6 +409,9 @@ LogicalResult SourceEmitter::indexABI() {
     for (auto [axis, extent] : llvm::enumerate(shape)) {
       if (auto symbol = dyn_cast<StringAttr>(extent)) {
         emitted.shape.push_back(symbol.getValue().str());
+        uint64_t staticExtent = 0;
+        if (!symbol.getValue().getAsInteger(10, staticExtent))
+          continue;
         if (!dimensionOwners.count(symbol.getValue())) {
           dimensionOwners[symbol.getValue()] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
@@ -524,10 +527,9 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
           !fixedOutput)
         fixedOutput = &view;
     }
-    if (!fixedOutput || fixedOutput->tensor.getRank() < 1 ||
-        fixedOutput->tensor.getRank() > 2 || searchSpace)
+    if (!fixedOutput || fixedOutput->tensor.getRank() < 1 || searchSpace)
       return realization.emitOpError(
-          "fixed persistent rows require one rank-one or rank-two output and no search space");
+          "fixed persistent rows require one ranked output and no search space");
   }
   if ((!planIndex.components.groups.empty() || !planIndex.streams.empty() ||
        !planIndex.stages.empty()) &&
@@ -1221,10 +1223,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    if not " << view.argument->name << ".is_contiguous():\n";
       output << "        raise ValueError('persistent-row views must be contiguous')\n";
     }
-    output << "    n_rows = "
-           << dimensionOwners.lookup(roleDimensions.lookup("program_0")) << "\n";
+    std::string rowDimension = roleDimensions.lookup("program_0");
+    std::string columnDimension = roleDimensions.lookup("lane_0");
+    std::string rowOwner = dimensionOwners.lookup(rowDimension);
+    std::string columnOwner = dimensionOwners.lookup(columnDimension);
+    output << "    n_rows = " << (rowOwner.empty() ? rowDimension : rowOwner)
+           << "\n";
     output << "    n_cols = "
-           << dimensionOwners.lookup(roleDimensions.lookup("lane_0")) << "\n";
+           << (columnOwner.empty() ? columnDimension : columnOwner) << "\n";
     output << "    configuration = row_configuration(n_cols)\n";
     output << "    num_programs = row_program_count(n_rows, _DEVICE, configuration.occupancy)\n";
     output << "    return ct.launch(torch.cuda.current_stream(), (num_programs, 1, 1), "

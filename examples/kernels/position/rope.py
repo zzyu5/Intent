@@ -2,12 +2,16 @@ import intent
 import intent.language as I
 
 
+HEAD_DIMENSION = 128
+HALF_DIMENSION = HEAD_DIMENSION // 2
+
+
 @intent.kernel
 def rotary_embedding_flat(
-    values: I.In[I.f16, ("R", "D")],
-    cosine: I.In[I.f16, ("U", "D_HALF")],
-    sine: I.In[I.f16, ("U", "D_HALF")],
-    output: I.Out[I.f16, ("R", "D")],
+    values: I.In[I.f16, ("R", HEAD_DIMENSION)],
+    cosine: I.In[I.f16, ("U", HALF_DIMENSION)],
+    sine: I.In[I.f16, ("U", HALF_DIMENSION)],
+    output: I.Out[I.f16, ("R", 2, HALF_DIMENSION)],
     HEADS: I.Constexpr[int],
 ):
     R, D = values.shape
@@ -22,9 +26,13 @@ def rotary_embedding_flat(
             I.cast(dimension_index >= half_dimension, I.i32) * 2 - 1,
             I.f16,
         )
-        output[row, dimensions] = (
+        rotated = (
             values[row, dimensions] * cosine[token, phase_dimension]
             + values[row, paired_dimension]
             * sine[token, phase_dimension]
             * rotate_sign
+        )
+        output[row, :, :] = I.reshape(
+            rotated,
+            (2, HALF_DIMENSION),
         )

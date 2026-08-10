@@ -6,6 +6,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <functional>
+#include <limits>
 
 using namespace mlir;
 
@@ -454,6 +455,20 @@ bool isUnitAxis(const LogicalAxis &axis, const KernelFacts &facts) {
   });
 }
 
+std::optional<uint64_t> staticAxisExtent(const LogicalAxis &axis) {
+  uint64_t value = 0;
+  if (StringRef(axis.extent).getAsInteger(10, value) || value == 0)
+    return std::nullopt;
+  return value;
+}
+
+bool multiplyExtent(uint64_t &product, uint64_t extent) {
+  if (product > std::numeric_limits<uint64_t>::max() / extent)
+    return false;
+  product *= extent;
+  return true;
+}
+
 LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
     return operation.emitOpError("has no canonical reshape schema");
@@ -463,8 +478,7 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
   if (source == facts.valueAxes.end() || failed(result))
     return operation.emitOpError("reshape has no logical-axis provenance");
 
-  size_t sourceIndex = 0;
-  size_t resultIndex = 0;
+  size_t sourceIndex = 0, resultIndex = 0;
   while (sourceIndex < source->second.size() && resultIndex < result->size()) {
     if (source->second[sourceIndex] == (*result)[resultIndex]) {
       ++sourceIndex;
@@ -479,8 +493,34 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
       ++resultIndex;
       continue;
     }
-    return operation.emitOpError(
-        "reshape currently supports only unit-axis insertion or removal");
+    std::optional<uint64_t> sourceProduct =
+        staticAxisExtent(source->second[sourceIndex++]);
+    std::optional<uint64_t> resultProduct =
+        staticAxisExtent((*result)[resultIndex++]);
+    if (!sourceProduct || !resultProduct)
+      return operation.emitOpError(
+          "reshape changes a symbolic logical-axis group");
+    while (*sourceProduct != *resultProduct) {
+      if (*sourceProduct < *resultProduct) {
+        if (sourceIndex == source->second.size())
+          return operation.emitOpError(
+              "reshape changes the logical element count");
+        std::optional<uint64_t> extent =
+            staticAxisExtent(source->second[sourceIndex++]);
+        if (!extent || !multiplyExtent(*sourceProduct, *extent))
+          return operation.emitOpError(
+              "reshape has an unsupported static source extent group");
+      } else {
+        if (resultIndex == result->size())
+          return operation.emitOpError(
+              "reshape changes the logical element count");
+        std::optional<uint64_t> extent =
+            staticAxisExtent((*result)[resultIndex++]);
+        if (!extent || !multiplyExtent(*resultProduct, *extent))
+          return operation.emitOpError(
+              "reshape has an unsupported static result extent group");
+      }
+    }
   }
   while (sourceIndex < source->second.size() &&
          isUnitAxis(source->second[sourceIndex], facts))
@@ -489,8 +529,7 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
          isUnitAxis((*result)[resultIndex], facts))
     ++resultIndex;
   if (sourceIndex != source->second.size() || resultIndex != result->size())
-    return operation.emitOpError(
-        "reshape currently supports only unit-axis insertion or removal");
+    return operation.emitOpError("reshape changes the logical element count");
   return bindResultAxes(operation, 0, std::move(*result), facts);
 }
 
