@@ -22,6 +22,7 @@ using AxisOp = target::emission::AxisBinding;
 using ProgramOp = target::emission::ProgramBinding;
 using PaddingOp = target::emission::PaddingBinding;
 using ReductionOp = target::emission::ReductionBinding;
+using ScanOp = target::emission::ScanBinding;
 using PointwiseOp = target::emission::PointwiseBinding;
 using ContractOp = target::emission::ContractBinding;
 using StreamOp = target::emission::StreamBinding;
@@ -41,6 +42,7 @@ struct RealizationIndex {
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
+  llvm::DenseMap<int64_t, plan::ScanOp> scans;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
@@ -97,6 +99,7 @@ public:
   mlir::LogicalResult emitIndices(mlir::Operation &operation);
   mlir::LogicalResult emitRandom(mlir::Operation &operation);
   mlir::LogicalResult emitReduction(mlir::Operation &operation);
+  mlir::LogicalResult emitScan(mlir::Operation &operation);
   mlir::LogicalResult emitBroadcast(mlir::Operation &operation);
   mlir::LogicalResult emitUnary(mlir::Operation &operation);
   mlir::LogicalResult emitBinary(mlir::Operation &operation);

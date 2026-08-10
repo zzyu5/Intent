@@ -92,6 +92,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitReduction(op);
                         })) ||
+      failed(addHandler(registry, "intent.scan", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitScan(op);
+      })) ||
       failed(addHandler(registry, "intent.broadcast",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -581,6 +586,21 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
        ", axis=" + std::to_string(binding.getAxis()) + ")");
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitScan(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "scan emission");
+  plan::ScanOp binding =
+      succeeded(node) ? planIndex.scans.lookup(*node) : plan::ScanOp();
+  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  if (failed(node) || !binding || binding.getLowering() != "tl.cumsum" ||
+      failed(operand) || operation.getNumResults() != 1)
+    return operation.emitOpError("lacks a mechanical Triton scan binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.cumsum(" + operand->str() + ", axis=" +
+       std::to_string(binding.getAxis()) + ")");
   bindResult(operation, 0, result);
   return success();
 }

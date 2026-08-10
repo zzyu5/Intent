@@ -34,6 +34,40 @@ LogicalResult validateReduction(Operation &operation) {
   return operation.emitOpError("has no supported GPU reduction role");
 }
 
+bool isLiteralZero(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition ||
+      definition->getName().getStringRef() != "intent.constant")
+    return false;
+  Attribute literal = definition->getAttr("intent.value");
+  if (auto integer = dyn_cast_or_null<IntegerAttr>(literal))
+    return integer.getValue().isZero();
+  if (auto floating = dyn_cast_or_null<FloatAttr>(literal))
+    return floating.getValue().isZero();
+  return false;
+}
+
+LogicalResult validateScan(Operation &operation) {
+  auto input = operation.getNumOperands() == 2
+                   ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                   : RankedTensorType();
+  auto result = operation.getNumResults() == 1
+                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                    : RankedTensorType();
+  auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
+  auto inclusive = operation.getAttrOfType<BoolAttr>("intent.inclusive");
+  if (!input || !result || input.getShape() != result.getShape() || !axis ||
+      axis.getInt() < 0 || axis.getInt() >= input.getRank() || !combine ||
+      combine.getValue() != "add" || !inclusive || !inclusive.getValue())
+    return operation.emitOpError(
+        "has no supported inclusive additive GPU scan schema");
+  if (!isLiteralZero(operation.getOperand(1)))
+    return operation.emitOpError(
+        "requires a literal zero identity for inclusive additive GPU scan");
+  return success();
+}
+
 LogicalResult validatePointwise(Operation &operation) {
   StringRef name = operation.getName().getStringRef();
   if (name == "intent.random") {
@@ -132,6 +166,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
     return failure();
   if (failed(addHandler(
           registry, "intent.arg_reduce", validateReduction)))
+    return failure();
+  if (failed(addHandler(registry, "intent.scan", validateScan)))
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",

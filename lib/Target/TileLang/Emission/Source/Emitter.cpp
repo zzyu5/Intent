@@ -168,6 +168,7 @@ indexRealization(intent::plan::RealizationOp realization,
                  const target::KernelModel &kernel) {
   RealizationIndex index;
   SmallVector<intent::plan::ReductionOp> reductions;
+  SmallVector<intent::plan::ScanOp> scans;
   SmallVector<intent::plan::PointwiseOp> pointwise;
   SmallVector<intent::plan::TransferOp> transfers;
   for (Operation &operation : realization.getBody().front()) {
@@ -197,6 +198,8 @@ indexRealization(intent::plan::RealizationOp realization,
       index.paddings[value.getValue()] = binding;
     } else if (auto value = dyn_cast<intent::plan::ReductionOp>(operation)) {
       reductions.push_back(value);
+    } else if (auto value = dyn_cast<intent::plan::ScanOp>(operation)) {
+      scans.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::PointwiseOp>(operation)) {
       pointwise.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
@@ -262,6 +265,25 @@ indexRealization(intent::plan::RealizationOp realization,
     if (binding.resultSpace.empty())
       return value.emitOpError("has no TileLang reduction residency spelling");
     index.reductions[value.getNode()] = binding;
+  }
+  for (intent::plan::ScanOp value : scans) {
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    FailureOr<std::string> role =
+        operation ? target::emission::scanRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<int64_t> axis =
+        operation ? target::emission::scanAxis(*operation)
+                  : FailureOr<int64_t>(failure());
+    if (failed(role) || failed(axis) || *role != "scan_inclusive_add")
+      return value.emitOpError("does not bind a canonical scan");
+    plan::ScanOp binding;
+    binding.operation = value;
+    binding.lowering = "T.cumsum";
+    binding.resultSpace = bufferSpace(value.getResultSpace()).str();
+    binding.axis = *axis;
+    if (binding.resultSpace.empty())
+      return value.emitOpError("has no TileLang scan residency spelling");
+    index.scans[value.getNode()] = binding;
   }
   for (intent::plan::PointwiseOp value : pointwise) {
     Operation *operation = kernel.nodes.lookup(value.getNode());

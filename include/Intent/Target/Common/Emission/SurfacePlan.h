@@ -41,6 +41,23 @@ reductionAxis(mlir::Operation &operation) {
   return axis.getInt();
 }
 
+inline mlir::FailureOr<std::string> scanRole(mlir::Operation &operation) {
+  auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
+  auto inclusive =
+      operation.getAttrOfType<mlir::BoolAttr>("intent.inclusive");
+  if (combine && combine.getValue() == "add" && inclusive &&
+      inclusive.getValue())
+    return std::string("scan_inclusive_add");
+  return operation.emitOpError("has no supported scan semantics");
+}
+
+inline mlir::FailureOr<int64_t> scanAxis(mlir::Operation &operation) {
+  auto axis = operation.getAttrOfType<mlir::IntegerAttr>("intent.axis");
+  if (!axis || axis.getInt() < 0)
+    return operation.emitOpError("has no canonical scan axis");
+  return axis.getInt();
+}
+
 inline mlir::FailureOr<std::string>
 pointwiseRole(mlir::Operation &operation) {
   llvm::StringRef name = operation.getName().getStringRef();
@@ -266,6 +283,17 @@ struct ReductionBinding : Binding<intent::plan::ReductionOp> {
   llvm::StringRef getLowering() const { return lowering; }
   int64_t getAxis() const { return axis; }
   bool getKeepDims() const { return keepDims; }
+  llvm::StringRef getResultSpace() const { return resultSpace; }
+};
+
+struct ScanBinding : Binding<intent::plan::ScanOp> {
+  std::string lowering;
+  std::string resultSpace;
+  int64_t axis = -1;
+
+  int64_t getNode() const { return operation.getNode(); }
+  llvm::StringRef getLowering() const { return lowering; }
+  int64_t getAxis() const { return axis; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
 };
 
@@ -940,6 +968,7 @@ mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
   };
   if (mlir::failed(requireCovered(index.boundaries)) ||
       mlir::failed(requireCovered(index.reductions)) ||
+      mlir::failed(requireCovered(index.scans)) ||
       mlir::failed(requireCovered(index.pointwise)) ||
       mlir::failed(requireCovered(index.contracts)))
     return mlir::failure();

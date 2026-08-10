@@ -97,6 +97,15 @@ def IntentPlan_ReductionOp : IntentPlan_Op<"reduction"> {
   let hasVerifier = 1;
 }
 
+def IntentPlan_ScanOp : IntentPlan_Op<"scan"> {
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$result_space
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
   let arguments = (ins
     I64Attr:$node,

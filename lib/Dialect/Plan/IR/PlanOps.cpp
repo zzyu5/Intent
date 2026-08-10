@@ -179,6 +179,14 @@ LogicalResult ReductionOp::verify() {
   return success();
 }
 
+LogicalResult ScanOp::verify() {
+  if (failed(requireNode(*this, getNode())))
+    return failure();
+  if (!isPrivateSpace(getResultSpace()))
+    return emitOpError("requires private scan result residency");
+  return success();
+}
+
 LogicalResult PointwiseOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
       getReuseOperandAttr().getInt() < -1)
@@ -281,6 +289,9 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
     } else if (auto binding = dyn_cast<ReductionOp>(operation)) {
+      if (!operations.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates an operation decision");
+    } else if (auto binding = dyn_cast<ScanOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
     } else if (auto binding = dyn_cast<PointwiseOp>(operation)) {

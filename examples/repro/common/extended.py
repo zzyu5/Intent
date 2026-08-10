@@ -85,6 +85,10 @@ from kernels.ragged.grouped_gemm import K as GROUPED_K
 from kernels.ragged.grouped_gemm import N as GROUPED_N
 from kernels.ragged.grouped_gemm import ROWS as GROUPED_ROWS
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
+from kernels.sampling.nucleus import CANDIDATES as NUCLEUS_CANDIDATES
+from kernels.sampling.nucleus import ROWS as NUCLEUS_ROWS
+from kernels.sampling.nucleus import THRESHOLD as NUCLEUS_THRESHOLD
+from kernels.sampling.nucleus import sorted_nucleus_cutoff
 from kernels.streaming.online_softmax import COLUMNS as ONLINE_COLUMNS
 from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from kernels.streaming.online_softmax import streamed_online_softmax
@@ -1671,6 +1675,53 @@ def _run_scalar_table_lookup(
     )
 
 
+def _run_sorted_nucleus_cutoff(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("sorted nucleus cutoff has no algorithm-matched baseline")
+    ranks = torch.arange(
+        NUCLEUS_CANDIDATES, device="cuda", dtype=torch.float32
+    )
+    probabilities = torch.softmax(-ranks / 256.0, dim=0)[None, :].expand(
+        NUCLEUS_ROWS, -1
+    ).contiguous()
+    artifact = intent.compile(sorted_nucleus_cutoff, target=target, compiler=compiler)
+    generated_cumulative, generated_cutoff = artifact.run(
+        probabilities, NUCLEUS_THRESHOLD
+    )
+    expected_cumulative = probabilities.cumsum(dim=1)
+    expected_cutoff = (
+        (expected_cumulative < NUCLEUS_THRESHOLD).sum(dim=1, dtype=torch.int32)
+        + 1
+    )
+    cumulative_error = (
+        generated_cumulative - expected_cumulative
+    ).abs().max().item()
+    cutoff_error = (generated_cutoff - expected_cutoff).abs().max().item()
+    if cumulative_error > 2.0e-4 or cutoff_error != 0:
+        raise RuntimeError(
+            f"{target_name} sorted nucleus cutoff comparison failed: "
+            f"cumulative={cumulative_error}, cutoff={cutoff_error}"
+        )
+    call = prepare_kernel_call(
+        artifact,
+        (probabilities, NUCLEUS_THRESHOLD),
+        (generated_cumulative, generated_cutoff),
+    )
+    p50, p95 = benchmark(call, warmup=25, repetitions=100, cuda_graph=True)
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} sorted nucleus cutoff numerical comparison: PASS "
+        f"(cumulative error={cumulative_error}, cutoff error={cutoff_error})"
+    )
+    print(
+        f"{target_name} sorted nucleus cutoff performance (CUDA Graph): "
+        f"p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} sorted nucleus cutoff upstream baseline: unavailable")
+
+
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
@@ -1690,6 +1741,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "rms_norm": _run_rms_norm,
     "scalar_table_lookup": _run_scalar_table_lookup,
     "shifted_row_copy": _run_shifted_row_copy,
+    "sorted_nucleus_cutoff": _run_sorted_nucleus_cutoff,
     "swiglu_backward": _run_swiglu_backward,
     "swiglu_forward": _run_swiglu_forward,
     "varlen_attention": _run_varlen_attention,

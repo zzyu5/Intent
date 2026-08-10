@@ -528,6 +528,35 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       failed(addHandler(registry, "intent.arg_reduce", bindReduction)))
     return failure();
 
+  if (failed(addHandler(
+          registry, "intent.scan", [&](Operation &operation) -> LogicalResult {
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "scan binding");
+            auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+            if (failed(node) || !axis || axis.getInt() < 0)
+              return operation.emitOpError("has no physical scan axis");
+            std::optional<std::string> inputPadding =
+                paddingState.paddingOf(operation.getOperand(0));
+            std::optional<std::string> identityPadding =
+                paddingState.paddingOf(operation.getOperand(1));
+            if (!inputPadding || !identityPadding ||
+                *inputPadding != *identityPadding) {
+              if (!identityPadding)
+                return operation.emitOpError(
+                    "cannot realize scan-lane padding without an identity");
+              if (failed(paddingState.require(
+                      operation.getOperand(0),
+                      {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+                      operation)))
+                return failure();
+            }
+            builder.create<intent::plan::ScanOp>(
+                operation.getLoc(), i64(builder, *node),
+                string(builder, "private_fragment"));
+            return success();
+          })))
+    return failure();
+
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast", "intent.full", "intent.zeros",

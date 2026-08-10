@@ -809,6 +809,23 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
       failed(addHandler(registry, "intent.arg_reduce", bindReductionAxes)))
     return failure();
 
+  if (failed(addHandler(
+          registry, "intent.scan", [&](Operation &operation) -> LogicalResult {
+            auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+            auto input = operation.getNumOperands() > 0
+                             ? facts.valueAxes.find(operation.getOperand(0))
+                             : facts.valueAxes.end();
+            if (!axis || axis.getInt() < 0 || input == facts.valueAxes.end() ||
+                static_cast<size_t>(axis.getInt()) >= input->second.size() ||
+                operation.getNumResults() != 1)
+              return operation.emitOpError(
+                  "scan axis has no logical-axis provenance");
+            if (Operation *domain = input->second[axis.getInt()].domain)
+              facts.vectorDomains.insert(domain);
+            return bindResultAxes(operation, 0, input->second, facts);
+          })))
+    return failure();
+
   for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
                          "intent.cast", "intent.compare", "intent.select",
                          "intent.mask", "intent.random"})

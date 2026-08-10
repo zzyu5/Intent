@@ -53,6 +53,13 @@ bool provePaddedUses(Value value, PaddedValue padded,
         return false;
       continue;
     }
+    if (name == "intent.scan") {
+      auto combine = user->getAttrOfType<StringAttr>("intent.combine");
+      if (!combine || combine.getValue() != "add" ||
+          padded != PaddedValue::zero)
+        return false;
+      continue;
+    }
     if (name == "intent.contract" && padded == PaddedValue::zero) {
       auto multiply = user->getAttrOfType<StringAttr>("intent.multiply");
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");

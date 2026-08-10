@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|sorted_nucleus_cutoff>" >&2
   exit 2
 fi
 
@@ -150,7 +150,8 @@ case "${backend}:${kernel}" in
   tilelang:quantized_gemm | tilelang:swiglu_forward | tilelang:swiglu_backward | tilelang:cross_entropy | \
   triton:varlen_attention | cutile:varlen_attention | triton:varlen_gqa_prefill | cutile:varlen_gqa_prefill | \
   triton:varlen_gqa_rope_prefill | cutile:varlen_gqa_rope_prefill | tilelang:varlen_gqa_rope_prefill | \
-  triton:dropout_residual_rms_norm)
+  triton:dropout_residual_rms_norm | triton:sorted_nucleus_cutoff | \
+  cutile:sorted_nucleus_cutoff | tilelang:sorted_nucleus_cutoff)
     ;;
   triton:shifted_row_copy | cutile:shifted_row_copy | tilelang:shifted_row_copy | \
   triton:grouped_query_head_add | cutile:grouped_query_head_add | tilelang:grouped_query_head_add | \
