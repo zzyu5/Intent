@@ -1122,15 +1122,11 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
   if (axis->hasRole("lane") && !axis->getReuseWorker() &&
       axis->getTileRole().starts_with("row_vector")) {
-    FailureOr<Operation *> domain =
-        resolveDomain(operation.getOperand(0), operation);
-    FailureOr<std::string> logical =
-        succeeded(domain) ? dimensionName(**domain)
-                          : FailureOr<std::string>(failure());
-    if (failed(domain) || failed(logical))
+    FailureOr<std::string> tile = physicalAxisTile(*axis);
+    if (failed(tile))
       return failure();
     bindResult(operation, 0,
-               addressIndex("ct.arange(" + physicalExtent(*logical) +
+               addressIndex("ct.arange(" + *tile +
                             ", dtype=ct.int32)"));
     return success();
   }
@@ -1146,11 +1142,14 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
                                           axis->getNode()) ||
       (axis->hasRole("lane") &&
        kernel.nodes.lookup(axis->getNode()) == vectorDomain);
+  FailureOr<std::string> tile = physicalAxisTile(*axis);
+  if (failed(tile))
+    return failure();
   std::string expression =
       directVector
           ? addressIndex(base)
-          : addressIndex(base) + " * " + axis->getTile().str() + " + " +
-                addressIndex("ct.arange(" + axis->getTile().str() +
+          : addressIndex(base) + " * " + *tile + " + " +
+                addressIndex("ct.arange(" + *tile +
                              ", dtype=ct.int32)");
   bindResult(operation, 0, expression);
   return success();

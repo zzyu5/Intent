@@ -547,16 +547,11 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!domain || domain->getNumResults() != 1 || !resultNode)
       return axis.emitOpError(
           "cannot index its domain result shape against the cuTile plan");
-    std::string tile = axis.getTile().str();
-    if (!axis.getReuseWorker() &&
-        axis.getTileRole().starts_with("row_vector")) {
-      FailureOr<std::string> dimension = dimensionName(*domain);
-      if (failed(dimension))
-        return axis.emitOpError("cannot resolve its row-vector extent");
-      tile = physicalExtent(*dimension);
-    }
+    FailureOr<std::string> tile = physicalAxisTile(axis);
+    if (failed(tile))
+      return failure();
     regionTiles["?region_" + std::to_string(resultNode.getInt()) + "_0"] =
-        tile;
+        *tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -1904,6 +1899,18 @@ std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
   return "PHYSICAL_" + logicalExtent.str();
 }
 
+FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
+  if (axis.getReuseWorker() ||
+      !axis.getTileRole().starts_with("row_vector"))
+    return axis.getTile().str();
+  Operation *domain = kernel.nodes.lookup(axis.getNode());
+  FailureOr<std::string> logical =
+      domain ? dimensionName(*domain) : FailureOr<std::string>(failure());
+  if (failed(logical))
+    return axis.emitOpError("cannot resolve its row-vector physical extent");
+  return physicalExtent(*logical);
+}
+
 FailureOr<std::string>
 SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -2032,10 +2039,14 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
                                               axis->getNode()) ||
           (axis->hasRole("lane") &&
            kernel.nodes.lookup(axis->getNode()) == vectorDomain);
-      std::string exact = directVector
+      FailureOr<std::string> tile = physicalAxisTile(*axis);
+      if (failed(tile))
+        return failure();
+      std::string exact =
+          directVector
               ? addressIndex(base)
-              : addressIndex(base) + " * " + axis->getTile().str() + " + " +
-                    addressIndex("ct.arange(" + axis->getTile().str() +
+              : addressIndex(base) + " * " + *tile + " + " +
+                    addressIndex("ct.arange(" + *tile +
                                  ", dtype=ct.int32)");
       indices.push_back(broadcast(exact, resultAxis++));
     }
@@ -2176,18 +2187,10 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
         return failure();
-      std::string extent = axis->getTile().str();
-      if (!axis->getReuseWorker() &&
-          axis->getTileRole().starts_with("row_vector")) {
-        FailureOr<Operation *> domain = resolveDomain(indexed, operation);
-        FailureOr<std::string> logical =
-            succeeded(domain) ? dimensionName(**domain)
-                              : FailureOr<std::string>(failure());
-        if (failed(domain) || failed(logical))
-          return failure();
-        extent = physicalExtent(*logical);
-      }
-      extents.push_back(extent);
+      FailureOr<std::string> extent = physicalAxisTile(*axis);
+      if (failed(extent))
+        return failure();
+      extents.push_back(*extent);
     }
   }
   std::string tuple = "(";
@@ -2228,10 +2231,13 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
                       planIndex.components, axis.getNode()) ||
                   (!planIndex.components.reusedAxes.empty() &&
                    kernel.nodes.lookup(axis.getNode()) == vectorDomain);
+    FailureOr<std::string> tile = physicalAxisTile(axis);
+    if (failed(tile))
+      return failure();
     std::string index =
         direct ? addressIndex(base)
-               : addressIndex(base) + " * " + axis.getTile().str() + " + " +
-                     addressIndex("ct.arange(" + axis.getTile().str() +
+               : addressIndex(base) + " * " + *tile + " + " +
+                     addressIndex("ct.arange(" + *tile +
                                   ", dtype=ct.int32)");
     if (tensor.getRank() > 1) {
       std::string broadcast = index + "[";
