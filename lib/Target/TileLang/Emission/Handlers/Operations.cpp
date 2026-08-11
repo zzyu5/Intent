@@ -1005,13 +1005,38 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         "has multiple affine access ranges; TileLang cannot project their "
         "joint footprint as one parallel fragment");
   bool expanded = !physicalFill->empty();
+  FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
+  if (failed(tensorIndirect))
+    return failure();
   bool guardedF16Bulk = !scalarResult && resultElementType.isF16() &&
-                        *derivedScalar && boundary.getCheckBounds() &&
+                        *derivedScalar && !*tensorIndirect &&
+                        boundary.getCheckBounds() &&
                         boundary.getPadding() != "none";
+  FailureOr<SmallVector<target::IndexTerm>> relation = failure();
+  if (guardedF16Bulk) {
+    relation = target::parseIndexRelation(operation);
+    if (failed(relation))
+      return failure();
+    for (const target::IndexTerm &term : *relation) {
+      if (term.kind != "region_index")
+        continue;
+      if (term.operands.size() != 1 || !term.operands.front())
+        return operation.emitOpError(
+            "has no mechanical guarded float16 region relation");
+      Value indexed = operation.getOperand(*term.operands.front());
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis))
+        return failure();
+      if (!axis->hasRole("lane") || axis->hasRole("parallel") ||
+          axis->hasRole("ordered") || axis->hasRole("reduction") ||
+          axis->hasRole("ragged_member")) {
+        guardedF16Bulk = false;
+        break;
+      }
+    }
+  }
   if (guardedF16Bulk) {
     if (expanded) {
-      FailureOr<SmallVector<target::IndexTerm>> relation =
-          target::parseIndexRelation(operation);
       if (failed(view) || failed(relation) ||
           relation->size() != (*view)->shape.size())
         return operation.emitOpError(
@@ -1090,7 +1115,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     StringRef padding = boundary.getPadding();
     if (padding == "none" && expanded)
       padding = *physicalFill;
-    FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
     bool stagePhysicalPadding =
         expanded && succeeded(tensorIndirect) && *tensorIndirect;
     FailureOr<SmallVector<std::string>> extents =
@@ -2767,7 +2791,13 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (failed(indices))
     return failure();
   if (!isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) {
-    if (boundary.getCheckBounds()) {
+    FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
+    if (failed(derivedScalar))
+      return failure();
+    bool guard = boundary.getCheckBounds() &&
+                 (*derivedScalar || target::emission::hasPackedScalarDomain(
+                                        planIndex, boundary));
+    if (guard) {
       FailureOr<std::string> predicate =
           elementBoundsPredicate(operation, {});
       if (failed(predicate))
@@ -2776,7 +2806,7 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       ++indentation;
     }
     line((*view)->argument->name + "[" + *indices + "] = " + stored->str());
-    if (boundary.getCheckBounds())
+    if (guard)
       --indentation;
     return success();
   }
