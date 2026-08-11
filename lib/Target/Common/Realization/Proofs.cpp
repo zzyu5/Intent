@@ -71,7 +71,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
 
     PaddedValue result = PaddedValue::arbitrary;
     if (name == "intent.cast" || name == "intent.broadcast" ||
-        name == "intent.reshape") {
+        name == "intent.reshape" || name == "intent.transpose") {
       result = padded;
     } else if (name == "intent.gather" && user->getNumOperands() >= 1 &&
                user->getOperand(0) == value && isShapeOnlyGather(*user)) {
@@ -163,7 +163,7 @@ std::optional<std::string> inferPadding(
   if (name == "intent.full" && definition->getNumOperands() == 1)
     return inferPadding(definition->getOperand(0), facts, assumedPadding);
   if ((name == "intent.cast" || name == "intent.broadcast" ||
-       name == "intent.reshape") &&
+       name == "intent.reshape" || name == "intent.transpose") &&
       definition->getNumOperands() >= 1)
     return inferPadding(definition->getOperand(0), facts, assumedPadding);
   if (name == "intent.gather" && definition->getNumOperands() >= 1) {

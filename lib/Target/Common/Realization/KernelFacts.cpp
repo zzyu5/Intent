@@ -1067,6 +1067,37 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
+  if (failed(addHandler(
+          registry, "intent.transpose",
+          [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumOperands() != 1 ||
+                operation.getNumResults() != 1)
+              return operation.emitOpError(
+                  "has no canonical transpose provenance schema");
+            auto source = facts.valueAxes.find(operation.getOperand(0));
+            auto permutation =
+                operation.getAttrOfType<ArrayAttr>("intent.permutation");
+            if (source == facts.valueAxes.end() || !permutation ||
+                permutation.size() != source->second.size())
+              return operation.emitOpError(
+                  "transpose has no logical-axis provenance");
+            SmallVector<LogicalAxis> resultAxes;
+            resultAxes.reserve(permutation.size());
+            SmallVector<bool> covered(source->second.size(), false);
+            for (Attribute attribute : permutation) {
+              auto axis = dyn_cast<IntegerAttr>(attribute);
+              if (!axis || axis.getInt() < 0 ||
+                  static_cast<size_t>(axis.getInt()) >= source->second.size() ||
+                  covered[axis.getInt()])
+                return operation.emitOpError(
+                    "transpose permutation has no logical-axis provenance");
+              covered[axis.getInt()] = true;
+              resultAxes.push_back(source->second[axis.getInt()]);
+            }
+            return bindResultAxes(operation, 0, std::move(resultAxes), facts);
+          })))
+    return failure();
+
   for (StringRef name : {"intent.full", "intent.zeros"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {

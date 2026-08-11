@@ -148,6 +148,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitReshape(op);
       })) ||
+      failed(addHandler(registry, "intent.transpose", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitTranspose(op);
+      })) ||
       failed(addHandler(registry, "intent.full", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -1511,6 +1516,58 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   line(result + " = T.reshape(" + operand->str() + ", " + *shape + ")");
   bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitTranspose(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "transpose emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<SmallVector<int64_t>> permutation =
+      target::emission::transposePermutation(operation);
+  FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  if (failed(node) || !binding ||
+      binding.getLowering() != "fragment_permute" ||
+      binding.getReuseOperandAttr().getInt() != -1 ||
+      binding.getSpace() != "fragment" || failed(permutation) ||
+      failed(extents) || failed(result))
+    return operation.emitOpError(
+        "lacks a mechanical TileLang transpose binding");
+
+  SmallVector<std::string> resultIndices;
+  std::string loop = "for ";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    resultIndices.push_back("transpose_i" + std::to_string(axis));
+    loop += resultIndices.back();
+  }
+  loop += " in T.Parallel(";
+  for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    if (axis)
+      loop += ", ";
+    loop += extent;
+  }
+  line(loop + "):");
+  ++indentation;
+
+  SmallVector<std::string> sourceIndices(resultIndices.size());
+  for (auto [resultAxis, sourceAxis] : llvm::enumerate(*permutation))
+    sourceIndices[sourceAxis] = resultIndices[resultAxis];
+  FailureOr<std::string> operand =
+      tensorElement(operation.getOperand(0), sourceIndices, operation);
+  if (failed(operand))
+    return failure();
+  std::string target = *result + "[";
+  for (auto [axis, index] : llvm::enumerate(resultIndices)) {
+    if (axis)
+      target += ", ";
+    target += index;
+  }
+  line(target + "] = " + *operand);
+  --indentation;
+  bindResult(operation, 0, *result);
   return success();
 }
 

@@ -73,6 +73,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("tl.cast");
   if (role == "reshape")
     return StringRef("tl.reshape");
+  if (role == "transpose")
+    return StringRef("tl.permute");
   if (role == "unary_exp")
     return StringRef("tl.exp");
   if (role == "unary_exp2")

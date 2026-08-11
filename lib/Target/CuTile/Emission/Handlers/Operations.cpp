@@ -153,6 +153,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitReshape(op);
                         })) ||
+      failed(addHandler(registry, "intent.transpose",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitTranspose(op);
+                        })) ||
       failed(addHandler(registry, "intent.full",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -1035,6 +1041,32 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
     return operation.emitOpError("lacks a mechanical cuTile reshape binding");
   std::string result = makeResultName(operation, 0);
   line(result + " = ct.reshape(" + operand->str() + ", " + *shape + ")");
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitTranspose(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "transpose emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  FailureOr<SmallVector<int64_t>> permutation =
+      target::emission::transposePermutation(operation);
+  if (failed(node) || !binding || binding.getLowering() != "ct.permute" ||
+      binding.getReuseOperandAttr().getInt() != -1 || failed(operand) ||
+      failed(permutation))
+    return operation.emitOpError("lacks a mechanical cuTile transpose binding");
+  std::string result = makeResultName(operation, 0);
+  std::string axes = "(";
+  for (auto [position, axis] : llvm::enumerate(*permutation)) {
+    if (position)
+      axes += ", ";
+    axes += std::to_string(axis);
+  }
+  if (permutation->size() == 1)
+    axes += ",";
+  axes += ")";
+  line(result + " = ct.permute(" + operand->str() + ", " + axes + ")");
   bindResult(operation, 0, result);
   return success();
 }

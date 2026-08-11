@@ -30,7 +30,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 int64_t reusableOperand(Operation &operation) {
   if (operation.getNumResults() != 1 ||
       !isa<RankedTensorType>(operation.getResult(0).getType()) ||
-      operation.getName().getStringRef() == "intent.broadcast")
+      operation.getName().getStringRef() == "intent.broadcast" ||
+      operation.getName().getStringRef() == "intent.transpose")
     return -1;
   Value result = operation.getResult(0);
   auto isStateCarrier = [](Value operand) {
@@ -260,7 +261,7 @@ private:
     if (name == "intent.full" && definition->getNumOperands() == 1)
       return paddingForDomain(definition->getOperand(0), domain);
     if ((name == "intent.cast" || name == "intent.broadcast" ||
-         name == "intent.reshape") &&
+         name == "intent.reshape" || name == "intent.transpose") &&
         definition->getNumOperands() >= 1)
       return paddingForDomain(definition->getOperand(0), domain);
     if (name == "intent.unary" && definition->getNumOperands() == 1) {
@@ -412,7 +413,7 @@ private:
         continue;
       }
       if (name != "intent.cast" && name != "intent.broadcast" &&
-          name != "intent.reshape" &&
+          name != "intent.reshape" && name != "intent.transpose" &&
           name != "intent.unary" && name != "intent.binary" &&
           name != "intent.compare" && name != "intent.select" &&
           name != "intent.mask")
@@ -625,7 +626,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                          "intent.binary", "intent.compare", "intent.mask",
                          "intent.cast", "intent.full", "intent.zeros",
                          "intent.members", "intent.gather", "intent.reshape",
-                         "intent.random"})
+                         "intent.transpose", "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =

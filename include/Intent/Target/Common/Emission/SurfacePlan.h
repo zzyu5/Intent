@@ -41,6 +41,31 @@ reductionAxis(mlir::Operation &operation) {
   return axis.getInt();
 }
 
+inline mlir::FailureOr<llvm::SmallVector<int64_t>>
+transposePermutation(mlir::Operation &operation) {
+  auto result = operation.getNumResults() == 1
+                    ? mlir::dyn_cast<mlir::RankedTensorType>(
+                          operation.getResult(0).getType())
+                    : mlir::RankedTensorType();
+  auto permutation =
+      operation.getAttrOfType<mlir::ArrayAttr>("intent.permutation");
+  if (!result || !permutation ||
+      permutation.size() != static_cast<size_t>(result.getRank()))
+    return operation.emitOpError("has no canonical transpose permutation");
+  llvm::SmallVector<int64_t> axes;
+  llvm::SmallVector<bool> covered(result.getRank(), false);
+  for (mlir::Attribute attribute : permutation) {
+    auto axis = mlir::dyn_cast<mlir::IntegerAttr>(attribute);
+    if (!axis || axis.getInt() < 0 || axis.getInt() >= result.getRank() ||
+        covered[axis.getInt()])
+      return operation.emitOpError(
+          "transpose permutation must cover every tensor axis");
+    axes.push_back(axis.getInt());
+    covered[axis.getInt()] = true;
+  }
+  return axes;
+}
+
 inline mlir::FailureOr<std::string> scanRole(mlir::Operation &operation) {
   auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
   auto inclusive =
@@ -76,6 +101,8 @@ pointwiseRole(mlir::Operation &operation) {
     return std::string("cast");
   if (name == "intent.reshape")
     return std::string("reshape");
+  if (name == "intent.transpose")
+    return std::string("transpose");
   if (name == "intent.mask")
     return std::string("mask");
   if (name == "intent.full")

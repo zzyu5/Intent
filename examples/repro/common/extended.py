@@ -61,6 +61,9 @@ from kernels.indexing.relations import OFFSET_ROWS
 from kernels.indexing.relations import grouped_query_head_add
 from kernels.indexing.relations import scalar_table_lookup
 from kernels.indexing.relations import shifted_row_copy
+from kernels.layout.transpose import COLUMNS as TRANSPOSE_COLUMNS
+from kernels.layout.transpose import ROWS as TRANSPOSE_ROWS
+from kernels.layout.transpose import matrix_transpose
 from kernels.loss.cross_entropy import IGNORE_INDEX as CROSS_ENTROPY_IGNORE_INDEX
 from kernels.loss.cross_entropy import TOKENS as CROSS_ENTROPY_TOKENS
 from kernels.loss.cross_entropy import VOCABULARY as CROSS_ENTROPY_VOCABULARY
@@ -2077,6 +2080,29 @@ def _run_shifted_row_copy(
     )
 
 
+def _run_matrix_transpose(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("matrix transpose has no upstream adapter")
+    x = torch.randn(
+        (TRANSPOSE_ROWS, TRANSPOSE_COLUMNS),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    artifact = intent.compile(matrix_transpose, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x,),
+        reference=lambda: x.transpose(0, 1).contiguous(),
+        target_name=target_name,
+        kernel_name="canonical matrix transpose",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.float16,
+    )
+
+
 def _run_grouped_query_head_add(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2287,6 +2313,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "layer_norm": _run_layer_norm,
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
+    "matrix_transpose": _run_matrix_transpose,
     "online_softmax": _run_online_softmax,
     "paged_attention": _run_paged_attention,
     "quantized_gemm": _run_quantized_gemm,

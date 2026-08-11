@@ -98,6 +98,32 @@ LogicalResult validatePointwise(Operation &operation) {
       return operation.emitOpError("has no canonical tensor reshape schema");
     return success();
   }
+  if (name == "intent.transpose") {
+    auto source = operation.getNumOperands() == 1
+                      ? dyn_cast<RankedTensorType>(
+                            operation.getOperand(0).getType())
+                      : RankedTensorType();
+    auto result = operation.getNumResults() == 1
+                      ? dyn_cast<RankedTensorType>(
+                            operation.getResult(0).getType())
+                      : RankedTensorType();
+    auto permutation =
+        operation.getAttrOfType<ArrayAttr>("intent.permutation");
+    if (!source || !result || source.getRank() != result.getRank() ||
+        source.getElementType() != result.getElementType() || !permutation ||
+        permutation.size() != static_cast<size_t>(source.getRank()))
+      return operation.emitOpError("has no canonical tensor transpose schema");
+    SmallVector<bool> covered(source.getRank(), false);
+    for (Attribute attribute : permutation) {
+      auto axis = dyn_cast<IntegerAttr>(attribute);
+      if (!axis || axis.getInt() < 0 || axis.getInt() >= source.getRank() ||
+          covered[axis.getInt()])
+        return operation.emitOpError(
+            "transpose permutation must cover each source axis exactly once");
+      covered[axis.getInt()] = true;
+    }
+    return success();
+  }
   if (name == "intent.cast") {
     if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
       return operation.emitOpError("has no canonical cast schema");
@@ -177,7 +203,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.cast", "intent.reshape", "intent.random"})
+                         "intent.cast", "intent.reshape", "intent.transpose",
+                         "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();
