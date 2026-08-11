@@ -338,7 +338,9 @@ indexRealization(intent::plan::RealizationOp realization,
                          ? (load ? "gather" : "scatter")
                          : (load ? "load" : "store");
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer = load && value.getResultSpace() == "shared";
+    binding.defer =
+        load && target::emission::deferSharedContractionTransfer(
+                    index, *operation, value.getResultSpace());
     binding.explicitBounds =
         rowStrided || raggedBound || (!index.stages.empty() && store) ||
         *derivedScalar;

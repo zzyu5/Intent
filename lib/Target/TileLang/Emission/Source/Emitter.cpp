@@ -366,7 +366,9 @@ indexRealization(intent::plan::RealizationOp realization,
                            ? "parallel_elements"
                            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
-    binding.defer = load && value.getResultSpace() == "shared";
+    binding.defer =
+        load && target::emission::deferSharedContractionTransfer(
+                    index, *operation, value.getResultSpace());
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
         (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect;

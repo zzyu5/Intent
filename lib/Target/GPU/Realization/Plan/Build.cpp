@@ -463,27 +463,40 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
              return static_cast<int64_t>(stage.getNode()) == node.getInt();
            });
   };
-  auto nestedInStateStream = [](Operation &operation) {
-    for (Operation *parent = operation.getParentOp(); parent;
-         parent = parent->getParentOp())
-      if (parent->getName().getStringRef() == "intent.state_stream")
-        return true;
-    return false;
-  };
   auto isDirectViewLoad = [](Value value) {
     Operation *definition = value.getDefiningOp();
     return definition &&
            definition->getName().getStringRef() == "intent.view_load";
   };
+  auto isContractionDerived = [](Value value) {
+    llvm::DenseSet<Value> visited;
+    std::function<bool(Value)> reachesContraction = [&](Value current) {
+      if (!visited.insert(current).second)
+        return false;
+      Operation *definition = current.getDefiningOp();
+      if (!definition)
+        return false;
+      if (definition->getName().getStringRef() == "intent.contract")
+        return true;
+      return llvm::any_of(definition->getOperands(), [&](Value operand) {
+        return isa<RankedTensorType>(operand.getType()) &&
+               reachesContraction(operand);
+      });
+    };
+    return reachesContraction(value);
+  };
   auto sharedContractOperand =
-      [isStagedContract, nestedInStateStream,
-       isDirectViewLoad](Value operand, Operation &contract) {
+      [isStagedContract, isDirectViewLoad,
+       isContractionDerived](Value operand, Operation &contract) {
     if (!isDirectViewLoad(operand))
       return false;
     if (isStagedContract(contract))
       return true;
-    return !nestedInStateStream(contract) &&
-           llvm::all_of(contract.getOperands(), isDirectViewLoad);
+    if (llvm::all_of(contract.getOperands(), isDirectViewLoad))
+      return true;
+    return llvm::any_of(contract.getOperands(), [&](Value other) {
+      return other != operand && isContractionDerived(other);
+    });
   };
 
   auto bindTransfer = [&, sharedContractOperand](Operation &operation) -> LogicalResult {

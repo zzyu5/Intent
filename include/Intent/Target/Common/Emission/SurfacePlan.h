@@ -555,6 +555,28 @@ bool feedsStagedContraction(const PlanIndex &index, mlir::Operation &operation) 
 }
 
 template <typename PlanIndex>
+bool deferSharedContractionTransfer(const PlanIndex &index,
+                                    mlir::Operation &operation,
+                                    llvm::StringRef resultSpace) {
+  if (resultSpace != "shared" || operation.getNumResults() != 1)
+    return false;
+  for (mlir::Operation *user : operation.getResult(0).getUsers()) {
+    if (user->getName().getStringRef() != "intent.contract")
+      continue;
+    auto node = user->getAttrOfType<mlir::IntegerAttr>("intent.node");
+    auto contract = node ? index.contracts.find(node.getInt())
+                         : index.contracts.end();
+    if (contract == index.contracts.end() ||
+        contract->second.getLhsSpace() != "shared" ||
+        contract->second.getRhsSpace() != "shared")
+      continue;
+    return !index.components.groups.empty() ||
+           isStagedContraction(index, user);
+  }
+  return false;
+}
+
+template <typename PlanIndex>
 bool isAbsorbedStagedAccessMetadata(const PlanIndex &index,
                                     mlir::Operation &operation) {
   if (index.stages.empty() || operation.getNumResults() == 0)

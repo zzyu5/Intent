@@ -329,7 +329,9 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.operation = value;
     binding.access = load ? "load" : "store";
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer = load && value.getResultSpace() == "shared";
+    binding.defer =
+        load && target::emission::deferSharedContractionTransfer(
+                    index, *operation, value.getResultSpace());
     index.boundaries[value.getNode()] = binding;
   }
   if (!index.target || !index.program) {
