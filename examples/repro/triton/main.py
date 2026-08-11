@@ -36,6 +36,8 @@ from repro.common.extended import run_attention_shape_cases
 from repro.common.extended import run_gemm_tail_case
 from repro.common.extended import run_wide_attention_index_case
 from repro.common.extended import run_extended
+from repro.common.unfamiliar import UNFAMILIAR_RUNNERS
+from repro.common.unfamiliar import run_unfamiliar
 from repro.common.support import benchmark
 from repro.common.support import make_moe_routes
 from repro.common.support import moe_reference
@@ -511,7 +513,9 @@ RUNNERS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=sorted(RUNNERS | EXTENDED_RUNNERS))
+    parser.add_argument(
+        "kernel", choices=sorted(RUNNERS | EXTENDED_RUNNERS | UNFAMILIAR_RUNNERS)
+    )
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--baseline-source", type=Path)
     arguments = parser.parse_args()
@@ -521,7 +525,7 @@ def main() -> None:
         if arguments.baseline_source is None:
             parser.error("the selected upstream comparison requires --baseline-source")
         RUNNERS[arguments.kernel](arguments.compiler, arguments.baseline_source)
-    else:
+    elif arguments.kernel in EXTENDED_RUNNERS:
         upstream = (
             _load_extended_upstream(arguments.kernel, arguments.baseline_source)
             if arguments.baseline_source is not None
@@ -533,6 +537,15 @@ def main() -> None:
             intent.TritonTarget(device=0),
             "Triton",
             upstream,
+        )
+    else:
+        if arguments.baseline_source is not None:
+            parser.error("unfamiliar programs do not accept an upstream adapter")
+        run_unfamiliar(
+            arguments.kernel,
+            arguments.compiler,
+            intent.TritonTarget(device=0),
+            "Triton",
         )
 
 

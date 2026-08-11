@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|embedding_backward_atomic|atomic_compare_exchange|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|batched_row_affine|quantized_gemm|dual_gemm|weight_only_int4|conv1d|conv2d|selective_scan|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|ordered_prefix|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|matrix_transpose|boolean_reduction|value_select|record_fields|scalar_while|sorted_nucleus_cutoff|insertion_top_k>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <kernel>" >&2
   exit 2
 fi
 
@@ -28,7 +28,21 @@ case "${backend}" in
 esac
 
 baseline=
-case "${backend}:${kernel}" in
+unfamiliar=false
+case "${kernel}" in
+  histogram | csr_spmv | radix2_fft | bitonic_sort | kmeans_assign | \
+  viterbi_decode | smith_waterman | greedy_nms | roi_align | barrier_option | \
+  variant_gemm_loop_interchange | variant_softmax_online | \
+  variant_online_softmax_inline | variant_attention_inline | \
+  variant_attention_select | variant_rope_index | variant_swiglu_helper | \
+  variant_layer_norm_second_moment | variant_conv2d_reduce_order | \
+  variant_transpose_scalar_domains)
+    unfamiliar=true
+    ;;
+esac
+
+if [[ ${unfamiliar} == false ]]; then
+  case "${backend}:${kernel}" in
   triton:softmax)
     baseline=source/triton/triton/normalization/softmax/02-fused-softmax.py
     ;;
@@ -182,11 +196,12 @@ case "${backend}:${kernel}" in
     ;;
   triton:ordered_prefix | cutile:ordered_prefix | tilelang:ordered_prefix)
     ;;
-  *)
-    echo "unsupported repro: ${backend}:${kernel}" >&2
-    exit 2
-    ;;
-esac
+    *)
+      echo "unsupported repro: ${backend}:${kernel}" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 python_bin=${INTENT_PYTHON:-${default_python}}
 cmake \
