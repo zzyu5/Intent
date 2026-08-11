@@ -127,15 +127,6 @@ struct PaddingState {
              << "cannot choose one semantics-preserving padding for value; "
                 "required "
              << fill;
-    Operation *definition = value.getDefiningOp();
-    if (!definition ||
-        (definition->getName().getStringRef() != "intent.binary" &&
-         definition->getName().getStringRef() != "intent.compare" &&
-         definition->getName().getStringRef() != "intent.select" &&
-         definition->getName().getStringRef() != "intent.mask"))
-      return consumer.emitOpError(
-          "producer-fused padding requires a pointwise binary, compare, "
-          "select, or mask value");
     FailureOr<int64_t> valueID = target::getValueID(
         value, facts.kernel, consumer, "padding binding");
     if (failed(valueID))
@@ -713,9 +704,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
 
 void emitPaddings(OpBuilder &builder, ArrayRef<PaddingDecision> paddings) {
   for (const PaddingDecision &padding : paddings) {
-    Operation *definition = padding.value.getDefiningOp();
     builder.create<intent::plan::PaddingOp>(
-        definition->getLoc(), i64(builder, padding.valueID),
+        padding.value.getLoc(), i64(builder, padding.valueID),
         builder.getDenseI64ArrayAttr(padding.validity.axes),
         builder.getDenseI64ArrayAttr(padding.validity.nodes),
         string(builder, padding.fill));

@@ -562,15 +562,8 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
-    Operation *definition = value ? value.getDefiningOp() : nullptr;
-    if (!definition || definition->getNumResults() != 1 ||
-        definition->getResult(0) != value ||
-        (definition->getName().getStringRef() != "intent.binary" &&
-         definition->getName().getStringRef() != "intent.compare" &&
-         definition->getName().getStringRef() != "intent.select" &&
-         definition->getName().getStringRef() != "intent.mask"))
-      return entry.second.emitOpError(
-          "does not bind a producer-fusible pointwise value");
+    if (!value || !isa<RankedTensorType>(value.getType()))
+      return entry.second.emitOpError("does not bind a ranked tensor value");
   }
   for (const target::RegionNode &region : kernel.regions.nodes) {
     Operation *operation = region.operation;
