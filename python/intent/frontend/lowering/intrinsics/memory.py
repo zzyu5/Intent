@@ -152,12 +152,9 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
         "value_operand_index": len(operands) - 1,
     }
     if reduce:
-        element = ScalarType(destination.type.dtype)
         attributes["combine"] = _callable_symbol(
             lowerer,
             bound["combine"],
-            (element, element),
-            (element,),
         )
     attributes.update(_optional_ordering(lowerer, bound, node))
     lowerer.emit(

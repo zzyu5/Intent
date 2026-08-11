@@ -75,7 +75,6 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
             if axis not in normalized
         )
         result_type: ValueType = lowerer.value_result_type(acc_dtype, result_shape)
-        accumulator_type: ValueType = ScalarType(acc_dtype)
         attributes: dict[str, object] = {"axes": axes, "acc_dtype": acc_dtype}
     elif isinstance(source.type, RecordType):
         if "acc_dtype" in bound:
@@ -86,7 +85,6 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         if not isinstance(identity.type, RecordType):
             lowerer.error(node, "record reduce identity must be I.record(...)")
         result_type = _record_result_type(lowerer, source.type, identity.type, axes, scan=False, node=node)
-        accumulator_type = identity.type
         attributes = {"axes": axes}
     else:
         lowerer.error(node, "I.reduce input must be tensor or tensor record")
@@ -101,8 +99,6 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         combine = _callable_symbol(
             lowerer,
             bound["combine"],
-            (accumulator_type, accumulator_type),
-            (accumulator_type,),
         )
     attributes["combine"] = combine
     operation = lowerer.emit(
@@ -195,7 +191,6 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             bound["identity"],
             ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
         )
-        accumulator_type: ValueType = ScalarType(acc_dtype)
         result_type: ValueType = TensorType(acc_dtype, source.type.shape)
         attributes: dict[str, object] = {
             "axis": axes[0],
@@ -210,7 +205,6 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         )
         if not isinstance(identity.type, RecordType):
             lowerer.error(node, "record scan identity must be I.record(...)")
-        accumulator_type = identity.type
         result_type = _record_result_type(
             lowerer, source.type, identity.type, axes, scan=True, node=node
         )
@@ -220,8 +214,6 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     attributes["combine"] = _callable_symbol(
         lowerer,
         bound["combine"],
-        (accumulator_type, accumulator_type),
-        (accumulator_type,),
     )
     operation = lowerer.emit(
         OperationKind.SCAN,
@@ -271,7 +263,6 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         dimension for axis, dimension in enumerate(rhs.type.shape) if axis not in rhs_axes
     )
     acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
-    accumulator_type = ScalarType(acc_dtype)
     multiply = "multiply"
     combine = "add"
     if "multiply" in bound:
@@ -306,7 +297,7 @@ def _callable_symbol(
     expression = lowerer.lower_expression(node)
     if isinstance(expression, Intrinsic):
         return expression.name
-    lowerer.error(node, "contract combine/multiply must be an Intent intrinsic")
+    lowerer.error(node, "combine/multiply must be an Intent intrinsic")
 
 
 def _reduction_pairs(lowerer: FunctionLowerer, node: ast.AST) -> tuple[tuple[int, int], ...]:
