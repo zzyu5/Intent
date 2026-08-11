@@ -738,6 +738,13 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (binding && binding.getSpace() == "private_workspace") {
+    if (failed(info) || info->shape.size() < 2 ||
+        !workspaceNames.count(operation.getResult(0)))
+      return operation.emitOpError(
+          "lacks a planned TileLang private workspace parameter");
+    return success();
+  }
   if (failed(node) || !binding || failed(info) || info->shape.size() != 1 ||
       failed(initializer))
     return operation.emitOpError(
@@ -772,6 +779,19 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto workspace = operation.getNumOperands() > 0
+                       ? workspaceNames.find(operation.getOperand(0))
+                       : workspaceNames.end();
+  if (workspace != workspaceNames.end()) {
+    FailureOr<std::string> index = privateWorkspaceIndex(operation);
+    if (failed(index) || operation.getNumResults() != 1)
+      return operation.emitOpError(
+          "lacks a mechanical TileLang private-workspace load");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + workspace->second + "[" + *index + "]");
+    bindResult(operation, 0, result);
+    return success();
+  }
   auto local = operation.getNumOperands() > 0
                    ? localBuffers.find(operation.getOperand(0))
                    : localBuffers.end();
@@ -824,6 +844,18 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
+  auto workspace = operation.getNumOperands() > 0
+                       ? workspaceNames.find(operation.getOperand(0))
+                       : workspaceNames.end();
+  if (workspace != workspaceNames.end()) {
+    FailureOr<std::string> index = privateWorkspaceIndex(operation);
+    FailureOr<StringRef> stored = lookupValue(operation, 1);
+    if (failed(index) || failed(stored))
+      return operation.emitOpError(
+          "lacks a mechanical TileLang private-workspace store");
+    line(workspace->second + "[" + *index + "] = " + stored->str());
+    return success();
+  }
   auto local = operation.getNumOperands() > 0
                    ? localBuffers.find(operation.getOperand(0))
                    : localBuffers.end();
@@ -866,6 +898,61 @@ LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
          std::to_string(position) + ", " + stored->str() + ", " + element +
          ")");
   return success();
+}
+
+FailureOr<std::string>
+SourceEmitter::privateWorkspaceIndex(Operation &operation) {
+  Operation *buffer = operation.getNumOperands() > 0
+                          ? operation.getOperand(0).getDefiningOp()
+                          : nullptr;
+  FailureOr<int64_t> node =
+      buffer ? target::getNodeID(*buffer, "private-workspace access")
+             : FailureOr<int64_t>(failure());
+  plan::BufferOp binding =
+      succeeded(node) ? planIndex.buffers.lookup(*node) : plan::BufferOp();
+  FailureOr<target::LogicalBufferInfo> info =
+      buffer ? target::getLogicalBufferInfo(*buffer)
+             : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> indices =
+      succeeded(info)
+          ? target::getLogicalBufferIndices(operation, info->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
+  if (failed(node) || !binding || binding.getSpace() != "private_workspace" ||
+      failed(info) || failed(indices))
+    return operation.emitOpError(
+        "does not resolve a planned TileLang private workspace");
+
+  std::string offset;
+  auto append = [&](StringRef index, StringRef extent) {
+    offset = offset.empty() ? index.str()
+                            : "(" + offset + ") * (" + extent.str() + ") + (" +
+                                  index.str() + ")";
+  };
+  for (int64_t owner : binding.getOwnerNodes()) {
+    plan::AxisOp axis = planIndex.axes.lookup(owner);
+    std::string index = axisIndices.lookup(owner);
+    std::string extent =
+        axis ? roleDimensions.lookup("program_" +
+                                     std::to_string(axis.getProgramOrder()))
+             : std::string();
+    if (!axis || index.empty() || extent.empty())
+      return operation.emitOpError(
+          "has no active TileLang private-workspace owner index");
+    append(index, extent);
+  }
+  for (auto [axis, index] : llvm::enumerate(*indices)) {
+    std::string spelling;
+    if (index.constant)
+      spelling = std::to_string(*index.constant);
+    else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
+      if (failed(dynamic))
+        return failure();
+      spelling = dynamic->str();
+    }
+    append(spelling, std::to_string(info->shape[axis]));
+  }
+  return addressIndex(offset);
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {

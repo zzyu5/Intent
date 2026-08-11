@@ -93,7 +93,11 @@ def IntentPlan_BlockExtentOp : IntentPlan_Op<"block_extent"> {
 }
 
 def IntentPlan_BufferOp : IntentPlan_Op<"buffer"> {
-  let arguments = (ins I64Attr:$node, StrAttr:$space);
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$space,
+    DenseI64ArrayAttr:$owner_nodes
+  );
   let results = (outs);
   let hasVerifier = 1;
 }

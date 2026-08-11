@@ -146,6 +146,7 @@ private:
 
   mlir::LogicalResult indexABI();
   mlir::LogicalResult resolvePhysicalBindings();
+  mlir::LogicalResult preparePrivateWorkspaces();
   mlir::LogicalResult emitConditional(mlir::Operation &operation, bool mask);
   void emitImports() override;
   mlir::LogicalResult emitKernelHeader() override;
@@ -165,6 +166,8 @@ private:
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation);
+  mlir::FailureOr<std::string>
+  privateWorkspaceIndex(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   elementAccessIndices(mlir::Operation &operation,
                        llvm::ArrayRef<std::string> tileIndices);
@@ -243,6 +246,7 @@ private:
       operationStages;
   llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;
   llvm::DenseMap<mlir::Value, std::string> workspaceNames;
+  llvm::SmallVector<mlir::Operation *> privateWorkspaceBuffers;
   llvm::SmallVector<std::string> stageBodies;
   llvm::SmallVector<unsigned> activeStages;
   llvm::DenseMap<unsigned, std::string> stageFeatureDimensions;

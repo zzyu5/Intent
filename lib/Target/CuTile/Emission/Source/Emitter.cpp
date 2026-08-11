@@ -204,7 +204,8 @@ indexRealization(intent::plan::RealizationOp realization,
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
-           value.getSpace() != "local_array"))
+           value.getSpace() != "local_array" &&
+           value.getSpace() != "private_workspace"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
       binding.operation = value;
@@ -409,8 +410,53 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(preparePrivateWorkspaces()))
+    return failure();
   if (!planIndex.stages.empty())
     return prepareRaggedStages();
+  return success();
+}
+
+LogicalResult SourceEmitter::preparePrivateWorkspaces() {
+  if (planIndex.program.getPersistent() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "persistent cuTile programs cannot preserve owner-private workspaces");
+  if (!planIndex.stages.empty() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "staged cuTile programs cannot share a logical private workspace");
+
+  SmallVector<int64_t> nodes;
+  for (const auto &entry : planIndex.buffers)
+    if (entry.second.getSpace() == "private_workspace")
+      nodes.push_back(entry.first);
+  llvm::sort(nodes);
+  for (int64_t node : nodes) {
+    plan::BufferOp binding = planIndex.buffers.lookup(node);
+    Operation *buffer = kernel.nodes.lookup(node);
+    FailureOr<target::LogicalBufferInfo> info =
+        buffer ? target::getLogicalBufferInfo(*buffer)
+               : FailureOr<target::LogicalBufferInfo>(failure());
+    if (!buffer || failed(info) || info->shape.size() < 2 ||
+        buffer->getNumResults() != 1)
+      return binding.emitOpError(
+          "does not bind a multidimensional logical workspace");
+    for (int64_t owner : binding.getOwnerNodes()) {
+      plan::AxisOp axis = planIndex.axes.lookup(owner);
+      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
+          axis.getReuseWorker() || axis.getGroupAttr())
+        return binding.emitOpError(
+            "cuTile private workspace requires scalar unreused program owners");
+    }
+    workspaceNames[buffer->getResult(0)] =
+        "workspace_" + std::to_string(node);
+    privateWorkspaceBuffers.push_back(buffer);
+  }
   return success();
 }
 
@@ -957,6 +1003,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
     emitParameter(scalar.name + ": " + annotation.str());
   }
+  for (Operation *buffer : privateWorkspaceBuffers)
+    emitParameter(workspaceNames.lookup(buffer->getResult(0)));
   if (!planIndex.components.reusedAxes.empty()) {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
@@ -1013,6 +1061,26 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       output << "    " << physicalExtent << " = 1 << (" << logicalExtent
              << " - 1).bit_length()\n";
+  };
+  auto emitPrivateWorkspaceAllocations = [&]() -> LogicalResult {
+    for (Operation *buffer : privateWorkspaceBuffers) {
+      FailureOr<std::string> size =
+          target::emission::privateWorkspaceElementCount(
+              *buffer, planIndex, roleDimensions);
+      FailureOr<std::string> initializer =
+          target::emission::logicalBufferPythonInitializer(*buffer);
+      FailureOr<target::LogicalBufferInfo> info =
+          target::getLogicalBufferInfo(*buffer);
+      StringRef dtype =
+          succeeded(info) ? torchDtype(info->elementType) : StringRef();
+      if (failed(size) || failed(initializer) || failed(info) || dtype.empty())
+        return buffer->emitOpError(
+            "has no supported cuTile private-workspace allocation");
+      output << "    " << workspaceNames.lookup(buffer->getResult(0))
+             << " = torch.full((" << *size << ",), " << *initializer
+             << ", device=_DEVICE, dtype=" << dtype << ")\n";
+    }
+    return success();
   };
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
@@ -1465,6 +1533,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
+  if (failed(emitPrivateWorkspaceAllocations()))
+    return failure();
   output << "    stream = torch.cuda.current_stream()\n";
   if (!searchIndex.autotune) {
     SmallVector<plan::AxisOp> axes =
@@ -1487,6 +1557,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << view.argument->name << ", ";
     for (ABIScalar &scalar : scalars)
       output << scalar.name << ", ";
+    for (Operation *buffer : privateWorkspaceBuffers)
+      output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
@@ -1571,6 +1643,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << view.argument->name << ", ";
     for (ABIScalar &scalar : scalars)
       output << scalar.name << ", ";
+    for (Operation *buffer : privateWorkspaceBuffers)
+      output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
@@ -1621,6 +1695,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << view.argument->name << ", ";
     for (ABIScalar &scalar : scalars)
       output << scalar.name << ", ";
+    for (Operation *buffer : privateWorkspaceBuffers)
+      output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)

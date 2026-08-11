@@ -53,6 +53,8 @@ def viterbi_decode(
         path[batch, TIME_STEPS - 1] = best_state
         time = TIME_STEPS - 1
         while time > 0:
+            I.assume_in_bounds(time, predecessors, axis=0)
+            I.assume_in_bounds(best_state, predecessors, axis=1)
             best_state = I.mutable_load(predecessors, (time, best_state))
             path[batch, time - 1] = best_state
             time = time - 1

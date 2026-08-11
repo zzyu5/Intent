@@ -195,8 +195,16 @@ LogicalResult BufferOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
   if (getSpace() != "private_scalar_array" &&
-      getSpace() != "private_vector" && getSpace() != "local_array")
+      getSpace() != "private_vector" && getSpace() != "local_array" &&
+      getSpace() != "private_workspace")
     return emitOpError("has an unsupported logical-buffer residency");
+  if (getSpace() == "private_workspace" && getOwnerNodes().empty())
+    return emitOpError("private workspace requires explicit program owners");
+  if (getSpace() != "private_workspace" && !getOwnerNodes().empty())
+    return emitOpError("kernel-local buffer cannot carry workspace owners");
+  for (int64_t owner : getOwnerNodes())
+    if (failed(requireNode(*this, owner)))
+      return failure();
   return success();
 }
 
@@ -356,6 +364,12 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<BufferOp>(operation)) {
       if (!buffers.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a logical-buffer decision");
+      for (int64_t owner : binding.getOwnerNodes()) {
+        auto axis = axes.find(owner);
+        if (axis == axes.end() || !axisHasRole(axis->second, "parallel"))
+          return binding.emitOpError(
+              "workspace owner is not a program ownership axis");
+      }
     } else if (auto binding = dyn_cast<PaddingOp>(operation)) {
       if (!paddedValues.insert(binding.getValue()).second)
         return binding.emitOpError("duplicates a value padding decision");

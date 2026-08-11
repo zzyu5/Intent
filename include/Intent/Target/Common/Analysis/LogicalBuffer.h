@@ -56,23 +56,42 @@ getLogicalBufferInfo(mlir::Operation &operation) {
   return result;
 }
 
-inline mlir::FailureOr<LogicalBufferIndex>
-getLogicalBufferIndex(mlir::Operation &operation) {
+inline mlir::FailureOr<llvm::SmallVector<LogicalBufferIndex>>
+getLogicalBufferIndices(mlir::Operation &operation, size_t expectedRank) {
   mlir::FailureOr<llvm::SmallVector<IndexTerm>> relation =
       parseIndexRelation(operation);
-  if (mlir::failed(relation) || relation->size() != 1)
+  if (mlir::failed(relation) || relation->size() != expectedRank)
     return operation.emitOpError(
-        "private logical buffer requires one scalar index");
-  const IndexTerm &term = relation->front();
-  if (term.kind == "value_index" && term.operands.size() == 1 &&
-      term.operands.front() &&
-      *term.operands.front() < operation.getNumOperands())
-    return LogicalBufferIndex{*term.operands.front(), std::nullopt};
-  if (term.kind == "static_index" && term.staticValues.size() == 1 &&
-      term.staticValues.front().has_value())
-    return LogicalBufferIndex{std::nullopt, *term.staticValues.front()};
-  return operation.emitOpError(
-      "private logical buffer index is not canonical");
+        "private logical buffer index rank does not match its shape");
+  llvm::SmallVector<LogicalBufferIndex> result;
+  result.reserve(relation->size());
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "value_index" && term.operands.size() == 1 &&
+        term.operands.front() &&
+        *term.operands.front() < operation.getNumOperands()) {
+      result.push_back(
+          LogicalBufferIndex{*term.operands.front(), std::nullopt});
+      continue;
+    }
+    if (term.kind == "static_index" && term.staticValues.size() == 1 &&
+        term.staticValues.front().has_value()) {
+      result.push_back(
+          LogicalBufferIndex{std::nullopt, *term.staticValues.front()});
+      continue;
+    }
+    return operation.emitOpError(
+        "private logical buffer index is not canonical");
+  }
+  return result;
+}
+
+inline mlir::FailureOr<LogicalBufferIndex>
+getLogicalBufferIndex(mlir::Operation &operation) {
+  mlir::FailureOr<llvm::SmallVector<LogicalBufferIndex>> indices =
+      getLogicalBufferIndices(operation, 1);
+  if (mlir::failed(indices))
+    return mlir::failure();
+  return indices->front();
 }
 
 } // namespace intent::target

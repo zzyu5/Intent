@@ -458,14 +458,32 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   "has no canonical private logical-buffer facts");
             const target::LogicalBufferFact &buffer =
                 facts.logicalBuffers.lookup(&operation);
-            StringRef space = buffer.requiresAddressableStorage
+            bool workspace = buffer.info.shape.size() > 1;
+            StringRef space = workspace
+                                  ? StringRef("private_workspace")
+                              : buffer.requiresAddressableStorage
                                   ? "local_array"
                               : buffer.hasDynamicAccess &&
                                         buffer.info.elementType.isInteger(1)
                                   ? "private_vector"
                                   : "private_scalar_array";
+            SmallVector<int64_t> ownerNodes;
+            if (workspace) {
+              auto domains = facts.parallelDomains.find(buffer.owner);
+              if (domains == facts.parallelDomains.end() || domains->second.empty())
+                return operation.emitOpError(
+                    "private workspace has no physical program owners");
+              for (Operation *domain : domains->second) {
+                FailureOr<int64_t> owner =
+                    target::getNodeID(*domain, "private-workspace owner");
+                if (failed(owner))
+                  return failure();
+                ownerNodes.push_back(*owner);
+              }
+            }
             builder.create<intent::plan::BufferOp>(
-                operation.getLoc(), i64(builder, *node), string(builder, space));
+                operation.getLoc(), i64(builder, *node), string(builder, space),
+                builder.getDenseI64ArrayAttr(ownerNodes));
             return success();
           })))
     return failure();

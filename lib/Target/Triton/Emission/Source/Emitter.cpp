@@ -220,7 +220,8 @@ indexRealization(intent::plan::RealizationOp realization,
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
-           value.getSpace() != "local_array"))
+           value.getSpace() != "local_array" &&
+           value.getSpace() != "private_workspace"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
       binding.operation = value;
@@ -400,8 +401,53 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(preparePrivateWorkspaces()))
+    return failure();
   if (!planIndex.stages.empty())
     return prepareRaggedStages();
+  return success();
+}
+
+LogicalResult SourceEmitter::preparePrivateWorkspaces() {
+  if (planIndex.program.getPersistent() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "persistent Triton programs cannot preserve owner-private workspaces");
+  if (!planIndex.stages.empty() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "staged Triton programs cannot share a logical private workspace");
+
+  SmallVector<int64_t> nodes;
+  for (const auto &entry : planIndex.buffers)
+    if (entry.second.getSpace() == "private_workspace")
+      nodes.push_back(entry.first);
+  llvm::sort(nodes);
+  for (int64_t node : nodes) {
+    plan::BufferOp binding = planIndex.buffers.lookup(node);
+    Operation *buffer = kernel.nodes.lookup(node);
+    FailureOr<target::LogicalBufferInfo> info =
+        buffer ? target::getLogicalBufferInfo(*buffer)
+               : FailureOr<target::LogicalBufferInfo>(failure());
+    if (!buffer || failed(info) || info->shape.size() < 2 ||
+        buffer->getNumResults() != 1)
+      return binding.emitOpError(
+          "does not bind a multidimensional logical workspace");
+    for (int64_t owner : binding.getOwnerNodes()) {
+      plan::AxisOp axis = planIndex.axes.lookup(owner);
+      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
+          axis.getReuseWorker() || axis.getGroupAttr())
+        return binding.emitOpError(
+            "Triton private workspace requires scalar unreused program owners");
+    }
+    workspaceNames[buffer->getResult(0)] =
+        "workspace_" + std::to_string(node) + "_ptr";
+    privateWorkspaceBuffers.push_back(buffer);
+  }
   return success();
 }
 
@@ -968,6 +1014,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     emitParameter(view.pointer);
   for (ABIScalar &scalar : scalars)
     emitParameter(scalar.name);
+  for (Operation *buffer : privateWorkspaceBuffers)
+    emitParameter(workspaceNames.lookup(buffer->getResult(0)));
   for (const std::string &dimension : dimensionOrder) {
     bool physicalDimension = llvm::any_of(
         roleDimensions,
@@ -993,6 +1041,27 @@ LogicalResult SourceEmitter::emitWrapper() {
            << view.argument->name << ".shape):\n";
     output << "        raise NotImplementedError('Triton does not support "
               "zero-extent external views in this compiler')\n";
+  };
+  auto emitPrivateWorkspaceAllocations = [&]() -> LogicalResult {
+    for (Operation *buffer : privateWorkspaceBuffers) {
+      FailureOr<std::string> size =
+          target::emission::privateWorkspaceElementCount(
+              *buffer, planIndex, roleDimensions);
+      FailureOr<std::string> initializer =
+          target::emission::logicalBufferPythonInitializer(*buffer);
+      FailureOr<target::LogicalBufferInfo> info =
+          target::getLogicalBufferInfo(*buffer);
+      StringRef dtype =
+          succeeded(info) ? torchDtype(info->elementType) : StringRef();
+      if (failed(size) || failed(initializer) || failed(info) || dtype.empty())
+        return buffer->emitOpError(
+            "has no supported Triton private-workspace allocation");
+      output << "    " << workspaceNames.lookup(buffer->getResult(0))
+             << " = torch.full((" << *size
+             << ",), " << *initializer << ", device=_DEVICE, dtype=" << dtype
+             << ")\n";
+    }
+    return success();
   };
   if (!planIndex.stages.empty()) {
     for (const std::string &body : stageBodies)
@@ -1447,6 +1516,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
+  if (failed(emitPrivateWorkspaceAllocations()))
+    return failure();
   SmallVector<plan::AxisOp> programAxes =
       target::emission::orderedProgramAxes(planIndex);
   for (plan::AxisOp axis : programAxes) {
@@ -1506,6 +1577,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     emitArgument(view.argument->name);
   for (ABIScalar &scalar : scalars)
     emitArgument(scalar.name);
+  for (Operation *buffer : privateWorkspaceBuffers)
+    emitArgument(workspaceNames.lookup(buffer->getResult(0)));
   for (const std::string &dimension : dimensionOrder)
     emitArgument(dimension);
   for (ABIView &view : views)

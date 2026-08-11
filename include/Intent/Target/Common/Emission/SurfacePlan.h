@@ -4,8 +4,12 @@
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
+#include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <optional>
 #include <array>
@@ -432,7 +436,72 @@ mlir::FailureOr<std::string> transferPhysicalExtentFill(
 struct BufferBinding : Binding<intent::plan::BufferOp> {
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getSpace() const { return operation.getSpace(); }
+  llvm::ArrayRef<int64_t> getOwnerNodes() const {
+    return operation.getOwnerNodes();
+  }
 };
+
+template <typename PlanIndex>
+inline mlir::FailureOr<std::string> privateWorkspaceElementCount(
+    mlir::Operation &buffer, const PlanIndex &index,
+    const llvm::StringMap<std::string> &roleDimensions) {
+  mlir::FailureOr<int64_t> node =
+      target::getNodeID(buffer, "private-workspace allocation");
+  auto binding = mlir::succeeded(node) ? index.buffers.find(*node)
+                                       : index.buffers.end();
+  mlir::FailureOr<target::LogicalBufferInfo> info =
+      target::getLogicalBufferInfo(buffer);
+  if (mlir::failed(node) || binding == index.buffers.end() ||
+      binding->second.getSpace() != "private_workspace" || mlir::failed(info))
+    return buffer.emitOpError("has no planned private-workspace allocation");
+
+  std::string size;
+  auto append = [&](llvm::StringRef extent) {
+    size = size.empty() ? extent.str() : size + " * " + extent.str();
+  };
+  for (int64_t owner : binding->second.getOwnerNodes()) {
+    auto axis = index.axes.find(owner);
+    std::string extent =
+        axis == index.axes.end()
+            ? std::string()
+            : roleDimensions.lookup(
+                  "program_" + std::to_string(axis->second.getProgramOrder()));
+    if (axis == index.axes.end() || extent.empty())
+      return buffer.emitOpError("has no private-workspace owner extent");
+    append(extent);
+  }
+  for (int64_t extent : info->shape)
+    append(std::to_string(extent));
+  return size;
+}
+
+inline mlir::FailureOr<std::string>
+logicalBufferPythonInitializer(mlir::Operation &buffer) {
+  mlir::Operation *constant = buffer.getNumOperands() == 1
+                                  ? buffer.getOperand(0).getDefiningOp()
+                                  : nullptr;
+  if (!constant ||
+      constant->getName().getStringRef() != "intent.constant")
+    return buffer.emitOpError(
+        "private workspace initializer must be a scalar constant");
+  if (auto integer =
+          constant->getAttrOfType<mlir::IntegerAttr>("intent.value"))
+    return std::to_string(integer.getInt());
+  auto floating =
+      constant->getAttrOfType<mlir::FloatAttr>("intent.value");
+  if (!floating)
+    return buffer.emitOpError(
+        "private workspace initializer has no scalar constant value");
+  const llvm::APFloat &value = floating.getValue();
+  if (value.isNaN())
+    return std::string("float('nan')");
+  if (value.isInfinity())
+    return value.isNegative() ? std::string("-float('inf')")
+                              : std::string("float('inf')");
+  llvm::SmallString<32> spelling;
+  value.toString(spelling);
+  return spelling.str().str();
+}
 
 struct PaddingBinding : Binding<intent::plan::PaddingOp> {
   int64_t getValue() const { return operation.getValue(); }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import inspect
+from types import FunctionType
 
 import torch
 
@@ -83,6 +84,8 @@ def prepare_kernel_call(
     launch_arguments.update(zip(output_names, output_values))
     ordered = tuple(launch_arguments[name] for name in launch_parameters)
     compiled = artifact._launcher(*ordered)
+    if isinstance(compiled, FunctionType):
+        return compiled
     if callable(compiled):
         return lambda: compiled(*ordered)
     return lambda: artifact._launcher(*ordered)

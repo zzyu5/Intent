@@ -1211,10 +1211,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.buffer", [&](Operation &operation) -> LogicalResult {
             FailureOr<LogicalBufferInfo> info = getLogicalBufferInfo(operation);
             Operation *owner = nearestParallelOwner(operation);
-            if (failed(info) || !owner || operation.getParentOp() != owner ||
-                info->shape.size() != 1)
+            if (failed(info) || !owner || operation.getParentOp() != owner)
               return operation.emitOpError(
-                  "private logical buffer must be a rank-one direct child of one parallel owner");
+                  "private logical buffer must be a direct child of one parallel owner");
             facts.logicalBuffers[&operation] =
                 LogicalBufferFact{owner, std::move(*info)};
             return success();
@@ -1228,61 +1227,56 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     auto found = facts.logicalBuffers.find(buffer);
     FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
     if (found == facts.logicalBuffers.end() || failed(relation) ||
-        relation->size() != 1 ||
-        ((*relation)[0].kind != "value_index" &&
-         (*relation)[0].kind != "static_index") ||
+        relation->size() != found->second.info.shape.size() ||
         nearestParallelOwner(operation) != found->second.owner)
       return operation.emitOpError(
-          "private logical buffer access must use one scalar index under its owner");
-    if ((*relation)[0].kind == "value_index" &&
-        ((*relation)[0].operands.size() != 1 ||
-         !(*relation)[0].operands.front()))
-      return operation.emitOpError(
-          "private logical buffer dynamic index is not canonical");
-    if ((*relation)[0].kind == "value_index") {
-      found->second.hasDynamicAccess = true;
-      unsigned operandIndex = *(*relation)[0].operands.front();
-      auto iterator = operandIndex < operation.getNumOperands()
-                          ? dyn_cast<BlockArgument>(
-                                operation.getOperand(operandIndex))
-                          : BlockArgument();
-      if (operandIndex >= operation.getNumOperands())
-        return operation.emitOpError(
-            "private logical buffer index references a missing operand");
-      Value indexed = operation.getOperand(operandIndex);
-      Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
-      Operation *domain =
-          loop && loop->getName().getStringRef() == "intent.for" &&
-                  iterator.getArgNumber() == 0 && loop->getNumOperands() > 0
-              ? loop->getOperand(0).getDefiningOp()
-              : nullptr;
-      std::optional<std::pair<int64_t, int64_t>> iteratorRange =
-          sequentialDomainRange(domain, facts, operation);
-      bool boundedIterator =
-          iteratorRange && iteratorRange->first >= 0 &&
-          iteratorRange->second < found->second.info.shape.front();
-      llvm::DenseSet<Value> active;
-      std::optional<AffineIndexExpression> expression =
-          affineIndexExpression(indexed, facts, operation, active);
-      std::optional<std::pair<int64_t, int64_t>> range =
-          expression ? staticAffineRange(*expression, facts) : std::nullopt;
-      bool boundedExpression =
-          range && range->first >= 0 &&
-          range->second < found->second.info.shape.front();
-      if (!boundedIterator && !boundedExpression) {
-        if (!hasInBoundsPrecondition(indexed, operation.getOperand(0), 0,
-                                     operation))
+          "private logical buffer access rank does not match its owner buffer");
+    for (auto [axis, term] : llvm::enumerate(*relation)) {
+      int64_t extent = found->second.info.shape[axis];
+      if (term.kind == "value_index") {
+        if (term.operands.size() != 1 || !term.operands.front())
           return operation.emitOpError(
-              "private logical buffer dynamic index requires a bounded iterator or preceding in-bounds declaration");
-        found->second.requiresAddressableStorage = true;
+              "private logical buffer dynamic index is not canonical");
+        found->second.hasDynamicAccess = true;
+        unsigned operandIndex = *term.operands.front();
+        if (operandIndex >= operation.getNumOperands())
+          return operation.emitOpError(
+              "private logical buffer index references a missing operand");
+        Value indexed = operation.getOperand(operandIndex);
+        auto iterator = dyn_cast<BlockArgument>(indexed);
+        Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
+        Operation *domain =
+            loop && loop->getName().getStringRef() == "intent.for" &&
+                    iterator.getArgNumber() == 0 && loop->getNumOperands() > 0
+                ? loop->getOperand(0).getDefiningOp()
+                : nullptr;
+        std::optional<std::pair<int64_t, int64_t>> iteratorRange =
+            sequentialDomainRange(domain, facts, operation);
+        bool boundedIterator = iteratorRange && iteratorRange->first >= 0 &&
+                               iteratorRange->second < extent;
+        llvm::DenseSet<Value> active;
+        std::optional<AffineIndexExpression> expression =
+            affineIndexExpression(indexed, facts, operation, active);
+        std::optional<std::pair<int64_t, int64_t>> range =
+            expression ? staticAffineRange(*expression, facts) : std::nullopt;
+        bool boundedExpression =
+            range && range->first >= 0 && range->second < extent;
+        if (!boundedIterator && !boundedExpression &&
+            !hasInBoundsPrecondition(indexed, operation.getOperand(0), axis,
+                                     operation))
+          return operation.emitOpError()
+                 << "private logical buffer dynamic index for axis " << axis
+                 << " requires a bounded iterator or preceding in-bounds declaration";
+        if (!boundedIterator && !boundedExpression)
+          found->second.requiresAddressableStorage = true;
+        continue;
       }
-    } else {
-      std::optional<int64_t> index = (*relation)[0].staticValues.size() == 1
-                                         ? (*relation)[0].staticValues.front()
-                                         : std::nullopt;
-      if (!index || *index < 0 || *index >= found->second.info.shape.front())
-        return operation.emitOpError(
-            "private logical buffer static index is outside its extent");
+      if (term.kind != "static_index" || term.staticValues.size() != 1 ||
+          !term.staticValues.front() || *term.staticValues.front() < 0 ||
+          *term.staticValues.front() >= extent)
+        return operation.emitOpError()
+               << "private logical buffer static index for axis " << axis
+               << " is outside its extent";
     }
     bool load = operation.getName().getStringRef() == "intent.buffer_load";
     if (load &&

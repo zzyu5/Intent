@@ -838,6 +838,13 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (binding && binding.getSpace() == "private_workspace") {
+    if (failed(info) || info->shape.size() < 2 ||
+        !workspaceNames.count(operation.getResult(0)))
+      return operation.emitOpError(
+          "lacks a planned Triton private workspace parameter");
+    return success();
+  }
   if (binding && binding.getSpace() == "private_vector") {
     if (failed(info) || info->shape.size() != 1 || failed(initializer) ||
         !info->elementType.isInteger(1))
@@ -871,6 +878,19 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto workspace = operation.getNumOperands() > 0
+                       ? workspaceNames.find(operation.getOperand(0))
+                       : workspaceNames.end();
+  if (workspace != workspaceNames.end()) {
+    FailureOr<std::string> pointer = privateWorkspacePointer(operation);
+    if (failed(pointer) || operation.getNumResults() != 1)
+      return operation.emitOpError(
+          "lacks a mechanical Triton private-workspace load");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.load(" + *pointer + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
@@ -925,6 +945,18 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
+  auto workspace = operation.getNumOperands() > 0
+                       ? workspaceNames.find(operation.getOperand(0))
+                       : workspaceNames.end();
+  if (workspace != workspaceNames.end()) {
+    FailureOr<std::string> pointer = privateWorkspacePointer(operation);
+    FailureOr<StringRef> stored = lookupValue(operation, 1);
+    if (failed(pointer) || failed(stored))
+      return operation.emitOpError(
+          "lacks a mechanical Triton private-workspace store");
+    line("tl.store(" + *pointer + ", " + stored->str() + ")");
+    return success();
+  }
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
@@ -969,6 +1001,64 @@ LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
          std::to_string(position) + ", " + stored->str() + ", " + element +
          ")");
   return success();
+}
+
+FailureOr<std::string>
+SourceEmitter::privateWorkspacePointer(Operation &operation) {
+  Operation *buffer = operation.getNumOperands() > 0
+                          ? operation.getOperand(0).getDefiningOp()
+                          : nullptr;
+  FailureOr<int64_t> node =
+      buffer ? target::getNodeID(*buffer, "private-workspace access")
+             : FailureOr<int64_t>(failure());
+  plan::BufferOp binding =
+      succeeded(node) ? planIndex.buffers.lookup(*node) : plan::BufferOp();
+  FailureOr<target::LogicalBufferInfo> info =
+      buffer ? target::getLogicalBufferInfo(*buffer)
+             : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> indices =
+      succeeded(info)
+          ? target::getLogicalBufferIndices(operation, info->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
+  auto workspace = buffer && buffer->getNumResults() == 1
+                       ? workspaceNames.find(buffer->getResult(0))
+                       : workspaceNames.end();
+  if (failed(node) || !binding || binding.getSpace() != "private_workspace" ||
+      failed(info) || failed(indices) || workspace == workspaceNames.end())
+    return operation.emitOpError(
+        "does not resolve a planned Triton private workspace");
+
+  std::string offset;
+  auto append = [&](StringRef index, StringRef extent) {
+    offset = offset.empty() ? index.str()
+                            : "(" + offset + ") * (" + extent.str() + ") + (" +
+                                  index.str() + ")";
+  };
+  for (int64_t owner : binding.getOwnerNodes()) {
+    plan::AxisOp axis = planIndex.axes.lookup(owner);
+    std::string index = axisIndices.lookup(owner);
+    std::string extent =
+        axis ? roleDimensions.lookup("program_" +
+                                     std::to_string(axis.getProgramOrder()))
+             : std::string();
+    if (!axis || index.empty() || extent.empty())
+      return operation.emitOpError(
+          "has no active Triton private-workspace owner index");
+    append(index, extent);
+  }
+  for (auto [axis, index] : llvm::enumerate(*indices)) {
+    std::string spelling;
+    if (index.constant)
+      spelling = std::to_string(*index.constant);
+    else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
+      if (failed(dynamic))
+        return failure();
+      spelling = dynamic->str();
+    }
+    append(spelling, std::to_string(info->shape[axis]));
+  }
+  return workspace->second + " + " + addressIndex(offset);
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {

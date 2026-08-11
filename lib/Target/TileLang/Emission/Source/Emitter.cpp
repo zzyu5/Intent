@@ -235,7 +235,8 @@ indexRealization(intent::plan::RealizationOp realization,
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
-           value.getSpace() != "local_array"))
+           value.getSpace() != "local_array" &&
+           value.getSpace() != "private_workspace"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
       binding.operation = value;
@@ -455,8 +456,53 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(preparePrivateWorkspaces()))
+    return failure();
   if (!planIndex.stages.empty())
     return prepareRaggedStages();
+  return success();
+}
+
+LogicalResult SourceEmitter::preparePrivateWorkspaces() {
+  if (planIndex.program.getPersistent() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "persistent TileLang programs cannot preserve owner-private workspaces");
+  if (!planIndex.stages.empty() &&
+      llvm::any_of(planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "private_workspace";
+      }))
+    return realization.emitOpError(
+        "staged TileLang programs cannot share a logical private workspace");
+
+  SmallVector<int64_t> nodes;
+  for (const auto &entry : planIndex.buffers)
+    if (entry.second.getSpace() == "private_workspace")
+      nodes.push_back(entry.first);
+  llvm::sort(nodes);
+  for (int64_t node : nodes) {
+    plan::BufferOp binding = planIndex.buffers.lookup(node);
+    Operation *buffer = kernel.nodes.lookup(node);
+    FailureOr<target::LogicalBufferInfo> info =
+        buffer ? target::getLogicalBufferInfo(*buffer)
+               : FailureOr<target::LogicalBufferInfo>(failure());
+    if (!buffer || failed(info) || info->shape.size() < 2 ||
+        buffer->getNumResults() != 1)
+      return binding.emitOpError(
+          "does not bind a multidimensional logical workspace");
+    for (int64_t owner : binding.getOwnerNodes()) {
+      plan::AxisOp axis = planIndex.axes.lookup(owner);
+      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
+          axis.getReuseWorker() || axis.getGroupAttr())
+        return binding.emitOpError(
+            "TileLang private workspace requires scalar unreused program owners");
+    }
+    workspaceNames[buffer->getResult(0)] =
+        "workspace_" + std::to_string(node);
+    privateWorkspaceBuffers.push_back(buffer);
+  }
   return success();
 }
 
@@ -874,6 +920,21 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         return failure();
       parameter(scalar.name + ": " + dtype);
     }
+    for (Operation *buffer : privateWorkspaceBuffers) {
+      FailureOr<std::string> size =
+          target::emission::privateWorkspaceElementCount(
+              *buffer, planIndex, roleDimensions);
+      FailureOr<target::LogicalBufferInfo> info =
+          target::getLogicalBufferInfo(*buffer);
+      std::string dtype = succeeded(info)
+                              ? dtypeName(info->elementType, *buffer)
+                              : std::string();
+      if (failed(size) || failed(info) || dtype.empty())
+        return buffer->emitOpError(
+            "has no supported TileLang private-workspace parameter");
+      parameter(workspaceNames.lookup(buffer->getResult(0)) +
+                ": T.Tensor((" + *size + ",), " + dtype + ")");
+    }
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
         Value value = kernel.values.lookup(valueID);
@@ -1239,6 +1300,26 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     return success();
   };
+  auto emitPrivateWorkspaceAllocations = [&]() -> LogicalResult {
+    for (Operation *buffer : privateWorkspaceBuffers) {
+      FailureOr<std::string> size =
+          target::emission::privateWorkspaceElementCount(
+              *buffer, planIndex, roleDimensions);
+      FailureOr<std::string> initializer =
+          target::emission::logicalBufferPythonInitializer(*buffer);
+      FailureOr<target::LogicalBufferInfo> info =
+          target::getLogicalBufferInfo(*buffer);
+      StringRef dtype =
+          succeeded(info) ? torchDtype(info->elementType) : StringRef();
+      if (failed(size) || failed(initializer) || failed(info) || dtype.empty())
+        return buffer->emitOpError(
+            "has no supported TileLang private-workspace allocation");
+      output << "    " << workspaceNames.lookup(buffer->getResult(0))
+             << " = torch.full((" << *size << ",), " << *initializer
+             << ", device=_DEVICE, dtype=" << dtype << ")\n";
+    }
+    return success();
+  };
   auto emitLaunchSignature = [&]() {
     bool first = true;
     for (ABIView &view : views) {
@@ -1269,6 +1350,12 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (!first)
         output << ", ";
       output << scalar.name;
+      first = false;
+    }
+    for (Operation *buffer : privateWorkspaceBuffers) {
+      if (!first)
+        output << ", ";
+      output << workspaceNames.lookup(buffer->getResult(0));
       first = false;
     }
     for (plan::StageOp stage : planIndex.stages)
@@ -1315,6 +1402,8 @@ LogicalResult SourceEmitter::emitWrapper() {
   emitLaunchSignature();
   output << "):\n";
   if (failed(emitValidation()))
+    return failure();
+  if (failed(emitPrivateWorkspaceAllocations()))
     return failure();
 
   if (!planIndex.stages.empty()) {
@@ -1532,7 +1621,14 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "        _KERNEL_CACHE[cache_key] = compiled\n";
   output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";
   emitKernelArguments();
-  output << ")\n    return compiled\n\n\n";
+  output << ")\n";
+  if (privateWorkspaceBuffers.empty()) {
+    output << "    return compiled\n\n\n";
+  } else {
+    output << "    return lambda: compiled(";
+    emitKernelArguments();
+    output << ")\n\n\n";
+  }
   output << "def run(";
   bool first = true;
   for (ABIView *view : inputs) {
