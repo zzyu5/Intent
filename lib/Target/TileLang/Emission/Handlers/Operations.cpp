@@ -977,6 +977,21 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   if (failed(node) || !binding || failed(operand) ||
       operation.getNumResults() != expectedResults)
     return operation.emitOpError("lacks a TileLang reduction binding");
+  bool logicalReduction = binding.getLowering() == "T.any_of" ||
+                          binding.getLowering() == "T.all_of";
+  if (logicalReduction) {
+    auto input = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+    if (!input || input.getRank() != 1 || binding.getAxis() != 0 ||
+        isa<RankedTensorType>(operation.getResult(0).getType()))
+      return operation.emitOpError(
+          "TileLang any/all projection requires a one-dimensional input "
+          "reduced to a scalar");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
+         ")");
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
   if (argReduction) {
     auto input = dyn_cast<OpResult>(operation.getOperand(0));
     FailureOr<SmallVector<std::string>> inputExtents =

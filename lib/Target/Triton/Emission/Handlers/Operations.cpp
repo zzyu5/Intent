@@ -844,8 +844,12 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("Triton reduction requires one result");
   std::string result = makeResultName(operation, 0);
-  line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
-       ", axis=" + std::to_string(binding.getAxis()) + ")");
+  if (binding.getLowering() == "tl.reduce_all")
+    line(result + " = ~tl.reduce_or(~(" + operand->str() + "), axis=" +
+         std::to_string(binding.getAxis()) + ")");
+  else
+    line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
+         ", axis=" + std::to_string(binding.getAxis()) + ")");
   bindResult(operation, 0, result);
   return success();
 }

@@ -856,9 +856,18 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("cuTile reduction requires one result");
   std::string result = makeResultName(operation, 0);
-  line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
-       ", " + std::to_string(binding.getAxis()) + ", keepdims=" +
-       (binding.getKeepDims() ? "True" : "False") + ")");
+  if (binding.getLowering() == "ct.any_via_max" ||
+      binding.getLowering() == "ct.all_via_min") {
+    StringRef reduction = binding.getLowering() == "ct.any_via_max" ? "ct.max"
+                                                                      : "ct.min";
+    line(result + " = ct.astype(" + reduction.str() + "(" + operand->str() +
+         ", " + std::to_string(binding.getAxis()) + ", keepdims=" +
+         (binding.getKeepDims() ? "True" : "False") + "), ct.bool_)");
+  } else {
+    line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
+         ", " + std::to_string(binding.getAxis()) + ", keepdims=" +
+         (binding.getKeepDims() ? "True" : "False") + ")");
+  }
   bindResult(operation, 0, result);
   return success();
 }

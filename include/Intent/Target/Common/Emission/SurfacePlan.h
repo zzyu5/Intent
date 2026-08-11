@@ -27,6 +27,10 @@ reductionRole(mlir::Operation &operation) {
     return std::string("reduce_maximum");
   if (combine && combine.getValue() == "add")
     return std::string("reduce_add");
+  if (combine && combine.getValue() == "logical_or")
+    return std::string("reduce_any");
+  if (combine && combine.getValue() == "logical_and")
+    return std::string("reduce_all");
   return operation.emitOpError("has no supported reduction semantics");
 }
 

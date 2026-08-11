@@ -15,6 +15,8 @@ enum class PaddedValue {
   arbitrary,
   zero,
   negativeInfinity,
+  booleanFalse,
+  booleanTrue,
 };
 
 bool isShapeOnlyGather(Operation &operation) {
@@ -49,7 +51,13 @@ bool provePaddedUses(Value value, PaddedValue padded,
           (combine.getValue() == "add" && padded != PaddedValue::zero) ||
           (combine.getValue() == "maximum" &&
            padded != PaddedValue::negativeInfinity) ||
-          (combine.getValue() != "add" && combine.getValue() != "maximum"))
+          (combine.getValue() == "logical_or" &&
+           padded != PaddedValue::booleanFalse) ||
+          (combine.getValue() == "logical_and" &&
+           padded != PaddedValue::booleanTrue) ||
+          (combine.getValue() != "add" && combine.getValue() != "maximum" &&
+           combine.getValue() != "logical_or" &&
+           combine.getValue() != "logical_and"))
         return false;
       continue;
     }
@@ -127,6 +135,11 @@ std::optional<std::string> literalPadding(Value value) {
   if (!definition || definition->getName().getStringRef() != "intent.constant")
     return std::nullopt;
   Attribute literal = definition->getAttr("intent.value");
+  if (value.getType().isInteger(1)) {
+    if (auto boolean = dyn_cast<IntegerAttr>(literal))
+      return boolean.getValue().isZero() ? std::string("false")
+                                         : std::string("true");
+  }
   if (auto floating = dyn_cast<FloatAttr>(literal)) {
     double number = floating.getValueAsDouble();
     if (number == 0.0)
@@ -229,7 +242,11 @@ std::optional<std::string> inferPadding(
         combine &&
         ((combine.getValue() == "add" && *inputPadding == "zero") ||
          (combine.getValue() == "maximum" &&
-          *inputPadding == "negative_infinity")))
+          *inputPadding == "negative_infinity") ||
+         (combine.getValue() == "logical_or" &&
+          *inputPadding == "false") ||
+         (combine.getValue() == "logical_and" &&
+          *inputPadding == "true")))
       return inputPadding;
   }
   return std::nullopt;
@@ -242,6 +259,10 @@ std::optional<std::string> inferMaskedLaneFill(Value loaded) {
     return std::string("zero");
   if (proveFill(loaded, PaddedValue::negativeInfinity))
     return std::string("negative_infinity");
+  if (proveFill(loaded, PaddedValue::booleanFalse))
+    return std::string("false");
+  if (proveFill(loaded, PaddedValue::booleanTrue))
+    return std::string("true");
   return std::nullopt;
 }
 

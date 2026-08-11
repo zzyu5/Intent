@@ -266,6 +266,8 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.lowering = *role == "reduce_argmax"
                            ? "ct.max_with_index"
                        : *role == "reduce_maximum" ? "ct.max"
+                       : *role == "reduce_any"     ? "ct.any_via_max"
+                       : *role == "reduce_all"     ? "ct.all_via_min"
                                                     : "ct.sum";
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = *axis;
@@ -501,6 +503,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!definition || definition->getNumResults() != 1 ||
         definition->getResult(0) != value ||
         (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.compare" &&
          definition->getName().getStringRef() != "intent.mask"))
       return entry.second.emitOpError(
           "does not bind a producer-fusible pointwise value");
@@ -2177,7 +2180,9 @@ FailureOr<std::string> SourceEmitter::padExpression(
     return failure();
   StringRef fill = padding.getFill() == "negative_infinity"
                        ? StringRef("-math.inf")
-                       : StringRef("0.0");
+                   : padding.getFill() == "true" ? StringRef("True")
+                   : padding.getFill() == "false" ? StringRef("False")
+                                                    : StringRef("0.0");
   return "ct.where(" + *predicate + ", " + expression.str() + ", " +
          fill.str() + ")";
 }

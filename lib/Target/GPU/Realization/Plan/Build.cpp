@@ -130,9 +130,11 @@ struct PaddingState {
     Operation *definition = value.getDefiningOp();
     if (!definition ||
         (definition->getName().getStringRef() != "intent.binary" &&
+         definition->getName().getStringRef() != "intent.compare" &&
          definition->getName().getStringRef() != "intent.mask"))
       return consumer.emitOpError(
-          "producer-fused padding requires a pointwise binary or mask value");
+          "producer-fused padding requires a pointwise binary, compare, or "
+          "mask value");
     FailureOr<int64_t> valueID = target::getValueID(
         value, facts.kernel, consumer, "padding binding");
     if (failed(valueID))
@@ -245,6 +247,12 @@ private:
       return std::string("zero");
     if (name == "intent.constant") {
       Attribute literal = definition->getAttr("intent.value");
+      if (value.getType().isInteger(1)) {
+        if (auto boolean = dyn_cast_or_null<IntegerAttr>(literal))
+          return boolean.getValue().isZero()
+                     ? std::optional<std::string>("false")
+                     : std::optional<std::string>("true");
+      }
       if (auto integer = dyn_cast_or_null<IntegerAttr>(literal))
         return integer.getValue().isZero()
                    ? std::optional<std::string>("zero")

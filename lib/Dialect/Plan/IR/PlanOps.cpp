@@ -150,7 +150,8 @@ LogicalResult intent::plan::verifyPaddingFields(
       tensorAxes.empty() ||
       failed(verifyValidityBinding(operation, tensorAxes, domainNodes, "value")))
     return failure();
-  if (fill != "negative_infinity" && fill != "zero")
+  if (fill != "negative_infinity" && fill != "zero" && fill != "false" &&
+      fill != "true")
     return operation->emitOpError(
         "contains an unsupported physical padding value");
   return success();

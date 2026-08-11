@@ -102,6 +102,9 @@ from kernels.ragged.grouped_gemm import K as GROUPED_K
 from kernels.ragged.grouped_gemm import N as GROUPED_N
 from kernels.ragged.grouped_gemm import ROWS as GROUPED_ROWS
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
+from kernels.reduction.boolean import COLUMNS as BOOLEAN_REDUCTION_COLUMNS
+from kernels.reduction.boolean import ROWS as BOOLEAN_REDUCTION_ROWS
+from kernels.reduction.boolean import row_boolean_reduction
 from kernels.sampling.nucleus import CANDIDATES as NUCLEUS_CANDIDATES
 from kernels.sampling.nucleus import ROWS as NUCLEUS_ROWS
 from kernels.sampling.nucleus import THRESHOLD as NUCLEUS_THRESHOLD
@@ -2103,6 +2106,33 @@ def _run_matrix_transpose(
     )
 
 
+def _run_boolean_reduction(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("boolean reduction has no upstream adapter")
+    shape_source = torch.empty(
+        (BOOLEAN_REDUCTION_ROWS, BOOLEAN_REDUCTION_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    artifact = intent.compile(
+        row_boolean_reduction, target=target, compiler=compiler
+    )
+    _compare(
+        artifact=artifact,
+        arguments=(shape_source,),
+        reference=lambda: torch.full(
+            (BOOLEAN_REDUCTION_ROWS,), 3, device="cuda", dtype=torch.int32
+        ),
+        target_name=target_name,
+        kernel_name="boolean any/all reduction",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.int32,
+    )
+
+
 def _run_grouped_query_head_add(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2300,6 +2330,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
+    "boolean_reduction": _run_boolean_reduction,
     "conv1d": _run_conv1d,
     "conv2d": _run_conv2d,
     "cross_entropy": _run_cross_entropy,

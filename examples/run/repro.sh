@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|embedding_backward_atomic|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|weight_only_int4|conv1d|conv2d|selective_scan|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|matrix_transpose|sorted_nucleus_cutoff|insertion_top_k>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|embedding_backward_atomic|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|quantized_gemm|dual_gemm|weight_only_int4|conv1d|conv2d|selective_scan|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|matrix_transpose|boolean_reduction|sorted_nucleus_cutoff|insertion_top_k>" >&2
   exit 2
 fi
 
@@ -167,6 +167,8 @@ case "${backend}:${kernel}" in
   triton:scalar_table_lookup | cutile:scalar_table_lookup | tilelang:scalar_table_lookup)
     ;;
   triton:matrix_transpose | cutile:matrix_transpose | tilelang:matrix_transpose)
+    ;;
+  triton:boolean_reduction | cutile:boolean_reduction | tilelang:boolean_reduction)
     ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2

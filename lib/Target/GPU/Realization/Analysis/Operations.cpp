@@ -16,6 +16,15 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
                       target::OperationHandler{std::move(enter), {}});
 }
 
+bool isLiteralBool(Value value, bool expected) {
+  Operation *definition = value.getDefiningOp();
+  if (!value.getType().isInteger(1) || !definition ||
+      definition->getName().getStringRef() != "intent.constant")
+    return false;
+  auto literal = definition->getAttrOfType<IntegerAttr>("intent.value");
+  return literal && (!literal.getValue().isZero()) == expected;
+}
+
 LogicalResult validateReduction(Operation &operation) {
   auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
   auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
@@ -31,6 +40,26 @@ LogicalResult validateReduction(Operation &operation) {
   }
   if (combine.getValue() == "maximum" || combine.getValue() == "add")
     return success();
+  if (combine.getValue() == "logical_or" ||
+      combine.getValue() == "logical_and") {
+    auto input = operation.getNumOperands() == 2
+                     ? dyn_cast<RankedTensorType>(
+                           operation.getOperand(0).getType())
+                     : RankedTensorType();
+    Type result = operation.getNumResults() == 1
+                      ? operation.getResult(0).getType()
+                      : Type();
+    Type resultElement = result;
+    if (auto tensor = dyn_cast<RankedTensorType>(result))
+      resultElement = tensor.getElementType();
+    bool identity = combine.getValue() == "logical_and";
+    if (input && input.getElementType().isInteger(1) && resultElement &&
+        resultElement.isInteger(1) &&
+        isLiteralBool(operation.getOperand(1), identity))
+      return success();
+    return operation.emitOpError(
+        "logical GPU reduction requires bool values and its bool identity");
+  }
   return operation.emitOpError("has no supported GPU reduction role");
 }
 
