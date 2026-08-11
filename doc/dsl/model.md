@@ -65,14 +65,14 @@ Source 固定：
 
 Realizer 决定：
 
-- 内部 `auto` extent 与 sub-tiling；
-- region 到 program、CTA、thread、task 的 ownership；
-- grid、grid-stride、persistent worker 与 swizzle；
-- address calculation、coalescing、tail 与 physical mask；
-- register/shared/local/cache/scratch placement；
-- physical layout、packing 与 fragment layout；
-- target contraction、reduction 和 scan primitive；
-- pipeline、prefetch、async copy、unroll 与 launch。
+- 内部 `auto` extent、逐轴角色与合法 sub-tiling 关系；
+- region 到 program、CTA、thread、task 的 ownership，以及不改变 source body 视野的 scalar lane packing；
+- program folding、grid-stride、persistent traversal 与 swizzle；
+- logical validity 的物理兑现、access footprint、tail 与 address formation；
+- 算法结构要求的 storage level、片上复用边界与 target primitive 数值角色；
+- 可交给下层 tuner 的合法参数轴与资源上界。
+
+下层 target compiler 决定不依赖 Intent 独有算法信息的部分：layout 推断、寄存器分配、指令选择、给定候选后的低层 pipeline/prefetch/unroll，以及候选值、排序与赢家。Surface 变强时 Intent emitter 应变薄，不把这些决定重新搬进共享 Plan。
 
 根规则是算法可观察性：
 

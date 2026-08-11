@@ -45,7 +45,7 @@ Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、
 
 ## Realizer
 
-Realizer 接收 Kernel IR、target information 与 compile policy，联合选择内部 extent、ownership、storage、layout、target primitive、pipeline、boundary 与 launch。
+Realizer 接收 Kernel IR、机器能力与 compile policy，只选择依赖算法结构才能确定的物理事实：逐轴角色与 range、program ownership、遍历关系、logical validity 的兑现方式、必要的 storage class、primitive 数值角色以及合法搜索轴。候选值由下层 tuner 选择；layout 推断、寄存器分配、指令选择和给定参数后的低层流水线继续交给下层。
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 
@@ -59,7 +59,7 @@ Physical Plan 是 realizer 的 target realization 结果，是独立于 source l
 
 ## Backend Emitter
 
-Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，并具体化为 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
+Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Kernel IR 与 Physical Plan 之外没有第三份 target IR；target 侧的临时 binding 只是查找索引，不是可独立验证或持久化的表示。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 

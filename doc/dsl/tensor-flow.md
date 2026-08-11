@@ -87,7 +87,7 @@ acc = I.contract(
 
 `reduce` 使用 positional reduction-axis pairs。Source 固定 operand shapes、配对归约轴、operand dtype、multiply/combine、accumulator dtype 与 epilogue tensor-flow。
 
-Realizer 决定 reduction subtile、MMA/`tl.dot`/`T.gemm`/`ct.mma`/CPU-RVV FMA microkernel、register blocking、packing、layout 与 pipeline。
+Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色，并把它投影到 MMA/`tl.dot`/`T.gemm`/cuTile matmul/CPU-RVV FMA microkernel。具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
 
 显式缩窄必须写在 source 中：
 
@@ -105,6 +105,8 @@ I.scatter_reduce(dst, index=indices, value=values, combine=I.add)
 ```
 
 Source 固定 logical index relation、invalid/fill、duplicate conflict semantics、combine 与明确要求的 memory order。Realizer 决定 coalescing、vector gather/scatter、privatization、atomics 与 physical scheduling。
+
+索引关系可以使某个输出块的输入覆盖范围更大并与相邻块重叠。Physical Plan 可以保存该 access footprint，但不会默认先物化一份去重 halo：现有目标上这种物化比直接使用目标原生块读取更慢。类似地，同一个边界谓词不会默认展开成每元素搬运；能用整块守卫、收紧范围、checked transfer 或 mask 时优先保留整块结构。
 
 Effectful 操作显式写出：
 

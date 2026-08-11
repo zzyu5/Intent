@@ -77,9 +77,10 @@ Wrapper 按该算法的调用约定初始化 `y`，例如在 invocation 前清�
 - ragged route tile；
 - static 或 persistent ownership；
 - expert scheduling；
-- MMA/CPU-RVV microkernel；
-- storage、layout 与 pipeline；
+- contraction primitive 数值角色与算法结构要求的 storage/reuse boundary；
 - gather/scatter physical mechanism。
+
+Target leaf 只把这些决定拼成各自的 matrix/gather/scatter primitive；layout、寄存器分配、指令选择与低层 pipeline 继续交给下层。
 
 ## 边界
 

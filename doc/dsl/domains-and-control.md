@@ -57,6 +57,8 @@ for part, region in I.partition(axis, count=P):
 
 `P` 来自 runtime、shape、`I.Constexpr` 或 wrapper，不接受 `I.auto`。
 
+显式 `partition` 是算法决定：source body 从“一个 logical element”变成“一个 logical region”，因而可以合法写 region reduction、contraction、scan、区域 mask 或片上复用。Compiler 不能因为某个标量写法性能差，就替作者补一个 partition 并把它改成块算法。
+
 ## Parallel
 
 ```python
@@ -65,6 +67,8 @@ for row in I.parallel(rows):
 ```
 
 表示 logical iterations 相互独立。Compiler 可以顺序执行、分配给不同 workers、persistent traversal、SIMD 打包或把同构 point-level 运算 tensorize，但不能给 source body 增加新的可观察 region、state 或 effect。
+
+其中 scalar lane packing 只允许在 body 没有任何依赖“看见一块区域”的语义时使用：每条 physical lane 仍执行一个 source scalar instance。出现 reduction、contract、scan、tensor-valued中间量、logical buffer、atomic/scatter 或 region-level mask 时，必须保持作者写下的 element/region 边界，不能自动打包成另一种算法。
 
 Region-level algorithm 必须在 source 中显式写出 region：
 

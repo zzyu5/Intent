@@ -41,9 +41,10 @@ Source 明确选择 stable softmax，而不是 online recurrence。它同时固�
 - row 到 worker 的 ownership；
 - column strip-mining；
 - SIMD、warp、block 或多级 reduction tree；
-- pure `exp` 的保存、重算或 spill；
 - boundary predicate、tail loop 或 `vsetvl`；
-- storage 与 launch。
+- 算法结构要求的 storage class 与 launch ownership。
+
+Pure `exp` 是否重算或 spill、寄存器分配和低层指令选择交给目标 compiler；它们不因某门 surface 要求显式语法就变成共享 Plan 决策。
 
 ## 边界
 

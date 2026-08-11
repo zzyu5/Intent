@@ -111,15 +111,16 @@ def flash_attention_fwd(
 
 - Q/K physical tile；
 - worker ownership、program mapping 与 persistent strategy；
-- Q/K/V/acc placement；
-- MMA 与 fragment layout；
-- pipeline、prefetch、warp specialization 与 tail；
-- generated launch configuration。
+- 算法结构要求的 Q/K/V/acc storage/reuse boundary；
+- contraction primitive 数值角色、logical validity 与 tail；
+- generated launch ownership 与合法 tuner 参数轴。
+
+Fragment layout、寄存器分配、指令选择以及给定候选后的低层 pipeline、prefetch 与 warp specialization 交给目标 compiler。
 
 Packed varlen 形式不引入另一类 attention schedule。Source 用一个 ragged relation
 把 `sequence -> packed token range` 写进 Kernel IR；同一 relation 的 outer domain
-由 program ownership 拥有，query member domain 被分块，另一个 member domain 由
-`state_stream` 顺序遍历。Plan 因而组合 `ragged ownership + ordered_stream`，三个
+由 parallel ownership range 拥有，query member domain 被分块，另一个 member domain 由
+`state_stream` 顺序遍历。Plan 因而在相应逻辑轴上组合不规则 membership、parallel ownership range 与 ordered traversal range，三个
 GPU surface 只把同一组合投影成各自的 grid、offset load 和 streamed loop。
 
 ## 边界

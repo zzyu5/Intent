@@ -4,37 +4,17 @@ Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 s
 
 ## 两类对象
 
-`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：
-
-```text
-device       算法层可用的机器能力与资源上限
-axis         logical domain → physical role / tile role
-program      ownership + traversals[]
-storage      value → machine storage class
-transfer     access / boundary fill / materialization / defer
-reduction    target-independent reduction role与物理存储
-pointwise    operation role、复用和物化位置
-contract     primitive role、累加语义、转置与 operand storage
-stream       ordered axis、tile、carry storage
-ragged       relation、outer domain、member domains、ragged traversal
-stage        跨 kernel 的物理阶段和 workspace 边界
-atomic       terminal combine mechanism
-```
+`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的操作片段与临时值边界。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；Plan 只引用它们，不复制第二份 schema。
 
 `intent_plan.search_space` 保存尚未选择、明确委托给目标后端 tuner 的合法轴和参数角色。Realizer 负责证明候选的结构合法性并给出参数关系；候选值、排序和赢家由 Triton、cuTile 或 TileLang 自带 tuner 决定。源码结构选择不进入 search space。
 
 两类对象不能混用：realization 中不存在“运行时再猜”的字段，search space 也不能改变 ownership、遍历顺序、边界语义或数值语义。
 
-## 组合式 program 决策
+## 组合式逐轴决策
 
-`intent_plan.program` 把两件正交的事分开保存：
+Realizer 不先问“kernel 属于哪一类”，而是逐个逻辑轴回答：是否 parallel、ordered、reduction、ragged member 或 lane；哪一个 range 用于 program ownership、块内 lane、ordered traversal、reduction，哪一个 access range 描述某次读取的覆盖范围；多级 traversal 则在同一轴上保留不同 level。
 
-- `ownership`：哪类 physical program 拥有 logical work，当前 GPU machine schema 为 `row`、`tiled` 或 `ragged`；
-- `traversals[]`：program 内部如何推进，可组合地记录 `persistent`、`grouped`、`ordered_stream`、`staged` 等机制。
-
-因此 row + ordered stream、tiled + ordered stream、ragged + ordered stream 是同一组部件的不同组合，不是三个 kernel 类别。Verifier 检查组合关系：例如 `ordered_stream` 必须有对应 `stream`，`staged` 必须有 stages，ragged ownership 必须有 ragged relation；它不根据 kernel 名称选择模式。
-
-`intent_plan.ragged.member_nodes` 是一个 domain 集合。同一 ragged relation 可以同时约束被 program 拥有的 member domain 与被 ordered stream 遍历的 member domain；是否 owned 或 streamed 由 axis role 和 program/stream binding 决定，而不是由 relation 本身硬编码。
+因此不规则 membership 与 ordered stream、分阶段 contraction 与 ordered traversal、一个轴的外层块和内层顺序都由角色与 range 的组合得到，不需要新增互斥 mapping mode。分析得到的 relation、def-use 与 provenance 可以在发射前重建索引，但不能形成拥有独立 schema 和 verifier 的第二份真理。
 
 ## 稳定引用与验证
 
@@ -73,3 +53,11 @@ W=\{\text{program / CTA / thread / task}\}
 Kernel IR 保存数学角色、dtype、累加语义、logical validity、state transition 与 effect。Plan 可以选择 tile、ownership、遍历、storage、target primitive、stage 和合法搜索轴；不能改变 tensor-flow、logical workset、wrapper-visible ABI 或数值角色。
 
 Layout 推断、寄存器分配、指令选择以及给定参数后的低层流水线尽量委托给下层。某个 surface 中不存在的概念不会为“字段对齐”而被抬到共享 Plan；它要求显式打印的机器决定则必须来自同一份 realization，不能在 emitter 中重新选择。
+
+`I.partition(...)` 改变 source body 看见的对象：作者选择的是一个 region 而不是一个元素，因此属于算法结构。相反，当 body 只含逐点标量 SSA、没有 reduction、contract、scan、region mask、logical buffer、atomic/scatter 或 tensor-valued 中间量时，把多个独立标量实例装进一个 physical program 的 lane 只是 realization；body 仍只看见一个元素。Realizer 不得跨过这条判据把标量 contraction 自动升级成块 contraction。
+
+地址索引宽度是正确性不变量，不是搜索参数。地址上界超过某个 surface 的可表达范围时，该 surface 必须明确拒绝；不能窄化、回绕，也不能把宽度放进候选空间。
+
+两个已否决的默认策略不重新引入：卷积式重叠读取可以记录比写区域更大的 access footprint，但显式物化唯一 halo 覆盖在现有目标上更慢；边界也不默认展开成逐元素搬运，优先使用收紧范围、整块守卫、目标原生 checked transfer 或 mask。只有目标能力要求且能保持性能语义时，leaf 才可选择自己的等价拼写。
+
+当前 `private_workspace` 使用外层分配的全局设备内存，这是总能成立的驻留位置，不代表物理 placement 已经选优。Owner 线性化与行主序偏移只有一份共享投影；workspace 应驻留 global、shared 还是目标私有存储仍是明确未决的机器决定。

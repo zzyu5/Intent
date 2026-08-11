@@ -58,9 +58,10 @@ def gemm(
 - M/N/K physical tile；
 - program mapping、grid 与 grouped swizzle；
 - worker hierarchy；
-- packing、storage 与 fragment layout；
-- MMA、`tl.dot`、`T.gemm`、`ct.mma` 或 CPU/RVV microkernel；
-- pipeline、prefetch 与 launch configuration。
+- 算法结构要求的 packing、storage/reuse boundary 与 contraction primitive 数值角色；
+- launch ownership 与合法 tuner 参数轴。
+
+各目标把 contraction role 拼成 MMA、`tl.dot`、`T.gemm`、cuTile matmul 或 CPU/RVV microkernel；fragment layout、寄存器分配、指令选择和给定候选后的低层 pipeline/prefetch 由目标 compiler 决定。
 
 ## 边界
 

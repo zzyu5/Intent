@@ -53,6 +53,8 @@ Kernel body 可以包含：
 - structured primitives；
 - logical mutable buffer 与显式 effects。
 
+普通 `for`/`while` 中的 Python `break` 与 `continue` 在 frontend AST lowering 时正规化为 loop-carried `live/active` 状态和结构化条件；Kernel IR 不定义 `break`/`continue` operation。`parallel`、`ordered` 与 `state_stream` 有各自明确的结构语义，不接受把终止构造原样带入后端。这样 emitter 只需处理已有的 `for`、`while`、`if` 与 SSA carry，不需要三门目标各自解释 Python 控制转移。
+
 Tuple 是 source 侧的结构化多值语法：解构、helper 多结果和 loop/stream carry 都按有序 SSA schema lowering。需要通过名称访问字段时使用 `I.record(...)`；tuple 不形成可变 Python object，也不形成 opaque runtime tuple。
 
 解构或赋值目标 `_` 表示丢弃对应结果：它不进入 DSL 环境，也不会形成需要由 structured region 携带的 SSA state。

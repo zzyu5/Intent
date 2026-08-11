@@ -40,7 +40,7 @@ compiled(input, output)
 生成代码应：
 
 - 保留 source variable 与 region 的可识别命名；
-- 明确显示 tile、grid、ownership、storage、layout 与 pipeline；
+- 明确显示 Intent 已决定的 tile、grid、ownership 与 storage；surface 要求显式拼写的 layout 或 pipeline 参数也保留在源码中，下层自行推断的部分不伪造出来；
 - 使用结构化 helper，不生成难以阅读的一次性字符串；
 - 可以脱离 Intent 继续编译、调试和人工修改；
 - 成为性能理解与极端 kernel 人工接管的直接接口。

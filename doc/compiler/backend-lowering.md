@@ -2,7 +2,7 @@
 
 Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、已经确定的 machine realization 与可选 search space，构造具体目标程序。
 
-完整 semantic path 位于 C++：`intent-compile` 分析 Kernel IR、构造并验证 machine plan，再投影到 Triton、cuTile 或 TileLang target dialect，最后由共享遍历框架逐 op 发射源码。Python 只负责调用 compiler、加载产物和运行 entry。
+完整 semantic path 位于 C++：`intent-compile` 分析 Kernel IR、构造并验证 machine plan，再由共享遍历框架按照 target capability 与 spelling table 逐 op 发射 Triton、cuTile 或 TileLang 源码。中间不物化第三份 target dialect。Python 只负责调用 compiler、加载产物和运行 entry。
 
 ## 共享层与 target 叶子
 
@@ -16,27 +16,25 @@ Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、
 每个 target 叶子只提供：
 
 - capability check：这门 surface 能表达 realization 的哪个子集；
-- projection：共享物理概念在 target dialect 中的字段与 spelling；
-- emission：target dialect operation 到目标语法的机械映射；
+- projection：共享物理概念在该 surface 中的 capability 与 spelling；
+- emission：canonical operation 加 Physical Plan 到目标语法的逐 op 机械映射；
 - compile/run 接线以及对下层 tuner 的显式委托。
 
-接入第四门 GPU tile surface 不应增加 kernel 分析路径，也不应修改共享 emitter traversal；只新增 target dialect、projection、leaf handlers 与 runtime adapter。
+接入第四门 GPU tile surface 不应增加 kernel 分析路径，也不应修改共享 emitter traversal；只新增 capability/spelling、leaf handlers 与 runtime adapter。
 
-## Program 投影
+## 逐轴物理投影
 
-Machine `program` 的 `ownership` 与 `traversals[]` 分开投影：
+Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐轴记录可组合的角色，并按用途、层级记录 ownership、lane、ordered traversal、reduction 与 access footprint 等 range。同一逻辑轴可以同时承担 parallel、ordered、reduction、ragged member 或 packed lane 中的合法组合。
 
 | machine concept | Triton | TileLang | cuTile |
 |---|---|---|---|
-| row ownership | `program_rows` | `block_rows` | `block_rows` |
-| tiled ownership | `program_tiles` | `block_tiles` | `block_tiles` |
-| ragged ownership | `program_ragged` | `block_ragged` | `block_ragged` |
-| persistent traversal | grid-stride program loop | persistent block loop | persistent block loop |
-| grouped traversal | grouped program-id mapping | grouped block-id mapping | grouped block-id mapping |
-| ordered stream | register-carried loop | fragment-carried `T.Pipelined` loop | register-carried loop |
-| staged traversal | target kernels + workspace | target kernels + workspace | target kernels + workspace |
+| parallel ownership range | `program_id` 与 grid projection | `T.Kernel` block projection | `ct.bid` 与 grid projection |
+| packed scalar lane range | `tl.arange` | `T.Parallel` lane | `ct.arange` |
+| ordered traversal range | state-carried loop | `T.Pipelined` / serial loop | state-carried loop |
+| access footprint / logical validity | pointer mask 或收紧范围 | guarded copy / range predicate | checked load、gather 或 scatter |
+| persistent program choice | grid-stride program loop | persistent block loop | persistent block loop |
 
-一条 realization 可以同时具有 ragged ownership 与 ordered stream；target 不得把它重新压回一个 kernel 类别字符串。Target surface 只可拒绝自己不能表达的组合，不能另选 tile、ownership 或遍历。
+一条 realization 可以让不规则 membership、ordered stream、head mapping 与尾块同时作用；target 不得把组合重新压回 kernel 类别字符串。Target surface 只可拒绝自己不能表达的组合，不能另选 tile、ownership、流终点或遍历。
 
 ## Operation 对应关系
 
@@ -56,7 +54,7 @@ Machine `program` 的 `ownership` 与 `traversals[]` 分开投影：
 Translator 开始前验证 Kernel IR、machine plan 与 target projection。以下情况直接以关联的 source location 报错：
 
 - Plan binding 缺失或引用错误 logical node；
-- ownership/traversal/stream/ragged/stage 组合不合法；
+- 逐轴 role/range 与 operation binding 的组合不合法；
 - target capability 不包含某个 machine concept；
 - 某个 canonical operation 没有注册 target handler；
 - target spelling 无法保持 dtype、boundary、effect 或 state semantics。

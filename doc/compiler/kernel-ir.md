@@ -24,6 +24,8 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - region 到原始 logical indices 的 relation；
 - gather/scatter index relation 与 conflict semantics。
 
+所有参与地址形成的 logical index 都遵守同一宽度不变量：在可达 shape、stride 和 offset 范围内不得溢出或窄化。具体 surface 无法表达所需宽度时由 target capability 明确拒绝，不能把宽度变成 Physical Plan 的可调选择。
+
 ### Tensor-flow
 
 - pure tensor SSA；
@@ -31,7 +33,7 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - pointwise math 与 logical mask；
 - `reduce`、`scan`、`contract`；
 - logical buffers；
-- atomic、mutable load/store、fence 与 RNG identity。
+- atomic、mutable load/store 与 RNG identity。没有跨目标共同语义的显式 fence 在 frontend 拒绝，不进入 Kernel IR。
 
 ### Control 与 state
 
@@ -40,6 +42,8 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - `parallel`、`ordered` 与 `state_stream`；
 - carry schema、initial state、step 与 final projection；
 - `@intent.fn` 展开的算法 helper relation。
+
+普通 Python loop 的 `break`/`continue` 在 frontend 被改写成结构化 `if`、`for`/`while` 与 carried control state；Kernel IR 不保留独立终止类节点。是否在现有语料中出现不影响这条语言合同。
 
 Python tuple state 在 Kernel IR 中正规化为有序的多 SSA carry/result schema；需要字段身份的复合值使用 `RecordType` 与 `make_record/extract`。Kernel IR 不保留一个无法被后端观察的 opaque tuple object。
 
@@ -59,6 +63,7 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 6. `ordered` 与 `state_stream` 的 source 顺序不可降格为 unordered partial merge。
 7. `reduce`、`scan` 与 `contract` 保持为 structured nodes，直到后端选择 physical implementation。
 8. Logical identity 来自原始 domain index，不来自 physical worker 或 auto-region ordinal。
+9. Address-forming index 的宽度必须覆盖已声明 shape/stride 的可达地址范围；不能依赖目标默认整数宽度静默回绕。
 
 ## 算法与物理 refinement
 
