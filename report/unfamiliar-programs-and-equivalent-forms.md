@@ -2,22 +2,23 @@
 
 ## 结论
 
-当前检验不是从编译器已有能力反推语料，而是先照公开实现或真实模型结构选算法，再直接写 DSL。两批陌生算法和一批等价写法的结果如下：
+当前检验不是从编译器已有能力反推语料，而是先照公开实现或真实模型结构选算法，再直接写 DSL。两批陌生算法、一批等价写法和一批等价分解的结果如下：
 
 | 检验组 | Triton | cuTile | TileLang | 合计 |
 |---|---:|---:|---:|---:|
 | 第一批 10 个陌生算法 | 10/10 | 10/10 | 9/10 | 29/30 |
 | 10 个已有算法的等价写法 | 10/10 | 10/10 | 9/10 | 29/30 |
 | 第二批 10 个陌生算法 | 10/10 | 8/10 | 9/10 | 27/30 |
-| 合计 | 30/30 | 28/30 | 27/30 | 85/90 |
+| 10 个算法的等价分解 | 10/10 | 10/10 | 10/10 | 30/30 |
+| 合计 | 40/40 | 38/40 | 37/40 | 115/120 |
 
 第二批没有通过的三格都属于整行 scan 的下层编译问题：`nonzero_compact × cuTile`、`unique_consecutive × cuTile` 在 cuTile 编译器的既定限时内未完成，`unique_consecutive × TileLang` 的候选首次 JIT 超过十分钟。三者都已经完成 Kernel MLIR、Physical Plan 和目标源码生成；当前如实记为 `downstream_fail`，没有增加按算子分支，也没有把串行慢路径伪装成支持。
 
-全量固定表现在包含 72 个 kernel、79 个 case、3 个 provider，共 237 格：
+全量固定表现在包含 82 个 kernel、89 个 case、3 个 provider，共 267 格：
 
 | 状态 | 数量 |
 |---|---:|
-| 数值通过 | 230 |
+| 数值通过 | 260 |
 | 明确不支持 | 3 |
 | 下层失败 | 4 |
 
@@ -142,3 +143,38 @@ nonzero、unique 和 MoE 都真实产生运行时计数，但输出 buffer 仍�
 ```
 
 第二批 kernel 名为：`nonzero_compact`、`unique_consecutive`、`moe_align_block`、`nested_ragged_pool`、`adamw_update`、`adafactor_update`、`reshape_and_cache`、`group_norm_silu_backward`、`batched_cholesky`、`batched_householder_qr`。
+
+## 八、同一个计算的十种结构分解
+
+这一批不是替换运算拼写，而是改变作者程序的分解方式。每格都分别编译原写法和变体，并完成原写法对参考、变体对参考、变体对原写法三次比较；整数结果逐元素精确比较，浮点结果先比较有限性分布，再比较有限值误差。30 格全部通过。
+
+表中延迟是变体自己的 p50/p95，括号内是变体 p50 / 原写法 p50。单 kernel 记 `K`；作者把一次调用拆成两次调用的三项记 `E`，区间覆盖拿到最终结果必须执行的两次 GPU launch。
+
+| 变体 | Scope | Triton | cuTile | TileLang |
+|---|:---:|---:|---:|---:|
+| MoE 两层并行 → 乘积域 | K | 0.0373 / 0.0416 (1.0043×) | 0.0192 / 0.0207 (1.0042×) | 0.0231 / 0.0245 (1.0119×) |
+| AdamW 单 kernel → moments + parameter | E | 0.1147 / 0.1167 (0.9655×) | 0.1310 / 0.1311 (1.0664×) | 0.1021 / 0.1039 (0.8452×) |
+| KV cache 合并写 → key/value 分开写 | E | 0.0287 / 0.0307 (0.9978×) | 0.0292 / 0.0328 (1.0167×) | 0.0292 / 0.0307 (1.0190×) |
+| 紧凑 ragged → 运行时恒等索引映射 | K | 0.8655 / 0.8690 (3.7943×) | 5.7817 / 5.8022 (9.0388×) | 0.6600 / 0.6685 (2.4643×) |
+| 嵌套 ragged 单 kernel → sentence/document 两阶段 | E | 0.2856 / 0.2865 (1.2513×) | 0.5787 / 0.5804 (0.9031×) | 0.2928 / 0.2946 (1.0927×) |
+| Cholesky 左看 → 右看 | K | 0.0584 / 0.0660 (1.2987×) | 0.0389 / 0.0403 (1.1176×) | 0.0460 / 0.0477 (1.1528×) |
+| Adafactor 行 region → 标量乘积域 | K | 0.0891 / 0.0932 (1.0118×) | 0.1192 / 0.1213 (1.3165×) | 0.1165 / 0.1168 (1.3234×) |
+| transpose 两层标量域 → 标量乘积域 | K | 0.6103 / 0.6113 (1.0008×) | 0.6226 / 0.6236 (1.0197×) | 0.6124 / 0.6144 (1.0047×) |
+| 有序乘积域 → 两层有序域 | K | 0.0388 / 0.0429 (0.9759×) | 0.0396 / 0.0406 (0.9984×) | 0.0197 / 0.0211 (0.9785×) |
+| 因果逻辑终点 → 全 K 流加因果 mask | K | 0.0594 / 0.0596 (1.0741×) | 0.0594 / 0.0614 (1.0120×) | 0.0594 / 0.0597 (1.1710×) |
+
+### 编译器实际补上的两处共享义务
+
+第一处是纯逐元素标量并行域的物理打包。此前一个 `parallel((axis0, axis1, ...))` 的每个轴都只会取得 ownership tile 1，导致每个逻辑标量实例启动一个程序。现在 realizer 只允许乘积域的最后一个轴取得可调的 `lane_pack`，其余轴仍映射程序空间。资格判断是保守白名单：只接受标量常量、维度、边界前置条件、view load/store、gather、record、普通逐点运算、counter RNG 和 yield；任何未知 op、region、函数调用、mask、归约、收缩、scan、state stream、buffer、atomic、scatter 或 tensor SSA 都会关闭打包。因此 transpose 和标量 Adafactor 可以由下层调 lane pack，MoE 的 atomic 主体不会被打包；编译器没有把作者的标量算法升级成块算法，也没有自动张量化带收缩的主体。
+
+第二处是 stream 轴索引的唯一作用域投影。三个 target leaf 原先会先把兼具 lane 角色的 stream 轴生成成整轴索引，进入 `state_stream` 后又用当前 stream tile 重写同名索引；Triton 因此把两种宽度的值误判成循环携带量并拒绝编译。Plan 中的 stream binding 已经给出 axis 与 traversal range；三个 leaf 现在进入 stream 时用 stream node 生成独立的词法名字，暂存外层索引绑定，离开时恢复。这样同一轴仍可在 stream 外作为 lane 使用，stream 内只消费自己的 traversal 投影。这个修改不认识 attention 名字，也不从张量形状重建流终点。
+
+### 慢项的性质
+
+运行时恒等索引映射是唯一达到数倍差距的项，但它不是假发射。索引张量是运行时输入；即使本次数据恰好为 `arange`，算法合同仍是间接不规则访问，三个下层都必须真实读取并应用映射。把它恢复成连续偏移需要作者改变表示，编译器不能靠本次输入值静态消掉。
+
+其余差异都小于 1.33×，并与作者写下的结构一致。左右看 Cholesky、行 region 与标量主体、逻辑终点与完整 masked stream 本来就应产生不同物理实现；单 kernel 与两 kernel 的比较也保留作者调用边界。这里没有为了追平数字而把任一变体重写回原算法。
+
+十个变体没有独立的公开 source adapter，CSV 的 source 时间保持为空；PyTorch 只承担数值参考，不被记成上游性能。
+
+这批 kernel 名为：`variant_moe_product_domain`、`variant_adamw_split_pipeline`、`variant_reshape_cache_split`、`variant_nested_ragged_identity`、`variant_nested_ragged_split`、`variant_cholesky_right_looking`、`variant_adafactor_scalar_product`、`variant_transpose_product_domain`、`variant_ordered_prefix_nested`、`variant_attention_full_causal_stream`。
