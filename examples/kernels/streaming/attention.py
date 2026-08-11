@@ -17,6 +17,29 @@ VARLEN_GQA_HEAD_GROUP = VARLEN_GQA_QUERY_HEADS // VARLEN_GQA_KV_HEADS
 VARLEN_GQA_TOTAL_TOKENS = 29184
 
 
+@intent.fn
+def online_attention_accumulate(
+    maximum,
+    normalization_maximum,
+    denominator,
+    accumulator,
+    scores,
+    value_block,
+):
+    alpha = I.exp2(maximum - normalization_maximum)
+    probability = I.exp2(scores - normalization_maximum[:, None])
+    next_denominator = alpha * denominator + I.reduce.sum(
+        probability, axis=1, identity=0.0
+    )
+    next_accumulator = alpha[:, None] * accumulator + I.contract(
+        I.cast(probability, I.f16),
+        value_block,
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    return next_denominator, next_accumulator
+
+
 @intent.kernel
 def flash_attention_fwd(
     q: I.In[I.f16, ("B", "H", "Q", "D")],
@@ -67,17 +90,13 @@ def flash_attention_fwd(
                             scores, axis=1, identity=-I.inf
                         )
                         next_maximum = I.maximum(maximum, local_maximum)
-                        alpha = I.exp2(maximum - next_maximum)
-                        probability = I.exp2(scores - next_maximum[:, None])
-                        next_denominator = alpha * denominator + I.reduce.sum(
-                            probability, axis=1, identity=0.0
-                        )
-                        low_probability = I.cast(probability, I.f16)
-                        next_accumulator = alpha[:, None] * accumulator + I.contract(
-                            low_probability,
+                        next_denominator, next_accumulator = online_attention_accumulate(
+                            maximum,
+                            next_maximum,
+                            denominator,
+                            accumulator,
+                            scores,
                             v_block,
-                            reduce=((1, 0),),
-                            acc_dtype=I.f32,
                         )
                         stream.yield_(
                             next_maximum,
@@ -143,18 +162,13 @@ def flash_attention_bias_fwd(
                             valid=next_maximum != -I.inf,
                             fill=0.0,
                         )
-                        alpha = I.exp2(maximum - normalization_maximum)
-                        probability = I.exp2(
-                            scores - normalization_maximum[:, None]
-                        )
-                        next_denominator = alpha * denominator + I.reduce.sum(
-                            probability, axis=1, identity=0.0
-                        )
-                        next_accumulator = alpha[:, None] * accumulator + I.contract(
-                            I.cast(probability, I.f16),
+                        next_denominator, next_accumulator = online_attention_accumulate(
+                            maximum,
+                            normalization_maximum,
+                            denominator,
+                            accumulator,
+                            scores,
                             v_block,
-                            reduce=((1, 0),),
-                            acc_dtype=I.f32,
                         )
                         stream.yield_(
                             next_maximum,
@@ -227,16 +241,13 @@ def flash_varlen_attention_fwd(
                         scores, axis=1, identity=-I.inf
                     )
                     next_maximum = I.maximum(maximum, local_maximum)
-                    alpha = I.exp2(maximum - next_maximum)
-                    probability = I.exp2(scores - next_maximum[:, None])
-                    next_denominator = alpha * denominator + I.reduce.sum(
-                        probability, axis=1, identity=0.0
-                    )
-                    next_accumulator = alpha[:, None] * accumulator + I.contract(
-                        I.cast(probability, I.f16),
+                    next_denominator, next_accumulator = online_attention_accumulate(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
                         v_block,
-                        reduce=((1, 0),),
-                        acc_dtype=I.f32,
                     )
                     stream.yield_(
                         next_maximum,
@@ -305,16 +316,13 @@ def flash_varlen_gqa_prefill(
                             scores, axis=1, identity=-I.inf
                         )
                         next_maximum = I.maximum(maximum, local_maximum)
-                        alpha = I.exp2(maximum - next_maximum)
-                        probability = I.exp2(scores - next_maximum[:, None])
-                        next_denominator = alpha * denominator + I.reduce.sum(
-                            probability, axis=1, identity=0.0
-                        )
-                        next_accumulator = alpha[:, None] * accumulator + I.contract(
-                            I.cast(probability, I.f16),
+                        next_denominator, next_accumulator = online_attention_accumulate(
+                            maximum,
+                            next_maximum,
+                            denominator,
+                            accumulator,
+                            scores,
                             v_block,
-                            reduce=((1, 0),),
-                            acc_dtype=I.f32,
                         )
                         stream.yield_(
                             next_maximum,

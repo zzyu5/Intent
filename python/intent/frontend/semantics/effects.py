@@ -12,13 +12,11 @@ class EffectKind(Enum):
     READ = "read"
     WRITE = "write"
     ATOMIC = "atomic"
-    FENCE = "fence"
 
 
 class ResourceKind(Enum):
     EXTERNAL_VIEW = "external_view"
     LOGICAL_BUFFER = "logical_buffer"
-    ORDERING = "ordering"
 
 
 @dataclass(frozen=True, slots=True)

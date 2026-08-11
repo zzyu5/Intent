@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
-from intent.api import Definition
 from intent.api import HelperDefinition
 from intent.api import KernelDefinition
-from intent.frontend.mlir import FunctionState
 from intent.frontend.mlir import FunctionKind
 from intent.frontend.mlir import MlirBuilder
+from intent.frontend.mlir import MlirValue
 from intent.frontend.mlir import canonicalize_mlir
 from intent.frontend.semantics import ValueType
 
@@ -35,7 +33,6 @@ class FrontendCompiler:
         self.source = SourceUnit.from_definition(definition)
         self.signature = lower_kernel_signature(definition, self.source, constexprs)
         self.builder = MlirBuilder(definition.__name__, self.source.location(self.source.function))
-        self.helper_cache: dict[HelperKey, FunctionState] = {}
         self.active_helpers: set[HelperKey] = set()
 
     def lower(self) -> str:
@@ -56,16 +53,15 @@ class FrontendCompiler:
         lowerer.lower()
         return canonicalize_mlir(self.builder.emit_module())
 
-    def lower_helper(
+    def lower_helper_inline(
         self,
+        caller: FunctionLowerer,
         definition: HelperDefinition[object, object],
-        argument_types: tuple[ValueType, ...],
+        arguments: tuple[MlirValue, ...],
         call_location: object,
-    ) -> FunctionState:
+    ) -> tuple[MlirValue, ...]:
+        argument_types = tuple(argument.type for argument in arguments)
         key = HelperKey(definition, argument_types)
-        cached = self.helper_cache.get(key)
-        if cached is not None and key not in self.active_helpers:
-            return cached
         if key in self.active_helpers:
             raise FrontendError(
                 "recursive @intent.fn requires an explicit recursive IR contract and is unsupported",
@@ -73,40 +69,15 @@ class FrontendCompiler:
             )
         source = SourceUnit.from_definition(definition)
         parameters = lower_helper_parameters(source, argument_types)
-        symbol = self._helper_symbol(definition, argument_types)
-        function = self.builder.function(
-            symbol,
-            FunctionKind.HELPER,
-            parameters,
-            (),
-            source.location(source.function),
-        )
-        self.helper_cache[key] = function
         self.active_helpers.add(key)
-        lowerer = FunctionLowerer(
-            compiler=self,
+        results = caller.lower_inline_helper(
             definition=definition,
             source=source,
-            function=function,
-            constexpr_values={},
+            parameters=parameters,
+            arguments=arguments,
         )
-        lowerer.lower()
         self.active_helpers.remove(key)
-        return function
-
-    def _helper_symbol(
-        self,
-        definition: Definition[object, object],
-        argument_types: tuple[ValueType, ...],
-    ) -> str:
-        suffix = "__".join(self._sanitize(value_type.format()) for value_type in argument_types)
-        base = self._sanitize(definition.__name__)
-        return base if not suffix else f"{base}__{suffix}"
-
-    def _sanitize(self, value: str) -> str:
-        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", value)
-        sanitized = re.sub(r"_+", "_", sanitized).strip("_")
-        return sanitized or "value"
+        return results
 
 
 def lower_to_mlir(

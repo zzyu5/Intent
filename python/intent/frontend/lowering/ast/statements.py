@@ -69,11 +69,9 @@ def lower_statement(lowerer: object, node: ast.stmt) -> None:
         _lower_with(lowerer, node)
         return
     if isinstance(node, ast.Break):
-        _lower_loop_exit(lowerer, node, OperationKind.BREAK)
-        return
+        lowerer.error(node, "break is not supported by portable Intent control flow")
     if isinstance(node, ast.Continue):
-        _lower_loop_exit(lowerer, node, OperationKind.CONTINUE)
-        return
+        lowerer.error(node, "continue is not supported by portable Intent control flow")
     if isinstance(node, ast.Assert):
         _lower_assert(lowerer, node)
         return
@@ -173,6 +171,26 @@ def _store_subscript(lowerer: object, target_node: ast.Subscript, expression: Ex
 
 
 def _lower_return(lowerer: object, node: ast.Return) -> None:
+    if lowerer.inline_helpers:
+        frame = lowerer.inline_helpers[-1]
+        if lowerer.current_block is not frame.entry_block:
+            lowerer.error(
+                node,
+                "return inside structured control flow is unsupported; return after the region",
+            )
+        if node.value is None:
+            values: tuple[MlirValue, ...] = ()
+        else:
+            expression = lowerer.lower_expression(node.value)
+            if isinstance(expression, StaticTuple):
+                values = tuple(
+                    lowerer.materialize(element, node.value)
+                    for element in expression.elements
+                )
+            else:
+                values = (lowerer.materialize(expression, node.value),)
+        frame.returned = values
+        return
     if lowerer.current_block.owner is not lowerer.function.body:
         lowerer.error(node, "return inside structured control flow is unsupported; return after the region")
     if lowerer.definition.kind is DefinitionKind.KERNEL:
@@ -180,20 +198,7 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
             lowerer.error(node, "kernel returns through Out/InOut views")
         lowerer.emit(OperationKind.RETURN, lowerer.location(node))
         return
-    if node.value is None:
-        values: tuple[MlirValue, ...] = ()
-    else:
-        expression = lowerer.lower_expression(node.value)
-        if isinstance(expression, StaticTuple):
-            values = tuple(lowerer.materialize(element, node.value) for element in expression.elements)
-        else:
-            values = (lowerer.materialize(expression, node.value),)
-    result_types = tuple(value.type for value in values)
-    if lowerer.return_types is None:
-        lowerer.return_types = result_types
-    elif lowerer.return_types != result_types:
-        lowerer.error(node, "helper return schemas are inconsistent")
-    lowerer.emit(OperationKind.RETURN, lowerer.location(node), operands=values)
+    lowerer.error(node, "only the kernel entry may return outside an inline @intent.fn")
 
 
 def _lower_if(lowerer: object, node: ast.If) -> None:
@@ -560,26 +565,6 @@ def _lower_with(lowerer: object, node: ast.With) -> None:
         regions=(region,),
     )
     stream.results = operation.results
-
-
-def _lower_loop_exit(lowerer: object, node: ast.AST, opcode: OperationKind) -> None:
-    if not lowerer.loop_stack:
-        lowerer.error(node, f"{opcode.value} is only legal inside a loop")
-    context = lowerer.loop_stack[-1]
-    if context.opcode is OperationKind.PARALLEL:
-        lowerer.error(node, "parallel logical work cannot use break/continue")
-    if context.opcode is OperationKind.STATE_STREAM:
-        if opcode is OperationKind.BREAK:
-            lowerer.error(node, "state_stream fixes the full streamed axis and cannot break")
-        if context.pending_stream_state is None:
-            lowerer.error(node, "state_stream continue requires stream.yield_(...) first")
-        operands = context.pending_stream_state
-    else:
-        operands = tuple(
-            lowerer.materialize(lowerer.environment[name], node)
-            for name in context.carried_names
-        )
-    lowerer.emit(opcode, lowerer.location(node), operands=operands)
 
 
 def _lower_assert(lowerer: object, node: ast.Assert) -> None:

@@ -350,22 +350,15 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
             lowerer.read_value(lowerer.lower_expression(argument), argument)
             for argument in node.args
         )
-        helper = lowerer.compiler.lower_helper(
+        results = lowerer.compiler.lower_helper_inline(
+            lowerer,
             callee,
-            tuple(argument.type for argument in arguments),
+            arguments,
             lowerer.location(node),
         )
-        operation = lowerer.emit(
-            OperationKind.CALL,
-            lowerer.location(node),
-            operands=arguments,
-            result_types=helper.result_types,
-            attributes={"callee": helper.name},
-            effects=lowerer.helper_call_effects(helper, arguments),
-        )
-        if len(operation.results) == 1:
-            return operation.results[0]
-        return StaticTuple(tuple(operation.results))
+        if len(results) == 1:
+            return results[0]
+        return StaticTuple(results)
     if callee is slice:
         lowerer.error(node, "slice(...) is only valid inside an explicit index relation")
     lowerer.error(node, "only Intent intrinsics and @intent.fn values are callable in DSL code")

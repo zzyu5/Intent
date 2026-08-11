@@ -96,8 +96,6 @@ def Intent_WhileOp : Intent_Op<"while", [RecursiveMemoryEffects]> {
 
 def Intent_YieldOp : Intent_TerminatorOp<"yield">;
 def Intent_ConditionOp : Intent_TerminatorOp<"condition">;
-def Intent_BreakOp : Intent_TerminatorOp<"break">;
-def Intent_ContinueOp : Intent_TerminatorOp<"continue">;
 
 def Intent_ViewLoadOp : Intent_VariadicOneResultOp<"view_load", [MemoryEffects<[MemRead]>]>;
 def Intent_ViewStoreOp : Intent_VariadicNoResultOp<"view_store", [MemoryEffects<[MemWrite]>]>;
@@ -148,19 +146,11 @@ def Intent_BufferLoadOp : Intent_VariadicOneResultOp<"buffer_load", [MemoryEffec
 def Intent_BufferStoreOp : Intent_VariadicNoResultOp<"buffer_store", [MemoryEffects<[MemWrite]>]>;
 def Intent_AtomicAddOp : Intent_VariadicNoResultOp<"atomic_add", [MemoryEffects<[MemRead, MemWrite]>]>;
 def Intent_AtomicCasOp : Intent_VariadicOneResultOp<"atomic_cas", [MemoryEffects<[MemRead, MemWrite]>]>;
-def Intent_FenceOp : Intent_Op<"fence", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins);
-  let results = (outs);
-}
 def Intent_RandomOp : Intent_Op<"random", [Pure]> {
   let arguments = (ins AnyType:$seed, AnyType:$logical_index);
   let results = (outs AnyType:$result);
 }
 
-def Intent_CallOp : Intent_Op<"call"> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
-}
 def Intent_ReturnOp : Intent_Op<"return", [Terminator, ReturnLike]> {
   let arguments = (ins Variadic<AnyType>:$inputs);
   let results = (outs);

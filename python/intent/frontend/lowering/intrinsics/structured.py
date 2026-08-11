@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
-from intent.api import HelperDefinition
 from intent.frontend.semantics import ValueType
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
@@ -279,15 +278,11 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         multiply = _callable_symbol(
             lowerer,
             bound["multiply"],
-            (ScalarType(lhs.type.dtype), ScalarType(rhs.type.dtype)),
-            (accumulator_type,),
         )
     if "combine" in bound:
         combine = _callable_symbol(
             lowerer,
             bound["combine"],
-            (accumulator_type, accumulator_type),
-            (accumulator_type,),
         )
     operation = lowerer.emit(
         OperationKind.CONTRACT,
@@ -307,24 +302,11 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 def _callable_symbol(
     lowerer: FunctionLowerer,
     node: ast.AST,
-    operand_types: tuple[ValueType, ...],
-    result_types: tuple[ValueType, ...],
 ) -> object:
     expression = lowerer.lower_expression(node)
     if isinstance(expression, Intrinsic):
         return expression.name
-    if isinstance(expression, HelperDefinition):
-        helper = lowerer.compiler.lower_helper(
-            expression,
-            operand_types,
-            lowerer.location(node),
-        )
-        if len(helper.result_types) != len(result_types) or any(
-            actual != expected for actual, expected in zip(helper.result_types, result_types)
-        ):
-            lowerer.error(node, "combiner helper result schema is incompatible")
-        return helper.name
-    lowerer.error(node, "combine/multiply must be an Intent intrinsic or @intent.fn")
+    lowerer.error(node, "contract combine/multiply must be an Intent intrinsic")
 
 
 def _reduction_pairs(lowerer: FunctionLowerer, node: ast.AST) -> tuple[tuple[int, int], ...]:

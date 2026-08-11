@@ -113,10 +113,10 @@ I.atomic_add(...)
 I.atomic_cas(...)
 I.store(...)
 I.mutable_load(...)
-I.fence(...)
 ```
 
 Effects 不能被非法复制、删除或跨依赖重排。
+三个目标语言没有共同的显式 fence 语义；`I.fence(...)` 在前端直接拒绝，不能降成 no-op。
 
 ## Logical buffer
 

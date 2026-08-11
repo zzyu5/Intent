@@ -191,10 +191,9 @@ LogicalResult verifyEffects(Operation *operation) {
     auto resource = effect.getAs<StringAttr>("resource");
     if (!kind || !resource ||
         (kind.getValue() != "read" && kind.getValue() != "write" &&
-         kind.getValue() != "atomic" && kind.getValue() != "fence") ||
+         kind.getValue() != "atomic") ||
         (resource.getValue() != "external_view" &&
-         resource.getValue() != "logical_buffer" &&
-         resource.getValue() != "ordering"))
+         resource.getValue() != "logical_buffer"))
       return operation->emitOpError("effect metadata contains an unknown kind/resource");
     auto target = effect.getAs<IntegerAttr>("target");
     if (!target || target.getInt() < -1 ||
@@ -279,8 +278,6 @@ LogicalResult verifyRegionTerminator(Operation *operation, Region &region,
     return operation->emitOpError("structured regions require a terminator");
   StringRef terminator = block.back().getName().getStringRef();
   if (terminator == expected)
-    return success();
-  if (terminator == "intent.break" || terminator == "intent.continue")
     return success();
   return operation->emitOpError()
          << "region requires " << expected << " terminator";
@@ -447,8 +444,6 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
       name == "intent.scatter_reduce" || name == "intent.buffer_load" ||
       name == "intent.buffer_store" || name == "intent.atomic_add")
     return requireAttribute<ArrayAttr>(operation, "intent.index");
-  if (name == "intent.call")
-    return requireAttribute<StringAttr>(operation, "intent.callee");
   return success();
 }
 

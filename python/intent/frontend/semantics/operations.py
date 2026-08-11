@@ -23,8 +23,6 @@ class OperationKind(Enum):
     WHILE = "while"
     YIELD = "yield"
     CONDITION = "condition"
-    BREAK = "break"
-    CONTINUE = "continue"
 
     VIEW_LOAD = "view_load"
     VIEW_STORE = "view_store"
@@ -62,18 +60,14 @@ class OperationKind(Enum):
     BUFFER_STORE = "buffer_store"
     ATOMIC_ADD = "atomic_add"
     ATOMIC_CAS = "atomic_cas"
-    FENCE = "fence"
     RANDOM = "random"
 
-    CALL = "call"
     RETURN = "return"
 
 
 TERMINATORS = {
     OperationKind.YIELD,
     OperationKind.CONDITION,
-    OperationKind.BREAK,
-    OperationKind.CONTINUE,
     OperationKind.RETURN,
 }
 
@@ -105,7 +99,6 @@ EFFECTFUL_OPS = {
     OperationKind.BUFFER_STORE,
     OperationKind.ATOMIC_ADD,
     OperationKind.ATOMIC_CAS,
-    OperationKind.FENCE,
     OperationKind.RANDOM,
 }
 

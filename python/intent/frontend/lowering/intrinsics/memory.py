@@ -350,14 +350,10 @@ def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 
 
 def _fence(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
-    bound = bind_call(lowerer, node, ("ordering", "scope"))
-    lowerer.emit(
-        OperationKind.FENCE,
-        lowerer.location(node),
-        attributes=_required_ordering(lowerer, bound, node),
-        effects=(Effect(EffectKind.FENCE, ResourceKind.ORDERING),),
+    lowerer.error(
+        node,
+        "I.fence has no portable semantics across the supported tile languages",
     )
-    return StaticTuple(())
 
 
 def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

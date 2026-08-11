@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from intent.api import Definition
@@ -46,6 +47,12 @@ if TYPE_CHECKING:
     from ...compilation.compiler import FrontendCompiler
 
 
+@dataclass(slots=True)
+class InlineHelperFrame:
+    entry_block: BlockState
+    returned: tuple[MlirValue, ...] | None = None
+
+
 class FunctionLowerer:
     def __init__(
         self,
@@ -64,7 +71,7 @@ class FunctionLowerer:
         self.current_block = function.body.blocks[0]
         self.loop_stack: list[LoopContext] = []
         self.view_kinds: dict[MlirValue, ViewKind] = {}
-        self.return_types: tuple[ValueType, ...] | None = None
+        self.inline_helpers: list[InlineHelperFrame] = []
         self._initialize_parameters(constexpr_values)
 
     def _initialize_parameters(self, constexpr_values: dict[str, object]) -> None:
@@ -81,19 +88,50 @@ class FunctionLowerer:
     def lower(self) -> None:
         self.lower_statements(self.source.function.body)
         if not self.is_terminated(self.current_block):
-            if self.definition.kind is DefinitionKind.KERNEL:
-                self.emit(OperationKind.RETURN, self.source.location(self.source.function))
-            else:
-                self.error(self.source.function, "@intent.fn must end with an explicit return")
-        if self.definition.kind is DefinitionKind.HELPER:
-            if self.return_types is None:
-                self.error(self.source.function, "@intent.fn did not produce a return schema")
-            self.function.result_types = self.return_types
+            self.emit(OperationKind.RETURN, self.source.location(self.source.function))
+
+    def lower_inline_helper(
+        self,
+        *,
+        definition: Definition[object, object],
+        source: SourceUnit,
+        parameters: tuple[object, ...],
+        arguments: tuple[MlirValue, ...],
+    ) -> tuple[MlirValue, ...]:
+        if len(parameters) != len(arguments):
+            self.error(source.function, "helper argument count does not match call")
+        saved_definition = self.definition
+        saved_source = self.source
+        saved_environment = self.environment
+        saved_loop_stack = self.loop_stack
+        entry_block = self.current_block
+        frame = InlineHelperFrame(entry_block)
+        self.definition = definition
+        self.source = source
+        self.environment = {
+            parameter.name: argument
+            for parameter, argument in zip(parameters, arguments)
+        }
+        self.loop_stack = []
+        self.inline_helpers.append(frame)
+        self.lower_statements(source.function.body)
+        if frame.returned is None:
+            self.error(source.function, "@intent.fn must end with an explicit return")
+        results = frame.returned
+        self.inline_helpers.pop()
+        self.definition = saved_definition
+        self.source = saved_source
+        self.environment = saved_environment
+        self.loop_stack = saved_loop_stack
+        self.current_block = entry_block
+        return results
 
     def lower_statements(self, statements: list[ast.stmt]) -> None:
         from .statements import lower_statement
 
         for statement in statements:
+            if self.inline_helpers and self.inline_helpers[-1].returned is not None:
+                self.error(statement, "statement is unreachable after helper return")
             if self.is_terminated(self.current_block):
                 self.error(statement, "statement is unreachable after a terminator")
             lower_statement(self, statement)
@@ -342,24 +380,3 @@ class FunctionLowerer:
 
     def logical_index_type(self, relation: str) -> LogicalIndexType:
         return LogicalIndexType(relation)
-
-    def helper_call_effects(
-        self,
-        helper: FunctionState,
-        arguments: tuple[MlirValue, ...],
-    ) -> tuple[Effect, ...]:
-        parameter_values = tuple(parameter.value for parameter in helper.parameters)
-        effects: list[Effect] = []
-        seen: set[tuple[object, object, MlirValue | None]] = set()
-
-        for effect in helper.body.effects:
-            target: MlirValue | None = None
-            if effect.target is not None:
-                if effect.target not in parameter_values:
-                    continue
-                target = arguments[parameter_values.index(effect.target)]
-            key = (effect.kind, effect.resource, target)
-            if key not in seen:
-                effects.append(Effect(effect.kind, effect.resource, target))
-                seen.add(key)
-        return tuple(effects)
