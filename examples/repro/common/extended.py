@@ -150,6 +150,8 @@ from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from kernels.streaming.selective_scan import BATCH as SELECTIVE_SCAN_BATCH
 from kernels.streaming.selective_scan import LENGTH as SELECTIVE_SCAN_LENGTH
 from kernels.streaming.selective_scan import selective_state_scan
+from kernels.synchronization.compare_exchange import SLOTS as CAS_SLOTS
+from kernels.synchronization.compare_exchange import claim_zero_slots
 from kernels.contraction.weight_only_int4 import GROUP_SIZE as W4_GROUP_SIZE
 from kernels.contraction.weight_only_int4 import K as W4_K
 from kernels.contraction.weight_only_int4 import M as W4_M
@@ -2140,6 +2142,41 @@ def _run_batched_row_affine(
     )
 
 
+def _run_atomic_compare_exchange(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("atomic compare exchange has no upstream adapter")
+    state = torch.where(
+        torch.arange(CAS_SLOTS, device="cuda") % 3 == 0,
+        torch.zeros((), device="cuda", dtype=torch.int32),
+        torch.full((), 2, device="cuda", dtype=torch.int32),
+    )
+    initial = state.clone()
+    artifact = intent.compile(claim_zero_slots, target=target, compiler=compiler)
+
+    def reference():
+        expected_state = torch.where(initial == 0, 1, initial)
+        state_error = (state - expected_state).abs().max().item()
+        if state_error != 0:
+            raise RuntimeError(
+                f"{target_name} compare-and-swap state transition failed: "
+                f"{state_error}"
+            )
+        return initial
+
+    _compare(
+        artifact=artifact,
+        arguments=(state,),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="scalar atomic compare exchange",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.int32,
+    )
+
+
 def _run_boolean_reduction(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2394,6 +2431,7 @@ def _run_embedding_backward_atomic(
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
+    "atomic_compare_exchange": _run_atomic_compare_exchange,
     "batched_row_affine": _run_batched_row_affine,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,

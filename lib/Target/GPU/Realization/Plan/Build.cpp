@@ -515,6 +515,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     if (failed(node))
       return failure();
     bool load = operation.getName().getStringRef() == "intent.view_load";
+    bool returnedAtomic =
+        operation.getName().getStringRef() == "intent.atomic_cas";
     bool contractOperand =
         load && operation.getNumResults() == 1 &&
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {
@@ -547,7 +549,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         return operation.emitOpError("has no resolved load boundary fill");
     }
     StringRef resultSpace = "none";
-    if (load) {
+    if (load || returnedAtomic) {
       resultSpace = sharedOperand
                         ? StringRef("shared")
                         : isa<RankedTensorType>(operation.getResult(0).getType())
@@ -564,7 +566,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   if (failed(addHandler(registry, "intent.view_load", bindTransfer)) ||
       failed(addHandler(registry, "intent.view_store", bindTransfer)) ||
       failed(addHandler(registry, "intent.scatter_unique", bindTransfer)) ||
-      failed(addHandler(registry, "intent.atomic_add", bindTransfer)))
+      failed(addHandler(registry, "intent.atomic_add", bindTransfer)) ||
+      failed(addHandler(registry, "intent.atomic_cas", bindTransfer)))
     return failure();
 
   auto bindReduction = [&](Operation &operation) -> LogicalResult {

@@ -317,7 +317,8 @@ indexRealization(intent::plan::RealizationOp realization,
     bool store = operation &&
                  (operation->getName().getStringRef() == "intent.view_store" ||
                   operation->getName().getStringRef() == "intent.scatter_unique" ||
-                  operation->getName().getStringRef() == "intent.atomic_add");
+                  operation->getName().getStringRef() == "intent.atomic_add" ||
+                  operation->getName().getStringRef() == "intent.atomic_cas");
     bool uniqueStore = operation &&
                        operation->getName().getStringRef() ==
                            "intent.scatter_unique";

@@ -323,6 +323,51 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
     return failure();
 
   if (failed(addHandler(
+          registry, "intent.atomic_cas",
+          [&](Operation &operation) -> LogicalResult {
+            auto compareIndex = operation.getAttrOfType<IntegerAttr>(
+                "intent.compare_operand_index");
+            auto valueIndex = operation.getAttrOfType<IntegerAttr>(
+                "intent.value_operand_index");
+            auto ordering =
+                operation.getAttrOfType<StringAttr>("intent.ordering");
+            auto scope = operation.getAttrOfType<StringAttr>("intent.scope");
+            auto view = operation.getNumOperands() > 0
+                            ? dyn_cast<intent::ViewType>(
+                                  operation.getOperand(0).getType())
+                            : intent::ViewType();
+            auto tensor = view ? dyn_cast<RankedTensorType>(view.getTensor())
+                               : RankedTensorType();
+            bool supportedOrdering =
+                ordering && llvm::is_contained(
+                                {StringRef("relaxed"), StringRef("acquire"),
+                                 StringRef("release"), StringRef("acq_rel")},
+                                ordering.getValue());
+            bool supportedScope =
+                scope && llvm::is_contained(
+                             {StringRef("workgroup"), StringRef("device"),
+                              StringRef("system")},
+                             scope.getValue());
+            if (operation.getNumResults() != 1 || !compareIndex || !valueIndex ||
+                compareIndex.getInt() <= 0 ||
+                valueIndex.getInt() != compareIndex.getInt() + 1 ||
+                static_cast<unsigned>(valueIndex.getInt()) !=
+                    operation.getNumOperands() - 1 ||
+                !view || view.getAccess() != "inout" || !tensor ||
+                !tensor.getElementType().isInteger(32) ||
+                operation.getOperand(compareIndex.getInt()).getType() !=
+                    tensor.getElementType() ||
+                operation.getOperand(valueIndex.getInt()).getType() !=
+                    tensor.getElementType() ||
+                operation.getResult(0).getType() != tensor.getElementType() ||
+                !supportedOrdering || !supportedScope)
+              return operation.emitOpError(
+                  "has no supported scalar i32 external GPU compare-and-swap schema");
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto accType =

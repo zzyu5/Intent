@@ -241,6 +241,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitAtomic(op);
+      })) ||
+      failed(addHandler(registry, "intent.atomic_cas", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAtomicCas(op);
       })))
     return failure();
   return success();
@@ -1653,6 +1658,55 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   line("tl.atomic_add(" + pointer + ", " + stored->str() +
        ", mask=member_mask[:, None] & feature_mask[None, :], "
        "sem='relaxed', scope='gpu')");
+  return success();
+}
+
+LogicalResult SourceEmitter::emitAtomicCas(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "compare-and-swap emission");
+  plan::BoundaryOp boundary =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  auto compareIndex = operation.getAttrOfType<IntegerAttr>(
+      "intent.compare_operand_index");
+  auto valueIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  auto ordering = operation.getAttrOfType<StringAttr>("intent.ordering");
+  auto scope = operation.getAttrOfType<StringAttr>("intent.scope");
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<StringRef> expected =
+      compareIndex ? lookupValue(operation, compareIndex.getInt())
+                   : FailureOr<StringRef>(failure());
+  FailureOr<StringRef> desired =
+      valueIndex ? lookupValue(operation, valueIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  if (failed(node) || !boundary || boundary.getAccess() != "store" ||
+      boundary.getCheckBounds() || !planIndex.stages.empty() || !compareIndex ||
+      !valueIndex || !ordering || !scope || failed(view) || failed(expected) ||
+      failed(desired) || operation.getNumResults() != 1 ||
+      !operation.getResult(0).getType().isInteger(32) ||
+      boundary.getResultSpace() != "private_scalar")
+    return operation.emitOpError(
+        "lacks an in-bounds scalar Triton compare-and-swap binding");
+
+  StringRef semantic = ordering.getValue();
+  std::string targetScope;
+  if (scope.getValue() == "workgroup")
+    targetScope = "cta";
+  else if (scope.getValue() == "device")
+    targetScope = "gpu";
+  else if (scope.getValue() == "system")
+    targetScope = "sys";
+  else
+    return operation.emitOpError("has no Triton atomic scope spelling");
+  FailureOr<std::string> pointer =
+      emitPointerExpression(operation, **view, true);
+  if (failed(pointer))
+    return failure();
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.atomic_cas(" + *pointer + ", " + expected->str() +
+       ", " + desired->str() + ", sem='" + semantic.str() +
+       "', scope='" + targetScope + "')");
+  bindResult(operation, 0, result);
   return success();
 }
 

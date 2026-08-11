@@ -224,6 +224,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitAtomic(op);
+      })) ||
+      failed(addHandler(registry, "intent.atomic_cas", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitAtomicCas(op);
       })))
     return failure();
   return success();
@@ -1819,6 +1824,65 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
        addressIndex("offs_feature[None, :]") + "), " + stored->str() +
        ", check_bounds=True, memory_order=ct.MemoryOrder.RELAXED, "
        "memory_scope=ct.MemoryScope.DEVICE)");
+  return success();
+}
+
+LogicalResult SourceEmitter::emitAtomicCas(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "compare-and-swap emission");
+  plan::BoundaryOp boundary =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  auto compareIndex = operation.getAttrOfType<IntegerAttr>(
+      "intent.compare_operand_index");
+  auto valueIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  auto ordering = operation.getAttrOfType<StringAttr>("intent.ordering");
+  auto scope = operation.getAttrOfType<StringAttr>("intent.scope");
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  FailureOr<StringRef> expected =
+      compareIndex ? lookupValue(operation, compareIndex.getInt())
+                   : FailureOr<StringRef>(failure());
+  FailureOr<StringRef> desired =
+      valueIndex ? lookupValue(operation, valueIndex.getInt())
+                 : FailureOr<StringRef>(failure());
+  if (failed(node) || !boundary || boundary.getAccess() != "store" ||
+      !planIndex.stages.empty() || !compareIndex || !valueIndex || !ordering ||
+      !scope || failed(view) || failed(expected) || failed(desired) ||
+      operation.getNumResults() != 1 ||
+      !operation.getResult(0).getType().isInteger(32) ||
+      boundary.getResultSpace() != "private_scalar")
+    return operation.emitOpError(
+        "lacks a scalar cuTile compare-and-swap binding");
+
+  std::string targetOrdering;
+  if (ordering.getValue() == "relaxed")
+    targetOrdering = "RELAXED";
+  else if (ordering.getValue() == "acquire")
+    targetOrdering = "ACQUIRE";
+  else if (ordering.getValue() == "release")
+    targetOrdering = "RELEASE";
+  else if (ordering.getValue() == "acq_rel")
+    targetOrdering = "ACQ_REL";
+  else
+    return operation.emitOpError("has no cuTile atomic ordering spelling");
+  std::string targetScope;
+  if (scope.getValue() == "workgroup")
+    targetScope = "BLOCK";
+  else if (scope.getValue() == "device")
+    targetScope = "DEVICE";
+  else if (scope.getValue() == "system")
+    targetScope = "SYS";
+  else
+    return operation.emitOpError("has no cuTile atomic scope spelling");
+  FailureOr<std::string> indices = indexTuple(operation, true);
+  if (failed(indices))
+    return failure();
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.atomic_cas(" + (*view)->argument->name + ", " +
+       *indices + ", " + expected->str() + ", " + desired->str() +
+       ", check_bounds=True, memory_order=ct.MemoryOrder." + targetOrdering +
+       ", memory_scope=ct.MemoryScope." + targetScope + ")");
+  bindResult(operation, 0, result);
   return success();
 }
 

@@ -132,6 +132,7 @@ public:
   mlir::LogicalResult emitStore(mlir::Operation &operation);
   mlir::LogicalResult emitUniqueStore(mlir::Operation &operation);
   mlir::LogicalResult emitAtomic(mlir::Operation &operation);
+  mlir::LogicalResult emitAtomicCas(mlir::Operation &operation);
   bool selectOperation(mlir::Operation &operation);
 
 private:

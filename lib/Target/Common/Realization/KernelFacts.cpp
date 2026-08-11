@@ -1203,8 +1203,15 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         inferIndexedAxes(operation, operation.getOperand(0), facts);
     auto valueAxes =
         facts.valueAxes.find(operation.getOperand(valueIndex.getInt()));
-    if (failed(indexedAxes) || valueAxes == facts.valueAxes.end() ||
-        *indexedAxes != valueAxes->second)
+    SmallVector<LogicalAxis> scalarAxes;
+    ArrayRef<LogicalAxis> writtenAxes =
+        valueAxes == facts.valueAxes.end()
+            ? ArrayRef<LogicalAxis>(scalarAxes)
+            : ArrayRef<LogicalAxis>(valueAxes->second);
+    if (failed(indexedAxes) ||
+        (valueAxes == facts.valueAxes.end() &&
+         isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) ||
+        ArrayRef<LogicalAxis>(*indexedAxes) != writtenAxes)
       return operation.emitOpError(
           "indexed write value does not match its destination");
     if (failed(analyzeBoundary(operation, facts, "none")))
@@ -1221,7 +1228,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
   };
   if (failed(addHandler(registry, "intent.scatter_unique", bindScatterWrite)) ||
       failed(addHandler(registry, "intent.scatter_reduce", bindScatterWrite)) ||
-      failed(addHandler(registry, "intent.atomic_add", bindAtomicWrite)))
+      failed(addHandler(registry, "intent.atomic_add", bindAtomicWrite)) ||
+      failed(addHandler(registry, "intent.atomic_cas", bindAtomicWrite)))
     return failure();
 
   auto enterStateStream = [&](Operation &operation) -> LogicalResult {

@@ -213,6 +213,13 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitAtomic(op);
+      })) ||
+      failed(addHandler(registry, "intent.atomic_cas",
+                        [&](Operation &op) -> LogicalResult {
+        if (!emitter.selectOperation(op))
+          return success();
+        return op.emitOpError(
+            "cannot lower compare-and-swap because the TileLang surface has no CAS primitive");
       })))
     return failure();
   return success();

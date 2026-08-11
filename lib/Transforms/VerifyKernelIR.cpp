@@ -407,11 +407,45 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
   }
   if (name == "intent.contract")
     return requireAttribute<ArrayAttr>(operation, "intent.reduce");
+  if (name == "intent.atomic_cas") {
+    auto relation = operation->getAttrOfType<ArrayAttr>("intent.index");
+    auto compareIndex = operation->getAttrOfType<IntegerAttr>(
+        "intent.compare_operand_index");
+    auto valueIndex = operation->getAttrOfType<IntegerAttr>(
+        "intent.value_operand_index");
+    auto ordering = operation->getAttrOfType<StringAttr>("intent.ordering");
+    auto scope = operation->getAttrOfType<StringAttr>("intent.scope");
+    bool knownOrdering =
+        ordering && llvm::is_contained(
+                        {StringRef("relaxed"), StringRef("acquire"),
+                         StringRef("release"), StringRef("acq_rel"),
+                         StringRef("seq_cst")},
+                        ordering.getValue());
+    bool knownScope =
+        scope && llvm::is_contained(
+                     {StringRef("work_item"), StringRef("subgroup"),
+                      StringRef("workgroup"), StringRef("device"),
+                      StringRef("system")},
+                     scope.getValue());
+    if (!relation || !compareIndex || !valueIndex ||
+        compareIndex.getInt() <= 0 ||
+        valueIndex.getInt() != compareIndex.getInt() + 1 ||
+        static_cast<unsigned>(valueIndex.getInt()) !=
+            operation->getNumOperands() - 1 ||
+        operation->getNumResults() != 1 ||
+        operation->getOperand(compareIndex.getInt()).getType() !=
+            operation->getOperand(valueIndex.getInt()).getType() ||
+        operation->getResult(0).getType() !=
+            operation->getOperand(valueIndex.getInt()).getType() ||
+        !knownOrdering || !knownScope)
+      return operation->emitOpError(
+          "requires trailing type-matched compare/value operands and canonical memory semantics");
+    return success();
+  }
   if (name == "intent.view_load" || name == "intent.view_store" ||
       name == "intent.gather" || name == "intent.scatter_unique" ||
       name == "intent.scatter_reduce" || name == "intent.buffer_load" ||
-      name == "intent.buffer_store" || name == "intent.atomic_add" ||
-      name == "intent.atomic_cas")
+      name == "intent.buffer_store" || name == "intent.atomic_add")
     return requireAttribute<ArrayAttr>(operation, "intent.index");
   if (name == "intent.call")
     return requireAttribute<StringAttr>(operation, "intent.callee");
