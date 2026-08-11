@@ -2373,6 +2373,9 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
     return "T.int32";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 64 && !integer.isUnsigned())
+    return "T.int64";
   if (isa<IndexType>(type))
     return "T.int32";
   consumer.emitOpError("uses an unsupported TileLang dtype");
