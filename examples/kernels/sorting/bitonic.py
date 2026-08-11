@@ -21,11 +21,13 @@ def bitonic_sort_rows(
             stride = sequence // 2
             while stride > 0:
                 for index in range(VALUES):
-                    partner = index ^ stride
-                    if partner > index:
+                    index_value = I.cast(index, I.i64)
+                    partner = index_value ^ stride
+                    I.assume_in_bounds(partner, local, axis=0)
+                    if partner > index_value:
                         lhs = I.mutable_load(local, index)
                         rhs = I.mutable_load(local, partner)
-                        ascending = (index & sequence) == 0
+                        ascending = (index_value & sequence) == 0
                         should_swap = (
                             lhs > rhs if ascending else lhs < rhs
                         )

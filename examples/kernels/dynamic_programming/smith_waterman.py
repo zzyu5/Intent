@@ -23,10 +23,11 @@ def smith_waterman_score(
         for row in range(1, QUERY_LENGTH + 1):
             I.store(current, 0, I.cast(0, I.i32))
             for column in range(1, REFERENCE_LENGTH + 1):
-                substitution = (
+                substitution = I.cast(
                     MATCH_SCORE
                     if query[batch, row - 1] == reference[batch, column - 1]
-                    else MISMATCH_SCORE
+                    else MISMATCH_SCORE,
+                    I.i32,
                 )
                 diagonal = (
                     I.mutable_load(previous, column - 1) + substitution

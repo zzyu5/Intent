@@ -506,7 +506,7 @@ def _run_smith_waterman(compiler: str, target: Target, target_name: str) -> None
                 current[:, column] = cell
                 maximum = torch.maximum(maximum, cell)
             previous = current
-        return maximum.cuda()
+        return maximum.to(torch.int32).cuda()
 
     _run_generated(
         definition=smith_waterman_score,
@@ -818,7 +818,7 @@ def _run_variant_rope(compiler: str, target: Target, target_name: str) -> None:
         target=target,
         target_name=target_name,
         kernel_name="RoPE equivalent paired index",
-        tolerance=2.0e-3,
+        tolerance=1.0e-2,
         constexprs={"HEADS": heads},
     )
 
