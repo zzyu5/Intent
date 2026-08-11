@@ -181,6 +181,19 @@ bool workerReuse(const RealizationIndex &index) {
   });
 }
 
+bool feedsAtomicValue(Operation &operation) {
+  if (operation.getNumResults() != 1 ||
+      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
+    return false;
+  Operation *user = *operation.getResult(0).user_begin();
+  auto valueIndex =
+      user->getAttrOfType<IntegerAttr>("intent.value_operand_index");
+  return user->getName().getStringRef() == "intent.atomic_add" && valueIndex &&
+         valueIndex.getInt() >= 0 &&
+         static_cast<unsigned>(valueIndex.getInt()) < user->getNumOperands() &&
+         user->getOperand(valueIndex.getInt()) == operation.getResult(0);
+}
+
 } // namespace
 
 FailureOr<RealizationIndex>
@@ -374,8 +387,9 @@ indexRealization(intent::plan::RealizationOp realization,
                            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
     binding.defer =
-        load && target::emission::deferSharedContractionTransfer(
-                    index, *operation, value.getResultSpace());
+        load && (target::emission::deferSharedContractionTransfer(
+                     index, *operation, value.getResultSpace()) ||
+                 (index.stages.empty() && feedsAtomicValue(*operation)));
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
         (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect;

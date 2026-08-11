@@ -1577,18 +1577,10 @@ LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
     return success();
   }
 
-  std::string result;
-  if (reuse >= 0) {
-    FailureOr<StringRef> reused = lookupValue(operation, reuse);
-    if (failed(reused))
-      return failure();
-    result = reused->str();
-  } else {
-    FailureOr<std::string> allocated = allocateResult(operation, 0, "fragment");
-    if (failed(allocated))
-      return failure();
-    result = *allocated;
-  }
+  FailureOr<std::string> allocated = allocateResult(operation, 0, "fragment");
+  if (failed(allocated))
+    return failure();
+  std::string result = *allocated;
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
   if (failed(extents) || extents->empty())
     return failure();
@@ -2548,9 +2540,14 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  Operation *deferredValue =
+      planIndex.stages.empty() && valueIndex
+          ? deferredLoads.lookup(operation.getOperand(valueIndex.getInt()))
+          : nullptr;
   FailureOr<StringRef> stored =
-      valueIndex ? lookupValue(operation, valueIndex.getInt())
-                 : FailureOr<StringRef>(failure());
+      deferredValue ? FailureOr<StringRef>(StringRef())
+      : valueIndex  ? lookupValue(operation, valueIndex.getInt())
+                    : FailureOr<StringRef>(failure());
   if (!valueIndex || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical TileLang atomic merge");
   if (planIndex.stages.empty()) {
@@ -2605,8 +2602,19 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
         elementAccessIndices(operation, tileIndices);
     FailureOr<std::string> predicate =
         elementBoundsPredicate(operation, tileIndices);
-    FailureOr<std::string> value =
-        tensorElement(storedValue, tileIndices, operation);
+    auto atomicValue = [&]() -> FailureOr<std::string> {
+      Operation *sourceLoad = deferredValue;
+      if (!sourceLoad)
+        return tensorElement(storedValue, tileIndices, operation);
+      FailureOr<ABIView *> sourceView =
+          lookupView(sourceLoad->getOperand(0), operation);
+      FailureOr<std::string> sourceIndices =
+          elementAccessIndices(*sourceLoad, tileIndices);
+      if (failed(sourceView) || failed(sourceIndices))
+        return failure();
+      return (*sourceView)->argument->name + "[" + *sourceIndices + "]";
+    };
+    FailureOr<std::string> value = atomicValue();
     if (failed(indices) || failed(predicate) || failed(value))
       return failure();
     line(loop);
