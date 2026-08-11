@@ -204,18 +204,15 @@ indexRealization(intent::plan::RealizationOp realization,
   SmallVector<intent::plan::ScanOp> scans;
   SmallVector<intent::plan::PointwiseOp> pointwise;
   SmallVector<intent::plan::TransferOp> transfers;
+  SmallVector<intent::plan::RangeOp> ranges;
   for (Operation &operation : realization.getBody().front()) {
     if (isa<intent::plan::YieldOp>(operation))
       continue;
     if (auto value = dyn_cast<intent::plan::DeviceOp>(operation)) {
       index.target.operation = value;
     } else if (auto value = dyn_cast<intent::plan::AxisOp>(operation)) {
-      FailureOr<std::string> tile = tileSpelling(value, value.getTile());
-      if (failed(tile))
-        return failure();
       plan::AxisOp binding;
       binding.operation = value;
-      binding.tile = *tile;
       if (std::optional<StringRef> group = value.getGroup()) {
         FailureOr<std::string> spelling = parameterSpelling(value, *group);
         if (failed(spelling))
@@ -223,6 +220,8 @@ indexRealization(intent::plan::RealizationOp realization,
         binding.group = *spelling;
       }
       index.axes.try_emplace(value.getNode(), binding);
+    } else if (auto value = dyn_cast<intent::plan::RangeOp>(operation)) {
+      ranges.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
@@ -275,7 +274,8 @@ indexRealization(intent::plan::RealizationOp realization,
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
     }
   }
-  if (failed(target::emission::indexCanonicalStructure(index, kernel)))
+  if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
+      failed(target::emission::indexCanonicalStructure(index, kernel)))
     return failure();
   target::emission::indexAxisRoles(index);
   for (auto &entry : index.streams) {

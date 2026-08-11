@@ -645,8 +645,31 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     }
     std::string iterator = makeRegionArgumentName(operation, index);
     valueNames[body.getArgument(index)] = iterator;
-    line("for " + iterator + " in tl.range(0, " + stop + "):");
-    ++indentation;
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    const target::emission::RangeBinding *outer =
+        ordered && axis ? axis.getRange("traversal", 0) : nullptr;
+    const target::emission::RangeBinding *inner =
+        ordered && axis ? axis.getRange("traversal", 1) : nullptr;
+    if (inner) {
+      if (!outer || inner->getTileRole() != "one")
+        return operation.emitOpError(
+            "has an invalid two-level Triton ordered traversal");
+      std::string chunk = iterator + "_chunk";
+      line("for " + chunk + " in tl.range(0, tl.cdiv(" + stop + ", " +
+           outer->getTile().str() + "), flatten=True):");
+      ++indentation;
+      line("for " + iterator + " in tl.range(" + chunk + " * " +
+           outer->getTile().str() + ", tl.minimum((" + chunk + " + 1) * " +
+           outer->getTile().str() + ", " + stop + ")):");
+      ++indentation;
+    } else {
+      line("for " + iterator + " in tl.range(0, " + stop + "):");
+      ++indentation;
+    }
   }
   return success();
 }
@@ -659,7 +682,17 @@ LogicalResult SourceEmitter::leaveFor(Operation &operation) {
       target::expandDomainSource(operation.getOperand(0), operation);
   if (failed(domains) || domains->empty())
     return failure();
-  indentation -= domains->size();
+  unsigned depth = 0;
+  bool ordered = operation.getName().getStringRef() == "intent.ordered";
+  for (Operation *domain : *domains) {
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    depth += ordered && axis && axis.getRange("traversal", 1) ? 2 : 1;
+  }
+  indentation -= depth;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     bindResult(operation, index, carriers->second[index]);
   return success();
@@ -1068,18 +1101,38 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
                  rhs->str() + ")";
   else if (binding.getLowering() == "python_floor_divide" ||
            binding.getLowering() == "python_remainder") {
-    std::string quotient = result + "_quotient";
+    Type elementType = operation.getResult(0).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(elementType))
+      elementType = tensor.getElementType();
+    StringRef resultDtype = tritonDtype(elementType);
+    if (resultDtype.empty())
+      return operation.emitOpError(
+          "requires an integer result for Python division semantics");
+    std::string wideLhs = result + "_wide_lhs";
+    std::string wideRhs = result + "_wide_rhs";
+    std::string lhsMagnitude = result + "_lhs_magnitude";
+    std::string rhsMagnitude = result + "_rhs_magnitude";
+    std::string quotientMagnitude = result + "_quotient_magnitude";
+    std::string quotient = result + "_truncating_quotient";
     std::string remainder = result + "_remainder";
     std::string adjust = result + "_adjust";
-    line(quotient + " = (" + lhs->str() + ") // (" + rhs->str() + ")");
-    line(remainder + " = (" + lhs->str() + ") - " + quotient + " * (" +
-         rhs->str() + ")");
+    line(wideLhs + " = tl.cast(" + lhs->str() + ", tl.int64)");
+    line(wideRhs + " = tl.cast(" + rhs->str() + ", tl.int64)");
+    line(lhsMagnitude + " = tl.where(" + wideLhs + " < 0, -" + wideLhs +
+         ", " + wideLhs + ")");
+    line(rhsMagnitude + " = tl.where(" + wideRhs + " < 0, -" + wideRhs +
+         ", " + wideRhs + ")");
+    line(quotientMagnitude + " = " + lhsMagnitude + " // " + rhsMagnitude);
+    line(quotient + " = tl.where((" + wideLhs + " < 0) != (" + wideRhs +
+         " < 0), -" + quotientMagnitude + ", " + quotientMagnitude + ")");
+    line(remainder + " = " + wideLhs + " - " + quotient + " * " + wideRhs);
     line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
-         " < 0) != (" + rhs->str() + " < 0))");
+         " < 0) != (" + wideRhs + " < 0))");
     expression = binding.getLowering() == "python_floor_divide"
-                     ? quotient + " - tl.where(" + adjust + ", 1, 0)"
-                     : remainder + " + tl.where(" + adjust + ", " +
-                           rhs->str() + ", 0)";
+                     ? "tl.cast(" + quotient + " - tl.where(" + adjust +
+                           ", 1, 0), " + resultDtype.str() + ")"
+                     : "tl.cast(" + remainder + " + tl.where(" + adjust +
+                           ", " + wideRhs + ", 0), " + resultDtype.str() + ")";
   } else {
     StringRef symbol;
     if (binding.getLowering() == "python_add")

@@ -514,8 +514,31 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     }
     std::string iterator = makeRegionArgumentName(operation, index);
     valueNames[body.getArgument(index)] = iterator;
-    line("for " + iterator + " in T.serial(" + stop + "):");
-    ++indentation;
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    const target::emission::RangeBinding *outer =
+        ordered && axis ? axis.getRange("traversal", 0) : nullptr;
+    const target::emission::RangeBinding *inner =
+        ordered && axis ? axis.getRange("traversal", 1) : nullptr;
+    if (inner) {
+      if (!outer || inner->getTileRole() != "one")
+        return operation.emitOpError(
+            "has an invalid two-level TileLang ordered traversal");
+      std::string chunk = iterator + "_chunk";
+      line("for " + chunk + " in T.serial(T.ceildiv(" + stop + ", " +
+           outer->getTile().str() + ")):");
+      ++indentation;
+      line("for " + iterator + " in T.serial(" + chunk + " * " +
+           outer->getTile().str() + ", T.min((" + chunk + " + 1) * " +
+           outer->getTile().str() + ", " + stop + ")):");
+      ++indentation;
+    } else {
+      line("for " + iterator + " in T.serial(" + stop + "):");
+      ++indentation;
+    }
   }
   return success();
 }
@@ -528,7 +551,17 @@ LogicalResult SourceEmitter::leaveFor(Operation &operation) {
       target::expandDomainSource(operation.getOperand(0), operation);
   if (failed(domains) || domains->empty())
     return failure();
-  indentation -= domains->size();
+  unsigned depth = 0;
+  bool ordered = operation.getName().getStringRef() == "intent.ordered";
+  for (Operation *domain : *domains) {
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    plan::AxisOp axis = succeeded(domainNode)
+                            ? planIndex.axes.lookup(*domainNode)
+                            : plan::AxisOp();
+    depth += ordered && axis && axis.getRange("traversal", 1) ? 2 : 1;
+  }
+  indentation -= depth;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     bindResult(operation, index, carriers->second[index] + "[0]");
   return success();
@@ -787,25 +820,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                                                                       : "0.0";
   if (failed(physicalFill))
     return failure();
-  if (!scalarResult) {
-    auto resultType =
-        dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-    FailureOr<SmallVector<target::IndexTerm>> relation =
-        target::parseIndexRelation(operation);
-    if (!resultType || failed(relation))
-      return failure();
-    unsigned tensorIndices = llvm::count_if(
-        *relation, [&](const target::IndexTerm &term) {
-          return term.kind == "value_index" && term.operands.size() == 1 &&
-                 term.operands.front() &&
-                 isa<RankedTensorType>(
-                     operation.getOperand(*term.operands.front()).getType());
-        });
-    if (resultType.getRank() > 2 && tensorIndices > 1)
-      return operation.emitOpError(
-          "requires a multi-axis broadcasted indirect read footprint that "
-          "TileLang cannot project as one parallel fragment");
-  }
+  auto accessRanges =
+      target::emission::accessRangesForTransfer(planIndex, *node);
+  if (accessRanges.size() > 1)
+    return operation.emitOpError(
+        "has multiple affine access ranges; TileLang cannot project their "
+        "joint footprint as one parallel fragment");
   bool expanded = !physicalFill->empty();
   if (scalarResult) {
     FailureOr<std::string> indices = accessIndices(operation);
@@ -1426,18 +1446,38 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
              rhs.str() + ")";
     if (binding.getLowering() == "python_floor_divide" ||
         binding.getLowering() == "python_remainder") {
-      std::string quotient = resultName + "_quotient";
+      Type elementType = operation.getResult(0).getType();
+      if (auto tensor = dyn_cast<RankedTensorType>(elementType))
+        elementType = tensor.getElementType();
+      std::string resultDtype = dtypeName(elementType, operation);
+      if (resultDtype.empty())
+        return failure();
+      std::string wideLhs = resultName + "_wide_lhs";
+      std::string wideRhs = resultName + "_wide_rhs";
+      std::string lhsMagnitude = resultName + "_lhs_magnitude";
+      std::string rhsMagnitude = resultName + "_rhs_magnitude";
+      std::string quotientMagnitude = resultName + "_quotient_magnitude";
+      std::string quotient = resultName + "_truncating_quotient";
       std::string remainder = resultName + "_remainder";
       std::string adjust = resultName + "_adjust";
-      line(quotient + " = (" + lhs.str() + ") // (" + rhs.str() + ")");
-      line(remainder + " = (" + lhs.str() + ") - " + quotient + " * (" +
-           rhs.str() + ")");
+      line(wideLhs + " = T.cast(" + lhs.str() + ", T.int64)");
+      line(wideRhs + " = T.cast(" + rhs.str() + ", T.int64)");
+      line(lhsMagnitude + " = T.if_then_else(" + wideLhs + " < 0, -" +
+           wideLhs + ", " + wideLhs + ")");
+      line(rhsMagnitude + " = T.if_then_else(" + wideRhs + " < 0, -" +
+           wideRhs + ", " + wideRhs + ")");
+      line(quotientMagnitude + " = " + lhsMagnitude + " // " + rhsMagnitude);
+      line(quotient + " = T.if_then_else((" + wideLhs + " < 0) != (" +
+           wideRhs + " < 0), -" + quotientMagnitude + ", " +
+           quotientMagnitude + ")");
+      line(remainder + " = " + wideLhs + " - " + quotient + " * " + wideRhs);
       line(adjust + " = (" + remainder + " != 0) & ((" + remainder +
-           " < 0) != (" + rhs.str() + " < 0))");
+           " < 0) != (" + wideRhs + " < 0))");
       return binding.getLowering() == "python_floor_divide"
-                 ? quotient + " - T.if_then_else(" + adjust + ", 1, 0)"
-                 : remainder + " + T.if_then_else(" + adjust + ", " +
-                       rhs.str() + ", 0)";
+                 ? "T.cast(" + quotient + " - T.if_then_else(" + adjust +
+                       ", 1, 0), " + resultDtype + ")"
+                 : "T.cast(" + remainder + " + T.if_then_else(" + adjust +
+                       ", " + wideRhs + ", 0), " + resultDtype + ")";
     }
     StringRef symbol;
     if (binding.getLowering() == "python_add")

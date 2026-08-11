@@ -60,6 +60,14 @@ struct LogicalBufferFact {
   LogicalBufferInfo info;
 };
 
+struct AccessRangeFact {
+  mlir::Operation *transfer = nullptr;
+  mlir::Operation *axis = nullptr;
+  unsigned sourceAxis = 0;
+  int64_t lowerOffset = 0;
+  int64_t upperOffset = 0;
+};
+
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
@@ -90,6 +98,7 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> scatterWrites;
   llvm::DenseMap<mlir::Operation *, ContractionFact> contractions;
   llvm::DenseMap<mlir::Operation *, LogicalBufferFact> logicalBuffers;
+  llvm::SmallVector<AccessRangeFact> accessRanges;
 };
 
 mlir::LogicalResult analyzeKernelFacts(KernelFacts &facts);

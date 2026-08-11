@@ -251,10 +251,38 @@ struct TargetBinding : Binding<intent::plan::DeviceOp> {
   int64_t getDevice() const { return operation.getDevice(); }
 };
 
+struct RangeBinding : Binding<intent::plan::RangeOp> {
+  std::string tile;
+
+  int64_t getAxisNode() const { return operation.getAxisNode(); }
+  llvm::StringRef getPurpose() const { return operation.getPurpose(); }
+  int64_t getLevel() const { return operation.getLevel(); }
+  llvm::StringRef getTile() const { return tile; }
+  llvm::StringRef getTileRole() const { return operation.getTile(); }
+  mlir::IntegerAttr getTransferNodeAttr() const {
+    return operation.getTransferNodeAttr();
+  }
+  mlir::IntegerAttr getSourceAxisAttr() const {
+    return operation.getSourceAxisAttr();
+  }
+  int64_t getTransferNode() const {
+    return operation.getTransferNodeAttr().getInt();
+  }
+  int64_t getSourceAxis() const {
+    return operation.getSourceAxisAttr().getInt();
+  }
+  int64_t getLowerOffset() const {
+    return operation.getLowerOffsetAttr().getInt();
+  }
+  int64_t getUpperOffset() const {
+    return operation.getUpperOffsetAttr().getInt();
+  }
+};
+
 struct AxisBinding : Binding<intent::plan::AxisOp> {
   std::string role;
-  std::string tile;
   std::string group;
+  llvm::SmallVector<RangeBinding> ranges;
 
   int64_t getNode() const { return operation.getNode(); }
   mlir::IntegerAttr getNodeAttr() const { return operation.getNodeAttr(); }
@@ -270,9 +298,51 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
     return false;
   }
   llvm::StringRef getRole() const { return role; }
-  llvm::StringRef getTile() const { return tile; }
-  llvm::StringRef getTileRole() const { return operation.getTile(); }
-  bool isScalar() const { return operation.getTile() == "one"; }
+  const RangeBinding *getRange(llvm::StringRef purpose,
+                               int64_t level = 0) const {
+    auto found = llvm::find_if(ranges, [&](const RangeBinding &range) {
+      return range.getPurpose() == purpose && range.getLevel() == level;
+    });
+    if (found == ranges.end())
+      return nullptr;
+    return &*found;
+  }
+  const RangeBinding *primaryRange() const {
+    llvm::SmallVector<llvm::StringRef> purposes;
+    llvm::StringRef activeRole(role);
+    if (activeRole.starts_with("program_") ||
+        activeRole.starts_with("ragged_member_"))
+      purposes.push_back("ownership");
+    else if (activeRole.starts_with("stream_"))
+      purposes.push_back("traversal");
+    else if (activeRole.starts_with("reduction_"))
+      purposes.push_back("reduction");
+    else if (activeRole.starts_with("lane_"))
+      purposes.push_back("lane");
+    for (llvm::StringRef purpose : {llvm::StringRef("ownership"),
+                                    llvm::StringRef("traversal"),
+                                    llvm::StringRef("reduction"),
+                                    llvm::StringRef("lane")})
+      if (!llvm::is_contained(purposes, purpose))
+        purposes.push_back(purpose);
+    for (llvm::StringRef purpose : purposes)
+      if (const RangeBinding *range = getRange(purpose))
+        return range;
+    return nullptr;
+  }
+  llvm::StringRef getTile() const {
+    const RangeBinding *range = primaryRange();
+    return range ? range->getTile() : llvm::StringRef();
+  }
+  llvm::StringRef getTileRole() const {
+    const RangeBinding *range = primaryRange();
+    return range ? range->getTileRole() : llvm::StringRef();
+  }
+  bool isScalar() const {
+    return llvm::all_of(ranges, [](const RangeBinding &range) {
+      return range.getTileRole() == "one";
+    });
+  }
   mlir::IntegerAttr getProgramOrderAttr() const {
     return operation.getProgramOrderAttr();
   }
@@ -294,6 +364,53 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
   }
   llvm::StringRef getGroupSpelling() const { return group; }
 };
+
+template <typename PlanIndex, typename TileSpelling>
+mlir::LogicalResult indexAxisRanges(
+    PlanIndex &index, llvm::ArrayRef<intent::plan::RangeOp> ranges,
+    TileSpelling spelling) {
+  for (intent::plan::RangeOp range : ranges) {
+    auto axis = index.axes.find(range.getAxisNode());
+    if (axis == index.axes.end())
+      return range.emitOpError("references an unbound target axis");
+    mlir::FailureOr<std::string> tile = spelling(range, range.getTile());
+    if (mlir::failed(tile))
+      return mlir::failure();
+    RangeBinding binding;
+    binding.operation = range;
+    binding.tile = std::move(*tile);
+    axis->second.ranges.push_back(std::move(binding));
+  }
+  for (auto &entry : index.axes)
+    llvm::sort(entry.second.ranges,
+               [](const RangeBinding &lhs, const RangeBinding &rhs) {
+                 if (lhs.getPurpose() != rhs.getPurpose())
+                   return lhs.getPurpose() < rhs.getPurpose();
+                 return lhs.getLevel() < rhs.getLevel();
+               });
+  return mlir::success();
+}
+
+struct AccessRangeProjection {
+  AxisBinding axis;
+  RangeBinding range;
+};
+
+template <typename PlanIndex>
+llvm::SmallVector<AccessRangeProjection>
+accessRangesForTransfer(const PlanIndex &index, int64_t transferNode) {
+  llvm::SmallVector<AccessRangeProjection> result;
+  for (const auto &entry : index.axes)
+    for (const RangeBinding &range : entry.second.ranges)
+      if (range.getPurpose() == "access" &&
+          range.getTransferNode() == transferNode)
+        result.push_back(AccessRangeProjection{entry.second, range});
+  llvm::sort(result, [](const AccessRangeProjection &lhs,
+                        const AccessRangeProjection &rhs) {
+    return lhs.range.getSourceAxis() < rhs.range.getSourceAxis();
+  });
+  return result;
+}
 
 struct ProgramBinding : Binding<intent::plan::ProgramOp> {
   int64_t getLoopNode() const { return operation.getLoopNode(); }
@@ -562,9 +679,11 @@ struct PhysicalComponents {
 template <typename PlanIndex>
 bool requiresDelegatedTuning(const PlanIndex &index) {
   return llvm::any_of(index.axes, [&](const auto &entry) {
-    llvm::StringRef tile = entry.second.getTileRole();
-    return tile != "one" && !tile.starts_with("row_vector") &&
-           !tile.starts_with("fixed_");
+    return llvm::any_of(entry.second.ranges, [](const RangeBinding &range) {
+      llvm::StringRef tile = range.getTileRole();
+      return tile != "one" && !tile.starts_with("row_vector") &&
+             !tile.starts_with("fixed_");
+    });
   });
 }
 

@@ -132,11 +132,17 @@ bool hasRole(ArrayRef<std::string> roles, StringRef role) {
 }
 
 struct AxisChoice {
+  struct RangeChoice {
+    std::string purpose;
+    int64_t level = 0;
+    std::string tile;
+  };
+
   Operation *domain = nullptr;
   SmallVector<Operation *> parallels;
   SmallVector<std::string> roles;
   bool tiled = false;
-  std::string tile;
+  SmallVector<RangeChoice> ranges;
   std::optional<int64_t> programOrder;
   std::optional<int64_t> worker;
   std::optional<int64_t> fold;
@@ -144,8 +150,23 @@ struct AxisChoice {
   std::string group;
 };
 
+void addRange(AxisChoice &choice, StringRef purpose, int64_t level,
+              std::string tile) {
+  choice.ranges.push_back(
+      AxisChoice::RangeChoice{purpose.str(), level, std::move(tile)});
+}
+
+const AxisChoice::RangeChoice *findRange(const AxisChoice &choice,
+                                         StringRef purpose,
+                                         int64_t level = 0) {
+  auto found = llvm::find_if(choice.ranges, [&](const auto &range) {
+    return range.purpose == purpose && range.level == level;
+  });
+  return found == choice.ranges.end() ? nullptr : &*found;
+}
+
 struct AxisAssignments {
-  SmallVector<AxisChoice> axes;
+  SmallVector<AxisChoice, 0> axes;
   bool persistent = false;
 };
 
@@ -218,7 +239,7 @@ SmallVector<unsigned> contractionProgramAxes(
 
 FailureOr<AxisAssignments>
 assignAxes(const target::KernelFacts &facts) {
-  SmallVector<AxisChoice> choices;
+  SmallVector<AxisChoice, 0> choices;
   llvm::DenseMap<Operation *, unsigned> positions;
   auto ensure = [&](Operation *domain) -> AxisChoice & {
     auto found = positions.find(domain);
@@ -278,48 +299,59 @@ assignAxes(const target::KernelFacts &facts) {
   };
   for (AxisChoice &choice : choices) {
     if (choice.programOrder) {
+      std::string tile;
       if (!choice.tiled) {
-        choice.tile = "one";
+        tile = "one";
       } else if (ownsOrderedStream(choice, facts)) {
-        choice.tile = indexedTile("query", queryTile);
+        tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {
-        choice.tile = indexedTile("ragged_member", raggedTile);
+        tile = indexedTile("ragged_member", raggedTile);
       } else if (ordinaryTile == 0) {
-        choice.tile = "program_m";
+        tile = "program_m";
         ++ordinaryTile;
       } else if (ordinaryTile == 1) {
-        choice.tile = "program_n";
+        tile = "program_n";
         ++ordinaryTile;
       } else {
-        choice.tile = "program_" + std::to_string(ordinaryTile++);
+        tile = "program_" + std::to_string(ordinaryTile++);
       }
-    } else if (hasRole(choice.roles, "ordered")) {
+      addRange(choice, "ownership", 0, std::move(tile));
+    }
+    if (hasRole(choice.roles, "ordered")) {
       auto fixed = facts.orderedStreamFixedExtents.find(choice.domain);
-      choice.tile = facts.serialLoopDomains.contains(choice.domain)
-                        ? "one"
-                    : fixed != facts.orderedStreamFixedExtents.end()
-                        ? "fixed_" + std::to_string(fixed->second)
-                    : hasIndirectRaggedMembership(choice.domain, facts)
-                        ? "one"
-                    : hasRole(choice.roles, "reduction")
-                        ? indexedTile("stream_contract",
-                                      streamContractionTile)
-                        : indexedTile("stream", streamTile);
-    } else if (hasRole(choice.roles, "reduction")) {
-      choice.tile = indexedTile("reduction", reductionTile);
-    } else if (hasRole(choice.roles, "lane")) {
+      std::string tile =
+          fixed != facts.orderedStreamFixedExtents.end()
+              ? "fixed_" + std::to_string(fixed->second)
+          : hasIndirectRaggedMembership(choice.domain, facts)
+              ? "one"
+          : hasRole(choice.roles, "reduction")
+              ? indexedTile("stream_contract", streamContractionTile)
+              : indexedTile("stream", streamTile);
+      addRange(choice, "traversal", 0, tile);
+      if (facts.serialLoopDomains.contains(choice.domain))
+        addRange(choice, "traversal", 1, "one");
+    }
+    if (hasRole(choice.roles, "reduction")) {
+      const AxisChoice::RangeChoice *traversal =
+          findRange(choice, "traversal");
+      addRange(choice, "reduction", 0,
+               traversal ? traversal->tile
+                         : indexedTile("reduction", reductionTile));
+    }
+    if (hasRole(choice.roles, "lane")) {
       auto extent = facts.staticDomainExtents.find(choice.domain);
       if (extent != facts.staticDomainExtents.end()) {
         int64_t physical = 1;
         while (physical < extent->second)
           physical *= 2;
-        choice.tile = "fixed_" + std::to_string(physical);
+        addRange(choice, "lane", 0,
+                 "fixed_" + std::to_string(physical));
       } else {
-        choice.tile = indexedTile("row_vector", laneTile);
+        addRange(choice, "lane", 0, indexedTile("row_vector", laneTile));
       }
-    } else {
-      choice.tile = "one";
     }
+    if (choice.ranges.empty())
+      addRange(choice, "traversal", 0, "one");
   }
 
   SmallVector<unsigned> parents(choices.size());
@@ -647,7 +679,8 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
       collectImplicitExtent(axis);
   }
   for (const AxisChoice &choice : assignments->axes) {
-    if (choice.reuse || !StringRef(choice.tile).starts_with("row_vector"))
+    const AxisChoice::RangeChoice *lane = findRange(choice, "lane");
+    if (choice.reuse || !lane || !StringRef(lane->tile).starts_with("row_vector"))
       continue;
     FailureOr<std::string> extent = sourceDimensionSymbol(*choice.domain, facts);
     if (failed(extent))
@@ -681,8 +714,37 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         choice.group.empty() ? StringAttr() : string(builder, choice.group);
     decisions.axes.push_back(builder.create<intent::plan::AxisOp>(
         choice.domain->getLoc(), i64(builder, *domainNode),
-        builder.getArrayAttr(roles), string(builder, choice.tile), programOrder,
-        worker, fold, builder.getBoolAttr(choice.reuse), group));
+        builder.getArrayAttr(roles), programOrder, worker, fold,
+        builder.getBoolAttr(choice.reuse), group));
+    for (const AxisChoice::RangeChoice &range : choice.ranges)
+      decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(
+          choice.domain->getLoc(), i64(builder, *domainNode),
+          string(builder, range.purpose), i64(builder, range.level),
+          string(builder, range.tile), IntegerAttr(), IntegerAttr(),
+          i64(builder, 0), i64(builder, 0)));
+  }
+
+  for (const target::AccessRangeFact &access : facts.accessRanges) {
+    auto choice = llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
+      return candidate.domain == access.axis;
+    });
+    const AxisChoice::RangeChoice *ownership =
+        choice == assignments->axes.end()
+            ? nullptr
+            : findRange(*choice, "ownership");
+    FailureOr<int64_t> axisNode =
+        node(*access.axis, "access-range axis binding");
+    FailureOr<int64_t> transferNode =
+        node(*access.transfer, "access-range transfer binding");
+    if (!ownership || failed(axisNode) || failed(transferNode))
+      return access.transfer->emitOpError(
+          "has no ownership range for its affine access footprint");
+    decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(
+        access.transfer->getLoc(), i64(builder, *axisNode),
+        string(builder, "access"), i64(builder, 0),
+        string(builder, ownership->tile), i64(builder, *transferNode),
+        i64(builder, access.sourceAxis), i64(builder, access.lowerOffset),
+        i64(builder, access.upperOffset)));
   }
 
   FailureOr<SmallVector<StageDecision, 0>> stages =
@@ -764,17 +826,19 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
     return tile != "one" && !tile.starts_with("row_vector") &&
            !tile.starts_with("fixed_");
   };
-  for (intent::plan::AxisOp axis : decisions.axes) {
-    if (tunable(axis.getTile())) {
-      Operation *domain = facts.kernel.nodes.lookup(axis.getNode());
+  for (intent::plan::RangeOp range : decisions.ranges) {
+    if (tunable(range.getTile())) {
+      Operation *domain = facts.kernel.nodes.lookup(range.getAxisNode());
       FailureOr<std::string> key =
           domain ? sourceDimensionSymbol(*domain, facts)
                  : FailureOr<std::string>(failure());
       if (failed(key))
         return failure();
       appendUnique(keys, *key);
-      appendUnique(parameters, axis.getTile());
+      appendUnique(parameters, range.getTile());
     }
+  }
+  for (intent::plan::AxisOp axis : decisions.axes) {
     if (axis.getGroupAttr())
       appendUnique(parameters, *axis.getGroup());
   }

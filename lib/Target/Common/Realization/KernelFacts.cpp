@@ -439,6 +439,185 @@ inferIndexedAxes(Operation &operation, Value source, KernelFacts &facts) {
   return resultAxes;
 }
 
+struct AffineIndexExpression {
+  llvm::DenseMap<Operation *, int64_t> coefficients;
+  int64_t constant = 0;
+};
+
+std::optional<int64_t> integerConstant(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition ||
+      definition->getName().getStringRef() != "intent.constant")
+    return std::nullopt;
+  if (auto literal = definition->getAttrOfType<BoolAttr>("intent.value"))
+    return literal.getValue() ? 1 : 0;
+  auto literal = definition->getAttrOfType<IntegerAttr>("intent.value");
+  return literal ? std::optional<int64_t>(literal.getInt()) : std::nullopt;
+}
+
+std::optional<AffineIndexExpression>
+affineIndexExpression(Value value, const KernelFacts &facts,
+                      llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return std::nullopt;
+  auto finish = [&](std::optional<AffineIndexExpression> expression) {
+    active.erase(value);
+    return expression;
+  };
+  if (std::optional<int64_t> literal = integerConstant(value)) {
+    AffineIndexExpression expression;
+    expression.constant = *literal;
+    return finish(std::move(expression));
+  }
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return finish(std::nullopt);
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.indices") {
+    auto axes = facts.valueAxes.find(value);
+    if (axes == facts.valueAxes.end() || axes->second.size() != 1 ||
+        !axes->second.front().domain)
+      return finish(std::nullopt);
+    AffineIndexExpression expression;
+    expression.coefficients[axes->second.front().domain] = 1;
+    return finish(std::move(expression));
+  }
+
+  if (name == "intent.gather") {
+    auto valid = definition->getAttrOfType<IntegerAttr>(
+        "intent.valid_operand_index");
+    if (valid) {
+      int64_t operand = valid.getInt();
+      if (operand < 0 ||
+          static_cast<unsigned>(operand) >= definition->getNumOperands() ||
+          integerConstant(definition->getOperand(operand)) !=
+              std::optional<int64_t>(1))
+        return finish(std::nullopt);
+    }
+  }
+  if (name == "intent.broadcast" || name == "intent.reshape" ||
+      name == "intent.transpose" || name == "intent.cast" ||
+      name == "intent.gather") {
+    if (definition->getNumOperands() == 0)
+      return finish(std::nullopt);
+    return finish(affineIndexExpression(definition->getOperand(0), facts,
+                                        active));
+  }
+
+  if (name == "intent.unary" && definition->getNumOperands() == 1) {
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    std::optional<AffineIndexExpression> operand =
+        affineIndexExpression(definition->getOperand(0), facts, active);
+    if (!logical || !operand || logical.getValue() != "negate")
+      return finish(std::nullopt);
+    operand->constant = -operand->constant;
+    for (auto &coefficient : operand->coefficients)
+      coefficient.second = -coefficient.second;
+    return finish(std::move(operand));
+  }
+
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return finish(std::nullopt);
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  std::optional<AffineIndexExpression> lhs =
+      affineIndexExpression(definition->getOperand(0), facts, active);
+  std::optional<AffineIndexExpression> rhs =
+      affineIndexExpression(definition->getOperand(1), facts, active);
+  if (!logical || !lhs || !rhs)
+    return finish(std::nullopt);
+  auto scale = [](AffineIndexExpression &expression, int64_t factor) {
+    expression.constant *= factor;
+    for (auto &coefficient : expression.coefficients)
+      coefficient.second *= factor;
+  };
+  if (logical.getValue() == "multiply") {
+    if (lhs->coefficients.empty()) {
+      int64_t factor = lhs->constant;
+      scale(*rhs, factor);
+      return finish(std::move(rhs));
+    }
+    if (rhs->coefficients.empty()) {
+      int64_t factor = rhs->constant;
+      scale(*lhs, factor);
+      return finish(std::move(lhs));
+    }
+    return finish(std::nullopt);
+  }
+  int64_t sign = logical.getValue() == "add"
+                     ? 1
+                     : logical.getValue() == "subtract" ? -1 : 0;
+  if (sign == 0)
+    return finish(std::nullopt);
+  lhs->constant += sign * rhs->constant;
+  for (const auto &coefficient : rhs->coefficients)
+    lhs->coefficients[coefficient.first] += sign * coefficient.second;
+  return finish(std::move(lhs));
+}
+
+LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
+  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  auto isPartitionedOwnership = [&](Operation *domain) {
+    return llvm::any_of(facts.partitionDomains, [&](const auto &entry) {
+      return entry.second == domain;
+    });
+  };
+  unsigned sourceAxis = 0;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
+    unsigned currentSourceAxis = sourceAxis++;
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    Value index = operation.getOperand(*term.operands.front());
+    if (!isa<RankedTensorType>(index.getType()))
+      continue;
+    llvm::DenseSet<Value> active;
+    std::optional<AffineIndexExpression> expression =
+        affineIndexExpression(index, facts, active);
+    if (!expression) {
+      continue;
+    }
+    Operation *ownership = nullptr;
+    for (const auto &coefficient : expression->coefficients) {
+      if (!isPartitionedOwnership(coefficient.first))
+        continue;
+      if (ownership || coefficient.second != 1) {
+        ownership = nullptr;
+        break;
+      }
+      ownership = coefficient.first;
+    }
+    if (!ownership) {
+      continue;
+    }
+    int64_t lower = expression->constant;
+    int64_t upper = expression->constant;
+    bool bounded = true;
+    for (const auto &coefficient : expression->coefficients) {
+      if (coefficient.first == ownership)
+        continue;
+      auto extent = facts.staticDomainExtents.find(coefficient.first);
+      if (extent == facts.staticDomainExtents.end()) {
+        bounded = false;
+        break;
+      }
+      int64_t endpoint = coefficient.second * (extent->second - 1);
+      lower += std::min<int64_t>(0, endpoint);
+      upper += std::max<int64_t>(0, endpoint);
+    }
+    if (!bounded || (lower == 0 && upper == 0)) {
+      continue;
+    }
+    facts.accessRanges.push_back(AccessRangeFact{
+        &operation, ownership, currentSourceAxis, lower, upper});
+  }
+  return success();
+}
+
 LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("pointwise provenance requires one result");
@@ -1144,10 +1323,10 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 diagnostic << " for " << names;
               return failure();
             }
-            if (failed(analyzeBoundary(
-                    operation, facts, *fill)))
+            if (failed(analyzeBoundary(operation, facts, *fill)) ||
+                failed(recordLoadAxes(operation, facts)))
               return failure();
-            return recordLoadAxes(operation, facts);
+            return recordAccessRanges(operation, facts);
           })))
     return failure();
 

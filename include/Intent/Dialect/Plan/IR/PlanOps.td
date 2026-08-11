@@ -48,12 +48,26 @@ def IntentPlan_AxisOp : IntentPlan_Op<"axis"> {
   let arguments = (ins
     I64Attr:$node,
     ArrayAttr:$roles,
-    StrAttr:$tile,
     OptionalAttr<I64Attr>:$program_order,
     OptionalAttr<I64Attr>:$worker_axis,
     OptionalAttr<I64Attr>:$fold_order,
     BoolAttr:$reuse_worker,
     OptionalAttr<StrAttr>:$group
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_RangeOp : IntentPlan_Op<"range"> {
+  let arguments = (ins
+    I64Attr:$axis_node,
+    StrAttr:$purpose,
+    I64Attr:$level,
+    StrAttr:$tile,
+    OptionalAttr<I64Attr>:$transfer_node,
+    OptionalAttr<I64Attr>:$source_axis,
+    I64Attr:$lower_offset,
+    I64Attr:$upper_offset
   );
   let results = (outs);
   let hasVerifier = 1;

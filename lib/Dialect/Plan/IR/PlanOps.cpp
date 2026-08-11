@@ -101,8 +101,7 @@ LogicalResult DeviceOp::verify() {
 LogicalResult AxisOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
-  if (failed(verifyStringArray(*this, getRoles(), "axis role")) ||
-      getTile().empty())
+  if (failed(verifyStringArray(*this, getRoles(), "axis role")))
     return failure();
   for (Attribute attribute : getRoles()) {
     StringRef role = cast<StringAttr>(attribute).getValue();
@@ -125,6 +124,40 @@ LogicalResult AxisOp::verify() {
              getFoldOrderAttr() || getReuseWorker() || getGroupAttr()) {
     return emitOpError(
         "non-parallel axes cannot own program-space assignment fields");
+  }
+  return success();
+}
+
+LogicalResult RangeOp::verify() {
+  if (failed(requireNode(*this, getAxisNode())) ||
+      failed(requireNonNegative(*this, getLevel(), "range level")) ||
+      getPurpose().empty() || getTile().empty())
+    return failure();
+  if (!llvm::is_contained(
+          {StringRef("ownership"), StringRef("traversal"),
+           StringRef("reduction"), StringRef("lane"),
+           StringRef("access")},
+          getPurpose()))
+    return emitOpError() << "contains unsupported range purpose " << getPurpose();
+  if (getPurpose() != "traversal" && getLevel() != 0)
+    return emitOpError("only ordered traversal may contain nested range levels");
+  if (getPurpose() == "access") {
+    if (!getTransferNodeAttr() || !getSourceAxisAttr() ||
+        failed(requireNode(*this, getTransferNodeAttr().getInt())) ||
+        failed(requireNonNegative(*this, getSourceAxisAttr().getInt(),
+                                  "source view axis")))
+      return emitOpError(
+          "access ranges require a transfer node and source view axis");
+    int64_t lower = getLowerOffsetAttr().getInt();
+    int64_t upper = getUpperOffsetAttr().getInt();
+    if (lower > upper)
+      return emitOpError() << "access range offsets do not form an interval: "
+                           << lower << " > " << upper;
+  } else if (getTransferNodeAttr() || getSourceAxisAttr() ||
+             getLowerOffsetAttr().getInt() != 0 ||
+             getUpperOffsetAttr().getInt() != 0) {
+    return emitOpError(
+        "non-access ranges cannot carry transfer-relative offsets");
   }
   return success();
 }
@@ -279,11 +312,14 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   ProgramOp program;
   llvm::StringSet<> blockExtents;
   llvm::DenseMap<int64_t, AxisOp> axes;
+  llvm::StringSet<> rangeKeys;
+  SmallVector<RangeOp> ranges;
   llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
   llvm::DenseSet<int64_t> buffers;
   SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
+  llvm::DenseSet<int64_t> transfers;
   llvm::DenseSet<int64_t> stageNodes;
   llvm::StringSet<> stageAxisRoles;
   SmallVector<StageAxisOp> stageAxes;
@@ -299,6 +335,16 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (axisHasRole(axis, "parallel") &&
           !programOrders.insert(axis.getProgramOrderAttr().getInt()).second)
         return axis.emitOpError("duplicates a program-axis order");
+    } else if (auto range = dyn_cast<RangeOp>(operation)) {
+      std::string key = std::to_string(range.getAxisNode()) + ":" +
+                        range.getPurpose().str() + ":" +
+                        std::to_string(range.getLevel());
+      if (range.getPurpose() == "access")
+        key += ":" + std::to_string(range.getTransferNodeAttr().getInt()) +
+               ":" + std::to_string(range.getSourceAxisAttr().getInt());
+      if (!rangeKeys.insert(key).second)
+        return range.emitOpError("duplicates an axis physical range");
+      ranges.push_back(range);
     } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       program = choice;
@@ -315,6 +361,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<TransferOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
+      transfers.insert(binding.getNode());
     } else if (auto binding = dyn_cast<ReductionOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
@@ -343,6 +390,29 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     return realization.emitOpError("requires one GPU device and one program mapping");
   if (programOrders.empty())
     return program.emitOpError("has no per-axis program-space assignment");
+  for (RangeOp range : ranges) {
+    if (!axes.count(range.getAxisNode()))
+      return range.emitOpError("references an unbound logical axis");
+    if (range.getPurpose() == "access" &&
+        !transfers.contains(range.getTransferNodeAttr().getInt()))
+      return range.emitOpError("references an unbound transfer operation");
+  }
+  auto hasRange = [&](int64_t node, StringRef purpose, int64_t level = 0) {
+    std::string key = std::to_string(node) + ":" + purpose.str() + ":" +
+                      std::to_string(level);
+    return rangeKeys.contains(key);
+  };
+  for (const auto &entry : axes) {
+    AxisOp axis = entry.second;
+    for (auto [role, purpose] :
+         {std::pair<StringRef, StringRef>("parallel", "ownership"),
+          std::pair<StringRef, StringRef>("ordered", "traversal"),
+          std::pair<StringRef, StringRef>("reduction", "reduction"),
+          std::pair<StringRef, StringRef>("lane", "lane")})
+      if (axisHasRole(axis, role) && !hasRange(axis.getNode(), purpose))
+        return axis.emitOpError() << "has no " << purpose
+                                  << " physical range for role " << role;
+  }
   if (program.getPersistent())
     for (const auto &entry : axes) {
       AxisOp axis = entry.second;
