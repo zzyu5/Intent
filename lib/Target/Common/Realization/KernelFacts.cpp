@@ -281,13 +281,22 @@ staticAffineRange(const AffineIndexExpression &expression,
     auto extent = facts.staticDomainExtents.find(domain);
     if (extent == facts.staticDomainExtents.end() || extent->second <= 0)
       return std::nullopt;
-    int64_t endpoint;
-    if (llvm::MulOverflow(coefficient, extent->second - 1, endpoint))
+    int64_t domainLower = 0;
+    int64_t domainUpper = extent->second - 1;
+    auto bounds = facts.staticDomainBounds.find(domain);
+    if (bounds != facts.staticDomainBounds.end()) {
+      domainLower = bounds->second.first;
+      domainUpper = bounds->second.second - 1;
+    }
+    int64_t first;
+    int64_t last;
+    if (llvm::MulOverflow(coefficient, domainLower, first) ||
+        llvm::MulOverflow(coefficient, domainUpper, last))
       return std::nullopt;
     int64_t nextLower;
     int64_t nextUpper;
-    if (llvm::AddOverflow(lower, std::min<int64_t>(0, endpoint), nextLower) ||
-        llvm::AddOverflow(upper, std::max<int64_t>(0, endpoint), nextUpper))
+    if (llvm::AddOverflow(lower, std::min(first, last), nextLower) ||
+        llvm::AddOverflow(upper, std::max(first, last), nextUpper))
       return std::nullopt;
     lower = nextLower;
     upper = nextUpper;
@@ -891,15 +900,23 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             auto stopValue =
                 stop ? stop->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
-            bool zeroBased =
+            bool staticStart =
                 start && start->getName().getStringRef() == "intent.constant" &&
-                startValue && startValue.getInt() == 0;
-            if (zeroBased && stop &&
+                startValue;
+            if (staticStart && stop &&
                 stop->getName().getStringRef() == "intent.constant" &&
-                stopValue && stopValue.getInt() > 0) {
-              facts.staticDomainExtents[&operation] = stopValue.getInt();
+                stopValue && stopValue.getInt() > startValue.getInt()) {
+              int64_t extent;
+              if (llvm::SubOverflow(stopValue.getInt(), startValue.getInt(),
+                                    extent) ||
+                  extent <= 0)
+                return operation.emitOpError("has an overflowing static domain");
+              facts.staticDomainExtents[&operation] = extent;
+              facts.staticDomainBounds[&operation] =
+                  {startValue.getInt(), stopValue.getInt()};
               return success();
             }
+            bool zeroBased = staticStart && startValue.getInt() == 0;
             if (zeroBased && stop &&
                 stop->getName().getStringRef() == "intent.dim" && axis &&
                 stop->getNumOperands() == 1) {
@@ -1202,9 +1219,23 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               ? loop->getOperand(0).getDefiningOp()
               : nullptr;
       auto extent = facts.staticDomainExtents.find(domain);
-      bool boundedIterator = domain && extent != facts.staticDomainExtents.end() &&
-                             extent->second <= found->second.info.shape.front();
-      if (!boundedIterator) {
+      auto bounds = facts.staticDomainBounds.find(domain);
+      bool boundedIterator =
+          domain && extent != facts.staticDomainExtents.end() &&
+          ((bounds != facts.staticDomainBounds.end() &&
+            bounds->second.first >= 0 &&
+            bounds->second.second <= found->second.info.shape.front()) ||
+           (bounds == facts.staticDomainBounds.end() &&
+            extent->second <= found->second.info.shape.front()));
+      llvm::DenseSet<Value> active;
+      std::optional<AffineIndexExpression> expression =
+          affineIndexExpression(indexed, facts, operation, active);
+      std::optional<std::pair<int64_t, int64_t>> range =
+          expression ? staticAffineRange(*expression, facts) : std::nullopt;
+      bool boundedExpression =
+          range && range->first >= 0 &&
+          range->second < found->second.info.shape.front();
+      if (!boundedIterator && !boundedExpression) {
         if (!hasInBoundsPrecondition(indexed, operation.getOperand(0), 0,
                                      operation))
           return operation.emitOpError(
