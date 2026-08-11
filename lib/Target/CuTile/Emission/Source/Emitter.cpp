@@ -990,8 +990,9 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.float32";
     if (type.isBF16())
       return "torch.bfloat16";
-    if (type.isInteger(8))
-      return "torch.int8";
+    if (auto integer = dyn_cast<IntegerType>(type);
+        integer && integer.getWidth() == 8)
+      return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 32)
       return "torch.int32";
@@ -2277,8 +2278,9 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "ct.float32";
   if (type.isBF16())
     return "ct.bfloat16";
-  if (type.isInteger(8))
-    return "ct.int8";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 8)
+    return integer.isUnsigned() ? "ct.uint8" : "ct.int8";
   if (type.isInteger(32))
     return "ct.int32";
   if (isa<IndexType>(type))

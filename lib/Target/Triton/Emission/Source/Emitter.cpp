@@ -17,8 +17,9 @@ StringRef torchDtype(Type type) {
     return "torch.float32";
   if (type.isBF16())
     return "torch.bfloat16";
-  if (type.isInteger(8))
-    return "torch.int8";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 8)
+    return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
     return "torch.int32";

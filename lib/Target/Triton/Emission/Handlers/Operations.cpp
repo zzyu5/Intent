@@ -29,8 +29,9 @@ StringRef tritonDtype(Type type) {
     return "tl.float32";
   if (type.isBF16())
     return "tl.bfloat16";
-  if (type.isInteger(8))
-    return "tl.int8";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 8)
+    return integer.isUnsigned() ? "tl.uint8" : "tl.int8";
   if (type.isInteger(32))
     return "tl.int32";
   if (isa<IndexType>(type))
@@ -1825,8 +1826,11 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     FailureOr<std::string> mask = emitMaskExpression(operation, true);
     if (failed(pointer) || failed(mask))
       return failure();
-    line("tl.atomic_add(" + *pointer + ", " + stored->str() + ", mask=" +
-         *mask + ", sem='relaxed', scope='gpu')");
+    std::string call = "tl.atomic_add(" + *pointer + ", " + stored->str();
+    if (*mask != "True")
+      call += ", mask=" + *mask;
+    call += ", sem='relaxed', scope='gpu')";
+    line(call);
     return success();
   }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||

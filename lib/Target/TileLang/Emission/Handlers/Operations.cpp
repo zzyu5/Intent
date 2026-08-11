@@ -2608,6 +2608,11 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
       if (failed(node) || !boundary || failed(indices))
         return operation.emitOpError(
             "lacks a mechanical scalar TileLang atomic merge");
+      bool singleLane = boundary.getDomainNodes().empty();
+      if (singleLane) {
+        line("if T.get_thread_binding() == 0:");
+        ++indentation;
+      }
       if (boundary.getCheckBounds()) {
         FailureOr<std::string> predicate =
             elementBoundsPredicate(operation, {});
@@ -2619,6 +2624,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
       line("T.atomic_add(" + (*view)->argument->name + "[" + *indices +
            "], " + stored->str() + ", memory_order=\"relaxed\")");
       if (boundary.getCheckBounds())
+        --indentation;
+      if (singleLane)
         --indentation;
       return success();
     }
