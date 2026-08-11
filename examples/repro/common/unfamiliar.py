@@ -120,10 +120,26 @@ def _errors(actual: TensorOutputs, expected: TensorOutputs) -> tuple[float, ...]
                 f"got shape={tuple(generated.shape)}, dtype={generated.dtype}; "
                 f"expected shape={tuple(wanted.shape)}, dtype={wanted.dtype}"
             )
-        if generated.dtype == torch.bool:
+        if generated.dtype == torch.bool or not generated.is_floating_point():
             result.append(0.0 if torch.equal(generated, wanted) else 1.0)
         else:
-            result.append((generated - wanted).abs().max().item())
+            generated_finite = torch.isfinite(generated)
+            wanted_finite = torch.isfinite(wanted)
+            if not torch.equal(generated_finite, wanted_finite):
+                result.append(float("inf"))
+                continue
+            nonfinite_equal = torch.equal(
+                generated[~generated_finite], wanted[~wanted_finite]
+            )
+            if not nonfinite_equal:
+                result.append(float("inf"))
+                continue
+            finite_error = torch.where(
+                generated_finite,
+                (generated - wanted).abs(),
+                torch.zeros((), device=generated.device, dtype=generated.dtype),
+            )
+            result.append(finite_error.max().item())
     return tuple(result)
 
 
