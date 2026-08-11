@@ -1732,6 +1732,8 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
+  streamOuterAxisIndices[&operation] =
+      axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
@@ -1810,7 +1812,7 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
         runtimes->second.size() != 1)
       return binding.emitOpError("has no unique ragged stream runtime");
     RaggedRuntime &ragged = raggedRuntimes[runtimes->second.front()];
-    std::string offsets = "axis_index_" + std::to_string(binding.getAxisNode());
+    std::string offsets = "stream_axis_index_" + std::to_string(*node);
     line(offsets + " = sequence_begin_" + raggedSuffix + " + " + streamTile +
          " * " + binding.getTile().str() + " + " +
          addressIndex("ct.arange(" + binding.getTile().str() +
@@ -1829,7 +1831,12 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
 
 LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
   auto carriers = streamCarriers.find(&operation);
-  if (carriers == streamCarriers.end())
+  auto outerIndex = streamOuterAxisIndices.find(&operation);
+  FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
+  plan::StreamOp binding =
+      succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
+  if (carriers == streamCarriers.end() ||
+      outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
     return operation.emitOpError("has no active cuTile stream state");
   Operation &terminator = operation.getRegion(0).front().back();
   if (terminator.getName().getStringRef() != "intent.yield" ||
@@ -1844,6 +1851,11 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
+  if (outerIndex->second.empty())
+    axisIndices.erase(binding.getAxisNode());
+  else
+    axisIndices[binding.getAxisNode()] = outerIndex->second;
+  streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
 

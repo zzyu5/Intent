@@ -151,10 +151,11 @@ struct AxisChoice {
   std::string group;
 };
 
-bool canPackScalarParallel(Operation *parallel,
+bool canPackScalarParallel(Operation *parallel, Operation *domain,
                            const target::KernelFacts &facts) {
   auto domains = facts.parallelDomains.find(parallel);
-  if (domains == facts.parallelDomains.end() || domains->second.size() != 1 ||
+  if (domains == facts.parallelDomains.end() || domains->second.empty() ||
+      domains->second.back() != domain ||
       parallel->getNumRegions() != 1 ||
       !llvm::hasSingleElement(parallel->getRegion(0)))
     return false;
@@ -162,14 +163,16 @@ bool canPackScalarParallel(Operation *parallel,
   Block &body = parallel->getRegion(0).front();
   for (Operation &operation : body) {
     StringRef name = operation.getName().getStringRef();
-    if (operation.getNumRegions() != 0 || name == "func.call" ||
-        name == "intent.mask" || name == "intent.contract" ||
-        name == "intent.reduce" || name == "intent.arg_reduce" ||
-        name == "intent.scan" || name == "intent.state_stream" ||
-        name == "intent.buffer" || name == "intent.buffer_load" ||
-        name == "intent.buffer_store" || name == "intent.atomic_add" ||
-        name == "intent.atomic_cas" || name == "intent.scatter_reduce" ||
-        name == "intent.scatter_unique")
+    bool scalarPointwise =
+        name == "intent.constant" || name == "intent.dim" ||
+        name == "intent.assume_in_bounds" || name == "intent.view_load" ||
+        name == "intent.view_store" || name == "intent.gather" ||
+        name == "intent.make_record" || name == "intent.extract" ||
+        name == "intent.unary" || name == "intent.binary" ||
+        name == "intent.compare" || name == "intent.select" ||
+        name == "intent.cast" || name == "intent.random" ||
+        name == "intent.yield";
+    if (operation.getNumRegions() != 0 || !scalarPointwise)
       return false;
     if (llvm::any_of(operation.getOperands(), [](Value value) {
           return isa<RankedTensorType>(value.getType());
@@ -368,7 +371,7 @@ assignAxes(const target::KernelFacts &facts) {
     choice.packedLane =
         scalarParallel && !choice.parallels.empty() &&
         llvm::all_of(choice.parallels, [&](Operation *parallel) {
-          return canPackScalarParallel(parallel, facts);
+          return canPackScalarParallel(parallel, choice.domain, facts);
         });
     if (choice.packedLane) {
       appendRole(choice.roles, "lane");

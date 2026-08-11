@@ -2405,6 +2405,8 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     }
   }
   streamCarriers[&operation] = carriers;
+  streamOuterAxisIndices[&operation] =
+      axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
@@ -2474,7 +2476,7 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
        ", " + binding.getTile().str() +
        "), num_stages=num_stages):");
   ++indentation;
-  std::string streamStart = "axis_index_" + std::to_string(binding.getAxisNode());
+  std::string streamStart = "stream_axis_index_" + std::to_string(*node);
   line(streamStart + " = " +
        std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
        addressIndex(streamTile) + " * " + binding.getTile().str());
@@ -2485,7 +2487,12 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
 
 LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
   auto carriers = streamCarriers.find(&operation);
-  if (carriers == streamCarriers.end())
+  auto outerIndex = streamOuterAxisIndices.find(&operation);
+  FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
+  plan::StreamOp binding =
+      succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
+  if (carriers == streamCarriers.end() ||
+      outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
     return operation.emitOpError("has no active TileLang stream state");
   Operation &terminator = operation.getRegion(0).front().back();
   if (terminator.getName().getStringRef() != "intent.yield" ||
@@ -2509,6 +2516,11 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     valueNames[operation.getResult(index)] =
         carriers->second[index] + (scalar ? "[0]" : "");
   }
+  if (outerIndex->second.empty())
+    axisIndices.erase(binding.getAxisNode());
+  else
+    axisIndices[binding.getAxisNode()] = outerIndex->second;
+  streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
 

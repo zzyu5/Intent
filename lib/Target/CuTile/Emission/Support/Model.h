@@ -217,6 +217,7 @@ private:
   llvm::SmallVector<std::string> dimensionOrder;
   llvm::SmallVector<std::string> kernelConstants;
   llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
+  llvm::DenseMap<mlir::Operation *, std::string> streamOuterAxisIndices;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
