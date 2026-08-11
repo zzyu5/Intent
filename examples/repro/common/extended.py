@@ -140,6 +140,8 @@ from kernels.pointwise.record import paired_sum_product
 from kernels.pointwise.select import COLUMNS as SELECT_COLUMNS
 from kernels.pointwise.select import ROWS as SELECT_ROWS
 from kernels.pointwise.select import alternating_signed_indices
+from kernels.pointwise.while_loop import ELEMENTS as WHILE_ELEMENTS
+from kernels.pointwise.while_loop import integer_log2_floor
 from kernels.streaming.paged_attention import BATCH as PAGED_BATCH
 from kernels.streaming.paged_attention import HEAD_DIMENSION as PAGED_HEAD_DIMENSION
 from kernels.streaming.paged_attention import HEAD_GROUP as PAGED_HEAD_GROUP
@@ -2199,6 +2201,41 @@ def _run_record_fields(
     )
 
 
+def _run_scalar_while(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("scalar while has no upstream adapter")
+    values = torch.randint(
+        1,
+        1 << 30,
+        (WHILE_ELEMENTS,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    artifact = intent.compile(integer_log2_floor, target=target, compiler=compiler)
+
+    def reference() -> torch.Tensor:
+        working = values.clone()
+        exponent = torch.zeros_like(values)
+        while torch.any(working > 1).item():
+            active = working > 1
+            working = torch.where(active, working // 2, working)
+            exponent += active.to(torch.int32)
+        return exponent
+
+    _compare(
+        artifact=artifact,
+        arguments=(values,),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="scalar carried-state while",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.int32,
+    )
+
+
 def _run_boolean_reduction(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2477,6 +2514,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "record_fields": _run_record_fields,
+    "scalar_while": _run_scalar_while,
     "scalar_table_lookup": _run_scalar_table_lookup,
     "selective_scan": _run_selective_scan,
     "shifted_row_copy": _run_shifted_row_copy,

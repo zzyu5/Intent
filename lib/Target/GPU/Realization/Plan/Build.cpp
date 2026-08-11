@@ -450,7 +450,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                          "intent.ragged_outer", "intent.ragged_member",
                          "intent.state_stream", "intent.scatter_reduce",
                          "intent.make_record", "intent.extract",
-                         "intent.for", "intent.if", "intent.buffer_load",
+                         "intent.for", "intent.if", "intent.while",
+                         "intent.condition", "intent.buffer_load",
                          "intent.buffer_store", "intent.yield", "intent.return"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();

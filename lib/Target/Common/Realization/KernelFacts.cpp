@@ -564,7 +564,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                    KernelFacts &facts) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.yield",
-                         "intent.return"})
+                         "intent.condition", "intent.return"})
     if (failed(addHandler(registry, name, noOp)))
       return failure();
 
@@ -810,6 +810,77 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     yielded.getType() != result.getType())
                   return operation.emitOpError(
                       "scalar if currently requires scalar type-stable results");
+            }
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.while", [&](Operation &operation) -> LogicalResult {
+            if (operation.getNumRegions() != 2 ||
+                !llvm::hasSingleElement(operation.getRegion(0)) ||
+                !llvm::hasSingleElement(operation.getRegion(1)) ||
+                operation.getNumOperands() != operation.getNumResults())
+              return operation.emitOpError(
+                  "has no canonical scalar while schema");
+            Block &before = operation.getRegion(0).front();
+            Block &after = operation.getRegion(1).front();
+            if (before.getNumArguments() != operation.getNumResults() ||
+                after.getNumArguments() != operation.getNumResults() ||
+                before.empty() || after.empty())
+              return operation.emitOpError(
+                  "while regions do not match their carried state");
+            for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+              Type type = operation.getOperand(index).getType();
+              if (!type.isIntOrIndexOrFloat() ||
+                  operation.getResult(index).getType() != type ||
+                  before.getArgument(index).getType() != type ||
+                  after.getArgument(index).getType() != type)
+                return operation.emitOpError(
+                    "while requires scalar type-stable carried values");
+            }
+            Operation &condition = before.back();
+            if (condition.getName().getStringRef() != "intent.condition" ||
+                condition.getNumOperands() != operation.getNumResults() + 1 ||
+                !condition.getOperand(0).getType().isInteger(1))
+              return operation.emitOpError(
+                  "while before-region must end in one scalar condition");
+            for (unsigned index = 0; index < operation.getNumResults(); ++index)
+              if (condition.getOperand(index + 1) != before.getArgument(index))
+                return operation.emitOpError(
+                    "while condition must forward every carried value unchanged");
+            Operation &yield = after.back();
+            if (yield.getName().getStringRef() != "intent.yield" ||
+                yield.getNumOperands() != operation.getNumResults())
+              return operation.emitOpError(
+                  "while body must yield every carried value");
+            for (auto [yielded, result] :
+                 llvm::zip(yield.getOperands(), operation.getResults()))
+              if (yielded.getType() != result.getType())
+                return operation.emitOpError(
+                    "while body changes a carried value type");
+            for (Operation &nested : before.without_terminator()) {
+              StringRef name = nested.getName().getStringRef();
+              if (!llvm::is_contained(
+                      {StringRef("intent.constant"), StringRef("intent.dim"),
+                       StringRef("intent.make_record"),
+                       StringRef("intent.extract"), StringRef("intent.unary"),
+                       StringRef("intent.binary"), StringRef("intent.compare"),
+                       StringRef("intent.select"), StringRef("intent.cast")},
+                      name))
+                return nested.emitOpError(
+                    "cannot be inlined into a scalar while condition");
+              auto logical = nested.getAttrOfType<StringAttr>("intent.operator");
+              if (name == "intent.binary" && logical &&
+                  (logical.getValue() == "floor_divide" ||
+                   logical.getValue() == "remainder"))
+                return nested.emitOpError(
+                    "requires multi-statement lowering in a while condition");
+              for (Value result : nested.getResults())
+                if (!result.getType().isIntOrIndexOrFloat() &&
+                    !isa<intent::RecordType>(result.getType()))
+                  return nested.emitOpError(
+                      "while condition values must remain scalar");
             }
             return success();
           })))

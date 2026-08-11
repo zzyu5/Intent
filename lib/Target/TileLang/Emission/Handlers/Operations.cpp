@@ -3,6 +3,7 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
+#include "Intent/Target/Common/Analysis/StructuredControl.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -72,6 +73,19 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           [&](Operation &op) {
             return emitter.selectOperation(op) ? emitter.leaveIf(op) : success();
           })) ||
+      failed(addHandler(
+          registry, "intent.while",
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterWhile(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveWhile(op)
+                                               : success();
+          })) ||
+      failed(addHandler(registry, "intent.condition", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitCondition(op) : success();
+      })) ||
       failed(addHandler(registry, "intent.yield", [&](Operation &op) {
         return emitter.selectOperation(op) ? emitter.emitYield(op) : success();
       })) ||
@@ -256,6 +270,10 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
       expression = std::to_string(integer.getInt());
   } else {
     return operation.emitOpError("has an unsupported TileLang constant value");
+  }
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
   }
   line(result + " = " + expression);
   valueNames[operation.getResult(0)] = result;
@@ -525,6 +543,54 @@ LogicalResult SourceEmitter::leaveIf(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::enterWhile(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "while emission");
+  if (failed(node) || operation.getNumRegions() != 2 ||
+      !llvm::hasSingleElement(operation.getRegion(0)) ||
+      !llvm::hasSingleElement(operation.getRegion(1)) ||
+      operation.getNumOperands() != operation.getNumResults())
+    return operation.emitOpError("lacks a mechanical TileLang scalar while");
+  Block &before = operation.getRegion(0).front();
+  Block &after = operation.getRegion(1).front();
+  SmallVector<std::string> carriers;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> initial = lookupValue(operation, index);
+    std::string dtype = dtypeName(operation.getResult(index).getType(), operation);
+    if (failed(initial) || dtype.empty())
+      return failure();
+    std::string carrier =
+        uniqueName("while_state_" + std::to_string(index), *node);
+    line(carrier + " = T.alloc_local((1,), " + dtype + ")");
+    line(carrier + "[0] = " + initial->str());
+    carriers.push_back(carrier);
+    valueNames[before.getArgument(index)] = carrier + "[0]";
+    valueNames[after.getArgument(index)] = carrier + "[0]";
+  }
+  whileCarriers[&operation] = std::move(carriers);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitCondition(Operation &operation) {
+  Operation *owner = target::whileConditionOwner(operation);
+  FailureOr<StringRef> condition = lookupValue(operation, 0);
+  if (!owner || failed(condition) || operation.getNumOperands() !=
+                                          owner->getNumResults() + 1)
+    return operation.emitOpError("does not match a TileLang scalar while");
+  line("while " + condition->str() + ":");
+  ++indentation;
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveWhile(Operation &operation) {
+  auto carriers = whileCarriers.find(&operation);
+  if (carriers == whileCarriers.end())
+    return operation.emitOpError("has no active TileLang scalar while");
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    bindResult(operation, index, carriers->second[index] + "[0]");
+  return success();
+}
+
 LogicalResult SourceEmitter::emitYield(Operation &operation) {
   Operation *owner = operation.getParentOp();
   if (!owner)
@@ -540,6 +606,21 @@ LogicalResult SourceEmitter::emitYield(Operation &operation) {
       if (failed(yielded))
         return failure();
       line(carriers->second[index] + "[0] = " + yielded->str());
+    }
+    return success();
+  }
+  if (name == "intent.while") {
+    auto carriers = whileCarriers.find(owner);
+    if (carriers == whileCarriers.end() ||
+        carriers->second.size() != operation.getNumOperands())
+      return operation.emitOpError("does not match its TileLang while state");
+    for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
+      FailureOr<StringRef> yielded = lookupValue(operation, index);
+      if (failed(yielded))
+        return failure();
+      std::string destination = carriers->second[index] + "[0]";
+      if (*yielded != destination)
+        line(destination + " = " + yielded->str());
     }
     return success();
   }
@@ -1239,6 +1320,10 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
         binding.getLowering() == "python_negate"
             ? "-(" + operand->str() + ")"
             : binding.getLowering().str() + "(" + operand->str() + ")";
+    if (target::whileConditionOwner(operation)) {
+      bindResult(operation, 0, expression);
+      return success();
+    }
     std::string result = makeResultName(operation, 0);
     line(result + " = " + expression);
     valueNames[operation.getResult(0)] = result;
@@ -1368,6 +1453,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     FailureOr<std::string> expression = makeExpression(*lhs, *rhs);
     if (failed(expression))
       return failure();
+    if (target::whileConditionOwner(operation)) {
+      bindResult(operation, 0, *expression);
+      return success();
+    }
     line(resultName + " = " + *expression);
     valueNames[operation.getResult(0)] = resultName;
     return success();
@@ -1456,8 +1545,13 @@ LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
     if (failed(condition) || failed(trueValue) || failed(falseValue))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = T.if_then_else(" + condition->str() + ", " +
-         trueValue->str() + ", " + falseValue->str() + ")");
+    std::string expression = "T.if_then_else(" + condition->str() + ", " +
+                             trueValue->str() + ", " + falseValue->str() + ")";
+    if (target::whileConditionOwner(operation)) {
+      bindResult(operation, 0, expression);
+      return success();
+    }
+    line(result + " = " + expression);
     valueNames[operation.getResult(0)] = result;
     return success();
   }
@@ -1549,7 +1643,13 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
     if (failed(operand) || dtype.empty())
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = T.cast(" + operand->str() + ", " + dtype + ")");
+    std::string expression =
+        "T.cast(" + operand->str() + ", " + dtype + ")";
+    if (target::whileConditionOwner(operation)) {
+      bindResult(operation, 0, expression);
+      return success();
+    }
+    line(result + " = " + expression);
     valueNames[operation.getResult(0)] = result;
     return success();
   }

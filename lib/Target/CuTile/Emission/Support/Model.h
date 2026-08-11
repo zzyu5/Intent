@@ -103,6 +103,9 @@ public:
   mlir::LogicalResult leaveFor(mlir::Operation &operation);
   mlir::LogicalResult enterIf(mlir::Operation &operation);
   mlir::LogicalResult leaveIf(mlir::Operation &operation);
+  mlir::LogicalResult enterWhile(mlir::Operation &operation);
+  mlir::LogicalResult leaveWhile(mlir::Operation &operation);
+  mlir::LogicalResult emitCondition(mlir::Operation &operation);
   mlir::LogicalResult emitYield(mlir::Operation &operation);
   mlir::LogicalResult emitBuffer(mlir::Operation &operation);
   mlir::LogicalResult emitBufferLoad(mlir::Operation &operation);
@@ -214,6 +217,8 @@ private:
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       loopCarriers;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
+      whileCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string>> scalarBuffers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>

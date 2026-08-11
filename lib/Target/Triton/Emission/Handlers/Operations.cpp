@@ -3,6 +3,7 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
+#include "Intent/Target/Common/Analysis/StructuredControl.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -91,6 +92,19 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           [&](Operation &op) {
             return emitter.selectOperation(op) ? emitter.leaveIf(op) : success();
           })) ||
+      failed(addHandler(
+          registry, "intent.while",
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterWhile(op)
+                                               : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveWhile(op)
+                                               : success();
+          })) ||
+      failed(addHandler(registry, "intent.condition", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitCondition(op) : success();
+      })) ||
       failed(addHandler(registry, "intent.yield", [&](Operation &op) {
         return emitter.selectOperation(op) ? emitter.emitYield(op) : success();
       })) ||
@@ -281,6 +295,10 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
       expression = std::to_string(integer.getInt());
   } else {
     return operation.emitOpError("has an unsupported Triton constant value");
+  }
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
   }
   line(result + " = " + expression);
   bindResult(operation, 0, result);
@@ -646,6 +664,52 @@ LogicalResult SourceEmitter::leaveIf(Operation &operation) {
   return success();
 }
 
+LogicalResult SourceEmitter::enterWhile(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "while emission");
+  if (failed(node) || operation.getNumRegions() != 2 ||
+      !llvm::hasSingleElement(operation.getRegion(0)) ||
+      !llvm::hasSingleElement(operation.getRegion(1)) ||
+      operation.getNumOperands() != operation.getNumResults())
+    return operation.emitOpError("lacks a mechanical Triton scalar while");
+  Block &before = operation.getRegion(0).front();
+  Block &after = operation.getRegion(1).front();
+  SmallVector<std::string> carriers;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    FailureOr<StringRef> initial = lookupValue(operation, index);
+    if (failed(initial))
+      return failure();
+    std::string carrier =
+        uniqueName("while_state_" + std::to_string(index), *node);
+    line(carrier + " = " + initial->str());
+    carriers.push_back(carrier);
+    valueNames[before.getArgument(index)] = carrier;
+    valueNames[after.getArgument(index)] = carrier;
+  }
+  whileCarriers[&operation] = std::move(carriers);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitCondition(Operation &operation) {
+  Operation *owner = target::whileConditionOwner(operation);
+  FailureOr<StringRef> condition = lookupValue(operation, 0);
+  if (!owner || failed(condition) || operation.getNumOperands() !=
+                                          owner->getNumResults() + 1)
+    return operation.emitOpError("does not match a Triton scalar while");
+  line("while " + condition->str() + ":");
+  ++indentation;
+  return success();
+}
+
+LogicalResult SourceEmitter::leaveWhile(Operation &operation) {
+  auto carriers = whileCarriers.find(&operation);
+  if (carriers == whileCarriers.end())
+    return operation.emitOpError("has no active Triton scalar while");
+  --indentation;
+  for (unsigned index = 0; index < operation.getNumResults(); ++index)
+    bindResult(operation, index, carriers->second[index]);
+  return success();
+}
+
 LogicalResult SourceEmitter::emitYield(Operation &operation) {
   Operation *owner = operation.getParentOp();
   if (!owner)
@@ -656,6 +720,19 @@ LogicalResult SourceEmitter::emitYield(Operation &operation) {
     if (carriers == loopCarriers.end() ||
         carriers->second.size() != operation.getNumOperands())
       return operation.emitOpError("does not match its Triton loop state");
+    for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
+      FailureOr<StringRef> yielded = lookupValue(operation, index);
+      if (failed(yielded))
+        return failure();
+      line(carriers->second[index] + " = " + yielded->str());
+    }
+    return success();
+  }
+  if (name == "intent.while") {
+    auto carriers = whileCarriers.find(owner);
+    if (carriers == whileCarriers.end() ||
+        carriers->second.size() != operation.getNumOperands())
+      return operation.emitOpError("does not match its Triton while state");
     for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
       FailureOr<StringRef> yielded = lookupValue(operation, index);
       if (failed(yielded))
@@ -942,6 +1019,10 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
                                ? "-(" + operand->str() + ")"
                                : binding.getLowering().str() + "(" +
                                      operand->str() + ")";
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
+  }
   line(result + " = " + expression);
   bindResult(operation, 0, result);
   return success();
@@ -1012,6 +1093,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
     expression = "(" + lhs->str() + ") " + symbol.str() + " (" +
                  rhs->str() + ")";
   }
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
+  }
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);
   if (failed(padded))
@@ -1038,6 +1123,10 @@ LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
   std::string result = makeResultName(operation, 0);
   std::string expression = "tl.where(" + condition->str() + ", " +
                            trueValue->str() + ", " + falseValue->str() + ")";
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
+  }
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);
   if (failed(padded))
@@ -1070,7 +1159,13 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   if (targetType.empty())
     return operation.emitOpError("casts to an unsupported Triton type");
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.cast(" + operand->str() + ", " + targetType.str() + ")");
+  std::string expression =
+      "tl.cast(" + operand->str() + ", " + targetType.str() + ")";
+  if (target::whileConditionOwner(operation)) {
+    bindResult(operation, 0, expression);
+    return success();
+  }
+  line(result + " = " + expression);
   bindResult(operation, 0, result);
   return success();
 }
