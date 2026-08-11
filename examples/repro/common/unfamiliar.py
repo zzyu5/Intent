@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -143,228 +142,13 @@ from kernels.vision.roi_align import roi_align_center_sample
 from .support import benchmark
 from .support import prepare_kernel_call
 from .support import print_artifact
-
-
-Runner = Callable[[str, Target, str], None]
-TensorOutputs = torch.Tensor | tuple[torch.Tensor, ...]
-
-
-def _outputs(value: TensorOutputs) -> tuple[torch.Tensor, ...]:
-    return value if isinstance(value, tuple) else (value,)
-
-
-def _errors(actual: TensorOutputs, expected: TensorOutputs) -> tuple[float, ...]:
-    actual_values = _outputs(actual)
-    expected_values = _outputs(expected)
-    if len(actual_values) != len(expected_values):
-        raise RuntimeError("generated result count does not match the reference")
-    result = []
-    for generated, wanted in zip(actual_values, expected_values):
-        if generated.shape != wanted.shape or generated.dtype != wanted.dtype:
-            raise RuntimeError(
-                "generated result shape or dtype does not match the reference: "
-                f"got shape={tuple(generated.shape)}, dtype={generated.dtype}; "
-                f"expected shape={tuple(wanted.shape)}, dtype={wanted.dtype}"
-            )
-        if generated.dtype == torch.bool or not generated.is_floating_point():
-            result.append(0.0 if torch.equal(generated, wanted) else 1.0)
-        else:
-            generated_finite = torch.isfinite(generated)
-            wanted_finite = torch.isfinite(wanted)
-            if not torch.equal(generated_finite, wanted_finite):
-                result.append(float("inf"))
-                continue
-            nonfinite_equal = torch.equal(
-                generated[~generated_finite], wanted[~wanted_finite]
-            )
-            if not nonfinite_equal:
-                result.append(float("inf"))
-                continue
-            finite_error = torch.where(
-                generated_finite,
-                (generated - wanted).abs(),
-                torch.zeros((), device=generated.device, dtype=generated.dtype),
-            )
-            result.append(finite_error.max().item())
-    return tuple(result)
-
-
-def _require_close(
-    *,
-    actual: TensorOutputs,
-    expected: TensorOutputs,
-    tolerance: float | tuple[float, ...],
-    target_name: str,
-    kernel_name: str,
-) -> tuple[float, ...]:
-    errors = _errors(actual, expected)
-    tolerances = (
-        tolerance
-        if isinstance(tolerance, tuple)
-        else tuple(tolerance for _ in errors)
-    )
-    if len(tolerances) != len(errors):
-        raise RuntimeError("tolerance count does not match the generated results")
-    if any(error > limit for error, limit in zip(errors, tolerances)):
-        raise RuntimeError(
-            f"{target_name} {kernel_name} numerical comparison failed: {errors}"
-        )
-    return errors
-
-
-def _run_generated(
-    *,
-    definition,
-    arguments: tuple[object, ...],
-    reference: Callable[[], TensorOutputs],
-    compiler: str,
-    target: Target,
-    target_name: str,
-    kernel_name: str,
-    tolerance: float | tuple[float, ...],
-    constexprs: dict[str, object] | None = None,
-    cuda_graph: bool = True,
-) -> None:
-    artifact = intent.compile(
-        definition,
-        target=target,
-        compiler=compiler,
-        constexprs=constexprs,
-    )
-    generated = artifact.run(*arguments)
-    expected = reference()
-    torch.cuda.synchronize()
-    errors = _require_close(
-        actual=generated,
-        expected=expected,
-        tolerance=tolerance,
-        target_name=target_name,
-        kernel_name=kernel_name,
-    )
-    generated_call = prepare_kernel_call(artifact, arguments, generated)
-    p50, p95 = benchmark(
-        generated_call,
-        warmup=3,
-        repetitions=100,
-        cuda_graph=cuda_graph,
-    )
-    print_artifact(artifact, target_name)
-    print(
-        f"{target_name} {kernel_name} numerical comparison: PASS "
-        f"(generated/reference={errors})"
-    )
-    print(
-        f"{target_name} {kernel_name} kernel-only performance "
-        f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
-        f"p50={p50:.4f} ms, p95={p95:.4f} ms"
-    )
-    print(f"{target_name} {kernel_name} upstream baseline: unavailable")
-
-
-def _report_pipeline(
-    *,
-    artifacts: tuple[object, ...],
-    launch: Callable[[], None],
-    errors: tuple[float, ...],
-    target_name: str,
-    kernel_name: str,
-    cuda_graph: bool = False,
-    prepare: Callable[[], object] | None = None,
-    performance_scope: str = "end-to-end GPU pipeline",
-) -> None:
-    p50, p95 = benchmark(
-        launch,
-        warmup=3,
-        repetitions=100,
-        cuda_graph=cuda_graph,
-        prepare=prepare,
-    )
-    for artifact in artifacts:
-        print_artifact(artifact, target_name)
-    print(
-        f"{target_name} {kernel_name} numerical comparison: PASS "
-        f"(generated/reference={errors})"
-    )
-    print(
-        f"{target_name} {kernel_name} {performance_scope} performance "
-        f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
-        f"p50={p50:.4f} ms, p95={p95:.4f} ms"
-    )
-    print(f"{target_name} {kernel_name} upstream baseline: unavailable")
-
-
-def _run_variant(
-    *,
-    original,
-    variant,
-    arguments: tuple[object, ...],
-    reference: Callable[[], TensorOutputs],
-    compiler: str,
-    target: Target,
-    target_name: str,
-    kernel_name: str,
-    tolerance: float | tuple[float, ...],
-    constexprs: dict[str, object] | None = None,
-    cuda_graph: bool = True,
-) -> None:
-    original_artifact = intent.compile(
-        original,
-        target=target,
-        compiler=compiler,
-        constexprs=constexprs,
-    )
-    variant_artifact = intent.compile(
-        variant,
-        target=target,
-        compiler=compiler,
-        constexprs=constexprs,
-    )
-    original_output = original_artifact.run(*arguments)
-    variant_output = variant_artifact.run(*arguments)
-    expected = reference()
-    torch.cuda.synchronize()
-    original_errors = _require_close(
-        actual=original_output,
-        expected=expected,
-        tolerance=tolerance,
-        target_name=target_name,
-        kernel_name=f"{kernel_name} original",
-    )
-    variant_errors = _require_close(
-        actual=variant_output,
-        expected=expected,
-        tolerance=tolerance,
-        target_name=target_name,
-        kernel_name=f"{kernel_name} variant",
-    )
-    pair_errors = _require_close(
-        actual=variant_output,
-        expected=original_output,
-        tolerance=tolerance,
-        target_name=target_name,
-        kernel_name=f"{kernel_name} equivalent pair",
-    )
-    original_call = prepare_kernel_call(original_artifact, arguments, original_output)
-    variant_call = prepare_kernel_call(variant_artifact, arguments, variant_output)
-    original_p50, original_p95 = benchmark(
-        original_call, warmup=3, repetitions=100, cuda_graph=cuda_graph
-    )
-    variant_p50, variant_p95 = benchmark(
-        variant_call, warmup=3, repetitions=100, cuda_graph=cuda_graph
-    )
-    print_artifact(variant_artifact, target_name)
-    print(
-        f"{target_name} {kernel_name} equivalent formulation comparison: PASS "
-        f"(original/reference={original_errors}, "
-        f"variant/reference={variant_errors}, variant/original={pair_errors})"
-    )
-    print(
-        f"{target_name} {kernel_name} kernel-only performance "
-        f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
-        f"original_p50={original_p50:.4f} ms, original_p95={original_p95:.4f} ms, "
-        f"variant_p50={variant_p50:.4f} ms, variant_p95={variant_p95:.4f} ms, "
-        f"variant/original_p50={variant_p50 / original_p50:.4f}x"
-    )
+from .evaluation import Runner
+from .evaluation import outputs as _outputs
+from .evaluation import report_pipeline as _report_pipeline
+from .evaluation import require_close as _require_close
+from .evaluation import run_generated as _run_generated
+from .evaluation import run_variant as _run_variant
+from .decomposition import DECOMPOSITION_RUNNERS
 
 
 def _run_histogram(compiler: str, target: Target, target_name: str) -> None:
@@ -1650,6 +1434,7 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "variant_layer_norm_second_moment": _run_variant_layer_norm,
     "variant_conv2d_reduce_order": _run_variant_conv2d,
     "variant_transpose_scalar_domains": _run_variant_transpose,
+    **DECOMPOSITION_RUNNERS,
 }
 
 

@@ -39,7 +39,12 @@ case "${kernel}" in
   variant_online_softmax_inline | variant_attention_inline | \
   variant_attention_select | variant_rope_index | variant_swiglu_helper | \
   variant_layer_norm_second_moment | variant_conv2d_reduce_order | \
-  variant_transpose_scalar_domains)
+  variant_transpose_scalar_domains | variant_moe_product_domain | \
+  variant_adamw_split_pipeline | variant_reshape_cache_split | \
+  variant_nested_ragged_identity | variant_nested_ragged_split | \
+  variant_cholesky_right_looking | variant_adafactor_scalar_product | \
+  variant_transpose_product_domain | variant_ordered_prefix_nested | \
+  variant_attention_full_causal_stream)
     unfamiliar=true
     ;;
 esac
