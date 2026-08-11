@@ -739,7 +739,7 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
   if (binding && binding.getSpace() == "private_workspace") {
-    if (failed(info) || info->shape.size() < 2 ||
+    if (failed(info) || info->shape.empty() ||
         !workspaceNames.count(operation.getResult(0)))
       return operation.emitOpError(
           "lacks a planned TileLang private workspace parameter");
@@ -753,8 +753,7 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   if (dtype.empty())
     return failure();
   std::string base = makeResultName(operation, 0);
-  if (binding.getSpace() == "local_array" ||
-      binding.getSpace() == "private_vector") {
+  if (binding.getSpace() == "private_vector") {
     if (binding.getSpace() == "private_vector" &&
         !info->elementType.isInteger(1))
       return operation.emitOpError(

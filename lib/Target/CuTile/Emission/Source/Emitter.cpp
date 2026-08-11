@@ -204,7 +204,6 @@ indexRealization(intent::plan::RealizationOp realization,
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
-           value.getSpace() != "local_array" &&
            value.getSpace() != "private_workspace"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
@@ -442,10 +441,10 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
     FailureOr<target::LogicalBufferInfo> info =
         buffer ? target::getLogicalBufferInfo(*buffer)
                : FailureOr<target::LogicalBufferInfo>(failure());
-    if (!buffer || failed(info) || info->shape.size() < 2 ||
+    if (!buffer || failed(info) || info->shape.empty() ||
         buffer->getNumResults() != 1)
       return binding.emitOpError(
-          "does not bind a multidimensional logical workspace");
+          "does not bind a logical private workspace");
     for (int64_t owner : binding.getOwnerNodes()) {
       plan::AxisOp axis = planIndex.axes.lookup(owner);
       if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
@@ -2371,6 +2370,8 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return integer.isUnsigned() ? "ct.uint8" : "ct.int8";
   if (type.isInteger(32))
     return "ct.int32";
+  if (type.isInteger(64))
+    return "ct.int64";
   if (isa<IndexType>(type))
     return "ct.int64";
   consumer.emitOpError("uses an unsupported cuTile dtype");

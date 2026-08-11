@@ -282,6 +282,9 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
     if (operation.getResult(0).getType().isInteger(1))
       expression = integer.getValue().isZero() ? "False" : "True";
+    else if (operation.getResult(0).getType().isInteger(64))
+      expression = "ct.full((), " + std::to_string(integer.getInt()) +
+                   ", dtype=ct.int64).item()";
     else
       expression = std::to_string(integer.getInt());
   } else {
@@ -807,7 +810,7 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
   if (binding && binding.getSpace() == "private_workspace") {
-    if (failed(info) || info->shape.size() < 2 ||
+    if (failed(info) || info->shape.empty() ||
         !workspaceNames.count(operation.getResult(0)))
       return operation.emitOpError(
           "lacks a planned cuTile private workspace parameter");
@@ -826,9 +829,6 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
     vectorBuffers[operation.getResult(0)] = base;
     return success();
   }
-  if (binding && binding.getSpace() == "local_array")
-    return operation.emitOpError(
-        "requires mutable addressable local storage absent from the cuTile model");
   if (failed(node) || !binding ||
       binding.getSpace() != "private_scalar_array" || failed(info) ||
       info->shape.size() != 1 || failed(initializer))

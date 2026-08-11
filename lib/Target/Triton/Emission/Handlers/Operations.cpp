@@ -34,6 +34,8 @@ StringRef tritonDtype(Type type) {
     return integer.isUnsigned() ? "tl.uint8" : "tl.int8";
   if (type.isInteger(32))
     return "tl.int32";
+  if (type.isInteger(64))
+    return "tl.int64";
   if (isa<IndexType>(type))
     return "tl.int64";
   return {};
@@ -839,7 +841,7 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
   if (binding && binding.getSpace() == "private_workspace") {
-    if (failed(info) || info->shape.size() < 2 ||
+    if (failed(info) || info->shape.empty() ||
         !workspaceNames.count(operation.getResult(0)))
       return operation.emitOpError(
           "lacks a planned Triton private workspace parameter");
@@ -858,9 +860,6 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
     vectorBuffers[operation.getResult(0)] = base;
     return success();
   }
-  if (binding && binding.getSpace() == "local_array")
-    return operation.emitOpError(
-        "requires an addressable local array that the Triton surface cannot express");
   if (failed(node) || !binding ||
       binding.getSpace() != "private_scalar_array" || failed(info) ||
       info->shape.size() != 1 || failed(initializer))

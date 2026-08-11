@@ -235,7 +235,6 @@ indexRealization(intent::plan::RealizationOp realization,
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
-           value.getSpace() != "local_array" &&
            value.getSpace() != "private_workspace"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
@@ -488,10 +487,10 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
     FailureOr<target::LogicalBufferInfo> info =
         buffer ? target::getLogicalBufferInfo(*buffer)
                : FailureOr<target::LogicalBufferInfo>(failure());
-    if (!buffer || failed(info) || info->shape.size() < 2 ||
+    if (!buffer || failed(info) || info->shape.empty() ||
         buffer->getNumResults() != 1)
       return binding.emitOpError(
-          "does not bind a multidimensional logical workspace");
+          "does not bind a logical private workspace");
     for (int64_t owner : binding.getOwnerNodes()) {
       plan::AxisOp axis = planIndex.axes.lookup(owner);
       if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
@@ -1125,8 +1124,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   }
   bool addressableLocalBuffer = llvm::any_of(
       planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "local_array" ||
-               entry.second.getSpace() == "private_vector";
+        return entry.second.getSpace() == "private_vector";
       });
   output << ", threads=" << (addressableLocalBuffer ? "1" : "threads") << ") as ";
   if (workers == 1)

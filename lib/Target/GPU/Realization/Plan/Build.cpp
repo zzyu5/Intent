@@ -458,11 +458,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   "has no canonical private logical-buffer facts");
             const target::LogicalBufferFact &buffer =
                 facts.logicalBuffers.lookup(&operation);
-            bool workspace = buffer.info.shape.size() > 1;
+            bool workspace = buffer.info.shape.size() > 1 ||
+                             buffer.requiresAddressableStorage;
             StringRef space = workspace
                                   ? StringRef("private_workspace")
-                              : buffer.requiresAddressableStorage
-                                  ? "local_array"
                               : buffer.hasDynamicAccess &&
                                         buffer.info.elementType.isInteger(1)
                                   ? "private_vector"

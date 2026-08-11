@@ -195,8 +195,7 @@ LogicalResult BufferOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
   if (getSpace() != "private_scalar_array" &&
-      getSpace() != "private_vector" && getSpace() != "local_array" &&
-      getSpace() != "private_workspace")
+      getSpace() != "private_vector" && getSpace() != "private_workspace")
     return emitOpError("has an unsupported logical-buffer residency");
   if (getSpace() == "private_workspace" && getOwnerNodes().empty())
     return emitOpError("private workspace requires explicit program owners");
