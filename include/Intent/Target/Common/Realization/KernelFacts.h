@@ -75,6 +75,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, mlir::Value> domainSources;
   llvm::DenseMap<mlir::Operation *, int64_t> domainSourceAxes;
   llvm::DenseMap<mlir::Operation *, int64_t> staticDomainExtents;
+  llvm::DenseSet<mlir::Operation *> runtimeSequentialDomains;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
   llvm::SmallVector<mlir::Operation *> parallels;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>

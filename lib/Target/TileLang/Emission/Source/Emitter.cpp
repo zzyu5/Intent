@@ -1486,16 +1486,21 @@ LogicalResult SourceEmitter::emitWrapper() {
            << offsets->argument->name << "[:-1]).max().item())\n";
   }
   output << "    cache_key = (";
-  for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
-    if (index)
+  bool firstCacheKey = true;
+  auto emitCacheKey = [&](const std::string &value) {
+    if (!firstCacheKey)
       output << ", ";
-    output << dimension;
-  }
+    output << value;
+    firstCacheKey = false;
+  };
+  for (const std::string &dimension : dimensionOrder)
+    emitCacheKey(dimension);
   for (int64_t axis : planIndex.components.orderedRaggedProgramAxes)
-    output << ", max_sequence_length_" << axis;
+    emitCacheKey("max_sequence_length_" + std::to_string(axis));
   for (ABIView *input : inputs)
-    output << ", " << input->argument->name << ".dtype";
-  output << ", str(_DEVICE))\n";
+    emitCacheKey(input->argument->name + ".dtype");
+  emitCacheKey("str(_DEVICE)");
+  output << ")\n";
   output << "    if cache_key not in _KERNEL_CACHE:\n";
   if (searchSpace) {
     output << "        with set_autotune_inputs(";

@@ -7,6 +7,7 @@
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <functional>
 #include <limits>
@@ -148,6 +149,152 @@ FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
   return axis;
 }
 
+struct AffineIndexExpression {
+  llvm::DenseMap<Operation *, int64_t> coefficients;
+  int64_t constant = 0;
+};
+
+std::optional<int64_t> integerConstant(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition ||
+      definition->getName().getStringRef() != "intent.constant")
+    return std::nullopt;
+  if (auto literal = definition->getAttrOfType<BoolAttr>("intent.value"))
+    return literal.getValue() ? 1 : 0;
+  auto literal = definition->getAttrOfType<IntegerAttr>("intent.value");
+  return literal ? std::optional<int64_t>(literal.getInt()) : std::nullopt;
+}
+
+std::optional<AffineIndexExpression>
+affineIndexExpression(Value value, const KernelFacts &facts,
+                      Operation &consumer, llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return std::nullopt;
+  auto finish = [&](std::optional<AffineIndexExpression> expression) {
+    active.erase(value);
+    return expression;
+  };
+  if (std::optional<int64_t> literal = integerConstant(value)) {
+    AffineIndexExpression expression;
+    expression.constant = *literal;
+    return finish(std::move(expression));
+  }
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition) {
+    FailureOr<ScalarIndexSource> source =
+        traceScalarIndexSource(value, consumer);
+    if (failed(source) || !source->domain || source->opaque || source->transformed)
+      return finish(std::nullopt);
+    AffineIndexExpression expression;
+    expression.coefficients[source->domain] = 1;
+    return finish(std::move(expression));
+  }
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.indices") {
+    auto axes = facts.valueAxes.find(value);
+    if (axes == facts.valueAxes.end() || axes->second.size() != 1 ||
+        !axes->second.front().domain)
+      return finish(std::nullopt);
+    AffineIndexExpression expression;
+    expression.coefficients[axes->second.front().domain] = 1;
+    return finish(std::move(expression));
+  }
+
+  if (name == "intent.gather") {
+    auto valid = definition->getAttrOfType<IntegerAttr>(
+        "intent.valid_operand_index");
+    if (valid) {
+      int64_t operand = valid.getInt();
+      if (operand < 0 ||
+          static_cast<unsigned>(operand) >= definition->getNumOperands() ||
+          integerConstant(definition->getOperand(operand)) !=
+              std::optional<int64_t>(1))
+        return finish(std::nullopt);
+    }
+  }
+  if (name == "intent.broadcast" || name == "intent.reshape" ||
+      name == "intent.transpose" || name == "intent.cast" ||
+      name == "intent.gather") {
+    if (definition->getNumOperands() == 0)
+      return finish(std::nullopt);
+    return finish(affineIndexExpression(definition->getOperand(0), facts,
+                                        consumer, active));
+  }
+
+  if (name == "intent.unary" && definition->getNumOperands() == 1) {
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    std::optional<AffineIndexExpression> operand = affineIndexExpression(
+        definition->getOperand(0), facts, consumer, active);
+    if (!logical || !operand || logical.getValue() != "negate")
+      return finish(std::nullopt);
+    operand->constant = -operand->constant;
+    for (auto &coefficient : operand->coefficients)
+      coefficient.second = -coefficient.second;
+    return finish(std::move(operand));
+  }
+
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return finish(std::nullopt);
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  std::optional<AffineIndexExpression> lhs = affineIndexExpression(
+      definition->getOperand(0), facts, consumer, active);
+  std::optional<AffineIndexExpression> rhs = affineIndexExpression(
+      definition->getOperand(1), facts, consumer, active);
+  if (!logical || !lhs || !rhs)
+    return finish(std::nullopt);
+  auto scale = [](AffineIndexExpression &expression, int64_t factor) {
+    expression.constant *= factor;
+    for (auto &coefficient : expression.coefficients)
+      coefficient.second *= factor;
+  };
+  if (logical.getValue() == "multiply") {
+    if (lhs->coefficients.empty()) {
+      int64_t factor = lhs->constant;
+      scale(*rhs, factor);
+      return finish(std::move(rhs));
+    }
+    if (rhs->coefficients.empty()) {
+      int64_t factor = rhs->constant;
+      scale(*lhs, factor);
+      return finish(std::move(lhs));
+    }
+    return finish(std::nullopt);
+  }
+  int64_t sign = logical.getValue() == "add"
+                     ? 1
+                     : logical.getValue() == "subtract" ? -1 : 0;
+  if (sign == 0)
+    return finish(std::nullopt);
+  lhs->constant += sign * rhs->constant;
+  for (const auto &coefficient : rhs->coefficients)
+    lhs->coefficients[coefficient.first] += sign * coefficient.second;
+  return finish(std::move(lhs));
+}
+
+std::optional<std::pair<int64_t, int64_t>>
+staticAffineRange(const AffineIndexExpression &expression,
+                  const KernelFacts &facts) {
+  int64_t lower = expression.constant;
+  int64_t upper = expression.constant;
+  for (const auto &[domain, coefficient] : expression.coefficients) {
+    auto extent = facts.staticDomainExtents.find(domain);
+    if (extent == facts.staticDomainExtents.end() || extent->second <= 0)
+      return std::nullopt;
+    int64_t endpoint;
+    if (llvm::MulOverflow(coefficient, extent->second - 1, endpoint))
+      return std::nullopt;
+    int64_t nextLower;
+    int64_t nextUpper;
+    if (llvm::AddOverflow(lower, std::min<int64_t>(0, endpoint), nextLower) ||
+        llvm::AddOverflow(upper, std::max<int64_t>(0, endpoint), nextUpper))
+      return std::nullopt;
+    lower = nextLower;
+    upper = nextUpper;
+  }
+  return std::pair<int64_t, int64_t>{lower, upper};
+}
+
 FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
                                         KernelFacts &facts) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
@@ -175,6 +322,22 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
       }
       if (isa<RankedTensorType>(indexed.getType()))
         return true;
+      llvm::DenseSet<Value> active;
+      std::optional<AffineIndexExpression> expression =
+          affineIndexExpression(indexed, facts, operation, active);
+      FailureOr<LogicalAxis> staticDestination =
+          axisFromView(operation.getOperand(0), sourceAxis, facts, operation);
+      int64_t destinationExtent;
+      std::optional<std::pair<int64_t, int64_t>> range =
+          expression ? staticAffineRange(*expression, facts) : std::nullopt;
+      if (succeeded(staticDestination) && range &&
+          !StringRef(staticDestination->extent)
+               .getAsInteger(10, destinationExtent)) {
+        if (range->first < 0 || range->second >= destinationExtent)
+          return true;
+        ++sourceAxis;
+        continue;
+      }
       FailureOr<ScalarIndexSource> source =
           traceScalarIndexSource(indexed, operation);
       if (failed(source))
@@ -439,122 +602,6 @@ inferIndexedAxes(Operation &operation, Value source, KernelFacts &facts) {
   return resultAxes;
 }
 
-struct AffineIndexExpression {
-  llvm::DenseMap<Operation *, int64_t> coefficients;
-  int64_t constant = 0;
-};
-
-std::optional<int64_t> integerConstant(Value value) {
-  Operation *definition = value.getDefiningOp();
-  if (!definition ||
-      definition->getName().getStringRef() != "intent.constant")
-    return std::nullopt;
-  if (auto literal = definition->getAttrOfType<BoolAttr>("intent.value"))
-    return literal.getValue() ? 1 : 0;
-  auto literal = definition->getAttrOfType<IntegerAttr>("intent.value");
-  return literal ? std::optional<int64_t>(literal.getInt()) : std::nullopt;
-}
-
-std::optional<AffineIndexExpression>
-affineIndexExpression(Value value, const KernelFacts &facts,
-                      llvm::DenseSet<Value> &active) {
-  if (!active.insert(value).second)
-    return std::nullopt;
-  auto finish = [&](std::optional<AffineIndexExpression> expression) {
-    active.erase(value);
-    return expression;
-  };
-  if (std::optional<int64_t> literal = integerConstant(value)) {
-    AffineIndexExpression expression;
-    expression.constant = *literal;
-    return finish(std::move(expression));
-  }
-
-  Operation *definition = value.getDefiningOp();
-  if (!definition)
-    return finish(std::nullopt);
-  StringRef name = definition->getName().getStringRef();
-  if (name == "intent.indices") {
-    auto axes = facts.valueAxes.find(value);
-    if (axes == facts.valueAxes.end() || axes->second.size() != 1 ||
-        !axes->second.front().domain)
-      return finish(std::nullopt);
-    AffineIndexExpression expression;
-    expression.coefficients[axes->second.front().domain] = 1;
-    return finish(std::move(expression));
-  }
-
-  if (name == "intent.gather") {
-    auto valid = definition->getAttrOfType<IntegerAttr>(
-        "intent.valid_operand_index");
-    if (valid) {
-      int64_t operand = valid.getInt();
-      if (operand < 0 ||
-          static_cast<unsigned>(operand) >= definition->getNumOperands() ||
-          integerConstant(definition->getOperand(operand)) !=
-              std::optional<int64_t>(1))
-        return finish(std::nullopt);
-    }
-  }
-  if (name == "intent.broadcast" || name == "intent.reshape" ||
-      name == "intent.transpose" || name == "intent.cast" ||
-      name == "intent.gather") {
-    if (definition->getNumOperands() == 0)
-      return finish(std::nullopt);
-    return finish(affineIndexExpression(definition->getOperand(0), facts,
-                                        active));
-  }
-
-  if (name == "intent.unary" && definition->getNumOperands() == 1) {
-    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
-    std::optional<AffineIndexExpression> operand =
-        affineIndexExpression(definition->getOperand(0), facts, active);
-    if (!logical || !operand || logical.getValue() != "negate")
-      return finish(std::nullopt);
-    operand->constant = -operand->constant;
-    for (auto &coefficient : operand->coefficients)
-      coefficient.second = -coefficient.second;
-    return finish(std::move(operand));
-  }
-
-  if (name != "intent.binary" || definition->getNumOperands() != 2)
-    return finish(std::nullopt);
-  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
-  std::optional<AffineIndexExpression> lhs =
-      affineIndexExpression(definition->getOperand(0), facts, active);
-  std::optional<AffineIndexExpression> rhs =
-      affineIndexExpression(definition->getOperand(1), facts, active);
-  if (!logical || !lhs || !rhs)
-    return finish(std::nullopt);
-  auto scale = [](AffineIndexExpression &expression, int64_t factor) {
-    expression.constant *= factor;
-    for (auto &coefficient : expression.coefficients)
-      coefficient.second *= factor;
-  };
-  if (logical.getValue() == "multiply") {
-    if (lhs->coefficients.empty()) {
-      int64_t factor = lhs->constant;
-      scale(*rhs, factor);
-      return finish(std::move(rhs));
-    }
-    if (rhs->coefficients.empty()) {
-      int64_t factor = rhs->constant;
-      scale(*lhs, factor);
-      return finish(std::move(lhs));
-    }
-    return finish(std::nullopt);
-  }
-  int64_t sign = logical.getValue() == "add"
-                     ? 1
-                     : logical.getValue() == "subtract" ? -1 : 0;
-  if (sign == 0)
-    return finish(std::nullopt);
-  lhs->constant += sign * rhs->constant;
-  for (const auto &coefficient : rhs->coefficients)
-    lhs->coefficients[coefficient.first] += sign * coefficient.second;
-  return finish(std::move(lhs));
-}
-
 LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
   if (failed(relation))
@@ -577,7 +624,7 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
       continue;
     llvm::DenseSet<Value> active;
     std::optional<AffineIndexExpression> expression =
-        affineIndexExpression(index, facts, active);
+        affineIndexExpression(index, facts, operation, active);
     if (!expression) {
       continue;
     }
@@ -829,26 +876,37 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             auto stepValue =
                 step ? step->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
-            if (!start || start->getName().getStringRef() != "intent.constant" ||
-                !startValue || startValue.getInt() != 0 ||
-                (step && (step->getName().getStringRef() != "intent.constant" ||
-                          !stepValue || stepValue.getInt() != 1)))
+            if (step && (step->getName().getStringRef() != "intent.constant" ||
+                         !stepValue || stepValue.getInt() != 1))
               return operation.emitOpError(
-                  "realization requires a zero-based unit-step domain");
+                  "runtime sequential domains currently require unit step");
             auto stopValue =
                 stop ? stop->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
-            if (stop && stop->getName().getStringRef() == "intent.constant" &&
+            bool zeroBased =
+                start && start->getName().getStringRef() == "intent.constant" &&
+                startValue && startValue.getInt() == 0;
+            if (zeroBased && stop &&
+                stop->getName().getStringRef() == "intent.constant" &&
                 stopValue && stopValue.getInt() > 0) {
               facts.staticDomainExtents[&operation] = stopValue.getInt();
               return success();
             }
-            if (!stop || stop->getName().getStringRef() != "intent.dim" || !axis ||
-                stop->getNumOperands() != 1)
+            if (zeroBased && stop &&
+                stop->getName().getStringRef() == "intent.dim" && axis &&
+                stop->getNumOperands() == 1) {
+              facts.domainSources[&operation] = stop->getOperand(0);
+              facts.domainSourceAxes[&operation] = axis.getInt();
+              return success();
+            }
+            if (!operation.getOperand(0).getType().isIntOrIndex() ||
+                !operation.getOperand(1).getType().isIntOrIndex() ||
+                !llvm::all_of(operation.getResult(0).getUsers(), [](Operation *user) {
+                  return user->getName().getStringRef() == "intent.for";
+                }))
               return operation.emitOpError(
-                  "domain stop must be a positive constant or ABI dimension");
-            facts.domainSources[&operation] = stop->getOperand(0);
-            facts.domainSourceAxes[&operation] = axis.getInt();
+                  "runtime-bounded domains require an ordinary scalar sequential loop");
+            facts.runtimeSequentialDomains.insert(&operation);
             return success();
           })))
     return failure();
@@ -951,11 +1009,13 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "has no canonical sequential-loop schema");
             for (auto [index, domain] : llvm::enumerate(*domains)) {
+              bool runtime = facts.runtimeSequentialDomains.contains(domain);
               if ((!facts.domainSourceAxes.count(domain) &&
-                   !facts.staticDomainExtents.count(domain)) ||
+                   !facts.staticDomainExtents.count(domain) && !runtime) ||
                   !isa<intent::LogicalIndexType>(
                       operation.getRegion(0).front().getArgument(index).getType()) ||
-                  failed(bindRegionArgumentAxis(operation, index, *domain, facts)))
+                  (!runtime &&
+                   failed(bindRegionArgumentAxis(operation, index, *domain, facts))))
                 return operation.emitOpError(
                     "sequential loop has an unrealized logical axis");
             }

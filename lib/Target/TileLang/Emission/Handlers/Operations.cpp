@@ -502,22 +502,34 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     if (!domain || domain->getName().getStringRef() != "intent.domain" ||
         domain->getNumOperands() < 2)
       return operation.emitOpError("has a non-canonical TileLang loop axis");
-    Operation *stopDefinition = domain->getOperand(1).getDefiningOp();
-    auto stopLiteral =
-        stopDefinition
-            ? stopDefinition->getAttrOfType<IntegerAttr>("intent.value")
-            : IntegerAttr();
-    std::string stop;
-    if (stopDefinition &&
-        stopDefinition->getName().getStringRef() == "intent.constant" &&
-        stopLiteral) {
-      stop = std::to_string(stopLiteral.getInt());
-    } else {
-      auto found = valueNames.find(domain->getOperand(1));
-      if (found == valueNames.end())
-        return operation.emitOpError("has no emitted TileLang loop bound");
-      stop = found->second;
-    }
+    auto rangeValue = [&](unsigned operand) -> FailureOr<std::string> {
+      Operation *definition = domain->getOperand(operand).getDefiningOp();
+      auto literal = definition
+                         ? definition->getAttrOfType<IntegerAttr>("intent.value")
+                         : IntegerAttr();
+      if (definition &&
+          definition->getName().getStringRef() == "intent.constant" && literal)
+        return std::to_string(literal.getInt());
+      auto found = valueNames.find(domain->getOperand(operand));
+      if (found == valueNames.end()) {
+        operation.emitOpError("has no emitted TileLang loop bound");
+        return failure();
+      }
+      return found->second;
+    };
+    FailureOr<std::string> start = rangeValue(0);
+    FailureOr<std::string> stop = rangeValue(1);
+    FailureOr<std::string> step = domain->getNumOperands() == 3
+                                      ? rangeValue(2)
+                                      : FailureOr<std::string>(std::string("1"));
+    if (failed(start) || failed(stop) || failed(step))
+      return failure();
+    if (*step != "1")
+      return operation.emitOpError(
+          "TileLang serial traversal requires a unit-step domain");
+    if (ordered && *start != "0")
+      return operation.emitOpError(
+          "TileLang ordered traversal requires a zero-based domain");
     std::string iterator = makeRegionArgumentName(operation, index);
     valueNames[body.getArgument(index)] = iterator;
     FailureOr<int64_t> domainNode =
@@ -534,15 +546,16 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
         return operation.emitOpError(
             "has an invalid two-level TileLang ordered traversal");
       std::string chunk = iterator + "_chunk";
-      line("for " + chunk + " in T.serial(T.ceildiv(" + stop + ", " +
+      line("for " + chunk + " in T.serial(T.ceildiv(" + *stop + ", " +
            outer->getTile().str() + ")):");
       ++indentation;
       line("for " + iterator + " in T.serial(" + chunk + " * " +
            outer->getTile().str() + ", T.min((" + chunk + " + 1) * " +
-           outer->getTile().str() + ", " + stop + ")):");
+           outer->getTile().str() + ", " + *stop + ")):");
       ++indentation;
     } else {
-      line("for " + iterator + " in T.serial(" + stop + "):");
+      line("for " + iterator + " in T.serial(" + *start + ", " + *stop +
+           "):");
       ++indentation;
     }
   }

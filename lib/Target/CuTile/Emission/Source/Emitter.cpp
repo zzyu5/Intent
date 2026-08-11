@@ -1516,16 +1516,21 @@ LogicalResult SourceEmitter::emitWrapper() {
       dynamicRaggedAxes.push_back(axis);
     }
     output << "    cache_key = (";
-    for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
-      if (index)
+    bool firstCacheKey = true;
+    auto emitCacheKey = [&](const std::string &value) {
+      if (!firstCacheKey)
         output << ", ";
-      output << dimension;
-    }
+      output << value;
+      firstCacheKey = false;
+    };
+    for (const std::string &dimension : dimensionOrder)
+      emitCacheKey(dimension);
     for (plan::AxisOp axis : dynamicRaggedAxes)
-      output << ", max_member_length_" << axis.getNode();
+      emitCacheKey("max_member_length_" + std::to_string(axis.getNode()));
     for (ABIView *input : inputs)
-      output << ", " << input->argument->name << ".dtype";
-    output << ", str(_DEVICE))\n";
+      emitCacheKey(input->argument->name + ".dtype");
+    emitCacheKey("str(_DEVICE)");
+    output << ")\n";
     output << "    if cache_key not in _TUNE_CACHE:\n";
     output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
     output << "            result = exhaustive_search(\n";

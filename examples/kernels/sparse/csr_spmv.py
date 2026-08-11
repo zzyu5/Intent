@@ -21,6 +21,8 @@ def csr_spmv(
         stop = row_offsets[row + 1]
         accumulation = I.cast(0.0, I.f32)
         for nonzero in range(start, stop):
+            I.assume_in_bounds(nonzero, column_indices, axis=0)
+            I.assume_in_bounds(nonzero, values, axis=0)
             column = column_indices[nonzero]
             I.assume_in_bounds(column, vector, axis=0)
             accumulation = accumulation + values[nonzero] * vector[column]
