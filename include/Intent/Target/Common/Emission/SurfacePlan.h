@@ -259,23 +259,11 @@ struct RangeBinding : Binding<intent::plan::RangeOp> {
   int64_t getLevel() const { return operation.getLevel(); }
   llvm::StringRef getTile() const { return tile; }
   llvm::StringRef getTileRole() const { return operation.getTile(); }
-  mlir::IntegerAttr getTransferNodeAttr() const {
-    return operation.getTransferNodeAttr();
-  }
-  mlir::IntegerAttr getSourceAxisAttr() const {
-    return operation.getSourceAxisAttr();
-  }
   int64_t getTransferNode() const {
     return operation.getTransferNodeAttr().getInt();
   }
   int64_t getSourceAxis() const {
     return operation.getSourceAxisAttr().getInt();
-  }
-  int64_t getLowerOffset() const {
-    return operation.getLowerOffsetAttr().getInt();
-  }
-  int64_t getUpperOffset() const {
-    return operation.getUpperOffsetAttr().getInt();
   }
 };
 
@@ -307,41 +295,30 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
       return nullptr;
     return &*found;
   }
-  const RangeBinding *primaryRange() const {
-    llvm::SmallVector<llvm::StringRef> purposes;
+  const RangeBinding *roleRange() const {
     llvm::StringRef activeRole(role);
     if (activeRole.starts_with("program_") ||
         activeRole.starts_with("ragged_member_"))
-      purposes.push_back("ownership");
-    else if (activeRole.starts_with("stream_"))
-      purposes.push_back("traversal");
-    else if (activeRole.starts_with("reduction_"))
-      purposes.push_back("reduction");
-    else if (activeRole.starts_with("lane_"))
-      purposes.push_back("lane");
-    for (llvm::StringRef purpose : {llvm::StringRef("ownership"),
-                                    llvm::StringRef("traversal"),
-                                    llvm::StringRef("reduction"),
-                                    llvm::StringRef("lane")})
-      if (!llvm::is_contained(purposes, purpose))
-        purposes.push_back(purpose);
-    for (llvm::StringRef purpose : purposes)
-      if (const RangeBinding *range = getRange(purpose))
-        return range;
+      return getRange("ownership");
+    if (activeRole.starts_with("stream_"))
+      return getRange("traversal");
+    if (activeRole.starts_with("reduction_"))
+      return getRange("reduction");
+    if (activeRole.starts_with("lane_"))
+      return getRange("lane");
     return nullptr;
   }
   llvm::StringRef getTile() const {
-    const RangeBinding *range = primaryRange();
+    const RangeBinding *range = roleRange();
     return range ? range->getTile() : llvm::StringRef();
   }
   llvm::StringRef getTileRole() const {
-    const RangeBinding *range = primaryRange();
+    const RangeBinding *range = roleRange();
     return range ? range->getTileRole() : llvm::StringRef();
   }
   bool isScalar() const {
-    return llvm::all_of(ranges, [](const RangeBinding &range) {
-      return range.getTileRole() == "one";
-    });
+    const RangeBinding *range = roleRange();
+    return range && range->getTileRole() == "one";
   }
   mlir::IntegerAttr getProgramOrderAttr() const {
     return operation.getProgramOrderAttr();
@@ -391,23 +368,17 @@ mlir::LogicalResult indexAxisRanges(
   return mlir::success();
 }
 
-struct AccessRangeProjection {
-  AxisBinding axis;
-  RangeBinding range;
-};
-
 template <typename PlanIndex>
-llvm::SmallVector<AccessRangeProjection>
+llvm::SmallVector<RangeBinding>
 accessRangesForTransfer(const PlanIndex &index, int64_t transferNode) {
-  llvm::SmallVector<AccessRangeProjection> result;
+  llvm::SmallVector<RangeBinding> result;
   for (const auto &entry : index.axes)
     for (const RangeBinding &range : entry.second.ranges)
       if (range.getPurpose() == "access" &&
           range.getTransferNode() == transferNode)
-        result.push_back(AccessRangeProjection{entry.second, range});
-  llvm::sort(result, [](const AccessRangeProjection &lhs,
-                        const AccessRangeProjection &rhs) {
-    return lhs.range.getSourceAxis() < rhs.range.getSourceAxis();
+        result.push_back(range);
+  llvm::sort(result, [](const RangeBinding &lhs, const RangeBinding &rhs) {
+    return lhs.getSourceAxis() < rhs.getSourceAxis();
   });
   return result;
 }

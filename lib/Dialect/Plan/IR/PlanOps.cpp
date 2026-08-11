@@ -391,11 +391,25 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   if (programOrders.empty())
     return program.emitOpError("has no per-axis program-space assignment");
   for (RangeOp range : ranges) {
-    if (!axes.count(range.getAxisNode()))
+    auto axis = axes.find(range.getAxisNode());
+    if (axis == axes.end())
       return range.emitOpError("references an unbound logical axis");
-    if (range.getPurpose() == "access" &&
-        !transfers.contains(range.getTransferNodeAttr().getInt()))
-      return range.emitOpError("references an unbound transfer operation");
+    StringRef purpose = range.getPurpose();
+    if (purpose == "access") {
+      if (!axisHasRole(axis->second, "parallel"))
+        return range.emitOpError(
+            "access footprint must be anchored to a parallel ownership axis");
+      if (!transfers.contains(range.getTransferNodeAttr().getInt()))
+        return range.emitOpError("references an unbound transfer operation");
+      continue;
+    }
+    StringRef requiredRole = purpose == "ownership" ? "parallel"
+                             : purpose == "traversal" ? "ordered"
+                             : purpose == "reduction" ? "reduction"
+                                                        : "lane";
+    if (!axisHasRole(axis->second, requiredRole))
+      return range.emitOpError()
+             << purpose << " range is not backed by axis role " << requiredRole;
   }
   auto hasRange = [&](int64_t node, StringRef purpose, int64_t level = 0) {
     std::string key = std::to_string(node) + ":" + purpose.str() + ":" +
@@ -412,6 +426,15 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (axisHasRole(axis, role) && !hasRange(axis.getNode(), purpose))
         return axis.emitOpError() << "has no " << purpose
                                   << " physical range for role " << role;
+  }
+  for (RangeOp range : ranges) {
+    if (range.getPurpose() != "traversal" || range.getLevel() == 0)
+      continue;
+    if (range.getLevel() != 1 ||
+        !hasRange(range.getAxisNode(), "traversal", 0) ||
+        range.getTile() != "one")
+      return range.emitOpError(
+          "nested ordered traversal requires one scalar level after level zero");
   }
   if (program.getPersistent())
     for (const auto &entry : axes) {

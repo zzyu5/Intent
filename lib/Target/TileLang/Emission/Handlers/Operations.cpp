@@ -434,9 +434,15 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       }
       std::string suffix = std::to_string(ordered->second.front());
       std::string query = std::to_string(memberNode);
+      plan::AxisOp memberAxis = planIndex.axes.lookup(memberNode);
+      const target::emission::RangeBinding *ownership =
+          memberAxis ? memberAxis.getRange("ownership", 0) : nullptr;
+      if (!ownership)
+        return operation.emitOpError(
+            "ordered ragged axis has no ownership range");
       line("query_start_" + query + " = sequence_begin_" + suffix + " + " +
            addressIndex(block) + " * " +
-           planIndex.axes.lookup(memberNode).getTile().str());
+           ownership->getTile().str());
       axisIndices[memberNode] = "query_start_" + query;
     }
   }

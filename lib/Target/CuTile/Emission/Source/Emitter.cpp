@@ -244,9 +244,11 @@ indexRealization(intent::plan::RealizationOp realization,
   for (auto &entry : index.streams) {
     plan::StreamOp &binding = entry.second;
     plan::AxisOp axis = index.axes.lookup(binding.getAxisNode());
+    const target::emission::RangeBinding *traversal =
+        axis ? axis.getRange("traversal", 0) : nullptr;
     FailureOr<std::string> tile =
-        axis ? tileSpelling(binding.operation, axis.getTileRole())
-             : FailureOr<std::string>(failure());
+        traversal ? tileSpelling(binding.operation, traversal->getTileRole())
+                  : FailureOr<std::string>(failure());
     if (failed(tile))
       return binding.emitOpError("does not bind an ordered physical axis");
     binding.tile = *tile;
@@ -545,11 +547,14 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
                               ? planIndex.axes.lookup(*domainNode)
                               : plan::AxisOp();
       auto argument = dyn_cast<IntegerAttr>(arguments[index]);
-      if (failed(domainNode) || !axis || !argument)
+      StringRef purpose = name == "intent.parallel" ? "ownership" : "traversal";
+      const target::emission::RangeBinding *range =
+          axis ? axis.getRange(purpose, 0) : nullptr;
+      if (failed(domainNode) || !axis || !argument || !range)
         return operation->emitOpError(
             "cannot index its region axis against the cuTile plan");
       regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
-          axis.getTile().str();
+          range->getTile().str();
     }
   }
 
