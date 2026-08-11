@@ -2181,8 +2181,15 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
     if (failed(extent))
       return failure();
     if (!target::emission::isRaggedBoundAxis(planIndex.components,
-                                             axis.getNode()))
-      *extent = dimensionOwners.lookup(*extent);
+                                             axis.getNode())) {
+      auto owner = dimensionOwners.find(*extent);
+      int64_t staticExtent;
+      if (owner != dimensionOwners.end())
+        *extent = owner->second;
+      else if (StringRef(*extent).getAsInteger(10, staticExtent))
+        return consumer.emitOpError(
+            "has no cuTile runtime binding for a symbolic validity extent");
+    }
     predicates.push_back("(" + index + " < " + *extent + ")");
   }
   if (predicates.empty())

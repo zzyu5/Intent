@@ -364,9 +364,6 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
     }
     if (term.kind != "region_index")
       return operation.emitOpError("has an unsupported boundary index relation");
-    if (!isa<intent::LogicalIndexType, IntegerType, IndexType>(
-            indexed.getType()))
-      return true;
     FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
     FailureOr<LogicalAxis> logical =
         succeeded(domain) ? axisFromDomain(**domain, facts, operation)
