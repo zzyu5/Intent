@@ -2356,6 +2356,8 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "T.float16";
   if (type.isF32())
     return "T.float32";
+  if (type.isF64())
+    return "T.float64";
   if (type.isBF16())
     return "T.bfloat16";
   if (auto integer = dyn_cast<IntegerType>(type);
