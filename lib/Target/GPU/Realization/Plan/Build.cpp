@@ -178,8 +178,10 @@ public:
 
   bool prove(Operation &load) const {
     auto domains = facts.boundaryDomains.find(&load);
+    auto fill = facts.boundaryFills.find(&load);
     if (load.getNumResults() != 1 || domains == facts.boundaryDomains.end() ||
-        domains->second.empty())
+        domains->second.empty() || fill == facts.boundaryFills.end() ||
+        fill->second == "none")
       return false;
     llvm::DenseSet<Value> active;
     return proveUses(load.getResult(0), domains->second, active);

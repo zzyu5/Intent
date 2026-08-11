@@ -12,6 +12,7 @@ from intent.frontend.semantics import RaggedType
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import UnaryOperator
+from intent.frontend.semantics import broadcast_shape
 from intent.frontend.mlir import MlirValue
 from intent.language import DType
 from intent.language import DTypeCategory
@@ -315,12 +316,23 @@ def _lower_if_expression(lowerer: object, node: ast.IfExp) -> Expression:
     known, value = compile_time_value(condition)
     if known:
         return lowerer.lower_expression(node.body if bool(value) else node.orelse)
-    condition_value = lowerer.materialize(condition, node.test, ScalarType(intent_bool))
+    condition_value = lowerer.materialize(condition, node.test)
+    condition_dtype, condition_shape = lowerer.dtype_and_shape(
+        condition_value.type,
+        node.test,
+    )
+    if condition_dtype != intent_bool:
+        lowerer.error(node.test, "conditional expression requires a bool predicate")
     true_value = lowerer.lower_expression(node.body)
     false_value = lowerer.lower_expression(node.orelse)
     lhs, rhs = lowerer.coerce_pair(true_value, false_value, node)
-    result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
-    _, result_shape = lowerer.dtype_and_shape(result_type, node)
+    branch_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+    result_dtype, branch_shape = lowerer.dtype_and_shape(branch_type, node)
+    try:
+        result_shape = broadcast_shape(condition_shape, branch_shape)
+    except ValueError as error:
+        lowerer.error(node, str(error))
+    result_type = lowerer.value_result_type(result_dtype, result_shape)
     condition_value = lowerer.broadcast_value(condition_value, result_shape, node)
     lhs = lowerer.broadcast_value(lhs, result_shape, node)
     rhs = lowerer.broadcast_value(rhs, result_shape, node)
