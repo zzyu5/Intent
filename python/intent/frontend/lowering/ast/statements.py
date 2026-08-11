@@ -252,6 +252,10 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
     merged_static: dict[str, Expression] = {}
     merge_types: dict[str, object] = {}
     for name in sorted(assigned):
+        if name not in snapshot and any(
+            name not in environment for environment in normal_environments
+        ):
+            continue
         branch_values: list[Expression] = []
         for environment in normal_environments:
             if name not in environment:
