@@ -202,10 +202,10 @@ struct AxisAssignments {
   bool persistent = false;
 };
 
-bool hasIndependentLane(const AxisChoice &choice,
-                        const target::KernelFacts &facts) {
+unsigned independentLaneCount(const AxisChoice &choice,
+                              const target::KernelFacts &facts) {
   if (choice.parallels.empty())
-    return false;
+    return 0;
   auto isOwnedByChoice = [&](Operation *operation) {
     return llvm::is_contained(choice.parallels, nearestParallel(operation));
   };
@@ -214,22 +214,25 @@ bool hasIndependentLane(const AxisChoice &choice,
            !facts.orderedDomains.contains(domain) &&
            !facts.contractionDomains.contains(domain);
   };
+  SmallVector<Operation *> lanes;
+  auto collect = [&](Operation *domain) {
+    if (usable(domain) && !llvm::is_contained(lanes, domain))
+      lanes.push_back(domain);
+  };
   for (const auto &entry : facts.boundaryDomains) {
     if (!isOwnedByChoice(entry.first))
       continue;
-    if (llvm::any_of(entry.second, usable))
-      return true;
+    for (Operation *domain : entry.second)
+      collect(domain);
   }
   for (const auto &entry : facts.valueAxes) {
     Operation *definition = entry.first.getDefiningOp();
     if (!definition || !isOwnedByChoice(definition))
       continue;
-    if (llvm::any_of(entry.second, [&](const target::LogicalAxis &axis) {
-          return usable(axis.domain);
-        }))
-      return true;
+    for (const target::LogicalAxis &axis : entry.second)
+      collect(axis.domain);
   }
-  return false;
+  return lanes.size();
 }
 
 bool ownsOrderedStream(const AxisChoice &choice,
@@ -535,7 +538,7 @@ assignAxes(const target::KernelFacts &facts) {
   for (AxisChoice &choice : choices)
     choice.reuse = choice.programOrder && !choice.tiled && !choice.packedLane &&
                    llvm::all_of(choice.parallels, ownsOneDomain) &&
-                   hasIndependentLane(choice, facts);
+                   independentLaneCount(choice, facts) == 1;
 
   bool persistent = llvm::any_of(facts.contractions, [&](const auto &entry) {
     llvm::DenseSet<unsigned> owned;

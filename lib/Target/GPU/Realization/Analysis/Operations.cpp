@@ -312,13 +312,15 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             auto ordering =
                 operation.getAttrOfType<StringAttr>("intent.ordering");
             auto scope = operation.getAttrOfType<StringAttr>("intent.scope");
-            if (operation.getNumResults() != 0 || !valueIndex ||
+            if (operation.getNumResults() != 1 || !valueIndex ||
                 valueIndex.getInt() <= 0 ||
                 static_cast<unsigned>(valueIndex.getInt()) >=
                     operation.getNumOperands() ||
                 !isa<intent::ViewType>(operation.getOperand(0).getType()) ||
                 !ordering || ordering.getValue() != "relaxed" || !scope ||
-                scope.getValue() != "device")
+                scope.getValue() != "device" ||
+                operation.getResult(0).getType() !=
+                    operation.getOperand(valueIndex.getInt()).getType())
               return operation.emitOpError(
                   "has no relaxed device-scoped external GPU atomic-add schema");
             return success();

@@ -38,6 +38,7 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
   SmallVector<Operation *> domains;
   bool hasOpaqueScalarIndex = false;
   bool hasInBoundsIndex = false;
+  bool requiresBoundarySource = false;
   unsigned sourceAxis = 0;
   for (const IndexTerm &term : *relation) {
     if (term.kind == "new_axis")
@@ -50,6 +51,7 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
     if (term.operands.size() != 1 || !term.operands.front())
       return operation.emitOpError(
           "boundary analysis requires one value per dynamic index term");
+    requiresBoundarySource = true;
     Value indexed = operation.getOperand(*term.operands.front());
     auto indexedAxes = facts.valueAxes.find(indexed);
     if (term.kind == "value_index") {
@@ -85,7 +87,8 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
     domains.push_back(*domain);
     ++sourceAxis;
   }
-  if (domains.empty() && !hasOpaqueScalarIndex && !hasInBoundsIndex)
+  if (requiresBoundarySource && domains.empty() && !hasOpaqueScalarIndex &&
+      !hasInBoundsIndex)
     return operation.emitOpError("has no domain-bound index for realization");
   facts.boundaryDomains[&operation] = std::move(domains);
   facts.boundaryFills[&operation] = fill.str();
@@ -423,8 +426,7 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
         ++sourceAxis;
         continue;
       }
-      if (isa<RankedTensorType>(indexed.getType()))
-        return true;
+      bool tensorIndex = isa<RankedTensorType>(indexed.getType());
       llvm::DenseSet<Value> active;
       std::optional<AffineIndexExpression> expression =
           affineIndexExpression(indexed, facts, operation, active);
@@ -441,6 +443,8 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
         ++sourceAxis;
         continue;
       }
+      if (tensorIndex)
+        return true;
       FailureOr<ScalarIndexSource> source =
           traceScalarIndexSource(indexed, operation);
       if (failed(source))
@@ -1025,8 +1029,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               facts.domainSourceAxes[&operation] = axis.getInt();
               return success();
             }
-            if (!operation.getOperand(0).getType().isIntOrIndex() ||
-                !operation.getOperand(1).getType().isIntOrIndex() ||
+            auto validLoopBound = [](Type type) {
+              return type.isIntOrIndex() || isa<intent::LogicalIndexType>(type);
+            };
+            if (!validLoopBound(operation.getOperand(0).getType()) ||
+                !validLoopBound(operation.getOperand(1).getType()) ||
                 !llvm::all_of(operation.getResult(0).getUsers(), [](Operation *user) {
                   return user->getName().getStringRef() == "intent.for";
                 }))
@@ -1435,12 +1442,22 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   "has no canonical ragged-member schema");
             Operation *relation = operation.getOperand(0).getDefiningOp();
             auto found = facts.raggedRelations.find(relation);
-            if (found == facts.raggedRelations.end() ||
-                !found->second.outerDomain)
+            if (found == facts.raggedRelations.end())
               return operation.emitOpError(
-                  "does not reference a resolved ragged relation");
+                  "does not reference a canonical ragged relation");
             FailureOr<Operation *> selector = resolveDomain(
                 operation.getOperand(1), facts, operation);
+            if (succeeded(selector) && !found->second.outerDomain) {
+              Operation *outerSource = found->second.outerSource;
+              Value selectorSource = facts.domainSources.lookup(*selector);
+              if (outerSource && selectorSource &&
+                  facts.domainSources.lookup(outerSource) == selectorSource &&
+                  facts.domainSourceAxes.lookup(outerSource) ==
+                      facts.domainSourceAxes.lookup(*selector)) {
+                found->second.outerDomain = *selector;
+                facts.raggedOuterRelations[*selector] = relation;
+              }
+            }
             if (failed(selector) || *selector != found->second.outerDomain)
               return operation.emitOpError(
                   "member selector is not owned by the ragged outer domain");

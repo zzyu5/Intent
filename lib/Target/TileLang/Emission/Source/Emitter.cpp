@@ -699,10 +699,13 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
     runtime.binding = ragged;
     runtime.relation = kernel.nodes.lookup(ragged.getNode());
     runtime.outer = kernel.nodes.lookup(ragged.getOuterNode());
+    StringRef outerName = runtime.outer
+                              ? runtime.outer->getName().getStringRef()
+                              : StringRef();
     if (!runtime.relation ||
         runtime.relation->getName().getStringRef() != "intent.ragged" ||
-        !runtime.outer ||
-        runtime.outer->getName().getStringRef() != "intent.ragged_outer" ||
+        (outerName != "intent.ragged_outer" &&
+         outerName != "intent.ragged_member") ||
         ragged.getMemberNodes().empty())
       return ragged.emitOpError(
           "does not resolve to canonical ragged ownership operations");
@@ -853,7 +856,7 @@ void SourceEmitter::emitImports() {
     output << "_NUM_SMS = torch.cuda.get_device_properties("
            << planIndex.target.getDevice() << ").multi_processor_count\n";
   if (searchSpace) {
-    output << "from tilelang.autotuner import autotune, set_autotune_inputs\n";
+    output << "from tilelang.autotuner import autotune\n";
     output << "from intent.runtime.tuning.tilelang import autotune_configurations\n";
     output << "\n_PARAMETER_MAP = {";
     for (auto [index, mapping] :
@@ -864,6 +867,11 @@ void SourceEmitter::emitImports() {
              << cast<StringAttr>(mapping.getValue()).getValue() << "'";
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
+    output << "_AUTOTUNE_INPUTS = None\n\n";
+    output << "def _fresh_autotune_inputs(_):\n";
+    output << "    if _AUTOTUNE_INPUTS is None:\n";
+    output << "        raise RuntimeError('TileLang autotuning has no captured launch inputs')\n";
+    output << "    return [value.clone() if isinstance(value, torch.Tensor) else value for value in _AUTOTUNE_INPUTS]\n";
   }
   output << "\n\n";
 }
@@ -966,7 +974,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   auto emitDecorator = [&](raw_ostream &stream) {
     if (searchSpace)
       stream << "@autotune(configs=_CONFIGS, warmup=3, rep=10, "
-                "timeout=100, skip_check=True)\n";
+                "timeout=100, skip_check=True, "
+                "supply_prog=_fresh_autotune_inputs)\n";
     stream << "@tilelang.jit\n";
   };
   auto emitBlockExtentConstants = [&](raw_ostream &stream) {
@@ -1422,6 +1431,8 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "def launch(";
   emitLaunchSignature();
   output << "):\n";
+  if (searchSpace)
+    output << "    global _AUTOTUNE_INPUTS\n";
   if (failed(emitValidation()))
     return failure();
   if (failed(emitPrivateWorkspaceAllocations()))
@@ -1487,7 +1498,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", " << input->argument->name << ".dtype";
       output << ", str(_DEVICE))\n";
       output << "    if cache_key not in _KERNEL_CACHE:\n";
-      output << "        with set_autotune_inputs(";
+      output << "        _AUTOTUNE_INPUTS = [";
       bool first = true;
       for (ABIView &view : views) {
         if (!first)
@@ -1515,10 +1526,11 @@ LogicalResult SourceEmitter::emitWrapper() {
           output << workspaceNames.lookup(kernel.values.lookup(valueID));
           first = false;
         }
-      output << "):\n            compiled = " << kernelName << "_stage_" << stage
+      output << "]\n        try:\n            compiled = " << kernelName << "_stage_" << stage
              << "(";
       emitBuilderArguments(stage);
-      output << ")\n        _KERNEL_CACHE[cache_key] = compiled\n";
+      output << ")\n        finally:\n            _AUTOTUNE_INPUTS = None\n";
+      output << "        _KERNEL_CACHE[cache_key] = compiled\n";
       output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";
       emitKernelArguments();
       output << ")\n";
@@ -1616,11 +1628,11 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << ")\n";
   output << "    if cache_key not in _KERNEL_CACHE:\n";
   if (searchSpace) {
-    output << "        with set_autotune_inputs(";
+    output << "        _AUTOTUNE_INPUTS = [";
     emitKernelArguments();
-    output << "):\n            compiled = " << kernelName << "(";
+    output << "]\n        try:\n            compiled = " << kernelName << "(";
     emitBuilderArguments(-1);
-    output << ")\n";
+    output << ")\n        finally:\n            _AUTOTUNE_INPUTS = None\n";
   } else if (!planIndex.components.reusedAxes.empty()) {
     std::string rowDimension = roleDimensions.lookup("lane_0");
     if (rowDimension.empty())
@@ -1869,6 +1881,8 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
     return failure();
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
     if (term.kind == "full_slice") {
       indices.push_back(":");
       continue;
@@ -1969,6 +1983,13 @@ SourceEmitter::elementAccessIndices(Operation &operation,
   unsigned tileAxis = 0;
   bool advancedTensorAxesCovered = false;
   for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "parallel TileLang transfer has too few new-axis indices");
+      ++tileAxis;
+      continue;
+    }
     if (term.kind == "full_slice") {
       if (tileAxis >= tileIndices.size())
         return operation.emitOpError(
@@ -2075,7 +2096,11 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
   if (failed(relation))
     return failure();
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  if (failed(view) || relation->size() != (*view)->shape.size())
+  if (failed(view) ||
+      static_cast<size_t>(llvm::count_if(
+          *relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != (*view)->shape.size())
     return failure();
   unsigned tensorIndexCount = llvm::count_if(
       *relation, [&](const target::IndexTerm &term) {
@@ -2086,8 +2111,17 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
       });
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
+  unsigned sourceAxis = 0;
   bool advancedTensorAxesCovered = false;
-  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      if (tileAxis >= tileIndices.size())
+        return operation.emitOpError(
+            "bounded TileLang transfer has too few new-axis indices");
+      ++tileAxis;
+      continue;
+    }
+    unsigned axisNumber = sourceAxis++;
     if (term.kind == "full_slice") {
       if (tileAxis >= tileIndices.size())
         return operation.emitOpError(
@@ -2235,17 +2269,67 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
   return result;
 }
 
+FailureOr<std::string> SourceEmitter::scalarTransferPredicate(
+    Operation &operation, const plan::BoundaryOp &boundary) {
+  SmallVector<std::string> predicates;
+  FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
+  if (failed(derivedScalar))
+    return failure();
+  if (*derivedScalar) {
+    FailureOr<std::string> address = elementBoundsPredicate(operation, {});
+    if (failed(address))
+      return failure();
+    if (!address->empty())
+      predicates.push_back(*address);
+  }
+  for (int64_t node : boundary.getDomainNodes()) {
+    auto found = planIndex.axes.find(node);
+    if (found == planIndex.axes.end() ||
+        !target::emission::isPackedScalarAxis(found->second))
+      continue;
+    std::string exact = axisIndices.lookup(node);
+    Operation *domain = kernel.nodes.lookup(node);
+    FailureOr<std::string> extent =
+        domain ? dimensionName(*domain)
+               : FailureOr<std::string>(failure());
+    if (exact.empty() || failed(extent))
+      return operation.emitOpError(
+          "packed scalar transfer has no exact TileLang interval");
+    predicates.push_back("0 <= " + exact);
+    predicates.push_back(exact + " < " + *extent);
+  }
+  std::string result;
+  for (StringRef predicate : predicates) {
+    if (!result.empty())
+      result += " and ";
+    result += predicate;
+  }
+  return result;
+}
+
 FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
     Operation &operation, ArrayRef<std::string> tileExtents) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(relation) || failed(view) ||
-      relation->size() != (*view)->shape.size())
+      static_cast<size_t>(llvm::count_if(
+          *relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != (*view)->shape.size())
     return failure();
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
-  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+  unsigned sourceAxis = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      if (tileAxis >= tileExtents.size())
+        return operation.emitOpError(
+            "whole-tile TileLang transfer has too few new-axis extents");
+      ++tileAxis;
+      continue;
+    }
+    unsigned axisNumber = sourceAxis++;
     if (term.kind == "full_slice") {
       if (tileAxis >= tileExtents.size())
         return operation.emitOpError(
@@ -2405,7 +2489,9 @@ FailureOr<std::string> SourceEmitter::padElementExpression(
                          ? "-T.infinity(" + dtype + ")"
                      : padding.getFill() == "true" ? "True"
                      : padding.getFill() == "false" ? "False"
-                                                      : "0.0";
+                     : isa<IntegerType, IndexType>(tensor.getElementType())
+                         ? "0"
+                         : "0.0";
   return "T.if_then_else(" + *predicate + ", " + expression.str() + ", " +
          fill + ")";
 }

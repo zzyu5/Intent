@@ -413,11 +413,18 @@ template <typename PlanIndex>
 mlir::FailureOr<std::string> transferPhysicalExtentFill(
     const PlanIndex &index, llvm::ArrayRef<target::IndexTerm> relation,
     llvm::ArrayRef<std::string> viewShape, mlir::Operation &operation) {
-  if (relation.size() != viewShape.size())
+  if (static_cast<size_t>(llvm::count_if(
+          relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != viewShape.size())
     return operation.emitOpError(
         "physical block-extent projection does not match the external view rank");
   std::string fill;
-  for (auto [axis, term] : llvm::enumerate(relation)) {
+  unsigned viewAxis = 0;
+  for (const target::IndexTerm &term : relation) {
+    if (term.kind == "new_axis")
+      continue;
+    llvm::StringRef viewExtent = viewShape[viewAxis++];
     bool vectorAccess = term.kind == "full_slice";
     if ((term.kind == "region_index" || term.kind == "value_index") &&
         term.operands.size() == 1 && term.operands.front()) {
@@ -428,7 +435,7 @@ mlir::FailureOr<std::string> transferPhysicalExtentFill(
     }
     if (!vectorAccess)
       continue;
-    auto extent = index.blockExtents.find(viewShape[axis]);
+    auto extent = index.blockExtents.find(viewExtent);
     if (extent == index.blockExtents.end())
       continue;
     if (!fill.empty() && fill != extent->second.getFill())
@@ -877,10 +884,19 @@ mlir::FailureOr<RaggedBinding>
 uniqueRaggedRelation(const PlanIndex &index, int64_t axis,
                      mlir::Operation &consumer) {
   auto found = index.components.raggedByAxis.find(axis);
-  if (found == index.components.raggedByAxis.end() || found->second.size() != 1)
+  if (found == index.components.raggedByAxis.end())
     return consumer.emitOpError(
         "does not resolve one ragged relation for its logical axis");
-  return found->second.front();
+  if (found->second.size() == 1)
+    return found->second.front();
+  llvm::SmallVector<RaggedBinding> memberRelations;
+  for (RaggedBinding relation : found->second)
+    if (llvm::is_contained(relation.getMemberNodes(), axis))
+      memberRelations.push_back(relation);
+  if (memberRelations.size() != 1)
+    return consumer.emitOpError(
+        "does not resolve one member relation for its logical axis");
+  return memberRelations.front();
 }
 
 inline bool isRaggedBoundAxis(const PhysicalComponents &components,
@@ -953,6 +969,21 @@ mlir::LogicalResult indexCanonicalStructure(
         binding.outerNode = *userNode;
       } else {
         binding.memberNodes.push_back(*userNode);
+        auto selector = mlir::dyn_cast<mlir::BlockArgument>(user->getOperand(1));
+        mlir::Operation *owner =
+            selector ? selector.getOwner()->getParentOp() : nullptr;
+        mlir::Operation *outer =
+            owner && selector.getArgNumber() == 0 && owner->getNumOperands() > 0
+                ? owner->getOperand(0).getDefiningOp()
+                : nullptr;
+        if (binding.outerNode < 0 && outer &&
+            outer->getName().getStringRef() == "intent.ragged_member") {
+          mlir::FailureOr<int64_t> outerNode =
+              target::getNodeID(*outer, "nested ragged outer emission index");
+          if (mlir::failed(outerNode))
+            return mlir::failure();
+          binding.outerNode = *outerNode;
+        }
       }
     }
     llvm::sort(binding.memberNodes);

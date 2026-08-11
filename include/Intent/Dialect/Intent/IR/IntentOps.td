@@ -144,7 +144,7 @@ def Intent_ScatterReduceOp : Intent_VariadicNoResultOp<"scatter_reduce", [Memory
 def Intent_BufferOp : Intent_VariadicOneResultOp<"buffer">;
 def Intent_BufferLoadOp : Intent_VariadicOneResultOp<"buffer_load", [MemoryEffects<[MemRead]>]>;
 def Intent_BufferStoreOp : Intent_VariadicNoResultOp<"buffer_store", [MemoryEffects<[MemWrite]>]>;
-def Intent_AtomicAddOp : Intent_VariadicNoResultOp<"atomic_add", [MemoryEffects<[MemRead, MemWrite]>]>;
+def Intent_AtomicAddOp : Intent_VariadicOneResultOp<"atomic_add", [MemoryEffects<[MemRead, MemWrite]>]>;
 def Intent_AtomicCasOp : Intent_VariadicOneResultOp<"atomic_cas", [MemoryEffects<[MemRead, MemWrite]>]>;
 def Intent_RandomOp : Intent_Op<"random", [Pure]> {
   let arguments = (ins AnyType:$seed, AnyType:$logical_index);

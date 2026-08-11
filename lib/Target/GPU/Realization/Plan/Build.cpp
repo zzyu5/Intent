@@ -121,12 +121,6 @@ struct PaddingState {
       return failure();
     if (validity->nodes.empty())
       return success();
-    std::optional<std::string> safeFill = target::inferMaskedLaneFill(value);
-    if (!safeFill || *safeFill != fill)
-      return consumer.emitOpError()
-             << "cannot choose one semantics-preserving padding for value; "
-                "required "
-             << fill;
     FailureOr<int64_t> valueID = target::getValueID(
         value, facts.kernel, consumer, "padding binding");
     if (failed(valueID))
@@ -535,7 +529,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       return failure();
     bool load = operation.getName().getStringRef() == "intent.view_load";
     bool returnedAtomic =
-        operation.getName().getStringRef() == "intent.atomic_cas";
+        operation.getName().getStringRef() == "intent.atomic_cas" ||
+        (operation.getName().getStringRef() == "intent.atomic_add" &&
+         operation.getNumResults() == 1);
     bool contractOperand =
         load && operation.getNumResults() == 1 &&
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {

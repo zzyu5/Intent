@@ -177,6 +177,9 @@ private:
                          bool physicalOnly = false,
                          bool includePhysical = true);
   mlir::FailureOr<std::string>
+  scalarTransferPredicate(mlir::Operation &operation,
+                          const plan::BoundaryOp &boundary);
+  mlir::FailureOr<std::string>
   wholeTileBoundsPredicate(mlir::Operation &operation,
                            llvm::ArrayRef<std::string> tileExtents);
   mlir::FailureOr<std::string>

@@ -503,7 +503,7 @@ LogicalResult SourceEmitter::emitProgramBindings() {
   }
   for (const auto &entry : planIndex.axesByRole) {
     plan::AxisOp axis = entry.getValue();
-    if (!entry.getKey().starts_with("lane_") || axis.hasRole("ordered") ||
+    if (!entry.getKey().starts_with("lane_") ||
         !axisIndices.lookup(axis.getNode()).empty())
       continue;
     std::string extent = roleDimensions.lookup(entry.getKey());
@@ -627,9 +627,12 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
   }
   loopCarriers[&operation] = carriers;
   for (auto [index, domain] : llvm::enumerate(*domains)) {
-    if (!domain || domain->getName().getStringRef() != "intent.domain" ||
-        domain->getNumOperands() < 2)
+    if (!domain)
       return operation.emitOpError("has a non-canonical Triton loop axis");
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    bool raggedAxis =
+        domain->getName().getStringRef() == "intent.ragged_member";
     auto rangeValue = [&](unsigned operand) -> FailureOr<std::string> {
       Operation *definition = domain->getOperand(operand).getDefiningOp();
       auto literal = definition
@@ -645,20 +648,53 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
       }
       return found->second;
     };
-    FailureOr<std::string> start = rangeValue(0);
-    FailureOr<std::string> stop = rangeValue(1);
-    FailureOr<std::string> step = domain->getNumOperands() == 3
-                                      ? rangeValue(2)
-                                      : FailureOr<std::string>(std::string("1"));
+    FailureOr<std::string> start = failure();
+    FailureOr<std::string> stop = failure();
+    FailureOr<std::string> step = std::string("1");
+    if (domain->getName().getStringRef() == "intent.domain" &&
+        domain->getNumOperands() >= 2) {
+      start = rangeValue(0);
+      stop = rangeValue(1);
+      if (domain->getNumOperands() == 3)
+        step = rangeValue(2);
+    } else if (ordered && raggedAxis && succeeded(domainNode)) {
+      FailureOr<plan::RaggedOp> relation =
+          target::emission::uniqueRaggedRelation(planIndex, *domainNode,
+                                                  operation);
+      std::string outer = succeeded(relation)
+                              ? axisIndices.lookup(relation->getOuterNode())
+                              : std::string();
+      auto runtime = succeeded(relation)
+                         ? raggedRuntimeByRelation.find(relation->getNode())
+                         : raggedRuntimeByRelation.end();
+      if (failed(relation) || outer.empty() ||
+          runtime == raggedRuntimeByRelation.end())
+        return operation.emitOpError(
+            "ordered ragged traversal has no outer-axis or offsets binding");
+      ABIView *offsets = raggedRuntimes[runtime->second].offsets;
+      std::string suffix = std::to_string(*domainNode);
+      std::string begin = "sequence_begin_" + suffix;
+      std::string end = "sequence_end_" + suffix;
+      line(begin + " = tl.load(" + offsets->pointer + " + " +
+           addressIndex(outer) + " * " + addressIndex(offsets->strides[0]) +
+           ")");
+      line(end + " = tl.load(" + offsets->pointer + " + " +
+           addressIndex(outer + " + 1") + " * " +
+           addressIndex(offsets->strides[0]) + ")");
+      start = begin;
+      stop = end;
+    } else {
+      return operation.emitOpError("has a non-canonical Triton loop axis");
+    }
     if (failed(start) || failed(stop) || failed(step))
       return failure();
-    if (ordered && (*start != "0" || *step != "1"))
+    if (ordered && ((!raggedAxis && *start != "0") || *step != "1"))
       return operation.emitOpError(
           "Triton ordered traversal requires a zero-based unit-step domain");
     std::string iterator = makeRegionArgumentName(operation, index);
     valueNames[body.getArgument(index)] = iterator;
-    FailureOr<int64_t> domainNode =
-        target::getNodeID(*domain, "ordered traversal range");
+    if (raggedAxis && succeeded(domainNode))
+      axisIndices[*domainNode] = iterator;
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
@@ -671,12 +707,14 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
         return operation.emitOpError(
             "has an invalid two-level Triton ordered traversal");
       std::string chunk = iterator + "_chunk";
-      line("for " + chunk + " in tl.range(0, tl.cdiv(" + *stop + ", " +
+      line("for " + chunk + " in tl.range(0, tl.cdiv(" + *stop + " - " +
+           *start + ", " +
            outer->getTile().str() + "), flatten=True):");
       ++indentation;
-      line("for " + iterator + " in tl.range(" + chunk + " * " +
-           outer->getTile().str() + ", tl.minimum((" + chunk + " + 1) * " +
-           outer->getTile().str() + ", " + *stop + ")):");
+      line("for " + iterator + " in tl.range(" + *start + " + " + chunk +
+           " * " + outer->getTile().str() + ", tl.minimum(" + *start +
+           " + (" + chunk + " + 1) * " + outer->getTile().str() + ", " +
+           *stop + ")):");
       ++indentation;
     } else {
       line("for " + iterator + " in tl.range(" + *start + ", " + *stop +
@@ -1489,6 +1527,35 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
+  bool scalarFragmentGather =
+      binding && binding.getLowering() == "tl.indirect_gather" &&
+      isa<RankedTensorType>(operation.getOperand(0).getType()) &&
+      !isa<RankedTensorType>(operation.getResult(0).getType()) &&
+      succeeded(relation) && relation->size() == 1 &&
+      (*relation)[0].kind == "value_index" &&
+      (*relation)[0].operands.size() == 1 &&
+      (*relation)[0].operands.front();
+  if (scalarFragmentGather) {
+    FailureOr<StringRef> source = lookupValue(operation, 0);
+    FailureOr<StringRef> index =
+        lookupValue(operation, *(*relation)[0].operands.front());
+    FailureOr<StringRef> valid =
+        validIndex ? lookupValue(operation, validIndex.getInt())
+                   : FailureOr<StringRef>(failure());
+    FailureOr<StringRef> fill =
+        fillIndex ? lookupValue(operation, fillIndex.getInt())
+                  : FailureOr<StringRef>(failure());
+    if (failed(source) || failed(index) || failed(valid) || failed(fill))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    std::string gathered =
+        "tl.gather(" + source->str() + ", tl.full(" + source->str() +
+        ".shape, " + index->str() + ", tl.int64), axis=0)";
+    line(result + " = tl.where(" + valid->str() + ", tl.max(" + gathered +
+         ", axis=0), " + fill->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (!planIndex.stages.empty() && binding &&
       binding.getLowering() == "tl.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
@@ -1982,7 +2049,13 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     if (*mask != "True")
       call += ", mask=" + *mask;
     call += ", sem='relaxed', scope='gpu')";
-    line(call);
+    if (operation.getNumResults() == 1 && !operation.getResult(0).use_empty()) {
+      std::string result = makeResultName(operation, 0);
+      line(result + " = " + call);
+      bindResult(operation, 0, result);
+    } else {
+      line(call);
+    }
     return success();
   }
   if (!valueIndex || failed(relation) || relation->size() != 2 ||

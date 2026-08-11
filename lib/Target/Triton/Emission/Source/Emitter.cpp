@@ -613,10 +613,13 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
     runtime.binding = ragged;
     runtime.relation = kernel.nodes.lookup(ragged.getNode());
     runtime.outer = kernel.nodes.lookup(ragged.getOuterNode());
+    StringRef outerName = runtime.outer
+                              ? runtime.outer->getName().getStringRef()
+                              : StringRef();
     if (!runtime.relation ||
         runtime.relation->getName().getStringRef() != "intent.ragged" ||
-        !runtime.outer ||
-        runtime.outer->getName().getStringRef() != "intent.ragged_outer" ||
+        (outerName != "intent.ragged_outer" &&
+         outerName != "intent.ragged_member") ||
         ragged.getMemberNodes().empty())
       return ragged.emitOpError(
           "does not resolve to canonical ragged ownership operations");
@@ -972,7 +975,18 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         output << ", ";
       output << "'" << cast<StringAttr>(attribute).getValue() << "'";
     }
-    output << "],\n)\n";
+    output << "]";
+    bool firstRestoredView = true;
+    for (ABIView &view : views) {
+      if (view.view.getAccess() != "inout")
+        continue;
+      output << (firstRestoredView ? ",\n    restore_value=[" : ", ")
+             << "'" << view.pointer << "'";
+      firstRestoredView = false;
+    }
+    if (!firstRestoredView)
+      output << "]";
+    output << ",\n)\n";
   }
   output << "@triton.jit\n";
   if (!planIndex.components.reusedAxes.empty()) {
@@ -1832,7 +1846,11 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
                                      bool store) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
-  if (failed(relation) || relation->size() != view.strides.size())
+  if (failed(relation) ||
+      static_cast<size_t>(llvm::count_if(
+          *relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != view.strides.size())
     return failure();
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
@@ -1845,8 +1863,14 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
   });
   std::string expression = view.pointer;
   unsigned vectorAxis = 0;
+  unsigned sourceAxis = 0;
   bool advancedTensorAxesCovered = false;
-  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      ++vectorAxis;
+      continue;
+    }
+    unsigned axisNumber = sourceAxis++;
     std::string index;
     if (term.kind == "full_slice") {
       index = broadcastIndex(
@@ -1933,7 +1957,11 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   if (failed(relation))
     return failure();
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  if (failed(view) || relation->size() != (*view)->shape.size())
+  if (failed(view) ||
+      static_cast<size_t>(llvm::count_if(
+          *relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != (*view)->shape.size())
     return failure();
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
@@ -1946,8 +1974,14 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
   });
   SmallVector<std::string> predicates;
   unsigned vectorAxis = 0;
+  unsigned sourceAxis = 0;
   bool advancedTensorAxesCovered = false;
-  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis") {
+      ++vectorAxis;
+      continue;
+    }
+    unsigned axisNumber = sourceAxis++;
     if (term.kind == "full_slice") {
       if (planIndex.blockExtents.count((*view)->shape[axisNumber])) {
         std::string index = broadcastIndex(
@@ -2141,11 +2175,15 @@ FailureOr<std::string> SourceEmitter::padExpression(
       padding.getTensorAxes(), padding.getDomainNodes(), value, consumer);
   if (failed(predicate))
     return failure();
+  Type valueType = value.getType();
+  if (auto tensor = dyn_cast<RankedTensorType>(valueType))
+    valueType = tensor.getElementType();
   StringRef fill = padding.getFill() == "negative_infinity"
                        ? StringRef("-float('inf')")
                    : padding.getFill() == "true" ? StringRef("True")
                    : padding.getFill() == "false" ? StringRef("False")
-                                                    : StringRef("0.0");
+                   : isa<IntegerType, IndexType>(valueType) ? StringRef("0")
+                                                            : StringRef("0.0");
   return "tl.where(" + *predicate + ", " + expression.str() + ", " +
          fill.str() + ")";
 }

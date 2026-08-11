@@ -347,10 +347,11 @@ LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
     FailureOr<SmallVector<std::string>> extents =
         result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                : FailureOr<SmallVector<std::string>>(failure());
-    if (tensor.getRank() != 1 || failed(extents) || extents->size() != 1 ||
-        extents->front() != "1")
+    if (tensor.getRank() != 1 || failed(extents) || extents->size() != 1)
       return operation.emitOpError(
-          "TileLang can project only singleton tensor index assumptions");
+          "TileLang in-bounds assumption has no ranked index schema");
+    if (extents->front() != "1")
+      return success();
     auto assumed = assumedIndexNames.find(operation.getOperand(0));
     if (assumed == assumedIndexNames.end()) {
       auto node = operation.getAttrOfType<IntegerAttr>("intent.node");
@@ -460,7 +461,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   }
   for (const auto &entry : planIndex.axesByRole) {
     plan::AxisOp lane = entry.getValue();
-    if (entry.getKey().starts_with("lane_") && !lane.hasRole("ordered") &&
+    if (entry.getKey().starts_with("lane_") &&
         axisIndices.lookup(lane.getNode()).empty())
       axisIndices[lane.getNode()] = "0";
   }
@@ -532,9 +533,12 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
   }
   loopCarriers[&operation] = carriers;
   for (auto [index, domain] : llvm::enumerate(*domains)) {
-    if (!domain || domain->getName().getStringRef() != "intent.domain" ||
-        domain->getNumOperands() < 2)
+    if (!domain)
       return operation.emitOpError("has a non-canonical TileLang loop axis");
+    FailureOr<int64_t> domainNode =
+        target::getNodeID(*domain, "ordered traversal range");
+    bool raggedAxis =
+        domain->getName().getStringRef() == "intent.ragged_member";
     auto rangeValue = [&](unsigned operand) -> FailureOr<std::string> {
       Operation *definition = domain->getOperand(operand).getDefiningOp();
       auto literal = definition
@@ -550,23 +554,54 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
       }
       return found->second;
     };
-    FailureOr<std::string> start = rangeValue(0);
-    FailureOr<std::string> stop = rangeValue(1);
-    FailureOr<std::string> step = domain->getNumOperands() == 3
-                                      ? rangeValue(2)
-                                      : FailureOr<std::string>(std::string("1"));
+    FailureOr<std::string> start = failure();
+    FailureOr<std::string> stop = failure();
+    FailureOr<std::string> step = std::string("1");
+    if (domain->getName().getStringRef() == "intent.domain" &&
+        domain->getNumOperands() >= 2) {
+      start = rangeValue(0);
+      stop = rangeValue(1);
+      if (domain->getNumOperands() == 3)
+        step = rangeValue(2);
+    } else if (ordered && raggedAxis && succeeded(domainNode)) {
+      FailureOr<plan::RaggedOp> relation =
+          target::emission::uniqueRaggedRelation(planIndex, *domainNode,
+                                                  operation);
+      std::string outer = succeeded(relation)
+                              ? axisIndices.lookup(relation->getOuterNode())
+                              : std::string();
+      auto runtime = succeeded(relation)
+                         ? raggedRuntimeByRelation.find(relation->getNode())
+                         : raggedRuntimeByRelation.end();
+      if (failed(relation) || outer.empty() ||
+          runtime == raggedRuntimeByRelation.end())
+        return operation.emitOpError(
+            "ordered ragged traversal has no outer-axis or offsets binding");
+      RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+      std::string suffix = std::to_string(*domainNode);
+      std::string begin = "sequence_begin_" + suffix;
+      std::string end = "sequence_end_" + suffix;
+      line(begin + " = " + ragged.offsets->argument->name + "[" +
+           addressIndex(outer) + "]");
+      line(end + " = " + ragged.offsets->argument->name + "[" +
+           addressIndex(outer + " + 1") + "]");
+      start = begin;
+      stop = end;
+    } else {
+      return operation.emitOpError("has a non-canonical TileLang loop axis");
+    }
     if (failed(start) || failed(stop) || failed(step))
       return failure();
     if (*step != "1")
       return operation.emitOpError(
           "TileLang serial traversal requires a unit-step domain");
-    if (ordered && *start != "0")
+    if (ordered && !raggedAxis && *start != "0")
       return operation.emitOpError(
           "TileLang ordered traversal requires a zero-based domain");
     std::string iterator = makeRegionArgumentName(operation, index);
     valueNames[body.getArgument(index)] = iterator;
-    FailureOr<int64_t> domainNode =
-        target::getNodeID(*domain, "ordered traversal range");
+    if (raggedAxis && succeeded(domainNode))
+      axisIndices[*domainNode] = iterator;
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
@@ -579,12 +614,14 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
         return operation.emitOpError(
             "has an invalid two-level TileLang ordered traversal");
       std::string chunk = iterator + "_chunk";
-      line("for " + chunk + " in T.serial(T.ceildiv(" + *stop + ", " +
+      line("for " + chunk + " in T.serial(T.ceildiv(" + *stop + " - " +
+           *start + ", " +
            outer->getTile().str() + ")):");
       ++indentation;
-      line("for " + iterator + " in T.serial(" + chunk + " * " +
-           outer->getTile().str() + ", T.min((" + chunk + " + 1) * " +
-           outer->getTile().str() + ", " + *stop + ")):");
+      line("for " + iterator + " in T.serial(" + *start + " + " + chunk +
+           " * " + outer->getTile().str() + ", T.min(" + *start + " + (" +
+           chunk + " + 1) * " + outer->getTile().str() + ", " + *stop +
+           ")):");
       ++indentation;
     } else {
       line("for " + iterator + " in T.serial(" + *start + ", " + *stop +
@@ -1115,13 +1152,16 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     StringRef padding = boundary.getPadding();
     if (padding == "none" && expanded)
       padding = *physicalFill;
+    bool materializeLogicalBounds =
+        boundary.getCheckBounds() && padding != "none";
     bool stagePhysicalPadding =
         expanded && succeeded(tensorIndirect) && *tensorIndirect;
     FailureOr<SmallVector<std::string>> extents =
         tensorExtents(operation, 0, !stagePhysicalPadding);
     if (failed(extents) || extents->empty() ||
         failed(tensorIndirect) ||
-        (padding != "zero" && padding != "negative_infinity"))
+        (padding != "none" && padding != "zero" &&
+         padding != "negative_infinity"))
       return operation.emitOpError(
           "has an invalid parallel TileLang load transfer");
     std::string elementResult = *result;
@@ -1168,7 +1208,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     if (failed(indices))
       return failure();
     FailureOr<std::string> logicalPredicate =
-        boundary.getCheckBounds()
+        materializeLogicalBounds
             ? elementBoundsPredicate(operation, tileIndices, false, false)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> physicalPredicate =
@@ -1176,12 +1216,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
             ? elementBoundsPredicate(operation, tileIndices, true)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> wholeTile =
-        boundary.getCheckBounds() && succeeded(tensorIndirect) &&
+        materializeLogicalBounds && succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? wholeTileBoundsPredicate(operation, *extents)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> bulkIndices =
-        boundary.getCheckBounds() && succeeded(tensorIndirect) &&
+        materializeLogicalBounds && succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
@@ -1210,7 +1250,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     auto emitElementwise = [&](bool includePhysicalBounds) {
       line(loop + "):");
       ++indentation;
-      if (boundary.getCheckBounds()) {
+      if (materializeLogicalBounds) {
         line("if " + *logicalPredicate + ":");
         ++indentation;
       }
@@ -1226,7 +1266,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         line(target + "] = " + fill.str());
         --indentation;
       }
-      if (boundary.getCheckBounds()) {
+      if (materializeLogicalBounds) {
         --indentation;
         line("else:");
         ++indentation;
@@ -2134,6 +2174,39 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return failure();
     return reused->str();
   };
+  bool scalarFragmentGather =
+      binding.getLowering() == "T.indirect_gather" &&
+      isa<RankedTensorType>(operation.getOperand(0).getType()) &&
+      !isa<RankedTensorType>(operation.getResult(0).getType()) &&
+      relation->size() == 1;
+  if (scalarFragmentGather) {
+    FailureOr<StringRef> source = lookupValue(operation, 0);
+    FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
+    FailureOr<StringRef> fill = lookupValue(operation, fillIndex.getInt());
+    const target::IndexTerm &term = relation->front();
+    std::string index;
+    if (term.kind == "static_index" && term.staticValues.size() == 1 &&
+        term.staticValues.front()) {
+      index = std::to_string(*term.staticValues.front());
+    } else if ((term.kind == "value_index" || term.kind == "region_index") &&
+               term.operands.size() == 1 && term.operands.front()) {
+      FailureOr<StringRef> dynamic =
+          lookupValue(operation, *term.operands.front());
+      if (failed(dynamic))
+        return failure();
+      index = dynamic->str();
+    } else {
+      return operation.emitOpError(
+          "scalar TileLang gather has no mechanical index relation");
+    }
+    if (failed(source) || failed(valid) || failed(fill))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = T.if_then_else(" + valid->str() + ", " + source->str() +
+         "[" + addressIndex(index) + "], " + fill->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (!planIndex.stages.empty() && binding.getLowering() == "T.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
@@ -2723,8 +2796,35 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (failed(physicalFill))
     return failure();
   bool expanded = !physicalFill->empty();
+  Value storedValue = operation.getOperand(valueIndex.getInt());
+  if (!isa<RankedTensorType>(storedValue.getType())) {
+    if (expanded || (boundary.getTransfer() != "bulk_copy" &&
+                     boundary.getTransfer() != "parallel_elements"))
+      return operation.emitOpError("has no scalar TileLang store transfer");
+    FailureOr<std::string> indices = accessIndices(operation);
+    FailureOr<std::string> predicate =
+        scalarTransferPredicate(operation, boundary);
+    if (failed(indices) || failed(predicate))
+      return failure();
+    bool singleLane =
+        !target::emission::hasPackedScalarDomain(planIndex, boundary);
+    bool guard = boundary.getCheckBounds() && !predicate->empty();
+    if (singleLane) {
+      line("if T.get_thread_binding() == 0:");
+      ++indentation;
+    }
+    if (guard) {
+      line("if " + *predicate + ":");
+      ++indentation;
+    }
+    line((*view)->argument->name + "[" + *indices + "] = " + stored->str());
+    if (guard)
+      --indentation;
+    if (singleLane)
+      --indentation;
+    return success();
+  }
   if (boundary.getTransfer() == "parallel_elements" || expanded) {
-    Value storedValue = operation.getOperand(valueIndex.getInt());
     auto result = dyn_cast<OpResult>(storedValue);
     Operation *definition = result ? result.getOwner() : nullptr;
     FailureOr<SmallVector<std::string>> extents =
@@ -2790,26 +2890,6 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   FailureOr<std::string> indices = accessIndices(operation);
   if (failed(indices))
     return failure();
-  if (!isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) {
-    FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
-    if (failed(derivedScalar))
-      return failure();
-    bool guard = boundary.getCheckBounds() &&
-                 (*derivedScalar || target::emission::hasPackedScalarDomain(
-                                        planIndex, boundary));
-    if (guard) {
-      FailureOr<std::string> predicate =
-          elementBoundsPredicate(operation, {});
-      if (failed(predicate))
-        return failure();
-      line("if " + *predicate + ":");
-      ++indentation;
-    }
-    line((*view)->argument->name + "[" + *indices + "] = " + stored->str());
-    if (guard)
-      --indentation;
-    return success();
-  }
   line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
        *indices + "])");
   return success();
@@ -2883,25 +2963,45 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
       if (failed(node) || !boundary || failed(indices))
         return operation.emitOpError(
             "lacks a mechanical scalar TileLang atomic merge");
-      bool singleLane = boundary.getDomainNodes().empty();
+      bool singleLane =
+          !target::emission::hasPackedScalarDomain(planIndex, boundary);
+      bool returnsPrevious =
+          operation.getNumResults() == 1 && !operation.getResult(0).use_empty();
+      std::string result;
+      if (returnsPrevious) {
+        std::string dtype = dtypeName(operation.getResult(0).getType(), operation);
+        if (dtype.empty())
+          return failure();
+        result = makeResultName(operation, 0);
+        line(result + " = T.alloc_var(dtype=" + dtype + ")");
+      }
       if (singleLane) {
         line("if T.get_thread_binding() == 0:");
         ++indentation;
       }
-      if (boundary.getCheckBounds()) {
-        FailureOr<std::string> predicate =
-            elementBoundsPredicate(operation, {});
-        if (failed(predicate))
-          return failure();
+      FailureOr<std::string> predicate =
+          scalarTransferPredicate(operation, boundary);
+      if (failed(predicate))
+        return failure();
+      bool guard = boundary.getCheckBounds() && !predicate->empty();
+      if (guard) {
         line("if " + *predicate + ":");
         ++indentation;
       }
-      line("T.atomic_add(" + (*view)->argument->name + "[" + *indices +
-           "], " + stored->str() + ", memory_order=\"relaxed\")");
-      if (boundary.getCheckBounds())
+      std::string call =
+          "T.atomic_add(" + (*view)->argument->name + "[" + *indices + "], " +
+          stored->str() + ", memory_order=\"relaxed\"";
+      if (returnsPrevious) {
+        line(result + " = " + call + ", return_prev=True)");
+      } else {
+        line(call + ")");
+      }
+      if (guard)
         --indentation;
       if (singleLane)
         --indentation;
+      if (returnsPrevious)
+        bindResult(operation, 0, result);
       return success();
     }
     auto result = dyn_cast<OpResult>(storedValue);

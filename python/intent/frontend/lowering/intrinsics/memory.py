@@ -271,7 +271,7 @@ def _mutable_load(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     return operation.results[0]
 
 
-def _atomic_add(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
+def _atomic_add(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
@@ -285,14 +285,17 @@ def _atomic_add(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         "value_operand_index": len(operands) - 1,
         **_required_ordering(lowerer, bound, node),
     }
-    lowerer.emit(
+    operation = lowerer.emit(
         OperationKind.ATOMIC_ADD,
         lowerer.location(node),
         operands=operands,
+        result_types=(
+            lowerer.value_result_type(target.type.dtype, lowered.result_shape),
+        ),
         attributes=attributes,
         effects=(_atomic_effect(target),),
     )
-    return StaticTuple(())
+    return operation.results[0]
 
 
 def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

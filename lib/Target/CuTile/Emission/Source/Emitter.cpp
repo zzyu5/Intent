@@ -624,13 +624,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
       (!searchSpace || !searchIndex.autotune))
     return realization.emitOpError(
         "tiled physical components require a delegated cuTile tuner");
-  for (const std::string &dimension : dimensionOrder) {
-    bool physicalDimension = llvm::any_of(
-        roleDimensions,
-        [&](const auto &binding) { return binding.getValue() == dimension; });
-    if (!physicalDimension)
-      kernelConstants.push_back(dimension);
-  }
+  kernelConstants.append(dimensionOrder.begin(), dimensionOrder.end());
   SmallVector<StringRef> logicalBlockExtents;
   logicalBlockExtents.reserve(planIndex.blockExtents.size());
   for (const auto &entry : planIndex.blockExtents)
@@ -649,10 +643,13 @@ LogicalResult SourceEmitter::prepareRaggedMetadata() {
     runtime.binding = ragged;
     runtime.relation = kernel.nodes.lookup(ragged.getNode());
     runtime.outer = kernel.nodes.lookup(ragged.getOuterNode());
+    StringRef outerName = runtime.outer
+                              ? runtime.outer->getName().getStringRef()
+                              : StringRef();
     if (!runtime.relation ||
         runtime.relation->getName().getStringRef() != "intent.ragged" ||
-        !runtime.outer ||
-        runtime.outer->getName().getStringRef() != "intent.ragged_outer" ||
+        (outerName != "intent.ragged_outer" &&
+         outerName != "intent.ragged_member") ||
         ragged.getMemberNodes().empty())
       return ragged.emitOpError(
           "does not resolve to canonical ragged ownership operations");
@@ -1239,6 +1236,8 @@ LogicalResult SourceEmitter::emitWrapper() {
                          ? "torch.zeros_like("
                          : "torch.empty_like(")
                  << view.argument->name << "), ";
+        else if (view.view.getAccess() == "inout")
+          output << view.argument->name << ".clone(), ";
         else
           output << view.argument->name << ", ";
       }
@@ -1555,8 +1554,10 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "    grid = (" << grid[0] << ", " << grid[1] << ", "
            << grid[2] << ")\n";
     output << "    return ct.launch(stream, grid, " << kernelName << ", (";
-    for (ABIView &view : views)
-      output << view.argument->name << ", ";
+    for (ABIView &view : views) {
+      output << view.argument->name;
+      output << ", ";
+    }
     for (ABIScalar &scalar : scalars)
       output << scalar.name << ", ";
     for (Operation *buffer : privateWorkspaceBuffers)
@@ -1641,8 +1642,12 @@ LogicalResult SourceEmitter::emitWrapper() {
     }
     output << "                " << kernelName << ",\n";
     output << "                lambda cfg: (";
-    for (ABIView &view : views)
-      output << view.argument->name << ", ";
+    for (ABIView &view : views) {
+      output << view.argument->name;
+      if (view.view.getAccess() == "inout")
+        output << ".clone()";
+      output << ", ";
+    }
     for (ABIScalar &scalar : scalars)
       output << scalar.name << ", ";
     for (Operation *buffer : privateWorkspaceBuffers)
@@ -1949,9 +1954,16 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
   }
   if (elementwiseAccess && projectedTensor) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-    if (failed(view) || relation->size() != (*view)->shape.size())
+    if (failed(view))
       return operation.emitOpError(
-          "indirect cuTile gather has no ranked access schema");
+          "indirect cuTile gather has no external-view ABI binding");
+    if (static_cast<size_t>(llvm::count_if(
+            *relation, [](const target::IndexTerm &term) {
+              return term.kind != "new_axis";
+            })) != (*view)->shape.size())
+      return operation.emitOpError("indirect cuTile gather has ")
+             << relation->size() << " index terms for a "
+             << (*view)->shape.size() << "-rank external view";
     unsigned tensorIndexCount = llvm::count_if(
         *relation, [&](const target::IndexTerm &term) {
           return term.kind == "value_index" && term.operands.size() == 1 &&
@@ -1975,7 +1987,13 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       return expression + "]";
     };
     SmallVector<std::string> indices;
-    for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+    unsigned sourceAxis = 0;
+    for (const target::IndexTerm &term : *relation) {
+      if (term.kind == "new_axis") {
+        ++resultAxis;
+        continue;
+      }
+      unsigned axisNumber = sourceAxis++;
       if (term.kind == "full_slice") {
         if (resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return operation.emitOpError(
@@ -2300,11 +2318,15 @@ FailureOr<std::string> SourceEmitter::padExpression(
       padding.getTensorAxes(), padding.getDomainNodes(), value, consumer);
   if (failed(predicate))
     return failure();
+  Type valueType = value.getType();
+  if (auto tensor = dyn_cast<RankedTensorType>(valueType))
+    valueType = tensor.getElementType();
   StringRef fill = padding.getFill() == "negative_infinity"
                        ? StringRef("-math.inf")
                    : padding.getFill() == "true" ? StringRef("True")
                    : padding.getFill() == "false" ? StringRef("False")
-                                                    : StringRef("0.0");
+                   : isa<IntegerType, IndexType>(valueType) ? StringRef("0")
+                                                            : StringRef("0.0");
   return "ct.where(" + *predicate + ", " + expression.str() + ", " +
          fill.str() + ")";
 }
