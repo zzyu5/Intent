@@ -977,11 +977,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a resolved Triton load binding");
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
   FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
-  if (failed(wholeView))
+  if (failed(physicalFill) || failed(wholeView))
     return failure();
   if (*wholeView && boundary.getDomainNodes().empty() &&
-      boundary.getLoadFill() == "none") {
+      boundary.getLoadFill() == "none" && physicalFill->empty()) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -998,8 +1000,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, false);
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
-  FailureOr<std::string> physicalFill =
-      transferPhysicalExtentFill(operation);
   if (failed(pointers) || failed(mask) || failed(physicalFill))
     return failure();
   std::string result = makeResultName(operation, 0);

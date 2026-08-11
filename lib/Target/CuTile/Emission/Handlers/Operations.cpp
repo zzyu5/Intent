@@ -945,11 +945,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a cuTile load boundary");
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
   FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
-  if (failed(wholeView))
+  if (failed(physicalFill) || failed(wholeView))
     return failure();
   if (*wholeView && boundary.getDomainNodes().empty() &&
-      boundary.getPadding() == "none") {
+      boundary.getPadding() == "none" && physicalFill->empty()) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -963,8 +965,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   FailureOr<std::string> indices =
       indexTuple(operation, boundary.getAccess() == "gather");
-  FailureOr<std::string> physicalFill =
-      transferPhysicalExtentFill(operation);
   if (failed(view) || failed(indices) || failed(physicalFill))
     return failure();
   StringRef loadFill = boundary.getPadding();

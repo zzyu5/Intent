@@ -874,11 +874,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
   if (failed(node) || !boundary)
     return operation.emitOpError("lacks a TileLang load binding");
+  FailureOr<std::string> physicalFill =
+      transferPhysicalExtentFill(operation);
   FailureOr<bool> wholeView = target::isWholeViewAccess(operation);
-  if (failed(wholeView))
+  if (failed(physicalFill) || failed(wholeView))
     return failure();
   if (*wholeView && boundary.getDomainNodes().empty() &&
-      boundary.getPadding() == "none") {
+      boundary.getPadding() == "none" && physicalFill->empty()) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
@@ -890,7 +892,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  FailureOr<std::string> physicalFill = transferPhysicalExtentFill(operation);
   bool scalarResult = operation.getNumResults() == 1 &&
                       !isa<RankedTensorType>(operation.getResult(0).getType());
   Type resultElementType = scalarResult

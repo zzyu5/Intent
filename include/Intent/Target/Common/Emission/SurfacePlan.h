@@ -408,7 +408,15 @@ mlir::FailureOr<std::string> transferPhysicalExtentFill(
         "physical block-extent projection does not match the external view rank");
   std::string fill;
   for (auto [axis, term] : llvm::enumerate(relation)) {
-    if (term.kind != "full_slice")
+    bool vectorAccess = term.kind == "full_slice";
+    if ((term.kind == "region_index" || term.kind == "value_index") &&
+        term.operands.size() == 1 && term.operands.front()) {
+      mlir::Value indexed = operation.getOperand(*term.operands.front());
+      vectorAccess = term.kind == "region_index"
+                         ? !isSequentialIterator(indexed)
+                         : mlir::isa<mlir::RankedTensorType>(indexed.getType());
+    }
+    if (!vectorAccess)
       continue;
     auto extent = index.blockExtents.find(viewShape[axis]);
     if (extent == index.blockExtents.end())

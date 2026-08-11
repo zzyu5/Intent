@@ -2043,10 +2043,6 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     if (tileAxis >= tileIndices.size())
       return operation.emitOpError(
           "bounded TileLang transfer has too few tile indices");
-    if (physicalOnly) {
-      ++tileAxis;
-      continue;
-    }
     std::string base = axisIndices.lookup(axis->getNode());
     Operation *domain = kernel.nodes.lookup(axis->getNode());
     FailureOr<std::string> extent = failure();
@@ -2064,6 +2060,10 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     if (base.empty() || failed(extent))
       return operation.emitOpError(
           "bounded TileLang transfer has no active axis interval");
+    if (physicalOnly && !planIndex.blockExtents.count(*extent)) {
+      ++tileAxis;
+      continue;
+    }
     predicates.push_back(base + " + " + tileIndices[tileAxis++] + " < " +
                          *extent);
   }
