@@ -138,6 +138,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitMask(op);
       })) ||
+      failed(addHandler(registry, "intent.select", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitSelect(op);
+      })) ||
       failed(addHandler(registry, "intent.cast", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -1382,22 +1387,44 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   return success();
 }
 
-LogicalResult SourceEmitter::emitMask(Operation &operation) {
-  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
+  FailureOr<int64_t> node = target::getNodeID(
+      operation, mask ? "mask emission" : "select emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   bool tensorResult = operation.getNumResults() == 1 &&
                       isa<RankedTensorType>(operation.getResult(0).getType());
   int64_t reuse = binding ? binding.getReuseOperandAttr().getInt() : -2;
-  if (failed(node) || !binding || binding.getLowering() != "T.if_then_else" ||
-      !tensorResult || (reuse != -1 && reuse != 0 && reuse != 2))
-    return operation.emitOpError("lacks a mechanical TileLang mask binding");
+  unsigned conditionOperand = mask ? 1 : 0;
+  unsigned trueOperand = mask ? 0 : 1;
+  if (failed(node) || !binding ||
+      binding.getLowering() != "T.if_then_else" ||
+      operation.getNumResults() != 1 ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local") ||
+      (mask && !tensorResult) || (!tensorResult && reuse != -1) ||
+      (tensorResult && reuse != -1 &&
+       reuse != static_cast<int64_t>(trueOperand) && reuse != 2))
+    return operation.emitOpError(
+        "lacks a mechanical TileLang conditional binding");
+  if (!tensorResult) {
+    FailureOr<StringRef> condition = lookupValue(operation, conditionOperand);
+    FailureOr<StringRef> trueValue = lookupValue(operation, trueOperand);
+    FailureOr<StringRef> falseValue = lookupValue(operation, 2);
+    if (failed(condition) || failed(trueValue) || failed(falseValue))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = T.if_then_else(" + condition->str() + ", " +
+         trueValue->str() + ", " + falseValue->str() + ")");
+    valueNames[operation.getResult(0)] = result;
+    return success();
+  }
+
   std::string result;
   if (reuse >= 0) {
-    FailureOr<StringRef> value = lookupValue(operation, reuse);
-    if (failed(value))
+    FailureOr<StringRef> reused = lookupValue(operation, reuse);
+    if (failed(reused))
       return failure();
-    result = value->str();
+    result = reused->str();
   } else {
     FailureOr<std::string> allocated = allocateResult(operation, 0, "fragment");
     if (failed(allocated))
@@ -1409,10 +1436,11 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
     return failure();
   SmallVector<std::string> indices;
   std::string loop = "for ";
+  StringRef prefix = mask ? "mask_i" : "select_i";
   for (unsigned axis = 0; axis < extents->size(); ++axis) {
     if (axis)
       loop += ", ";
-    indices.push_back("mask_i" + std::to_string(axis));
+    indices.push_back(prefix.str() + std::to_string(axis));
     loop += indices.back();
   }
   loop += " in T.Parallel(";
@@ -1423,13 +1451,19 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
   }
   line(loop + "):");
   ++indentation;
-  FailureOr<std::string> value =
-      tensorElement(operation.getOperand(0), indices, operation);
-  FailureOr<std::string> predicate =
-      tensorElement(operation.getOperand(1), indices, operation);
-  FailureOr<std::string> fill =
+  FailureOr<std::string> condition =
+      tensorElement(operation.getOperand(conditionOperand), indices, operation);
+  FailureOr<std::string> trueValue =
+      tensorElement(operation.getOperand(trueOperand), indices, operation);
+  FailureOr<std::string> falseValue =
       tensorElement(operation.getOperand(2), indices, operation);
-  if (failed(value) || failed(predicate) || failed(fill))
+  if (failed(condition) || failed(trueValue) || failed(falseValue))
+    return failure();
+  std::string expression = "T.if_then_else(" + *condition + ", " +
+                           *trueValue + ", " + *falseValue + ")";
+  FailureOr<std::string> padded = padElementExpression(
+      operation.getResult(0), expression, indices, operation);
+  if (failed(padded))
     return failure();
   std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {
@@ -1437,16 +1471,18 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
       target += ", ";
     target += index;
   }
-  std::string expression = "T.if_then_else(" + *predicate + ", " + *value +
-                           ", " + *fill + ")";
-  FailureOr<std::string> padded = padElementExpression(
-      operation.getResult(0), expression, indices, operation);
-  if (failed(padded))
-    return failure();
   line(target + "] = " + *padded);
   --indentation;
   bindResult(operation, 0, result);
   return success();
+}
+
+LogicalResult SourceEmitter::emitMask(Operation &operation) {
+  return emitConditional(operation, true);
+}
+
+LogicalResult SourceEmitter::emitSelect(Operation &operation) {
+  return emitConditional(operation, false);
 }
 
 LogicalResult SourceEmitter::emitCast(Operation &operation) {

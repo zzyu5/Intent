@@ -131,6 +131,9 @@ from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 from kernels.streaming.attention import flash_varlen_gqa_prefill
 from kernels.position.rope import rotary_embedding_flat
+from kernels.pointwise.select import COLUMNS as SELECT_COLUMNS
+from kernels.pointwise.select import ROWS as SELECT_ROWS
+from kernels.pointwise.select import alternating_signed_indices
 from kernels.streaming.paged_attention import BATCH as PAGED_BATCH
 from kernels.streaming.paged_attention import HEAD_DIMENSION as PAGED_HEAD_DIMENSION
 from kernels.streaming.paged_attention import HEAD_GROUP as PAGED_HEAD_GROUP
@@ -2133,6 +2136,38 @@ def _run_boolean_reduction(
     )
 
 
+def _run_value_select(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("value select has no upstream adapter")
+    shape_source = torch.empty(
+        (SELECT_ROWS, SELECT_COLUMNS), device="cuda", dtype=torch.float32
+    )
+    artifact = intent.compile(
+        alternating_signed_indices, target=target, compiler=compiler
+    )
+
+    def reference() -> torch.Tensor:
+        columns = torch.arange(
+            SELECT_COLUMNS, device="cuda", dtype=torch.int32
+        ).unsqueeze(0)
+        rows = torch.arange(SELECT_ROWS, device="cuda", dtype=torch.int32)
+        signs = torch.where(rows % 2 == 0, 1, -1).unsqueeze(1)
+        return columns * signs
+
+    _compare(
+        artifact=artifact,
+        arguments=(shape_source,),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="canonical SSA value select",
+        tolerance=0.0,
+        upstream=None,
+        expected_dtype=torch.int32,
+    )
+
+
 def _run_grouped_query_head_add(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2358,6 +2393,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "varlen_attention": _run_varlen_attention,
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
     "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,
+    "value_select": _run_value_select,
     "weight_only_int4": _run_weight_only_int4,
 }
 

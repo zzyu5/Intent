@@ -110,6 +110,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_greater_equal");
   if (role == "mask")
     return StringRef("ct.where");
+  if (role == "select")
+    return StringRef("ct.where");
   if (role == "full")
     return StringRef("ct.full");
   if (role == "zeros")
@@ -504,6 +506,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         definition->getResult(0) != value ||
         (definition->getName().getStringRef() != "intent.binary" &&
          definition->getName().getStringRef() != "intent.compare" &&
+         definition->getName().getStringRef() != "intent.select" &&
          definition->getName().getStringRef() != "intent.mask"))
       return entry.second.emitOpError(
           "does not bind a producer-fusible pointwise value");

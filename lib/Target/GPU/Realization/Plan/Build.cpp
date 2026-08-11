@@ -131,10 +131,11 @@ struct PaddingState {
     if (!definition ||
         (definition->getName().getStringRef() != "intent.binary" &&
          definition->getName().getStringRef() != "intent.compare" &&
+         definition->getName().getStringRef() != "intent.select" &&
          definition->getName().getStringRef() != "intent.mask"))
       return consumer.emitOpError(
-          "producer-fused padding requires a pointwise binary, compare, or "
-          "mask value");
+          "producer-fused padding requires a pointwise binary, compare, "
+          "select, or mask value");
     FailureOr<int64_t> valueID = target::getValueID(
         value, facts.kernel, consumer, "padding binding");
     if (failed(valueID))
@@ -632,9 +633,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.cast", "intent.full", "intent.zeros",
-                         "intent.members", "intent.gather", "intent.reshape",
-                         "intent.transpose", "intent.random"})
+                         "intent.select", "intent.cast", "intent.full",
+                         "intent.zeros", "intent.members", "intent.gather",
+                         "intent.reshape", "intent.transpose", "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =

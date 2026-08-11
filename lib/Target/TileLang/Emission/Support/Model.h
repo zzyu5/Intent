@@ -116,6 +116,7 @@ public:
   mlir::LogicalResult emitUnary(mlir::Operation &operation);
   mlir::LogicalResult emitBinary(mlir::Operation &operation);
   mlir::LogicalResult emitMask(mlir::Operation &operation);
+  mlir::LogicalResult emitSelect(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
   mlir::LogicalResult emitReshape(mlir::Operation &operation);
   mlir::LogicalResult emitTranspose(mlir::Operation &operation);
@@ -141,6 +142,7 @@ private:
 
   mlir::LogicalResult indexABI();
   mlir::LogicalResult resolvePhysicalBindings();
+  mlir::LogicalResult emitConditional(mlir::Operation &operation, bool mask);
   void emitImports() override;
   mlir::LogicalResult emitKernelHeader() override;
   mlir::LogicalResult emitWrapper() override;

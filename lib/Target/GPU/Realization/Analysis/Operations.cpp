@@ -120,6 +120,24 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.indices" || name == "intent.broadcast" ||
       name == "intent.mask")
     return success();
+  if (name == "intent.select") {
+    if (operation.getNumOperands() != 3 || operation.getNumResults() != 1 ||
+        operation.getOperand(1).getType() != operation.getOperand(2).getType() ||
+        operation.getOperand(1).getType() != operation.getResult(0).getType())
+      return operation.emitOpError("has no canonical select value schema");
+    Type condition = operation.getOperand(0).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(condition)) {
+      auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+      if (!result || !tensor.getElementType().isInteger(1) ||
+          tensor.getShape() != result.getShape())
+        return operation.emitOpError("has no canonical tensor select condition");
+      return success();
+    }
+    if (!condition.isInteger(1) ||
+        isa<RankedTensorType>(operation.getResult(0).getType()))
+      return operation.emitOpError("has no canonical scalar select condition");
+    return success();
+  }
   if (name == "intent.reshape") {
     if (operation.getNumOperands() != 1 || operation.getNumResults() != 1 ||
         !isa<RankedTensorType>(operation.getOperand(0).getType()) ||
@@ -232,8 +250,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.cast", "intent.reshape", "intent.transpose",
-                         "intent.random"})
+                         "intent.select", "intent.cast", "intent.reshape",
+                         "intent.transpose", "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();

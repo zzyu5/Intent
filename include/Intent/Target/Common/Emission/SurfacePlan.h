@@ -109,6 +109,8 @@ pointwiseRole(mlir::Operation &operation) {
     return std::string("transpose");
   if (name == "intent.mask")
     return std::string("mask");
+  if (name == "intent.select")
+    return std::string("select");
   if (name == "intent.full")
     return std::string("full");
   if (name == "intent.zeros")

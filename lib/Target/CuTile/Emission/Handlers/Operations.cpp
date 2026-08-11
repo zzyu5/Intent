@@ -141,6 +141,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitMask(op);
       })) ||
+      failed(addHandler(registry, "intent.select", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitSelect(op);
+      })) ||
       failed(addHandler(registry, "intent.cast",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -985,20 +990,23 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   return success();
 }
 
-LogicalResult SourceEmitter::emitMask(Operation &operation) {
-  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
+  FailureOr<int64_t> node = target::getNodeID(
+      operation, mask ? "mask emission" : "select emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
-  FailureOr<StringRef> value = lookupValue(operation, 0);
-  FailureOr<StringRef> predicate = lookupValue(operation, 1);
-  FailureOr<StringRef> fill = lookupValue(operation, 2);
+  unsigned conditionOperand = mask ? 1 : 0;
+  unsigned trueOperand = mask ? 0 : 1;
+  FailureOr<StringRef> condition = lookupValue(operation, conditionOperand);
+  FailureOr<StringRef> trueValue = lookupValue(operation, trueOperand);
+  FailureOr<StringRef> falseValue = lookupValue(operation, 2);
   if (failed(node) || !binding || binding.getLowering() != "ct.where" ||
-      operation.getNumResults() != 1 || failed(value) || failed(predicate) ||
-      failed(fill))
-    return operation.emitOpError("lacks a mechanical cuTile mask binding");
+      operation.getNumResults() != 1 || failed(condition) || failed(trueValue) ||
+      failed(falseValue))
+    return operation.emitOpError("lacks a mechanical cuTile conditional binding");
   std::string result = makeResultName(operation, 0);
-  std::string expression = "ct.where(" + predicate->str() + ", " +
-                           value->str() + ", " + fill->str() + ")";
+  std::string expression = "ct.where(" + condition->str() + ", " +
+                           trueValue->str() + ", " + falseValue->str() + ")";
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), expression, operation);
   if (failed(padded))
@@ -1006,6 +1014,14 @@ LogicalResult SourceEmitter::emitMask(Operation &operation) {
   line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
+}
+
+LogicalResult SourceEmitter::emitMask(Operation &operation) {
+  return emitConditional(operation, true);
+}
+
+LogicalResult SourceEmitter::emitSelect(Operation &operation) {
+  return emitConditional(operation, false);
 }
 
 LogicalResult SourceEmitter::emitCast(Operation &operation) {

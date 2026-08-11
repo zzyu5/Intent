@@ -231,6 +231,14 @@ std::optional<std::string> inferPadding(
     if (valuePadding && fillPadding && *valuePadding == *fillPadding)
       return valuePadding;
   }
+  if (name == "intent.select" && definition->getNumOperands() == 3) {
+    std::optional<std::string> truePadding =
+        inferPadding(definition->getOperand(1), facts, assumedPadding);
+    std::optional<std::string> falsePadding =
+        inferPadding(definition->getOperand(2), facts, assumedPadding);
+    if (truePadding && falsePadding && *truePadding == *falsePadding)
+      return truePadding;
+  }
   if ((name == "intent.reduce" || name == "intent.scan") &&
       definition->getNumOperands() == 2) {
     std::optional<std::string> inputPadding =
