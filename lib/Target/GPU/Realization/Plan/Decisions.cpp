@@ -142,6 +142,7 @@ struct AxisChoice {
   SmallVector<Operation *> parallels;
   SmallVector<std::string> roles;
   bool tiled = false;
+  bool packedLane = false;
   SmallVector<RangeChoice> ranges;
   std::optional<int64_t> programOrder;
   std::optional<int64_t> worker;
@@ -149,6 +150,37 @@ struct AxisChoice {
   bool reuse = false;
   std::string group;
 };
+
+bool canPackScalarParallel(Operation *parallel,
+                           const target::KernelFacts &facts) {
+  auto domains = facts.parallelDomains.find(parallel);
+  if (domains == facts.parallelDomains.end() || domains->second.size() != 1 ||
+      parallel->getNumRegions() != 1 ||
+      !llvm::hasSingleElement(parallel->getRegion(0)))
+    return false;
+
+  Block &body = parallel->getRegion(0).front();
+  for (Operation &operation : body) {
+    StringRef name = operation.getName().getStringRef();
+    if (operation.getNumRegions() != 0 || name == "func.call" ||
+        name == "intent.mask" || name == "intent.contract" ||
+        name == "intent.reduce" || name == "intent.arg_reduce" ||
+        name == "intent.scan" || name == "intent.state_stream" ||
+        name == "intent.buffer" || name == "intent.buffer_load" ||
+        name == "intent.buffer_store" || name == "intent.atomic_add" ||
+        name == "intent.atomic_cas" || name == "intent.scatter_reduce" ||
+        name == "intent.scatter_unique")
+      return false;
+    if (llvm::any_of(operation.getOperands(), [](Value value) {
+          return isa<RankedTensorType>(value.getType());
+        }) ||
+        llvm::any_of(operation.getResults(), [](Value value) {
+          return isa<RankedTensorType>(value.getType());
+        }))
+      return false;
+  }
+  return true;
+}
 
 void addRange(AxisChoice &choice, StringRef purpose, int64_t level,
               std::string tile) {
@@ -326,6 +358,21 @@ assignAxes(const target::KernelFacts &facts) {
       std::swap(mChoice.programOrder, nChoice.programOrder);
   }
 
+  for (AxisChoice &choice : choices) {
+    bool scalarParallel = choice.programOrder && !choice.tiled &&
+                          choice.roles.size() == 1 &&
+                          hasRole(choice.roles, "parallel");
+    choice.packedLane =
+        scalarParallel && !choice.parallels.empty() &&
+        llvm::all_of(choice.parallels, [&](Operation *parallel) {
+          return canPackScalarParallel(parallel, facts);
+        });
+    if (choice.packedLane) {
+      appendRole(choice.roles, "lane");
+      appendRole(choice.roles, "packed_lane");
+    }
+  }
+
   bool hasMatrixProgramAxes = llvm::any_of(choices, [](const AxisChoice &choice) {
     return choice.programOrder && choice.tiled &&
            (hasRole(choice.roles, "contraction_m") ||
@@ -344,10 +391,13 @@ assignAxes(const target::KernelFacts &facts) {
                         : base.str() + "_" + std::to_string(current);
   };
   for (AxisChoice &choice : choices) {
+    std::string packedTile = choice.packedLane
+                                 ? indexedTile("lane_pack", laneTile)
+                                 : std::string();
     if (choice.programOrder) {
       std::string tile;
       if (!choice.tiled) {
-        tile = "one";
+        tile = choice.packedLane ? packedTile : "one";
       } else if (ownsOrderedStream(choice, facts)) {
         tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {
@@ -388,7 +438,9 @@ assignAxes(const target::KernelFacts &facts) {
                traversal ? traversal->tile
                          : indexedTile("reduction", reductionTile));
     }
-    if (hasRole(choice.roles, "lane")) {
+    if (choice.packedLane) {
+      addRange(choice, "lane", 0, packedTile);
+    } else if (hasRole(choice.roles, "lane")) {
       auto extent = facts.staticDomainExtents.find(choice.domain);
       if (extent != facts.staticDomainExtents.end()) {
         int64_t physical = 1;
@@ -481,7 +533,7 @@ assignAxes(const target::KernelFacts &facts) {
     return found != facts.parallelDomains.end() && found->second.size() == 1;
   };
   for (AxisChoice &choice : choices)
-    choice.reuse = choice.programOrder && !choice.tiled &&
+    choice.reuse = choice.programOrder && !choice.tiled && !choice.packedLane &&
                    llvm::all_of(choice.parallels, ownsOneDomain) &&
                    hasIndependentLane(choice, facts);
 

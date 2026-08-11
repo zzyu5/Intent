@@ -17,6 +17,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))
     return "TILE_SIZE_V" + role.drop_front(11).str();
+  if (role == "lane_pack")
+    return std::string("TILE_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "TILE_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))
@@ -129,6 +133,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
 }
 
 FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
+  if (role == "lane_pack")
+    return std::string("TILE_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "TILE_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))

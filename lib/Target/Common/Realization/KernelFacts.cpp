@@ -304,6 +304,70 @@ staticAffineRange(const AffineIndexExpression &expression,
   return std::pair<int64_t, int64_t>{lower, upper};
 }
 
+std::optional<int64_t>
+affineLowerBound(const AffineIndexExpression &expression,
+                 const KernelFacts &facts) {
+  int64_t lower = expression.constant;
+  for (const auto &[domain, coefficient] : expression.coefficients) {
+    std::optional<int64_t> domainLower;
+    std::optional<int64_t> domainUpper;
+    auto bounds = facts.staticDomainBounds.find(domain);
+    if (bounds != facts.staticDomainBounds.end()) {
+      domainLower = bounds->second.first;
+      domainUpper = bounds->second.second - 1;
+    } else {
+      auto extent = facts.staticDomainExtents.find(domain);
+      if (extent != facts.staticDomainExtents.end() && extent->second > 0) {
+        domainLower = 0;
+        domainUpper = extent->second - 1;
+      } else if (facts.domainSources.count(domain)) {
+        domainLower = 0;
+      } else if (domain &&
+                 domain->getName().getStringRef() == "intent.domain" &&
+                 domain->getNumOperands() >= 2) {
+        domainLower = integerConstant(domain->getOperand(0));
+        std::optional<int64_t> stop = integerConstant(domain->getOperand(1));
+        if (stop)
+          domainUpper = *stop - 1;
+      }
+    }
+    std::optional<int64_t> endpoint =
+        coefficient >= 0 ? domainLower : domainUpper;
+    if (!endpoint)
+      return std::nullopt;
+    int64_t contribution;
+    int64_t next;
+    if (llvm::MulOverflow(coefficient, *endpoint, contribution) ||
+        llvm::AddOverflow(lower, contribution, next))
+      return std::nullopt;
+    lower = next;
+  }
+  return lower;
+}
+
+bool hasNonnegativeIntegerOperandsImpl(Operation &operation,
+                                       const KernelFacts &facts) {
+  if (operation.getName().getStringRef() != "intent.binary" ||
+      operation.getNumOperands() != 2)
+    return false;
+  auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
+  if (!logical ||
+      (logical.getValue() != "floor_divide" &&
+       logical.getValue() != "remainder"))
+    return false;
+  llvm::DenseSet<Value> divisorActive;
+  std::optional<AffineIndexExpression> divisor = affineIndexExpression(
+      operation.getOperand(1), facts, operation, divisorActive);
+  if (!divisor || !divisor->coefficients.empty() || divisor->constant <= 0)
+    return false;
+  llvm::DenseSet<Value> active;
+  std::optional<AffineIndexExpression> dividend = affineIndexExpression(
+      operation.getOperand(0), facts, operation, active);
+  std::optional<int64_t> lower =
+      dividend ? affineLowerBound(*dividend, facts) : std::nullopt;
+  return lower && *lower >= 0;
+}
+
 std::optional<std::pair<int64_t, int64_t>>
 sequentialDomainRange(Operation *domain, const KernelFacts &facts,
                       Operation &consumer) {
@@ -1194,7 +1258,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               auto logical = nested.getAttrOfType<StringAttr>("intent.operator");
               if (name == "intent.binary" && logical &&
                   (logical.getValue() == "floor_divide" ||
-                   logical.getValue() == "remainder"))
+                   logical.getValue() == "remainder") &&
+                  !hasNonnegativeIntegerOperandsImpl(nested, facts))
                 return nested.emitOpError(
                     "requires multi-statement lowering in a while condition");
               for (Value result : nested.getResults())
@@ -1901,6 +1966,11 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
     return domains->second[argument.getArgNumber()];
   consumer.emitOpError("cannot resolve an indexed region to its source domain");
   return failure();
+}
+
+bool hasNonnegativeIntegerOperands(Operation &operation,
+                                   const KernelFacts &facts) {
+  return hasNonnegativeIntegerOperandsImpl(operation, facts);
 }
 
 LogicalResult analyzeKernelFacts(KernelFacts &facts) {

@@ -23,6 +23,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (64, 128),
+        "lane_pack": (64, 128, 256),
         "feature": (64, 128),
         "reduction": (32, 64),
         "program_m": (64, 128),
@@ -36,6 +37,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream",
         "query",
         "ragged_member",
+        "lane_pack",
         "feature",
         "reduction",
     ):

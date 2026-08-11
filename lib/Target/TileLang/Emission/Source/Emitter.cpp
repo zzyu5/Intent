@@ -21,6 +21,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))
     return "TILE_SIZE_V" + role.drop_front(11).str();
+  if (role == "lane_pack")
+    return std::string("TILE_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "TILE_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))
@@ -147,6 +151,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
 }
 
 FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
+  if (role == "lane_pack")
+    return std::string("TILE_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "TILE_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("TILE_SIZE_M");
   if (role.starts_with("ragged_member_"))
@@ -386,6 +394,8 @@ indexRealization(intent::plan::RealizationOp realization,
     });
     bool materializeLogicalBounds =
         raggedBound && !value.getConsumerNeutralized();
+    bool packedScalar =
+        target::emission::hasPackedScalarDomain(index, binding);
     binding.transfer = *derivedScalar || *tensorIndirect ||
                                materializeLogicalBounds
                            ? "parallel_elements"
@@ -397,7 +407,8 @@ indexRealization(intent::plan::RealizationOp realization,
                  (index.stages.empty() && feedsAtomicValue(*operation)));
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
-        (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect;
+        (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect ||
+        packedScalar;
     if (binding.resultSpace.empty()) {
       value.emitOpError("has no TileLang transfer residency spelling");
       return failure();
@@ -1283,6 +1294,18 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
+    llvm::SmallVector<StringRef> exactExtents;
+    exactExtents.reserve(exactBulkExtents.size());
+    for (const auto &extent : exactBulkExtents)
+      exactExtents.push_back(extent.getKey());
+    llvm::sort(exactExtents);
+    for (StringRef extent : exactExtents) {
+      std::string logical = dimensionSpelling(extent);
+      output << "    if " << logical << " != 1 << (" << logical
+             << " - 1).bit_length():\n";
+      output << "        raise NotImplementedError('TileLang guarded float16 "
+                "bulk transfer requires an exact power-of-two extent')\n";
+    }
     for (ABIView &view : views) {
       output << "    if tuple(" << view.argument->name << ".shape) != (";
       for (auto [axis, extent] : llvm::enumerate(view.shape)) {
@@ -1898,6 +1921,10 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
         return failure();
       }
       std::string wideBase = addressIndex(base);
+      if (target::emission::isPackedScalarAxis(*axis)) {
+        indices.push_back(wideBase);
+        continue;
+      }
       std::string extent = axis->getTile().str();
       if (!axis->getReuseWorker() &&
           axis->getTileRole().starts_with("row_vector")) {
@@ -2011,6 +2038,10 @@ SourceEmitter::elementAccessIndices(Operation &operation,
       if (base.empty())
         return operation.emitOpError(
             "has no active TileLang element index for its logical axis");
+      if (target::emission::isPackedScalarAxis(*axis)) {
+        indices.push_back(addressIndex(base));
+        continue;
+      }
       if (!axis->isScalar()) {
         if (tileAxis >= tileIndices.size())
           return operation.emitOpError(
@@ -2117,7 +2148,20 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
           target::traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      if (!physicalOnly && source->domain && source->transformed) {
+      bool packedScalar = false;
+      if (source->domain) {
+        FailureOr<int64_t> node =
+            target::getNodeID(*source->domain, "packed scalar bounds");
+        auto axis = succeeded(node) ? planIndex.axes.find(*node)
+                                    : planIndex.axes.end();
+        if (failed(node))
+          return failure();
+        packedScalar =
+            axis != planIndex.axes.end() &&
+            target::emission::isPackedScalarAxis(axis->second);
+      }
+      if (!physicalOnly && source->domain &&
+          (source->transformed || packedScalar)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
@@ -2132,6 +2176,21 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
         resolveAxis(indexed, operation);
     if (failed(axis))
       return failure();
+    if (target::emission::isPackedScalarAxis(*axis)) {
+      if (!physicalOnly) {
+        std::string exact = axisIndices.lookup(axis->getNode());
+        Operation *domain = kernel.nodes.lookup(axis->getNode());
+        FailureOr<std::string> extent =
+            domain ? dimensionName(*domain)
+                   : FailureOr<std::string>(failure());
+        if (exact.empty() || failed(extent))
+          return operation.emitOpError(
+              "bounded TileLang packed scalar has no exact interval");
+        predicates.push_back("0 <= " + exact);
+        predicates.push_back(exact + " < " + *extent);
+      }
+      continue;
+    }
     if (axis->isScalar())
       continue;
     if (tileAxis >= tileIndices.size())

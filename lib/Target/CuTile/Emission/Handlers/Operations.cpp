@@ -556,6 +556,14 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       return axis.emitOpError(planIndex.program.getPersistent()
                                   ? "has no persistent cuTile program index"
                                   : "has no emitted per-axis program index");
+    if (target::emission::isPackedScalarAxis(axis)) {
+      FailureOr<std::string> tile = physicalAxisTile(axis);
+      if (failed(tile))
+        return failure();
+      value = addressIndex(value) + " * " + *tile + " + " +
+              addressIndex("ct.arange(" + *tile + ", dtype=ct.int32)");
+      axisIndices[axis.getNode()] = value;
+    }
     valueNames[argument] = value;
   }
   return success();
@@ -1001,37 +1009,22 @@ SourceEmitter::privateWorkspaceIndex(Operation &operation) {
     return operation.emitOpError(
         "does not resolve a planned cuTile private workspace");
 
-  std::string offset;
-  auto append = [&](StringRef index, StringRef extent) {
-    offset = offset.empty() ? index.str()
-                            : "(" + offset + ") * (" + extent.str() + ") + (" +
-                                  index.str() + ")";
-  };
-  for (int64_t owner : binding.getOwnerNodes()) {
-    plan::AxisOp axis = planIndex.axes.lookup(owner);
-    std::string index = axisIndices.lookup(owner);
-    std::string extent =
-        axis ? roleDimensions.lookup("program_" +
-                                     std::to_string(axis.getProgramOrder()))
-             : std::string();
-    if (!axis || index.empty() || extent.empty())
-      return operation.emitOpError(
-          "has no active cuTile private-workspace owner index");
-    append(index, extent);
-  }
-  for (auto [axis, index] : llvm::enumerate(*indices)) {
-    std::string spelling;
+  auto spellIndex = [&](const target::LogicalBufferIndex &index)
+      -> FailureOr<std::string> {
     if (index.constant)
-      spelling = std::to_string(*index.constant);
-    else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
-      if (failed(dynamic))
-        return failure();
-      spelling = dynamic->str();
-    }
-    append(spelling, std::to_string(info->shape[axis]));
-  }
-  return addressIndex(offset);
+      return std::to_string(*index.constant);
+    FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
+    if (failed(dynamic))
+      return failure();
+    return dynamic->str();
+  };
+  FailureOr<std::string> offset =
+      target::emission::projectPrivateWorkspaceOffset(
+          binding, *info, *indices, planIndex, axisIndices, roleDimensions,
+          spellIndex, operation);
+  if (failed(offset))
+    return failure();
+  return addressIndex(*offset);
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
@@ -1058,8 +1051,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  bool packedScalar =
+      target::emission::hasPackedScalarDomain(planIndex, boundary);
   FailureOr<std::string> indices =
-      indexTuple(operation, boundary.getAccess() == "gather");
+      indexTuple(operation, boundary.getAccess() == "gather" || packedScalar);
   if (failed(view) || failed(indices) || failed(physicalFill))
     return failure();
   StringRef loadFill = boundary.getPadding();
@@ -1071,7 +1066,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                       : isa<IntegerType, IndexType>(elementType) ? "0"
                                                                 : "0.0";
   std::string result = makeResultName(operation, 0);
-  if (boundary.getAccess() == "gather") {
+  if (boundary.getAccess() == "gather" || packedScalar) {
     line(result + " = ct.gather(" + (*view)->argument->name + ", " +
          *indices + ", check_bounds=True, padding_value=" + padding.str() +
          ")");
@@ -1295,7 +1290,12 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
   else if (binding.getLowering().starts_with("ct.bitwise_"))
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
-  else if (binding.getLowering() == "python_floor_divide" ||
+  else if ((binding.getLowering() == "python_floor_divide" ||
+            binding.getLowering() == "python_remainder") &&
+           binding.getNonnegativeOperands()) {
+    StringRef symbol = binding.getLowering() == "python_floor_divide" ? "//" : "%";
+    expression = "(" + lhs->str() + ") " + symbol.str() + " (" + rhs->str() + ")";
+  } else if (binding.getLowering() == "python_floor_divide" ||
            binding.getLowering() == "python_remainder") {
     Type elementType = operation.getResult(0).getType();
     if (auto tensor = dyn_cast<RankedTensorType>(elementType))
@@ -2032,7 +2032,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       transferPhysicalExtentFill(operation);
   bool expanded = succeeded(physicalFill) && !physicalFill->empty();
   bool scatter = boundary.getAccess() == "scatter" ||
-                 expanded;
+                 expanded ||
+                 target::emission::hasPackedScalarDomain(planIndex, boundary);
   FailureOr<std::string> indices = indexTuple(operation, scatter);
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
       failed(view) || failed(physicalFill) || failed(indices))

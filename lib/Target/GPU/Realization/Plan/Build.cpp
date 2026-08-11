@@ -671,7 +671,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   operation.getLoc(), i64(builder, *node),
                   string(builder,
                          tensor ? "private_fragment" : "private_scalar"),
-                  i64(builder, reusableOperand(operation)));
+                  i64(builder, reusableOperand(operation)),
+                  builder.getBoolAttr(
+                      target::hasNonnegativeIntegerOperands(operation, facts)));
               return success();
             })))
       return failure();

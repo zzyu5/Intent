@@ -5,6 +5,7 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
@@ -346,6 +347,11 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
   llvm::StringRef getGroupSpelling() const { return group; }
 };
 
+inline bool isPackedScalarAxis(const AxisBinding &axis) {
+  return axis.hasRole("parallel") && axis.hasRole("lane") &&
+         axis.hasRole("packed_lane");
+}
+
 template <typename PlanIndex, typename TileSpelling>
 mlir::LogicalResult indexAxisRanges(
     PlanIndex &index, llvm::ArrayRef<intent::plan::RangeOp> ranges,
@@ -440,6 +446,50 @@ struct BufferBinding : Binding<intent::plan::BufferOp> {
     return operation.getOwnerNodes();
   }
 };
+
+template <typename PlanIndex, typename LogicalIndexSpelling>
+inline mlir::FailureOr<std::string> projectPrivateWorkspaceOffset(
+    const BufferBinding &binding, const target::LogicalBufferInfo &info,
+    llvm::ArrayRef<target::LogicalBufferIndex> logicalIndices,
+    const PlanIndex &index,
+    const llvm::DenseMap<int64_t, std::string> &axisIndices,
+    const llvm::StringMap<std::string> &roleDimensions,
+    LogicalIndexSpelling spellLogicalIndex, mlir::Operation &operation) {
+  if (logicalIndices.size() != info.shape.size())
+    return operation.emitOpError(
+        "private-workspace projection does not match its logical buffer rank");
+
+  std::string offset;
+  auto append = [&](llvm::StringRef projectedIndex, llvm::StringRef extent) {
+    offset = offset.empty()
+                 ? projectedIndex.str()
+                 : "(" + offset + ") * (" + extent.str() + ") + (" +
+                       projectedIndex.str() + ")";
+  };
+  for (int64_t owner : binding.getOwnerNodes()) {
+    auto axis = index.axes.find(owner);
+    std::string projectedIndex = axisIndices.lookup(owner);
+    std::string extent =
+        axis == index.axes.end()
+            ? std::string()
+            : roleDimensions.lookup(
+                  "program_" + std::to_string(axis->second.getProgramOrder()));
+    if (axis == index.axes.end() || projectedIndex.empty() || extent.empty())
+      return operation.emitOpError(
+          "has no active private-workspace owner projection");
+    append(projectedIndex, extent);
+  }
+  for (auto [axis, logicalIndex] : llvm::enumerate(logicalIndices)) {
+    mlir::FailureOr<std::string> projectedIndex =
+        spellLogicalIndex(logicalIndex);
+    if (mlir::failed(projectedIndex))
+      return mlir::failure();
+    append(*projectedIndex, std::to_string(info.shape[axis]));
+  }
+  if (offset.empty())
+    return operation.emitOpError("has an empty private-workspace projection");
+  return offset;
+}
 
 template <typename PlanIndex>
 inline mlir::FailureOr<std::string> privateWorkspaceElementCount(
@@ -551,6 +601,9 @@ struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
     return operation.getReuseOperandAttr();
   }
   int64_t getReuseOperand() const { return operation.getReuseOperand(); }
+  bool getNonnegativeOperands() const {
+    return operation.getNonnegativeOperands();
+  }
   bool getDefer() const { return defer; }
 };
 
@@ -704,6 +757,15 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   bool getCheckBounds() const { return explicitBounds; }
   bool getDefer() const { return defer; }
 };
+
+template <typename PlanIndex>
+inline bool hasPackedScalarDomain(const PlanIndex &index,
+                                  const BoundaryBinding &binding) {
+  return llvm::any_of(binding.getDomainNodes(), [&](int64_t node) {
+    auto axis = index.axes.find(node);
+    return axis != index.axes.end() && isPackedScalarAxis(axis->second);
+  });
+}
 
 struct AutotuneBinding : Binding<intent::plan::AutotuneOp> {
   mlir::DictionaryAttr parameterMap;

@@ -37,6 +37,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("BLOCK_SIZE");
   if (role.starts_with("row_vector_"))
     return "BLOCK_SIZE_V" + role.drop_front(11).str();
+  if (role == "lane_pack")
+    return std::string("BLOCK_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "BLOCK_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("BLOCK_SIZE_M");
   if (role.starts_with("ragged_member_"))
@@ -149,6 +153,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
 }
 
 FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
+  if (role == "lane_pack")
+    return std::string("BLOCK_SIZE_L");
+  if (role.starts_with("lane_pack_"))
+    return "BLOCK_SIZE_L" + role.drop_front(10).str();
   if (role == "program_m" || role == "ragged_member")
     return std::string("BLOCK_SIZE_M");
   if (role.starts_with("ragged_member_"))
@@ -2000,7 +2008,19 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
           target::traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      if (source->domain && source->transformed) {
+      bool packedScalar = false;
+      if (source->domain) {
+        FailureOr<int64_t> node =
+            target::getNodeID(*source->domain, "packed scalar bounds");
+        auto axis = succeeded(node) ? planIndex.axes.find(*node)
+                                    : planIndex.axes.end();
+        if (failed(node))
+          return failure();
+        packedScalar =
+            axis != planIndex.axes.end() &&
+            target::emission::isPackedScalarAxis(axis->second);
+      }
+      if (source->domain && (source->transformed || packedScalar)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))

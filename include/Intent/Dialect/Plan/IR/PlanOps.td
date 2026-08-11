@@ -147,7 +147,8 @@ def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
   let arguments = (ins
     I64Attr:$node,
     StrAttr:$result_space,
-    I64Attr:$reuse_operand
+    I64Attr:$reuse_operand,
+    BoolAttr:$nonnegative_operands
   );
   let results = (outs);
   let hasVerifier = 1;

@@ -1027,37 +1027,22 @@ SourceEmitter::privateWorkspacePointer(Operation &operation) {
     return operation.emitOpError(
         "does not resolve a planned Triton private workspace");
 
-  std::string offset;
-  auto append = [&](StringRef index, StringRef extent) {
-    offset = offset.empty() ? index.str()
-                            : "(" + offset + ") * (" + extent.str() + ") + (" +
-                                  index.str() + ")";
-  };
-  for (int64_t owner : binding.getOwnerNodes()) {
-    plan::AxisOp axis = planIndex.axes.lookup(owner);
-    std::string index = axisIndices.lookup(owner);
-    std::string extent =
-        axis ? roleDimensions.lookup("program_" +
-                                     std::to_string(axis.getProgramOrder()))
-             : std::string();
-    if (!axis || index.empty() || extent.empty())
-      return operation.emitOpError(
-          "has no active Triton private-workspace owner index");
-    append(index, extent);
-  }
-  for (auto [axis, index] : llvm::enumerate(*indices)) {
-    std::string spelling;
+  auto spellIndex = [&](const target::LogicalBufferIndex &index)
+      -> FailureOr<std::string> {
     if (index.constant)
-      spelling = std::to_string(*index.constant);
-    else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
-      if (failed(dynamic))
-        return failure();
-      spelling = dynamic->str();
-    }
-    append(spelling, std::to_string(info->shape[axis]));
-  }
-  return workspace->second + " + " + addressIndex(offset);
+      return std::to_string(*index.constant);
+    FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
+    if (failed(dynamic))
+      return failure();
+    return dynamic->str();
+  };
+  FailureOr<std::string> offset =
+      target::emission::projectPrivateWorkspaceOffset(
+          binding, *info, *indices, planIndex, axisIndices, roleDimensions,
+          spellIndex, operation);
+  if (failed(offset))
+    return failure();
+  return workspace->second + " + " + addressIndex(*offset);
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
@@ -1095,6 +1080,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   StringRef loadFill = boundary.getLoadFill();
   if (loadFill == "none" && !physicalFill->empty())
     loadFill = *physicalFill;
+  if (loadFill == "none" &&
+      target::emission::hasPackedScalarDomain(planIndex, boundary))
+    loadFill = "zero";
   if (loadFill == "none") {
     line(result + " = tl.load(" + *pointers + ")");
   } else {
@@ -1259,7 +1247,12 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       binding.getLowering() == "tl.minimum")
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
-  else if (binding.getLowering() == "python_floor_divide" ||
+  else if ((binding.getLowering() == "python_floor_divide" ||
+            binding.getLowering() == "python_remainder") &&
+           binding.getNonnegativeOperands()) {
+    StringRef symbol = binding.getLowering() == "python_floor_divide" ? "//" : "%";
+    expression = "(" + lhs->str() + ") " + symbol.str() + " (" + rhs->str() + ")";
+  } else if (binding.getLowering() == "python_floor_divide" ||
            binding.getLowering() == "python_remainder") {
     Type elementType = operation.getResult(0).getType();
     if (auto tensor = dyn_cast<RankedTensorType>(elementType))

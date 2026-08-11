@@ -113,6 +113,9 @@ mlir::FailureOr<mlir::Operation *>
 resolveDomain(mlir::Value indexedValue, const KernelFacts &facts,
               mlir::Operation &consumer);
 
+bool hasNonnegativeIntegerOperands(mlir::Operation &operation,
+                                   const KernelFacts &facts);
+
 std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded);
 
 std::optional<std::string> inferValuePadding(

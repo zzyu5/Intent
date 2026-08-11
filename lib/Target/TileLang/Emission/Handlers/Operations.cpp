@@ -471,12 +471,33 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
             : programBlocks.lookup(axis.getNode());
     if (value.empty())
       return axis.emitOpError("has no emitted per-axis program index");
+    if (target::emission::isPackedScalarAxis(axis)) {
+      const target::emission::RangeBinding *ownership =
+          axis.getRange("ownership");
+      if (!ownership)
+        return axis.emitOpError("has no packed-lane ownership range");
+      std::string lane =
+          "packed_lane_" + std::to_string(axis.getNode());
+      line("for " + lane + " in T.Parallel(" + ownership->getTile().str() +
+           "):");
+      ++indentation;
+      value = value + " * " + ownership->getTile().str() + " + " + lane;
+      axisIndices[axis.getNode()] = value;
+    }
     valueNames[argument] = value;
   }
   return success();
 }
 
 LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
+  if (operation.getNumRegions() == 1 &&
+      llvm::hasSingleElement(operation.getRegion(0))) {
+    for (BlockArgument argument : operation.getRegion(0).front().getArguments()) {
+      FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+      if (succeeded(axis) && target::emission::isPackedScalarAxis(*axis))
+        --indentation;
+    }
+  }
   if (&operation == programRoot && planIndex.program.getPersistent())
     indentation -= 2;
   return success();
@@ -921,37 +942,22 @@ SourceEmitter::privateWorkspaceIndex(Operation &operation) {
     return operation.emitOpError(
         "does not resolve a planned TileLang private workspace");
 
-  std::string offset;
-  auto append = [&](StringRef index, StringRef extent) {
-    offset = offset.empty() ? index.str()
-                            : "(" + offset + ") * (" + extent.str() + ") + (" +
-                                  index.str() + ")";
-  };
-  for (int64_t owner : binding.getOwnerNodes()) {
-    plan::AxisOp axis = planIndex.axes.lookup(owner);
-    std::string index = axisIndices.lookup(owner);
-    std::string extent =
-        axis ? roleDimensions.lookup("program_" +
-                                     std::to_string(axis.getProgramOrder()))
-             : std::string();
-    if (!axis || index.empty() || extent.empty())
-      return operation.emitOpError(
-          "has no active TileLang private-workspace owner index");
-    append(index, extent);
-  }
-  for (auto [axis, index] : llvm::enumerate(*indices)) {
-    std::string spelling;
+  auto spellIndex = [&](const target::LogicalBufferIndex &index)
+      -> FailureOr<std::string> {
     if (index.constant)
-      spelling = std::to_string(*index.constant);
-    else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
-      if (failed(dynamic))
-        return failure();
-      spelling = dynamic->str();
-    }
-    append(spelling, std::to_string(info->shape[axis]));
-  }
-  return addressIndex(offset);
+      return std::to_string(*index.constant);
+    FailureOr<StringRef> dynamic = lookupValue(operation, *index.operand);
+    if (failed(dynamic))
+      return failure();
+    return dynamic->str();
+  };
+  FailureOr<std::string> offset =
+      target::emission::projectPrivateWorkspaceOffset(
+          binding, *info, *indices, planIndex, axisIndices, roleDimensions,
+          spellIndex, operation);
+  if (failed(offset))
+    return failure();
+  return addressIndex(*offset);
 }
 
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
@@ -988,11 +994,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
   if (failed(derivedScalar))
     return failure();
-  if (!scalarResult && resultElementType.isF16() && *derivedScalar &&
-      boundary.getCheckBounds() && boundary.getPadding() != "none")
-    return operation.emitOpError(
-        "requires conditional float16 padding for a transformed scalar index; "
-        "TileLang 0.1.13 cannot lower this fragment path");
   StringRef zeroFill = isa<IntegerType, IndexType>(resultElementType) ? "0"
                                                                       : "0.0";
   if (failed(physicalFill))
@@ -1004,6 +1005,57 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         "has multiple affine access ranges; TileLang cannot project their "
         "joint footprint as one parallel fragment");
   bool expanded = !physicalFill->empty();
+  bool guardedF16Bulk = !scalarResult && resultElementType.isF16() &&
+                        *derivedScalar && boundary.getCheckBounds() &&
+                        boundary.getPadding() != "none";
+  if (guardedF16Bulk) {
+    if (expanded) {
+      FailureOr<SmallVector<target::IndexTerm>> relation =
+          target::parseIndexRelation(operation);
+      if (failed(view) || failed(relation) ||
+          relation->size() != (*view)->shape.size())
+        return operation.emitOpError(
+            "cannot resolve guarded float16 bulk extents");
+      for (auto [axis, term] : llvm::enumerate(*relation)) {
+        auto extent = planIndex.blockExtents.find((*view)->shape[axis]);
+        bool vectorAccess = term.kind == "full_slice" ||
+                            term.kind == "region_index";
+        if (!vectorAccess || extent == planIndex.blockExtents.end())
+          continue;
+        if (extent->second.getRounding() != "power_of_two")
+          return extent->second.emitOpError(
+              "has no exact-extent TileLang bulk capability check");
+        exactBulkExtents.insert((*view)->shape[axis]);
+      }
+    }
+    FailureOr<std::string> result =
+        allocateResult(operation, 0, boundary.getResultSpace());
+    FailureOr<SmallVector<std::string>> extents =
+        tensorExtents(operation, 0);
+    FailureOr<std::string> indices = accessIndices(operation);
+    FailureOr<std::string> predicate =
+        succeeded(extents)
+            ? wholeTileBoundsPredicate(operation, *extents)
+            : FailureOr<std::string>(failure());
+    if (failed(view) || failed(result) || failed(extents) ||
+        failed(indices) || failed(predicate) || predicate->empty())
+      return operation.emitOpError(
+          "has no guarded TileLang float16 bulk-transfer projection");
+    line("if " + *predicate + ":");
+    ++indentation;
+    line("T.copy(" + (*view)->argument->name + "[" + *indices + "], " +
+         *result + ")");
+    --indentation;
+    line("else:");
+    ++indentation;
+    if (boundary.getPadding() == "negative_infinity")
+      line("T.fill(" + *result + ", -T.infinity(T.float32))");
+    else
+      line("T.clear(" + *result + ")");
+    --indentation;
+    bindResult(operation, 0, *result);
+    return success();
+  }
   if (scalarResult) {
     FailureOr<std::string> indices = accessIndices(operation);
     if (failed(view) || failed(indices))
@@ -1011,7 +1063,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
           "lacks a mechanical TileLang scalar load binding");
     std::string expression =
         (*view)->argument->name + "[" + *indices + "]";
-    if (boundary.getCheckBounds() && boundary.getPadding() != "none") {
+    bool packedScalar =
+        target::emission::hasPackedScalarDomain(planIndex, boundary);
+    if (boundary.getCheckBounds() &&
+        (boundary.getPadding() != "none" || packedScalar)) {
       FailureOr<std::string> predicate =
           elementBoundsPredicate(operation, {});
       if (failed(predicate))
@@ -1627,6 +1682,11 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
              rhs.str() + ")";
     if (binding.getLowering() == "python_floor_divide" ||
         binding.getLowering() == "python_remainder") {
+      if (binding.getNonnegativeOperands()) {
+        StringRef symbol =
+            binding.getLowering() == "python_floor_divide" ? "//" : "%";
+        return "(" + lhs.str() + ") " + symbol.str() + " (" + rhs.str() + ")";
+      }
       Type elementType = operation.getResult(0).getType();
       if (auto tensor = dyn_cast<RankedTensorType>(elementType))
         elementType = tensor.getElementType();
@@ -2707,7 +2767,17 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (failed(indices))
     return failure();
   if (!isa<RankedTensorType>(operation.getOperand(valueIndex.getInt()).getType())) {
+    if (boundary.getCheckBounds()) {
+      FailureOr<std::string> predicate =
+          elementBoundsPredicate(operation, {});
+      if (failed(predicate))
+        return failure();
+      line("if " + *predicate + ":");
+      ++indentation;
+    }
     line((*view)->argument->name + "[" + *indices + "] = " + stored->str());
+    if (boundary.getCheckBounds())
+      --indentation;
     return success();
   }
   line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
