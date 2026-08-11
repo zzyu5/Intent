@@ -465,13 +465,16 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             if (failed(node) || !facts.logicalBuffers.count(&operation))
               return operation.emitOpError(
                   "has no canonical private logical-buffer facts");
+            const target::LogicalBufferFact &buffer =
+                facts.logicalBuffers.lookup(&operation);
+            StringRef space = buffer.requiresAddressableStorage
+                                  ? "local_array"
+                              : buffer.hasDynamicAccess &&
+                                        buffer.info.elementType.isInteger(1)
+                                  ? "private_vector"
+                                  : "private_scalar_array";
             builder.create<intent::plan::BufferOp>(
-                operation.getLoc(), i64(builder, *node),
-                string(builder,
-                       facts.logicalBuffers.lookup(&operation)
-                               .requiresAddressableStorage
-                           ? "local_array"
-                           : "private_scalar_array"));
+                operation.getLoc(), i64(builder, *node), string(builder, space));
             return success();
           })))
     return failure();

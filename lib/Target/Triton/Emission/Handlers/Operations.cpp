@@ -838,6 +838,19 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (binding && binding.getSpace() == "private_vector") {
+    if (failed(info) || info->shape.size() != 1 || failed(initializer) ||
+        !info->elementType.isInteger(1))
+      return operation.emitOpError(
+          "private Triton vectors currently require one static bool axis");
+    std::string base = makeResultName(operation, 0);
+    line(base + "_lanes = tl.arange(0, " +
+         std::to_string(info->shape.front()) + ")");
+    line(base + " = tl.full((" + std::to_string(info->shape.front()) +
+         ",), " + initializer->str() + ", tl.int1)");
+    vectorBuffers[operation.getResult(0)] = base;
+    return success();
+  }
   if (binding && binding.getSpace() == "local_array")
     return operation.emitOpError(
         "requires an addressable local array that the Triton surface cannot express");
@@ -858,11 +871,33 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto vector = operation.getNumOperands() > 0
+                    ? vectorBuffers.find(operation.getOperand(0))
+                    : vectorBuffers.end();
+  FailureOr<target::LogicalBufferIndex> index =
+      target::getLogicalBufferIndex(operation);
+  if (vector != vectorBuffers.end()) {
+    if (failed(index) || operation.getNumResults() != 1)
+      return operation.emitOpError("lacks a private Triton vector load");
+    std::string selected;
+    if (index->constant) {
+      selected = std::to_string(*index->constant);
+    } else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      selected = dynamic->str();
+    }
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.sum(tl.where(" + vector->second +
+         "_lanes == " + selected + ", " + vector->second +
+         ".to(tl.int32), 0), axis=0) != 0");
+    bindResult(operation, 0, result);
+    return success();
+  }
   auto buffer = operation.getNumOperands() > 0
                     ? scalarBuffers.find(operation.getOperand(0))
                     : scalarBuffers.end();
-  FailureOr<target::LogicalBufferIndex> index =
-      target::getLogicalBufferIndex(operation);
   if (buffer == scalarBuffers.end() || failed(index) ||
       buffer->second.empty() || operation.getNumResults() != 1)
     return operation.emitOpError("lacks a scalarized Triton buffer load");
@@ -890,12 +925,32 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
-  auto buffer = operation.getNumOperands() > 0
-                    ? scalarBuffers.find(operation.getOperand(0))
-                    : scalarBuffers.end();
+  auto vector = operation.getNumOperands() > 0
+                    ? vectorBuffers.find(operation.getOperand(0))
+                    : vectorBuffers.end();
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
+  if (vector != vectorBuffers.end()) {
+    if (failed(index) || failed(stored))
+      return operation.emitOpError("lacks a private Triton vector store");
+    std::string selected;
+    if (index->constant) {
+      selected = std::to_string(*index->constant);
+    } else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      selected = dynamic->str();
+    }
+    line(vector->second + " = tl.where(" + vector->second +
+         "_lanes == " + selected + ", " + stored->str() + ", " +
+         vector->second + ")");
+    return success();
+  }
+  auto buffer = operation.getNumOperands() > 0
+                    ? scalarBuffers.find(operation.getOperand(0))
+                    : scalarBuffers.end();
   if (buffer == scalarBuffers.end() || failed(index) || failed(stored) ||
       buffer->second.empty())
     return operation.emitOpError("lacks a scalarized Triton buffer store");
@@ -1088,6 +1143,8 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   std::string expression = binding.getLowering() == "python_negate"
                                ? "-(" + operand->str() + ")"
+                           : binding.getLowering() == "python_not"
+                               ? "(" + operand->str() + ") == False"
                                : binding.getLowering().str() + "(" +
                                      operand->str() + ")";
   if (target::whileConditionOwner(operation)) {

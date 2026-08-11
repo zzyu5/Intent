@@ -88,6 +88,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("T.sigmoid");
   if (role == "unary_negate")
     return StringRef("python_negate");
+  if (role == "unary_not")
+    return StringRef("python_not");
   if (role == "binary_add")
     return StringRef("python_add");
   if (role == "binary_subtract")
@@ -232,6 +234,7 @@ indexRealization(intent::plan::RealizationOp realization,
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
+           value.getSpace() != "private_vector" &&
            value.getSpace() != "local_array"))
         return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
@@ -1068,7 +1071,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   }
   bool addressableLocalBuffer = llvm::any_of(
       planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "local_array";
+        return entry.second.getSpace() == "local_array" ||
+               entry.second.getSpace() == "private_vector";
       });
   output << ", threads=" << (addressableLocalBuffer ? "1" : "threads") << ") as ";
   if (workers == 1)
@@ -1180,6 +1184,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
 
 LogicalResult SourceEmitter::emitWrapper() {
   auto torchDtype = [&](Type type) -> StringRef {
+    if (type.isInteger(1))
+      return "torch.bool";
     if (type.isF16())
       return "torch.float16";
     if (type.isF32())

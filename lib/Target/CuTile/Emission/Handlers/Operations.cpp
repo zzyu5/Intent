@@ -806,6 +806,19 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (binding && binding.getSpace() == "private_vector") {
+    if (failed(info) || info->shape.size() != 1 || failed(initializer) ||
+        !info->elementType.isInteger(1))
+      return operation.emitOpError(
+          "private cuTile vectors currently require one static bool axis");
+    std::string base = makeResultName(operation, 0);
+    line(base + "_lanes = ct.arange(" +
+         std::to_string(info->shape.front()) + ", dtype=ct.int32)");
+    line(base + " = ct.full((" + std::to_string(info->shape.front()) +
+         ",), " + initializer->str() + ", dtype=ct.bool_)");
+    vectorBuffers[operation.getResult(0)] = base;
+    return success();
+  }
   if (binding && binding.getSpace() == "local_array")
     return operation.emitOpError(
         "requires mutable addressable local storage absent from the cuTile model");
@@ -826,11 +839,33 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto vector = operation.getNumOperands() > 0
+                    ? vectorBuffers.find(operation.getOperand(0))
+                    : vectorBuffers.end();
+  FailureOr<target::LogicalBufferIndex> index =
+      target::getLogicalBufferIndex(operation);
+  if (vector != vectorBuffers.end()) {
+    if (failed(index) || operation.getNumResults() != 1)
+      return operation.emitOpError("lacks a private cuTile vector load");
+    std::string selected;
+    if (index->constant) {
+      selected = std::to_string(*index->constant);
+    } else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      selected = dynamic->str();
+    }
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.sum(ct.where(" + vector->second +
+         "_lanes == " + selected + ", ct.astype(" + vector->second +
+         ", ct.int32), 0), axis=0) != 0");
+    bindResult(operation, 0, result);
+    return success();
+  }
   auto buffer = operation.getNumOperands() > 0
                     ? scalarBuffers.find(operation.getOperand(0))
                     : scalarBuffers.end();
-  FailureOr<target::LogicalBufferIndex> index =
-      target::getLogicalBufferIndex(operation);
   if (buffer == scalarBuffers.end() || failed(index) ||
       buffer->second.empty() || operation.getNumResults() != 1)
     return operation.emitOpError("lacks a scalarized cuTile buffer load");
@@ -858,12 +893,32 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
-  auto buffer = operation.getNumOperands() > 0
-                    ? scalarBuffers.find(operation.getOperand(0))
-                    : scalarBuffers.end();
+  auto vector = operation.getNumOperands() > 0
+                    ? vectorBuffers.find(operation.getOperand(0))
+                    : vectorBuffers.end();
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
+  if (vector != vectorBuffers.end()) {
+    if (failed(index) || failed(stored))
+      return operation.emitOpError("lacks a private cuTile vector store");
+    std::string selected;
+    if (index->constant) {
+      selected = std::to_string(*index->constant);
+    } else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      selected = dynamic->str();
+    }
+    line(vector->second + " = ct.where(" + vector->second +
+         "_lanes == " + selected + ", " + stored->str() + ", " +
+         vector->second + ")");
+    return success();
+  }
+  auto buffer = operation.getNumOperands() > 0
+                    ? scalarBuffers.find(operation.getOperand(0))
+                    : scalarBuffers.end();
   if (buffer == scalarBuffers.end() || failed(index) || failed(stored) ||
       buffer->second.empty())
     return operation.emitOpError("lacks a scalarized cuTile buffer store");
@@ -1114,6 +1169,8 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
   std::string expression;
   if (binding.getLowering() == "python_negate")
     expression = "-(" + operand->str() + ")";
+  else if (binding.getLowering() == "python_not")
+    expression = "(" + operand->str() + ") == False";
   else if (binding.getLowering() == "python_sigmoid")
     expression = "1.0 / (1.0 + ct.exp(-(" + operand->str() + ")))";
   else

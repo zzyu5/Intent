@@ -168,15 +168,20 @@ def _lower_unary(lowerer: object, node: ast.UnaryOp) -> Expression:
     operand_value = lowerer.materialize(operand, node.operand)
     if isinstance(node.op, ast.USub):
         operator_value = UnaryOperator.NEGATE
+        result_type = operand_value.type
     elif isinstance(node.op, ast.Not):
         operator_value = UnaryOperator.NOT
+        operand_dtype, operand_shape = lowerer.dtype_and_shape(operand_value.type, node.operand)
+        if operand_dtype != intent_bool:
+            lowerer.error(node.operand, "runtime not requires a bool operand")
+        result_type = lowerer.value_result_type(intent_bool, operand_shape)
     else:
         lowerer.error(node, f"unsupported runtime unary operator {type(node.op).__name__}")
     operation = lowerer.emit(
         OperationKind.UNARY,
         lowerer.location(node),
         operands=(operand_value,),
-        result_types=(operand_value.type,),
+        result_types=(result_type,),
         attributes={"operator": operator_value},
     )
     return operation.results[0]

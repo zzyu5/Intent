@@ -18,7 +18,6 @@ from intent.frontend.semantics import broadcast_shape
 from intent.frontend.semantics.types import is_integer
 from intent.language import f32
 from intent.language import bool as intent_bool
-from intent.language import index as intent_index
 
 from ..ast.indexing import lower_index
 from ..ast.indexing import validate_indexed_value
@@ -371,14 +370,14 @@ def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     dtype = require_dtype(lowerer, bound["dtype"]) if "dtype" in bound else f32
     if dtype != f32:
         lowerer.error(node, "I.random currently produces f32 uniform values")
-    if isinstance(identity.type, LogicalIndexType):
+    if is_integer(identity.type):
         shape: tuple[object, ...] = ()
     elif isinstance(identity.type, TensorType):
-        if identity.type.dtype != intent_index:
-            lowerer.error(bound["index"], "random index tensor must have index dtype")
+        if not is_integer(ScalarType(identity.type.dtype)):
+            lowerer.error(bound["index"], "random counter tensor must be integer/index")
         shape = tuple(identity.type.shape)
     else:
-        lowerer.error(node, "random identity must be logical index/index tensor")
+        lowerer.error(node, "random counter must be an integer scalar/tensor")
     operation = lowerer.emit(
         OperationKind.RANDOM,
         lowerer.location(node),

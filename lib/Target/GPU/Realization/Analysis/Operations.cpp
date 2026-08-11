@@ -208,7 +208,8 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.unary" &&
       llvm::is_contained({StringRef("exp"), StringRef("exp2"),
                           StringRef("log"), StringRef("rsqrt"),
-                          StringRef("sigmoid"), StringRef("negate")},
+                          StringRef("sigmoid"), StringRef("negate"),
+                          StringRef("not")},
                          logical.getValue()))
     return success();
   if (name == "intent.binary" &&

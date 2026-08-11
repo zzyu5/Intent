@@ -221,6 +221,7 @@ private:
       whileCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string>> scalarBuffers;
+  llvm::DenseMap<mlir::Value, std::string> vectorBuffers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>
       operationStages;
   llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;

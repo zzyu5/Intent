@@ -304,6 +304,36 @@ staticAffineRange(const AffineIndexExpression &expression,
   return std::pair<int64_t, int64_t>{lower, upper};
 }
 
+std::optional<std::pair<int64_t, int64_t>>
+sequentialDomainRange(Operation *domain, const KernelFacts &facts,
+                      Operation &consumer) {
+  if (!domain)
+    return std::nullopt;
+  auto bounds = facts.staticDomainBounds.find(domain);
+  if (bounds != facts.staticDomainBounds.end())
+    return std::pair<int64_t, int64_t>{bounds->second.first,
+                                       bounds->second.second - 1};
+  if (!facts.runtimeSequentialDomains.contains(domain) ||
+      domain->getNumOperands() < 2)
+    return std::nullopt;
+
+  llvm::DenseSet<Value> startActive;
+  llvm::DenseSet<Value> stopActive;
+  std::optional<AffineIndexExpression> start = affineIndexExpression(
+      domain->getOperand(0), facts, consumer, startActive);
+  std::optional<AffineIndexExpression> stop = affineIndexExpression(
+      domain->getOperand(1), facts, consumer, stopActive);
+  std::optional<std::pair<int64_t, int64_t>> startRange =
+      start ? staticAffineRange(*start, facts) : std::nullopt;
+  std::optional<std::pair<int64_t, int64_t>> stopRange =
+      stop ? staticAffineRange(*stop, facts) : std::nullopt;
+  int64_t upper;
+  if (!startRange || !stopRange ||
+      llvm::SubOverflow(stopRange->second, int64_t{1}, upper))
+    return std::nullopt;
+  return std::pair<int64_t, int64_t>{startRange->first, upper};
+}
+
 FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
                                         KernelFacts &facts) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
@@ -351,6 +381,18 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
           traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
+      if (source->domain &&
+          facts.runtimeSequentialDomains.contains(source->domain)) {
+        range = sequentialDomainRange(source->domain, facts, operation);
+        if (!range || failed(staticDestination) ||
+            StringRef(staticDestination->extent)
+                .getAsInteger(10, destinationExtent))
+          return true;
+        if (range->first < 0 || range->second >= destinationExtent)
+          return true;
+        ++sourceAxis;
+        continue;
+      }
       if (source->opaque && !source->domain) {
         return operation.emitOpError(
             "opaque scalar index requires a preceding I.assume_in_bounds declaration");
@@ -1198,6 +1240,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
       return operation.emitOpError(
           "private logical buffer dynamic index is not canonical");
     if ((*relation)[0].kind == "value_index") {
+      found->second.hasDynamicAccess = true;
       unsigned operandIndex = *(*relation)[0].operands.front();
       auto iterator = operandIndex < operation.getNumOperands()
                           ? dyn_cast<BlockArgument>(
@@ -1213,15 +1256,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   iterator.getArgNumber() == 0 && loop->getNumOperands() > 0
               ? loop->getOperand(0).getDefiningOp()
               : nullptr;
-      auto extent = facts.staticDomainExtents.find(domain);
-      auto bounds = facts.staticDomainBounds.find(domain);
+      std::optional<std::pair<int64_t, int64_t>> iteratorRange =
+          sequentialDomainRange(domain, facts, operation);
       bool boundedIterator =
-          domain && extent != facts.staticDomainExtents.end() &&
-          ((bounds != facts.staticDomainBounds.end() &&
-            bounds->second.first >= 0 &&
-            bounds->second.second <= found->second.info.shape.front()) ||
-           (bounds == facts.staticDomainBounds.end() &&
-            extent->second <= found->second.info.shape.front()));
+          iteratorRange && iteratorRange->first >= 0 &&
+          iteratorRange->second < found->second.info.shape.front();
       llvm::DenseSet<Value> active;
       std::optional<AffineIndexExpression> expression =
           affineIndexExpression(indexed, facts, operation, active);

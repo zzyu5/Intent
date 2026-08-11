@@ -746,7 +746,12 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   if (dtype.empty())
     return failure();
   std::string base = makeResultName(operation, 0);
-  if (binding.getSpace() == "local_array") {
+  if (binding.getSpace() == "local_array" ||
+      binding.getSpace() == "private_vector") {
+    if (binding.getSpace() == "private_vector" &&
+        !info->elementType.isInteger(1))
+      return operation.emitOpError(
+          "private TileLang vectors currently require bool elements");
     line(base + " = T.alloc_local((" + std::to_string(info->shape.front()) +
          ",), " + dtype + ")");
     line("T.fill(" + base + ", " + initializer->str() + ")");
@@ -1437,6 +1442,8 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
     std::string expression =
         binding.getLowering() == "python_negate"
             ? "-(" + operand->str() + ")"
+        : binding.getLowering() == "python_not"
+            ? "(" + operand->str() + ") == False"
             : binding.getLowering().str() + "(" + operand->str() + ")";
     if (target::whileConditionOwner(operation)) {
       bindResult(operation, 0, expression);
@@ -1485,6 +1492,8 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
     return failure();
   std::string expression = binding.getLowering() == "python_negate"
                                ? "-(" + *operand + ")"
+                           : binding.getLowering() == "python_not"
+                               ? "(" + *operand + ") == False"
                                : binding.getLowering().str() + "(" + *operand + ")";
   std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {

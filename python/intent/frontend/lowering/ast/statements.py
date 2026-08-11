@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from typing import cast
 
 from intent.api import DefinitionKind
 from intent.frontend.semantics import BufferType
@@ -69,15 +70,33 @@ def lower_statement(lowerer: object, node: ast.stmt) -> None:
         _lower_with(lowerer, node)
         return
     if isinstance(node, ast.Break):
-        lowerer.error(node, "break is not supported by portable Intent control flow")
+        _reject_unlowered_loop_exit(lowerer, node)
+        return
     if isinstance(node, ast.Continue):
-        lowerer.error(node, "continue is not supported by portable Intent control flow")
+        _reject_unlowered_loop_exit(lowerer, node)
+        return
     if isinstance(node, ast.Assert):
         _lower_assert(lowerer, node)
         return
     if isinstance(node, ast.Pass):
         return
     lowerer.error(node, f"unsupported Python statement {type(node).__name__}")
+
+
+def _reject_unlowered_loop_exit(lowerer: object, node: ast.Break | ast.Continue) -> None:
+    keyword = "break" if isinstance(node, ast.Break) else "continue"
+    if not lowerer.loop_stack:
+        lowerer.error(node, f"{keyword} requires an enclosing loop")
+    context = lowerer.loop_stack[-1]
+    if context.opcode not in (OperationKind.FOR, OperationKind.WHILE):
+        lowerer.error(
+            node,
+            f"{keyword} is supported only by ordinary for/while loops",
+        )
+    lowerer.error(
+        node,
+        f"{keyword} escaped ordinary-loop control normalization",
+    )
 
 
 def _lower_assign(lowerer: object, node: ast.Assign) -> None:
@@ -376,10 +395,37 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
         source = iteration
     else:
         lowerer.error(node, "for iterator must be domain/partition/I.parallel/I.ordered")
+    has_break, has_continue = (
+        _loop_exit_kinds(node.body)
+        if opcode is OperationKind.FOR
+        else (False, False)
+    )
+    live_name = _fresh_loop_control_name(lowerer, node, "live") if has_break else None
+    active_name = (
+        _fresh_loop_control_name(lowerer, node, "active")
+        if has_break or has_continue
+        else None
+    )
+    if live_name is not None:
+        lowerer.environment[live_name] = Literal(True)
+    body = (
+        _normalize_loop_exit_body(node.body, active_name, live_name)
+        if active_name is not None
+        else node.body
+    )
+    if live_name is not None:
+        guarded = ast.If(
+            test=_control_name(live_name, ast.Load(), node),
+            body=body,
+            orelse=[],
+        )
+        ast.copy_location(guarded, node)
+        body = [guarded]
+
     snapshot = dict(lowerer.environment)
     target_names = _target_names(node.target)
     assigned_existing = (
-        _assigned_names(node.body) & set(snapshot)
+        _assigned_names(body) & set(snapshot)
     ) - target_names
     if opcode is OperationKind.PARALLEL and assigned_existing:
         lowerer.error(
@@ -405,7 +451,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     for name, value in zip(carried_names, state_arguments):
         lowerer.environment[name] = value
     lowerer.loop_stack.append(LoopContext(opcode, carried_names))
-    lowerer.lower_statements(node.body)
+    lowerer.lower_statements(body)
     if not lowerer.is_terminated(block):
         yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
         lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
@@ -422,6 +468,8 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     )
     for name, value in zip(carried_names, operation.results):
         lowerer.environment[name] = value
+    if live_name is not None:
+        lowerer.environment.pop(live_name)
 
 
 def _lower_iteration_expression(lowerer: object, node: ast.AST) -> Expression:
@@ -449,8 +497,31 @@ def _lower_iteration_expression(lowerer: object, node: ast.AST) -> Expression:
 def _lower_while(lowerer: object, node: ast.While) -> None:
     if node.orelse:
         lowerer.error(node, "while-else is not part of Intent control flow")
+    has_break, has_continue = _loop_exit_kinds(node.body)
+    live_name = _fresh_loop_control_name(lowerer, node, "live") if has_break else None
+    active_name = (
+        _fresh_loop_control_name(lowerer, node, "active")
+        if has_break or has_continue
+        else None
+    )
+    if live_name is not None:
+        lowerer.environment[live_name] = Literal(True)
+    body = (
+        _normalize_loop_exit_body(node.body, active_name, live_name)
+        if active_name is not None
+        else node.body
+    )
+    condition_node: ast.expr = node.test
+    if live_name is not None:
+        condition_node = ast.IfExp(
+            test=_control_name(live_name, ast.Load(), node.test),
+            body=node.test,
+            orelse=ast.Constant(value=False),
+        )
+        ast.copy_location(condition_node, node.test)
+
     snapshot = dict(lowerer.environment)
-    carried_names = tuple(sorted(_assigned_names(node.body) & set(snapshot)))
+    carried_names = tuple(sorted(_assigned_names(body) & set(snapshot)))
     initial_values = tuple(lowerer.materialize(snapshot[name], node) for name in carried_names)
     state_types = tuple(value.type for value in initial_values)
     before = lowerer.compiler.builder.region(lowerer.location(node), state_types)
@@ -461,7 +532,7 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     lowerer.environment = dict(snapshot)
     for name, value in zip(carried_names, before.blocks[0].arguments):
         lowerer.environment[name] = value
-    condition_expression = lowerer.lower_expression(node.test)
+    condition_expression = lowerer.lower_expression(condition_node)
     condition = lowerer.materialize(condition_expression, node.test, ScalarType(intent_bool))
     lowerer.emit(
         OperationKind.CONDITION,
@@ -474,7 +545,7 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     for name, value in zip(carried_names, after.blocks[0].arguments):
         lowerer.environment[name] = value
     lowerer.loop_stack.append(LoopContext(OperationKind.WHILE, carried_names))
-    lowerer.lower_statements(node.body)
+    lowerer.lower_statements(body)
     if not lowerer.is_terminated(after.blocks[0]):
         yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
         lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
@@ -492,6 +563,8 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     )
     for name, result in zip(carried_names, operation.results):
         lowerer.environment[name] = result
+    if live_name is not None:
+        lowerer.environment.pop(live_name)
 
 
 def _lower_with(lowerer: object, node: ast.With) -> None:
@@ -639,6 +712,129 @@ def _target_names(target: ast.AST) -> set[str]:
             names.update(_target_names(element))
         return names
     return set()
+
+
+def _loop_exit_kinds(statements: list[ast.stmt]) -> tuple[bool, bool]:
+    class Collector(ast.NodeVisitor):
+        has_break = False
+        has_continue = False
+
+        def visit_Break(self, node: ast.Break) -> None:
+            self.has_break = True
+
+        def visit_Continue(self, node: ast.Continue) -> None:
+            self.has_continue = True
+
+        def visit_For(self, node: ast.For) -> None:
+            return
+
+        def visit_While(self, node: ast.While) -> None:
+            return
+
+        def visit_With(self, node: ast.With) -> None:
+            return
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+    collector = Collector()
+    for statement in statements:
+        collector.visit(statement)
+    return collector.has_break, collector.has_continue
+
+
+def _fresh_loop_control_name(lowerer: object, node: ast.AST, role: str) -> str:
+    line = getattr(node, "lineno", 0)
+    column = getattr(node, "col_offset", 0)
+    candidate = f"__intent_{role}_{line}_{column}"
+    occupied = set(lowerer.environment)
+    occupied.update(
+        child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+    )
+    while candidate in occupied:
+        candidate += "_"
+    return candidate
+
+
+def _control_name(name: str, context: ast.expr_context, location: ast.AST) -> ast.Name:
+    value = ast.Name(id=name, ctx=context)
+    ast.copy_location(value, location)
+    return value
+
+
+def _control_assignment(name: str, value: bool, location: ast.AST) -> ast.Assign:
+    assignment = ast.Assign(
+        targets=[_control_name(name, ast.Store(), location)],
+        value=ast.Constant(value=value),
+    )
+    ast.copy_location(assignment.value, location)
+    ast.copy_location(assignment, location)
+    return assignment
+
+
+def _normalize_loop_exit_body(
+    statements: list[ast.stmt],
+    active_name: str,
+    live_name: str | None,
+) -> list[ast.stmt]:
+    location = statements[0]
+    return [
+        _control_assignment(active_name, True, location),
+        *_normalize_guarded_block(statements, active_name, live_name),
+    ]
+
+
+def _rewrite_loop_exit_statement(
+    statement: ast.stmt,
+    active_name: str,
+    live_name: str | None,
+) -> list[ast.stmt]:
+    if isinstance(statement, ast.Break):
+        return [
+            _control_assignment(cast(str, live_name), False, statement),
+            _control_assignment(active_name, False, statement),
+        ]
+    if isinstance(statement, ast.Continue):
+        return [_control_assignment(active_name, False, statement)]
+    if isinstance(statement, ast.If):
+        rewritten = ast.If(
+            test=statement.test,
+            body=_normalize_guarded_block(statement.body, active_name, live_name),
+            orelse=_normalize_guarded_block(statement.orelse, active_name, live_name),
+        )
+        ast.copy_location(rewritten, statement)
+        return [rewritten]
+    return [statement]
+
+
+def _normalize_guarded_block(
+    statements: list[ast.stmt],
+    active_name: str,
+    live_name: str | None,
+) -> list[ast.stmt]:
+    normalized: list[ast.stmt] = []
+    for position, statement in enumerate(statements):
+        has_break, has_continue = _loop_exit_kinds([statement])
+        if not has_break and not has_continue:
+            normalized.append(statement)
+            continue
+        normalized.extend(
+            _rewrite_loop_exit_statement(statement, active_name, live_name)
+        )
+        remaining = statements[position + 1 :]
+        if remaining:
+            guarded = ast.If(
+                test=_control_name(active_name, ast.Load(), remaining[0]),
+                body=_normalize_guarded_block(remaining, active_name, live_name),
+                orelse=[],
+            )
+            ast.copy_location(guarded, remaining[0])
+            normalized.append(guarded)
+        break
+    return normalized
 
 
 def _copy_loop_stack(stack: list[LoopContext]) -> list[LoopContext]:
