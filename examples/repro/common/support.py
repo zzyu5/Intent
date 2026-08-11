@@ -19,7 +19,10 @@ def benchmark(
     warmup: int = 25,
     repetitions: int = 100,
     cuda_graph: bool = False,
+    prepare: Callable[[], object] | None = None,
 ) -> tuple[float, float]:
+    if cuda_graph and prepare is not None:
+        raise ValueError("CUDA Graph measurement cannot reset inputs between replays")
     measured = function
     measurement_stream = torch.cuda.current_stream()
     if cuda_graph:
@@ -35,6 +38,8 @@ def benchmark(
         measured = graph.replay
     else:
         for _ in range(warmup):
+            if prepare is not None:
+                prepare()
             function()
     flush_buffer = None
     if cuda_graph:
@@ -57,6 +62,8 @@ def benchmark(
         for start, end in zip(starts, ends):
             if flush_buffer is not None:
                 flush_buffer.add_(1)
+            if prepare is not None:
+                prepare()
             start.record()
             measured()
             end.record()

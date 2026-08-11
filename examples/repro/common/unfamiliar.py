@@ -8,6 +8,52 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.backward.group_norm_silu import BATCH as GROUP_NORM_BATCH
+from kernels.backward.group_norm_silu import CHANNELS as GROUP_NORM_CHANNELS
+from kernels.backward.group_norm_silu import CHANNELS_PER_GROUP
+from kernels.backward.group_norm_silu import GROUPS as GROUP_NORM_GROUPS
+from kernels.backward.group_norm_silu import SPATIAL as GROUP_NORM_SPATIAL
+from kernels.backward.group_norm_silu import group_norm_silu_backward
+from kernels.cache.reshape_and_cache import BLOCKS as CACHE_BLOCKS
+from kernels.cache.reshape_and_cache import BLOCK_SIZE as CACHE_BLOCK_SIZE
+from kernels.cache.reshape_and_cache import HEAD_DIMENSION as CACHE_HEAD_DIMENSION
+from kernels.cache.reshape_and_cache import HEADS as CACHE_HEADS
+from kernels.cache.reshape_and_cache import TOKENS as CACHE_TOKENS
+from kernels.cache.reshape_and_cache import reshape_and_cache
+from kernels.compaction.nonzero import ROWS as NONZERO_ROWS
+from kernels.compaction.nonzero import VALUES as NONZERO_VALUES
+from kernels.compaction.nonzero import compact_nonzero_rows
+from kernels.compaction.unique_consecutive import ROWS as UNIQUE_ROWS
+from kernels.compaction.unique_consecutive import VALUES as UNIQUE_VALUES
+from kernels.compaction.unique_consecutive import unique_consecutive_rows
+from kernels.factorization.cholesky import BATCH as CHOLESKY_BATCH
+from kernels.factorization.cholesky import SIZE as CHOLESKY_SIZE
+from kernels.factorization.cholesky import batched_cholesky_lower
+from kernels.factorization.householder_qr import BATCH as QR_BATCH
+from kernels.factorization.householder_qr import COLUMNS as QR_COLUMNS
+from kernels.factorization.householder_qr import ROWS as QR_ROWS
+from kernels.factorization.householder_qr import batched_householder_qr
+from kernels.optimization.adafactor import COLUMNS as ADAFACTOR_COLUMNS
+from kernels.optimization.adafactor import ROWS as ADAFACTOR_ROWS
+from kernels.optimization.adafactor import adafactor_apply
+from kernels.optimization.adafactor import adafactor_update_columns
+from kernels.optimization.adafactor import adafactor_update_rows
+from kernels.optimization.adamw import PARAMETERS as ADAMW_PARAMETERS
+from kernels.optimization.adamw import adamw_update
+from kernels.ragged.nested_pool import DOCUMENTS as NESTED_DOCUMENTS
+from kernels.ragged.nested_pool import FEATURES as NESTED_FEATURES
+from kernels.ragged.nested_pool import SENTENCES as NESTED_SENTENCES
+from kernels.ragged.nested_pool import TOKENS as NESTED_TOKENS
+from kernels.ragged.nested_pool import nested_jagged_mean_pool
+from kernels.routing.moe_align import BLOCK_SIZE as MOE_ALIGN_BLOCK_SIZE
+from kernels.routing.moe_align import EXPERTS as MOE_ALIGN_EXPERTS
+from kernels.routing.moe_align import PADDED_ROUTES as MOE_ALIGN_PADDED_ROUTES
+from kernels.routing.moe_align import TOKENS as MOE_ALIGN_TOKENS
+from kernels.routing.moe_align import TOP_K as MOE_ALIGN_TOP_K
+from kernels.routing.moe_align import moe_count_routes
+from kernels.routing.moe_align import moe_mark_expert_blocks
+from kernels.routing.moe_align import moe_prefix_routes
+from kernels.routing.moe_align import moe_scatter_routes
 from kernels.activation.swiglu import FEATURES as SWIGLU_FEATURES
 from kernels.activation.swiglu import TOKENS as SWIGLU_TOKENS
 from kernels.activation.swiglu import swiglu_forward
@@ -209,6 +255,38 @@ def _run_generated(
     )
     print(
         f"{target_name} {kernel_name} kernel-only performance "
+        f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
+        f"p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} {kernel_name} upstream baseline: unavailable")
+
+
+def _report_pipeline(
+    *,
+    artifacts: tuple[object, ...],
+    launch: Callable[[], None],
+    errors: tuple[float, ...],
+    target_name: str,
+    kernel_name: str,
+    cuda_graph: bool = False,
+    prepare: Callable[[], object] | None = None,
+    performance_scope: str = "end-to-end GPU pipeline",
+) -> None:
+    p50, p95 = benchmark(
+        launch,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=cuda_graph,
+        prepare=prepare,
+    )
+    for artifact in artifacts:
+        print_artifact(artifact, target_name)
+    print(
+        f"{target_name} {kernel_name} numerical comparison: PASS "
+        f"(generated/reference={errors})"
+    )
+    print(
+        f"{target_name} {kernel_name} {performance_scope} performance "
         f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
         f"p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
@@ -930,6 +1008,617 @@ def _run_variant_transpose(
     )
 
 
+def _run_nonzero_compact(
+    compiler: str, target: Target, target_name: str
+) -> None:
+    values = torch.randn(
+        (NONZERO_ROWS, NONZERO_VALUES), device="cuda", dtype=torch.float32
+    )
+    values[torch.rand_like(values) < 0.7] = 0.0
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        flags = values != 0.0
+        prefix = flags.to(torch.int32).cumsum(dim=1, dtype=torch.int32)
+        output = torch.full_like(prefix, -1)
+        rows, columns = torch.nonzero(flags, as_tuple=True)
+        output[rows, prefix[rows, columns].long() - 1] = columns.to(torch.int32)
+        return output, flags.sum(dim=1, dtype=torch.int32)
+
+    _run_generated(
+        definition=compact_nonzero_rows,
+        arguments=(values,),
+        reference=reference,
+        compiler=compiler,
+        target=target,
+        target_name=target_name,
+        kernel_name="row-wise nonzero compact-select",
+        tolerance=(0.0, 0.0),
+        cuda_graph=False,
+    )
+
+
+def _run_unique_consecutive(
+    compiler: str, target: Target, target_name: str
+) -> None:
+    increments = torch.randint(
+        0,
+        5,
+        (UNIQUE_ROWS, UNIQUE_VALUES),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    values = torch.cumsum(increments == 0, dim=1, dtype=torch.int32)
+    run_lengths = torch.zeros_like(values)
+    artifact = intent.compile(
+        unique_consecutive_rows,
+        target=target,
+        compiler=compiler,
+    )
+    generated = artifact.run(values, run_lengths)
+    generated_call = prepare_kernel_call(
+        artifact,
+        (values, run_lengths),
+        generated,
+    )
+    run_lengths.zero_()
+    generated_call()
+    run_starts = torch.ones_like(values, dtype=torch.bool)
+    run_starts[:, 1:] = values[:, 1:] != values[:, :-1]
+    groups = run_starts.to(torch.int32).cumsum(dim=1, dtype=torch.int32) - 1
+    expected_values = torch.zeros_like(values)
+    rows, columns = torch.nonzero(run_starts, as_tuple=True)
+    expected_values[rows, groups[rows, columns].long()] = values[rows, columns]
+    expected_lengths = torch.zeros_like(values)
+    expected_lengths.scatter_add_(1, groups.long(), torch.ones_like(values))
+    expected_counts = run_starts.sum(dim=1, dtype=torch.int32)
+    expected = (expected_values, groups, expected_counts, expected_lengths)
+    actual = (*_outputs(generated), run_lengths)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=actual,
+        expected=expected,
+        tolerance=(0.0, 0.0, 0.0, 0.0),
+        target_name=target_name,
+        kernel_name="unique-consecutive run-length encoding",
+    )
+    def clear_and_launch() -> None:
+        run_lengths.zero_()
+        generated_call()
+
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=clear_and_launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="unique-consecutive run-length encoding",
+    )
+
+
+def _run_moe_align(compiler: str, target: Target, target_name: str) -> None:
+    topk_ids = torch.randint(
+        0,
+        MOE_ALIGN_EXPERTS,
+        (MOE_ALIGN_TOKENS, MOE_ALIGN_TOP_K),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    expert_counts = torch.zeros(
+        (MOE_ALIGN_EXPERTS,), device="cuda", dtype=torch.int32
+    )
+    expert_cursors = torch.zeros_like(expert_counts)
+    sorted_routes = torch.full(
+        (MOE_ALIGN_PADDED_ROUTES,), -1, device="cuda", dtype=torch.int32
+    )
+    count_artifact = intent.compile(
+        moe_count_routes, target=target, compiler=compiler
+    )
+    prefix_artifact = intent.compile(
+        moe_prefix_routes, target=target, compiler=compiler
+    )
+    scatter_artifact = intent.compile(
+        moe_scatter_routes, target=target, compiler=compiler
+    )
+    blocks_artifact = intent.compile(
+        moe_mark_expert_blocks, target=target, compiler=compiler
+    )
+    count_artifact.run(topk_ids, expert_counts)
+    prefix_outputs = prefix_artifact.run(expert_counts)
+    expert_offsets, total_padded = _outputs(prefix_outputs)
+    scatter_artifact.run(topk_ids, expert_offsets, expert_cursors, sorted_routes)
+    expert_blocks = blocks_artifact.run(expert_offsets)
+
+    expected_counts = torch.bincount(
+        topk_ids.flatten().long(), minlength=MOE_ALIGN_EXPERTS
+    ).to(torch.int32)
+    expected_padded = (
+        (expected_counts + MOE_ALIGN_BLOCK_SIZE - 1) // MOE_ALIGN_BLOCK_SIZE
+    ) * MOE_ALIGN_BLOCK_SIZE
+    expected_offsets = torch.zeros_like(expert_offsets)
+    expected_offsets[1:] = expected_padded.cumsum(dim=0)
+    expected_total = expected_offsets[-1:].clone()
+    expected_routes = torch.full_like(sorted_routes, -1)
+    actual_routes = sorted_routes.clone()
+    valid_block_count = int(expected_total.item()) // MOE_ALIGN_BLOCK_SIZE
+    expected_blocks = torch.zeros(
+        (valid_block_count,), device="cuda", dtype=torch.int32
+    )
+    flat_ids = topk_ids.flatten()
+    for expert in range(MOE_ALIGN_EXPERTS):
+        routes = torch.nonzero(flat_ids == expert, as_tuple=False).flatten().to(torch.int32)
+        start = int(expected_offsets[expert].item())
+        expected_routes[start : start + routes.numel()] = routes
+        actual_routes[start : start + routes.numel()] = torch.sort(
+            actual_routes[start : start + routes.numel()]
+        ).values
+        first_block = start // MOE_ALIGN_BLOCK_SIZE
+        last_block = int(expected_offsets[expert + 1].item()) // MOE_ALIGN_BLOCK_SIZE
+        expected_blocks[first_block:last_block] = expert
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(
+            expert_counts,
+            expert_offsets,
+            total_padded,
+            actual_routes,
+            expert_blocks[:valid_block_count],
+        ),
+        expected=(
+            expected_counts,
+            expected_offsets,
+            expected_total,
+            expected_routes,
+            expected_blocks,
+        ),
+        tolerance=(0.0, 0.0, 0.0, 0.0, 0.0),
+        target_name=target_name,
+        kernel_name="MoE block alignment pipeline",
+    )
+    count_call = prepare_kernel_call(
+        count_artifact, (topk_ids, expert_counts), ()
+    )
+    prefix_call = prepare_kernel_call(
+        prefix_artifact, (expert_counts,), prefix_outputs
+    )
+    scatter_call = prepare_kernel_call(
+        scatter_artifact,
+        (topk_ids, expert_offsets, expert_cursors, sorted_routes),
+        (),
+    )
+    blocks_call = prepare_kernel_call(
+        blocks_artifact, (expert_offsets,), expert_blocks
+    )
+
+    def launch_pipeline() -> None:
+        expert_counts.zero_()
+        expert_cursors.zero_()
+        sorted_routes.fill_(-1)
+        count_call()
+        prefix_call()
+        scatter_call()
+        blocks_call()
+
+    _report_pipeline(
+        artifacts=(count_artifact, prefix_artifact, scatter_artifact, blocks_artifact),
+        launch=launch_pipeline,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="MoE block alignment pipeline",
+    )
+
+
+def _run_nested_ragged_pool(
+    compiler: str, target: Target, target_name: str
+) -> None:
+    document_lengths = torch.tensor(
+        [8 if index % 2 == 0 else 24 for index in range(NESTED_DOCUMENTS)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    sentence_lengths = torch.tensor(
+        [8 if index % 2 == 0 else 24 for index in range(NESTED_SENTENCES)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    document_offsets = torch.zeros(
+        (NESTED_DOCUMENTS + 1,), device="cuda", dtype=torch.int32
+    )
+    sentence_offsets = torch.zeros(
+        (NESTED_SENTENCES + 1,), device="cuda", dtype=torch.int32
+    )
+    document_offsets[1:] = document_lengths.cumsum(dim=0)
+    sentence_offsets[1:] = sentence_lengths.cumsum(dim=0)
+    values = torch.randn(
+        (NESTED_TOKENS, NESTED_FEATURES),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        sentence_ids = torch.repeat_interleave(
+            torch.arange(NESTED_SENTENCES, device="cuda"), sentence_lengths.long()
+        )
+        sentence_sums = torch.zeros(
+            (NESTED_SENTENCES, NESTED_FEATURES), device="cuda"
+        )
+        sentence_sums.index_add_(0, sentence_ids, values)
+        sentence_means = sentence_sums / sentence_lengths[:, None]
+        document_ids = torch.repeat_interleave(
+            torch.arange(NESTED_DOCUMENTS, device="cuda"), document_lengths.long()
+        )
+        document_sums = torch.zeros(
+            (NESTED_DOCUMENTS, NESTED_FEATURES), device="cuda"
+        )
+        document_sums.index_add_(0, document_ids, sentence_sums)
+        document_tokens = torch.zeros(
+            (NESTED_DOCUMENTS,), device="cuda", dtype=torch.int32
+        )
+        document_tokens.index_add_(0, document_ids, sentence_lengths)
+        return sentence_means, document_sums / document_tokens[:, None]
+
+    _run_generated(
+        definition=nested_jagged_mean_pool,
+        arguments=(document_offsets, sentence_offsets, values),
+        reference=reference,
+        compiler=compiler,
+        target=target,
+        target_name=target_name,
+        kernel_name="two-level nested jagged mean pooling",
+        tolerance=(2.0e-5, 2.0e-5),
+        cuda_graph=False,
+    )
+
+
+def _run_adamw(compiler: str, target: Target, target_name: str) -> None:
+    gradient = torch.randn(
+        (ADAMW_PARAMETERS,), device="cuda", dtype=torch.float32
+    ) * 0.01
+    parameter = torch.randn_like(gradient)
+    first = torch.randn_like(gradient) * 0.01
+    second = torch.rand_like(gradient) * 0.01
+    expected_parameter = parameter.clone()
+    expected_first = first.clone()
+    expected_second = second.clone()
+    initial_parameter = parameter.clone()
+    initial_first = first.clone()
+    initial_second = second.clone()
+    learning_rate, beta1, beta2 = 1.0e-3, 0.9, 0.999
+    inverse_bias1, inverse_bias2 = 10.0, 1000.0
+    epsilon, weight_decay = 1.0e-8, 0.01
+    expected_first.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
+    expected_second.mul_(beta2).addcmul_(gradient, gradient, value=1.0 - beta2)
+    expected_parameter.mul_(1.0 - learning_rate * weight_decay).add_(
+        expected_first
+        * inverse_bias1
+        * torch.rsqrt(expected_second * inverse_bias2 + epsilon),
+        alpha=-learning_rate,
+    )
+    artifact = intent.compile(adamw_update, target=target, compiler=compiler)
+    arguments = (
+        gradient,
+        parameter,
+        first,
+        second,
+        learning_rate,
+        beta1,
+        beta2,
+        inverse_bias1,
+        inverse_bias2,
+        epsilon,
+        weight_decay,
+    )
+    artifact.run(*arguments)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(parameter, first, second),
+        expected=(expected_parameter, expected_first, expected_second),
+        tolerance=(2.0e-6, 2.0e-6, 2.0e-6),
+        target_name=target_name,
+        kernel_name="fused AdamW update",
+    )
+    launch = prepare_kernel_call(artifact, arguments, ())
+
+    def restore_state() -> None:
+        parameter.copy_(initial_parameter)
+        first.copy_(initial_first)
+        second.copy_(initial_second)
+
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="fused AdamW update",
+        prepare=restore_state,
+        performance_scope="kernel-only",
+    )
+
+
+def _run_adafactor(compiler: str, target: Target, target_name: str) -> None:
+    gradient = torch.randn(
+        (ADAFACTOR_ROWS, ADAFACTOR_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.01
+    parameter = torch.randn_like(gradient)
+    row_state = torch.rand((ADAFACTOR_ROWS,), device="cuda") * 0.01
+    column_state = torch.rand((ADAFACTOR_COLUMNS,), device="cuda") * 0.01
+    row_mean = torch.zeros((1,), device="cuda")
+    expected_parameter = parameter.clone()
+    expected_row = row_state.clone()
+    expected_column = column_state.clone()
+    initial_parameter = parameter.clone()
+    initial_row = row_state.clone()
+    initial_column = column_state.clone()
+    decay, learning_rate, epsilon = 0.8, 1.0e-2, 1.0e-8
+    expected_row.mul_(decay).add_(
+        gradient.square().mean(dim=1), alpha=1.0 - decay
+    )
+    expected_column.mul_(decay).add_(
+        gradient.square().mean(dim=0), alpha=1.0 - decay
+    )
+    expected_mean = expected_row.mean().reshape(1)
+    variance = expected_row[:, None] * expected_column[None, :] / expected_mean
+    expected_parameter.add_(
+        gradient * torch.rsqrt(variance + epsilon), alpha=-learning_rate
+    )
+    rows_artifact = intent.compile(
+        adafactor_update_rows, target=target, compiler=compiler
+    )
+    columns_artifact = intent.compile(
+        adafactor_update_columns, target=target, compiler=compiler
+    )
+    apply_artifact = intent.compile(adafactor_apply, target=target, compiler=compiler)
+    rows_arguments = (
+        gradient,
+        row_state,
+        row_mean,
+        decay,
+        1.0 / ADAFACTOR_COLUMNS,
+        1.0 / ADAFACTOR_ROWS,
+    )
+    columns_arguments = (
+        gradient,
+        column_state,
+        decay,
+        1.0 / ADAFACTOR_ROWS,
+    )
+    apply_arguments = (
+        gradient,
+        row_state,
+        column_state,
+        row_mean,
+        parameter,
+        learning_rate,
+        epsilon,
+    )
+    rows_artifact.run(*rows_arguments)
+    columns_artifact.run(*columns_arguments)
+    apply_artifact.run(*apply_arguments)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(parameter, row_state, column_state, row_mean),
+        expected=(expected_parameter, expected_row, expected_column, expected_mean),
+        tolerance=(2.0e-5, 2.0e-7, 2.0e-7, 2.0e-7),
+        target_name=target_name,
+        kernel_name="factored Adafactor update pipeline",
+    )
+    rows_call = prepare_kernel_call(rows_artifact, rows_arguments, ())
+    columns_call = prepare_kernel_call(columns_artifact, columns_arguments, ())
+    apply_call = prepare_kernel_call(apply_artifact, apply_arguments, ())
+
+    def launch_pipeline() -> None:
+        rows_call()
+        columns_call()
+        apply_call()
+
+    def restore_state() -> None:
+        parameter.copy_(initial_parameter)
+        row_state.copy_(initial_row)
+        column_state.copy_(initial_column)
+        row_mean.zero_()
+
+    _report_pipeline(
+        artifacts=(rows_artifact, columns_artifact, apply_artifact),
+        launch=launch_pipeline,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="factored Adafactor update pipeline",
+        prepare=restore_state,
+    )
+
+
+def _run_reshape_cache(compiler: str, target: Target, target_name: str) -> None:
+    key = torch.randn(
+        (CACHE_TOKENS, CACHE_HEADS, CACHE_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    value = torch.randn_like(key)
+    slots = torch.randperm(
+        CACHE_BLOCKS * CACHE_BLOCK_SIZE, device="cuda", dtype=torch.int64
+    )[:CACHE_TOKENS].to(torch.int32)
+    key_cache = torch.zeros(
+        (CACHE_BLOCKS, CACHE_BLOCK_SIZE, CACHE_HEADS, CACHE_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    value_cache = torch.zeros_like(key_cache)
+    expected_key = key_cache.clone()
+    expected_value = value_cache.clone()
+    blocks = slots.long() // CACHE_BLOCK_SIZE
+    offsets = slots.long() % CACHE_BLOCK_SIZE
+    expected_key[blocks, offsets] = key
+    expected_value[blocks, offsets] = value
+    artifact = intent.compile(reshape_and_cache, target=target, compiler=compiler)
+    arguments = (key, value, slots, key_cache, value_cache)
+    artifact.run(*arguments)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(key_cache, value_cache),
+        expected=(expected_key, expected_value),
+        tolerance=(0.0, 0.0),
+        target_name=target_name,
+        kernel_name="reshape-and-cache in-place update",
+    )
+    launch = prepare_kernel_call(artifact, arguments, ())
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="reshape-and-cache in-place update",
+        cuda_graph=True,
+        performance_scope="kernel-only",
+    )
+
+
+def _run_group_norm_silu_backward(
+    compiler: str, target: Target, target_name: str
+) -> None:
+    x = torch.randn(
+        (GROUP_NORM_BATCH, GROUP_NORM_CHANNELS, GROUP_NORM_SPATIAL),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    upstream = torch.randn_like(x)
+    weight = torch.randn((GROUP_NORM_CHANNELS,), device="cuda")
+    bias = torch.randn_like(weight)
+    grouped = x.float().reshape(
+        GROUP_NORM_BATCH,
+        GROUP_NORM_GROUPS,
+        CHANNELS_PER_GROUP,
+        GROUP_NORM_SPATIAL,
+    )
+    mean = grouped.mean(dim=(2, 3))
+    variance = grouped.var(dim=(2, 3), unbiased=False)
+    rstd = torch.rsqrt(variance + 1.0e-5)
+    x_ref = x.float().detach().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    bias_ref = bias.detach().clone().requires_grad_(True)
+    output = F.silu(
+        F.group_norm(
+            x_ref,
+            GROUP_NORM_GROUPS,
+            weight_ref,
+            bias_ref,
+            eps=1.0e-5,
+        )
+    )
+    output.backward(upstream.float())
+    expected_dx = x_ref.grad.to(torch.bfloat16)
+    expected_dw = weight_ref.grad
+    expected_db = bias_ref.grad
+    dweight = torch.zeros_like(weight)
+    dbias = torch.zeros_like(bias)
+    artifact = intent.compile(
+        group_norm_silu_backward, target=target, compiler=compiler
+    )
+    arguments = (
+        x,
+        upstream,
+        weight,
+        bias,
+        mean,
+        rstd,
+        dweight,
+        dbias,
+        1.0 / (CHANNELS_PER_GROUP * GROUP_NORM_SPATIAL),
+    )
+    dx = artifact.run(*arguments)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(dx, dweight, dbias),
+        expected=(expected_dx, expected_dw, expected_db),
+        tolerance=(4.0e-2, 3.0e-2, 3.0e-2),
+        target_name=target_name,
+        kernel_name="GroupNorm plus SiLU backward",
+    )
+    launch = prepare_kernel_call(artifact, arguments, dx)
+
+    def clear_and_launch() -> None:
+        dweight.zero_()
+        dbias.zero_()
+        launch()
+
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=clear_and_launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="GroupNorm plus SiLU backward",
+    )
+
+
+def _run_cholesky(compiler: str, target: Target, target_name: str) -> None:
+    seed = torch.randn(
+        (CHOLESKY_BATCH, CHOLESKY_SIZE, CHOLESKY_SIZE),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    matrices = seed @ seed.transpose(1, 2)
+    matrices.add_(
+        torch.eye(CHOLESKY_SIZE, device="cuda")[None], alpha=CHOLESKY_SIZE
+    )
+    expected = torch.linalg.cholesky(matrices)
+    original_matrices = matrices.clone()
+    artifact = intent.compile(
+        batched_cholesky_lower, target=target, compiler=compiler
+    )
+    artifact.run(matrices)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=matrices,
+        expected=expected,
+        tolerance=2.0e-4,
+        target_name=target_name,
+        kernel_name="batched in-place Cholesky factorization",
+    )
+    launch = prepare_kernel_call(artifact, (matrices,), ())
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="batched in-place Cholesky factorization",
+        cuda_graph=False,
+        prepare=lambda: matrices.copy_(original_matrices),
+        performance_scope="kernel-only",
+    )
+
+
+def _run_householder_qr(compiler: str, target: Target, target_name: str) -> None:
+    matrices = torch.randn(
+        (QR_BATCH, QR_ROWS, QR_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    expected_matrix, expected_tau = torch.geqrf(matrices)
+    original_matrices = matrices.clone()
+    artifact = intent.compile(
+        batched_householder_qr, target=target, compiler=compiler
+    )
+    tau = artifact.run(matrices)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(matrices, tau),
+        expected=(expected_matrix, expected_tau),
+        tolerance=(3.0e-4, 3.0e-4),
+        target_name=target_name,
+        kernel_name="batched in-place Householder QR",
+    )
+    launch = prepare_kernel_call(artifact, (matrices,), tau)
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="batched in-place Householder QR",
+        cuda_graph=False,
+        prepare=lambda: matrices.copy_(original_matrices),
+        performance_scope="kernel-only",
+    )
+
+
 UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "histogram": _run_histogram,
     "csr_spmv": _run_csr_spmv,
@@ -941,6 +1630,16 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "greedy_nms": _run_nms,
     "roi_align": _run_roi_align,
     "barrier_option": _run_monte_carlo,
+    "nonzero_compact": _run_nonzero_compact,
+    "unique_consecutive": _run_unique_consecutive,
+    "moe_align_block": _run_moe_align,
+    "nested_ragged_pool": _run_nested_ragged_pool,
+    "adamw_update": _run_adamw,
+    "adafactor_update": _run_adafactor,
+    "reshape_and_cache": _run_reshape_cache,
+    "group_norm_silu_backward": _run_group_norm_silu_backward,
+    "batched_cholesky": _run_cholesky,
+    "batched_householder_qr": _run_householder_qr,
     "variant_gemm_loop_interchange": _run_variant_gemm,
     "variant_softmax_online": _run_variant_softmax,
     "variant_online_softmax_inline": _run_variant_online_softmax,

@@ -32,6 +32,9 @@ unfamiliar=false
 case "${kernel}" in
   histogram | csr_spmv | radix2_fft | bitonic_sort | kmeans_assign | \
   viterbi_decode | smith_waterman | greedy_nms | roi_align | barrier_option | \
+  nonzero_compact | unique_consecutive | moe_align_block | nested_ragged_pool | \
+  adamw_update | adafactor_update | reshape_and_cache | \
+  group_norm_silu_backward | batched_cholesky | batched_householder_qr | \
   variant_gemm_loop_interchange | variant_softmax_online | \
   variant_online_softmax_inline | variant_attention_inline | \
   variant_attention_select | variant_rope_index | variant_swiglu_helper | \
