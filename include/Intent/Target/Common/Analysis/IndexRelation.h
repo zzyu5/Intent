@@ -29,6 +29,9 @@ parseIndexRelation(mlir::Operation &operation);
 mlir::FailureOr<ScalarIndexSource>
 traceScalarIndexSource(mlir::Value value, mlir::Operation &consumer);
 
+mlir::FailureOr<llvm::SmallVector<mlir::Operation *>>
+expandDomainSource(mlir::Value source, mlir::Operation &consumer);
+
 bool hasInBoundsPrecondition(mlir::Value index, mlir::Value view, unsigned axis,
                              mlir::Operation &access);
 

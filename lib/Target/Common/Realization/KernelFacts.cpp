@@ -636,6 +636,32 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   if (failed(addHandler(
+          registry, "intent.domain_product",
+          [&](Operation &operation) -> LogicalResult {
+            auto type = operation.getNumResults() == 1
+                            ? dyn_cast<intent::DomainType>(
+                                  operation.getResult(0).getType())
+                            : intent::DomainType();
+            if (operation.getNumOperands() == 0 || !type)
+              return operation.emitOpError(
+                  "has no canonical domain-product schema");
+            FailureOr<SmallVector<Operation *>> domains =
+                expandDomainSource(operation.getResult(0), operation);
+            if (failed(domains) || domains->size() != operation.getNumOperands() ||
+                type.getSpec() !=
+                    ("domain<product," + std::to_string(domains->size()) + ">"))
+              return operation.emitOpError(
+                  "domain product requires direct rank-one logical domains");
+            for (Operation *domain : *domains)
+              if (!facts.domainSourceAxes.count(domain) &&
+                  !facts.staticDomainExtents.count(domain))
+                return operation.emitOpError(
+                    "domain product contains an unrealized logical domain");
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.partition", [&](Operation &operation) -> LogicalResult {
             if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical partition schema");
@@ -661,21 +687,26 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (operation.getNumOperands() != 1 ||
                 operation.getNumRegions() != 1 ||
                 !llvm::hasSingleElement(operation.getRegion(0)) ||
-                operation.getRegion(0).front().getNumArguments() != 1 ||
                 operation.getNumResults() != 0)
               return operation.emitOpError(
                   "parallel ownership requires one stateless region");
-            Operation *source = operation.getOperand(0).getDefiningOp();
-            if (!source || (!facts.domainSourceAxes.count(source) &&
-                            !facts.partitionDomains.count(source)))
+            FailureOr<SmallVector<Operation *>> domains =
+                expandDomainSource(operation.getOperand(0), operation);
+            if (failed(domains) || domains->empty() ||
+                operation.getRegion(0).front().getNumArguments() !=
+                    domains->size())
               return operation.emitOpError(
-                  "parallel ownership requires a domain or partition");
-            Operation *domain = facts.domainSourceAxes.count(source)
-                                    ? source
-                                    : facts.partitionDomains.lookup(source);
-            if (failed(bindRegionArgumentAxis(operation, 0, *domain, facts)))
-              return failure();
+                  "parallel ownership must match its logical source axes");
+            for (auto [index, domain] : llvm::enumerate(*domains)) {
+              if (!facts.domainSourceAxes.count(domain) &&
+                  !facts.staticDomainExtents.count(domain))
+                return operation.emitOpError(
+                    "parallel ownership requires canonical logical domains");
+              if (failed(bindRegionArgumentAxis(operation, index, *domain, facts)))
+                return failure();
+            }
             facts.parallels.push_back(&operation);
+            facts.parallelDomains[&operation] = std::move(*domains);
             return success();
           })))
     return failure();
@@ -1402,12 +1433,10 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
     consumer.emitOpError("indexes with a value not owned by a parallel region");
     return failure();
   }
-  Operation *source = owner->getOperand(0).getDefiningOp();
-  if (facts.domainSourceAxes.count(source))
-    return source;
-  auto partition = facts.partitionDomains.find(source);
-  if (partition != facts.partitionDomains.end())
-    return partition->second;
+  auto domains = facts.parallelDomains.find(owner);
+  if (domains != facts.parallelDomains.end() &&
+      argument.getArgNumber() < domains->second.size())
+    return domains->second[argument.getArgNumber()];
   consumer.emitOpError("cannot resolve an indexed region to its source domain");
   return failure();
 }
@@ -1422,13 +1451,9 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
     return failure();
 
   llvm::DenseSet<Operation *> programDomains;
-  for (Operation *parallel : facts.parallels) {
-    Operation *source = parallel->getOperand(0).getDefiningOp();
-    auto partition = facts.partitionDomains.find(source);
-    programDomains.insert(partition == facts.partitionDomains.end()
-                              ? source
-                              : partition->second);
-  }
+  for (Operation *parallel : facts.parallels)
+    for (Operation *domain : facts.parallelDomains.lookup(parallel))
+      programDomains.insert(domain);
   for (const auto &entry : facts.valueAxes)
     for (const LogicalAxis &axis : entry.second)
       if (axis.domain && !programDomains.contains(axis.domain) &&

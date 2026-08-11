@@ -529,8 +529,16 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
         domain->getResult(0), kernel, *domain, "TileLang domain tile binding");
     if (failed(valueID))
       return failure();
+    std::string tile = entry.second.getTile().str();
+    if (!entry.second.getReuseWorker() &&
+        entry.second.getTileRole().starts_with("row_vector")) {
+      FailureOr<std::string> dimension = dimensionName(*domain);
+      if (failed(dimension))
+        return entry.second.emitOpError("cannot resolve its row-vector extent");
+      tile = physicalExtent(*dimension);
+    }
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
-        entry.second.getTile().str();
+        tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -549,38 +557,32 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     StringRef name = operation->getName().getStringRef();
     if (name != "intent.parallel" && name != "intent.state_stream")
       continue;
-    Operation *domain = nullptr;
-    if (name == "intent.state_stream")
-      domain = operation->getNumOperands() > 0
-                   ? operation->getOperand(0).getDefiningOp()
-                   : nullptr;
-    else if (operation->getNumOperands() > 0) {
-      Operation *source = operation->getOperand(0).getDefiningOp();
-      if (source && source->getName().getStringRef() == "intent.partition" &&
-          source->getNumOperands() == 1)
-        source = source->getOperand(0).getDefiningOp();
-      domain = source;
-    }
-    FailureOr<int64_t> domainNode =
-        domain ? target::getNodeID(*domain, "region tile indexing")
-               : FailureOr<int64_t>(failure());
-    plan::AxisOp axis = succeeded(domainNode)
-                            ? planIndex.axes.lookup(*domainNode)
-                            : plan::AxisOp();
+    FailureOr<SmallVector<Operation *>> domains =
+        operation->getNumOperands() > 0
+            ? target::expandDomainSource(operation->getOperand(0), *operation)
+            : FailureOr<SmallVector<Operation *>>(failure());
     auto regions = operation->getAttrOfType<ArrayAttr>(
         "intent.region_argument_nodes");
     auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
                                               : ArrayAttr();
     auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
                                                : ArrayAttr();
-    auto argument = arguments && !arguments.empty()
-                        ? dyn_cast<IntegerAttr>(arguments[0])
-                        : IntegerAttr();
-    if (failed(domainNode) || !axis || !argument)
+    if (failed(domains) || !arguments || arguments.size() < domains->size())
       return operation->emitOpError(
           "cannot index its region shape against the TileLang plan");
-    regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
-        axis.getTile().str();
+    for (auto [index, domain] : llvm::enumerate(*domains)) {
+      FailureOr<int64_t> domainNode =
+          target::getNodeID(*domain, "region tile indexing");
+      plan::AxisOp axis = succeeded(domainNode)
+                              ? planIndex.axes.lookup(*domainNode)
+                              : plan::AxisOp();
+      auto argument = dyn_cast<IntegerAttr>(arguments[index]);
+      if (failed(domainNode) || !axis || !argument)
+        return operation->emitOpError(
+            "cannot index its region axis against the TileLang plan");
+      regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
+          axis.getTile().str();
+    }
   }
 
   if (!planIndex.components.reusedAxes.empty()) {
@@ -1773,10 +1775,21 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
         return failure();
       }
       std::string wideBase = addressIndex(base);
+      std::string extent = axis->getTile().str();
+      if (!axis->getReuseWorker() &&
+          axis->getTileRole().starts_with("row_vector")) {
+        FailureOr<Operation *> domain = resolveDomain(indexed, operation);
+        FailureOr<std::string> logical =
+            succeeded(domain) ? dimensionName(**domain)
+                              : FailureOr<std::string>(failure());
+        if (failed(domain) || failed(logical))
+          return failure();
+        extent = physicalExtent(*logical);
+      }
       indices.push_back(axis->isScalar()
                             ? wideBase
                             : wideBase + " : " + wideBase + " + " +
-                                  axis->getTile().str());
+                                  extent);
     }
   }
   std::string result;

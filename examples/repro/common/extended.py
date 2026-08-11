@@ -131,6 +131,10 @@ from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 from kernels.streaming.attention import flash_varlen_gqa_prefill
 from kernels.position.rope import rotary_embedding_flat
+from kernels.pointwise.batched_affine import BATCH as AFFINE_BATCH
+from kernels.pointwise.batched_affine import COLUMNS as AFFINE_COLUMNS
+from kernels.pointwise.batched_affine import ROWS as AFFINE_ROWS
+from kernels.pointwise.batched_affine import batched_row_affine
 from kernels.pointwise.select import COLUMNS as SELECT_COLUMNS
 from kernels.pointwise.select import ROWS as SELECT_ROWS
 from kernels.pointwise.select import alternating_signed_indices
@@ -2109,6 +2113,33 @@ def _run_matrix_transpose(
     )
 
 
+def _run_batched_row_affine(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("batched row affine has no upstream adapter")
+    x = torch.randn(
+        (AFFINE_BATCH, AFFINE_ROWS, AFFINE_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    scale = torch.randn(
+        (AFFINE_BATCH, AFFINE_ROWS), device="cuda", dtype=torch.float32
+    )
+    bias = torch.randn_like(scale)
+    artifact = intent.compile(batched_row_affine, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x, scale, bias),
+        reference=lambda: x * scale[:, :, None] + bias[:, :, None],
+        target_name=target_name,
+        kernel_name="parallel domain product row affine",
+        tolerance=2.0e-6,
+        upstream=None,
+        expected_dtype=torch.float32,
+    )
+
+
 def _run_boolean_reduction(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2363,6 +2394,7 @@ def _run_embedding_backward_atomic(
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "attention_bias": _run_attention_bias,
+    "batched_row_affine": _run_batched_row_affine,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "boolean_reduction": _run_boolean_reduction,

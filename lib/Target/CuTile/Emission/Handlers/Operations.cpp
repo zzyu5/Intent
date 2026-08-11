@@ -24,7 +24,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.domain_product",
+                         "intent.region_end",
                          "intent.assume_in_bounds", "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
@@ -422,29 +423,47 @@ LogicalResult SourceEmitter::emitProgramBindings() {
          ".shape[0])");
     axisIndices[axis.getNode()] = values;
   }
+  for (const auto &entry : planIndex.axesByRole) {
+    plan::AxisOp axis = entry.getValue();
+    if (!entry.getKey().starts_with("lane_") ||
+        !axisIndices.lookup(axis.getNode()).empty())
+      continue;
+    std::string extent = roleDimensions.lookup(entry.getKey());
+    if (extent.empty())
+      return axis.emitOpError("has no cuTile lane extent");
+    axisIndices[axis.getNode()] = "0";
+  }
   return success();
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   if (operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)) ||
-      operation.getRegion(0).front().getNumArguments() != 1)
-    return operation.emitOpError(
-        "parallel ownership requires one region argument");
-  BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-  FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-  if (failed(axis))
-    return failure();
+      operation.getRegion(0).front().getNumArguments() == 0)
+    return operation.emitOpError("parallel ownership requires region arguments");
+  Block &body = operation.getRegion(0).front();
+  SmallVector<plan::AxisOp> axes;
+  for (BlockArgument argument : body.getArguments()) {
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    axes.push_back(*axis);
+  }
 
   if (!planIndex.stages.empty()) {
+    if (axes.size() != 1)
+      return operation.emitOpError(
+          "staged cuTile ownership requires one logical axis");
+    BlockArgument argument = body.getArgument(0);
+    plan::AxisOp axis = axes.front();
     bool outer = false;
     bool member = false;
     for (const auto &entry : stageRaggedRuntime) {
       const RaggedRuntime &runtime = raggedRuntimes[entry.second];
-      outer |= runtime.binding.getOuterNode() == axis->getNode();
+      outer |= runtime.binding.getOuterNode() == axis.getNode();
       member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
         auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-        return node && node.getInt() == axis->getNode();
+        return node && node.getInt() == axis.getNode();
       });
     }
     if (outer == member)
@@ -454,10 +473,15 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   }
 
   if (!planIndex.components.reusedAxes.empty()) {
+    if (axes.size() != 1)
+      return operation.emitOpError(
+          "worker-reused cuTile ownership requires one logical axis");
+    BlockArgument argument = body.getArgument(0);
+    plan::AxisOp axis = axes.front();
     if (&operation != programRoot ||
-        axis->getNode() != planIndex.components.reusedAxes.front().getNode())
+        axis.getNode() != planIndex.components.reusedAxes.front().getNode())
       return operation.emitOpError("is not the worker-reused program axis");
-    int64_t workerAxis = axis->getWorkerAxis();
+    int64_t workerAxis = axis.getWorkerAxis();
     line("program_start = " +
          addressIndex("ct.bid(" + std::to_string(workerAxis) + ")"));
     line("program_step = " +
@@ -467,27 +491,21 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
     line("for " + programIndex +
          " in range(program_start, N_ROWS, program_step):");
     ++indentation;
-    axisIndices[axis->getNode()] = programIndex;
+    axisIndices[axis.getNode()] = programIndex;
     valueNames[argument] = programIndex;
-    return success();
-  }
-
-  if (planIndex.program.getPersistent()) {
-    if (&operation == programRoot && failed(emitProgramBindings()))
-      return failure();
-    std::string value = axisIndices.lookup(axis->getNode());
-    if (value.empty())
-      return axis->emitOpError("has no persistent cuTile program index");
-    valueNames[argument] = value;
     return success();
   }
 
   if (&operation == programRoot && failed(emitProgramBindings()))
     return failure();
-  std::string value = axisIndices.lookup(axis->getNode());
-  if (value.empty())
-    return axis->emitOpError("has no emitted per-axis program index");
-  valueNames[argument] = value;
+  for (auto [argument, axis] : llvm::zip(body.getArguments(), axes)) {
+    std::string value = axisIndices.lookup(axis.getNode());
+    if (value.empty())
+      return axis.emitOpError(planIndex.program.getPersistent()
+                                  ? "has no persistent cuTile program index"
+                                  : "has no emitted per-axis program index");
+    valueNames[argument] = value;
+  }
   return success();
 }
 
@@ -785,6 +803,20 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(axis) || !result || result.getRank() != 1 ||
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
+  if (axis->hasRole("lane") && !axis->getReuseWorker() &&
+      axis->getTileRole().starts_with("row_vector")) {
+    FailureOr<Operation *> domain =
+        resolveDomain(operation.getOperand(0), operation);
+    FailureOr<std::string> logical =
+        succeeded(domain) ? dimensionName(**domain)
+                          : FailureOr<std::string>(failure());
+    if (failed(domain) || failed(logical))
+      return failure();
+    bindResult(operation, 0,
+               addressIndex("ct.arange(" + physicalExtent(*logical) +
+                            ", dtype=ct.int32)"));
+    return success();
+  }
   std::string base = axisIndices.lookup(axis->getNode());
   if (base.empty() && axis->hasRole("lane")) {
     base = "0";

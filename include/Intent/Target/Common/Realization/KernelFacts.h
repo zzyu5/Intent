@@ -69,6 +69,8 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, int64_t> staticDomainExtents;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
   llvm::SmallVector<mlir::Operation *> parallels;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
+      parallelDomains;
   llvm::DenseMap<mlir::Operation *, std::string> boundaryFills;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       boundaryDomains;

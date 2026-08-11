@@ -443,6 +443,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                                    PaddingState &paddingState) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.constant", "intent.dim", "intent.domain",
+                         "intent.domain_product",
                          "intent.region_end", "intent.assume_in_bounds",
                          "intent.partition",
                          "intent.parallel", "intent.ragged",

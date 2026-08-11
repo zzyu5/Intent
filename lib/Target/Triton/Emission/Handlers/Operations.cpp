@@ -41,7 +41,8 @@ StringRef tritonDtype(Type type) {
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.domain_product",
+                         "intent.region_end",
                          "intent.assume_in_bounds", "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
@@ -448,29 +449,49 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     }
     axisIndices[axis.getNode()] = value;
   }
+  for (const auto &entry : planIndex.axesByRole) {
+    plan::AxisOp axis = entry.getValue();
+    if (!entry.getKey().starts_with("lane_") ||
+        !axisIndices.lookup(axis.getNode()).empty())
+      continue;
+    std::string extent = roleDimensions.lookup(entry.getKey());
+    if (extent.empty())
+      return axis.emitOpError("has no Triton lane extent");
+    std::string value = "axis_index_" + std::to_string(axis.getNode());
+    line(value + " = tl.arange(0, " + physicalExtent(extent) + ")");
+    axisIndices[axis.getNode()] = value;
+  }
   return success();
 }
 
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   if (operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)) ||
-      operation.getRegion(0).front().getNumArguments() != 1)
-    return operation.emitOpError(
-        "parallel ownership requires one region argument");
-  BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-  FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-  if (failed(axis))
-    return failure();
+      operation.getRegion(0).front().getNumArguments() == 0)
+    return operation.emitOpError("parallel ownership requires region arguments");
+  Block &body = operation.getRegion(0).front();
+  SmallVector<plan::AxisOp> axes;
+  for (BlockArgument argument : body.getArguments()) {
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    axes.push_back(*axis);
+  }
 
   if (!planIndex.stages.empty()) {
+    if (axes.size() != 1)
+      return operation.emitOpError(
+          "staged Triton ownership requires one logical axis");
+    BlockArgument argument = body.getArgument(0);
+    plan::AxisOp axis = axes.front();
     bool outer = false;
     bool member = false;
     for (const auto &entry : stageRaggedRuntime) {
       const RaggedRuntime &runtime = raggedRuntimes[entry.second];
-      outer |= runtime.binding.getOuterNode() == axis->getNode();
+      outer |= runtime.binding.getOuterNode() == axis.getNode();
       member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
         auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-        return node && node.getInt() == axis->getNode();
+        return node && node.getInt() == axis.getNode();
       });
     }
     if (outer == member)
@@ -480,10 +501,15 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   }
 
   if (!planIndex.components.reusedAxes.empty()) {
+    if (axes.size() != 1)
+      return operation.emitOpError(
+          "worker-reused Triton ownership requires one logical axis");
+    BlockArgument argument = body.getArgument(0);
+    plan::AxisOp axis = axes.front();
     if (&operation != programRoot ||
-        axis->getNode() != planIndex.components.reusedAxes.front().getNode())
+        axis.getNode() != planIndex.components.reusedAxes.front().getNode())
       return operation.emitOpError("is not the worker-reused program axis");
-    int64_t workerAxis = axis->getWorkerAxis();
+    int64_t workerAxis = axis.getWorkerAxis();
     line("program_start = " + addressIndex("tl.program_id(" +
                                             std::to_string(workerAxis) + ")"));
     line("program_step = " + addressIndex("tl.num_programs(" +
@@ -493,27 +519,21 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
          "num_stages=num_stages):");
     ++indentation;
     line(vectorIndex + " = tl.arange(0, BLOCK_SIZE)");
-    axisIndices[axis->getNode()] = programIndex;
+    axisIndices[axis.getNode()] = programIndex;
     valueNames[argument] = programIndex;
-    return success();
-  }
-
-  if (planIndex.program.getPersistent()) {
-    if (&operation == programRoot && failed(emitProgramBindings()))
-      return failure();
-    std::string value = axisIndices.lookup(axis->getNode());
-    if (value.empty())
-      return axis->emitOpError("has no persistent Triton program index");
-    valueNames[argument] = value;
     return success();
   }
 
   if (&operation == programRoot && failed(emitProgramBindings()))
     return failure();
-  std::string value = axisIndices.lookup(axis->getNode());
-  if (value.empty())
-    return axis->emitOpError("has no emitted per-axis program index");
-  valueNames[argument] = value;
+  for (auto [argument, axis] : llvm::zip(body.getArguments(), axes)) {
+    std::string value = axisIndices.lookup(axis.getNode());
+    if (value.empty())
+      return axis.emitOpError(planIndex.program.getPersistent()
+                                  ? "has no persistent Triton program index"
+                                  : "has no emitted per-axis program index");
+    valueNames[argument] = value;
+  }
   return success();
 }
 

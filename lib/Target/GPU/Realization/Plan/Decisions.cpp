@@ -28,16 +28,14 @@ FailureOr<int64_t> valueID(Value value, const target::KernelModel &kernel,
   return target::getValueID(value, kernel, consumer, purpose);
 }
 
-FailureOr<Operation *> ownedDomain(Operation &parallel,
-                                   const target::KernelFacts &facts) {
-  Operation *source = parallel.getOperand(0).getDefiningOp();
-  if (facts.domainSourceAxes.count(source))
-    return source;
-  auto partition = facts.partitionDomains.find(source);
-  if (partition != facts.partitionDomains.end())
-    return partition->second;
-  parallel.emitOpError("has no source domain for physical role assignment");
-  return failure();
+FailureOr<ArrayRef<Operation *>> ownedDomains(
+    Operation &parallel, const target::KernelFacts &facts) {
+  auto found = facts.parallelDomains.find(&parallel);
+  if (found == facts.parallelDomains.end() || found->second.empty()) {
+    parallel.emitOpError("has no source domains for physical role assignment");
+    return failure();
+  }
+  return ArrayRef<Operation *>(found->second);
 }
 
 FailureOr<Operation *> programRoot(const target::KernelFacts &facts) {
@@ -235,18 +233,21 @@ assignAxes(const target::KernelFacts &facts) {
 
   int64_t programOrder = 0;
   for (Operation *parallel : facts.parallels) {
-    FailureOr<Operation *> domain = ownedDomain(*parallel, facts);
-    if (failed(domain))
+    FailureOr<ArrayRef<Operation *>> domains = ownedDomains(*parallel, facts);
+    if (failed(domains))
       return failure();
-    AxisChoice &choice = ensure(*domain);
-    if (!llvm::is_contained(choice.parallels, parallel))
-      choice.parallels.push_back(parallel);
-    if (choice.programOrder)
-      continue;
-    choice.programOrder = programOrder++;
     Operation *source = parallel->getOperand(0).getDefiningOp();
-    choice.tiled = facts.partitionDomains.count(source) != 0;
-    appendRole(choice.roles, "parallel");
+    for (Operation *domain : *domains) {
+      AxisChoice &choice = ensure(domain);
+      if (!llvm::is_contained(choice.parallels, parallel))
+        choice.parallels.push_back(parallel);
+      if (choice.programOrder)
+        continue;
+      choice.programOrder = programOrder++;
+      choice.tiled = domains->size() == 1 &&
+                     facts.partitionDomains.count(source) != 0;
+      appendRole(choice.roles, "parallel");
+    }
   }
   if (programOrder == 0) {
     facts.kernel.entry.emitOpError("has no parallel axis to assign");
@@ -391,8 +392,13 @@ assignAxes(const target::KernelFacts &facts) {
   for (unsigned position : llvm::reverse(scalar))
     assignWorker(position);
 
+  auto ownsOneDomain = [&](Operation *parallel) {
+    auto found = facts.parallelDomains.find(parallel);
+    return found != facts.parallelDomains.end() && found->second.size() == 1;
+  };
   for (AxisChoice &choice : choices)
     choice.reuse = choice.programOrder && !choice.tiled &&
+                   llvm::all_of(choice.parallels, ownsOneDomain) &&
                    hasIndependentLane(choice, facts);
 
   bool persistent = llvm::any_of(facts.contractions, [&](const auto &entry) {
@@ -405,18 +411,19 @@ assignAxes(const target::KernelFacts &facts) {
       if (parent->getName().getStringRef() != "intent.parallel" ||
           parent->getNumOperands() != 1)
         continue;
-      Operation *source = parent->getOperand(0).getDefiningOp();
-      Operation *domain = facts.domainSourceAxes.count(source)
-                              ? source
-                              : facts.partitionDomains.lookup(source);
-      auto found = positions.find(domain);
-      if (found == positions.end() ||
-          !choices[found->second].programOrder ||
-          !owned.insert(found->second).second)
+      auto domains = facts.parallelDomains.find(parent);
+      if (domains == facts.parallelDomains.end())
         continue;
-      ragged |= facts.raggedMembers.count(domain);
-      ++parallel;
-      tiled += choices[found->second].tiled;
+      for (Operation *domain : domains->second) {
+        auto found = positions.find(domain);
+        if (found == positions.end() ||
+            !choices[found->second].programOrder ||
+            !owned.insert(found->second).second)
+          continue;
+        ragged |= facts.raggedMembers.count(domain);
+        ++parallel;
+        tiled += choices[found->second].tiled;
+      }
     }
     return !ragged && parallel >= 3 && tiled >= 2;
   });
@@ -564,8 +571,9 @@ stageMemberDomain(const StageDecision &stage, const target::KernelFacts &facts) 
   auto ownedMember = [&](const target::LogicalAxis &axis) {
     return axis.domain && facts.raggedMembers.count(axis.domain) &&
            llvm::any_of(facts.parallels, [&](Operation *parallel) {
-             FailureOr<Operation *> owned = ownedDomain(*parallel, facts);
-             return succeeded(owned) && *owned == axis.domain;
+             FailureOr<ArrayRef<Operation *>> owned =
+                 ownedDomains(*parallel, facts);
+             return succeeded(owned) && llvm::is_contained(*owned, axis.domain);
            });
   };
   for (const target::LogicalAxis &axis : contract.resultAxes)
@@ -622,10 +630,10 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
       (*root)->getLoc(), i64(builder, *rootNode),
       builder.getBoolAttr(assignments->persistent));
 
-  llvm::StringSet<> implicitContractionExtents;
+  llvm::StringSet<> roundedBlockExtents;
   auto collectImplicitExtent = [&](const target::LogicalAxis &axis) {
     if (!axis.domain && axis.extent != "1")
-      implicitContractionExtents.insert(axis.extent);
+      roundedBlockExtents.insert(axis.extent);
   };
   for (const auto &entry : facts.contractions) {
     const target::ContractionFact &contraction = entry.second;
@@ -636,8 +644,18 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     for (const target::LogicalAxis &axis : contraction.resultAxes)
       collectImplicitExtent(axis);
   }
+  bool hasWorkerReuse = llvm::any_of(
+      assignments->axes, [](const AxisChoice &choice) { return choice.reuse; });
+  for (const AxisChoice &choice : assignments->axes) {
+    if (hasWorkerReuse || !StringRef(choice.tile).starts_with("row_vector"))
+      continue;
+    FailureOr<std::string> extent = sourceDimensionSymbol(*choice.domain, facts);
+    if (failed(extent))
+      return failure();
+    roundedBlockExtents.insert(*extent);
+  }
   SmallVector<std::string> orderedImplicitExtents;
-  for (const auto &extent : implicitContractionExtents)
+  for (const auto &extent : roundedBlockExtents)
     orderedImplicitExtents.push_back(extent.getKey().str());
   llvm::sort(orderedImplicitExtents);
   for (const std::string &extent : orderedImplicitExtents)

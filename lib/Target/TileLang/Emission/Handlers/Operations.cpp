@@ -23,7 +23,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registry,
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
-  for (StringRef name : {"intent.domain", "intent.region_end",
+  for (StringRef name : {"intent.domain", "intent.domain_product",
+                         "intent.region_end",
                          "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
@@ -312,23 +313,32 @@ LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
 LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   if (operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)) ||
-      operation.getRegion(0).front().getNumArguments() != 1)
+      operation.getRegion(0).front().getNumArguments() == 0)
     return operation.emitOpError(
-        "TileLang parallel ownership requires one region argument");
-  BlockArgument argument = operation.getRegion(0).front().getArgument(0);
-  FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
-  if (failed(axis))
-    return failure();
+        "TileLang parallel ownership requires region arguments");
+  Block &body = operation.getRegion(0).front();
+  SmallVector<plan::AxisOp> axes;
+  for (BlockArgument argument : body.getArguments()) {
+    FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
+    if (failed(axis))
+      return failure();
+    axes.push_back(*axis);
+  }
 
   if (!planIndex.stages.empty()) {
+    if (axes.size() != 1)
+      return operation.emitOpError(
+          "staged TileLang ownership requires one logical axis");
+    BlockArgument argument = body.getArgument(0);
+    plan::AxisOp axis = axes.front();
     bool outer = false;
     bool member = false;
     for (const auto &entry : stageRaggedRuntime) {
       const RaggedRuntime &runtime = raggedRuntimes[entry.second];
-      outer |= runtime.binding.getOuterNode() == axis->getNode();
+      outer |= runtime.binding.getOuterNode() == axis.getNode();
       member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
         auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-        return node && node.getInt() == axis->getNode();
+        return node && node.getInt() == axis.getNode();
       });
     }
     if (outer == member)
@@ -379,13 +389,21 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
       axisIndices[memberNode] = "query_start_" + query;
     }
   }
-  std::string value =
-      planIndex.components.orderedRaggedProgramAxes.contains(axis->getNode())
-          ? axisIndices.lookup(axis->getNode())
-          : programBlocks.lookup(axis->getNode());
-  if (value.empty())
-    return axis->emitOpError("has no emitted per-axis program index");
-  valueNames[argument] = value;
+  for (const auto &entry : planIndex.axesByRole) {
+    plan::AxisOp lane = entry.getValue();
+    if (entry.getKey().starts_with("lane_") &&
+        axisIndices.lookup(lane.getNode()).empty())
+      axisIndices[lane.getNode()] = "0";
+  }
+  for (auto [argument, axis] : llvm::zip(body.getArguments(), axes)) {
+    std::string value =
+        planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode())
+            ? axisIndices.lookup(axis.getNode())
+            : programBlocks.lookup(axis.getNode());
+    if (value.empty())
+      return axis.emitOpError("has no emitted per-axis program index");
+    valueNames[argument] = value;
+  }
   return success();
 }
 

@@ -9,6 +9,36 @@ using namespace mlir;
 namespace intent::target {
 namespace {
 
+LogicalResult collectDomainSource(Value source,
+                                  SmallVectorImpl<Operation *> &domains,
+                                  Operation *consumer) {
+  Operation *definition = source.getDefiningOp();
+  auto fail = [&]() {
+    if (consumer)
+      consumer->emitOpError("has an unsupported logical iteration source");
+    return failure();
+  };
+  if (!definition)
+    return fail();
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.domain" || name == "intent.ragged_outer" ||
+      name == "intent.ragged_member") {
+    domains.push_back(definition);
+    return success();
+  }
+  if (name == "intent.partition") {
+    if (definition->getNumOperands() != 1)
+      return fail();
+    return collectDomainSource(definition->getOperand(0), domains, consumer);
+  }
+  if (name != "intent.domain_product" || definition->getNumOperands() == 0)
+    return fail();
+  for (Value operand : definition->getOperands())
+    if (failed(collectDomainSource(operand, domains, consumer)))
+      return failure();
+  return success();
+}
+
 Operation *structuralDomain(Value value) {
   if (Operation *definition = value.getDefiningOp()) {
     StringRef name = definition->getName().getStringRef();
@@ -29,11 +59,11 @@ Operation *structuralDomain(Value value) {
     return owner->getOperand(0).getDefiningOp();
   if (name != "intent.parallel" || owner->getNumOperands() != 1)
     return nullptr;
-  Operation *source = owner->getOperand(0).getDefiningOp();
-  if (source && source->getName().getStringRef() == "intent.partition" &&
-      source->getNumOperands() == 1)
-    source = source->getOperand(0).getDefiningOp();
-  return source;
+  SmallVector<Operation *> domains;
+  if (failed(collectDomainSource(owner->getOperand(0), domains, nullptr)) ||
+      argument.getArgNumber() >= domains.size())
+    return nullptr;
+  return domains[argument.getArgNumber()];
 }
 
 FailureOr<ScalarIndexSource>
@@ -80,6 +110,14 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
 }
 
 } // namespace
+
+FailureOr<SmallVector<Operation *>>
+expandDomainSource(Value source, Operation &consumer) {
+  SmallVector<Operation *> domains;
+  if (failed(collectDomainSource(source, domains, &consumer)))
+    return failure();
+  return domains;
+}
 
 FailureOr<llvm::SmallVector<IndexTerm>>
 parseIndexRelation(Operation &operation) {
