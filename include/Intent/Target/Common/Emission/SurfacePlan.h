@@ -596,6 +596,8 @@ bool deferSharedContractionTransfer(const PlanIndex &index,
   for (mlir::Operation *user : operation.getResult(0).getUsers()) {
     if (user->getName().getStringRef() != "intent.contract")
       continue;
+    if (isStagedContraction(index, user))
+      return true;
     auto node = user->getAttrOfType<mlir::IntegerAttr>("intent.node");
     auto contract = node ? index.contracts.find(node.getInt())
                          : index.contracts.end();
@@ -603,8 +605,7 @@ bool deferSharedContractionTransfer(const PlanIndex &index,
         contract->second.getLhsSpace() != "shared" ||
         contract->second.getRhsSpace() != "shared")
       continue;
-    return !index.components.groups.empty() ||
-           isStagedContraction(index, user);
+    return !index.components.groups.empty();
   }
   return false;
 }

@@ -507,7 +507,10 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     if (extent.empty())
       return axis.emitOpError("has no Triton lane extent");
     std::string value = "axis_index_" + std::to_string(axis.getNode());
-    line(value + " = tl.arange(0, " + physicalExtent(extent) + ")");
+    std::string physical = axis.getTileRole().starts_with("fixed_")
+                               ? axis.getTile().str()
+                               : physicalExtent(extent);
+    line(value + " = tl.arange(0, " + physical + ")");
     axisIndices[axis.getNode()] = value;
   }
   return success();

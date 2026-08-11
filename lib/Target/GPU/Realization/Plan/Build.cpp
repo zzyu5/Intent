@@ -501,10 +501,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   auto sharedContractOperand =
       [isStagedContract, isDirectViewLoad,
        isContractionDerived](Value operand, Operation &contract) {
-    if (!isDirectViewLoad(operand))
-      return false;
     if (isStagedContract(contract))
       return true;
+    if (!isDirectViewLoad(operand))
+      return false;
     if (llvm::all_of(contract.getOperands(), isDirectViewLoad))
       return true;
     return llvm::any_of(contract.getOperands(), [&](Value other) {

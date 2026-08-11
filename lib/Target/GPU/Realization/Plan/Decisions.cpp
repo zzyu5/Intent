@@ -646,10 +646,8 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     for (const target::LogicalAxis &axis : contraction.resultAxes)
       collectImplicitExtent(axis);
   }
-  bool hasWorkerReuse = llvm::any_of(
-      assignments->axes, [](const AxisChoice &choice) { return choice.reuse; });
   for (const AxisChoice &choice : assignments->axes) {
-    if (hasWorkerReuse || !StringRef(choice.tile).starts_with("row_vector"))
+    if (choice.reuse || !StringRef(choice.tile).starts_with("row_vector"))
       continue;
     FailureOr<std::string> extent = sourceDimensionSymbol(*choice.domain, facts);
     if (failed(extent))
