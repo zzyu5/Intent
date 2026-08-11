@@ -231,9 +231,9 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
-          value.getSpace() != "private_scalar_array")
-        return value.emitOpError(
-            "does not bind a private scalar-array logical buffer");
+          (value.getSpace() != "private_scalar_array" &&
+           value.getSpace() != "local_array"))
+        return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
       binding.operation = value;
       index.buffers[value.getNode()] = binding;
@@ -1066,7 +1066,11 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       output << grid[worker];
     }
   }
-  output << ", threads=threads) as ";
+  bool addressableLocalBuffer = llvm::any_of(
+      planIndex.buffers, [](const auto &entry) {
+        return entry.second.getSpace() == "local_array";
+      });
+  output << ", threads=" << (addressableLocalBuffer ? "1" : "threads") << ") as ";
   if (workers == 1)
     output << "pid_worker_0:\n";
   else {

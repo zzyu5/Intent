@@ -214,9 +214,9 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
       if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
-          value.getSpace() != "private_scalar_array")
-        return value.emitOpError(
-            "does not bind a private scalar-array logical buffer");
+          (value.getSpace() != "private_scalar_array" &&
+           value.getSpace() != "local_array"))
+        return value.emitOpError("does not bind a logical buffer residency");
       plan::BufferOp binding;
       binding.operation = value;
       index.buffers[value.getNode()] = binding;

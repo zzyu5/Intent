@@ -807,15 +807,26 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 (tensorIndex &&
                  isa<IntegerType, IndexType>(tensorIndex.getElementType()));
             if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
-                !axis || axis.getInt() < 0 || !integerIndex ||
-                !isa<intent::ViewType>(operation.getOperand(1).getType()))
+                !axis || axis.getInt() < 0 || !integerIndex)
               return operation.emitOpError(
                   "has no canonical in-bounds precondition schema");
-            auto view = cast<intent::ViewType>(operation.getOperand(1).getType());
-            auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
-            if (!tensor || axis.getInt() >= tensor.getRank())
+            Type targetType = operation.getOperand(1).getType();
+            if (auto view = dyn_cast<intent::ViewType>(targetType)) {
+              auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
+              if (!tensor || axis.getInt() >= tensor.getRank())
+                return operation.emitOpError(
+                    "in-bounds precondition axis exceeds its view rank");
+              return success();
+            }
+            Operation *buffer = operation.getOperand(1).getDefiningOp();
+            FailureOr<LogicalBufferInfo> info = buffer
+                                                    ? getLogicalBufferInfo(*buffer)
+                                                    : FailureOr<LogicalBufferInfo>(
+                                                          failure());
+            if (!isa<intent::BufferType>(targetType) || failed(info) ||
+                axis.getInt() >= static_cast<int64_t>(info->shape.size()))
               return operation.emitOpError(
-                  "in-bounds precondition axis exceeds its view rank");
+                  "in-bounds precondition axis exceeds its logical-buffer rank");
             return success();
           })))
     return failure();
@@ -1183,17 +1194,26 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                           ? dyn_cast<BlockArgument>(
                                 operation.getOperand(operandIndex))
                           : BlockArgument();
-      Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
-      Operation *domain = loop && loop->getName().getStringRef() == "intent.for" &&
-                                  iterator.getArgNumber() == 0 &&
-                                  loop->getNumOperands() > 0
-                              ? loop->getOperand(0).getDefiningOp()
-                              : nullptr;
-      auto extent = facts.staticDomainExtents.find(domain);
-      if (!domain || extent == facts.staticDomainExtents.end() ||
-          extent->second > found->second.info.shape.front())
+      if (operandIndex >= operation.getNumOperands())
         return operation.emitOpError(
-            "private logical buffer dynamic index must be a bounded static sequential iterator");
+            "private logical buffer index references a missing operand");
+      Value indexed = operation.getOperand(operandIndex);
+      Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
+      Operation *domain =
+          loop && loop->getName().getStringRef() == "intent.for" &&
+                  iterator.getArgNumber() == 0 && loop->getNumOperands() > 0
+              ? loop->getOperand(0).getDefiningOp()
+              : nullptr;
+      auto extent = facts.staticDomainExtents.find(domain);
+      bool boundedIterator = domain && extent != facts.staticDomainExtents.end() &&
+                             extent->second <= found->second.info.shape.front();
+      if (!boundedIterator) {
+        if (!hasInBoundsPrecondition(indexed, operation.getOperand(0), 0,
+                                     operation))
+          return operation.emitOpError(
+              "private logical buffer dynamic index requires a bounded iterator or preceding in-bounds declaration");
+        found->second.requiresAddressableStorage = true;
+      }
     } else {
       std::optional<int64_t> index = (*relation)[0].staticValues.size() == 1
                                          ? (*relation)[0].staticValues.front()

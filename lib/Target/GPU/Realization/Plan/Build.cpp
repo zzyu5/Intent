@@ -465,7 +465,11 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   "has no canonical private logical-buffer facts");
             builder.create<intent::plan::BufferOp>(
                 operation.getLoc(), i64(builder, *node),
-                string(builder, "private_scalar_array"));
+                string(builder,
+                       facts.logicalBuffers.lookup(&operation)
+                               .requiresAddressableStorage
+                           ? "local_array"
+                           : "private_scalar_array"));
             return success();
           })))
     return failure();

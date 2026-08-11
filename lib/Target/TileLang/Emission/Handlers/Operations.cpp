@@ -317,15 +317,28 @@ LogicalResult SourceEmitter::emitDimension(Operation &operation) {
 LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
   auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
   FailureOr<StringRef> index = lookupValue(operation, 0);
-  FailureOr<ABIView *> view =
-      operation.getNumOperands() == 2
-          ? lookupView(operation.getOperand(1), operation)
-          : FailureOr<ABIView *>(failure());
   if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
-      !axis || axis.getInt() < 0 || failed(index) || failed(view) ||
-      axis.getInt() >= (*view)->tensor.getRank())
+      !axis || axis.getInt() < 0 || failed(index))
     return operation.emitOpError(
         "lacks a mechanical TileLang in-bounds assumption binding");
+  std::string bound;
+  if (isa<intent::ViewType>(operation.getOperand(1).getType())) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(1), operation);
+    if (failed(view) || axis.getInt() >= (*view)->tensor.getRank())
+      return operation.emitOpError(
+          "lacks a mechanical TileLang view-bound assumption");
+    bound = (*view)->shape[axis.getInt()];
+  } else {
+    Operation *buffer = operation.getOperand(1).getDefiningOp();
+    FailureOr<target::LogicalBufferInfo> info =
+        buffer ? target::getLogicalBufferInfo(*buffer)
+               : FailureOr<target::LogicalBufferInfo>(failure());
+    if (failed(info) ||
+        axis.getInt() >= static_cast<int64_t>(info->shape.size()))
+      return operation.emitOpError(
+          "lacks a mechanical TileLang logical-buffer assumption");
+    bound = std::to_string(info->shape[axis.getInt()]);
+  }
 
   Type indexType = operation.getOperand(0).getType();
   std::string expression = index->str();
@@ -356,8 +369,7 @@ LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
   }
 
   line("T.assume(0 <= " + expression + ")");
-  line("T.assume(" + expression + " < " +
-       (*view)->shape[axis.getInt()] + ")");
+  line("T.assume(" + expression + " < " + bound + ")");
   return success();
 }
 
@@ -726,15 +738,23 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
-  if (failed(node) || !binding ||
-      binding.getSpace() != "private_scalar_array" || failed(info) ||
-      info->shape.size() != 1 || failed(initializer))
+  if (failed(node) || !binding || failed(info) || info->shape.size() != 1 ||
+      failed(initializer))
     return operation.emitOpError(
-        "lacks a private scalar-array TileLang buffer binding");
+        "lacks a rank-one TileLang logical-buffer binding");
   std::string dtype = dtypeName(info->elementType, operation);
   if (dtype.empty())
     return failure();
   std::string base = makeResultName(operation, 0);
+  if (binding.getSpace() == "local_array") {
+    line(base + " = T.alloc_local((" + std::to_string(info->shape.front()) +
+         ",), " + dtype + ")");
+    line("T.fill(" + base + ", " + initializer->str() + ")");
+    localBuffers[operation.getResult(0)] = base;
+    return success();
+  }
+  if (binding.getSpace() != "private_scalar_array")
+    return operation.emitOpError("has an unsupported TileLang buffer residency");
   SmallVector<std::string> elements;
   for (int64_t index = 0; index < info->shape.front(); ++index) {
     std::string storage = base + "_" + std::to_string(index);
@@ -747,11 +767,31 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
+  auto local = operation.getNumOperands() > 0
+                   ? localBuffers.find(operation.getOperand(0))
+                   : localBuffers.end();
+  FailureOr<target::LogicalBufferIndex> index =
+      target::getLogicalBufferIndex(operation);
+  if (local != localBuffers.end()) {
+    if (failed(index) || operation.getNumResults() != 1)
+      return operation.emitOpError("lacks an addressable TileLang buffer load");
+    std::string subscript;
+    if (index->constant)
+      subscript = std::to_string(*index->constant);
+    else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      subscript = dynamic->str();
+    }
+    std::string result = makeResultName(operation, 0);
+    line(result + " = " + local->second + "[" + subscript + "]");
+    bindResult(operation, 0, result);
+    return success();
+  }
   auto buffer = operation.getNumOperands() > 0
                     ? scalarBuffers.find(operation.getOperand(0))
                     : scalarBuffers.end();
-  FailureOr<target::LogicalBufferIndex> index =
-      target::getLogicalBufferIndex(operation);
   if (buffer == scalarBuffers.end() || failed(index) ||
       buffer->second.empty() || operation.getNumResults() != 1)
     return operation.emitOpError("lacks a scalarized TileLang buffer load");
@@ -779,12 +819,30 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
 }
 
 LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
-  auto buffer = operation.getNumOperands() > 0
-                    ? scalarBuffers.find(operation.getOperand(0))
-                    : scalarBuffers.end();
+  auto local = operation.getNumOperands() > 0
+                   ? localBuffers.find(operation.getOperand(0))
+                   : localBuffers.end();
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
+  if (local != localBuffers.end()) {
+    if (failed(index) || failed(stored))
+      return operation.emitOpError("lacks an addressable TileLang buffer store");
+    std::string subscript;
+    if (index->constant)
+      subscript = std::to_string(*index->constant);
+    else {
+      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
+      if (failed(dynamic))
+        return failure();
+      subscript = dynamic->str();
+    }
+    line(local->second + "[" + subscript + "] = " + stored->str());
+    return success();
+  }
+  auto buffer = operation.getNumOperands() > 0
+                    ? scalarBuffers.find(operation.getOperand(0))
+                    : scalarBuffers.end();
   if (buffer == scalarBuffers.end() || failed(index) || failed(stored) ||
       buffer->second.empty())
     return operation.emitOpError("lacks a scalarized TileLang buffer store");

@@ -58,6 +58,7 @@ struct ContractionFact {
 struct LogicalBufferFact {
   mlir::Operation *owner = nullptr;
   LogicalBufferInfo info;
+  bool requiresAddressableStorage = false;
 };
 
 struct AccessRangeFact {

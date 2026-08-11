@@ -193,8 +193,8 @@ LogicalResult intent::plan::verifyPaddingFields(
 LogicalResult BufferOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
-  if (getSpace() != "private_scalar_array")
-    return emitOpError("requires private scalar-array residency");
+  if (getSpace() != "private_scalar_array" && getSpace() != "local_array")
+    return emitOpError("has an unsupported logical-buffer residency");
   return success();
 }
 

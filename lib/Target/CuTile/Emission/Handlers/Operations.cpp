@@ -806,6 +806,9 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
   FailureOr<target::LogicalBufferInfo> info =
       target::getLogicalBufferInfo(operation);
   FailureOr<StringRef> initializer = lookupValue(operation, 0);
+  if (binding && binding.getSpace() == "local_array")
+    return operation.emitOpError(
+        "requires mutable addressable local storage absent from the cuTile model");
   if (failed(node) || !binding ||
       binding.getSpace() != "private_scalar_array" || failed(info) ||
       info->shape.size() != 1 || failed(initializer))

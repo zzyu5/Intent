@@ -4,6 +4,7 @@ import ast
 from typing import TYPE_CHECKING
 
 from intent.frontend.semantics import AutoExtent
+from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import DomainFlavor
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import OperationKind
@@ -244,16 +245,23 @@ def _assume_in_bounds(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     )
     if not scalar_index and not tensor_index:
         lowerer.error(bound["index"], "assumed index must be an integer scalar or tensor")
-    if view not in lowerer.view_kinds or not isinstance(view.type, TensorType):
-        lowerer.error(bound["view"], "assumed bound must reference an ABI view")
+    if view in lowerer.view_kinds and isinstance(view.type, TensorType):
+        shape = view.type.shape
+    elif isinstance(view.type, BufferType):
+        shape = view.type.shape
+    else:
+        lowerer.error(
+            bound["view"],
+            "assumed bound must reference an ABI view or logical buffer",
+        )
     axis = require_static_int(lowerer, bound["axis"])
-    if not -len(view.type.shape) <= axis < len(view.type.shape):
-        lowerer.error(bound["axis"], "assumed bound axis is outside the view rank")
+    if not -len(shape) <= axis < len(shape):
+        lowerer.error(bound["axis"], "assumed bound axis is outside the target rank")
     lowerer.emit(
         OperationKind.ASSUME_IN_BOUNDS,
         lowerer.location(node),
         operands=(index, view),
-        attributes={"axis": axis % len(view.type.shape)},
+        attributes={"axis": axis % len(shape)},
     )
     return StaticTuple(())
 
