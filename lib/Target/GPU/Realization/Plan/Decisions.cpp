@@ -285,7 +285,53 @@ assignAxes(const target::KernelFacts &facts) {
     for (Operation *member : entry.second.memberDomains)
       appendRole(ensure(member).roles, "ragged_member");
 
-  unsigned ordinaryTile = 0;
+  SmallVector<std::pair<Operation *, Operation *>> matrixAxes;
+  auto matrixAxis = [](ArrayRef<target::LogicalAxis> axes,
+                       ArrayRef<unsigned> reduced) -> Operation * {
+    for (size_t position = axes.size(); position > 0; --position) {
+      size_t axis = position - 1;
+      if (!llvm::is_contained(reduced, axis) && axes[axis].domain)
+        return axes[axis].domain;
+    }
+    return nullptr;
+  };
+  auto assignMatrixRole = [&](Operation *domain, StringRef role,
+                              Operation &contract) -> LogicalResult {
+    if (!domain)
+      return success();
+    AxisChoice &choice = ensure(domain);
+    StringRef incompatible =
+        role == "contraction_m" ? "contraction_n" : "contraction_m";
+    if (hasRole(choice.roles, incompatible))
+      return contract.emitOpError(
+          "maps one logical axis to incompatible contraction matrix roles");
+    appendRole(choice.roles, role);
+    return success();
+  };
+  for (const auto &entry : facts.contractions) {
+    const target::ContractionFact &contract = entry.second;
+    Operation *m = matrixAxis(contract.lhsAxes, contract.lhsReductionAxes);
+    Operation *n = matrixAxis(contract.rhsAxes, contract.rhsReductionAxes);
+    if (failed(assignMatrixRole(m, "contraction_m", *entry.first)) ||
+        failed(assignMatrixRole(n, "contraction_n", *entry.first)))
+      return failure();
+    if (m && n && m != n)
+      matrixAxes.emplace_back(m, n);
+  }
+  for (auto [m, n] : matrixAxes) {
+    AxisChoice &mChoice = ensure(m);
+    AxisChoice &nChoice = ensure(n);
+    if (mChoice.programOrder && nChoice.programOrder &&
+        *mChoice.programOrder > *nChoice.programOrder)
+      std::swap(mChoice.programOrder, nChoice.programOrder);
+  }
+
+  bool hasMatrixProgramAxes = llvm::any_of(choices, [](const AxisChoice &choice) {
+    return choice.programOrder && choice.tiled &&
+           (hasRole(choice.roles, "contraction_m") ||
+            hasRole(choice.roles, "contraction_n"));
+  });
+  unsigned ordinaryTile = hasMatrixProgramAxes ? 2 : 0;
   unsigned queryTile = 0;
   unsigned raggedTile = 0;
   unsigned streamTile = 0;
@@ -306,6 +352,10 @@ assignAxes(const target::KernelFacts &facts) {
         tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {
         tile = indexedTile("ragged_member", raggedTile);
+      } else if (hasRole(choice.roles, "contraction_m")) {
+        tile = "program_m";
+      } else if (hasRole(choice.roles, "contraction_n")) {
+        tile = "program_n";
       } else if (ordinaryTile == 0) {
         tile = "program_m";
         ++ordinaryTile;
