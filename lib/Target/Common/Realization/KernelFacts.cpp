@@ -675,13 +675,8 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumResults() != 1)
     return operation.emitOpError("pointwise provenance requires one result");
   auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-  if (!result) {
-    FailureOr<ScalarIndexSource> source =
-        traceScalarIndexSource(operation.getResult(0), operation);
-    if (failed(source))
-      return failure();
+  if (!result)
     return success();
-  }
   FailureOr<SmallVector<LogicalAxis>> axes =
       axesFromResultShape(operation, 0, facts);
   if (failed(axes))

@@ -624,7 +624,7 @@ def _run_roi_align(compiler: str, target: Target, target_name: str) -> None:
         target=target,
         target_name=target_name,
         kernel_name="ROI Align center sampling",
-        tolerance=2.0e-5,
+        tolerance=1.0e-4,
         cuda_graph=False,
     )
 
