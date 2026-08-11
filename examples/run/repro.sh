@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|embedding_backward_atomic|atomic_compare_exchange|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|batched_row_affine|quantized_gemm|dual_gemm|weight_only_int4|conv1d|conv2d|selective_scan|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|matrix_transpose|boolean_reduction|value_select|sorted_nucleus_cutoff|insertion_top_k>" >&2
+  echo "usage: $0 <triton|cutile|tilelang> <softmax|layer_norm|layer_norm_backward|embedding_backward_atomic|atomic_compare_exchange|rms_norm|fused_add_rms_norm|dropout_residual_rms_norm|logsumexp|cross_entropy|gemm|bf16_gemm|batched_gemm|batched_row_affine|quantized_gemm|dual_gemm|weight_only_int4|conv1d|conv2d|selective_scan|attention|attention_bias|varlen_attention|varlen_gqa_prefill|varlen_gqa_rope_prefill|paged_attention|online_softmax|moe|grouped_gemm|swiglu_forward|swiglu_backward|shifted_row_copy|grouped_query_head_add|scalar_table_lookup|matrix_transpose|boolean_reduction|value_select|record_fields|sorted_nucleus_cutoff|insertion_top_k>" >&2
   exit 2
 fi
 
@@ -175,6 +175,8 @@ case "${backend}:${kernel}" in
   triton:batched_row_affine | cutile:batched_row_affine | tilelang:batched_row_affine)
     ;;
   triton:atomic_compare_exchange | cutile:atomic_compare_exchange)
+    ;;
+  triton:record_fields | cutile:record_fields | tilelang:record_fields)
     ;;
   *)
     echo "unsupported repro: ${backend}:${kernel}" >&2

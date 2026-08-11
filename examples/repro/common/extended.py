@@ -135,6 +135,8 @@ from kernels.pointwise.batched_affine import BATCH as AFFINE_BATCH
 from kernels.pointwise.batched_affine import COLUMNS as AFFINE_COLUMNS
 from kernels.pointwise.batched_affine import ROWS as AFFINE_ROWS
 from kernels.pointwise.batched_affine import batched_row_affine
+from kernels.pointwise.record import ELEMENTS as RECORD_ELEMENTS
+from kernels.pointwise.record import paired_sum_product
 from kernels.pointwise.select import COLUMNS as SELECT_COLUMNS
 from kernels.pointwise.select import ROWS as SELECT_ROWS
 from kernels.pointwise.select import alternating_signed_indices
@@ -2177,6 +2179,26 @@ def _run_atomic_compare_exchange(
     )
 
 
+def _run_record_fields(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("record fields have no upstream adapter")
+    x = torch.randn((RECORD_ELEMENTS,), device="cuda", dtype=torch.float32)
+    y = torch.randn_like(x)
+    artifact = intent.compile(paired_sum_product, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x, y),
+        reference=lambda: (x + y) + (x * y),
+        target_name=target_name,
+        kernel_name="named SSA record fields",
+        tolerance=2.0e-6,
+        upstream=None,
+        expected_dtype=torch.float32,
+    )
+
+
 def _run_boolean_reduction(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2454,6 +2476,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "paged_attention": _run_paged_attention,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
+    "record_fields": _run_record_fields,
     "scalar_table_lookup": _run_scalar_table_lookup,
     "selective_scan": _run_selective_scan,
     "shifted_row_copy": _run_shifted_row_copy,

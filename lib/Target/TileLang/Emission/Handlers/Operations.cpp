@@ -2,6 +2,7 @@
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Record.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -24,6 +25,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                                        SourceEmitter &emitter) {
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.domain", "intent.domain_product",
+                         "intent.make_record",
                          "intent.region_end",
                          "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
@@ -38,6 +40,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitConstant(op);
+      })) ||
+      failed(addHandler(registry, "intent.extract", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitExtract(op);
       })) ||
       failed(addHandler(
           registry, "intent.parallel",
@@ -252,6 +259,17 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
   }
   line(result + " = " + expression);
   valueNames[operation.getResult(0)] = result;
+  return success();
+}
+
+LogicalResult SourceEmitter::emitExtract(Operation &operation) {
+  FailureOr<Value> field = target::resolveRecordField(operation);
+  if (failed(field))
+    return failure();
+  auto found = valueNames.find(*field);
+  if (found == valueNames.end())
+    return operation.emitOpError("record field has no emitted TileLang SSA value");
+  bindResult(operation, 0, found->second);
   return success();
 }
 

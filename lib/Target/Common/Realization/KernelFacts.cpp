@@ -3,8 +3,10 @@
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <functional>
 #include <limits>
@@ -589,6 +591,43 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "in-bounds precondition axis exceeds its view rank");
             return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.make_record",
+          [&](Operation &operation) -> LogicalResult {
+            auto fields = operation.getAttrOfType<ArrayAttr>("intent.fields");
+            llvm::StringSet<> names;
+            if (operation.getNumResults() != 1 ||
+                !isa<intent::RecordType>(operation.getResult(0).getType()) ||
+                !fields || fields.empty() ||
+                fields.size() != operation.getNumOperands())
+              return operation.emitOpError("has no canonical record schema");
+            for (Attribute attribute : fields) {
+              auto name = dyn_cast<StringAttr>(attribute);
+              if (!name || name.getValue().empty() ||
+                  !names.insert(name.getValue()).second)
+                return operation.emitOpError(
+                    "record fields must be unique non-empty names");
+            }
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.extract",
+          [&](Operation &operation) -> LogicalResult {
+            FailureOr<Value> field = resolveRecordField(operation);
+            if (failed(field))
+              return failure();
+            if (!isa<RankedTensorType>(field->getType()))
+              return success();
+            auto axes = facts.valueAxes.find(*field);
+            if (axes == facts.valueAxes.end())
+              return operation.emitOpError(
+                  "tensor record field has no logical-axis provenance");
+            return bindResultAxes(operation, 0, axes->second, facts);
           })))
     return failure();
 
