@@ -39,7 +39,7 @@ grouped_gemm,empty_groups,E,pass,0.0850,0.0893,,,E,pass,0.0513,0.0555,,,E,pass,0
 swiglu_forward,default,K,pass,0.2328,0.2371,0.2273,0.2294,K,pass,0.2409,0.2438,0.2447,0.2461,K,pass,0.2882,0.2911,,
 swiglu_backward,default,K,pass,0.1113,0.1135,0.1094,0.1115,K,pass,0.1162,0.1188,,,K,pass,0.1119,0.1138,,
 shifted_row_copy,default,K,pass,0.0220,0.0241,,,K,pass,0.0220,0.0240,,,K,pass,0.0220,0.0243,,
-grouped_query_head_add,default,K,pass,0.0041,0.0061,,,K,pass,0.0036,0.0056,,,,downstream_fail,,,,
+grouped_query_head_add,default,K,pass,0.0041,0.0061,,,K,pass,0.0036,0.0056,,,,unsupported,,,,
 scalar_table_lookup,default,K,pass,0.0404,0.0430,,,K,pass,0.0568,0.0589,,,K,pass,0.0430,0.0452,,
 matrix_transpose,default,K,pass,0.0922,0.0944,,,K,pass,0.0937,0.0963,,,K,pass,0.6057,0.6106,,
 boolean_reduction,default,K,pass,0.0036,0.0055,,,K,pass,0.0034,0.0044,,,K,pass,9.2251,9.2525,,

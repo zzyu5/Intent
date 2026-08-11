@@ -985,6 +985,14 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                                : cast<RankedTensorType>(
                                      operation.getResult(0).getType())
                                      .getElementType();
+  FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
+  if (failed(derivedScalar))
+    return failure();
+  if (!scalarResult && resultElementType.isF16() && *derivedScalar &&
+      boundary.getCheckBounds() && boundary.getPadding() != "none")
+    return operation.emitOpError(
+        "requires conditional float16 padding for a transformed scalar index; "
+        "TileLang 0.1.13 cannot lower this fragment path");
   StringRef zeroFill = isa<IntegerType, IndexType>(resultElementType) ? "0"
                                                                       : "0.0";
   if (failed(physicalFill))
