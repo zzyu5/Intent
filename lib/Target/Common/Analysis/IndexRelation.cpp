@@ -57,6 +57,13 @@ Operation *structuralDomain(Value value) {
   if (name == "intent.for" && argument.getArgNumber() == 0 &&
       owner->getNumOperands() > 0)
     return owner->getOperand(0).getDefiningOp();
+  if (name == "intent.ordered" && owner->getNumOperands() > 0) {
+    SmallVector<Operation *> domains;
+    if (failed(collectDomainSource(owner->getOperand(0), domains, nullptr)) ||
+        argument.getArgNumber() >= domains.size())
+      return nullptr;
+    return domains[argument.getArgNumber()];
+  }
   if (name != "intent.parallel" || owner->getNumOperands() != 1)
     return nullptr;
   SmallVector<Operation *> domains;

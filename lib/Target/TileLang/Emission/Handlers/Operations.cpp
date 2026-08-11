@@ -66,6 +66,14 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
             return emitter.selectOperation(op) ? emitter.leaveFor(op) : success();
           })) ||
       failed(addHandler(
+          registry, "intent.ordered",
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
+          },
+          [&](Operation &op) {
+            return emitter.selectOperation(op) ? emitter.leaveFor(op) : success();
+          })) ||
+      failed(addHandler(
           registry, "intent.if",
           [&](Operation &op) {
             return emitter.selectOperation(op) ? emitter.enterIf(op) : success();
@@ -434,7 +442,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
   }
   for (const auto &entry : planIndex.axesByRole) {
     plan::AxisOp lane = entry.getValue();
-    if (entry.getKey().starts_with("lane_") &&
+    if (entry.getKey().starts_with("lane_") && !lane.hasRole("ordered") &&
         axisIndices.lookup(lane.getNode()).empty())
       axisIndices[lane.getNode()] = "0";
   }
@@ -458,30 +466,18 @@ LogicalResult SourceEmitter::leaveParallel(Operation &operation) {
 
 LogicalResult SourceEmitter::enterFor(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "for emission");
-  Operation *domain = operation.getNumOperands() > 0
-                          ? operation.getOperand(0).getDefiningOp()
-                          : nullptr;
-  if (failed(node) || !domain ||
-      domain->getName().getStringRef() != "intent.domain" ||
-      domain->getNumOperands() < 2 || operation.getNumRegions() != 1 ||
+  FailureOr<SmallVector<Operation *>> domains =
+      operation.getNumOperands() > 0
+          ? target::expandDomainSource(operation.getOperand(0), operation)
+          : FailureOr<SmallVector<Operation *>>(failure());
+  bool ordered = operation.getName().getStringRef() == "intent.ordered";
+  if (failed(node) || failed(domains) || domains->empty() ||
+      (!ordered && domains->size() != 1) || operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang sequential loop");
   Block &body = operation.getRegion(0).front();
-  std::string stop;
-  Operation *stopDefinition = domain->getOperand(1).getDefiningOp();
-  auto stopLiteral = stopDefinition
-                         ? stopDefinition->getAttrOfType<IntegerAttr>("intent.value")
-                         : IntegerAttr();
-  if (stopDefinition &&
-      stopDefinition->getName().getStringRef() == "intent.constant" &&
-      stopLiteral)
-    stop = std::to_string(stopLiteral.getInt());
-  else {
-    auto found = valueNames.find(domain->getOperand(1));
-    if (found == valueNames.end())
-      return operation.emitOpError("has no emitted TileLang loop bound");
-    stop = found->second;
-  }
+  if (body.getNumArguments() != domains->size() + operation.getNumResults())
+    return operation.emitOpError("does not match its TileLang sequential axes");
   SmallVector<std::string> carriers;
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
     FailureOr<StringRef> initial = lookupValue(operation, index + 1);
@@ -493,13 +489,34 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     line(carrier + " = T.alloc_local((1,), " + dtype + ")");
     line(carrier + "[0] = " + initial->str());
     carriers.push_back(carrier);
-    valueNames[body.getArgument(index + 1)] = carrier + "[0]";
+    valueNames[body.getArgument(domains->size() + index)] = carrier + "[0]";
   }
   loopCarriers[&operation] = carriers;
-  std::string iterator = makeRegionArgumentName(operation, 0);
-  valueNames[body.getArgument(0)] = iterator;
-  line("for " + iterator + " in T.serial(" + stop + "):");
-  ++indentation;
+  for (auto [index, domain] : llvm::enumerate(*domains)) {
+    if (!domain || domain->getName().getStringRef() != "intent.domain" ||
+        domain->getNumOperands() < 2)
+      return operation.emitOpError("has a non-canonical TileLang loop axis");
+    Operation *stopDefinition = domain->getOperand(1).getDefiningOp();
+    auto stopLiteral =
+        stopDefinition
+            ? stopDefinition->getAttrOfType<IntegerAttr>("intent.value")
+            : IntegerAttr();
+    std::string stop;
+    if (stopDefinition &&
+        stopDefinition->getName().getStringRef() == "intent.constant" &&
+        stopLiteral) {
+      stop = std::to_string(stopLiteral.getInt());
+    } else {
+      auto found = valueNames.find(domain->getOperand(1));
+      if (found == valueNames.end())
+        return operation.emitOpError("has no emitted TileLang loop bound");
+      stop = found->second;
+    }
+    std::string iterator = makeRegionArgumentName(operation, index);
+    valueNames[body.getArgument(index)] = iterator;
+    line("for " + iterator + " in T.serial(" + stop + "):");
+    ++indentation;
+  }
   return success();
 }
 
@@ -507,7 +524,11 @@ LogicalResult SourceEmitter::leaveFor(Operation &operation) {
   auto carriers = loopCarriers.find(&operation);
   if (carriers == loopCarriers.end())
     return operation.emitOpError("has no active TileLang sequential loop");
-  --indentation;
+  FailureOr<SmallVector<Operation *>> domains =
+      target::expandDomainSource(operation.getOperand(0), operation);
+  if (failed(domains) || domains->empty())
+    return failure();
+  indentation -= domains->size();
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     bindResult(operation, index, carriers->second[index] + "[0]");
   return success();
@@ -596,7 +617,7 @@ LogicalResult SourceEmitter::emitYield(Operation &operation) {
   if (!owner)
     return operation.emitOpError("has no structured-control owner");
   StringRef name = owner->getName().getStringRef();
-  if (name == "intent.for") {
+  if (name == "intent.for" || name == "intent.ordered") {
     auto carriers = loopCarriers.find(owner);
     if (carriers == loopCarriers.end() ||
         carriers->second.size() != operation.getNumOperands())

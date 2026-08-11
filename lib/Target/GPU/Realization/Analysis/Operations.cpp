@@ -231,7 +231,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                          "intent.region_end",
                          "intent.assume_in_bounds",
                          "intent.partition", "intent.parallel",
-                         "intent.for", "intent.if", "intent.while",
+                         "intent.for", "intent.ordered", "intent.if", "intent.while",
                          "intent.condition", "intent.buffer",
                          "intent.make_record", "intent.extract",
                          "intent.buffer_load", "intent.buffer_store",

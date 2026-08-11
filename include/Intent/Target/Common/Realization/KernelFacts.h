@@ -78,7 +78,8 @@ struct KernelFacts {
   llvm::StringMap<LogicalAxis> axisLabels;
   llvm::DenseSet<mlir::Operation *> vectorDomains;
   llvm::DenseSet<mlir::Operation *> contractionDomains;
-  llvm::DenseSet<mlir::Operation *> orderedStreamDomains;
+  llvm::DenseSet<mlir::Operation *> orderedDomains;
+  llvm::DenseSet<mlir::Operation *> serialLoopDomains;
   llvm::DenseMap<mlir::Operation *, int64_t> orderedStreamFixedExtents;
   llvm::DenseMap<mlir::Operation *, StateStreamFact> stateStreams;
   llvm::DenseMap<mlir::Operation *, RaggedRelationFact> raggedRelations;

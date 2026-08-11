@@ -116,6 +116,10 @@ from kernels.sampling.top_k import insertion_top_k
 from kernels.streaming.online_softmax import COLUMNS as ONLINE_COLUMNS
 from kernels.streaming.online_softmax import ROWS as ONLINE_ROWS
 from kernels.streaming.online_softmax import streamed_online_softmax
+from kernels.streaming.ordered_prefix import BATCH as ORDERED_PREFIX_BATCH
+from kernels.streaming.ordered_prefix import COLUMNS as ORDERED_PREFIX_COLUMNS
+from kernels.streaming.ordered_prefix import ROWS as ORDERED_PREFIX_ROWS
+from kernels.streaming.ordered_prefix import ordered_product_prefix
 from kernels.streaming.attention import BATCH as ATTENTION_BATCH
 from kernels.streaming.attention import HEADS as ATTENTION_HEADS
 from kernels.streaming.attention import HEAD_DIMENSION
@@ -2236,6 +2240,30 @@ def _run_scalar_while(
     )
 
 
+def _run_ordered_prefix(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("ordered prefix has no upstream adapter")
+    x = torch.randn(
+        (ORDERED_PREFIX_BATCH, ORDERED_PREFIX_ROWS, ORDERED_PREFIX_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.01
+    artifact = intent.compile(ordered_product_prefix, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(x,),
+        reference=lambda: torch.cumsum(x.flatten(1), dim=1).reshape_as(x),
+        target_name=target_name,
+        kernel_name="ordered Cartesian prefix",
+        tolerance=2.0e-5,
+        upstream=None,
+        expected_dtype=torch.float32,
+        cuda_graph=False,
+    )
+
+
 def _run_boolean_reduction(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2510,6 +2538,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "logsumexp": _run_logsumexp,
     "matrix_transpose": _run_matrix_transpose,
     "online_softmax": _run_online_softmax,
+    "ordered_prefix": _run_ordered_prefix,
     "paged_attention": _run_paged_attention,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,

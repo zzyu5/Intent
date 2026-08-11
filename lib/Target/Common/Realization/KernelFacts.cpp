@@ -750,42 +750,62 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.for", [&](Operation &operation) -> LogicalResult {
-            Operation *domain = operation.getNumOperands() > 0
+  auto analyzeSequentialLoop = [&](Operation &operation) -> LogicalResult {
+            bool ordered =
+                operation.getName().getStringRef() == "intent.ordered";
+            FailureOr<SmallVector<Operation *>> domains =
+                operation.getNumOperands() > 0
+                    ? expandDomainSource(operation.getOperand(0), operation)
+                    : FailureOr<SmallVector<Operation *>>(failure());
+            Operation *source = operation.getNumOperands() > 0
                                     ? operation.getOperand(0).getDefiningOp()
                                     : nullptr;
-            if (!domain ||
-                (!facts.domainSourceAxes.count(domain) &&
-                 !facts.staticDomainExtents.count(domain)) ||
+            if (failed(domains) || domains->empty() ||
+                (!ordered &&
+                 (domains->size() != 1 || !source ||
+                  source->getName().getStringRef() != "intent.domain")) ||
                 operation.getNumRegions() != 1 ||
                 !llvm::hasSingleElement(operation.getRegion(0)) ||
                 operation.getNumOperands() != operation.getNumResults() + 1 ||
                 operation.getRegion(0).front().getNumArguments() !=
-                    operation.getNumResults() + 1 ||
-                !isa<intent::LogicalIndexType>(
-                    operation.getRegion(0).front().getArgument(0).getType()))
+                    operation.getNumResults() + domains->size())
               return operation.emitOpError(
-                  "has no canonical sequential-for schema");
+                  "has no canonical sequential-loop schema");
+            for (auto [index, domain] : llvm::enumerate(*domains)) {
+              if ((!facts.domainSourceAxes.count(domain) &&
+                   !facts.staticDomainExtents.count(domain)) ||
+                  !isa<intent::LogicalIndexType>(
+                      operation.getRegion(0).front().getArgument(index).getType()) ||
+                  failed(bindRegionArgumentAxis(operation, index, *domain, facts)))
+                return operation.emitOpError(
+                    "sequential loop has an unrealized logical axis");
+            }
             Operation &terminator = operation.getRegion(0).front().back();
             if (terminator.getName().getStringRef() != "intent.yield" ||
                 terminator.getNumOperands() != operation.getNumResults())
               return operation.emitOpError(
-                  "sequential for must yield every carried value");
+                  "sequential loop must yield every carried value");
             for (unsigned index = 0; index < operation.getNumResults(); ++index) {
               Type initial = operation.getOperand(index + 1).getType();
               Type argument = operation.getRegion(0).front()
-                                  .getArgument(index + 1)
+                                  .getArgument(domains->size() + index)
                                   .getType();
               Type result = operation.getResult(index).getType();
               if (!initial.isIntOrIndexOrFloat() || initial != argument ||
                   initial != result ||
                   terminator.getOperand(index).getType() != result)
                 return operation.emitOpError(
-                    "sequential for currently requires scalar type-stable carried values");
+                    "sequential loop currently requires scalar type-stable carried values");
             }
+            if (ordered)
+              for (Operation *domain : *domains) {
+                facts.orderedDomains.insert(domain);
+                facts.serialLoopDomains.insert(domain);
+              }
             return success();
-          })))
+          };
+  if (failed(addHandler(registry, "intent.for", analyzeSequentialLoop)) ||
+      failed(addHandler(registry, "intent.ordered", analyzeSequentialLoop)))
     return failure();
 
   if (failed(addHandler(
@@ -1432,7 +1452,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         facts.valueAxes[operation.getResult(index)] = axes->second;
       }
     }
-    facts.orderedStreamDomains.insert(axisDomain);
+    facts.orderedDomains.insert(axisDomain);
     facts.stateStreams[&operation] = std::move(fact);
     return success();
   };
@@ -1546,6 +1566,15 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
     consumer.emitOpError("cannot resolve a sequential for to its source domain");
     return failure();
   }
+  if (owner && owner->getName().getStringRef() == "intent.ordered" &&
+      owner->getNumOperands() > 0) {
+    FailureOr<SmallVector<Operation *>> domains =
+        expandDomainSource(owner->getOperand(0), consumer);
+    if (succeeded(domains) && argument.getArgNumber() < domains->size())
+      return (*domains)[argument.getArgNumber()];
+    consumer.emitOpError("cannot resolve an ordered loop to its source domain");
+    return failure();
+  }
   if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
       owner->getNumOperands() != 1) {
     consumer.emitOpError("indexes with a value not owned by a parallel region");
@@ -1575,7 +1604,7 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
   for (const auto &entry : facts.valueAxes)
     for (const LogicalAxis &axis : entry.second)
       if (axis.domain && !programDomains.contains(axis.domain) &&
-          !facts.orderedStreamDomains.contains(axis.domain) &&
+          !facts.orderedDomains.contains(axis.domain) &&
           !facts.contractionDomains.contains(axis.domain))
         facts.vectorDomains.insert(axis.domain);
   return success();

@@ -158,7 +158,7 @@ bool hasIndependentLane(const AxisChoice &choice,
   };
   auto usable = [&](Operation *domain) {
     return domain != choice.domain && facts.vectorDomains.contains(domain) &&
-           !facts.orderedStreamDomains.contains(domain) &&
+           !facts.orderedDomains.contains(domain) &&
            !facts.contractionDomains.contains(domain);
   };
   for (const auto &entry : facts.boundaryDomains) {
@@ -254,7 +254,7 @@ assignAxes(const target::KernelFacts &facts) {
     return failure();
   }
 
-  for (Operation *domain : facts.orderedStreamDomains)
+  for (Operation *domain : facts.orderedDomains)
     appendRole(ensure(domain).roles, "ordered");
   for (Operation *domain : facts.contractionDomains)
     appendRole(ensure(domain).roles, "reduction");
@@ -295,7 +295,9 @@ assignAxes(const target::KernelFacts &facts) {
       }
     } else if (hasRole(choice.roles, "ordered")) {
       auto fixed = facts.orderedStreamFixedExtents.find(choice.domain);
-      choice.tile = fixed != facts.orderedStreamFixedExtents.end()
+      choice.tile = facts.serialLoopDomains.contains(choice.domain)
+                        ? "one"
+                    : fixed != facts.orderedStreamFixedExtents.end()
                         ? "fixed_" + std::to_string(fixed->second)
                     : hasIndirectRaggedMembership(choice.domain, facts)
                         ? "one"
