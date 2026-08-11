@@ -21,7 +21,7 @@ def shifted_row_copy(
     M, N = x.shape
     features = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        shifted_row = row + 1
+        shifted_row = ((row + 1) % -M) % M
         output[row, features] = x[shifted_row, features]
 
 
@@ -34,7 +34,10 @@ def grouped_query_head_add(
     HQ, N = query.shape
     tokens = I.domain(0, N)
     for query_head in I.parallel(I.domain(0, HQ)):
-        key_head = query_head // GQA_HEAD_GROUP
+        key_head = (
+            (query_head - GQA_QUERY_HEADS) // GQA_HEAD_GROUP
+            + GQA_KEY_HEADS
+        )
         output[query_head, tokens] = (
             query[query_head, tokens] + key[key_head, tokens]
         )

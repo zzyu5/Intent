@@ -41,16 +41,15 @@ def weight_only_int4_matmul(
                         I.i32,
                     )
                     packed = packed_weight[packed_indices, column_region]
-                    unpacked = (packed >> shifts[:, None]) & 15
+                    nibble = (packed >> shifts[:, None]) & 15
+                    sign = -((nibble & 8) << 1)
+                    unpacked = nibble + sign
                     group_indices = k_indices // GROUP_SIZE
                     group_scales = scales[group_indices, column_region]
-                    dequantized = I.cast(unpacked, I.f32) * I.cast(
-                        group_scales,
-                        I.f32,
-                    )
+                    dequantized = I.cast(unpacked, I.f16) * group_scales
                     partial = I.contract(
                         activation[row_region, k_region],
-                        I.cast(dequantized, I.f16),
+                        dequantized,
                         reduce=((1, 0),),
                         acc_dtype=I.f32,
                     )

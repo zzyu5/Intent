@@ -384,8 +384,8 @@ def _run_weight_only_int4(
         (W4_M, W4_K), device="cuda", dtype=torch.float16
     ) * 0.05
     quantized = torch.randint(
-        0,
-        16,
+        -8,
+        8,
         (W4_K, W4_N),
         device="cuda",
         dtype=torch.int32,
@@ -395,7 +395,7 @@ def _run_weight_only_int4(
         device="cuda",
         dtype=torch.int32,
     )
-    unsigned = quantized
+    unsigned = quantized & 15
     for lane in range(W4_PACK_FACTOR):
         packed |= unsigned[lane::W4_PACK_FACTOR] << (4 * lane)
     scales = (
@@ -425,7 +425,7 @@ def _run_weight_only_int4(
         arguments=(activation, packed, scales),
         reference=reference,
         target_name=target_name,
-        kernel_name="W4A16 groupwise matmul",
+        kernel_name="signed W4A16 groupwise matmul",
         tolerance=4.0e-2,
         upstream=upstream,
         expected_dtype=torch.float16,
@@ -2092,7 +2092,7 @@ def _run_shifted_row_copy(
     _compare(
         artifact=artifact,
         arguments=(x,),
-        reference=lambda: torch.cat((x[1:], torch.zeros_like(x[:1])), dim=0),
+        reference=lambda: torch.cat((x[1:], x[:1]), dim=0),
         target_name=target_name,
         kernel_name="derived scalar offset index",
         tolerance=0.0,
