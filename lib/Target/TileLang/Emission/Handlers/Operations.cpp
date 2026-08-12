@@ -1037,10 +1037,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return failure();
   auto accessRanges =
       target::emission::accessRangesForTransfer(planIndex, *node);
-  if (accessRanges.size() > 1)
-    return operation.emitOpError(
-        "has multiple affine access ranges; TileLang cannot project their "
-        "joint footprint as one parallel fragment");
+  bool serialJointFootprint = accessRanges.size() > 1;
   bool expanded = !physicalFill->empty();
   FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
   if (failed(tensorIndirect))
@@ -1216,12 +1213,14 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
             ? elementBoundsPredicate(operation, tileIndices, true)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> wholeTile =
-        materializeLogicalBounds && succeeded(tensorIndirect) &&
+        !serialJointFootprint && materializeLogicalBounds &&
+                succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? wholeTileBoundsPredicate(operation, *extents)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> bulkIndices =
-        materializeLogicalBounds && succeeded(tensorIndirect) &&
+        !serialJointFootprint && materializeLogicalBounds &&
+                succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
@@ -1248,8 +1247,18 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                          ? "-T.infinity(T.float32)"
                          : zeroFill;
     auto emitElementwise = [&](bool includePhysicalBounds) {
-      line(loop + "):");
-      ++indentation;
+      unsigned loopDepth = 0;
+      if (serialJointFootprint) {
+        for (auto [axis, extent] : llvm::enumerate(*extents)) {
+          line("for " + tileIndices[axis] + " in T.Serial(" + extent + "):");
+          ++indentation;
+          ++loopDepth;
+        }
+      } else {
+        line(loop + "):");
+        ++indentation;
+        loopDepth = 1;
+      }
       if (materializeLogicalBounds) {
         line("if " + *logicalPredicate + ":");
         ++indentation;
@@ -1273,7 +1282,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         line(target + "] = " + fill.str());
         --indentation;
       }
-      --indentation;
+      indentation -= loopDepth;
       if (boundary.getResultSpace() == "shared")
         line("T.sync_threads()");
     };

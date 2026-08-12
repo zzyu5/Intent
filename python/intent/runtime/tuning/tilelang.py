@@ -54,6 +54,18 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
     roles = frozenset(parameter_map.values())
     for role in roles:
         _role_candidates(role)
+    joint_program_profiles = (
+        (
+            ({"program_m": 8, "program_n": 8}, 1, 128),
+            ({"program_m": 16, "program_n": 16}, 1, 128),
+            ({"program_m": 32, "program_n": 32}, 1, 128),
+            ({"program_m": 128, "program_n": 64}, 2, 128),
+            ({"program_m": 128, "program_n": 128}, 3, 256),
+            ({"program_m": 64, "program_n": 128}, 2, 128),
+        )
+        if {"program_m", "program_n"}.issubset(roles)
+        else ()
+    )
     profiles = (
         (
             ({"stream": 256}, 1, 128),
@@ -74,6 +86,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
                 (128, 128, 1, 128),
             )
         ),
+        joint_program_profiles,
         (
             ({"program_m": 128, "program_n": 64, "reduction": 64, "group_m": 8}, 2, 128),
             ({"program_m": 128, "program_n": 128, "reduction": 32, "group_m": 8}, 3, 256),
