@@ -291,20 +291,15 @@ indexRealization(intent::plan::RealizationOp realization,
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
-    Operation *operation = kernel.nodes.lookup(value.getNode());
-    FailureOr<std::string> role =
-        operation ? target::emission::scanRole(*operation)
-                  : FailureOr<std::string>(failure());
-    FailureOr<int64_t> axis =
-        operation ? target::emission::scanAxis(*operation)
-                  : FailureOr<int64_t>(failure());
-    if (failed(role) || failed(axis) || *role != "scan_inclusive_add")
+    if (value.getSemantics() != "scan_inclusive_add" ||
+        !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;
     binding.operation = value;
     binding.lowering = "tl.cumsum";
     binding.resultSpace = value.getResultSpace().str();
-    binding.axis = *axis;
+    binding.axis = value.getTensorAxis();
+    binding.axisNode = value.getAxisNode();
     index.scans[value.getNode()] = binding;
   }
   for (intent::plan::PointwiseOp value : pointwise) {

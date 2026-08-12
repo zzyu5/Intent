@@ -588,10 +588,12 @@ struct ScanBinding : Binding<intent::plan::ScanOp> {
   std::string lowering;
   std::string resultSpace;
   int64_t axis = -1;
+  int64_t axisNode = -1;
 
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getLowering() const { return lowering; }
   int64_t getAxis() const { return axis; }
+  int64_t getAxisNode() const { return axisNode; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
 };
 

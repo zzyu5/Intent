@@ -137,6 +137,9 @@ def IntentPlan_ReductionOp : IntentPlan_Op<"reduction"> {
 def IntentPlan_ScanOp : IntentPlan_Op<"scan"> {
   let arguments = (ins
     I64Attr:$node,
+    StrAttr:$semantics,
+    I64Attr:$axis_node,
+    I64Attr:$tensor_axis,
     StrAttr:$result_space
   );
   let results = (outs);

@@ -242,8 +242,11 @@ LogicalResult ReductionOp::verify() {
 }
 
 LogicalResult ScanOp::verify() {
-  if (failed(requireNode(*this, getNode())))
+  if (failed(requireNode(*this, getNode())) ||
+      failed(requireNode(*this, getAxisNode())))
     return failure();
+  if (getSemantics() != "scan_inclusive_add")
+    return emitOpError("contains unsupported physical scan semantics");
   if (!isPrivateSpace(getResultSpace()))
     return emitOpError("requires private scan result residency");
   return success();

@@ -628,6 +628,16 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
             if (failed(node) || !axis || axis.getInt() < 0)
               return operation.emitOpError("has no physical scan axis");
+            auto inputAxes = facts.valueAxes.find(operation.getOperand(0));
+            if (inputAxes == facts.valueAxes.end() ||
+                static_cast<size_t>(axis.getInt()) >= inputAxes->second.size() ||
+                !inputAxes->second[axis.getInt()].domain)
+              return operation.emitOpError(
+                  "has no logical domain for its physical scan axis");
+            FailureOr<int64_t> axisNode = target::getNodeID(
+                *inputAxes->second[axis.getInt()].domain, "scan axis binding");
+            if (failed(axisNode))
+              return failure();
             std::optional<std::string> inputPadding =
                 paddingState.paddingOf(operation.getOperand(0));
             std::optional<std::string> identityPadding =
@@ -645,6 +655,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             }
             builder.create<intent::plan::ScanOp>(
                 operation.getLoc(), i64(builder, *node),
+                string(builder, "scan_inclusive_add"), i64(builder, *axisNode),
+                i64(builder, axis.getInt()),
                 string(builder, "private_fragment"));
             return success();
           })))
