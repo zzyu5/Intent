@@ -1739,6 +1739,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "cfg." << parameter.getName().getValue() << ", ";
     output << "),\n";
     output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
+    output << "                single_run_timeout_sec=_TUNE_TIMEOUT,\n";
     output << "            )\n";
     output << "        best = result.best.config\n";
     output << "        _TUNE_CACHE[cache_key] = (best, " << kernelName
