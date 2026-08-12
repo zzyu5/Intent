@@ -25,16 +25,43 @@ class GpuDeviceCapabilities:
 
 
 def resolve_gpu_device(device: int) -> GpuDeviceCapabilities:
+    from cuda.bindings import driver
     import torch
 
     if not torch.cuda.is_available() or device >= torch.cuda.device_count():
         raise RuntimeError("requested CUDA device is unavailable")
-    properties = torch.cuda.get_device_properties(device)
+
+    def require_success(result: tuple[object, ...], operation: str) -> object:
+        status, *values = result
+        if status != driver.CUresult.CUDA_SUCCESS:
+            _, name = driver.cuGetErrorName(status)
+            raise RuntimeError(f"{operation} failed: {name.decode()}")
+        return values[0] if values else None
+
+    require_success(driver.cuInit(0), "cuInit")
+    cuda_device = require_success(driver.cuDeviceGet(device), "cuDeviceGet")
+
+    def attribute(name: object) -> int:
+        value = require_success(
+            driver.cuDeviceGetAttribute(name, cuda_device),
+            f"cuDeviceGetAttribute({name.name})",
+        )
+        return int(value)
+
+    major = attribute(
+        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
+    )
     return GpuDeviceCapabilities(
         device=device,
-        compute_units=properties.multi_processor_count,
-        shared_memory_per_unit=properties.shared_memory_per_multiprocessor,
-        registers_per_unit=properties.regs_per_multiprocessor,
-        matrix_units=properties.major >= 7,
+        compute_units=attribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        ),
+        shared_memory_per_unit=attribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        ),
+        registers_per_unit=attribute(
+            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR
+        ),
+        matrix_units=major >= 7,
         dynamic_vector_width=False,
     )
