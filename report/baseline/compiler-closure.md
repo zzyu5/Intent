@@ -1,5 +1,7 @@
 # Intent Kernel 编译器收官报告
 
+> 本文是 42 个公开 repro 的固定收官快照；当前编译器已经扩展到 89 个 case。请以 `report/compiler-evolution-and-current-state.md` 的统一分析和同目录 `kernel-performance.csv` 的全量数字为准，本文旧数字不滚动覆盖。
+
 ## 结论
 
 当前编译器已经形成一条统一主链：
@@ -210,17 +212,17 @@ cuTile Conv2D 的 autotuner 有 3 个候选成功、9 个候选编译失败或�
 
 同算法、同 kernel 数的 K 项可以判断 generated kernel 与上游 kernel；E/R 只判断对应用户 scope。没有高质量上游的格保持为空，没有用 PyTorch reference 或拼接 adapter 冒充高性能 baseline。
 
-source 中的 causal Conv1D、Mamba chunk scan 与当前 DSL kernel 算法并不相同；前者是 causal 小宽度卷积，后者是多状态、块间编排的扫描。它们继续作为结构参考，但不接成虚假的一对一性能对照。TileLang Conv2D generated 目标本身明确 N/S，也不存在合法的 generated/upstream 同任务比较。
+source 中的 causal Conv1D、Mamba chunk scan 与该快照中的 DSL kernel 算法并不相同；前者是 causal 小宽度卷积，后者是多状态、块间编排的扫描。它们继续作为结构参考，但不接成虚假的一对一性能对照。该快照中的 TileLang Conv2D generated 目标明确 N/S；这一格后来已闭合，当前结果见全量 CSV。
 
-## 六、当前明确边界
+## 六、该快照当时的明确边界
 
 1. **TileLang compare-and-swap：N/S。** 当前 surface 没有可核验的等价 CAS primitive；没有串行或非原子 fallback。
-2. **TileLang Conv2D：N/S。** shared Plan 已有两个 access ranges，但当前 TileLang 不能把它们的联合 footprint 投影成一个并行 fragment；没有为它重新推导布局。
-3. **TileLang LayerNorm backward：下层 FAIL。** source 与四组候选均成功生成，失败发生在 TileLang autotuner benchmark/module load 的 CUDA launch。相同代码在本轮 range-role 收紧前的隔离代码点加上必要 helper 修复后也复现，因此没有证据把它归因为这轮 shared Plan 重构；也没有加入 target hardcode 掩盖失败。
+2. **TileLang Conv2D：当时 N/S。** shared Plan 已有两个 access ranges，但当时 TileLang 不能把它们的联合 footprint 投影；后续以通用串行 joint-footprint 路径闭合正确性。
+3. **TileLang LayerNorm backward：当时下层 FAIL。** source 与四组候选均成功生成，失败发生在 TileLang autotuner benchmark/module load 的 CUDA launch；当前矩阵中该格已经通过。
 4. **cuTile/TileLang 超 32 位外部地址：明确拒绝。** Triton 使用 i64 地址算术并实际访问过元素偏移 `2^31`；另外两个 surface 在当前 tensor descriptor/bulk-copy 合同下于 launch 前拒绝，不会静默回绕。
 5. **TileLang 个别通用原语性能不成立。** `boolean_reduction` 为 9.2236 ms、`matrix_transpose` 为 0.6053 ms，功能正确但明显落后；这是当前下层投影/原语质量，不被写成编译器算法成功的性能结论。
 
-TileLang 仍保留：39 个入口格真实通过，并在 softmax、LayerNorm、scan、dense attention、causal varlen attention 和 grouped GEMM 等结构上形成当前最低值；同时它继续作为抽象线最低的 surface 暴露显式 storage/layout 能力边界。当前没有为它建立第二套 realizer，因此尚未触发“宁可删除后端，也不接受第二个编译器”的条件。
+在该快照中，TileLang 有 39 个入口格真实通过，并在 softmax、LayerNorm、scan、dense attention、causal varlen attention 和 grouped GEMM 等结构上形成最低值；同时它继续作为抽象线最低的 surface 暴露显式 storage/layout 能力边界。项目没有为它建立第二套 realizer。
 
 ## 七、复现口径
 

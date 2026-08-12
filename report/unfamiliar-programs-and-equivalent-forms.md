@@ -7,10 +7,10 @@
 | 检验组 | Triton | cuTile | TileLang | 合计 |
 |---|---:|---:|---:|---:|
 | 第一批 10 个陌生算法 | 10/10 | 10/10 | 9/10 | 29/30 |
-| 10 个已有算法的等价写法 | 10/10 | 10/10 | 9/10 | 29/30 |
+| 10 个已有算法的等价写法 | 10/10 | 10/10 | 10/10 | 30/30 |
 | 第二批 10 个陌生算法 | 10/10 | 8/10 | 9/10 | 27/30 |
 | 10 个算法的等价分解 | 10/10 | 10/10 | 10/10 | 30/30 |
-| 合计 | 40/40 | 38/40 | 37/40 | 115/120 |
+| 合计 | 40/40 | 38/40 | 39/40 | 117/120 |
 
 第二批没有通过的三格都属于整行 scan 的下层编译问题：`nonzero_compact × cuTile`、`unique_consecutive × cuTile` 在 cuTile 编译器的既定限时内未完成，`unique_consecutive × TileLang` 的候选首次 JIT 超过十分钟。三者都已经完成 Kernel MLIR、Physical Plan 和目标源码生成；当前如实记为 `downstream_fail`，没有增加按算子分支，也没有把串行慢路径伪装成支持。
 
@@ -18,11 +18,11 @@
 
 | 状态 | 数量 |
 |---|---:|
-| 数值通过 | 260 |
-| 明确不支持 | 3 |
-| 下层失败 | 4 |
+| 数值通过 | 263 |
+| 明确不支持 | 1 |
+| 下层失败 | 3 |
 
-完整数字在 `report/baseline/kernel-performance.csv`。既有 source baseline 的测试逻辑和数字没有改动；第二批没有可直接拆出的同算法 kernel-only adapter，因此 source 数字留空，不拿 PyTorch reference 或相邻算法冒充上游时间。
+完整数字在 `report/baseline/kernel-performance.csv`。既有 source baseline 的测试逻辑和数字没有改动；第二批没有可直接拆出的同算法 kernel-only adapter，因此 source 数字留空，不拿 PyTorch reference 或相邻算法冒充上游时间。全量另外还剩 `radix2_fft × TileLang` 一格下层失败的旧结论已经由后续共享修复闭合；当前三个失败格全部来自第二批整行 scan。
 
 ## 一、第二批算法是怎样选的
 
@@ -113,7 +113,7 @@ runner 的 `prepare` 在 CUDA start event 之前恢复 AdamW、Adafactor、Chole
 
 ### 整行 scan 的共享 realization 仍然缺一格
 
-两个 compaction 算法把 scan 直接展开为完整行上的顺序递推。Triton 能编译，TileLang 对较小的 nonzero 能编译但代价很高，cuTile 两项都在下层编译限时内失败，TileLang 的 unique 也出现不可接受的首次 JIT 时间。证据指向的是同一个结构问题：当前 Physical Plan 只给出了“整行有序”，没有给出通用的 chunked scan、块内 scan 与块间 carry 组合。
+两个 compaction 算法把 scan 结果保留为完整行 fragment，再由后续 ordered consumer 逐位置提取。Triton 能编译，TileLang 对较小的 nonzero 能编译但代价很高，cuTile 两项都在下层编译限时内失败，TileLang 的 unique 也出现不可接受的首次 JIT 时间。证据指向的是同一个结构问题：当前 Physical Plan 已拥有 scan 的规范语义和逻辑轴，但没有给出通用的 chunked scan、块间 carry 与 consumer/materialization 组合。
 
 这不是 cuTile 或 TileLang 应该各自决定的，也不是 `nonzero` / `unique` 两个算子分支。正确落点只能是共享物理决策：由算法 IR 的 scan 依赖确定顺序语义，由 realizer 选择分块与 carry 结构，再让目标投影原语或显式循环。此轮没有用 target 私有特判绕过，因此三格保留为下层失败。
 

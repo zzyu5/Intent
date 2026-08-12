@@ -2,6 +2,8 @@
 
 ## 结论
 
+本文记录的是 42 个 repro 收官节点的实现过程；当前全量结果已经扩展为 89 个 case，统一结论见 `report/compiler-evolution-and-current-state.md`，固定数字见 `report/baseline/kernel-performance.csv`。
+
 上一轮不是补 baseline，而是围绕三个问题做了五个代码提交：
 
 1. 把“一个逻辑轴只能带一个物理范围”改成同轴多 purpose、多 level 的 Physical Plan；
@@ -102,7 +104,7 @@ realizer 把它们写成绑定具体 transfer/source-axis 的 `intent_plan.range
 ### 2. 三个 target 实际做了什么
 
 - Triton、cuTile 继续发射精确索引张量和边界，把重复地址的合并、缓存与实际搬运交给下层；当前 emitter 没有直接读取 access range 去新建唯一 halo buffer。
-- TileLang 会读取一个 transfer 的 access ranges。单轴 footprint 可以继续投影，因此 Conv1D 通过；两个 access ranges 的联合 footprint 当前不能成为一个 parallel fragment，因此 Conv2D 明确 N/S。
+- TileLang 会读取一个 transfer 的 access ranges。单轴 footprint 继续投影；双 access-range 不能成为一个 parallel fragment，后续实现以通用的串行 joint-footprint 投影保证正确性，因此当前 Conv2D 已可运行，但不是高性能并行 footprint。
 
 本轮曾在 Triton 中显式物化 Conv1D 唯一 halo hull。数值正确，但 p50 从约 `0.0082 ms` 变为约 `0.0102 ms`。这条路径把下层可自行处理的 load 形态提前固定，并造成约 24% 退化，所以没有保留。
 
@@ -260,7 +262,7 @@ Python AST 遇到两者时直接给出带源码位置的诊断。当前 portable
 
 ### 2. 没有发现的错误形态
 
-当前没有发现：
+在该 42-case 节点没有发现：
 
 - 按 kernel 名字选择 realizer 或 emitter；
 - 为 Conv、scan、attention、MoE 单独增加 whole-kernel matcher；
@@ -276,7 +278,7 @@ entry 名只用于 MLIR symbol 与最终 target function name。
 
 **target emitter 仍然较厚。**三个 leaf 中还有 staged workspace、ragged、row mapping、allocation、GEMM primitive、runtime launch 等 target-specific control path。审计没有发现它们重新决定算法或 ownership，但它们也不是简单的静态字段打印器；当前边界更准确地说是“共享决定 + target-specific mechanical projection”。
 
-**TileLang 对 access range 的消费主要表现为能力检查。**它能接受一个 affine access range，遇到两个就明确拒绝；没有在 leaf 中重新推导联合 footprint。Triton/cuTile 则尚未使用 Plan access range 物化独立 halo。
+**TileLang 对 access range 的消费后来补上了联合正确性投影。**多个 affine access ranges 仍不被伪装成一个 parallel fragment，而是按 Plan 给出的联合 footprint 生成串行逐元素搬运；Triton/cuTile 仍把具体合并委托给下层。该路径闭合了功能，不代表跨 target halo 物化已经选优。
 
 ## 九、代码提交边界
 
@@ -290,7 +292,7 @@ entry 名只用于 MLIR symbol 与最终 target function name。
 
 ## 十、验证与当前边界
 
-本轮最后一次全量执行为 42 个公开 repro × 3 个 provider：
+该节点最后一次全量执行为 42 个公开 repro × 3 个 provider；下表是历史快照，不是当前全量矩阵：
 
 | 状态 | 数量 |
 |---|---:|
@@ -298,16 +300,16 @@ entry 名只用于 MLIR symbol 与最终 target function name。
 | 明确 N/S | 2 |
 | 下层运行时 FAIL | 1 |
 
-与本轮直接相关的结果：
+该历史节点与本轮直接相关的结果：
 
 - Conv1D：Triton、cuTile、TileLang PASS；
-- Conv2D：Triton、cuTile PASS，TileLang 对双 access-range footprint 明确 N/S；
+- Conv2D：当时 Triton、cuTile PASS，TileLang 对双 access-range footprint 明确 N/S；该格已在后续通用串行 joint-footprint 投影中闭合；
 - selective scan：三个 provider 的真实双层 traversal PASS；
 - attention/helper：四个 attention 算法保持运行，dense attention 三 provider PASS；
 - negative div/mod：两个真实索引 kernel 三 provider PASS；
 - signed W4A16：三个 provider PASS。
 
-另外两项不是本轮抽象的假成功：
+该历史节点另外两项不是本轮抽象的假成功；其后 LayerNorm backward 已在当前矩阵通过：
 
 - TileLang CAS 因下层无等价 primitive，明确 N/S；
 - TileLang LayerNorm backward 的四个候选均在下层 autotuner benchmark/module load 阶段触发 CUDA launch failure，仍是 FAIL，没有用 target 特判掩盖。

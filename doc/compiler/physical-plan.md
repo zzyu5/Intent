@@ -6,6 +6,8 @@ Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 s
 
 `intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的操作片段与临时值边界。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；Plan 只引用它们，不复制第二份 schema。
 
+Structured primitive 的 binding 必须把 emitter 机械投影所需的规范角色与逻辑轴引用写进 Plan。例如 scan 保存 canonical semantics、logical axis node、tensor axis 与 result residency；target 不得回到 Kernel op 各自重推这些字段。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
+
 `intent_plan.search_space` 保存尚未选择、明确委托给目标后端 tuner 的合法轴和参数角色。Realizer 负责证明候选的结构合法性并给出参数关系；候选值、排序和赢家由 Triton、cuTile 或 TileLang 自带 tuner 决定。源码结构选择不进入 search space。
 
 两类对象不能混用：realization 中不存在“运行时再猜”的字段，search space 也不能改变 ownership、遍历顺序、边界语义或数值语义。
