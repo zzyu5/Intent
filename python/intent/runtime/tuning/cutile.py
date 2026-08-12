@@ -19,6 +19,7 @@ def _configuration(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 512, 1024, 2048),
+        "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (64, 128),
@@ -33,6 +34,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         return candidates
     for base in (
         "stream_contract",
+        "scan",
         "stream",
         "query",
         "ragged_member",
@@ -54,6 +56,11 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
     for role in roles:
         _role_candidates(role)
     profiles = (
+        (
+            ({"scan": 64}, 1, 4),
+            ({"scan": 128}, 1, 2),
+            ({"scan": 256}, 2, 1),
+        ),
         (
             ({"stream": 512}, 1, 4),
             ({"stream": 1024}, 1, 2),

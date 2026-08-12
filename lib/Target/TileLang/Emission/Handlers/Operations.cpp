@@ -316,6 +316,11 @@ LogicalResult SourceEmitter::emitDimension(Operation &operation) {
 
 LogicalResult SourceEmitter::emitAssumeInBounds(Operation &operation) {
   auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  auto producer = operation.getNumOperands() > 0
+                      ? operation.getOperand(0).getDefiningOp()
+                      : nullptr;
+  if (producer && scanProducerOwners.count(producer))
+    return success();
   FailureOr<StringRef> index = lookupValue(operation, 0);
   if (operation.getNumOperands() != 2 || operation.getNumResults() != 0 ||
       !axis || axis.getInt() < 0 || failed(index))
@@ -803,20 +808,19 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
           "lacks a planned TileLang private workspace parameter");
     return success();
   }
-  if (failed(node) || !binding || failed(info) || info->shape.size() != 1 ||
-      failed(initializer))
+  if (failed(node) || !binding || failed(info) || failed(initializer))
     return operation.emitOpError(
-        "lacks a rank-one TileLang logical-buffer binding");
+        "lacks a TileLang logical-buffer binding");
   std::string dtype = dtypeName(info->elementType, operation);
   if (dtype.empty())
     return failure();
   std::string base = makeResultName(operation, 0);
   if (binding.getSpace() == "private_vector") {
-    if (binding.getSpace() == "private_vector" &&
-        !info->elementType.isInteger(1))
-      return operation.emitOpError(
-          "private TileLang vectors currently require bool elements");
-    line(base + " = T.alloc_local((" + std::to_string(info->shape.front()) +
+    FailureOr<int64_t> elements =
+        target::logicalBufferElementCount(*info, operation);
+    if (failed(elements))
+      return failure();
+    line(base + " = T.alloc_local((" + std::to_string(*elements) +
          ",), " + dtype + ")");
     line("T.fill(" + base + ", " + initializer->str() + ")");
     localBuffers[operation.getResult(0)] = base;
@@ -852,19 +856,37 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
   auto local = operation.getNumOperands() > 0
                    ? localBuffers.find(operation.getOperand(0))
                    : localBuffers.end();
+  Operation *localOwner = operation.getNumOperands() > 0
+                              ? operation.getOperand(0).getDefiningOp()
+                              : nullptr;
+  FailureOr<target::LogicalBufferInfo> localInfo =
+      localOwner ? target::getLogicalBufferInfo(*localOwner)
+                 : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> localIndices =
+      succeeded(localInfo)
+          ? target::getLogicalBufferIndices(operation, localInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   if (local != localBuffers.end()) {
-    if (failed(index) || operation.getNumResults() != 1)
+    if (failed(localInfo) || failed(localIndices) || operation.getNumResults() != 1)
       return operation.emitOpError("lacks an addressable TileLang buffer load");
     std::string subscript;
-    if (index->constant)
-      subscript = std::to_string(*index->constant);
-    else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      subscript = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*localIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      subscript = subscript.empty()
+                      ? component
+                      : "(" + subscript + ") * " +
+                            std::to_string(localInfo->shape[axis]) + " + (" +
+                            component + ")";
     }
     std::string result = makeResultName(operation, 0);
     line(result + " = " + local->second + "[" + subscript + "]");
@@ -916,20 +938,38 @@ LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
   auto local = operation.getNumOperands() > 0
                    ? localBuffers.find(operation.getOperand(0))
                    : localBuffers.end();
+  Operation *localOwner = operation.getNumOperands() > 0
+                              ? operation.getOperand(0).getDefiningOp()
+                              : nullptr;
+  FailureOr<target::LogicalBufferInfo> localInfo =
+      localOwner ? target::getLogicalBufferInfo(*localOwner)
+                 : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> localIndices =
+      succeeded(localInfo)
+          ? target::getLogicalBufferIndices(operation, localInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
   if (local != localBuffers.end()) {
-    if (failed(index) || failed(stored))
+    if (failed(localInfo) || failed(localIndices) || failed(stored))
       return operation.emitOpError("lacks an addressable TileLang buffer store");
     std::string subscript;
-    if (index->constant)
-      subscript = std::to_string(*index->constant);
-    else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      subscript = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*localIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      subscript = subscript.empty()
+                      ? component
+                      : "(" + subscript + ") * " +
+                            std::to_string(localInfo->shape[axis]) + " + (" +
+                            component + ")";
     }
     line(local->second + "[" + subscript + "] = " + stored->str());
     return success();
@@ -1037,7 +1077,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return failure();
   auto accessRanges =
       target::emission::accessRangesForTransfer(planIndex, *node);
-  bool serialJointFootprint = accessRanges.size() > 1;
+  if (accessRanges.size() > 1)
+    return operation.emitOpError(
+        "TileLang cannot project a multi-axis checked access footprint as one "
+        "cooperative transfer");
   bool expanded = !physicalFill->empty();
   FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
   if (failed(tensorIndirect))
@@ -1213,14 +1256,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
             ? elementBoundsPredicate(operation, tileIndices, true)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> wholeTile =
-        !serialJointFootprint && materializeLogicalBounds &&
-                succeeded(tensorIndirect) &&
+        materializeLogicalBounds && succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? wholeTileBoundsPredicate(operation, *extents)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> bulkIndices =
-        !serialJointFootprint && materializeLogicalBounds &&
-                succeeded(tensorIndirect) &&
+        materializeLogicalBounds && succeeded(tensorIndirect) &&
                 !*tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
@@ -1247,18 +1288,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                          ? "-T.infinity(T.float32)"
                          : zeroFill;
     auto emitElementwise = [&](bool includePhysicalBounds) {
-      unsigned loopDepth = 0;
-      if (serialJointFootprint) {
-        for (auto [axis, extent] : llvm::enumerate(*extents)) {
-          line("for " + tileIndices[axis] + " in T.Serial(" + extent + "):");
-          ++indentation;
-          ++loopDepth;
-        }
-      } else {
-        line(loop + "):");
-        ++indentation;
-        loopDepth = 1;
-      }
+      line(loop + "):");
+      ++indentation;
+      unsigned loopDepth = 1;
       if (materializeLogicalBounds) {
         line("if " + *logicalPredicate + ":");
         ++indentation;
@@ -1448,23 +1480,43 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
   FailureOr<StringRef> operand = lookupValue(operation, 0);
   bool argReduction =
       binding && binding.getLowering() == "T.reduce_max_with_index";
+  bool logicalReduction = binding &&
+                          (binding.getLowering() == "T.reduce_any_i32" ||
+                           binding.getLowering() == "T.reduce_all_i32");
   unsigned expectedResults = argReduction ? 2 : 1;
   if (failed(node) || !binding || failed(operand) ||
       operation.getNumResults() != expectedResults)
     return operation.emitOpError("lacks a TileLang reduction binding");
-  bool logicalReduction = binding.getLowering() == "T.any_of" ||
-                          binding.getLowering() == "T.all_of";
   if (logicalReduction) {
-    auto input = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
-    if (!input || input.getRank() != 1 || binding.getAxis() != 0 ||
+    auto inputType = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+    if (!inputType || inputType.getRank() != 1 || binding.getAxis() != 0 ||
         isa<RankedTensorType>(operation.getResult(0).getType()))
       return operation.emitOpError(
-          "TileLang any/all projection requires a one-dimensional input "
+          "TileLang logical reduction requires a one-dimensional input "
           "reduced to a scalar");
-    std::string result = makeResultName(operation, 0);
-    line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
-         ")");
-    valueNames[operation.getResult(0)] = result;
+    auto inputResult = dyn_cast<OpResult>(operation.getOperand(0));
+    FailureOr<SmallVector<std::string>> extents =
+        inputResult
+            ? tensorExtents(*inputResult.getOwner(), inputResult.getResultNumber())
+            : FailureOr<SmallVector<std::string>>(failure());
+    if (failed(extents) || extents->size() != 1)
+      return operation.emitOpError("has no logical reduction fragment extent");
+    std::string inputBuffer = makeResultName(operation, 0) + "_logical_input";
+    std::string reduced = makeResultName(operation, 0) + "_logical_result";
+    line(inputBuffer + " = T.alloc_fragment((" + extents->front() +
+         ",), T.int32)");
+    line("for logical_i in T.Parallel(" + extents->front() + "):");
+    ++indentation;
+    line(inputBuffer + "[logical_i] = T.cast(" + operand->str() +
+         "[logical_i], T.int32)");
+    --indentation;
+    line(reduced + " = T.alloc_fragment((1,), T.int32)");
+    StringRef primitive = binding.getLowering() == "T.reduce_any_i32"
+                              ? StringRef("T.reduce_max")
+                              : StringRef("T.reduce_min");
+    line(primitive.str() + "(" + inputBuffer + ", " + reduced +
+         ", dim=0, clear=True)");
+    valueNames[operation.getResult(0)] = reduced + "[0] != 0";
     return success();
   }
   if (argReduction) {
@@ -1588,6 +1640,69 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "scan emission");
   plan::ScanOp binding =
       succeeded(node) ? planIndex.scans.lookup(*node) : plan::ScanOp();
+  if (binding && binding.getResultSpace() == "global") {
+    plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange("traversal", 0) : nullptr;
+    std::string extent = scanExtents.lookup(binding.getNode());
+    Operation *scan = kernel.nodes.lookup(binding.getNode());
+    if (failed(node) || binding.getLowering() != "T.cumsum" ||
+        !range || extent.empty() || !scan ||
+        scan->getNumResults() != 1)
+      return operation.emitOpError(
+          "lacks a workspace-backed TileLang scan binding");
+    std::string result = makeResultName(operation, 0);
+    std::string carry = result + "_carry";
+    std::string block = result + "_block";
+    std::string index = result + "_index";
+    auto resultType = dyn_cast<RankedTensorType>(scan->getResult(0).getType());
+    std::string carryDtype =
+        resultType ? dtypeName(resultType.getElementType(), operation)
+                   : std::string();
+    if (!resultType || carryDtype.empty())
+      return operation.emitOpError("has no TileLang scan carry dtype");
+    line(carry + " = T.alloc_local((1,), " + carryDtype + ")");
+    line(carry + "[0] = 0");
+    line("for " + block + " in T.serial(T.ceildiv(" + extent + ", " +
+         range->getTile().str() + ")):");
+    ++indentation;
+    line("for " + index + " in T.serial(" + range->getTile().str() + "):");
+    ++indentation;
+    std::string logical = block + " * " + range->getTile().str() + " + " + index;
+    FailureOr<std::string> workspace =
+        scanWorkspaceIndex(binding, logical, operation);
+    if (failed(workspace))
+      return failure();
+    if (failed(replayScanProducers(binding, logical)))
+      return failure();
+    FailureOr<StringRef> operand = lookupValue(operation, 0);
+    if (failed(operand))
+      return failure();
+    for (int64_t valueID : binding.getMaterializedValues()) {
+      Value value = kernel.values.lookup(valueID);
+      auto name = valueNames.find(value);
+      FailureOr<std::string> materialized =
+          scanMaterializedIndex(value, logical, operation);
+      if (name == valueNames.end() || failed(materialized))
+        return binding.emitOpError(
+            "has no emitted TileLang value for scan materialization");
+      line("if " + logical + " < " + extent + ":");
+      ++indentation;
+      line(workspaceNames.lookup(value) + "[" + *materialized + "] = " +
+           name->second + "[0]");
+      --indentation;
+    }
+    line(carry + "[0] = " + carry + "[0] + T.if_then_else(" + logical +
+         " < " + extent + ", " + operand->str() + "[0], 0)");
+    line("if " + logical + " < " + extent + ":");
+    ++indentation;
+    line(workspaceNames.lookup(scan->getResult(0)) + "[" + *workspace + "] = " +
+         carry + "[0]");
+    --indentation;
+    indentation -= 2;
+    valueNames.erase(operation.getResult(0));
+    return success();
+  }
   FailureOr<StringRef> operand = lookupValue(operation, 0);
   FailureOr<std::string> result =
       operation.getNumResults() == 1
@@ -1601,6 +1716,90 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
        std::to_string(binding.getAxis()) + ")");
   bindResult(operation, 0, *result);
   return success();
+}
+
+LogicalResult SourceEmitter::replayScanProducers(const plan::ScanOp &binding,
+                                                 StringRef logicalIndex) {
+  if (!operationRegistry())
+    return binding.emitOpError(
+        "has no TileLang operation registry for scan replay");
+  auto oldAxis = axisIndices.find(binding.getAxisNode());
+  std::optional<std::string> savedAxis =
+      oldAxis == axisIndices.end() ? std::nullopt
+                                   : std::optional<std::string>(oldAxis->second);
+  axisIndices[binding.getAxisNode()] = logicalIndex.str();
+  llvm::StringMap<std::optional<std::string>> savedTiles;
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer)
+      return binding.emitOpError(
+          "references an unknown TileLang scan producer");
+    auto shapes = producer->getAttrOfType<ArrayAttr>("intent.result_shapes");
+    if (!shapes)
+      continue;
+    for (Attribute shapeAttr : shapes) {
+      auto shape = dyn_cast<ArrayAttr>(shapeAttr);
+      if (!shape)
+        continue;
+      for (Attribute labelAttr : shape) {
+        auto label = dyn_cast<StringAttr>(labelAttr);
+        if (!label || !label.getValue().starts_with("?region_") ||
+            savedTiles.count(label.getValue()))
+          continue;
+        auto found = regionTiles.find(label.getValue());
+        savedTiles[label.getValue()] =
+            found == regionTiles.end()
+                ? std::nullopt
+                : std::optional<std::string>(found->getValue());
+        regionTiles[label.getValue()] = "1";
+      }
+    }
+  }
+  auto restore = [&]() {
+    activeScanReplay = -1;
+    if (savedAxis)
+      axisIndices[binding.getAxisNode()] = *savedAxis;
+    else
+      axisIndices.erase(binding.getAxisNode());
+    for (const auto &entry : savedTiles) {
+      if (entry.getValue())
+        regionTiles[entry.getKey()] = *entry.getValue();
+      else
+        regionTiles.erase(entry.getKey());
+    }
+  };
+  activeScanReplay = binding.getNode();
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer || failed(operationRegistry()->dispatch(*producer, stage()))) {
+      restore();
+      return failure();
+    }
+  }
+  restore();
+  return success();
+}
+
+FailureOr<std::string>
+SourceEmitter::scanWorkspaceIndex(const plan::ScanOp &binding,
+                                  StringRef logicalIndex,
+                                  Operation &consumer) {
+  FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
+      binding, scanExtents.lookup(binding.getNode()), logicalIndex, planIndex,
+      axisIndices, roleDimensions, consumer);
+  if (failed(offset))
+    return failure();
+  return addressIndex(*offset);
+}
+
+FailureOr<std::string>
+SourceEmitter::scanMaterializedIndex(Value value, StringRef logicalIndex,
+                                     Operation &consumer) {
+  auto binding = scanMaterializedValues.find(value);
+  if (binding == scanMaterializedValues.end())
+    return consumer.emitOpError(
+        "has no TileLang scan materialization binding");
+  return scanWorkspaceIndex(binding->second, logicalIndex, consumer);
 }
 
 LogicalResult SourceEmitter::emitBroadcast(Operation &operation) {
@@ -2189,7 +2388,14 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       !isa<RankedTensorType>(operation.getResult(0).getType()) &&
       relation->size() == 1;
   if (scalarFragmentGather) {
-    FailureOr<StringRef> source = lookupValue(operation, 0);
+    auto scanSource = scanResults.find(operation.getOperand(0));
+    auto materializedSource =
+        scanMaterializedValues.find(operation.getOperand(0));
+    FailureOr<StringRef> source =
+        scanSource == scanResults.end() &&
+                materializedSource == scanMaterializedValues.end()
+            ? lookupValue(operation, 0)
+            : FailureOr<StringRef>(StringRef());
     FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
     FailureOr<StringRef> fill = lookupValue(operation, fillIndex.getInt());
     const target::IndexTerm &term = relation->front();
@@ -2208,11 +2414,32 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return operation.emitOpError(
           "scalar TileLang gather has no mechanical index relation");
     }
-    if (failed(source) || failed(valid) || failed(fill))
+    if ((scanSource == scanResults.end() &&
+         materializedSource == scanMaterializedValues.end() && failed(source)) ||
+        failed(valid) || failed(fill))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = T.if_then_else(" + valid->str() + ", " + source->str() +
-         "[" + addressIndex(index) + "], " + fill->str() + ")");
+    if (scanSource != scanResults.end()) {
+      FailureOr<std::string> workspace =
+          scanWorkspaceIndex(scanSource->second, index, operation);
+      Operation *scan = kernel.nodes.lookup(scanSource->second.getNode());
+      if (failed(workspace) || !scan)
+        return failure();
+      line(result + " = T.if_then_else(" + valid->str() + ", " +
+           workspaceNames.lookup(scan->getResult(0)) + "[" + *workspace +
+           "], " + fill->str() + ")");
+    } else if (materializedSource != scanMaterializedValues.end()) {
+      FailureOr<std::string> workspace = scanMaterializedIndex(
+          operation.getOperand(0), index, operation);
+      if (failed(workspace))
+        return failure();
+      line(result + " = T.if_then_else(" + valid->str() + ", " +
+           workspaceNames.lookup(operation.getOperand(0)) + "[" + *workspace +
+           "], " + fill->str() + ")");
+    } else {
+      line(result + " = T.if_then_else(" + valid->str() + ", " + source->str() +
+           "[" + addressIndex(index) + "], " + fill->str() + ")");
+    }
     bindResult(operation, 0, result);
     return success();
   }

@@ -24,6 +24,8 @@ public:
   mlir::LogicalResult add(llvm::StringRef operationName,
                           OperationHandler handler);
   const OperationHandler *lookup(llvm::StringRef operationName) const;
+  mlir::LogicalResult dispatch(mlir::Operation &operation,
+                               llvm::StringRef stage) const;
 
 private:
   llvm::StringMap<OperationHandler> handlers;

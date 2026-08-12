@@ -315,6 +315,9 @@ assignAxes(const target::KernelFacts &facts) {
 
   for (Operation *domain : facts.orderedDomains)
     appendRole(ensure(domain).roles, "ordered");
+  for (const auto &entry : facts.scans)
+    if (entry.second.scalarConsumers)
+      appendRole(ensure(entry.second.axis).roles, "ordered");
   for (Operation *domain : facts.contractionDomains)
     appendRole(ensure(domain).roles, "reduction");
   for (Operation *domain : facts.vectorDomains)
@@ -389,6 +392,7 @@ assignAxes(const target::KernelFacts &facts) {
   unsigned raggedTile = 0;
   unsigned streamTile = 0;
   unsigned streamContractionTile = 0;
+  unsigned scanTile = 0;
   unsigned reductionTile = 0;
   unsigned laneTile = 0;
   auto indexedTile = [](StringRef base, unsigned &ordinal) {
@@ -425,8 +429,12 @@ assignAxes(const target::KernelFacts &facts) {
     }
     if (hasRole(choice.roles, "ordered")) {
       auto fixed = facts.orderedStreamFixedExtents.find(choice.domain);
+      bool scanAxis = llvm::any_of(facts.scans, [&](const auto &entry) {
+        return entry.second.scalarConsumers && entry.second.axis == choice.domain;
+      });
       std::string tile =
-          fixed != facts.orderedStreamFixedExtents.end()
+          scanAxis ? indexedTile("scan", scanTile)
+          : fixed != facts.orderedStreamFixedExtents.end()
               ? "fixed_" + std::to_string(fixed->second)
           : hasIndirectRaggedMembership(choice.domain, facts)
               ? "one"

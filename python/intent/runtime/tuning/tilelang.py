@@ -20,6 +20,7 @@ def _configuration(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 256, 512, 1024),
+        "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
         "query": (64, 128),
         "ragged_member": (64, 128),
@@ -34,6 +35,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         return candidates
     for base in (
         "stream_contract",
+        "scan",
         "stream",
         "query",
         "ragged_member",
@@ -67,6 +69,11 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
         else ()
     )
     profiles = (
+        (
+            ({"scan": 64}, 1, 128),
+            ({"scan": 128}, 1, 128),
+            ({"scan": 256}, 2, 256),
+        ),
         (
             ({"stream": 256}, 1, 128),
             ({"stream": 512}, 1, 128),

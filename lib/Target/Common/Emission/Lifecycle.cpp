@@ -12,8 +12,13 @@ LogicalResult emitSource(TargetSourceEmitter &emitter) {
     return failure();
 
   OperationHandlerRegistry registry;
-  if (failed(emitter.registerOperationHandlers(registry)) ||
-      failed(traverseKernel(emitter.entry(), registry, emitter.stage())))
+  if (failed(emitter.registerOperationHandlers(registry)))
+    return failure();
+  emitter.setOperationRegistry(&registry);
+  LogicalResult result =
+      traverseKernel(emitter.entry(), registry, emitter.stage());
+  emitter.setOperationRegistry(nullptr);
+  if (failed(result))
     return failure();
 
   emitter.stream() << "\n\n";

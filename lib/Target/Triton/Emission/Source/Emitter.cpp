@@ -59,6 +59,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
     return std::string("BLOCK_SIZE_K");
+  if (role == "scan")
+    return std::string("BLOCK_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("BLOCK_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -179,6 +183,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
     return std::string("BLOCK_SIZE_K");
+  if (role == "scan")
+    return std::string("BLOCK_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("BLOCK_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -403,6 +411,13 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(target::emission::indexScanProducerOperations(
+          kernel, planIndex, scanProducerOwners)))
+    return failure();
+  for (const auto &entry : planIndex.scans)
+    if (failed(target::emission::verifyScanMaterializedValues(kernel,
+                                                              entry.second)))
+      return failure();
   if (failed(preparePrivateWorkspaces()))
     return failure();
   if (!planIndex.stages.empty())
@@ -411,19 +426,6 @@ LogicalResult SourceEmitter::prepare() {
 }
 
 LogicalResult SourceEmitter::preparePrivateWorkspaces() {
-  if (planIndex.program.getPersistent() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "persistent Triton programs cannot preserve owner-private workspaces");
-  if (!planIndex.stages.empty() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "staged Triton programs cannot share a logical private workspace");
-
   SmallVector<int64_t> nodes;
   for (const auto &entry : planIndex.buffers)
     if (entry.second.getSpace() == "private_workspace")
@@ -439,16 +441,34 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
         buffer->getNumResults() != 1)
       return binding.emitOpError(
           "does not bind a logical private workspace");
-    for (int64_t owner : binding.getOwnerNodes()) {
-      plan::AxisOp axis = planIndex.axes.lookup(owner);
-      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
-          axis.getReuseWorker() || axis.getGroupAttr())
-        return binding.emitOpError(
-            "Triton private workspace requires scalar unreused program owners");
-    }
     workspaceNames[buffer->getResult(0)] =
         "workspace_" + std::to_string(node) + "_ptr";
     privateWorkspaceBuffers.push_back(buffer);
+  }
+  for (const auto &entry : planIndex.scans) {
+    plan::ScanOp binding = entry.second;
+    if (binding.getResultSpace() != "private_workspace")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    Operation *axis = kernel.nodes.lookup(binding.getAxisNode());
+    FailureOr<std::string> extent =
+        axis ? dimensionName(*axis) : FailureOr<std::string>(failure());
+    if (!scan || scan->getName().getStringRef() != "intent.scan" ||
+        scan->getNumResults() != 1 || failed(extent))
+      return binding.emitOpError("does not bind a workspace-backed scan tensor");
+    workspaceNames[scan->getResult(0)] =
+        "scan_workspace_" + std::to_string(entry.first) + "_ptr";
+    scanResults[scan->getResult(0)] = binding;
+    scanExtents[entry.first] = *extent;
+    for (int64_t valueID : binding.getMaterializedValues()) {
+      FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
+          kernel, binding, valueID);
+      if (failed(value))
+        return failure();
+      workspaceNames[*value] =
+          "scan_materialized_" + std::to_string(valueID) + "_ptr";
+      scanMaterializedValues[*value] = binding;
+    }
   }
   return success();
 }
@@ -743,6 +763,9 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto scanProducer = scanProducerOwners.find(&operation);
+  if (scanProducer != scanProducerOwners.end())
+    return activeScanReplay == scanProducer->second;
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
@@ -1032,6 +1055,14 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     emitParameter(scalar.name);
   for (Operation *buffer : privateWorkspaceBuffers)
     emitParameter(workspaceNames.lookup(buffer->getResult(0)));
+  for (const auto &entry : planIndex.scans) {
+    if (entry.second.getResultSpace() != "private_workspace")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    emitParameter(workspaceNames.lookup(scan->getResult(0)));
+    for (int64_t valueID : entry.second.getMaterializedValues())
+      emitParameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
+  }
   for (const std::string &dimension : dimensionOrder) {
     bool physicalDimension = llvm::any_of(
         roleDimensions,
@@ -1076,6 +1107,37 @@ LogicalResult SourceEmitter::emitWrapper() {
              << " = torch.full((" << *size
              << ",), " << *initializer << ", device=_DEVICE, dtype=" << dtype
              << ")\n";
+    }
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "private_workspace")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      auto resultType = scan && scan->getNumResults() == 1
+                            ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
+                            : RankedTensorType();
+      FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
+          entry.second, scanExtents.lookup(entry.first), planIndex,
+          roleDimensions);
+      StringRef dtype = resultType ? torchDtype(resultType.getElementType())
+                                   : StringRef();
+      if (!scan || failed(size) || dtype.empty())
+        return entry.second.emitOpError(
+            "has no supported Triton scan-workspace allocation");
+      output << "    " << workspaceNames.lookup(scan->getResult(0))
+             << " = torch.empty((" << *size
+             << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      for (int64_t valueID : entry.second.getMaterializedValues()) {
+        Value value = kernel.values.lookup(valueID);
+        auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        StringRef valueDtype =
+            tensor ? torchDtype(tensor.getElementType()) : StringRef();
+        if (!tensor || tensor.getRank() != 1 || valueDtype.empty())
+          return entry.second.emitOpError(
+              "requires rank-one materialized scan producer values");
+        output << "    " << workspaceNames.lookup(value)
+               << " = torch.empty((" << *size
+               << ",), device=_DEVICE, dtype=" << valueDtype << ")\n";
+      }
     }
     return success();
   };
@@ -1595,6 +1657,14 @@ LogicalResult SourceEmitter::emitWrapper() {
     emitArgument(scalar.name);
   for (Operation *buffer : privateWorkspaceBuffers)
     emitArgument(workspaceNames.lookup(buffer->getResult(0)));
+  for (const auto &entry : planIndex.scans) {
+    if (entry.second.getResultSpace() != "private_workspace")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    emitArgument(workspaceNames.lookup(scan->getResult(0)));
+    for (int64_t valueID : entry.second.getMaterializedValues())
+      emitArgument(workspaceNames.lookup(kernel.values.lookup(valueID)));
+  }
   for (const std::string &dimension : dimensionOrder)
     emitArgument(dimension);
   for (ABIView &view : views)

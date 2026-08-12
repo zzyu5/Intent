@@ -7,6 +7,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
+#include <limits>
 
 using namespace mlir;
 
@@ -25,6 +26,108 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
                          StringRef name, target::OperationCallback enter) {
   return registry.add(name,
                       target::OperationHandler{std::move(enter), {}});
+}
+
+struct PrivateBufferCandidate {
+  Operation *operation = nullptr;
+  int64_t registerUnits = 0;
+  bool scalarized = false;
+};
+
+FailureOr<int64_t> privateBufferRegisterUnits(
+    Operation &operation, const target::LogicalBufferInfo &info,
+    bool roundToVectorExtent) {
+  int64_t elements = 1;
+  for (int64_t extent : info.shape) {
+    if (elements > std::numeric_limits<int64_t>::max() / extent) {
+      operation.emitOpError(
+          "private logical-buffer capacity overflows the machine plan");
+      return failure();
+    }
+    elements *= extent;
+  }
+  if (roundToVectorExtent) {
+    int64_t physicalExtent = 1;
+    while (physicalExtent < elements) {
+      if (physicalExtent > std::numeric_limits<int64_t>::max() / 2) {
+        operation.emitOpError(
+            "private logical-buffer vector extent overflows the machine plan");
+        return failure();
+      }
+      physicalExtent *= 2;
+    }
+    elements = physicalExtent;
+  }
+  int64_t elementBits = info.elementType.isIndex()
+                            ? 64
+                            : info.elementType.getIntOrFloatBitWidth();
+  int64_t unitsPerElement = std::max<int64_t>(1, (elementBits + 31) / 32);
+  if (elements > std::numeric_limits<int64_t>::max() / unitsPerElement) {
+    operation.emitOpError(
+        "private logical-buffer capacity overflows the machine plan");
+    return failure();
+  }
+  return elements * unitsPerElement;
+}
+
+FailureOr<llvm::DenseMap<Operation *, std::string>>
+choosePrivateBufferResidencies(const target::KernelFacts &facts,
+                               const DeviceCapabilities &device) {
+  llvm::DenseMap<Operation *, std::string> spaces;
+  llvm::DenseMap<Operation *, SmallVector<PrivateBufferCandidate>> byOwner;
+  int64_t scalarizationBudget =
+      std::max<int64_t>(1, device.registersPerUnit / 1024);
+  int64_t localRegisterBudget =
+      std::max<int64_t>(1, device.registersPerUnit / 128);
+
+  for (const auto &entry : facts.logicalBuffers) {
+    Operation *operation = entry.first;
+    const target::LogicalBufferFact &buffer = entry.second;
+    if (!buffer.owner) {
+      operation->emitOpError("private logical buffer has no parallel owner");
+      return failure();
+    }
+    FailureOr<int64_t> logicalUnits =
+        privateBufferRegisterUnits(*operation, buffer.info, false);
+    if (failed(logicalUnits))
+      return failure();
+    bool scalarized = buffer.info.shape.size() == 1 &&
+                      *logicalUnits <= scalarizationBudget;
+    if (buffer.hasUnstructuredDynamicAccess) {
+      spaces[operation] = "private_workspace";
+      continue;
+    }
+    FailureOr<int64_t> physicalUnits = scalarized
+                                           ? logicalUnits
+                                           : privateBufferRegisterUnits(
+                                                 *operation, buffer.info, true);
+    if (failed(physicalUnits))
+      return failure();
+    byOwner[buffer.owner].push_back(
+        PrivateBufferCandidate{operation, *physicalUnits, scalarized});
+  }
+
+  for (auto &entry : byOwner) {
+    llvm::sort(entry.second, [](const PrivateBufferCandidate &lhs,
+                                const PrivateBufferCandidate &rhs) {
+      if (lhs.registerUnits != rhs.registerUnits)
+        return lhs.registerUnits < rhs.registerUnits;
+      auto lhsNode = lhs.operation->getAttrOfType<IntegerAttr>("intent.node");
+      auto rhsNode = rhs.operation->getAttrOfType<IntegerAttr>("intent.node");
+      return lhsNode && rhsNode && lhsNode.getInt() < rhsNode.getInt();
+    });
+    int64_t used = 0;
+    for (const PrivateBufferCandidate &candidate : entry.second) {
+      bool fits = candidate.registerUnits <= localRegisterBudget - used;
+      spaces[candidate.operation] =
+          fits ? candidate.scalarized ? "private_scalar_array"
+                                      : "private_vector"
+               : "private_workspace";
+      if (fits)
+        used += candidate.registerUnits;
+    }
+  }
+  return spaces;
 }
 
 int64_t reusableOperand(Operation &operation) {
@@ -426,6 +529,8 @@ private:
 LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                                    const KernelFacts &facts,
                                    const PhysicalDecisions &decisions,
+                                   const llvm::DenseMap<Operation *, std::string>
+                                       &bufferSpaces,
                                    OpBuilder &builder,
                                    PaddingState &paddingState) {
   auto noOp = [](Operation &) { return success(); };
@@ -452,14 +557,12 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   "has no canonical private logical-buffer facts");
             const target::LogicalBufferFact &buffer =
                 facts.logicalBuffers.lookup(&operation);
-            bool workspace = buffer.info.shape.size() > 1 ||
-                             buffer.requiresAddressableStorage;
-            StringRef space = workspace
-                                  ? StringRef("private_workspace")
-                              : buffer.hasDynamicAccess &&
-                                        buffer.info.elementType.isInteger(1)
-                                  ? "private_vector"
-                                  : "private_scalar_array";
+            auto placement = bufferSpaces.find(&operation);
+            if (placement == bufferSpaces.end())
+              return operation.emitOpError(
+                  "has no private logical-buffer residency decision");
+            StringRef space = placement->second;
+            bool workspace = space == "private_workspace";
             SmallVector<int64_t> ownerNodes;
             if (workspace) {
               auto domains = facts.parallelDomains.find(buffer.owner);
@@ -636,8 +739,28 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   "has no logical domain for its physical scan axis");
             FailureOr<int64_t> axisNode = target::getNodeID(
                 *inputAxes->second[axis.getInt()].domain, "scan axis binding");
-            if (failed(axisNode))
+            auto scanFact = facts.scans.find(&operation);
+            Operation *owner = nullptr;
+            for (Operation *parent = operation.getParentOp(); parent;
+                 parent = parent->getParentOp())
+              if (parent->getName().getStringRef() == "intent.parallel") {
+                owner = parent;
+                break;
+              }
+            auto ownerDomains = owner ? facts.parallelDomains.find(owner)
+                                      : facts.parallelDomains.end();
+            if (failed(axisNode) || scanFact == facts.scans.end() ||
+                ownerDomains == facts.parallelDomains.end() ||
+                ownerDomains->second.empty())
               return failure();
+            SmallVector<int64_t> ownerNodes;
+            for (Operation *domain : ownerDomains->second) {
+              FailureOr<int64_t> ownerNode =
+                  target::getNodeID(*domain, "scan result owner");
+              if (failed(ownerNode))
+                return failure();
+              ownerNodes.push_back(*ownerNode);
+            }
             std::optional<std::string> inputPadding =
                 paddingState.paddingOf(operation.getOperand(0));
             std::optional<std::string> identityPadding =
@@ -653,11 +776,26 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                       operation)))
                 return failure();
             }
+            bool scalarConsumers = scanFact->second.scalarConsumers;
+            ArrayRef<int64_t> producers =
+                scalarConsumers ? ArrayRef<int64_t>(scanFact->second.producers)
+                                : ArrayRef<int64_t>();
+            ArrayRef<int64_t> materializedValues =
+                scalarConsumers
+                    ? ArrayRef<int64_t>(scanFact->second.materializedValues)
+                    : ArrayRef<int64_t>();
             builder.create<intent::plan::ScanOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, "scan_inclusive_add"), i64(builder, *axisNode),
                 i64(builder, axis.getInt()),
-                string(builder, "private_fragment"));
+                string(builder, scalarConsumers ? "private_workspace"
+                                                : "private_fragment"),
+                string(builder, "private_scalar"),
+                string(builder, scalarConsumers ? "scalar_access"
+                                                 : "fragment_access"),
+                builder.getDenseI64ArrayAttr(ownerNodes),
+                builder.getDenseI64ArrayAttr(producers),
+                builder.getDenseI64ArrayAttr(materializedValues));
             return success();
           })))
     return failure();
@@ -760,11 +898,15 @@ LogicalResult emitMachinePlan(ModuleOp module, const DeviceCapabilities &device,
       emitPhysicalDecisions(builder, facts);
   if (failed(decisions))
     return failure();
+  FailureOr<llvm::DenseMap<Operation *, std::string>> bufferSpaces =
+      choosePrivateBufferResidencies(facts, device);
+  if (failed(bufferSpaces))
+    return failure();
   target::OperationHandlerRegistry registry;
   SmallVector<PaddingDecision> paddings;
   PaddingState paddingState(facts, paddings);
-  if (failed(registerPlanHandlers(registry, facts, *decisions, builder,
-                                  paddingState)) ||
+  if (failed(registerPlanHandlers(registry, facts, *decisions, *bufferSpaces,
+                                  builder, paddingState)) ||
       failed(target::traverseKernel(entry, registry,
                                     "GPU machine-plan construction")))
     return failure();

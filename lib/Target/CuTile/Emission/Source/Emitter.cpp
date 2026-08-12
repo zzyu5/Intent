@@ -31,6 +31,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "scan")
+    return std::string("TILE_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("TILE_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -147,6 +151,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "feature" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "scan")
+    return std::string("TILE_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("TILE_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -412,6 +420,13 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(target::emission::indexScanProducerOperations(
+          kernel, planIndex, scanProducerOwners)))
+    return failure();
+  for (const auto &entry : planIndex.scans)
+    if (failed(target::emission::verifyScanMaterializedValues(kernel,
+                                                              entry.second)))
+      return failure();
   if (failed(preparePrivateWorkspaces()))
     return failure();
   if (!planIndex.stages.empty())
@@ -420,19 +435,6 @@ LogicalResult SourceEmitter::prepare() {
 }
 
 LogicalResult SourceEmitter::preparePrivateWorkspaces() {
-  if (planIndex.program.getPersistent() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "persistent cuTile programs cannot preserve owner-private workspaces");
-  if (!planIndex.stages.empty() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "staged cuTile programs cannot share a logical private workspace");
-
   SmallVector<int64_t> nodes;
   for (const auto &entry : planIndex.buffers)
     if (entry.second.getSpace() == "private_workspace")
@@ -448,16 +450,34 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
         buffer->getNumResults() != 1)
       return binding.emitOpError(
           "does not bind a logical private workspace");
-    for (int64_t owner : binding.getOwnerNodes()) {
-      plan::AxisOp axis = planIndex.axes.lookup(owner);
-      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
-          axis.getReuseWorker() || axis.getGroupAttr())
-        return binding.emitOpError(
-            "cuTile private workspace requires scalar unreused program owners");
-    }
     workspaceNames[buffer->getResult(0)] =
         "workspace_" + std::to_string(node);
     privateWorkspaceBuffers.push_back(buffer);
+  }
+  for (const auto &entry : planIndex.scans) {
+    plan::ScanOp binding = entry.second;
+    if (binding.getResultSpace() != "private_workspace")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    Operation *axis = kernel.nodes.lookup(binding.getAxisNode());
+    FailureOr<std::string> extent =
+        axis ? dimensionName(*axis) : FailureOr<std::string>(failure());
+    if (!scan || scan->getName().getStringRef() != "intent.scan" ||
+        scan->getNumResults() != 1 || failed(extent))
+      return binding.emitOpError("does not bind a workspace-backed scan tensor");
+    workspaceNames[scan->getResult(0)] =
+        "scan_workspace_" + std::to_string(entry.first);
+    scanResults[scan->getResult(0)] = binding;
+    scanExtents[entry.first] = *extent;
+    for (int64_t valueID : binding.getMaterializedValues()) {
+      FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
+          kernel, binding, valueID);
+      if (failed(value))
+        return failure();
+      workspaceNames[*value] =
+          "scan_materialized_" + std::to_string(valueID);
+      scanMaterializedValues[*value] = binding;
+    }
   }
   return success();
 }
@@ -782,6 +802,9 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto scanProducer = scanProducerOwners.find(&operation);
+  if (scanProducer != scanProducerOwners.end())
+    return activeScanReplay == scanProducer->second;
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
@@ -999,6 +1022,14 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   }
   for (Operation *buffer : privateWorkspaceBuffers)
     emitParameter(workspaceNames.lookup(buffer->getResult(0)));
+  for (const auto &entry : planIndex.scans) {
+    if (entry.second.getResultSpace() != "private_workspace")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    emitParameter(workspaceNames.lookup(scan->getResult(0)));
+    for (int64_t valueID : entry.second.getMaterializedValues())
+      emitParameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
+  }
   if (!planIndex.components.reusedAxes.empty()) {
     for (const std::string &dimension : kernelConstants)
       emitParameter(dimension + ": ConstInt");
@@ -1070,9 +1101,46 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (failed(size) || failed(initializer) || failed(info) || dtype.empty())
         return buffer->emitOpError(
             "has no supported cuTile private-workspace allocation");
+      output << "    if " << *size << " > 2147483647:\n";
+      output << "        raise NotImplementedError('cuTile private workspace "
+                "exceeds its current 32-bit address projection')\n";
       output << "    " << workspaceNames.lookup(buffer->getResult(0))
              << " = torch.full((" << *size << ",), " << *initializer
              << ", device=_DEVICE, dtype=" << dtype << ")\n";
+    }
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "private_workspace")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      auto resultType = scan && scan->getNumResults() == 1
+                            ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
+                            : RankedTensorType();
+      FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
+          entry.second, scanExtents.lookup(entry.first), planIndex,
+          roleDimensions);
+      StringRef dtype = resultType ? torchDtype(resultType.getElementType())
+                                   : StringRef();
+      if (!scan || failed(size) || dtype.empty())
+        return entry.second.emitOpError(
+            "has no supported cuTile scan-workspace allocation");
+      output << "    if " << *size << " > 2147483647:\n";
+      output << "        raise NotImplementedError('cuTile scan workspace exceeds "
+                "its current 32-bit address projection')\n";
+      output << "    " << workspaceNames.lookup(scan->getResult(0))
+             << " = torch.empty((" << *size
+             << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      for (int64_t valueID : entry.second.getMaterializedValues()) {
+        Value value = kernel.values.lookup(valueID);
+        auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        StringRef valueDtype =
+            tensor ? torchDtype(tensor.getElementType()) : StringRef();
+        if (!tensor || tensor.getRank() != 1 || valueDtype.empty())
+          return entry.second.emitOpError(
+              "requires rank-one materialized scan producer values");
+        output << "    " << workspaceNames.lookup(value)
+               << " = torch.empty((" << *size
+               << ",), device=_DEVICE, dtype=" << valueDtype << ")\n";
+      }
     }
     return success();
   };
@@ -1557,6 +1625,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (Operation *buffer : privateWorkspaceBuffers)
       output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
+  for (const auto &entry : planIndex.scans) {
+    if (entry.second.getResultSpace() != "private_workspace")
+      continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (int64_t valueID : entry.second.getMaterializedValues())
+        output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+    }
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
@@ -1647,6 +1723,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (Operation *buffer : privateWorkspaceBuffers)
       output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "private_workspace")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (int64_t valueID : entry.second.getMaterializedValues())
+        output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+    }
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
@@ -1699,6 +1783,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << scalar.name << ", ";
     for (Operation *buffer : privateWorkspaceBuffers)
       output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "private_workspace")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (int64_t valueID : entry.second.getMaterializedValues())
+        output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+    }
     for (const std::string &dimension : kernelConstants)
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
@@ -1908,6 +2000,9 @@ std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
 }
 
 FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
+  auto scanTile = scanAxisTiles.find(axis.getNode());
+  if (scanTile != scanAxisTiles.end())
+    return scanTile->second;
   if (axis.getReuseWorker() ||
       !axis.getTileRole().starts_with("row_vector"))
     return axis.getTile().str();
@@ -2066,7 +2161,9 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       std::string exact =
           directVector
               ? addressIndex(base)
-              : addressIndex(base) + " * " + *tile + " + " +
+              : activeScanReplay >= 0
+                    ? addressIndex(base)
+                    : addressIndex(base) + " * " + *tile + " + " +
                     addressIndex("ct.arange(" + *tile +
                                  ", dtype=ct.int32)");
       indices.push_back(broadcast(exact, resultAxis++));
@@ -2257,7 +2354,9 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
       return failure();
     std::string index =
         direct ? addressIndex(base)
-               : addressIndex(base) + " * " + *tile + " + " +
+               : activeScanReplay >= 0
+                     ? addressIndex(base)
+                     : addressIndex(base) + " * " + *tile + " + " +
                      addressIndex("ct.arange(" + *tile +
                                   ", dtype=ct.int32)");
     if (tensor.getRank() > 1) {

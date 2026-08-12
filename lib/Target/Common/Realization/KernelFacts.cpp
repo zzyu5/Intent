@@ -1511,7 +1511,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                  << "private logical buffer dynamic index for axis " << axis
                  << " requires a bounded iterator or preceding in-bounds declaration";
         if (!boundedIterator && !boundedExpression)
-          found->second.requiresAddressableStorage = true;
+          found->second.hasUnstructuredDynamicAccess = true;
         continue;
       }
       if (term.kind != "static_index" || term.staticValues.size() != 1 ||
@@ -2180,6 +2180,110 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
           !facts.orderedDomains.contains(axis.domain) &&
           !facts.contractionDomains.contains(axis.domain))
         facts.vectorDomains.insert(axis.domain);
+
+  auto collectScanProducers = [&](Operation &scan) -> LogicalResult {
+    auto axis = scan.getAttrOfType<IntegerAttr>("intent.axis");
+    auto axes = scan.getNumOperands() > 0
+                    ? facts.valueAxes.find(scan.getOperand(0))
+                    : facts.valueAxes.end();
+    if (!axis || axis.getInt() < 0 || axes == facts.valueAxes.end() ||
+        static_cast<size_t>(axis.getInt()) >= axes->second.size() ||
+        !axes->second[axis.getInt()].domain)
+      return scan.emitOpError("has no canonical scan producer axis");
+
+    llvm::DenseSet<Value> visited;
+    llvm::DenseSet<Operation *> slice;
+    std::function<LogicalResult(Value)> collect = [&](Value value) -> LogicalResult {
+      if (!visited.insert(value).second)
+        return success();
+      Operation *producer = value.getDefiningOp();
+      if (!producer)
+        return success();
+      StringRef name = producer->getName().getStringRef();
+      if (name == "intent.constant" || name == "intent.dim" ||
+          name == "intent.domain" || name == "intent.domain_product" ||
+          name == "intent.partition")
+        return success();
+      bool pure = name == "intent.view_load" || name == "intent.indices" ||
+                  name == "intent.broadcast" || name == "intent.unary" ||
+                  name == "intent.binary" || name == "intent.compare" ||
+                  name == "intent.mask" || name == "intent.select" ||
+                  name == "intent.cast" || name == "intent.full" ||
+                  name == "intent.zeros" || name == "intent.reshape" ||
+                  name == "intent.transpose";
+      if (!pure) {
+        producer->emitOpError(
+            "cannot be replayed inside a physical scan chunk");
+        return failure();
+      }
+      slice.insert(producer);
+      if (name == "intent.indices")
+        return success();
+      unsigned firstOperand = name == "intent.view_load" ? 1 : 0;
+      for (Value operand : producer->getOperands().drop_front(firstOperand))
+        if (failed(collect(operand)))
+          return failure();
+      return success();
+    };
+    if (failed(collect(scan.getOperand(0))))
+      return failure();
+    ScanFact fact;
+    fact.axis = axes->second[axis.getInt()].domain;
+    fact.scalarConsumers = !scan.getResult(0).use_empty() && llvm::all_of(
+        scan.getResult(0).getUsers(), [&](Operation *user) {
+          return user->getName().getStringRef() == "intent.gather" &&
+                 user->getNumOperands() > 0 &&
+                 user->getOperand(0) == scan.getResult(0) &&
+                 user->getNumResults() == 1 &&
+                 !isa<RankedTensorType>(user->getResult(0).getType());
+        });
+    for (Operation *producer : slice) {
+      FailureOr<int64_t> producerNode =
+          target::getNodeID(*producer, "scan producer slice");
+      if (failed(producerNode))
+        return failure();
+      fact.producers.push_back(*producerNode);
+      if (producer->getNumResults() != 1)
+        continue;
+      Value result = producer->getResult(0);
+      bool escapes = llvm::any_of(result.getUsers(), [&](Operation *user) {
+        return user != &scan && !slice.contains(user) &&
+               user->getName().getStringRef() != "intent.assume_in_bounds";
+      });
+      if (escapes) {
+        if (fact.scalarConsumers &&
+            llvm::any_of(result.getUsers(), [&](Operation *user) {
+              if (user == &scan || slice.contains(user) ||
+                  user->getName().getStringRef() == "intent.assume_in_bounds")
+                return false;
+              return user->getName().getStringRef() != "intent.gather" ||
+                     user->getNumOperands() == 0 ||
+                     user->getOperand(0) != result ||
+                     user->getNumResults() != 1 ||
+                     isa<RankedTensorType>(user->getResult(0).getType());
+            }))
+          return producer->emitOpError(
+              "escapes a chunked scan through a non-scalar-gather consumer");
+        FailureOr<int64_t> valueID = target::getValueID(
+            result, facts.kernel, scan, "scan producer materialization");
+        if (failed(valueID))
+          return failure();
+        fact.materializedValues.push_back(*valueID);
+      }
+    }
+    llvm::sort(fact.producers);
+    llvm::sort(fact.materializedValues);
+    facts.scans[&scan] = std::move(fact);
+    return success();
+  };
+  WalkResult scanWalk = facts.kernel.entry.walk([&](Operation *operation) {
+    if (operation->getName().getStringRef() != "intent.scan")
+      return WalkResult::advance();
+    return failed(collectScanProducers(*operation)) ? WalkResult::interrupt()
+                                                     : WalkResult::advance();
+  });
+  if (scanWalk.wasInterrupted())
+    return failure();
   return success();
 }
 

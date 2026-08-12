@@ -23,6 +23,8 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 StringRef tritonDtype(Type type) {
   if (auto tensor = dyn_cast<RankedTensorType>(type))
     type = tensor.getElementType();
+  if (type.isInteger(1))
+    return "tl.int1";
   if (type.isF16())
     return "tl.float16";
   if (type.isF32())
@@ -886,15 +888,23 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
     return success();
   }
   if (binding && binding.getSpace() == "private_vector") {
-    if (failed(info) || info->shape.size() != 1 || failed(initializer) ||
-        !info->elementType.isInteger(1))
+    if (failed(info) || failed(initializer) ||
+        tritonDtype(info->elementType).empty())
       return operation.emitOpError(
-          "private Triton vectors currently require one static bool axis");
+          "private Triton vectors require a supported static shape");
     std::string base = makeResultName(operation, 0);
+    FailureOr<int64_t> elements =
+        target::logicalBufferElementCount(*info, operation);
+    if (failed(elements))
+      return failure();
+    int64_t physicalExtent = 1;
+    while (physicalExtent < *elements)
+      physicalExtent *= 2;
     line(base + "_lanes = tl.arange(0, " +
-         std::to_string(info->shape.front()) + ")");
-    line(base + " = tl.full((" + std::to_string(info->shape.front()) +
-         ",), " + initializer->str() + ", tl.int1)");
+         std::to_string(physicalExtent) + ")");
+    line(base + " = tl.full((" + std::to_string(physicalExtent) +
+         ",), " + initializer->str() + ", " +
+         tritonDtype(info->elementType).str() + ")");
     vectorBuffers[operation.getResult(0)] = base;
     return success();
   }
@@ -931,24 +941,50 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
+  Operation *vectorOwner = operation.getNumOperands() > 0
+                               ? operation.getOperand(0).getDefiningOp()
+                               : nullptr;
+  FailureOr<target::LogicalBufferInfo> vectorInfo =
+      vectorOwner ? target::getLogicalBufferInfo(*vectorOwner)
+                  : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> vectorIndices =
+      succeeded(vectorInfo)
+          ? target::getLogicalBufferIndices(operation, vectorInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   if (vector != vectorBuffers.end()) {
-    if (failed(index) || operation.getNumResults() != 1)
+    if (failed(vectorInfo) || failed(vectorIndices) ||
+        operation.getNumResults() != 1)
       return operation.emitOpError("lacks a private Triton vector load");
     std::string selected;
-    if (index->constant) {
-      selected = std::to_string(*index->constant);
-    } else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      selected = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*vectorIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      selected = selected.empty()
+                     ? component
+                     : "(" + selected + ") * " +
+                           std::to_string(vectorInfo->shape[axis]) + " + (" +
+                           component + ")";
     }
     std::string result = makeResultName(operation, 0);
-    line(result + " = tl.sum(tl.where(" + vector->second +
-         "_lanes == " + selected + ", " + vector->second +
-         ".to(tl.int32), 0), axis=0) != 0");
+    if (operation.getResult(0).getType().isInteger(1)) {
+      line(result + " = tl.sum(tl.where(" + vector->second + "_lanes == " +
+           selected + ", tl.cast(" + vector->second +
+           ", tl.int32), 0), axis=0) != 0");
+    } else {
+      line(result + "_index = tl.full((1,), " + selected + ", tl.int32)");
+      line(result + "_tile = tl.gather(" + vector->second + ", " + result +
+           "_index, axis=0)");
+      line(result + " = tl.sum(" + result + "_tile, axis=0)");
+    }
     bindResult(operation, 0, result);
     return success();
   }
@@ -997,20 +1033,38 @@ LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
+  Operation *vectorOwner = operation.getNumOperands() > 0
+                               ? operation.getOperand(0).getDefiningOp()
+                               : nullptr;
+  FailureOr<target::LogicalBufferInfo> vectorInfo =
+      vectorOwner ? target::getLogicalBufferInfo(*vectorOwner)
+                  : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> vectorIndices =
+      succeeded(vectorInfo)
+          ? target::getLogicalBufferIndices(operation, vectorInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
   if (vector != vectorBuffers.end()) {
-    if (failed(index) || failed(stored))
+    if (failed(vectorInfo) || failed(vectorIndices) || failed(stored))
       return operation.emitOpError("lacks a private Triton vector store");
     std::string selected;
-    if (index->constant) {
-      selected = std::to_string(*index->constant);
-    } else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      selected = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*vectorIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      selected = selected.empty()
+                     ? component
+                     : "(" + selected + ") * " +
+                           std::to_string(vectorInfo->shape[axis]) + " + (" +
+                           component + ")";
     }
     line(vector->second + " = tl.where(" + vector->second +
          "_lanes == " + selected + ", " + stored->str() + ", " +
@@ -1078,6 +1132,41 @@ SourceEmitter::privateWorkspacePointer(Operation &operation) {
       target::emission::projectPrivateWorkspaceOffset(
           binding, *info, *indices, planIndex, axisIndices, roleDimensions,
           spellIndex, operation);
+  if (failed(offset))
+    return failure();
+  return workspace->second + " + " + addressIndex(*offset);
+}
+
+FailureOr<std::string>
+SourceEmitter::scanWorkspacePointer(const plan::ScanOp &binding,
+                                    StringRef logicalIndex,
+                                    Operation &consumer) {
+  Operation *scan = kernel.nodes.lookup(binding.getNode());
+  auto workspace = scan && scan->getNumResults() == 1
+                       ? workspaceNames.find(scan->getResult(0))
+                       : workspaceNames.end();
+  std::string extent = scanExtents.lookup(binding.getNode());
+  if (!scan || workspace == workspaceNames.end() || extent.empty())
+    return binding.emitOpError("has no Triton scan workspace binding");
+  FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
+      binding, extent, logicalIndex, planIndex, axisIndices, roleDimensions,
+      consumer);
+  if (failed(offset))
+    return failure();
+  return workspace->second + " + " + addressIndex(*offset);
+}
+
+FailureOr<std::string>
+SourceEmitter::scanMaterializedPointer(Value value, StringRef logicalIndex,
+                                       Operation &consumer) {
+  auto materialized = scanMaterializedValues.find(value);
+  auto workspace = workspaceNames.find(value);
+  if (materialized == scanMaterializedValues.end() ||
+      workspace == workspaceNames.end())
+    return consumer.emitOpError("has no Triton materialized scan value");
+  FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
+      materialized->second, scanExtents.lookup(materialized->second.getNode()),
+      logicalIndex, planIndex, axisIndices, roleDimensions, consumer);
   if (failed(offset))
     return failure();
   return workspace->second + " + " + addressIndex(*offset);
@@ -1225,13 +1314,136 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   plan::ScanOp binding =
       succeeded(node) ? planIndex.scans.lookup(*node) : plan::ScanOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
+  if (binding && binding.getResultSpace() == "private_fragment") {
+    if (failed(node) || binding.getLowering() != "tl.cumsum" ||
+        failed(operand) || operation.getNumResults() != 1)
+      return operation.emitOpError("lacks a fragment Triton scan binding");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.cumsum(" + operand->str() + ", axis=" +
+         std::to_string(binding.getAxis()) + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  plan::AxisOp axis = binding ? planIndex.axes.lookup(binding.getAxisNode())
+                              : plan::AxisOp();
+  const target::emission::RangeBinding *range =
+      axis ? axis.getRange("traversal", 0) : nullptr;
+  std::string extent = binding ? scanExtents.lookup(binding.getNode())
+                               : std::string();
   if (failed(node) || !binding || binding.getLowering() != "tl.cumsum" ||
-      failed(operand) || operation.getNumResults() != 1)
+      !axis || !range || extent.empty() ||
+      operation.getNumResults() != 1)
     return operation.emitOpError("lacks a mechanical Triton scan binding");
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.cumsum(" + operand->str() + ", axis=" +
-       std::to_string(binding.getAxis()) + ")");
-  bindResult(operation, 0, result);
+  std::string carry = result + "_carry";
+  std::string block = result + "_block";
+  std::string offsets = result + "_offsets";
+  std::string values = result + "_values";
+  std::string scanned = result + "_scanned";
+  line(carry + " = 0");
+  line("for " + block + " in tl.range(0, tl.cdiv(" + extent + ", " +
+       range->getTile().str() + "), flatten=True):");
+  ++indentation;
+  line(offsets + " = " + block + " * " + range->getTile().str() +
+       " + tl.arange(0, " + range->getTile().str() + ")");
+  if (failed(replayScanProducers(binding, offsets)))
+    return failure();
+  operand = lookupValue(operation, 0);
+  if (failed(operand))
+    return failure();
+  FailureOr<std::string> input = scanWorkspacePointer(
+      binding, offsets, operation);
+  if (failed(input))
+    return failure();
+  line(values + " = " + operand->str());
+  for (int64_t valueID : binding.getMaterializedValues()) {
+    Value value = kernel.values.lookup(valueID);
+    auto name = valueNames.find(value);
+    FailureOr<std::string> pointer =
+        scanMaterializedPointer(value, offsets, operation);
+    if (name == valueNames.end() || failed(pointer))
+      return binding.emitOpError(
+          "has no emitted Triton value for scan materialization");
+    line("tl.store(" + *pointer + ", " + name->second + ", mask=" + offsets +
+         " < " + extent + ")");
+  }
+  line(scanned + " = tl.cumsum(tl.where(" + offsets + " < " + extent +
+       ", " + values + ", 0), axis=" +
+       std::to_string(binding.getAxis()) + ") + " + carry);
+  line("tl.store(" + *input + ", " + scanned + ", mask=" + offsets +
+       " < " + extent + ")");
+  std::string lastLane = "tl.minimum(" + range->getTile().str() +
+                         " - 1, " + extent + " - " + block + " * " +
+                         range->getTile().str() + " - 1)";
+  line(carry + " = tl.sum(tl.where(tl.arange(0, " +
+       range->getTile().str() + ") == " + lastLane + ", " + scanned +
+       ", 0), axis=0)");
+  --indentation;
+  valueNames.erase(operation.getResult(0));
+  return success();
+}
+
+LogicalResult SourceEmitter::replayScanProducers(const plan::ScanOp &binding,
+                                                 StringRef offsets) {
+  if (!operationRegistry())
+    return binding.emitOpError("has no Triton operation registry for scan replay");
+  auto oldAxis = axisIndices.find(binding.getAxisNode());
+  std::optional<std::string> savedAxis =
+      oldAxis == axisIndices.end() ? std::nullopt
+                                   : std::optional<std::string>(oldAxis->second);
+  axisIndices[binding.getAxisNode()] = offsets.str();
+  llvm::StringMap<std::optional<std::string>> savedTiles;
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer)
+      return binding.emitOpError("references an unknown Triton scan producer");
+    auto shapes = producer->getAttrOfType<ArrayAttr>("intent.result_shapes");
+    if (!shapes)
+      continue;
+    for (Attribute shapeAttr : shapes) {
+      auto shape = dyn_cast<ArrayAttr>(shapeAttr);
+      if (!shape)
+        continue;
+      for (Attribute labelAttr : shape) {
+        auto label = dyn_cast<StringAttr>(labelAttr);
+        if (!label || !label.getValue().starts_with("?region_") ||
+            savedTiles.count(label.getValue()))
+          continue;
+        auto found = regionTiles.find(label.getValue());
+        savedTiles[label.getValue()] =
+            found == regionTiles.end()
+                ? std::nullopt
+                : std::optional<std::string>(found->getValue());
+        regionTiles[label.getValue()] =
+            planIndex.axes.lookup(binding.getAxisNode())
+                .getRange("traversal", 0)
+                ->getTile()
+                .str();
+      }
+    }
+  }
+  activeScanReplay = binding.getNode();
+  auto restore = [&]() {
+    activeScanReplay = -1;
+    if (savedAxis)
+      axisIndices[binding.getAxisNode()] = *savedAxis;
+    else
+      axisIndices.erase(binding.getAxisNode());
+    for (const auto &entry : savedTiles) {
+      if (entry.getValue())
+        regionTiles[entry.getKey()] = *entry.getValue();
+      else
+        regionTiles.erase(entry.getKey());
+    }
+  };
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer || failed(operationRegistry()->dispatch(*producer, stage()))) {
+      restore();
+      return failure();
+    }
+  }
+  restore();
   return success();
 }
 
@@ -1536,7 +1748,14 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       (*relation)[0].operands.size() == 1 &&
       (*relation)[0].operands.front();
   if (scalarFragmentGather) {
-    FailureOr<StringRef> source = lookupValue(operation, 0);
+    auto scanSource = scanResults.find(operation.getOperand(0));
+    auto materializedSource =
+        scanMaterializedValues.find(operation.getOperand(0));
+    FailureOr<StringRef> source =
+        scanSource == scanResults.end() &&
+                materializedSource == scanMaterializedValues.end()
+            ? lookupValue(operation, 0)
+            : FailureOr<StringRef>(StringRef());
     FailureOr<StringRef> index =
         lookupValue(operation, *(*relation)[0].operands.front());
     FailureOr<StringRef> valid =
@@ -1545,14 +1764,33 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     FailureOr<StringRef> fill =
         fillIndex ? lookupValue(operation, fillIndex.getInt())
                   : FailureOr<StringRef>(failure());
-    if (failed(source) || failed(index) || failed(valid) || failed(fill))
+    if ((scanSource == scanResults.end() &&
+         materializedSource == scanMaterializedValues.end() && failed(source)) ||
+        failed(index) ||
+        failed(valid) || failed(fill))
       return failure();
     std::string result = makeResultName(operation, 0);
-    std::string gathered =
-        "tl.gather(" + source->str() + ", tl.full(" + source->str() +
-        ".shape, " + index->str() + ", tl.int64), axis=0)";
-    line(result + " = tl.where(" + valid->str() + ", tl.max(" + gathered +
-         ", axis=0), " + fill->str() + ")");
+    if (scanSource != scanResults.end()) {
+      FailureOr<std::string> pointer =
+          scanWorkspacePointer(scanSource->second, index->str(), operation);
+      if (failed(pointer))
+        return failure();
+      line(result + " = tl.where(" + valid->str() + ", tl.load(" + *pointer +
+           "), " + fill->str() + ")");
+    } else if (materializedSource != scanMaterializedValues.end()) {
+      FailureOr<std::string> pointer = scanMaterializedPointer(
+          operation.getOperand(0), index->str(), operation);
+      if (failed(pointer))
+        return failure();
+      line(result + " = tl.where(" + valid->str() + ", tl.load(" + *pointer +
+           "), " + fill->str() + ")");
+    } else {
+      std::string gathered =
+          "tl.gather(" + source->str() + ", tl.full(" + source->str() +
+          ".shape, " + index->str() + ", tl.int64), axis=0)";
+      line(result + " = tl.where(" + valid->str() + ", tl.max(" + gathered +
+           ", axis=0), " + fill->str() + ")");
+    }
     bindResult(operation, 0, result);
     return success();
   }

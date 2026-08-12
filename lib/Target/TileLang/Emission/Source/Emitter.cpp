@@ -35,6 +35,10 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "scan")
+    return std::string("TILE_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("TILE_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -165,6 +169,10 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return std::string("TILE_SIZE_Q");
   if (role == "program_n" || role == "feature" || role == "stream")
     return std::string("TILE_SIZE_N");
+  if (role == "scan")
+    return std::string("TILE_SIZE_SCAN");
+  if (role.starts_with("scan_"))
+    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return std::string("TILE_SIZE_K");
   if (role.starts_with("stream_contract_"))
@@ -318,8 +326,8 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.lowering = *role == "reduce_argmax"
                            ? "T.reduce_max_with_index"
                        : *role == "reduce_maximum" ? "T.reduce_max"
-                       : *role == "reduce_any"     ? "T.any_of"
-                       : *role == "reduce_all"     ? "T.all_of"
+                       : *role == "reduce_any"     ? "T.reduce_any_i32"
+                       : *role == "reduce_all"     ? "T.reduce_all_i32"
                                                     : "T.reduce_sum";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
     binding.axis = *axis;
@@ -334,7 +342,9 @@ indexRealization(intent::plan::RealizationOp realization,
     plan::ScanOp binding;
     binding.operation = value;
     binding.lowering = "T.cumsum";
-    binding.resultSpace = bufferSpace(value.getResultSpace()).str();
+    binding.resultSpace = value.getResultSpace() == "private_workspace"
+                              ? "global"
+                              : bufferSpace(value.getResultSpace()).str();
     binding.axis = value.getTensorAxis();
     binding.axisNode = value.getAxisNode();
     if (binding.resultSpace.empty())
@@ -461,6 +471,13 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (failed(target::emission::indexScanProducerOperations(
+          kernel, planIndex, scanProducerOwners)))
+    return failure();
+  for (const auto &entry : planIndex.scans)
+    if (failed(target::emission::verifyScanMaterializedValues(kernel,
+                                                              entry.second)))
+      return failure();
   if (failed(preparePrivateWorkspaces()))
     return failure();
   if (!planIndex.stages.empty())
@@ -469,19 +486,6 @@ LogicalResult SourceEmitter::prepare() {
 }
 
 LogicalResult SourceEmitter::preparePrivateWorkspaces() {
-  if (planIndex.program.getPersistent() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "persistent TileLang programs cannot preserve owner-private workspaces");
-  if (!planIndex.stages.empty() &&
-      llvm::any_of(planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_workspace";
-      }))
-    return realization.emitOpError(
-        "staged TileLang programs cannot share a logical private workspace");
-
   SmallVector<int64_t> nodes;
   for (const auto &entry : planIndex.buffers)
     if (entry.second.getSpace() == "private_workspace")
@@ -497,16 +501,35 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
         buffer->getNumResults() != 1)
       return binding.emitOpError(
           "does not bind a logical private workspace");
-    for (int64_t owner : binding.getOwnerNodes()) {
-      plan::AxisOp axis = planIndex.axes.lookup(owner);
-      if (!axis || !axis.hasRole("parallel") || !axis.isScalar() ||
-          axis.getReuseWorker() || axis.getGroupAttr())
-        return binding.emitOpError(
-            "TileLang private workspace requires scalar unreused program owners");
-    }
     workspaceNames[buffer->getResult(0)] =
         "workspace_" + std::to_string(node);
     privateWorkspaceBuffers.push_back(buffer);
+  }
+  for (const auto &entry : planIndex.scans) {
+    plan::ScanOp binding = entry.second;
+    if (binding.getResultSpace() != "global")
+      continue;
+    Operation *scan = kernel.nodes.lookup(entry.first);
+    Operation *axis = kernel.nodes.lookup(binding.getAxisNode());
+    FailureOr<std::string> extent =
+        axis ? dimensionName(*axis) : FailureOr<std::string>(failure());
+    if (!scan || scan->getName().getStringRef() != "intent.scan" ||
+        scan->getNumResults() != 1 || failed(extent))
+      return binding.emitOpError(
+          "does not bind a workspace-backed TileLang scan tensor");
+    workspaceNames[scan->getResult(0)] =
+        "scan_workspace_" + std::to_string(entry.first);
+    scanResults[scan->getResult(0)] = binding;
+    scanExtents[entry.first] = *extent;
+    for (int64_t valueID : binding.getMaterializedValues()) {
+      FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
+          kernel, binding, valueID);
+      if (failed(value))
+        return failure();
+      workspaceNames[*value] =
+          "scan_materialized_" + std::to_string(valueID);
+      scanMaterializedValues[*value] = binding;
+    }
   }
   return success();
 }
@@ -828,6 +851,9 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto scanProducer = scanProducerOwners.find(&operation);
+  if (scanProducer != scanProducerOwners.end())
+    return activeScanReplay == scanProducer->second;
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
@@ -947,6 +973,37 @@ LogicalResult SourceEmitter::emitKernelHeader() {
             "has no supported TileLang private-workspace parameter");
       parameter(workspaceNames.lookup(buffer->getResult(0)) +
                 ": T.Tensor((" + *size + ",), " + dtype + ")");
+    }
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "global")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      auto tensor = scan && scan->getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
+                        : RankedTensorType();
+      FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
+          entry.second, scanExtents.lookup(entry.first), planIndex,
+          roleDimensions);
+      std::string dtype =
+          tensor ? dtypeName(tensor.getElementType(), *scan) : std::string();
+      if (!tensor || failed(size) || dtype.empty())
+        return entry.second.emitOpError(
+            "has no supported TileLang scan-workspace parameter");
+      parameter(workspaceNames.lookup(scan->getResult(0)) +
+                ": T.Tensor((" + *size + ",), " + dtype + ")");
+      for (int64_t valueID : entry.second.getMaterializedValues()) {
+        Value value = kernel.values.lookup(valueID);
+        auto materialized = dyn_cast<RankedTensorType>(value.getType());
+        std::string valueDtype = materialized
+                                     ? dtypeName(materialized.getElementType(),
+                                                 *scan)
+                                     : std::string();
+        if (!materialized || materialized.getRank() != 1 || valueDtype.empty())
+          return entry.second.emitOpError(
+              "requires rank-one materialized TileLang scan producer values");
+        parameter(workspaceNames.lookup(value) + ": T.Tensor((" + *size +
+                  ",), " + valueDtype + ")");
+      }
     }
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
@@ -1344,6 +1401,35 @@ LogicalResult SourceEmitter::emitWrapper() {
              << " = torch.full((" << *size << ",), " << *initializer
              << ", device=_DEVICE, dtype=" << dtype << ")\n";
     }
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "global")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      auto tensor = scan && scan->getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
+                        : RankedTensorType();
+      FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
+          entry.second, scanExtents.lookup(entry.first), planIndex,
+          roleDimensions);
+      StringRef dtype = tensor ? torchDtype(tensor.getElementType()) : StringRef();
+      if (!tensor || failed(size) || dtype.empty())
+        return entry.second.emitOpError(
+            "has no supported TileLang scan-workspace allocation");
+      output << "    " << workspaceNames.lookup(scan->getResult(0))
+             << " = torch.empty((" << *size
+             << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      for (int64_t valueID : entry.second.getMaterializedValues()) {
+        Value value = kernel.values.lookup(valueID);
+        auto materialized = dyn_cast<RankedTensorType>(value.getType());
+        StringRef valueDtype =
+            materialized ? torchDtype(materialized.getElementType()) : StringRef();
+        if (!materialized || materialized.getRank() != 1 || valueDtype.empty())
+          return entry.second.emitOpError(
+              "requires rank-one materialized TileLang scan producer values");
+        output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
+               << *size << ",), device=_DEVICE, dtype=" << valueDtype << ")\n";
+      }
+    }
     return success();
   };
   auto emitLaunchSignature = [&]() {
@@ -1383,6 +1469,18 @@ LogicalResult SourceEmitter::emitWrapper() {
         output << ", ";
       output << workspaceNames.lookup(buffer->getResult(0));
       first = false;
+    }
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "global")
+        continue;
+      if (!first)
+        output << ", ";
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      output << workspaceNames.lookup(scan->getResult(0));
+      first = false;
+      for (int64_t valueID : entry.second.getMaterializedValues()) {
+        output << ", " << workspaceNames.lookup(kernel.values.lookup(valueID));
+      }
     }
     for (plan::StageOp stage : planIndex.stages)
       for (int64_t valueID : stage.getOutputs()) {
@@ -1651,7 +1749,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";
   emitKernelArguments();
   output << ")\n";
-  if (privateWorkspaceBuffers.empty()) {
+  if (privateWorkspaceBuffers.empty() && scanResults.empty()) {
     output << "    return compiled\n\n\n";
   } else {
     output << "    return lambda: compiled(";

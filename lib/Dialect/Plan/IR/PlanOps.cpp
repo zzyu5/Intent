@@ -247,8 +247,37 @@ LogicalResult ScanOp::verify() {
     return failure();
   if (getSemantics() != "scan_inclusive_add")
     return emitOpError("contains unsupported physical scan semantics");
-  if (!isPrivateSpace(getResultSpace()))
-    return emitOpError("requires private scan result residency");
+  if (((getMaterialization() == "scalar_access" &&
+        getResultSpace() != "private_workspace") ||
+       (getMaterialization() == "fragment_access" &&
+        getResultSpace() != "private_fragment")) ||
+      getCarrySpace() != "private_scalar" ||
+      (getMaterialization() != "scalar_access" &&
+       getMaterialization() != "fragment_access"))
+    return emitOpError(
+        "requires owner-private materialization and a scalar carry");
+  if (getOwnerNodes().empty())
+    return emitOpError("requires physical owner axes");
+  if (getMaterialization() == "scalar_access" && getProducers().empty())
+    return emitOpError(
+        "workspace-backed scan requires a non-empty producer slice");
+  if (getMaterialization() == "fragment_access" &&
+      (!getProducers().empty() || !getMaterializedValues().empty()))
+    return emitOpError(
+        "fragment scan cannot carry a replay slice or materialized values");
+  for (int64_t owner : getOwnerNodes())
+    if (failed(requireNode(*this, owner)))
+      return failure();
+  llvm::DenseSet<int64_t> producers;
+  for (int64_t producer : getProducers())
+    if (failed(requireNode(*this, producer)) ||
+        !producers.insert(producer).second)
+      return emitOpError("scan producer nodes must be unique");
+  llvm::DenseSet<int64_t> materialized;
+  for (int64_t value : getMaterializedValues())
+    if (failed(requireNonNegative(*this, value, "Kernel IR value ID")) ||
+        !materialized.insert(value).second)
+      return emitOpError("scan materialized values must be unique");
   return success();
 }
 
@@ -327,9 +356,11 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::StringSet<> rangeKeys;
   SmallVector<RangeOp> ranges;
+  SmallVector<ScanOp> scans;
   llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
   llvm::DenseSet<int64_t> buffers;
+  SmallVector<BufferOp> bufferBindings;
   SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> transfers;
@@ -367,6 +398,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<BufferOp>(operation)) {
       if (!buffers.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a logical-buffer decision");
+      bufferBindings.push_back(binding);
       for (int64_t owner : binding.getOwnerNodes()) {
         auto axis = axes.find(owner);
         if (axis == axes.end() || !axisHasRole(axis->second, "parallel"))
@@ -387,6 +419,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<ScanOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
+      scans.push_back(binding);
     } else if (auto binding = dyn_cast<PointwiseOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
@@ -435,6 +468,54 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
                       std::to_string(level);
     return rangeKeys.contains(key);
   };
+  auto isScalarUnreusedProgramOwner = [&](int64_t node) {
+    auto axis = axes.find(node);
+    if (axis == axes.end() || !axisHasRole(axis->second, "parallel") ||
+        axis->second.getReuseWorker() || axis->second.getGroupAttr())
+      return false;
+    return llvm::any_of(ranges, [&](RangeOp range) {
+      return static_cast<int64_t>(range.getAxisNode()) == node &&
+             range.getPurpose() == "ownership" &&
+             range.getLevel() == 0 && range.getTile() == "one";
+    });
+  };
+  for (BufferOp buffer : bufferBindings) {
+    if (buffer.getSpace() != "private_workspace")
+      continue;
+    if (program.getPersistent())
+      return buffer.emitOpError(
+          "owner-private workspace cannot outlive a persistent program mapping");
+    if (!stageNodes.empty())
+      return buffer.emitOpError(
+          "owner-private workspace cannot cross physical stage boundaries");
+    for (int64_t owner : buffer.getOwnerNodes())
+      if (!isScalarUnreusedProgramOwner(owner))
+        return buffer.emitOpError(
+            "private workspace requires scalar unreused program owners");
+  }
+  for (ScanOp scan : scans) {
+    auto axis = axes.find(scan.getAxisNode());
+    bool workspaceScan = scan.getResultSpace() == "private_workspace";
+    if (workspaceScan && program.getPersistent())
+      return scan.emitOpError(
+          "scan workspace cannot outlive a persistent program mapping");
+    if (workspaceScan && !stageNodes.empty())
+      return scan.emitOpError(
+          "scan workspace cannot cross physical stage boundaries");
+    if (axis == axes.end() ||
+        (workspaceScan && (!axisHasRole(axis->second, "ordered") ||
+                           !hasRange(scan.getAxisNode(), "traversal"))))
+      return scan.emitOpError("requires an ordered traversal range");
+    for (int64_t owner : scan.getOwnerNodes()) {
+      auto ownerAxis = axes.find(owner);
+      if (ownerAxis == axes.end() ||
+          !axisHasRole(ownerAxis->second, "parallel"))
+        return scan.emitOpError("references a non-program scan owner");
+      if (workspaceScan && !isScalarUnreusedProgramOwner(owner))
+        return scan.emitOpError(
+            "scan workspace requires scalar unreused program owners");
+    }
+  }
   for (const auto &entry : axes) {
     AxisOp axis = entry.second;
     for (auto [role, purpose] :

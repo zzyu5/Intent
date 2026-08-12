@@ -44,6 +44,18 @@ OperationHandlerRegistry::lookup(StringRef operationName) const {
   return found == handlers.end() ? nullptr : &found->second;
 }
 
+LogicalResult OperationHandlerRegistry::dispatch(Operation &operation,
+                                                 StringRef stage) const {
+  const OperationHandler *handler = lookup(operation.getName().getStringRef());
+  if (!handler)
+    return operation.emitOpError() << "has no registered handler during " << stage;
+  if (handler->enter && failed(handler->enter(operation)))
+    return failure();
+  if (handler->leave && failed(handler->leave(operation)))
+    return failure();
+  return success();
+}
+
 LogicalResult traverseKernel(func::FuncOp entry,
                              const OperationHandlerRegistry &registry,
                              StringRef stage) {

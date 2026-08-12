@@ -148,6 +148,8 @@ private:
   mlir::LogicalResult resolvePhysicalBindings();
   mlir::LogicalResult preparePrivateWorkspaces();
   mlir::LogicalResult emitConditional(mlir::Operation &operation, bool mask);
+  mlir::LogicalResult replayScanProducers(const plan::ScanOp &binding,
+                                          llvm::StringRef offsets);
   void emitImports() override;
   mlir::LogicalResult emitKernelHeader() override;
   mlir::LogicalResult emitWrapper() override;
@@ -170,6 +172,13 @@ private:
   indexTuple(mlir::Operation &operation, bool elementwiseAccess);
   mlir::FailureOr<std::string>
   privateWorkspaceIndex(mlir::Operation &operation);
+  mlir::FailureOr<std::string>
+  scanWorkspaceIndex(const plan::ScanOp &binding,
+                     llvm::StringRef logicalIndex,
+                     mlir::Operation &consumer);
+  mlir::FailureOr<std::string>
+  scanMaterializedIndex(mlir::Value value, llvm::StringRef logicalIndex,
+                        mlir::Operation &consumer);
   mlir::FailureOr<std::string> tileShape(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   emitValidityExpression(llvm::ArrayRef<int64_t> tensorAxes,
@@ -231,6 +240,12 @@ private:
       operationStages;
   llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;
   llvm::DenseMap<mlir::Value, std::string> workspaceNames;
+  llvm::DenseMap<mlir::Value, plan::ScanOp> scanResults;
+  llvm::DenseMap<mlir::Value, plan::ScanOp> scanMaterializedValues;
+  llvm::DenseMap<int64_t, std::string> scanExtents;
+  llvm::DenseMap<mlir::Operation *, int64_t> scanProducerOwners;
+  llvm::DenseMap<int64_t, std::string> scanAxisTiles;
+  int64_t activeScanReplay = -1;
   llvm::SmallVector<mlir::Operation *> privateWorkspaceBuffers;
   llvm::SmallVector<std::string> stageBodies;
   llvm::SmallVector<unsigned> activeStages;

@@ -140,7 +140,12 @@ def IntentPlan_ScanOp : IntentPlan_Op<"scan"> {
     StrAttr:$semantics,
     I64Attr:$axis_node,
     I64Attr:$tensor_axis,
-    StrAttr:$result_space
+    StrAttr:$result_space,
+    StrAttr:$carry_space,
+    StrAttr:$materialization,
+    DenseI64ArrayAttr:$owner_nodes,
+    DenseI64ArrayAttr:$producers,
+    DenseI64ArrayAttr:$materialized_values
   );
   let results = (outs);
   let hasVerifier = 1;

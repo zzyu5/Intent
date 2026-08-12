@@ -595,7 +595,134 @@ struct ScanBinding : Binding<intent::plan::ScanOp> {
   int64_t getAxis() const { return axis; }
   int64_t getAxisNode() const { return axisNode; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
+  llvm::StringRef getCarrySpace() const { return operation.getCarrySpace(); }
+  llvm::StringRef getMaterialization() const {
+    return operation.getMaterialization();
+  }
+  llvm::ArrayRef<int64_t> getOwnerNodes() const {
+    return operation.getOwnerNodes();
+  }
+  llvm::ArrayRef<int64_t> getProducers() const {
+    return operation.getProducers();
+  }
+  llvm::ArrayRef<int64_t> getMaterializedValues() const {
+    return operation.getMaterializedValues();
+  }
 };
+
+template <typename PlanIndex, typename OperationSlices>
+mlir::LogicalResult indexScanProducerOperations(
+    const target::KernelModel &kernel, const PlanIndex &index,
+    OperationSlices &operationSlices) {
+  for (const auto &entry : index.scans) {
+    const ScanBinding &scan = entry.second;
+    if (scan.getMaterialization() != "scalar_access")
+      continue;
+    for (int64_t node : scan.getProducers()) {
+      mlir::Operation *operation = kernel.nodes.lookup(node);
+      if (!operation)
+        return scan.emitOpError("references an unknown scan producer node");
+      auto existing = operationSlices.find(operation);
+      if (existing != operationSlices.end() && existing->second != scan.getNode())
+        return scan.emitOpError(
+            "shares a producer with another physical scan slice");
+      operationSlices[operation] = scan.getNode();
+    }
+  }
+  return mlir::success();
+}
+
+inline mlir::LogicalResult verifyScanMaterializedValues(
+    const target::KernelModel &kernel, const ScanBinding &scan) {
+  llvm::DenseSet<int64_t> producedValues;
+  for (int64_t node : scan.getProducers()) {
+    mlir::Operation *producer = kernel.nodes.lookup(node);
+    if (!producer)
+      return scan.emitOpError("references an unknown scan producer node");
+    for (mlir::Value result : producer->getResults()) {
+      mlir::FailureOr<int64_t> value = target::getValueID(
+          result, kernel, *producer, "scan materialized value verification");
+      if (mlir::failed(value))
+        return mlir::failure();
+      producedValues.insert(*value);
+    }
+  }
+  for (int64_t value : scan.getMaterializedValues())
+    if (!producedValues.contains(value))
+      return scan.emitOpError(
+          "materializes a value outside its physical producer slice");
+  return mlir::success();
+}
+
+inline mlir::FailureOr<mlir::Value>
+lookupScanMaterializedValue(const target::KernelModel &kernel,
+                            const ScanBinding &scan, int64_t valueID) {
+  if (!llvm::is_contained(scan.getMaterializedValues(), valueID))
+    return mlir::failure();
+  auto value = kernel.values.find(valueID);
+  if (value == kernel.values.end() ||
+      !mlir::isa<mlir::RankedTensorType>(value->second.getType()))
+    return scan.emitOpError("references an invalid materialized tensor value");
+  return value->second;
+}
+
+template <typename PlanIndex>
+inline mlir::FailureOr<std::string> scanWorkspaceElementCount(
+    const ScanBinding &binding, llvm::StringRef logicalExtent,
+    const PlanIndex &index,
+    const llvm::StringMap<std::string> &roleDimensions) {
+  std::string size;
+  auto append = [&](llvm::StringRef extent) {
+    size = size.empty() ? extent.str() : size + " * " + extent.str();
+  };
+  for (int64_t owner : binding.getOwnerNodes()) {
+    auto axis = index.axes.find(owner);
+    std::string extent =
+        axis == index.axes.end()
+            ? std::string()
+            : roleDimensions.lookup(
+                  "program_" + std::to_string(axis->second.getProgramOrder()));
+    if (axis == index.axes.end() || extent.empty())
+      return binding.emitOpError("has no scan workspace owner extent");
+    append(extent);
+  }
+  if (logicalExtent.empty())
+    return binding.emitOpError("has no scan workspace logical extent");
+  append(logicalExtent);
+  return size;
+}
+
+template <typename PlanIndex>
+inline mlir::FailureOr<std::string> projectScanWorkspaceOffset(
+    const ScanBinding &binding, llvm::StringRef logicalExtent,
+    llvm::StringRef logicalIndex, const PlanIndex &index,
+    const llvm::DenseMap<int64_t, std::string> &axisIndices,
+    const llvm::StringMap<std::string> &roleDimensions,
+    mlir::Operation &operation) {
+  std::string offset;
+  auto append = [&](llvm::StringRef projectedIndex, llvm::StringRef extent) {
+    offset = offset.empty()
+                 ? projectedIndex.str()
+                 : "(" + offset + ") * (" + extent.str() + ") + (" +
+                       projectedIndex.str() + ")";
+  };
+  for (int64_t owner : binding.getOwnerNodes()) {
+    auto axis = index.axes.find(owner);
+    std::string projected = axisIndices.lookup(owner);
+    std::string extent =
+        axis == index.axes.end()
+            ? std::string()
+            : roleDimensions.lookup(
+                  "program_" + std::to_string(axis->second.getProgramOrder()));
+    if (axis == index.axes.end() || projected.empty() || extent.empty())
+      return operation.emitOpError("has no active scan workspace owner projection");
+    append(projected, extent);
+  }
+  if (logicalExtent.empty() || logicalIndex.empty())
+    return operation.emitOpError("has no scan workspace logical projection");
+  append(logicalIndex, logicalExtent);
+  return offset;
+}
 
 struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
   std::string lowering;

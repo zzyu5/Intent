@@ -12,6 +12,7 @@ def _target_parameters(
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 256, 512, 1024),
+        "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (16, 32, 64, 128),
         "query": (16, 32, 64, 128),
         "ragged_member": (32, 64, 128),
@@ -26,6 +27,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         return candidates
     for base in (
         "stream_contract",
+        "scan",
         "stream",
         "query",
         "ragged_member",
@@ -49,6 +51,11 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     for role in roles:
         _role_candidates(role)
     profiles = (
+        (
+            ({"scan": 64}, 1, 4),
+            ({"scan": 128}, 2, 4),
+            ({"scan": 256}, 2, 8),
+        ),
         (
             ({"stream": 256}, 4, 4),
             ({"stream": 512}, 3, 8),

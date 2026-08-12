@@ -861,15 +861,24 @@ LogicalResult SourceEmitter::emitBuffer(Operation &operation) {
     return success();
   }
   if (binding && binding.getSpace() == "private_vector") {
-    if (failed(info) || info->shape.size() != 1 || failed(initializer) ||
-        !info->elementType.isInteger(1))
+    std::string dtype = succeeded(info) ? dtypeName(info->elementType, operation)
+                                        : std::string();
+    if (failed(info) || failed(initializer) ||
+        dtype.empty())
       return operation.emitOpError(
-          "private cuTile vectors currently require one static bool axis");
+          "private cuTile vectors require a supported static shape");
     std::string base = makeResultName(operation, 0);
+    FailureOr<int64_t> elements =
+        target::logicalBufferElementCount(*info, operation);
+    if (failed(elements))
+      return failure();
+    int64_t physicalExtent = 1;
+    while (physicalExtent < *elements)
+      physicalExtent *= 2;
     line(base + "_lanes = ct.arange(" +
-         std::to_string(info->shape.front()) + ", dtype=ct.int32)");
-    line(base + " = ct.full((" + std::to_string(info->shape.front()) +
-         ",), " + initializer->str() + ", dtype=ct.bool_)");
+         std::to_string(physicalExtent) + ", dtype=ct.int32)");
+    line(base + " = ct.full((" + std::to_string(physicalExtent) +
+         ",), " + initializer->str() + ", dtype=" + dtype + ")");
     vectorBuffers[operation.getResult(0)] = base;
     return success();
   }
@@ -907,24 +916,49 @@ LogicalResult SourceEmitter::emitBufferLoad(Operation &operation) {
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
+  Operation *vectorOwner = operation.getNumOperands() > 0
+                               ? operation.getOperand(0).getDefiningOp()
+                               : nullptr;
+  FailureOr<target::LogicalBufferInfo> vectorInfo =
+      vectorOwner ? target::getLogicalBufferInfo(*vectorOwner)
+                  : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> vectorIndices =
+      succeeded(vectorInfo)
+          ? target::getLogicalBufferIndices(operation, vectorInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   if (vector != vectorBuffers.end()) {
-    if (failed(index) || operation.getNumResults() != 1)
+    if (failed(vectorInfo) || failed(vectorIndices) ||
+        operation.getNumResults() != 1)
       return operation.emitOpError("lacks a private cuTile vector load");
     std::string selected;
-    if (index->constant) {
-      selected = std::to_string(*index->constant);
-    } else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      selected = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*vectorIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      selected = selected.empty()
+                     ? component
+                     : "(" + selected + ") * " +
+                           std::to_string(vectorInfo->shape[axis]) + " + (" +
+                           component + ")";
     }
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.sum(ct.where(" + vector->second +
-         "_lanes == " + selected + ", ct.astype(" + vector->second +
-         ", ct.int32), 0), axis=0) != 0");
+    if (operation.getResult(0).getType().isInteger(1)) {
+      line(result + " = ct.sum(ct.where(" + vector->second + "_lanes == " +
+           selected + ", ct.astype(" + vector->second +
+           ", ct.int32), 0), axis=0) != 0");
+    } else {
+      line(result + "_tile = ct.extract(" + vector->second + ", (" +
+           addressIndex(selected) + ",), shape=(1,))");
+      line(result + " = " + result + "_tile.item()");
+    }
     bindResult(operation, 0, result);
     return success();
   }
@@ -980,20 +1014,38 @@ LogicalResult SourceEmitter::emitBufferStore(Operation &operation) {
   auto vector = operation.getNumOperands() > 0
                     ? vectorBuffers.find(operation.getOperand(0))
                     : vectorBuffers.end();
+  Operation *vectorOwner = operation.getNumOperands() > 0
+                               ? operation.getOperand(0).getDefiningOp()
+                               : nullptr;
+  FailureOr<target::LogicalBufferInfo> vectorInfo =
+      vectorOwner ? target::getLogicalBufferInfo(*vectorOwner)
+                  : FailureOr<target::LogicalBufferInfo>(failure());
+  FailureOr<SmallVector<target::LogicalBufferIndex>> vectorIndices =
+      succeeded(vectorInfo)
+          ? target::getLogicalBufferIndices(operation, vectorInfo->shape.size())
+          : FailureOr<SmallVector<target::LogicalBufferIndex>>(failure());
   FailureOr<target::LogicalBufferIndex> index =
       target::getLogicalBufferIndex(operation);
   FailureOr<StringRef> stored = lookupValue(operation, 1);
   if (vector != vectorBuffers.end()) {
-    if (failed(index) || failed(stored))
+    if (failed(vectorInfo) || failed(vectorIndices) || failed(stored))
       return operation.emitOpError("lacks a private cuTile vector store");
     std::string selected;
-    if (index->constant) {
-      selected = std::to_string(*index->constant);
-    } else {
-      FailureOr<StringRef> dynamic = lookupValue(operation, *index->operand);
-      if (failed(dynamic))
-        return failure();
-      selected = dynamic->str();
+    for (auto [axis, logical] : llvm::enumerate(*vectorIndices)) {
+      std::string component;
+      if (logical.constant)
+        component = std::to_string(*logical.constant);
+      else {
+        FailureOr<StringRef> dynamic = lookupValue(operation, *logical.operand);
+        if (failed(dynamic))
+          return failure();
+        component = dynamic->str();
+      }
+      selected = selected.empty()
+                     ? component
+                     : "(" + selected + ") * " +
+                           std::to_string(vectorInfo->shape[axis]) + " + (" +
+                           component + ")";
     }
     line(vector->second + " = ct.where(" + vector->second +
          "_lanes == " + selected + ", " + stored->str() + ", " +
@@ -1063,6 +1115,35 @@ SourceEmitter::privateWorkspaceIndex(Operation &operation) {
   return addressIndex(*offset);
 }
 
+FailureOr<std::string>
+SourceEmitter::scanWorkspaceIndex(const plan::ScanOp &binding,
+                                  StringRef logicalIndex,
+                                  Operation &consumer) {
+  std::string extent = scanExtents.lookup(binding.getNode());
+  if (extent.empty())
+    return binding.emitOpError("has no cuTile scan workspace binding");
+  FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
+      binding, extent, logicalIndex, planIndex, axisIndices, roleDimensions,
+      consumer);
+  if (failed(offset))
+    return failure();
+  return addressIndex(*offset);
+}
+
+FailureOr<std::string>
+SourceEmitter::scanMaterializedIndex(Value value, StringRef logicalIndex,
+                                     Operation &consumer) {
+  auto materialized = scanMaterializedValues.find(value);
+  if (materialized == scanMaterializedValues.end())
+    return consumer.emitOpError("has no cuTile materialized scan value");
+  FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
+      materialized->second, scanExtents.lookup(materialized->second.getNode()),
+      logicalIndex, planIndex, axisIndices, roleDimensions, consumer);
+  if (failed(offset))
+    return failure();
+  return addressIndex(*offset);
+}
+
 LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "load emission");
   plan::BoundaryOp boundary =
@@ -1089,8 +1170,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   bool packedScalar =
       target::emission::hasPackedScalarDomain(planIndex, boundary);
-  FailureOr<std::string> indices =
-      indexTuple(operation, boundary.getAccess() == "gather" || packedScalar);
+  bool scanReplay = activeScanReplay >= 0;
+  FailureOr<std::string> indices = indexTuple(
+      operation, boundary.getAccess() == "gather" || packedScalar || scanReplay);
   if (failed(view) || failed(indices) || failed(physicalFill))
     return failure();
   StringRef loadFill = boundary.getPadding();
@@ -1102,7 +1184,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
                       : isa<IntegerType, IndexType>(elementType) ? "0"
                                                                 : "0.0";
   std::string result = makeResultName(operation, 0);
-  if (boundary.getAccess() == "gather" || packedScalar) {
+  if (boundary.getAccess() == "gather" || packedScalar || scanReplay) {
     line(result + " = ct.gather(" + (*view)->argument->name + ", " +
          *indices + ", check_bounds=True, padding_value=" + padding.str() +
          ")");
@@ -1151,6 +1233,13 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
       failed(axis) || !result || result.getRank() != 1 ||
       !isa<IntegerType, IndexType>(result.getElementType()))
     return operation.emitOpError("lacks a mechanical cuTile indices binding");
+  if (activeScanReplay >= 0) {
+    std::string replay = axisIndices.lookup(axis->getNode());
+    if (replay.empty())
+      return operation.emitOpError("has no active cuTile scan replay index");
+    bindResult(operation, 0, replay);
+    return success();
+  }
   if (axis->hasRole("lane") && !axis->getReuseWorker() &&
       axis->getTileRole().starts_with("row_vector")) {
     FailureOr<std::string> tile = physicalAxisTile(*axis);
@@ -1261,13 +1350,140 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   plan::ScanOp binding =
       succeeded(node) ? planIndex.scans.lookup(*node) : plan::ScanOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
+  if (binding && binding.getResultSpace() == "private_fragment") {
+    if (failed(node) || binding.getLowering() != "ct.cumsum" ||
+        failed(operand) || operation.getNumResults() != 1)
+      return operation.emitOpError("lacks a fragment cuTile scan binding");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.cumsum(" + operand->str() + ", axis=" +
+         std::to_string(binding.getAxis()) + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  plan::AxisOp axis = binding ? planIndex.axes.lookup(binding.getAxisNode())
+                              : plan::AxisOp();
+  const target::emission::RangeBinding *range =
+      axis ? axis.getRange("traversal", 0) : nullptr;
+  std::string extent = binding ? scanExtents.lookup(binding.getNode())
+                               : std::string();
   if (failed(node) || !binding || binding.getLowering() != "ct.cumsum" ||
-      failed(operand) || operation.getNumResults() != 1)
+      !axis || !range || extent.empty() ||
+      operation.getNumResults() != 1)
     return operation.emitOpError("lacks a mechanical cuTile scan binding");
   std::string result = makeResultName(operation, 0);
-  line(result + " = ct.cumsum(" + operand->str() + ", axis=" +
-       std::to_string(binding.getAxis()) + ")");
-  bindResult(operation, 0, result);
+  std::string carry = result + "_carry";
+  std::string block = result + "_block";
+  std::string offsets = result + "_offsets";
+  std::string values = result + "_values";
+  std::string scanned = result + "_scanned";
+  line(carry + " = 0");
+  line("for " + block + " in range(ct.cdiv(" + extent + ", " +
+       range->getTile().str() + ")):");
+  ++indentation;
+  line(offsets + " = " + addressIndex(block) + " * " +
+       range->getTile().str() + " + " +
+       addressIndex("ct.arange(" + range->getTile().str() +
+                    ", dtype=ct.int32)"));
+  if (failed(replayScanProducers(binding, offsets)))
+    return failure();
+  operand = lookupValue(operation, 0);
+  if (failed(operand))
+    return failure();
+  line(values + " = " + operand->str());
+  for (int64_t valueID : binding.getMaterializedValues()) {
+    Value value = kernel.values.lookup(valueID);
+    auto name = valueNames.find(value);
+    FailureOr<std::string> workspaceIndex =
+        scanMaterializedIndex(value, offsets, operation);
+    if (name == valueNames.end() || failed(workspaceIndex))
+      return binding.emitOpError(
+          "has no emitted cuTile value for scan materialization");
+    line("ct.scatter(" + workspaceNames.lookup(value) + ", " +
+         *workspaceIndex + ", " + name->second + ", check_bounds=True)");
+  }
+  line(scanned + " = ct.cumsum(ct.where(" + offsets + " < " + extent +
+       ", " + values + ", 0), axis=" +
+       std::to_string(binding.getAxis()) + ") + " + carry);
+  FailureOr<std::string> workspaceIndex =
+      scanWorkspaceIndex(binding, offsets, operation);
+  Operation *scan = kernel.nodes.lookup(binding.getNode());
+  if (failed(workspaceIndex) || !scan || scan->getNumResults() != 1)
+    return failure();
+  line("ct.scatter(" + workspaceNames.lookup(scan->getResult(0)) + ", " +
+       *workspaceIndex + ", " + scanned + ", check_bounds=True)");
+  std::string lastLane = "ct.minimum(" + range->getTile().str() + " - 1, " +
+                         extent + " - " + block + " * " +
+                         range->getTile().str() + " - 1)";
+  line(carry + " = ct.extract(" + scanned + ", (" +
+       lastLane + ",), shape=(1,)).item()");
+  --indentation;
+  valueNames.erase(operation.getResult(0));
+  return success();
+}
+
+LogicalResult SourceEmitter::replayScanProducers(const plan::ScanOp &binding,
+                                                 StringRef offsets) {
+  if (!operationRegistry())
+    return binding.emitOpError("has no cuTile operation registry for scan replay");
+  auto oldAxis = axisIndices.find(binding.getAxisNode());
+  std::optional<std::string> savedAxis =
+      oldAxis == axisIndices.end() ? std::nullopt
+                                   : std::optional<std::string>(oldAxis->second);
+  axisIndices[binding.getAxisNode()] = offsets.str();
+  const auto *range = planIndex.axes.lookup(binding.getAxisNode())
+                          .getRange("traversal", 0);
+  if (!range)
+    return binding.emitOpError("has no cuTile scan traversal tile");
+  scanAxisTiles[binding.getAxisNode()] = range->getTile().str();
+  llvm::StringMap<std::optional<std::string>> savedTiles;
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer)
+      return binding.emitOpError("references an unknown cuTile scan producer");
+    auto shapes = producer->getAttrOfType<ArrayAttr>("intent.result_shapes");
+    if (!shapes)
+      continue;
+    for (Attribute shapeAttr : shapes) {
+      auto shape = dyn_cast<ArrayAttr>(shapeAttr);
+      if (!shape)
+        continue;
+      for (Attribute labelAttr : shape) {
+        auto label = dyn_cast<StringAttr>(labelAttr);
+        if (!label || !label.getValue().starts_with("?region_") ||
+            savedTiles.count(label.getValue()))
+          continue;
+        auto found = regionTiles.find(label.getValue());
+        savedTiles[label.getValue()] =
+            found == regionTiles.end()
+                ? std::nullopt
+                : std::optional<std::string>(found->getValue());
+        regionTiles[label.getValue()] = range->getTile().str();
+      }
+    }
+  }
+  activeScanReplay = binding.getNode();
+  auto restore = [&]() {
+    activeScanReplay = -1;
+    scanAxisTiles.erase(binding.getAxisNode());
+    if (savedAxis)
+      axisIndices[binding.getAxisNode()] = *savedAxis;
+    else
+      axisIndices.erase(binding.getAxisNode());
+    for (const auto &entry : savedTiles) {
+      if (entry.getValue())
+        regionTiles[entry.getKey()] = *entry.getValue();
+      else
+        regionTiles.erase(entry.getKey());
+    }
+  };
+  for (int64_t node : binding.getProducers()) {
+    Operation *producer = kernel.nodes.lookup(node);
+    if (!producer || failed(operationRegistry()->dispatch(*producer, stage()))) {
+      restore();
+      return failure();
+    }
+  }
+  restore();
   return success();
 }
 
@@ -1579,7 +1795,14 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       (*relation)[0].operands.size() == 1 &&
       (*relation)[0].operands.front();
   if (scalarFragmentGather) {
-    FailureOr<StringRef> source = lookupValue(operation, 0);
+    auto scanSource = scanResults.find(operation.getOperand(0));
+    auto materializedSource =
+        scanMaterializedValues.find(operation.getOperand(0));
+    FailureOr<StringRef> source =
+        scanSource == scanResults.end() &&
+                materializedSource == scanMaterializedValues.end()
+            ? lookupValue(operation, 0)
+            : FailureOr<StringRef>(StringRef());
     FailureOr<StringRef> index =
         lookupValue(operation, *(*relation)[0].operands.front());
     FailureOr<StringRef> valid =
@@ -1588,12 +1811,34 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     FailureOr<StringRef> fill =
         fillIndex ? lookupValue(operation, fillIndex.getInt())
                   : FailureOr<StringRef>(failure());
-    if (failed(source) || failed(index) || failed(valid) || failed(fill))
+    if ((scanSource == scanResults.end() &&
+         materializedSource == scanMaterializedValues.end() && failed(source)) ||
+        failed(index) ||
+        failed(valid) || failed(fill))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.where(" + valid->str() + ", ct.extract(" +
-         source->str() + ", (" + addressIndex(index->str()) +
-         ",), shape=(1,)).item(), " + fill->str() + ")");
+    if (scanSource != scanResults.end()) {
+      FailureOr<std::string> workspaceIndex = scanWorkspaceIndex(
+          scanSource->second, index->str(), operation);
+      Operation *scan = kernel.nodes.lookup(scanSource->second.getNode());
+      if (failed(workspaceIndex) || !scan || scan->getNumResults() != 1)
+        return failure();
+      line(result + " = ct.where(" + valid->str() + ", ct.load(" +
+           workspaceNames.lookup(scan->getResult(0)) + ", index=(" +
+           *workspaceIndex + ",), shape=()).item(), " + fill->str() + ")");
+    } else if (materializedSource != scanMaterializedValues.end()) {
+      FailureOr<std::string> workspaceIndex = scanMaterializedIndex(
+          operation.getOperand(0), index->str(), operation);
+      if (failed(workspaceIndex))
+        return failure();
+      line(result + " = ct.where(" + valid->str() + ", ct.load(" +
+           workspaceNames.lookup(operation.getOperand(0)) + ", index=(" +
+           *workspaceIndex + ",), shape=()).item(), " + fill->str() + ")");
+    } else {
+      line(result + " = ct.where(" + valid->str() + ", ct.extract(" +
+           source->str() + ", (" + addressIndex(index->str()) +
+           ",), shape=(1,)).item(), " + fill->str() + ")");
+    }
     bindResult(operation, 0, result);
     return success();
   }

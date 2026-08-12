@@ -10,6 +10,7 @@
 #include "mlir/Support/LLVM.h"
 
 #include <optional>
+#include <limits>
 
 namespace intent::target {
 
@@ -22,6 +23,19 @@ struct LogicalBufferIndex {
   std::optional<unsigned> operand;
   std::optional<int64_t> constant;
 };
+
+inline mlir::FailureOr<int64_t>
+logicalBufferElementCount(const LogicalBufferInfo &info,
+                          mlir::Operation &operation) {
+  int64_t count = 1;
+  for (int64_t extent : info.shape) {
+    if (count > std::numeric_limits<int64_t>::max() / extent)
+      return operation.emitOpError(
+          "private logical-buffer extent overflows target allocation");
+    count *= extent;
+  }
+  return count;
+}
 
 inline mlir::FailureOr<LogicalBufferInfo>
 getLogicalBufferInfo(mlir::Operation &operation) {

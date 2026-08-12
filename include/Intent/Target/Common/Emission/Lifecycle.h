@@ -23,6 +23,16 @@ public:
   virtual mlir::func::FuncOp entry() const = 0;
   virtual llvm::StringRef stage() const = 0;
   virtual llvm::raw_ostream &stream() = 0;
+
+  void setOperationRegistry(const OperationHandlerRegistry *value) {
+    registry = value;
+  }
+
+protected:
+  const OperationHandlerRegistry *operationRegistry() const { return registry; }
+
+private:
+  const OperationHandlerRegistry *registry = nullptr;
 };
 
 mlir::LogicalResult emitSource(TargetSourceEmitter &emitter);

@@ -60,7 +60,14 @@ struct LogicalBufferFact {
   mlir::Operation *owner = nullptr;
   LogicalBufferInfo info;
   bool hasDynamicAccess = false;
-  bool requiresAddressableStorage = false;
+  bool hasUnstructuredDynamicAccess = false;
+};
+
+struct ScanFact {
+  mlir::Operation *axis = nullptr;
+  llvm::SmallVector<int64_t> producers;
+  llvm::SmallVector<int64_t> materializedValues;
+  bool scalarConsumers = false;
 };
 
 struct AccessRangeFact {
@@ -94,6 +101,7 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> contractionDomains;
   llvm::DenseSet<mlir::Operation *> orderedDomains;
   llvm::DenseSet<mlir::Operation *> serialLoopDomains;
+  llvm::DenseMap<mlir::Operation *, ScanFact> scans;
   llvm::DenseMap<mlir::Operation *, int64_t> orderedStreamFixedExtents;
   llvm::DenseMap<mlir::Operation *, StateStreamFact> stateStreams;
   llvm::DenseMap<mlir::Operation *, RaggedRelationFact> raggedRelations;

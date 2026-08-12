@@ -151,6 +151,8 @@ private:
   mlir::LogicalResult resolvePhysicalBindings();
   mlir::LogicalResult preparePrivateWorkspaces();
   mlir::LogicalResult emitConditional(mlir::Operation &operation, bool mask);
+  mlir::LogicalResult replayScanProducers(const plan::ScanOp &binding,
+                                          llvm::StringRef offsets);
   void emitImports() override;
   mlir::LogicalResult emitKernelHeader() override;
   mlir::LogicalResult emitWrapper() override;
@@ -176,6 +178,13 @@ private:
   emitPointerExpression(mlir::Operation &operation, ABIView &view, bool store);
   mlir::FailureOr<std::string>
   privateWorkspacePointer(mlir::Operation &operation);
+  mlir::FailureOr<std::string>
+  scanWorkspacePointer(const plan::ScanOp &binding,
+                       llvm::StringRef logicalIndex,
+                       mlir::Operation &consumer);
+  mlir::FailureOr<std::string>
+  scanMaterializedPointer(mlir::Value value, llvm::StringRef logicalIndex,
+                          mlir::Operation &consumer);
   mlir::FailureOr<std::string>
   emitMaskExpression(mlir::Operation &operation, bool store);
   mlir::FailureOr<std::string>
@@ -237,6 +246,11 @@ private:
       operationStages;
   llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;
   llvm::DenseMap<mlir::Value, std::string> workspaceNames;
+  llvm::DenseMap<mlir::Value, plan::ScanOp> scanResults;
+  llvm::DenseMap<mlir::Value, plan::ScanOp> scanMaterializedValues;
+  llvm::DenseMap<int64_t, std::string> scanExtents;
+  llvm::DenseMap<mlir::Operation *, int64_t> scanProducerOwners;
+  int64_t activeScanReplay = -1;
   llvm::SmallVector<mlir::Operation *> privateWorkspaceBuffers;
   llvm::SmallVector<std::string> stageBodies;
   llvm::SmallVector<unsigned> activeStages;
