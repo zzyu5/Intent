@@ -9,7 +9,10 @@ fi
 backend=$1
 kernel=$2
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-build_root=/tmp/intentdsl-build
+build_root=${INTENT_BUILD_ROOT:-/tmp/intentdsl-build}
+cmake_generator=${INTENT_CMAKE_GENERATOR:-Ninja}
+mlir_dir=${INTENT_MLIR_DIR:-/usr/lib/llvm-20/lib/cmake/mlir}
+llvm_dir=${INTENT_LLVM_DIR:-/usr/lib/llvm-20/lib/cmake/llvm}
 
 case "${backend}" in
   triton)
@@ -215,9 +218,9 @@ python_bin=${INTENT_PYTHON:-${default_python}}
 cmake \
   -S "${project_root}" \
   -B "${build_root}" \
-  -G Ninja \
-  -DMLIR_DIR=/usr/lib/llvm-20/lib/cmake/mlir \
-  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+  -G "${cmake_generator}" \
+  -DMLIR_DIR="${mlir_dir}" \
+  -DLLVM_DIR="${llvm_dir}"
 cmake --build "${build_root}" --target intent-compile
 
 runner_arguments=(
