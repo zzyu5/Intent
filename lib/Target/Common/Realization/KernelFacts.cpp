@@ -348,6 +348,164 @@ affineLowerBound(const AffineIndexExpression &expression,
   return lower;
 }
 
+bool proveScalarAtLeast(Value value, int64_t minimum,
+                        const KernelFacts &facts, Operation &consumer,
+                        llvm::DenseSet<Value> &active,
+                        llvm::DenseMap<Value, int64_t> &assumed) {
+  auto invariant = assumed.find(value);
+  if (invariant != assumed.end() && invariant->second >= minimum)
+    return true;
+  if (!active.insert(value).second)
+    return false;
+  auto finish = [&](bool result) {
+    active.erase(value);
+    return result;
+  };
+  if (std::optional<int64_t> literal = integerConstant(value))
+    return finish(*literal >= minimum);
+
+  {
+    llvm::DenseSet<Value> affineActive;
+    std::optional<AffineIndexExpression> expression =
+        affineIndexExpression(value, facts, consumer, affineActive);
+    std::optional<int64_t> lower =
+        expression ? affineLowerBound(*expression, facts) : std::nullopt;
+    if (lower && *lower >= minimum)
+      return finish(true);
+  }
+
+  auto argument = dyn_cast<BlockArgument>(value);
+  if (argument) {
+    Operation *loop = argument.getOwner()->getParentOp();
+    if (!loop || loop->getName().getStringRef() != "intent.for" ||
+        loop->getNumRegions() != 1 || !llvm::hasSingleElement(loop->getRegion(0)) ||
+        loop->getNumOperands() != loop->getNumResults() + 1)
+      return finish(false);
+    FailureOr<SmallVector<Operation *>> domains =
+        expandDomainSource(loop->getOperand(0), *loop);
+    if (failed(domains) || argument.getArgNumber() < domains->size())
+      return finish(false);
+    unsigned carried = argument.getArgNumber() - domains->size();
+    if (carried >= loop->getNumResults())
+      return finish(false);
+    Operation &yield = loop->getRegion(0).front().back();
+    if (yield.getName().getStringRef() != "intent.yield" ||
+        yield.getNumOperands() != loop->getNumResults())
+      return finish(false);
+    Value initial = loop->getOperand(carried + 1);
+    Value next = yield.getOperand(carried);
+    assumed[value] = minimum;
+    bool result = proveScalarAtLeast(initial, minimum, facts, consumer, active,
+                                     assumed) &&
+                  proveScalarAtLeast(next, minimum, facts, consumer, active,
+                                     assumed);
+    assumed.erase(value);
+    return finish(result);
+  }
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return finish(false);
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.cast" && definition->getNumOperands() == 1 &&
+      isa<intent::LogicalIndexType>(definition->getOperand(0).getType())) {
+    llvm::DenseSet<Value> sourceActive;
+    std::optional<AffineIndexExpression> expression = affineIndexExpression(
+        definition->getOperand(0), facts, *definition, sourceActive);
+    std::optional<int64_t> lower =
+        expression ? affineLowerBound(*expression, facts) : std::nullopt;
+    std::optional<std::pair<int64_t, int64_t>> range =
+        expression ? staticAffineRange(*expression, facts) : std::nullopt;
+    auto resultInteger = dyn_cast<IntegerType>(definition->getResult(0).getType());
+    if (lower && *lower >= minimum && range && resultInteger &&
+        resultInteger.getWidth() > 1 &&
+        (resultInteger.getWidth() >= 64 ||
+         range->second <
+             (int64_t{1} << (resultInteger.getWidth() - 1))))
+      return finish(true);
+  }
+  auto signPreservingCast = [&]() {
+    if (name != "intent.cast" || definition->getNumOperands() == 0)
+      return false;
+    Type source = definition->getOperand(0).getType();
+    Type result = definition->getResult(0).getType();
+    auto sourceInteger = dyn_cast<IntegerType>(source);
+    auto resultInteger = dyn_cast<IntegerType>(result);
+    return sourceInteger && resultInteger &&
+           resultInteger.getWidth() >= sourceInteger.getWidth();
+  };
+  if ((signPreservingCast() || name == "intent.broadcast" ||
+       name == "intent.reshape" || name == "intent.transpose") &&
+      definition->getNumOperands() > 0)
+    return finish(proveScalarAtLeast(definition->getOperand(0), minimum, facts,
+                                     consumer, active, assumed));
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return finish(false);
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  if (!logical)
+    return finish(false);
+  Value lhs = definition->getOperand(0);
+  Value rhs = definition->getOperand(1);
+  std::optional<int64_t> lhsConstant = integerConstant(lhs);
+  std::optional<int64_t> rhsConstant = integerConstant(rhs);
+  if (logical.getValue() == "add") {
+    if (rhsConstant)
+      return finish(proveScalarAtLeast(lhs, minimum - *rhsConstant, facts,
+                                       consumer, active, assumed));
+    if (lhsConstant)
+      return finish(proveScalarAtLeast(rhs, minimum - *lhsConstant, facts,
+                                       consumer, active, assumed));
+    if (minimum <= 0)
+      return finish(proveScalarAtLeast(lhs, 0, facts, consumer, active,
+                                       assumed) &&
+                    proveScalarAtLeast(rhs, 0, facts, consumer, active,
+                                       assumed));
+    return finish(false);
+  }
+  if (logical.getValue() == "multiply") {
+    if (rhsConstant && *rhsConstant > 0)
+      return finish(proveScalarAtLeast(
+          lhs, llvm::divideCeil(minimum, *rhsConstant), facts, consumer, active,
+          assumed));
+    if (lhsConstant && *lhsConstant > 0)
+      return finish(proveScalarAtLeast(
+          rhs, llvm::divideCeil(minimum, *lhsConstant), facts, consumer, active,
+          assumed));
+    if (minimum <= 0)
+      return finish(proveScalarAtLeast(lhs, 0, facts, consumer, active,
+                                       assumed) &&
+                    proveScalarAtLeast(rhs, 0, facts, consumer, active,
+                                       assumed));
+    return finish(false);
+  }
+  if (logical.getValue() == "floor_divide" && rhsConstant &&
+      *rhsConstant > 0) {
+    int64_t required;
+    if (llvm::MulOverflow(minimum, *rhsConstant, required))
+      return finish(false);
+    return finish(
+        proveScalarAtLeast(lhs, required, facts, consumer, active, assumed));
+  }
+  if (minimum <= 0 &&
+      (logical.getValue() == "bitwise_and" ||
+       logical.getValue() == "bitwise_or" ||
+       logical.getValue() == "shift_left" ||
+       logical.getValue() == "shift_right"))
+    return finish(proveScalarAtLeast(lhs, 0, facts, consumer, active,
+                                     assumed) &&
+                  proveScalarAtLeast(rhs, 0, facts, consumer, active,
+                                     assumed));
+  if (minimum <= 0 && logical.getValue() == "remainder") {
+    llvm::DenseSet<Value> divisorActive;
+    llvm::DenseMap<Value, int64_t> divisorAssumed;
+    return finish(proveScalarAtLeast(lhs, 0, facts, consumer, active,
+                                     assumed) &&
+                  proveScalarAtLeast(rhs, 1, facts, consumer, divisorActive,
+                                     divisorAssumed));
+  }
+  return finish(false);
+}
+
 bool hasNonnegativeIntegerOperandsImpl(Operation &operation,
                                        const KernelFacts &facts) {
   if (operation.getName().getStringRef() != "intent.binary" ||
@@ -361,14 +519,27 @@ bool hasNonnegativeIntegerOperandsImpl(Operation &operation,
   llvm::DenseSet<Value> divisorActive;
   std::optional<AffineIndexExpression> divisor = affineIndexExpression(
       operation.getOperand(1), facts, operation, divisorActive);
-  if (!divisor || !divisor->coefficients.empty() || divisor->constant <= 0)
+  bool positiveDivisor = divisor && divisor->coefficients.empty() &&
+                         divisor->constant > 0;
+  if (!positiveDivisor) {
+    llvm::DenseSet<Value> proofActive;
+    llvm::DenseMap<Value, int64_t> assumed;
+    positiveDivisor = proveScalarAtLeast(operation.getOperand(1), 1, facts,
+                                         operation, proofActive, assumed);
+  }
+  if (!positiveDivisor)
     return false;
   llvm::DenseSet<Value> active;
   std::optional<AffineIndexExpression> dividend = affineIndexExpression(
       operation.getOperand(0), facts, operation, active);
   std::optional<int64_t> lower =
       dividend ? affineLowerBound(*dividend, facts) : std::nullopt;
-  return lower && *lower >= 0;
+  if (lower && *lower >= 0)
+    return true;
+  llvm::DenseSet<Value> proofActive;
+  llvm::DenseMap<Value, int64_t> assumed;
+  return proveScalarAtLeast(operation.getOperand(0), 0, facts, operation,
+                            proofActive, assumed);
 }
 
 std::optional<std::pair<int64_t, int64_t>>

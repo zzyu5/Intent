@@ -1144,7 +1144,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   }
   bool addressableLocalBuffer = llvm::any_of(
       planIndex.buffers, [](const auto &entry) {
-        return entry.second.getSpace() == "private_vector";
+        return entry.second.getSpace() == "private_vector" ||
+               entry.second.getSpace() == "private_workspace";
       });
   output << ", threads=" << (addressableLocalBuffer ? "1" : "threads") << ") as ";
   if (workers == 1)
