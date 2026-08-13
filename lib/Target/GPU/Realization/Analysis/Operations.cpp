@@ -402,14 +402,21 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                                   ? dyn_cast<RankedTensorType>(
                                         operation.getResult(0).getType())
                                   : RankedTensorType();
+            bool supportedAccumulator =
+                accType && (accType.getValue() == "f32" ||
+                            accType.getValue() == "i32");
             if (operation.getNumOperands() != 2 ||
-                operation.getNumResults() != 1 || !accType ||
-                accType.getValue() != "f32" || !multiply ||
+                operation.getNumResults() != 1 || !supportedAccumulator ||
+                !multiply ||
                 multiply.getValue() != "multiply" || !combine ||
                 combine.getValue() != "add" || !lhsAxis || !rhsAxis ||
                 !lhsType || lhsType.getRank() != 2 || !rhsType ||
                 rhsType.getRank() != 2 || !resultType ||
                 resultType.getRank() != 2 ||
+                (accType.getValue() == "f32" &&
+                 !resultType.getElementType().isF32()) ||
+                (accType.getValue() == "i32" &&
+                 !resultType.getElementType().isInteger(32)) ||
                 (lhsAxis.getInt() != 0 && lhsAxis.getInt() != 1) ||
                 (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1))
               return operation.emitOpError(

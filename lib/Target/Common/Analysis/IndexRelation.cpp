@@ -235,22 +235,6 @@ FailureOr<bool> hasDerivedScalarIndex(Operation &operation) {
   return false;
 }
 
-FailureOr<bool> hasTensorIndirectIndex(Operation &operation) {
-  FailureOr<llvm::SmallVector<IndexTerm>> relation =
-      parseIndexRelation(operation);
-  if (failed(relation))
-    return failure();
-  for (const IndexTerm &term : *relation) {
-    if (term.kind != "value_index" || term.operands.size() != 1 ||
-        !term.operands.front())
-      continue;
-    if (isa<RankedTensorType>(
-            operation.getOperand(*term.operands.front()).getType()))
-      return true;
-  }
-  return false;
-}
-
 FailureOr<bool> isWholeViewAccess(Operation &operation) {
   FailureOr<llvm::SmallVector<IndexTerm>> relation =
       parseIndexRelation(operation);

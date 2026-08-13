@@ -53,6 +53,94 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "block_scaled_matmul":
+        block_scaled = _load_module(
+            source_path, "intent_upstream_cutile_block_scaled"
+        )
+        state = {}
+
+        def run(arguments):
+            lhs, lhs_scale, rhs, rhs_scale = arguments
+            lhs = lhs.reshape(lhs.shape[0], -1)
+            rhs = rhs.reshape(-1, rhs.shape[-1])
+            if not state:
+                state["output"] = torch.empty(
+                    (lhs.shape[0], rhs.shape[1]),
+                    device=lhs.device,
+                    dtype=torch.float32,
+                )
+            tm, tn, tk, scaling_block_size = 256, 256, 128, 32
+            grid = (
+                block_scaled.ct.cdiv(lhs.shape[0], tm)
+                * block_scaled.ct.cdiv(rhs.shape[1], tn),
+                1,
+                1,
+            )
+            block_scaled.ct.launch(
+                torch.cuda.current_stream(),
+                grid,
+                block_scaled.block_scaled_matmul_kernel,
+                (
+                    lhs,
+                    lhs_scale,
+                    rhs,
+                    rhs_scale,
+                    state["output"],
+                    tm,
+                    tn,
+                    tk,
+                    scaling_block_size,
+                ),
+            )
+            return state["output"]
+
+        return run
+    if kernel == "splitk_attention_reduce":
+        utils_path = source_path.parents[2] / "support" / "utils.py"
+        _load_module(utils_path, "tilegym.ops.cutile.utils")
+        splitk_reduce = _load_module(
+            source_path, "tilegym.ops.cutile._intent_splitk_reduce"
+        ).splitk_reduce
+
+        state = {}
+
+        def run(arguments):
+            partial, partial_lse = arguments
+            if not state:
+                state["output"] = torch.empty(
+                    partial.shape[0],
+                    partial.shape[1],
+                    partial.shape[3],
+                    device=partial.device,
+                    dtype=partial.dtype,
+                )
+            return splitk_reduce(partial, partial_lse, state["output"], 8192)
+
+        return run
+    if kernel == "mla_prefill":
+        source = _load_module(source_path, "intent_upstream_cutile_mla_prefill")
+        state = {}
+
+        def run(arguments):
+            q, qpe, k, kpe, v, scale = arguments
+            if not state:
+                state["output"] = torch.empty_like(q)
+            head_group = q.shape[1] // k.shape[1]
+            source._cutile_autotune_mla(
+                torch.cuda.current_stream(),
+                q,
+                qpe,
+                k,
+                kpe,
+                v,
+                state["output"],
+                scale,
+                q.shape[1],
+                head_group,
+            )
+            return state["output"]
+
+        return run
     if kernel == "batched_gemm":
         bmm = _load_module(source_path, "intent_upstream_cutile_batched_gemm").bmm
         return lambda arguments: bmm(

@@ -34,6 +34,7 @@ _DTYPE_TYPES = {
     "u64": "ui64",
     "f8e4m3fn": "f8E4M3FN",
     "f8e5m2": "f8E5M2",
+    "f8e8m0fnu": "f8E8M0FNU",
     "f16": "f16",
     "bf16": "bf16",
     "f32": "f32",

@@ -1082,11 +1082,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
   bool expanded = !physicalFill->empty();
-  FailureOr<bool> tensorIndirect = target::hasTensorIndirectIndex(operation);
-  if (failed(tensorIndirect))
-    return failure();
+  bool tensorIndirect = boundary.hasDataDependentTensorIndex();
   bool guardedF16Bulk = !scalarResult && resultElementType.isF16() &&
-                        *derivedScalar && !*tensorIndirect &&
+                        *derivedScalar && !tensorIndirect &&
                         boundary.getCheckBounds() &&
                         boundary.getPadding() != "none";
   FailureOr<SmallVector<target::IndexTerm>> relation = failure();
@@ -1195,11 +1193,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     bool materializeLogicalBounds =
         boundary.getCheckBounds() && padding != "none";
     bool stagePhysicalPadding =
-        expanded && succeeded(tensorIndirect) && *tensorIndirect;
+        expanded && tensorIndirect;
     FailureOr<SmallVector<std::string>> extents =
         tensorExtents(operation, 0, !stagePhysicalPadding);
     if (failed(extents) || extents->empty() ||
-        failed(tensorIndirect) ||
         (padding != "none" && padding != "zero" &&
          padding != "negative_infinity"))
       return operation.emitOpError(
@@ -1256,17 +1253,15 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
             ? elementBoundsPredicate(operation, tileIndices, true)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> wholeTile =
-        materializeLogicalBounds && succeeded(tensorIndirect) &&
-                !*tensorIndirect
+        materializeLogicalBounds && !tensorIndirect
             ? wholeTileBoundsPredicate(operation, *extents)
             : FailureOr<std::string>(std::string());
     FailureOr<std::string> bulkIndices =
-        materializeLogicalBounds && succeeded(tensorIndirect) &&
-                !*tensorIndirect
+        materializeLogicalBounds && !tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
     if (failed(logicalPredicate) || failed(physicalPredicate) ||
-        failed(tensorIndirect) || failed(wholeTile) || failed(bulkIndices))
+        failed(wholeTile) || failed(bulkIndices))
       return failure();
     bool hasBulkFastPath = !expanded && !wholeTile->empty();
     if (hasBulkFastPath) {
@@ -1917,13 +1912,17 @@ LogicalResult SourceEmitter::emitUnary(Operation &operation) {
                            : binding.getLowering() == "python_not"
                                ? "(" + *operand + ") == False"
                                : binding.getLowering().str() + "(" + *operand + ")";
+  FailureOr<std::string> padded = padElementExpression(
+      operation.getResult(0), expression, indices, operation);
+  if (failed(padded))
+    return failure();
   std::string target = result + "[";
   for (auto [axis, index] : llvm::enumerate(indices)) {
     if (axis)
       target += ", ";
     target += index;
   }
-  line(target + "] = " + expression);
+  line(target + "] = " + *padded);
   --indentation;
   bindResult(operation, 0, result);
   return success();
@@ -2266,7 +2265,45 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
-  FailureOr<std::string> shape = tensorShape(operation, 0);
+  auto resultTensor = operation.getNumResults() == 1
+                          ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                          : RankedTensorType();
+  SmallVector<std::string> extents;
+  auto sourceTensor = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  bool introducesUnitAxis = sourceTensor && resultTensor &&
+                            sourceTensor.getRank() + 1 == resultTensor.getRank() &&
+                            llvm::count(resultTensor.getShape(), 1) == 1;
+  if (introducesUnitAxis && binding &&
+      binding.getAxisNodes().size() == static_cast<size_t>(resultTensor.getRank())) {
+    for (int64_t axisNode : binding.getAxisNodes()) {
+      if (axisNode < 0) {
+        extents.push_back("1");
+        continue;
+      }
+      plan::AxisOp axis = planIndex.axes.lookup(axisNode);
+      const target::emission::RangeBinding *range =
+          axis ? axis.getRange("reduction", 0) : nullptr;
+      if (!range) {
+        extents.clear();
+        break;
+      }
+      extents.push_back(range->getTile().str());
+    }
+  }
+  FailureOr<std::string> shape = failure();
+  if (!extents.empty()) {
+    std::string spelling = "(";
+    for (auto [index, extent] : llvm::enumerate(extents)) {
+      if (index)
+        spelling += ", ";
+      spelling += extent;
+    }
+    if (extents.size() == 1)
+      spelling += ",";
+    shape = spelling + ")";
+  } else {
+    shape = tensorShape(operation, 0);
+  }
   if (failed(node) || !binding || binding.getLowering() != "T.reshape" ||
       binding.getReuseOperandAttr().getInt() != -1 ||
       binding.getSpace() != "fragment" || failed(operand) || failed(shape) ||
@@ -2509,6 +2546,24 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       failed(extents) || extents->size() != 2)
     return failure();
   auto sourceTensor = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  Operation *validDefinition =
+      operation.getOperand(validIndex.getInt()).getDefiningOp();
+  Attribute validLiteral =
+      validDefinition ? validDefinition->getAttr("intent.value") : Attribute();
+  bool alwaysValid = false;
+  if (auto boolean = dyn_cast_if_present<BoolAttr>(validLiteral))
+    alwaysValid = boolean.getValue();
+  else if (auto integer = dyn_cast_if_present<IntegerAttr>(validLiteral))
+    alwaysValid = !integer.getValue().isZero();
+  if (sourceTensor && sourceTensor.getRank() == 1 &&
+      ((appendAxis && (*extents)[1] == "1") ||
+       (prependAxis && (*extents)[0] == "1")) &&
+      alwaysValid) {
+    line(*result + " = T.reshape(" + source->str() + ", (" + (*extents)[0] +
+         ", " + (*extents)[1] + "))");
+    bindResult(operation, 0, *result);
+    return success();
+  }
   line("for gather_i, gather_j in T.Parallel(" + (*extents)[0] + ", " +
        (*extents)[1] + "):");
   ++indentation;
@@ -2718,6 +2773,16 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
        addressIndex(streamTile) + " * " + binding.getTile().str());
   axisIndices[binding.getAxisNode()] = streamStart;
   valueNames[body.getArgument(0)] = streamStart;
+  for (int64_t axisNode : binding.getInnerReductionAxes()) {
+    if (axisNode == binding.getAxisNode())
+      continue;
+    plan::AxisOp axis = planIndex.axes.lookup(axisNode);
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange("reduction", 0) : nullptr;
+    if (!range)
+      return binding.emitOpError("has no inner reduction range");
+    axisIndices[axisNode] = "0";
+  }
   return success();
 }
 
@@ -2756,6 +2821,9 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     axisIndices.erase(binding.getAxisNode());
   else
     axisIndices[binding.getAxisNode()] = outerIndex->second;
+  for (int64_t axisNode : binding.getInnerReductionAxes())
+    if (axisNode != binding.getAxisNode())
+      axisIndices.erase(axisNode);
   streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
@@ -2909,6 +2977,22 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
                                                    *rhsLoad, operation);
     if (failed(reductionAxis))
       return failure();
+    FailureOr<int64_t> lhsNode =
+        target::getNodeID(*lhsLoad, "TileLang contraction lhs transfer");
+    FailureOr<int64_t> rhsNode =
+        target::getNodeID(*rhsLoad, "TileLang contraction rhs transfer");
+    plan::BoundaryOp lhsBoundary =
+        succeeded(lhsNode) ? planIndex.boundaries.lookup(*lhsNode)
+                           : plan::BoundaryOp();
+    plan::BoundaryOp rhsBoundary =
+        succeeded(rhsNode) ? planIndex.boundaries.lookup(*rhsNode)
+                           : plan::BoundaryOp();
+    if (failed(lhsNode) || failed(rhsNode) || !lhsBoundary || !rhsBoundary)
+      return failure();
+    if (lhsBoundary.hasDataDependentTensorIndex() ||
+        rhsBoundary.hasDataDependentTensorIndex())
+      return operation.emitOpError(
+          "TileLang cannot bulk-copy a contraction operand with a noncontiguous index tile");
     axisIndices[reductionAxis->getNode()] =
         addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad);
@@ -2995,7 +3079,42 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         resultTensor ? dtypeName(resultTensor.getElementType(), operation) : "";
     if (accumulatorDtype.empty())
       return failure();
-    std::string reductionExtent = (*lhsExtents)[1];
+    auto lhsValue = dyn_cast<OpResult>(operation.getOperand(0));
+    auto rhsValue = dyn_cast<OpResult>(operation.getOperand(1));
+    plan::PointwiseOp lhsBinding =
+        lhsValue ? planIndex.pointwise.lookup(
+                       target::getNodeID(*lhsValue.getOwner(),
+                                         "single-row contraction lhs")
+                           .value_or(-1))
+                 : plan::PointwiseOp();
+    plan::PointwiseOp rhsBinding =
+        rhsValue ? planIndex.pointwise.lookup(
+                       target::getNodeID(*rhsValue.getOwner(),
+                                         "single-row contraction rhs")
+                           .value_or(-1))
+                 : plan::PointwiseOp();
+    auto physicalAxisExtent = [&](plan::PointwiseOp operandBinding,
+                                  unsigned tensorAxis) -> std::string {
+      if (!operandBinding || tensorAxis >= operandBinding.getAxisNodes().size())
+        return {};
+      int64_t axisNode = operandBinding.getAxisNodes()[tensorAxis];
+      plan::AxisOp axis = axisNode >= 0 ? planIndex.axes.lookup(axisNode)
+                                       : plan::AxisOp();
+      const target::emission::RangeBinding *range =
+          axis ? axis.getRange("reduction", 0) : nullptr;
+      return range ? range->getTile().str() : std::string();
+    };
+    std::string lhsPhysical =
+        physicalAxisExtent(lhsBinding, lhsReduction.getInt());
+    std::string rhsPhysical =
+        physicalAxisExtent(rhsBinding, rhsReduction.getInt());
+    std::string reductionExtent;
+    if (!lhsPhysical.empty() && !rhsPhysical.empty() &&
+        lhsPhysical == rhsPhysical) {
+      reductionExtent = lhsPhysical;
+    } else {
+      reductionExtent = (*lhsExtents)[lhsReduction.getInt()];
+    }
     std::string outputExtent =
         (*rhsExtents)[rhsReduction.getInt() == 0 ? 1 : 0];
     std::string products = makeResultName(operation, 0) + "_products";
@@ -3156,28 +3275,98 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
-  if (failed(node) || !binding || binding.getAccess() != "store" ||
-      !binding.getCheckBounds() || binding.getDefer() || !valueIndex ||
-      failed(relation) || relation->size() != 2 ||
-      (*relation)[0].kind != "value_index" ||
-      (*relation)[0].operands.size() != 1 ||
-      !(*relation)[0].operands.front() ||
-      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored))
+  Value storedValue = valueIndex ? operation.getOperand(valueIndex.getInt()) : Value();
+  if (failed(node) || !binding ||
+      (binding.getAccess() != "store" && binding.getAccess() != "scatter") ||
+      binding.getDefer() || !valueIndex ||
+      failed(relation) || failed(view) || failed(stored) ||
+      !isa<RankedTensorType>(storedValue.getType()))
     return operation.emitOpError("lacks a mechanical TileLang unique store");
-  FailureOr<StringRef> rows =
-      lookupValue(operation, *(*relation)[0].operands.front());
-  if (failed(rows))
+  if (binding.getTensorIndexing() == "none") {
+    FailureOr<std::string> indices = accessIndices(operation);
+    if (failed(indices))
+      return failure();
+    line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
+         *indices + "])");
+    return success();
+  }
+  if (binding.getTensorIndexing() == "structured" && planIndex.stages.empty()) {
+    FailureOr<std::string> indices = accessIndices(operation);
+    if (failed(indices))
+      return failure();
+    line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
+         *indices + "])");
+    return success();
+  }
+  auto result = dyn_cast<OpResult>(storedValue);
+  Operation *definition = result ? result.getOwner() : nullptr;
+  FailureOr<SmallVector<std::string>> extents =
+      definition ? tensorExtents(*definition, result.getResultNumber())
+                 : FailureOr<SmallVector<std::string>>(failure());
+  if (failed(extents) || extents->empty())
+    return operation.emitOpError("has no TileLang unique-store value shape");
+  SmallVector<std::string> tileIndices;
+  std::string loop = "for ";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    tileIndices.push_back("unique_i" + std::to_string(axis));
+    loop += tileIndices.back();
+  }
+  loop += " in T.Parallel(";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    loop += (*extents)[axis];
+  }
+  loop += "):";
+  FailureOr<std::string> indices =
+      elementAccessIndices(operation, tileIndices);
+  FailureOr<std::string> predicate =
+      elementBoundsPredicate(operation, tileIndices, false, false);
+  if (failed(indices) || failed(predicate))
     return failure();
-  line("for store_i, store_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+  if (!planIndex.stages.empty()) {
+    auto storedTensor = dyn_cast<RankedTensorType>(storedValue.getType());
+    if (activeStages.size() != 1 || relation->size() != 2 ||
+        (*relation)[0].kind != "value_index" ||
+        (*relation)[0].operands.size() != 1 ||
+        !(*relation)[0].operands.front() ||
+        !isa<RankedTensorType>(
+            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
+        (*relation)[1].kind != "full_slice" || !storedTensor ||
+        storedTensor.getRank() != 2 || tileIndices.size() != 2)
+      return operation.emitOpError(
+          "staged TileLang unique store requires one member-indexed matrix");
+    FailureOr<StringRef> rows =
+        lookupValue(operation, *(*relation)[0].operands.front());
+    if (failed(rows))
+      return failure();
+    line("for store_i, store_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+    ++indentation;
+    line("if member_start + store_i < route_end and bid_feature * "
+         "TILE_SIZE_N + store_j < " +
+         stageFeatureDimensions.lookup(activeStages.front()) + ":");
+    ++indentation;
+    line((*view)->argument->name + "[" + rows->str() +
+         "[store_i], " + addressIndex("bid_feature * TILE_SIZE_N + store_j") +
+         "] = " + stored->str() + "[store_i, store_j]");
+    --indentation;
+    --indentation;
+    return success();
+  }
+  line(loop);
   ++indentation;
-  line("if member_start + store_i < route_end and bid_feature * "
-       "TILE_SIZE_N + store_j < " +
-       stageFeatureDimensions.lookup(activeStages.front()) + ":");
+  line("if " + *predicate + ":");
   ++indentation;
-  line((*view)->argument->name + "[" + rows->str() +
-       "[store_i], " + addressIndex("bid_feature * TILE_SIZE_N + store_j") +
-       "] = " + stored->str() +
-       "[store_i, store_j]");
+  std::string source = stored->str() + "[";
+  for (auto [axis, index] : llvm::enumerate(tileIndices)) {
+    if (axis)
+      source += ", ";
+    source += index;
+  }
+  source += "]";
+  line((*view)->argument->name + "[" + *indices + "] = " + source);
   --indentation;
   --indentation;
   return success();

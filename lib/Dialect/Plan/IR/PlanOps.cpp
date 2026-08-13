@@ -227,6 +227,9 @@ LogicalResult TransferOp::verify() {
        getResultSpace() == "none"))
     return emitOpError(
         "consumer-neutralized transfer requires a bounded load with a fill");
+  if (getTensorIndexing() != "none" && getTensorIndexing() != "structured" &&
+      getTensorIndexing() != "data_dependent")
+    return emitOpError("contains an unsupported tensor-indexing class");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
       !isPrivateSpace(getResultSpace()))
     return emitOpError("contains an unsupported result residency");
@@ -285,6 +288,9 @@ LogicalResult PointwiseOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
       getReuseOperandAttr().getInt() < -1)
     return failure();
+  for (int64_t axis : getAxisNodes())
+    if (axis < -1)
+      return emitOpError("contains an invalid pointwise result-axis binding");
   if (!isPrivateSpace(getResultSpace()))
     return emitOpError("requires private pointwise result residency");
   return success();
@@ -299,6 +305,15 @@ LogicalResult ContractOp::verify() {
   if (!validOperand(getLhsSpace()) || !validOperand(getRhsSpace()) ||
       getAccumulatorSpace() != "private_fragment")
     return emitOpError("contains an invalid matrix operand residency");
+  return success();
+}
+
+LogicalResult StreamAxisOp::verify() {
+  if (failed(requireNode(*this, getStreamNode())) ||
+      failed(requireNode(*this, getAxisNode())))
+    return failure();
+  if (getRole() != "inner_reduction")
+    return emitOpError("contains an unsupported stream-axis role");
   return success();
 }
 
@@ -357,6 +372,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::StringSet<> rangeKeys;
   SmallVector<RangeOp> ranges;
   SmallVector<ScanOp> scans;
+  SmallVector<PointwiseOp> pointwise;
   llvm::DenseSet<int64_t> programOrders;
   llvm::DenseSet<int64_t> paddedValues;
   llvm::DenseSet<int64_t> buffers;
@@ -365,6 +381,8 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> transfers;
   llvm::DenseSet<int64_t> stageNodes;
+  llvm::StringSet<> streamAxisRoles;
+  SmallVector<StreamAxisOp> streamAxes;
   llvm::StringSet<> stageAxisRoles;
   SmallVector<StageAxisOp> stageAxes;
   for (Operation &operation : realization.getBody().front()) {
@@ -423,9 +441,17 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<PointwiseOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
+      pointwise.push_back(binding);
     } else if (auto binding = dyn_cast<ContractOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
+    } else if (auto binding = dyn_cast<StreamAxisOp>(operation)) {
+      std::string key = std::to_string(binding.getStreamNode()) + ":" +
+                        std::to_string(binding.getAxisNode()) + ":" +
+                        binding.getRole().str();
+      if (!streamAxisRoles.insert(key).second)
+        return binding.emitOpError("duplicates a stream-axis relation");
+      streamAxes.push_back(binding);
     } else if (auto binding = dyn_cast<StageOp>(operation)) {
       if (!stageNodes.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a physical stage decision");
@@ -516,6 +542,11 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
             "scan workspace requires scalar unreused program owners");
     }
   }
+  for (PointwiseOp binding : pointwise)
+    for (int64_t axis : binding.getAxisNodes())
+      if (axis >= 0 && !axes.count(axis))
+        return binding.emitOpError(
+            "references an unbound pointwise result axis");
   for (const auto &entry : axes) {
     AxisOp axis = entry.second;
     for (auto [role, purpose] :
@@ -554,6 +585,13 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       return axis.emitOpError("references an unknown physical stage");
     if (axis.getAxisNodeAttr() && !axes.count(axis.getAxisNodeAttr().getInt()))
       return axis.emitOpError("references an unbound logical axis");
+  }
+  for (StreamAxisOp relation : streamAxes) {
+    auto axis = axes.find(relation.getAxisNode());
+    if (axis == axes.end() || !axisHasRole(axis->second, "reduction") ||
+        !hasRange(relation.getAxisNode(), "reduction"))
+      return relation.emitOpError(
+          "requires a planned inner reduction axis and range");
   }
   return success();
 }

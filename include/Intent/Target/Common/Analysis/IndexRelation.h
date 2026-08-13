@@ -37,8 +37,6 @@ bool hasInBoundsPrecondition(mlir::Value index, mlir::Value view, unsigned axis,
 
 mlir::FailureOr<bool> hasDerivedScalarIndex(mlir::Operation &operation);
 
-mlir::FailureOr<bool> hasTensorIndirectIndex(mlir::Operation &operation);
-
 mlir::FailureOr<bool> isWholeViewAccess(mlir::Operation &operation);
 
 } // namespace intent::target

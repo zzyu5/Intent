@@ -62,6 +62,89 @@ def _load_module(source_path: Path, module_name: str):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "embedding_forward_lookup":
+        support = source_path.parents[2] / "support"
+        sys.path.insert(0, str(support))
+        module = _load_module(source_path, "intent_upstream_triton_embedding_forward")
+        block = module.triton.next_power_of_2(128)
+        state = {}
+
+        def run(arguments):
+            embedding_table, indices = arguments
+            if not state:
+                state["output"] = torch.empty(
+                    (indices.numel(), embedding_table.shape[1]),
+                    device=embedding_table.device,
+                    dtype=embedding_table.dtype,
+                )
+            grid = (
+                module.triton.cdiv(indices.numel(), block),
+                module.triton.cdiv(embedding_table.shape[1], block),
+            )
+            module.embedding_forward_kernel[grid](
+                embedding_table,
+                indices,
+                state["output"],
+                indices.numel(),
+                embedding_dim=embedding_table.shape[1],
+                BLOCK_SIZE_M=block,
+                BLOCK_SIZE_N=block,
+            )
+            return state["output"]
+
+        return run
+    if kernel == "embedding_backward_atomic":
+        support = source_path.parents[2] / "support"
+        sys.path.insert(0, str(support))
+        module = _load_module(
+            source_path, "intent_upstream_triton_embedding_backward"
+        )
+        block = module.triton.next_power_of_2(128)
+
+        def run(arguments):
+            indices, grad_output, grad_weight = arguments
+            grid = (
+                module.triton.cdiv(grad_output.shape[0], block),
+                module.triton.cdiv(grad_output.shape[1], block),
+            )
+            module.embedding_backward_kernel[grid](
+                grad_output,
+                grad_weight,
+                indices,
+                grad_output.shape[0],
+                embedding_dim=grad_output.shape[1],
+                BLOCK_SIZE_M=block,
+                BLOCK_SIZE_N=block,
+            )
+            return grad_weight
+
+        return run
+    if kernel == "index_select_rows":
+        module = _load_module(source_path, "intent_upstream_triton_index_select")
+        state = {}
+
+        def run(arguments):
+            source, indices = arguments
+            if not state:
+                state["output"] = torch.empty(
+                    (indices.shape[0], source.shape[1]),
+                    device=source.device,
+                    dtype=source.dtype,
+                )
+            return module.index_select_cat_fwd(state["output"], source, indices)
+
+        return run
+    if kernel == "scaled_index_add":
+        module = _load_module(source_path, "intent_upstream_triton_scaled_index_add")
+
+        def run(arguments):
+            destination, indices, source, scaling, alpha = arguments
+            module.scaled_index_add_fwd(
+                destination, indices, source, scaling, alpha
+            )
+            return destination
+
+        return run
     if kernel == "cross_entropy":
         source = _load_module(
             source_path, "intent_upstream_triton_cross_entropy"

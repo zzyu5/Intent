@@ -25,7 +25,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
         "feature": (64, 128),
-        "reduction": (32, 64),
+        "reduction": (16, 32, 64),
         "program_m": (64, 128),
         "program_n": (64, 128),
         "group_m": (4, 8),
@@ -93,7 +93,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             )
             for program_m in (64, 128)
             for program_n in (64, 128)
-            for reduction in (32, 64)
+            for reduction in (16, 32, 64)
             for occupancy in (1, 2, 4)
         ),
         (

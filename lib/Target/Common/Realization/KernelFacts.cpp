@@ -832,6 +832,111 @@ inferIndexedAxes(Operation &operation, Value source, KernelFacts &facts) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  unsigned tensorIndexCount = llvm::count_if(
+      *relation, [&](const IndexTerm &term) {
+        return term.kind == "value_index" && term.operands.size() == 1 &&
+               term.operands.front() &&
+               isa<RankedTensorType>(
+                   operation.getOperand(*term.operands.front()).getType());
+      });
+  if (tensorIndexCount > 1) {
+    SmallVector<LogicalAxis> resultAxes;
+    SmallVector<LogicalAxis> advancedAxes;
+    std::optional<size_t> advancedPosition;
+    auto mergeAdvanced = [&](ArrayRef<LogicalAxis> incoming) -> LogicalResult {
+      if (advancedAxes.empty()) {
+        advancedAxes.assign(incoming.begin(), incoming.end());
+        return success();
+      }
+      size_t rank = std::max(advancedAxes.size(), incoming.size());
+      SmallVector<LogicalAxis> merged(rank, LogicalAxis{nullptr, "1"});
+      for (size_t offset = 0; offset < rank; ++offset) {
+        std::optional<LogicalAxis> lhs =
+            offset < advancedAxes.size()
+                ? std::optional<LogicalAxis>(
+                      advancedAxes[advancedAxes.size() - 1 - offset])
+                : std::nullopt;
+        std::optional<LogicalAxis> rhs =
+            offset < incoming.size()
+                ? std::optional<LogicalAxis>(incoming[incoming.size() - 1 - offset])
+                : std::nullopt;
+        LogicalAxis selected = lhs ? *lhs : *rhs;
+        if (lhs && rhs && *lhs != *rhs) {
+          if (lhs->extent == "1")
+            selected = *rhs;
+          else if (rhs->extent != "1")
+            return operation.emitOpError(
+                "tensor index axes cannot broadcast to one logical relation");
+        }
+        merged[rank - 1 - offset] = selected;
+      }
+      advancedAxes = std::move(merged);
+      return success();
+    };
+    auto sourceAxes = facts.valueAxes.find(source);
+    bool sourceIsView = isa<intent::ViewType>(source.getType());
+    unsigned sourceAxis = 0;
+    for (const IndexTerm &term : *relation) {
+      if (term.kind == "new_axis") {
+        resultAxes.push_back(LogicalAxis{nullptr, "1"});
+        continue;
+      }
+      if (term.kind == "full_slice" || term.kind == "slice") {
+        FailureOr<LogicalAxis> axis =
+            sourceIsView
+                ? axisFromView(source, sourceAxis, facts, operation)
+                : sourceAxes != facts.valueAxes.end() &&
+                          sourceAxis < sourceAxes->second.size()
+                      ? FailureOr<LogicalAxis>(sourceAxes->second[sourceAxis])
+                      : FailureOr<LogicalAxis>(failure());
+        if (failed(axis))
+          return operation.emitOpError(
+              "indexed source axis has no logical provenance");
+        resultAxes.push_back(*axis);
+        ++sourceAxis;
+        continue;
+      }
+      if (term.kind == "static_index") {
+        ++sourceAxis;
+        continue;
+      }
+      if (term.operands.size() != 1 || !term.operands.front())
+        return operation.emitOpError("index requires one dynamic operand");
+      Value indexed = operation.getOperand(*term.operands.front());
+      if (term.kind == "value_index" &&
+          isa<RankedTensorType>(indexed.getType())) {
+        auto indexedAxes = facts.valueAxes.find(indexed);
+        if (indexedAxes == facts.valueAxes.end())
+          return operation.emitOpError(
+              "tensor index has no logical-axis provenance");
+        if (!advancedPosition)
+          advancedPosition = resultAxes.size();
+        if (failed(mergeAdvanced(indexedAxes->second)))
+          return failure();
+      } else if (term.kind == "region_index") {
+        FailureOr<Operation *> domain = resolveDomain(indexed, facts, operation);
+        if (failed(domain))
+          return failure();
+        if (!isa<intent::LogicalIndexType, IntegerType, IndexType>(
+                indexed.getType())) {
+          FailureOr<LogicalAxis> axis =
+              axisFromDomain(**domain, facts, operation);
+          if (failed(axis))
+            return failure();
+          resultAxes.push_back(*axis);
+        }
+      } else if (term.kind != "value_index") {
+        return operation.emitOpError("has an unsupported index relation");
+      }
+      ++sourceAxis;
+    }
+    if (!advancedPosition)
+      return operation.emitOpError(
+          "multi-index relation has no tensor index provenance");
+    resultAxes.insert(resultAxes.begin() + *advancedPosition,
+                      advancedAxes.begin(), advancedAxes.end());
+    return resultAxes;
+  }
   SmallVector<LogicalAxis> resultAxes;
   auto sourceAxes = facts.valueAxes.find(source);
   bool sourceIsView = isa<intent::ViewType>(source.getType());
@@ -949,6 +1054,120 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
     facts.accessRanges.push_back(AccessRangeFact{
         &operation, ownership, currentSourceAxis, lower, upper});
   }
+  return success();
+}
+
+struct StructuredTensorIndex {
+  bool valid = false;
+  bool dependsOnTensorAxis = false;
+};
+
+StructuredTensorIndex classifyStructuredIndex(Value value,
+                                               const KernelFacts &facts,
+                                               llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return {};
+  auto finish = [&](StructuredTensorIndex result) {
+    active.erase(value);
+    return result;
+  };
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *owner = argument.getOwner()->getParentOp();
+    StringRef name = owner ? owner->getName().getStringRef() : StringRef();
+    bool structural = name == "intent.parallel" || name == "intent.ordered" ||
+                      name == "intent.for" || name == "intent.state_stream";
+    return finish({structural, false});
+  }
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return finish({});
+  StringRef name = definition->getName().getStringRef();
+  if (name == "intent.constant" || name == "intent.dim" ||
+      name == "intent.region_end")
+    return finish({true, false});
+  if (name == "intent.indices") {
+    auto axes = facts.valueAxes.find(value);
+    bool valid = axes != facts.valueAxes.end() &&
+                 llvm::count_if(axes->second, [](const LogicalAxis &axis) {
+                   return axis.extent != "1" && axis.domain;
+                 }) == 1;
+    return finish({valid, valid});
+  }
+  if (name == "intent.gather") {
+    FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(*definition);
+    if (failed(relation) ||
+        !llvm::all_of(*relation, [](const IndexTerm &term) {
+          return term.kind == "full_slice" || term.kind == "new_axis";
+        }) || definition->getNumOperands() == 0)
+      return finish({});
+    return finish(classifyStructuredIndex(definition->getOperand(0), facts,
+                                          active));
+  }
+  if ((name == "intent.broadcast" || name == "intent.reshape" ||
+       name == "intent.cast") &&
+      definition->getNumOperands() == 1)
+    return finish(classifyStructuredIndex(definition->getOperand(0), facts,
+                                          active));
+  if (name == "intent.unary" && definition->getNumOperands() == 1) {
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    StructuredTensorIndex operand =
+        classifyStructuredIndex(definition->getOperand(0), facts, active);
+    if (!logical || !operand.valid ||
+        (operand.dependsOnTensorAxis && logical.getValue() != "negate"))
+      return finish({});
+    return finish(operand);
+  }
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return finish({});
+  StructuredTensorIndex lhs =
+      classifyStructuredIndex(definition->getOperand(0), facts, active);
+  StructuredTensorIndex rhs =
+      classifyStructuredIndex(definition->getOperand(1), facts, active);
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  if (!lhs.valid || !rhs.valid || !logical)
+    return finish({});
+  bool tensorAxis = lhs.dependsOnTensorAxis || rhs.dependsOnTensorAxis;
+  if (!tensorAxis)
+    return finish({true, false});
+  if (lhs.dependsOnTensorAxis && rhs.dependsOnTensorAxis)
+    return finish({});
+  if (logical.getValue() != "add" && logical.getValue() != "subtract")
+    return finish({});
+  return finish({true, true});
+}
+
+LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
+  FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  bool hasTensorIndex = false;
+  bool dataDependent = false;
+  for (const IndexTerm &term : *relation) {
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (!isa<RankedTensorType>(indexed.getType()))
+      continue;
+    hasTensorIndex = true;
+    llvm::DenseSet<Value> active;
+    StructuredTensorIndex structured =
+        classifyStructuredIndex(indexed, facts, active);
+    if (!structured.valid || !structured.dependsOnTensorAxis) {
+      dataDependent = true;
+      continue;
+    }
+    auto axes = facts.valueAxes.find(indexed);
+    if (axes == facts.valueAxes.end() ||
+        llvm::count_if(axes->second, [](const LogicalAxis &axis) {
+          return axis.extent != "1" && axis.domain;
+        }) != 1)
+      dataDependent = true;
+  }
+  facts.tensorIndexing[&operation] =
+      dataDependent ? TensorIndexingKind::dataDependent
+      : hasTensorIndex ? TensorIndexingKind::structured
+                       : TensorIndexingKind::none;
   return success();
 }
 
@@ -1715,6 +1934,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (failed(analyzeBoundary(operation, facts, *fill)) ||
                 failed(recordLoadAxes(operation, facts)))
               return failure();
+            if (failed(classifyTensorIndices(operation, facts)))
+              return failure();
             return recordAccessRanges(operation, facts);
           })))
     return failure();
@@ -1912,7 +2133,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         ArrayRef<LogicalAxis>(*indexedAxes) != writtenAxes)
       return operation.emitOpError(
           "indexed write value does not match its destination");
-    if (failed(analyzeBoundary(operation, facts, "none")))
+    if (failed(analyzeBoundary(operation, facts, "none")) ||
+        failed(classifyTensorIndices(operation, facts)))
       return failure();
     if (recordScatter)
       facts.scatterWrites.insert(&operation);
@@ -2159,6 +2381,13 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
 bool hasNonnegativeIntegerOperands(Operation &operation,
                                    const KernelFacts &facts) {
   return hasNonnegativeIntegerOperandsImpl(operation, facts);
+}
+
+TensorIndexingKind tensorIndexingKind(Operation &operation,
+                                      const KernelFacts &facts) {
+  auto found = facts.tensorIndexing.find(&operation);
+  return found == facts.tensorIndexing.end() ? TensorIndexingKind::none
+                                              : found->second;
 }
 
 LogicalResult analyzeKernelFacts(KernelFacts &facts) {

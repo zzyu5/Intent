@@ -33,14 +33,16 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "stream")
+  if (role == "program_n")
     return std::string("TILE_SIZE_N");
+  if (role == "stream")
+    return std::string("TILE_SIZE_S");
   if (role == "scan")
     return std::string("TILE_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("TILE_SIZE_K");
+    return std::string("TILE_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -167,14 +169,16 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "feature" || role == "stream")
+  if (role == "program_n" || role == "feature")
     return std::string("TILE_SIZE_N");
+  if (role == "stream")
+    return std::string("TILE_SIZE_S");
   if (role == "scan")
     return std::string("TILE_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("TILE_SIZE_K");
+    return std::string("TILE_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -291,6 +295,8 @@ indexRealization(intent::plan::RealizationOp realization,
       plan::StageAxisOp binding;
       binding.operation = value;
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
+      index.streamAxes.push_back(value);
     }
   }
   if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
@@ -386,9 +392,8 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
         target::hasDerivedScalarIndex(*operation);
-    FailureOr<bool> tensorIndirect =
-        target::hasTensorIndirectIndex(*operation);
-    if (failed(derivedScalar) || failed(tensorIndirect))
+    bool tensorIndirect = value.getTensorIndexing() == "data_dependent";
+    if (failed(derivedScalar))
       return failure();
     plan::BoundaryOp binding;
     binding.operation = value;
@@ -401,7 +406,7 @@ indexRealization(intent::plan::RealizationOp realization,
         raggedBound && !value.getConsumerNeutralized();
     bool packedScalar =
         target::emission::hasPackedScalarDomain(index, binding);
-    binding.transfer = *derivedScalar || *tensorIndirect ||
+    binding.transfer = *derivedScalar || tensorIndirect ||
                                materializeLogicalBounds
                            ? "parallel_elements"
                            : "bulk_copy";
@@ -412,7 +417,7 @@ indexRealization(intent::plan::RealizationOp realization,
                  (index.stages.empty() && feedsAtomicValue(*operation)));
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
-        (!index.stages.empty() && store) || *derivedScalar || *tensorIndirect ||
+        (!index.stages.empty() && store) || *derivedScalar || tensorIndirect ||
         packedScalar;
     if (binding.resultSpace.empty()) {
       value.emitOpError("has no TileLang transfer residency spelling");
@@ -1317,12 +1322,21 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.float32";
     if (type.isBF16())
       return "torch.bfloat16";
+    if (isa<Float8E4M3FNType>(type))
+      return "torch.float8_e4m3fn";
+    if (isa<Float8E5M2Type>(type))
+      return "torch.float8_e5m2";
+    if (isa<Float8E8M0FNUType>(type))
+      return "torch.float8_e8m0fnu";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 8)
       return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 32)
       return "torch.int32";
+    if (auto integer = dyn_cast<IntegerType>(type);
+        integer && integer.getWidth() == 64)
+      return "torch.int64";
     return {};
   };
   auto emitValidation = [&]() -> LogicalResult {
@@ -1847,43 +1861,17 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->opaque) {
+    consumer.emitOpError(
+        "cannot resolve an opaque index source during TileLang emission");
+    return failure();
+  }
   if (Operation *definition = indexedValue.getDefiningOp())
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
         definition->getName().getStringRef() == "intent.ragged_member")
       return definition;
-  auto argument = dyn_cast<BlockArgument>(indexedValue);
-  Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
-      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
-    Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-    consumer.emitOpError("cannot resolve a TileLang stream source domain");
-    return failure();
-  }
-  if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
-      owner->getNumOperands() != 1) {
-    consumer.emitOpError("cannot resolve index ownership during TileLang emission");
-    return failure();
-  }
-  Operation *source = owner->getOperand(0).getDefiningOp();
-  if (source &&
-      (source->getName().getStringRef() == "intent.domain" ||
-       source->getName().getStringRef() == "intent.ragged_outer" ||
-       source->getName().getStringRef() == "intent.ragged_member"))
-    return source;
-  if (source && source->getName().getStringRef() == "intent.partition" &&
-      source->getNumOperands() == 1) {
-    Operation *domain = source->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-  }
-  consumer.emitOpError("cannot resolve a partition to its source domain");
+  consumer.emitOpError("cannot resolve index ownership during TileLang emission");
   return failure();
 }
 
@@ -1968,6 +1956,90 @@ SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
       planIndex, *relation, (*view)->shape, operation);
 }
 
+FailureOr<std::string> SourceEmitter::structuredIndexExpression(
+    Value value, Operation &consumer) {
+  llvm::DenseSet<Value> active;
+  auto project = [&](auto &self, Value current) -> FailureOr<std::string> {
+    if (!active.insert(current).second)
+      return consumer.emitOpError("contains a cyclic structured index");
+    auto finish = [&](FailureOr<std::string> result) {
+      active.erase(current);
+      return result;
+    };
+    if (auto argument = dyn_cast<BlockArgument>(current)) {
+      Operation *owner = argument.getOwner()->getParentOp();
+      if (owner && argument.getArgNumber() == 0 &&
+          (owner->getName().getStringRef() == "intent.parallel" ||
+           owner->getName().getStringRef() == "intent.ordered" ||
+           owner->getName().getStringRef() == "intent.for" ||
+           owner->getName().getStringRef() == "intent.state_stream")) {
+        FailureOr<plan::AxisOp> axis = resolveAxis(current, consumer);
+        std::string spelling =
+            succeeded(axis) ? axisIndices.lookup(axis->getNode()) : std::string();
+        if (!spelling.empty())
+          return finish(spelling);
+      }
+      auto emitted = valueNames.find(current);
+      return finish(emitted == valueNames.end()
+                        ? FailureOr<std::string>(failure())
+                        : FailureOr<std::string>(emitted->second));
+    }
+    Operation *definition = current.getDefiningOp();
+    if (!definition)
+      return finish(failure());
+    StringRef name = definition->getName().getStringRef();
+    if (name == "intent.constant") {
+      if (auto integer =
+              definition->getAttrOfType<IntegerAttr>("intent.value"))
+        return finish(std::to_string(integer.getInt()));
+      return finish(failure());
+    }
+    if (name == "intent.dim" || name == "intent.region_end") {
+      auto emitted = valueNames.find(current);
+      return finish(emitted == valueNames.end()
+                        ? FailureOr<std::string>(failure())
+                        : FailureOr<std::string>(emitted->second));
+    }
+    if (name == "intent.indices" && definition->getNumOperands() == 1) {
+      FailureOr<plan::AxisOp> axis =
+          resolveAxis(definition->getOperand(0), consumer);
+      std::string base =
+          succeeded(axis) ? axisIndices.lookup(axis->getNode()) : std::string();
+      if (base.empty())
+        return finish(failure());
+      return finish(base);
+    }
+    if (name == "intent.gather" && definition->getNumOperands() > 0)
+      return finish(self(self, definition->getOperand(0)));
+    if ((name == "intent.broadcast" || name == "intent.reshape" ||
+         name == "intent.cast") &&
+        definition->getNumOperands() == 1)
+      return finish(self(self, definition->getOperand(0)));
+    if (name == "intent.unary" && definition->getNumOperands() == 1) {
+      auto logical =
+          definition->getAttrOfType<StringAttr>("intent.operator");
+      FailureOr<std::string> operand = self(self, definition->getOperand(0));
+      if (!logical || logical.getValue() != "negate" || failed(operand))
+        return finish(failure());
+      return finish("-(" + *operand + ")");
+    }
+    if (name != "intent.binary" || definition->getNumOperands() != 2)
+      return finish(failure());
+    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+    FailureOr<std::string> lhs = self(self, definition->getOperand(0));
+    FailureOr<std::string> rhs = self(self, definition->getOperand(1));
+    StringRef symbol = !logical   ? StringRef()
+                       : logical.getValue() == "add"      ? "+"
+                       : logical.getValue() == "subtract" ? "-"
+                       : logical.getValue() == "multiply" ? "*"
+                                                           : StringRef();
+    if (failed(lhs) || failed(rhs) || symbol.empty())
+      return finish(failure());
+    return finish("(" + *lhs + ") " + symbol.str() + " (" + *rhs + ")");
+  };
+  return project(project, value);
+}
+
 FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
@@ -2002,8 +2074,45 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
       FailureOr<SmallVector<std::string>> extents =
           result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                  : FailureOr<SmallVector<std::string>>(failure());
-      if (tensor.getRank() != 1 || failed(exact) || failed(extents) ||
-          extents->size() != 1 || extents->front() != "1")
+      FailureOr<int64_t> transferNode =
+          target::getNodeID(operation, "TileLang tensor-index transfer");
+      plan::BoundaryOp boundary =
+          succeeded(transferNode) ? planIndex.boundaries.lookup(*transferNode)
+                                  : plan::BoundaryOp();
+      if (failed(exact) || failed(extents) || failed(transferNode) || !boundary ||
+          extents->size() != static_cast<size_t>(tensor.getRank()))
+        return failure();
+      if (!boundary.hasDataDependentTensorIndex()) {
+        std::optional<unsigned> varying;
+        FailureOr<std::string> projected =
+            structuredIndexExpression(indexed, operation);
+        std::string base = succeeded(projected) ? *projected : std::string();
+        bool materialized = failed(projected);
+        if (materialized)
+          base = exact->str() + "[";
+        for (auto [axis, extent] : llvm::enumerate(*extents)) {
+          if (materialized) {
+            if (axis)
+              base += ", ";
+            base += "0";
+          }
+          if (extent != "1") {
+            if (varying)
+              return operation.emitOpError(
+                  "regular TileLang index tile varies along more than one axis");
+            varying = axis;
+          }
+        }
+        if (materialized)
+          base += "]";
+        indices.push_back(varying ? addressIndex(base) + " : " +
+                                        addressIndex(base) + " + " +
+                                        (*extents)[*varying]
+                                  : addressIndex(base));
+        continue;
+      }
+      if (tensor.getRank() != 1 || extents->size() != 1 ||
+          extents->front() != "1")
         return operation.emitOpError(
             "TileLang bulk indirect access requires one singleton index tile");
       auto assumed = assumedIndexNames.find(indexed);
@@ -2115,11 +2224,18 @@ SourceEmitter::elementAccessIndices(Operation &operation,
             (tileAxis != 0 && !advancedTensorAxesCovered))
           return operation.emitOpError(
               "TileLang broadcasted tensor indices must jointly cover the transfer rank");
+        auto result = dyn_cast<OpResult>(indexed);
+        FailureOr<SmallVector<std::string>> extents =
+            result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+                   : FailureOr<SmallVector<std::string>>(failure());
+        if (failed(extents) || extents->size() != tileIndices.size())
+          return operation.emitOpError(
+              "TileLang broadcasted tensor index has no canonical extents");
         std::string element = exact->str() + "[";
         for (auto [axis, index] : llvm::enumerate(tileIndices)) {
           if (axis)
             element += ", ";
-          element += index;
+          element += (*extents)[axis] == "1" ? "0" : index;
         }
         element += "]";
         indices.push_back(addressIndex(element));
@@ -2247,11 +2363,18 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
             (tileAxis != 0 && !advancedTensorAxesCovered))
           return operation.emitOpError(
               "TileLang broadcasted tensor bounds must jointly cover the transfer rank");
+        auto result = dyn_cast<OpResult>(indexed);
+        FailureOr<SmallVector<std::string>> extents =
+            result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+                   : FailureOr<SmallVector<std::string>>(failure());
+        if (failed(extents) || extents->size() != tileIndices.size())
+          return operation.emitOpError(
+              "TileLang broadcasted tensor bounds have no canonical extents");
         index = exact->str() + "[";
         for (auto [axis, tileIndex] : llvm::enumerate(tileIndices)) {
           if (axis)
             index += ", ";
-          index += tileIndex;
+          index += (*extents)[axis] == "1" ? "0" : tileIndex;
         }
         index += "]";
         if (!advancedTensorAxesCovered) {
@@ -2352,8 +2475,7 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     return operation.emitOpError(
         "bounded TileLang transfer has unused tile indices");
   if (predicates.empty())
-    return operation.emitOpError(
-        "bounded TileLang transfer has no dynamic boundary predicate");
+    return std::string("True");
   std::string result;
   for (auto [index, predicate] : llvm::enumerate(predicates)) {
     if (index)
@@ -2693,6 +2815,12 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "T.float64";
   if (type.isBF16())
     return "T.bfloat16";
+  if (isa<Float8E4M3FNType>(type))
+    return "T.float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type))
+    return "T.float8_e5m2";
+  if (isa<Float8E8M0FNUType>(type))
+    return "T.float8_e8m0fnu";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 8)
     return integer.isUnsigned() ? "T.uint8" : "T.int8";
@@ -2732,7 +2860,11 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
 }
 
 std::string SourceEmitter::uniqueName(StringRef candidate, int64_t node) {
-  std::string result = candidate.str();
+  // TileLang lowers these names into generated C++, so even a valid Python
+  // identifier such as `signed` may be a target-language keyword.  A stable
+  // target prefix keeps author-provided SSA names out of that namespace
+  // without changing the canonical Kernel IR name.
+  std::string result = "intent_" + candidate.str();
   if (!usedNames.insert(result).second) {
     result += "_" + std::to_string(node);
     usedNames.insert(result);

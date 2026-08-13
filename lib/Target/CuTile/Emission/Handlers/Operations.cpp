@@ -2071,6 +2071,16 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     axisIndices[binding.getAxisNode()] = streamTile;
   }
   valueNames[body.getArgument(0)] = streamTile;
+  for (int64_t axisNode : binding.getInnerReductionAxes()) {
+    if (axisNode == binding.getAxisNode())
+      continue;
+    plan::AxisOp axis = planIndex.axes.lookup(axisNode);
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange("reduction", 0) : nullptr;
+    if (!range)
+      return binding.emitOpError("has no inner reduction range");
+    axisIndices[axisNode] = "0";
+  }
   return success();
 }
 
@@ -2100,6 +2110,9 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     axisIndices.erase(binding.getAxisNode());
   else
     axisIndices[binding.getAxisNode()] = outerIndex->second;
+  for (int64_t axisNode : binding.getInnerReductionAxes())
+    if (axisNode != binding.getAxisNode())
+      axisIndices.erase(axisNode);
   streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
@@ -2115,6 +2128,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       target::emission::contractionOrientation(operation);
   if (failed(orientation))
     return failure();
+  auto resultTensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  std::string accumulatorDtype =
+      resultTensor ? dtypeName(resultTensor.getElementType(), operation) : "";
+  if (accumulatorDtype.empty())
+    return operation.emitOpError("has no supported cuTile accumulator dtype");
   if (!planIndex.stages.empty()) {
     if (activeStages.size() != 1)
       return operation.emitOpError(
@@ -2145,8 +2163,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           "has unsupported staged matrix operand types");
     std::string reduction = stageReductionDimensions.lookup(stage);
     std::string result = makeResultName(operation, 0);
-    line(result +
-         " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
+    line(result + " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0, dtype=" +
+         accumulatorDtype + ")");
     line("for k_tile in range(ct.cdiv(" + reduction + ", TILE_SIZE_K)):");
     ++indentation;
     line("offs_reduction = " + addressIndex("k_tile") +
@@ -2221,8 +2239,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     if (orientation->rhsTranspose)
       rhsExpression = "ct.transpose(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.full(" + *shape +
-         ", 0.0, dtype=ct.float32)");
+    line(result + " = ct.full(" + *shape + ", 0, dtype=" +
+         accumulatorDtype + ")");
     line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression +
          ", " + result + ")");
     bindResult(operation, 0, result);
@@ -2233,43 +2251,35 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         "deferred cuTile contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-  FailureOr<plan::AxisOp> reductionAxis =
-      target::emission::contractionReductionAxis(planIndex, *lhsLoad, *rhsLoad,
-                                                 operation);
-  if (failed(reductionAxis))
-    return failure();
-  auto physicalReductionAxis = [&](Operation &load) -> FailureOr<int64_t> {
-    FailureOr<SmallVector<target::IndexTerm>> relation =
-        target::parseIndexRelation(load);
-    if (failed(relation))
-      return failure();
-    std::optional<int64_t> result;
-    for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
-      if ((term.kind != "region_index" && term.kind != "value_index") ||
-          term.operands.size() != 1 || !term.operands.front())
-        continue;
-      FailureOr<plan::AxisOp> axis =
-          resolveAxis(load.getOperand(*term.operands.front()), load);
-      if (failed(axis))
-        return failure();
-      if (axis->getNode() != reductionAxis->getNode())
-        continue;
-      if (result)
-        return load.emitOpError(
-            "maps its contraction reduction axis more than once");
-      result = axisNumber;
-    }
-    if (!result)
+  auto transferBoundary = [&](Operation &load) -> FailureOr<plan::BoundaryOp> {
+    FailureOr<int64_t> node =
+        target::getNodeID(load, "deferred contraction transfer");
+    plan::BoundaryOp boundary =
+        succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+    if (failed(node) || !boundary ||
+        (boundary.getAccess() != "load" && boundary.getAccess() != "gather"))
       return load.emitOpError(
-          "does not map its contraction reduction axis to a source dimension");
-    return *result;
+          "has no load-or-gather physical transfer binding");
+    return boundary;
   };
-  FailureOr<int64_t> lhsReductionDimension = physicalReductionAxis(*lhsLoad);
-  axisIndices[reductionAxis->getNode()] = "k_tile";
-  FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, false);
-  FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, false);
-  FailureOr<std::string> lhsShape = tileShape(*lhsLoad);
-  FailureOr<std::string> rhsShape = tileShape(*rhsLoad);
+  FailureOr<plan::BoundaryOp> lhsBoundary = transferBoundary(*lhsLoad);
+  FailureOr<plan::BoundaryOp> rhsBoundary = transferBoundary(*rhsLoad);
+  FailureOr<target::emission::ContractionAxes> axes =
+      target::emission::contractionAxes(planIndex, *lhsLoad, *rhsLoad,
+                                        operation);
+  if (failed(lhsView) || failed(rhsView) || failed(lhsBoundary) ||
+      failed(rhsBoundary) || failed(axes))
+    return failure();
+  plan::AxisOp reductionAxis = axes->reduction;
+  axisIndices[reductionAxis.getNode()] = "k_tile";
+  bool gatherLhs = lhsBoundary->getAccess() == "gather";
+  bool gatherRhs = rhsBoundary->getAccess() == "gather";
+  FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, gatherLhs);
+  FailureOr<std::string> rhsIndex = indexTuple(*rhsLoad, gatherRhs);
+  FailureOr<std::string> lhsShape =
+      gatherLhs ? FailureOr<std::string>(std::string()) : tileShape(*lhsLoad);
+  FailureOr<std::string> rhsShape =
+      gatherRhs ? FailureOr<std::string>(std::string()) : tileShape(*rhsLoad);
   bool permuteLhs =
       orientation->lhsTranspose && (*lhsView)->tensor.getRank() > 2;
   bool permuteRhs =
@@ -2278,18 +2288,20 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       emitTensorShape(*lhsLoad, 0, permuteLhs);
   FailureOr<std::string> rhsResultShape =
       emitTensorShape(*rhsLoad, 0, permuteRhs);
-  if (failed(lhsView) || failed(rhsView) || failed(lhsIndex) ||
-      failed(rhsIndex) || failed(lhsShape) || failed(rhsShape) ||
-      failed(lhsResultShape) || failed(rhsResultShape) ||
-      failed(lhsReductionDimension))
+  if (failed(lhsIndex) || failed(rhsIndex) || failed(lhsShape) || failed(rhsShape) ||
+      failed(lhsResultShape) || failed(rhsResultShape))
     return failure();
 
   std::string result = makeResultName(operation, 0);
-  line("num_tiles_k = ct.num_tiles(" + (*lhsView)->argument->name +
-       ", axis=" + std::to_string(*lhsReductionDimension) +
-       ", shape=" + *lhsShape + ")");
-  line(result +
-       " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)");
+  std::string reductionExtent = roleDimensions.lookup(reductionAxis.getRole());
+  if (reductionExtent.empty())
+    return reductionAxis.emitOpError(
+        "has no cuTile physical reduction extent binding");
+  line("num_tiles_k = ct.cdiv(" + reductionExtent + ", " +
+       reductionAxis.getTile().str() + ")");
+  line(result + " = ct.full((" + axes->lhsResult.getTile().str() + ", " +
+       axes->rhsResult.getTile().str() + "), 0, dtype=" + accumulatorDtype +
+       ")");
   std::string operandDtype =
       dtypeName((*lhsView)->tensor.getElementType(), operation);
   if (operandDtype.empty())
@@ -2299,32 +2311,30 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   std::string lhs = makeResultName(*lhsLoad, 0);
   std::string rhs = makeResultName(*rhsLoad, 0);
   auto emitOperand = [&](StringRef name, ABIView &view, StringRef index,
-                         StringRef shape, StringRef resultShape,
+                         StringRef shape, StringRef resultShape, bool gather,
                          bool transpose) {
     std::string physical = name.str() + "_physical";
-    line(physical + " = ct.load(" + view.argument->name + ", index=" +
-         index.str() + ", shape=" + shape.str() +
-         ", padding_mode=ct.PaddingMode.ZERO)");
-    if (transpose && view.tensor.getRank() > 2) {
-      std::string permutation = "(";
-      for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis) {
-        if (axis)
-          permutation += ", ";
-        int64_t projected = axis;
-        if (axis == view.tensor.getRank() - 2)
-          projected = axis + 1;
-        else if (axis == view.tensor.getRank() - 1)
-          projected = axis - 1;
-        permutation += std::to_string(projected);
-      }
-      permutation += ")";
-      line(physical + " = ct.permute(" + physical + ", " + permutation + ")");
+    if (gather) {
+      StringRef padding = isa<IntegerType, IndexType>(view.tensor.getElementType())
+                              ? "0"
+                              : "0.0";
+      line(physical + " = ct.gather(" + view.argument->name + ", " +
+           index.str() + ", check_bounds=True, padding_value=" +
+           padding.str() + ")");
+    } else {
+      line(physical + " = ct.load(" + view.argument->name + ", index=" +
+           index.str() + ", shape=" + shape.str() +
+           ", padding_mode=ct.PaddingMode.ZERO)");
     }
     line(name.str() + " = " + physical + ".reshape(" + resultShape.str() +
          ").astype(" + operandDtype + ")");
+    if (transpose)
+      line(name.str() + " = ct.transpose(" + name.str() + ")");
   };
-  emitOperand(lhs, **lhsView, *lhsIndex, *lhsShape, *lhsResultShape, permuteLhs);
-  emitOperand(rhs, **rhsView, *rhsIndex, *rhsShape, *rhsResultShape, permuteRhs);
+  emitOperand(lhs, **lhsView, *lhsIndex, *lhsShape, *lhsResultShape, gatherLhs,
+              permuteLhs);
+  emitOperand(rhs, **rhsView, *rhsIndex, *rhsShape, *rhsResultShape, gatherRhs,
+              permuteRhs);
   std::string lhsExpression = lhs;
   std::string rhsExpression = rhs;
   if (orientation->lhsTranspose && (*lhsView)->tensor.getRank() == 2)
@@ -2433,25 +2443,41 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
   FailureOr<StringRef> stored =
       valueIndex ? lookupValue(operation, valueIndex.getInt())
                  : FailureOr<StringRef>(failure());
-  if (failed(node) || !binding || binding.getAccess() != "store" ||
-      !binding.getCheckBounds() || binding.getDefer() || !valueIndex ||
-      failed(relation) || relation->size() != 2 ||
-      (*relation)[0].kind != "value_index" ||
-      (*relation)[0].operands.size() != 1 ||
-      !(*relation)[0].operands.front() ||
-      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored) ||
-      (*view)->tensor.getRank() != 2)
+  if (failed(node) || !binding ||
+      (binding.getAccess() != "store" && binding.getAccess() != "scatter") ||
+      binding.getDefer() || !valueIndex ||
+      failed(relation) || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical cuTile unique store");
-  FailureOr<StringRef> rows =
-      lookupValue(operation, *(*relation)[0].operands.front());
-  if (failed(rows))
+  FailureOr<std::string> indices = failure();
+  std::string mask;
+  if (!planIndex.stages.empty()) {
+    auto storedTensor = dyn_cast<RankedTensorType>(
+        operation.getOperand(valueIndex.getInt()).getType());
+    if (activeStages.size() != 1 || relation->size() != 2 ||
+        (*relation)[0].kind != "value_index" ||
+        (*relation)[0].operands.size() != 1 ||
+        !(*relation)[0].operands.front() ||
+        !isa<RankedTensorType>(
+            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
+        (*relation)[1].kind != "full_slice" || !storedTensor ||
+        storedTensor.getRank() != 2)
+      return operation.emitOpError(
+          "staged cuTile unique store requires one member-indexed matrix");
+    FailureOr<StringRef> rows =
+        lookupValue(operation, *(*relation)[0].operands.front());
+    if (failed(rows))
+      return failure();
+    indices = "(" + addressIndex(rows->str() + "[:, None]") + ", " +
+              addressIndex("offs_feature[None, :]") +
+              ")";
+    mask = "member_mask[:, None] & feature_mask[None, :]";
+  } else
+    indices = indexTuple(operation, true);
+  if (failed(indices))
     return failure();
-  line("unique_rows = ct.where(member_mask, " + rows->str() + ", " +
-       (*view)->argument->name + ".shape[0])");
-  line("ct.scatter(" + (*view)->argument->name +
-       ", (" + addressIndex("unique_rows[:, None]") + ", " +
-       addressIndex("offs_feature[None, :]") + "), " + stored->str() +
-       ", check_bounds=True)");
+  line("ct.scatter(" + (*view)->argument->name + ", " + *indices + ", " +
+       stored->str() + ", check_bounds=True" +
+       (mask.empty() ? std::string() : ", mask=" + mask) + ")");
   return success();
 }
 

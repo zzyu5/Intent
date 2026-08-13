@@ -88,3 +88,15 @@ variant_adafactor_scalar_product,default,K,pass,0.0891,0.0932,,,K,pass,0.1192,0.
 variant_transpose_product_domain,default,K,pass,0.6103,0.6113,,,K,pass,0.6226,0.6236,,,K,pass,0.6124,0.6144,,
 variant_ordered_prefix_nested,default,K,pass,0.0388,0.0429,,,K,pass,0.0396,0.0406,,,K,pass,0.0197,0.0211,,
 variant_attention_full_causal_stream,default,K,pass,0.0594,0.0596,,,K,pass,0.0594,0.0614,,,K,pass,0.0594,0.0597,,
+causal_conv1d,default,K,pass,0.1905,0.1915,,,K,pass,0.7967,0.7994,,,K,pass,0.2652,0.2668,,
+continuous_gqa_decode,default,K,pass,0.9385,0.9421,,,,not_measured,,,,,,not_measured,,,,
+mla_prefill,default,K,pass,0.0507,0.0515,,,,not_measured,,,,,K,pass,0.0402,0.0422,,
+mamba_chunk_scan,default,K,pass,0.0307,0.0327,,,K,pass,0.0205,0.0226,,,K,pass,0.0261,0.0267,,
+w4a8_packed,default,K,pass,0.0977,0.0985,,,K,pass,0.1164,0.1189,,,K,pass,0.1163,0.1178,0.0895,0.0901
+embedding_forward_lookup,default,,not_measured,,,,,K,pass,0.0998,0.1025,,,K,pass,0.0667,0.0686,,
+block_scaled_matmul,default,K,pass,0.0180,0.0187,,,K,pass,0.1775,0.1798,0.1393,0.1434,K,pass,0.0368,0.0384,,
+splitk_attention_reduce,default,K,pass,0.0054,0.0063,,,K,pass,0.0056,0.0065,0.0061,0.0067,K,pass,0.0056,0.0064,,
+fp8_gemm,e4m3,K,pass,0.0118,0.0126,,,K,pass,0.0115,0.0125,,,K,pass,0.0124,0.0145,0.0184,0.0185
+fp8_gemm,e5m2,K,pass,0.0123,0.0123,,,K,pass,0.0123,0.0133,,,K,pass,0.0138,0.0144,0.0184,0.0186
+index_select_rows,default,K,pass,0.3702,0.3721,0.3666,0.3686,K,pass,0.3667,0.3691,,,K,pass,0.3606,0.3638,,
+scaled_index_add,default,K,pass,0.5222,0.5248,0.5268,0.5289,K,pass,0.5196,0.5218,,,K,pass,0.5222,0.5248,,

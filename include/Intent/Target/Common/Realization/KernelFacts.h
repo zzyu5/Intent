@@ -78,6 +78,12 @@ struct AccessRangeFact {
   int64_t upperOffset = 0;
 };
 
+enum class TensorIndexingKind {
+  none,
+  structured,
+  dataDependent,
+};
+
 struct KernelFacts {
   explicit KernelFacts(KernelModel &kernel) : kernel(kernel) {}
 
@@ -95,6 +101,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, std::string> boundaryFills;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       boundaryDomains;
+  llvm::DenseMap<mlir::Operation *, TensorIndexingKind> tensorIndexing;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<LogicalAxis>> valueAxes;
   llvm::StringMap<LogicalAxis> axisLabels;
   llvm::DenseSet<mlir::Operation *> vectorDomains;
@@ -123,6 +130,9 @@ resolveDomain(mlir::Value indexedValue, const KernelFacts &facts,
 
 bool hasNonnegativeIntegerOperands(mlir::Operation &operation,
                                    const KernelFacts &facts);
+
+TensorIndexingKind tensorIndexingKind(mlir::Operation &operation,
+                                      const KernelFacts &facts);
 
 std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded);
 

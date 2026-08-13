@@ -33,6 +33,9 @@ bool isShapeOnlyGather(Operation &operation) {
   return true;
 }
 
+std::optional<std::string> literalPadding(Value value);
+std::optional<std::string> semanticLiteralPadding(Value value);
+
 bool provePaddedUses(Value value, PaddedValue padded,
                      llvm::DenseMap<Value, PaddedValue> &visited) {
   auto found = visited.find(value);
@@ -45,6 +48,25 @@ bool provePaddedUses(Value value, PaddedValue padded,
     if (name == "intent.view_store" || name == "intent.scatter_unique" ||
         name == "intent.scatter_reduce" || name == "intent.atomic_add")
       continue;
+    if (name == "intent.mask" && padded == PaddedValue::zero &&
+        user->getNumOperands() == 3 && user->getOperand(0) == value &&
+        semanticLiteralPadding(user->getOperand(2)) == "zero")
+      continue;
+    if (name == "intent.mask" && user->getNumOperands() == 3 &&
+        user->getOperand(0) == value) {
+      std::optional<std::string> fill =
+          semanticLiteralPadding(user->getOperand(2));
+      bool matching =
+          (padded == PaddedValue::zero && fill == "zero") ||
+          (padded == PaddedValue::negativeInfinity &&
+           fill == "negative_infinity") ||
+          (padded == PaddedValue::booleanFalse && fill == "false") ||
+          (padded == PaddedValue::booleanTrue && fill == "true");
+      if (matching && user->getNumResults() == 1 &&
+          provePaddedUses(user->getResult(0), padded, visited))
+        continue;
+      return false;
+    }
     if (name == "intent.reduce" || name == "intent.arg_reduce") {
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");
       if (!combine ||
@@ -110,10 +132,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
                padded == PaddedValue::zero) {
         // This input is neutral; consumers realize the result's own padding.
         continue;
-      } else if (logical && logical.getValue() == "subtract" &&
-               user->getOperand(0) == value &&
-               padded == PaddedValue::negativeInfinity)
-        result = PaddedValue::negativeInfinity;
+      }
     } else {
       return false;
     }
@@ -151,6 +170,19 @@ std::optional<std::string> literalPadding(Value value) {
     if (integer.getValue().isZero())
       return std::string("zero");
   return std::nullopt;
+}
+
+std::optional<std::string> semanticLiteralPadding(Value value) {
+  if (std::optional<std::string> literal = literalPadding(value))
+    return literal;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getNumOperands() != 1)
+    return std::nullopt;
+  StringRef name = definition->getName().getStringRef();
+  if (name != "intent.cast" && name != "intent.broadcast" &&
+      name != "intent.reshape")
+    return std::nullopt;
+  return semanticLiteralPadding(definition->getOperand(0));
 }
 
 std::optional<std::string> inferPadding(
@@ -219,9 +251,6 @@ std::optional<std::string> inferPadding(
          logical.getValue() == "right_shift") &&
         lhs && *lhs == "zero")
       return std::string("zero");
-    if (logical && logical.getValue() == "subtract" && lhs &&
-        *lhs == "negative_infinity")
-      return std::string("negative_infinity");
   }
   if (name == "intent.mask" && definition->getNumOperands() == 3) {
     std::optional<std::string> valuePadding =

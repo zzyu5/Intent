@@ -19,12 +19,21 @@ StringRef torchDtype(Type type) {
     return "torch.float32";
   if (type.isBF16())
     return "torch.bfloat16";
+  if (isa<Float8E4M3FNType>(type))
+    return "torch.float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type))
+    return "torch.float8_e5m2";
+  if (isa<Float8E8M0FNUType>(type))
+    return "torch.uint8";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 8)
     return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
     return "torch.int32";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 64)
+    return "torch.int64";
   return {};
 }
 
@@ -58,13 +67,13 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
   if (role.starts_with("query_"))
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
-    return std::string("BLOCK_SIZE_K");
+    return std::string("BLOCK_SIZE_S");
   if (role == "scan")
     return std::string("BLOCK_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("BLOCK_SIZE_K");
+    return std::string("BLOCK_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "BLOCK_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -182,13 +191,13 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
   if (role.starts_with("query_"))
     return "BLOCK_SIZE_Q" + role.drop_front(6).str();
   if (role == "stream")
-    return std::string("BLOCK_SIZE_K");
+    return std::string("BLOCK_SIZE_S");
   if (role == "scan")
     return std::string("BLOCK_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("BLOCK_SIZE_K");
+    return std::string("BLOCK_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "BLOCK_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -270,6 +279,8 @@ indexRealization(intent::plan::RealizationOp realization,
       plan::StageAxisOp binding;
       binding.operation = value;
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
+      index.streamAxes.push_back(value);
     }
   }
   if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
@@ -897,7 +908,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
             "has no program-owned outer-axis dimension");
       for (const std::string &dimension : dimensionOrder)
         parameter(dimension +
-                  (compact && dimension == experts ? ": tl.constexpr" : ""));
+                  ((compact && dimension == experts) ||
+                           planIndex.blockExtents.count(dimension)
+                       ? ": tl.constexpr"
+                       : ""));
       for (ABIView &view : views)
         for (const std::string &stride : view.strides)
           parameter(stride);
@@ -1766,45 +1780,18 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->opaque) {
+    consumer.emitOpError(
+        "cannot resolve an opaque index source during Triton emission");
+    return failure();
+  }
   if (Operation *definition = indexedValue.getDefiningOp()) {
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
         definition->getName().getStringRef() == "intent.ragged_member")
       return definition;
   }
-  auto argument = dyn_cast<BlockArgument>(indexedValue);
-  Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
-      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
-    Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_outer" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-    consumer.emitOpError("cannot resolve a stream to its source domain");
-    return failure();
-  }
-  if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
-      owner->getNumOperands() != 1) {
-    consumer.emitOpError("cannot resolve index ownership during emission");
-    return failure();
-  }
-  Operation *source = owner->getOperand(0).getDefiningOp();
-  if (source &&
-      (source->getName().getStringRef() == "intent.domain" ||
-       source->getName().getStringRef() == "intent.ragged_outer" ||
-       source->getName().getStringRef() == "intent.ragged_member"))
-    return source;
-  if (source && source->getName().getStringRef() == "intent.partition" &&
-      source->getNumOperands() == 1) {
-    Operation *domain = source->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-  }
-  consumer.emitOpError("cannot resolve a partition to its source domain");
+  consumer.emitOpError("cannot resolve index ownership during Triton emission");
   return failure();
 }
 

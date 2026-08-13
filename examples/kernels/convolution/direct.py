@@ -5,6 +5,10 @@ import intent.language as I
 CONV1D_BATCH = 64
 CONV1D_LENGTH = 16384
 CONV1D_FILTER = 5
+CAUSAL_CONV_BATCH = 8
+CAUSAL_CONV_CHANNELS = 2048
+CAUSAL_CONV_LENGTH = 4096
+CAUSAL_CONV_WIDTH = 4
 
 CONV2D_BATCH = 16
 CONV2D_HEIGHT = 256
@@ -43,6 +47,48 @@ def conv1d_same(
                 acc_dtype=I.f32,
             )
             output[batch, output_region] = I.cast(reduced, I.f16)
+
+
+@intent.kernel
+def causal_depthwise_conv1d(
+    x: I.In[I.f16, ("B", "D", "L")],
+    weight: I.In[I.f16, ("D", "W")],
+    bias: I.In[I.f16, ("D",)],
+    output: I.Out[I.f16, ("B", "D", "L")],
+    SILU: I.Constexpr[bool],
+):
+    B, D, L = x.shape
+    W = weight.shape[1]
+    positions = I.domain(0, L)
+    taps = I.domain(0, W)
+    for batch in I.parallel(I.domain(0, B)):
+        for channel in I.parallel(I.domain(0, D)):
+            for output_region in I.parallel(
+                I.partition(positions, extent=I.auto("L_TILE"))
+            ):
+                output_index = I.indices(output_region)[:, None]
+                tap_index = I.indices(taps)[None, :]
+                input_index = output_index - (W - 1) + tap_index
+                valid = input_index >= 0
+                patch = x[batch, channel, input_index]
+                patch = I.mask(
+                    patch,
+                    valid=valid,
+                    fill=I.cast(0.0, I.f16),
+                )
+                products = (
+                    I.cast(patch, I.f32)
+                    * I.cast(weight[channel, taps], I.f32)[None, :]
+                )
+                reduced = I.reduce.sum(
+                    products,
+                    axis=1,
+                    identity=0.0,
+                    acc_dtype=I.f32,
+                ) + I.cast(bias[channel], I.f32)
+                if SILU:
+                    reduced = reduced * I.sigmoid(reduced)
+                output[batch, channel, output_region] = I.cast(reduced, I.f16)
 
 
 @intent.kernel

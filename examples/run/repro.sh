@@ -102,6 +102,18 @@ if [[ ${unfamiliar} == false ]]; then
   triton:swiglu_forward)
     baseline=source/triton/liger-kernel/activation/swiglu/swiglu_runtime.py
     ;;
+  triton:embedding_backward_atomic)
+    baseline=source/triton/liger-kernel/embedding/lookup/embedding.py
+    ;;
+  triton:embedding_forward_lookup)
+    baseline=source/triton/liger-kernel/embedding/lookup/embedding.py
+    ;;
+  triton:index_select_rows)
+    baseline=source/triton/xformers/indexing/index_select_cat/k_index_select_cat.py
+    ;;
+  triton:scaled_index_add)
+    baseline=source/triton/xformers/indexing/scaled_index_add/k_scaled_index_add.py
+    ;;
   cutile:softmax)
     baseline=source/cutile/tilegym/normalization/softmax/softmax.py
     ;;
@@ -168,6 +180,9 @@ if [[ ${unfamiliar} == false ]]; then
   tilelang:varlen_gqa_prefill)
     baseline=source/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen.py
     ;;
+  cutile:mla_prefill)
+    baseline=source/cutile/tilegym/attention/mla/mla.py
+    ;;
   triton:bf16_gemm | triton:batched_gemm | triton:quantized_gemm | triton:logsumexp | \
   cutile:attention_bias | cutile:paged_attention | cutile:quantized_gemm | cutile:rms_norm | cutile:fused_add_rms_norm | cutile:dropout_residual_rms_norm | cutile:logsumexp | \
   cutile:layer_norm_backward | cutile:swiglu_backward | cutile:cross_entropy | \
@@ -178,18 +193,48 @@ if [[ ${unfamiliar} == false ]]; then
   triton:dropout_residual_rms_norm | triton:sorted_nucleus_cutoff | \
   cutile:sorted_nucleus_cutoff | tilelang:sorted_nucleus_cutoff | \
   triton:insertion_top_k | cutile:insertion_top_k | tilelang:insertion_top_k | \
-  triton:embedding_backward_atomic | cutile:embedding_backward_atomic | tilelang:embedding_backward_atomic)
+  cutile:embedding_backward_atomic | tilelang:embedding_backward_atomic)
     ;;
   triton:conv1d | cutile:conv1d | tilelang:conv1d | \
+  triton:causal_conv1d | cutile:causal_conv1d | tilelang:causal_conv1d | \
   triton:conv2d | cutile:conv2d | tilelang:conv2d)
     ;;
   triton:selective_scan | cutile:selective_scan | tilelang:selective_scan)
     ;;
+  triton:mamba_chunk_scan | cutile:mamba_chunk_scan | tilelang:mamba_chunk_scan)
+    ;;
+  triton:splitk_attention_reduce | tilelang:splitk_attention_reduce)
+    ;;
+  cutile:splitk_attention_reduce)
+    baseline=source/cutile/tilegym/attention/flash_decode/splitk_reduce.py
+    ;;
+  triton:mla_prefill | cutile:mla_prefill | tilelang:mla_prefill)
+    ;;
+  cutile:embedding_forward_lookup | tilelang:embedding_forward_lookup)
+    ;;
+  triton:continuous_gqa_decode | cutile:continuous_gqa_decode | tilelang:continuous_gqa_decode)
+    ;;
   triton:weight_only_int4 | cutile:weight_only_int4 | tilelang:weight_only_int4)
+    ;;
+  triton:block_scaled_matmul | tilelang:block_scaled_matmul)
+    ;;
+  cutile:block_scaled_matmul)
+    baseline=source/cutile/cutile-python/gemm/block_scaled/BlockScaledMatMul.py
+    ;;
+  triton:w4a8_packed | cutile:w4a8_packed | \
+  triton:fp8_gemm | cutile:fp8_gemm)
+    ;;
+  tilelang:w4a8_packed)
+    baseline=source/tilelang/tilelang/gemm/dequantize_w4a8/example_dequant_gemm_w4a8.py
+    ;;
+  tilelang:fp8_gemm)
+    baseline=source/tilelang/tilelang/gemm/fp8/example_tilelang_gemm_fp8.py
     ;;
   triton:shifted_row_copy | cutile:shifted_row_copy | tilelang:shifted_row_copy | \
   triton:grouped_query_head_add | cutile:grouped_query_head_add | tilelang:grouped_query_head_add | \
-  triton:scalar_table_lookup | cutile:scalar_table_lookup | tilelang:scalar_table_lookup)
+  triton:scalar_table_lookup | cutile:scalar_table_lookup | tilelang:scalar_table_lookup | \
+  cutile:index_select_rows | tilelang:index_select_rows | \
+  cutile:scaled_index_add | tilelang:scaled_index_add)
     ;;
   triton:matrix_transpose | cutile:matrix_transpose | tilelang:matrix_transpose)
     ;;

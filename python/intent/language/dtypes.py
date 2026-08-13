@@ -55,6 +55,7 @@ u64 = DType("u64", DTypeCategory.UNSIGNED_INTEGER, 64)
 
 f8e4m3fn = DType("f8e4m3fn", DTypeCategory.FLOAT, 8)
 f8e5m2 = DType("f8e5m2", DTypeCategory.FLOAT, 8)
+f8e8m0fnu = DType("f8e8m0fnu", DTypeCategory.FLOAT, 8)
 f16 = DType("f16", DTypeCategory.FLOAT, 16)
 bf16 = DType("bf16", DTypeCategory.BFLOAT, 16)
 f32 = DType("f32", DTypeCategory.FLOAT, 32)
@@ -78,6 +79,7 @@ DTYPES = {
         u64,
         f8e4m3fn,
         f8e5m2,
+        f8e8m0fnu,
         f16,
         bf16,
         f32,

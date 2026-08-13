@@ -245,6 +245,36 @@ bool ownsOrderedStream(const AxisChoice &choice,
   });
 }
 
+std::optional<int64_t>
+innerStreamContractionExtent(Operation *domain,
+                             const target::KernelFacts &facts) {
+  for (const auto &entry : facts.contractions) {
+    const target::ContractionFact &contract = entry.second;
+    const target::LogicalAxis *reduction = nullptr;
+    for (unsigned axis : contract.lhsReductionAxes)
+      if (axis < contract.lhsAxes.size() &&
+          contract.lhsAxes[axis].domain == domain) {
+        reduction = &contract.lhsAxes[axis];
+        break;
+      }
+    if (!reduction)
+      continue;
+    bool nested = false;
+    for (Operation *parent = entry.first->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (parent->getName().getStringRef() == "intent.state_stream") {
+        nested = true;
+        break;
+      }
+    if (!nested)
+      continue;
+    int64_t extent = 0;
+    if (!StringRef(reduction->extent).getAsInteger(10, extent) && extent > 0)
+      return extent;
+  }
+  return std::nullopt;
+}
+
 bool hasIndirectRaggedMembership(Operation *domain,
                                  const target::KernelFacts &facts) {
   auto member = facts.raggedMembers.find(domain);
@@ -448,9 +478,22 @@ assignAxes(const target::KernelFacts &facts) {
     if (hasRole(choice.roles, "reduction")) {
       const AxisChoice::RangeChoice *traversal =
           findRange(choice, "traversal");
+      auto staticExtent = facts.staticDomainExtents.find(choice.domain);
+      auto staticBounds = facts.staticDomainBounds.find(choice.domain);
+      std::optional<int64_t> innerExtent =
+          innerStreamContractionExtent(choice.domain, facts);
+      if (!innerExtent && staticExtent != facts.staticDomainExtents.end() &&
+          llvm::is_contained(facts.contractionDomains, choice.domain))
+        innerExtent = staticExtent->second;
+      if (!innerExtent && staticBounds != facts.staticDomainBounds.end() &&
+          llvm::is_contained(facts.contractionDomains, choice.domain))
+        innerExtent =
+            staticBounds->second.second - staticBounds->second.first;
       addRange(choice, "reduction", 0,
-               traversal ? traversal->tile
-                         : indexedTile("reduction", reductionTile));
+               innerExtent
+                   ? "fixed_" + std::to_string(*innerExtent)
+                   : traversal ? traversal->tile
+                               : indexedTile("reduction", reductionTile));
     }
     if (choice.packedLane) {
       addRange(choice, "lane", 0, packedTile);

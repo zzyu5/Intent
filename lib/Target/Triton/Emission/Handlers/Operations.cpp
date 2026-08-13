@@ -31,6 +31,12 @@ StringRef tritonDtype(Type type) {
     return "tl.float32";
   if (type.isBF16())
     return "tl.bfloat16";
+  if (isa<Float8E4M3FNType>(type))
+    return "tl.float8e4nv";
+  if (isa<Float8E5M2Type>(type))
+    return "tl.float8e5";
+  if (isa<Float8E8M0FNUType>(type))
+    return "tl.uint8";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 8)
     return integer.isUnsigned() ? "tl.uint8" : "tl.int8";
@@ -1638,9 +1644,18 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   StringRef targetType = tritonDtype(resultType);
   if (targetType.empty())
     return operation.emitOpError("casts to an unsupported Triton type");
+  Type operandType = operation.getOperand(0).getType();
+  if (auto tensor = dyn_cast<RankedTensorType>(operandType))
+    operandType = tensor.getElementType();
+  bool e8m0Storage = isa<Float8E8M0FNUType>(operandType);
+  Type resultElementType = resultType;
+  if (auto tensor = dyn_cast<RankedTensorType>(resultElementType))
+    resultElementType = tensor.getElementType();
   std::string result = makeResultName(operation, 0);
   std::string expression =
-      "tl.cast(" + operand->str() + ", " + targetType.str() + ")";
+      e8m0Storage && resultElementType.isF32()
+          ? "tl.exp2(" + operand->str() + ".to(tl.float32) - 127.0)"
+          : "tl.cast(" + operand->str() + ", " + targetType.str() + ")";
   if (target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
     return success();
@@ -2006,6 +2021,17 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
        addressIndex("tl.arange(0, " + binding.getTile().str() + ")"));
   axisIndices[binding.getAxisNode()] = offsets;
   valueNames[body.getArgument(0)] = offsets;
+  for (int64_t axisNode : binding.getInnerReductionAxes()) {
+    if (axisNode == binding.getAxisNode())
+      continue;
+    plan::AxisOp axis = planIndex.axes.lookup(axisNode);
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange("reduction", 0) : nullptr;
+    if (!range)
+      return binding.emitOpError("has no inner reduction range");
+    axisIndices[axisNode] =
+        addressIndex("tl.arange(0, " + range->getTile().str() + ")");
+  }
   return success();
 }
 
@@ -2035,6 +2061,9 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     axisIndices.erase(binding.getAxisNode());
   else
     axisIndices[binding.getAxisNode()] = outerIndex->second;
+  for (int64_t axisNode : binding.getInnerReductionAxes())
+    if (axisNode != binding.getAxisNode())
+      axisIndices.erase(axisNode);
   streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
@@ -2051,6 +2080,17 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       target::emission::contractionOrientation(operation);
   if (failed(orientation))
     return failure();
+  auto resultTensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  std::string accumulatorDtype =
+      resultTensor ? tritonDtype(resultTensor.getElementType()).str() : "";
+  if (accumulatorDtype.empty())
+    return operation.emitOpError("has no supported Triton accumulator dtype");
+  auto operandElementType = [](Value value) -> Type {
+    auto tensor = dyn_cast<RankedTensorType>(value.getType());
+    return tensor ? tensor.getElementType() : Type();
+  };
+  Type lhsElement = operandElementType(operation.getOperand(0));
+  Type rhsElement = operandElementType(operation.getOperand(1));
   if (!planIndex.stages.empty()) {
     if (activeStages.size() != 1)
       return operation.emitOpError(
@@ -2066,12 +2106,6 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         orientation->lhsTranspose || orientation->rhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
-    auto operandElementType = [](Value value) -> Type {
-      auto tensor = dyn_cast<RankedTensorType>(value.getType());
-      return tensor ? tensor.getElementType() : Type();
-    };
-    Type lhsElement = operandElementType(operation.getOperand(0));
-    Type rhsElement = operandElementType(operation.getOperand(1));
     bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
     if (!lhsElement || !rhsElement ||
         (!promoteToF32 && lhsElement != rhsElement) ||
@@ -2082,8 +2116,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     std::string feature = stageFeatureDimensions.lookup(stage);
     std::string reduction = stageReductionDimensions.lookup(stage);
     std::string result = makeResultName(operation, 0);
-    line(result +
-         " = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)");
+    line(result + " = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=" +
+         accumulatorDtype + ")");
     line("for reduction_block in range(0, tl.cdiv(" + reduction +
          ", BLOCK_SIZE_K)):");
     ++indentation;
@@ -2165,7 +2199,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       rhsExpression = "tl.trans(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
     line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression +
-         ", out_dtype=tl.float32)");
+         ", out_dtype=" + accumulatorDtype + ")");
     bindResult(operation, 0, result);
     return success();
   }
@@ -2174,24 +2208,28 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         "deferred Triton contraction has inconsistent operand residency");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-  FailureOr<plan::AxisOp> reductionAxis =
-      target::emission::contractionReductionAxis(planIndex, *lhsLoad, *rhsLoad,
-                                                 operation);
-  if (failed(lhsView) || failed(rhsView) || failed(reductionAxis))
+  FailureOr<target::emission::ContractionAxes> axes =
+      target::emission::contractionAxes(planIndex, *lhsLoad, *rhsLoad,
+                                        operation);
+  if (failed(lhsView) || failed(rhsView) || failed(axes))
     return failure();
 
-  std::string reductionRole = reductionAxis->getRole().str();
-  std::string reductionTile = reductionAxis->getTile().str();
+  plan::AxisOp reductionAxis = axes->reduction;
+  std::string reductionRole = reductionAxis.getRole().str();
+  std::string reductionTile = reductionAxis.getTile().str();
+  std::string lhsTile = axes->lhsResult.getTile().str();
+  std::string rhsTile = axes->rhsResult.getTile().str();
   std::string reductionOffset = "offs_" + reductionRole;
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)");
+  line(result + " = tl.zeros((" + lhsTile + ", " + rhsTile +
+       "), dtype=" + accumulatorDtype + ")");
   line("for reduction_block in range(0, tl.cdiv(" +
        roleDimensions.lookup(reductionRole) + ", " + reductionTile + ")):");
   ++indentation;
   line(reductionOffset + " = " + addressIndex("reduction_block") + " * " +
        reductionTile + " + " +
        addressIndex("tl.arange(0, " + reductionTile + ")"));
-  axisIndices[reductionAxis->getNode()] = reductionOffset;
+  axisIndices[reductionAxis.getNode()] = reductionOffset;
   FailureOr<std::string> lhsPointers =
       emitPointerExpression(*lhsLoad, **lhsView, false);
   FailureOr<std::string> rhsPointers =
@@ -2257,24 +2295,41 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
                  : FailureOr<StringRef>(failure());
   if (failed(node) || !binding || binding.getDefer() ||
       binding.getStoreMask() != "predicate" || !valueIndex ||
-      failed(relation) || relation->size() != 2 ||
-      (*relation)[0].kind != "value_index" ||
-      (*relation)[0].operands.size() != 1 ||
-      !(*relation)[0].operands.front() ||
-      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored) ||
-      (*view)->tensor.getRank() != 2)
+      failed(relation) || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical Triton unique store");
-  FailureOr<StringRef> rows =
-      lookupValue(operation, *(*relation)[0].operands.front());
-  if (failed(rows))
+  if (!planIndex.stages.empty()) {
+    auto storedTensor = dyn_cast<RankedTensorType>(
+        operation.getOperand(valueIndex.getInt()).getType());
+    if (activeStages.size() != 1 || relation->size() != 2 ||
+        (*relation)[0].kind != "value_index" ||
+        (*relation)[0].operands.size() != 1 ||
+        !(*relation)[0].operands.front() ||
+        !isa<RankedTensorType>(
+            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
+        (*relation)[1].kind != "full_slice" || !storedTensor ||
+        storedTensor.getRank() != 2)
+      return operation.emitOpError(
+          "staged Triton unique store requires one member-indexed matrix");
+    FailureOr<StringRef> rows =
+        lookupValue(operation, *(*relation)[0].operands.front());
+    if (failed(rows))
+      return failure();
+    std::string pointer = (*view)->pointer + " + " +
+                          addressIndex(rows->str() + "[:, None]") + " * " +
+                          addressIndex((*view)->strides[0]) + " + " +
+                          addressIndex("offs_feature[None, :]") + " * " +
+                          addressIndex((*view)->strides[1]);
+    line("tl.store(" + pointer + ", " + stored->str() +
+         ", mask=member_mask[:, None] & feature_mask[None, :])");
+    return success();
+  }
+  FailureOr<std::string> pointers =
+      emitPointerExpression(operation, **view, true);
+  FailureOr<std::string> mask = emitMaskExpression(operation, true);
+  if (failed(pointers) || failed(mask))
     return failure();
-  std::string pointer = (*view)->pointer + " + " +
-                        addressIndex(rows->str() + "[:, None]") + " * " +
-                        addressIndex((*view)->strides[0]) + " + " +
-                        addressIndex("offs_feature[None, :]") + " * " +
-                        addressIndex((*view)->strides[1]);
-  line("tl.store(" + pointer + ", " + stored->str() +
-       ", mask=member_mask[:, None] & feature_mask[None, :])");
+  line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" + *mask +
+       ")");
   return success();
 }
 

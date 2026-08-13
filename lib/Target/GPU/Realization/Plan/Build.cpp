@@ -130,37 +130,6 @@ choosePrivateBufferResidencies(const target::KernelFacts &facts,
   return spaces;
 }
 
-int64_t reusableOperand(Operation &operation) {
-  if (operation.getNumResults() != 1 ||
-      !isa<RankedTensorType>(operation.getResult(0).getType()) ||
-      operation.getName().getStringRef() == "intent.broadcast" ||
-      operation.getName().getStringRef() == "intent.transpose")
-    return -1;
-  Value result = operation.getResult(0);
-  auto isStateCarrier = [](Value operand) {
-    auto argument = dyn_cast<BlockArgument>(operand);
-    Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-    return owner && owner->getName().getStringRef() == "intent.state_stream" &&
-           argument.getArgNumber() > 0;
-  };
-  auto reusable = [&](Value operand) {
-    if (operand.getType() != result.getType() ||
-        operand.getParentBlock() != operation.getBlock() ||
-        (!operand.getDefiningOp() && !isStateCarrier(operand)))
-      return false;
-    return llvm::all_of(operand.getUsers(), [&](Operation *user) {
-      return user == &operation ||
-             (user->getBlock() == operation.getBlock() &&
-              user->isBeforeInBlock(&operation));
-    });
-  };
-  for (bool requireCarrier : {true, false})
-    for (auto [index, operand] : llvm::enumerate(operation.getOperands()))
-      if (isStateCarrier(operand) == requireCarrier && reusable(operand))
-        return index;
-  return -1;
-}
-
 struct ValidityBinding {
   SmallVector<int64_t> axes;
   SmallVector<int64_t> nodes;
@@ -674,10 +643,19 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                               ? StringRef("private_fragment")
                               : StringRef("private_scalar");
     }
+    target::TensorIndexingKind tensorIndexing =
+        target::tensorIndexingKind(operation, facts);
+    StringRef tensorIndexingName =
+        tensorIndexing == target::TensorIndexingKind::dataDependent
+            ? "data_dependent"
+        : tensorIndexing == target::TensorIndexingKind::structured
+            ? "structured"
+            : "none";
     builder.create<intent::plan::TransferOp>(
         operation.getLoc(), i64(builder, *node),
         builder.getDenseI64ArrayAttr(domains), string(builder, fill),
         builder.getBoolAttr(false),
+        string(builder, tensorIndexingName),
         string(builder, resultSpace));
     return success();
   };
@@ -715,6 +693,14 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
               operation)))
         return failure();
     }
+    auto combineAttr = operation.getAttrOfType<StringAttr>("intent.combine");
+    StringRef combine = combineAttr ? combineAttr.getValue() : StringRef();
+    if (combine == "maximum" &&
+        failed(paddingState.require(
+            operation.getOperand(0),
+            {static_cast<unsigned>(axis.getInt())}, "negative_infinity",
+            operation)))
+      return failure();
     builder.create<intent::plan::ReductionOp>(
         operation.getLoc(), i64(builder, *node),
         string(builder, "private_fragment"));
@@ -813,13 +799,33 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 return failure();
               bool tensor =
                   isa<RankedTensorType>(operation.getResult(0).getType());
+              SmallVector<int64_t> axisNodes;
+              auto resultAxes = facts.valueAxes.find(operation.getResult(0));
+              if (tensor && resultAxes == facts.valueAxes.end())
+                return operation.emitOpError(
+                    "has no logical-axis provenance for its physical result");
+              if (resultAxes != facts.valueAxes.end()) {
+                axisNodes.reserve(resultAxes->second.size());
+                for (const target::LogicalAxis &axis : resultAxes->second) {
+                  if (!axis.domain) {
+                    axisNodes.push_back(-1);
+                    continue;
+                  }
+                  FailureOr<int64_t> axisNode = target::getNodeID(
+                      *axis.domain, "pointwise result-axis binding");
+                  if (failed(axisNode))
+                    return failure();
+                  axisNodes.push_back(*axisNode);
+                }
+              }
               builder.create<intent::plan::PointwiseOp>(
                   operation.getLoc(), i64(builder, *node),
                   string(builder,
                          tensor ? "private_fragment" : "private_scalar"),
-                  i64(builder, reusableOperand(operation)),
+                  i64(builder, -1),
                   builder.getBoolAttr(
-                      target::hasNonnegativeIntegerOperands(operation, facts)));
+                      target::hasNonnegativeIntegerOperands(operation, facts)),
+                  builder.getDenseI64ArrayAttr(axisNodes));
               return success();
             })))
       return failure();
@@ -860,6 +866,39 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 string(builder, operandSpace(operation.getOperand(0))),
                 string(builder, operandSpace(operation.getOperand(1))),
                 string(builder, "private_fragment"));
+            Operation *stream = nullptr;
+            for (Operation *parent = operation.getParentOp(); parent;
+                 parent = parent->getParentOp())
+              if (parent->getName().getStringRef() == "intent.state_stream") {
+                stream = parent;
+                break;
+              }
+            if (stream) {
+              FailureOr<int64_t> streamNode =
+                  target::getNodeID(*stream, "stream contraction binding");
+              llvm::DenseSet<int64_t> innerAxes;
+              for (unsigned lhsAxis : contraction->second.lhsReductionAxes) {
+                if (lhsAxis >= contraction->second.lhsAxes.size())
+                  return operation.emitOpError(
+                      "has no logical inner reduction axis");
+                if (!contraction->second.lhsAxes[lhsAxis].domain)
+                  continue;
+                FailureOr<int64_t> axisNode = target::getNodeID(
+                    *contraction->second.lhsAxes[lhsAxis].domain,
+                    "stream inner reduction binding");
+                if (failed(axisNode))
+                  return failure();
+                innerAxes.insert(*axisNode);
+              }
+              if (innerAxes.empty())
+                return success();
+              if (failed(streamNode))
+                return failure();
+              for (int64_t axisNode : innerAxes)
+                builder.create<intent::plan::StreamAxisOp>(
+                    operation.getLoc(), i64(builder, *streamNode),
+                    i64(builder, axisNode), string(builder, "inner_reduction"));
+            }
             return success();
           })))
     return failure();

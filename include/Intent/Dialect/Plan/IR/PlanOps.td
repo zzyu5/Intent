@@ -119,6 +119,7 @@ def IntentPlan_TransferOp : IntentPlan_Op<"transfer"> {
     DenseI64ArrayAttr:$domain_nodes,
     StrAttr:$fill,
     BoolAttr:$consumer_neutralized,
+    StrAttr:$tensor_indexing,
     StrAttr:$result_space
   );
   let results = (outs);
@@ -156,7 +157,8 @@ def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
     I64Attr:$node,
     StrAttr:$result_space,
     I64Attr:$reuse_operand,
-    BoolAttr:$nonnegative_operands
+    BoolAttr:$nonnegative_operands,
+    DenseI64ArrayAttr:$axis_nodes
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -168,6 +170,16 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
     StrAttr:$lhs_space,
     StrAttr:$rhs_space,
     StrAttr:$accumulator_space
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_StreamAxisOp : IntentPlan_Op<"stream_axis"> {
+  let arguments = (ins
+    I64Attr:$stream_node,
+    I64Attr:$axis_node,
+    StrAttr:$role
   );
   let results = (outs);
   let hasVerifier = 1;

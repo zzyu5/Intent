@@ -72,6 +72,75 @@ def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "w4a8_packed":
+        source = _load_module(source_path, "intent_upstream_tilelang_w4a8")
+        state = {}
+
+        def run(arguments):
+            activation, packed = arguments
+            shape = (activation.shape[0], packed.shape[0], activation.shape[1])
+            if shape not in state:
+                compiled = source.matmul_int8xint4(
+                    *shape,
+                    T.int8,
+                    T.int32,
+                    T.int32,
+                    num_bits=4,
+                    block_M=32,
+                    block_N=32,
+                    block_K=128,
+                    num_stages=2,
+                    threads=128,
+                )
+                state[shape] = (
+                    compiled,
+                    torch.empty(
+                        (shape[1], shape[0]),
+                        device=activation.device,
+                        dtype=torch.int32,
+                    ),
+                )
+            compiled, output = state[shape]
+            compiled.adapter._get_executable()(activation, packed, output)
+            return output
+
+        return run
+    if kernel == "fp8_gemm":
+        source = _load_module(source_path, "intent_upstream_tilelang_fp8")
+        state = {}
+
+        def run(arguments):
+            lhs, rhs = arguments
+            label = "e5m2" if lhs.dtype == torch.float8_e5m2 else "e4m3"
+            shape = (lhs.shape[0], rhs.shape[0], lhs.shape[1], label)
+            if shape not in state:
+                dtype = (
+                    source.determine_fp8_type("e5m2")
+                    if label == "e5m2"
+                    else source.determine_fp8_type()
+                )
+                compiled = source.matmul.compile(
+                    M=shape[0],
+                    N=shape[1],
+                    K=shape[2],
+                    block_M=128,
+                    block_N=128,
+                    block_K=64,
+                    dtype=dtype,
+                )
+                state[shape] = (
+                    compiled,
+                    torch.empty(
+                        (shape[0], shape[1]),
+                        device=lhs.device,
+                        dtype=lhs.dtype,
+                    ),
+                )
+            compiled, output = state[shape]
+            compiled.adapter._get_executable()(lhs, rhs, output)
+            return output
+
+        return run
     if kernel == "bf16_gemm":
         source = _load_module(source_path, "intent_upstream_tilelang_bf16_gemm")
         compiled = {}

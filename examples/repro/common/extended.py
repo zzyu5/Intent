@@ -19,10 +19,12 @@ from kernels.contraction.batched_gemm import batched_gemm_nn
 from kernels.contraction.batched_gemm import batched_gemm_nt
 from kernels.contraction.batched_gemm import batched_gemm_tn
 from kernels.contraction.batched_gemm import batched_gemm_tt
+from kernels.contraction.block_scaled import block_scaled_matmul
 from kernels.backward.embedding import FEATURES as EMBEDDING_FEATURES
 from kernels.backward.embedding import TOKENS as EMBEDDING_TOKENS
 from kernels.backward.embedding import VOCABULARY as EMBEDDING_VOCABULARY
 from kernels.backward.embedding import embedding_backward_atomic
+from kernels.backward.embedding import embedding_forward_lookup
 from kernels.backward.layer_norm import FEATURES as BWD_LAYER_FEATURES
 from kernels.backward.layer_norm import PARTIAL_GROUPS as BWD_LAYER_PARTIAL_GROUPS
 from kernels.backward.layer_norm import ROWS as BWD_LAYER_ROWS
@@ -48,6 +50,11 @@ from kernels.convolution.direct import CONV2D_FILTER_HEIGHT
 from kernels.convolution.direct import CONV2D_FILTER_WIDTH
 from kernels.convolution.direct import CONV2D_HEIGHT
 from kernels.convolution.direct import CONV2D_WIDTH
+from kernels.convolution.direct import CAUSAL_CONV_BATCH
+from kernels.convolution.direct import CAUSAL_CONV_CHANNELS
+from kernels.convolution.direct import CAUSAL_CONV_LENGTH
+from kernels.convolution.direct import CAUSAL_CONV_WIDTH
+from kernels.convolution.direct import causal_depthwise_conv1d
 from kernels.convolution.direct import conv1d_same
 from kernels.convolution.direct import conv2d_same
 from kernels.indexing.relations import GQA_KEY_HEADS
@@ -61,6 +68,15 @@ from kernels.indexing.relations import OFFSET_ROWS
 from kernels.indexing.relations import grouped_query_head_add
 from kernels.indexing.relations import scalar_table_lookup
 from kernels.indexing.relations import shifted_row_copy
+from kernels.indexing.relations import INDEX_SELECT_FEATURES
+from kernels.indexing.relations import INDEX_SELECT_ROWS
+from kernels.indexing.relations import INDEX_SELECT_SOURCE_ROWS
+from kernels.indexing.relations import SCALED_ADD_DESTINATION_ROWS
+from kernels.indexing.relations import SCALED_ADD_FEATURES
+from kernels.indexing.relations import SCALED_ADD_INNER_ROWS
+from kernels.indexing.relations import SCALED_ADD_SOURCE_ROWS
+from kernels.indexing.relations import index_select_rows
+from kernels.indexing.relations import scaled_index_add_unique
 from kernels.layout.transpose import COLUMNS as TRANSPOSE_COLUMNS
 from kernels.layout.transpose import ROWS as TRANSPOSE_ROWS
 from kernels.layout.transpose import matrix_transpose
@@ -134,6 +150,23 @@ from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
 from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
 from kernels.streaming.attention import flash_varlen_gqa_prefill
+from kernels.streaming.attention import GQA_DECODE_BATCH
+from kernels.streaming.attention import GQA_DECODE_HEAD_DIMENSION
+from kernels.streaming.attention import GQA_DECODE_HEAD_GROUP
+from kernels.streaming.attention import GQA_DECODE_KV_HEADS
+from kernels.streaming.attention import GQA_DECODE_QUERY_HEADS
+from kernels.streaming.attention import GQA_DECODE_SCALE
+from kernels.streaming.attention import GQA_DECODE_SEQUENCE
+from kernels.streaming.attention import continuous_gqa_decode
+from kernels.streaming.attention import MLA_PREFILL_BATCH
+from kernels.streaming.attention import MLA_PREFILL_CONTENT_DIMENSION
+from kernels.streaming.attention import MLA_PREFILL_HEAD_GROUP
+from kernels.streaming.attention import MLA_PREFILL_KV_HEADS
+from kernels.streaming.attention import MLA_PREFILL_POSITION_DIMENSION
+from kernels.streaming.attention import MLA_PREFILL_QUERY_HEADS
+from kernels.streaming.attention import MLA_PREFILL_SCALE
+from kernels.streaming.attention import MLA_PREFILL_SEQUENCE
+from kernels.streaming.attention import mla_prefill
 from kernels.position.rope import rotary_embedding_flat
 from kernels.pointwise.batched_affine import BATCH as AFFINE_BATCH
 from kernels.pointwise.batched_affine import COLUMNS as AFFINE_COLUMNS
@@ -158,6 +191,19 @@ from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from kernels.streaming.selective_scan import BATCH as SELECTIVE_SCAN_BATCH
 from kernels.streaming.selective_scan import LENGTH as SELECTIVE_SCAN_LENGTH
 from kernels.streaming.selective_scan import selective_state_scan
+from kernels.streaming.selective_scan import MAMBA_BATCH
+from kernels.streaming.selective_scan import MAMBA_CHUNKS
+from kernels.streaming.selective_scan import MAMBA_GROUPS
+from kernels.streaming.selective_scan import MAMBA_CHUNK_SIZE
+from kernels.streaming.selective_scan import MAMBA_HEADS
+from kernels.streaming.selective_scan import MAMBA_HEAD_DIMENSION
+from kernels.streaming.selective_scan import MAMBA_STATE_DIMENSION
+from kernels.streaming.selective_scan import mamba_chunk_scan_fwd
+from kernels.streaming.splitk_reduce import BATCH as SPLITK_REDUCE_BATCH
+from kernels.streaming.splitk_reduce import HEAD_DIMENSION as SPLITK_REDUCE_DIMENSION
+from kernels.streaming.splitk_reduce import HEADS as SPLITK_REDUCE_HEADS
+from kernels.streaming.splitk_reduce import SPLITS as SPLITK_REDUCE_SPLITS
+from kernels.streaming.splitk_reduce import splitk_attention_reduce
 from kernels.synchronization.compare_exchange import SLOTS as CAS_SLOTS
 from kernels.synchronization.compare_exchange import claim_zero_slots
 from kernels.contraction.weight_only_int4 import GROUP_SIZE as W4_GROUP_SIZE
@@ -166,6 +212,13 @@ from kernels.contraction.weight_only_int4 import M as W4_M
 from kernels.contraction.weight_only_int4 import N as W4_N
 from kernels.contraction.weight_only_int4 import PACK_FACTOR as W4_PACK_FACTOR
 from kernels.contraction.weight_only_int4 import weight_only_int4_matmul
+from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
+from kernels.contraction.weight_only_int4 import fp8_e5m2_matmul
+from kernels.contraction.weight_only_int4 import W4A8_K
+from kernels.contraction.weight_only_int4 import W4A8_M
+from kernels.contraction.weight_only_int4 import W4A8_N
+from kernels.contraction.weight_only_int4 import W4A8_PACK_FACTOR
+from kernels.contraction.weight_only_int4 import w4a8_packed_matmul
 
 from .support import benchmark
 from .support import prepare_kernel_call
@@ -189,6 +242,7 @@ def _compare(
     tolerance: float,
     upstream: Upstream | None,
     expected_dtype: torch.dtype | None = None,
+    comparison_error: Callable[[torch.Tensor, torch.Tensor], float] | None = None,
     measurement_scope: str = "kernel-only",
     cuda_graph: bool = True,
 ) -> None:
@@ -211,7 +265,11 @@ def _compare(
             f"{target_name} {kernel_name} returned {generated.dtype}, "
             f"expected {expected_dtype}"
         )
-    error = (generated - expected).abs().max().item()
+    error = (
+        comparison_error(generated, expected)
+        if comparison_error is not None
+        else (generated - expected).abs().max().item()
+    )
     if error > tolerance:
         raise RuntimeError(
             f"{target_name} {kernel_name} numerical comparison failed: {error}"
@@ -233,7 +291,11 @@ def _compare(
                 f"{target_name} {kernel_name} upstream returned "
                 f"{upstream_output.dtype}, expected {expected_dtype}"
             )
-        upstream_error = (upstream_output - expected).abs().max().item()
+        upstream_error = (
+            comparison_error(upstream_output, expected)
+            if comparison_error is not None
+            else (upstream_output - expected).abs().max().item()
+        )
         if upstream_error > tolerance:
             raise RuntimeError(
                 f"{target_name} {kernel_name} upstream numerical comparison "
@@ -333,6 +395,189 @@ def _run_conv2d(
     )
 
 
+def _run_causal_conv1d(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError(
+            "causal conv source checkout contains only the C++ dispatch wrapper"
+        )
+    x = torch.randn(
+        (CAUSAL_CONV_BATCH, CAUSAL_CONV_CHANNELS, CAUSAL_CONV_LENGTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    weight = torch.randn(
+        (CAUSAL_CONV_CHANNELS, CAUSAL_CONV_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    bias = torch.randn(
+        (CAUSAL_CONV_CHANNELS,), device="cuda", dtype=torch.float16
+    ) * 0.1
+    artifact = intent.compile(
+        causal_depthwise_conv1d,
+        constexprs={"SILU": True},
+        target=target,
+        compiler=compiler,
+    )
+    _compare(
+        artifact=artifact,
+        arguments=(x, weight, bias),
+        reference=lambda: F.silu(
+            F.conv1d(
+                F.pad(x, (CAUSAL_CONV_WIDTH - 1, 0)),
+                weight[:, None, :],
+                bias,
+                groups=CAUSAL_CONV_CHANNELS,
+            )
+        ),
+        target_name=target_name,
+        kernel_name="causal depthwise conv1d",
+        tolerance=3.0e-3,
+        upstream=None,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_continuous_gqa_decode(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    q = torch.randn(
+        (
+            GQA_DECODE_BATCH,
+            GQA_DECODE_QUERY_HEADS,
+            GQA_DECODE_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    k = torch.randn(
+        (
+            GQA_DECODE_BATCH,
+            GQA_DECODE_SEQUENCE,
+            GQA_DECODE_KV_HEADS,
+            GQA_DECODE_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    valid = torch.ones(
+        (
+            GQA_DECODE_BATCH,
+            GQA_DECODE_SEQUENCE,
+            GQA_DECODE_KV_HEADS,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    artifact = intent.compile(
+        continuous_gqa_decode,
+        constexprs={"HEAD_GROUP": GQA_DECODE_HEAD_GROUP},
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        expected = torch.empty_like(q)
+        for key_head in range(GQA_DECODE_KV_HEADS):
+            begin = key_head * GQA_DECODE_HEAD_GROUP
+            end = begin + GQA_DECODE_HEAD_GROUP
+            expected[:, begin:end] = F.scaled_dot_product_attention(
+                q[:, begin:end, None, :],
+                k[:, :, key_head, :][:, None, :, :],
+                v[:, :, key_head, :][:, None, :, :],
+                scale=GQA_DECODE_SCALE,
+            )[:, :, 0, :]
+        return expected
+
+    _compare(
+        artifact=artifact,
+        arguments=(q, k, v, valid, GQA_DECODE_SCALE),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="continuous GQA decode",
+        tolerance=3.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_mla_prefill(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    q = torch.randn(
+        (MLA_PREFILL_BATCH, MLA_PREFILL_QUERY_HEADS, MLA_PREFILL_SEQUENCE,
+         MLA_PREFILL_CONTENT_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    qpe = torch.randn(
+        (MLA_PREFILL_BATCH, MLA_PREFILL_QUERY_HEADS, MLA_PREFILL_SEQUENCE,
+         MLA_PREFILL_POSITION_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    k = torch.randn(
+        (MLA_PREFILL_BATCH, MLA_PREFILL_KV_HEADS, MLA_PREFILL_SEQUENCE,
+         MLA_PREFILL_CONTENT_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    kpe = torch.randn(
+        (MLA_PREFILL_BATCH, 1, MLA_PREFILL_SEQUENCE,
+         MLA_PREFILL_POSITION_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v = torch.randn_like(k)
+    artifact = intent.compile(
+        mla_prefill,
+        target=target,
+        compiler=compiler,
+        constexprs={"HEAD_GROUP": MLA_PREFILL_HEAD_GROUP},
+    )
+
+    def reference() -> torch.Tensor:
+        key = k.repeat_interleave(MLA_PREFILL_HEAD_GROUP, dim=1).float()
+        value = v.repeat_interleave(MLA_PREFILL_HEAD_GROUP, dim=1).float()
+        position_key = kpe.expand(
+            MLA_PREFILL_BATCH,
+            MLA_PREFILL_QUERY_HEADS,
+            MLA_PREFILL_SEQUENCE,
+            MLA_PREFILL_POSITION_DIMENSION,
+        ).float()
+        score = torch.matmul(q.float(), key.transpose(-1, -2))
+        score += torch.matmul(qpe.float(), position_key.transpose(-1, -2))
+        score *= MLA_PREFILL_SCALE
+        causal = torch.triu(
+            torch.ones(
+                (MLA_PREFILL_SEQUENCE, MLA_PREFILL_SEQUENCE),
+                device="cuda",
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        score.masked_fill_(causal, -torch.inf)
+        probability = torch.softmax(score, dim=-1)
+        return torch.matmul(probability, value).to(torch.float16)
+
+    _compare(
+        artifact=artifact,
+        arguments=(q, qpe, k, kpe, v, MLA_PREFILL_SCALE),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="MLA causal prefill",
+        tolerance=3e-2,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
+
+
 def _run_selective_scan(
     compiler: str,
     target: Target,
@@ -372,6 +617,337 @@ def _run_selective_scan(
         expected_dtype=torch.float32,
         cuda_graph=False,
     )
+
+
+def _run_mamba_chunk_scan(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    length = MAMBA_CHUNKS * MAMBA_CHUNK_SIZE
+    heads_per_group = MAMBA_HEADS // MAMBA_GROUPS
+    cb = torch.randn(
+        (
+            MAMBA_BATCH,
+            MAMBA_CHUNKS,
+            MAMBA_GROUPS,
+            MAMBA_CHUNK_SIZE,
+            MAMBA_CHUNK_SIZE,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.05
+    x = torch.randn(
+        (MAMBA_BATCH, length, MAMBA_HEADS, MAMBA_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    dt = torch.rand(
+        (MAMBA_BATCH, MAMBA_HEADS, MAMBA_CHUNKS, MAMBA_CHUNK_SIZE),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    dA = -torch.rand_like(dt) * 0.1
+    state_matrix = torch.randn(
+        (MAMBA_BATCH, length, MAMBA_GROUPS, MAMBA_STATE_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.05
+    previous = torch.randn(
+        (
+            MAMBA_BATCH,
+            MAMBA_CHUNKS,
+            MAMBA_HEADS,
+            MAMBA_HEAD_DIMENSION,
+            MAMBA_STATE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.05
+    residual_scale = torch.randn(
+        (MAMBA_HEADS,), device="cuda", dtype=torch.float16
+    ) * 0.1
+    artifact = intent.compile(
+        mamba_chunk_scan_fwd,
+        constexprs={"HEADS_PER_GROUP": heads_per_group},
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        group_index = torch.arange(MAMBA_HEADS, device="cuda") // heads_per_group
+        chunk_x = x.reshape(
+            MAMBA_BATCH,
+            MAMBA_CHUNKS,
+            MAMBA_CHUNK_SIZE,
+            MAMBA_HEADS,
+            MAMBA_HEAD_DIMENSION,
+        )
+        state_c = state_matrix.reshape(
+            MAMBA_BATCH,
+            MAMBA_CHUNKS,
+            MAMBA_CHUNK_SIZE,
+            MAMBA_GROUPS,
+            MAMBA_STATE_DIMENSION,
+        )[:, :, :, group_index, :]
+        state = torch.einsum(
+            "bcshn,bchpn->bcshp",
+            state_c.float(),
+            previous.float(),
+        )
+        state *= torch.exp(dA.float()).permute(0, 2, 3, 1)[..., None]
+        decay = torch.exp(
+            dA.float()[:, :, :, :, None] - dA.float()[:, :, :, None, :]
+        ).permute(0, 2, 3, 4, 1)
+        coefficients = cb[:, :, group_index].permute(0, 1, 3, 4, 2).float()
+        coefficients *= decay
+        coefficients *= dt.float().permute(0, 2, 3, 1)[:, :, None, :, :]
+        causal = torch.tril(
+            torch.ones(
+                (MAMBA_CHUNK_SIZE, MAMBA_CHUNK_SIZE),
+                device="cuda",
+                dtype=torch.bool,
+            )
+        )
+        coefficients.masked_fill_(~causal[None, None, :, :, None], 0.0)
+        scan = torch.einsum(
+            "bcskh,bckhp->bcshp",
+            coefficients,
+            chunk_x.float(),
+        )
+        result = state + scan + chunk_x.float() * residual_scale.float()[None, None, None, :, None]
+        return result.reshape_as(x).half()
+
+    _compare(
+        artifact=artifact,
+        arguments=(cb, x, dt, dA, state_matrix, previous, residual_scale),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="Mamba chunk scan forward",
+        tolerance=5.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_w4a8_packed(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    activation = torch.randint(
+        -4, 5, (W4A8_M, W4A8_K), device="cuda", dtype=torch.int8
+    )
+    quantized = torch.randint(
+        -8, 8, (W4A8_N, W4A8_K), device="cuda", dtype=torch.int32
+    )
+    packed = torch.zeros(
+        (W4A8_N, W4A8_K // W4A8_PACK_FACTOR),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    unsigned = quantized & 15
+    for lane in range(W4A8_PACK_FACTOR):
+        packed |= (unsigned[:, lane::W4A8_PACK_FACTOR] << (4 * lane)).to(
+            torch.uint8
+        )
+    artifact = intent.compile(
+        w4a8_packed_matmul,
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        return torch.matmul(
+            quantized.float(),
+            activation.float().transpose(0, 1),
+        ).to(torch.int32)
+
+    _compare(
+        artifact=artifact,
+        arguments=(activation, packed),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="packed W4A8 int8-by-int4 matmul",
+        tolerance=0.0,
+        upstream=upstream,
+        expected_dtype=torch.int32,
+    )
+
+
+def _run_embedding_forward_lookup(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    lookup_tokens = 8192
+    embedding_table = torch.randn(
+        (EMBEDDING_VOCABULARY, EMBEDDING_FEATURES),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    indices = torch.randint(
+        0,
+        EMBEDDING_VOCABULARY,
+        (lookup_tokens,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    artifact = intent.compile(
+        embedding_forward_lookup,
+        target=target,
+        compiler=compiler,
+    )
+    _compare(
+        artifact=artifact,
+        arguments=(embedding_table, indices),
+        reference=lambda: embedding_table[indices.long()],
+        target_name=target_name,
+        kernel_name="embedding forward lookup",
+        tolerance=0.0,
+        upstream=upstream,
+        expected_dtype=torch.float32,
+    )
+
+
+def _run_block_scaled_matmul(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    lhs = torch.randn(
+        (512, 24, 32), device="cuda", dtype=torch.float16
+    ).to(torch.float8_e4m3fn)
+    rhs = torch.randn(
+        (24, 32, 512), device="cuda", dtype=torch.float16
+    ).to(torch.float8_e4m3fn)
+    lhs_scale = torch.ones(
+        (512, 24), device="cuda", dtype=torch.float32
+    ).to(torch.float8_e8m0fnu)
+    rhs_scale = torch.ones(
+        (24, 512), device="cuda", dtype=torch.float32
+    ).to(torch.float8_e8m0fnu)
+    if target_name == "Triton":
+        lhs_scale = lhs_scale.view(torch.uint8)
+        rhs_scale = rhs_scale.view(torch.uint8)
+    artifact = intent.compile(
+        block_scaled_matmul, target=target, compiler=compiler
+    )
+
+    def reference() -> torch.Tensor:
+        decoded_lhs_scale = (
+            torch.pow(2.0, lhs_scale.float() - 127.0)
+            if lhs_scale.dtype == torch.uint8
+            else lhs_scale.float()
+        )
+        decoded_rhs_scale = (
+            torch.pow(2.0, rhs_scale.float() - 127.0)
+            if rhs_scale.dtype == torch.uint8
+            else rhs_scale.float()
+        )
+        scaled_lhs = lhs.float().reshape(512, 24 * 32) * decoded_lhs_scale.repeat_interleave(
+            32, dim=1
+        )
+        scaled_rhs = rhs.float().reshape(24 * 32, 512) * decoded_rhs_scale.repeat_interleave(
+            32, dim=0
+        )
+        return scaled_lhs @ scaled_rhs
+
+    _compare(
+        artifact=artifact,
+        arguments=(lhs, lhs_scale, rhs, rhs_scale),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="block-scaled matmul",
+        tolerance=4.0e-1,
+        upstream=upstream,
+        expected_dtype=torch.float32,
+    )
+
+
+def _run_splitk_attention_reduce(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    partial = torch.randn(
+        (
+            SPLITK_REDUCE_BATCH,
+            SPLITK_REDUCE_HEADS,
+            SPLITK_REDUCE_SPLITS,
+            SPLITK_REDUCE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    partial_lse = torch.randn(
+        (SPLITK_REDUCE_BATCH, SPLITK_REDUCE_HEADS, SPLITK_REDUCE_SPLITS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    artifact = intent.compile(
+        splitk_attention_reduce,
+        target=target,
+        compiler=compiler,
+    )
+
+    def reference() -> torch.Tensor:
+        maximum = partial_lse.max(dim=2, keepdim=True).values
+        weights = torch.exp2(partial_lse - maximum)
+        return (
+            torch.sum(weights[..., None] * partial.float(), dim=2)
+            / weights.sum(dim=2)[..., None]
+        ).bfloat16()
+
+    _compare(
+        artifact=artifact,
+        arguments=(partial, partial_lse),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="split-K attention reducer",
+        tolerance=2.0e-2,
+        upstream=upstream,
+        expected_dtype=torch.bfloat16,
+    )
+
+
+def _run_fp8_gemm(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    for label, dtype, kernel in (
+        ("e4m3", torch.float8_e4m3fn, fp8_e4m3_matmul),
+        ("e5m2", torch.float8_e5m2, fp8_e5m2_matmul),
+    ):
+        lhs = torch.randn((1024, 1024), device="cuda", dtype=torch.float16).to(
+            dtype
+        )
+        rhs = torch.randn((1024, 1024), device="cuda", dtype=torch.float16).to(
+            dtype
+        )
+        artifact = intent.compile(kernel, target=target, compiler=compiler)
+
+        def reference(lhs=lhs, rhs=rhs, dtype=dtype) -> torch.Tensor:
+            return torch.matmul(lhs.float(), rhs.float().transpose(0, 1)).to(dtype)
+
+        def similarity_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+            actual64 = actual.double()
+            expected64 = expected.double()
+            denominator = (actual64 * actual64 + expected64 * expected64).sum()
+            return abs(1.0 - (2.0 * (actual64 * expected64).sum() / denominator).item())
+
+        _compare(
+            artifact=artifact,
+            arguments=(lhs, rhs),
+            reference=reference,
+            target_name=target_name,
+            kernel_name=f"FP8 GEMM {label}",
+            tolerance=1.0e-3,
+            upstream=upstream,
+            expected_dtype=dtype,
+            comparison_error=similarity_error,
+        )
 
 
 def _run_weight_only_int4(
@@ -2469,8 +3045,6 @@ def _run_insertion_top_k(
 def _run_embedding_backward_atomic(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("embedding backward atomic has no algorithm-matched baseline")
     token_ids = torch.arange(
         EMBEDDING_TOKENS, device="cuda", dtype=torch.int32
     )
@@ -2504,6 +3078,25 @@ def _run_embedding_backward_atomic(
         (),
     )
     p50, p95 = benchmark(call, warmup=3, repetitions=100, cuda_graph=True)
+    upstream_error = None
+    upstream_p50 = None
+    upstream_p95 = None
+    if upstream is not None:
+        upstream_weight = torch.zeros_like(grad_weight)
+        upstream_output = upstream((indices, grad_output, upstream_weight))
+        torch.cuda.synchronize()
+        upstream_error = (upstream_output - expected).abs().max().item()
+        if upstream_error > 2.0e-6:
+            raise RuntimeError(
+                f"{target_name} embedding backward upstream comparison failed: "
+                f"{upstream_error}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream((indices, grad_output, upstream_weight)),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+        )
     print_artifact(artifact, target_name)
     print(
         f"{target_name} embedding backward atomic numerical comparison: PASS "
@@ -2513,7 +3106,171 @@ def _run_embedding_backward_atomic(
         f"{target_name} embedding backward atomic kernel-only performance "
         f"(CUDA Graph): p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} embedding backward atomic upstream baseline: unavailable")
+    if upstream_p50 is None:
+        print(f"{target_name} embedding backward atomic upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} embedding backward atomic upstream comparison: PASS "
+            f"(upstream/reference={upstream_error}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={p50 / upstream_p50:.4f}x)"
+        )
+
+
+def _run_index_select_rows(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    source = torch.randn(
+        (INDEX_SELECT_SOURCE_ROWS, INDEX_SELECT_FEATURES),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    indices = torch.arange(
+        0,
+        INDEX_SELECT_ROWS * 2,
+        2,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    artifact = intent.compile(index_select_rows, target=target, compiler=compiler)
+    _compare(
+        artifact=artifact,
+        arguments=(source, indices),
+        reference=lambda: source[indices],
+        target_name=target_name,
+        kernel_name="row index-select",
+        tolerance=0.0,
+        upstream=upstream,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_scaled_index_add(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    initial = torch.randn(
+        (
+            SCALED_ADD_DESTINATION_ROWS,
+            SCALED_ADD_INNER_ROWS,
+            SCALED_ADD_FEATURES,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    source = torch.randn(
+        (SCALED_ADD_SOURCE_ROWS, SCALED_ADD_INNER_ROWS, SCALED_ADD_FEATURES),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    indices = torch.arange(
+        0,
+        SCALED_ADD_SOURCE_ROWS * 2,
+        2,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    scaling = torch.randn(
+        (SCALED_ADD_FEATURES,), device="cuda", dtype=torch.float16
+    )
+    alpha = 1.0
+    generated_destination = initial.clone()
+    expected_selected = torch.empty_like(source)
+    reference_chunk = 1024
+    for begin in range(0, SCALED_ADD_SOURCE_ROWS, reference_chunk):
+        end = min(begin + reference_chunk, SCALED_ADD_SOURCE_ROWS)
+        expected_selected[begin:end] = (
+            initial[indices[begin:end]].float()
+            + alpha
+            * scaling.float()[None, None, :]
+            * source[begin:end].float()
+        ).half()
+    artifact = intent.compile(
+        scaled_index_add_unique, target=target, compiler=compiler
+    )
+    arguments = (
+        generated_destination,
+        indices,
+        source,
+        scaling,
+        alpha,
+    )
+    artifact.run(*arguments)
+    torch.cuda.synchronize()
+    error = 0.0
+    for begin in range(0, SCALED_ADD_SOURCE_ROWS, reference_chunk):
+        end = min(begin + reference_chunk, SCALED_ADD_SOURCE_ROWS)
+        error = max(
+            error,
+            (
+                generated_destination[indices[begin:end]]
+                - expected_selected[begin:end]
+            ).abs().max().item(),
+        )
+    if error != 0.0:
+        raise RuntimeError(
+            f"{target_name} scaled index-add comparison failed: {error}"
+        )
+    generated_call = prepare_kernel_call(artifact, arguments, ())
+    generated_p50, generated_p95 = benchmark(
+        generated_call,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+        prepare=lambda: generated_destination.copy_(initial),
+    )
+    upstream_error = None
+    upstream_p50 = None
+    upstream_p95 = None
+    if upstream is not None:
+        upstream_destination = initial.clone()
+        upstream_output = upstream(
+            (upstream_destination, indices, source, scaling, alpha)
+        )
+        torch.cuda.synchronize()
+        upstream_error = 0.0
+        for begin in range(0, SCALED_ADD_SOURCE_ROWS, reference_chunk):
+            end = min(begin + reference_chunk, SCALED_ADD_SOURCE_ROWS)
+            upstream_error = max(
+                upstream_error,
+                (
+                    upstream_output[indices[begin:end]]
+                    - expected_selected[begin:end]
+                ).abs().max().item(),
+            )
+        if upstream_error != 0.0:
+            raise RuntimeError(
+                f"{target_name} scaled index-add upstream comparison failed: "
+                f"{upstream_error}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(
+                (upstream_destination, indices, source, scaling, alpha)
+            ),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+            prepare=lambda: upstream_destination.copy_(initial),
+        )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} scaled index-add numerical comparison: PASS "
+        f"(generated/reference={error})"
+    )
+    print(
+        f"{target_name} scaled index-add kernel-only performance (CUDA Event): "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_p50 is None:
+        print(f"{target_name} scaled index-add upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} scaled index-add upstream comparison: PASS "
+            f"(upstream/reference={upstream_error}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
 
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
@@ -2522,21 +3279,30 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "batched_row_affine": _run_batched_row_affine,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
+    "block_scaled_matmul": _run_block_scaled_matmul,
     "boolean_reduction": _run_boolean_reduction,
+    "causal_conv1d": _run_causal_conv1d,
     "conv1d": _run_conv1d,
     "conv2d": _run_conv2d,
+    "continuous_gqa_decode": _run_continuous_gqa_decode,
     "cross_entropy": _run_cross_entropy,
     "dropout_residual_rms_norm": _run_dropout_residual_rms_norm,
     "dual_gemm": _run_dual_gemm,
     "embedding_backward_atomic": _run_embedding_backward_atomic,
+    "embedding_forward_lookup": _run_embedding_forward_lookup,
+    "fp8_gemm": _run_fp8_gemm,
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "grouped_query_head_add": _run_grouped_query_head_add,
     "insertion_top_k": _run_insertion_top_k,
+    "index_select_rows": _run_index_select_rows,
     "layer_norm": _run_layer_norm,
     "layer_norm_backward": _run_layer_norm_backward,
     "logsumexp": _run_logsumexp,
     "matrix_transpose": _run_matrix_transpose,
+    "mamba_chunk_scan": _run_mamba_chunk_scan,
+    "splitk_attention_reduce": _run_splitk_attention_reduce,
+    "mla_prefill": _run_mla_prefill,
     "online_softmax": _run_online_softmax,
     "ordered_prefix": _run_ordered_prefix,
     "paged_attention": _run_paged_attention,
@@ -2544,6 +3310,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "rms_norm": _run_rms_norm,
     "record_fields": _run_record_fields,
     "scalar_while": _run_scalar_while,
+    "scaled_index_add": _run_scaled_index_add,
     "scalar_table_lookup": _run_scalar_table_lookup,
     "selective_scan": _run_selective_scan,
     "shifted_row_copy": _run_shifted_row_copy,
@@ -2554,6 +3321,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
     "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,
     "value_select": _run_value_select,
+    "w4a8_packed": _run_w4a8_packed,
     "weight_only_int4": _run_weight_only_int4,
 }
 

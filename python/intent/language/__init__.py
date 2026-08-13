@@ -61,6 +61,7 @@ from .dtypes import bool
 from .dtypes import dtype
 from .dtypes import f8e4m3fn
 from .dtypes import f8e5m2
+from .dtypes import f8e8m0fnu
 from .dtypes import f16
 from .dtypes import f32
 from .dtypes import f64
@@ -113,6 +114,7 @@ __all__ = [
     "exp2",
     "f8e4m3fn",
     "f8e5m2",
+    "f8e8m0fnu",
     "f16",
     "f32",
     "f64",

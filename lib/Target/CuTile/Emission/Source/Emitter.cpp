@@ -29,14 +29,16 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "stream")
+  if (role == "program_n")
     return std::string("TILE_SIZE_N");
+  if (role == "stream")
+    return std::string("TILE_SIZE_S");
   if (role == "scan")
     return std::string("TILE_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("TILE_SIZE_K");
+    return std::string("TILE_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -149,14 +151,16 @@ FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "feature" || role == "stream")
+  if (role == "program_n" || role == "feature")
     return std::string("TILE_SIZE_N");
+  if (role == "stream")
+    return std::string("TILE_SIZE_S");
   if (role == "scan")
     return std::string("TILE_SIZE_SCAN");
   if (role.starts_with("scan_"))
     return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
-    return std::string("TILE_SIZE_K");
+    return std::string("TILE_SIZE_C");
   if (role.starts_with("stream_contract_"))
     return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -254,6 +258,8 @@ indexRealization(intent::plan::RealizationOp realization,
       plan::StageAxisOp binding;
       binding.operation = value;
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
+      index.streamAxes.push_back(value);
     }
   }
   if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
@@ -342,9 +348,8 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
         target::hasDerivedScalarIndex(*operation);
-    FailureOr<bool> tensorIndirect =
-        target::hasTensorIndirectIndex(*operation);
-    if (failed(derivedScalar) || failed(tensorIndirect))
+    bool tensorIndexed = value.getTensorIndexing() != "none";
+    if (failed(derivedScalar))
       return failure();
     bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
       auto axis = index.axes.find(node);
@@ -356,7 +361,7 @@ indexRealization(intent::plan::RealizationOp realization,
     plan::BoundaryOp binding;
     binding.operation = value;
     binding.access = !uniqueStore &&
-                             (*tensorIndirect ||
+                             (tensorIndexed ||
                               ((rowStrided || raggedBound) && vectorized))
                          ? (load ? "gather" : "scatter")
                          : (load ? "load" : "store");
@@ -1061,12 +1066,21 @@ LogicalResult SourceEmitter::emitWrapper() {
       return "torch.float32";
     if (type.isBF16())
       return "torch.bfloat16";
+    if (isa<Float8E4M3FNType>(type))
+      return "torch.float8_e4m3fn";
+    if (isa<Float8E5M2Type>(type))
+      return "torch.float8_e5m2";
+    if (isa<Float8E8M0FNUType>(type))
+      return "torch.float8_e8m0fnu";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 8)
       return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 32)
       return "torch.int32";
+    if (auto integer = dyn_cast<IntegerType>(type);
+        integer && integer.getWidth() == 64)
+      return "torch.int64";
     return {};
   };
   auto emitViewCapabilityCheck = [&](const ABIView &view) {
@@ -1889,44 +1903,17 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->opaque) {
+    consumer.emitOpError(
+        "cannot resolve an opaque index source during cuTile emission");
+    return failure();
+  }
   if (Operation *definition = indexedValue.getDefiningOp())
     if (definition->getName().getStringRef() == "intent.domain" ||
         definition->getName().getStringRef() == "intent.ragged_outer" ||
         definition->getName().getStringRef() == "intent.ragged_member")
       return definition;
-  auto argument = dyn_cast<BlockArgument>(indexedValue);
-  Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
-      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
-    Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_outer" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-    consumer.emitOpError("cannot resolve a cuTile stream source domain");
-    return failure();
-  }
-  if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
-      owner->getNumOperands() != 1) {
-    consumer.emitOpError("cannot resolve index ownership during cuTile emission");
-    return failure();
-  }
-  Operation *source = owner->getOperand(0).getDefiningOp();
-  if (source &&
-      (source->getName().getStringRef() == "intent.domain" ||
-       source->getName().getStringRef() == "intent.ragged_outer" ||
-       source->getName().getStringRef() == "intent.ragged_member"))
-    return source;
-  if (source && source->getName().getStringRef() == "intent.partition" &&
-      source->getNumOperands() == 1) {
-    Operation *domain = source->getOperand(0).getDefiningOp();
-    if (domain &&
-        (domain->getName().getStringRef() == "intent.domain" ||
-         domain->getName().getStringRef() == "intent.ragged_member"))
-      return domain;
-  }
-  consumer.emitOpError("cannot resolve a partition to its source domain");
+  consumer.emitOpError("cannot resolve index ownership during cuTile emission");
   return failure();
 }
 
@@ -2236,6 +2223,18 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       return operation.emitOpError(
           "cuTile access has no mechanical index relation");
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      if (!elementwiseAccess)
+        return operation.emitOpError(
+            "cuTile tensor-index transfer requires element-coordinate projection");
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (failed(exact))
+        return failure();
+      indices.push_back(addressIndex(*exact));
+      continue;
+    }
     if ((term.kind == "value_index" &&
          !isa<RankedTensorType>(indexed.getType())) ||
         (term.kind == "region_index" &&
@@ -2297,6 +2296,39 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
       return operation.emitOpError(
           "cuTile tile has no mechanical shape relation");
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      auto result = dyn_cast<OpResult>(indexed);
+      auto tensor = dyn_cast<RankedTensorType>(indexed.getType());
+      auto shapes = result ? result.getOwner()->getAttrOfType<ArrayAttr>(
+                                 "intent.result_shapes")
+                           : ArrayAttr();
+      auto labels = shapes && result.getResultNumber() < shapes.size()
+                        ? dyn_cast<ArrayAttr>(shapes[result.getResultNumber()])
+                        : ArrayAttr();
+      if (!tensor || !labels ||
+          labels.size() != static_cast<size_t>(tensor.getRank()))
+        return failure();
+      std::optional<std::string> varying;
+      for (Attribute attribute : labels) {
+        auto label = dyn_cast<StringAttr>(attribute);
+        if (!label)
+          return failure();
+        std::string extent = label.getValue() == "1"
+                                 ? "1"
+                                 : regionTiles.lookup(label.getValue());
+        if (extent.empty())
+          extent = physicalExtent(label.getValue());
+        if (extent == "1")
+          continue;
+        if (varying)
+          return operation.emitOpError(
+              "regular cuTile index tile varies along more than one axis");
+        varying = extent;
+      }
+      extents.push_back(varying.value_or("1"));
+      continue;
+    }
     if ((term.kind == "value_index" &&
          !isa<RankedTensorType>(indexed.getType())) ||
         (term.kind == "region_index" &&
@@ -2496,6 +2528,12 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return "ct.float32";
   if (type.isBF16())
     return "ct.bfloat16";
+  if (isa<Float8E4M3FNType>(type))
+    return "ct.float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type))
+    return "ct.float8_e5m2";
+  if (isa<Float8E8M0FNUType>(type))
+    return "ct.float8_e8m0fnu";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 8)
     return integer.isUnsigned() ? "ct.uint8" : "ct.int8";

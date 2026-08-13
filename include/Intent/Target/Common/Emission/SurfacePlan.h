@@ -740,6 +740,9 @@ struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
   bool getNonnegativeOperands() const {
     return operation.getNonnegativeOperands();
   }
+  llvm::ArrayRef<int64_t> getAxisNodes() const {
+    return operation.getAxisNodes();
+  }
   bool getDefer() const { return defer; }
 };
 
@@ -808,11 +811,15 @@ struct StreamBinding : CanonicalBinding {
   int64_t axisNode = -1;
   mlir::IntegerAttr stopNode;
   std::string tile;
+  llvm::SmallVector<int64_t> innerReductionAxes;
 
   int64_t getNode() const { return node; }
   int64_t getAxisNode() const { return axisNode; }
   mlir::IntegerAttr getStopNodeAttr() const { return stopNode; }
   llvm::StringRef getTile() const { return tile; }
+  llvm::ArrayRef<int64_t> getInnerReductionAxes() const {
+    return innerReductionAxes;
+  }
 };
 
 struct RaggedBinding : CanonicalBinding {
@@ -884,6 +891,15 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   llvm::StringRef getAccess() const { return access; }
   llvm::StringRef getLoadFill() const { return operation.getFill(); }
   llvm::StringRef getPadding() const { return operation.getFill(); }
+  llvm::StringRef getTensorIndexing() const {
+    return operation.getTensorIndexing();
+  }
+  bool hasStructuredTensorIndex() const {
+    return operation.getTensorIndexing() == "structured";
+  }
+  bool hasDataDependentTensorIndex() const {
+    return operation.getTensorIndexing() == "data_dependent";
+  }
   llvm::StringRef getStoreMask() const { return "predicate"; }
   llvm::StringRef getTransfer() const { return transfer; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
@@ -1155,6 +1171,23 @@ mlir::LogicalResult indexCanonicalStructure(
     }
     index.streams[binding.node] = std::move(binding);
   }
+  for (auto relation : index.streamAxes) {
+    auto stream = index.streams.find(relation.getStreamNode());
+    auto axis = index.axes.find(relation.getAxisNode());
+    if (stream == index.streams.end() || axis == index.axes.end() ||
+        relation.getRole() != "inner_reduction")
+      return relation.emitOpError(
+          "does not resolve a canonical stream-axis relation");
+    stream->second.innerReductionAxes.push_back(relation.getAxisNode());
+  }
+  for (auto &entry : index.streams) {
+    llvm::sort(entry.second.innerReductionAxes);
+    if (std::adjacent_find(entry.second.innerReductionAxes.begin(),
+                           entry.second.innerReductionAxes.end()) !=
+        entry.second.innerReductionAxes.end())
+      return entry.second.emitOpError(
+          "contains a duplicate inner stream axis");
+  }
   return mlir::success();
 }
 
@@ -1230,6 +1263,58 @@ contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
     return consumer.emitOpError(
         "does not resolve exactly one shared physical reduction axis");
   return candidates.front();
+}
+
+struct ContractionAxes {
+  AxisBinding lhsResult;
+  AxisBinding rhsResult;
+  AxisBinding reduction;
+};
+
+template <typename PlanIndex>
+mlir::FailureOr<ContractionAxes>
+contractionAxes(const PlanIndex &index, mlir::Operation &lhsLoad,
+                mlir::Operation &rhsLoad, mlir::Operation &consumer) {
+  mlir::FailureOr<AxisBinding> reduction =
+      contractionReductionAxis(index, lhsLoad, rhsLoad, consumer);
+  mlir::FailureOr<int64_t> lhsNode =
+      target::getNodeID(lhsLoad, "contraction lhs transfer");
+  mlir::FailureOr<int64_t> rhsNode =
+      target::getNodeID(rhsLoad, "contraction rhs transfer");
+  if (mlir::failed(reduction) || mlir::failed(lhsNode) ||
+      mlir::failed(rhsNode))
+    return mlir::failure();
+  auto lhs = index.boundaries.find(*lhsNode);
+  auto rhs = index.boundaries.find(*rhsNode);
+  if (lhs == index.boundaries.end() || rhs == index.boundaries.end())
+    return consumer.emitOpError(
+        "has no physical transfer binding for its contraction operands");
+  auto resultAxis = [&](llvm::ArrayRef<int64_t> domains,
+                        llvm::StringRef side) -> mlir::FailureOr<AxisBinding> {
+    llvm::SmallVector<AxisBinding> candidates;
+    for (int64_t node : domains) {
+      auto found = index.axes.find(node);
+      if (found == index.axes.end() || node == reduction->getNode() ||
+          found->second.isScalar())
+        continue;
+      if (!llvm::any_of(candidates, [&](const AxisBinding &candidate) {
+            return candidate.getNode() == found->second.getNode();
+          }))
+        candidates.push_back(found->second);
+    }
+    if (candidates.size() != 1)
+      return consumer.emitOpError()
+             << "does not resolve exactly one physical " << side
+             << " result axis";
+    return candidates.front();
+  };
+  mlir::FailureOr<AxisBinding> lhsResult =
+      resultAxis(lhs->second.getDomainNodes(), "lhs");
+  mlir::FailureOr<AxisBinding> rhsResult =
+      resultAxis(rhs->second.getDomainNodes(), "rhs");
+  if (mlir::failed(lhsResult) || mlir::failed(rhsResult))
+    return mlir::failure();
+  return ContractionAxes{*lhsResult, *rhsResult, *reduction};
 }
 
 template <typename PlanIndex>
