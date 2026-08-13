@@ -2332,48 +2332,20 @@ LogicalResult SourceEmitter::emitTranspose(Operation &operation) {
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<SmallVector<int64_t>> permutation =
       target::emission::transposePermutation(operation);
-  FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  FailureOr<std::string> result = allocateResult(operation, 0, "shared");
   if (failed(node) || !binding ||
-      binding.getLowering() != "fragment_permute" ||
+      binding.getLowering() != "T.transpose" ||
       binding.getReuseOperandAttr().getInt() != -1 ||
       binding.getSpace() != "fragment" || failed(permutation) ||
-      failed(extents) || failed(result))
+      failed(operand) || failed(result))
     return operation.emitOpError(
         "lacks a mechanical TileLang transpose binding");
-
-  SmallVector<std::string> resultIndices;
-  std::string loop = "for ";
-  for (unsigned axis = 0; axis < extents->size(); ++axis) {
-    if (axis)
-      loop += ", ";
-    resultIndices.push_back("transpose_i" + std::to_string(axis));
-    loop += resultIndices.back();
-  }
-  loop += " in T.Parallel(";
-  for (auto [axis, extent] : llvm::enumerate(*extents)) {
-    if (axis)
-      loop += ", ";
-    loop += extent;
-  }
-  line(loop + "):");
-  ++indentation;
-
-  SmallVector<std::string> sourceIndices(resultIndices.size());
-  for (auto [resultAxis, sourceAxis] : llvm::enumerate(*permutation))
-    sourceIndices[sourceAxis] = resultIndices[resultAxis];
-  FailureOr<std::string> operand =
-      tensorElement(operation.getOperand(0), sourceIndices, operation);
-  if (failed(operand))
-    return failure();
-  std::string target = *result + "[";
-  for (auto [axis, index] : llvm::enumerate(resultIndices)) {
-    if (axis)
-      target += ", ";
-    target += index;
-  }
-  line(target + "] = " + *operand);
-  --indentation;
+  if (permutation->size() != 2 || (*permutation)[0] != 1 ||
+      (*permutation)[1] != 0)
+    return operation.emitOpError(
+        "TileLang transpose only supports swapping the final two axes");
+  line("T.transpose(" + operand->str() + ", " + *result + ")");
   bindResult(operation, 0, *result);
   return success();
 }
@@ -3129,10 +3101,6 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       binding.getAccumulatorSpace() != "fragment")
     return operation.emitOpError(
         "direct TileLang contraction has invalid projected spaces");
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
-  if (failed(lhs) || failed(rhs) || failed(result))
-    return failure();
-  line("T.clear(" + *result + ")");
   auto valueExtents = [&](Value value)
       -> FailureOr<SmallVector<std::string>> {
     auto opResult = dyn_cast<OpResult>(value);
@@ -3163,68 +3131,14 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
                  lhsReduction.getInt() == 1 &&
                  (rhsReduction.getInt() == 0 || rhsReduction.getInt() == 1);
   if (unitRow) {
-    auto resultTensor =
-        dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-    std::string accumulatorDtype =
-        resultTensor ? dtypeName(resultTensor.getElementType(), operation) : "";
-    if (accumulatorDtype.empty())
-      return failure();
-    auto lhsValue = dyn_cast<OpResult>(operation.getOperand(0));
-    auto rhsValue = dyn_cast<OpResult>(operation.getOperand(1));
-    plan::PointwiseOp lhsBinding =
-        lhsValue ? planIndex.pointwise.lookup(
-                       target::getNodeID(*lhsValue.getOwner(),
-                                         "single-row contraction lhs")
-                           .value_or(-1))
-                 : plan::PointwiseOp();
-    plan::PointwiseOp rhsBinding =
-        rhsValue ? planIndex.pointwise.lookup(
-                       target::getNodeID(*rhsValue.getOwner(),
-                                         "single-row contraction rhs")
-                           .value_or(-1))
-                 : plan::PointwiseOp();
-    auto physicalAxisExtent = [&](plan::PointwiseOp operandBinding,
-                                  unsigned tensorAxis) -> std::string {
-      if (!operandBinding || tensorAxis >= operandBinding.getAxisNodes().size())
-        return {};
-      int64_t axisNode = operandBinding.getAxisNodes()[tensorAxis];
-      plan::AxisOp axis = axisNode >= 0 ? planIndex.axes.lookup(axisNode)
-                                       : plan::AxisOp();
-      const target::emission::RangeBinding *range =
-          axis ? axis.getRange("reduction", 0) : nullptr;
-      return range ? range->getTile().str() : std::string();
-    };
-    std::string lhsPhysical =
-        physicalAxisExtent(lhsBinding, lhsReduction.getInt());
-    std::string rhsPhysical =
-        physicalAxisExtent(rhsBinding, rhsReduction.getInt());
-    std::string reductionExtent;
-    if (!lhsPhysical.empty() && !rhsPhysical.empty() &&
-        lhsPhysical == rhsPhysical) {
-      reductionExtent = lhsPhysical;
-    } else {
-      reductionExtent = (*lhsExtents)[lhsReduction.getInt()];
-    }
-    std::string outputExtent =
-        (*rhsExtents)[rhsReduction.getInt() == 0 ? 1 : 0];
-    std::string products = makeResultName(operation, 0) + "_products";
-    line(products + " = T.alloc_fragment((1, " + outputExtent + ", " +
-         reductionExtent + "), " + accumulatorDtype + ")");
-    line("for contract_j, contract_k in T.Parallel(" + outputExtent + ", " +
-         reductionExtent + "):");
-    ++indentation;
-    std::string rhsElement = rhsReduction.getInt() == 0
-                                 ? rhs->str() + "[contract_k, contract_j]"
-                                 : rhs->str() + "[contract_j, contract_k]";
-    line(products + "[0, contract_j, contract_k] = T.cast(" + lhs->str() +
-         "[0, contract_k], " + accumulatorDtype + ") * T.cast(" + rhsElement +
-         ", " + accumulatorDtype + ")");
-    --indentation;
-    line("T.reduce_sum(" + products + ", " + *result +
-         ", dim=2, clear=True)");
-    bindResult(operation, 0, *result);
-    return success();
+    return operation.emitOpError(
+        "TileLang 0.1.13 has no native single-row contraction projection; "
+        "the scalar product-and-reduce fallback is intentionally unsupported");
   }
+  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  if (failed(lhs) || failed(rhs) || failed(result))
+    return failure();
+  line("T.clear(" + *result + ")");
   std::string call = "T.gemm(" + lhs->str() + ", " + rhs->str() + ", " +
                      *result;
   if (orientation->lhsTranspose)
