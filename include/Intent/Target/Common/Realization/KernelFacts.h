@@ -54,6 +54,8 @@ struct ContractionFact {
   llvm::SmallVector<LogicalAxis> resultAxes;
   llvm::SmallVector<unsigned> lhsReductionAxes;
   llvm::SmallVector<unsigned> rhsReductionAxes;
+  llvm::SmallVector<unsigned> lhsBatchAxes;
+  llvm::SmallVector<unsigned> rhsBatchAxes;
 };
 
 struct LogicalBufferFact {

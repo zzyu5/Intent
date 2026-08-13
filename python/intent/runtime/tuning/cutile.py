@@ -21,7 +21,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream": (32, 64, 128, 512, 1024, 2048),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
-        "query": (64, 128),
+        "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
         "feature": (64, 128),
@@ -74,6 +74,8 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             ({"query": query, stream_role: stream}, num_ctas, occupancy)
             for stream_role in ("stream", "stream_contract")
             for query, stream, num_ctas, occupancy in (
+                (1, 32, 1, 4),
+                (2, 32, 1, 4),
                 (128, 128, 1, 2),
                 (128, 128, 2, 2),
                 (64, 64, 1, 4),

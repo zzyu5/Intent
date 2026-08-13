@@ -229,7 +229,7 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
-        ("lhs", "rhs", "reduce", "acc_dtype", "multiply", "combine"),
+        ("lhs", "rhs", "reduce", "acc_dtype", "batch", "multiply", "combine"),
         required=("lhs", "rhs", "reduce", "acc_dtype"),
     )
     lhs = lowerer.read_value(lowerer.lower_expression(bound["lhs"]), bound["lhs"])
@@ -255,12 +255,36 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         rhs_seen.add(rhs_axis)
         normalized_pairs.append((lhs_axis, rhs_axis))
     pairs = tuple(normalized_pairs)
+    batch_pairs = _axis_pairs(lowerer, bound["batch"], "batch") if "batch" in bound else ()
+    lhs_batch_seen: set[int] = set()
+    rhs_batch_seen: set[int] = set()
+    normalized_batch_pairs: list[tuple[int, int]] = []
+    for lhs_axis, rhs_axis in batch_pairs:
+        if not -lhs.type.rank <= lhs_axis < lhs.type.rank:
+            lowerer.error(node, "contract lhs batch axis is outside rank")
+        if not -rhs.type.rank <= rhs_axis < rhs.type.rank:
+            lowerer.error(node, "contract rhs batch axis is outside rank")
+        lhs_axis %= lhs.type.rank
+        rhs_axis %= rhs.type.rank
+        if lhs_axis in lhs_seen or rhs_axis in rhs_seen:
+            lowerer.error(node, "contract batch axes cannot also be reduction axes")
+        if lhs_axis in lhs_batch_seen or rhs_axis in rhs_batch_seen:
+            lowerer.error(node, "contract batch axes must be unique")
+        if not dims_compatible(lhs.type.shape[lhs_axis], rhs.type.shape[rhs_axis]):
+            lowerer.error(node, "contract paired batch dimensions are incompatible")
+        lhs_batch_seen.add(lhs_axis)
+        rhs_batch_seen.add(rhs_axis)
+        normalized_batch_pairs.append((lhs_axis, rhs_axis))
+    batch_pairs = tuple(normalized_batch_pairs)
     lhs_axes = {pair[0] for pair in pairs}
     rhs_axes = {pair[1] for pair in pairs}
+    rhs_batch_axes = {pair[1] for pair in batch_pairs}
     result_shape = tuple(
         dimension for axis, dimension in enumerate(lhs.type.shape) if axis not in lhs_axes
     ) + tuple(
-        dimension for axis, dimension in enumerate(rhs.type.shape) if axis not in rhs_axes
+        dimension
+        for axis, dimension in enumerate(rhs.type.shape)
+        if axis not in rhs_axes and axis not in rhs_batch_axes
     )
     acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
     multiply = "multiply"
@@ -282,6 +306,7 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         result_types=(TensorType(acc_dtype, result_shape),),
         attributes={
             "reduce": pairs,
+            "batch": batch_pairs,
             "acc_dtype": acc_dtype,
             "multiply": multiply,
             "combine": combine,
@@ -301,22 +326,34 @@ def _callable_symbol(
 
 
 def _reduction_pairs(lowerer: FunctionLowerer, node: ast.AST) -> tuple[tuple[int, int], ...]:
+    pairs = _axis_pairs(lowerer, node, "reduction")
+    if not pairs:
+        lowerer.error(node, "contract requires at least one reduction pair")
+    return pairs
+
+
+def _axis_pairs(
+    lowerer: FunctionLowerer,
+    node: ast.AST,
+    purpose: str,
+) -> tuple[tuple[int, int], ...]:
     expression = lowerer.lower_expression(node)
     if not isinstance(expression, StaticTuple):
-        lowerer.error(node, "contract reduce= must be a tuple of axis pairs")
+        lowerer.error(node, f"contract {purpose}= must be a tuple of axis pairs")
     pairs: list[tuple[int, int]] = []
     for element in expression.elements:
         if not isinstance(element, StaticTuple) or len(element.elements) != 2:
-            lowerer.error(node, "contract reduction entry must be an axis pair")
+            lowerer.error(node, f"contract {purpose} entry must be an axis pair")
         pair: list[int] = []
         for axis in element.elements:
             known, value = compile_time_value(axis)
             if not known or isinstance(value, bool) or not isinstance(value, int):
-                lowerer.error(node, "contract reduction axes must be compile-time integers")
+                lowerer.error(
+                    node,
+                    f"contract {purpose} axes must be compile-time integers",
+                )
             pair.append(value)
         pairs.append((pair[0], pair[1]))
-    if not pairs:
-        lowerer.error(node, "contract requires at least one reduction pair")
     return tuple(pairs)
 
 

@@ -22,7 +22,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream": (32, 64, 128, 256, 512, 1024),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
-        "query": (64, 128),
+        "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
         "feature": (64, 128),
@@ -87,6 +87,8 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
             ({"query": query, stream_role: stream}, num_stages, threads)
             for stream_role in ("stream", "stream_contract")
             for query, stream, num_stages, threads in (
+                (1, 32, 1, 128),
+                (2, 32, 1, 128),
                 (64, 64, 1, 128),
                 (64, 64, 2, 128),
                 (128, 64, 1, 128),

@@ -231,6 +231,7 @@ private:
   llvm::StringSet<> usedNames;
   llvm::StringMap<std::string> dimensionOwners;
   llvm::StringMap<std::string> roleDimensions;
+  llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
   llvm::DenseMap<int64_t, std::string> axisIndices;
   llvm::DenseMap<int64_t, std::string> programBlocks;

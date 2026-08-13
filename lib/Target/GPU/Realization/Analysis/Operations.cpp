@@ -380,6 +380,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
   if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
+            auto batch = operation.getAttrOfType<ArrayAttr>("intent.batch");
             auto accType =
                 operation.getAttrOfType<StringAttr>("intent.acc_dtype");
             auto multiply =
@@ -395,6 +396,15 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             auto rhsAxis = pair && pair.size() == 2
                                ? dyn_cast<IntegerAttr>(pair[1])
                                : IntegerAttr();
+            auto batchPair = batch && batch.size() == 1
+                                 ? dyn_cast<ArrayAttr>(batch[0])
+                                 : ArrayAttr();
+            auto lhsBatch = batchPair && batchPair.size() == 2
+                                ? dyn_cast<IntegerAttr>(batchPair[0])
+                                : IntegerAttr();
+            auto rhsBatch = batchPair && batchPair.size() == 2
+                                ? dyn_cast<IntegerAttr>(batchPair[1])
+                                : IntegerAttr();
             auto lhsType = operation.getNumOperands() == 2
                                ? dyn_cast<RankedTensorType>(
                                      operation.getOperand(0).getType())
@@ -410,20 +420,30 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             bool supportedAccumulator =
                 accType && (accType.getValue() == "f32" ||
                             accType.getValue() == "i32");
+            bool ordinary = batch && batch.empty() && lhsType && rhsType &&
+                            resultType && lhsType.getRank() == 2 &&
+                            rhsType.getRank() == 2 && resultType.getRank() == 2;
+            bool batched = batch && batch.size() == 1 && lhsBatch && rhsBatch &&
+                           lhsType && rhsType && resultType &&
+                           lhsType.getRank() == 3 && rhsType.getRank() == 3 &&
+                           resultType.getRank() == 3 && lhsBatch.getInt() == 0 &&
+                           rhsBatch.getInt() == 0 &&
+                           (lhsAxis.getInt() == 1 || lhsAxis.getInt() == 2) &&
+                           (rhsAxis.getInt() == 1 || rhsAxis.getInt() == 2);
             if (operation.getNumOperands() != 2 ||
                 operation.getNumResults() != 1 || !supportedAccumulator ||
                 !multiply ||
                 multiply.getValue() != "multiply" || !combine ||
                 combine.getValue() != "add" || !lhsAxis || !rhsAxis ||
-                !lhsType || lhsType.getRank() != 2 || !rhsType ||
-                rhsType.getRank() != 2 || !resultType ||
-                resultType.getRank() != 2 ||
+                (!ordinary && !batched) ||
                 (accType.getValue() == "f32" &&
                  !resultType.getElementType().isF32()) ||
                 (accType.getValue() == "i32" &&
                  !resultType.getElementType().isInteger(32)) ||
-                (lhsAxis.getInt() != 0 && lhsAxis.getInt() != 1) ||
-                (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1))
+                (lhsAxis.getInt() != 0 && lhsAxis.getInt() != 1 &&
+                 lhsAxis.getInt() != 2) ||
+                (rhsAxis.getInt() != 0 && rhsAxis.getInt() != 1 &&
+                 rhsAxis.getInt() != 2))
               return operation.emitOpError(
                   "has no semantics-preserving GPU matrix-unit realization");
             return success();

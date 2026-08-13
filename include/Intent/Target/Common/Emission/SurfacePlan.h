@@ -463,7 +463,7 @@ inline mlir::FailureOr<std::string> projectPrivateWorkspaceOffset(
     llvm::ArrayRef<target::LogicalBufferIndex> logicalIndices,
     const PlanIndex &index,
     const llvm::DenseMap<int64_t, std::string> &axisIndices,
-    const llvm::StringMap<std::string> &roleDimensions,
+    const llvm::DenseMap<int64_t, std::string> &axisDimensions,
     LogicalIndexSpelling spellLogicalIndex, mlir::Operation &operation) {
   if (logicalIndices.size() != info.shape.size())
     return operation.emitOpError(
@@ -477,14 +477,9 @@ inline mlir::FailureOr<std::string> projectPrivateWorkspaceOffset(
                        projectedIndex.str() + ")";
   };
   for (int64_t owner : binding.getOwnerNodes()) {
-    auto axis = index.axes.find(owner);
     std::string projectedIndex = axisIndices.lookup(owner);
-    std::string extent =
-        axis == index.axes.end()
-            ? std::string()
-            : roleDimensions.lookup(
-                  "program_" + std::to_string(axis->second.getProgramOrder()));
-    if (axis == index.axes.end() || projectedIndex.empty() || extent.empty())
+    std::string extent = axisDimensions.lookup(owner);
+    if (!index.axes.count(owner) || projectedIndex.empty() || extent.empty())
       return operation.emitOpError(
           "has no active private-workspace owner projection");
     append(projectedIndex, extent);
@@ -504,7 +499,7 @@ inline mlir::FailureOr<std::string> projectPrivateWorkspaceOffset(
 template <typename PlanIndex>
 inline mlir::FailureOr<std::string> privateWorkspaceElementCount(
     mlir::Operation &buffer, const PlanIndex &index,
-    const llvm::StringMap<std::string> &roleDimensions) {
+    const llvm::DenseMap<int64_t, std::string> &axisDimensions) {
   mlir::FailureOr<int64_t> node =
       target::getNodeID(buffer, "private-workspace allocation");
   auto binding = mlir::succeeded(node) ? index.buffers.find(*node)
@@ -520,13 +515,8 @@ inline mlir::FailureOr<std::string> privateWorkspaceElementCount(
     size = size.empty() ? extent.str() : size + " * " + extent.str();
   };
   for (int64_t owner : binding->second.getOwnerNodes()) {
-    auto axis = index.axes.find(owner);
-    std::string extent =
-        axis == index.axes.end()
-            ? std::string()
-            : roleDimensions.lookup(
-                  "program_" + std::to_string(axis->second.getProgramOrder()));
-    if (axis == index.axes.end() || extent.empty())
+    std::string extent = axisDimensions.lookup(owner);
+    if (!index.axes.count(owner) || extent.empty())
       return buffer.emitOpError("has no private-workspace owner extent");
     append(extent);
   }
@@ -673,19 +663,14 @@ template <typename PlanIndex>
 inline mlir::FailureOr<std::string> scanWorkspaceElementCount(
     const ScanBinding &binding, llvm::StringRef logicalExtent,
     const PlanIndex &index,
-    const llvm::StringMap<std::string> &roleDimensions) {
+    const llvm::DenseMap<int64_t, std::string> &axisDimensions) {
   std::string size;
   auto append = [&](llvm::StringRef extent) {
     size = size.empty() ? extent.str() : size + " * " + extent.str();
   };
   for (int64_t owner : binding.getOwnerNodes()) {
-    auto axis = index.axes.find(owner);
-    std::string extent =
-        axis == index.axes.end()
-            ? std::string()
-            : roleDimensions.lookup(
-                  "program_" + std::to_string(axis->second.getProgramOrder()));
-    if (axis == index.axes.end() || extent.empty())
+    std::string extent = axisDimensions.lookup(owner);
+    if (!index.axes.count(owner) || extent.empty())
       return binding.emitOpError("has no scan workspace owner extent");
     append(extent);
   }
@@ -700,7 +685,7 @@ inline mlir::FailureOr<std::string> projectScanWorkspaceOffset(
     const ScanBinding &binding, llvm::StringRef logicalExtent,
     llvm::StringRef logicalIndex, const PlanIndex &index,
     const llvm::DenseMap<int64_t, std::string> &axisIndices,
-    const llvm::StringMap<std::string> &roleDimensions,
+    const llvm::DenseMap<int64_t, std::string> &axisDimensions,
     mlir::Operation &operation) {
   std::string offset;
   auto append = [&](llvm::StringRef projectedIndex, llvm::StringRef extent) {
@@ -710,14 +695,9 @@ inline mlir::FailureOr<std::string> projectScanWorkspaceOffset(
                        projectedIndex.str() + ")";
   };
   for (int64_t owner : binding.getOwnerNodes()) {
-    auto axis = index.axes.find(owner);
     std::string projected = axisIndices.lookup(owner);
-    std::string extent =
-        axis == index.axes.end()
-            ? std::string()
-            : roleDimensions.lookup(
-                  "program_" + std::to_string(axis->second.getProgramOrder()));
-    if (axis == index.axes.end() || projected.empty() || extent.empty())
+    std::string extent = axisDimensions.lookup(owner);
+    if (!index.axes.count(owner) || projected.empty() || extent.empty())
       return operation.emitOpError("has no active scan workspace owner projection");
     append(projected, extent);
   }
@@ -765,6 +745,7 @@ struct ContractBinding : Binding<intent::plan::ContractOp> {
 struct ContractionOrientation {
   bool lhsTranspose;
   bool rhsTranspose;
+  bool batched;
 };
 
 inline mlir::FailureOr<ContractionOrientation>
@@ -778,6 +759,7 @@ contractionOrientation(mlir::Operation &operation) {
                            operation.getOperand(1).getType())
                      : mlir::RankedTensorType();
   auto reduce = operation.getAttrOfType<mlir::ArrayAttr>("intent.reduce");
+  auto batch = operation.getAttrOfType<mlir::ArrayAttr>("intent.batch");
   auto pair = reduce && reduce.size() == 1
                   ? mlir::dyn_cast<mlir::ArrayAttr>(reduce[0])
                   : mlir::ArrayAttr();
@@ -787,13 +769,31 @@ contractionOrientation(mlir::Operation &operation) {
   auto rhs = pair && pair.size() == 2
                  ? mlir::dyn_cast<mlir::IntegerAttr>(pair[1])
                  : mlir::IntegerAttr();
-  if (!lhsType || lhsType.getRank() != 2 || !rhsType ||
-      rhsType.getRank() != 2 || !lhs || !rhs ||
-      (lhs.getInt() != 0 && lhs.getInt() != 1) ||
-      (rhs.getInt() != 0 && rhs.getInt() != 1))
+  auto batchPair = batch && batch.size() == 1
+                       ? mlir::dyn_cast<mlir::ArrayAttr>(batch[0])
+                       : mlir::ArrayAttr();
+  auto lhsBatch = batchPair && batchPair.size() == 2
+                      ? mlir::dyn_cast<mlir::IntegerAttr>(batchPair[0])
+                      : mlir::IntegerAttr();
+  auto rhsBatch = batchPair && batchPair.size() == 2
+                      ? mlir::dyn_cast<mlir::IntegerAttr>(batchPair[1])
+                      : mlir::IntegerAttr();
+  bool ordinary = batch && batch.empty() && lhsType && rhsType &&
+                  lhsType.getRank() == 2 && rhsType.getRank() == 2;
+  bool batched = batch && batch.size() == 1 && lhsBatch && rhsBatch &&
+                 lhsType && rhsType && lhsType.getRank() == 3 &&
+                 rhsType.getRank() == 3 && lhsBatch.getInt() == 0 &&
+                 rhsBatch.getInt() == 0 && lhs && rhs &&
+                 (lhs.getInt() == 1 || lhs.getInt() == 2) &&
+                 (rhs.getInt() == 1 || rhs.getInt() == 2);
+  if ((!ordinary && !batched) || !lhs || !rhs ||
+      (lhs.getInt() != 0 && lhs.getInt() != 1 && lhs.getInt() != 2) ||
+      (rhs.getInt() != 0 && rhs.getInt() != 1 && rhs.getInt() != 2))
     return operation.emitOpError(
-        "has no rank-two contraction orientation for target emission");
-  return ContractionOrientation{lhs.getInt() == 0, rhs.getInt() == 1};
+        "has no supported contraction orientation for target emission");
+  return ContractionOrientation{batched ? lhs.getInt() == 1 : lhs.getInt() == 0,
+                                batched ? rhs.getInt() == 2 : rhs.getInt() == 1,
+                                batched};
 }
 
 struct CanonicalBinding {

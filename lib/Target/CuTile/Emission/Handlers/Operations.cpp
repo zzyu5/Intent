@@ -508,16 +508,22 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
           "staged cuTile ownership requires one logical axis");
     BlockArgument argument = body.getArgument(0);
     plan::AxisOp axis = axes.front();
-    bool outer = false;
-    bool member = false;
-    for (const auto &entry : stageRaggedRuntime) {
-      const RaggedRuntime &runtime = raggedRuntimes[entry.second];
-      outer |= runtime.binding.getOuterNode() == axis.getNode();
-      member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
-        auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-        return node && node.getInt() == axis.getNode();
-      });
-    }
+    bool outer = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
+      unsigned position = stage.getOrdinal();
+      auto runtime = stageRaggedRuntime.find(position);
+      return runtime != stageRaggedRuntime.end() &&
+             raggedRuntimes[runtime->second].binding.getOuterNode() ==
+                 axis.getNode();
+    });
+    bool member = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
+      auto stageAxes = planIndex.stageAxes.find(stage.getNode());
+      plan::StageAxisOp binding =
+          stageAxes == planIndex.stageAxes.end()
+              ? plan::StageAxisOp()
+              : stageAxes->second.lookup("member");
+      return binding && binding.getAxisNodeAttr() &&
+             binding.getAxisNodeAttr().getInt() == axis.getNode();
+    });
     if (outer == member)
       return operation.emitOpError("has no staged program-axis binding");
     valueNames[argument] = outer ? "expert" : "member_offsets";
@@ -1108,7 +1114,7 @@ SourceEmitter::privateWorkspaceIndex(Operation &operation) {
   };
   FailureOr<std::string> offset =
       target::emission::projectPrivateWorkspaceOffset(
-          binding, *info, *indices, planIndex, axisIndices, roleDimensions,
+          binding, *info, *indices, planIndex, axisIndices, axisDimensions,
           spellIndex, operation);
   if (failed(offset))
     return failure();
@@ -1123,7 +1129,7 @@ SourceEmitter::scanWorkspaceIndex(const plan::ScanOp &binding,
   if (extent.empty())
     return binding.emitOpError("has no cuTile scan workspace binding");
   FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
-      binding, extent, logicalIndex, planIndex, axisIndices, roleDimensions,
+      binding, extent, logicalIndex, planIndex, axisIndices, axisDimensions,
       consumer);
   if (failed(offset))
     return failure();
@@ -1138,7 +1144,7 @@ SourceEmitter::scanMaterializedIndex(Value value, StringRef logicalIndex,
     return consumer.emitOpError("has no cuTile materialized scan value");
   FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
       materialized->second, scanExtents.lookup(materialized->second.getNode()),
-      logicalIndex, planIndex, axisIndices, roleDimensions, consumer);
+      logicalIndex, planIndex, axisIndices, axisDimensions, consumer);
   if (failed(offset))
     return failure();
   return addressIndex(*offset);
@@ -2163,6 +2169,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (accumulatorDtype.empty())
     return operation.emitOpError("has no supported cuTile accumulator dtype");
   if (!planIndex.stages.empty()) {
+    if (orientation->batched)
+      return operation.emitOpError(
+          "cuTile staged batch contraction is not supported");
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");
@@ -2264,9 +2273,13 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     std::string lhsExpression = lhs->str();
     std::string rhsExpression = rhs->str();
     if (orientation->lhsTranspose)
-      lhsExpression = "ct.transpose(" + lhsExpression + ")";
+      lhsExpression = orientation->batched
+                          ? "ct.transpose(" + lhsExpression + ", 1, 2)"
+                          : "ct.transpose(" + lhsExpression + ")";
     if (orientation->rhsTranspose)
-      rhsExpression = "ct.transpose(" + rhsExpression + ")";
+      rhsExpression = orientation->batched
+                          ? "ct.transpose(" + rhsExpression + ", 1, 2)"
+                          : "ct.transpose(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
     line(result + " = ct.full(" + *shape + ", 0, dtype=" +
          accumulatorDtype + ")");
@@ -2278,6 +2291,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (!lhsLoad || !rhsLoad)
     return operation.emitOpError(
         "deferred cuTile contraction has inconsistent operand residency");
+  if (orientation->batched)
+    return operation.emitOpError(
+        "deferred cuTile batch contraction is not supported");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
   auto transferBoundary = [&](Operation &load) -> FailureOr<plan::BoundaryOp> {

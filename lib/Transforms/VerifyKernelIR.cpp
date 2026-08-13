@@ -402,8 +402,11 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
       return failure();
     return requireAttribute<StringAttr>(operation, "intent.combine");
   }
-  if (name == "intent.contract")
-    return requireAttribute<ArrayAttr>(operation, "intent.reduce");
+  if (name == "intent.contract") {
+    if (failed(requireAttribute<ArrayAttr>(operation, "intent.reduce")))
+      return failure();
+    return requireAttribute<ArrayAttr>(operation, "intent.batch");
+  }
   if (name == "intent.atomic_cas") {
     auto relation = operation->getAttrOfType<ArrayAttr>("intent.index");
     auto compareIndex = operation->getAttrOfType<IntegerAttr>(

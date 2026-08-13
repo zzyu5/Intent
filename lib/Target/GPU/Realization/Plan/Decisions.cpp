@@ -358,10 +358,12 @@ assignAxes(const target::KernelFacts &facts) {
 
   SmallVector<std::pair<Operation *, Operation *>> matrixAxes;
   auto matrixAxis = [](ArrayRef<target::LogicalAxis> axes,
-                       ArrayRef<unsigned> reduced) -> Operation * {
+                       ArrayRef<unsigned> reduced,
+                       ArrayRef<unsigned> batched) -> Operation * {
     for (size_t position = axes.size(); position > 0; --position) {
       size_t axis = position - 1;
-      if (!llvm::is_contained(reduced, axis) && axes[axis].domain)
+      if (!llvm::is_contained(reduced, axis) &&
+          !llvm::is_contained(batched, axis) && axes[axis].domain)
         return axes[axis].domain;
     }
     return nullptr;
@@ -381,8 +383,10 @@ assignAxes(const target::KernelFacts &facts) {
   };
   for (const auto &entry : facts.contractions) {
     const target::ContractionFact &contract = entry.second;
-    Operation *m = matrixAxis(contract.lhsAxes, contract.lhsReductionAxes);
-    Operation *n = matrixAxis(contract.rhsAxes, contract.rhsReductionAxes);
+    Operation *m = matrixAxis(contract.lhsAxes, contract.lhsReductionAxes,
+                              contract.lhsBatchAxes);
+    Operation *n = matrixAxis(contract.rhsAxes, contract.rhsReductionAxes,
+                              contract.rhsBatchAxes);
     if (failed(assignMatrixRole(m, "contraction_m", *entry.first)) ||
         failed(assignMatrixRole(n, "contraction_n", *entry.first)))
       return failure();

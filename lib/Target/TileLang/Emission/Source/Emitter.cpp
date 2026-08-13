@@ -523,17 +523,15 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
     if (binding.getResultSpace() != "global")
       continue;
     Operation *scan = kernel.nodes.lookup(entry.first);
-    Operation *axis = kernel.nodes.lookup(binding.getAxisNode());
-    FailureOr<std::string> extent =
-        axis ? dimensionName(*axis) : FailureOr<std::string>(failure());
+    std::string extent = axisDimensions.lookup(binding.getAxisNode());
     if (!scan || scan->getName().getStringRef() != "intent.scan" ||
-        scan->getNumResults() != 1 || failed(extent))
+        scan->getNumResults() != 1 || extent.empty())
       return binding.emitOpError(
           "does not bind a workspace-backed TileLang scan tensor");
     workspaceNames[scan->getResult(0)] =
         "scan_workspace_" + std::to_string(entry.first);
     scanResults[scan->getResult(0)] = binding;
-    scanExtents[entry.first] = *extent;
+    scanExtents[entry.first] = extent;
     for (int64_t valueID : binding.getMaterializedValues()) {
       FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
           kernel, binding, valueID);
@@ -625,6 +623,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (failed(dimension))
       return entry.getValue().emitOpError("cannot resolve its source dimension");
     roleDimensions[entry.getValue().getRole()] = *dimension;
+    axisDimensions[entry.getValue().getNode()] = *dimension;
   }
   for (auto &entry : planIndex.axes) {
     Operation *domain = kernel.nodes.lookup(entry.first);
@@ -975,7 +974,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     for (Operation *buffer : privateWorkspaceBuffers) {
       FailureOr<std::string> size =
           target::emission::privateWorkspaceElementCount(
-              *buffer, planIndex, roleDimensions);
+              *buffer, planIndex, axisDimensions);
       FailureOr<target::LogicalBufferInfo> info =
           target::getLogicalBufferInfo(*buffer);
       std::string dtype = succeeded(info)
@@ -996,7 +995,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                         : RankedTensorType();
       FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
           entry.second, scanExtents.lookup(entry.first), planIndex,
-          roleDimensions);
+          axisDimensions);
       std::string dtype =
           tensor ? dtypeName(tensor.getElementType(), *scan) : std::string();
       if (!tensor || failed(size) || dtype.empty())
@@ -1409,7 +1408,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (Operation *buffer : privateWorkspaceBuffers) {
       FailureOr<std::string> size =
           target::emission::privateWorkspaceElementCount(
-              *buffer, planIndex, roleDimensions);
+              *buffer, planIndex, axisDimensions);
       FailureOr<std::string> initializer =
           target::emission::logicalBufferPythonInitializer(*buffer);
       FailureOr<target::LogicalBufferInfo> info =
@@ -1432,7 +1431,7 @@ LogicalResult SourceEmitter::emitWrapper() {
                         : RankedTensorType();
       FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
           entry.second, scanExtents.lookup(entry.first), planIndex,
-          roleDimensions);
+          axisDimensions);
       StringRef dtype = tensor ? torchDtype(tensor.getElementType()) : StringRef();
       if (!tensor || failed(size) || dtype.empty())
         return entry.second.emitOpError(

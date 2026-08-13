@@ -400,16 +400,22 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
           "staged TileLang ownership requires one logical axis");
     BlockArgument argument = body.getArgument(0);
     plan::AxisOp axis = axes.front();
-    bool outer = false;
-    bool member = false;
-    for (const auto &entry : stageRaggedRuntime) {
-      const RaggedRuntime &runtime = raggedRuntimes[entry.second];
-      outer |= runtime.binding.getOuterNode() == axis.getNode();
-      member |= llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
-        auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-        return node && node.getInt() == axis.getNode();
-      });
-    }
+    bool outer = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
+      unsigned position = stage.getOrdinal();
+      auto runtime = stageRaggedRuntime.find(position);
+      return runtime != stageRaggedRuntime.end() &&
+             raggedRuntimes[runtime->second].binding.getOuterNode() ==
+                 axis.getNode();
+    });
+    bool member = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
+      auto stageAxes = planIndex.stageAxes.find(stage.getNode());
+      plan::StageAxisOp binding =
+          stageAxes == planIndex.stageAxes.end()
+              ? plan::StageAxisOp()
+              : stageAxes->second.lookup("member");
+      return binding && binding.getAxisNodeAttr() &&
+             binding.getAxisNodeAttr().getInt() == axis.getNode();
+    });
     if (outer == member)
       return operation.emitOpError("has no staged program-axis binding");
     valueNames[argument] = outer ? "expert" : "member_start";
@@ -1030,7 +1036,7 @@ SourceEmitter::privateWorkspaceIndex(Operation &operation) {
   };
   FailureOr<std::string> offset =
       target::emission::projectPrivateWorkspaceOffset(
-          binding, *info, *indices, planIndex, axisIndices, roleDimensions,
+          binding, *info, *indices, planIndex, axisIndices, axisDimensions,
           spellIndex, operation);
   if (failed(offset))
     return failure();
@@ -1781,7 +1787,7 @@ SourceEmitter::scanWorkspaceIndex(const plan::ScanOp &binding,
                                   Operation &consumer) {
   FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
       binding, scanExtents.lookup(binding.getNode()), logicalIndex, planIndex,
-      axisIndices, roleDimensions, consumer);
+      axisIndices, axisDimensions, consumer);
   if (failed(offset))
     return failure();
   return addressIndex(*offset);
@@ -2920,6 +2926,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       target::emission::contractionOrientation(operation);
   if (failed(orientation))
     return failure();
+  if (orientation->batched)
+    return operation.emitOpError(
+        "TileLang 0.1.13 has no mechanical batched GEMM projection");
   if (!planIndex.stages.empty()) {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||

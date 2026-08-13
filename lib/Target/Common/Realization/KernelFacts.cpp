@@ -2273,13 +2273,14 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
   if (failed(addHandler(
           registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
+            auto batch = operation.getAttrOfType<ArrayAttr>("intent.batch");
             auto lhs = operation.getNumOperands() == 2
                            ? facts.valueAxes.find(operation.getOperand(0))
                            : facts.valueAxes.end();
             auto rhs = operation.getNumOperands() == 2
                            ? facts.valueAxes.find(operation.getOperand(1))
                            : facts.valueAxes.end();
-            if (!reduce || reduce.empty() || lhs == facts.valueAxes.end() ||
+            if (!reduce || reduce.empty() || !batch || lhs == facts.valueAxes.end() ||
                 rhs == facts.valueAxes.end() || operation.getNumResults() != 1)
               return operation.emitOpError(
                   "contraction has no logical-axis provenance");
@@ -2305,12 +2306,34 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               if (Operation *domain = lhs->second[lhsAxis.getInt()].domain)
                 facts.contractionDomains.insert(domain);
             }
+            llvm::DenseSet<unsigned> lhsBatched;
+            llvm::DenseSet<unsigned> rhsBatched;
+            for (Attribute attribute : batch) {
+              auto pair = dyn_cast<ArrayAttr>(attribute);
+              auto lhsAxis = pair && pair.size() == 2
+                                 ? dyn_cast<IntegerAttr>(pair[0])
+                                 : IntegerAttr();
+              auto rhsAxis = pair && pair.size() == 2
+                                 ? dyn_cast<IntegerAttr>(pair[1])
+                                 : IntegerAttr();
+              if (!lhsAxis || !rhsAxis || lhsAxis.getInt() < 0 ||
+                  rhsAxis.getInt() < 0 ||
+                  static_cast<size_t>(lhsAxis.getInt()) >= lhs->second.size() ||
+                  static_cast<size_t>(rhsAxis.getInt()) >= rhs->second.size() ||
+                  lhs->second[lhsAxis.getInt()] != rhs->second[rhsAxis.getInt()] ||
+                  lhsReduced.contains(lhsAxis.getInt()) ||
+                  rhsReduced.contains(rhsAxis.getInt()) ||
+                  !lhsBatched.insert(lhsAxis.getInt()).second ||
+                  !rhsBatched.insert(rhsAxis.getInt()).second)
+                return operation.emitOpError(
+                    "contraction batch pair has invalid logical-domain provenance");
+            }
             SmallVector<LogicalAxis> resultAxes;
             for (auto [axis, logicalAxis] : llvm::enumerate(lhs->second))
               if (!lhsReduced.contains(axis))
                 resultAxes.push_back(logicalAxis);
             for (auto [axis, logicalAxis] : llvm::enumerate(rhs->second))
-              if (!rhsReduced.contains(axis))
+              if (!rhsReduced.contains(axis) && !rhsBatched.contains(axis))
                 resultAxes.push_back(logicalAxis);
             ContractionFact fact;
             fact.operation = &operation;
@@ -2319,8 +2342,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             fact.resultAxes = resultAxes;
             fact.lhsReductionAxes.assign(lhsReduced.begin(), lhsReduced.end());
             fact.rhsReductionAxes.assign(rhsReduced.begin(), rhsReduced.end());
+            fact.lhsBatchAxes.assign(lhsBatched.begin(), lhsBatched.end());
+            fact.rhsBatchAxes.assign(rhsBatched.begin(), rhsBatched.end());
             llvm::sort(fact.lhsReductionAxes);
             llvm::sort(fact.rhsReductionAxes);
+            llvm::sort(fact.lhsBatchAxes);
+            llvm::sort(fact.rhsBatchAxes);
             facts.contractions[&operation] = std::move(fact);
             return bindResultAxes(operation, 0, std::move(resultAxes), facts);
           })))
