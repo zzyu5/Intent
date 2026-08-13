@@ -100,8 +100,8 @@ fp8_gemm,e4m3,K,pass,0.0102,0.0109,,,K,pass,0.0095,0.0098,,,K,pass,0.0141,0.0150
 fp8_gemm,e5m2,K,pass,0.0099,0.0105,,,K,pass,0.0094,0.0100,,,K,pass,0.0143,0.0151,0.0135,0.0148
 index_select_rows,default,K,pass,0.1891,0.1900,0.2198,0.2208,K,pass,0.1877,0.1896,,,K,pass,0.1838,0.1845,,
 scaled_index_add,default,K,pass,0.2698,0.2712,0.2979,0.3006,K,pass,0.2702,0.2730,,,K,pass,0.2684,0.2692,,
-mla_head_projection,query_absorb,,not_measured,,,,,,not_measured,,,,,,not_measured,,,,
-mla_head_projection,value_reconstruct,,not_measured,,,,,,not_measured,,,,,,not_measured,,,,
-absorbed_mla_prefill,default,,not_measured,,,,,,not_measured,,,,,,not_measured,,,,
-token_sparse_mla_prefill,default,,not_measured,,,,,,not_measured,,,,,,not_measured,,,,
-fp8_mqa_logits,default,,not_measured,,,,,,not_measured,,,,,,not_measured,,,,
+mla_head_projection,query_absorb,K,pass,0.0090,0.0094,,,K,pass,0.0087,0.0092,,,K,unsupported,,,,
+mla_head_projection,value_reconstruct,K,pass,0.0104,0.0112,,,K,pass,0.0097,0.0101,,,K,unsupported,,,,
+absorbed_mla_prefill,default,K,pass,0.0556,0.0568,,,K,pass,0.2861,0.2878,,,K,unsupported,,,,
+token_sparse_mla_prefill,default,K,compile_timeout,,,,,K,compile_timeout,,,,,K,unsupported,,,,
+fp8_mqa_logits,default,K,pass,0.0496,0.0501,,,K,unsupported,,,,,K,unsupported,,,,
