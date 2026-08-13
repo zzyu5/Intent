@@ -2000,6 +2000,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_logical_and")
+      symbol = "&";
+    else if (binding.getLowering() == "python_logical_or")
+      symbol = "|";
     else if (binding.getLowering() == "python_equal")
       symbol = "==";
     else if (binding.getLowering() == "python_not_equal")
@@ -2528,14 +2532,64 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  bool appendAxis = relation->size() == 2 &&
-                    (*relation)[0].kind == "full_slice" &&
-                    (*relation)[1].kind == "new_axis";
-  bool prependAxis = relation->size() == 2 &&
-                     (*relation)[0].kind == "new_axis" &&
-                     (*relation)[1].kind == "full_slice";
-  if (binding.getLowering() != "expand_dims" ||
-      (!appendAxis && !prependAxis))
+  if (binding.getLowering() == "T.indirect_gather" &&
+      isa<intent::ViewType>(operation.getOperand(0).getType())) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+    FailureOr<std::string> result = resultStorage();
+    if (failed(view) || failed(extents) || extents->empty() || failed(result))
+      return failure();
+    SmallVector<std::string> indices;
+    std::string loop = "for ";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      indices.push_back("gather_i" + std::to_string(axis));
+      loop += indices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    line(loop + "):");
+    ++indentation;
+    FailureOr<std::string> sourceIndices =
+        elementAccessIndices(operation, indices);
+    FailureOr<std::string> bounds =
+        elementBoundsPredicate(operation, indices, false, false);
+    FailureOr<std::string> valid =
+        tensorElement(operation.getOperand(validIndex.getInt()), indices, operation);
+    FailureOr<std::string> fill =
+        tensorElement(operation.getOperand(fillIndex.getInt()), indices, operation);
+    if (failed(sourceIndices) || failed(bounds) || failed(valid) || failed(fill))
+      return failure();
+    std::string target = *result + "[";
+    for (auto [axis, index] : llvm::enumerate(indices)) {
+      if (axis)
+        target += ", ";
+      target += index;
+    }
+    target += "]";
+    std::string predicate = *valid;
+    if (*bounds != "True")
+      predicate = "(" + *bounds + ") and (" + predicate + ")";
+    line(target + " = T.if_then_else(" + predicate + ", " +
+         (*view)->argument->name + "[" + *sourceIndices + "], " + *fill +
+         ")");
+    --indentation;
+    bindResult(operation, 0, *result);
+    return success();
+  }
+  bool expand = binding.getLowering() == "expand_dims" &&
+                llvm::any_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "new_axis";
+                }) &&
+                llvm::all_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "full_slice" || term.kind == "new_axis";
+                });
+  if (!expand)
     return operation.emitOpError("has no mechanical TileLang gather relation");
   FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
@@ -2543,7 +2597,7 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<std::string> result = resultStorage();
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
   if (failed(source) || failed(valid) || failed(fill) || failed(result) ||
-      failed(extents) || extents->size() != 2)
+      failed(extents) || extents->size() != relation->size())
     return failure();
   auto sourceTensor = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
   Operation *validDefinition =
@@ -2555,27 +2609,54 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     alwaysValid = boolean.getValue();
   else if (auto integer = dyn_cast_if_present<IntegerAttr>(validLiteral))
     alwaysValid = !integer.getValue().isZero();
-  if (sourceTensor && sourceTensor.getRank() == 1 &&
-      ((appendAxis && (*extents)[1] == "1") ||
-       (prependAxis && (*extents)[0] == "1")) &&
-      alwaysValid) {
-    line(*result + " = T.reshape(" + source->str() + ", (" + (*extents)[0] +
-         ", " + (*extents)[1] + "))");
+  if (sourceTensor && alwaysValid) {
+    std::string shape = "(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        shape += ", ";
+      shape += extent;
+    }
+    if (extents->size() == 1)
+      shape += ",";
+    shape += ")";
+    line(*result + " = T.reshape(" + source->str() + ", " + shape + ")");
     bindResult(operation, 0, *result);
     return success();
   }
-  line("for gather_i, gather_j in T.Parallel(" + (*extents)[0] + ", " +
-       (*extents)[1] + "):");
+  SmallVector<std::string> indices;
+  std::string loop = "for ";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    indices.push_back("gather_i" + std::to_string(axis));
+    loop += indices.back();
+  }
+  loop += " in T.Parallel(";
+  for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    if (axis)
+      loop += ", ";
+    loop += extent;
+  }
+  line(loop + "):");
   ++indentation;
-  std::string sourceElement = sourceTensor && sourceTensor.getRank() == 1
-                                  ? source->str() +
-                                        (appendAxis ? "[gather_i]"
-                                                    : "[gather_j]")
-                                  : sourceTensor
-                                        ? source->str() + "[gather_i, gather_j]"
-                                        : source->str();
-  line(*result + "[gather_i, gather_j] = T.if_then_else(" + valid->str() +
-       ", " + sourceElement + ", " + fill->str() + ")");
+  std::string target = *result + "[";
+  std::string sourceElement = source->str() + "[";
+  unsigned sourceAxis = 0;
+  for (auto [axis, term] : llvm::enumerate(*relation)) {
+    if (axis)
+      target += ", ";
+    target += indices[axis];
+    if (term.kind == "new_axis")
+      continue;
+    if (sourceAxis)
+      sourceElement += ", ";
+    sourceElement += indices[axis];
+    ++sourceAxis;
+  }
+  target += "]";
+  sourceElement += "]";
+  line(target + " = T.if_then_else(" + valid->str() + ", " + sourceElement +
+       ", " + fill->str() + ")");
   --indentation;
   bindResult(operation, 0, *result);
   return success();

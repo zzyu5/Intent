@@ -146,11 +146,14 @@ pointwiseRole(mlir::Operation &operation) {
         target::parseIndexRelation(operation);
     if (mlir::failed(relation))
       return mlir::failure();
-    bool expand = relation->size() == 2 &&
-                  (((*relation)[0].kind == "full_slice" &&
-                    (*relation)[1].kind == "new_axis") ||
-                   ((*relation)[0].kind == "new_axis" &&
-                    (*relation)[1].kind == "full_slice"));
+    bool hasNewAxis = llvm::any_of(*relation, [](const target::IndexTerm &term) {
+      return term.kind == "new_axis";
+    });
+    bool expand = hasNewAxis && llvm::all_of(
+                                    *relation, [](const target::IndexTerm &term) {
+                                      return term.kind == "full_slice" ||
+                                             term.kind == "new_axis";
+                                    });
     bool indirect = llvm::any_of(*relation, [](const target::IndexTerm &term) {
       return term.kind == "value_index";
     });
@@ -972,7 +975,8 @@ template <typename PlanIndex>
 bool deferSharedContractionTransfer(const PlanIndex &index,
                                     mlir::Operation &operation,
                                     llvm::StringRef resultSpace) {
-  if (resultSpace != "shared" || operation.getNumResults() != 1)
+  if (resultSpace != "shared" || operation.getNumResults() != 1 ||
+      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
     return false;
   for (mlir::Operation *user : operation.getResult(0).getUsers()) {
     if (user->getName().getStringRef() != "intent.contract")
@@ -986,7 +990,39 @@ bool deferSharedContractionTransfer(const PlanIndex &index,
         contract->second.getLhsSpace() != "shared" ||
         contract->second.getRhsSpace() != "shared")
       continue;
-    return !index.components.groups.empty();
+    auto boundary = [&](mlir::Operation &load) -> const BoundaryBinding * {
+      auto loadNode = load.getAttrOfType<mlir::IntegerAttr>("intent.node");
+      auto found = loadNode ? index.boundaries.find(loadNode.getInt())
+                            : index.boundaries.end();
+      return found == index.boundaries.end() ? nullptr : &found->second;
+    };
+    mlir::Operation *lhs = user->getOperand(0).getDefiningOp();
+    mlir::Operation *rhs = user->getOperand(1).getDefiningOp();
+    const BoundaryBinding *lhsBoundary = lhs ? boundary(*lhs) : nullptr;
+    const BoundaryBinding *rhsBoundary = rhs ? boundary(*rhs) : nullptr;
+    if (!lhsBoundary || !rhsBoundary ||
+        lhsBoundary->getResultSpace() != "shared" ||
+        rhsBoundary->getResultSpace() != "shared")
+      continue;
+    auto directLoad = [](mlir::Value operand) {
+      mlir::Operation *definition = operand.getDefiningOp();
+      return definition &&
+             definition->getName().getStringRef() == "intent.view_load";
+    };
+    if (!llvm::all_of(user->getOperands(), directLoad))
+      continue;
+    unsigned reductionAxes = 0;
+    for (const auto &entry : index.axesByRole) {
+      const AxisBinding &axis = entry.getValue();
+      if (!entry.getKey().starts_with("reduction_") ||
+          !llvm::is_contained(lhsBoundary->getDomainNodes(), axis.getNode()) ||
+          !llvm::is_contained(rhsBoundary->getDomainNodes(), axis.getNode()))
+        continue;
+      ++reductionAxes;
+    }
+    if (reductionAxes != 1)
+      return false;
+    return true;
   }
   return false;
 }

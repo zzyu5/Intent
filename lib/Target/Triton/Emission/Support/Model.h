@@ -170,6 +170,7 @@ private:
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
   std::string physicalExtent(llvm::StringRef logicalExtent) const;
+  mlir::FailureOr<std::string> physicalAxisTile(plan::AxisOp axis);
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string>

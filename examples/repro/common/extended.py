@@ -42,6 +42,7 @@ from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import quantized_gemm
+from kernels.contraction.mla import mla_head_projection
 from kernels.convolution.direct import CONV1D_BATCH
 from kernels.convolution.direct import CONV1D_FILTER
 from kernels.convolution.direct import CONV1D_LENGTH
@@ -118,6 +119,11 @@ from kernels.ragged.grouped_gemm import K as GROUPED_K
 from kernels.ragged.grouped_gemm import N as GROUPED_N
 from kernels.ragged.grouped_gemm import ROWS as GROUPED_ROWS
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
+from kernels.routing.mqa_logits import MQA_HEAD_DIMENSION
+from kernels.routing.mqa_logits import MQA_HEADS
+from kernels.routing.mqa_logits import MQA_KEYS
+from kernels.routing.mqa_logits import MQA_QUERIES
+from kernels.routing.mqa_logits import fp8_mqa_logits
 from kernels.reduction.boolean import COLUMNS as BOOLEAN_REDUCTION_COLUMNS
 from kernels.reduction.boolean import ROWS as BOOLEAN_REDUCTION_ROWS
 from kernels.reduction.boolean import row_boolean_reduction
@@ -167,6 +173,23 @@ from kernels.streaming.attention import MLA_PREFILL_QUERY_HEADS
 from kernels.streaming.attention import MLA_PREFILL_SCALE
 from kernels.streaming.attention import MLA_PREFILL_SEQUENCE
 from kernels.streaming.attention import mla_prefill
+from kernels.streaming.mla import ABSORBED_MLA_BATCH
+from kernels.streaming.mla import ABSORBED_MLA_HEADS
+from kernels.streaming.mla import ABSORBED_MLA_LATENT_DIMENSION
+from kernels.streaming.mla import ABSORBED_MLA_NOPE_DIMENSION
+from kernels.streaming.mla import ABSORBED_MLA_ROPE_DIMENSION
+from kernels.streaming.mla import ABSORBED_MLA_SCALE
+from kernels.streaming.mla import ABSORBED_MLA_SEQUENCE
+from kernels.streaming.mla import ABSORBED_MLA_VALUE_DIMENSION
+from kernels.streaming.mla import SPARSE_MLA_HEADS
+from kernels.streaming.mla import SPARSE_MLA_KEYS
+from kernels.streaming.mla import SPARSE_MLA_LATENT_DIMENSION
+from kernels.streaming.mla import SPARSE_MLA_QUERIES
+from kernels.streaming.mla import SPARSE_MLA_ROPE_DIMENSION
+from kernels.streaming.mla import SPARSE_MLA_SCALE
+from kernels.streaming.mla import SPARSE_MLA_SELECTED_KEYS
+from kernels.streaming.mla import absorbed_mla_prefill
+from kernels.streaming.mla import token_sparse_mla_prefill
 from kernels.position.rope import rotary_embedding_flat
 from kernels.pointwise.batched_affine import BATCH as AFFINE_BATCH
 from kernels.pointwise.batched_affine import COLUMNS as AFFINE_COLUMNS
@@ -578,6 +601,241 @@ def _run_mla_prefill(
     )
 
 
+def _run_absorbed_mla_prefill(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    q_latent = torch.randn(
+        (
+            ABSORBED_MLA_BATCH,
+            ABSORBED_MLA_SEQUENCE,
+            ABSORBED_MLA_HEADS,
+            ABSORBED_MLA_LATENT_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    q_rope = torch.randn(
+        (
+            ABSORBED_MLA_BATCH,
+            ABSORBED_MLA_SEQUENCE,
+            ABSORBED_MLA_HEADS,
+            ABSORBED_MLA_ROPE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    latent_cache = torch.randn(
+        (
+            ABSORBED_MLA_BATCH,
+            ABSORBED_MLA_SEQUENCE,
+            ABSORBED_MLA_LATENT_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    rope_cache = torch.randn(
+        (
+            ABSORBED_MLA_BATCH,
+            ABSORBED_MLA_SEQUENCE,
+            ABSORBED_MLA_ROPE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    artifact = intent.compile(absorbed_mla_prefill, target=target, compiler=compiler)
+
+    def reference() -> torch.Tensor:
+        scores = torch.einsum(
+            "bqhc,bkc->bqhk",
+            q_latent.float(),
+            latent_cache.float(),
+        )
+        scores += torch.einsum(
+            "bqhr,bkr->bqhk",
+            q_rope.float(),
+            rope_cache.float(),
+        )
+        scores *= ABSORBED_MLA_SCALE
+        causal = torch.triu(
+            torch.ones(
+                (ABSORBED_MLA_SEQUENCE, ABSORBED_MLA_SEQUENCE),
+                device="cuda",
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        scores.masked_fill_(causal[None, :, None, :], -torch.inf)
+        probability = torch.softmax(scores, dim=-1)
+        return torch.einsum(
+            "bqhk,bkc->bqhc",
+            probability,
+            latent_cache.float(),
+        ).half()
+
+    _compare(
+        artifact=artifact,
+        arguments=(
+            q_latent,
+            q_rope,
+            latent_cache,
+            rope_cache,
+            ABSORBED_MLA_SCALE,
+        ),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="absorbed MLA causal prefill",
+        tolerance=4.0e-2,
+        upstream=None,
+        expected_dtype=torch.float16,
+    )
+
+
+def _run_mla_head_projection(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    artifact = intent.compile(mla_head_projection, target=target, compiler=compiler)
+    cases = (
+        (
+            "query absorb",
+            ABSORBED_MLA_NOPE_DIMENSION,
+            ABSORBED_MLA_LATENT_DIMENSION,
+        ),
+        (
+            "value reconstruct",
+            ABSORBED_MLA_LATENT_DIMENSION,
+            ABSORBED_MLA_VALUE_DIMENSION,
+        ),
+    )
+    for label, input_dimension, output_dimension in cases:
+        source = torch.randn(
+            (
+                ABSORBED_MLA_BATCH,
+                ABSORBED_MLA_SEQUENCE,
+                ABSORBED_MLA_HEADS,
+                input_dimension,
+            ),
+            device="cuda",
+            dtype=torch.float16,
+        ) * 0.1
+        weight = torch.randn(
+            (ABSORBED_MLA_HEADS, output_dimension, input_dimension),
+            device="cuda",
+            dtype=torch.float16,
+        ) * 0.05
+        _compare(
+            artifact=artifact,
+            arguments=(source, weight),
+            reference=lambda source=source, weight=weight: torch.einsum(
+                "bqhi,hoi->bqho",
+                source.float(),
+                weight.float(),
+            ).half(),
+            target_name=target_name,
+            kernel_name=f"MLA head projection {label}",
+            tolerance=3.0e-2,
+            upstream=None,
+            expected_dtype=torch.float16,
+        )
+
+
+def _run_token_sparse_mla_prefill(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    q_latent = torch.randn(
+        (SPARSE_MLA_QUERIES, SPARSE_MLA_HEADS, SPARSE_MLA_LATENT_DIMENSION),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    q_rope = torch.randn(
+        (SPARSE_MLA_QUERIES, SPARSE_MLA_HEADS, SPARSE_MLA_ROPE_DIMENSION),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    latent_cache = torch.randn(
+        (SPARSE_MLA_KEYS, SPARSE_MLA_LATENT_DIMENSION),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    rope_cache = torch.randn(
+        (SPARSE_MLA_KEYS, SPARSE_MLA_ROPE_DIMENSION),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.1
+    selected = torch.randint(
+        0,
+        SPARSE_MLA_KEYS,
+        (SPARSE_MLA_QUERIES, SPARSE_MLA_SELECTED_KEYS),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    selected[:, -2] = -1
+    selected[:, -1] = SPARSE_MLA_KEYS
+    artifact = intent.compile(token_sparse_mla_prefill, target=target, compiler=compiler)
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid = (selected >= 0) & (selected < SPARSE_MLA_KEYS)
+        safe = selected.clamp(0, SPARSE_MLA_KEYS - 1).long()
+        focused_latent = latent_cache[safe].float()
+        focused_rope = rope_cache[safe].float()
+        scores = torch.einsum("qhc,qtc->qht", q_latent.float(), focused_latent)
+        scores += torch.einsum("qhr,qtr->qht", q_rope.float(), focused_rope)
+        scores *= SPARSE_MLA_SCALE * math.log2(math.e)
+        scores.masked_fill_(~valid[:, None, :], -torch.inf)
+        maximum = scores.max(dim=2).values
+        denominator = torch.exp2(scores - maximum[:, :, None]).sum(dim=2)
+        lse = maximum + torch.log2(denominator)
+        probability = torch.exp2(scores - lse[:, :, None])
+        output = torch.einsum("qht,qtc->qhc", probability, focused_latent)
+        return output.bfloat16(), maximum, lse
+
+    arguments = (
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        selected,
+        SPARSE_MLA_SCALE,
+    )
+    generated = artifact.run(*arguments)
+    expected = reference()
+    if not isinstance(generated, tuple) or len(generated) != 3:
+        raise RuntimeError(f"{target_name} token-sparse MLA returned wrong ABI")
+    errors = tuple(
+        (actual.float() - wanted.float()).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if errors[0] > 5.0e-2 or errors[1] > 5.0e-3 or errors[2] > 5.0e-3:
+        raise RuntimeError(
+            f"{target_name} token-sparse MLA numerical comparison failed: {errors}"
+        )
+    generated_call = prepare_kernel_call(artifact, arguments, generated)
+    generated_p50, generated_p95 = benchmark(
+        generated_call,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=True,
+    )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} token-sparse MLA prefill numerical comparison: PASS "
+        f"(output/max/lse={errors})"
+    )
+    print(
+        f"{target_name} token-sparse MLA prefill kernel-only performance "
+        f"(CUDA Graph): p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    print(f"{target_name} token-sparse MLA prefill upstream baseline: unavailable")
+
+
 def _run_selective_scan(
     compiler: str,
     target: Target,
@@ -865,6 +1123,75 @@ def _run_block_scaled_matmul(
         expected_dtype=torch.float32,
     )
 
+
+def _run_fp8_mqa_logits(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None,
+) -> None:
+    q = (
+        torch.randn(
+            (MQA_QUERIES, MQA_HEADS, MQA_HEAD_DIMENSION),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    kv = (
+        torch.randn(
+            (MQA_KEYS, MQA_HEAD_DIMENSION),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    kv_scale = 0.5 + torch.rand(
+        (MQA_KEYS,),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    head_weight = torch.randn(
+        (MQA_QUERIES, MQA_HEADS),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.1
+    key_start = torch.arange(MQA_QUERIES, device="cuda", dtype=torch.int32) % 17
+    key_end = MQA_KEYS - (
+        torch.arange(MQA_QUERIES, device="cuda", dtype=torch.int32) % 19
+    )
+    artifact = intent.compile(fp8_mqa_logits, target=target, compiler=compiler)
+
+    def reference() -> torch.Tensor:
+        per_head = torch.einsum("qhd,kd->qhk", q.float(), kv.float())
+        result = (
+            torch.relu(per_head) * head_weight[:, :, None]
+        ).sum(dim=1) * kv_scale[None, :]
+        key = torch.arange(MQA_KEYS, device="cuda", dtype=torch.int32)
+        valid = (
+            key[None, :] >= key_start[:, None]
+        ) & (
+            key[None, :] < key_end[:, None]
+        )
+        return result.masked_fill(~valid, -torch.inf)
+
+    def finite_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        finite = torch.isfinite(expected)
+        if not torch.equal(torch.isfinite(actual), finite):
+            return float("inf")
+        return (actual[finite] - expected[finite]).abs().max().item()
+
+    _compare(
+        artifact=artifact,
+        arguments=(q, kv, kv_scale, head_weight, key_start, key_end),
+        reference=reference,
+        target_name=target_name,
+        kernel_name="FP8 MQA weighted logits",
+        tolerance=2.0e-2,
+        upstream=None,
+        expected_dtype=torch.float32,
+        comparison_error=finite_error,
+    )
 
 def _run_splitk_attention_reduce(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
@@ -3274,6 +3601,7 @@ def _run_scaled_index_add(
 
 
 EXTENDED_RUNNERS: dict[str, Runner] = {
+    "absorbed_mla_prefill": _run_absorbed_mla_prefill,
     "attention_bias": _run_attention_bias,
     "atomic_compare_exchange": _run_atomic_compare_exchange,
     "batched_row_affine": _run_batched_row_affine,
@@ -3291,6 +3619,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "embedding_backward_atomic": _run_embedding_backward_atomic,
     "embedding_forward_lookup": _run_embedding_forward_lookup,
     "fp8_gemm": _run_fp8_gemm,
+    "fp8_mqa_logits": _run_fp8_mqa_logits,
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "grouped_query_head_add": _run_grouped_query_head_add,
@@ -3303,6 +3632,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "mamba_chunk_scan": _run_mamba_chunk_scan,
     "splitk_attention_reduce": _run_splitk_attention_reduce,
     "mla_prefill": _run_mla_prefill,
+    "mla_head_projection": _run_mla_head_projection,
     "online_softmax": _run_online_softmax,
     "ordered_prefix": _run_ordered_prefix,
     "paged_attention": _run_paged_attention,
@@ -3317,6 +3647,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "sorted_nucleus_cutoff": _run_sorted_nucleus_cutoff,
     "swiglu_backward": _run_swiglu_backward,
     "swiglu_forward": _run_swiglu_forward,
+    "token_sparse_mla_prefill": _run_token_sparse_mla_prefill,
     "varlen_attention": _run_varlen_attention,
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
     "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,

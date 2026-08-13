@@ -131,6 +131,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_left_shift");
   if (role == "binary_right_shift")
     return StringRef("python_right_shift");
+  if (role == "binary_logical_and")
+    return StringRef("python_logical_and");
+  if (role == "binary_logical_or")
+    return StringRef("python_logical_or");
   if (role == "binary_maximum")
     return StringRef("tl.maximum");
   if (role == "binary_minimum")
@@ -366,10 +370,13 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.operation = value;
     binding.access = load ? "load" : "store";
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer =
-        load && target::emission::deferSharedContractionTransfer(
-                    index, *operation, value.getResultSpace());
     index.boundaries[value.getNode()] = binding;
+  }
+  for (auto &entry : index.boundaries) {
+    Operation *operation = kernel.nodes.lookup(entry.first);
+    entry.second.defer =
+        operation && target::emission::deferSharedContractionTransfer(
+                         index, *operation, entry.second.getResultSpace());
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks target or program realization choices");
@@ -1882,6 +1889,17 @@ std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
   return "triton.next_power_of_2(" + logicalExtent.str() + ")";
 }
 
+FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
+  if (axis.getReuseWorker() || !axis.getTileRole().starts_with("row_vector"))
+    return axis.getTile().str();
+  Operation *domain = kernel.nodes.lookup(axis.getNode());
+  FailureOr<std::string> logical =
+      domain ? dimensionName(*domain) : FailureOr<std::string>(failure());
+  if (failed(logical))
+    return axis.emitOpError("cannot resolve its row-vector physical extent");
+  return physicalExtent(*logical);
+}
+
 FailureOr<std::string>
 SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -1951,13 +1969,23 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
           index = "(" + exact->str() + ")";
         } else {
           if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-            if (tensor.getRank() != static_cast<int64_t>(*tensorRank) ||
+            if (tensor.getRank() > static_cast<int64_t>(*tensorRank) ||
                 (vectorAxis != 0 && !advancedTensorAxesCovered))
               return operation.emitOpError(
-                  "Triton broadcasted tensor indices must jointly cover the emitted tensor rank");
+                  "Triton broadcasted tensor index exceeds the emitted tensor rank");
             index = "(" + exact->str() + ")";
+            if (tensor.getRank() < static_cast<int64_t>(*tensorRank)) {
+              index += "[";
+              for (unsigned axis = 0; axis < *tensorRank; ++axis) {
+                if (axis)
+                  index += ", ";
+                index += axis < static_cast<unsigned>(tensor.getRank()) ? ":"
+                                                                        : "None";
+              }
+              index += "]";
+            }
             if (!advancedTensorAxesCovered) {
-              vectorAxis = *tensorRank;
+              vectorAxis = tensor.getRank();
               advancedTensorAxesCovered = true;
             }
           } else {
@@ -2062,13 +2090,23 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
         return failure();
       std::string index;
       if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() != static_cast<int64_t>(*tensorRank) ||
+        if (tensor.getRank() > static_cast<int64_t>(*tensorRank) ||
             (vectorAxis != 0 && !advancedTensorAxesCovered))
           return operation.emitOpError(
-              "Triton broadcasted tensor bounds must jointly cover the emitted tensor rank");
+              "Triton broadcasted tensor bounds exceed the emitted tensor rank");
         index = "(" + exact->str() + ")";
+        if (tensor.getRank() < static_cast<int64_t>(*tensorRank)) {
+          index += "[";
+          for (unsigned axis = 0; axis < *tensorRank; ++axis) {
+            if (axis)
+              index += ", ";
+            index += axis < static_cast<unsigned>(tensor.getRank()) ? ":"
+                                                                    : "None";
+          }
+          index += "]";
+        }
         if (!advancedTensorAxesCovered) {
-          vectorAxis = *tensorRank;
+          vectorAxis = tensor.getRank();
           advancedTensorAxesCovered = true;
         }
       } else {

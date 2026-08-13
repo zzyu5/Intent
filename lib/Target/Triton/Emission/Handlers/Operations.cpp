@@ -1558,6 +1558,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "|";
     else if (binding.getLowering() == "python_bitwise_xor")
       symbol = "^";
+    else if (binding.getLowering() == "python_logical_and")
+      symbol = "&";
+    else if (binding.getLowering() == "python_logical_or")
+      symbol = "|";
     else if (binding.getLowering() == "python_left_shift")
       symbol = "<<";
     else if (binding.getLowering() == "python_right_shift")
@@ -1844,25 +1848,48 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid =
       validIndex ? lookupValue(operation, validIndex.getInt())
                  : FailureOr<StringRef>(failure());
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  bool appendAxis = succeeded(relation) && relation->size() == 2 &&
-                    (*relation)[0].kind == "full_slice" &&
-                    (*relation)[1].kind == "new_axis";
-  bool prependAxis = succeeded(relation) && relation->size() == 2 &&
-                     (*relation)[0].kind == "new_axis" &&
-                     (*relation)[1].kind == "full_slice";
-  if (failed(node) || !binding || binding.getLowering() != "expand_dims" ||
-      failed(relation) || (!appendAxis && !prependAxis) || failed(source) ||
-      failed(valid) || failed(fill))
+  if (failed(node) || !binding || failed(relation) || failed(valid) ||
+      failed(fill))
+    return operation.emitOpError("lacks a mechanical Triton gather binding");
+  if (binding.getLowering() == "tl.indirect_gather" &&
+      isa<intent::ViewType>(operation.getOperand(0).getType())) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    FailureOr<std::string> pointer =
+        succeeded(view) ? emitPointerExpression(operation, **view, false)
+                        : FailureOr<std::string>(failure());
+    FailureOr<std::string> mask = emitMaskExpression(operation, false);
+    if (failed(view) || failed(pointer) || failed(mask))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.load(" + *pointer + ", mask=(" + *mask + ") & (" +
+         valid->str() + "), other=" + fill->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  FailureOr<StringRef> source = lookupValue(operation, 0);
+  bool expand = binding.getLowering() == "expand_dims" &&
+                llvm::any_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "new_axis";
+                }) &&
+                llvm::all_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "full_slice" || term.kind == "new_axis";
+                });
+  if (!expand || failed(source))
     return operation.emitOpError("lacks a mechanical Triton gather binding");
   std::string result = makeResultName(operation, 0);
-  std::string expanded = source->str() + (appendAxis ? "[:, None]" : "[None, :]");
+  std::string expanded = source->str() + "[";
+  for (auto [index, term] : llvm::enumerate(*relation)) {
+    if (index)
+      expanded += ", ";
+    expanded += term.kind == "new_axis" ? "None" : ":";
+  }
+  expanded += "]";
   line(result + " = tl.where(" + valid->str() + ", " + expanded + ", " +
        fill->str() + ")");
   bindResult(operation, 0, result);
@@ -2217,11 +2244,13 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   plan::AxisOp reductionAxis = axes->reduction;
   std::string reductionRole = reductionAxis.getRole().str();
   std::string reductionTile = reductionAxis.getTile().str();
-  std::string lhsTile = axes->lhsResult.getTile().str();
-  std::string rhsTile = axes->rhsResult.getTile().str();
+  FailureOr<std::string> lhsTile = physicalAxisTile(axes->lhsResult);
+  FailureOr<std::string> rhsTile = physicalAxisTile(axes->rhsResult);
+  if (failed(lhsTile) || failed(rhsTile))
+    return failure();
   std::string reductionOffset = "offs_" + reductionRole;
   std::string result = makeResultName(operation, 0);
-  line(result + " = tl.zeros((" + lhsTile + ", " + rhsTile +
+  line(result + " = tl.zeros((" + *lhsTile + ", " + *rhsTile +
        "), dtype=" + accumulatorDtype + ")");
   line("for reduction_block in range(0, tl.cdiv(" +
        roleDimensions.lookup(reductionRole) + ", " + reductionTile + ")):");

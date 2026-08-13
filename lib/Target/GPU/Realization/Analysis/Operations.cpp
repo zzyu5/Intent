@@ -219,6 +219,7 @@ LogicalResult validatePointwise(Operation &operation) {
                           StringRef("bitwise_and"), StringRef("bitwise_or"),
                           StringRef("bitwise_xor"), StringRef("left_shift"),
                           StringRef("right_shift"),
+                          StringRef("logical_and"), StringRef("logical_or"),
                           StringRef("maximum"), StringRef("minimum")},
                          logical.getValue()))
     return success();
@@ -270,12 +271,16 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 target::parseIndexRelation(operation);
             if (failed(relation))
               return failure();
-            bool expand =
-                relation->size() == 2 &&
-                (((*relation)[0].kind == "full_slice" &&
-                  (*relation)[1].kind == "new_axis") ||
-                 ((*relation)[0].kind == "new_axis" &&
-                  (*relation)[1].kind == "full_slice"));
+            bool hasNewAxis =
+                llvm::any_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "new_axis";
+                });
+            bool expand = hasNewAxis && llvm::all_of(
+                                              *relation,
+                                              [](const target::IndexTerm &term) {
+                                                return term.kind == "full_slice" ||
+                                                       term.kind == "new_axis";
+                                              });
             bool indirect = llvm::any_of(
                 *relation, [](const target::IndexTerm &term) {
                   return term.kind == "value_index";

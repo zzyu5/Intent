@@ -100,3 +100,8 @@ fp8_gemm,e4m3,K,pass,0.0118,0.0126,,,K,pass,0.0115,0.0125,,,K,pass,0.0124,0.0145
 fp8_gemm,e5m2,K,pass,0.0123,0.0123,,,K,pass,0.0123,0.0133,,,K,pass,0.0138,0.0144,0.0184,0.0186
 index_select_rows,default,K,pass,0.3702,0.3721,0.3666,0.3686,K,pass,0.3667,0.3691,,,K,pass,0.3606,0.3638,,
 scaled_index_add,default,K,pass,0.5222,0.5248,0.5268,0.5289,K,pass,0.5196,0.5218,,,K,pass,0.5222,0.5248,,
+mla_head_projection,query_absorb,K,pass,0.0097,0.0105,,,K,pass,0.0098,0.0118,,,K,pass,0.0103,0.0123,,
+mla_head_projection,value_reconstruct,K,pass,0.0102,0.0104,,,K,pass,0.0123,0.0130,,,K,pass,0.0142,0.0144,,
+absorbed_mla_prefill,default,K,not_measured,,,,,K,pass,0.1536,0.1557,,,K,not_measured,,,,
+token_sparse_mla_prefill,default,K,not_measured,,,,,K,not_measured,,,,,K,not_measured,,,,
+fp8_mqa_logits,default,K,pass,0.0364,0.0384,,,K,unsupported,,,,,K,pass,0.0895,0.0915,,

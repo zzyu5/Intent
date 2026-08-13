@@ -1590,6 +1590,10 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       symbol = "*";
     else if (binding.getLowering() == "python_true_divide")
       symbol = "/";
+    else if (binding.getLowering() == "python_logical_and")
+      symbol = "&";
+    else if (binding.getLowering() == "python_logical_or")
+      symbol = "|";
     else if (binding.getLowering() == "python_equal")
       symbol = "==";
     else if (binding.getLowering() == "python_not_equal")
@@ -1878,26 +1882,51 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid =
       validIndex ? lookupValue(operation, validIndex.getInt())
                  : FailureOr<StringRef>(failure());
   FailureOr<StringRef> fill =
       fillIndex ? lookupValue(operation, fillIndex.getInt())
                 : FailureOr<StringRef>(failure());
-  bool appendAxis = succeeded(relation) && relation->size() == 2 &&
-                    (*relation)[0].kind == "full_slice" &&
-                    (*relation)[1].kind == "new_axis";
-  bool prependAxis = succeeded(relation) && relation->size() == 2 &&
-                     (*relation)[0].kind == "new_axis" &&
-                     (*relation)[1].kind == "full_slice";
-  if (failed(node) || !binding || binding.getLowering() != "expand_dims" ||
-      failed(relation) || (!appendAxis && !prependAxis) || failed(source) ||
-      failed(valid) || failed(fill))
+  if (failed(node) || !binding || failed(relation) || failed(valid) ||
+      failed(fill))
+    return operation.emitOpError("lacks a mechanical cuTile gather binding");
+  if (binding.getLowering() == "ct.indirect_gather" &&
+      isa<intent::ViewType>(operation.getOperand(0).getType())) {
+    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+    FailureOr<std::string> indices = indexTuple(operation, true);
+    if (failed(view) || failed(indices))
+      return failure();
+    StringRef padding = isa<IntegerType, IndexType>(
+                            (*view)->tensor.getElementType())
+                            ? "0"
+                            : "0.0";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.gather(" + (*view)->argument->name + ", " + *indices +
+         ", check_bounds=True, padding_value=" + padding.str() + ")");
+    line(result + " = ct.where(" + valid->str() + ", " + result + ", " +
+         fill->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  FailureOr<StringRef> source = lookupValue(operation, 0);
+  bool expand = binding.getLowering() == "expand_dims" &&
+                llvm::any_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "new_axis";
+                }) &&
+                llvm::all_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "full_slice" || term.kind == "new_axis";
+                });
+  if (!expand || failed(source))
     return operation.emitOpError("lacks a mechanical cuTile gather binding");
   std::string result = makeResultName(operation, 0);
-  std::string expanded =
-      source->str() + (appendAxis ? "[:, None]" : "[None, :]");
+  std::string expanded = source->str() + "[";
+  for (auto [index, term] : llvm::enumerate(*relation)) {
+    if (index)
+      expanded += ", ";
+    expanded += term.kind == "new_axis" ? "None" : ":";
+  }
+  expanded += "]";
   line(result + " = ct.where(" + valid->str() + ", " + expanded + ", " +
        fill->str() + ")");
   bindResult(operation, 0, result);
@@ -2288,8 +2317,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       emitTensorShape(*lhsLoad, 0, permuteLhs);
   FailureOr<std::string> rhsResultShape =
       emitTensorShape(*rhsLoad, 0, permuteRhs);
+  FailureOr<std::string> lhsTile = physicalAxisTile(axes->lhsResult);
+  FailureOr<std::string> rhsTile = physicalAxisTile(axes->rhsResult);
   if (failed(lhsIndex) || failed(rhsIndex) || failed(lhsShape) || failed(rhsShape) ||
-      failed(lhsResultShape) || failed(rhsResultShape))
+      failed(lhsResultShape) || failed(rhsResultShape) || failed(lhsTile) ||
+      failed(rhsTile))
     return failure();
 
   std::string result = makeResultName(operation, 0);
@@ -2299,9 +2331,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         "has no cuTile physical reduction extent binding");
   line("num_tiles_k = ct.cdiv(" + reductionExtent + ", " +
        reductionAxis.getTile().str() + ")");
-  line(result + " = ct.full((" + axes->lhsResult.getTile().str() + ", " +
-       axes->rhsResult.getTile().str() + "), 0, dtype=" + accumulatorDtype +
-       ")");
+  line(result + " = ct.full((" + *lhsTile + ", " + *rhsTile +
+       "), 0, dtype=" + accumulatorDtype + ")");
   std::string operandDtype =
       dtypeName((*lhsView)->tensor.getElementType(), operation);
   if (operandDtype.empty())

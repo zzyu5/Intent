@@ -122,6 +122,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("T.shift_left");
   if (role == "binary_right_shift")
     return StringRef("T.shift_right");
+  if (role == "binary_logical_and")
+    return StringRef("python_logical_and");
+  if (role == "binary_logical_or")
+    return StringRef("python_logical_or");
   if (role == "binary_maximum")
     return StringRef("T.max");
   if (role == "binary_minimum")
@@ -411,10 +415,7 @@ indexRealization(intent::plan::RealizationOp realization,
                            ? "parallel_elements"
                            : "bulk_copy";
     binding.resultSpace = bufferSpace(value.getResultSpace()).str();
-    binding.defer =
-        load && (target::emission::deferSharedContractionTransfer(
-                     index, *operation, value.getResultSpace()) ||
-                 (index.stages.empty() && feedsAtomicValue(*operation)));
+    binding.defer = load && index.stages.empty() && feedsAtomicValue(*operation);
     binding.explicitBounds =
         rowStrided || materializeLogicalBounds ||
         (!index.stages.empty() && store) || *derivedScalar || tensorIndirect ||
@@ -424,6 +425,13 @@ indexRealization(intent::plan::RealizationOp realization,
       return failure();
     }
     index.boundaries[value.getNode()] = binding;
+  }
+  for (auto &entry : index.boundaries) {
+    Operation *operation = kernel.nodes.lookup(entry.first);
+    entry.second.defer =
+        entry.second.defer ||
+        (operation && target::emission::deferSharedContractionTransfer(
+                          index, *operation, entry.second.getResultSpace()));
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks TileLang target or program choices");
@@ -2220,27 +2228,27 @@ SourceEmitter::elementAccessIndices(Operation &operation,
       if (failed(exact))
         return failure();
       if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() != static_cast<int64_t>(tileIndices.size()) ||
+        if (tensor.getRank() > static_cast<int64_t>(tileIndices.size()) ||
             (tileAxis != 0 && !advancedTensorAxesCovered))
           return operation.emitOpError(
-              "TileLang broadcasted tensor indices must jointly cover the transfer rank");
+              "TileLang broadcasted tensor index exceeds the transfer rank");
         auto result = dyn_cast<OpResult>(indexed);
         FailureOr<SmallVector<std::string>> extents =
             result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                    : FailureOr<SmallVector<std::string>>(failure());
-        if (failed(extents) || extents->size() != tileIndices.size())
+        if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor index has no canonical extents");
         std::string element = exact->str() + "[";
-        for (auto [axis, index] : llvm::enumerate(tileIndices)) {
+        for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
           if (axis)
             element += ", ";
-          element += (*extents)[axis] == "1" ? "0" : index;
+          element += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
         }
         element += "]";
         indices.push_back(addressIndex(element));
         if (!advancedTensorAxesCovered) {
-          tileAxis = tileIndices.size();
+          tileAxis = tensor.getRank();
           advancedTensorAxesCovered = true;
         }
       } else {
@@ -2359,26 +2367,26 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
         return failure();
       std::string index;
       if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() != static_cast<int64_t>(tileIndices.size()) ||
+        if (tensor.getRank() > static_cast<int64_t>(tileIndices.size()) ||
             (tileAxis != 0 && !advancedTensorAxesCovered))
           return operation.emitOpError(
-              "TileLang broadcasted tensor bounds must jointly cover the transfer rank");
+              "TileLang broadcasted tensor bounds exceed the transfer rank");
         auto result = dyn_cast<OpResult>(indexed);
         FailureOr<SmallVector<std::string>> extents =
             result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                    : FailureOr<SmallVector<std::string>>(failure());
-        if (failed(extents) || extents->size() != tileIndices.size())
+        if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor bounds have no canonical extents");
         index = exact->str() + "[";
-        for (auto [axis, tileIndex] : llvm::enumerate(tileIndices)) {
+        for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
           if (axis)
             index += ", ";
-          index += (*extents)[axis] == "1" ? "0" : tileIndex;
+          index += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
         }
         index += "]";
         if (!advancedTensorAxesCovered) {
-          tileAxis = tileIndices.size();
+          tileAxis = tensor.getRank();
           advancedTensorAxesCovered = true;
         }
       } else {

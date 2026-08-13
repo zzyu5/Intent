@@ -208,7 +208,11 @@ if [[ ${unfamiliar} == false ]]; then
   cutile:splitk_attention_reduce)
     baseline=source/cutile/tilegym/attention/flash_decode/splitk_reduce.py
     ;;
-  triton:mla_prefill | cutile:mla_prefill | tilelang:mla_prefill)
+  triton:mla_prefill | cutile:mla_prefill | tilelang:mla_prefill | \
+  triton:absorbed_mla_prefill | cutile:absorbed_mla_prefill | tilelang:absorbed_mla_prefill | \
+  triton:mla_head_projection | cutile:mla_head_projection | tilelang:mla_head_projection | \
+  triton:token_sparse_mla_prefill | cutile:token_sparse_mla_prefill | tilelang:token_sparse_mla_prefill | \
+  triton:fp8_mqa_logits | cutile:fp8_mqa_logits | tilelang:fp8_mqa_logits)
     ;;
   cutile:embedding_forward_lookup | tilelang:embedding_forward_lookup)
     ;;

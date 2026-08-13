@@ -104,6 +104,10 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("ct.bitwise_lshift");
   if (role == "binary_right_shift")
     return StringRef("ct.bitwise_rshift");
+  if (role == "binary_logical_and")
+    return StringRef("python_logical_and");
+  if (role == "binary_logical_or")
+    return StringRef("python_logical_or");
   if (role == "binary_maximum")
     return StringRef("ct.maximum");
   if (role == "binary_minimum")
@@ -366,13 +370,24 @@ indexRealization(intent::plan::RealizationOp realization,
                          ? (load ? "gather" : "scatter")
                          : (load ? "load" : "store");
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer =
-        load && target::emission::deferSharedContractionTransfer(
-                    index, *operation, value.getResultSpace());
     binding.explicitBounds =
         rowStrided || raggedBound || (!index.stages.empty() && store) ||
         *derivedScalar;
     index.boundaries[value.getNode()] = binding;
+  }
+  for (auto &entry : index.boundaries) {
+    Operation *operation = kernel.nodes.lookup(entry.first);
+    entry.second.defer =
+        operation && target::emission::deferSharedContractionTransfer(
+                         index, *operation, entry.second.getResultSpace());
+  }
+  for (const auto &entry : index.axes) {
+    const plan::AxisOp &axis = entry.second;
+    if (axis.hasRole("contraction_m") &&
+        axis.getTileRole().starts_with("row_vector") &&
+        !axis.getReuseWorker())
+      return axis.emitOpError(
+          "cuTile does not support a runtime-sized lane as the matrix-M axis");
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks cuTile target or program choices");
@@ -2103,13 +2118,23 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
           return operation.emitOpError(
               "cuTile indirect tensor index has no canonical value");
         if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-          if (tensor.getRank() != projectedTensor.getRank() ||
+          if (tensor.getRank() > projectedTensor.getRank() ||
               (resultAxis != 0 && !advancedTensorAxesCovered))
             return operation.emitOpError(
-                "cuTile broadcasted tensor indices must jointly cover the result rank");
-          indices.push_back(addressIndex(*exact));
+                "cuTile broadcasted tensor index exceeds the result rank");
+          std::string projected = exact->str();
+          if (tensor.getRank() < projectedTensor.getRank()) {
+            projected += "[";
+            for (int64_t axis = 0; axis < projectedTensor.getRank(); ++axis) {
+              if (axis)
+                projected += ", ";
+              projected += axis < tensor.getRank() ? ":" : "None";
+            }
+            projected += "]";
+          }
+          indices.push_back(addressIndex(projected));
           if (!advancedTensorAxesCovered) {
-            resultAxis = projectedTensor.getRank();
+            resultAxis = tensor.getRank();
             advancedTensorAxesCovered = true;
           }
         } else {
@@ -2207,6 +2232,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
   }
   SmallVector<std::string> indices;
   for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
     if (term.kind == "full_slice") {
       indices.push_back("0");
       continue;
