@@ -2448,7 +2448,7 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
             lookupValue(operation, *term.operands.front());
         if (failed(source) || failed(exact))
           return failure();
-        if (source->domain && source->transformed) {
+        if (source->hasDomain() && source->transformed) {
           std::string extent = (*view)->shape[axisNumber];
           if (!planIndex.components.reusedAxes.empty()) {
             if (roleDimensions.lookup("program_0") == extent)

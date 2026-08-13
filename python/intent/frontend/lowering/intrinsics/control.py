@@ -322,8 +322,15 @@ def _members(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 
 
 def _integer_value(lowerer: FunctionLowerer, expression: object, node: ast.AST) -> MlirValue:
-    if isinstance(expression, Literal):
-        return lowerer.materialize(expression, node, ScalarType(intent_index))
+    known, static_value = compile_time_value(expression)
+    if known:
+        if isinstance(static_value, bool) or not isinstance(static_value, int):
+            lowerer.error(node, "domain/partition extent must be an integer constexpr")
+        return lowerer.materialize(
+            Literal(static_value),
+            node,
+            ScalarType(intent_index),
+        )
     value = lowerer.materialize(expression, node)
     if not is_integer(value.type):
         lowerer.error(node, "domain/partition extent must be integer/index")

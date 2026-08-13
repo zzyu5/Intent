@@ -1786,6 +1786,11 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->hasDomain()) {
+    consumer.emitOpError(
+        "cannot resolve multi-axis scalar ownership during Triton emission");
+    return failure();
+  }
   if (scalarSource->opaque) {
     consumer.emitOpError(
         "cannot resolve an opaque index source during Triton emission");
@@ -2143,7 +2148,7 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
             axis != planIndex.axes.end() &&
             target::emission::isPackedScalarAxis(axis->second);
       }
-      if (source->domain && (source->transformed || packedScalar)) {
+      if (source->hasDomain() && (source->transformed || packedScalar)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))

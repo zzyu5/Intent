@@ -1868,6 +1868,11 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->hasDomain()) {
+    consumer.emitOpError(
+        "cannot resolve multi-axis scalar ownership during TileLang emission");
+    return failure();
+  }
   if (scalarSource->opaque) {
     consumer.emitOpError(
         "cannot resolve an opaque index source during TileLang emission");
@@ -2000,6 +2005,11 @@ FailureOr<std::string> SourceEmitter::structuredIndexExpression(
               definition->getAttrOfType<IntegerAttr>("intent.value"))
         return finish(std::to_string(integer.getInt()));
       return finish(failure());
+    }
+    if (!isa<RankedTensorType>(current.getType())) {
+      auto emitted = valueNames.find(current);
+      if (emitted != valueNames.end())
+        return finish(emitted->second);
     }
     if (name == "intent.dim" || name == "intent.region_end") {
       auto emitted = valueNames.find(current);
@@ -2222,9 +2232,11 @@ SourceEmitter::elementAccessIndices(Operation &operation,
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
       auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<std::string> projected =
+          structuredIndexExpression(indexed, operation);
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
-      if (failed(exact))
+      if (failed(exact) && failed(projected))
         return failure();
       if (tensorIndexCount > 1 || tensor.getRank() > 1) {
         if (tensor.getRank() > static_cast<int64_t>(tileIndices.size()) ||
@@ -2238,13 +2250,18 @@ SourceEmitter::elementAccessIndices(Operation &operation,
         if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor index has no canonical extents");
-        std::string element = exact->str() + "[";
-        for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
-          if (axis)
-            element += ", ";
-          element += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+        std::string element;
+        if (succeeded(projected) && tensor.getRank() == 1) {
+          element = *projected + " + " + tileIndices.front();
+        } else {
+          element = exact->str() + "[";
+          for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
+            if (axis)
+              element += ", ";
+            element += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+          }
+          element += "]";
         }
-        element += "]";
         indices.push_back(addressIndex(element));
         if (!advancedTensorAxesCovered) {
           tileAxis = tensor.getRank();
@@ -2255,10 +2272,14 @@ SourceEmitter::elementAccessIndices(Operation &operation,
           return operation.emitOpError(
               "TileLang indirect element access requires one index-tile axis");
         auto assumed = assumedIndexNames.find(indexed);
-        indices.push_back(assumed == assumedIndexNames.end()
-                              ? addressIndex(exact->str() + "[" +
-                                             tileIndices[tileAxis] + "]")
-                              : addressIndex(assumed->second));
+        if (assumed != assumedIndexNames.end())
+          indices.push_back(addressIndex(assumed->second));
+        else if (succeeded(projected))
+          indices.push_back(
+              addressIndex(*projected + " + " + tileIndices[tileAxis]));
+        else
+          indices.push_back(addressIndex(exact->str() + "[" +
+                                         tileIndices[tileAxis] + "]"));
         ++tileAxis;
       }
     } else if (term.kind == "value_index" ||
@@ -2360,9 +2381,11 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
       auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<std::string> projected =
+          structuredIndexExpression(indexed, operation);
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
-      if (failed(exact))
+      if (failed(exact) && failed(projected))
         return failure();
       std::string index;
       if (tensorIndexCount > 1 || tensor.getRank() > 1) {
@@ -2377,13 +2400,17 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
         if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor bounds have no canonical extents");
-        index = exact->str() + "[";
-        for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
-          if (axis)
-            index += ", ";
-          index += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+        if (succeeded(projected) && tensor.getRank() == 1) {
+          index = *projected + " + " + tileIndices.front();
+        } else {
+          index = exact->str() + "[";
+          for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
+            if (axis)
+              index += ", ";
+            index += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+          }
+          index += "]";
         }
-        index += "]";
         if (!advancedTensorAxesCovered) {
           tileAxis = tensor.getRank();
           advancedTensorAxesCovered = true;
@@ -2392,7 +2419,9 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
         if (tensor.getRank() != 1 || tileAxis >= tileIndices.size())
           return operation.emitOpError(
               "TileLang indirect bounds require one index-tile axis");
-        index = exact->str() + "[" + tileIndices[tileAxis++] + "]";
+        index = succeeded(projected)
+                    ? *projected + " + " + tileIndices[tileAxis++]
+                    : exact->str() + "[" + tileIndices[tileAxis++] + "]";
       }
       if (!physicalOnly) {
         predicates.push_back("0 <= " + index);
@@ -2418,7 +2447,7 @@ SourceEmitter::elementBoundsPredicate(Operation &operation,
             axis != planIndex.axes.end() &&
             target::emission::isPackedScalarAxis(axis->second);
       }
-      if (!physicalOnly && source->domain &&
+      if (!physicalOnly && source->hasDomain() &&
           (source->transformed || packedScalar)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
@@ -2588,7 +2617,7 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
           target::traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      if (source->domain && source->transformed) {
+      if (source->hasDomain() && source->transformed) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))

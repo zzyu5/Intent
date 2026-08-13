@@ -532,15 +532,26 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
   SmallVector<std::string> carriers;
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
     FailureOr<StringRef> initial = lookupValue(operation, index + 1);
-    std::string dtype = dtypeName(operation.getResult(index).getType(), operation);
-    if (failed(initial) || dtype.empty())
+    if (failed(initial))
       return failure();
-    std::string carrier =
-        uniqueName("loop_state_" + std::to_string(index), *node);
-    line(carrier + " = T.alloc_local((1,), " + dtype + ")");
-    line(carrier + "[0] = " + initial->str());
-    carriers.push_back(carrier);
-    valueNames[body.getArgument(domains->size() + index)] = carrier + "[0]";
+    Type carrierType = operation.getResult(index).getType();
+    if (carrierType.isIntOrIndexOrFloat()) {
+      std::string dtype = dtypeName(carrierType, operation);
+      if (dtype.empty())
+        return failure();
+      std::string carrier =
+          uniqueName("loop_state_" + std::to_string(index), *node);
+      line(carrier + " = T.alloc_local((1,), " + dtype + ")");
+      line(carrier + "[0] = " + initial->str());
+      carriers.push_back(carrier);
+      valueNames[body.getArgument(domains->size() + index)] = carrier + "[0]";
+    } else if (isa<RankedTensorType>(carrierType)) {
+      carriers.push_back(initial->str());
+      valueNames[body.getArgument(domains->size() + index)] = initial->str();
+    } else {
+      return operation.emitOpError(
+          "has an unsupported TileLang sequential-loop carrier type");
+    }
   }
   loopCarriers[&operation] = carriers;
   for (auto [index, domain] : llvm::enumerate(*domains)) {
@@ -662,8 +673,11 @@ LogicalResult SourceEmitter::leaveFor(Operation &operation) {
     depth += ordered && axis && axis.getRange("traversal", 1) ? 2 : 1;
   }
   indentation -= depth;
-  for (unsigned index = 0; index < operation.getNumResults(); ++index)
-    bindResult(operation, index, carriers->second[index] + "[0]");
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    bool scalar = operation.getResult(index).getType().isIntOrIndexOrFloat();
+    bindResult(operation, index,
+               carriers->second[index] + (scalar ? "[0]" : ""));
+  }
   return success();
 }
 
@@ -759,7 +773,15 @@ LogicalResult SourceEmitter::emitYield(Operation &operation) {
       FailureOr<StringRef> yielded = lookupValue(operation, index);
       if (failed(yielded))
         return failure();
-      line(carriers->second[index] + "[0] = " + yielded->str());
+      bool scalar = owner->getResult(index).getType().isIntOrIndexOrFloat();
+      std::string destination =
+          carriers->second[index] + (scalar ? "[0]" : "");
+      if (*yielded == destination)
+        continue;
+      if (scalar)
+        line(destination + " = " + yielded->str());
+      else
+        line("T.copy(" + yielded->str() + ", " + destination + ")");
     }
     return success();
   }
@@ -2116,7 +2138,7 @@ LogicalResult SourceEmitter::emitConditional(Operation &operation, bool mask) {
       binding.getLowering() != "T.if_then_else" ||
       operation.getNumResults() != 1 ||
       binding.getSpace() != (tensorResult ? "fragment" : "local") ||
-      (mask && !tensorResult) || (!tensorResult && reuse != -1) ||
+      (!tensorResult && reuse != -1) ||
       (tensorResult && reuse != -1 &&
        reuse != static_cast<int64_t>(trueOperand) && reuse != 2))
     return operation.emitOpError(
@@ -2275,6 +2297,20 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   FailureOr<StringRef> operand = lookupValue(operation, 0);
+  auto sourceType = operation.getNumOperands() == 1
+                        ? dyn_cast<RankedTensorType>(
+                              operation.getOperand(0).getType())
+                        : RankedTensorType();
+  auto resultType = operation.getNumResults() == 1
+                        ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                        : RankedTensorType();
+  if (sourceType && resultType && sourceType.getRank() == 1 &&
+      sourceType.getDimSize(0) == 1 && resultType.getRank() == 0) {
+    if (failed(operand))
+      return failure();
+    bindResult(operation, 0, operand->str() + "[0]");
+    return success();
+  }
   auto resultTensor = operation.getNumResults() == 1
                           ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
                           : RankedTensorType();
@@ -3114,6 +3150,39 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       valueExtents(operation.getOperand(1));
   FailureOr<SmallVector<std::string>> resultExtents =
       tensorExtents(operation, 0);
+  auto isolateRepeatedContractionOperand =
+      [&](Value operand, StringRef emitted,
+          unsigned operandNumber) -> FailureOr<std::string> {
+    unsigned contractionUses = llvm::count_if(
+        operand.getUsers(), [](Operation *user) {
+          return user->getName().getStringRef() == "intent.contract";
+        });
+    if (contractionUses <= 1)
+      return emitted.str();
+    auto tensor = dyn_cast<RankedTensorType>(operand.getType());
+    FailureOr<SmallVector<std::string>> extents = valueExtents(operand);
+    if (!tensor || failed(extents) || extents->empty())
+      return operation.emitOpError(
+          "cannot isolate a repeated TileLang contraction operand");
+    std::string dtype = dtypeName(tensor.getElementType(), operation);
+    if (dtype.empty())
+      return failure();
+    std::string isolated = makeResultName(operation, 0) + "_operand_" +
+                           std::to_string(operandNumber);
+    std::string shape = "(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        shape += ", ";
+      shape += extent;
+    }
+    if (extents->size() == 1)
+      shape += ",";
+    shape += ")";
+    line(isolated + " = T.alloc_shared(" + shape + ", " + dtype + ")");
+    line("T.copy(" + emitted.str() + ", " + isolated + ")");
+    line("T.sync_threads()");
+    return isolated;
+  };
   auto reduction = operation.getAttrOfType<ArrayAttr>("intent.reduce");
   auto pair = reduction && reduction.size() == 1
                   ? dyn_cast<ArrayAttr>(reduction[0])
@@ -3138,9 +3207,15 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(lhs) || failed(rhs) || failed(result))
     return failure();
+  FailureOr<std::string> isolatedLhs =
+      isolateRepeatedContractionOperand(operation.getOperand(0), *lhs, 0);
+  FailureOr<std::string> isolatedRhs =
+      isolateRepeatedContractionOperand(operation.getOperand(1), *rhs, 1);
+  if (failed(isolatedLhs) || failed(isolatedRhs))
+    return failure();
   line("T.clear(" + *result + ")");
-  std::string call = "T.gemm(" + lhs->str() + ", " + rhs->str() + ", " +
-                     *result;
+  std::string call =
+      "T.gemm(" + *isolatedLhs + ", " + *isolatedRhs + ", " + *result;
   if (orientation->lhsTranspose)
     call += ", transpose_A=True";
   if (orientation->rhsTranspose)

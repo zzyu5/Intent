@@ -81,6 +81,12 @@ if [[ ${unfamiliar} == false ]]; then
   triton:layer_norm_backward)
     baseline=source/triton/triton/normalization/layer_norm/05-layer-norm.py
     ;;
+  triton:attention_backward | cutile:attention_backward | tilelang:attention_backward)
+    ;;
+  triton:causal_conv1d_backward | cutile:causal_conv1d_backward | tilelang:causal_conv1d_backward)
+    ;;
+  triton:block_sparse_attention | cutile:block_sparse_attention | tilelang:block_sparse_attention)
+    ;;
   triton:rms_norm)
     baseline=source/triton/liger-kernel/normalization/rms_norm/rms_norm_runtime.py
     ;;

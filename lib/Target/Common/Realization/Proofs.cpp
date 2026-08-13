@@ -132,6 +132,12 @@ bool provePaddedUses(Value value, PaddedValue padded,
                padded == PaddedValue::zero) {
         // This input is neutral; consumers realize the result's own padding.
         continue;
+      } else if (logical && logical.getValue() == "subtract" &&
+                 user->getNumOperands() == 2 &&
+                 user->getOperand(1) == value && padded == PaddedValue::zero) {
+        // A zero-padded right operand is neutral for subtraction; the result's
+        // invalid-lane value is determined by the left operand.
+        continue;
       }
     } else {
       return false;

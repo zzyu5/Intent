@@ -1917,6 +1917,11 @@ FailureOr<Operation *> SourceEmitter::resolveDomain(Value indexedValue,
     return failure();
   if (scalarSource->domain)
     return scalarSource->domain;
+  if (scalarSource->hasDomain()) {
+    consumer.emitOpError(
+        "cannot resolve multi-axis scalar ownership during cuTile emission");
+    return failure();
+  }
   if (scalarSource->opaque) {
     consumer.emitOpError(
         "cannot resolve an opaque index source during cuTile emission");

@@ -8,6 +8,22 @@ import torch.nn.functional as F
 
 import intent
 from intent.targets.base import Target
+from kernels.backward.attention import BATCH as BWD_ATTENTION_BATCH
+from kernels.backward.attention import HEAD_DIMENSION as BWD_ATTENTION_DIMENSION
+from kernels.backward.attention import HEAD_GROUP as BWD_ATTENTION_HEAD_GROUP
+from kernels.backward.attention import KV_HEADS as BWD_ATTENTION_KV_HEADS
+from kernels.backward.attention import QUERY_HEADS as BWD_ATTENTION_QUERY_HEADS
+from kernels.backward.attention import SCALE as BWD_ATTENTION_SCALE
+from kernels.backward.attention import SEQUENCE as BWD_ATTENTION_SEQUENCE
+from kernels.backward.attention import attention_backward_delta
+from kernels.backward.attention import attention_backward_dkdv
+from kernels.backward.attention import attention_backward_dq
+from kernels.backward.causal_conv import BATCH as BWD_CAUSAL_CONV_BATCH
+from kernels.backward.causal_conv import CHANNELS as BWD_CAUSAL_CONV_CHANNELS
+from kernels.backward.causal_conv import LENGTH as BWD_CAUSAL_CONV_LENGTH
+from kernels.backward.causal_conv import WIDTH as BWD_CAUSAL_CONV_WIDTH
+from kernels.backward.causal_conv import causal_conv1d_backward_partials
+from kernels.backward.causal_conv import causal_conv1d_backward_reduce
 from kernels.activation.swiglu import FEATURES as SWIGLU_FORWARD_FEATURES
 from kernels.activation.swiglu import TOKENS as SWIGLU_FORWARD_TOKENS
 from kernels.activation.swiglu import swiglu_forward
@@ -211,6 +227,18 @@ from kernels.streaming.paged_attention import QUERY_HEADS as PAGED_QUERY_HEADS
 from kernels.streaming.paged_attention import SCALE as PAGED_SCALE
 from kernels.streaming.paged_attention import SEQUENCE_LENGTHS as PAGED_SEQUENCE_LENGTHS
 from kernels.streaming.paged_attention import paged_gqa_decode_attention
+from kernels.streaming.block_sparse_attention import BATCH as BLOCK_SPARSE_BATCH
+from kernels.streaming.block_sparse_attention import BLOCK_SIZE as BLOCK_SPARSE_BLOCK_SIZE
+from kernels.streaming.block_sparse_attention import HEAD_DIMENSION as BLOCK_SPARSE_DIMENSION
+from kernels.streaming.block_sparse_attention import HEAD_GROUP as BLOCK_SPARSE_HEAD_GROUP
+from kernels.streaming.block_sparse_attention import KV_HEADS as BLOCK_SPARSE_KV_HEADS
+from kernels.streaming.block_sparse_attention import QUERY_HEADS as BLOCK_SPARSE_QUERY_HEADS
+from kernels.streaming.block_sparse_attention import SCALE as BLOCK_SPARSE_SCALE
+from kernels.streaming.block_sparse_attention import SELECTED_BLOCKS as BLOCK_SPARSE_SELECTED_BLOCKS
+from kernels.streaming.block_sparse_attention import SEQUENCE as BLOCK_SPARSE_SEQUENCE
+from kernels.streaming.block_sparse_attention import SPLITS as BLOCK_SPARSE_SPLITS
+from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_combine
+from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.selective_scan import BATCH as SELECTIVE_SCAN_BATCH
 from kernels.streaming.selective_scan import LENGTH as SELECTIVE_SCAN_LENGTH
 from kernels.streaming.selective_scan import selective_state_scan
@@ -1971,6 +1999,225 @@ def _run_layer_norm_backward(
         )
 
 
+def _run_attention_backward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape_q = (
+        BWD_ATTENTION_BATCH,
+        BWD_ATTENTION_QUERY_HEADS,
+        BWD_ATTENTION_SEQUENCE,
+        BWD_ATTENTION_DIMENSION,
+    )
+    shape_kv = (
+        BWD_ATTENTION_BATCH,
+        BWD_ATTENTION_KV_HEADS,
+        BWD_ATTENTION_SEQUENCE,
+        BWD_ATTENTION_DIMENSION,
+    )
+    q = torch.randn(shape_q, device="cuda", dtype=torch.float16) * 0.5
+    k = torch.randn(shape_kv, device="cuda", dtype=torch.float16) * 0.5
+    v = torch.randn(shape_kv, device="cuda", dtype=torch.float16) * 0.5
+    grad_output = torch.randn_like(q) * 0.05
+
+    q_reference = q.float().detach().requires_grad_(True)
+    k_reference = k.float().detach().requires_grad_(True)
+    v_reference = v.float().detach().requires_grad_(True)
+    expanded_k = k_reference.repeat_interleave(BWD_ATTENTION_HEAD_GROUP, dim=1)
+    expanded_v = v_reference.repeat_interleave(BWD_ATTENTION_HEAD_GROUP, dim=1)
+    scores = torch.matmul(q_reference, expanded_k.transpose(-2, -1))
+    scores = scores * BWD_ATTENTION_SCALE
+    causal = torch.ones(
+        (BWD_ATTENTION_SEQUENCE, BWD_ATTENTION_SEQUENCE),
+        device="cuda",
+        dtype=torch.bool,
+    ).tril()
+    scores = scores.masked_fill(~causal, -float("inf"))
+    probability = torch.softmax(scores, dim=-1)
+    reference_output_f32 = torch.matmul(probability, expanded_v)
+    reference_output_f32.backward(grad_output.float())
+    expected = (
+        q_reference.grad.to(torch.float16),
+        k_reference.grad.to(torch.float16),
+        v_reference.grad.to(torch.float16),
+    )
+    output = reference_output_f32.detach().to(torch.float16)
+    lse = (
+        torch.logsumexp(scores.detach(), dim=-1) * math.log2(math.e)
+    ).to(torch.float32)
+
+    delta_artifact = intent.compile(
+        attention_backward_delta, target=target, compiler=compiler
+    )
+    constexprs = {"HEAD_GROUP": BWD_ATTENTION_HEAD_GROUP, "CAUSAL": True}
+    dkdv_artifact = intent.compile(
+        attention_backward_dkdv,
+        target=target,
+        compiler=compiler,
+        constexprs=constexprs,
+    )
+    dq_artifact = intent.compile(
+        attention_backward_dq,
+        target=target,
+        compiler=compiler,
+        constexprs=constexprs,
+    )
+    delta = torch.empty(
+        shape_q[:-1], device="cuda", dtype=torch.float32
+    )
+    grad_q = torch.empty_like(q)
+    grad_k = torch.empty_like(k)
+    grad_v = torch.empty_like(v)
+    delta_call = prepare_kernel_call(
+        delta_artifact, (output, grad_output), delta
+    )
+    common = (q, k, v, grad_output, lse, delta, BWD_ATTENTION_SCALE)
+    dkdv_call = prepare_kernel_call(
+        dkdv_artifact, common, (grad_k, grad_v)
+    )
+    dq_call = prepare_kernel_call(dq_artifact, common, grad_q)
+
+    def generated_pipeline() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        delta_call()
+        dkdv_call()
+        dq_call()
+        return grad_q, grad_k, grad_v
+
+    generated = generated_pipeline()
+    torch.cuda.synchronize()
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if errors[0] > 1.25e-1 or errors[1] > 2.5e-1 or errors[2] > 1.25e-1:
+        raise RuntimeError(
+            f"{target_name} attention backward numerical comparison failed: {errors}"
+        )
+    p50, p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    for artifact in (delta_artifact, dkdv_artifact, dq_artifact):
+        print_artifact(artifact, target_name)
+    print(
+        f"{target_name} attention backward numerical comparison: PASS "
+        f"(dq/dk/dv errors={errors})"
+    )
+    print(
+        f"{target_name} attention backward end-to-end GPU pipeline performance "
+        f"(CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} attention backward upstream baseline: unavailable")
+
+
+def _run_causal_conv1d_backward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape = (
+        BWD_CAUSAL_CONV_BATCH,
+        BWD_CAUSAL_CONV_CHANNELS,
+        BWD_CAUSAL_CONV_LENGTH,
+    )
+    x = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    weight = torch.randn(
+        (BWD_CAUSAL_CONV_CHANNELS, BWD_CAUSAL_CONV_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    grad_output = torch.randn_like(x) * 0.05
+    x_reference = x.float().detach().requires_grad_(True)
+    weight_reference = weight.float().detach().requires_grad_(True)
+    bias_reference = torch.zeros(
+        (BWD_CAUSAL_CONV_CHANNELS,),
+        device="cuda",
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    expected_output = F.conv1d(
+        x_reference,
+        weight_reference[:, None, :],
+        bias=bias_reference,
+        padding=BWD_CAUSAL_CONV_WIDTH - 1,
+        groups=BWD_CAUSAL_CONV_CHANNELS,
+    )[..., :BWD_CAUSAL_CONV_LENGTH]
+    expected_output.backward(grad_output.float())
+    expected = (
+        x_reference.grad.to(torch.float16),
+        weight_reference.grad,
+        bias_reference.grad,
+    )
+
+    partial_artifact = intent.compile(
+        causal_conv1d_backward_partials, target=target, compiler=compiler
+    )
+    reduce_artifact = intent.compile(
+        causal_conv1d_backward_reduce, target=target, compiler=compiler
+    )
+    grad_x = torch.empty_like(x)
+    partial_weight = torch.empty(
+        (
+            BWD_CAUSAL_CONV_BATCH,
+            BWD_CAUSAL_CONV_CHANNELS,
+            BWD_CAUSAL_CONV_WIDTH,
+        ),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    partial_bias = torch.empty(
+        (BWD_CAUSAL_CONV_BATCH, BWD_CAUSAL_CONV_CHANNELS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    grad_weight = torch.empty_like(weight, dtype=torch.float32)
+    grad_bias = torch.empty(
+        (BWD_CAUSAL_CONV_CHANNELS,), device="cuda", dtype=torch.float32
+    )
+    partial_call = prepare_kernel_call(
+        partial_artifact,
+        (x, weight, grad_output),
+        (grad_x, partial_weight, partial_bias),
+    )
+    reduce_call = prepare_kernel_call(
+        reduce_artifact,
+        (partial_weight, partial_bias),
+        (grad_weight, grad_bias),
+    )
+
+    def generated_pipeline() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        partial_call()
+        reduce_call()
+        return grad_x, grad_weight, grad_bias
+
+    generated = generated_pipeline()
+    torch.cuda.synchronize()
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if errors[0] > 2.5e-3 or errors[1] > 2.5e-1 or errors[2] > 2.5e-1:
+        raise RuntimeError(
+            f"{target_name} causal conv1d backward numerical comparison failed: {errors}"
+        )
+    p50, p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    for artifact in (partial_artifact, reduce_artifact):
+        print_artifact(artifact, target_name)
+    print(
+        f"{target_name} causal conv1d backward numerical comparison: PASS "
+        f"(dx/dw/db errors={errors})"
+    )
+    print(
+        f"{target_name} causal conv1d backward end-to-end GPU pipeline performance "
+        f"(CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} causal conv1d backward upstream baseline: unavailable")
+
+
 def _run_layer_norm(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -2904,6 +3151,164 @@ def _run_paged_attention(
     )
 
 
+def _run_block_sparse_attention(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("block-sparse attention has no comparable upstream adapter")
+    q = torch.randn(
+        (BLOCK_SPARSE_BATCH, BLOCK_SPARSE_QUERY_HEADS, BLOCK_SPARSE_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    k = torch.randn(
+        (
+            BLOCK_SPARSE_BATCH,
+            BLOCK_SPARSE_SEQUENCE,
+            BLOCK_SPARSE_KV_HEADS,
+            BLOCK_SPARSE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    total_blocks = BLOCK_SPARSE_SEQUENCE // BLOCK_SPARSE_BLOCK_SIZE
+    selected_base = torch.arange(
+        total_blocks - 1,
+        total_blocks - BLOCK_SPARSE_SELECTED_BLOCKS - 1,
+        -1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_indices = torch.empty(
+        (
+            BLOCK_SPARSE_BATCH,
+            BLOCK_SPARSE_KV_HEADS,
+            BLOCK_SPARSE_SELECTED_BLOCKS,
+        ),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    for batch in range(BLOCK_SPARSE_BATCH):
+        for key_head in range(BLOCK_SPARSE_KV_HEADS):
+            block_indices[batch, key_head] = torch.roll(
+                selected_base, shifts=(batch + key_head) % BLOCK_SPARSE_SELECTED_BLOCKS
+            )
+    cache_lengths = torch.tensor(
+        [BLOCK_SPARSE_SEQUENCE - 3 * index for index in range(BLOCK_SPARSE_BATCH)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    split_offsets = torch.arange(
+        0,
+        BLOCK_SPARSE_SELECTED_BLOCKS + 1,
+        BLOCK_SPARSE_SELECTED_BLOCKS // BLOCK_SPARSE_SPLITS,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    partial_artifact = intent.compile(
+        block_sparse_gqa_decode_partials,
+        target=target,
+        compiler=compiler,
+        constexprs={
+            "HEAD_GROUP": BLOCK_SPARSE_HEAD_GROUP,
+            "BLOCK_SIZE": BLOCK_SPARSE_BLOCK_SIZE,
+            "SPLITS": BLOCK_SPARSE_SPLITS,
+        },
+    )
+    combine_artifact = intent.compile(
+        block_sparse_gqa_decode_combine,
+        target=target,
+        compiler=compiler,
+    )
+    partial_lse = torch.empty(
+        (
+            BLOCK_SPARSE_BATCH,
+            BLOCK_SPARSE_QUERY_HEADS,
+            BLOCK_SPARSE_SPLITS,
+        ),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    partial_output = torch.empty(
+        (
+            BLOCK_SPARSE_BATCH,
+            BLOCK_SPARSE_QUERY_HEADS,
+            BLOCK_SPARSE_SPLITS,
+            BLOCK_SPARSE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    output = torch.empty_like(q)
+    partial_call = prepare_kernel_call(
+        partial_artifact,
+        (q, k, v, block_indices, cache_lengths, split_offsets, BLOCK_SPARSE_SCALE),
+        (partial_lse, partial_output),
+    )
+    combine_call = prepare_kernel_call(
+        combine_artifact,
+        (partial_lse, partial_output),
+        output,
+    )
+
+    def generated_pipeline() -> torch.Tensor:
+        partial_call()
+        combine_call()
+        return output
+
+    def reference() -> torch.Tensor:
+        expected = torch.empty_like(q)
+        token_offsets = torch.arange(
+            BLOCK_SPARSE_BLOCK_SIZE, device="cuda", dtype=torch.int64
+        )
+        for batch in range(BLOCK_SPARSE_BATCH):
+            cache_length = int(cache_lengths[batch].item())
+            for query_head in range(BLOCK_SPARSE_QUERY_HEADS):
+                key_head = query_head // BLOCK_SPARSE_HEAD_GROUP
+                tokens = (
+                    block_indices[batch, key_head].long()[:, None]
+                    * BLOCK_SPARSE_BLOCK_SIZE
+                    + token_offsets[None, :]
+                ).reshape(-1)
+                tokens = tokens[tokens < cache_length]
+                scores = (
+                    q[batch, query_head].float()
+                    @ k[batch, tokens, key_head].float().transpose(0, 1)
+                ) * BLOCK_SPARSE_SCALE
+                probability = torch.softmax(scores, dim=0)
+                expected[batch, query_head] = (
+                    probability @ v[batch, tokens, key_head].float()
+                ).to(torch.float16)
+        return expected
+
+    actual = generated_pipeline()
+    expected = reference()
+    torch.cuda.synchronize()
+    error = (actual - expected).abs().max().item()
+    if error > 7.5e-2:
+        raise RuntimeError(
+            f"{target_name} block-sparse GQA decode numerical comparison failed: {error}"
+        )
+    p50, p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    for artifact in (partial_artifact, combine_artifact):
+        print_artifact(artifact, target_name)
+    print(
+        f"{target_name} block-sparse GQA decode numerical comparison: PASS "
+        f"(generated/reference={error})"
+    )
+    print(
+        f"{target_name} block-sparse GQA decode end-to-end GPU pipeline performance "
+        f"(CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} block-sparse GQA decode upstream baseline: unavailable")
+
+
 def _run_attention_bias(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -3603,13 +4008,16 @@ def _run_scaled_index_add(
 EXTENDED_RUNNERS: dict[str, Runner] = {
     "absorbed_mla_prefill": _run_absorbed_mla_prefill,
     "attention_bias": _run_attention_bias,
+    "attention_backward": _run_attention_backward,
     "atomic_compare_exchange": _run_atomic_compare_exchange,
     "batched_row_affine": _run_batched_row_affine,
     "batched_gemm": _run_batched_gemm,
     "bf16_gemm": _run_bf16_gemm,
     "block_scaled_matmul": _run_block_scaled_matmul,
+    "block_sparse_attention": _run_block_sparse_attention,
     "boolean_reduction": _run_boolean_reduction,
     "causal_conv1d": _run_causal_conv1d,
+    "causal_conv1d_backward": _run_causal_conv1d_backward,
     "conv1d": _run_conv1d,
     "conv2d": _run_conv2d,
     "continuous_gqa_decode": _run_continuous_gqa_decode,

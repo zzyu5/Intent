@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from intent.frontend.semantics import DimExpr
 from intent.frontend.semantics import DynamicDim
+from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import SymbolDim
@@ -108,20 +109,25 @@ def lower_shape(lowerer: FunctionLowerer, node: ast.AST) -> tuple[DimExpr, ...]:
     for element in elements:
         if isinstance(element, ShapeDimension):
             dimensions.append(element.dimension)
-        elif isinstance(element, MlirValue) and isinstance(element.type, RegionType):
-            dimensions.extend(lowerer.dynamic_shape_for_region(element))
-        elif isinstance(element, Literal) and isinstance(element.value, int) and not isinstance(
-            element.value, bool
+        elif isinstance(element, MlirValue) and isinstance(
+            element.type, (DomainType, RegionType)
         ):
-            if element.value < 0:
-                lowerer.error(node, "shape dimensions must be non-negative")
-            dimensions.append(StaticDim(element.value))
-        elif isinstance(element, str):
-            dimensions.append(SymbolDim(element))
-        elif element is Ellipsis:
-            dimensions.append(DynamicDim("reshape_inferred"))
+            dimensions.extend(lowerer.dynamic_shape_for_region(element))
         else:
-            lowerer.error(node, "shape elements must be static, symbolic, shape-derived, or region")
+            known, value = compile_time_value(element)
+            if known and isinstance(value, int) and not isinstance(value, bool):
+                if value < 0:
+                    lowerer.error(node, "shape dimensions must be non-negative")
+                dimensions.append(StaticDim(value))
+            elif isinstance(element, str):
+                dimensions.append(SymbolDim(element))
+            elif element is Ellipsis:
+                dimensions.append(DynamicDim("reshape_inferred"))
+            else:
+                lowerer.error(
+                    node,
+                    "shape elements must be static, symbolic, shape-derived, or region",
+                )
     return tuple(dimensions)
 
 

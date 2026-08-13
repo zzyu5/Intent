@@ -72,9 +72,10 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
           traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      if (source->domain) {
-        if (!llvm::is_contained(domains, source->domain))
-          domains.push_back(source->domain);
+      if (source->hasDomain()) {
+        for (Operation *domain : source->domains)
+          if (!llvm::is_contained(domains, domain))
+            domains.push_back(domain);
       } else if (source->opaque) {
         hasOpaqueScalarIndex = true;
       }
@@ -632,12 +633,16 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
         ++sourceAxis;
         continue;
       }
-      if (source->opaque && !source->domain) {
+      if (source->opaque && !source->hasDomain()) {
         return operation.emitOpError(
             "opaque scalar index requires a preceding I.assume_in_bounds declaration");
       }
       if (source->transformed)
         return true;
+      if (!source->hasDomain()) {
+        ++sourceAxis;
+        continue;
+      }
       if (!source->domain) {
         ++sourceAxis;
         continue;
@@ -1177,11 +1182,45 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
   if (!result)
     return success();
-  FailureOr<SmallVector<LogicalAxis>> axes =
-      axesFromResultShape(operation, 0, facts);
-  if (failed(axes))
+  FailureOr<SmallVector<StringRef>> labels = resultShapeLabels(operation, 0);
+  if (failed(labels))
     return failure();
-  return bindResultAxes(operation, 0, std::move(*axes), facts);
+  SmallVector<LogicalAxis> axes(result.getRank(), LogicalAxis{nullptr, "1"});
+  for (Value operand : operation.getOperands()) {
+    auto source = facts.valueAxes.find(operand);
+    if (source == facts.valueAxes.end())
+      continue;
+    if (source->second.size() > axes.size())
+      return operation.emitOpError(
+          "pointwise operand provenance rank exceeds the result rank");
+    size_t offset = axes.size() - source->second.size();
+    for (auto [position, axis] : llvm::enumerate(source->second)) {
+      LogicalAxis &destination = axes[offset + position];
+      if (destination.extent == "1")
+        destination = axis;
+      else if (axis.extent != "1" && destination != axis) {
+        bool sameExtent = destination.extent == axis.extent;
+        bool implicitAlias = sameExtent &&
+                             (!destination.domain || !axis.domain);
+        if (!implicitAlias)
+          return operation.emitOpError(
+              "pointwise operands have incompatible logical-axis provenance");
+        if (!destination.domain)
+          destination = axis;
+      }
+    }
+  }
+  if (labels->size() != axes.size())
+    return operation.emitOpError(
+        "pointwise result shape does not match its tensor rank");
+  for (auto [position, label] : llvm::enumerate(*labels))
+    if (axes[position].extent == "1" && label != "1") {
+      FailureOr<LogicalAxis> fallback = axisFromLabel(label, facts, operation);
+      if (failed(fallback))
+        return failure();
+      axes[position] = *fallback;
+    }
+  return bindResultAxes(operation, 0, std::move(axes), facts);
 }
 
 bool isUnitAxis(const LogicalAxis &axis, const KernelFacts &facts) {
@@ -1462,20 +1501,26 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   if (failed(addHandler(
           registry, "intent.partition", [&](Operation &operation) -> LogicalResult {
-            if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
+            if ((operation.getNumOperands() != 1 &&
+                 operation.getNumOperands() != 2) ||
+                operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical partition schema");
             Operation *domain = operation.getOperand(0).getDefiningOp();
-            if (!domain || !facts.domainSourceAxes.count(domain))
+            if (!domain || (!facts.domainSourceAxes.count(domain) &&
+                            !facts.staticDomainExtents.count(domain)))
               return operation.emitOpError(
                   "tiled partitions currently require a source domain");
             auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
             auto extent =
                 operation.getAttrOfType<DictionaryAttr>("intent.extent");
             auto name = extent ? extent.getAs<StringAttr>("name") : StringAttr();
-            if (!mode || mode.getValue() != "extent" || !name ||
-                name.getValue().empty())
+            bool namedAuto = name && !name.getValue().empty();
+            bool fixedExtent = operation.getNumOperands() == 2 &&
+                               integerConstant(operation.getOperand(1));
+            if (!mode || mode.getValue() != "extent" ||
+                (!namedAuto && !fixedExtent))
               return operation.emitOpError(
-                  "tiled partitions require a named auto extent");
+                  "tiled partitions require a named auto or fixed extent");
             facts.partitionDomains[&operation] = domain;
             return success();
           })))
@@ -1548,16 +1593,28 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "sequential loop must yield every carried value");
             for (unsigned index = 0; index < operation.getNumResults(); ++index) {
-              Type initial = operation.getOperand(index + 1).getType();
+              Value initialValue = operation.getOperand(index + 1);
+              Type initial = initialValue.getType();
               Type argument = operation.getRegion(0).front()
                                   .getArgument(domains->size() + index)
                                   .getType();
               Type result = operation.getResult(index).getType();
-              if (!initial.isIntOrIndexOrFloat() || initial != argument ||
+              if ((!initial.isIntOrIndexOrFloat() &&
+                   !isa<RankedTensorType>(initial)) ||
+                  initial != argument ||
                   initial != result ||
                   terminator.getOperand(index).getType() != result)
                 return operation.emitOpError(
-                    "sequential loop currently requires scalar type-stable carried values");
+                    "sequential loop requires scalar or tensor type-stable carried values");
+              if (isa<RankedTensorType>(initial)) {
+                auto axes = facts.valueAxes.find(initialValue);
+                if (axes == facts.valueAxes.end())
+                  return operation.emitOpError(
+                      "tensor loop state has no logical-axis provenance");
+                facts.valueAxes[operation.getRegion(0).front().getArgument(
+                    domains->size() + index)] = axes->second;
+                facts.valueAxes[operation.getResult(index)] = axes->second;
+              }
             }
             if (ordered)
               for (Operation *domain : *domains) {
@@ -1566,8 +1623,31 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               }
             return success();
           };
-  if (failed(addHandler(registry, "intent.for", analyzeSequentialLoop)) ||
-      failed(addHandler(registry, "intent.ordered", analyzeSequentialLoop)))
+  auto leaveSequentialLoop = [&](Operation &operation) -> LogicalResult {
+    FailureOr<SmallVector<Operation *>> domains =
+        expandDomainSource(operation.getOperand(0), operation);
+    if (failed(domains))
+      return failure();
+    Operation &terminator = operation.getRegion(0).front().back();
+    for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+      Value initial = operation.getOperand(index + 1);
+      if (!isa<RankedTensorType>(initial.getType()))
+        continue;
+      Value yielded = terminator.getOperand(index);
+      auto initialAxes = facts.valueAxes.find(initial);
+      auto yieldedAxes = facts.valueAxes.find(yielded);
+      if (initialAxes == facts.valueAxes.end() ||
+          yieldedAxes == facts.valueAxes.end() ||
+          yieldedAxes->second != initialAxes->second)
+        return operation.emitOpError(
+            "yielded tensor loop state changes its logical axis identity");
+    }
+    return success();
+  };
+  OperationHandler sequentialLoopHandler{analyzeSequentialLoop,
+                                         leaveSequentialLoop};
+  if (failed(registry.add("intent.for", sequentialLoopHandler)) ||
+      failed(registry.add("intent.ordered", sequentialLoopHandler)))
     return failure();
 
   if (failed(addHandler(
@@ -1775,7 +1855,10 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                ? dyn_cast<RankedTensorType>(
                                      operation.getOperand(3).getType())
                                : RankedTensorType();
-            if (!outer || !facts.domainSourceAxes.count(outer) || !members ||
+            bool supportedOuter =
+                outer && (facts.domainSourceAxes.count(outer) ||
+                          facts.staticDomainExtents.count(outer));
+            if (!supportedOuter || !members ||
                 !facts.domainSourceAxes.count(members) || !offsets ||
                 offsets.getRank() != 1 ||
                 !isa<IntegerType, IndexType>(offsets.getElementType()) ||
@@ -1814,9 +1897,16 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "does not reference one unresolved ragged relation");
             Operation *source = found->second.outerSource;
-            facts.domainSources[&operation] = facts.domainSources.lookup(source);
-            facts.domainSourceAxes[&operation] =
-                facts.domainSourceAxes.lookup(source);
+            if (facts.staticDomainExtents.count(source)) {
+              facts.staticDomainExtents[&operation] =
+                  facts.staticDomainExtents.lookup(source);
+              facts.staticDomainBounds[&operation] =
+                  facts.staticDomainBounds.lookup(source);
+            } else {
+              facts.domainSources[&operation] = facts.domainSources.lookup(source);
+              facts.domainSourceAxes[&operation] =
+                  facts.domainSourceAxes.lookup(source);
+            }
             found->second.outerDomain = &operation;
             facts.raggedOuterRelations[&operation] = relation;
             return success();
@@ -1840,10 +1930,16 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (succeeded(selector) && !found->second.outerDomain) {
               Operation *outerSource = found->second.outerSource;
               Value selectorSource = facts.domainSources.lookup(*selector);
-              if (outerSource && selectorSource &&
+              bool sameDynamicSource =
+                  outerSource && selectorSource &&
                   facts.domainSources.lookup(outerSource) == selectorSource &&
                   facts.domainSourceAxes.lookup(outerSource) ==
-                      facts.domainSourceAxes.lookup(*selector)) {
+                      facts.domainSourceAxes.lookup(*selector);
+              bool sameStaticDomain =
+                  outerSource && facts.staticDomainBounds.count(outerSource) &&
+                  facts.staticDomainBounds.lookup(outerSource) ==
+                      facts.staticDomainBounds.lookup(*selector);
+              if (sameDynamicSource || sameStaticDomain) {
                 found->second.outerDomain = *selector;
                 facts.raggedOuterRelations[*selector] = relation;
               }

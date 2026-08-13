@@ -17,10 +17,12 @@ struct IndexTerm {
 
 struct ScalarIndexSource {
   mlir::Operation *domain = nullptr;
+  llvm::SmallVector<mlir::Operation *> domains;
   bool opaque = false;
   bool transformed = false;
 
-  bool isStatic() const { return !domain && !opaque; }
+  bool isStatic() const { return domains.empty() && !opaque; }
+  bool hasDomain() const { return !domains.empty(); }
 };
 
 mlir::FailureOr<llvm::SmallVector<IndexTerm>>

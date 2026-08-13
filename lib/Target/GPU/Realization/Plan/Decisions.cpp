@@ -65,6 +65,13 @@ Operation *nearestParallel(Operation *operation) {
 
 FailureOr<std::string> sourceDimensionSymbol(Operation &domain,
                                              const target::KernelFacts &facts) {
+  auto staticExtent = facts.staticDomainExtents.find(&domain);
+  if (staticExtent != facts.staticDomainExtents.end())
+    return std::to_string(staticExtent->second);
+  auto staticBounds = facts.staticDomainBounds.find(&domain);
+  if (staticBounds != facts.staticDomainBounds.end())
+    return std::to_string(staticBounds->second.second -
+                          staticBounds->second.first);
   Value source = facts.domainSources.lookup(&domain);
   int64_t axis = facts.domainSourceAxes.lookup(&domain);
   auto argument = llvm::find_if(facts.kernel.abi.arguments,
@@ -503,9 +510,17 @@ assignAxes(const target::KernelFacts &facts) {
       addRange(choice, "lane", 0, packedTile);
     } else if (hasRole(choice.roles, "lane")) {
       auto extent = facts.staticDomainExtents.find(choice.domain);
-      if (extent != facts.staticDomainExtents.end()) {
+      auto bounds = facts.staticDomainBounds.find(choice.domain);
+      std::optional<int64_t> staticExtent =
+          extent != facts.staticDomainExtents.end()
+              ? std::optional<int64_t>(extent->second)
+          : bounds != facts.staticDomainBounds.end()
+              ? std::optional<int64_t>(bounds->second.second -
+                                       bounds->second.first)
+              : std::nullopt;
+      if (staticExtent) {
         int64_t physical = 1;
-        while (physical < extent->second)
+        while (physical < *staticExtent)
           physical *= 2;
         addRange(choice, "lane", 0,
                  "fixed_" + std::to_string(physical));
@@ -593,8 +608,24 @@ assignAxes(const target::KernelFacts &facts) {
     auto found = facts.parallelDomains.find(parallel);
     return found != facts.parallelDomains.end() && found->second.size() == 1;
   };
+  bool hasDelegatedTileChoice = llvm::any_of(choices, [](const AxisChoice &choice) {
+    return llvm::any_of(choice.ranges, [](const AxisChoice::RangeChoice &range) {
+      return range.tile != "one" && !StringRef(range.tile).starts_with("fixed_");
+    });
+  });
+  Operation *outerProgram = nullptr;
+  for (const target::RegionNode &region : facts.kernel.regions.nodes)
+    if (region.operation->getName().getStringRef() == "intent.parallel" &&
+        !region.parent) {
+      outerProgram = region.operation;
+      break;
+    }
   for (AxisChoice &choice : choices)
     choice.reuse = choice.programOrder && !choice.tiled && !choice.packedLane &&
+                   !hasDelegatedTileChoice &&
+                   llvm::all_of(choice.parallels, [&](Operation *parallel) {
+                     return parallel == outerProgram;
+                   }) &&
                    llvm::all_of(choice.parallels, ownsOneDomain) &&
                    independentLaneCount(choice, facts) == 1;
 

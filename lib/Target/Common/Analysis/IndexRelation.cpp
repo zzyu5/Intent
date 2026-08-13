@@ -27,7 +27,7 @@ LogicalResult collectDomainSource(Value source,
     return success();
   }
   if (name == "intent.partition") {
-    if (definition->getNumOperands() != 1)
+    if (definition->getNumOperands() < 1 || definition->getNumOperands() > 2)
       return fail();
     return collectDomainSource(definition->getOperand(0), domains, consumer);
   }
@@ -83,18 +83,18 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
     return source;
   };
   if (Operation *domain = structuralDomain(value))
-    return finish(ScalarIndexSource{domain, false});
+    return finish(ScalarIndexSource{domain, {domain}, false, false});
   Operation *definition = value.getDefiningOp();
   if (!definition)
-    return finish(ScalarIndexSource{nullptr, true});
+    return finish(ScalarIndexSource{nullptr, {}, true, false});
   StringRef name = definition->getName().getStringRef();
   if (name == "intent.constant")
     return finish(ScalarIndexSource{});
   bool transparent = name == "intent.binary" || name == "intent.unary" ||
                      name == "intent.cast";
   if (!transparent || isa<RankedTensorType>(value.getType()))
-    return finish(ScalarIndexSource{nullptr, true});
-  Operation *uniqueDomain = nullptr;
+    return finish(ScalarIndexSource{nullptr, {}, true, false});
+  SmallVector<Operation *> domains;
   bool opaque = false;
   for (Value operand : definition->getOperands()) {
     FailureOr<ScalarIndexSource> source =
@@ -104,16 +104,12 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
       return failure();
     }
     opaque |= source->opaque;
-    if (!source->domain)
-      continue;
-    if (uniqueDomain && uniqueDomain != source->domain) {
-      active.erase(value);
-      return definition->emitOpError(
-          "combines scalar indices owned by different logical axes");
-    }
-    uniqueDomain = source->domain;
+    for (Operation *domain : source->domains)
+      if (!llvm::is_contained(domains, domain))
+        domains.push_back(domain);
   }
-  return finish(ScalarIndexSource{uniqueDomain, opaque, true});
+  Operation *uniqueDomain = domains.size() == 1 ? domains.front() : nullptr;
+  return finish(ScalarIndexSource{uniqueDomain, std::move(domains), opaque, true});
 }
 
 } // namespace
@@ -229,7 +225,7 @@ FailureOr<bool> hasDerivedScalarIndex(Operation &operation) {
         traceScalarIndexSource(indexed, operation);
     if (failed(source))
       return failure();
-    if (source->domain && source->transformed)
+    if (source->hasDomain() && source->transformed)
       return true;
   }
   return false;

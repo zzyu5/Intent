@@ -68,6 +68,15 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
         if {"program_m", "program_n"}.issubset(roles)
         else ()
     )
+    single_program_m_profiles = (
+        (
+            ({"program_m": 64}, 1, 128),
+            ({"program_m": 64}, 2, 128),
+            ({"program_m": 128}, 1, 128),
+        )
+        if roles == {"program_m"}
+        else ()
+    )
     profiles = (
         (
             ({"scan": 64}, 1, 128),
@@ -96,6 +105,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
             )
         ),
         joint_program_profiles,
+        single_program_m_profiles,
         (
             ({"program_m": 128, "program_n": 64, "reduction": 64, "group_m": 8}, 2, 128),
             ({"program_m": 128, "program_n": 128, "reduction": 32, "group_m": 8}, 3, 256),

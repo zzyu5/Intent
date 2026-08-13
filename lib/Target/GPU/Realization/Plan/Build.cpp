@@ -894,10 +894,23 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 return success();
               if (failed(streamNode))
                 return failure();
-              for (int64_t axisNode : innerAxes)
+              for (int64_t axisNode : innerAxes) {
+                auto existing = llvm::find_if(
+                    builder.getBlock()->getOps<intent::plan::StreamAxisOp>(),
+                    [&](intent::plan::StreamAxisOp binding) {
+                      return static_cast<int64_t>(binding.getStreamNode()) ==
+                                 *streamNode &&
+                             static_cast<int64_t>(binding.getAxisNode()) ==
+                                 axisNode &&
+                             binding.getRole() == "inner_reduction";
+                    });
+                if (existing !=
+                    builder.getBlock()->getOps<intent::plan::StreamAxisOp>().end())
+                  continue;
                 builder.create<intent::plan::StreamAxisOp>(
                     operation.getLoc(), i64(builder, *streamNode),
                     i64(builder, axisNode), string(builder, "inner_reduction"));
+              }
             }
             return success();
           })))
