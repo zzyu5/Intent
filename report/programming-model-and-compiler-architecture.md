@@ -52,23 +52,44 @@ Intent 是一门 **面向算子内部算法、target-independent、region-parame
 
 > **在逻辑坐标与逻辑区域上定义的、带 tensor-flow、状态和 effects 的算子内程序。**
 
-### 1.2 为什么应叫 region-parametric，而不应把 tile 当本体
+### 1.2 真正的分界主要在分配层，而不是张量代数层
 
-`partition(domain, extent=I.auto(...))` 的本质不是“请生成一个 GPU tile”，而是：
+可以把一个算子内程序概念性地拆成两部分：
+
+- **分配/ownership 层**：当前执行实例拿到哪一部分逻辑工作与数据；
+- **算法层**：拿到这些值后执行什么 exp、broadcast、reduce、scan、contract、状态更新与 effects。
+
+这不是要求实现中增加两层 IR，只是用来定位双方差别。在算法层，Intent 与 Triton、cuTile、TileLang 都提供张量计算原语；不能笼统说 Intent 比它们“更张量”。它们在控制、effects、closure 与结构化原语的具体表达上仍有差异，但最关键的抽象分界确实在前一层。
+
+Triton、cuTile、TileLang 的 source 通常已经拿到了一个与具体执行结构绑定的数据块，再在块上写算法。三者的 tile 合同并不完全相同，不能压成一句统一定义；以当前 cuTile 为最清楚的例子：官方模型中的 tile 是单个 tile block 内的多维 value，shape/dtype 编译期已知，每个维度要求 2 的幂，而 block 内的线程映射由 compiler 管理。也就是说，cuTile 区分了“数据单位 tile”和“执行单位 block”，却仍然把二者通过 block-local ownership 与静态 shape 绑定在一起。参见 [CUDA tile programming model](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-tile-kernels.html)。
+
+Intent 在同一位置给出的不是 tile，而是 **region**：domain 上的一个逻辑子集。Region 本身不携带 program/block/hart/thread owner，也不规定 register/shared/vector register。当前 frontend 实际可以生成类似：
+
+```text
+intent.result_shapes = [["?region_13_0"]]
+```
+
+这样的动态 symbolic region shape；它在 Kernel IR 中不是编译期常量，也没有 2 的幂要求。
+
+这里也要避免反向绝对化：
+
+- 不是每个 Intent region 都运行时动态，fixed partition 与静态 domain 当然可以产生静态 region；
+- “没有 physical owner”只描述算法 IR，realizer 最终必须给它选择 owner；
+- 当前 GPU target 为了生成 Triton/cuTile/TileLang，仍会把 region 兑现成编译期 tile、lane range 或其他 surface 能表达的形态。
+
+所以“Intent 抽掉 tile”最准确的含义是：
+
+> **tile 不再是 source/Kernel IR 中的算法身份；它被推迟为 target realization 给 region 的一种物理答案。**
+
+它不是“更硬件无关的 tile”。从 tile 中去掉静态 shape 与执行单元 ownership 后，剩下的是另一种对象——logical region。到了 GPU Plan 和生成源码，tile 会被重新引入；到了 RVV，它可能变成 VLA chunk；到了 Scalar target，它可能只是 loop interval。
+
+这项设计只保证未来 target 不必从已经拍扁成 GPU program/tile 的代码中逆向恢复 logical workset，并不保证 RVV/CPU 自动高效。能否高效，仍取决于对应 realizer 是否正确解决 ownership、chunk、storage 与 primitive realization；Kernel IR 干净只是必要条件，不是性能充分条件。
+
+`partition(domain, extent=I.auto(...))` 因而表示：
 
 > 作者允许 compiler 选择一个 region extent，但 region body 的逻辑意义不随这个选择改变。
 
-在不同 target 上，它可以兑现为：
-
-- GPU：program/CTA 拥有的 tile；
-- RVV：一次 strip-mine 的 VLA chunk；
-- CPU SIMD：一个 vector chunk；
-- Scalar：普通循环的一段；
-- 专用矩阵扩展：喂给 microkernel 的局部区域。
-
-去掉 source 中的 tile/worker identity，价值正是在这里：同一个逻辑索引不能因为换成 GPU program id、RVV lane 或 CPU thread 而改变；RNG counter、ragged membership、state carry 与 effect 顺序也不会绑定某种物理执行模型。
-
-但“去掉 tile”不等于“去掉物理 mapping”。ownership、chunking、vectorization、遍历与存储仍然必须由 target realizer 决定，只是不进入算法身份。
+在不同 target 上，它可以兑现为 GPU tile、RVV VLA chunk、CPU SIMD chunk、Scalar loop segment 或专用矩阵 microkernel region。去掉的是 target-specific identity，不是 physical mapping 这项编译器责任。
 
 ### 1.3 作者决定 partition 是否存在，compiler 只填 extent
 
