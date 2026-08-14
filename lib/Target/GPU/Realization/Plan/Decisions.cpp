@@ -989,6 +989,8 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
       return failure();
     }
     StringRef name = owner->getName().getStringRef();
+    if (name == "intent.for" || name == "intent.ordered")
+      continue;
     if (name != "intent.parallel" && name != "intent.state_stream")
       return owner->emitOpError(
           "does not define a supported physical region-argument binding");

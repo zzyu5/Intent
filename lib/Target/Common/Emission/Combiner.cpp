@@ -1,11 +1,12 @@
 #include "Intent/Target/Common/Emission/Combiner.h"
 
+#include "Intent/Target/Common/Emission/Literal.h"
+
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -34,9 +35,7 @@ FailureOr<std::string> constantExpression(Operation &operation) {
   if (number.isInfinity())
     return number.isNegative() ? std::string("-float('inf')")
                                : std::string("float('inf')");
-  llvm::SmallString<32> spelling;
-  number.toString(spelling);
-  return spelling.str().str();
+  return spellFiniteFloatLiteral(floating);
 }
 
 } // namespace

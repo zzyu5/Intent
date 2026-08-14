@@ -435,8 +435,10 @@ indexRealization(intent::plan::RealizationOp realization,
     bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
       return target::emission::isRaggedBoundAxis(index.components, axis);
     });
+    bool plannedValidity = value.getFill() != "none" &&
+                           !value.getValidityDomainNodes().empty();
     bool materializeLogicalBounds =
-        raggedBound && !value.getConsumerNeutralized();
+        (raggedBound || plannedValidity) && !value.getConsumerNeutralized();
     bool packedScalar =
         target::emission::hasPackedScalarDomain(index, binding);
     binding.transfer = *derivedScalar || tensorIndirect ||

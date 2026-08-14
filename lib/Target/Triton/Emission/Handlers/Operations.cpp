@@ -4,6 +4,7 @@
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
+#include "Intent/Target/Common/Emission/Literal.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 
@@ -301,7 +302,7 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     else if (std::isnan(number))
       expression = "float('nan')";
     else
-      expression = std::to_string(number);
+      expression = target::emission::spellFiniteFloatLiteral(floating);
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
     if (operation.getResult(0).getType().isInteger(1))
       expression = integer.getValue().isZero() ? "False" : "True";
@@ -1207,15 +1208,27 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, false);
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
-  if (failed(pointers) || failed(mask) || failed(physicalFill))
-    return failure();
-  std::string result = makeResultName(operation, 0);
   StringRef loadFill = boundary.getLoadFill();
   if (loadFill == "none" && !physicalFill->empty())
     loadFill = *physicalFill;
   if (loadFill == "none" &&
       target::emission::hasPackedScalarDomain(planIndex, boundary))
     loadFill = "zero";
+  bool materializeValidity = !boundary.getConsumerNeutralized() &&
+                             loadFill != "none" &&
+                             !boundary.getValidityDomainNodes().empty();
+  FailureOr<std::string> validity =
+      materializeValidity
+          ? emitValidityExpression(boundary.getValidityTensorAxes(),
+                                   boundary.getValidityDomainNodes(),
+                                   operation.getResult(0), operation)
+          : FailureOr<std::string>(std::string("True"));
+  if (failed(pointers) || failed(mask) || failed(validity) ||
+      failed(physicalFill))
+    return failure();
+  std::string result = makeResultName(operation, 0);
+  if (*validity != "True")
+    *mask = "(" + *mask + ") & (" + *validity + ")";
   if (loadFill == "none") {
     line(result + " = tl.load(" + *pointers + ")");
   } else {

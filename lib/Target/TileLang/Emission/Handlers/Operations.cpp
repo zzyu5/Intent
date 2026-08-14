@@ -4,6 +4,7 @@
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
+#include "Intent/Target/Common/Emission/Literal.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 
@@ -271,7 +272,7 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     else if (std::isnan(number))
       return operation.emitOpError("TileLang constants cannot materialize NaN");
     else
-      expression = std::to_string(number);
+      expression = target::emission::spellFiniteFloatLiteral(floating);
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
     if (operation.getResult(0).getType().isInteger(1))
       expression = integer.getValue().isZero() ? "False" : "True";
@@ -1112,8 +1113,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         "cooperative transfer");
   bool expanded = !physicalFill->empty();
   bool tensorIndirect = boundary.hasDataDependentTensorIndex();
+  bool plannedValidity = !boundary.getConsumerNeutralized() &&
+                         boundary.getPadding() != "none" &&
+                         !boundary.getValidityDomainNodes().empty();
   bool guardedF16Bulk = !scalarResult && resultElementType.isF16() &&
                         *derivedScalar && !tensorIndirect &&
+                        !plannedValidity &&
                         boundary.getCheckBounds() &&
                         boundary.getPadding() != "none";
   FailureOr<SmallVector<target::IndexTerm>> relation = failure();
@@ -1277,6 +1282,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         materializeLogicalBounds
             ? elementBoundsPredicate(operation, tileIndices, false, false)
             : FailureOr<std::string>(std::string());
+    FailureOr<std::string> validityPredicate =
+        plannedValidity
+            ? elementValidityPredicate(boundary.getValidityTensorAxes(),
+                                       boundary.getValidityDomainNodes(),
+                                       tileIndices, operation)
+            : FailureOr<std::string>(std::string("True"));
     FailureOr<std::string> physicalPredicate =
         expanded && !stagePhysicalPadding
             ? elementBoundsPredicate(operation, tileIndices, true)
@@ -1289,10 +1300,19 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         materializeLogicalBounds && !tensorIndirect
             ? accessIndices(operation)
             : FailureOr<std::string>(std::string());
-    if (failed(logicalPredicate) || failed(physicalPredicate) ||
+    if (failed(logicalPredicate) || failed(validityPredicate) ||
+        failed(physicalPredicate) ||
         failed(wholeTile) || failed(bulkIndices))
       return failure();
-    bool hasBulkFastPath = !expanded && !wholeTile->empty();
+    if (*validityPredicate != "True") {
+      if (logicalPredicate->empty())
+        *logicalPredicate = *validityPredicate;
+      else
+        *logicalPredicate = "(" + *logicalPredicate + ") and (" +
+                            *validityPredicate + ")";
+    }
+    bool hasBulkFastPath =
+        !expanded && !wholeTile->empty() && !plannedValidity;
     if (hasBulkFastPath) {
       line("if " + *wholeTile + ":");
       ++indentation;

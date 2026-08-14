@@ -4,6 +4,7 @@
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
+#include "Intent/Target/Common/Emission/Literal.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 
@@ -273,7 +274,7 @@ LogicalResult SourceEmitter::emitConstant(Operation &operation) {
     else if (std::isnan(number))
       expression = "math.nan";
     else
-      expression = std::to_string(number);
+      expression = target::emission::spellFiniteFloatLiteral(floating);
   } else if (auto integer = dyn_cast<IntegerAttr>(value)) {
     if (operation.getResult(0).getType().isInteger(1))
       expression = integer.getValue().isZero() ? "False" : "True";
@@ -331,11 +332,15 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     return success();
   programBindingsEmitted = true;
 
+  auto roleExtent = [&](StringRef role) {
+    std::string dimension = roleDimensions.lookup(role);
+    std::string owner = dimensionOwners.lookup(dimension);
+    return owner.empty() ? dimension : owner;
+  };
   auto axisExtent = [&](plan::AxisOp axis) {
     std::string role =
         "program_" + std::to_string(axis.getProgramOrder());
-    std::string extent =
-        dimensionOwners.lookup(roleDimensions.lookup(role));
+    std::string extent = roleExtent(role);
     return axis.isScalar()
                ? extent
                : "ct.cdiv(" + extent + ", " + axis.getTile().str() + ")";
@@ -394,12 +399,10 @@ LogicalResult SourceEmitter::emitProgramBindings() {
     }
     line(lhsCount + " = " +
          addressIndex("ct.cdiv(" +
-                      dimensionOwners.lookup(roleDimensions.lookup(lhsRole)) +
-                      ", " + lhs.getTile().str() + ")"));
+                      roleExtent(lhsRole) + ", " + lhs.getTile().str() + ")"));
     line(rhsCount + " = " +
          addressIndex("ct.cdiv(" +
-                      dimensionOwners.lookup(roleDimensions.lookup(rhsRole)) +
-                      ", " + rhs.getTile().str() + ")"));
+                      roleExtent(rhsRole) + ", " + rhs.getTile().str() + ")"));
     line(span + " = " + group.str() + " * " + rhsCount);
     line(id + " = " + pid + " // " + span);
     line(first + " = " + id + " * " + group.str());
@@ -1179,6 +1182,17 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   StringRef loadFill = boundary.getPadding();
   if (loadFill == "none" && !physicalFill->empty())
     loadFill = *physicalFill;
+  bool materializeValidity = !boundary.getConsumerNeutralized() &&
+                             loadFill != "none" &&
+                             !boundary.getValidityDomainNodes().empty();
+  FailureOr<std::string> validity =
+      materializeValidity
+          ? emitValidityExpression(boundary.getValidityTensorAxes(),
+                                   boundary.getValidityDomainNodes(),
+                                   operation.getResult(0), operation)
+          : FailureOr<std::string>(std::string("True"));
+  if (failed(validity))
+    return failure();
   Type elementType = (*view)->tensor.getElementType();
   StringRef padding = loadFill == "negative_infinity"
                           ? "-math.inf"
@@ -1215,6 +1229,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   } else {
     return boundary.emitOpError("is not a load-like cuTile access");
   }
+  if (*validity != "True")
+    line(result + " = ct.where(" + *validity + ", " + result + ", " +
+         padding.str() + ")");
   bindResult(operation, 0, result);
   return success();
 }
