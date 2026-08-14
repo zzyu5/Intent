@@ -51,6 +51,11 @@ def _role_candidates(role: str) -> tuple[int, ...]:
     raise NotImplementedError(f"unsupported cuTile tuner role: {role}")
 
 
+def _role_default(role: str) -> int:
+    candidates = _role_candidates(role)
+    return 64 if 64 in candidates else candidates[0]
+
+
 def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamespace, ...]:
     roles = frozenset(parameter_map.values())
     for role in roles:
@@ -120,9 +125,9 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
     ]
     choices = []
     seen = set()
-    for index, (profile, num_ctas, occupancy) in enumerate(selected):
+    for profile, num_ctas, occupancy in selected:
         values = {
-            role: profile.get(role, _role_candidates(role)[index % len(_role_candidates(role))])
+            role: profile.get(role, _role_default(role))
             for role in roles
         }
         key = (tuple(sorted(values.items())), num_ctas, occupancy)

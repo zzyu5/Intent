@@ -219,6 +219,13 @@ LogicalResult TransferOp::verify() {
   for (int64_t domain : getDomainNodes())
     if (failed(requireNode(*this, domain)))
       return failure();
+  if (failed(verifyValidityBinding(*this, getValidityTensorAxes(),
+                                   getValidityDomainNodes(), "transfer")))
+    return failure();
+  for (int64_t domain : getValidityDomainNodes())
+    if (!llvm::is_contained(getDomainNodes(), domain))
+      return emitOpError(
+          "validity domain is not part of the transfer boundary");
   if (getFill() != "negative_infinity" && getFill() != "zero" &&
       getFill() != "none")
     return emitOpError("contains an unsupported boundary fill");

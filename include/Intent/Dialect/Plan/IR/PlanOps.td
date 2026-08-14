@@ -117,6 +117,8 @@ def IntentPlan_TransferOp : IntentPlan_Op<"transfer"> {
   let arguments = (ins
     I64Attr:$node,
     DenseI64ArrayAttr:$domain_nodes,
+    DenseI64ArrayAttr:$validity_tensor_axes,
+    DenseI64ArrayAttr:$validity_domain_nodes,
     StrAttr:$fill,
     BoolAttr:$consumer_neutralized,
     StrAttr:$tensor_indexing,

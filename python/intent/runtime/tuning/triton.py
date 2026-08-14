@@ -44,6 +44,11 @@ def _role_candidates(role: str) -> tuple[int, ...]:
     raise NotImplementedError(f"unsupported Triton tuner role: {role}")
 
 
+def _role_default(role: str) -> int:
+    candidates = _role_candidates(role)
+    return 64 if 64 in candidates else candidates[0]
+
+
 def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     import triton
 
@@ -137,9 +142,9 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     ]
     choices = []
     seen = set()
-    for index, (profile, stages, warps) in enumerate(selected):
+    for profile, stages, warps in selected:
         values = {
-            role: profile.get(role, _role_candidates(role)[index % len(_role_candidates(role))])
+            role: profile.get(role, _role_default(role))
             for role in roles
         }
         key = (tuple(sorted(values.items())), stages, warps)

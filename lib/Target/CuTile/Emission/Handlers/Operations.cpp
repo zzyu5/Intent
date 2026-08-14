@@ -2426,9 +2426,22 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
   if (!valueIndex || failed(node) || !boundary || failed(stored) ||
       failed(view) || failed(physicalFill) || failed(indices))
     return operation.emitOpError("lacks a cuTile store binding");
+  std::string scatterMask;
+  if (scatter && !boundary.getValidityTensorAxes().empty()) {
+    FailureOr<std::string> validity = emitValidityExpression(
+        boundary.getValidityTensorAxes(), boundary.getValidityDomainNodes(),
+        operation.getOperand(valueIndex.getInt()), operation);
+    if (failed(validity))
+      return failure();
+    if (*validity != "True")
+      scatterMask = *validity;
+  }
   if (scatter)
     line("ct.scatter(" + (*view)->argument->name + ", " + *indices + ", " +
-         stored->str() + ", check_bounds=True)");
+         stored->str() + ", check_bounds=True" +
+         (scatterMask.empty() ? std::string()
+                              : ", mask=" + scatterMask) +
+         ")");
   else if (boundary.getAccess() == "store") {
     FailureOr<unsigned> storedRank = emittedTensorRank(operation, true);
     if (failed(storedRank))
@@ -2533,6 +2546,16 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
     indices = indexTuple(operation, true);
   if (failed(indices))
     return failure();
+  if (!binding.getValidityTensorAxes().empty()) {
+    FailureOr<std::string> validity = emitValidityExpression(
+        binding.getValidityTensorAxes(), binding.getValidityDomainNodes(),
+        operation.getOperand(valueIndex.getInt()), operation);
+    if (failed(validity))
+      return failure();
+    if (*validity != "True")
+      mask = mask.empty() ? *validity
+                          : "(" + mask + ") & (" + *validity + ")";
+  }
   line("ct.scatter(" + (*view)->argument->name + ", " + *indices + ", " +
        stored->str() + ", check_bounds=True" +
        (mask.empty() ? std::string() : ", mask=" + mask) + ")");

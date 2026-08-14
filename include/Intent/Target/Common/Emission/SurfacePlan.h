@@ -908,6 +908,12 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   llvm::ArrayRef<int64_t> getDomainNodes() const {
     return operation.getDomainNodes();
   }
+  llvm::ArrayRef<int64_t> getValidityTensorAxes() const {
+    return operation.getValidityTensorAxes();
+  }
+  llvm::ArrayRef<int64_t> getValidityDomainNodes() const {
+    return operation.getValidityDomainNodes();
+  }
   llvm::StringRef getAccess() const { return access; }
   llvm::StringRef getLoadFill() const { return operation.getFill(); }
   llvm::StringRef getPadding() const { return operation.getFill(); }

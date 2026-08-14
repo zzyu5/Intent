@@ -627,6 +627,42 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         return failure();
       domains.push_back(*domainNode);
     }
+    Value transferred;
+    if (load && operation.getNumResults() == 1) {
+      transferred = operation.getResult(0);
+    } else if (auto valueIndex = operation.getAttrOfType<IntegerAttr>(
+                   "intent.value_operand_index");
+               valueIndex && valueIndex.getInt() >= 0 &&
+               static_cast<unsigned>(valueIndex.getInt()) <
+                   operation.getNumOperands()) {
+      transferred = operation.getOperand(valueIndex.getInt());
+    }
+    SmallVector<int64_t> validityTensorAxes;
+    SmallVector<int64_t> validityDomainNodes;
+    auto transferredAxes = transferred ? facts.valueAxes.find(transferred)
+                                       : facts.valueAxes.end();
+    if (transferredAxes != facts.valueAxes.end()) {
+      for (Operation *domain : facts.boundaryDomains.lookup(&operation)) {
+        std::optional<unsigned> tensorAxis;
+        for (auto [axis, logical] : llvm::enumerate(transferredAxes->second)) {
+          if (logical.domain != domain)
+            continue;
+          if (tensorAxis) {
+            tensorAxis.reset();
+            break;
+          }
+          tensorAxis = axis;
+        }
+        if (!tensorAxis)
+          continue;
+        FailureOr<int64_t> domainNode =
+            target::getNodeID(*domain, "transfer validity binding");
+        if (failed(domainNode))
+          return failure();
+        validityTensorAxes.push_back(*tensorAxis);
+        validityDomainNodes.push_back(*domainNode);
+      }
+    }
     StringRef fill = "none";
     if (load) {
       auto found = facts.boundaryFills.find(&operation);
@@ -657,7 +693,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             : "none";
     builder.create<intent::plan::TransferOp>(
         operation.getLoc(), i64(builder, *node),
-        builder.getDenseI64ArrayAttr(domains), string(builder, fill),
+        builder.getDenseI64ArrayAttr(domains),
+        builder.getDenseI64ArrayAttr(validityTensorAxes),
+        builder.getDenseI64ArrayAttr(validityDomainNodes),
+        string(builder, fill),
         builder.getBoolAttr(false),
         string(builder, tensorIndexingName),
         string(builder, resultSpace));
