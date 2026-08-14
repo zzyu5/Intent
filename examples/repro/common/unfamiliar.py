@@ -149,6 +149,7 @@ from .evaluation import require_close as _require_close
 from .evaluation import run_generated as _run_generated
 from .evaluation import run_variant as _run_variant
 from .decomposition import DECOMPOSITION_RUNNERS
+from .small_operators import SMALL_OPERATOR_RUNNERS
 
 
 def _run_histogram(compiler: str, target: Target, target_name: str) -> None:
@@ -1424,6 +1425,7 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "group_norm_silu_backward": _run_group_norm_silu_backward,
     "batched_cholesky": _run_cholesky,
     "batched_householder_qr": _run_householder_qr,
+    **SMALL_OPERATOR_RUNNERS,
     "variant_gemm_loop_interchange": _run_variant_gemm,
     "variant_softmax_online": _run_variant_softmax,
     "variant_online_softmax_inline": _run_variant_online_softmax,

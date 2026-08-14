@@ -38,6 +38,8 @@ case "${kernel}" in
   nonzero_compact | unique_consecutive | moe_align_block | nested_ragged_pool | \
   adamw_update | adafactor_update | reshape_and_cache | \
   group_norm_silu_backward | batched_cholesky | batched_householder_qr | \
+  batch_norm_training | csr_spmm | max_pool2d | softmax_backward | \
+  triangular_solve | \
   variant_gemm_loop_interchange | variant_softmax_online | \
   variant_online_softmax_inline | variant_attention_inline | \
   variant_attention_select | variant_rope_index | variant_swiglu_helper | \
