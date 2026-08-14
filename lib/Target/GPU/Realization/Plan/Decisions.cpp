@@ -717,6 +717,7 @@ assignAxes(const target::KernelFacts &facts) {
 
 struct StageDecision {
   Operation *contraction = nullptr;
+  SmallVector<Operation *> dependencies;
   SmallVector<Value> inputs;
   SmallVector<Value> outputs;
   SmallVector<Operation *> terminals;
@@ -788,6 +789,8 @@ contractionStages(const target::KernelFacts &facts) {
         llvm::DenseSet<Value> visited;
         if (!dependsOn(operand, *producer, facts.kernel, visited))
           continue;
+        if (!llvm::is_contained(consumerStage.dependencies, producer))
+          consumerStage.dependencies.push_back(producer);
         appendUnique(consumerStage.inputs, operand);
         appendUnique(stages[stagePositions.lookup(producer)].outputs, operand);
       }
@@ -974,14 +977,21 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
   SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
   for (const auto &entry : facts.regionArgumentAxes) {
     auto argument = dyn_cast<BlockArgument>(entry.first);
-    if (!argument || !entry.second.domain)
-      continue;
+    if (!argument || !entry.second.domain) {
+      facts.kernel.entry.emitOpError(
+          "has a region argument without an exact logical-axis provenance");
+      return failure();
+    }
     Operation *owner = argument.getOwner()->getParentOp();
-    if (!owner)
-      continue;
+    if (!owner) {
+      facts.kernel.entry.emitOpError(
+          "has a region argument without a canonical region owner");
+      return failure();
+    }
     StringRef name = owner->getName().getStringRef();
     if (name != "intent.parallel" && name != "intent.state_stream")
-      continue;
+      return owner->emitOpError(
+          "does not define a supported physical region-argument binding");
     FailureOr<int64_t> argumentID = valueID(
         argument, facts.kernel, *owner, "region-argument range binding");
     FailureOr<int64_t> axisNode = node(
@@ -1086,6 +1096,14 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     SmallVector<int64_t> inputs;
     SmallVector<int64_t> outputs;
     SmallVector<int64_t> terminals;
+    SmallVector<int64_t> dependencies;
+    for (Operation *dependency : stage.dependencies) {
+      FailureOr<int64_t> id = node(*dependency, "stage dependency binding");
+      if (failed(id))
+        return failure();
+      dependencies.push_back(*id);
+    }
+    llvm::sort(dependencies);
     for (Value value : stage.inputs) {
       FailureOr<int64_t> id = valueID(value, facts.kernel,
                                       *stage.contraction, "stage input binding");
@@ -1108,10 +1126,12 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     }
     decisions.stages.push_back(builder.create<intent::plan::StageOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
+        builder.getDenseI64ArrayAttr(dependencies),
         builder.getDenseI64ArrayAttr(inputs),
         builder.getDenseI64ArrayAttr(outputs),
         builder.getDenseI64ArrayAttr(stage.operations),
-        builder.getDenseI64ArrayAttr(terminals)));
+        builder.getDenseI64ArrayAttr(terminals), string(builder, "same_stream"),
+        string(builder, "forbidden")));
     FailureOr<int64_t> memberNode = node(**member, "stage member axis");
     auto memberChoice =
         llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
@@ -1140,6 +1160,32 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         string(builder, "reduction"), IntegerAttr(),
         string(builder, *reduction), string(builder, "reduction"),
         IntegerAttr()));
+    for (Value output : stage.outputs) {
+      FailureOr<int64_t> outputID = valueID(
+          output, facts.kernel, *stage.contraction, "stage buffer value binding");
+      if (failed(outputID))
+        return failure();
+      SmallVector<int64_t> consumers;
+      for (const StageDecision &consumer : *stages) {
+        if (!llvm::is_contained(consumer.inputs, output))
+          continue;
+        FailureOr<int64_t> consumerNode =
+            node(*consumer.contraction, "stage buffer consumer binding");
+        if (failed(consumerNode))
+          return failure();
+        consumers.push_back(*consumerNode);
+      }
+      llvm::sort(consumers);
+      decisions.stageBuffers.push_back(
+          builder.create<intent::plan::StageBufferOp>(
+              stage.contraction->getLoc(), i64(builder, *outputID),
+              i64(builder, *stageNode),
+              builder.getDenseI64ArrayAttr(consumers),
+              builder.getStrArrayAttr({"member", "feature"}),
+              string(builder, "single_writer_read_only_consumers"),
+              string(builder, "producer_to_last_consumer"),
+              string(builder, "same_stream")));
+    }
   }
   return decisions;
 }

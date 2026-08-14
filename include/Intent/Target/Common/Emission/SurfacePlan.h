@@ -5,6 +5,7 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Emission/Combiner.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -22,12 +23,14 @@ namespace intent::target::emission {
 
 inline mlir::FailureOr<std::string>
 reductionRole(mlir::Operation &operation) {
-  auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
-  auto tie = operation.getAttrOfType<mlir::StringAttr>("intent.tie");
-  if (operation.getName().getStringRef() == "intent.arg_reduce" && combine &&
-      combine.getValue() == "maximum" && tie &&
-      tie.getValue() == "lowest_index")
+  auto builtin =
+      operation.getAttrOfType<mlir::StringAttr>("intent.combine_builtin");
+  if (hasGenericCombiner(operation) && builtin &&
+      builtin.getValue() == "argmax_lowest")
     return std::string("reduce_argmax");
+  if (hasGenericCombiner(operation))
+    return std::string("reduce_generic");
+  auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
   if (combine && combine.getValue() == "maximum")
     return std::string("reduce_maximum");
   if (combine && combine.getValue() == "add")
@@ -76,6 +79,14 @@ transposePermutation(mlir::Operation &operation) {
 }
 
 inline mlir::FailureOr<std::string> scanRole(mlir::Operation &operation) {
+  if (hasGenericCombiner(operation)) {
+    auto inclusive =
+        operation.getAttrOfType<mlir::BoolAttr>("intent.inclusive");
+    if (inclusive && inclusive.getValue())
+      return std::string("scan_generic_inclusive");
+    return operation.emitOpError(
+        "generic scan currently requires inclusive prefix semantics");
+  }
   auto combine = operation.getAttrOfType<mlir::StringAttr>("intent.combine");
   auto inclusive =
       operation.getAttrOfType<mlir::BoolAttr>("intent.inclusive");
@@ -866,6 +877,9 @@ struct StageBinding : Binding<intent::plan::StageOp> {
 
   unsigned getOrdinal() const { return position; }
   int64_t getNode() const { return operation.getNode(); }
+  llvm::ArrayRef<int64_t> getDependencies() const {
+    return operation.getDependencies();
+  }
   llvm::ArrayRef<int64_t> getInputs() const { return operation.getInputs(); }
   llvm::ArrayRef<int64_t> getOutputs() const { return operation.getOutputs(); }
   llvm::ArrayRef<int64_t> getOperations() const {
@@ -874,6 +888,22 @@ struct StageBinding : Binding<intent::plan::StageOp> {
   llvm::ArrayRef<int64_t> getTerminals() const {
     return operation.getTerminals();
   }
+  llvm::StringRef getSynchronization() const {
+    return operation.getSynchronization();
+  }
+  llvm::StringRef getFusion() const { return operation.getFusion(); }
+};
+
+struct StageBufferBinding : Binding<intent::plan::StageBufferOp> {
+  int64_t getValue() const { return operation.getValue(); }
+  int64_t getProducerStage() const { return operation.getProducerStage(); }
+  llvm::ArrayRef<int64_t> getConsumerStages() const {
+    return operation.getConsumerStages();
+  }
+  mlir::ArrayAttr getOwnerRoles() const { return operation.getOwnerRoles(); }
+  llvm::StringRef getAccess() const { return operation.getAccess(); }
+  llvm::StringRef getLifetime() const { return operation.getLifetime(); }
+  llvm::StringRef getVisibility() const { return operation.getVisibility(); }
 };
 
 struct StageAxisBinding : Binding<intent::plan::StageAxisOp> {
@@ -1151,6 +1181,38 @@ llvm::SmallVector<AxisBinding> orderedProgramAxes(const PlanIndex &index);
 template <typename PlanIndex>
 mlir::LogicalResult indexCanonicalStructure(
     PlanIndex &index, const target::KernelModel &kernel) {
+  for (const auto &entry : index.regionBindings) {
+    intent::plan::RegionBindingOp binding = entry.second;
+    mlir::Value value = kernel.values.lookup(entry.first);
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+    auto axis = index.axes.find(binding.getAxisNode());
+    const RangeBinding *range =
+        axis == index.axes.end()
+            ? nullptr
+            : axis->second.getRange(binding.getPurpose(), binding.getLevel());
+    mlir::Operation *owner =
+        argument ? argument.getOwner()->getParentOp() : nullptr;
+    llvm::StringRef expected =
+        owner && owner->getName().getStringRef() == "intent.parallel"
+            ? llvm::StringRef("ownership")
+        : owner && owner->getName().getStringRef() == "intent.state_stream"
+            ? llvm::StringRef("traversal")
+            : llvm::StringRef();
+    mlir::FailureOr<target::ScalarIndexSource> source =
+        argument && owner
+            ? target::traceScalarIndexSource(argument, *owner)
+            : mlir::FailureOr<target::ScalarIndexSource>(mlir::failure());
+    mlir::FailureOr<int64_t> sourceNode =
+        mlir::succeeded(source) && source->domain
+            ? target::getNodeID(*source->domain,
+                                "region-argument source-axis verification")
+            : mlir::FailureOr<int64_t>(mlir::failure());
+    if (!argument || !owner || expected.empty() ||
+        binding.getPurpose() != expected || !range || mlir::failed(sourceNode) ||
+        *sourceNode != static_cast<int64_t>(binding.getAxisNode()))
+      return binding.emitOpError(
+          "does not bind the exact region argument source to its selected range");
+  }
   llvm::SmallVector<int64_t> relationNodes;
   for (const auto &entry : kernel.raggedRelations)
     relationNodes.push_back(entry.first);
@@ -1546,7 +1608,38 @@ template <typename PlanIndex, typename OperationStages>
 mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
                                          const PlanIndex &index,
                                          OperationStages &operationStages) {
+  llvm::DenseMap<int64_t, unsigned> stagePositions;
+  for (auto [position, stage] : llvm::enumerate(index.stages))
+    stagePositions[stage.getNode()] = position;
   for (auto [position, stage] : llvm::enumerate(index.stages)) {
+    if (stage.getSynchronization() != "same_stream" ||
+        stage.getFusion() != "forbidden")
+      return stage.emitOpError(
+          "target emitter requires ordered same-stream unfused stages");
+    for (int64_t dependency : stage.getDependencies()) {
+      auto found = stagePositions.find(dependency);
+      if (found == stagePositions.end() || found->second >= position)
+        return stage.emitOpError(
+            "references a non-predecessor stage dependency");
+    }
+    for (int64_t input : stage.getInputs()) {
+      auto buffer = index.stageBuffers.find(input);
+      if (buffer == index.stageBuffers.end() ||
+          !llvm::is_contained(buffer->second.getConsumerStages(),
+                              stage.getNode()))
+        return stage.emitOpError(
+            "input lacks a matching stage-buffer read contract");
+    }
+    for (int64_t output : stage.getOutputs()) {
+      mlir::Value value = kernel.values.lookup(output);
+      auto buffer = index.stageBuffers.find(output);
+      if (!value || !mlir::isa<mlir::RankedTensorType>(value.getType()) ||
+          buffer == index.stageBuffers.end() ||
+          buffer->second.getProducerStage() != stage.getNode() ||
+          buffer->second.getVisibility() != "same_stream")
+        return stage.emitOpError(
+            "output lacks a matching visible stage-buffer write contract");
+    }
     for (int64_t node : stage.getOperations()) {
       mlir::Operation *operation = kernel.nodes.lookup(node);
       if (!operation)

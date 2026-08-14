@@ -22,6 +22,7 @@ class ParameterKind(Enum):
 
 class FunctionKind(Enum):
     KERNEL = "kernel"
+    HELPER = "helper"
 
 
 @dataclass(frozen=True, slots=True)

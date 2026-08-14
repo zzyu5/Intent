@@ -230,10 +230,27 @@ def IntentPlan_StreamBindingOp : IntentPlan_Op<"stream_binding"> {
 def IntentPlan_StageOp : IntentPlan_Op<"stage"> {
   let arguments = (ins
     I64Attr:$node,
+    DenseI64ArrayAttr:$dependencies,
     DenseI64ArrayAttr:$inputs,
     DenseI64ArrayAttr:$outputs,
     DenseI64ArrayAttr:$operations,
-    DenseI64ArrayAttr:$terminals
+    DenseI64ArrayAttr:$terminals,
+    StrAttr:$synchronization,
+    StrAttr:$fusion
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_StageBufferOp : IntentPlan_Op<"stage_buffer"> {
+  let arguments = (ins
+    I64Attr:$value,
+    I64Attr:$producer_stage,
+    DenseI64ArrayAttr:$consumer_stages,
+    ArrayAttr:$owner_roles,
+    StrAttr:$access,
+    StrAttr:$lifetime,
+    StrAttr:$visibility
   );
   let results = (outs);
   let hasVerifier = 1;

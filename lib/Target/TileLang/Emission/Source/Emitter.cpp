@@ -1,6 +1,7 @@
 #include "Support/Model.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Emission/Combiner.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -306,6 +307,11 @@ indexRealization(intent::plan::RealizationOp realization,
       binding.operation = value;
       binding.position = index.stages.size();
       index.stages.push_back(binding);
+    } else if (auto value =
+                   dyn_cast<intent::plan::StageBufferOp>(operation)) {
+      plan::StageBufferOp binding;
+      binding.operation = value;
+      index.stageBuffers[value.getValue()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
       plan::StageAxisOp binding;
       binding.operation = value;
@@ -346,6 +352,10 @@ indexRealization(intent::plan::RealizationOp realization,
                   : FailureOr<int64_t>(failure());
     if (failed(role) || failed(axis))
       return value.emitOpError("does not bind a canonical reduction");
+    if (*role == "reduce_generic")
+      return operation->emitOpError(
+          "TileLang 0.1.13 has no mechanical generic reduction combiner "
+          "projection in its current PrimFunc surface");
     plan::ReductionOp binding;
     binding.operation = value;
     binding.lowering = *role == "reduce_argmax"
@@ -361,6 +371,10 @@ indexRealization(intent::plan::RealizationOp realization,
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
+    if (value.getSemantics() == "scan_generic_inclusive")
+      return value.emitOpError(
+          "TileLang 0.1.13 has no mechanical generic scan combiner "
+          "projection in its current PrimFunc surface");
     if (value.getSemantics() != "scan_inclusive_add" ||
         !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
@@ -540,12 +554,15 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
     Operation *scan = kernel.nodes.lookup(entry.first);
     std::string extent = axisDimensions.lookup(binding.getAxisNode());
     if (!scan || scan->getName().getStringRef() != "intent.scan" ||
-        scan->getNumResults() != 1 || extent.empty())
+        scan->getNumResults() == 0 || extent.empty())
       return binding.emitOpError(
           "does not bind a workspace-backed TileLang scan tensor");
-    workspaceNames[scan->getResult(0)] =
-        "scan_workspace_" + std::to_string(entry.first);
-    scanResults[scan->getResult(0)] = binding;
+    for (auto [component, result] : llvm::enumerate(scan->getResults())) {
+      workspaceNames[result] = "scan_workspace_" +
+                               std::to_string(entry.first) + "_" +
+                               std::to_string(component);
+      scanResults[result] = binding;
+    }
     scanExtents[entry.first] = extent;
     for (int64_t valueID : binding.getMaterializedValues()) {
       FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
@@ -654,7 +671,7 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!entry.second.getReuseWorker() &&
         entry.second.getTileRole().starts_with("row_vector")) {
       const target::emission::RangeBinding *range = entry.second.roleRange();
-      if (!range)
+      if (!range || !planIndex.blockExtents.count(range->getExtent()))
         return entry.second.emitOpError("cannot resolve its row-vector extent");
       tile = physicalExtent(range->getExtent());
     }
@@ -676,10 +693,13 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!argument || !axis || !range)
       return binding.emitOpError(
           "does not bind a canonical region argument and selected range");
-    std::string tile =
-        !axis.getReuseWorker() && range->getTileRole().starts_with("row_vector")
-            ? physicalExtent(range->getExtent())
-            : range->getTile().str();
+    bool roundedRow = !axis.getReuseWorker() &&
+                      range->getTileRole().starts_with("row_vector");
+    if (roundedRow && !planIndex.blockExtents.count(range->getExtent()))
+      return binding.emitOpError(
+          "row-vector region range lacks its selected physical extent");
+    std::string tile = roundedRow ? physicalExtent(range->getExtent())
+                                  : range->getTile().str();
     regionTiles["?region_" + std::to_string(entry.first) + "_0"] = tile;
   }
 
@@ -916,6 +936,18 @@ void SourceEmitter::emitImports() {
   output << "\n\n";
 }
 
+LogicalResult SourceEmitter::emitHelpers() {
+  FailureOr<SmallVector<func::FuncOp>> combiners =
+      target::emission::collectCombiners(kernel.entry);
+  if (failed(combiners))
+    return failure();
+  if (!combiners->empty())
+    return combiners->front().emitOpError(
+        "TileLang 0.1.13 exposes fixed ReduceKind operations but no mechanical "
+        "generic combiner projection in the current PrimFunc surface");
+  return success();
+}
+
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
   auto emitBuilderParameters = [&](raw_ostream &stream, int64_t stage) {
@@ -997,19 +1029,22 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       if (entry.second.getResultSpace() != "global")
         continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      auto tensor = scan && scan->getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
-                        : RankedTensorType();
       FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
           entry.second, scanExtents.lookup(entry.first), planIndex,
           axisDimensions);
-      std::string dtype =
-          tensor ? dtypeName(tensor.getElementType(), *scan) : std::string();
-      if (!tensor || failed(size) || dtype.empty())
+      if (!scan || scan->getNumResults() == 0 || failed(size))
         return entry.second.emitOpError(
             "has no supported TileLang scan-workspace parameter");
-      parameter(workspaceNames.lookup(scan->getResult(0)) +
-                ": T.Tensor((" + *size + ",), " + dtype + ")");
+      for (Value result : scan->getResults()) {
+        auto tensor = dyn_cast<RankedTensorType>(result.getType());
+        std::string dtype = tensor ? dtypeName(tensor.getElementType(), *scan)
+                                   : std::string();
+        if (dtype.empty())
+          return entry.second.emitOpError(
+              "has an unsupported TileLang scan-workspace component dtype");
+        parameter(workspaceNames.lookup(result) +
+                  ": T.Tensor((" + *size + ",), " + dtype + ")");
+      }
       for (int64_t valueID : entry.second.getMaterializedValues()) {
         Value value = kernel.values.lookup(valueID);
         auto materialized = dyn_cast<RankedTensorType>(value.getType());
@@ -1441,19 +1476,23 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (entry.second.getResultSpace() != "global")
         continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      auto tensor = scan && scan->getNumResults() == 1
-                        ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
-                        : RankedTensorType();
       FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
           entry.second, scanExtents.lookup(entry.first), planIndex,
           axisDimensions);
-      StringRef dtype = tensor ? torchDtype(tensor.getElementType()) : StringRef();
-      if (!tensor || failed(size) || dtype.empty())
+      if (!scan || scan->getNumResults() == 0 || failed(size))
         return entry.second.emitOpError(
             "has no supported TileLang scan-workspace allocation");
-      output << "    " << workspaceNames.lookup(scan->getResult(0))
-             << " = torch.empty((" << *size
-             << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      for (Value result : scan->getResults()) {
+        auto tensor = dyn_cast<RankedTensorType>(result.getType());
+        StringRef dtype = tensor ? torchDtype(tensor.getElementType())
+                                 : StringRef();
+        if (dtype.empty())
+          return entry.second.emitOpError(
+              "has an unsupported TileLang scan-workspace component dtype");
+        output << "    " << workspaceNames.lookup(result)
+               << " = torch.empty((" << *size
+               << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      }
       for (int64_t valueID : entry.second.getMaterializedValues()) {
         Value value = kernel.values.lookup(valueID);
         auto materialized = dyn_cast<RankedTensorType>(value.getType());
@@ -1509,11 +1548,13 @@ LogicalResult SourceEmitter::emitWrapper() {
     for (const auto &entry : planIndex.scans) {
       if (entry.second.getResultSpace() != "global")
         continue;
-      if (!first)
-        output << ", ";
       Operation *scan = kernel.nodes.lookup(entry.first);
-      output << workspaceNames.lookup(scan->getResult(0));
-      first = false;
+      for (Value result : scan->getResults()) {
+        if (!first)
+          output << ", ";
+        output << workspaceNames.lookup(result);
+        first = false;
+      }
       for (int64_t valueID : entry.second.getMaterializedValues()) {
         output << ", " << workspaceNames.lookup(kernel.values.lookup(valueID));
       }
@@ -2754,10 +2795,18 @@ FailureOr<std::string> SourceEmitter::padElementExpression(
       consumer);
   if (failed(predicate))
     return failure();
-  std::string fill = padding.getFill() == "negative_infinity"
+  StringRef planned = padding.getFill();
+  std::string fill = planned == "negative_infinity"
                          ? "-T.infinity(" + dtype + ")"
-                     : padding.getFill() == "true" ? "True"
-                     : padding.getFill() == "false" ? "False"
+                     : planned == "positive_infinity"
+                         ? "T.infinity(" + dtype + ")"
+                     : planned == "nan" ? "float('nan')"
+                     : planned == "true" ? "True"
+                     : planned == "false" ? "False"
+                     : planned.starts_with("literal_integer:")
+                         ? planned.drop_front(16).str()
+                     : planned.starts_with("literal_float:")
+                         ? planned.drop_front(14).str()
                      : isa<IntegerType, IndexType>(tensor.getElementType())
                          ? "0"
                          : "0.0";

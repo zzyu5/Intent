@@ -5,6 +5,7 @@
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 
 #include <cmath>
 
@@ -155,12 +156,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
         return emitter.emitRandom(op);
       })) ||
       failed(addHandler(registry, "intent.reduce",
-                        [&](Operation &op) {
-                          if (!emitter.selectOperation(op))
-                            return success();
-                          return emitter.emitReduction(op);
-                        })) ||
-      failed(addHandler(registry, "intent.arg_reduce",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
                             return success();
@@ -1150,15 +1145,14 @@ SourceEmitter::privateWorkspacePointer(Operation &operation) {
 }
 
 FailureOr<std::string>
-SourceEmitter::scanWorkspacePointer(const plan::ScanOp &binding,
+SourceEmitter::scanWorkspacePointer(Value result, const plan::ScanOp &binding,
                                     StringRef logicalIndex,
                                     Operation &consumer) {
   Operation *scan = kernel.nodes.lookup(binding.getNode());
-  auto workspace = scan && scan->getNumResults() == 1
-                       ? workspaceNames.find(scan->getResult(0))
-                       : workspaceNames.end();
+  auto workspace = workspaceNames.find(result);
   std::string extent = scanExtents.lookup(binding.getNode());
-  if (!scan || workspace == workspaceNames.end() || extent.empty())
+  if (!scan || result.getDefiningOp() != scan ||
+      workspace == workspaceNames.end() || extent.empty())
     return binding.emitOpError("has no Triton scan workspace binding");
   FailureOr<std::string> offset = target::emission::projectScanWorkspaceOffset(
       binding, extent, logicalIndex, planIndex, axisIndices, axisDimensions,
@@ -1239,25 +1233,44 @@ LogicalResult SourceEmitter::emitIndices(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "indices emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
-  FailureOr<plan::AxisOp> axis =
-      operation.getNumOperands() == 1
-          ? resolveAxis(operation.getOperand(0), operation)
-          : FailureOr<plan::AxisOp>(failure());
   auto result = operation.getNumResults() == 1
                     ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
                     : RankedTensorType();
   if (failed(node) || !binding || binding.getLowering() != "logical_indices" ||
-      failed(axis) || !result || result.getRank() != 1 ||
-      !isa<IntegerType, IndexType>(result.getElementType()))
+      !result || !isa<IntegerType, IndexType>(result.getElementType()))
+    return operation.emitOpError("lacks a mechanical Triton indices binding");
+  auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
+  auto tensorAxis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+  FailureOr<plan::AxisOp> axis = failure();
+  unsigned emittedAxis = 0;
+  if (mode && mode.getValue() == "tensor_axis") {
+    if (!tensorAxis || tensorAxis.getInt() < 0 || !result ||
+        tensorAxis.getInt() >= result.getRank() ||
+        static_cast<size_t>(tensorAxis.getInt()) >= binding.getAxisNodes().size())
+      return operation.emitOpError("has no tensor-axis indices binding");
+    axis = planIndex.axes.lookup(binding.getAxisNodes()[tensorAxis.getInt()]);
+    emittedAxis = tensorAxis.getInt();
+  } else if (operation.getNumOperands() == 1) {
+    axis = resolveAxis(operation.getOperand(0), operation);
+  }
+  if (failed(axis) ||
+      ((!mode || mode.getValue() != "tensor_axis") && result.getRank() != 1) ||
+      result.getRank() <= 0)
     return operation.emitOpError("lacks a mechanical Triton indices binding");
   if (axisIndices.lookup(axis->getNode()).empty() && axis->hasRole("lane"))
     axisIndices[axis->getNode()] =
         "tl.arange(0, " + axis->getTile().str() + ")";
   FailureOr<std::string> expression =
-      indexExpression(*axis, false, 0, 1, operation);
+      indexExpression(*axis, false, emittedAxis, result.getRank(), operation);
   if (failed(expression))
     return failure();
-  bindResult(operation, 0, *expression);
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), *expression, operation);
+  if (failed(padded))
+    return failure();
+  std::string emitted = makeResultName(operation, 0);
+  line(emitted + " = " + *padded);
+  bindResult(operation, 0, emitted);
   return success();
 }
 
@@ -1292,32 +1305,88 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
       succeeded(node) ? planIndex.reductions.lookup(*node) : plan::ReductionOp();
   if (failed(node) || !binding)
     return operation.emitOpError("lacks a Triton reduction binding");
-  FailureOr<StringRef> operand = lookupValue(operation, 0);
-  if (failed(operand))
-    return failure();
+  auto components =
+      operation.getAttrOfType<IntegerAttr>("intent.component_count");
+  if (!components || components.getInt() <= 0 ||
+      operation.getNumResults() != static_cast<unsigned>(components.getInt()))
+    return operation.emitOpError("has no canonical reduction component schema");
+  SmallVector<std::string> operands;
+  for (unsigned component = 0;
+       component < static_cast<unsigned>(components.getInt()); ++component) {
+    FailureOr<StringRef> operand = lookupValue(operation, component);
+    if (failed(operand))
+      return failure();
+    operands.push_back(operand->str());
+  }
   if (binding.getLowering() == "tl.max_with_index") {
     if (operation.getNumResults() != 2)
       return operation.emitOpError(
           "Triton arg-reduction requires value and index results");
     std::string value = makeResultName(operation, 0);
     std::string index = makeResultName(operation, 1);
-    line(value + ", " + index + " = tl.max(" + operand->str() + ", axis=" +
+    line(value + ", " + index + " = tl.max(" + operands.front() + ", axis=" +
          std::to_string(binding.getAxis()) +
          ", return_indices=True, return_indices_tie_break_left=True)");
     bindResult(operation, 0, value);
     bindResult(operation, 1, index);
     return success();
   }
-  if (operation.getNumResults() != 1)
-    return operation.emitOpError("Triton reduction requires one result");
-  std::string result = makeResultName(operation, 0);
+  if (binding.getLowering() == "tl.reduce") {
+    FailureOr<target::emission::CombinerUse> combiner =
+        target::emission::resolveCombiner(operation);
+    if (failed(combiner))
+      return failure();
+    SmallVector<std::string> results;
+    for (unsigned component = 0; component < operation.getNumResults(); ++component)
+      results.push_back(makeResultName(operation, component));
+    SmallVector<std::string> projectedInputs = operands;
+    SmallVector<std::string> projectedResults = results;
+    std::string function = combiner->function.getName().str();
+    if (combiner->captureCount != 0) {
+      FailureOr<std::string> projection =
+          target::emission::combinerProjectionName(operation);
+      if (failed(projection))
+        return failure();
+      function = *projection;
+      for (unsigned capture = 0; capture < combiner->captureCount; ++capture) {
+        unsigned operandIndex = 2 * combiner->componentCount + capture;
+        FailureOr<StringRef> value = lookupValue(operation, operandIndex);
+        StringRef dtype = tritonDtype(operation.getOperand(operandIndex).getType());
+        if (failed(value) || dtype.empty())
+          return operation.emitOpError(
+              "has no Triton scalar capture projection");
+        projectedInputs.push_back("tl.full(" + operands.front() + ".shape, " +
+                                  value->str() + ", " + dtype.str() + ")");
+        projectedResults.push_back(makeResultName(operation, 0) + "_capture_" +
+                                   std::to_string(capture));
+      }
+      projectedInputs.push_back("tl.full(" + operands.front() +
+                                ".shape, True, tl.int1)");
+      projectedResults.push_back(makeResultName(operation, 0) + "_capture_valid");
+    }
+    std::string input = projectedInputs.size() == 1
+                            ? projectedInputs.front()
+                            : "(" + llvm::join(projectedInputs, ", ") + ")";
+    line(llvm::join(projectedResults, ", ") + " = tl.reduce(" + input + ", axis=" +
+         std::to_string(binding.getAxis()) + ", combine_fn=" +
+         function + ")");
+    for (auto [index, result] : llvm::enumerate(results))
+      bindResult(operation, index, result);
+    return success();
+  }
+  if (operation.getNumResults() != operands.size())
+    return operation.emitOpError(
+        "built-in Triton reduction components do not match results");
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    std::string result = makeResultName(operation, component);
   if (binding.getLowering() == "tl.reduce_all")
-    line(result + " = ~tl.reduce_or(~(" + operand->str() + "), axis=" +
+      line(result + " = ~tl.reduce_or(~(" + operands[component] + "), axis=" +
          std::to_string(binding.getAxis()) + ")");
   else
-    line(result + " = " + binding.getLowering().str() + "(" + operand->str() +
+      line(result + " = " + binding.getLowering().str() + "(" + operands[component] +
          ", axis=" + std::to_string(binding.getAxis()) + ")");
-  bindResult(operation, 0, result);
+    bindResult(operation, component, result);
+  }
   return success();
 }
 
@@ -1325,15 +1394,76 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "scan emission");
   plan::ScanOp binding =
       succeeded(node) ? planIndex.scans.lookup(*node) : plan::ScanOp();
-  FailureOr<StringRef> operand = lookupValue(operation, 0);
+  auto components =
+      operation.getAttrOfType<IntegerAttr>("intent.component_count");
+  if (!components || components.getInt() <= 0 ||
+      operation.getNumResults() != static_cast<unsigned>(components.getInt()))
+    return operation.emitOpError("has no canonical scan component schema");
+  SmallVector<std::string> operands;
+  for (unsigned component = 0;
+       component < static_cast<unsigned>(components.getInt()); ++component) {
+    FailureOr<StringRef> operand = lookupValue(operation, component);
+    if (failed(operand))
+      return failure();
+    operands.push_back(operand->str());
+  }
   if (binding && binding.getResultSpace() == "private_fragment") {
-    if (failed(node) || binding.getLowering() != "tl.cumsum" ||
-        failed(operand) || operation.getNumResults() != 1)
+    if (failed(node) ||
+        (binding.getLowering() != "tl.cumsum" &&
+         binding.getLowering() != "tl.associative_scan"))
       return operation.emitOpError("lacks a fragment Triton scan binding");
-    std::string result = makeResultName(operation, 0);
-    line(result + " = tl.cumsum(" + operand->str() + ", axis=" +
-         std::to_string(binding.getAxis()) + ")");
-    bindResult(operation, 0, result);
+    if (binding.getLowering() == "tl.associative_scan") {
+      FailureOr<target::emission::CombinerUse> combiner =
+          target::emission::resolveCombiner(operation);
+      if (failed(combiner))
+        return failure();
+      SmallVector<std::string> results;
+      for (unsigned component = 0; component < operation.getNumResults(); ++component)
+        results.push_back(makeResultName(operation, component));
+      SmallVector<std::string> projectedInputs = operands;
+      SmallVector<std::string> projectedResults = results;
+      std::string function = combiner->function.getName().str();
+      if (combiner->captureCount != 0) {
+        FailureOr<std::string> projection =
+            target::emission::combinerProjectionName(operation);
+        if (failed(projection))
+          return failure();
+        function = *projection;
+        for (unsigned capture = 0; capture < combiner->captureCount; ++capture) {
+          unsigned operandIndex = 2 * combiner->componentCount + capture;
+          FailureOr<StringRef> value = lookupValue(operation, operandIndex);
+          StringRef dtype = tritonDtype(operation.getOperand(operandIndex).getType());
+          if (failed(value) || dtype.empty())
+            return operation.emitOpError(
+                "has no Triton scalar capture projection");
+          projectedInputs.push_back("tl.full(" + operands.front() + ".shape, " +
+                                    value->str() + ", " + dtype.str() + ")");
+          projectedResults.push_back(makeResultName(operation, 0) + "_capture_" +
+                                     std::to_string(capture));
+        }
+        projectedInputs.push_back("tl.full(" + operands.front() +
+                                  ".shape, True, tl.int1)");
+        projectedResults.push_back(makeResultName(operation, 0) + "_capture_valid");
+      }
+      std::string input = projectedInputs.size() == 1
+                              ? projectedInputs.front()
+                              : "(" + llvm::join(projectedInputs, ", ") + ")";
+      line(llvm::join(projectedResults, ", ") + " = tl.associative_scan(" + input +
+           ", axis=" + std::to_string(binding.getAxis()) + ", combine_fn=" +
+           function + ")");
+      for (auto [index, result] : llvm::enumerate(results))
+        bindResult(operation, index, result);
+      return success();
+    }
+    if (operation.getNumResults() != operands.size())
+      return operation.emitOpError(
+          "built-in Triton scan components do not match results");
+    for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+      std::string result = makeResultName(operation, component);
+      line(result + " = tl.cumsum(" + operands[component] + ", axis=" +
+           std::to_string(binding.getAxis()) + ")");
+      bindResult(operation, component, result);
+    }
     return success();
   }
   plan::AxisOp axis = binding ? planIndex.axes.lookup(binding.getAxisNode())
@@ -1342,17 +1472,54 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
       axis ? axis.getRange("traversal", 0) : nullptr;
   std::string extent = binding ? scanExtents.lookup(binding.getNode())
                                : std::string();
-  if (failed(node) || !binding || binding.getLowering() != "tl.cumsum" ||
-      !axis || !range || extent.empty() ||
-      operation.getNumResults() != 1)
+  bool generic = binding && binding.getLowering() == "tl.associative_scan";
+  if (failed(node) || !binding ||
+      (binding.getLowering() != "tl.cumsum" && !generic) || !axis || !range ||
+      extent.empty() || operation.getNumResults() == 0)
     return operation.emitOpError("lacks a mechanical Triton scan binding");
-  std::string result = makeResultName(operation, 0);
-  std::string carry = result + "_carry";
-  std::string block = result + "_block";
-  std::string offsets = result + "_offsets";
-  std::string values = result + "_values";
-  std::string scanned = result + "_scanned";
-  line(carry + " = 0");
+  FailureOr<target::emission::CombinerUse> combiner = failure();
+  std::string function;
+  if (generic) {
+    combiner = target::emission::resolveCombiner(operation);
+    if (failed(combiner))
+      return failure();
+    function = combiner->function.getName().str();
+    if (combiner->captureCount != 0) {
+      FailureOr<std::string> projection =
+          target::emission::combinerProjectionName(operation);
+      if (failed(projection))
+        return failure();
+      function = *projection;
+    }
+  }
+  SmallVector<std::string> identities;
+  SmallVector<std::string> carries;
+  SmallVector<Type> carryTypes;
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    FailureOr<StringRef> identity =
+        lookupValue(operation, operation.getNumResults() + component);
+    if (failed(identity))
+      return failure();
+    identities.push_back(identity->str());
+    carries.push_back(makeResultName(operation, component) + "_carry");
+    carryTypes.push_back(operation.getResult(component).getType());
+    line(carries.back() + " = " + identities.back());
+  }
+  if (generic && combiner->captureCount != 0) {
+    for (unsigned capture = 0; capture < combiner->captureCount; ++capture) {
+      carries.push_back(makeResultName(operation, 0) + "_capture_" +
+                        std::to_string(capture) + "_carry");
+      carryTypes.push_back(
+          operation.getOperand(2 * combiner->componentCount + capture).getType());
+      line(carries.back() + " = 0");
+    }
+    carries.push_back(makeResultName(operation, 0) + "_capture_valid_carry");
+    carryTypes.push_back(IntegerType::get(operation.getContext(), 1));
+    line(carries.back() + " = False");
+  }
+  std::string stem = makeResultName(operation, 0);
+  std::string block = stem + "_block";
+  std::string offsets = stem + "_offsets";
   line("for " + block + " in tl.range(0, tl.cdiv(" + extent + ", " +
        range->getTile().str() + "), flatten=True):");
   ++indentation;
@@ -1360,14 +1527,14 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
        " + tl.arange(0, " + range->getTile().str() + ")");
   if (failed(replayScanProducers(binding, offsets)))
     return failure();
-  operand = lookupValue(operation, 0);
-  if (failed(operand))
-    return failure();
-  FailureOr<std::string> input = scanWorkspacePointer(
-      binding, offsets, operation);
-  if (failed(input))
-    return failure();
-  line(values + " = " + operand->str());
+  SmallVector<std::string> blockInputs;
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    FailureOr<StringRef> operand = lookupValue(operation, component);
+    if (failed(operand))
+      return failure();
+    blockInputs.push_back("tl.where(" + offsets + " < " + extent + ", " +
+                          operand->str() + ", " + identities[component] + ")");
+  }
   for (int64_t valueID : binding.getMaterializedValues()) {
     Value value = kernel.values.lookup(valueID);
     auto name = valueNames.find(value);
@@ -1379,19 +1546,74 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
     line("tl.store(" + *pointer + ", " + name->second + ", mask=" + offsets +
          " < " + extent + ")");
   }
-  line(scanned + " = tl.cumsum(tl.where(" + offsets + " < " + extent +
-       ", " + values + ", 0), axis=" +
-       std::to_string(binding.getAxis()) + ") + " + carry);
-  line("tl.store(" + *input + ", " + scanned + ", mask=" + offsets +
-       " < " + extent + ")");
+  SmallVector<std::string> localInputs = blockInputs;
+  SmallVector<std::string> localResults;
+  SmallVector<std::string> globalResults;
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    localResults.push_back(makeResultName(operation, component) + "_local_scan");
+    globalResults.push_back(makeResultName(operation, component) + "_global_scan");
+  }
+  if (generic && combiner->captureCount != 0) {
+    for (unsigned capture = 0; capture < combiner->captureCount; ++capture) {
+      unsigned operandIndex = 2 * combiner->componentCount + capture;
+      FailureOr<StringRef> captureValue = lookupValue(operation, operandIndex);
+      StringRef dtype = tritonDtype(operation.getOperand(operandIndex).getType());
+      if (failed(captureValue) || dtype.empty())
+        return operation.emitOpError(
+            "has no Triton workspace-scan capture projection");
+      localInputs.push_back("tl.full(" + blockInputs.front() + ".shape, " +
+                            captureValue->str() + ", " + dtype.str() + ")");
+      localResults.push_back(stem + "_capture_" + std::to_string(capture) +
+                             "_local_scan");
+      globalResults.push_back(stem + "_capture_" + std::to_string(capture) +
+                              "_global_scan");
+    }
+    localInputs.push_back("tl.full(" + blockInputs.front() +
+                          ".shape, True, tl.int1)");
+    localResults.push_back(stem + "_capture_valid_local_scan");
+    globalResults.push_back(stem + "_capture_valid_global_scan");
+  }
+  if (generic) {
+    std::string input = localInputs.size() == 1
+                            ? localInputs.front()
+                            : "(" + llvm::join(localInputs, ", ") + ")";
+    line(llvm::join(localResults, ", ") + " = tl.associative_scan(" + input +
+         ", axis=" + std::to_string(binding.getAxis()) + ", combine_fn=" +
+         function + ")");
+    SmallVector<std::string> arguments = carries;
+    arguments.append(localResults);
+    line(llvm::join(globalResults, ", ") + " = " + function + "(" +
+         llvm::join(arguments, ", ") + ")");
+  } else {
+    for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+      line(localResults[component] + " = tl.cumsum(" + blockInputs[component] +
+           ", axis=" + std::to_string(binding.getAxis()) + ")");
+      line(globalResults[component] + " = " + localResults[component] + " + " +
+           carries[component]);
+    }
+  }
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    FailureOr<std::string> pointer = scanWorkspacePointer(
+        operation.getResult(component), binding, offsets, operation);
+    if (failed(pointer))
+      return failure();
+    line("tl.store(" + *pointer + ", " + globalResults[component] + ", mask=" +
+         offsets + " < " + extent + ")");
+  }
   std::string lastLane = "tl.minimum(" + range->getTile().str() +
                          " - 1, " + extent + " - " + block + " * " +
                          range->getTile().str() + " - 1)";
-  line(carry + " = tl.sum(tl.where(tl.arange(0, " +
-       range->getTile().str() + ") == " + lastLane + ", " + scanned +
-       ", 0), axis=0)");
+  for (unsigned component = 0; component < carries.size(); ++component) {
+    StringRef dtype = tritonDtype(carryTypes[component]);
+    if (dtype.empty())
+      return operation.emitOpError("has no Triton scan carry dtype");
+    line(carries[component] + " = tl.cast(tl.sum(tl.where(tl.arange(0, " +
+         range->getTile().str() + ") == " + lastLane + ", " +
+         globalResults[component] + ", 0), axis=0), " + dtype.str() + ")");
+  }
   --indentation;
-  valueNames.erase(operation.getResult(0));
+  for (Value result : operation.getResults())
+    valueNames.erase(result);
   return success();
 }
 
@@ -1826,8 +2048,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       return failure();
     std::string result = makeResultName(operation, 0);
     if (scanSource != scanResults.end()) {
-      FailureOr<std::string> pointer =
-          scanWorkspacePointer(scanSource->second, index->str(), operation);
+      FailureOr<std::string> pointer = scanWorkspacePointer(
+          operation.getOperand(0), scanSource->second, index->str(), operation);
       if (failed(pointer))
         return failure();
       line(result + " = tl.where(" + valid->str() + ", tl.load(" + *pointer +

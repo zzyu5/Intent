@@ -120,12 +120,14 @@ def Intent_MaskOp : Intent_Op<"mask", [Pure]> {
   let results = (outs AnyType:$result);
 }
 
-def Intent_ReduceOp : Intent_BinaryOneResultOp<"reduce">;
-def Intent_ArgReduceOp : Intent_Op<"arg_reduce", [Pure]> {
-  let arguments = (ins AnyType:$input, AnyType:$identity);
+def Intent_ReduceOp : Intent_Op<"reduce", [Pure]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>:$results);
 }
-def Intent_ScanOp : Intent_BinaryOneResultOp<"scan">;
+def Intent_ScanOp : Intent_Op<"scan", [Pure]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+}
 def Intent_ContractOp : Intent_BinaryOneResultOp<"contract">;
 def Intent_SparseContractOp : Intent_VariadicOneResultOp<"sparse_contract">;
 

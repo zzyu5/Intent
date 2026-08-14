@@ -1,8 +1,10 @@
 #include "Intent/Target/Common/Realization/KernelFacts.h"
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "Intent/Target/Common/Analysis/Record.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallString.h"
 
 #include <cmath>
 
@@ -67,7 +69,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
         continue;
       return false;
     }
-    if (name == "intent.reduce" || name == "intent.arg_reduce") {
+    if (name == "intent.reduce") {
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");
       if (!combine ||
           (combine.getValue() == "add" && padded != PaddedValue::zero) ||
@@ -166,15 +168,24 @@ std::optional<std::string> literalPadding(Value value) {
                                          : std::string("true");
   }
   if (auto floating = dyn_cast<FloatAttr>(literal)) {
-    double number = floating.getValueAsDouble();
-    if (number == 0.0)
+    const llvm::APFloat &number = floating.getValue();
+    if (number.isZero())
       return std::string("zero");
-    if (std::isinf(number) && number < 0.0)
-      return std::string("negative_infinity");
+    if (number.isInfinity())
+      return number.isNegative() ? std::string("negative_infinity")
+                                 : std::string("positive_infinity");
+    if (number.isNaN())
+      return std::string("nan");
+    llvm::SmallString<32> spelling;
+    number.toString(spelling);
+    return "literal_float:" + spelling.str().str();
   }
-  if (auto integer = dyn_cast<IntegerAttr>(literal))
+  if (auto integer = dyn_cast<IntegerAttr>(literal)) {
     if (integer.getValue().isZero())
       return std::string("zero");
+    else
+      return "literal_integer:" + std::to_string(integer.getInt());
+  }
   return std::nullopt;
 }
 
@@ -213,6 +224,12 @@ std::optional<std::string> inferPadding(
     return std::string("zero");
   if (name == "intent.full" && definition->getNumOperands() == 1)
     return inferPadding(definition->getOperand(0), facts, assumedPadding);
+  if (name == "intent.extract") {
+    FailureOr<Value> field = resolveRecordField(*definition);
+    return succeeded(field)
+               ? inferPadding(*field, facts, assumedPadding)
+               : std::nullopt;
+  }
   if ((name == "intent.cast" || name == "intent.broadcast" ||
        name == "intent.reshape" || name == "intent.transpose") &&
       definition->getNumOperands() >= 1)

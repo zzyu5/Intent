@@ -15,6 +15,7 @@ public:
 
   virtual mlir::LogicalResult prepare() = 0;
   virtual void emitImports() = 0;
+  virtual mlir::LogicalResult emitHelpers() = 0;
   virtual mlir::LogicalResult emitKernelHeader() = 0;
   virtual mlir::LogicalResult
   registerOperationHandlers(OperationHandlerRegistry &registry) = 0;

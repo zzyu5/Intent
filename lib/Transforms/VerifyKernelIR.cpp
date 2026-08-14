@@ -3,6 +3,7 @@
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -511,41 +512,128 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
           "requires integer seed/counter and counter_xorshift32 f32 output");
     return success();
   }
+  auto verifyCombinerUse = [&](bool scan) -> LogicalResult {
+    auto components =
+        operation->getAttrOfType<IntegerAttr>("intent.component_count");
+    auto captures = operation->getAttrOfType<IntegerAttr>("intent.capture_count");
+    Attribute combine = operation->getAttr("intent.combine");
+    if (!components || components.getInt() <= 0 || !captures ||
+        captures.getInt() < 0 || !combine)
+      return operation->emitOpError(
+          "requires component_count, capture_count, and combine semantics");
+    unsigned componentCount = static_cast<unsigned>(components.getInt());
+    unsigned captureCount = static_cast<unsigned>(captures.getInt());
+    if (operation->getNumOperands() != 2 * componentCount + captureCount ||
+        operation->getNumResults() != componentCount)
+      return operation->emitOpError(
+          "combiner operands/results do not match its component schema");
+
+    for (unsigned index = 0; index < componentCount; ++index) {
+      auto source = dyn_cast<RankedTensorType>(operation->getOperand(index).getType());
+      Type identity = operation->getOperand(componentCount + index).getType();
+      Type result = operation->getResult(index).getType();
+      Type resultElement = result;
+      if (auto tensor = dyn_cast<RankedTensorType>(result))
+        resultElement = tensor.getElementType();
+      if (!source || !isa<IntegerType, IndexType, FloatType>(identity) ||
+          source.getElementType() != identity || resultElement != identity)
+        return operation->emitOpError(
+            "combiner source, identity, and result component types disagree");
+      if (scan) {
+        auto resultTensor = dyn_cast<RankedTensorType>(result);
+        if (!resultTensor || resultTensor.getShape() != source.getShape())
+          return operation->emitOpError(
+              "scan result components must preserve their source shape");
+      }
+    }
+
+    if (auto builtin = dyn_cast<StringAttr>(combine)) {
+      if (captureCount != 0 ||
+          !llvm::is_contained(
+              {StringRef("add"), StringRef("maximum"),
+               StringRef("logical_or"), StringRef("logical_and")},
+              builtin.getValue()))
+        return operation->emitOpError(
+            "has unsupported built-in combiner semantics");
+      return success();
+    }
+
+    auto reference = dyn_cast<FlatSymbolRefAttr>(combine);
+    auto module = operation->getParentOfType<ModuleOp>();
+    auto function = reference && module
+                        ? module.lookupSymbol<func::FuncOp>(reference.getValue())
+                        : func::FuncOp();
+    auto role = function
+                    ? function->getAttrOfType<StringAttr>("intent.role")
+                    : StringAttr();
+    auto helperComponents =
+        function ? function->getAttrOfType<IntegerAttr>(
+                       "intent.component_count")
+                 : IntegerAttr();
+    auto helperCaptures =
+        function ? function->getAttrOfType<IntegerAttr>("intent.capture_count")
+                 : IntegerAttr();
+    if (!function || !role || role.getValue() != "combiner" ||
+        !helperComponents || helperComponents.getInt() != components.getInt() ||
+        !helperCaptures || helperCaptures.getInt() != captures.getInt() ||
+        function.getNumArguments() != 2 * componentCount + captureCount ||
+        function.getNumResults() != componentCount)
+      return operation->emitOpError(
+          "does not reference a typed combiner helper with matching arity");
+    auto builtin =
+        operation->getAttrOfType<StringAttr>("intent.combine_builtin");
+    auto helperBuiltin =
+        function->getAttrOfType<StringAttr>("intent.builtin");
+    if (static_cast<bool>(builtin) != static_cast<bool>(helperBuiltin) ||
+        (builtin && builtin.getValue() != helperBuiltin.getValue()) ||
+        (builtin &&
+         (builtin.getValue() != "argmax_lowest" || componentCount != 2 ||
+          captureCount != 0)))
+      return operation->emitOpError(
+          "combiner built-in role does not match its typed helper contract");
+    for (unsigned index = 0; index < componentCount; ++index) {
+      Type identity = operation->getOperand(componentCount + index).getType();
+      if (function.getArgument(index).getType() != identity ||
+          function.getArgument(componentCount + index).getType() != identity ||
+          function.getResultTypes()[index] != identity)
+        return operation->emitOpError(
+            "combiner helper accumulator types do not match identities");
+    }
+    for (unsigned index = 0; index < captureCount; ++index)
+      if (!isa<IntegerType, IndexType, FloatType>(
+              operation->getOperand(2 * componentCount + index).getType()) ||
+          function.getArgument(2 * componentCount + index).getType() !=
+              operation->getOperand(2 * componentCount + index).getType())
+        return operation->emitOpError(
+            "combiner helper captures must be matching explicit scalar operands");
+    return success();
+  };
   if (name == "intent.reduce") {
     if (failed(requireAttribute<ArrayAttr>(operation, "intent.axes")))
       return failure();
-    return requireAttribute<StringAttr>(operation, "intent.combine");
-  }
-  if (name == "intent.arg_reduce") {
-    if (operation->getNumOperands() != 2 || operation->getNumResults() != 2)
-      return operation->emitOpError(
-          "requires source/identity operands and value/index results");
-    if (failed(requireAttribute<ArrayAttr>(operation, "intent.axes")) ||
-        failed(requireAttribute<StringAttr>(operation, "intent.combine")) ||
-        failed(requireAttribute<StringAttr>(operation, "intent.tie")))
-      return failure();
-    auto combine = operation->getAttrOfType<StringAttr>("intent.combine");
-    auto tie = operation->getAttrOfType<StringAttr>("intent.tie");
-    Type indexType = operation->getResult(1).getType();
-    if (auto tensor = dyn_cast<RankedTensorType>(indexType))
-      indexType = tensor.getElementType();
-    if (!combine || combine.getValue() != "maximum" || !tie ||
-        tie.getValue() != "lowest_index" || !indexType.isInteger(32))
-      return operation->emitOpError(
-          "requires maximum with lowest-index tie breaking and i32 indices");
-    return success();
+    return verifyCombinerUse(false);
   }
   if (name == "intent.scan") {
     if (failed(requireAttribute<IntegerAttr>(operation, "intent.axis")))
       return failure();
     if (failed(requireAttribute<BoolAttr>(operation, "intent.inclusive")))
       return failure();
-    return requireAttribute<StringAttr>(operation, "intent.combine");
+    return verifyCombinerUse(true);
   }
   if (name == "intent.contract") {
     if (failed(requireAttribute<ArrayAttr>(operation, "intent.reduce")))
       return failure();
-    return requireAttribute<ArrayAttr>(operation, "intent.batch");
+    if (failed(requireAttribute<ArrayAttr>(operation, "intent.batch")) ||
+        failed(requireAttribute<StringAttr>(operation, "intent.multiply")) ||
+        failed(requireAttribute<StringAttr>(operation, "intent.combine")))
+      return failure();
+    auto multiply = operation->getAttrOfType<StringAttr>("intent.multiply");
+    auto combine = operation->getAttrOfType<StringAttr>("intent.combine");
+    if (multiply.getValue() != "multiply" || combine.getValue() != "add")
+      return operation->emitOpError(
+          "supports only the multiply/add semiring; use explicit pointwise "
+          "operations and intent.reduce for another semiring");
+    return success();
   }
   if (name == "intent.atomic_cas") {
     auto relation = operation->getAttrOfType<ArrayAttr>("intent.index");
@@ -590,6 +678,66 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
   return success();
 }
 
+LogicalResult verifyCombinerHelper(func::FuncOp function) {
+  auto role = function->getAttrOfType<StringAttr>("intent.role");
+  if (!role || role.getValue() != "combiner")
+    return function.emitOpError("helper requires a supported intent.role");
+  auto components =
+      function->getAttrOfType<IntegerAttr>("intent.component_count");
+  auto captures = function->getAttrOfType<IntegerAttr>("intent.capture_count");
+  if (!components || components.getInt() <= 0 || !captures ||
+      captures.getInt() < 0)
+    return function.emitOpError(
+        "combiner helper requires positive component_count and non-negative capture_count");
+  unsigned componentCount = static_cast<unsigned>(components.getInt());
+  unsigned captureCount = static_cast<unsigned>(captures.getInt());
+  if (auto builtin =
+          function->getAttrOfType<StringAttr>("intent.builtin"))
+    if (builtin.getValue() != "argmax_lowest" || componentCount != 2 ||
+        captureCount != 0)
+      return function.emitOpError("has an unsupported combiner built-in role");
+  if (function.getNumArguments() != 2 * componentCount + captureCount ||
+      function.getNumResults() != componentCount)
+    return function.emitOpError(
+        "combiner helper signature does not match its component schema");
+  for (unsigned index = 0; index < componentCount; ++index) {
+    Type type = function.getResultTypes()[index];
+    if (!isa<IntegerType, IndexType, FloatType>(type) ||
+        function.getArgument(index).getType() != type ||
+        function.getArgument(componentCount + index).getType() != type)
+      return function.emitOpError(
+          "combiner accumulator parameters/results must be matching scalar types");
+  }
+  for (Operation &operation : function.getBody().front()) {
+    StringRef name = operation.getName().getStringRef();
+    if (!llvm::is_contained(
+            {StringRef("intent.constant"), StringRef("intent.make_record"),
+             StringRef("intent.extract"), StringRef("intent.unary"),
+             StringRef("intent.binary"), StringRef("intent.compare"),
+             StringRef("intent.select"), StringRef("intent.cast"),
+             StringRef("intent.return")},
+            name))
+      return operation.emitOpError(
+          "is not legal in a pure scalar combiner helper");
+    if (operation.getNumRegions() != 0 || operation.getAttr("intent.effects"))
+      return operation.emitOpError(
+          "combiner helper operations must be effect-free scalar SSA");
+    if (name == "intent.return" &&
+        &operation != &function.getBody().front().back())
+      return operation.emitOpError(
+          "combiner helper return must be the final operation");
+  }
+  Operation &terminator = function.getBody().front().back();
+  if (terminator.getNumOperands() != componentCount)
+    return terminator.emitOpError(
+        "combiner return schema does not match accumulator components");
+  for (unsigned index = 0; index < componentCount; ++index)
+    if (terminator.getOperand(index).getType() != function.getResultTypes()[index])
+      return terminator.emitOpError(
+          "combiner return type does not match accumulator component");
+  return success();
+}
+
 class VerifyKernelIRPass
     : public PassWrapper<VerifyKernelIRPass, OperationPass<ModuleOp>> {
 public:
@@ -627,6 +775,8 @@ LogicalResult verifyKernelModule(ModuleOp module) {
         return function.emitOpError("module contains more than one kernel entry");
       sawKernel = true;
     }
+    if (kind.getValue() == "helper" && failed(verifyCombinerHelper(function)))
+      return failure();
     if (parameters.size() != function.getNumArguments() ||
         parameterNodes.size() != function.getNumArguments() ||
         results.size() != function.getNumResults())

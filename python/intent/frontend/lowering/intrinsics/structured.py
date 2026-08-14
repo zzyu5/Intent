@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+from intent.api import HelperDefinition
 from intent.frontend.semantics import ValueType
+from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
@@ -49,7 +51,7 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
-        ("value", "axis", "identity", "combine", "acc_dtype"),
+        ("value", "axis", "identity", "combine", "combine_operands", "acc_dtype"),
         required=("value", "axis", "identity"),
     )
     source = lowerer.read_value(
@@ -71,6 +73,13 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         )
         if identity.type != ScalarType(acc_dtype):
             lowerer.error(node, "reduce identity must have accumulator dtype")
+        if source.type.dtype != acc_dtype:
+            source = lowerer.emit(
+                OperationKind.CAST,
+                lowerer.location(node),
+                operands=(source,),
+                result_types=(TensorType(acc_dtype, source.type.shape),),
+            ).results[0]
         normalized = {axis % source.type.rank for axis in axes}
         result_shape = tuple(
             dimension
@@ -92,26 +101,47 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
     else:
         lowerer.error(node, "I.reduce input must be tensor or tensor record")
 
+    source_components, identity_components, component_names, result_components = (
+        _flatten_accumulator(lowerer, source, identity, result_type, node)
+    )
+    captures = _combine_operands(lowerer, bound.get("combine_operands"), node)
     if name == "reduce.max":
+        if captures:
+            lowerer.error(node, "built-in reduction does not accept combine_operands=")
         combine: object = "maximum"
     elif name == "reduce.sum":
+        if captures:
+            lowerer.error(node, "built-in reduction does not accept combine_operands=")
         combine = "add"
     else:
         if "combine" not in bound:
             lowerer.error(node, "generic I.reduce requires combine=")
-        combine = _callable_symbol(
+        combine = _combiner(
             lowerer,
             bound["combine"],
+            identity.type,
+            component_names,
+            tuple(value.type for value in identity_components),
+            captures,
+            node,
         )
-    attributes["combine"] = combine
+    attributes.update(
+        {
+            "combine": combine,
+            "component_count": len(source_components),
+            "capture_count": len(captures),
+        }
+    )
     operation = lowerer.emit(
         OperationKind.REDUCE,
         lowerer.location(node),
-        operands=(source, identity),
-        result_types=(result_type,),
+        operands=source_components + identity_components + captures,
+        result_types=result_components,
         attributes=attributes,
     )
-    return operation.results[0]
+    return _rebuild_accumulator(
+        lowerer, operation.results, result_type, component_names, node
+    )
 
 
 def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
@@ -145,6 +175,13 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     )
     if identity.type != ScalarType(acc_dtype):
         lowerer.error(node, "arg-reduce identity must have accumulator dtype")
+    if source.type.dtype != acc_dtype:
+        source = lowerer.emit(
+            OperationKind.CAST,
+            lowerer.location(node),
+            operands=(source,),
+            result_types=(TensorType(acc_dtype, source.type.shape),),
+        ).results[0]
     result_shape = tuple(
         dimension
         for axis, dimension in enumerate(source.type.shape)
@@ -152,16 +189,28 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
     )
     value_type = lowerer.value_result_type(acc_dtype, result_shape)
     index_type = lowerer.value_result_type(i32, result_shape)
-    operation = lowerer.emit(
-        OperationKind.ARG_REDUCE,
+    indices = lowerer.emit(
+        OperationKind.INDICES,
         lowerer.location(node),
-        operands=(source, identity),
+        operands=(source,),
+        result_types=(TensorType(i32, source.type.shape),),
+        attributes={"axis": axes[0], "mode": "tensor_axis"},
+    ).results[0]
+    index_identity = lowerer.emit_literal(2147483647, node, ScalarType(i32))
+    combine = lowerer.compiler.lower_argmax_combiner(
+        ScalarType(acc_dtype), ScalarType(i32), lowerer.location(node)
+    )
+    operation = lowerer.emit(
+        OperationKind.REDUCE,
+        lowerer.location(node),
+        operands=(source, indices, identity, index_identity),
         result_types=(value_type, index_type),
         attributes={
             "axes": axes,
-            "acc_dtype": acc_dtype,
-            "combine": "maximum",
-            "tie": "lowest_index",
+            "combine": combine,
+            "combine_builtin": "argmax_lowest",
+            "component_count": 2,
+            "capture_count": 0,
         },
     )
     return StaticTuple(operation.results)
@@ -171,7 +220,15 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
-        ("value", "axis", "identity", "combine", "inclusive", "acc_dtype"),
+        (
+            "value",
+            "axis",
+            "identity",
+            "combine",
+            "combine_operands",
+            "inclusive",
+            "acc_dtype",
+        ),
         required=("value", "axis", "identity", "combine", "inclusive"),
     )
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
@@ -194,6 +251,15 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             bound["identity"],
             ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
         )
+        if identity.type != ScalarType(acc_dtype):
+            lowerer.error(node, "scan identity must have accumulator dtype")
+        if source.type.dtype != acc_dtype:
+            source = lowerer.emit(
+                OperationKind.CAST,
+                lowerer.location(node),
+                operands=(source,),
+                result_types=(TensorType(acc_dtype, source.type.shape),),
+            ).results[0]
         result_type: ValueType = TensorType(acc_dtype, source.type.shape)
         attributes: dict[str, object] = {
             "axis": axes[0],
@@ -214,18 +280,31 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         attributes = {"axis": axes[0], "inclusive": inclusive}
     else:
         lowerer.error(node, "I.scan input must be tensor or tensor record")
-    attributes["combine"] = _callable_symbol(
+    source_components, identity_components, component_names, result_components = (
+        _flatten_accumulator(lowerer, source, identity, result_type, node)
+    )
+    captures = _combine_operands(lowerer, bound.get("combine_operands"), node)
+    attributes["combine"] = _combiner(
         lowerer,
         bound["combine"],
+        identity.type,
+        component_names,
+        tuple(value.type for value in identity_components),
+        captures,
+        node,
     )
+    attributes["component_count"] = len(source_components)
+    attributes["capture_count"] = len(captures)
     operation = lowerer.emit(
         OperationKind.SCAN,
         lowerer.location(node),
-        operands=(source, identity),
-        result_types=(result_type,),
+        operands=source_components + identity_components + captures,
+        result_types=result_components,
         attributes=attributes,
     )
-    return operation.results[0]
+    return _rebuild_accumulator(
+        lowerer, operation.results, result_type, component_names, node
+    )
 
 
 def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
@@ -302,6 +381,12 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             lowerer,
             bound["combine"],
         )
+    if multiply != "multiply" or combine != "add":
+        lowerer.error(
+            node,
+            "I.contract currently supports only multiply/add; spell a different "
+            "semiring explicitly with pointwise operations and I.reduce",
+        )
     operation = lowerer.emit(
         OperationKind.CONTRACT,
         lowerer.location(node),
@@ -374,6 +459,122 @@ def _callable_symbol(
     if isinstance(expression, Intrinsic):
         return expression.name
     lowerer.error(node, "combine/multiply must be an Intent intrinsic")
+
+
+def _combiner(
+    lowerer: FunctionLowerer,
+    node: ast.AST,
+    accumulator_type: ValueType,
+    component_names: tuple[str, ...],
+    component_types: tuple[ValueType, ...],
+    captures: tuple[MlirValue, ...],
+    call_node: ast.AST,
+) -> object:
+    expression = lowerer.lower_expression(node)
+    if isinstance(expression, Intrinsic):
+        if captures:
+            lowerer.error(node, "built-in combiner does not accept combine_operands=")
+        return expression.name
+    if isinstance(expression, HelperDefinition):
+        return lowerer.compiler.lower_combiner(
+            lowerer,
+            expression,
+            accumulator_type,
+            component_names,
+            component_types,
+            captures,
+            lowerer.location(call_node),
+        )
+    lowerer.error(node, "combine= must be an Intent intrinsic or @intent.fn")
+
+
+def _combine_operands(
+    lowerer: FunctionLowerer,
+    node: ast.AST | None,
+    call_node: ast.AST,
+) -> tuple[MlirValue, ...]:
+    if node is None:
+        return ()
+    expression = lowerer.lower_expression(node)
+    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
+    values = tuple(lowerer.materialize(element, node) for element in elements)
+    if any(isinstance(value.type, (TensorType, RecordType)) for value in values):
+        lowerer.error(
+            call_node,
+            "combine_operands must be explicit scalar SSA values",
+        )
+    return values
+
+
+def _extract_record_components(
+    lowerer: FunctionLowerer,
+    value: MlirValue,
+    node: ast.AST,
+) -> tuple[MlirValue, ...]:
+    if not isinstance(value.type, RecordType):
+        return (value,)
+    return tuple(
+        lowerer.emit(
+            OperationKind.EXTRACT,
+            lowerer.location(node),
+            operands=(value,),
+            result_types=(field_type,),
+            attributes={"key": field},
+        ).results[0]
+        for field, field_type in value.type.fields
+    )
+
+
+def _flatten_accumulator(
+    lowerer: FunctionLowerer,
+    source: MlirValue,
+    identity: MlirValue,
+    result_type: ValueType,
+    node: ast.AST,
+) -> tuple[
+    tuple[MlirValue, ...],
+    tuple[MlirValue, ...],
+    tuple[str, ...],
+    tuple[ValueType, ...],
+]:
+    source_components = _extract_record_components(lowerer, source, node)
+    identity_components = _extract_record_components(lowerer, identity, node)
+    if len(source_components) != len(identity_components):
+        lowerer.error(node, "source and identity accumulator schemas must match")
+    if isinstance(result_type, RecordType):
+        component_names = tuple(name for name, _ in result_type.fields)
+        result_components = tuple(field_type for _, field_type in result_type.fields)
+    else:
+        component_names = ("value",)
+        result_components = (result_type,)
+    if len(result_components) != len(source_components):
+        lowerer.error(node, "result accumulator schema must match source and identity")
+    return (
+        source_components,
+        identity_components,
+        component_names,
+        result_components,
+    )
+
+
+def _rebuild_accumulator(
+    lowerer: FunctionLowerer,
+    results: tuple[MlirValue, ...],
+    result_type: ValueType,
+    component_names: tuple[str, ...],
+    node: ast.AST,
+) -> MlirValue:
+    if not isinstance(result_type, RecordType):
+        if len(results) != 1:
+            lowerer.error(node, "scalar accumulator requires one result")
+        return results[0]
+    return lowerer.emit(
+        OperationKind.MAKE_RECORD,
+        lowerer.location(node),
+        operands=results,
+        result_types=(result_type,),
+        attributes={"fields": component_names},
+    ).results[0]
 
 
 def _reduction_pairs(lowerer: FunctionLowerer, node: ast.AST) -> tuple[tuple[int, int], ...]:

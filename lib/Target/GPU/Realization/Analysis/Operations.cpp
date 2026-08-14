@@ -2,6 +2,8 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/Record.h"
+#include "Intent/Target/Common/Emission/Combiner.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -28,16 +30,12 @@ bool isLiteralBool(Value value, bool expected) {
 LogicalResult validateReduction(Operation &operation) {
   auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
   auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
-  if (!combine || !axes || axes.size() != 1 ||
-      !isa<IntegerAttr>(axes[0]))
+  if (!axes || axes.size() != 1 || !isa<IntegerAttr>(axes[0]))
     return operation.emitOpError("has no canonical single-axis reduction");
-  if (operation.getName().getStringRef() == "intent.arg_reduce") {
-    auto tie = operation.getAttrOfType<StringAttr>("intent.tie");
-    if (operation.getNumResults() == 2 && combine.getValue() == "maximum" &&
-        tie && tie.getValue() == "lowest_index")
-      return success();
-    return operation.emitOpError("has no supported GPU arg-reduction role");
-  }
+  if (target::emission::hasGenericCombiner(operation))
+    return success();
+  if (!combine)
+    return operation.emitOpError("has no canonical built-in reduction combiner");
   if (combine.getValue() == "maximum" || combine.getValue() == "add")
     return success();
   if (combine.getValue() == "logical_or" ||
@@ -65,6 +63,19 @@ LogicalResult validateReduction(Operation &operation) {
 
 bool isLiteralZero(Value value) {
   Operation *definition = value.getDefiningOp();
+  while (definition) {
+    if (definition->getName().getStringRef() == "intent.cast" &&
+        definition->getNumOperands() == 1)
+      value = definition->getOperand(0);
+    else if (definition->getName().getStringRef() == "intent.extract") {
+      FailureOr<Value> field = target::resolveRecordField(*definition);
+      if (failed(field))
+        return false;
+      value = *field;
+    } else
+      break;
+    definition = value.getDefiningOp();
+  }
   if (!definition ||
       definition->getName().getStringRef() != "intent.constant")
     return false;
@@ -77,23 +88,44 @@ bool isLiteralZero(Value value) {
 }
 
 LogicalResult validateScan(Operation &operation) {
-  auto input = operation.getNumOperands() == 2
-                   ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
-                   : RankedTensorType();
-  auto result = operation.getNumResults() == 1
-                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
-                    : RankedTensorType();
+  if (target::emission::hasGenericCombiner(operation)) {
+    auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+    auto inclusive = operation.getAttrOfType<BoolAttr>("intent.inclusive");
+    if (!axis || axis.getInt() < 0 || !inclusive || !inclusive.getValue())
+      return operation.emitOpError(
+          "generic GPU scan requires an inclusive logical prefix");
+    return success();
+  }
+  auto components =
+      operation.getAttrOfType<IntegerAttr>("intent.component_count");
+  auto captures =
+      operation.getAttrOfType<IntegerAttr>("intent.capture_count");
   auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
   auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
   auto inclusive = operation.getAttrOfType<BoolAttr>("intent.inclusive");
-  if (!input || !result || input.getShape() != result.getShape() || !axis ||
-      axis.getInt() < 0 || axis.getInt() >= input.getRank() || !combine ||
-      combine.getValue() != "add" || !inclusive || !inclusive.getValue())
+  if (!components || components.getInt() <= 0 || !captures ||
+      captures.getInt() != 0 ||
+      operation.getNumOperands() !=
+          static_cast<unsigned>(2 * components.getInt()) ||
+      operation.getNumResults() != static_cast<unsigned>(components.getInt()) ||
+      !axis || !combine || combine.getValue() != "add" || !inclusive ||
+      !inclusive.getValue())
     return operation.emitOpError(
         "has no supported inclusive additive GPU scan schema");
-  if (!isLiteralZero(operation.getOperand(1)))
-    return operation.emitOpError(
-        "requires a literal zero identity for inclusive additive GPU scan");
+  for (unsigned component = 0;
+       component < static_cast<unsigned>(components.getInt()); ++component) {
+    auto input =
+        dyn_cast<RankedTensorType>(operation.getOperand(component).getType());
+    auto result = dyn_cast<RankedTensorType>(
+        operation.getResult(component).getType());
+    Value identity = operation.getOperand(components.getInt() + component);
+    if (!input || !result || input != result || axis.getInt() < 0 ||
+        axis.getInt() >= input.getRank() ||
+        input.getElementType() != identity.getType() ||
+        !isLiteralZero(identity))
+      return operation.emitOpError(
+          "requires shape-preserving components with literal zero identities for inclusive additive GPU scan");
+  }
   return success();
 }
 
@@ -277,9 +309,6 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   if (failed(addHandler(
           registry, "intent.reduce", validateReduction)))
-    return failure();
-  if (failed(addHandler(
-          registry, "intent.arg_reduce", validateReduction)))
     return failure();
   if (failed(addHandler(registry, "intent.scan", validateScan)))
     return failure();

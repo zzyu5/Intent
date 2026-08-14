@@ -42,7 +42,6 @@ class OperationKind(Enum):
     MASK = "mask"
 
     REDUCE = "reduce"
-    ARG_REDUCE = "arg_reduce"
     SCAN = "scan"
     CONTRACT = "contract"
     SPARSE_CONTRACT = "sparse_contract"
@@ -83,7 +82,6 @@ REGION_OPS = {
 
 STRUCTURED_OPS = {
     OperationKind.REDUCE,
-    OperationKind.ARG_REDUCE,
     OperationKind.SCAN,
     OperationKind.CONTRACT,
     OperationKind.SPARSE_CONTRACT,

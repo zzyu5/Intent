@@ -8,6 +8,8 @@ LogicalResult emitSource(TargetSourceEmitter &emitter) {
   if (failed(emitter.prepare()))
     return failure();
   emitter.emitImports();
+  if (failed(emitter.emitHelpers()))
+    return failure();
   if (failed(emitter.emitKernelHeader()))
     return failure();
 

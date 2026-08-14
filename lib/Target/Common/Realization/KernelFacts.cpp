@@ -2043,12 +2043,24 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   auto bindReductionAxes = [&](Operation &operation) -> LogicalResult {
     auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
+    auto components =
+        operation.getAttrOfType<IntegerAttr>("intent.component_count");
     auto input = operation.getNumOperands() > 0
                      ? facts.valueAxes.find(operation.getOperand(0))
                      : facts.valueAxes.end();
-    if (!axes || axes.empty() || input == facts.valueAxes.end())
+    if (!axes || axes.empty() || !components || components.getInt() <= 0 ||
+        operation.getNumResults() != static_cast<unsigned>(components.getInt()) ||
+        input == facts.valueAxes.end())
       return operation.emitOpError(
           "reduction axes have no logical-axis provenance");
+    for (unsigned component = 1;
+         component < static_cast<unsigned>(components.getInt()); ++component) {
+      auto componentAxes = facts.valueAxes.find(operation.getOperand(component));
+      if (componentAxes == facts.valueAxes.end() ||
+          componentAxes->second != input->second)
+        return operation.emitOpError(
+            "reduction components must share one logical-axis schema");
+    }
     SmallVector<unsigned> reducedAxes;
     for (Attribute attribute : axes) {
       auto axis = dyn_cast<IntegerAttr>(attribute);
@@ -2069,24 +2081,42 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         return failure();
     return success();
   };
-  if (failed(addHandler(registry, "intent.reduce", bindReductionAxes)) ||
-      failed(addHandler(registry, "intent.arg_reduce", bindReductionAxes)))
+  if (failed(addHandler(registry, "intent.reduce", bindReductionAxes)))
     return failure();
 
   if (failed(addHandler(
           registry, "intent.scan", [&](Operation &operation) -> LogicalResult {
             auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+            auto components =
+                operation.getAttrOfType<IntegerAttr>("intent.component_count");
             auto input = operation.getNumOperands() > 0
                              ? facts.valueAxes.find(operation.getOperand(0))
                              : facts.valueAxes.end();
-            if (!axis || axis.getInt() < 0 || input == facts.valueAxes.end() ||
+            if (!axis || axis.getInt() < 0 || !components ||
+                components.getInt() <= 0 ||
+                operation.getNumResults() !=
+                    static_cast<unsigned>(components.getInt()) ||
+                input == facts.valueAxes.end() ||
                 static_cast<size_t>(axis.getInt()) >= input->second.size() ||
-                operation.getNumResults() != 1)
+                operation.getNumResults() == 0)
               return operation.emitOpError(
                   "scan axis has no logical-axis provenance");
+            for (unsigned component = 1;
+                 component < static_cast<unsigned>(components.getInt());
+                 ++component) {
+              auto componentAxes =
+                  facts.valueAxes.find(operation.getOperand(component));
+              if (componentAxes == facts.valueAxes.end() ||
+                  componentAxes->second != input->second)
+                return operation.emitOpError(
+                    "scan components must share one logical-axis schema");
+            }
             if (Operation *domain = input->second[axis.getInt()].domain)
               facts.vectorDomains.insert(domain);
-            return bindResultAxes(operation, 0, input->second, facts);
+            for (unsigned result = 0; result < operation.getNumResults(); ++result)
+              if (failed(bindResultAxes(operation, result, input->second, facts)))
+                return failure();
+            return success();
           })))
     return failure();
 
@@ -2151,6 +2181,18 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.indices", [&](Operation &operation) -> LogicalResult {
             if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical indices schema");
+            auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
+            if (mode && mode.getValue() == "tensor_axis") {
+              auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
+              auto source = facts.valueAxes.find(operation.getOperand(0));
+              if (!axis || axis.getInt() < 0 || source == facts.valueAxes.end() ||
+                  static_cast<size_t>(axis.getInt()) >= source->second.size())
+                return operation.emitOpError(
+                    "tensor-axis indices have no logical-axis provenance");
+              if (Operation *domain = source->second[axis.getInt()].domain)
+                facts.vectorDomains.insert(domain);
+              return bindResultAxes(operation, 0, source->second, facts);
+            }
             FailureOr<Operation *> domain =
                 resolveDomain(operation.getOperand(0), facts, operation);
             if (failed(domain))
@@ -2592,10 +2634,14 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
 
   auto collectScanProducers = [&](Operation &scan) -> LogicalResult {
     auto axis = scan.getAttrOfType<IntegerAttr>("intent.axis");
+    auto components =
+        scan.getAttrOfType<IntegerAttr>("intent.component_count");
     auto axes = scan.getNumOperands() > 0
                     ? facts.valueAxes.find(scan.getOperand(0))
                     : facts.valueAxes.end();
-    if (!axis || axis.getInt() < 0 || axes == facts.valueAxes.end() ||
+    if (!axis || axis.getInt() < 0 || !components || components.getInt() <= 0 ||
+        scan.getNumResults() != static_cast<unsigned>(components.getInt()) ||
+        axes == facts.valueAxes.end() ||
         static_cast<size_t>(axis.getInt()) >= axes->second.size() ||
         !axes->second[axis.getInt()].domain)
       return scan.emitOpError("has no canonical scan producer axis");
@@ -2619,7 +2665,8 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
                   name == "intent.mask" || name == "intent.select" ||
                   name == "intent.cast" || name == "intent.full" ||
                   name == "intent.zeros" || name == "intent.reshape" ||
-                  name == "intent.transpose";
+                  name == "intent.transpose" ||
+                  name == "intent.make_record" || name == "intent.extract";
       if (!pure) {
         producer->emitOpError(
             "cannot be replayed inside a physical scan chunk");
@@ -2634,18 +2681,20 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
           return failure();
       return success();
     };
-    if (failed(collect(scan.getOperand(0))))
-      return failure();
+    for (unsigned component = 0;
+         component < static_cast<unsigned>(components.getInt()); ++component)
+      if (failed(collect(scan.getOperand(component))))
+        return failure();
     ScanFact fact;
     fact.axis = axes->second[axis.getInt()].domain;
-    fact.scalarConsumers = !scan.getResult(0).use_empty() && llvm::all_of(
-        scan.getResult(0).getUsers(), [&](Operation *user) {
-          return user->getName().getStringRef() == "intent.gather" &&
-                 user->getNumOperands() > 0 &&
-                 user->getOperand(0) == scan.getResult(0) &&
-                 user->getNumResults() == 1 &&
-                 !isa<RankedTensorType>(user->getResult(0).getType());
-        });
+    fact.scalarConsumers = llvm::all_of(scan.getResults(), [&](Value result) {
+      return !result.use_empty() && llvm::all_of(result.getUsers(), [&](Operation *user) {
+        return user->getName().getStringRef() == "intent.gather" &&
+               user->getNumOperands() > 0 && user->getOperand(0) == result &&
+               user->getNumResults() == 1 &&
+               !isa<RankedTensorType>(user->getResult(0).getType());
+      });
+    });
     for (Operation *producer : slice) {
       FailureOr<int64_t> producerNode =
           target::getNodeID(*producer, "scan producer slice");

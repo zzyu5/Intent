@@ -197,10 +197,15 @@ LogicalResult intent::plan::verifyPaddingFields(
       tensorAxes.empty() ||
       failed(verifyValidityBinding(operation, tensorAxes, domainNodes, "value")))
     return failure();
-  if (fill != "negative_infinity" && fill != "zero" && fill != "false" &&
-      fill != "true")
+  bool literal = fill.starts_with("literal_integer:") ||
+                 fill.starts_with("literal_float:");
+  if (fill != "negative_infinity" && fill != "positive_infinity" &&
+      fill != "nan" && fill != "zero" && fill != "false" &&
+      fill != "true" && !literal)
     return operation->emitOpError(
         "contains an unsupported physical padding value");
+  if (literal && fill.split(':').second.empty())
+    return operation->emitOpError("contains an empty literal padding value");
   return success();
 }
 
@@ -267,7 +272,8 @@ LogicalResult ScanOp::verify() {
   if (failed(requireNode(*this, getNode())) ||
       failed(requireNode(*this, getAxisNode())))
     return failure();
-  if (getSemantics() != "scan_inclusive_add")
+  if (getSemantics() != "scan_inclusive_add" &&
+      getSemantics() != "scan_generic_inclusive")
     return emitOpError("contains unsupported physical scan semantics");
   if (((getMaterialization() == "scalar_access" &&
         getResultSpace() != "private_workspace") ||
@@ -365,12 +371,24 @@ LogicalResult StreamBindingOp::verify() {
 LogicalResult StageOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
+  llvm::DenseSet<int64_t> dependencies;
+  for (int64_t dependency : getDependencies())
+    if (failed(requireNode(*this, dependency)) ||
+        dependency == static_cast<int64_t>(getNode()) ||
+        !dependencies.insert(dependency).second)
+      return emitOpError(
+          "stage dependencies must be unique non-self stage nodes");
+  llvm::DenseSet<int64_t> inputs;
   for (int64_t value : getInputs())
-    if (failed(requireNonNegative(*this, value, "stage input value ID")))
-      return failure();
+    if (failed(requireNonNegative(*this, value, "stage input value ID")) ||
+        !inputs.insert(value).second)
+      return emitOpError("stage input value IDs must be unique");
+  llvm::DenseSet<int64_t> outputs;
   for (int64_t value : getOutputs())
-    if (failed(requireNonNegative(*this, value, "stage output value ID")))
-      return failure();
+    if (failed(requireNonNegative(*this, value, "stage output value ID")) ||
+        inputs.contains(value) || !outputs.insert(value).second)
+      return emitOpError(
+          "stage output value IDs must be unique and distinct from inputs");
   if (getOperations().empty())
     return emitOpError("requires an explicit physical operation slice");
   llvm::DenseSet<int64_t> operations;
@@ -384,6 +402,36 @@ LogicalResult StageOp::verify() {
         !operations.contains(terminal) || !terminals.insert(terminal).second)
       return emitOpError(
           "stage terminals must be unique members of its operation slice");
+  if (getSynchronization() != "same_stream")
+    return emitOpError(
+        "contains an unsupported stage synchronization contract");
+  if (getFusion() != "forbidden" && getFusion() != "target_may_fuse")
+    return emitOpError("contains an unsupported stage fusion policy");
+  return success();
+}
+
+LogicalResult StageBufferOp::verify() {
+  if (failed(requireNonNegative(*this, getValue(),
+                                "stage intermediate value ID")) ||
+      failed(requireNode(*this, getProducerStage())))
+    return failure();
+  llvm::DenseSet<int64_t> consumers;
+  for (int64_t consumer : getConsumerStages())
+    if (failed(requireNode(*this, consumer)) ||
+        consumer == static_cast<int64_t>(getProducerStage()) ||
+        !consumers.insert(consumer).second)
+      return emitOpError(
+          "stage buffer consumers must be unique non-producer stage nodes");
+  if (getConsumerStages().empty())
+    return emitOpError("requires at least one stage consumer");
+  if (failed(verifyStringArray(*this, getOwnerRoles(),
+                               "stage buffer owner role")) ||
+      getOwnerRoles().empty())
+    return failure();
+  if (getAccess() != "single_writer_read_only_consumers" ||
+      getLifetime() != "producer_to_last_consumer" ||
+      getVisibility() != "same_stream")
+    return emitOpError("contains an unsupported stage buffer contract");
   return success();
 }
 
@@ -428,6 +476,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> transfers;
   llvm::DenseSet<int64_t> stageNodes;
+  llvm::DenseMap<int64_t, StageOp> stageBindings;
+  SmallVector<StageOp> stages;
+  llvm::DenseMap<int64_t, StageBufferOp> stageBufferValues;
+  SmallVector<StageBufferOp> stageBuffers;
   llvm::StringSet<> streamAxisRoles;
   SmallVector<StreamAxisOp> streamAxes;
   llvm::DenseSet<int64_t> streamNodes;
@@ -521,6 +573,13 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<StageOp>(operation)) {
       if (!stageNodes.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a physical stage decision");
+      stageBindings[binding.getNode()] = binding;
+      stages.push_back(binding);
+    } else if (auto binding = dyn_cast<StageBufferOp>(operation)) {
+      if (!stageBufferValues.try_emplace(binding.getValue(), binding).second)
+        return binding.emitOpError(
+            "duplicates a stage intermediate buffer contract");
+      stageBuffers.push_back(binding);
     } else if (auto binding = dyn_cast<StageAxisOp>(operation)) {
       std::string key = std::to_string(binding.getStageNode()) + ":" +
                         binding.getRole().str();
@@ -666,6 +725,80 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       return axis.emitOpError("references an unknown physical stage");
     if (axis.getAxisNodeAttr() && !axes.count(axis.getAxisNodeAttr().getInt()))
       return axis.emitOpError("references an unbound logical axis");
+  }
+  llvm::DenseMap<int64_t, unsigned> stagePositions;
+  llvm::DenseSet<int64_t> stagedTerminals;
+  for (auto [position, stage] : llvm::enumerate(stages))
+    stagePositions[stage.getNode()] = position;
+  for (auto [position, stage] : llvm::enumerate(stages)) {
+    if (stage.getOutputs().empty() == stage.getTerminals().empty())
+      return stage.emitOpError(
+          "must be either an intermediate stage with outputs or a final stage with terminals");
+    for (int64_t terminal : stage.getTerminals())
+      if (!stagedTerminals.insert(terminal).second)
+        return stage.emitOpError(
+            "reuses a terminal already owned by another physical stage");
+    llvm::DenseSet<int64_t> expectedDependencies;
+    for (int64_t dependency : stage.getDependencies()) {
+      auto found = stagePositions.find(dependency);
+      if (found == stagePositions.end() || found->second >= position)
+        return stage.emitOpError(
+            "dependencies must reference earlier stages in topological order");
+    }
+    for (int64_t input : stage.getInputs()) {
+      auto buffer = stageBufferValues.find(input);
+      if (buffer == stageBufferValues.end() ||
+          !llvm::is_contained(buffer->second.getConsumerStages(),
+                              stage.getNode()))
+        return stage.emitOpError(
+            "input does not have a matching intermediate buffer consumer contract");
+      expectedDependencies.insert(buffer->second.getProducerStage());
+    }
+    if (expectedDependencies.size() != stage.getDependencies().size() ||
+        llvm::any_of(stage.getDependencies(), [&](int64_t dependency) {
+          return !expectedDependencies.contains(dependency);
+        }))
+      return stage.emitOpError(
+          "dependencies do not match the producers of its inputs");
+    if (!stage.getTerminals().empty() &&
+        llvm::any_of(stages, [&](StageOp successor) {
+          return llvm::is_contained(successor.getDependencies(),
+                                    stage.getNode());
+        }))
+      return stage.emitOpError(
+          "final stage cannot be a dependency of another physical stage");
+    for (int64_t output : stage.getOutputs()) {
+      auto buffer = stageBufferValues.find(output);
+      if (buffer == stageBufferValues.end() ||
+          buffer->second.getProducerStage() != stage.getNode())
+        return stage.emitOpError(
+            "output does not have a matching intermediate buffer producer contract");
+    }
+  }
+  for (StageBufferOp buffer : stageBuffers) {
+    auto producer = stageBindings.find(buffer.getProducerStage());
+    if (producer == stageBindings.end() ||
+        !llvm::is_contained(producer->second.getOutputs(), buffer.getValue()))
+      return buffer.emitOpError("references an unknown stage buffer producer");
+    for (int64_t consumerNode : buffer.getConsumerStages()) {
+      auto consumer = stageBindings.find(consumerNode);
+      if (consumer == stageBindings.end() ||
+          !llvm::is_contained(consumer->second.getInputs(), buffer.getValue()) ||
+          stagePositions.lookup(consumerNode) <=
+              stagePositions.lookup(buffer.getProducerStage()))
+        return buffer.emitOpError(
+            "references an invalid or non-successor stage buffer consumer");
+    }
+    for (Attribute roleAttr : buffer.getOwnerRoles()) {
+      auto role = dyn_cast<StringAttr>(roleAttr);
+      if (!role)
+        return buffer.emitOpError("contains a non-string owner role");
+      std::string key = std::to_string(buffer.getProducerStage()) + ":" +
+                        role.getValue().str();
+      if (!stageAxisRoles.contains(key))
+        return buffer.emitOpError(
+            "owner role is not bound on its producer stage");
+    }
   }
   for (StreamAxisOp relation : streamAxes) {
     auto axis = axes.find(relation.getAxisNode());

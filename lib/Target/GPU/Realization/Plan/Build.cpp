@@ -719,22 +719,33 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       return failure();
     if (axis.getInt() < 0)
       return operation.emitOpError("has a negative reduction axis");
-    std::optional<std::string> inputPadding =
-        paddingState.paddingOf(operation.getOperand(0));
-    std::optional<std::string> identityPadding =
-        operation.getNumOperands() > 1
-            ? paddingState.paddingOf(operation.getOperand(1))
-            : std::nullopt;
-    if (!inputPadding || !identityPadding ||
-        *inputPadding != *identityPadding) {
-      if (!identityPadding)
-        return operation.emitOpError(
-            "cannot realize reduction-lane padding without an identity");
-      if (failed(paddingState.require(
-              operation.getOperand(0),
-              {static_cast<unsigned>(axis.getInt())}, *identityPadding,
-              operation)))
-        return failure();
+    auto components =
+        operation.getAttrOfType<IntegerAttr>("intent.component_count");
+    auto captures =
+        operation.getAttrOfType<IntegerAttr>("intent.capture_count");
+    if (!components || components.getInt() <= 0 || !captures ||
+        captures.getInt() < 0 ||
+        operation.getNumOperands() !=
+            2 * static_cast<unsigned>(components.getInt()) +
+                static_cast<unsigned>(captures.getInt()))
+      return operation.emitOpError("has no physical reduction component schema");
+    for (unsigned component = 0;
+         component < static_cast<unsigned>(components.getInt()); ++component) {
+      std::optional<std::string> inputPadding =
+          paddingState.paddingOf(operation.getOperand(component));
+      std::optional<std::string> identityPadding = paddingState.paddingOf(
+          operation.getOperand(components.getInt() + component));
+      if (!inputPadding || !identityPadding ||
+          *inputPadding != *identityPadding) {
+        if (!identityPadding)
+          return operation.emitOpError(
+              "cannot realize reduction-lane padding without a literal identity");
+        if (failed(paddingState.require(
+                operation.getOperand(component),
+                {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+                operation)))
+          return failure();
+      }
     }
     auto combineAttr = operation.getAttrOfType<StringAttr>("intent.combine");
     StringRef combine = combineAttr ? combineAttr.getValue() : StringRef();
@@ -749,8 +760,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         string(builder, "private_fragment"));
     return success();
   };
-  if (failed(addHandler(registry, "intent.reduce", bindReduction)) ||
-      failed(addHandler(registry, "intent.arg_reduce", bindReduction)))
+  if (failed(addHandler(registry, "intent.reduce", bindReduction)))
     return failure();
 
   if (failed(addHandler(
@@ -758,8 +768,14 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "scan binding");
             auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
-            if (failed(node) || !axis || axis.getInt() < 0)
+            auto inclusive =
+                operation.getAttrOfType<BoolAttr>("intent.inclusive");
+            if (failed(node) || !axis || axis.getInt() < 0 || !inclusive)
               return operation.emitOpError("has no physical scan axis");
+            if (!inclusive.getValue())
+              return operation.emitOpError(
+                  "GPU targets expose inclusive scan only; express an exclusive "
+                  "scan explicitly from the inclusive result and its identity");
             auto inputAxes = facts.valueAxes.find(operation.getOperand(0));
             if (inputAxes == facts.valueAxes.end() ||
                 static_cast<size_t>(axis.getInt()) >= inputAxes->second.size() ||
@@ -792,18 +808,35 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             }
             std::optional<std::string> inputPadding =
                 paddingState.paddingOf(operation.getOperand(0));
-            std::optional<std::string> identityPadding =
-                paddingState.paddingOf(operation.getOperand(1));
-            if (!inputPadding || !identityPadding ||
-                *inputPadding != *identityPadding) {
-              if (!identityPadding)
-                return operation.emitOpError(
-                    "cannot realize scan-lane padding without an identity");
-              if (failed(paddingState.require(
-                      operation.getOperand(0),
-                      {static_cast<unsigned>(axis.getInt())}, *identityPadding,
-                      operation)))
-                return failure();
+            auto components = operation.getAttrOfType<IntegerAttr>(
+                "intent.component_count");
+            auto captures = operation.getAttrOfType<IntegerAttr>(
+                "intent.capture_count");
+            if (!components || components.getInt() <= 0 || !captures ||
+                captures.getInt() < 0 ||
+                operation.getNumOperands() !=
+                    2 * static_cast<unsigned>(components.getInt()) +
+                        static_cast<unsigned>(captures.getInt()))
+              return operation.emitOpError(
+                  "has no physical scan component schema");
+            for (unsigned component = 0;
+                 component < static_cast<unsigned>(components.getInt());
+                 ++component) {
+              inputPadding =
+                  paddingState.paddingOf(operation.getOperand(component));
+              std::optional<std::string> identityPadding = paddingState.paddingOf(
+                  operation.getOperand(components.getInt() + component));
+              if (!inputPadding || !identityPadding ||
+                  *inputPadding != *identityPadding) {
+                if (!identityPadding)
+                  return operation.emitOpError(
+                      "cannot realize scan-lane padding without a literal identity");
+                if (failed(paddingState.require(
+                        operation.getOperand(component),
+                        {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+                        operation)))
+                  return failure();
+              }
             }
             bool scalarConsumers = scanFact->second.scalarConsumers;
             ArrayRef<int64_t> producers =
@@ -813,9 +846,13 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 scalarConsumers
                     ? ArrayRef<int64_t>(scanFact->second.materializedValues)
                     : ArrayRef<int64_t>();
+            StringRef semantics = isa<FlatSymbolRefAttr>(
+                                      operation.getAttr("intent.combine"))
+                                      ? StringRef("scan_generic_inclusive")
+                                      : StringRef("scan_inclusive_add");
             builder.create<intent::plan::ScanOp>(
                 operation.getLoc(), i64(builder, *node),
-                string(builder, "scan_inclusive_add"), i64(builder, *axisNode),
+                string(builder, semantics), i64(builder, *axisNode),
                 i64(builder, axis.getInt()),
                 string(builder, scalarConsumers ? "private_workspace"
                                                 : "private_fragment"),

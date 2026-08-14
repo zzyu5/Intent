@@ -277,6 +277,8 @@ def _logical_reduce(
             "axes": axes,
             "acc_dtype": intent_bool,
             "combine": "logical_or" if any_value else "logical_and",
+            "component_count": 1,
+            "capture_count": 0,
         },
     )
     return operation.results[0]

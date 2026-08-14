@@ -1,6 +1,7 @@
 #include "Support/Model.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Emission/Combiner.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -271,6 +272,11 @@ indexRealization(intent::plan::RealizationOp realization,
       binding.operation = value;
       binding.position = index.stages.size();
       index.stages.push_back(binding);
+    } else if (auto value =
+                   dyn_cast<intent::plan::StageBufferOp>(operation)) {
+      plan::StageBufferOp binding;
+      binding.operation = value;
+      index.stageBuffers[value.getValue()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
       plan::StageAxisOp binding;
       binding.operation = value;
@@ -315,6 +321,7 @@ indexRealization(intent::plan::RealizationOp realization,
     binding.operation = value;
     binding.lowering = *role == "reduce_argmax"
                            ? "ct.max_with_index"
+                       : *role == "reduce_generic" ? "ct.reduce"
                        : *role == "reduce_maximum" ? "ct.max"
                        : *role == "reduce_any"     ? "ct.any_via_max"
                        : *role == "reduce_all"     ? "ct.all_via_min"
@@ -324,12 +331,15 @@ indexRealization(intent::plan::RealizationOp realization,
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
-    if (value.getSemantics() != "scan_inclusive_add" ||
+    if ((value.getSemantics() != "scan_inclusive_add" &&
+         value.getSemantics() != "scan_generic_inclusive") ||
         !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;
     binding.operation = value;
-    binding.lowering = "ct.cumsum";
+    binding.lowering = value.getSemantics() == "scan_generic_inclusive"
+                           ? "ct.scan"
+                           : "ct.cumsum";
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = value.getTensorAxis();
     binding.axisNode = value.getAxisNode();
@@ -498,11 +508,14 @@ LogicalResult SourceEmitter::preparePrivateWorkspaces() {
     Operation *scan = kernel.nodes.lookup(entry.first);
     std::string extent = axisDimensions.lookup(binding.getAxisNode());
     if (!scan || scan->getName().getStringRef() != "intent.scan" ||
-        scan->getNumResults() != 1 || extent.empty())
+        scan->getNumResults() == 0 || extent.empty())
       return binding.emitOpError("does not bind a workspace-backed scan tensor");
-    workspaceNames[scan->getResult(0)] =
-        "scan_workspace_" + std::to_string(entry.first);
-    scanResults[scan->getResult(0)] = binding;
+    for (auto [component, result] : llvm::enumerate(scan->getResults())) {
+      workspaceNames[result] = "scan_workspace_" +
+                               std::to_string(entry.first) + "_" +
+                               std::to_string(component);
+      scanResults[result] = binding;
+    }
     scanExtents[entry.first] = extent;
     for (int64_t valueID : binding.getMaterializedValues()) {
       FailureOr<Value> value = target::emission::lookupScanMaterializedValue(
@@ -627,10 +640,13 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!argument || !axis || !range)
       return binding.emitOpError(
           "does not bind a canonical region argument and selected range");
-    std::string tile =
-        !axis.getReuseWorker() && range->getTileRole().starts_with("row_vector")
-            ? physicalExtent(range->getExtent())
-            : range->getTile().str();
+    bool roundedRow = !axis.getReuseWorker() &&
+                      range->getTileRole().starts_with("row_vector");
+    if (roundedRow && !planIndex.blockExtents.count(range->getExtent()))
+      return binding.emitOpError(
+          "row-vector region range lacks its selected physical extent");
+    std::string tile = roundedRow ? physicalExtent(range->getExtent())
+                                  : range->getTile().str();
     regionTiles["?region_" + std::to_string(entry.first) + "_0"] = tile;
   }
 
@@ -885,6 +901,60 @@ void SourceEmitter::emitImports() {
   output << "\n\n";
 }
 
+LogicalResult SourceEmitter::emitHelpers() {
+  FailureOr<SmallVector<func::FuncOp>> combiners =
+      target::emission::collectCombiners(kernel.entry);
+  if (failed(combiners))
+    return failure();
+  for (func::FuncOp function : *combiners) {
+    auto expression = [&](Operation &operation,
+                          ArrayRef<std::string> operands)
+        -> FailureOr<std::string> {
+      FailureOr<std::string> role =
+          target::emission::pointwiseRole(operation);
+      FailureOr<StringRef> spelling =
+          succeeded(role)
+              ? pointwiseSpelling(&operation, *role, "private_fragment")
+                          : FailureOr<StringRef>(failure());
+      if (failed(spelling))
+        return failure();
+      return target::emission::renderPythonPointwiseExpression(
+          operation, operands, *spelling,
+          [&](Type type) -> FailureOr<std::string> {
+            std::string dtype = dtypeName(type, operation);
+            return dtype.empty() ? FailureOr<std::string>(failure())
+                                 : FailureOr<std::string>(std::move(dtype));
+          });
+    };
+    FailureOr<std::string> source = target::emission::renderPythonCombiner(
+        function, function.getName(), "", expression);
+    if (failed(source))
+      return failure();
+    output << *source;
+  }
+  WalkResult projected = kernel.entry.walk([&](Operation *operation) {
+    if (!target::emission::hasGenericCombiner(*operation) ||
+        operation->getAttrOfType<StringAttr>("intent.combine_builtin"))
+      return WalkResult::advance();
+    FailureOr<target::emission::CombinerUse> combiner =
+        target::emission::resolveCombiner(*operation);
+    if (failed(combiner))
+      return WalkResult::interrupt();
+    if (combiner->captureCount == 0)
+      return WalkResult::advance();
+    FailureOr<std::string> source =
+        target::emission::renderPythonCombinerProjection(
+            *operation, "", "ct.where");
+    if (failed(source))
+      return WalkResult::interrupt();
+    output << *source;
+    return WalkResult::advance();
+  });
+  if (projected.wasInterrupted())
+    return failure();
+  return success();
+}
+
 LogicalResult SourceEmitter::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
   if (!planIndex.stages.empty()) {
@@ -1058,7 +1128,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     if (entry.second.getResultSpace() != "private_workspace")
       continue;
     Operation *scan = kernel.nodes.lookup(entry.first);
-    emitParameter(workspaceNames.lookup(scan->getResult(0)));
+    for (Value result : scan->getResults())
+      emitParameter(workspaceNames.lookup(result));
     for (int64_t valueID : entry.second.getMaterializedValues())
       emitParameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
   }
@@ -1153,23 +1224,26 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (entry.second.getResultSpace() != "private_workspace")
         continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      auto resultType = scan && scan->getNumResults() == 1
-                            ? dyn_cast<RankedTensorType>(scan->getResult(0).getType())
-                            : RankedTensorType();
       FailureOr<std::string> size = target::emission::scanWorkspaceElementCount(
           entry.second, scanExtents.lookup(entry.first), planIndex,
           axisDimensions);
-      StringRef dtype = resultType ? torchDtype(resultType.getElementType())
-                                   : StringRef();
-      if (!scan || failed(size) || dtype.empty())
+      if (!scan || scan->getNumResults() == 0 || failed(size))
         return entry.second.emitOpError(
             "has no supported cuTile scan-workspace allocation");
       output << "    if " << *size << " > 2147483647:\n";
       output << "        raise NotImplementedError('cuTile scan workspace exceeds "
                 "its current 32-bit address projection')\n";
-      output << "    " << workspaceNames.lookup(scan->getResult(0))
-             << " = torch.empty((" << *size
-             << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      for (Value result : scan->getResults()) {
+        auto resultType = dyn_cast<RankedTensorType>(result.getType());
+        StringRef dtype = resultType ? torchDtype(resultType.getElementType())
+                                     : StringRef();
+        if (dtype.empty())
+          return entry.second.emitOpError(
+              "has an unsupported cuTile scan-workspace component dtype");
+        output << "    " << workspaceNames.lookup(result)
+               << " = torch.empty((" << *size
+               << ",), device=_DEVICE, dtype=" << dtype << ")\n";
+      }
       for (int64_t valueID : entry.second.getMaterializedValues()) {
         Value value = kernel.values.lookup(valueID);
         auto tensor = dyn_cast<RankedTensorType>(value.getType());
@@ -1672,7 +1746,8 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (entry.second.getResultSpace() != "private_workspace")
       continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (Value result : scan->getResults())
+        output << workspaceNames.lookup(result) << ", ";
       for (int64_t valueID : entry.second.getMaterializedValues())
         output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
     }
@@ -1770,7 +1845,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (entry.second.getResultSpace() != "private_workspace")
         continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (Value result : scan->getResults())
+        output << workspaceNames.lookup(result) << ", ";
       for (int64_t valueID : entry.second.getMaterializedValues())
         output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
     }
@@ -1831,7 +1907,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       if (entry.second.getResultSpace() != "private_workspace")
         continue;
       Operation *scan = kernel.nodes.lookup(entry.first);
-      output << workspaceNames.lookup(scan->getResult(0)) << ", ";
+      for (Value result : scan->getResults())
+        output << workspaceNames.lookup(result) << ", ";
       for (int64_t valueID : entry.second.getMaterializedValues())
         output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
     }
@@ -2029,7 +2106,7 @@ FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
       !axis.getTileRole().starts_with("row_vector"))
     return axis.getTile().str();
   const target::emission::RangeBinding *range = axis.roleRange();
-  if (!range)
+  if (!range || !planIndex.blockExtents.count(range->getExtent()))
     return axis.emitOpError("cannot resolve its row-vector physical extent");
   return physicalExtent(range->getExtent());
 }
@@ -2521,14 +2598,21 @@ FailureOr<std::string> SourceEmitter::padExpression(
   Type valueType = value.getType();
   if (auto tensor = dyn_cast<RankedTensorType>(valueType))
     valueType = tensor.getElementType();
-  StringRef fill = padding.getFill() == "negative_infinity"
-                       ? StringRef("-math.inf")
-                   : padding.getFill() == "true" ? StringRef("True")
-                   : padding.getFill() == "false" ? StringRef("False")
-                   : isa<IntegerType, IndexType>(valueType) ? StringRef("0")
-                                                            : StringRef("0.0");
+  StringRef planned = padding.getFill();
+  std::string fill = planned == "negative_infinity"
+                         ? "-math.inf"
+                     : planned == "positive_infinity" ? "math.inf"
+                     : planned == "nan" ? "math.nan"
+                     : planned == "true" ? "True"
+                     : planned == "false" ? "False"
+                     : planned.starts_with("literal_integer:")
+                         ? planned.drop_front(16).str()
+                     : planned.starts_with("literal_float:")
+                         ? planned.drop_front(14).str()
+                     : isa<IntegerType, IndexType>(valueType) ? "0"
+                                                              : "0.0";
   return "ct.where(" + *predicate + ", " + expression.str() + ", " +
-         fill.str() + ")";
+         fill + ")";
 }
 
 FailureOr<std::string>

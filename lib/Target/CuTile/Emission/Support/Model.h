@@ -32,6 +32,7 @@ using SparseContractOp = intent::plan::SparseContractOp;
 using StreamOp = target::emission::StreamBinding;
 using RaggedOp = target::emission::RaggedBinding;
 using StageOp = target::emission::StageBinding;
+using StageBufferOp = target::emission::StageBufferBinding;
 using StageAxisOp = target::emission::StageAxisBinding;
 using StreamAxisOp = intent::plan::StreamAxisOp;
 using StreamBindingOp = intent::plan::StreamBindingOp;
@@ -60,6 +61,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StageOp> stages;
+  llvm::DenseMap<int64_t, plan::StageBufferOp> stageBuffers;
   llvm::DenseMap<int64_t, llvm::StringMap<plan::StageAxisOp>> stageAxes;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::emission::PhysicalComponents components;
@@ -159,6 +161,7 @@ private:
   mlir::LogicalResult replayScanProducers(const plan::ScanOp &binding,
                                           llvm::StringRef offsets);
   void emitImports() override;
+  mlir::LogicalResult emitHelpers() override;
   mlir::LogicalResult emitKernelHeader() override;
   mlir::LogicalResult emitWrapper() override;
 

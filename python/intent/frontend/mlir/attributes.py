@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import re
+from dataclasses import dataclass
 from enum import Enum
 
 from intent.language import DType
@@ -14,7 +15,18 @@ from .state import MlirValue
 from .types import quote
 
 
+@dataclass(frozen=True, slots=True)
+class SymbolRef:
+    name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name or not self.name.isidentifier():
+            raise ValueError("MLIR symbol reference requires an identifier")
+
+
 def emit_attribute(value: object) -> str:
+    if isinstance(value, SymbolRef):
+        return f"@{value.name}"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
