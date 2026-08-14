@@ -64,10 +64,22 @@ def IntentPlan_RangeOp : IntentPlan_Op<"range"> {
     StrAttr:$purpose,
     I64Attr:$level,
     StrAttr:$tile,
+    StrAttr:$extent,
     OptionalAttr<I64Attr>:$transfer_node,
     OptionalAttr<I64Attr>:$source_axis,
     I64Attr:$lower_offset,
     I64Attr:$upper_offset
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_RegionBindingOp : IntentPlan_Op<"region_binding"> {
+  let arguments = (ins
+    I64Attr:$argument,
+    I64Attr:$axis_node,
+    StrAttr:$purpose,
+    I64Attr:$level
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -198,6 +210,18 @@ def IntentPlan_StreamAxisOp : IntentPlan_Op<"stream_axis"> {
     I64Attr:$stream_node,
     I64Attr:$axis_node,
     StrAttr:$role
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_StreamBindingOp : IntentPlan_Op<"stream_binding"> {
+  let arguments = (ins
+    I64Attr:$stream_node,
+    I64Attr:$axis_node,
+    StrAttr:$purpose,
+    I64Attr:$level,
+    OptionalAttr<I64Attr>:$relation_node
   );
   let results = (outs);
   let hasVerifier = 1;

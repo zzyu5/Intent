@@ -5,6 +5,7 @@
 
 #include <array>
 #include <numeric>
+#include <tuple>
 
 using namespace mlir;
 
@@ -913,7 +914,9 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
 
   for (const AxisChoice &choice : assignments->axes) {
     FailureOr<int64_t> domainNode = node(*choice.domain, "axis binding");
-    if (failed(domainNode))
+    FailureOr<std::string> logicalExtent =
+        sourceDimensionSymbol(*choice.domain, facts);
+    if (failed(domainNode) || failed(logicalExtent))
       return failure();
     SmallVector<Attribute> roles;
     for (const std::string &role : choice.roles)
@@ -934,8 +937,72 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
       decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(
           choice.domain->getLoc(), i64(builder, *domainNode),
           string(builder, range.purpose), i64(builder, range.level),
-          string(builder, range.tile), IntegerAttr(), IntegerAttr(),
+          string(builder, range.tile), string(builder, *logicalExtent),
+          IntegerAttr(), IntegerAttr(),
           i64(builder, 0), i64(builder, 0)));
+  }
+
+  SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
+  for (const auto &entry : facts.regionArgumentAxes) {
+    auto argument = dyn_cast<BlockArgument>(entry.first);
+    if (!argument || !entry.second.domain)
+      continue;
+    Operation *owner = argument.getOwner()->getParentOp();
+    if (!owner)
+      continue;
+    StringRef name = owner->getName().getStringRef();
+    if (name != "intent.parallel" && name != "intent.state_stream")
+      continue;
+    FailureOr<int64_t> argumentID = valueID(
+        argument, facts.kernel, *owner, "region-argument range binding");
+    FailureOr<int64_t> axisNode = node(
+        *entry.second.domain, "region-argument physical axis binding");
+    if (failed(argumentID) || failed(axisNode))
+      return failure();
+    regionBindings.emplace_back(
+        *argumentID, *axisNode,
+        name == "intent.parallel" ? StringRef("ownership")
+                                  : StringRef("traversal"));
+  }
+  llvm::sort(regionBindings, [](const auto &lhs, const auto &rhs) {
+    return std::get<0>(lhs) < std::get<0>(rhs);
+  });
+  for (const auto &[argument, axis, purpose] : regionBindings)
+    decisions.regionBindings.push_back(
+        builder.create<intent::plan::RegionBindingOp>(
+            facts.kernel.entry.getLoc(), i64(builder, argument),
+            i64(builder, axis), string(builder, purpose), i64(builder, 0)));
+
+  SmallVector<int64_t> streamNodes;
+  for (const auto &entry : facts.kernel.stateStreams)
+    streamNodes.push_back(entry.first);
+  llvm::sort(streamNodes);
+  for (int64_t streamNode : streamNodes) {
+    const target::StateStreamStructure &stream =
+        facts.kernel.stateStreams.lookup(streamNode);
+    Operation *axis = facts.kernel.nodes.lookup(stream.axisNode);
+    Operation *relation = nullptr;
+    auto member = axis ? facts.raggedMembers.find(axis) : facts.raggedMembers.end();
+    if (member != facts.raggedMembers.end())
+      relation = member->second.relation;
+    else if (axis) {
+      auto outer = facts.raggedOuterRelations.find(axis);
+      if (outer != facts.raggedOuterRelations.end())
+        relation = outer->second;
+    }
+    IntegerAttr relationNode;
+    if (relation) {
+      FailureOr<int64_t> id =
+          node(*relation, "state-stream selected ragged relation");
+      if (failed(id))
+        return failure();
+      relationNode = i64(builder, *id);
+    }
+    decisions.streamBindings.push_back(
+        builder.create<intent::plan::StreamBindingOp>(
+            stream.operation->getLoc(), i64(builder, stream.node),
+            i64(builder, stream.axisNode), string(builder, "traversal"),
+            i64(builder, 0), relationNode));
   }
 
   for (const target::AccessRangeFact &access : facts.accessRanges) {
@@ -950,13 +1017,18 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         node(*access.axis, "access-range axis binding");
     FailureOr<int64_t> transferNode =
         node(*access.transfer, "access-range transfer binding");
-    if (!ownership || failed(axisNode) || failed(transferNode))
+    FailureOr<std::string> logicalExtent =
+        sourceDimensionSymbol(*access.axis, facts);
+    if (!ownership || failed(axisNode) || failed(transferNode) ||
+        failed(logicalExtent))
       return access.transfer->emitOpError(
           "has no ownership range for its affine access footprint");
     decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(
         access.transfer->getLoc(), i64(builder, *axisNode),
         string(builder, "access"), i64(builder, 0),
-        string(builder, ownership->tile), i64(builder, *transferNode),
+        string(builder, ownership->tile),
+        string(builder, *logicalExtent),
+        i64(builder, *transferNode),
         i64(builder, access.sourceAxis), i64(builder, access.lowerOffset),
         i64(builder, access.upperOffset)));
   }

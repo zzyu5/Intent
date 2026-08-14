@@ -112,6 +112,7 @@ struct KernelFacts {
       boundaryDomains;
   llvm::DenseMap<mlir::Operation *, TensorIndexingKind> tensorIndexing;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<LogicalAxis>> valueAxes;
+  llvm::DenseMap<mlir::Value, LogicalAxis> regionArgumentAxes;
   llvm::StringMap<LogicalAxis> axisLabels;
   llvm::DenseSet<mlir::Operation *> vectorDomains;
   llvm::DenseSet<mlir::Operation *> contractionDomains;

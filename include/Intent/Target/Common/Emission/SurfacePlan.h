@@ -284,6 +284,7 @@ struct RangeBinding : Binding<intent::plan::RangeOp> {
   int64_t getLevel() const { return operation.getLevel(); }
   llvm::StringRef getTile() const { return tile; }
   llvm::StringRef getTileRole() const { return operation.getTile(); }
+  llvm::StringRef getExtent() const { return operation.getExtent(); }
   int64_t getTransferNode() const {
     return operation.getTransferNodeAttr().getInt();
   }
@@ -830,12 +831,20 @@ struct StreamBinding : CanonicalBinding {
   int64_t node = -1;
   int64_t axisNode = -1;
   mlir::IntegerAttr stopNode;
+  int64_t relationNode = -1;
+  std::string rangePurpose;
+  int64_t rangeLevel = 0;
+  std::string extent;
   std::string tile;
   llvm::SmallVector<int64_t> innerReductionAxes;
 
   int64_t getNode() const { return node; }
   int64_t getAxisNode() const { return axisNode; }
   mlir::IntegerAttr getStopNodeAttr() const { return stopNode; }
+  int64_t getRelationNode() const { return relationNode; }
+  llvm::StringRef getRangePurpose() const { return rangePurpose; }
+  int64_t getRangeLevel() const { return rangeLevel; }
+  llvm::StringRef getExtent() const { return extent; }
   llvm::StringRef getTile() const { return tile; }
   llvm::ArrayRef<int64_t> getInnerReductionAxes() const {
     return innerReductionAxes;
@@ -1142,99 +1151,63 @@ llvm::SmallVector<AxisBinding> orderedProgramAxes(const PlanIndex &index);
 template <typename PlanIndex>
 mlir::LogicalResult indexCanonicalStructure(
     PlanIndex &index, const target::KernelModel &kernel) {
-  llvm::SmallVector<mlir::Operation *> relations;
-  llvm::SmallVector<mlir::Operation *> streams;
-  for (const auto &entry : kernel.nodes) {
-    mlir::Operation *operation = entry.second;
-    llvm::StringRef name = operation->getName().getStringRef();
-    if (name == "intent.ragged")
-      relations.push_back(operation);
-    else if (name == "intent.state_stream")
-      streams.push_back(operation);
-  }
-  auto byNode = [](mlir::Operation *lhs, mlir::Operation *rhs) {
-    return lhs->getAttrOfType<mlir::IntegerAttr>("intent.node").getInt() <
-           rhs->getAttrOfType<mlir::IntegerAttr>("intent.node").getInt();
-  };
-  llvm::sort(relations, byNode);
-  llvm::sort(streams, byNode);
-
-  for (mlir::Operation *operation : relations) {
-    mlir::FailureOr<int64_t> relationNode =
-        target::getNodeID(*operation, "ragged emission index");
-    if (mlir::failed(relationNode) || operation->getNumResults() != 1)
-      return operation->emitOpError("has no canonical ragged result");
+  llvm::SmallVector<int64_t> relationNodes;
+  for (const auto &entry : kernel.raggedRelations)
+    relationNodes.push_back(entry.first);
+  llvm::sort(relationNodes);
+  for (int64_t relationNode : relationNodes) {
+    const target::RaggedStructure &relation =
+        kernel.raggedRelations.lookup(relationNode);
     RaggedBinding binding;
-    binding.operation = operation;
-    binding.node = *relationNode;
-    for (mlir::Operation *user : operation->getResult(0).getUsers()) {
-      llvm::StringRef name = user->getName().getStringRef();
-      if (name != "intent.ragged_outer" && name != "intent.ragged_member")
-        continue;
-      mlir::FailureOr<int64_t> userNode =
-          target::getNodeID(*user, "ragged axis emission index");
-      if (mlir::failed(userNode))
-        return mlir::failure();
-      if (name == "intent.ragged_outer") {
-        if (binding.outerNode >= 0)
-          return operation->emitOpError("has multiple canonical outer domains");
-        binding.outerNode = *userNode;
-      } else {
-        binding.memberNodes.push_back(*userNode);
-        auto selector = mlir::dyn_cast<mlir::BlockArgument>(user->getOperand(1));
-        mlir::Operation *owner =
-            selector ? selector.getOwner()->getParentOp() : nullptr;
-        mlir::Operation *outer =
-            owner && selector.getArgNumber() == 0 && owner->getNumOperands() > 0
-                ? owner->getOperand(0).getDefiningOp()
-                : nullptr;
-        if (binding.outerNode < 0 && outer &&
-            outer->getName().getStringRef() == "intent.ragged_member") {
-          mlir::FailureOr<int64_t> outerNode =
-              target::getNodeID(*outer, "nested ragged outer emission index");
-          if (mlir::failed(outerNode))
-            return mlir::failure();
-          binding.outerNode = *outerNode;
-        }
-      }
-    }
-    llvm::sort(binding.memberNodes);
-    if (binding.outerNode < 0 || binding.memberNodes.empty())
-      return operation->emitOpError(
-          "has incomplete canonical ragged ownership domains");
+    binding.operation = relation.operation;
+    binding.node = relation.node;
+    binding.outerNode = relation.outerNode;
+    binding.memberNodes = relation.memberNodes;
     index.ragged.push_back(std::move(binding));
   }
 
-  for (mlir::Operation *operation : streams) {
-    mlir::FailureOr<int64_t> streamNode =
-        target::getNodeID(*operation, "stream emission index");
-    mlir::Operation *axis = operation->getNumOperands() > 0
-                                ? operation->getOperand(0).getDefiningOp()
-                                : nullptr;
-    mlir::FailureOr<int64_t> axisNode =
-        axis ? target::getNodeID(*axis, "ordered-axis emission index")
-             : mlir::FailureOr<int64_t>(mlir::failure());
-    if (mlir::failed(streamNode) || mlir::failed(axisNode) ||
-        !index.axes.count(*axisNode))
-      return operation->emitOpError(
-          "does not resolve an ordered physical axis");
+  llvm::SmallVector<int64_t> streamNodes;
+  for (const auto &entry : kernel.stateStreams)
+    streamNodes.push_back(entry.first);
+  llvm::sort(streamNodes);
+  for (int64_t streamNode : streamNodes) {
+    const target::StateStreamStructure &stream =
+        kernel.stateStreams.lookup(streamNode);
+    auto selected = index.streamBindings.find(streamNode);
+    if (selected == index.streamBindings.end())
+      return stream.operation->emitOpError(
+          "has no selected physical stream binding");
+    intent::plan::StreamBindingOp physical = selected->second;
+    if (static_cast<int64_t>(physical.getAxisNode()) != stream.axisNode ||
+        !index.axes.count(physical.getAxisNode()))
+      return physical.emitOpError(
+          "does not bind the canonical state-stream axis");
+    const AxisBinding &axis = index.axes.lookup(physical.getAxisNode());
+    const RangeBinding *range =
+        axis.getRange(physical.getPurpose(), physical.getLevel());
+    if (!range)
+      return physical.emitOpError(
+          "does not select a physical range for the state-stream axis");
     StreamBinding binding;
-    binding.operation = operation;
-    binding.node = *streamNode;
-    binding.axisNode = *axisNode;
-    auto stopIndex =
-        operation->getAttrOfType<mlir::IntegerAttr>("intent.stop_operand_index");
-    if (stopIndex) {
-      int64_t operand = stopIndex.getInt();
-      mlir::Operation *stop =
-          operand >= 0 && static_cast<unsigned>(operand) < operation->getNumOperands()
-              ? operation->getOperand(operand).getDefiningOp()
-              : nullptr;
-      binding.stopNode =
-          stop ? stop->getAttrOfType<mlir::IntegerAttr>("intent.node")
-               : mlir::IntegerAttr();
-      if (!binding.stopNode)
-        return operation->emitOpError("has no canonical logical stream stop");
+    binding.operation = stream.operation;
+    binding.node = stream.node;
+    binding.axisNode = physical.getAxisNode();
+    binding.rangePurpose = physical.getPurpose().str();
+    binding.rangeLevel = physical.getLevel();
+    binding.extent = range->getExtent().str();
+    if (stream.stopNode >= 0)
+      binding.stopNode = mlir::IntegerAttr::get(
+          mlir::IntegerType::get(stream.operation->getContext(), 64),
+          stream.stopNode);
+    if (physical.getRelationNodeAttr()) {
+      binding.relationNode = physical.getRelationNodeAttr().getInt();
+      auto relation = kernel.raggedRelations.find(binding.relationNode);
+      if (relation == kernel.raggedRelations.end() ||
+          (relation->second.outerNode != binding.axisNode &&
+           !llvm::is_contained(relation->second.memberNodes,
+                               binding.axisNode)))
+        return physical.emitOpError(
+            "does not bind a canonical ragged relation for its stream axis");
     }
     index.streams[binding.node] = std::move(binding);
   }
@@ -1402,12 +1375,11 @@ PhysicalComponents indexPhysicalComponents(const PlanIndex &index) {
       result.raggedByAxis[member].push_back(relation);
   }
   for (const auto &entry : result.streamsByAxis) {
-    auto relations = result.raggedByAxis.find(entry.first);
-    if (relations == result.raggedByAxis.end())
-      continue;
-    for (RaggedBinding relation : relations->second) {
+    for (StreamBinding stream : entry.second) {
+      if (stream.getRelationNode() < 0)
+        continue;
       result.orderedRaggedAxes.insert(entry.first);
-      result.orderedAxesByRelation[relation.getNode()].push_back(entry.first);
+      result.orderedAxesByRelation[stream.getRelationNode()].push_back(entry.first);
     }
   }
   for (RaggedBinding relation : index.ragged) {

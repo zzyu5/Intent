@@ -1760,8 +1760,13 @@ LogicalResult SourceEmitter::emitFull(Operation &operation) {
   if (dtype.empty())
     return failure();
   std::string result = makeResultName(operation, 0);
-  line(result + " = ct.full(" + *shape + ", " + fill->str() +
-       ", dtype=" + dtype + ")");
+  std::string expression = "ct.full(" + *shape + ", " + fill->str() +
+                           ", dtype=" + dtype + ")";
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), expression, operation);
+  if (failed(padded))
+    return failure();
+  line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
 }
@@ -2027,7 +2032,6 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
       axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
-  Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
   if (raggedStream) {
     FailureOr<plan::RaggedOp> relation =
@@ -2053,14 +2057,9 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     line("sequence_length_" + raggedSuffix + " = sequence_end_" +
          raggedSuffix + " - sequence_begin_" + raggedSuffix);
   }
-  FailureOr<std::string> logicalExtent =
-      streamDomain ? dimensionName(*streamDomain)
-                   : FailureOr<std::string>(failure());
-  if (failed(logicalExtent))
-    return binding.emitOpError("has no logical ordered-axis extent");
   std::string streamExtent = raggedStream
                                  ? "sequence_length_" + raggedSuffix
-                                 : dimensionOwners.lookup(*logicalExtent);
+                                 : binding.getExtent().str();
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");

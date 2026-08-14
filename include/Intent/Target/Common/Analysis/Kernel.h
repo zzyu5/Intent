@@ -34,6 +34,20 @@ struct RegionStructure {
   llvm::DenseMap<mlir::Operation *, unsigned> positions;
 };
 
+struct RaggedStructure {
+  mlir::Operation *operation;
+  int64_t node;
+  int64_t outerNode;
+  llvm::SmallVector<int64_t> memberNodes;
+};
+
+struct StateStreamStructure {
+  mlir::Operation *operation;
+  int64_t node;
+  int64_t axisNode;
+  int64_t stopNode;
+};
+
 struct KernelModel {
   mlir::func::FuncOp entry;
   KernelABI abi;
@@ -41,6 +55,8 @@ struct KernelModel {
   llvm::DenseMap<int64_t, mlir::Operation *> nodes;
   llvm::DenseMap<int64_t, mlir::Value> values;
   llvm::DenseMap<mlir::Value, int64_t> valueIDs;
+  llvm::DenseMap<int64_t, RaggedStructure> raggedRelations;
+  llvm::DenseMap<int64_t, StateStreamStructure> stateStreams;
 };
 
 mlir::FailureOr<int64_t> getNodeID(mlir::Operation &operation,

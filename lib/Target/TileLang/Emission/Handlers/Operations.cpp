@@ -2412,7 +2412,45 @@ LogicalResult SourceEmitter::emitFull(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "T.fill" ||
       binding.getReuseOperandAttr().getInt() != -1 || failed(fill) || failed(result))
     return operation.emitOpError("lacks a TileLang full binding");
-  line("T.fill(" + *result + ", " + fill->str() + ")");
+  FailureOr<int64_t> valueID = target::getValueID(
+      operation.getResult(0), kernel, operation, "TileLang full padding lookup");
+  if (failed(valueID))
+    return failure();
+  if (!planIndex.paddings.contains(*valueID)) {
+    line("T.fill(" + *result + ", " + fill->str() + ")");
+  } else {
+    FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+    if (failed(extents))
+      return failure();
+    SmallVector<std::string> indices;
+    std::string loop = "for ";
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
+      if (axis)
+        loop += ", ";
+      indices.push_back("full_i" + std::to_string(axis));
+      loop += indices.back();
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    line(loop + "):");
+    ++indentation;
+    FailureOr<std::string> padded = padElementExpression(
+        operation.getResult(0), *fill, indices, operation);
+    if (failed(padded))
+      return failure();
+    std::string target = *result + "[";
+    for (auto [axis, index] : llvm::enumerate(indices)) {
+      if (axis)
+        target += ", ";
+      target += index;
+    }
+    line(target + "] = " + *padded);
+    --indentation;
+  }
   bindResult(operation, 0, *result);
   return success();
 }
@@ -2810,7 +2848,6 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
       axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
-  Operation *streamDomain = kernel.nodes.lookup(binding.getAxisNode());
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
   if (raggedStream) {
     FailureOr<plan::RaggedOp> relation =
@@ -2835,13 +2872,9 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
     line("sequence_length_" + raggedSuffix + " = sequence_end_" +
          raggedSuffix + " - sequence_begin_" + raggedSuffix);
   }
-  FailureOr<std::string> logicalExtent =
-      streamDomain ? dimensionName(*streamDomain)
-                   : FailureOr<std::string>(failure());
-  if (failed(logicalExtent))
-    return binding.emitOpError("has no logical ordered-axis extent");
   std::string streamExtent =
-      raggedStream ? "sequence_length_" + raggedSuffix : *logicalExtent;
+      raggedStream ? "sequence_length_" + raggedSuffix
+                   : logicalExtent(binding.getExtent());
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");

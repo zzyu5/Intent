@@ -133,7 +133,7 @@ LogicalResult AxisOp::verify() {
 LogicalResult RangeOp::verify() {
   if (failed(requireNode(*this, getAxisNode())) ||
       failed(requireNonNegative(*this, getLevel(), "range level")) ||
-      getPurpose().empty() || getTile().empty())
+      getPurpose().empty() || getTile().empty() || getExtent().empty())
     return failure();
   if (!llvm::is_contained(
           {StringRef("ownership"), StringRef("traversal"),
@@ -161,6 +161,18 @@ LogicalResult RangeOp::verify() {
     return emitOpError(
         "non-access ranges cannot carry transfer-relative offsets");
   }
+  return success();
+}
+
+LogicalResult RegionBindingOp::verify() {
+  if (failed(requireNonNegative(*this, getArgument(),
+                                "region argument value ID")) ||
+      failed(requireNode(*this, getAxisNode())) ||
+      failed(requireNonNegative(*this, getLevel(), "range level")))
+    return failure();
+  if (getPurpose() != "ownership" && getPurpose() != "traversal")
+    return emitOpError(
+        "region arguments may only bind ownership or traversal ranges");
   return success();
 }
 
@@ -337,6 +349,19 @@ LogicalResult StreamAxisOp::verify() {
   return success();
 }
 
+LogicalResult StreamBindingOp::verify() {
+  if (failed(requireNode(*this, getStreamNode())) ||
+      failed(requireNode(*this, getAxisNode())) ||
+      failed(requireNonNegative(*this, getLevel(), "stream range level")))
+    return failure();
+  if (getPurpose() != "traversal")
+    return emitOpError("state streams require a traversal range binding");
+  if (getRelationNodeAttr() &&
+      failed(requireNode(*this, getRelationNodeAttr().getInt())))
+    return failure();
+  return success();
+}
+
 LogicalResult StageOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
@@ -391,6 +416,8 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::StringSet<> rangeKeys;
   SmallVector<RangeOp> ranges;
+  llvm::DenseSet<int64_t> regionArguments;
+  SmallVector<RegionBindingOp> regionBindings;
   SmallVector<ScanOp> scans;
   SmallVector<PointwiseOp> pointwise;
   llvm::DenseSet<int64_t> programOrders;
@@ -403,6 +430,8 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::DenseSet<int64_t> stageNodes;
   llvm::StringSet<> streamAxisRoles;
   SmallVector<StreamAxisOp> streamAxes;
+  llvm::DenseSet<int64_t> streamNodes;
+  SmallVector<StreamBindingOp> streamBindings;
   llvm::StringSet<> stageAxisRoles;
   SmallVector<StageAxisOp> stageAxes;
   for (Operation &operation : realization.getBody().front()) {
@@ -427,6 +456,11 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (!rangeKeys.insert(key).second)
         return range.emitOpError("duplicates an axis physical range");
       ranges.push_back(range);
+    } else if (auto binding = dyn_cast<RegionBindingOp>(operation)) {
+      if (!regionArguments.insert(binding.getArgument()).second)
+        return binding.emitOpError(
+            "duplicates a region-argument physical binding");
+      regionBindings.push_back(binding);
     } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
       ++programs;
       program = choice;
@@ -480,6 +514,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       if (!streamAxisRoles.insert(key).second)
         return binding.emitOpError("duplicates a stream-axis relation");
       streamAxes.push_back(binding);
+    } else if (auto binding = dyn_cast<StreamBindingOp>(operation)) {
+      if (!streamNodes.insert(binding.getStreamNode()).second)
+        return binding.emitOpError("duplicates a state-stream physical binding");
+      streamBindings.push_back(binding);
     } else if (auto binding = dyn_cast<StageOp>(operation)) {
       if (!stageNodes.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates a physical stage decision");
@@ -522,6 +560,21 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
                       std::to_string(level);
     return rangeKeys.contains(key);
   };
+  for (RegionBindingOp binding : regionBindings) {
+    if (!axes.count(binding.getAxisNode()) ||
+        !hasRange(binding.getAxisNode(), binding.getPurpose(),
+                  binding.getLevel()))
+      return binding.emitOpError(
+          "references an unbound selected physical range");
+  }
+  for (StreamBindingOp binding : streamBindings) {
+    auto axis = axes.find(binding.getAxisNode());
+    if (axis == axes.end() || !axisHasRole(axis->second, "ordered") ||
+        !hasRange(binding.getAxisNode(), binding.getPurpose(),
+                  binding.getLevel()))
+      return binding.emitOpError(
+          "references an unbound ordered traversal range");
+  }
   auto isScalarUnreusedProgramOwner = [&](int64_t node) {
     auto axis = axes.find(node);
     if (axis == axes.end() || !axisHasRole(axis->second, "parallel") ||

@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
@@ -15,6 +16,125 @@ namespace {
 
 bool isIntentOperation(Operation *operation) {
   return operation->getName().getDialectNamespace() == "intent";
+}
+
+std::optional<std::string> builtinMetadataSpelling(Type type) {
+  std::string spelling;
+  llvm::raw_string_ostream stream(spelling);
+  type.print(stream);
+  stream.flush();
+  if (spelling == "i1")
+    return std::string("bool");
+  if (StringRef(spelling).starts_with("ui"))
+    return "u" + StringRef(spelling).drop_front(2).str();
+  if (spelling == "f8E4M3FN")
+    return std::string("f8e4m3fn");
+  if (spelling == "f8E5M2")
+    return std::string("f8e5m2");
+  if (spelling == "f8E8M0FNU")
+    return std::string("f8e8m0fnu");
+  if (isa<IntegerType, IndexType, FloatType>(type))
+    return spelling;
+  return std::nullopt;
+}
+
+std::optional<StringRef> logicalMetadataSpelling(Type type) {
+  if (auto value = dyn_cast<intent::LogicalIndexType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::DomainType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::RegionType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::PartitionType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::RaggedType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::BufferType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::RecordType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::ConstexprType>(type))
+    return value.getSpec();
+  if (auto value = dyn_cast<intent::EnumType>(type))
+    return value.getSpec();
+  return std::nullopt;
+}
+
+FailureOr<std::string> tensorMetadataSpelling(Operation *owner,
+                                              RankedTensorType tensor,
+                                              ArrayAttr shape) {
+  if (!shape || shape.size() != static_cast<size_t>(tensor.getRank())) {
+    owner->emitOpError("tensor metadata shape does not match the SSA rank");
+    return failure();
+  }
+  std::optional<std::string> element =
+      builtinMetadataSpelling(tensor.getElementType());
+  if (!element) {
+    owner->emitOpError("tensor metadata has no canonical element type spelling");
+    return failure();
+  }
+  std::string result = "tensor<";
+  for (auto [axis, attribute] : llvm::enumerate(shape)) {
+    auto dimension = dyn_cast<StringAttr>(attribute);
+    if (!dimension) {
+      owner->emitOpError("tensor shape metadata contains a non-string dimension");
+      return failure();
+    }
+    if (tensor.isDynamicDim(axis)) {
+      if (dimension.getValue().empty()) {
+        owner->emitOpError("dynamic tensor metadata dimension is empty");
+        return failure();
+      }
+    } else {
+      int64_t metadataExtent = -1;
+      if (dimension.getValue().getAsInteger(10, metadataExtent) ||
+          metadataExtent != tensor.getDimSize(axis)) {
+        owner->emitOpError(
+            "static tensor metadata dimension does not match the SSA type");
+        return failure();
+      }
+    }
+    result += dimension.getValue().str() + "x";
+  }
+  result += *element + ">";
+  return result;
+}
+
+LogicalResult verifyMetadataMatchesType(Operation *owner, Type actualType,
+                                        StringRef metadataType,
+                                        ArrayAttr shape = {}) {
+  std::string expected;
+  if (auto view = dyn_cast<intent::ViewType>(actualType)) {
+    auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
+    FailureOr<std::string> spelling =
+        tensor ? tensorMetadataSpelling(owner, tensor, shape)
+               : FailureOr<std::string>(failure());
+    if (!tensor)
+      owner->emitOpError("view metadata requires a ranked tensor SSA type");
+    if (failed(spelling))
+      return failure();
+    expected = std::move(*spelling);
+  } else if (auto tensor = dyn_cast<RankedTensorType>(actualType)) {
+    FailureOr<std::string> spelling =
+        tensorMetadataSpelling(owner, tensor, shape);
+    if (failed(spelling))
+      return failure();
+    expected = std::move(*spelling);
+  } else if (std::optional<StringRef> spelling =
+                 logicalMetadataSpelling(actualType)) {
+    expected = spelling->str();
+  } else if (std::optional<std::string> spelling =
+                 builtinMetadataSpelling(actualType)) {
+    expected = std::move(*spelling);
+  } else {
+    return owner->emitOpError(
+        "SSA type has no canonical Intent metadata spelling");
+  }
+  if (metadataType != expected)
+    return owner->emitOpError()
+           << "type metadata '" << metadataType << "' does not match SSA type '"
+           << expected << "'";
+  return success();
 }
 
 LogicalResult verifyResultMetadata(Operation *operation,
@@ -66,6 +186,17 @@ LogicalResult verifyResultMetadata(Operation *operation,
           return operation->emitOpError(
               "intent.result_shapes dimensions must be canonical strings");
     }
+  }
+  auto resultShapes =
+      operation->getAttrOfType<ArrayAttr>("intent.result_shapes");
+  for (auto [index, attribute] : llvm::enumerate(resultTypes)) {
+    auto type = cast<StringAttr>(attribute);
+    ArrayAttr shape =
+        resultShapes ? dyn_cast<ArrayAttr>(resultShapes[index]) : ArrayAttr();
+    if (failed(verifyMetadataMatchesType(
+            operation, operation->getResult(index).getType(), type.getValue(),
+            shape)))
+      return failure();
   }
   return success();
 }
@@ -137,7 +268,7 @@ LogicalResult verifyTypeMetadata(Operation *owner, DictionaryAttr metadata) {
 
 LogicalResult verifyParameterMetadata(func::FuncOp function,
                                       ArrayAttr parameters) {
-  for (Attribute attribute : parameters) {
+  for (auto [index, attribute] : llvm::enumerate(parameters)) {
     auto metadata = dyn_cast<DictionaryAttr>(attribute);
     if (!metadata)
       return function.emitOpError("parameter metadata entries must be dictionaries");
@@ -147,6 +278,11 @@ LogicalResult verifyParameterMetadata(func::FuncOp function,
       return function.emitOpError("parameter metadata requires name and kind");
     if (failed(verifyTypeMetadata(function, metadata)))
       return failure();
+    if (failed(verifyMetadataMatchesType(
+            function, function.getArgument(index).getType(),
+            metadata.getAs<StringAttr>("type").getValue(),
+            metadata.getAs<ArrayAttr>("shape"))))
+      return failure();
     if (kind.getValue() == "view") {
       auto viewKind = metadata.getAs<StringAttr>("view_kind");
       auto constraints = metadata.getAs<DictionaryAttr>("constraints");
@@ -154,6 +290,10 @@ LogicalResult verifyParameterMetadata(func::FuncOp function,
           (viewKind.getValue() != "in" && viewKind.getValue() != "out" &&
            viewKind.getValue() != "inout"))
         return function.emitOpError("view metadata requires kind and constraints");
+      auto view = dyn_cast<intent::ViewType>(function.getArgument(index).getType());
+      if (!view || view.getAccess() != viewKind.getValue())
+        return function.emitOpError(
+            "view access metadata does not match the SSA view type");
       if (!constraints.get("strides") || !constraints.get("layout") ||
           !constraints.get("alignment") || !constraints.get("alias") ||
           !constraints.getAs<BoolAttr>("noalias"))
@@ -493,9 +633,14 @@ LogicalResult verifyKernelModule(ModuleOp module) {
       return function.emitOpError("Intent ABI metadata does not match function type");
     if (failed(verifyParameterMetadata(function, parameters)))
       return failure();
-    for (Attribute attribute : results) {
+    for (auto [index, attribute] : llvm::enumerate(results)) {
       auto metadata = dyn_cast<DictionaryAttr>(attribute);
       if (!metadata || failed(verifyTypeMetadata(function, metadata)))
+        return failure();
+      if (failed(verifyMetadataMatchesType(
+              function, function.getResultTypes()[index],
+              metadata.getAs<StringAttr>("type").getValue(),
+              metadata.getAs<ArrayAttr>("shape"))))
         return failure();
     }
     for (Attribute attribute : parameterNodes) {

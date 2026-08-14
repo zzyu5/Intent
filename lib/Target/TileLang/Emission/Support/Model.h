@@ -19,6 +19,7 @@
 namespace intent::tilelang::plan {
 using TargetOp = target::emission::TargetBinding;
 using AxisOp = target::emission::AxisBinding;
+using RegionBindingOp = intent::plan::RegionBindingOp;
 using ProgramOp = target::emission::ProgramBinding;
 using BlockExtentOp = target::emission::BlockExtentBinding;
 using BufferOp = target::emission::BufferBinding;
@@ -33,6 +34,7 @@ using RaggedOp = target::emission::RaggedBinding;
 using StageOp = target::emission::StageBinding;
 using StageAxisOp = target::emission::StageAxisBinding;
 using StreamAxisOp = intent::plan::StreamAxisOp;
+using StreamBindingOp = intent::plan::StreamBindingOp;
 using BoundaryOp = target::emission::BoundaryBinding;
 using AutotuneOp = target::emission::AutotuneBinding;
 } // namespace intent::tilelang::plan
@@ -44,6 +46,7 @@ struct RealizationIndex {
   plan::ProgramOp program;
   llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
+  llvm::DenseMap<int64_t, plan::RegionBindingOp> regionBindings;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
   llvm::DenseMap<int64_t, plan::BufferOp> buffers;
@@ -53,6 +56,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::SparseContractOp> sparseContracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
+  llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StageOp> stages;
@@ -176,6 +180,7 @@ private:
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
+  std::string logicalExtent(llvm::StringRef extent) const;
   std::string physicalExtent(llvm::StringRef logicalExtent) const;
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);

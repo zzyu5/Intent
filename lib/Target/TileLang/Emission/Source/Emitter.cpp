@@ -250,6 +250,9 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::RangeOp>(operation)) {
       ranges.push_back(value);
+    } else if (auto value =
+                   dyn_cast<intent::plan::RegionBindingOp>(operation)) {
+      index.regionBindings[value.getArgument()] = value;
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
@@ -307,6 +310,9 @@ indexRealization(intent::plan::RealizationOp realization,
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
       index.streamAxes.push_back(value);
+    } else if (auto value =
+                   dyn_cast<intent::plan::StreamBindingOp>(operation)) {
+      index.streamBindings[value.getStreamNode()] = value;
     }
   }
   if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
@@ -317,7 +323,8 @@ indexRealization(intent::plan::RealizationOp realization,
     plan::StreamOp &binding = entry.second;
     plan::AxisOp axis = index.axes.lookup(binding.getAxisNode());
     const target::emission::RangeBinding *traversal =
-        axis ? axis.getRange("traversal", 0) : nullptr;
+        axis ? axis.getRange(binding.getRangePurpose(), binding.getRangeLevel())
+             : nullptr;
     FailureOr<std::string> tile =
         traversal ? tileSpelling(binding.operation, traversal->getTileRole())
                   : FailureOr<std::string>(failure());
@@ -644,10 +651,10 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     std::string tile = entry.second.getTile().str();
     if (!entry.second.getReuseWorker() &&
         entry.second.getTileRole().starts_with("row_vector")) {
-      FailureOr<std::string> dimension = dimensionName(*domain);
-      if (failed(dimension))
+      const target::emission::RangeBinding *range = entry.second.roleRange();
+      if (!range)
         return entry.second.emitOpError("cannot resolve its row-vector extent");
-      tile = physicalExtent(*dimension);
+      tile = physicalExtent(range->getExtent());
     }
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
         tile;
@@ -657,40 +664,21 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!value || !isa<RankedTensorType>(value.getType()))
       return entry.second.emitOpError("does not bind a ranked tensor value");
   }
-  for (const target::RegionNode &region : kernel.regions.nodes) {
-    Operation *operation = region.operation;
-    StringRef name = operation->getName().getStringRef();
-    if (name != "intent.parallel" && name != "intent.state_stream")
-      continue;
-    FailureOr<SmallVector<Operation *>> domains =
-        operation->getNumOperands() > 0
-            ? target::expandDomainSource(operation->getOperand(0), *operation)
-            : FailureOr<SmallVector<Operation *>>(failure());
-    auto regions = operation->getAttrOfType<ArrayAttr>(
-        "intent.region_argument_nodes");
-    auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
-                                              : ArrayAttr();
-    auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
-                                               : ArrayAttr();
-    if (failed(domains) || !arguments || arguments.size() < domains->size())
-      return operation->emitOpError(
-          "cannot index its region shape against the TileLang plan");
-    for (auto [index, domain] : llvm::enumerate(*domains)) {
-      FailureOr<int64_t> domainNode =
-          target::getNodeID(*domain, "region tile indexing");
-      plan::AxisOp axis = succeeded(domainNode)
-                              ? planIndex.axes.lookup(*domainNode)
-                              : plan::AxisOp();
-      auto argument = dyn_cast<IntegerAttr>(arguments[index]);
-      StringRef purpose = name == "intent.parallel" ? "ownership" : "traversal";
-      const target::emission::RangeBinding *range =
-          axis ? axis.getRange(purpose, 0) : nullptr;
-      if (failed(domainNode) || !axis || !argument || !range)
-        return operation->emitOpError(
-            "cannot index its region axis against the TileLang plan");
-      regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
-          range->getTile().str();
-    }
+  for (const auto &entry : planIndex.regionBindings) {
+    Value value = kernel.values.lookup(entry.first);
+    auto argument = dyn_cast<BlockArgument>(value);
+    plan::RegionBindingOp binding = entry.second;
+    plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange(binding.getPurpose(), binding.getLevel()) : nullptr;
+    if (!argument || !axis || !range)
+      return binding.emitOpError(
+          "does not bind a canonical region argument and selected range");
+    std::string tile =
+        !axis.getReuseWorker() && range->getTileRole().starts_with("row_vector")
+            ? physicalExtent(range->getExtent())
+            : range->getTile().str();
+    regionTiles["?region_" + std::to_string(entry.first) + "_0"] = tile;
   }
 
   if (!planIndex.components.reusedAxes.empty()) {
@@ -1982,6 +1970,10 @@ std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
   return "PHYSICAL_" + dimensionSpelling(logicalExtent);
 }
 
+std::string SourceEmitter::logicalExtent(StringRef extent) const {
+  return dimensionSpelling(extent);
+}
+
 FailureOr<std::string>
 SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -2187,13 +2179,11 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
       std::string extent = axis->getTile().str();
       if (!axis->getReuseWorker() &&
           axis->getTileRole().starts_with("row_vector")) {
-        FailureOr<Operation *> domain = resolveDomain(indexed, operation);
-        FailureOr<std::string> logical =
-            succeeded(domain) ? dimensionName(**domain)
-                              : FailureOr<std::string>(failure());
-        if (failed(domain) || failed(logical))
-          return failure();
-        extent = physicalExtent(*logical);
+        const target::emission::RangeBinding *range = axis->roleRange();
+        if (!range)
+          return axis->emitOpError(
+              "cannot resolve its row-vector physical extent");
+        extent = physicalExtent(range->getExtent());
       }
       indices.push_back(axis->isScalar()
                             ? wideBase

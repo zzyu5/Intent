@@ -219,6 +219,9 @@ indexRealization(intent::plan::RealizationOp realization,
       index.axes.try_emplace(value.getNode(), binding);
     } else if (auto value = dyn_cast<intent::plan::RangeOp>(operation)) {
       ranges.push_back(value);
+    } else if (auto value =
+                   dyn_cast<intent::plan::RegionBindingOp>(operation)) {
+      index.regionBindings[value.getArgument()] = value;
     } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
@@ -272,6 +275,9 @@ indexRealization(intent::plan::RealizationOp realization,
       index.stageAxes[value.getStageNode()][value.getRole()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
       index.streamAxes.push_back(value);
+    } else if (auto value =
+                   dyn_cast<intent::plan::StreamBindingOp>(operation)) {
+      index.streamBindings[value.getStreamNode()] = value;
     }
   }
   if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
@@ -282,7 +288,8 @@ indexRealization(intent::plan::RealizationOp realization,
     plan::StreamOp &binding = entry.second;
     plan::AxisOp axis = index.axes.lookup(binding.getAxisNode());
     const target::emission::RangeBinding *traversal =
-        axis ? axis.getRange("traversal", 0) : nullptr;
+        axis ? axis.getRange(binding.getRangePurpose(), binding.getRangeLevel())
+             : nullptr;
     FailureOr<std::string> tile =
         traversal ? tileSpelling(binding.operation, traversal->getTileRole())
                   : FailureOr<std::string>(failure());
@@ -608,40 +615,21 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     if (!value || !isa<RankedTensorType>(value.getType()))
       return entry.second.emitOpError("does not bind a ranked tensor value");
   }
-  for (const target::RegionNode &region : kernel.regions.nodes) {
-    Operation *operation = region.operation;
-    StringRef name = operation->getName().getStringRef();
-    if (name != "intent.parallel" && name != "intent.state_stream")
-      continue;
-    FailureOr<SmallVector<Operation *>> domains =
-        operation->getNumOperands() > 0
-            ? target::expandDomainSource(operation->getOperand(0), *operation)
-            : FailureOr<SmallVector<Operation *>>(failure());
-    auto regions = operation->getAttrOfType<ArrayAttr>(
-        "intent.region_argument_nodes");
-    auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
-                                              : ArrayAttr();
-    auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
-                                               : ArrayAttr();
-    if (failed(domains) || !arguments || arguments.size() < domains->size())
-      return operation->emitOpError(
-          "cannot index its region shape against the cuTile plan");
-    for (auto [index, domain] : llvm::enumerate(*domains)) {
-      FailureOr<int64_t> domainNode =
-          target::getNodeID(*domain, "region tile indexing");
-      plan::AxisOp axis = succeeded(domainNode)
-                              ? planIndex.axes.lookup(*domainNode)
-                              : plan::AxisOp();
-      auto argument = dyn_cast<IntegerAttr>(arguments[index]);
-      StringRef purpose = name == "intent.parallel" ? "ownership" : "traversal";
-      const target::emission::RangeBinding *range =
-          axis ? axis.getRange(purpose, 0) : nullptr;
-      if (failed(domainNode) || !axis || !argument || !range)
-        return operation->emitOpError(
-            "cannot index its region axis against the cuTile plan");
-      regionTiles["?region_" + std::to_string(argument.getInt()) + "_0"] =
-          range->getTile().str();
-    }
+  for (const auto &entry : planIndex.regionBindings) {
+    Value value = kernel.values.lookup(entry.first);
+    auto argument = dyn_cast<BlockArgument>(value);
+    plan::RegionBindingOp binding = entry.second;
+    plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
+    const target::emission::RangeBinding *range =
+        axis ? axis.getRange(binding.getPurpose(), binding.getLevel()) : nullptr;
+    if (!argument || !axis || !range)
+      return binding.emitOpError(
+          "does not bind a canonical region argument and selected range");
+    std::string tile =
+        !axis.getReuseWorker() && range->getTileRole().starts_with("row_vector")
+            ? physicalExtent(range->getExtent())
+            : range->getTile().str();
+    regionTiles["?region_" + std::to_string(entry.first) + "_0"] = tile;
   }
 
   if (!planIndex.components.reusedAxes.empty()) {
@@ -2038,12 +2026,10 @@ FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
   if (axis.getReuseWorker() ||
       !axis.getTileRole().starts_with("row_vector"))
     return axis.getTile().str();
-  Operation *domain = kernel.nodes.lookup(axis.getNode());
-  FailureOr<std::string> logical =
-      domain ? dimensionName(*domain) : FailureOr<std::string>(failure());
-  if (failed(logical))
+  const target::emission::RangeBinding *range = axis.roleRange();
+  if (!range)
     return axis.emitOpError("cannot resolve its row-vector physical extent");
-  return physicalExtent(*logical);
+  return physicalExtent(range->getExtent());
 }
 
 FailureOr<std::string>

@@ -675,18 +675,17 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
 
 LogicalResult bindRegionArgumentAxis(Operation &owner, unsigned argumentIndex,
                                      Operation &domain, KernelFacts &facts) {
-  auto regions = owner.getAttrOfType<ArrayAttr>("intent.region_argument_nodes");
-  auto blocks = regions && !regions.empty() ? dyn_cast<ArrayAttr>(regions[0])
-                                            : ArrayAttr();
-  auto arguments = blocks && !blocks.empty() ? dyn_cast<ArrayAttr>(blocks[0])
-                                             : ArrayAttr();
-  auto node = arguments && argumentIndex < arguments.size()
-                  ? dyn_cast<IntegerAttr>(arguments[argumentIndex])
-                  : IntegerAttr();
+  if (owner.getNumRegions() == 0 || owner.getRegion(0).empty() ||
+      argumentIndex >= owner.getRegion(0).front().getNumArguments())
+    return owner.emitOpError("has no canonical region argument");
+  Value argument = owner.getRegion(0).front().getArgument(argumentIndex);
+  FailureOr<int64_t> node = getValueID(
+      argument, facts.kernel, owner, "region argument logical-axis binding");
   FailureOr<LogicalAxis> axis = axisFromDomain(domain, facts, owner);
-  if (!node || failed(axis))
+  if (failed(node) || failed(axis))
     return owner.emitOpError("has no canonical region-axis identity");
-  facts.axisLabels["?region_" + std::to_string(node.getInt()) + "_0"] = *axis;
+  facts.axisLabels["?region_" + std::to_string(*node) + "_0"] = *axis;
+  facts.regionArgumentAxes[argument] = *axis;
   return success();
 }
 
@@ -715,18 +714,9 @@ FailureOr<LogicalAxis> axisFromLabel(StringRef label, KernelFacts &facts,
   auto known = facts.axisLabels.find(label);
   if (known != facts.axisLabels.end())
     return known->second;
-  for (const auto &binding : facts.domainSourceAxes) {
-    FailureOr<LogicalAxis> axis = axisFromDomain(*binding.first, facts, consumer);
-    if (failed(axis))
-      return failure();
-    if (axis->extent == label) {
-      facts.axisLabels[label] = *axis;
-      return axis;
-    }
-  }
-  LogicalAxis implicit{nullptr, label.str()};
-  facts.axisLabels[label] = implicit;
-  return implicit;
+  consumer.emitOpError() << "has no exact logical-axis provenance for shape label '"
+                         << label << "'";
+  return failure();
 }
 
 LogicalResult bindResultAxes(Operation &operation, unsigned resultIndex,
@@ -2566,6 +2556,19 @@ TensorIndexingKind tensorIndexingKind(Operation &operation,
 }
 
 LogicalResult analyzeKernelFacts(KernelFacts &facts) {
+  for (const ABIArgument &argument : facts.kernel.abi.arguments) {
+    auto shape = argument.metadata.getAs<ArrayAttr>("shape");
+    if (!shape)
+      continue;
+    for (Attribute attribute : shape) {
+      auto label = dyn_cast<StringAttr>(attribute);
+      if (!label || label.getValue().empty())
+        return facts.kernel.entry.emitOpError(
+            "has non-canonical ABI axis provenance metadata");
+      facts.axisLabels.try_emplace(
+          label.getValue(), LogicalAxis{nullptr, label.getValue().str()});
+    }
+  }
   OperationHandlerRegistry registry;
   if (failed(registerFactHandlers(registry, facts)))
     return facts.kernel.entry.emitOpError(
