@@ -127,6 +127,7 @@ def Intent_ArgReduceOp : Intent_Op<"arg_reduce", [Pure]> {
 }
 def Intent_ScanOp : Intent_BinaryOneResultOp<"scan">;
 def Intent_ContractOp : Intent_BinaryOneResultOp<"contract">;
+def Intent_SparseContractOp : Intent_VariadicOneResultOp<"sparse_contract">;
 
 def Intent_RaggedOp : Intent_Op<"ragged", [Pure]> {
   let arguments = (ins AnyType:$outer, AnyType:$members, AnyType:$offsets,

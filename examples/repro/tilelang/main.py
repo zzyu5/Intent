@@ -72,6 +72,30 @@ def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if kernel == "sparse_2to4_gemm":
+        sys.path.insert(0, str(source_path.parent))
+        source = _load_module(source_path, "intent_upstream_tilelang_sparse_2to4")
+        compiled = {}
+
+        def run(arguments):
+            compressed, metadata, rhs = arguments
+            shape = (compressed.shape[0], rhs.shape[1], rhs.shape[0])
+            if shape not in compiled:
+                compiled[shape] = source.matmul_sp_fp16(
+                    *shape,
+                    T.float,
+                    T.int16,
+                    128,
+                    128,
+                    32,
+                    3,
+                    256,
+                    T.GemmWarpPolicy.Square,
+                    True,
+                )
+            return compiled[shape](compressed, metadata, rhs)
+
+        return run
     if kernel == "w4a8_packed":
         source = _load_module(source_path, "intent_upstream_tilelang_w4a8")
         state = {}

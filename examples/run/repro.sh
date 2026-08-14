@@ -69,6 +69,10 @@ if [[ ${unfamiliar} == false ]]; then
   triton:paged_attention)
     baseline=source/triton/xformers/attention/splitk/splitk_kernels_runtime.py
     ;;
+  triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode)
+    ;;
+  triton:paged_splitk_attention | cutile:paged_splitk_attention | tilelang:paged_splitk_attention)
+    ;;
   triton:moe)
     baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
     ;;
@@ -82,6 +86,13 @@ if [[ ${unfamiliar} == false ]]; then
     baseline=source/triton/triton/normalization/layer_norm/05-layer-norm.py
     ;;
   triton:attention_backward | cutile:attention_backward | tilelang:attention_backward)
+    ;;
+  triton:varlen_gqa_decode_logits | cutile:varlen_gqa_decode_logits | tilelang:varlen_gqa_decode_logits)
+    ;;
+  triton:sparse_2to4_gemm | cutile:sparse_2to4_gemm)
+    ;;
+  tilelang:sparse_2to4_gemm)
+    baseline=source/tilelang/tilelang/gemm/sparse_2to4/example_gemm_sp.py
     ;;
   triton:causal_conv1d_backward | cutile:causal_conv1d_backward | tilelang:causal_conv1d_backward)
     ;;

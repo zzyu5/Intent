@@ -245,6 +245,18 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
       return failure();
 
   if (failed(addHandler(
+          registry, "intent.sparse_contract",
+          [&](Operation &operation) -> LogicalResult {
+            auto format = operation.getAttrOfType<StringAttr>("intent.format");
+            if (!format || format.getValue() != "two_of_four" ||
+                operation.getNumOperands() != 3 || operation.getNumResults() != 1)
+              return operation.emitOpError(
+                  "has no mechanical 2:4 sparse contraction schema");
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
           registry, "intent.reduce", validateReduction)))
     return failure();
   if (failed(addHandler(
@@ -285,7 +297,22 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 *relation, [](const target::IndexTerm &term) {
                   return term.kind == "value_index";
                 });
-            if (!expand && !indirect)
+            auto sourceType = dyn_cast<RankedTensorType>(
+                operation.getNumOperands() > 0
+                    ? operation.getOperand(0).getType()
+                    : Type());
+            bool scalarizeStaticUnitTensor =
+                operation.getNumOperands() > 0 && operation.getNumResults() == 1 &&
+                sourceType &&
+                llvm::all_of(*relation, [](const target::IndexTerm &term) {
+                  return term.kind == "static_index" &&
+                         term.staticValues.size() == 1 &&
+                         term.staticValues.front() &&
+                         *term.staticValues.front() == 0;
+                }) &&
+                llvm::all_of(sourceType.getShape(),
+                             [](int64_t extent) { return extent == 1; });
+            if (!expand && !indirect && !scalarizeStaticUnitTensor)
               return operation.emitOpError(
                   "has no mechanical GPU gather realization");
             return success();

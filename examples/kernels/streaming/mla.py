@@ -27,6 +27,18 @@ SPARSE_MLA_SCALE = 1.0 / math.sqrt(
     SPARSE_MLA_LATENT_DIMENSION + SPARSE_MLA_ROPE_DIMENSION
 )
 
+PAGED_MLA_BATCH = 8
+PAGED_MLA_QUERY_HEADS = 32
+PAGED_MLA_KV_HEADS = 1
+PAGED_MLA_HEAD_GROUP = PAGED_MLA_QUERY_HEADS // PAGED_MLA_KV_HEADS
+PAGED_MLA_PAGE_SIZE = 64
+PAGED_MLA_LATENT_DIMENSION = 128
+PAGED_MLA_ROPE_DIMENSION = 64
+PAGED_MLA_SEQUENCE_LENGTHS = (4096, 4093, 4087, 4081, 4079, 4073, 4069, 4063)
+PAGED_MLA_SCALE = 1.0 / math.sqrt(
+    PAGED_MLA_LATENT_DIMENSION + PAGED_MLA_ROPE_DIMENSION
+)
+
 
 @intent.fn
 def online_sparse_mla_accumulate(
@@ -239,3 +251,166 @@ def token_sparse_mla_prefill(
         )
         maximum_output[query_region, :] = maximum
         lse_output[query_region, :] = maximum + I.log(safe_denominator) * I.LOG2E
+
+
+@intent.kernel
+def paged_mla_decode(
+    q_latent: I.In[I.f16, ("B", "HQ", "C")],
+    q_rope: I.In[I.f16, ("B", "HQ", "DR")],
+    latent_cache: I.In[I.f16, ("P", "PS", "HK", "C")],
+    rope_cache: I.In[I.f16, ("P", "PS", "HK", "DR")],
+    page_offsets: I.In[I.i32, ("B_PLUS_1",)],
+    page_indices: I.In[I.i32, ("S",)],
+    sequence_lengths: I.In[I.i32, ("B",)],
+    output: I.Out[I.f16, ("B", "HQ", "C")],
+    scale: I.f32,
+    PAGE_SIZE: I.Constexpr[int],
+    HEAD_GROUP: I.Constexpr[int],
+):
+    B, HQ, C = q_latent.shape
+    DR = q_rope.shape[-1]
+    _, PS, _, _ = latent_cache.shape
+    page_slots = page_indices.shape[0]
+    pages = I.ragged(
+        outer=I.domain(0, B),
+        members=I.domain(0, page_slots),
+        offsets=page_offsets,
+        indices=page_indices,
+    )
+    page_tokens = I.domain(0, PS)
+    for batch in I.parallel(pages.outer):
+        I.assume_in_bounds(batch, page_offsets, axis=0)
+        page_begin = I.cast(page_offsets[batch], I.index)
+        sequence_length = I.cast(sequence_lengths[batch], I.index)
+        for query_head in I.parallel(I.domain(0, HQ)):
+            key_head = query_head // HEAD_GROUP
+            latent_query = q_latent[batch, query_head, :][None, :]
+            rope_query = q_rope[batch, query_head, :][None, :]
+            page_axis = pages[batch]
+            page_stream = I.state_stream(
+                page_axis,
+                extent=1,
+                init=(
+                    I.full((1,), -I.inf, dtype=I.f32),
+                    I.zeros((1,), dtype=I.f32),
+                    I.zeros((1, C), dtype=I.f32),
+                ),
+                stop=I.end(page_axis),
+            )
+            with page_stream:
+                for page_region, (maximum, denominator, accumulator) in page_stream:
+                    physical_page = I.members(page_region)
+                    I.assume_in_bounds(physical_page, latent_cache, axis=0)
+                    I.assume_in_bounds(physical_page, rope_cache, axis=0)
+                    page_ordinal = I.indices(page_region) - page_begin
+                    token_stream = I.state_stream(
+                        page_tokens,
+                        extent=I.auto("K_TILE"),
+                        init=(maximum, denominator, accumulator),
+                        stop=I.end(page_tokens),
+                    )
+                    with token_stream:
+                        for token_region, (
+                            token_maximum,
+                            token_denominator,
+                            token_accumulator,
+                        ) in token_stream:
+                            token_index = I.indices(token_region)
+                            I.assume_in_bounds(key_head, latent_cache, axis=2)
+                            I.assume_in_bounds(key_head, rope_cache, axis=2)
+                            logical_token = I.reshape(
+                                page_ordinal[:, None] * PAGE_SIZE
+                                + token_index[None, :],
+                                (token_region,),
+                            )
+                            token_valid = logical_token < sequence_length
+                            latent_block = I.reshape(
+                                latent_cache[
+                                    physical_page, token_region, key_head, :
+                                ],
+                                (token_region, C),
+                            )
+                            rope_block = I.reshape(
+                                rope_cache[
+                                    physical_page, token_region, key_head, :
+                                ],
+                                (token_region, DR),
+                            )
+                            content_scores = I.contract(
+                                latent_query,
+                                latent_block,
+                                reduce=((1, 1),),
+                                acc_dtype=I.f32,
+                            )
+                            position_scores = I.contract(
+                                rope_query,
+                                rope_block,
+                                reduce=((1, 1),),
+                                acc_dtype=I.f32,
+                            )
+                            scores = I.mask(
+                                (content_scores + position_scores)
+                                * (scale * I.LOG2E),
+                                valid=token_valid[None, :],
+                                fill=-I.inf,
+                            )
+                            local_maximum = I.reduce.max(
+                                scores, axis=1, identity=-I.inf
+                            )
+                            next_maximum = I.maximum(
+                                token_maximum, local_maximum
+                            )
+                            safe_maximum = I.mask(
+                                next_maximum,
+                                valid=next_maximum != -I.inf,
+                                fill=0.0,
+                            )
+                            old_scale = I.exp2(
+                                token_maximum - safe_maximum
+                            )
+                            probability = I.exp2(
+                                scores - safe_maximum[:, None]
+                            )
+                            next_denominator = (
+                                old_scale * token_denominator
+                                + I.reduce.sum(
+                                    probability,
+                                    axis=1,
+                                    identity=0.0,
+                                )
+                            )
+                            next_accumulator = (
+                                old_scale[:, None] * token_accumulator
+                                + I.contract(
+                                    I.cast(probability, I.f16),
+                                    latent_block,
+                                    reduce=((1, 0),),
+                                    acc_dtype=I.f32,
+                                )
+                            )
+                            token_stream.yield_(
+                                next_maximum,
+                                next_denominator,
+                                next_accumulator,
+                            )
+                    inner_maximum, inner_denominator, inner_accumulator = (
+                        token_stream.result
+                    )
+                    page_stream.yield_(
+                        inner_maximum,
+                        inner_denominator,
+                        inner_accumulator,
+                    )
+            _, denominator, accumulator = page_stream.result
+            safe_denominator = I.mask(
+                denominator,
+                valid=denominator > 0.0,
+                fill=1.0,
+            )
+            output[batch, query_head, :] = I.reshape(
+                I.cast(
+                    accumulator / safe_denominator[:, None],
+                    I.f16,
+                ),
+                (C,),
+            )

@@ -138,6 +138,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("expand_dims");
   if (role == "indirect_gather")
     return StringRef("ct.indirect_gather");
+  if (role == "extract_unit_scalar")
+    return StringRef("ct.extract_unit_scalar");
   operation->emitOpError("has no cuTile pointwise spelling for role ") << role;
   return failure();
 }
@@ -251,6 +253,12 @@ indexRealization(intent::plan::RealizationOp realization,
       binding.rhsSpace = value.getRhsSpace().str();
       binding.accumulatorSpace = value.getAccumulatorSpace().str();
       index.contracts[value.getNode()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::SparseContractOp>(operation)) {
+      Operation *sparse = kernel.nodes.lookup(value.getNode());
+      if (!sparse || sparse->getName().getStringRef() != "intent.sparse_contract")
+        return value.emitOpError("does not bind sparse contraction semantics");
+      return sparse->emitOpError(
+          "cuTile has no native 2:4 sparse contraction projection");
     } else if (auto value = dyn_cast<intent::plan::TransferOp>(operation)) {
       transfers.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::StageOp>(operation)) {

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+import importlib.util
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +60,10 @@ from kernels.contraction.gemm import M as GEMM_M
 from kernels.contraction.gemm import N as GEMM_N
 from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import quantized_gemm
+from kernels.contraction.sparse_2to4 import K as SPARSE_2TO4_K
+from kernels.contraction.sparse_2to4 import M as SPARSE_2TO4_M
+from kernels.contraction.sparse_2to4 import N as SPARSE_2TO4_N
+from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.mla import mla_head_projection
 from kernels.convolution.direct import CONV1D_BATCH
 from kernels.convolution.direct import CONV1D_FILTER
@@ -168,6 +174,14 @@ from kernels.streaming.attention import VARLEN_GQA_HEAD_GROUP
 from kernels.streaming.attention import VARLEN_GQA_KV_HEADS
 from kernels.streaming.attention import VARLEN_GQA_QUERY_HEADS
 from kernels.streaming.attention import VARLEN_GQA_TOTAL_TOKENS
+from kernels.streaming.attention import VARLEN_GQA_DECODE_BATCH
+from kernels.streaming.attention import VARLEN_GQA_DECODE_BLOCK_SIZE
+from kernels.streaming.attention import VARLEN_GQA_DECODE_HEAD_DIMENSION
+from kernels.streaming.attention import VARLEN_GQA_DECODE_HEAD_GROUP
+from kernels.streaming.attention import VARLEN_GQA_DECODE_KV_HEADS
+from kernels.streaming.attention import VARLEN_GQA_DECODE_MAX_BLOCKS
+from kernels.streaming.attention import VARLEN_GQA_DECODE_QUERY_HEADS
+from kernels.streaming.attention import VARLEN_GQA_DECODE_SCALE
 from kernels.streaming.attention import VARLEN_TOTAL_TOKENS
 from kernels.streaming.attention import flash_attention_bias_fwd
 from kernels.streaming.attention import flash_varlen_attention_fwd
@@ -180,6 +194,7 @@ from kernels.streaming.attention import GQA_DECODE_QUERY_HEADS
 from kernels.streaming.attention import GQA_DECODE_SCALE
 from kernels.streaming.attention import GQA_DECODE_SEQUENCE
 from kernels.streaming.attention import continuous_gqa_decode
+from kernels.streaming.attention import varlen_gqa_decode_with_sink_logits
 from kernels.streaming.attention import MLA_PREFILL_BATCH
 from kernels.streaming.attention import MLA_PREFILL_CONTENT_DIMENSION
 from kernels.streaming.attention import MLA_PREFILL_HEAD_GROUP
@@ -203,6 +218,16 @@ from kernels.streaming.mla import SPARSE_MLA_LATENT_DIMENSION
 from kernels.streaming.mla import SPARSE_MLA_QUERIES
 from kernels.streaming.mla import SPARSE_MLA_ROPE_DIMENSION
 from kernels.streaming.mla import SPARSE_MLA_SCALE
+from kernels.streaming.mla import PAGED_MLA_BATCH
+from kernels.streaming.mla import PAGED_MLA_HEAD_GROUP
+from kernels.streaming.mla import PAGED_MLA_KV_HEADS
+from kernels.streaming.mla import PAGED_MLA_LATENT_DIMENSION
+from kernels.streaming.mla import PAGED_MLA_PAGE_SIZE
+from kernels.streaming.mla import PAGED_MLA_QUERY_HEADS
+from kernels.streaming.mla import PAGED_MLA_ROPE_DIMENSION
+from kernels.streaming.mla import PAGED_MLA_SCALE
+from kernels.streaming.mla import PAGED_MLA_SEQUENCE_LENGTHS
+from kernels.streaming.mla import paged_mla_decode
 from kernels.streaming.mla import SPARSE_MLA_SELECTED_KEYS
 from kernels.streaming.mla import absorbed_mla_prefill
 from kernels.streaming.mla import token_sparse_mla_prefill
@@ -225,6 +250,8 @@ from kernels.streaming.paged_attention import KV_HEADS as PAGED_KV_HEADS
 from kernels.streaming.paged_attention import PAGE_SIZE as PAGED_PAGE_SIZE
 from kernels.streaming.paged_attention import QUERY_HEADS as PAGED_QUERY_HEADS
 from kernels.streaming.paged_attention import SCALE as PAGED_SCALE
+from kernels.streaming.paged_attention import SPLITS as PAGED_SPLITS
+from kernels.streaming.paged_attention import paged_gqa_decode_partials
 from kernels.streaming.paged_attention import SEQUENCE_LENGTHS as PAGED_SEQUENCE_LENGTHS
 from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from kernels.streaming.block_sparse_attention import BATCH as BLOCK_SPARSE_BATCH
@@ -1518,6 +1545,45 @@ def _run_bf16_gemm(
         tolerance=5.0e-2,
         upstream=upstream,
         expected_dtype=torch.bfloat16,
+    )
+
+
+def _run_sparse_2to4_gemm(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    artifact = intent.compile(sparse_2to4_gemm, target=target, compiler=compiler)
+    dense = torch.randn(
+        (SPARSE_2TO4_M, SPARSE_2TO4_K), device="cuda", dtype=torch.float16
+    )
+    dense = dense.view(SPARSE_2TO4_M, -1, 4)
+    keep = dense.abs().topk(2, dim=-1).indices
+    sparse_dense = torch.zeros_like(dense).scatter(-1, keep, dense.gather(-1, keep))
+    sparse_dense = sparse_dense.view(SPARSE_2TO4_M, SPARSE_2TO4_K)
+    source_path = (
+        Path(__file__).parents[3]
+        / "source/tilelang/tilelang/gemm/sparse_2to4/sparse_utils.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "intent_sparse_2to4_utils", source_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    compressed, metadata = module.torch_compress(
+        sparse_dense, meta_dtype=torch.int16
+    )
+    rhs = torch.randn(
+        (SPARSE_2TO4_K, SPARSE_2TO4_N), device="cuda", dtype=torch.float16
+    )
+    rhs /= math.sqrt(SPARSE_2TO4_K)
+    _compare(
+        artifact=artifact,
+        arguments=(compressed, metadata, rhs),
+        reference=lambda: sparse_dense.float() @ rhs.float(),
+        target_name=target_name,
+        kernel_name="2:4 structured sparse GEMM",
+        tolerance=1.0e-1,
+        upstream=upstream,
+        expected_dtype=torch.float32,
     )
 
 
@@ -2854,6 +2920,142 @@ def _run_varlen_gqa_prefill(
     )
 
 
+def _run_varlen_gqa_decode_logits(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError(
+            "varlen GQA decode logits has no target-matched generated comparison"
+        )
+    lengths = torch.tensor(
+        [4096, 3904, 3584, 3328, 3008, 2752, 2432, 2176],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    if lengths.numel() != VARLEN_GQA_DECODE_BATCH:
+        raise RuntimeError("varlen GQA decode batch constant does not match its input")
+    cu_seqlens = torch.zeros(
+        (VARLEN_GQA_DECODE_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    cu_seqlens[1:] = lengths.cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+    q = torch.randn(
+        (
+            VARLEN_GQA_DECODE_BATCH,
+            VARLEN_GQA_DECODE_QUERY_HEADS,
+            VARLEN_GQA_DECODE_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    k = torch.randn(
+        (
+            total_tokens,
+            VARLEN_GQA_DECODE_KV_HEADS,
+            VARLEN_GQA_DECODE_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    v = torch.randn_like(k) * 0.5
+    sink = torch.rand(
+        (VARLEN_GQA_DECODE_QUERY_HEADS,), device="cuda", dtype=torch.float32
+    ) * 0.125
+    artifact = intent.compile(
+        varlen_gqa_decode_with_sink_logits,
+        constexprs={
+            "HEAD_GROUP": VARLEN_GQA_DECODE_HEAD_GROUP,
+            "MAX_BLOCKS": VARLEN_GQA_DECODE_MAX_BLOCKS,
+        },
+        target=target,
+        compiler=compiler,
+    )
+    output = torch.empty_like(q)
+    block_logits = torch.empty(
+        (
+            VARLEN_GQA_DECODE_BATCH,
+            VARLEN_GQA_DECODE_QUERY_HEADS,
+            VARLEN_GQA_DECODE_MAX_BLOCKS,
+        ),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    arguments = (
+        q,
+        k,
+        v,
+        cu_seqlens,
+        sink,
+        VARLEN_GQA_DECODE_SCALE,
+    )
+    generated_call = prepare_kernel_call(
+        artifact, arguments, (output, block_logits)
+    )
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        expected_output = torch.empty_like(q)
+        expected_logits = torch.zeros_like(block_logits)
+        for batch in range(VARLEN_GQA_DECODE_BATCH):
+            begin = int(cu_seqlens[batch].item())
+            end = int(cu_seqlens[batch + 1].item())
+            for query_head in range(VARLEN_GQA_DECODE_QUERY_HEADS):
+                key_head = query_head // VARLEN_GQA_DECODE_HEAD_GROUP
+                scores = (
+                    q[batch, query_head].float()
+                    @ k[begin:end, key_head].float().transpose(0, 1)
+                ) * VARLEN_GQA_DECODE_SCALE
+                maximum = scores.max()
+                probability = torch.exp(scores - maximum)
+                denominator = probability.sum() + sink[query_head]
+                expected_output[batch, query_head] = (
+                    probability @ v[begin:end, key_head].float() / denominator
+                ).to(torch.float16)
+                block_count = math.ceil(
+                    (end - begin) / VARLEN_GQA_DECODE_BLOCK_SIZE
+                )
+                for block in range(block_count):
+                    block_begin = block * VARLEN_GQA_DECODE_BLOCK_SIZE
+                    block_end = min(
+                        block_begin + VARLEN_GQA_DECODE_BLOCK_SIZE,
+                        end - begin,
+                    )
+                    expected_logits[batch, query_head, block] = torch.exp(
+                        scores[block_begin:block_end].max() - maximum
+                    ) / denominator
+        return expected_output, expected_logits
+
+    generated_call()
+    expected_output, expected_logits = reference()
+    torch.cuda.synchronize()
+    errors = (
+        (output - expected_output).abs().max().item(),
+        (block_logits - expected_logits).abs().max().item(),
+    )
+    if errors[0] > 3.0e-2 or errors[1] > 3.0e-3:
+        raise RuntimeError(
+            f"{target_name} varlen GQA decode logits comparison failed: {errors}"
+        )
+    p50, p95 = benchmark(
+        generated_call,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} varlen GQA decode with sink/logits numerical comparison: "
+        f"PASS (output/logits errors={errors})"
+    )
+    print(
+        f"{target_name} varlen GQA decode with sink/logits runtime-metadata "
+        f"performance (CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(
+        f"{target_name} varlen GQA decode with sink/logits upstream baseline: "
+        "unavailable"
+    )
+
+
 def _run_varlen_gqa_rope_prefill(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -3148,6 +3350,281 @@ def _run_paged_attention(
     print(
         f"{target_name} paged attention D=80 fully masked row: PASS "
         "(defined output=0)"
+    )
+
+
+def _run_paged_splitk_attention(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("paged split-K attention has no matched multi-kernel adapter")
+    sequence_lengths = torch.tensor(
+        PAGED_SEQUENCE_LENGTHS, device="cuda", dtype=torch.int32
+    )
+    page_counts = torch.div(
+        sequence_lengths + PAGED_PAGE_SIZE - 1,
+        PAGED_PAGE_SIZE,
+        rounding_mode="floor",
+    )
+    page_offsets = torch.zeros(
+        (PAGED_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    page_offsets[1:] = page_counts.cumsum(0)
+    total_pages = int(page_offsets[-1].item())
+    page_indices = torch.randperm(
+        total_pages, device="cuda", dtype=torch.int64
+    ).to(torch.int32)
+    q = torch.randn(
+        (PAGED_BATCH, PAGED_QUERY_HEADS, PAGED_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    key_cache = torch.randn(
+        (
+            total_pages,
+            PAGED_PAGE_SIZE,
+            PAGED_KV_HEADS,
+            PAGED_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    value_cache = torch.randn_like(key_cache) * 0.5
+    host_page_counts = tuple(int(count) for count in page_counts.cpu())
+    host_page_offsets = tuple(int(offset) for offset in page_offsets.cpu())
+    split_offsets = []
+    for batch, page_count in enumerate(host_page_counts):
+        page_begin = host_page_offsets[batch]
+        for split in range(PAGED_SPLITS):
+            split_offsets.append(
+                page_begin + page_count * split // PAGED_SPLITS
+            )
+    split_offsets.append(total_pages)
+    split_offsets = torch.tensor(
+        split_offsets, device="cuda", dtype=torch.int32
+    )
+    partial_artifact = intent.compile(
+        paged_gqa_decode_partials,
+        constexprs={
+            "PAGE_SIZE": PAGED_PAGE_SIZE,
+            "HEAD_GROUP": PAGED_HEAD_GROUP,
+            "SPLITS": PAGED_SPLITS,
+            "BATCH_SIZE": PAGED_BATCH,
+        },
+        target=target,
+        compiler=compiler,
+    )
+    reduce_artifact = intent.compile(
+        splitk_attention_reduce, target=target, compiler=compiler
+    )
+    partial_lse = torch.empty(
+        (PAGED_BATCH, PAGED_QUERY_HEADS, PAGED_SPLITS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    partial_output = torch.empty(
+        (
+            PAGED_BATCH,
+            PAGED_QUERY_HEADS,
+            PAGED_SPLITS,
+            PAGED_HEAD_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    output = torch.empty(
+        (PAGED_BATCH, PAGED_QUERY_HEADS, PAGED_HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    partial_call = prepare_kernel_call(
+        partial_artifact,
+        (
+            q,
+            key_cache,
+            value_cache,
+            page_offsets,
+            page_indices,
+            sequence_lengths,
+            split_offsets,
+            PAGED_SCALE,
+        ),
+        (partial_lse, partial_output),
+    )
+    reduce_call = prepare_kernel_call(
+        reduce_artifact, (partial_output, partial_lse), output
+    )
+
+    def pipeline():
+        partial_call()
+        reduce_call()
+
+    def reference() -> torch.Tensor:
+        expected = torch.empty_like(output)
+        key_heads = torch.arange(
+            PAGED_QUERY_HEADS, device="cuda"
+        ) // PAGED_HEAD_GROUP
+        for batch in range(PAGED_BATCH):
+            begin = int(page_offsets[batch].item())
+            end = int(page_offsets[batch + 1].item())
+            length = int(sequence_lengths[batch].item())
+            physical_pages = page_indices[begin:end].long()
+            key = key_cache[physical_pages].reshape(
+                -1, PAGED_KV_HEADS, PAGED_HEAD_DIMENSION
+            )[:length]
+            value = value_cache[physical_pages].reshape(
+                -1, PAGED_KV_HEADS, PAGED_HEAD_DIMENSION
+            )[:length]
+            expected[batch] = F.scaled_dot_product_attention(
+                q[batch][None, :, None, :],
+                key[:, key_heads].permute(1, 0, 2)[None],
+                value[:, key_heads].permute(1, 0, 2)[None],
+                scale=PAGED_SCALE,
+            )[0, :, 0].to(torch.bfloat16)
+        return expected
+
+    pipeline()
+    expected = reference()
+    torch.cuda.synchronize()
+    error = (output.float() - expected.float()).abs().max().item()
+    if error > 4.0e-2:
+        raise RuntimeError(
+            f"{target_name} paged split-K attention comparison failed: {error}"
+        )
+    p50, p95 = benchmark(
+        pipeline, warmup=3, repetitions=100, cuda_graph=False
+    )
+    for artifact in (partial_artifact, reduce_artifact):
+        print_artifact(artifact, target_name)
+    print(
+        f"{target_name} paged split-K GQA decode numerical comparison: PASS "
+        f"(generated/reference={error})"
+    )
+    print(
+        f"{target_name} paged split-K GQA decode end-to-end GPU pipeline "
+        f"performance (CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
+    )
+    print(f"{target_name} paged split-K GQA decode upstream baseline: unavailable")
+
+
+def _run_paged_mla_decode(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("paged MLA decode has no same-ABI upstream adapter")
+    sequence_lengths = torch.tensor(
+        PAGED_MLA_SEQUENCE_LENGTHS, device="cuda", dtype=torch.int32
+    )
+    page_counts = torch.div(
+        sequence_lengths + PAGED_MLA_PAGE_SIZE - 1,
+        PAGED_MLA_PAGE_SIZE,
+        rounding_mode="floor",
+    )
+    page_offsets = torch.zeros(
+        (PAGED_MLA_BATCH + 1,), device="cuda", dtype=torch.int32
+    )
+    page_offsets[1:] = page_counts.cumsum(0)
+    total_pages = int(page_offsets[-1].item())
+    page_indices = torch.randperm(
+        total_pages, device="cuda", dtype=torch.int64
+    ).to(torch.int32)
+    q_latent = torch.randn(
+        (
+            PAGED_MLA_BATCH,
+            PAGED_MLA_QUERY_HEADS,
+            PAGED_MLA_LATENT_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    q_rope = torch.randn(
+        (
+            PAGED_MLA_BATCH,
+            PAGED_MLA_QUERY_HEADS,
+            PAGED_MLA_ROPE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    latent_cache = torch.randn(
+        (
+            total_pages,
+            PAGED_MLA_PAGE_SIZE,
+            PAGED_MLA_KV_HEADS,
+            PAGED_MLA_LATENT_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    rope_cache = torch.randn(
+        (
+            total_pages,
+            PAGED_MLA_PAGE_SIZE,
+            PAGED_MLA_KV_HEADS,
+            PAGED_MLA_ROPE_DIMENSION,
+        ),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.5
+    artifact = intent.compile(
+        paged_mla_decode,
+        constexprs={
+            "PAGE_SIZE": PAGED_MLA_PAGE_SIZE,
+            "HEAD_GROUP": PAGED_MLA_HEAD_GROUP,
+        },
+        target=target,
+        compiler=compiler,
+    )
+    arguments = (
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        page_offsets,
+        page_indices,
+        sequence_lengths,
+        PAGED_MLA_SCALE,
+    )
+
+    def reference() -> torch.Tensor:
+        expected = torch.empty_like(q_latent)
+        key_heads = torch.arange(
+            PAGED_MLA_QUERY_HEADS, device="cuda"
+        ) // PAGED_MLA_HEAD_GROUP
+        for batch in range(PAGED_MLA_BATCH):
+            begin = int(page_offsets[batch].item())
+            end = int(page_offsets[batch + 1].item())
+            length = int(sequence_lengths[batch].item())
+            physical_pages = page_indices[begin:end].long()
+            latent = latent_cache[physical_pages].reshape(
+                -1, PAGED_MLA_KV_HEADS, PAGED_MLA_LATENT_DIMENSION
+            )[:length]
+            rope = rope_cache[physical_pages].reshape(
+                -1, PAGED_MLA_KV_HEADS, PAGED_MLA_ROPE_DIMENSION
+            )[:length]
+            content = torch.einsum(
+                "hd,khd->hk", q_latent[batch].float(), latent[:, key_heads].float()
+            )
+            position = torch.einsum(
+                "hd,khd->hk", q_rope[batch].float(), rope[:, key_heads].float()
+            )
+            probability = torch.softmax(
+                (content + position) * PAGED_MLA_SCALE, dim=1
+            )
+            expected[batch] = torch.einsum(
+                "hk,khd->hd", probability, latent[:, key_heads].float()
+            ).to(torch.float16)
+        return expected
+
+    _compare(
+        artifact=artifact,
+        arguments=arguments,
+        reference=reference,
+        target_name=target_name,
+        kernel_name="paged MLA decode",
+        tolerance=4.0e-2,
+        upstream=None,
+        expected_dtype=torch.float16,
     )
 
 
@@ -4044,10 +4521,13 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "online_softmax": _run_online_softmax,
     "ordered_prefix": _run_ordered_prefix,
     "paged_attention": _run_paged_attention,
+    "paged_mla_decode": _run_paged_mla_decode,
+    "paged_splitk_attention": _run_paged_splitk_attention,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "record_fields": _run_record_fields,
     "scalar_while": _run_scalar_while,
+    "sparse_2to4_gemm": _run_sparse_2to4_gemm,
     "scaled_index_add": _run_scaled_index_add,
     "scalar_table_lookup": _run_scalar_table_lookup,
     "selective_scan": _run_selective_scan,
@@ -4058,6 +4538,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "token_sparse_mla_prefill": _run_token_sparse_mla_prefill,
     "varlen_attention": _run_varlen_attention,
     "varlen_gqa_prefill": _run_varlen_gqa_prefill,
+    "varlen_gqa_decode_logits": _run_varlen_gqa_decode_logits,
     "varlen_gqa_rope_prefill": _run_varlen_gqa_rope_prefill,
     "value_select": _run_value_select,
     "w4a8_packed": _run_w4a8_packed,

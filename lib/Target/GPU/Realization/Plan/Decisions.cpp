@@ -363,6 +363,15 @@ assignAxes(const target::KernelFacts &facts) {
     for (Operation *member : entry.second.memberDomains)
       appendRole(ensure(member).roles, "ragged_member");
 
+  for (const auto &entry : facts.raggedRelations) {
+    bool ordered = llvm::any_of(entry.second.memberDomains, [&](Operation *member) {
+      return facts.orderedDomains.contains(member);
+    });
+    if (ordered)
+      for (Operation *member : entry.second.memberDomains)
+        appendRole(ensure(member).roles, "ordered");
+  }
+
   SmallVector<std::pair<Operation *, Operation *>> matrixAxes;
   auto matrixAxis = [](ArrayRef<target::LogicalAxis> axes,
                        ArrayRef<unsigned> reduced,
@@ -399,6 +408,17 @@ assignAxes(const target::KernelFacts &facts) {
       return failure();
     if (m && n && m != n)
       matrixAxes.emplace_back(m, n);
+  }
+  for (const auto &entry : facts.sparseContractions) {
+    const target::SparseContractionFact &contract = entry.second;
+    if (failed(assignMatrixRole(contract.rowDomain, "contraction_m",
+                                *entry.first)) ||
+        failed(assignMatrixRole(contract.columnDomain, "contraction_n",
+                                *entry.first)))
+      return failure();
+    if (contract.rowDomain && contract.columnDomain &&
+        contract.rowDomain != contract.columnDomain)
+      matrixAxes.emplace_back(contract.rowDomain, contract.columnDomain);
   }
   for (auto [m, n] : matrixAxes) {
     AxisChoice &mChoice = ensure(m);

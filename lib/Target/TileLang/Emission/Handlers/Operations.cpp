@@ -223,6 +223,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitContract(op);
       })) ||
+      failed(addHandler(registry, "intent.sparse_contract", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitSparseContract(op);
+      })) ||
       failed(addHandler(registry, "intent.view_store", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -2442,6 +2447,16 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       isa<RankedTensorType>(operation.getOperand(0).getType()) &&
       !isa<RankedTensorType>(operation.getResult(0).getType()) &&
       relation->size() == 1;
+  if (binding.getLowering() == "T.extract_unit_scalar" &&
+      relation->size() == 1 && relation->front().kind == "static_index") {
+    FailureOr<StringRef> source = lookupValue(operation, 0);
+    if (failed(source))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = T.reduce_sum(" + source->str() + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (scalarFragmentGather) {
     auto scanSource = scanResults.find(operation.getOperand(0));
     auto materializedSource =
@@ -2920,6 +2935,77 @@ LogicalResult SourceEmitter::leaveStateStream(Operation &operation) {
     if (axisNode != binding.getAxisNode())
       axisIndices.erase(axisNode);
   streamOuterAxisIndices.erase(outerIndex);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitSparseContract(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "sparse-contract emission");
+  intent::plan::SparseContractOp binding =
+      succeeded(node) ? planIndex.sparseContracts.lookup(*node)
+                      : intent::plan::SparseContractOp();
+  if (failed(node) || !binding || binding.getFormat() != "two_of_four" ||
+      operation.getNumOperands() != 3 || operation.getNumResults() != 1)
+    return operation.emitOpError("lacks a TileLang 2:4 sparse contraction binding");
+  Operation *compressedLoad = deferredLoads.lookup(operation.getOperand(0));
+  Operation *metadataLoad = deferredLoads.lookup(operation.getOperand(1));
+  Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(2));
+  if (!compressedLoad || !metadataLoad || !rhsLoad)
+    return operation.emitOpError(
+        "requires three planned deferred sparse-matrix transfers");
+  FailureOr<ABIView *> compressedView =
+      lookupView(compressedLoad->getOperand(0), *compressedLoad);
+  FailureOr<ABIView *> metadataView =
+      lookupView(metadataLoad->getOperand(0), *metadataLoad);
+  FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
+  plan::AxisOp rowAxis = planIndex.axes.lookup(binding.getRowAxisNode());
+  plan::AxisOp columnAxis = planIndex.axes.lookup(binding.getColumnAxisNode());
+  plan::AxisOp reductionAxis =
+      planIndex.axes.lookup(binding.getReductionAxisNode());
+  std::string rowStart = axisIndices.lookup(binding.getRowAxisNode());
+  std::string columnStart = axisIndices.lookup(binding.getColumnAxisNode());
+  std::string reductionExtent =
+      axisDimensions.lookup(binding.getReductionAxisNode());
+  if (failed(compressedView) || failed(metadataView) || failed(rhsView) ||
+      !rowAxis || !columnAxis || !reductionAxis || rowStart.empty() ||
+      columnStart.empty() || reductionExtent.empty() || rowAxis.getTile().empty() ||
+      columnAxis.getTile().empty() || reductionAxis.getTile().empty())
+    return operation.emitOpError(
+        "has an incomplete planned 2:4 sparse-matrix projection");
+  std::string compressed = makeResultName(*compressedLoad, 0) + "_shared";
+  std::string metadata = makeResultName(*metadataLoad, 0) + "_shared";
+  std::string rhs = makeResultName(*rhsLoad, 0) + "_shared";
+  line(compressed + " = T.alloc_shared((" + rowAxis.getTile().str() + ", " +
+       reductionAxis.getTile().str() + " // 2), " +
+       dtypeName((*compressedView)->tensor.getElementType(), *compressedLoad) +
+       ")");
+  line(metadata + " = T.alloc_shared((" + rowAxis.getTile().str() + ", " +
+       reductionAxis.getTile().str() + " // 16), " +
+       dtypeName((*metadataView)->tensor.getElementType(), *metadataLoad) + ")");
+  line(rhs + " = T.alloc_shared((" + reductionAxis.getTile().str() + ", " +
+       columnAxis.getTile().str() + "), " +
+       dtypeName((*rhsView)->tensor.getElementType(), *rhsLoad) + ")");
+  FailureOr<std::string> accumulator =
+      allocateResult(operation, 0, "fragment");
+  if (failed(accumulator))
+    return failure();
+  line("T.clear(" + *accumulator + ")");
+  line("for k_tile in T.Pipelined(T.ceildiv(" + reductionExtent + ", " +
+       reductionAxis.getTile().str() + "), num_stages=num_stages):");
+  ++indentation;
+  line("T.copy(" + (*compressedView)->argument->name + "[" +
+       addressIndex(rowStart) + ", " + addressIndex("k_tile") + " * " +
+       reductionAxis.getTile().str() + " // 2], " + compressed + ")");
+  line("T.copy(" + (*metadataView)->argument->name + "[" +
+       addressIndex(rowStart) + ", " + addressIndex("k_tile") + " * " +
+       reductionAxis.getTile().str() + " // 16], " + metadata + ")");
+  line("T.copy(" + (*rhsView)->argument->name + "[" +
+       addressIndex("k_tile") + " * " + reductionAxis.getTile().str() +
+       ", " + addressIndex(columnStart) + "], " + rhs + ")");
+  line("T.gemm_sp(" + compressed + ", " + metadata + ", " + rhs + ", " +
+       *accumulator + ", policy=T.GemmWarpPolicy.FullRow)");
+  --indentation;
+  bindResult(operation, 0, *accumulator);
   return success();
 }
 

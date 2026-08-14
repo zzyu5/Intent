@@ -308,6 +308,19 @@ LogicalResult ContractOp::verify() {
   return success();
 }
 
+LogicalResult SparseContractOp::verify() {
+  if (failed(requireNode(*this, getNode())) ||
+      failed(requireNode(*this, getRowAxisNode())) ||
+      failed(requireNode(*this, getColumnAxisNode())) ||
+      failed(requireNode(*this, getReductionAxisNode())) ||
+      getFormat() != "two_of_four")
+    return failure();
+  if (getCompressedSpace() != "shared" || getMetadataSpace() != "shared" ||
+      getRhsSpace() != "shared" || getAccumulatorSpace() != "private_fragment")
+    return emitOpError("contains an invalid 2:4 sparse matrix residency");
+  return success();
+}
+
 LogicalResult StreamAxisOp::verify() {
   if (failed(requireNode(*this, getStreamNode())) ||
       failed(requireNode(*this, getAxisNode())))
@@ -445,6 +458,14 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else if (auto binding = dyn_cast<ContractOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
+    } else if (auto binding = dyn_cast<SparseContractOp>(operation)) {
+      if (!operations.insert(binding.getNode()).second)
+        return binding.emitOpError("duplicates an operation decision");
+      if (!axes.count(binding.getRowAxisNode()) ||
+          !axes.count(binding.getColumnAxisNode()) ||
+          !axes.count(binding.getReductionAxisNode()))
+        return binding.emitOpError(
+            "references an unbound sparse-contraction axis");
     } else if (auto binding = dyn_cast<StreamAxisOp>(operation)) {
       std::string key = std::to_string(binding.getStreamNode()) + ":" +
                         std::to_string(binding.getAxisNode()) + ":" +

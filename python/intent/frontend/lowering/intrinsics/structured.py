@@ -11,7 +11,7 @@ from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import dims_compatible
 from intent.language.builtins import Intrinsic
-from intent.language.dtypes import i32
+from intent.language.dtypes import i16
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import Literal
@@ -39,6 +39,8 @@ def lower_structured_intrinsic(
         return _scan(lowerer, node)
     if name == "contract":
         return _contract(lowerer, node)
+    if name == "sparse_contract_2to4":
+        return _sparse_contract_2to4(lowerer, node)
     return NotImplemented
 
 
@@ -310,6 +312,54 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             "acc_dtype": acc_dtype,
             "multiply": multiply,
             "combine": combine,
+        },
+    )
+    return operation.results[0]
+
+
+def _sparse_contract_2to4(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("compressed_lhs", "metadata", "rhs", "acc_dtype"),
+        required=("compressed_lhs", "metadata", "rhs", "acc_dtype"),
+    )
+    compressed = lowerer.read_value(
+        lowerer.lower_expression(bound["compressed_lhs"]),
+        bound["compressed_lhs"],
+    )
+    metadata = lowerer.read_value(
+        lowerer.lower_expression(bound["metadata"]),
+        bound["metadata"],
+    )
+    rhs = lowerer.read_value(
+        lowerer.lower_expression(bound["rhs"]),
+        bound["rhs"],
+    )
+    if not all(
+        isinstance(value.type, TensorType)
+        for value in (compressed, metadata, rhs)
+    ):
+        lowerer.error(node, "I.sparse_contract_2to4 operands must be tensors")
+    if compressed.type.rank != 2 or metadata.type.rank != 2 or rhs.type.rank != 2:
+        lowerer.error(node, "I.sparse_contract_2to4 requires rank-two operands")
+    if compressed.type.dtype != rhs.type.dtype:
+        lowerer.error(node, "2:4 sparse contraction data operands must share a dtype")
+    if metadata.type.dtype != i16:
+        lowerer.error(node, "2:4 sparse contraction metadata must be i16")
+    result_shape = (compressed.type.shape[0], rhs.type.shape[1])
+    acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
+    operation = lowerer.emit(
+        OperationKind.SPARSE_CONTRACT,
+        lowerer.location(node),
+        operands=(compressed, metadata, rhs),
+        result_types=(TensorType(acc_dtype, result_shape),),
+        attributes={
+            "format": "two_of_four",
+            "compressed_axis": 1,
+            "metadata_axis": 1,
+            "rhs_reduction_axis": 0,
+            "acc_dtype": acc_dtype,
         },
     )
     return operation.results[0]

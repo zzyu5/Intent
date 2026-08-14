@@ -2448,6 +2448,58 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             return bindResultAxes(operation, 0, std::move(resultAxes), facts);
           })))
     return failure();
+  if (failed(addHandler(
+          registry, "intent.sparse_contract",
+          [&](Operation &operation) -> LogicalResult {
+            auto format = operation.getAttrOfType<StringAttr>("intent.format");
+            auto compressed = operation.getNumOperands() == 3
+                                  ? facts.valueAxes.find(operation.getOperand(0))
+                                  : facts.valueAxes.end();
+            auto metadata = operation.getNumOperands() == 3
+                                ? facts.valueAxes.find(operation.getOperand(1))
+                                : facts.valueAxes.end();
+            auto rhs = operation.getNumOperands() == 3
+                           ? facts.valueAxes.find(operation.getOperand(2))
+                           : facts.valueAxes.end();
+            auto compressedType = operation.getNumOperands() == 3
+                                      ? dyn_cast<RankedTensorType>(
+                                            operation.getOperand(0).getType())
+                                      : RankedTensorType();
+            auto metadataType = operation.getNumOperands() == 3
+                                    ? dyn_cast<RankedTensorType>(
+                                          operation.getOperand(1).getType())
+                                    : RankedTensorType();
+            auto rhsType = operation.getNumOperands() == 3
+                               ? dyn_cast<RankedTensorType>(
+                                     operation.getOperand(2).getType())
+                               : RankedTensorType();
+            auto resultType = operation.getNumResults() == 1
+                                  ? dyn_cast<RankedTensorType>(
+                                        operation.getResult(0).getType())
+                                  : RankedTensorType();
+            if (!format || format.getValue() != "two_of_four" ||
+                !compressedType || !metadataType || !rhsType || !resultType ||
+                compressedType.getRank() != 2 || metadataType.getRank() != 2 ||
+                rhsType.getRank() != 2 || resultType.getRank() != 2 ||
+                compressed == facts.valueAxes.end() ||
+                metadata == facts.valueAxes.end() || rhs == facts.valueAxes.end() ||
+                compressed->second.size() != 2 || metadata->second.size() != 2 ||
+                rhs->second.size() != 2 ||
+                compressed->second[0] != metadata->second[0])
+              return operation.emitOpError(
+                  "2:4 sparse contraction has no canonical compressed/metadata axis provenance");
+            SmallVector<LogicalAxis> resultAxes{
+                compressed->second[0], rhs->second[1]};
+            Operation *row = compressed->second[0].domain;
+            Operation *column = rhs->second[1].domain;
+            Operation *reduction = rhs->second[0].domain;
+            if (reduction)
+              facts.contractionDomains.insert(reduction);
+            facts.sparseContractions[&operation] =
+                SparseContractionFact{&operation, row, column, reduction};
+            return bindResultAxes(operation, 0, std::move(resultAxes), facts);
+          })))
+    return failure();
   return success();
 }
 

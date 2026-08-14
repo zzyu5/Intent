@@ -175,6 +175,22 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
   let hasVerifier = 1;
 }
 
+def IntentPlan_SparseContractOp : IntentPlan_Op<"sparse_contract"> {
+  let arguments = (ins
+    I64Attr:$node,
+    StrAttr:$format,
+    I64Attr:$row_axis_node,
+    I64Attr:$column_axis_node,
+    I64Attr:$reduction_axis_node,
+    StrAttr:$compressed_space,
+    StrAttr:$metadata_space,
+    StrAttr:$rhs_space,
+    StrAttr:$accumulator_space
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentPlan_StreamAxisOp : IntentPlan_Op<"stream_axis"> {
   let arguments = (ins
     I64Attr:$stream_node,

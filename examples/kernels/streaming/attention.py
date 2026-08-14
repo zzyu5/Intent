@@ -15,6 +15,16 @@ VARLEN_GQA_QUERY_HEADS = 32
 VARLEN_GQA_KV_HEADS = 8
 VARLEN_GQA_HEAD_GROUP = VARLEN_GQA_QUERY_HEADS // VARLEN_GQA_KV_HEADS
 VARLEN_GQA_TOTAL_TOKENS = 29184
+VARLEN_GQA_DECODE_BATCH = 8
+VARLEN_GQA_DECODE_QUERY_HEADS = 32
+VARLEN_GQA_DECODE_KV_HEADS = 8
+VARLEN_GQA_DECODE_HEAD_DIMENSION = 64
+VARLEN_GQA_DECODE_BLOCK_SIZE = 64
+VARLEN_GQA_DECODE_MAX_BLOCKS = 64
+VARLEN_GQA_DECODE_HEAD_GROUP = (
+    VARLEN_GQA_DECODE_QUERY_HEADS // VARLEN_GQA_DECODE_KV_HEADS
+)
+VARLEN_GQA_DECODE_SCALE = 1.0 / math.sqrt(VARLEN_GQA_DECODE_HEAD_DIMENSION)
 GQA_DECODE_BATCH = 32
 GQA_DECODE_QUERY_HEADS = 32
 GQA_DECODE_KV_HEADS = 8
@@ -206,6 +216,104 @@ def continuous_gqa_decode(
                 I.cast(accumulator / safe_denominator[:, None], I.f16),
                 (DV,),
             )
+
+
+@intent.kernel
+def varlen_gqa_decode_with_sink_logits(
+    q: I.In[I.f16, ("B", "HQ", "D")],
+    k: I.In[I.f16, ("U", "HK", "D")],
+    v: I.In[I.f16, ("U", "HK", "DV")],
+    cu_seqlens: I.In[I.i32, ("B_PLUS_1",)],
+    sink: I.In[I.f32, ("HQ",)],
+    output: I.Out[I.f16, ("B", "HQ", "DV")],
+    block_logits: I.Out[
+        I.f32, ("B", "HQ", VARLEN_GQA_DECODE_MAX_BLOCKS)
+    ],
+    scale: I.f32,
+    HEAD_GROUP: I.Constexpr[int],
+    MAX_BLOCKS: I.Constexpr[int],
+):
+    B, HQ, D = q.shape
+    U = k.shape[0]
+    DV = v.shape[-1]
+    sequences = I.ragged(
+        outer=I.domain(0, B),
+        members=I.domain(0, U),
+        offsets=cu_seqlens,
+    )
+    for sequence in I.parallel(sequences.outer):
+        for query_head in I.parallel(I.domain(0, HQ)):
+            key_head = query_head // HEAD_GROUP
+            query = I.reshape(q[sequence, query_head, :], (1, D))
+            block_maxima = I.buffer((MAX_BLOCKS,), I.f32, init=-I.inf)
+            stream = I.state_stream(
+                sequences[sequence],
+                extent=VARLEN_GQA_DECODE_BLOCK_SIZE,
+                init=(
+                    I.full((1,), -I.inf, dtype=I.f32),
+                    I.zeros((1,), dtype=I.f32),
+                    I.zeros((1, DV), dtype=I.f32),
+                    I.cast(0, I.i32),
+                ),
+            )
+            with stream:
+                for key_region, (
+                    maximum,
+                    denominator,
+                    accumulator,
+                    block_index,
+                ) in stream:
+                    scores = I.contract(
+                        query,
+                        k[key_region, key_head, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    scores = scores * (scale * I.LOG2E)
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    I.assume_in_bounds(block_index, block_maxima, axis=0)
+                    I.store(
+                        block_maxima,
+                        block_index,
+                        I.reduce.sum(local_maximum, axis=0, identity=0.0),
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[key_region, key_head, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                        block_index + 1,
+                    )
+            maximum, denominator, accumulator, block_count = stream.result
+            sink_denominator = denominator + sink[query_head]
+            safe_denominator = I.mask(
+                sink_denominator,
+                valid=sink_denominator > 0.0,
+                fill=1.0,
+            )
+            output[sequence, query_head, :] = I.reshape(
+                I.cast(accumulator / safe_denominator[:, None], I.f16),
+                (DV,),
+            )
+            for block in I.ordered(I.domain(0, MAX_BLOCKS)):
+                block_valid = I.cast(block, I.i32) < block_count
+                block_maximum = I.mutable_load(block_maxima, block)
+                probability = I.exp2(block_maximum - maximum)
+                block_logits[sequence, query_head, block] = I.mask(
+                    probability / safe_denominator,
+                    valid=block_valid,
+                    fill=0.0,
+                )[0]
 
 
 @intent.kernel

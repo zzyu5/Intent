@@ -157,10 +157,26 @@ pointwiseRole(mlir::Operation &operation) {
     bool indirect = llvm::any_of(*relation, [](const target::IndexTerm &term) {
       return term.kind == "value_index";
     });
+    auto sourceType = operation.getNumOperands() > 0
+                          ? mlir::dyn_cast<mlir::RankedTensorType>(
+                                operation.getOperand(0).getType())
+                          : mlir::RankedTensorType();
+    bool scalarizeStaticUnitTensor =
+        sourceType && operation.getNumResults() == 1 &&
+        llvm::all_of(*relation, [](const target::IndexTerm &term) {
+          return term.kind == "static_index" &&
+                 term.staticValues.size() == 1 &&
+                 term.staticValues.front() &&
+                 *term.staticValues.front() == 0;
+        }) &&
+        llvm::all_of(sourceType.getShape(),
+                     [](int64_t extent) { return extent == 1; });
     if (expand)
       return std::string("expand_dims");
     if (indirect)
       return std::string("indirect_gather");
+    if (scalarizeStaticUnitTensor)
+      return std::string("extract_unit_scalar");
     return operation.emitOpError("has no supported gather relation");
   }
   auto logical = operation.getAttrOfType<mlir::StringAttr>("intent.operator");
@@ -174,7 +190,8 @@ pointwiseRole(mlir::Operation &operation) {
 inline bool feedsContraction(mlir::Operation &operation) {
   return operation.getNumResults() == 1 &&
          llvm::any_of(operation.getResult(0).getUsers(), [](mlir::Operation *user) {
-           return user->getName().getStringRef() == "intent.contract";
+           llvm::StringRef name = user->getName().getStringRef();
+           return name == "intent.contract" || name == "intent.sparse_contract";
          });
 }
 
@@ -979,6 +996,14 @@ bool deferSharedContractionTransfer(const PlanIndex &index,
       !llvm::hasSingleElement(operation.getResult(0).getUsers()))
     return false;
   for (mlir::Operation *user : operation.getResult(0).getUsers()) {
+    if (user->getName().getStringRef() == "intent.sparse_contract") {
+      auto node = user->getAttrOfType<mlir::IntegerAttr>("intent.node");
+      auto sparse = node ? index.sparseContracts.find(node.getInt())
+                         : index.sparseContracts.end();
+      if (sparse != index.sparseContracts.end())
+        return true;
+      continue;
+    }
     if (user->getName().getStringRef() != "intent.contract")
       continue;
     if (isStagedContraction(index, user))

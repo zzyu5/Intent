@@ -22,6 +22,7 @@ from .builtins import auto
 from .builtins import buffer
 from .builtins import cast
 from .builtins import contract
+from .builtins import sparse_contract_2to4
 from .builtins import domain
 from .builtins import end
 from .builtins import exp
@@ -107,6 +108,7 @@ __all__ = [
     "cast",
     "constraints",
     "contract",
+    "sparse_contract_2to4",
     "domain",
     "dtype",
     "end",

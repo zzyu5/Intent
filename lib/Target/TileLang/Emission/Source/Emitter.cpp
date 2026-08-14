@@ -156,6 +156,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("expand_dims");
   if (role == "indirect_gather")
     return StringRef("T.indirect_gather");
+  if (role == "extract_unit_scalar")
+    return StringRef("T.extract_unit_scalar");
   operation->emitOpError("has no TileLang pointwise spelling for role ") << role;
   return failure();
 }
@@ -288,6 +290,10 @@ indexRealization(intent::plan::RealizationOp realization,
         return failure();
       }
       index.contracts[value.getNode()] = binding;
+    } else if (auto value = dyn_cast<intent::plan::SparseContractOp>(operation)) {
+      if (value.getFormat() != "two_of_four")
+        return value.emitOpError("has no TileLang sparse contraction spelling");
+      index.sparseContracts[value.getNode()] = value;
     } else if (auto value = dyn_cast<intent::plan::TransferOp>(operation)) {
       transfers.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::StageOp>(operation)) {
@@ -1338,6 +1344,9 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 8)
       return integer.isUnsigned() ? "torch.uint8" : "torch.int8";
+    if (auto integer = dyn_cast<IntegerType>(type);
+        integer && integer.getWidth() == 16)
+      return integer.isUnsigned() ? "torch.uint16" : "torch.int16";
     if (auto integer = dyn_cast<IntegerType>(type);
         integer && integer.getWidth() == 32)
       return "torch.int32";
@@ -2862,6 +2871,9 @@ std::string SourceEmitter::dtypeName(Type type, Operation &consumer) {
     return integer.isUnsigned() ? "T.uint8" : "T.int8";
   if (type.isInteger(1))
     return "T.bool";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 16)
+    return integer.isUnsigned() ? "T.uint16" : "T.int16";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
     return "T.int32";

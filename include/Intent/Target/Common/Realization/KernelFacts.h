@@ -58,6 +58,13 @@ struct ContractionFact {
   llvm::SmallVector<unsigned> rhsBatchAxes;
 };
 
+struct SparseContractionFact {
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *rowDomain = nullptr;
+  mlir::Operation *columnDomain = nullptr;
+  mlir::Operation *reductionDomain = nullptr;
+};
+
 struct LogicalBufferFact {
   mlir::Operation *owner = nullptr;
   LogicalBufferInfo info;
@@ -120,6 +127,7 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> wholeViewLoads;
   llvm::DenseSet<mlir::Operation *> scatterWrites;
   llvm::DenseMap<mlir::Operation *, ContractionFact> contractions;
+  llvm::DenseMap<mlir::Operation *, SparseContractionFact> sparseContractions;
   llvm::DenseMap<mlir::Operation *, LogicalBufferFact> logicalBuffers;
   llvm::SmallVector<AccessRangeFact> accessRanges;
 };

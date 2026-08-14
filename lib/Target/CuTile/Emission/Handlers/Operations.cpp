@@ -1852,6 +1852,17 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
+  if (binding && binding.getLowering() == "ct.extract_unit_scalar" &&
+      succeeded(relation) && relation->size() == 1 &&
+      (*relation)[0].kind == "static_index") {
+    FailureOr<StringRef> source = lookupValue(operation, 0);
+    if (failed(source))
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.sum(" + source->str() + ", axis=0)");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (!planIndex.stages.empty() && binding &&
       binding.getLowering() == "ct.indirect_gather") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);

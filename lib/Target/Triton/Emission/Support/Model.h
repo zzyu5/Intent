@@ -28,6 +28,7 @@ using ReductionOp = target::emission::ReductionBinding;
 using ScanOp = target::emission::ScanBinding;
 using PointwiseOp = target::emission::PointwiseBinding;
 using ContractOp = target::emission::ContractBinding;
+using SparseContractOp = intent::plan::SparseContractOp;
 using StreamOp = target::emission::StreamBinding;
 using RaggedOp = target::emission::RaggedBinding;
 using StageOp = target::emission::StageBinding;
@@ -51,6 +52,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, plan::ScanOp> scans;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
+  llvm::DenseMap<int64_t, plan::SparseContractOp> sparseContracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;

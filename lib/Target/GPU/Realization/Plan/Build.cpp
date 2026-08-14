@@ -607,14 +607,18 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     bool contractOperand =
         load && operation.getNumResults() == 1 &&
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {
-          return user->getName().getStringRef() == "intent.contract";
+          StringRef name = user->getName().getStringRef();
+          return name == "intent.contract" || name == "intent.sparse_contract";
         });
     Operation *soleUser = nullptr;
     if (contractOperand &&
         llvm::hasSingleElement(operation.getResult(0).getUsers()))
       soleUser = *operation.getResult(0).user_begin();
-    bool sharedOperand =
-        soleUser && sharedContractOperand(operation.getResult(0), *soleUser);
+    bool sharedOperand = soleUser &&
+                         (soleUser->getName().getStringRef() ==
+                              "intent.sparse_contract" ||
+                          sharedContractOperand(operation.getResult(0),
+                                                *soleUser));
     SmallVector<int64_t> domains;
     for (Operation *domain : facts.boundaryDomains.lookup(&operation)) {
       FailureOr<int64_t> domainNode =
@@ -912,6 +916,38 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                     i64(builder, axisNode), string(builder, "inner_reduction"));
               }
             }
+            return success();
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.sparse_contract",
+          [&](Operation &operation) -> LogicalResult {
+            FailureOr<int64_t> node =
+                target::getNodeID(operation, "sparse-contract binding");
+            auto format = operation.getAttrOfType<StringAttr>("intent.format");
+            if (failed(node) || !format || format.getValue() != "two_of_four" ||
+                facts.sparseContractions.find(&operation) ==
+                    facts.sparseContractions.end())
+              return operation.emitOpError(
+                  "has no canonical 2:4 sparse contraction facts");
+            const target::SparseContractionFact &fact =
+                facts.sparseContractions.find(&operation)->second;
+            FailureOr<int64_t> row = target::getNodeID(
+                *fact.rowDomain, "sparse-contract row-axis binding");
+            FailureOr<int64_t> column = target::getNodeID(
+                *fact.columnDomain, "sparse-contract column-axis binding");
+            FailureOr<int64_t> reduction = target::getNodeID(
+                *fact.reductionDomain, "sparse-contract reduction-axis binding");
+            if (failed(row) || failed(column) || failed(reduction))
+              return failure();
+            builder.create<intent::plan::SparseContractOp>(
+                operation.getLoc(), i64(builder, *node),
+                string(builder, format.getValue()), i64(builder, *row),
+                i64(builder, *column), i64(builder, *reduction),
+                string(builder, "shared"),
+                string(builder, "shared"), string(builder, "shared"),
+                string(builder, "private_fragment"));
             return success();
           })))
     return failure();
