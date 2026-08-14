@@ -57,6 +57,10 @@ struct KernelModel {
   llvm::DenseMap<mlir::Value, int64_t> valueIDs;
   llvm::DenseMap<int64_t, RaggedStructure> raggedRelations;
   llvm::DenseMap<int64_t, StateStreamStructure> stateStreams;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>>
+      structuredResultSources;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>>
+      structuredValueUsers;
 };
 
 mlir::FailureOr<int64_t> getNodeID(mlir::Operation &operation,

@@ -107,7 +107,9 @@ FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
                     llvm::DenseMap<int64_t, Value>(),
                     llvm::DenseMap<Value, int64_t>(),
                     llvm::DenseMap<int64_t, RaggedStructure>(),
-                    llvm::DenseMap<int64_t, StateStreamStructure>()};
+                    llvm::DenseMap<int64_t, StateStreamStructure>(),
+                    llvm::DenseMap<Value, SmallVector<Value, 2>>(),
+                    llvm::DenseMap<Value, SmallVector<Value, 2>>()};
   auto indexValue = [&](int64_t id, Value value, Operation &owner) {
     if (id < 0 || !model.values.try_emplace(id, value).second ||
         !model.valueIDs.try_emplace(value, id).second) {
@@ -255,6 +257,23 @@ FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
     }
     model.stateStreams[entry.first] =
         StateStreamStructure{operation, entry.first, *axisNode, stopNode};
+    if (operation->getNumRegions() != 1 ||
+        !llvm::hasSingleElement(operation->getRegion(0)))
+      return operation->emitOpError(
+          "has no canonical single-block state-stream body");
+    Operation *terminator = operation->getRegion(0).front().getTerminator();
+    if (!terminator || terminator->getName().getStringRef() != "intent.yield" ||
+        terminator->getNumOperands() != operation->getNumResults() ||
+        operation->getNumOperands() < operation->getNumResults() + 1)
+      return operation->emitOpError(
+          "has no canonical state-stream result source schema");
+    for (auto [index, result] : llvm::enumerate(operation->getResults())) {
+      for (Value source : {operation->getOperand(index + 1),
+                           terminator->getOperand(index)}) {
+        model.structuredResultSources[result].push_back(source);
+        model.structuredValueUsers[source].push_back(result);
+      }
+    }
   }
   return model;
 }

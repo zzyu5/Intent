@@ -95,29 +95,60 @@ FailureOr<std::string> sourceDimensionSymbol(Operation &domain,
 }
 
 bool dependsOn(Value value, Operation &producer,
+               const target::KernelModel &kernel,
                llvm::DenseSet<Value> &visited) {
   if (!visited.insert(value).second)
     return false;
   if (value.getDefiningOp() == &producer)
     return true;
+  auto semantic = kernel.structuredResultSources.find(value);
+  if (semantic != kernel.structuredResultSources.end() &&
+      llvm::any_of(semantic->second, [&](Value source) {
+        return dependsOn(source, producer, kernel, visited);
+      }))
+    return true;
   Operation *definition = value.getDefiningOp();
   return definition && llvm::any_of(definition->getOperands(), [&](Value operand) {
-           return dependsOn(operand, producer, visited);
+           return dependsOn(operand, producer, kernel, visited);
          });
 }
 
-bool reachesTerminal(Operation &operation,
+bool reachesTerminal(Value value, const target::KernelModel &kernel,
                      const llvm::DenseSet<Operation *> &terminals,
-                     llvm::DenseSet<Operation *> &visited) {
-  if (!visited.insert(&operation).second)
+                     llvm::DenseSet<Operation *> &visitedOperations,
+                     llvm::DenseSet<Value> &visitedValues);
+
+bool reachesTerminal(Operation &operation, const target::KernelModel &kernel,
+                     const llvm::DenseSet<Operation *> &terminals,
+                     llvm::DenseSet<Operation *> &visitedOperations,
+                     llvm::DenseSet<Value> &visitedValues) {
+  if (!visitedOperations.insert(&operation).second)
     return false;
   if (terminals.contains(&operation))
     return true;
   for (Value result : operation.getResults())
-    for (Operation *user : result.getUsers())
-      if (reachesTerminal(*user, terminals, visited))
-        return true;
+    if (reachesTerminal(result, kernel, terminals, visitedOperations,
+                        visitedValues))
+      return true;
   return false;
+}
+
+bool reachesTerminal(Value value, const target::KernelModel &kernel,
+                     const llvm::DenseSet<Operation *> &terminals,
+                     llvm::DenseSet<Operation *> &visitedOperations,
+                     llvm::DenseSet<Value> &visitedValues) {
+  if (!visitedValues.insert(value).second)
+    return false;
+  for (Operation *user : value.getUsers())
+    if (reachesTerminal(*user, kernel, terminals, visitedOperations,
+                        visitedValues))
+      return true;
+  auto semantic = kernel.structuredValueUsers.find(value);
+  return semantic != kernel.structuredValueUsers.end() &&
+         llvm::any_of(semantic->second, [&](Value result) {
+           return reachesTerminal(result, kernel, terminals, visitedOperations,
+                                  visitedValues);
+         });
 }
 
 void appendUnique(SmallVectorImpl<std::string> &values, StringRef value) {
@@ -712,11 +743,16 @@ bool hasRaggedAxis(const target::ContractionFact &contraction,
          contains(contraction.resultAxes);
 }
 
-void collectSlice(Value value, const llvm::DenseSet<Value> &inputs,
+void collectSlice(Value value, const target::KernelModel &kernel,
+                  const llvm::DenseSet<Value> &inputs,
                   llvm::DenseSet<Value> &visited,
                   llvm::DenseSet<int64_t> &operations) {
   if (inputs.contains(value) || !visited.insert(value).second)
     return;
+  auto semantic = kernel.structuredResultSources.find(value);
+  if (semantic != kernel.structuredResultSources.end())
+    for (Value source : semantic->second)
+      collectSlice(source, kernel, inputs, visited, operations);
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return;
@@ -724,7 +760,7 @@ void collectSlice(Value value, const llvm::DenseSet<Value> &inputs,
   if (node)
     operations.insert(node.getInt());
   for (Value operand : definition->getOperands())
-    collectSlice(operand, inputs, visited, operations);
+    collectSlice(operand, kernel, inputs, visited, operations);
 }
 
 FailureOr<SmallVector<StageDecision, 0>>
@@ -732,9 +768,11 @@ contractionStages(const target::KernelFacts &facts) {
   llvm::DenseSet<Operation *> terminals = facts.scatterWrites;
   SmallVector<Operation *> contractions;
   for (const auto &entry : facts.contractions) {
-    llvm::DenseSet<Operation *> visited;
+    llvm::DenseSet<Operation *> visitedOperations;
+    llvm::DenseSet<Value> visitedValues;
     if (hasRaggedAxis(entry.second, facts) &&
-        reachesTerminal(*entry.first, terminals, visited))
+        reachesTerminal(*entry.first, facts.kernel, terminals,
+                        visitedOperations, visitedValues))
       contractions.push_back(entry.first);
   }
   llvm::sort(contractions, [](Operation *lhs, Operation *rhs) {
@@ -757,7 +795,7 @@ contractionStages(const target::KernelFacts &facts) {
         if (producer == consumer)
           continue;
         llvm::DenseSet<Value> visited;
-        if (!dependsOn(operand, *producer, visited))
+        if (!dependsOn(operand, *producer, facts.kernel, visited))
           continue;
         appendUnique(consumerStage.inputs, operand);
         appendUnique(stages[stagePositions.lookup(producer)].outputs, operand);
@@ -769,7 +807,7 @@ contractionStages(const target::KernelFacts &facts) {
       for (Operation *terminal : terminals) {
         bool dependent = llvm::any_of(terminal->getOperands(), [&](Value operand) {
           llvm::DenseSet<Value> visited;
-          return dependsOn(operand, *stage.contraction, visited);
+          return dependsOn(operand, *stage.contraction, facts.kernel, visited);
         });
         if (dependent)
           stage.terminals.push_back(terminal);
@@ -782,14 +820,14 @@ contractionStages(const target::KernelFacts &facts) {
     llvm::DenseSet<Value> visited;
     llvm::DenseSet<int64_t> operationNodes;
     for (Value output : stage.outputs)
-      collectSlice(output, inputs, visited, operationNodes);
+      collectSlice(output, facts.kernel, inputs, visited, operationNodes);
     for (Operation *terminal : stage.terminals) {
       FailureOr<int64_t> terminalNode = node(*terminal, "stage terminal");
       if (failed(terminalNode))
         return failure();
       operationNodes.insert(*terminalNode);
       for (Value operand : terminal->getOperands())
-        collectSlice(operand, inputs, visited, operationNodes);
+        collectSlice(operand, facts.kernel, inputs, visited, operationNodes);
     }
     FailureOr<int64_t> rootNode = node(*stage.contraction, "stage root");
     if (failed(rootNode))
@@ -1084,12 +1122,23 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         builder.getDenseI64ArrayAttr(stage.operations),
         builder.getDenseI64ArrayAttr(terminals)));
     FailureOr<int64_t> memberNode = node(**member, "stage member axis");
+    auto memberChoice =
+        llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
+          return candidate.domain == *member;
+        });
+    const AxisChoice::RangeChoice *memberOwnership =
+        memberChoice == assignments->axes.end()
+            ? nullptr
+            : findRange(*memberChoice, "ownership");
     if (failed(memberNode))
       return failure();
+    if (!memberOwnership)
+      return stage.contraction->emitOpError(
+          "has no selected ownership range for its stage member axis");
     decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
         string(builder, "member"), i64(builder, *memberNode),
-        string(builder, *memberExtent), string(builder, "ragged_member"),
+        string(builder, *memberExtent), string(builder, memberOwnership->tile),
         i64(builder, 1)));
     decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),

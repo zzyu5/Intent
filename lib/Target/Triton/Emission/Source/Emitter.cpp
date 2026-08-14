@@ -2335,6 +2335,10 @@ SourceEmitter::emitTensorShape(Operation &operation, unsigned resultIndex) {
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());
+    else if (!planIndex.stages.empty() && activeStages.size() == 1 &&
+             label.getValue() ==
+                 stageFeatureDimensions.lookup(activeStages.front()))
+      extents.push_back(stageFeatureTiles.lookup(activeStages.front()));
     else if (label.getValue().starts_with("?region_"))
       return operation.emitOpError(
           "tensor shape region has no physical tile binding");
