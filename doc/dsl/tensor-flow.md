@@ -56,6 +56,8 @@ stats = I.reduce(
 )
 ```
 
+上例保留的是 generic combine 将来应有的 source 形态，不是当前可运行示例。当前 Kernel IR/realization 只闭合内建 reduction/scan combiner；任意 helper closure 尚未进入 typed Kernel IR region，编译器会在进入 target emission 前明确拒绝。Welford 数值算法目前可用 `state_stream`、内建块内归约与普通标量 carry 合并表达，但这不等于 generic combine 通道已经实现。
+
 选择 `reduce` 表示 compiler 可以选择物理 reduction tree 与 hierarchy。需要严格逐元素顺序时使用 `ordered`，不增加 `mergeable` 或 `@associative` 合同。
 
 一个 logical reduction 可以在同一 target entry 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。
@@ -118,7 +120,7 @@ I.mutable_load(...)
 ```
 
 Effects 不能被非法复制、删除或跨依赖重排。
-三个目标语言没有共同的显式 fence 语义；`I.fence(...)` 在前端直接拒绝，不能降成 no-op。
+三个目标语言没有共同的显式 fence 语义，当前 public API 不导出 `I.fence(...)`；未来若加入，必须先定义 scope、ordering 与 participant 合同，不能降成 no-op。
 
 ## Logical buffer
 

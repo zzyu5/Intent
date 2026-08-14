@@ -4,7 +4,7 @@ Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 s
 
 ## 两类对象
 
-`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的操作片段与临时值边界。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；Plan 只引用它们，不复制第二份 schema。
+`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的操作片段与临时值边界。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node ID 引用它们并保存已选物理关系，不复制第二份算法 schema。
 
 Structured primitive 的 binding 必须把 emitter 机械投影所需的规范角色与逻辑轴引用写进 Plan。例如 scan 保存 canonical semantics、logical axis node、tensor axis 与 result residency；target 不得回到 Kernel op 各自重推这些字段。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
 
@@ -16,7 +16,9 @@ Structured primitive 的 binding 必须把 emitter 机械投影所需的规范�
 
 Realizer 不先问“kernel 属于哪一类”，而是逐个逻辑轴回答：是否 parallel、ordered、reduction、ragged member 或 lane；哪一个 range 用于 program ownership、块内 lane、ordered traversal、reduction，哪一个 access range 描述某次读取的覆盖范围；多级 traversal 则在同一轴上保留不同 level。
 
-因此不规则 membership 与 ordered stream、分阶段 contraction 与 ordered traversal、一个轴的外层块和内层顺序都由角色与 range 的组合得到，不需要新增互斥 mapping mode。分析得到的 relation、def-use 与 provenance 可以在发射前重建索引，但不能形成拥有独立 schema 和 verifier 的第二份真理。
+因此不规则 membership 与 ordered stream、分阶段 contraction 与 ordered traversal、一个轴的外层块和内层顺序都由角色与 range 的组合得到，不需要新增互斥 mapping mode。Relation、def-use 与 provenance 从 Kernel IR 在公共 KernelModel 中派生一次；SurfacePlan 只能索引这份语义事实和 Plan 中已选的物理绑定，不能遍历周围 operation 再重建一份。
+
+每条 range 同时保存 canonical logical extent 与已选 tile。Region block argument 通过稳定 value ID 显式绑定到 axis、range purpose 和 level；state stream 显式绑定到 axis、range purpose/level 以及适用的 ragged relation。Row-vector 上界、stream 上界和 region 归属因此都由 leaf 直接读取，leaf 只负责目标符号和语法拼写。
 
 ## 稳定引用与验证
 

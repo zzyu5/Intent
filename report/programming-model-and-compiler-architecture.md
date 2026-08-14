@@ -289,9 +289,11 @@ Welford/Chan 的单遍方差可以写成：
 - mean 最大误差约 `0.079155`；
 - variance 最大误差约 `0.586592`。
 
-该 probe 故意使用非整除尾块。结构能编不等于 lowering 正确；当前最可疑的是 `I.full((column_region,), 1)` 形成的逻辑 count 在 physical tail 上没有按 reduction identity 正确 neutralize，但根因尚未完成定位。
+该 probe 故意使用非整除尾块。结构能编不等于 lowering 正确；修复前的嫌疑是 `I.full((column_region,), 1)` 形成的逻辑 count 在 physical tail 上没有按 reduction identity 正确 neutralize。
 
 这项发现应登记为 **validity/padding correctness bug**，不能拿来否定 state-stream 的表达力，也不能用 generic combine 掩盖。
+
+本轮定位确认：Plan 已经为这个 `full` 结果给出 reduction identity padding，丢失发生在三个 `emitFull` 没有消费该绑定。修复后同一 `M=64, N=257` source 的 mean 最大误差为 `1.49e-8`、variance 最大误差为 `2.38e-7`；修法是所有 region-shaped `full` 统一消费 Plan padding，不含 Welford 特判。
 
 ### 4.3 下层真实 API 支持到哪里
 
@@ -377,7 +379,7 @@ TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs
 
 ### 5.2 非 unit-step domain：大多是可删除的 convenience
 
-真实算法可以用 dense logical domain 加显式 affine/quasi-affine index 表达 stride：
+真实算法可以用 unit-step logical domain 加显式 affine/quasi-affine index 表达 stride：
 
 ```text
 i in [0, count)
@@ -388,7 +390,7 @@ address = start + i * step
 
 结论：
 
-- 保留 runtime unit-step dense domain；
+- 保留 runtime unit-step logical domain；
 - 非 unit-step domain 先在 frontend 明确拒绝；
 - 不把“完整 Python range”当语言完整性的指标；
 - 真有算法证明 explicit index 不够时再重开，而不是现在扩 realizer。
@@ -455,7 +457,7 @@ Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。需�
 
 ### 5.9 `I.fence`：当前 public API 应删除
 
-当前 `I.fence` 被导出，但 frontend 无条件报错；它没有 scope、ordering、参与者或 barrier 语义。这不是“暂时 backend 不支持”，而是 source operation 本身没有定义。
+修复前 `I.fence` 被导出，但 frontend 无条件报错；它没有 scope、ordering、参与者或 barrier 语义。这不是“暂时 backend 不支持”，而是 source operation 本身没有定义。
 
 未来 RVV/CPU 确实可能需要 memory fence，但应从真实算法重新设计：
 
@@ -463,7 +465,7 @@ Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。需�
 - ordering、scope、participation 明确；
 - 与 atomic/effect model 一致。
 
-在那之前，删除当前 public `I.fence` 比保留一个假入口更干净。
+本轮已经删除该 public API；未来若有真实 memory-model 需求，再从完整合同重新设计。
 
 ---
 
@@ -477,7 +479,7 @@ Intent op 同时处理 scalar、tensor、record、logical domain 等多态值，
 
 ### 6.2 真问题一：SSA type 与 shadow metadata 可以分叉
 
-当前 `intent.result_types`、ABI metadata 的 `type/shape` 与真实 MLIR SSA type 没有集中一致性验证。后续 analysis 有时读 metadata，emitter 又读实际 `ViewType`。错误或外部构造的 MLIR 可以让两份事实不一致。
+修复前 `intent.result_types`、ABI metadata 的 `type/shape` 与真实 MLIR SSA type 没有集中一致性验证。后续 analysis 有时读 metadata，emitter 又读实际 `ViewType`。错误或外部构造的 MLIR 可以让两份事实不一致。
 
 最小修法：
 
@@ -486,9 +488,11 @@ Intent op 同时处理 scalar、tensor、record、logical domain 等多态值，
 - 检查 access mode、rank、element dtype 与必要 attrs；
 - 冗余且无人消费的 metadata 直接删除，不再维护影子真理。
 
+本轮按该最小修法闭合：canonical verifier 统一核对 function ABI、operation result metadata 与真实 SSA type/rank/shape/access mode。
+
 ### 6.3 真问题二：block argument stable ID 没进入公共 KernelModel
 
-Frontend 为 region block arguments 生成 `intent.region_argument_nodes`，verifier 也检查其唯一性；但 `analyzeKernel()` 只把 ABI arguments 和 operation results 放入 `KernelModel.values/valueIDs`。
+修复前 frontend 为 region block arguments 生成 `intent.region_argument_nodes`，verifier 也检查其唯一性；但 `analyzeKernel()` 只把 ABI arguments 和 operation results 放入 `KernelModel.values/valueIDs`。
 
 三个 emitter 因而绕过公共模型，自己解析 `region_argument_nodes`。
 
@@ -501,6 +505,8 @@ Frontend 为 region block arguments 生成 `intent.region_argument_nodes`，veri
 
 这是明确、有限的公共合同修复，也直接帮助未来 RVV consumer。
 
+本轮已经按此闭合：nested-region block argument 与 ABI/result value 共用 KernelModel value-ID 索引，三个 leaf 的重复 metadata 解析已删除。
+
 ### 6.4 字符串 logical spec 不必全删
 
 symbolic extent、relation name 等本来就是符号内容，字符串可以合理存在。需要的是规范格式与 producer/type metadata 一致性，不是再造一套 Python typed IR 或复杂字符串类型系统。
@@ -509,7 +515,7 @@ symbolic extent、relation name 等本来就是符号内容，字符串可以合
 
 ## 七、Plan 与 emitter：逐项区分“合法读取”和“假发射”
 
-### 7.1 Region argument → selected range：Plan 确实少一个 binding
+### 7.1 Region argument → selected range：修复前 Plan 少一个 binding
 
 三个 leaf 都从 Kernel IR region 名字重新决定：
 
@@ -520,7 +526,9 @@ Region argument 身份属于 Kernel IR；但“这个 argument 消费哪个已�
 
 结论：Plan 应显式绑定 stable region-argument ID → axis/range。Leaf 只读取，不再按 op 名选择。
 
-### 7.2 Row-vector physical extent：决定已经有一半，最终 binding 仍缺
+本轮已增加可验证的 region argument → axis/range purpose/level binding，三个 leaf 只读该绑定。
+
+### 7.2 Row-vector physical extent：修复前最终 binding 仍缺
 
 Realizer 已创建 `BlockExtentOp(rounding=power_of_two, fill=...)`，但 leaf 又从 domain → ABI dimension → BlockExtent 查找最终 physical extent。
 
@@ -529,6 +537,8 @@ Realizer 已创建 `BlockExtentOp(rounding=power_of_two, fill=...)`，但 leaf �
 - ABI symbol 怎样拼成 Python/C 表达式，仍是 leaf 工作；
 - axis/range 绑定哪个 logical/block extent，应在 Plan 明确；
 - Triton `next_power_of_2`、RVV `vl` 等 target spelling 留在各自 leaf。
+
+本轮 range 已同时携带 canonical logical extent 与 selected tile；row-vector 与 stream consumer 从该 range 读取上界，leaf 只保留 target spelling。
 
 ### 7.3 Ragged/stream use-def：主要是共享 semantic analysis，不应全复制进 Plan
 
@@ -540,12 +550,14 @@ Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；�
 - Plan 只保存 relation/stream → selected physical axis/range 的选择；
 - leaf 消费 shared semantic binding + Plan physical binding。
 
+本轮 KernelModel 已一次建立 ragged/state-stream semantic index，Plan 只记录 selected stream axis/range/relation；SurfacePlan 不再遍历周围 operation 重建 use-def。
+
 ### 7.4 `dimensionName`：一半合法，一半危险
 
 - 把 ABI dynamic shape 变成目标语言中的参数表达式，是合法 leaf spelling；
 - 用相同 shape label/extent 反猜 logical axis identity，是 provenance bug。
 
-当前 `axisFromLabel` 找不到精确 provenance 时会选择第一个同 extent domain，甚至构造 implicit axis。这个 fallback 应删除：沿 SSA、region argument、index relation无法唯一解析时直接诊断。
+修复前 `axisFromLabel` 找不到精确 provenance 时会选择第一个同 extent domain，甚至构造 implicit axis。本轮已删除该 fallback：provenance 只能沿 SSA、ABI shape symbol、region argument 与 index relation 得到，无法唯一解析时直接诊断。
 
 ### 7.5 persistent heuristic：是 GPU policy，不是 emitter 假发射
 
@@ -666,37 +678,37 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 
 ### A. Correctness 与唯一语义合同
 
-| 问题 | 责任层 | 已有证据 | 闭合标准 |
+| 问题 | 责任层 | 已有证据 | 当前状态 |
 |---|---|---|---|
-| Welford/state-stream 在非整除尾块数值错误 | GPU validity/padding realization | `N=257` 真实 repro，mean/variance 显著误差 | 定位具体 value validity 丢失点；同一 source 尾块数值正确，不加 Welford 特判 |
-| SSA type 与 ABI/result metadata 可分叉 | Kernel IR verifier | verifier 只检查 metadata 形状/非空，analysis/emitter 读取不同来源 | canonical boundary 统一验证或删除冗余 metadata |
-| Region block argument ID 不进入 KernelModel | Common Kernel analysis | builder/verifier有 ID，三个 leaf 重读 metadata | 所有 block argument 可由 `getValueID()` 查询，leaf 删除重复解析 |
-| extent-label/implicit axis fallback | Shared semantic analysis | `axisFromLabel` 可按同 extent 猜第一个 domain | provenance 只能来自 SSA/region/index relation；不唯一即诊断 |
+| Welford/state-stream 在非整除尾块数值错误 | GPU validity/padding realization | `N=257` 真实 repro，mean/variance 显著误差 | 已闭合：根因是 region-shaped `full` 没有消费 Plan padding；三叶子统一按 reduction identity 中和物理尾块，无 Welford 特判 |
+| SSA type 与 ABI/result metadata 可分叉 | Kernel IR verifier | verifier 只检查 metadata 形状/非空，analysis/emitter 读取不同来源 | 已闭合：canonical verifier 集中核对 function ABI、operation result metadata 与真实 SSA type/rank/shape/access mode |
+| Region block argument ID 不进入 KernelModel | Common Kernel analysis | builder/verifier有 ID，三个 leaf 重读 metadata | 已闭合：nested-region block argument 进入公共 value-ID index，leaf 不再解析底层 metadata |
+| extent-label/implicit axis fallback | Shared semantic analysis | `axisFromLabel` 可按同 extent 猜第一个 domain | 已闭合：删除同 extent 猜轴；provenance 只来自 SSA、ABI shape symbol、region 与 index relation，缺失即诊断 |
 
 ### B. Physical Plan 与 emission 边界
 
-| 问题 | 责任层 | 闭合标准 |
+| 问题 | 责任层 | 当前状态 |
 |---|---|---|
-| Region argument 未直接绑定 selected range | Physical Plan | Plan 保存 argument→axis/range；三个 leaf 不再按 region 名重选 |
-| Row-vector final extent binding不完整 | Physical Plan | Plan 明确 axis/range→logical/block extent；leaf 只拼 target syntax |
-| Ragged/stream binding在 SurfacePlan 重建 | Common semantic index + Plan | 算法 use-def共享分析一次；Plan只保存 selected physical relation |
-| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | dependency、workspace lifetime、visibility可验证；GPU/RVV均有明确投影 |
+| Region argument 未直接绑定 selected range | Physical Plan | 已闭合：Plan 显式保存 argument→axis/range purpose/level，三个 leaf 只消费绑定 |
+| Row-vector final extent binding不完整 | Physical Plan | 已闭合：range 同时保存 logical extent 与已选 tile，leaf 只做目标符号拼写 |
+| Ragged/stream binding在 SurfacePlan 重建 | Common semantic index + Plan | 已闭合：算法 relation/use-def 在 KernelModel 建一次；Plan 只保存已选 stream axis/range/relation |
+| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | 本轮明确不动；仍需 dependency、workspace lifetime、visibility 可验证，并为 GPU/RVV 分别投影 |
 
 ### C. 语言表面收敛
 
 | 项目 | 决定 |
 |---|---|
-| generic reduce/scan combine | 应进入 typed Kernel IR region；Triton/cuTile机械委托，TileLang按真实能力支持或拒绝，RVV由target realizer兑现 |
+| generic reduce/scan combine | 当前不支持；方向仍是进入 typed Kernel IR region，由 Triton/cuTile 机械委托，TileLang按真实能力支持或拒绝，RVV由 target realizer 兑现；留到能力完善轮 |
 | arbitrary contract multiply/combine | 不随 reduce 一起放开；按目标矩阵原语 capability定义 |
-| `arg_reduce.max` | 真实需求；generic combine闭合后收敛为 sugar/通用 tuple reduction |
-| `partition(count)` | 语义合理但当前未使用；实现前 target-aware 提前拒绝，不列 correctness blocker |
-| 非 unit-step domain | 当前拒绝；使用 dense domain + 显式 index relation |
-| runtime `state_stream` extent | 当前移除假能力；保留 fixed/auto extent + runtime stop |
+| `arg_reduce.max` | 真实需求但当前形态是过渡；generic combine 闭合后收敛为 sugar/通用 tuple reduction，本轮不改 API |
+| `partition(count)` | 语义合理但当前 realizer 不支持；frontend 在构造 IR 前明确拒绝，不列 correctness blocker |
+| 非 unit-step domain | frontend 明确拒绝；当前使用 unit-step logical domain + 显式 index relation |
+| runtime `state_stream` extent | frontend 明确拒绝；保留 compile-time fixed/auto extent + runtime logical stop |
 | logical buffer | 保留 portable Core；owner-private 是当前 GPU capability，不是永久语言定义 |
 | `end` | 保留并补正式语义 |
 | `assume_in_bounds` | 保留为 unsafe source precondition |
-| sparse 2:4 | 收敛为 sparse contract + format descriptor，而非继续扩专用算子名字 |
-| `fence` | 删除当前无语义 public API；未来从真实 memory model需求重新设计 |
+| sparse 2:4 | 真实需求但当前形态是过渡；以后收敛为 sparse contract + format descriptor，本轮不改 API |
+| `fence` | 无 scope/ordering/participant 合同的 public API 已删除；未来只从真实 memory model 需求重新设计 |
 
 ### D. 不是当前任务的问题
 
@@ -747,6 +759,6 @@ Intent 的稳定核心不是“跨三种 GPU tile 语言”，而是：
 
 > **用一份 target-independent 的结构化逻辑区域算法，驱动多个算子级 target realizer；每个 realizer产生自己的 Physical Plan，surface/emitter只投影，下层 compiler继续完成其擅长的布局、指令与调优。**
 
-当前 GPU 主线已经证明这不是 rowwise/softmax 特化，但还不能立即冻结。需要先处理登记表中的四类具体问题：tail correctness、Kernel IR 唯一合同、Plan binding、stage execution contract；同时把 generic reduce/scan closure 和几个假 public capability定下来。
+当前 GPU 主线已经证明这不是 rowwise/softmax 特化。Tail correctness、Kernel IR 唯一合同、Plan binding 与几项假 public capability 已经闭合；尚未冻结的是 stage execution contract 与 generic reduce/scan closure，以及登记表中明确保留的过渡能力。
 
 完成这些之后，后续新增 GPU provider 或 RISC-V/RVV backend 都不应再改编程模型：只新增 target-family realizer、Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core表达时才允许进入。

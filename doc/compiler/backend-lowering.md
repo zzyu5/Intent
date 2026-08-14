@@ -34,7 +34,7 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 | access footprint / logical validity | pointer mask 或收紧范围 | guarded copy / range predicate | checked load、gather 或 scatter |
 | persistent program choice | grid-stride program loop | persistent block loop | persistent block loop |
 
-一条 realization 可以让不规则 membership、ordered stream、head mapping 与尾块同时作用；target 不得把组合重新压回 kernel 类别字符串。Target surface 只可拒绝自己不能表达的组合，不能另选 tile、ownership、流终点或遍历。
+一条 realization 可以让不规则 membership、ordered stream、head mapping 与尾块同时作用；target 不得把组合重新压回 kernel 类别字符串。Region argument、row-vector logical extent 与 stream/ragged relation 都由 Plan 显式绑定；target surface 只可读取并拼写，或拒绝自己不能表达的组合，不能另选 tile、ownership、流终点或遍历。
 
 ## Operation 对应关系
 

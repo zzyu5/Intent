@@ -39,7 +39,7 @@ Frontend 在 AST lowering 期间只维护 symbol、shape、region、constexpr �
 
 ## Kernel IR
 
-Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、logical workset、tensor-flow、state、control、structured nodes、index relation 与 effects。Intent Kernel MLIR 保存稳定 operation/value node ID、结构化 region、类型和 metadata，并由 MLIR parser 与 Kernel IR verifier 守住 backend boundary。
+Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、logical workset、tensor-flow、state、control、structured nodes、index relation 与 effects。Intent Kernel MLIR 保存稳定 operation/value node ID、结构化 region、类型和 metadata；Kernel IR verifier 集中核对 metadata 与真实 SSA function/result/block-argument schema，公共 KernelModel 再以这些稳定 ID 建立唯一索引。
 
 详见 [Kernel IR](kernel-ir.md)。
 
@@ -59,7 +59,7 @@ Physical Plan 是 realizer 的 target realization 结果，是独立于 source l
 
 ## Backend Emitter
 
-Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Kernel IR 与 Physical Plan 之外没有第三份 target IR；target 侧的临时 binding 只是查找索引，不是可独立验证或持久化的表示。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
+Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Region argument、row-vector extent 与 stream/ragged relation 的已选物理绑定都进入可验证的 Physical Plan；target 侧只建立从这些 Plan operation 到生成变量的查找索引，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 

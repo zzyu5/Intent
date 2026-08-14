@@ -2,6 +2,8 @@
 
 当 partial buffer、part count 与 kernel 数量对 wrapper 可见时，它们属于 source program，而不是 compiler-private realization。
 
+本页保存 `partition(count=P)` 完成 realization 后应有的 host-visible 两遍算法结构。目前 frontend 会明确拒绝 count 模式，所以下面的代码是设计模板，不是当前可运行示例；不能为了跑通而把它改写成 `extent` 模式。
+
 ## Canonical kernels
 
 ```python

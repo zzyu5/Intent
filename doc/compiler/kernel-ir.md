@@ -4,7 +4,7 @@ Kernel IR 表示一个完整、runtime-visible 的 source kernel algorithm。它
 
 每个 operation 与 SSA value 都有 module 内稳定的非负 node id。Physical Plan 只能通过这些 id 引用 Kernel IR，不复制或按 source 文本重新猜测算法节点。
 
-Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function parameter、operation result 与 nested-region block argument 的 value ID，以及每个 operation 的 node ID，都显式进入 MLIR metadata；SSA 打印名称不承担 identity。MLIR consumer 必须验证 function metadata、node/value ID 唯一性、result schema、region-argument schema、structured-region terminator、effect/index metadata 与 operation 所需属性。
+Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function parameter、operation result 与 nested-region block argument 的 value ID，以及每个 operation 的 node ID，都显式进入 MLIR metadata；SSA 打印名称不承担 identity。MLIR consumer 集中验证 function ABI metadata、真实 SSA type/rank/shape/access mode、node/value ID 唯一性、result schema、region-argument schema、structured-region terminator、effect/index metadata 与 operation 所需属性。通过后，公共 KernelModel 对 parameter、operation result 和 nested-region block argument 提供同一套 value-ID 查询；target leaf 不再解析 metadata 建第二份身份表。
 
 ## 必须保存的内容
 
@@ -33,7 +33,7 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - pointwise math 与 logical mask；
 - `reduce`、`scan`、`contract`；
 - logical buffers；
-- atomic、mutable load/store 与 RNG identity。没有跨目标共同语义的显式 fence 在 frontend 拒绝，不进入 Kernel IR。
+- atomic、mutable load/store 与 RNG identity。当前语言没有 public fence 构造；没有 scope、ordering 与 participant 合同的同步不会以 no-op 进入 Kernel IR。
 
 ### Control 与 state
 
@@ -57,7 +57,7 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 
 1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel` 和一个 target entry。
 2. `I.auto` 只能占据内部 region extent hole，不能成为普通 SSA value。
-3. `partition(count=...)` 的 count 必须是 source-visible runtime/shape/`Constexpr`/wrapper value。
+3. `partition(count=...)` 是保留但尚未 realization 的 Core 语义，当前 frontend 明确拒绝；启用后 count 必须是 source-visible runtime/shape/`Constexpr`/wrapper value。
 4. Physical refinement 不得改变 logical workset、state、effect、ABI 或 wrapper-visible relation。
 5. Pure SSA 可以安全地复制、删除、融合或重算；effectful node 必须保持依赖与执行语义。
 6. `ordered` 与 `state_stream` 的 source 顺序不可降格为 unordered partial merge。
