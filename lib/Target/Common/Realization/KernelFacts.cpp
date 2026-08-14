@@ -711,6 +711,8 @@ FailureOr<SmallVector<StringRef>> resultShapeLabels(Operation &operation,
 
 FailureOr<LogicalAxis> axisFromLabel(StringRef label, KernelFacts &facts,
                                      Operation &consumer) {
+  if (label == "1")
+    return LogicalAxis{nullptr, "1"};
   auto known = facts.axisLabels.find(label);
   if (known != facts.axisLabels.end())
     return known->second;

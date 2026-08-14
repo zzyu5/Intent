@@ -541,17 +541,8 @@ assignAxes(const target::KernelFacts &facts) {
     if (hasRole(choice.roles, "reduction")) {
       const AxisChoice::RangeChoice *traversal =
           findRange(choice, "traversal");
-      auto staticExtent = facts.staticDomainExtents.find(choice.domain);
-      auto staticBounds = facts.staticDomainBounds.find(choice.domain);
       std::optional<int64_t> innerExtent =
           innerStreamContractionExtent(choice.domain, facts);
-      if (!innerExtent && staticExtent != facts.staticDomainExtents.end() &&
-          llvm::is_contained(facts.contractionDomains, choice.domain))
-        innerExtent = staticExtent->second;
-      if (!innerExtent && staticBounds != facts.staticDomainBounds.end() &&
-          llvm::is_contained(facts.contractionDomains, choice.domain))
-        innerExtent =
-            staticBounds->second.second - staticBounds->second.first;
       addRange(choice, "reduction", 0,
                innerExtent
                    ? "fixed_" + std::to_string(*innerExtent)
