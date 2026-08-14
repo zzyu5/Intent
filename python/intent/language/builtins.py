@@ -82,7 +82,6 @@ store = Intrinsic("store")
 mutable_load = Intrinsic("mutable_load")
 atomic_add = Intrinsic("atomic_add")
 atomic_cas = Intrinsic("atomic_cas")
-fence = Intrinsic("fence")
 
 ragged = Intrinsic("ragged")
 members = Intrinsic("members")
@@ -137,7 +136,6 @@ INTRINSICS = {
         mutable_load,
         atomic_add,
         atomic_cas,
-        fence,
         ragged,
         members,
         random,

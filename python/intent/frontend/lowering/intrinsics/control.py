@@ -69,7 +69,14 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("start", "stop", "step"), required=("start", "stop"))
     expressions = [lowerer.lower_expression(bound["start"]), lowerer.lower_expression(bound["stop"])]
     if "step" in bound:
-        expressions.append(lowerer.lower_expression(bound["step"]))
+        step = lowerer.lower_expression(bound["step"])
+        known, value = compile_time_value(step)
+        if not known or isinstance(value, bool) or not isinstance(value, int) or value != 1:
+            lowerer.error(
+                bound["step"],
+                "I.domain currently requires a compile-time unit step",
+            )
+        expressions.append(step)
     runtime = any(not compile_time_value(expression)[0] for expression in expressions)
     operands = tuple(_integer_value(lowerer, expression, node) for expression in expressions)
     flavor = DomainFlavor.RUNTIME if runtime else (
@@ -88,6 +95,11 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("axis", "extent", "count"), required=("axis",))
     if ("extent" in bound) == ("count" in bound):
         lowerer.error(node, "I.partition requires exactly one of extent= or count=")
+    if "count" in bound:
+        lowerer.error(
+            bound["count"],
+            "I.partition(count=...) is reserved but not supported by the current realization contract; use extent=...",
+        )
     source = lowerer.materialize(lowerer.lower_expression(bound["axis"]), bound["axis"])
     if not isinstance(source.type, (DomainType, RegionType)):
         lowerer.error(node, "partition axis must be a domain or region")
@@ -102,21 +114,13 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     region_type = RegionType(source.type.rank, relation)
     operands = [source]
     attributes: dict[str, object]
-    if "count" in bound:
-        expression = lowerer.lower_expression(bound["count"])
-        if isinstance(expression, AutoExtent):
-            lowerer.error(bound["count"], "partition count cannot use I.auto")
-        operands.append(_integer_value(lowerer, expression, bound["count"]))
-        mode = PartitionMode.COUNT
-        attributes = {"mode": mode}
+    expression = lowerer.lower_expression(bound["extent"])
+    mode = PartitionMode.EXTENT
+    attributes = {"mode": mode}
+    if isinstance(expression, AutoExtent):
+        attributes["extent"] = expression
     else:
-        expression = lowerer.lower_expression(bound["extent"])
-        mode = PartitionMode.EXTENT
-        attributes = {"mode": mode}
-        if isinstance(expression, AutoExtent):
-            attributes["extent"] = expression
-        else:
-            operands.append(_integer_value(lowerer, expression, bound["extent"]))
+        operands.append(_integer_value(lowerer, expression, bound["extent"]))
     operation = lowerer.emit(
         OperationKind.PARTITION,
         lowerer.location(node),
@@ -171,6 +175,12 @@ def _state_stream(lowerer: FunctionLowerer, node: ast.Call) -> StreamSpec:
     if isinstance(extent_expression, AutoExtent):
         extent: AutoExtent | MlirValue = extent_expression
     else:
+        known, value = compile_time_value(extent_expression)
+        if not known or isinstance(value, bool) or not isinstance(value, int):
+            lowerer.error(
+                bound["extent"],
+                "state_stream extent must be a compile-time integer or I.auto(...)",
+            )
         extent = _integer_value(lowerer, extent_expression, bound["extent"])
     initial_expression = lowerer.lower_expression(bound["init"])
     if isinstance(initial_expression, StaticTuple):

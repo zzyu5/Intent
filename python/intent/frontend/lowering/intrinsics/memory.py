@@ -46,7 +46,6 @@ def lower_memory_intrinsic(
         "mutable_load": _mutable_load,
         "atomic_add": _atomic_add,
         "atomic_cas": _atomic_cas,
-        "fence": _fence,
         "random": _random,
     }
     handler = handlers.get(name)
@@ -346,13 +345,6 @@ def _atomic_cas(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         effects=(_atomic_effect(target),),
     )
     return operation.results[0]
-
-
-def _fence(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
-    lowerer.error(
-        node,
-        "I.fence has no portable semantics across the supported tile languages",
-    )
 
 
 def _random(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
