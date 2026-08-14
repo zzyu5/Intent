@@ -2310,7 +2310,19 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
                         ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
                         : RankedTensorType();
   if (sourceType && resultType && sourceType.getRank() == 1 &&
-      sourceType.getDimSize(0) == 1 && resultType.getRank() == 0) {
+      resultType.getRank() == 0) {
+    bool singleton = sourceType.getDimSize(0) == 1;
+    if (!singleton) {
+      auto source = dyn_cast<OpResult>(operation.getOperand(0));
+      FailureOr<SmallVector<std::string>> extents =
+          source ? tensorExtents(*source.getOwner(), source.getResultNumber())
+                 : FailureOr<SmallVector<std::string>>(failure());
+      singleton = succeeded(extents) && extents->size() == 1 &&
+                  extents->front() == "1";
+    }
+    if (!singleton)
+      return operation.emitOpError(
+          "TileLang scalar reshape requires a singleton physical source");
     if (failed(operand))
       return failure();
     bindResult(operation, 0, operand->str() + "[0]");
@@ -2628,30 +2640,6 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
   if (failed(source) || failed(valid) || failed(fill) || failed(result) ||
       failed(extents) || extents->size() != relation->size())
     return failure();
-  auto sourceTensor = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
-  Operation *validDefinition =
-      operation.getOperand(validIndex.getInt()).getDefiningOp();
-  Attribute validLiteral =
-      validDefinition ? validDefinition->getAttr("intent.value") : Attribute();
-  bool alwaysValid = false;
-  if (auto boolean = dyn_cast_if_present<BoolAttr>(validLiteral))
-    alwaysValid = boolean.getValue();
-  else if (auto integer = dyn_cast_if_present<IntegerAttr>(validLiteral))
-    alwaysValid = !integer.getValue().isZero();
-  if (sourceTensor && alwaysValid) {
-    std::string shape = "(";
-    for (auto [axis, extent] : llvm::enumerate(*extents)) {
-      if (axis)
-        shape += ", ";
-      shape += extent;
-    }
-    if (extents->size() == 1)
-      shape += ",";
-    shape += ")";
-    line(*result + " = T.reshape(" + source->str() + ", " + shape + ")");
-    bindResult(operation, 0, *result);
-    return success();
-  }
   SmallVector<std::string> indices;
   std::string loop = "for ";
   for (unsigned axis = 0; axis < extents->size(); ++axis) {
