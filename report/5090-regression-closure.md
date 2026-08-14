@@ -1,10 +1,10 @@
-# 5090 全量回归修复报告
+# 5090 回归修复与 H100 全量复验报告
 
 ## 报告边界
 
-本报告记录从 `deaa410` 到 `8e81210` 这一轮针对 5090 全量结果的修复。
+本报告记录从 `deaa410` 到 `8e81210` 针对 5090 全量结果的修复，以及在当前代码基线上继续完成的 H100 全量复验。
 
-本轮只做了受影响算子的定向复现，没有重新执行全量矩阵，也没有连接、运行或更新 H100。验证入口仍然只有：
+5090 修复阶段只运行受影响算子的定向复现，没有重跑 5090 全量。H100 恢复空闲后，在提交 `6d4b2c6` 的独立临时快照上运行了完整的 104 个 runner × 3 个 provider；其中 6 个 runner 展开多个 case，最终形成 113 行、339 个 provider cell。验证入口始终只有：
 
 ```bash
 examples/run/repro.sh <triton|cutile|tilelang> <kernel>
@@ -21,7 +21,7 @@ examples/run/repro.sh <triton|cutile|tilelang> <kernel>
 8e81210 data(baseline): record repaired 5090 cells
 ```
 
-固定的上游 source 数字没有重测、没有移动。本轮只把实际定向运行得到的 generated 状态和延迟写回 `report/baseline/kernel-performance.csv`。
+5090 固定表中的上游 source 数字没有重测、没有移动，只写回定向运行得到的 generated 状态和延迟。H100 表则由本次完整运行重新生成，generated 与能够公平调用的 upstream 都来自同一 H100 代码和环境基线。
 
 ## 本轮结论
 
@@ -347,9 +347,9 @@ BLOCK_SIZE / TILE_SIZE
 
 因此这些代码虽然较厚，但仍属于必要的目标接口与语法映射。为了让 emitter 看起来更薄而删除它们，反而会把合法的 target ABI 投影误判成信息丢失。
 
-## 九、实际验证范围
+## 九、5090 修复阶段的验证范围
 
-本轮运行了以下受影响 repro，没有运行全量：
+5090 修复阶段运行了以下受影响 repro，没有重新运行 5090 全量：
 
 ```text
 cross_entropy              Triton / cuTile / TileLang
@@ -364,9 +364,116 @@ variant_reshape_cache_split 复验 Triton
 w4a8_packed                复验 TileLang，并在历史提交复验
 ```
 
-没有运行 H100，没有修改 `report/baseline/kernel-performance-h100.csv`。
+## 十、H100 完整矩阵
 
-## 十、当前状态与未闭合观察
+### 执行基线
+
+H100 使用独立 `/tmp` 快照，不修改远端原有脏工作树。环境为：
+
+```text
+GPU       NVIDIA H100 80GB HBM3
+Triton    3.6.0
+cuTile    1.5.0
+TileLang  0.1.13
+LLVM/MLIR 20
+```
+
+远端默认 `/usr/bin/nvcc` 是 CUDA 11.5，不认识 TileLang 为 H100 选择的 `sm_90a`。机器已安装 CUDA 12.2，因此 TileLang 全量使用：
+
+```text
+PATH=/usr/local/cuda-12.2/bin:$PATH
+CUDA_HOME=/usr/local/cuda-12.2
+```
+
+修正前产生的 TileLang 环境失败全部作废；随后完整重跑 TileLang 104 个 runner，没有把两套环境的结果混在同一张表里。
+
+### 状态总览
+
+| Provider | PASS | UNSUPPORTED | COMPILE_TIMEOUT | FAILED |
+|---|---:|---:|---:|---:|
+| Triton | 111 | 1 | 1 | 0 |
+| cuTile | 109 | 3 | 1 | 0 |
+| TileLang | 102 | 10 | 0 | 1 |
+| 合计 | 322 | 14 | 2 | 1 |
+
+唯一真实 failed 是 TileLang `fp8_mqa_logits`：生成路径进入了 CUTLASS FP8 MMA，但当前 H100 架构路径在下层 assertion 失败。它没有被伪装成 pass，也没有在没有明确能力检查的情况下改写成另一种算法。
+
+compile-timeout 为：
+
+- Triton `token_sparse_mla_prefill`：外层 900 秒上限耗尽；
+- cuTile `token_sparse_mla_prefill`：下层 TileIR 编译器触发自身 10 秒 compile timeout。
+
+明确 unsupported 包括：
+
+- Triton/cuTile 没有原生 2:4 sparse contraction 投影；
+- cuTile 在 `sm_90` 不支持 block-scaled kernel 所需的 `float8_e8m0fnu`；
+- cuTile 不接受 FP8 MQA 的 runtime-sized matrix-M lane；
+- TileLang 不支持 compare-exchange、二维联合覆盖范围 cooperative transfer、single-row contraction、token-sparse batched GEMM 以及若干 paged/split-K 组合。
+
+这些项都没有走慢几个数量级的伪支持路径。
+
+### 5090 修复的跨设备复验
+
+以下本轮重点路径在 H100 上全部通过：
+
+```text
+cross_entropy            3/3 provider PASS
+sorted_nucleus_cutoff    3/3 provider PASS
+moe                      3/3 provider PASS
+grouped_gemm             3/3 provider，base/tail/empty_groups 全部 PASS
+mamba_chunk_scan         3/3 provider PASS
+block_sparse_attention   3/3 provider PASS
+```
+
+因此 i32 导入、TileLang fragment reshape、transfer validity 和 staged-axis 消费都不是 5090 专属修复。
+
+### 共享内存容量 A/B
+
+TileLang `absorbed_mla_prefill` 在 5090 上因为候选需要 `102400 B`、设备可用 `101376 B` 而失败；同一份当前代码在 H100 上自动通过：
+
+```text
+p50 = 0.1032 ms
+p95 = 0.1043 ms
+```
+
+这个 A/B 给出了明确责任边界：候选是否装得下由 TileLang 下层编译/调优器根据当前设备容量筛选。共享内存容量不需要进入我们的算法结构决策，也没有理由增加架构型号分支。
+
+### 三后端赢家分布
+
+按每个 kernel/case 的 generated p50 最小值统计，只计 `status=pass`：
+
+| 设备 | Triton 唯一赢家 | cuTile 唯一赢家 | TileLang 唯一赢家 | 并列 | 无赢家 |
+|---|---:|---:|---:|---:|---:|
+| H100 | 52 | 30 | 27 | 3 | 1 |
+| 5090 | 38 | 27 | 37 | 10 | 1 |
+
+两台设备有 56/113 行的赢家集合不同；只比较两边都有唯一赢家的行，也有 45 行发生变化。这直接证明同一份算法与共享物理模型能吃到三种 surface language 在不同机器上的不同强项，而不是某一个 provider 固定占优。
+
+### 与上游主场对照
+
+H100 上有 33 个 kernel/case 能同时取得 generated 最优值与同范围 upstream 最优值：
+
+```text
+generated 最优更快：19 行
+upstream 最优更快： 14 行
+```
+
+按 provider-cell 统计，51 个可比格中 generated 更快 26 格、upstream 更快 25 格。上游回到数据中心卡主场之后，我们在三 provider 中取最优的优势仍然存在，但不再表现为单边压倒。
+
+### 相对旧 H100 表的能力变化
+
+旧表只有 106 行，本次新增 7 行：attention backward、block-sparse attention、causal Conv1D backward、paged MLA decode、paged split-K attention、sparse 2:4 GEMM、varlen GQA decode logits。
+
+已有 106 行中状态变化只发生在 TileLang：
+
+- `mla_head_projection` 两个 case：unsupported → pass；
+- `absorbed_mla_prefill`：unsupported → pass；
+- `paged_attention`、`continuous_gqa_decode`、`splitk_attention_reduce`：旧慢路径 pass → 当前明确 unsupported；
+- `fp8_mqa_logits`：unsupported → failed，说明能力检查仍比实际 target projection 宽。
+
+H100 完整数字见 `report/baseline/kernel-performance-h100.csv`。
+
+## 十一、当前状态与未闭合观察
 
 正确性方面，本轮列出的两处静默数值错误、六格前端失败和 block-sparse 结果不一致均已闭合。
 
@@ -376,5 +483,9 @@ w4a8_packed                复验 TileLang，并在历史提交复验
 - reshape-cache split variant 存在约几微秒差异，但没有稳定的共享层回归证据。
 
 这两项没有被包装成编译器已修复问题，也没有为它们引入 provider 特判。
+
+H100 新增一项明确的 target 闭合问题：TileLang `fp8_mqa_logits` 目前通过了上层能力检查，却在 CUTLASS H100 FP8 MMA 路径失败。当前表如实记为 `failed`，没有提前改写算法或伪装成 unsupported。
+
+另外，TileLang `shifted_row_copy` 首次编译耗时 161 秒但最终数值与运行通过；这是编译成本观察，不是运行能力失败。
 
 本轮结束时主工作树代码提交完整，二分定位生成的 detached 临时 worktree 已确认无修改后删除。
