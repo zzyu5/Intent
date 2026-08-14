@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "Support/Decisions.h"
 #include "llvm/ADT/STLExtras.h"
@@ -187,23 +188,32 @@ struct PaddingState {
 
   LogicalResult require(Value value, ArrayRef<unsigned> requiredAxes,
                         StringRef fill, Operation &consumer) {
+    Value materialized = value;
+    if (Operation *definition = value.getDefiningOp();
+        definition &&
+        definition->getName().getStringRef() == "intent.extract") {
+      FailureOr<Value> field = target::resolveRecordField(*definition);
+      if (failed(field))
+        return failure();
+      materialized = *field;
+    }
     FailureOr<ValidityBinding> validity =
-        validityBinding(value, requiredAxes, facts, consumer);
+        validityBinding(materialized, requiredAxes, facts, consumer);
     if (failed(validity))
       return failure();
     if (validity->nodes.empty())
       return success();
     FailureOr<int64_t> valueID = target::getValueID(
-        value, facts.kernel, consumer, "padding binding");
+        materialized, facts.kernel, consumer, "padding binding");
     if (failed(valueID))
       return failure();
     auto existing =
         llvm::find_if(decisions, [&](const PaddingDecision &decision) {
-          return decision.value == value;
+          return decision.value == materialized;
         });
     if (existing == decisions.end()) {
       decisions.push_back(
-          PaddingDecision{value, *valueID, std::move(*validity), fill.str()});
+          PaddingDecision{materialized, *valueID, std::move(*validity), fill.str()});
     } else {
       if (existing->fill != fill)
         return consumer.emitOpError(
@@ -222,6 +232,7 @@ struct PaddingState {
               "binds one tensor axis to incompatible validity domains");
       }
     }
+    assumed[materialized] = fill.str();
     assumed[value] = fill.str();
     return success();
   }

@@ -634,6 +634,19 @@ LogicalResult SourceEmitter::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  for (const auto &entry : planIndex.axes) {
+    plan::AxisOp axis = entry.second;
+    Operation *domain = kernel.nodes.lookup(axis.getNode());
+    if (!domain || domain->getNumResults() != 1)
+      return axis.emitOpError(
+          "cannot index its domain result shape against the Triton plan");
+    FailureOr<int64_t> valueID = target::getValueID(
+        domain->getResult(0), kernel, *domain, "Triton domain tile binding");
+    FailureOr<std::string> tile = physicalAxisTile(axis);
+    if (failed(valueID) || failed(tile))
+      return failure();
+    regionTiles["?region_" + std::to_string(*valueID) + "_0"] = *tile;
+  }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
     if (!value || !isa<RankedTensorType>(value.getType()))
