@@ -213,6 +213,25 @@ LogicalResult validatePointwise(Operation &operation) {
                          logical.getValue()))
     return success();
   if (name == "intent.binary" &&
+      logical.getValue() == "power") {
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    auto supported = [](Type type) {
+      return type.isF16() || type.isBF16() || type.isF32() ||
+             isa<Float8E4M3FNType, Float8E5M2Type>(type);
+    };
+    if (operation.getNumOperands() == 2 && operation.getNumResults() == 1 &&
+        supported(elementType(operation.getOperand(0).getType())) &&
+        supported(elementType(operation.getOperand(1).getType())) &&
+        supported(elementType(operation.getResult(0).getType())))
+      return success();
+    return operation.emitOpError(
+        "GPU power projection requires f8e4m3fn, f8e5m2, f16, bf16, or f32 operands and result");
+  }
+  if (name == "intent.binary" &&
       llvm::is_contained({StringRef("add"), StringRef("subtract"),
                           StringRef("multiply"), StringRef("true_divide"),
                           StringRef("floor_divide"), StringRef("remainder"),

@@ -1980,6 +1980,8 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
         binding.getLowering() == "T.min")
       return binding.getLowering().str() + "(" + lhs.str() + ", " +
              rhs.str() + ")";
+    if (binding.getLowering() == "T.pow")
+      return "T.pow(" + lhs.str() + ", " + rhs.str() + ")";
     if (binding.getLowering().starts_with("T.bitwise_") ||
         binding.getLowering().starts_with("T.shift_"))
       return binding.getLowering().str() + "(" + lhs.str() + ", " +

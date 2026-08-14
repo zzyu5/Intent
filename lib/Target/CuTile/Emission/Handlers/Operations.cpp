@@ -1545,7 +1545,33 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       binding.getLowering() == "ct.minimum")
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
-  else if (binding.getLowering().starts_with("ct.bitwise_"))
+  else if (binding.getLowering() == "ct.pow") {
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    Type lhsType = elementType(operation.getOperand(0).getType());
+    Type rhsType = elementType(operation.getOperand(1).getType());
+    Type resultType = elementType(operation.getResult(0).getType());
+    bool needsWidening =
+        isa<Float8E4M3FNType, Float8E5M2Type>(lhsType) ||
+        isa<Float8E4M3FNType, Float8E5M2Type>(rhsType) ||
+        isa<Float8E4M3FNType, Float8E5M2Type>(resultType);
+    if (!needsWidening) {
+      expression = "ct.pow(" + lhs->str() + ", " + rhs->str() + ")";
+    } else {
+      std::string resultDtype = dtypeName(resultType, operation);
+      if (resultDtype.empty())
+        return failure();
+      std::string widened = "ct.pow(ct.astype(" + lhs->str() +
+                            ", ct.float32), ct.astype(" + rhs->str() +
+                            ", ct.float32))";
+      expression = resultType.isF32()
+                       ? std::move(widened)
+                       : "ct.astype(" + widened + ", " + resultDtype + ")";
+    }
+  } else if (binding.getLowering().starts_with("ct.bitwise_"))
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
   else if ((binding.getLowering() == "python_floor_divide" ||

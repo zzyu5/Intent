@@ -121,6 +121,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
     return StringRef("python_floor_divide");
   if (role == "binary_remainder")
     return StringRef("python_remainder");
+  if (role == "binary_power")
+    return StringRef("libdevice.pow");
   if (role == "binary_bitwise_and")
     return StringRef("python_bitwise_and");
   if (role == "binary_bitwise_or")
@@ -824,6 +826,10 @@ void SourceEmitter::emitImports() {
   output << "import torch\n";
   output << "import triton\n";
   output << "import triton.language as tl\n";
+  if (llvm::any_of(planIndex.pointwise, [](const auto &entry) {
+        return entry.second.getLowering() == "libdevice.pow";
+      }))
+    output << "from triton.language.extra import libdevice\n";
   if (!planIndex.components.reusedAxes.empty()) {
     output << "from triton.runtime import driver\n";
     output << "from intent.runtime.tuning.triton import row_configuration, row_program_count\n";

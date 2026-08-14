@@ -112,6 +112,8 @@ FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
     return StringRef("python_floor_divide");
   if (role == "binary_remainder")
     return StringRef("python_remainder");
+  if (role == "binary_power")
+    return StringRef("T.pow");
   if (role == "binary_bitwise_and")
     return StringRef("T.bitwise_and");
   if (role == "binary_bitwise_or")

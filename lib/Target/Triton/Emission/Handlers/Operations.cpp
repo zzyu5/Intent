@@ -1509,7 +1509,32 @@ LogicalResult SourceEmitter::emitBinary(Operation &operation) {
       binding.getLowering() == "tl.minimum")
     expression = binding.getLowering().str() + "(" + lhs->str() + ", " +
                  rhs->str() + ")";
-  else if ((binding.getLowering() == "python_floor_divide" ||
+  else if (binding.getLowering() == "libdevice.pow") {
+    auto elementType = [](Type type) {
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        return tensor.getElementType();
+      return type;
+    };
+    Type lhsType = elementType(operation.getOperand(0).getType());
+    Type rhsType = elementType(operation.getOperand(1).getType());
+    Type resultType = operation.getResult(0).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(resultType))
+      resultType = tensor.getElementType();
+    StringRef resultDtype = tritonDtype(resultType);
+    if (resultDtype.empty())
+      return operation.emitOpError("uses an unsupported Triton power type");
+    if (lhsType.isF32() && rhsType.isF32() && resultType.isF32()) {
+      expression =
+          "libdevice.pow(" + lhs->str() + ", " + rhs->str() + ")";
+    } else {
+      std::string widened = "libdevice.pow(tl.cast(" + lhs->str() +
+                            ", tl.float32), tl.cast(" + rhs->str() +
+                            ", tl.float32))";
+      expression = resultType.isF32()
+                       ? std::move(widened)
+                       : "tl.cast(" + widened + ", " + resultDtype.str() + ")";
+    }
+  } else if ((binding.getLowering() == "python_floor_divide" ||
             binding.getLowering() == "python_remainder") &&
            binding.getNonnegativeOperands()) {
     StringRef symbol = binding.getLowering() == "python_floor_divide" ? "//" : "%";
