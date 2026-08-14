@@ -1,564 +1,731 @@
 # Intent 编程模型与编译器架构收敛审计
 
-## 结论先行
+## 这份报告怎样得出结论
 
-Intent 的正确定位不是“另一门 Triton”，也不是通用 Python 编译器。它是一门 **Python-hosted、单 kernel、跨后端、tile-parametric 的结构化逻辑区域程序语言**：作者写完整的 kernel 内算法与逻辑工作集，编译器补上作者有意省略的机器 realization，再把同一份 realization 投影成 Triton、cuTile 或 TileLang 源码。
+这次不把 `doc/` 当作真理。文档只记录某个时刻想要的设计；后续实现、真实 kernel 和讨论可能已经推翻它，而文档没有同步。
 
-它的核心编程单位不是 Triton 的 program instance，也不是 CUDA thread/block，而是：
+本报告按下面的证据顺序判断：
 
-> **带逻辑坐标、结构化区域、tensor-flow、状态与 effect 的单-kernel 算法。**
+1. 当前 Python frontend、canonical MLIR、realizer、Plan、三个 emitter 的真实代码；
+2. 现有 DSL kernel 实际采用的算法结构；
+3. Triton、cuTile、TileLang 当前安装版本的真实 API；
+4. 一个实际编译并运行的 Welford/state-stream repro；
+5. 将来接入 RISC-V/RVV、CPU/Scalar、专用矩阵扩展时仍然成立的边界；
+6. 最后才用文档解释最初意图，并标出需要修改的旧判断。
 
-编译器的核心工作也不是重新猜算法，而是：
+当前环境中核验的版本是：
 
-> **把 source 已经确定的逻辑工作，兑现成轴角色、物理范围、ownership、遍历、有效区间、访问覆盖、必要存储与合法调优轴。**
+- Triton 3.6.0；
+- cuTile Python 1.5.0；
+- TileLang 0.1.13。
 
-所以，“我们本质上是不是在处理范围问题”的答案是：**范围与轴是主骨架，但不止范围。** 完整 realization 还包含 ownership、program folding、状态推进、padding/fill、访问覆盖、private storage、primitive 数值角色以及 effect 的物理兑现。layout、寄存器分配、指令选择、候选值和低层流水线仍交给下层 tile compiler。
-
-当前总体分层方向是正确的，也已有很广的真实 kernel 覆盖；但实现还不能原样冻结。冻结前必须先解决三个性质不同的问题：
-
-1. 规范坚持一个 source invocation 对应一个 target dispatch，而当前分阶段 ragged contraction 会生成并依次启动多个 target kernels。这是编程模型冲突，不是普通代码瑕疵。
-2. 公开 DSL、canonical Kernel MLIR 与 realizer 的实际能力不完全闭合，存在“前端看起来支持、后端边界才拒绝”的假能力。
-3. emitter 仍在若干位置从 Kernel IR 的结构或张量 shape 重建本该由 Physical Plan 直接给出的物理事实，尚未完全退化成机械投影。
-
-本报告只做架构审计与收敛判断，没有修改编译器，也没有运行性能或数值 repro。
-
----
-
-## 一、我们的编程模型到底是什么
-
-### 1.1 最准确的名字：结构化逻辑区域程序
-
-Intent source 描述的是一个 machine-unbound kernel：
-
-- ABI、输入输出、alias、effects；
-- logical domain、region、partition 关系；
-- 坐标与 index relation；
-- 独立工作 `parallel`；
-- 有序工作 `ordered`；
-- 带 carry 的物理分块流 `state_stream`；
-- `reduce`、`scan`、`contract`；
-- gather、scatter、原子、logical buffer；
-- dtype、cast、数值路径、控制流；
-- ragged membership 与作者声明的边界/前置条件。
-
-Source 不描述：
-
-- `program_id`、grid、block/thread/warp identity；
-- `num_warps`、`num_stages`；
-- 内部 tile 的具体值；
-- register/shared/global address space；
-- MMA fragment layout；
-- instruction selection、register allocation、pipeline schedule。
-
-“tile-parametric”不等于作者完全不知道区域。作者可以决定 **算法上是否存在 partition，以及主体看见一个元素还是一块区域**；但 `I.auto("...")` 的具体 extent 是物理选择。这个边界很重要：
-
-- 是否分区、是否分成多个算法阶段，是作者的算法结构；
-- 分区取 32、64 还是 128，是 realization/tuner 的机器选择；
-- 编译器不能把作者写的逐元素主体偷偷改成块矩阵算法；
-- 编译器可以把互相独立的标量实例打包到一个物理 program 的 lanes 中，只要 source body 的可观察语义不变。
-
-### 1.2 它与 Triton 的根本差别
-
-| 问题 | Triton source | Intent source |
-|---|---|---|
-| 作者面对的执行单位 | program instance 与块张量 | logical domain、region 与结构化 tensor-flow |
-| grid/program mapping | 作者直接写 | realizer 选择 |
-| tile 大小 | 通常由作者/launcher/tuner 暴露 | source 只声明 fixed 或 `auto`；合法轴由 realizer给出，值交给下层 tuner |
-| mask 与 tail | 作者常显式按 block 写 | source 固定 logical validity；realizer 决定 tail/mask/fill 的兑现 |
-| layout/thread mapping | Triton compiler 从显式 block program 推 | 下层 Triton/cuTile/TileLang compiler 继续负责；Intent 不复制 |
-| 算法结构 | 作者写 | 作者写，且 Intent 不得替换 |
-| 跨表面语言 | 不是核心合同 | 同一 Kernel IR + 同一 Physical Plan 投影到多个 GPU surface |
-
-因此，Triton 可以概括为“作者给出 tile program，下层推 layout 与线程映射”；Intent 应概括为：
-
-> **作者给出完整的逻辑区域算法，Intent 选择该算法在 GPU 上的物理区域实现，下层 tile compiler 再完成低层布局和指令实现。**
-
-### 1.3 单-kernel 边界必须保留
-
-正式语言合同已经写得很清楚：
-
-- 一个 `@intent.kernel` invocation 对应一个 target entry invocation；
-- 多 kernel 算法由普通 Python wrapper 按作者决定的顺序编排；
-- 编译器不替作者决定调用次数，不把一个 source kernel 拆成 runtime-visible 的多个 dispatch；
-- `@intent.fn` 只是 kernel 内 inline helper，不是另一个 entry。
-
-这个边界不只是 API 习惯，它决定了算法所有权：拆成几遍、跨 kernel workspace、多阶段归约与同步，都是作者可观察的算法决定。
-
-**本次收敛判断：保留这一不变量，不放宽。** 如果某算法需要多次启动，就应在 wrapper 中写成多个 `@intent.kernel`。编译器可以在单次 dispatch 内做多级 physical implementation，也可以使用 compiler-private scratch，但不能偷偷增加 launch。
+最终目标不是让文档和代码彼此迁就，而是确定一个之后可以冻结的编程模型，再把每个偏差登记到唯一的责任层。
 
 ---
 
-## 二、编译器到底在做什么
+## 一、最终编程模型：不是 tile program，而是结构化逻辑区域 kernel
 
-### 2.1 编译器不是算法推断器
+### 1.1 最短定义
 
-Intent compiler 不负责把“数学结果”自动变成某个高性能算法。以下变化都不允许：
+Intent 是一门 **面向算子内部算法、target-independent、region-parametric 的结构化 kernel DSL**。
 
-- stable softmax 自动换成 online softmax；
-- 普通 GEMM 自动换成 Strassen；
-- 原子 bucket 自动换成排序分组；
-- 一个 source kernel 自动拆成多个 runtime kernels；
-- 为追求块原语，把逐元素 source body 改写成块矩阵 body。
+作者写：
 
-算法差异必须由不同 DSL source 或 wrapper orchestration 表达。编译器只允许做保持 source tensor-flow、logical workset、state、effect、ABI 与调用边界不变的物理变换。
+- 一个逻辑 callable 的 ABI、输入输出、alias 与 effects；
+- logical domain、region、index relation；
+- 哪些工作独立、哪些有序、哪些携带状态；
+- reduce、scan、contract、gather、scatter、原子与 logical buffer；
+- 数值路径、dtype、identity、逻辑边界与调用前置条件；
+- 一个算法包含哪些逻辑阶段以及阶段间的数据依赖。
 
-### 2.2 编译器是 realization compiler
+作者不写：
 
-它在“多个合法物理实现”中选择：
+- GPU program/block/thread/warp identity；
+- RVV hart、`vl`、LMUL 或具体 vector register grouping；
+- CPU thread id、SIMD width；
+- 具体 tile/chunk/vector width；
+- register/shared/stack/scratch 的具体 placement；
+- 低层 layout、指令、pipeline、prefetch、unroll；
+- 某门下层语言特有的 launcher 参数。
 
-1. 每个逻辑轴承担哪些角色：parallel、ordered、reduction、ragged member、contraction、lane；
-2. 同一轴有哪些用途不同的物理 range：ownership、traversal、reduction、lane、access；
-3. 哪些轴进入 program space，怎样折叠、swizzle、复用 worker、是否 persistent；
-4. logical validity 如何变成 stop、guard、mask、fill 或 checked transfer；
-5. 一个输出 tile 对输入的 access footprint，包含 tail 与重叠 halo；
-6. logical buffer 的生命周期、所有者与必要 residency；
-7. reduction/scan/contract 的数值角色、identity、accumulator dtype 与 target primitive 合同；
-8. 哪些参数是合法搜索轴，以及它们受哪些结构/资源约束。
+因此，Intent 的核心单位既不是 Triton program instance，也不是 CUDA tile。它是：
 
-这就是我们比 Triton source 更上一层的部分：Triton 作者必须手工写的 program geometry、tile、mask、部分 storage/launch 事实，由 Intent realizer 填一次；三门表面语言只渲染同一份决定。
+> **在逻辑坐标与逻辑区域上定义的、带 tensor-flow、状态和 effects 的算子内程序。**
 
-### 2.3 编译器明确不做的事情
+### 1.2 为什么应叫 region-parametric，而不应把 tile 当本体
 
-下列工作应持续交给下层：
+`partition(domain, extent=I.auto(...))` 的本质不是“请生成一个 GPU tile”，而是：
 
-- layout inference；
-- register allocation；
-- instruction selection；
-- 对给定参数的 pipeline、prefetch、unroll；
-- 不同 GPU 架构的具体指令路径；
-- tuner 的候选具体取值、排序与最终 winner；
-- 下层 JIT、module load 与 runtime launch 实现。
+> 作者允许 compiler 选择一个 region extent，但 region body 的逻辑意义不随这个选择改变。
 
-判断标准仍然是：**答案是否依赖只有 Intent 的算法结构才知道的信息。** 依赖，realizer 决定；不依赖，交给下层。下层变强后，Intent emitter 应该变薄。
+在不同 target 上，它可以兑现为：
+
+- GPU：program/CTA 拥有的 tile；
+- RVV：一次 strip-mine 的 VLA chunk；
+- CPU SIMD：一个 vector chunk；
+- Scalar：普通循环的一段；
+- 专用矩阵扩展：喂给 microkernel 的局部区域。
+
+去掉 source 中的 tile/worker identity，价值正是在这里：同一个逻辑索引不能因为换成 GPU program id、RVV lane 或 CPU thread 而改变；RNG counter、ragged membership、state carry 与 effect 顺序也不会绑定某种物理执行模型。
+
+但“去掉 tile”不等于“去掉物理 mapping”。ownership、chunking、vectorization、遍历与存储仍然必须由 target realizer 决定，只是不进入算法身份。
+
+### 1.3 作者决定 partition 是否存在，compiler 只填 extent
+
+这是一个必须固定的边界：
+
+- 作者写逐元素 body，body 就只看见一个逻辑元素；
+- 作者显式写 partition，body 才看见一块逻辑区域；
+- compiler 可以把互相独立的标量实例打包进一个物理 program 的 lanes；
+- compiler 不能把逐元素 body 改写成作者没写的块矩阵算法；
+- `auto` 只授权 extent/chunk realization，不授权改变 body 的可观察工作集。
+
+所以 Intent 不是自动张量化器，也不通过识别 operand 形状把 scalar program 偷换成 block program。
+
+### 1.4 一个 source kernel 对应一个 logical callable，不必强行等于一次机器 launch
+
+上一版报告把“多个 target launch”直接判成违反 single-kernel，这是过度解释。
+
+真正应冻结的不变量是：
+
+- 一个 `@intent.kernel` 产生一个对调用方可见的 callable/ABI/effect boundary；
+- 作者写下的逻辑阶段、数据依赖、数值路径与外部 effects 不被改变；
+- compiler-private workspace 不进入用户 ABI；
+- 物理 stage 不能改变结果、别名、外部可见顺序或调用方需要支付的额外协议；
+- 多个 source kernels 之间的算法级 orchestration 仍由普通 wrapper 明确表达。
+
+一个 logical callable 的机器实现可以是：
+
+- 一个 GPU kernel launch；
+- split reduction 的若干 GPU launches；
+- 同一个 CPU/RVV function 内的多个 loop/microkernel stages；
+- 一部分 target 可以 fuse，而另一部分 target 需要 materialize intermediate。
+
+这仍是算子编译器内部的 physical realization，不是 framework graph partition。关键不是 launch 数量，而是 **是否只物化作者已经写下的数据依赖，还是 compiler 发明了新的算法阶段**。
+
+当前 ragged contraction 的 `StageOp` 方向因此并非天然错误；真正的问题是它尚未形成完整 execution contract，后文单独分析。
 
 ---
 
-## 三、系统实际组成与具体数据流
+## 二、编译器的职责：从逻辑区域到 target-family realization
+
+### 2.1 我们不是在“推算法”
+
+Intent compiler 不应自动做：
+
+- stable softmax 与 online softmax 的互换；
+- radix grouping 与 atomic bucket 的互换；
+- ordinary GEMM 与不同数学算法的互换；
+- 为了某个 target primitive 重写 source body；
+- 决定 framework operator fusion/fission；
+- 改变 source-visible passes、外部 workspace 或调用顺序。
+
+这些都需要作者独有的算法意图，必须留在 source 或普通 Python wrapper。
+
+### 2.2 我们真正求解的东西
+
+编译器求的是一个 target 上的 physical realization：
+
+1. logical axis 在这个 target 上承担 parallel、ordered、reduction、ragged member、lane 等哪些角色；
+2. ownership、traversal、reduction、access 等用途分别用什么物理范围；
+3. 哪些区域被分块、strip-mine、vectorize 或 persistent traversal；
+4. logical validity 如何兑现成 loop bound、mask、fill、checked transfer 或完整块搬运；
+5. 输出区域对应怎样的输入 access footprint，包括 tail 与重叠 halo；
+6. logical buffer 的 lifetime、owner、residency 与必要 workspace；
+7. structured primitive 是交给下层，还是由本 target realizer 明确展开一个物理 hierarchy；
+8. 哪些 realization 参数可以交给下层 tuner，哪些结构选择必须先确定；
+9. 一个 logical callable 是否需要多个私有 machine stages，以及它们的依赖和 intermediate lifetime。
+
+所以“范围”确实是主骨架，但完整职责还包括 ownership、effects、validity、storage、primitive delegation 与 execution stages。
+
+### 2.3 target 在哪里分叉
+
+正确分叉点在 canonical Kernel IR 之后，而不是 source 语言里：
 
 ```text
-普通 Python wrapper
-  │  负责 shape/device 检查、输出/跨 kernel workspace、多 kernel 编排
-  ▼
-Python DSL Frontend
-  │  AST、constexpr、symbol/shape/region、源码位置、就地诊断
-  ▼
-Canonical Intent Kernel MLIR                 ← 唯一算法真理
-  │
-  ├─ Kernel IR verifier
-  └─ KernelFacts / def-use / provenance       ← 可重算的派生分析，不是表示层
-  ▼
-Physical Plan MLIR                           ← 唯一已选物理决定
-  │  Axis / Range / Program / Boundary / Transfer / Storage /
-  │  Reduction / Scan / Contract / SearchSpace ...
-  ▼
-Common surface projection + target leaf
-  │  能力检查、逐 op 投影、目标语法、编译/运行接线
-  ├─ Triton Python
-  ├─ cuTile Python
-  └─ TileLang Python
-  ▼
-下层 target compiler
-  │  layout、线程/warp 细化、寄存器、指令、pipeline、JIT
-  ▼
-单次 runtime dispatch
+Python DSL
+    ↓
+Canonical Kernel IR
+    ↓
+共享 semantic facts / provenance / legality
+    ├── GPU realizer ── GPU Physical Plan
+    │                    ├── Triton surface
+    │                    ├── cuTile surface
+    │                    └── TileLang surface
+    │
+    ├── RVV realizer ── RVV Physical Plan ── intrinsic C / MLIR / object
+    ├── Scalar/CPU realizer ── CPU Physical Plan ── C/LLVM
+    └── 其他机器 realizer
 ```
+
+GPU、RVV、Scalar 是不同的 target family；Triton、cuTile、TileLang 是同一个 GPU realization 的不同 surface/provider。
+
+### 2.4 不应强迫 GPU 与 RVV 共用一份具体 Plan
+
+可以共享的是 Plan 的概念骨架：
+
+- iteration/ownership；
+- chunk/range；
+- traversal/order；
+- validity/access footprint；
+- storage requirement；
+- primitive realization/delegation；
+- execution stage/dependency；
+- tunable parameter 与合法性约束。
+
+不能强行共享的是具体选择：
+
+- GPU 的 3D program grid、worker axis、persistent CTA；
+- RVV 的 VLA、LMUL、unroll、microtile；
+- CPU 的 thread partition 与 SIMD width；
+- 某专用扩展的 fragment/register rule。
+
+当前 `intent_plan` 中的 `ProgramOp`、`program_order`、`worker_axis`、三维 grid 投影明显是 GPU Plan。未来接 RVV 时，应保留共同 Plan vocabulary，并允许 target-family extension；不能把 RVV 塞进 GPU program/worker 字段，也不能为了“统一”把 GPU 决定搬回 Kernel IR。
+
+---
+
+## 三、实际系统的表示与边界
 
 ### 3.1 Python Frontend
 
-当前 frontend 的正确职责是：
+Frontend 只应维护 lowering 期间的临时状态：AST、constexpr、symbol/shape、region、source location 与临时 `ValueType`。它负责：
 
-- 解析受限 Python AST；
-- 处理 `Constexpr`、symbolic shape、region nesting、source location；
-- 维护 lowering 期间的 `ValueType` 等临时状态；
-- 内联 `@intent.fn`；
-- 将普通 Python `break`/`continue` 正规化成 loop-carried control state；
-- 在构造 IR 时直接报 source-located error；
-- 直接创建 canonical Intent MLIR。
+- 将受限 Python 语法正规化；
+- 内联 kernel-local `@intent.fn`；
+- 把 break/continue 变成 loop-carried control state；
+- 构造 canonical Intent MLIR；
+- 在作者源码位置报基础语言错误。
 
-这些临时 Python 类型不是第二套持久化 Kernel IR。当前 pipeline 也没有 Python Plan、Python emitter 或 Python physical decision 旁路，这一点符合目标架构。
+这些临时对象不是第二套持久化 typed Kernel IR。
 
-### 3.2 Canonical Kernel MLIR
+### 3.2 Canonical Kernel IR
 
-Kernel IR 应是 source-visible 算法的唯一真理，保存：
+Kernel IR 是唯一算法真理，应保存：
 
-- ABI 与 view access mode；
-- stable node/value IDs；
-- logical domain/partition/ragged relation；
-- structured regions 与 carried state；
+- ABI、view access、alias、effects；
+- logical domains/regions/partitions/ragged relations；
+- structured control 与 carried state；
 - tensor-flow、index relation、dtype；
-- reduce/scan/contract；
-- memory effects 与 source preconditions。
+- reduce/scan/contract 及其算法 closure；
+- source precondition 与 numerical contract；
+- 稳定 operation/value identity。
 
-后续阶段不得回到 Python object 猜算法，也不得让 derived facts 变成第二份语义真理。
+GPU、RVV、Scalar realizer 都只能从这里读取算法事实，不能回到 Python object 或根据 kernel 名字重新识别。
 
-### 3.3 KernelFacts 不是第四层 IR
+### 3.3 KernelFacts 是派生分析，不是第四份真理
 
-`KernelFacts` 包含 ABI、region tree、axis provenance、def-use、access range、contraction/scan/ragged/stream 等索引。它是从 Kernel IR 可重算的分析缓存，合理存在，但必须遵守：
+当前 `KernelFacts` 保存 axis provenance、region tree、def-use、contraction、scan、ragged、stream、boundary 和 access range。它合理存在，因为这些是昂贵但可重算的分析。
 
-- 没有独立序列化 schema；
-- 不承载“多个合法方案中选了哪个”；
-- 不拥有一套与 Kernel IR 冲突的 verifier；
-- 丢失时可以从 Kernel IR 重建；
-- emitter 不应绕过 Kernel IR/Plan，把它当第三份输入。
+它不应：
 
-### 3.4 Physical Plan MLIR
+- 持久化成另一套 IR；
+- 保存多个合法方案中“选了哪个”；
+- 用 extent label/shape 猜 logical identity；
+- 替代 Kernel IR 的基础 type/schema verifier。
 
-Plan 是唯一承重的物理表示，只保存不能从算法 IR 唯一推出、且确实由我们决定的事实：
+### 3.4 Physical Plan 是 target-family 的已选 realization
 
-- `Program`：program root、是否 persistent；
-- `Axis`：角色、program order、worker/fold、reuse/group；
-- `Range`：某轴在 ownership/traversal/reduction/lane/access 用途下的 tile 与层级；
-- `BlockExtent`：需要物理取整的 extent 与 fill；
-- boundary/transfer/padding；
-- buffer residency 与 workspace；
-- reduction/scan/contract 的物理绑定；
-- 合法 autotune 参数轴。
+Plan 只保存无法从 Kernel IR 唯一推出的选择，以及 lower target 必须直接消费的 binding。
 
-Plan 通过 stable node/value IDs 绑定 Kernel IR。它不是目标方言，也不应该分别存在 Triton Plan、cuTile Plan 与 TileLang Plan。
+它不应复制完整算法；也不能只保存模糊角色，让三个 leaf 各自再选一次。
 
-### 3.5 Surface projection 与 target leaf
+### 3.5 Surface/leaf
 
-发射层的合法职责只有：
+一个合格 leaf 只做：
 
-1. 检查目标是否能表达 Plan 要求的概念；
-2. 把概念映射到目标语法或目标原语；
-3. 按 Kernel IR 的 def-use 逐 op 发射；
-4. 生成 ABI、JIT、workspace 物化与 launch 接线；
-5. 对不能表达的组合给 source-located unsupported。
+- capability check；
+- Plan binding 到目标原语/语法的机械投影；
+- Kernel IR op 的逐 op spelling；
+- ABI、JIT、workspace materialization、runtime 接线；
+- source-located unsupported。
 
-三门语言的合法差异是：
-
-- 能表达的 Plan 子集不同；
-- 某概念是否需要显式拼写；
-- 目标 API、编译器与 runtime 接线不同；
-- 对应的 target primitive 不同。
-
-它们不应各自重做 ownership、tile、stream stop、padding、storage 或算法阶段选择。
+某个 surface 的下层 primitive 更强时，可以明确 delegate；更弱时可以拒绝，或消费 Plan 中更显式的 hierarchy。不能因为 TileLang 需要写得更细，就把 TileLang 字段表变成所有 target 的共同算法模型。
 
 ---
 
-## 四、DSL 表面：什么应该留，什么不能随便加
+## 四、generic combine：重新验证后的准确结论
 
-### 4.1 当前 Core 的稳定主干
+### 4.1 Welford 能否用当前原语表达
 
-下列构造确实表达作者独有的算法信息，应保留为 Core：
+能。
 
-- `domain`、domain product、`partition`、`indices`；
-- `parallel`、`ordered`、`state_stream`；
-- tensor expression、broadcast、reshape、transpose、record、cast；
-- `reduce`、`scan`、`contract`；
-- gather、unique scatter、reduction scatter；
-- ragged descriptor 与 member relation；
-- logical buffer、mutable load/store；
-- atomic add/CAS 与明确 effect；
-- counter-based random；
-- scalar `if/for/while` 与 frontend-normalized break/continue；
-- kernel-local inline `@intent.fn`。
+Welford/Chan 的单遍方差可以写成：
 
-这些不是“为了某个 kernel 加的名字”，而是可组合的算法结构。
+- chunk 内用现有 `I.reduce.sum` 求 count、sum、局部 M2；
+- chunk 间用 `I.state_stream` 携带 `(count, mean, m2)`；
+- 合并公式用普通标量算术表达。
 
-### 4.2 后来加入、但需要正式定性的构造
+这和 online softmax 在 chunk 内求 max/sum、chunk 间显式更新 `(maximum, denominator)` 是同一结构。因此：
 
-| 构造 | 正确归属 | 当前判断 |
-|---|---|---|
-| `I.sigmoid` | 数学/数值语义 | 可以保留；它与 `exp`、`log` 同类，不是调度 hint |
-| `I.end(domain_or_region)` | 作者声明的 logical read/stream endpoint | 应保留，但必须在 DSL 文档正式定义，不应只靠 attention 示例暗示 |
-| `I.assume_in_bounds` | 作者给出的调用前置条件/合法性合同 | 可以保留，但应明确是 unsafe assertion，不是 compiler 推断结果，也不是性能 hint |
-| `I.arg_reduce.max` | 同时返回值与位置的算法原语 | 应保留；必须正式写明 single-axis、lowest-index tie、index dtype 与 identity 语义 |
-| `I.sparse_contract_2to4` | 稀疏数据格式 + 稀疏 contraction 语义 | 不能继续处于“无规范的专用 builtin”状态。要么把它正式定义为 generic sparse contraction 的首个 format，要么移到算法库层；不能把 TileLang/CUTLASS 的 target primitive 直接当 Core 理由 |
-| `I.fence` | 无共同 portable semantics | 不应继续作为公开可调用能力。当前它被导出但 frontend 永远报错，这是假的 public surface；应从公开入口移除，直到有明确跨目标合同 |
+> **“表达 Welford”本身不构成新增 generic combine 的理由。**
 
-### 4.3 新 DSL 构造的准入门槛
+### 4.2 真实 repro 暴露了另一件事
 
-以后默认 **不增加 DSL 构造**。只有同时满足下面条件才允许增加：
+我用 `M=64, N=257` 写了上述 state-stream Welford，并实际经过 Triton 路径编译和运行。结果：
 
-1. 某个真实算法必须表达这个语义；
-2. 正确答案依赖作者知道的算法信息，而不是机器或下层 compiler 信息；
-3. 现有 Core 不能自然组合表达，且不是换一种方便写法就能绕过；
-4. 能给出 target-independent 的语义、类型、effect 与错误条件；
-5. 有 canonical Kernel IR 节点或明确的 frontend normalization；
-6. Kernel IR verifier 能守住合同；
-7. 至少一个后端能机械投影，其他后端能在 emission 前明确 capability rejection；
-8. 文档与真实 repro 同步闭合。
+- 编译、JIT、运行均成功；
+- 输出均为有限值；
+- mean 最大误差约 `0.079155`；
+- variance 最大误差约 `0.586592`。
 
-“某个后端有一个好用 API”“某个 kernel 用它会快”“加一个 builtin 最省事”都不是准入理由。
+该 probe 故意使用非整除尾块。结构能编不等于 lowering 正确；当前最可疑的是 `I.full((column_region,), 1)` 形成的逻辑 count 在 physical tail 上没有按 reduction identity 正确 neutralize，但根因尚未完成定位。
 
----
+这项发现应登记为 **validity/padding correctness bug**，不能拿来否定 state-stream 的表达力，也不能用 generic combine 掩盖。
 
-## 五、按层定位当前缺陷
+### 4.3 下层真实 API 支持到哪里
 
-### 5.1 编程模型/DSL 问题：数量少，但必须先定合同
+Triton 3.6.0 当前 API：
 
-#### 复合 combiner 的文档与实现不一致
-
-`doc/dsl/tensor-flow.md` 展示了把自定义 `@intent.fn welford_combine` 传给 `I.reduce`；当前 frontend 的 `_callable_symbol` 只接受内建 `Intrinsic`，自定义 helper 会报错。这里不能模糊处理：
-
-- 若 Core 要支持自定义 monoid/record combiner，需要结构化 combiner region 的 Kernel IR 与 lowering；
-- 若暂时只支持固定 intrinsic，就应删除该文档承诺并明确 operator set。
-
-目前属于 **语言合同未闭合**，不是 emitter 缺 op spelling。
-
-#### `partition(count=...)` 是公开能力但 realizer 只接受 extent
-
-Frontend 与文档允许 `partition(count=P)`；`KernelFacts` 只接受 `intent.mode == "extent"` 且 extent 为 named auto 或固定值。它在前端成功、realization 才失败。
-
-`count` 会影响 wrapper-visible/算法可见分区数量，属于 source 决定，不应被静默改写成 extent。冻结前必须二选一：真正实现 count realization，或从公开合同删除。
-
-#### strided/dynamic domain 表面宽于 GPU realization
-
-Frontend 的 domain 接受 start/stop/step；GPU realization 实际主要闭合 unit-step、静态或特定 runtime sequential domain。任意 stride 目前不是普遍支持。应把 frontend 接受范围和 realizer 合同对齐，不能让后端边界承担基础语言诊断。
-
-#### `state_stream` 的 runtime extent 实际要求正编译期常量
-
-Frontend 能生成 runtime extent operand；`KernelFacts` 随后要求它来自正的 `intent.constant`。这不是 runtime extent。应实现真正动态 extent，或在 frontend/规范将它命名并限制为 fixed extent。
-
-#### logical buffer 的表面语义宽，实际 realization 窄
-
-规范把 `I.buffer` 描述为一般 kernel-local logical mutable object；当前 realizer 要求它是某一个 `parallel` owner 的直接 child，且访问需静态可界定或带前置条件。这个限制可以合理存在，但必须是语言能力边界，而不能伪装成一般 buffer 后在深层报错。
-
-### 5.2 Frontend → Kernel IR：不要丢作者已经写下的东西
-
-这一层应只做语法正规化与 canonical construction。典型故障定位规则：
-
-- source 已写 index expression，IR 丢掉 offset/div/mod → frontend bug；
-- source 写了 region stop，IR 只留下 bool → frontend/IR schema bug；
-- source 写了 alias/effect，IR ABI metadata 没保存 → frontend bug；
-- break/continue 被正规化成 carried state → 合法 frontend normalization，不需要 IR `break` op；
-- helper 被内联 → 合法 frontend normalization，但不能改变 helper 数值语义。
-
-这一层不应创建 physical tile、storage、program mapping 或 target capability。
-
-### 5.3 Canonical Kernel MLIR：当前最薄弱的承重边界
-
-当前 ODS 大量使用 `AnyType`，logical types 又把核心结构编码成字符串 `spec`。许多 rank、dtype、operand/result、attribute 兼容性靠后续 `KernelFacts` 手工检查。结果是 parser 接受的“canonical IR”范围比真正能 realization 的范围大。
-
-这不表示要再造一套 typed Python IR；正确修法是让 MLIR 自己更权威：
-
-- 将能静态表达的 operand/result/type constraint 下沉到 ODS/type；
-- op verifier 检查 attribute schema 与 SSA type/rank/dtype 一致性；
-- Kernel IR verifier 守 stable IDs、region schema、ABI、effects；
-- `KernelFacts` 只分析 provenance/legality，不补一遍 IR 类型系统。
-
-还有一个具体 ID 闭合问题：frontend builder 为 region block arguments 写入 `intent.region_argument_nodes`，Kernel IR verifier 也检查这些 ID；但 `analyzeKernel()` 的 `KernelModel.values/valueIDs` 只索引 ABI arguments 和 operation results，没有索引 block arguments。于是“所有 canonical values 都有稳定 ID”的合同在公共 KernelModel 中并未闭合，叶子只能直接重读 metadata。
-
-### 5.4 Derived analysis / Realizer：决定应组合，不应按 kernel 分类
-
-好的部分已经成立：当前 realizer 没有按 kernel symbol/name 分支，轴角色可组合，Range 也按 purpose 区分 ownership、traversal、reduction、lane 与 access。
-
-仍需收敛的部分：
-
-#### GPU program root 被限制为恰好一个顶层 parallel
-
-`programRoot()` 要求一个 GPU kernel 函数恰好含一个 outer `intent.parallel`；纯 sequential root、两个独立顶层 program region 都不在当前实现内。这个限制未必错误，但它必须成为正式 GPU capability，而不是被 DSL 的“完整单 kernel”表述掩盖。
-
-#### `axisFromLabel`/shape fallback 会制造第二份 provenance
-
-当精确 domain provenance 缺失时，通过相同 extent label 选择第一个 domain，或构造 implicit axis，会把“名字/shape 恰好相同”当作逻辑身份。正确方向是沿 SSA、region argument 与显式 index relation 保存唯一来源；缺失就诊断，不应猜。
-
-#### persistent 决定仍是固定结构启发式
-
-当前条件近似为：某 contraction 位于至少三个 parallel axes 下，其中至少两个 tiled，且没有 ragged，即把 program axes 折叠为 persistent traversal。它不是 kernel-name 特判，但仍是一个 whole-program 静态规则。两台机器尚未证明它必须成为搜索维；现阶段可保留为受控 policy，但必须单独登记，不能继续散落成“默认正确”的魔法条件。
-
-#### private buffer residency 仍有经验常数与 workspace 未决项
-
-buffer placement 读取寄存器容量，但容量预算使用固定除数；unstructured dynamic access 一律退到全局 private workspace。它保证可实现，不等于选对物理位置。这里属于 realizer policy，而不是 DSL 或 emitter。
-
-#### scan 当前只真正闭合 inclusive add
-
-Frontend 表面接受 `combine=`；Physical Plan/leaf 当前核心路径按 `scan_inclusive_add` 兑现。要么将 Core 明确限制为 inclusive add，要么让 Plan 保存并验证一般 associative combine。不能靠 frontend generic 参数制造假能力。
-
-#### SearchSpace 只保存参数名，没有合法候选关系
-
-`intent_plan.autotune` 当前只有 `key` 和 `parameters`。这能把具体值交给下层，但不能表达 realizer 推出的合法集合、参数耦合和资源上界。我们不应自建 cost model；但“哪些候选合法”若依赖算法结构，仍应有可传递的合同，而不是只给下层一个名字。
-
-### 5.5 Physical Plan → emitter：仍有几处假发射
-
-共享 `SurfacePlan` 已经统一了 Axis/Range、program folding、workspace offset、scan/stage 等大量投影；三个 leaf 也没有按 kernel 名字或整 kernel matcher 发射。这一方向正确。
-
-但以下事实仍被重新拼装：
-
-- 三个 leaf 都从 `parallel/state_stream` region 名字重新选择 `ownership/traversal` range，再用 `intent.region_argument_nodes` 配对 region argument；
-- row-vector tile 会从 logical domain dimension 与 `BlockExtent` 再推一次 physical extent；
-- `SurfacePlan::indexCanonicalStructure` 从 Kernel IR use-def 重建 ragged outer/member 与 stream stop/axis binding；
-- target leaf 的 `dimensionName` 会从 domain → dim → ABI view shape 恢复维度名字。
-
-其中 ABI shape 拼写本身是合法 leaf 工作；但 **已经属于物理决定的 range/axis/binding 不应靠 region 名字和 shape 再选一次**。Plan 应直接绑定“这个 region argument 消费哪个 range”“这个 emitted axis 的最终 physical extent 是什么”。修完后叶子只查 binding，不再重建。
-
-另外，TileLang `fp8_mqa_logits` 在能力检查阶段被接受，最终在下层 CUTLASS FP8 MMA assertion 失败。这说明 capability predicate 仍偏宽；应在 emitter 前明确拒绝该不能兑现的组合，而不是把下层 crash 记作支持。
-
-### 5.6 下层 target compiler：到这里就应停止向上加机制
-
-以下故障原则上属于下层：
-
-- 首次 JIT 编译超时；
-- layout inference 找不到合法布局；
-- 某候选 shared memory/register 超限但 tuner 能筛掉；
-- target runtime/module load 失败；
-- 某架构上的 CUTLASS/编译器 bug；
-- 同一合法搜索空间中不同 provider/device 选出不同赢家。
-
-处理方式是：改机械拼写、缩窄 capability，或交给下层升级。除非能证明 Plan 缺了一个依赖算法结构的决定，否则不能往共享层增加机制。
-
----
-
-## 六、冻结前必须解决的架构冲突
-
-### 6.1 分阶段 ragged contraction 违反 single-kernel invariant
-
-这是本次审计最重要的发现。
-
-Realizer 的 `contractionStages()` 会：
-
-- 找出具有 ragged axis 且最终到达 scatter terminal 的 contractions；
-- 沿 def-use 收集每一 stage 的 operation slice；
-- 在 Plan 中生成 `StageOp`、stage inputs/outputs、terminal 与 stage axes。
-
-三个 emitter 随后都会：
-
-- 生成 `kernel_stage_0`、`kernel_stage_1` 等多个目标 kernel；
-- 分配 stage workspace；
-- 在生成的 `launch()` 中逐 stage 发起独立 target launch。
-
-这与 `doc/dsl/model.md` 和 `doc/compiler/compiled-artifact.md` 的不变量直接冲突：compiler-private 多级实现不得暴露为额外 runtime dispatch。
-
-这条路径也不是单纯“目标语言内部实现”：每个 stage 都有独立 grid、autotune、workspace 与 launch，调用次数已经改变。
-
-**收敛决定：不放宽语言模型，分阶段 runtime orchestration 回到作者 wrapper。**
-
-因此冻结前应做到：
-
-- 一个 `@intent.kernel` 的 Plan 不再含会产生额外 dispatch 的 `StageOp`；
-- 需要分阶段的 MoE/grouped contraction 等算法写成多个 source kernels；
-- wrapper 明确分配跨 kernel workspace 并决定调用顺序；
-- Plan 可保留单次 dispatch 内的 stage/pipeline 概念，但不能复用当前“operation slice → 多 kernel launch”的语义。
-
-否则必须反过来正式改写整个语言定义为“一个 source kernel 对应一个 callable artifact，artifact 可含多次 dispatch”。这会改变作者/编译器的算法所有权，并与此前所有收敛原则冲突，本报告不建议这样做。
-
-### 6.2 公开 surface 必须与可实现合同对齐
-
-冻结不要求所有想象中的能力都实现，但要求不存在假能力。下列项必须逐一选择“实现”或“前端提前拒绝/从文档删除”：
-
-- custom reduce/scan/contract combiner；
-- `partition(count=...)`；
-- 非 unit-step domain；
-- 真正 runtime `state_stream` extent；
-- 一般 logical buffer placement/ownership；
-- 一般 scan combine；
-- public `I.fence`；
-- 2:4 sparse contraction 的 Core 定位。
-
-### 6.3 Kernel MLIR 必须成为真正的唯一语义边界
-
-冻结前至少需要闭合：
-
-- region block arguments 的 stable value ID 索引；
-- ODS/type/verifier 能表达的静态约束不再推迟到 target facts；
-- attribute schema 与 SSA type/rank/dtype 的一致性；
-- 不允许 extent label/shape fallback 猜 logical axis identity。
-
-否则“canonical”只是一种文本格式，而不是后端可以独立信任的算法合同。
-
-### 6.4 Plan 必须给 emitter 足够精确的 binding
-
-冻结前应消除这几种重建：
-
-- region argument → range purpose；
-- row-vector logical extent → final physical extent；
-- ragged/stream 的物理 binding；
-- 已选 program/range 事实在三个 leaf 中各拼一遍。
-
-不是把所有 Kernel IR 信息复制进 Plan；只把“多个合法物理方案中已经选了哪个”保存下来。纯算法结构仍从 Kernel IR 读，纯 spelling 仍留在 leaf。
-
----
-
-## 七、以后每类问题固定落在哪里
-
-| 观察到的现象 | 应先检查的层 | 正确处理 |
-|---|---|---|
-| 作者无法说出算法必需的语义 | DSL / programming model | 先证明现有 Core 不能组合表达，再提新构造；同步定义 IR/type/effect |
-| 作者已经写出 X，但 Kernel MLIR 没保存 | Frontend → Kernel IR | 修 lowering/schema，禁止后续重新推 X |
-| MLIR parser 接受，到了 facts 才发现基本 rank/type/schema 错 | Kernel IR verifier | 把能静态验证的合同下沉到 ODS/type/verifier |
-| IR 语义明确，但没有轴角色、range、validity、storage 决定 | Realizer / Physical Plan | 增加共享 per-op fact、legality proof 或 physical decision；不按 kernel 名分支 |
-| 三个后端各自从 shape/role 拼同一个物理事实 | Plan → emitter boundary | 在 Plan 建唯一 binding，删除三份重建 |
-| Plan 已经明确，但某 surface 没有对应表达 | Target capability / leaf | 明确 unsupported，给源码位置；不能加慢几个数量级的伪支持 |
-| 目标源码结构异常庞大、原语选错 | Target leaf spelling | 换机械等价的目标原语，不改 Kernel IR/Plan |
-| 目标源码合理但 JIT timeout/layout/资源候选失败 | 下层 compiler/tuner | 交给下层、缩窄 capability 或候选；没有算法证据就不上移机制 |
-| 同一 source 需要多次 kernel launch | Python wrapper / 多个 source kernels | 作者明确编排；不能由 single-kernel realizer 自动拆分 |
-| 某 provider 快很多 | 先并排读生成源码与 capability | 判断 spelling、Plan 欠定或真实后端边界；不能直接归因下层质量 |
-
-这张表就是后续收尾的定位规则。以后不再用“这个 kernel 特殊”作为入口，也不再因为 emitter 某段很长就机械上移；只看该事实属于算法、已选物理决定、目标拼写还是下层实现。
-
----
-
-## 八、当前证据能证明什么，不能证明什么
-
-当前两份 baseline 各有 113 个 kernel/case、339 个 provider cells；其中 100 个 case 在 Triton、cuTile、TileLang 三个 provider 上都通过。语料已经覆盖：
-
-- pointwise、broadcast、reshape、transpose；
-- 多种 reduction、scan、compaction；
-- GEMM、batched/grouped/dual/quantized/sparse contraction；
-- dense/varlen/paged/MLA/块稀疏 attention；
-- ragged、indirect、atomic、scatter；
-- logical buffer、动态规划、排序、控制流；
-- convolution、状态空间与反向；
-- 大量等价表达与分解变体。
-
-这足以证明：当前架构不是 softmax/rowwise 的一次特化，也没有按 kernel name 建十几条后端。
-
-但它不能证明：
-
-- 所有公开 DSL 组合都闭合；
-- 任意 shape、stride、空域与 runtime extent 都正确；
-- Kernel IR verifier 已经完整；
-- 三个 leaf 完全不重建物理事实；
-- 每个 pass 都严格遵守 single-dispatch；
-- `unsupported`、`compile_timeout`、`failed` 都处于正确边界。
-
-现有 H100 表中仍有 14 个 unsupported、2 个 compile timeout 和 1 个 failed cell；这些大多是 target/downstream capability 边界，但 `fp8_mqa_logits` 的 failed 也说明 capability 检查还没有完全挡住下层不能兑现的组合。
-
-因此，覆盖广度是架构成立的证据，不是冻结语义合同的替代品。
-
----
-
-## 九、最终应冻结成什么样
-
-### 编程模型
-
-一门面向 **结构化逻辑区域单-kernel 算法** 的 Python eDSL。作者拥有算法、ABI、状态、effects、逻辑索引、partition 是否存在以及多 kernel 编排；机器相关的 tile 值、program mapping、validity 兑现和 storage placement 被抽掉。
-
-### 编译器
-
-一个 realization compiler：
-
-```text
-作者算法
-  → canonical Kernel MLIR
-  → 可重算的 facts
-  → 一次、共享的 Physical Plan
-  → 三个只做 capability + projection + spelling 的 GPU surface
-  → 下层 compiler
+```python
+tl.reduce(input, axis, combine_fn, keep_dims=False)
+tl.associative_scan(input, axis, combine_fn, reverse=False)
 ```
 
-### 只有三份承重表示
+`input` 可以是 tuple，`combine_fn` 是 `@triton.jit` 函数。官方接口见 [Triton reduce](https://triton-lang.org/main/python-api/generated/triton.language.reduce.html)。
 
-1. Source/Kernel IR：算法真理；
-2. Physical Plan：已选机器 realization；
-3. Target source：机械投影产物，不再是需要独立验证的 IR。
+cuTile Python 1.5.0 当前 API：
 
-KernelFacts、SurfacePlan index、target bindings 都只是派生索引，不拥有独立语义。
+```python
+ct.reduce(x, axis, func, identity, keepdims=False)
+ct.scan(x, axis, func, identity, reverse=False)
+```
 
-### 冻结后的变化规则
+`x` 可以是 tuple，`func` 接收两组 0D tiles 并返回同结构结果。官方接口见 [cuTile reduce](https://docs.nvidia.com/cuda/cutile-python/generated/cuda.tile.reduce.html)。
 
-- 新 kernel 优先只增加 DSL source；
-- 真有新算法语义才增加 Core op；
-- 新 target 只增加 capability、op mapping、API/runtime glue；
-- shared realizer 只增加可组合 fact/legality/decision，不增加 kernel 分类入口；
-- emitter 不再从 shape、角色名或周围结构重建 Plan 已选事实；
-- 下层已经做好的事不上移；
-- 一个 source kernel 永远不被拆成额外 runtime dispatch。
+TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs/bitwise 等，没有等价的任意 Python combine 参数。TileLang/TVM 的更低层有 `comm_reducer`，但它是否能在当前 eager/prim-func emission 路径中机械闭合尚未验证；不能先写成“TileLang 已支持”。其当前高层接口见 [TileLang reduce](https://www.tilelang.com/autoapi/tilelang/language/reduce_op/index.html)。
+
+### 4.4 generic combine 是真实能力缺口，但不是算法表达力堵点
+
+准确分类是：
+
+- Welford 等算法可以用现有 state-stream 表达，所以不是“没有 combine 就写不出算法”；
+- 但作者若选择 **一个结构化 reduction/scan，并授权下层自行选择归约树**，当前 canonical IR 只能传固定字符串，无法携带作者写的 closure；
+- Triton/cuTile 已原生支持这条委托，Intent 当前把它焊死在固定 add/max/or/and；
+- 因此它是 structured primitive 完整性与薄投影能力的缺口。
+
+### 4.5 正确设计不是“把函数名字符串放开”
+
+`combine_fn` 应成为 Kernel IR 中的 typed region，而不是 opaque Python callable 或字符串：
+
+- region 参数是两组 accumulator scalar/record values；
+- region 结果与 accumulator schema 完全相同；
+- identity 按每个 component 显式给出；
+- region 必须 pure，不允许 load/store/atomic/RNG state 等 effects；
+- runtime capture 必须成为显式 operand；只允许 constexpr 直接捕获；
+- `reduce` 的语义本身表示作者接受合法的 reassociation/tree；compiler 不证明数学结合律，但作者选择该 op 就承担这项合同；
+- 需要严格顺序时使用 `ordered/state_stream`；
+- source location 和 helper-inline 后的 region body必须保留。
+
+这仍是算法 IR，不是图调度。Emitter 对 Triton/cuTile 只需把 region 机械转成 jitted function/lambda，并把 tuple state 对齐；reduction tree 继续交给下层。
+
+工程量也不能说成“只改一个属性”：它涉及 region schema、tuple/record arity、identity、purity/effect verification、helper/capture lowering、三个 surface 的 nested function emission 与 unsupported capability。但它是边界清楚的纵向闭环，不需要自建 reduction scheduler。
+
+### 4.6 reduce、scan、contract 不能混成一个问题
+
+- `reduce`：Triton/cuTile 原生 generic combine，应该支持 typed closure。
+- `scan`：Triton/cuTile 同样有 generic associative scan，应该与 reduce 共用 closure contract，但保留 prefix/reverse 语义。
+- `contract`：`tl.dot`、`ct.mma`、TileLang GEMM 并不接受任意 semiring closure。任意 multiply/combine 会失去现成矩阵原语，不能因 reduce 支持 lambda 就一起放开。现阶段 contract 应明确支持的 semiring/dtype capability，或回到显式 pointwise + reduce source。
+
+### 4.7 对 arg-reduce 的影响
+
+`I.arg_reduce.max` 当前固定 lowest-index tie 与 i32 index。它解决了真实需求，但从编程模型看，它可以由 tuple-valued generic reduce 表达：输入 `(value, index)`，closure 写 maximum 与 tie-break。
+
+因此它更适合作为：
+
+- 方便作者使用的 library/frontend sugar；
+- lower 到通用 typed reduce region；
+
+而不是永久增加一个独立 canonical reduction 家族。generic combine 闭合前可以保留现有 node，但应把它视为过渡特化。
+
+---
+
+## 五、逐项重审上一版列出的“DSL 问题”
+
+### 5.1 `partition(count=P)`：可移植的 source 语义，但当前没有真实使用
+
+`count=P` 与 `extent=T` 不是同义词。固定 part 数会影响 part identity、partial buffer 与算法可见分片，属于作者决定；GPU、RVV、CPU 都能实现。
+
+但当前 113 个 case 没有一个使用 `count=`，现有 split-K 也用 extent partition。它不是当前算法阻塞项。
+
+结论：
+
+- 不应静默改写成 extent；
+- 可以保留为待闭合的 Core 语义；
+- 在实现 realizer 前，frontend 应明确报“当前 target 不支持 count partition”，不能生成 IR 后在深层失败；
+- 优先级低于 correctness 与公共 IR 合同。
+
+### 5.2 非 unit-step domain：大多是可删除的 convenience
+
+真实算法可以用 dense logical domain 加显式 affine/quasi-affine index 表达 stride：
+
+```text
+i in [0, count)
+address = start + i * step
+```
+
+这样 logical iteration identity 更清楚，range/provenance 也不必同时承载方向与 stride。当前语料没有非 unit-step domain。
+
+结论：
+
+- 保留 runtime unit-step dense domain；
+- 非 unit-step domain 先在 frontend 明确拒绝；
+- 不把“完整 Python range”当语言完整性的指标；
+- 真有算法证明 explicit index 不够时再重开，而不是现在扩 realizer。
+
+### 5.3 `state_stream` runtime extent：当前不需要
+
+现有 attention/ragged kernel 需要的是 runtime logical stop，已经由 `I.end(...)` 表达；stream chunk extent 使用 fixed 或 `I.auto`。没有 case 需要一个运行时值直接决定 physical chunk width。
+
+RVV 的动态 `vl` 也可以是 target 对 `auto` 的 realization，不需要 source runtime extent。
+
+结论：
+
+- 将 source contract 限制为 fixed extent 或 `auto`；
+- runtime endpoint 与 extent 分开；
+- 删除“runtime extent”假能力，除非未来真实算法证明 chunk size 是 source-visible 值。
+
+### 5.4 Logical buffer：Core 正确，当前只是 GPU capability 子集
+
+`I.buffer` 表达 kernel-local mutable logical object，不指定 register/shared/global/stack。这个抽象对 GPU、RVV、CPU 都成立，应保留。
+
+当前 GPU realizer 只支持一个 parallel owner 的直接 child，并把难以结构化的动态访问 spill 到 global private workspace。这是当前 target realization 的能力边界，不是 logical buffer 的完整语义。
+
+结论：
+
+- 不把“direct child of parallel”写成整个语言永久规则；
+- shared analysis 负责 lexical lifetime、owner/effect 合法性；
+- GPU/RVV/CPU realizer分别声明能兑现的 residency/共享范围；
+- 跨 parallel owner 的共享若没有 barrier/atomic/order 合同，应明确拒绝。
+
+### 5.5 `I.end`：真正的 Core 语义
+
+`I.end(domain_or_region)` 表示逻辑区域的 exclusive endpoint，被 causal、varlen、paged、ragged stream 实际使用。它不是 physical tile end，普通 shape arithmetic 也不能替代 ragged member endpoint。
+
+结论：保留，并正式定义 domain/region、empty region、exclusive endpoint 与 stop 的语义。
+
+### 5.6 `I.assume_in_bounds`：真正的调用前置条件
+
+间接索引、routing、embedding、paged cache 中，compiler 无法一般证明数据读出的 index 范围。作者必须能声明前置条件。
+
+结论：保留，但明确：
+
+- 违反时是调用方错误/undefined behavior；
+- 它不是 compiler 自动推导结果，也不是性能 hint；
+- verifier 只验证声明的类型、view、axis 与支配关系；
+- target 可以用它消除 mask，也可以只用作 legality proof。
+
+### 5.7 `I.arg_reduce.max`：真实需求，canonical 形态可在 combine 闭合后收敛
+
+Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。需求是真实的；专门 canonical op 未必永久必要。处理见 4.7。
+
+### 5.8 `I.sparse_contract_2to4`：需要 semantic anchor，但当前 API 形状过专
+
+2:4 compressed values、metadata interpretation 与 dense RHS 是真实数据格式语义，不能假装成普通 dense contract；有 native primitive 的 target 也需要一个 semantic anchor 才能利用。
+
+但 `sparse_contract_2to4` 直接作为 Core 名字把一个 format 焊进 API，不利于以后 RVV/CPU fallback 与其他 sparse formats。
+
+结论：
+
+- 保留 sparse contraction 的 canonical 概念；
+- format、compressed axis、metadata schema 显式化；
+- 2:4 是第一个 format descriptor，而不是一个永久独立算子家族；
+- GPU target 可用 native sparse MMA，RVV/CPU 可解压+dot 或明确 capability；
+- surface 无原语时提前 unsupported，不能慢路径冒充高性能支持。
+
+### 5.9 `I.fence`：当前 public API 应删除
+
+当前 `I.fence` 被导出，但 frontend 无条件报错；它没有 scope、ordering、参与者或 barrier 语义。这不是“暂时 backend 不支持”，而是 source operation 本身没有定义。
+
+未来 RVV/CPU 确实可能需要 memory fence，但应从真实算法重新设计：
+
+- memory fence 与 execution barrier 分开；
+- ordering、scope、participation 明确；
+- 与 atomic/effect model 一致。
+
+在那之前，删除当前 public `I.fence` 比保留一个假入口更干净。
+
+---
+
+## 六、Kernel IR：上一版“全面强类型化”的判断过重
+
+### 6.1 `AnyType` 本身不是 correctness bug
+
+Intent op 同时处理 scalar、tensor、record、logical domain 等多态值，ODS 使用 `AnyType` 可以是合理选择。当前 Kernel verifier、`KernelFacts` 与 GPU analysis 已经检查大量 rank、dtype、shape、region schema 和 provenance。
+
+不需要为了形式好看把所有 ODS 重写成庞大的类型层级，也不能把 padding proof、index range、axis provenance 塞进 ODS。
+
+### 6.2 真问题一：SSA type 与 shadow metadata 可以分叉
+
+当前 `intent.result_types`、ABI metadata 的 `type/shape` 与真实 MLIR SSA type 没有集中一致性验证。后续 analysis 有时读 metadata，emitter 又读实际 `ViewType`。错误或外部构造的 MLIR 可以让两份事实不一致。
+
+最小修法：
+
+- verifier 比对 function argument metadata 与真实 parameter type；
+- 比对 `intent.result_types/result_shapes` 与真实 SSA result；
+- 检查 access mode、rank、element dtype 与必要 attrs；
+- 冗余且无人消费的 metadata 直接删除，不再维护影子真理。
+
+### 6.3 真问题二：block argument stable ID 没进入公共 KernelModel
+
+Frontend 为 region block arguments 生成 `intent.region_argument_nodes`，verifier 也检查其唯一性；但 `analyzeKernel()` 只把 ABI arguments 和 operation results 放入 `KernelModel.values/valueIDs`。
+
+三个 emitter 因而绕过公共模型，自己解析 `region_argument_nodes`。
+
+最小修法：
+
+- `analyzeKernel()` 统一索引 block arguments；
+- 验证 ID 数量、顺序、实际 type；
+- 所有 consumer 使用 `getValueID()`；
+- 删除三个 leaf 对 metadata 的重复解析。
+
+这是明确、有限的公共合同修复，也直接帮助未来 RVV consumer。
+
+### 6.4 字符串 logical spec 不必全删
+
+symbolic extent、relation name 等本来就是符号内容，字符串可以合理存在。需要的是规范格式与 producer/type metadata 一致性，不是再造一套 Python typed IR 或复杂字符串类型系统。
+
+---
+
+## 七、Plan 与 emitter：逐项区分“合法读取”和“假发射”
+
+### 7.1 Region argument → selected range：Plan 确实少一个 binding
+
+三个 leaf 都从 Kernel IR region 名字重新决定：
+
+- `parallel` argument 使用 ownership range；
+- `state_stream` argument 使用 traversal range。
+
+Region argument 身份属于 Kernel IR；但“这个 argument 消费哪个已经选定的 range”是 physical binding。
+
+结论：Plan 应显式绑定 stable region-argument ID → axis/range。Leaf 只读取，不再按 op 名选择。
+
+### 7.2 Row-vector physical extent：决定已经有一半，最终 binding 仍缺
+
+Realizer 已创建 `BlockExtentOp(rounding=power_of_two, fill=...)`，但 leaf 又从 domain → ABI dimension → BlockExtent 查找最终 physical extent。
+
+结论：
+
+- ABI symbol 怎样拼成 Python/C 表达式，仍是 leaf 工作；
+- axis/range 绑定哪个 logical/block extent，应在 Plan 明确；
+- Triton `next_power_of_2`、RVV `vl` 等 target spelling 留在各自 leaf。
+
+### 7.3 Ragged/stream use-def：主要是共享 semantic analysis，不应全复制进 Plan
+
+Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；把它们全复制进 Plan 会形成第二份算法真理。
+
+正确拆分：
+
+- shared analysis 一次建立 canonical ragged/stream binding；
+- Plan 只保存 relation/stream → selected physical axis/range 的选择；
+- leaf 消费 shared semantic binding + Plan physical binding。
+
+### 7.4 `dimensionName`：一半合法，一半危险
+
+- 把 ABI dynamic shape 变成目标语言中的参数表达式，是合法 leaf spelling；
+- 用相同 shape label/extent 反猜 logical axis identity，是 provenance bug。
+
+当前 `axisFromLabel` 找不到精确 provenance 时会选择第一个同 extent domain，甚至构造 implicit axis。这个 fallback 应删除：沿 SSA、region argument、index relation无法唯一解析时直接诊断。
+
+### 7.5 persistent heuristic：是 GPU policy，不是 emitter 假发射
+
+当前 persistent bool 由 contraction/parallel/tiled/ragged 结构规则选择，并已写进 `ProgramOp`。Leaf 没有重新决定。
+
+问题只在于：这条规则是否对不同 GPU 都好。现有跨设备证据还没有证明它必须进入 search space。
+
+结论：
+
+- 保留为 GPU realizer policy；
+- 不推广到 RVV/CPU；
+- 出现一条规则无法兼顾设备的实测证据时，再把这一维变成候选；
+- 不提前建搜索框架。
+
+### 7.6 SearchSpace 只有参数名：目前不是已证实 bug
+
+当前 Plan 只告诉下层“哪些参数可调”，具体候选值、排序和 winner 由 provider tuner 决定。这符合我们不复制下层知识的原则。
+
+只有当某个合法性约束依赖 Intent 独有算法结构，而下层无法自行筛掉时，Plan 才必须增加参数域/耦合/资源上界。
+
+结论：不因为 schema 看起来薄就补 candidate list。先保留 names-only delegation；用真实失败决定是否增加约束。
+
+---
+
+## 八、当前 StageOp：允许多 machine stages，但 execution contract 未闭合
+
+### 8.1 当前真实行为
+
+`contractionStages()` 会找到带 ragged member、最终到达 scatter 的 contractions，沿 def-use 收集 operation slice，并在 Plan 里记录 inputs、outputs、operations、terminals。
+
+三个 emitter 都会生成多个私有 target kernels，在同一个生成 wrapper 中按顺序 launch；intermediate workspace 由 wrapper 私下分配，调用方仍只看见一个 callable。
+
+### 8.2 它为什么可以属于 physical realization
+
+该拆分：
+
+- 没改变 source ABI；
+- 没增加用户可见 output；
+- 没改变 contraction/scatter 的 logical dataflow；
+- 只 materialize compiler-private intermediate；
+- 对 CPU/RVV 可以变成一个 function 内的多个 loop/microkernel stages。
+
+因此，多 launch 本身不应被禁止。
+
+### 8.3 真正缺少的合同
+
+当前 StageOp 没完整表达：
+
+- stage dependency/拓扑顺序；
+- intermediate buffer lifetime 与读写 owner；
+- memory visibility/synchronization；
+- 是否允许 fuse；
+- target 是否可以选择不同 stage grouping。
+
+GPU 路径目前依赖同一 CUDA stream 的隐含顺序；cuTile 显式取得当前 stream，Triton/TileLang 也依赖当前 stream launch order。这使当前路径能工作，却不是可移植 Plan 语义。
+
+结论：
+
+- 将 single-kernel invariant 改写成 single logical callable；
+- Plan 的 execution stage 必须显式可验证；
+- stage grouping 是 target realization，不能按 kernel 名；
+- wrapper-visible 多 kernel orchestration仍由作者负责；
+- compiler-private stage 只允许在同一 callable 内、对 ABI/effects 不可见。
+
+---
+
+## 九、未来 RISC-V/RVV 后端对当前架构的约束
+
+### 9.1 Kernel IR 必须保持 target-independent
+
+RVV backend 应直接消费同一份：
+
+- logical axes/regions；
+- typed values、index relation、alias/effects；
+- parallel/ordered/state_stream；
+- reduce/scan/contract；
+- ragged、logical buffer、validity；
+- generic combine region；
+- source ABI 与 logical callable contract。
+
+不能让 GPU `program_id`、three-dimensional grid、shared fragment、TileLang buffer scope 进入 Kernel IR。
+
+### 9.2 RVV realizer 做什么
+
+它应选择：
+
+- 哪些 logical axes 由外层 runtime/worker 拥有；
+- 哪些 axis strip-mine 为 VLA loop；
+- vector width/VL policy、LMUL、unroll；
+- reduction/scan 的 vector hierarchy；
+- contraction 是 RVV FMA、dot/microkernel 还是专用矩阵扩展；
+- logical buffer 落 vector register、stack/local scratch；
+- tail policy、mask 与 scalar fallback；
+- target-local search/candidate。
+
+这些是 RVV Physical Plan，不是 GPU Plan 的另一种 spelling。
+
+### 9.3 RVV emitter 同样不能成为第二个编译器
+
+Emitter 只消费 typed decisions：
+
+- 不能看 kernel 名选择实现；
+- 不能按 op 数量、邻近模式、whole-region shape 猜 VLA/IME；
+- 不能重新决定 LMUL、microtile、residency；
+- 没有 target decision 就明确 unsupported。
+
+### 9.4 generic combine 在 RVV 上仍然成立
+
+Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector tree 或 scratch hierarchy，并把 closure body内联到选定结构。它不是 GPU lambda 特例。
+
+但 RVV 是否能高效 vectorize某个 closure是 target capability；不能因为 Triton/cuTile 能委托就宣称 RVV 自动高效支持。
+
+---
+
+## 十、冻结前的问题登记表
+
+下面只登记已经有具体证据的问题，不把“可能更漂亮”列成任务。
+
+### A. Correctness 与唯一语义合同
+
+| 问题 | 责任层 | 已有证据 | 闭合标准 |
+|---|---|---|---|
+| Welford/state-stream 在非整除尾块数值错误 | GPU validity/padding realization | `N=257` 真实 repro，mean/variance 显著误差 | 定位具体 value validity 丢失点；同一 source 尾块数值正确，不加 Welford 特判 |
+| SSA type 与 ABI/result metadata 可分叉 | Kernel IR verifier | verifier 只检查 metadata 形状/非空，analysis/emitter 读取不同来源 | canonical boundary 统一验证或删除冗余 metadata |
+| Region block argument ID 不进入 KernelModel | Common Kernel analysis | builder/verifier有 ID，三个 leaf 重读 metadata | 所有 block argument 可由 `getValueID()` 查询，leaf 删除重复解析 |
+| extent-label/implicit axis fallback | Shared semantic analysis | `axisFromLabel` 可按同 extent 猜第一个 domain | provenance 只能来自 SSA/region/index relation；不唯一即诊断 |
+
+### B. Physical Plan 与 emission 边界
+
+| 问题 | 责任层 | 闭合标准 |
+|---|---|---|
+| Region argument 未直接绑定 selected range | Physical Plan | Plan 保存 argument→axis/range；三个 leaf 不再按 region 名重选 |
+| Row-vector final extent binding不完整 | Physical Plan | Plan 明确 axis/range→logical/block extent；leaf 只拼 target syntax |
+| Ragged/stream binding在 SurfacePlan 重建 | Common semantic index + Plan | 算法 use-def共享分析一次；Plan只保存 selected physical relation |
+| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | dependency、workspace lifetime、visibility可验证；GPU/RVV均有明确投影 |
+
+### C. 语言表面收敛
+
+| 项目 | 决定 |
+|---|---|
+| generic reduce/scan combine | 应进入 typed Kernel IR region；Triton/cuTile机械委托，TileLang按真实能力支持或拒绝，RVV由target realizer兑现 |
+| arbitrary contract multiply/combine | 不随 reduce 一起放开；按目标矩阵原语 capability定义 |
+| `arg_reduce.max` | 真实需求；generic combine闭合后收敛为 sugar/通用 tuple reduction |
+| `partition(count)` | 语义合理但当前未使用；实现前 target-aware 提前拒绝，不列 correctness blocker |
+| 非 unit-step domain | 当前拒绝；使用 dense domain + 显式 index relation |
+| runtime `state_stream` extent | 当前移除假能力；保留 fixed/auto extent + runtime stop |
+| logical buffer | 保留 portable Core；owner-private 是当前 GPU capability，不是永久语言定义 |
+| `end` | 保留并补正式语义 |
+| `assume_in_bounds` | 保留为 unsafe source precondition |
+| sparse 2:4 | 收敛为 sparse contract + format descriptor，而非继续扩专用算子名字 |
+| `fence` | 删除当前无语义 public API；未来从真实 memory model需求重新设计 |
+
+### D. 不是当前任务的问题
+
+以下事项没有证据要求现在修改：
+
+- 全面删除 ODS `AnyType`；
+- 强制一个 logical callable 只有一次机器 launch；
+- 为 search space 自建候选值/排序/cost model；
+- 为所有 target 统一 GPU `ProgramOp/worker_axis`；
+- 为了让 TileLang 跟上，把其显式 buffer/layout 字段抬进 Kernel IR；
+- 没有真实需求时实现一般 strided domain 或 runtime stream tile。
+
+---
+
+## 十一、以后遇到问题的固定提问顺序
+
+### 第一步：作者是否已经写下了
+
+- 写下了但丢失：修 frontend/Kernel IR/provenance；
+- 没写且属于算法：考虑 DSL/Core；
+- 没写且属于机器：进入 target realizer。
+
+### 第二步：下层是否已经原生支持
+
+- Triton/cuTile generic reduce/scan：传 typed closure，不自建树；
+- TileLang 固定 reduction：能力检查或显式 target realization；
+- RVV intrinsic/microkernel：使用其现成 primitive，不复制 instruction selection。
+
+### 第三步：这是算法语义、派生事实、已选决定还是 spelling
+
+| 性质 | 唯一归属 |
+|---|---|
+| 算法语义、closure、logical index/effect | Kernel IR |
+| 可从 Kernel IR 重算的 provenance/use-def | Shared facts |
+| 多个合法物理方案中选了哪个 | Target-family Physical Plan |
+| 目标 API 与语法 | Leaf/emitter |
+| layout/register/instruction/tuner winner | 下层 compiler |
+
+### 第四步：跨 target 后是否仍成立
+
+若一个“Core”字段只能用 GPU program/warp/shared memory解释，它大概率放错层；若一个 physical decision 在 GPU 与 RVV 应不同，它应在 target realizer 分叉，而不是 source 分叉。
+
+---
 
 ## 最终判断
 
-架构思想已经收敛：**Intent 不是 tile 语言本身，而是位于算法 source 与 tile 语言之间、负责逻辑区域到机器 realization 的单-kernel 编译器。** 当前代码的大部分也已经符合这一形状。
+Intent 的稳定核心不是“跨三种 GPU tile 语言”，而是：
 
-真正还挡着“之后不要再乱动”的，不是缺更多 kernel，而是四个边界要闭合：single-dispatch、公开 DSL 合同、canonical Kernel MLIR、Plan-to-leaf 唯一 binding。把这四处处理完，编程模型就可以冻结；之后的问题都能按本报告第七节落到明确层次，而不再通过扩 DSL、加 kernel 分支或让某个后端长成第二个编译器来解决。
+> **用一份 target-independent 的结构化逻辑区域算法，驱动多个算子级 target realizer；每个 realizer产生自己的 Physical Plan，surface/emitter只投影，下层 compiler继续完成其擅长的布局、指令与调优。**
+
+当前 GPU 主线已经证明这不是 rowwise/softmax 特化，但还不能立即冻结。需要先处理登记表中的四类具体问题：tail correctness、Kernel IR 唯一合同、Plan binding、stage execution contract；同时把 generic reduce/scan closure 和几个假 public capability定下来。
+
+完成这些之后，后续新增 GPU provider 或 RISC-V/RVV backend 都不应再改编程模型：只新增 target-family realizer、Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core表达时才允许进入。
