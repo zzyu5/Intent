@@ -2211,14 +2211,19 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       return operation.emitOpError(
           "has unsupported staged matrix operand types");
     std::string reduction = stageReductionDimensions.lookup(stage);
+    std::string memberTile = stageMemberTiles.lookup(stage);
+    std::string featureTile = stageFeatureTiles.lookup(stage);
+    std::string reductionTile = stageReductionTiles.lookup(stage);
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0, dtype=" +
+    line(result + " = ct.full((" + memberTile + ", " + featureTile +
+         "), 0, dtype=" +
          accumulatorDtype + ")");
-    line("for k_tile in range(ct.cdiv(" + reduction + ", TILE_SIZE_K)):");
+    line("for k_tile in range(ct.cdiv(" + reduction + ", " + reductionTile +
+         ")):");
     ++indentation;
     line("offs_reduction = " + addressIndex("k_tile") +
-         " * TILE_SIZE_K + " +
-         addressIndex("ct.arange(TILE_SIZE_K, dtype=ct.int32)"));
+         " * " + reductionTile + " + " +
+         addressIndex("ct.arange(" + reductionTile + ", dtype=ct.int32)"));
 
     std::string lhs;
     if (lhsAccess) {
@@ -2261,9 +2266,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     line(rhs + " = ct.load(" + (*rhsView)->argument->name +
          ", index=(" + addressIndex("expert") + ", " +
          addressIndex("k_tile") + ", " + addressIndex("bid_feature") +
-         "), shape=(1, TILE_SIZE_K, "
-         "TILE_SIZE_N), padding_mode=ct.PaddingMode.ZERO).reshape((TILE_SIZE_K, "
-         "TILE_SIZE_N))");
+         "), shape=(1, " + reductionTile + ", " + featureTile +
+         "), padding_mode=ct.PaddingMode.ZERO).reshape((" + reductionTile +
+         ", " + featureTile + "))");
     if (promoteToF32 && !lhsElement.isF32())
       line(lhs + " = " + lhs + ".astype(ct.tfloat32)");
     if (promoteToF32 && !rhsElement.isF32())
@@ -2591,7 +2596,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     }
     return success();
   }
-  if (!valueIndex || failed(relation) || relation->size() != 2 ||
+  if (!valueIndex || activeStages.size() != 1 || failed(relation) ||
+      relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||
       !(*relation)[0].operands.front() ||
@@ -2603,7 +2609,7 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
   if (failed(rows))
     return failure();
   line("atomic_rows = ct.where(member_mask, " + rows->str() + ", " +
-       (*view)->argument->name + ".shape[0])");
+       stageMemberDimensions.lookup(activeStages.front()) + ")");
   line("ct.atomic_add(" + (*view)->argument->name +
        ", (" + addressIndex("atomic_rows[:, None]") + ", " +
        addressIndex("offs_feature[None, :]") + "), " + stored->str() +

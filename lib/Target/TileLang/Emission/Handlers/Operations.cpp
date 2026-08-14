@@ -2561,8 +2561,15 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     FailureOr<std::string> allocated = resultStorage();
     if (failed(indices) || failed(valid) || failed(fill) || failed(allocated))
       return failure();
+    if (activeStages.empty())
+      return operation.emitOpError("has no active staged member tile");
+    std::string memberTile = stageMemberTiles.lookup(activeStages.front());
+    for (unsigned stage : llvm::drop_begin(activeStages))
+      if (stageMemberTiles.lookup(stage) != memberTile)
+        return operation.emitOpError(
+            "is shared by stages with inconsistent member tiles");
     std::string result = *allocated;
-    line("for gather_i in T.Parallel(TILE_SIZE_M):");
+    line("for gather_i in T.Parallel(" + memberTile + "):");
     ++indentation;
     line(result + "[gather_i] = T.if_then_else(member_start + gather_i < "
          "route_end and " + *valid + ", " +
@@ -2735,10 +2742,15 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
         stageRaggedRuntime.lookup(stage) != runtime->second)
       return operation.emitOpError(
           "is shared by stages with inconsistent ragged ownership");
+  std::string memberTile = stageMemberTiles.lookup(activeStages.front());
+  for (unsigned stage : llvm::drop_begin(activeStages))
+    if (stageMemberTiles.lookup(stage) != memberTile)
+      return operation.emitOpError(
+          "is shared by stages with inconsistent member tiles");
   FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
   if (failed(result))
     return failure();
-  line("for member_i in T.Parallel(TILE_SIZE_M):");
+  line("for member_i in T.Parallel(" + memberTile + "):");
   ++indentation;
   std::string member = ragged.indices
                            ? ragged.indices->argument->name +
@@ -3045,6 +3057,9 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       return operation.emitOpError(
           "has unsupported staged matrix operand types");
     std::string reduction = stageReductionDimensions.lookup(stage);
+    std::string memberTile = stageMemberTiles.lookup(stage);
+    std::string featureTile = stageFeatureTiles.lookup(stage);
+    std::string reductionTile = stageReductionTiles.lookup(stage);
     std::string matrixDtype =
         promoteToF32 ? "T.float32" : dtypeName(lhsElement, operation);
     if (matrixDtype.empty())
@@ -3052,15 +3067,16 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     std::string lhs = makeResultName(operation, 0) + "_lhs";
     std::string rhs = makeResultName(*rhsLoad, 0) + "_shared";
     std::string result = makeResultName(operation, 0);
-    line(lhs + " = T.alloc_shared((TILE_SIZE_M, TILE_SIZE_K), " +
-         matrixDtype + ")");
-    line(rhs + " = T.alloc_shared((TILE_SIZE_K, TILE_SIZE_N), " +
-         matrixDtype + ")");
+    line(lhs + " = T.alloc_shared((" + memberTile + ", " + reductionTile +
+         "), " + matrixDtype + ")");
+    line(rhs + " = T.alloc_shared((" + reductionTile + ", " + featureTile +
+         "), " + matrixDtype + ")");
     line(result +
-         " = T.alloc_fragment((TILE_SIZE_M, TILE_SIZE_N), T.float32)");
+         " = T.alloc_fragment((" + memberTile + ", " + featureTile +
+         "), T.float32)");
     line("T.clear(" + result + ")");
     line("for k_tile in T.Pipelined(T.ceildiv(" + reduction +
-         ", TILE_SIZE_K), num_stages=num_stages):");
+         ", " + reductionTile + "), num_stages=num_stages):");
     ++indentation;
     if (lhsAccess) {
       if (lhsAccess->getName().getStringRef() != "intent.gather")
@@ -3089,18 +3105,21 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       if (contiguous) {
         line("T.copy(" + (*lhsView)->argument->name +
              "[" + addressIndex("member_start") + " : " +
-             addressIndex("member_start") + " + TILE_SIZE_M, " +
-             addressIndex("k_tile") + " * TILE_SIZE_K : " +
-             addressIndex("k_tile + 1") + " * TILE_SIZE_K], " +
+             addressIndex("member_start") + " + " + memberTile + ", " +
+             addressIndex("k_tile") + " * " + reductionTile + " : " +
+             addressIndex("k_tile + 1") + " * " + reductionTile + "], " +
              lhs + ")");
       } else {
-        line("for load_i, load_k in T.Parallel(TILE_SIZE_M, TILE_SIZE_K):");
+        line("for load_i, load_k in T.Parallel(" + memberTile + ", " +
+             reductionTile + "):");
         ++indentation;
         line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
-             "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
+             "route_end and k_tile * " + reductionTile + " + load_k < " +
+             reduction +
              ", " + (*lhsView)->argument->name + "[" +
              addressIndex(rows->str() + "[load_i]") + ", " +
-             addressIndex("k_tile * TILE_SIZE_K + load_k") + "], 0.0)");
+             addressIndex("k_tile * " + reductionTile + " + load_k") +
+             "], 0.0)");
         --indentation;
       }
     } else {
@@ -3108,21 +3127,24 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       if (workspace == workspaceNames.end())
         return operation.emitOpError(
             "staged contraction input has no materialized workspace");
-      line("for load_i, load_k in T.Parallel(TILE_SIZE_M, TILE_SIZE_K):");
+      line("for load_i, load_k in T.Parallel(" + memberTile + ", " +
+           reductionTile + "):");
       ++indentation;
       line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
-           "route_end and k_tile * TILE_SIZE_K + load_k < " + reduction +
+           "route_end and k_tile * " + reductionTile + " + load_k < " +
+           reduction +
            ", " + workspace->second + "[" +
            addressIndex("member_start + load_i") + ", " +
-           addressIndex("k_tile * TILE_SIZE_K + load_k") + "], 0.0)");
+           addressIndex("k_tile * " + reductionTile + " + load_k") +
+           "], 0.0)");
       --indentation;
     }
     line("T.copy(" + (*rhsView)->argument->name +
          "[" + addressIndex("expert") + ", " + addressIndex("k_tile") +
-         " * TILE_SIZE_K : " + addressIndex("k_tile + 1") +
-         " * TILE_SIZE_K, " + addressIndex("bid_feature") +
-         " * TILE_SIZE_N : " + addressIndex("bid_feature + 1") +
-         " * TILE_SIZE_N], " +
+         " * " + reductionTile + " : " + addressIndex("k_tile + 1") +
+         " * " + reductionTile + ", " + addressIndex("bid_feature") +
+         " * " + featureTile + " : " + addressIndex("bid_feature + 1") +
+         " * " + featureTile + "], " +
          rhs + ")");
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
          ", policy=T.GemmWarpPolicy.FullRow)");
@@ -3495,14 +3517,19 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
         lookupValue(operation, *(*relation)[0].operands.front());
     if (failed(rows))
       return failure();
-    line("for store_i, store_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+    unsigned stage = activeStages.front();
+    std::string memberTile = stageMemberTiles.lookup(stage);
+    std::string featureTile = stageFeatureTiles.lookup(stage);
+    line("for store_i, store_j in T.Parallel(" + memberTile + ", " +
+         featureTile + "):");
     ++indentation;
-    line("if member_start + store_i < route_end and bid_feature * "
-         "TILE_SIZE_N + store_j < " +
-         stageFeatureDimensions.lookup(activeStages.front()) + ":");
+    line("if member_start + store_i < route_end and bid_feature * " +
+         featureTile + " + store_j < " +
+         stageFeatureDimensions.lookup(stage) + ":");
     ++indentation;
     line((*view)->argument->name + "[" + rows->str() +
-         "[store_i], " + addressIndex("bid_feature * TILE_SIZE_N + store_j") +
+         "[store_i], " +
+         addressIndex("bid_feature * " + featureTile + " + store_j") +
          "] = " + stored->str() + "[store_i, store_j]");
     --indentation;
     --indentation;
@@ -3645,7 +3672,8 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
     --indentation;
     return success();
   }
-  if (!valueIndex || failed(relation) || relation->size() != 2 ||
+  if (!valueIndex || activeStages.size() != 1 || failed(relation) ||
+      relation->size() != 2 ||
       (*relation)[0].kind != "value_index" ||
       (*relation)[0].operands.size() != 1 ||
       !(*relation)[0].operands.front() ||
@@ -3655,14 +3683,19 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
       lookupValue(operation, *(*relation)[0].operands.front());
   if (failed(rows))
     return failure();
-  line("for atomic_i, atomic_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+  unsigned stage = activeStages.front();
+  std::string memberTile = stageMemberTiles.lookup(stage);
+  std::string featureTile = stageFeatureTiles.lookup(stage);
+  line("for atomic_i, atomic_j in T.Parallel(" + memberTile + ", " +
+       featureTile + "):");
   ++indentation;
-  line("if member_start + atomic_i < route_end and bid_feature * "
-       "TILE_SIZE_N + atomic_j < " + stageFeatureDimensions.lookup(activeStages.front()) +
+  line("if member_start + atomic_i < route_end and bid_feature * " +
+       featureTile + " + atomic_j < " + stageFeatureDimensions.lookup(stage) +
        ":");
   ++indentation;
   line("T.atomic_add(" + (*view)->argument->name + "[" + rows->str() +
-       "[atomic_i], " + addressIndex("bid_feature * TILE_SIZE_N + atomic_j") +
+       "[atomic_i], " +
+       addressIndex("bid_feature * " + featureTile + " + atomic_j") +
        "], " + stored->str() +
        "[atomic_i, atomic_j], memory_order=\"relaxed\")");
   --indentation;

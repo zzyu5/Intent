@@ -33,7 +33,7 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n")
+  if (role == "program_n" || role == "feature")
     return std::string("TILE_SIZE_N");
   if (role == "stream")
     return std::string("TILE_SIZE_S");
@@ -845,10 +845,21 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     }
     if (!members)
       return stage.emitOpError("has no member enumeration operation");
+    FailureOr<std::string> featureTile =
+        tileSpelling(feature.operation, feature.getTile());
+    FailureOr<std::string> memberTile =
+        tileSpelling(member.operation, member.getTile());
+    FailureOr<std::string> reductionTile =
+        tileSpelling(reduction.operation, reduction.getTile());
+    if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
+      return failure();
     stageRaggedRuntime[position] = runtimeIndex;
     stageFeatureDimensions[position] = feature.getExtent().str();
     stageMemberDimensions[position] = member.getExtent().str();
     stageReductionDimensions[position] = reduction.getExtent().str();
+    stageFeatureTiles[position] = *featureTile;
+    stageMemberTiles[position] = *memberTile;
+    stageReductionTiles[position] = *reductionTile;
     stageFeatureWorkers[position] = feature.getWorkerAxisAttr().getInt();
     stageMemberWorkers[position] = member.getWorkerAxisAttr().getInt();
     for (int64_t valueID : stage.getInputs())
@@ -1065,9 +1076,11 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       emitBuilderParameters(source, stage);
       source << "):\n";
       emitBlockExtentConstants(source);
+      std::string featureTile = stageFeatureTiles.lookup(stage);
+      std::string memberTile = stageMemberTiles.lookup(stage);
       if (compact)
-        source << "    total_route_tiles = sum((length + TILE_SIZE_M - 1) "
-                  "// TILE_SIZE_M for length in ROUTE_LENGTHS)\n";
+        source << "    total_route_tiles = sum((length + " << memberTile
+               << " - 1) // " << memberTile << " for length in ROUTE_LENGTHS)\n";
       source << "    @T.prim_func\n    def main(";
       if (failed(emitMainParameters(source)))
         return failure();
@@ -1081,7 +1094,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
             "has invalid TileLang stage worker-axis decisions");
       SmallVector<std::string> grids(2);
       SmallVector<std::string> names(2);
-      grids[featureWorker] = "T.ceildiv(" + feature + ", TILE_SIZE_N)";
+      grids[featureWorker] =
+          "T.ceildiv(" + feature + ", " + featureTile + ")";
       plan::AxisOp outerAxis =
           planIndex.axes.lookup(ragged.binding.getOuterNode());
       std::string experts =
@@ -1094,7 +1108,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       grids[memberWorker] = compact
                                 ? "total_route_tiles"
                                 : experts +
-                                      " * T.ceildiv(MAX_ROUTES, TILE_SIZE_M)";
+                                      " * T.ceildiv(MAX_ROUTES, " + memberTile +
+                                      ")";
       names[featureWorker] = "bid_feature";
       names[memberWorker] = "bid_expert_route";
       source << "        with T.Kernel(" << grids[0] << ", " << grids[1]
@@ -1120,7 +1135,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                   4);
         stageLine(stage,
                   "candidate_tiles = T.ceildiv(candidate_end - "
-                  "candidate_begin, TILE_SIZE_M)",
+                  "candidate_begin, " + memberTile + ")",
                   4);
         stageLine(stage,
                   "owns_tile = bid_expert_route >= tile_cursor and "
@@ -1135,7 +1150,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "tile_cursor = tile_cursor + candidate_tiles", 4);
       } else {
         stageLine(stage,
-                  "num_route_tiles = T.ceildiv(MAX_ROUTES, TILE_SIZE_M)");
+                  "num_route_tiles = T.ceildiv(MAX_ROUTES, " + memberTile +
+                      ")");
         stageLine(stage, "expert = bid_expert_route // num_route_tiles");
         stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
       }
@@ -1145,7 +1161,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                            "[" + addressIndex("expert + 1") + "]");
       stageLine(stage,
                 "member_start = " + addressIndex("route_begin") + " + " +
-                    addressIndex("route_tile") + " * TILE_SIZE_M");
+                    addressIndex("route_tile") + " * " + memberTile);
     }
     return success();
   }
@@ -2778,7 +2794,7 @@ SourceEmitter::tensorExtents(Operation &operation, unsigned resultIndex,
     else if (!planIndex.stages.empty() && activeStages.size() == 1 &&
              label.getValue() ==
                  stageFeatureDimensions.lookup(activeStages.front()))
-      extents.push_back("TILE_SIZE_N");
+      extents.push_back(stageFeatureTiles.lookup(activeStages.front()));
     else if (label.getValue().starts_with("?region_"))
       return operation.emitOpError(
           "tensor shape region has no TileLang tile binding");
@@ -2893,15 +2909,18 @@ void SourceEmitter::bindResult(Operation &operation, unsigned index,
   auto owner = stageOutputOwners.find(value);
   if (planIndex.stages.empty() || owner == stageOutputOwners.end())
     return;
+  std::string memberTile = stageMemberTiles.lookup(owner->second);
+  std::string featureTile = stageFeatureTiles.lookup(owner->second);
   std::string feature = stageFeatureDimensions.lookup(owner->second);
-  line("for store_i, store_j in T.Parallel(TILE_SIZE_M, TILE_SIZE_N):");
+  line("for store_i, store_j in T.Parallel(" + memberTile + ", " +
+       featureTile + "):");
   ++indentation;
   line("if member_start + store_i < route_end and "
-       "bid_feature * TILE_SIZE_N + store_j < " + feature + ":");
+       "bid_feature * " + featureTile + " + store_j < " + feature + ":");
   ++indentation;
   line(workspaceNames.lookup(value) +
        "[" + addressIndex("member_start + store_i") + ", " +
-       addressIndex("bid_feature * TILE_SIZE_N + store_j") + "] = " +
+       addressIndex("bid_feature * " + featureTile + " + store_j") + "] = " +
        name.str() + "[store_i, store_j]");
   --indentation;
   --indentation;

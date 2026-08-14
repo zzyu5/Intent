@@ -279,6 +279,9 @@ private:
   llvm::DenseMap<unsigned, std::string> stageFeatureDimensions;
   llvm::DenseMap<unsigned, std::string> stageMemberDimensions;
   llvm::DenseMap<unsigned, std::string> stageReductionDimensions;
+  llvm::DenseMap<unsigned, std::string> stageFeatureTiles;
+  llvm::DenseMap<unsigned, std::string> stageMemberTiles;
+  llvm::DenseMap<unsigned, std::string> stageReductionTiles;
   llvm::DenseMap<unsigned, int64_t> stageFeatureWorkers;
   llvm::DenseMap<unsigned, int64_t> stageMemberWorkers;
   llvm::SmallVector<RaggedRuntime, 0> raggedRuntimes;

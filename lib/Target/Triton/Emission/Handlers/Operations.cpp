@@ -2162,15 +2162,19 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
           "has unsupported staged matrix operand types");
     std::string feature = stageFeatureDimensions.lookup(stage);
     std::string reduction = stageReductionDimensions.lookup(stage);
+    std::string memberTile = stageMemberTiles.lookup(stage);
+    std::string featureTile = stageFeatureTiles.lookup(stage);
+    std::string reductionTile = stageReductionTiles.lookup(stage);
     std::string result = makeResultName(operation, 0);
-    line(result + " = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=" +
+    line(result + " = tl.zeros((" + memberTile + ", " + featureTile +
+         "), dtype=" +
          accumulatorDtype + ")");
     line("for reduction_block in range(0, tl.cdiv(" + reduction +
-         ", BLOCK_SIZE_K)):");
+         ", " + reductionTile + ")):");
     ++indentation;
     line("offs_reduction = " + addressIndex("reduction_block") +
-         " * BLOCK_SIZE_K + " +
-         addressIndex("tl.arange(0, BLOCK_SIZE_K)"));
+         " * " + reductionTile + " + " +
+         addressIndex("tl.arange(0, " + reductionTile + ")"));
 
     std::string lhs;
     if (lhsAccess) {

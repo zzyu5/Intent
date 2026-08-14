@@ -29,7 +29,7 @@ FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
     return "TILE_SIZE_Q" + role.drop_front(6).str();
   if (role == "query")
     return std::string("TILE_SIZE_Q");
-  if (role == "program_n")
+  if (role == "program_n" || role == "feature")
     return std::string("TILE_SIZE_N");
   if (role == "stream")
     return std::string("TILE_SIZE_S");
@@ -803,10 +803,21 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     }
     if (!members)
       return stage.emitOpError("has no member enumeration operation");
+    FailureOr<std::string> featureTile =
+        tileSpelling(feature.operation, feature.getTile());
+    FailureOr<std::string> memberTile =
+        tileSpelling(member.operation, member.getTile());
+    FailureOr<std::string> reductionTile =
+        tileSpelling(reduction.operation, reduction.getTile());
+    if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
+      return failure();
     stageRaggedRuntime[position] = runtimeIndex;
     stageFeatureDimensions[position] = feature.getExtent().str();
     stageMemberDimensions[position] = member.getExtent().str();
     stageReductionDimensions[position] = reduction.getExtent().str();
+    stageFeatureTiles[position] = *featureTile;
+    stageMemberTiles[position] = *memberTile;
+    stageReductionTiles[position] = *reductionTile;
     stageFeatureWorkers[position] = feature.getWorkerAxisAttr().getInt();
     stageMemberWorkers[position] = member.getWorkerAxisAttr().getInt();
 
@@ -929,6 +940,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       source.flush();
 
       std::string feature = stageFeatureDimensions.lookup(stage);
+      std::string featureTile = stageFeatureTiles.lookup(stage);
+      std::string memberTile = stageMemberTiles.lookup(stage);
       stageLine(stage, "bid_feature = " +
                            addressIndex("ct.bid(" +
                                         std::to_string(
@@ -966,8 +979,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                   2);
         stageLine(stage,
                   "candidate_tiles = " +
-                      addressIndex("ct.cdiv(candidate_end - candidate_begin, "
-                                   "TILE_SIZE_M)"),
+                      addressIndex("ct.cdiv(candidate_end - candidate_begin, " +
+                                   memberTile + ")"),
                   2);
         stageLine(stage,
                   "owns_tile = (bid_expert_route >= tile_cursor) & "
@@ -984,7 +997,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
         stageLine(stage, "tile_cursor += candidate_tiles", 2);
       } else {
         stageLine(stage,
-                  "num_route_tiles = ct.cdiv(MAX_ROUTES, TILE_SIZE_M)");
+                  "num_route_tiles = ct.cdiv(MAX_ROUTES, " + memberTile + ")");
         stageLine(stage, "expert = bid_expert_route // num_route_tiles");
         stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
       }
@@ -998,8 +1011,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                            ", shape=())");
       stageLine(stage,
                 "member_offsets = " + addressIndex("route_begin") + " + " +
-                    addressIndex("route_tile") + " * TILE_SIZE_M + " +
-                    addressIndex("ct.arange(TILE_SIZE_M, dtype=ct.int32)"));
+                    addressIndex("route_tile") + " * " + memberTile + " + " +
+                    addressIndex("ct.arange(" + memberTile +
+                                 ", dtype=ct.int32)"));
       stageLine(stage, "member_mask = member_offsets < route_end");
       stageLine(stage,
                 "safe_member_offsets = ct.where(member_mask, member_offsets, " +
@@ -1015,8 +1029,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       }
       stageLine(stage,
                 "offs_feature = " + addressIndex("bid_feature") +
-                    " * TILE_SIZE_N + " +
-                    addressIndex("ct.arange(TILE_SIZE_N, dtype=ct.int32)"));
+                    " * " + featureTile + " + " +
+                    addressIndex("ct.arange(" + featureTile +
+                                 ", dtype=ct.int32)"));
       stageLine(stage, "feature_mask = offs_feature < " + feature);
     }
     return success();
@@ -1303,6 +1318,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         return ragged.binding.emitOpError(
             "has no program-owned outer-axis dimension");
       std::string feature = stageFeatureDimensions.lookup(stage);
+      std::string featureTile = stageFeatureTiles.lookup(stage);
+      std::string memberTile = stageMemberTiles.lookup(stage);
       output << "    cache_key_" << stage << " = (" << stage;
       for (const std::string &dimension : dimensionOrder)
         output << ", " << dimension;
@@ -1316,14 +1333,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "            result = exhaustive_search(\n";
       output << "                _CONFIGS,\n                stream,\n";
       output << "                lambda cfg: (ceil(" << feature
-             << " / cfg.TILE_SIZE_N), ";
+             << " / cfg." << featureTile << "), ";
       if (compact)
-        output << "sum(ceil(length / cfg.TILE_SIZE_M) for length in "
+        output << "sum(ceil(length / cfg." << memberTile << ") for length in "
                   "route_lengths_"
                << suffix << ")";
       else
         output << experts << " * ceil(max_routes_" << suffix
-               << " / cfg.TILE_SIZE_M)";
+               << " / cfg." << memberTile << ")";
       output << ", 1),\n";
       output << "                " << kernelName << "_stage_" << stage
              << ",\n";
@@ -1363,14 +1380,14 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "    best, tuned_kernel = _TUNE_CACHE[cache_key_" << stage
              << "]\n";
       output << "    grid = (ceil(" << feature
-             << " / best.TILE_SIZE_N), ";
+             << " / best." << featureTile << "), ";
       if (compact)
-        output << "sum(ceil(length / best.TILE_SIZE_M) for length in "
+        output << "sum(ceil(length / best." << memberTile << ") for length in "
                   "route_lengths_"
                << suffix << ")";
       else
         output << experts << " * ceil(max_routes_" << suffix
-               << " / best.TILE_SIZE_M)";
+               << " / best." << memberTile << ")";
       output << ", 1)\n";
       output << "    ct.launch(stream, grid, tuned_kernel, (";
       for (ABIView &view : views)
@@ -2413,6 +2430,35 @@ FailureOr<std::string> SourceEmitter::emitValidityExpression(
     plan::AxisOp axis = physical->second;
     if (axis.isScalar())
       continue;
+    bool stagedMember = llvm::any_of(activeStages, [&](unsigned ordinal) {
+      auto stage = llvm::find_if(planIndex.stages, [&](plan::StageOp candidate) {
+        return candidate.getOrdinal() == ordinal;
+      });
+      if (stage == planIndex.stages.end())
+        return false;
+      auto axes = planIndex.stageAxes.find(stage->getNode());
+      plan::StageAxisOp member =
+          axes == planIndex.stageAxes.end()
+              ? plan::StageAxisOp()
+              : axes->second.lookup("member");
+      return member && member.getAxisNodeAttr() &&
+             member.getAxisNodeAttr().getInt() == domainNode;
+    });
+    if (stagedMember) {
+      std::string predicate = "member_mask";
+      if (tensor.getRank() > 1) {
+        predicate += "[";
+        for (int64_t axisNumber = 0; axisNumber < tensor.getRank();
+             ++axisNumber) {
+          if (axisNumber)
+            predicate += ", ";
+          predicate += axisNumber == tensorAxis ? ":" : "None";
+        }
+        predicate += "]";
+      }
+      predicates.push_back(std::move(predicate));
+      continue;
+    }
     std::string base = axisIndices.lookup(axis.getNode());
     if (base.empty())
       return consumer.emitOpError(
