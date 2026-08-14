@@ -3202,8 +3202,25 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     FailureOr<plan::AxisOp> reductionAxis =
         target::emission::contractionReductionAxis(planIndex, *lhsLoad,
                                                    *rhsLoad, operation);
-    if (failed(reductionAxis))
+    FailureOr<target::emission::ContractionAxes> contractionAxes =
+        target::emission::contractionAxes(planIndex, *lhsLoad, *rhsLoad,
+                                          operation);
+    auto operandElementType = [](Value value) -> Type {
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      return tensor ? tensor.getElementType() : Type();
+    };
+    Type lhsElement = operandElementType(operation.getOperand(0));
+    Type rhsElement = operandElementType(operation.getOperand(1));
+    bool fp8Operands =
+        lhsElement && rhsElement &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(lhsElement) &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(rhsElement);
+    if (failed(reductionAxis) || failed(contractionAxes))
       return failure();
+    if (fp8Operands && contractionAxes->lhsResult.hasRole("lane"))
+      return operation.emitOpError(
+          "TileLang 0.1.13 cannot project an FP8 contraction whose matrix-M "
+          "axis is a runtime lane extent to a supported MMA primitive");
     FailureOr<int64_t> lhsNode =
         target::getNodeID(*lhsLoad, "TileLang contraction lhs transfer");
     FailureOr<int64_t> rhsNode =
