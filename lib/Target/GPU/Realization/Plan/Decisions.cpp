@@ -1131,7 +1131,8 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         builder.getDenseI64ArrayAttr(outputs),
         builder.getDenseI64ArrayAttr(stage.operations),
         builder.getDenseI64ArrayAttr(terminals), string(builder, "same_stream"),
-        string(builder, "forbidden")));
+        string(builder, "forbidden"),
+        string(builder, "fixed_operation_slice")));
     FailureOr<int64_t> memberNode = node(**member, "stage member axis");
     auto memberChoice =
         llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {

@@ -236,7 +236,8 @@ def IntentPlan_StageOp : IntentPlan_Op<"stage"> {
     DenseI64ArrayAttr:$operations,
     DenseI64ArrayAttr:$terminals,
     StrAttr:$synchronization,
-    StrAttr:$fusion
+    StrAttr:$fusion,
+    StrAttr:$grouping
   );
   let results = (outs);
   let hasVerifier = 1;

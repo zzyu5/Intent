@@ -407,6 +407,8 @@ LogicalResult StageOp::verify() {
         "contains an unsupported stage synchronization contract");
   if (getFusion() != "forbidden" && getFusion() != "target_may_fuse")
     return emitOpError("contains an unsupported stage fusion policy");
+  if (getGrouping() != "fixed_operation_slice")
+    return emitOpError("contains an unsupported stage grouping policy");
   return success();
 }
 

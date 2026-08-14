@@ -892,6 +892,7 @@ struct StageBinding : Binding<intent::plan::StageOp> {
     return operation.getSynchronization();
   }
   llvm::StringRef getFusion() const { return operation.getFusion(); }
+  llvm::StringRef getGrouping() const { return operation.getGrouping(); }
 };
 
 struct StageBufferBinding : Binding<intent::plan::StageBufferOp> {
@@ -1613,9 +1614,10 @@ mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
     stagePositions[stage.getNode()] = position;
   for (auto [position, stage] : llvm::enumerate(index.stages)) {
     if (stage.getSynchronization() != "same_stream" ||
-        stage.getFusion() != "forbidden")
+        stage.getFusion() != "forbidden" ||
+        stage.getGrouping() != "fixed_operation_slice")
       return stage.emitOpError(
-          "target emitter requires ordered same-stream unfused stages");
+          "target emitter requires ordered same-stream unfused stages with fixed operation slices");
     for (int64_t dependency : stage.getDependencies()) {
       auto found = stagePositions.find(dependency);
       if (found == stagePositions.end() || found->second >= position)
