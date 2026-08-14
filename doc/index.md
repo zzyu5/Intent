@@ -2,7 +2,7 @@
 
 这组文档是 Intent Kernel DSL 当前唯一的语言与编译器设计规范。它描述最终语义和模块边界，不记录实现进度、历史版本、测试清单或迁移过程。
 
-Intent 是一门 **Python-hosted、单-kernel、跨后端、tile-parametric 的 Structured Tensor-Flow DSL**：用户写完整的 kernel 内算法，编译器补全不可由 source 观察的机器 realization。
+Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL**：用户写一个 logical callable 内的完整算法，编译器补全不可由 source 观察的机器 realization；一个 callable 的目标实现可以包含多个 compiler-private stages。
 
 ## 阅读顺序
 

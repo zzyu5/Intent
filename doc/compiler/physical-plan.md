@@ -4,7 +4,7 @@ Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 s
 
 ## 两类对象
 
-`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的操作片段与临时值边界。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node ID 引用它们并保存已选物理关系，不复制第二份算法 schema。
+`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的 execution-stage operation slice 与 intermediate contract。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node ID 引用它们并保存已选物理关系，不复制第二份算法 schema。
 
 Structured primitive 的 binding 必须把 emitter 机械投影所需的规范角色与逻辑轴引用写进 Plan。例如 scan 保存 canonical semantics、logical axis node、tensor axis 与 result residency；target 不得回到 Kernel op 各自重推这些字段。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
 
@@ -29,6 +29,14 @@ Physical Plan 使用 Kernel IR 的稳定 operation/value ID 引用逻辑节点�
 - target projection 只使用该表面真实能表达的 realization 子集。
 
 Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 到 canonical Kernel MLIR 为止；项目中没有 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
+
+## Execution stages
+
+一个 logical callable 需要多个 machine stages 时，Plan 显式保存每个 stage 的 dependencies、input/output value、operation slice、terminal、synchronization、fusion 与 grouping policy。每个 intermediate 另有唯一 buffer contract：producer、consumer stages、owner roles、single-writer/read-only-consumer access、从 producer 到最后 consumer 的最短 lifetime，以及 memory visibility。
+
+Verifier 要求 dependency 与 input buffer producer 精确一致、拓扑有序、intermediate 只有一个 writer、consumer 位于 producer 之后、final stage 拥有唯一 terminal 且没有后继。Operation slice 可以因 Plan 明确选择 pure recomputation 而重叠，但 effectful terminal 与 intermediate writer不能重复。
+
+当前 GPU realization 使用 `same_stream` synchronization/visibility、`forbidden` fusion 与 `fixed_operation_slice` grouping。三个 surface 只能机械兑现这份合同；不能兑现的 policy 在 emission 前拒绝。实际 stage grouping 已由 Plan 的 operation slices 给出，GPU surface 不得重新分组；未来 CPU/RVV realizer可以在构造自己的 target-family Plan 时选择不同 grouping。
 
 ## Ownership 与 physical identity
 

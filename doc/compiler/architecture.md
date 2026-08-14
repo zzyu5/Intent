@@ -45,7 +45,7 @@ Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、
 
 ## Realizer
 
-Realizer 接收 Kernel IR、机器能力与 compile policy，只选择依赖算法结构才能确定的物理事实：逐轴角色与 range、program ownership、遍历关系、logical validity 的兑现方式、必要的 storage class、primitive 数值角色以及合法搜索轴。候选值由下层 tuner 选择；layout 推断、寄存器分配、指令选择和给定参数后的低层流水线继续交给下层。
+Realizer 接收 Kernel IR、机器能力与 compile policy，只选择依赖算法结构才能确定的物理事实：逐轴角色与 range、program ownership、遍历关系、logical validity 的兑现方式、必要的 storage class、primitive 数值角色、execution-stage grouping/dependency/intermediate contract 以及合法搜索轴。候选值由下层 tuner 选择；layout 推断、寄存器分配、指令选择和给定参数后的低层流水线继续交给下层。
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 
@@ -53,18 +53,18 @@ Backend boundary 从 Intent Kernel MLIR 开始。C++/MLIR compiler 解析并验�
 
 ## Physical Plan
 
-Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node ID 绑定 Kernel IR，可以被验证、比较、搜索与交给 backend lowering。正式边界中只有 MLIR Plan；不存在 Python Plan、Python Plan serializer 或绕过 MLIR verifier 的旁路输入。
+Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node/value ID 绑定 Kernel IR，可以验证逐轴 range、operation binding、execution-stage topology、intermediate lifetime/visibility 与 target capability，再交给 backend lowering。正式边界中只有 MLIR Plan；不存在 Python Plan、Python Plan serializer 或绕过 MLIR verifier 的旁路输入。
 
 详见 [Physical Plan](physical-plan.md)。
 
 ## Backend Emitter
 
-Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成 Triton、TileLang、cuTile、CPU SIMD 或 RVV program。Region argument、row-vector extent 与 stream/ragged relation 的已选物理绑定都进入可验证的 Physical Plan；target 侧只建立从这些 Plan operation 到生成变量的查找索引，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
+Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成目标 program。当前已接入的 surface 是 Triton、TileLang 与 cuTile；CPU SIMD 和 RVV 将由未来各自的 target-family realizer 与 emitter 接入，不是现有 GPU Plan 的另一种拼写。Region argument、row-vector extent、stream/ragged relation 与 execution-stage contract 的已选物理绑定都进入可验证的 Physical Plan；target 侧只建立从这些 Plan operation 到生成变量的查找索引，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
 
 详见 [后端 lowering](backend-lowering.md)。
 
 ## Compiled Artifact 与 runtime
 
-Artifact 保存组合 MLIR、可读生成源码、可调用 entry，以及首次真实 JIT 后得到的后端/低层 IR。Launch policy 位于 Physical Plan 和生成源码中，不再以第二套 Python 配置对象保存。Runtime 只负责物化并提交这个 entry；完整图与多-kernel 调度仍在 Python wrapper。
+Artifact 保存组合 MLIR、可读生成源码、可调用 entry，以及首次真实 JIT 后得到的后端/低层 IR。Launch 与 execution-stage policy 位于 Physical Plan 和生成源码中，不再以第二套 Python 配置对象保存。Runtime 只负责物化并提交这个 logical entry；完整图与多 source-kernel 调度仍在 Python wrapper。
 
 详见 [编译产物与运行边界](compiled-artifact.md)。

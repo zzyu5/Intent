@@ -15,7 +15,7 @@ print(compiled.ir)
 
 编译产物至少包含：
 
-- 一个 callable target kernel entry；
+- 一个对调用方可见的 callable target entry，以及必要时只在 entry 内部使用的 private stage kernels；
 - 包含 Kernel IR 与 Physical Plan 的组合 MLIR；
 - 可读、可导出的 target source；
 - 第一次真实 launch 后由 Triton JIT 产生的 backend 或 lower-level IR。
@@ -49,18 +49,18 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 
 ## Runtime invocation
 
-调用 Intent kernel 时，用户不提供 `[grid]`。Runtime 根据 compiled artifact 的 entry 与 launch configuration，在当前 device/stream 提交一次 invocation。
+调用 Intent kernel 时，用户不提供 `[grid]`。Runtime 根据 compiled artifact 的 entry 与 Physical Plan，在当前 device/stream 提交一次 logical callable invocation；entry 内部可以按显式 stage dependency 顺序提交多个 private launches。
 
 底层 `compiled(input, output)` launch 不负责：
 
 - framework graph partition；
-- 输出或 workspace 分配；
-- 多-kernel 调用顺序；
+- 用户输出或跨 source-kernel workspace 分配；
+- 多 source-kernel 调用顺序；
 - 自动融合或拆分 kernels；
 - source variant 的 library policy。
 
 这些仍属于普通 Python wrapper。当前 artifact 额外提供的 `compiled.run(input)` 是一个会执行 `empty_like` 的 convenience wrapper；它用于与同样包含 output allocation 的上游 softmax wrapper 做公平比较，不改变底层 launch 边界。
 
-## Single-kernel invariant
+## Single logical callable invariant
 
-一个 source kernel invocation 对应一个 target entry invocation。Compiler-private scratch、completion counter 或 target 内部多级 physical implementation 可以存在，但不得暴露为额外 runtime dispatch。
+一个 source kernel invocation 对应一个 target callable invocation。Compiler-private scratch、intermediate buffer 与多个 machine stages 可以存在，但必须由 Plan 显式描述 dependency、lifetime、visibility、synchronization 与 fusion policy，不得改变用户 ABI、effects 或 wrapper-visible调用协议。

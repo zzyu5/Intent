@@ -43,24 +43,35 @@ s = I.reduce.sum(x, axis=0, identity=0.0, acc_dtype=I.f32)
 def welford_combine(a, b):
     n = a.n + b.n
     delta = b.mean - a.mean
-    mean = a.mean + delta * b.n / n
-    m2 = a.m2 + b.m2 + delta * delta * a.n * b.n / n
+    safe_n = I.maximum(n, I.cast(1, I.i32))
+    mean = a.mean + delta * I.cast(b.n, I.f32) / I.cast(safe_n, I.f32)
+    m2 = (
+        a.m2
+        + b.m2
+        + delta * delta * I.cast(a.n * b.n, I.f32) / I.cast(safe_n, I.f32)
+    )
     return I.record(n=n, mean=mean, m2=m2)
 
 
 stats = I.reduce(
     partial_stats,
     axis=0,
-    identity=I.record(n=0, mean=0.0, m2=0.0),
+    identity=I.record(
+        n=I.cast(0, I.i32),
+        mean=I.cast(0.0, I.f32),
+        m2=I.cast(0.0, I.f32),
+    ),
     combine=welford_combine,
 )
 ```
 
-上例保留的是 generic combine 将来应有的 source 形态，不是当前可运行示例。当前 Kernel IR/realization 只闭合内建 reduction/scan combiner；任意 helper closure 尚未进入 typed Kernel IR region，编译器会在进入 target emission 前明确拒绝。Welford 数值算法目前可用 `state_stream`、内建块内归约与普通标量 carry 合并表达，但这不等于 generic combine 通道已经实现。
+上例是当前正式 generic combine 形态。Frontend 把 helper lower 成 canonical Kernel IR 中的 typed combiner body：参数是两组 accumulator components，返回 schema 与 accumulator 完全一致，identity 逐 component 显式给出。Combiner 必须 pure，不能包含 load/store/atomic/RNG；runtime capture 必须通过 `combine_operands=(...)` 成为 reduce/scan 的显式 scalar operand，只有 `Constexpr` 可以直接捕获。
 
-选择 `reduce` 表示 compiler 可以选择物理 reduction tree 与 hierarchy。需要严格逐元素顺序时使用 `ordered`，不增加 `mergeable` 或 `@associative` 合同。
+选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。
 
-一个 logical reduction 可以在同一 target entry 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。
+一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。Triton/cuTile 将 typed helper 机械投影到原生 generic reduce；TileLang 0.1.13 的当前 PrimFunc surface 没有等价入口，因此 generic closure 明确 unsupported，固定内建 reduction 不受影响。
+
+`I.arg_reduce.max` 是 convenience sugar：frontend 将 `(value, index)` 与 lowest-index tie closure lower 成同一个 tuple-valued generic reduction。目标可以使用经过语义对齐的原生 `max_with_index`，但 Kernel IR helper仍是权威语义。
 
 ## Scan
 
@@ -76,6 +87,8 @@ prefix = I.scan(
 
 Source 固定 logical prefix relation，realizer 决定物理 scan hierarchy。
 
+`I.scan` 与 `I.reduce` 共用 typed combiner、component identity、purity 和显式 capture 合同。Triton/cuTile 委托给原生 associative scan；长轴可以由 Plan 选择 block-local scan 加 block 间 scalar carry。TileLang 当前只支持固定 combiner的机械投影，generic scan明确 unsupported。
+
 ## Contraction
 
 ```python
@@ -87,9 +100,11 @@ acc = I.contract(
 )
 ```
 
-`reduce` 使用 positional reduction-axis pairs。Source 固定 operand shapes、配对归约轴、operand dtype、multiply/combine、accumulator dtype 与 epilogue tensor-flow。
+`reduce` 使用 positional reduction-axis pairs。Source 固定 operand shapes、配对归约轴、operand dtype、multiply-add 数值角色、accumulator dtype 与 epilogue tensor-flow。
 
-Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色，并把它投影到 MMA/`tl.dot`/`T.gemm`/cuTile matmul/CPU-RVV FMA microkernel。具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
+Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色。当前 GPU target 将其投影到 MMA/`tl.dot`/`T.gemm`/cuTile matmul；未来 CPU/RVV target 可投影到自己的 FMA microkernel。具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
+
+Generic reduce/scan closure 不会使 `contract` 自动变成任意 semiring。当前 `contract` 只覆盖目标矩阵原语支持的 multiply/add 与 dtype/accumulator 组合；其他 semiring 必须由作者显式写成 pointwise + reduce，或由未来 target capability正式扩展。
 
 显式缩窄必须写在 source 中：
 

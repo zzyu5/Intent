@@ -19,7 +19,7 @@
 - cuTile Python 1.5.0；
 - TileLang 0.1.13。
 
-最终目标不是让文档和代码彼此迁就，而是确定一个之后可以冻结的编程模型，再把每个偏差登记到唯一的责任层。
+最终目标不是让文档和代码彼此迁就，而是确定一套可以冻结的编程模型，再把每个偏差登记到唯一的责任层。本轮已经按这份报告完成最后两项承重能力，并以代码与跨设备运行结果反向修正文档。
 
 ---
 
@@ -124,7 +124,7 @@ intent.result_shapes = [["?region_13_0"]]
 
 这仍是算子编译器内部的 physical realization，不是 framework graph partition。关键不是 launch 数量，而是 **是否只物化作者已经写下的数据依赖，还是 compiler 发明了新的算法阶段**。
 
-当前 ragged contraction 的 `StageOp` 方向因此并非天然错误；真正的问题是它尚未形成完整 execution contract，后文单独分析。
+Ragged contraction 的 `StageOp` 方向因此并非天然错误；真正需要的是一份完整 execution contract。本轮已将这份合同闭合到 Physical Plan、verifier 与三个 surface 的公共 preflight，第八节给出最终语义。
 
 ---
 
@@ -212,7 +212,7 @@ GPU、RVV、Scalar 是不同的 target family；Triton、cuTile、TileLang 是�
 Frontend 只应维护 lowering 期间的临时状态：AST、constexpr、symbol/shape、region、source location 与临时 `ValueType`。它负责：
 
 - 将受限 Python 语法正规化；
-- 内联 kernel-local `@intent.fn`；
+- 内联普通 kernel-local `@intent.fn`；当 helper 被用作 structured combiner 时，将其保存为 typed、effect-free 的 Kernel IR helper body；
 - 把 break/continue 变成 loop-carried control state；
 - 构造 canonical Intent MLIR；
 - 在作者源码位置报基础语言错误。
@@ -295,6 +295,8 @@ Welford/Chan 的单遍方差可以写成：
 
 本轮定位确认：Plan 已经为这个 `full` 结果给出 reduction identity padding，丢失发生在三个 `emitFull` 没有消费该绑定。修复后同一 `M=64, N=257` source 的 mean 最大误差为 `1.49e-8`、variance 最大误差为 `2.38e-7`；修法是所有 region-shaped `full` 统一消费 Plan padding，不含 Welford 特判。
 
+generic combine 闭合后，又用 tuple-valued Welford reduction 对同一非整除形态做了独立验证。第一次运行暴露出另一处同类丢失：reduction 要求的是 record field 的 identity padding，Plan 却把 binding 留在 `extract` 别名上，leaf 最终发射的是底层 field；Triton 同时缺少 domain-result value ID 到已选 physical tile 的机械索引。修复后 padding 在共享 Plan 构造中规范化到真正 materialized field，Triton只补读取 Plan 的 shape spelling。5090 与 H100 上 Triton/cuTile 的 mean 最大误差约 `3e-8`、variance 最大误差 `2.38e-7`。这再次说明问题不是 Welford 或 generic closure 特殊，而是物理 binding 必须落在真正被发射的 SSA value 上。
+
 ### 4.3 下层真实 API 支持到哪里
 
 Triton 3.6.0 当前 API：
@@ -317,18 +319,18 @@ ct.scan(x, axis, func, identity, reverse=False)
 
 TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs/bitwise 等，没有等价的任意 Python combine 参数。TileLang/TVM 的更低层有 `comm_reducer`，但它是否能在当前 eager/prim-func emission 路径中机械闭合尚未验证；不能先写成“TileLang 已支持”。其当前高层接口见 [TileLang reduce](https://www.tilelang.com/autoapi/tilelang/language/reduce_op/index.html)。
 
-### 4.4 generic combine 是真实能力缺口，但不是算法表达力堵点
+### 4.4 generic combine 已闭合，但它仍不是算法表达力的唯一入口
 
 准确分类是：
 
-- Welford 等算法可以用现有 state-stream 表达，所以不是“没有 combine 就写不出算法”；
-- 但作者若选择 **一个结构化 reduction/scan，并授权下层自行选择归约树**，当前 canonical IR 只能传固定字符串，无法携带作者写的 closure；
-- Triton/cuTile 已原生支持这条委托，Intent 当前把它焊死在固定 add/max/or/and；
-- 因此它是 structured primitive 完整性与薄投影能力的缺口。
+- Welford 等算法仍然可以用 state-stream 表达，所以 generic combine 不是唯一写法；
+- 作者若选择 **一个结构化 reduction/scan，并授权合法 reassociation**，现在可以把 typed combiner 随 Kernel IR 一起交给 compiler；
+- Triton/cuTile 原生接受该委托，Intent 不再把 structured primitive 焊死在固定 add/max/or/and；
+- TileLang 0.1.13 的当前 PrimFunc surface 没有可机械承接任意 closure 的入口，因此在 source emission 前明确 unsupported，而不是生成串行慢路径。
 
 ### 4.5 正确设计不是“把函数名字符串放开”
 
-`combine_fn` 应成为 Kernel IR 中的 typed region，而不是 opaque Python callable 或字符串：
+`combine_fn` 现在以 Kernel IR 中带 `intent.role = "combiner"` 的 typed helper body 表示。它在语义上就是 reduction/scan 的 closure region，不是 opaque Python callable 或函数名字符串：
 
 - region 参数是两组 accumulator scalar/record values；
 - region 结果与 accumulator schema 完全相同；
@@ -337,28 +339,30 @@ TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs
 - runtime capture 必须成为显式 operand；只允许 constexpr 直接捕获；
 - `reduce` 的语义本身表示作者接受合法的 reassociation/tree；compiler 不证明数学结合律，但作者选择该 op 就承担这项合同；
 - 需要严格顺序时使用 `ordered/state_stream`；
-- source location 和 helper-inline 后的 region body必须保留。
+- source location 与 lowering 后的 helper body必须保留。
 
-这仍是算法 IR，不是图调度。Emitter 对 Triton/cuTile 只需把 region 机械转成 jitted function/lambda，并把 tuple state 对齐；reduction tree 继续交给下层。
+Canonical verifier 集中检查 helper ABI、component/result schema、identity dtype、capture operand、return schema 与 purity；load/store/atomic/RNG 等 effectful operation 不能进入 combiner。Runtime capture 必须作为 reduction/scan 的显式 scalar operand，constexpr 才能直接进入 helper body。
 
-工程量也不能说成“只改一个属性”：它涉及 region schema、tuple/record arity、identity、purity/effect verification、helper/capture lowering、三个 surface 的 nested function emission 与 unsupported capability。但它是边界清楚的纵向闭环，不需要自建 reduction scheduler。
+Emitter 对 Triton/cuTile 将 helper 机械转成 `@triton.jit` function 或 cuTile function。由于 cuTile 的 identity 必须是常量，runtime capture 在目标投影中携带为 `(capture, valid)` 附加 component：真实 lane 写入 capture，identity lane 的 `valid=false`，combiner只选择有效 capture。这个 carrier 不改变作者的 accumulator schema，也不参与数学求解；它只是把同一个显式 operand适配到下层 tuple ABI。Reduction tree、scan hierarchy 与低层 collective 继续由下层决定。
+
+这项能力涉及 helper schema、tuple/record arity、component-wise identity、purity/effect verification、显式 capture、三个 surface 的 function emission 与 capability rejection；它已经形成一条边界清楚的纵向闭环，没有自建 reduction scheduler。
 
 ### 4.6 reduce、scan、contract 不能混成一个问题
 
-- `reduce`：Triton/cuTile 原生 generic combine，应该支持 typed closure。
-- `scan`：Triton/cuTile 同样有 generic associative scan，应该与 reduce 共用 closure contract，但保留 prefix/reverse 语义。
-- `contract`：`tl.dot`、`ct.mma`、TileLang GEMM 并不接受任意 semiring closure。任意 multiply/combine 会失去现成矩阵原语，不能因 reduce 支持 lambda 就一起放开。现阶段 contract 应明确支持的 semiring/dtype capability，或回到显式 pointwise + reduce source。
+- `reduce`：Triton/cuTile 已机械承接 typed closure；固定内建 combiner仍走目标原语。
+- `scan`：Triton/cuTile 与 reduce 共用 closure contract，并保留 inclusive prefix 语义；长轴实现为 block-local native scan 加 block 间 typed scalar carry。TileLang 只承接当前固定 combiner能力，generic closure 明确拒绝。
+- `contract`：仍只表示当前矩阵原语支持的 multiply/add contraction 与 dtype/accumulator 组合。`tl.dot`、`ct.mma`、TileLang GEMM 不接受任意 semiring closure；作者需要其他 semiring 时必须显式写 pointwise + reduce，不能因 reduce 支持 closure 就在 contract 上开一个假通道。
 
 ### 4.7 对 arg-reduce 的影响
 
-`I.arg_reduce.max` 当前固定 lowest-index tie 与 i32 index。它解决了真实需求，但从编程模型看，它可以由 tuple-valued generic reduce 表达：输入 `(value, index)`，closure 写 maximum 与 tie-break。
+`I.arg_reduce.max` 固定 lowest-index tie 与 i32 index。它现在由 frontend lower 成 tuple-valued generic `intent.reduce`：输入 `(value, index)`，typed closure 表达 maximum 与 tie-break。
 
-因此它更适合作为：
+因此它的正式定位是：
 
 - 方便作者使用的 library/frontend sugar；
-- lower 到通用 typed reduce region；
+- lower 到通用 typed reduce closure；
 
-而不是永久增加一个独立 canonical reduction 家族。generic combine 闭合前可以保留现有 node，但应把它视为过渡特化。
+而不是独立 canonical reduction 家族。Kernel IR 中的 helper 是语义权威；`combine_builtin = argmax_lowest` 只允许 target 选择数值等价的原生 `max_with_index` spelling，不能替代 closure 语义。替换旧路径前已对 cross entropy 的 value/index/tie 结果做数值对照，三个 target 的现行路径均通过。
 
 ---
 
@@ -437,9 +441,9 @@ RVV 的动态 `vl` 也可以是 target 对 `auto` 的 realization，不需要 so
 - verifier 只验证声明的类型、view、axis 与支配关系；
 - target 可以用它消除 mask，也可以只用作 legality proof。
 
-### 5.7 `I.arg_reduce.max`：真实需求，canonical 形态可在 combine 闭合后收敛
+### 5.7 `I.arg_reduce.max`：真实需求，canonical 形态已收敛
 
-Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。需求是真实的；专门 canonical op 未必永久必要。处理见 4.7。
+Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。Public sugar 保留，独立 canonical op 已删除；当前统一 lower 到 typed tuple reduction，处理见 4.7。
 
 ### 5.8 `I.sparse_contract_2to4`：需要 semantic anchor，但当前 API 形状过专
 
@@ -582,13 +586,13 @@ Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；�
 
 ---
 
-## 八、当前 StageOp：允许多 machine stages，但 execution contract 未闭合
+## 八、Stage execution：多 machine stages 已有显式合同
 
-### 8.1 当前真实行为
+### 8.1 当前表示
 
-`contractionStages()` 会找到带 ragged member、最终到达 scatter 的 contractions，沿 def-use 收集 operation slice，并在 Plan 里记录 inputs、outputs、operations、terminals。
+GPU realizer 沿 canonical def-use 形成 physical stage operation slice，并为每个 stage 记录 dependencies、inputs、outputs、operations、terminals、synchronization、fusion 与 grouping policy。
 
-三个 emitter 都会生成多个私有 target kernels，在同一个生成 wrapper 中按顺序 launch；intermediate workspace 由 wrapper 私下分配，调用方仍只看见一个 callable。
+每个 intermediate 另有唯一 `StageBufferOp`，显式保存 value、唯一 producer、consumer stages、owner roles、single-writer/read-only-consumer access、`producer_to_last_consumer` lifetime 与 visibility。三个 emitter 仍可生成多个私有 target kernels，但调用方只看见一个 logical callable。
 
 ### 8.2 它为什么可以属于 physical realization
 
@@ -602,22 +606,24 @@ Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；�
 
 因此，多 launch 本身不应被禁止。
 
-### 8.3 真正缺少的合同
+### 8.3 可验证的 execution contract
 
-当前 StageOp 没完整表达：
+Plan 与公共 emission preflight 现在验证：
 
-- stage dependency/拓扑顺序；
-- intermediate buffer lifetime 与读写 owner；
-- memory visibility/synchronization；
-- 是否允许 fuse；
-- target 是否可以选择不同 stage grouping。
+- dependency 必须引用拓扑上更早的 stage，并且精确等于所有 input buffer 的 producer；
+- 每个 intermediate 只有一个 writer，consumer 必须是后继 stage，owner role 必须存在于 producer stage；
+- intermediate 至少活到最后一个 consumer，当前 visibility/synchronization 合同为 `same_stream`；
+- intermediate stage 必须产出 buffer，final stage 必须拥有唯一 terminal，final stage不能再成为后继依赖；
+- 当前 GPU realization 的 fusion policy 为 `forbidden`、grouping policy 为 `fixed_operation_slice`，三个 surface 在 emission 前拒绝自己不能兑现的其他 policy。
 
-GPU 路径目前依赖同一 CUDA stream 的隐含顺序；cuTile 显式取得当前 stream，Triton/TileLang 也依赖当前 stream launch order。这使当前路径能工作，却不是可移植 Plan 语义。
+同一 operation 可以出现在多个 stage slice 中，但这表示 Plan 明确选择的 pure recomputation；effectful terminal 与 intermediate writer不能重复。实际 grouping 由每个 target-family realizer产生的 stage operation slice表示，surface leaf 无权重新分组。未来 RVV/CPU 可以产生不同 grouping 的 Plan；不需要在 GPU leaf 中再放一份判断。
 
-结论：
+当前三个 GPU surface 都消费 `same_stream + forbidden + fixed_operation_slice` 合同。cuTile 显式把同一 current stream 传给每次 launch；Triton/TileLang 的 runtime launch同样提交到 current stream。CUDA 的同 stream happens-before 与可见性不再是未登记假设，而是 Plan 要求、preflight 检查和 runtime 投影共同兑现的语义。
+
+冻结结论：
 
 - 将 single-kernel invariant 改写成 single logical callable；
-- Plan 的 execution stage 必须显式可验证；
+- Plan 的 execution stage 已显式可验证；
 - stage grouping 是 target realization，不能按 kernel 名；
 - wrapper-visible 多 kernel orchestration仍由作者负责；
 - compiler-private stage 只允许在同一 callable 内、对 ABI/effects 不可见。
@@ -692,15 +698,15 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 | Region argument 未直接绑定 selected range | Physical Plan | 已闭合：Plan 显式保存 argument→axis/range purpose/level，三个 leaf 只消费绑定 |
 | Row-vector final extent binding不完整 | Physical Plan | 已闭合：range 同时保存 logical extent 与已选 tile，leaf 只做目标符号拼写 |
 | Ragged/stream binding在 SurfacePlan 重建 | Common semantic index + Plan | 已闭合：算法 relation/use-def 在 KernelModel 建一次；Plan 只保存已选 stream axis/range/relation |
-| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | 本轮明确不动；仍需 dependency、workspace lifetime、visibility 可验证，并为 GPU/RVV 分别投影 |
+| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | 已闭合：dependency、topology、intermediate producer/consumer/owner/lifetime/visibility、sync、fusion 与 grouping policy 都进入 Plan；三个 GPU surface 只消费 `same_stream + forbidden + fixed_operation_slice` 合同 |
 
 ### C. 语言表面收敛
 
 | 项目 | 决定 |
 |---|---|
-| generic reduce/scan combine | 当前不支持；方向仍是进入 typed Kernel IR region，由 Triton/cuTile 机械委托，TileLang按真实能力支持或拒绝，RVV由 target realizer 兑现；留到能力完善轮 |
-| arbitrary contract multiply/combine | 不随 reduce 一起放开；按目标矩阵原语 capability定义 |
-| `arg_reduce.max` | 真实需求但当前形态是过渡；generic combine 闭合后收敛为 sugar/通用 tuple reduction，本轮不改 API |
+| generic reduce/scan combine | 已闭合：typed helper/closure、component identity、purity、显式 capture 进入 canonical Kernel IR；Triton/cuTile机械委托，TileLang 0.1.13 明确 unsupported |
+| arbitrary contract multiply/combine | 正式不随 reduce 一起放开；当前 contract 是目标矩阵原语支持的 multiply/add 与 dtype capability，其他 semiring显式写 pointwise + reduce |
+| `arg_reduce.max` | 已收敛为 frontend sugar + tuple-valued generic reduce；target 原生 argmax 只是经验证的等价 spelling hint，不是第二份语义 |
 | `partition(count)` | 语义合理但当前 realizer 不支持；frontend 在构造 IR 前明确拒绝，不列 correctness blocker |
 | 非 unit-step domain | frontend 明确拒绝；当前使用 unit-step logical domain + 显式 index relation |
 | runtime `state_stream` extent | frontend 明确拒绝；保留 compile-time fixed/auto extent + runtime logical stop |
@@ -720,6 +726,21 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 - 为所有 target 统一 GPU `ProgramOp/worker_axis`；
 - 为了让 TileLang 跟上，把其显式 buffer/layout 字段抬进 Kernel IR；
 - 没有真实需求时实现一般 strided domain 或 runtime stream tile。
+
+### E. 冻结前定向验证
+
+本轮没有跑全量矩阵，只运行直接消费新合同的入口；一次性 probe 位于 `/tmp`，验证后删除，不进入语料或测试设施。
+
+| 能力 | 5090 | H100 |
+|---|---|---|
+| generic record reduce/scan + runtime scalar capture，Triton/cuTile | 通过；长轴 `N=4093`，sum 最大误差 `2.29e-5`、max 误差 `0` | 同样通过，误差一致 |
+| generic Welford record reduction，Triton/cuTile | `M=64,N=257` 通过；mean 误差约 `3e-8`、variance `2.38e-7` | 同样通过，误差一致 |
+| fixed add 的多组件长轴 scan，三个 surface | 通过；两个 component 最大误差分别 `7.63e-6`、`1.53e-5` | 通过；误差一致 |
+| TileLang generic combine capability boundary | emission 前明确 unsupported | emission 前明确 unsupported |
+| `I.arg_reduce.max` sugar 的 cross entropy forward/backward | 三 target 数值通过；旧/新路径分别对 reference 的 loss/prediction/gradient 一致 | 三 target 数值通过 |
+| 两 stage ragged MoE execution contract | 三 target 数值通过 | 三 target 数值通过 |
+
+H100 的 TileLang 初次运行曾调用系统 CUDA 11.5 `nvcc`，该工具不识别 `sm_90a`；切换到机器已有 CUDA 12.2 后，同一生成源码直接通过。这个失败属于运行环境工具链选择，没有转化成 compiler 或 Plan 特判。
 
 ---
 
@@ -759,6 +780,6 @@ Intent 的稳定核心不是“跨三种 GPU tile 语言”，而是：
 
 > **用一份 target-independent 的结构化逻辑区域算法，驱动多个算子级 target realizer；每个 realizer产生自己的 Physical Plan，surface/emitter只投影，下层 compiler继续完成其擅长的布局、指令与调优。**
 
-当前 GPU 主线已经证明这不是 rowwise/softmax 特化。Tail correctness、Kernel IR 唯一合同、Plan binding 与几项假 public capability 已经闭合；尚未冻结的是 stage execution contract 与 generic reduce/scan closure，以及登记表中明确保留的过渡能力。
+当前 GPU 主线已经证明这不是 rowwise/softmax 特化。Tail correctness、Kernel IR 唯一合同、region/row/stream Plan binding、generic reduce/scan closure 与 stage execution contract 都已闭合；不同 surface 不能机械表达的能力会在 emission 前明确拒绝，而不是形成第二套编译器或慢路径。
 
-完成这些之后，后续新增 GPU provider 或 RISC-V/RVV backend 都不应再改编程模型：只新增 target-family realizer、Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core表达时才允许进入。
+编程模型由此冻结。除尚未接入 CPU/RISC-V/RVV target family 外，Intent 已形成完整的算子级语言—Kernel IR—target-family Plan—surface emission 闭环。后续新增 GPU provider 或 RISC-V/RVV backend 不应修改现有编程模型：只新增 target-family realizer、必要的 Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core表达、且不能由下层已有能力承接时，才按修改正式规格的标准进入。

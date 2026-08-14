@@ -2,13 +2,13 @@
 
 ## 定义
 
-Intent 是一门 Python-hosted、单-kernel、跨后端、tile-parametric 的 Structured Tensor-Flow DSL。
+Intent 是一门 Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL。
 
 用户在一个 `@intent.kernel` 中写出完整的 kernel 内算法：logical domain、region、tensor-flow、顺序或独立工作、carry state、structured computation、控制流与 effects。用户不写物理 worker identity、内部 tile、grid、地址运算、storage placement、fragment layout 或 pipeline。
 
 最短定义是：
 
-> Intent 保留完整的单-kernel 算法，抽掉该 kernel 对具体机器 realization 的绑定。
+> Intent 保留一个 logical callable 内的完整算法，抽掉它对具体机器 realization 的绑定。
 
 形式上：
 
@@ -18,10 +18,10 @@ Intent 是一门 Python-hosted、单-kernel、跨后端、tile-parametric 的 St
 
 - \(K\)：Intent source kernel；
 - \(s\)：用户 specialization；
-- \(E_t\)：目标上的一个 callable kernel entry；
-- \(L_t\)：该 entry 的 launch configuration。
+- \(E_t\)：目标上对调用方可见的一个 callable entry；
+- \(L_t\)：该 entry 的 Physical Plan 与内部 execution-stage realization。
 
-一次 source-kernel invocation 对应一次 target-kernel invocation。
+一次 source-kernel invocation 对应一次 target callable invocation；该 callable 内部可以按已验证的 Physical Plan 提交一个或多个 compiler-private machine stages。
 
 ## 在完整程序中的位置
 
@@ -46,7 +46,7 @@ Python / framework wrapper
 - 根据 target、shape、dtype 或库策略选择 source variant；
 - 注册 framework custom op 与 autograd 接口。
 
-多-kernel 算法仍由 wrapper 明确表达。Intent 不自动融合多个 source kernels，也不把一个 source kernel 拆成多个 runtime-visible dispatches。
+多 source-kernel 算法仍由 wrapper 明确表达，Intent 不自动融合 source callables。单个 callable 内部可以 materialize 作者已经写下的数据依赖为多个私有 stages，但这些 stage 不改变 ABI、effects、调用次数或 wrapper-visible orchestration。
 
 ## 权限分界
 
@@ -56,7 +56,7 @@ Source 固定：
 - 算法阶段、数据遍数、状态 schema 与更新；
 - logical domain、region 与 indexing relation；
 - `parallel`、`ordered`、`state_stream`；
-- `reduce`、`scan`、`contract` 的组合；
+- `reduce`、`scan`、typed pure combiner，以及目标矩阵原语支持的 `contract` 语义；
 - stable、online、multi-pass 等算法选择；
 - 显式 dtype、`cast` 与数学表达；
 - gather/scatter 的索引和冲突语义；
@@ -70,6 +70,7 @@ Realizer 决定：
 - program folding、grid-stride、persistent traversal 与 swizzle；
 - logical validity 的物理兑现、access footprint、tail 与 address formation；
 - 算法结构要求的 storage level、片上复用边界与 target primitive 数值角色；
+- compiler-private stage grouping、dependency、intermediate lifetime、visibility 与 fusion permission；
 - 可交给下层 tuner 的合法参数轴与资源上界。
 
 下层 target compiler 决定不依赖 Intent 独有算法信息的部分：layout 推断、寄存器分配、指令选择、给定候选后的低层 pipeline/prefetch/unroll，以及候选值、排序与赢家。Surface 变强时 Intent emitter 应变薄，不把这些决定重新搬进共享 Plan。

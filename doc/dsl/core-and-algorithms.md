@@ -8,7 +8,7 @@ Core 包含：
 domain / region / view
 partition / parallel / ordered / state_stream
 pure tensor expressions
-reduce / scan / contract
+reduce / scan + typed pure combiner / multiply-add contract
 gather / scatter
 ragged descriptor
 logical buffer

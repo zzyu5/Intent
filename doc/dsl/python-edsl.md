@@ -119,4 +119,4 @@ I.partition(axis, count=I.auto("PARTS"))
 kernel(x, y, FLAG=value)
 ```
 
-用户不提供 Triton 式 `[grid]`。调用根据 target、tensor signature 与 `Constexpr` 获取 specialization 和 Physical Plan，然后以编译器生成的 launch configuration 提交一次 target-kernel invocation。
+用户不提供 Triton 式 `[grid]`。调用根据 target、tensor signature 与 `Constexpr` 获取 specialization 和 Physical Plan，然后提交一次 logical callable invocation。该 callable 可以按 Plan 在当前 stream 内执行多个 compiler-private stages；这些 stages 不进入用户 ABI，也不替代 wrapper 对多个 source kernels 的编排。

@@ -11,6 +11,7 @@ Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、
 - Kernel IR 的 operation/region/def-use 遍历；
 - ABI、domain、ragged relation、state stream 与 contraction 分析；
 - ownership、traversal、tile role、storage、boundary 和合法搜索轴的 machine 决策；
+- execution-stage dependency、intermediate lifetime/visibility、同步与 fusion policy；
 - operation handler registry 与 unsupported-op 诊断机制。
 
 每个 target 叶子只提供：
@@ -42,12 +43,17 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 |---|---|---|---|
 | logical view/index | pointer + masked load/store | buffer region + `T.copy` | array/tile load/store |
 | `contract` role | `tl.dot` | `T.gemm` | tile MMA/matmul |
-| `reduce` role | `tl.max` / `tl.sum` | target reduction | tile reduction |
+| fixed `reduce/scan` role | `tl.max` / `tl.sum` / `tl.cumsum` | fixed target reduction/scan | tile reduction/scan |
+| generic `reduce/scan` combiner | typed `@triton.jit` helper | 当前 PrimFunc surface 明确 unsupported | typed function/lambda |
 | logical validity | mask / tightened loop | predicate / range | boundary handling |
 | Plan storage | compiler-local representation | shared/fragment/local | tile/register storage |
 | Plan stream | explicit state-carried loop | pipelined state-carried loop | explicit state-carried loop |
 
-使用 target 的高性能内层 primitive，不等于把数学语义交给 target。Contract 的 reduction axes、operand dtype、accumulator dtype 与 result role先由 Kernel IR/Plan 固定；leaf emitter 只选择对应 spelling并让下层完成 layout、指令和 machine code generation。
+使用 target 的高性能内层 primitive，不等于把数学语义交给 target。Reduce/scan closure、contract reduction axes、operand dtype、accumulator dtype 与 result role先由 Kernel IR/Plan 固定；leaf emitter 只选择对应 spelling并让下层完成 collective tree、layout、指令和 machine code generation。Generic reduce/scan不意味着 arbitrary contract semiring；当前矩阵原语只承接正式声明的 multiply/add 与 dtype capability。
+
+## Execution-stage 投影
+
+Plan 已给出 stage operation slice、dependency、intermediate producer/consumer/owner/lifetime/visibility、synchronization、fusion 与 grouping policy。当前三个 GPU surface 只接受 `same_stream + forbidden + fixed_operation_slice`，按拓扑顺序发射 private kernels；leaf 不从 def-use 重新划分 stage，也不自行决定 workspace owner。不同 target family 可以在各自 realizer 中产生不同 grouping，surface provider不能改写同一份 GPU Plan。
 
 ## 失败边界
 

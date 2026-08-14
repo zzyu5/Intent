@@ -7,7 +7,7 @@ rows = I.domain(0, M)
 cols = I.domain(0, N)
 ```
 
-Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。当前 frontend 只接受 unit-step domain；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。非 unit-step domain 的语言语义保留，但当前 realizer 尚未闭合，frontend 会在构造 IR 前明确拒绝；需要偏移、整除或取模时使用显式 index relation。
+Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。当前正式语言只承诺 unit-step domain；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。Frontend 在构造 IR 前明确拒绝非 unit-step domain；需要 stride、偏移、整除或取模时，使用 unit-step logical identity 加显式 index relation。只有未来真实算法证明这种表达不足时，才重新打开该语义。
 
 ## Region 与位置式 tensor 语义
 
