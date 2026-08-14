@@ -12,6 +12,7 @@ from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import dims_compatible
 from intent.language.builtins import Intrinsic
 from intent.language.dtypes import i16
+from intent.language.dtypes import i32
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import Literal
