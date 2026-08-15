@@ -65,6 +65,7 @@ struct RealizationIndex {
   llvm::DenseMap<int64_t, llvm::StringMap<plan::StageAxisOp>> stageAxes;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::emission::PhysicalComponents components;
+  bool requiresSymmetricProgramTiles = false;
 };
 
 struct SearchIndex {

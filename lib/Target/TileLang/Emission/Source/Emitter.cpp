@@ -225,25 +225,20 @@ bool feedsAtomicValue(Operation &operation) {
          user->getOperand(valueIndex.getInt()) == operation.getResult(0);
 }
 
-bool hasNestedTensorReduction(func::FuncOp entry) {
-  bool nested = false;
-  entry.walk([&](Operation *operation) {
-    if (nested || operation->getName().getStringRef() != "intent.reduce" ||
-        operation->getNumOperands() == 0)
-      return;
-    Operation *producer = operation->getOperand(0).getDefiningOp();
-    if (!producer || producer->getName().getStringRef() != "intent.reduce" ||
-        producer->getNumOperands() == 0)
-      return;
-    auto source = dyn_cast<RankedTensorType>(producer->getOperand(0).getType());
-    auto intermediate =
-        dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
-    auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
-    nested = source && intermediate && result && source.getRank() >= 4 &&
-             intermediate.getRank() + 1 == source.getRank() &&
-             result.getRank() + 1 == intermediate.getRank();
-  });
-  return nested;
+bool isRankReducingReductionChain(Operation &operation) {
+  if (operation.getNumOperands() == 0 || operation.getNumResults() != 1)
+    return false;
+  Operation *producer = operation.getOperand(0).getDefiningOp();
+  if (!producer || producer->getName().getStringRef() != "intent.reduce" ||
+      producer->getNumOperands() == 0)
+    return false;
+  auto source = dyn_cast<RankedTensorType>(producer->getOperand(0).getType());
+  auto intermediate =
+      dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  return source && intermediate && result && source.getRank() >= 4 &&
+         intermediate.getRank() + 1 == source.getRank() &&
+         result.getRank() + 1 == intermediate.getRank();
 }
 
 } // namespace
@@ -373,6 +368,9 @@ indexRealization(intent::plan::RealizationOp realization,
                   : FailureOr<int64_t>(failure());
     if (failed(role) || failed(axis))
       return value.emitOpError("does not bind a canonical reduction");
+    index.requiresSymmetricProgramTiles =
+        index.requiresSymmetricProgramTiles ||
+        isRankReducingReductionChain(*operation);
     if (*role == "reduce_generic")
       return operation->emitOpError(
           "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced "
@@ -955,7 +953,7 @@ void SourceEmitter::emitImports() {
       programN = programN || role == "program_n";
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
-    if (programM && programN && hasNestedTensorReduction(kernel.entry))
+    if (programM && programN && planIndex.requiresSymmetricProgramTiles)
       output << ", equal_role_groups=(('program_m', 'program_n'),)";
     output << ")\n";
     output << "_AUTOTUNE_INPUTS = None\n\n";
