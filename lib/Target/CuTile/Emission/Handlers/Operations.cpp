@@ -1,4 +1,5 @@
 #include "Support/Model.h"
+#include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
@@ -1994,9 +1995,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
     return failure();
   std::string result = makeResultName(operation, 0);
   std::string expression =
-      binding.getLowering() == "ct.full_cast"
-          ? "ct.full((), " + operand->str() + ", dtype=" + targetType + ")"
-          : "ct.astype(" + operand->str() + ", " + targetType + ")";
+      syntax::cast(binding.getLowering(), *operand, targetType);
   if (target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
     return success();
@@ -2198,11 +2197,9 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     if (failed(index))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.gather(" + (*view)->argument->name + ", " +
-         addressIndex(*index) + ", check_bounds=True, padding_value=" +
-         fill->str() + ")");
-    line(result + " = ct.where(member_mask & " + valid->str() + ", " +
-         result + ", " + fill->str() + ")");
+    line(result + " = " +
+         syntax::gather((*view)->argument->name, addressIndex(*index), *fill,
+                        "member_mask & " + valid->str()));
     bindResult(operation, 0, result);
     return success();
   }
@@ -2292,9 +2289,9 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   std::string valid = position + " < sequence_end_" + suffix;
   std::string result = makeResultName(operation, 0);
   if (ragged.indices) {
-    line(result + " = ct.gather(" + ragged.indices->argument->name + ", " +
-         addressIndex(position) + ", check_bounds=True, padding_value=0)");
-    line(result + " = ct.where(" + valid + ", " + result + ", 0)");
+    line(result + " = " +
+         syntax::gather(ragged.indices->argument->name, addressIndex(position),
+                        "0", valid));
   } else {
     line(result + " = ct.where(" + valid + ", " + position + ", 0)");
   }
@@ -2552,11 +2549,12 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       if (failed(rows))
         return failure();
       lhs = makeResultName(*lhsAccess, 0);
-      line(lhs + " = ct.gather(" + (*lhsView)->argument->name + ", (" +
-           addressIndex(rows->str() + "[:, None]") + ", " +
-           addressIndex("offs_reduction[None, :]") + "), "
-           "check_bounds=True, padding_value=0.0)");
-      line(lhs + " = ct.where(member_mask[:, None], " + lhs + ", 0.0)");
+      line(lhs + " = " +
+           syntax::gather((*lhsView)->argument->name,
+                          "(" + addressIndex(rows->str() + "[:, None]") +
+                              ", " +
+                              addressIndex("offs_reduction[None, :]") + ")",
+                          "0.0", "member_mask[:, None]"));
     } else {
       auto workspace = workspaceNames.find(operation.getOperand(0));
       if (workspace == workspaceNames.end())

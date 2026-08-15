@@ -1,4 +1,5 @@
 #include "Support/Model.h"
+#include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Emission/Combiner.h"
@@ -38,142 +39,6 @@ StringRef torchDtype(Type type) {
   return {};
 }
 
-FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
-  if (role == "one")
-    return std::string("1");
-  if (role.starts_with("fixed_"))
-    return role.drop_front(6).str();
-  if (role == "row_vector")
-    return std::string("BLOCK_SIZE");
-  if (role.starts_with("row_vector_"))
-    return "BLOCK_SIZE_V" + role.drop_front(11).str();
-  if (role == "lane_pack")
-    return std::string("BLOCK_SIZE_L");
-  if (role.starts_with("lane_pack_"))
-    return "BLOCK_SIZE_L" + role.drop_front(10).str();
-  if (role == "program_m" || role == "ragged_member")
-    return std::string("BLOCK_SIZE_M");
-  if (role.starts_with("ragged_member_"))
-    return "BLOCK_SIZE_R" + role.drop_front(14).str();
-  if (role == "program_n" || role == "feature")
-    return std::string("BLOCK_SIZE_N");
-  if (role.starts_with("program_"))
-    return "BLOCK_SIZE_P" + role.drop_front(8).str();
-  if (role == "reduction")
-    return std::string("BLOCK_SIZE_K");
-  if (role.starts_with("reduction_"))
-    return "BLOCK_SIZE_K" + role.drop_front(10).str();
-  if (role == "query")
-    return std::string("BLOCK_SIZE_Q");
-  if (role.starts_with("query_"))
-    return "BLOCK_SIZE_Q" + role.drop_front(6).str();
-  if (role == "stream")
-    return std::string("BLOCK_SIZE_S");
-  if (role == "scan")
-    return std::string("BLOCK_SIZE_SCAN");
-  if (role.starts_with("scan_"))
-    return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
-  if (role == "stream_contract")
-    return std::string("BLOCK_SIZE_C");
-  if (role.starts_with("stream_contract_"))
-    return "BLOCK_SIZE_C" + role.drop_front(16).str();
-  if (role.starts_with("stream_"))
-    return "BLOCK_SIZE_S" + role.drop_front(7).str();
-  operation->emitOpError("has no Triton tile spelling for role ") << role;
-  return failure();
-}
-
-FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role) {
-  if (role == "indices")
-    return StringRef("logical_indices");
-  if (role == "counter_random_f32")
-    return StringRef("counter_xorshift32");
-  if (role == "broadcast")
-    return StringRef("alias");
-  if (role == "cast")
-    return StringRef("tl.cast");
-  if (role == "reshape")
-    return StringRef("tl.reshape");
-  if (role == "transpose")
-    return StringRef("tl.permute");
-  if (role == "unary_exp")
-    return StringRef("tl.exp");
-  if (role == "unary_exp2")
-    return StringRef("tl.exp2");
-  if (role == "unary_log")
-    return StringRef("tl.log");
-  if (role == "unary_rsqrt")
-    return StringRef("tl.rsqrt");
-  if (role == "unary_sigmoid")
-    return StringRef("tl.sigmoid");
-  if (role == "unary_negate")
-    return StringRef("python_negate");
-  if (role == "unary_not")
-    return StringRef("python_not");
-  if (role == "binary_add")
-    return StringRef("python_add");
-  if (role == "binary_subtract")
-    return StringRef("python_subtract");
-  if (role == "binary_multiply")
-    return StringRef("python_multiply");
-  if (role == "binary_true_divide")
-    return StringRef("python_true_divide");
-  if (role == "binary_floor_divide")
-    return StringRef("python_floor_divide");
-  if (role == "binary_remainder")
-    return StringRef("python_remainder");
-  if (role == "binary_power")
-    return StringRef("libdevice.pow");
-  if (role == "binary_bitwise_and")
-    return StringRef("python_bitwise_and");
-  if (role == "binary_bitwise_or")
-    return StringRef("python_bitwise_or");
-  if (role == "binary_bitwise_xor")
-    return StringRef("python_bitwise_xor");
-  if (role == "binary_left_shift")
-    return StringRef("python_left_shift");
-  if (role == "binary_right_shift")
-    return StringRef("python_right_shift");
-  if (role == "binary_logical_and")
-    return StringRef("python_logical_and");
-  if (role == "binary_logical_or")
-    return StringRef("python_logical_or");
-  if (role == "binary_maximum")
-    return StringRef("tl.maximum");
-  if (role == "binary_minimum")
-    return StringRef("tl.minimum");
-  if (role == "compare_equal")
-    return StringRef("python_equal");
-  if (role == "compare_not_equal")
-    return StringRef("python_not_equal");
-  if (role == "compare_less")
-    return StringRef("python_less");
-  if (role == "compare_less_equal")
-    return StringRef("python_less_equal");
-  if (role == "compare_greater")
-    return StringRef("python_greater");
-  if (role == "compare_greater_equal")
-    return StringRef("python_greater_equal");
-  if (role == "mask")
-    return StringRef("tl.where");
-  if (role == "select")
-    return StringRef("tl.where");
-  if (role == "full")
-    return StringRef("tl.full");
-  if (role == "zeros")
-    return StringRef("tl.zeros");
-  if (role == "members")
-    return StringRef("tl.members");
-  if (role == "expand_dims")
-    return StringRef("expand_dims");
-  if (role == "indirect_gather")
-    return StringRef("tl.indirect_gather");
-  if (role == "extract_unit_scalar")
-    return StringRef("tl.extract_unit_scalar");
-  operation->emitOpError("has no Triton pointwise spelling for role ") << role;
-  return failure();
-}
-
 StringRef combinerDtype(Type type) {
   if (type.isInteger(1))
     return "tl.int1";
@@ -196,7 +61,7 @@ FailureOr<std::string>
 combinerExpression(Operation &operation, ArrayRef<std::string> operands) {
   FailureOr<std::string> role = target::emission::pointwiseRole(operation);
   FailureOr<StringRef> spelling =
-      succeeded(role) ? pointwiseSpelling(&operation, *role)
+      succeeded(role) ? syntax::pointwise(&operation, *role)
                       : FailureOr<StringRef>(failure());
   if (failed(spelling))
     return failure();
@@ -206,47 +71,6 @@ combinerExpression(Operation &operation, ArrayRef<std::string> operands) {
         return dtype.empty() ? FailureOr<std::string>(failure())
                              : FailureOr<std::string>(dtype.str());
       });
-}
-
-FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
-  if (role == "lane_pack")
-    return std::string("BLOCK_SIZE_L");
-  if (role.starts_with("lane_pack_"))
-    return "BLOCK_SIZE_L" + role.drop_front(10).str();
-  if (role == "program_m" || role == "ragged_member")
-    return std::string("BLOCK_SIZE_M");
-  if (role.starts_with("ragged_member_"))
-    return "BLOCK_SIZE_R" + role.drop_front(14).str();
-  if (role == "program_n" || role == "feature")
-    return std::string("BLOCK_SIZE_N");
-  if (role.starts_with("program_"))
-    return "BLOCK_SIZE_P" + role.drop_front(8).str();
-  if (role == "reduction")
-    return std::string("BLOCK_SIZE_K");
-  if (role.starts_with("reduction_"))
-    return "BLOCK_SIZE_K" + role.drop_front(10).str();
-  if (role == "group_m")
-    return std::string("GROUP_SIZE_M");
-  if (role.starts_with("group_"))
-    return "GROUP_SIZE_G" + role.drop_front(6).str();
-  if (role == "query")
-    return std::string("BLOCK_SIZE_Q");
-  if (role.starts_with("query_"))
-    return "BLOCK_SIZE_Q" + role.drop_front(6).str();
-  if (role == "stream")
-    return std::string("BLOCK_SIZE_S");
-  if (role == "scan")
-    return std::string("BLOCK_SIZE_SCAN");
-  if (role.starts_with("scan_"))
-    return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
-  if (role == "stream_contract")
-    return std::string("BLOCK_SIZE_C");
-  if (role.starts_with("stream_contract_"))
-    return "BLOCK_SIZE_C" + role.drop_front(16).str();
-  if (role.starts_with("stream_"))
-    return "BLOCK_SIZE_S" + role.drop_front(7).str();
-  operation->emitOpError("has no Triton tuner parameter for role ") << role;
-  return failure();
 }
 
 } // namespace
@@ -269,7 +93,7 @@ indexRealization(intent::plan::RealizationOp realization,
       plan::AxisOp binding;
       binding.operation = value;
       if (std::optional<StringRef> group = value.getGroup()) {
-        FailureOr<std::string> spelling = parameterSpelling(value, *group);
+        FailureOr<std::string> spelling = syntax::parameter(value, *group);
         if (failed(spelling))
           return failure();
         binding.group = *spelling;
@@ -309,7 +133,7 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      binding.lowering = "tl.dot";
+      binding.lowering = syntax::contraction().str();
       binding.lhsSpace = value.getLhsSpace().str();
       binding.rhsSpace = value.getRhsSpace().str();
       binding.accumulatorSpace = value.getAccumulatorSpace().str();
@@ -338,7 +162,7 @@ indexRealization(intent::plan::RealizationOp realization,
       index.streamBindings[value.getStreamNode()] = value;
     }
   }
-  if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
+  if (failed(target::emission::indexAxisRanges(index, ranges, syntax::tile)) ||
       failed(target::emission::indexCanonicalStructure(index, kernel)))
     return failure();
   target::emission::indexAxisRoles(index);
@@ -354,13 +178,7 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical reduction");
     plan::ReductionOp binding;
     binding.operation = value;
-    binding.lowering = *role == "reduce_argmax"
-                           ? "tl.max_with_index"
-                       : *role == "reduce_generic" ? "tl.reduce"
-                       : *role == "reduce_maximum" ? "tl.max"
-                       : *role == "reduce_any"     ? "tl.reduce_or"
-                       : *role == "reduce_all"     ? "tl.reduce_all"
-                                                    : "tl.sum";
+    binding.lowering = syntax::reduction(*role).str();
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = *axis;
     index.reductions[value.getNode()] = binding;
@@ -374,9 +192,7 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;
     binding.operation = value;
-    binding.lowering = *role == "scan_generic_inclusive"
-                           ? "tl.associative_scan"
-                           : "tl.cumsum";
+    binding.lowering = syntax::scan(*role).str();
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = value.getTensorAxis();
     binding.axisNode = value.getAxisNode();
@@ -388,7 +204,7 @@ indexRealization(intent::plan::RealizationOp realization,
         operation ? target::emission::pointwiseRole(*operation)
                   : FailureOr<std::string>(failure());
     FailureOr<StringRef> lowering =
-        succeeded(role) ? pointwiseSpelling(value, *role)
+        succeeded(role) ? syntax::pointwise(value, *role)
                         : FailureOr<StringRef>(failure());
     if (failed(lowering))
       return value.emitOpError("does not bind canonical pointwise semantics");
@@ -406,7 +222,7 @@ indexRealization(intent::plan::RealizationOp realization,
         axis ? axis.getRange(binding.getRangePurpose(), binding.getRangeLevel())
              : nullptr;
     FailureOr<std::string> tile =
-        traversal ? tileSpelling(binding.operation, traversal->getTileRole())
+        traversal ? syntax::tile(binding.operation, traversal->getTileRole())
                   : FailureOr<std::string>(failure());
     if (failed(tile))
       return binding.emitOpError("does not bind an ordered physical axis");
@@ -454,7 +270,7 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
       OpBuilder builder(searchSpace.getContext());
       for (Attribute attribute : autotune.getParameters()) {
         StringRef role = cast<StringAttr>(attribute).getValue();
-        FailureOr<std::string> spelling = parameterSpelling(autotune, role);
+        FailureOr<std::string> spelling = syntax::parameter(autotune, role);
         if (failed(spelling))
           return failure();
         mappings.push_back(builder.getNamedAttr(*spelling,
@@ -813,11 +629,11 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     if (!members)
       return stage.emitOpError("has no member enumeration operation");
     FailureOr<std::string> featureTile =
-        tileSpelling(feature.operation, feature.getTile());
+        syntax::tile(feature.operation, feature.getTile());
     FailureOr<std::string> memberTile =
-        tileSpelling(member.operation, member.getTile());
+        syntax::tile(member.operation, member.getTile());
     FailureOr<std::string> reductionTile =
-        tileSpelling(reduction.operation, reduction.getTile());
+        syntax::tile(reduction.operation, reduction.getTile());
     if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
       return failure();
     stageRaggedRuntime[position] = runtimeIndex;

@@ -1,4 +1,5 @@
 #include "Support/Model.h"
+#include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Emission/Combiner.h"
@@ -8,185 +9,6 @@ using namespace mlir;
 
 namespace intent::cutile::emission {
 namespace {
-
-FailureOr<std::string> tileSpelling(Operation *operation, StringRef role) {
-  if (role == "one")
-    return std::string("1");
-  if (role.starts_with("fixed_"))
-    return role.drop_front(6).str();
-  if (role == "row_vector")
-    return std::string("TILE_SIZE");
-  if (role.starts_with("row_vector_"))
-    return "TILE_SIZE_V" + role.drop_front(11).str();
-  if (role == "lane_pack")
-    return std::string("TILE_SIZE_L");
-  if (role.starts_with("lane_pack_"))
-    return "TILE_SIZE_L" + role.drop_front(10).str();
-  if (role == "program_m" || role == "ragged_member")
-    return std::string("TILE_SIZE_M");
-  if (role.starts_with("ragged_member_"))
-    return "TILE_SIZE_R" + role.drop_front(14).str();
-  if (role.starts_with("query_"))
-    return "TILE_SIZE_Q" + role.drop_front(6).str();
-  if (role == "query")
-    return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "feature")
-    return std::string("TILE_SIZE_N");
-  if (role == "stream")
-    return std::string("TILE_SIZE_S");
-  if (role == "scan")
-    return std::string("TILE_SIZE_SCAN");
-  if (role.starts_with("scan_"))
-    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
-  if (role == "stream_contract")
-    return std::string("TILE_SIZE_C");
-  if (role.starts_with("stream_contract_"))
-    return "TILE_SIZE_C" + role.drop_front(16).str();
-  if (role.starts_with("stream_"))
-    return "TILE_SIZE_S" + role.drop_front(7).str();
-  if (role.starts_with("program_"))
-    return "TILE_SIZE_P" + role.drop_front(8).str();
-  if (role == "reduction")
-    return std::string("TILE_SIZE_K");
-  if (role.starts_with("reduction_"))
-    return "TILE_SIZE_K" + role.drop_front(10).str();
-  operation->emitOpError("has no cuTile tile spelling for role ") << role;
-  return failure();
-}
-
-FailureOr<StringRef> pointwiseSpelling(Operation *operation, StringRef role,
-                                       StringRef resultSpace) {
-  if (role == "indices")
-    return StringRef("logical_indices");
-  if (role == "counter_random_f32")
-    return StringRef("counter_xorshift32");
-  if (role == "broadcast")
-    return StringRef("alias");
-  if (role == "cast")
-    return resultSpace == "private_scalar" ? StringRef("ct.full_cast")
-                                            : StringRef("ct.astype");
-  if (role == "reshape")
-    return StringRef("ct.reshape");
-  if (role == "transpose")
-    return StringRef("ct.permute");
-  if (role == "unary_exp")
-    return StringRef("ct.exp");
-  if (role == "unary_exp2")
-    return StringRef("ct.exp2");
-  if (role == "unary_log")
-    return StringRef("ct.log");
-  if (role == "unary_rsqrt")
-    return StringRef("ct.rsqrt");
-  if (role == "unary_sigmoid")
-    return StringRef("python_sigmoid");
-  if (role == "unary_negate")
-    return StringRef("python_negate");
-  if (role == "unary_not")
-    return StringRef("python_not");
-  if (role == "binary_add")
-    return StringRef("python_add");
-  if (role == "binary_subtract")
-    return StringRef("python_subtract");
-  if (role == "binary_multiply")
-    return StringRef("python_multiply");
-  if (role == "binary_true_divide")
-    return StringRef("python_true_divide");
-  if (role == "binary_floor_divide")
-    return StringRef("python_floor_divide");
-  if (role == "binary_remainder")
-    return StringRef("python_remainder");
-  if (role == "binary_power")
-    return StringRef("ct.pow");
-  if (role == "binary_bitwise_and")
-    return StringRef("ct.bitwise_and");
-  if (role == "binary_bitwise_or")
-    return StringRef("ct.bitwise_or");
-  if (role == "binary_bitwise_xor")
-    return StringRef("ct.bitwise_xor");
-  if (role == "binary_left_shift")
-    return StringRef("ct.bitwise_lshift");
-  if (role == "binary_right_shift")
-    return StringRef("ct.bitwise_rshift");
-  if (role == "binary_logical_and")
-    return StringRef("python_logical_and");
-  if (role == "binary_logical_or")
-    return StringRef("python_logical_or");
-  if (role == "binary_maximum")
-    return StringRef("ct.maximum");
-  if (role == "binary_minimum")
-    return StringRef("ct.minimum");
-  if (role == "compare_equal")
-    return StringRef("python_equal");
-  if (role == "compare_not_equal")
-    return StringRef("python_not_equal");
-  if (role == "compare_less")
-    return StringRef("python_less");
-  if (role == "compare_less_equal")
-    return StringRef("python_less_equal");
-  if (role == "compare_greater")
-    return StringRef("python_greater");
-  if (role == "compare_greater_equal")
-    return StringRef("python_greater_equal");
-  if (role == "mask")
-    return StringRef("ct.where");
-  if (role == "select")
-    return StringRef("ct.where");
-  if (role == "full")
-    return StringRef("ct.full");
-  if (role == "zeros")
-    return StringRef("ct.zeros");
-  if (role == "members")
-    return StringRef("ct.members");
-  if (role == "expand_dims")
-    return StringRef("expand_dims");
-  if (role == "indirect_gather")
-    return StringRef("ct.indirect_gather");
-  if (role == "extract_unit_scalar")
-    return StringRef("ct.extract_unit_scalar");
-  operation->emitOpError("has no cuTile pointwise spelling for role ") << role;
-  return failure();
-}
-
-FailureOr<std::string> parameterSpelling(Operation *operation, StringRef role) {
-  if (role == "lane_pack")
-    return std::string("TILE_SIZE_L");
-  if (role.starts_with("lane_pack_"))
-    return "TILE_SIZE_L" + role.drop_front(10).str();
-  if (role == "program_m" || role == "ragged_member")
-    return std::string("TILE_SIZE_M");
-  if (role.starts_with("ragged_member_"))
-    return "TILE_SIZE_R" + role.drop_front(14).str();
-  if (role.starts_with("query_"))
-    return "TILE_SIZE_Q" + role.drop_front(6).str();
-  if (role == "query")
-    return std::string("TILE_SIZE_Q");
-  if (role == "program_n" || role == "feature")
-    return std::string("TILE_SIZE_N");
-  if (role == "stream")
-    return std::string("TILE_SIZE_S");
-  if (role == "scan")
-    return std::string("TILE_SIZE_SCAN");
-  if (role.starts_with("scan_"))
-    return "TILE_SIZE_SCAN" + role.drop_front(5).str();
-  if (role == "stream_contract")
-    return std::string("TILE_SIZE_C");
-  if (role.starts_with("stream_contract_"))
-    return "TILE_SIZE_C" + role.drop_front(16).str();
-  if (role.starts_with("stream_"))
-    return "TILE_SIZE_S" + role.drop_front(7).str();
-  if (role.starts_with("program_"))
-    return "TILE_SIZE_P" + role.drop_front(8).str();
-  if (role == "reduction")
-    return std::string("TILE_SIZE_K");
-  if (role.starts_with("reduction_"))
-    return "TILE_SIZE_K" + role.drop_front(10).str();
-  if (role == "group_m")
-    return std::string("GROUP_SIZE_M");
-  if (role.starts_with("group_"))
-    return "GROUP_SIZE_G" + role.drop_front(6).str();
-  operation->emitOpError("has no cuTile tuner parameter for role ") << role;
-  return failure();
-}
 
 bool workerReuse(const RealizationIndex &index) {
   return llvm::any_of(index.axesByRole, [](const auto &binding) {
@@ -214,7 +36,7 @@ indexRealization(intent::plan::RealizationOp realization,
       plan::AxisOp binding;
       binding.operation = value;
       if (std::optional<StringRef> group = value.getGroup()) {
-        FailureOr<std::string> spelling = parameterSpelling(value, *group);
+        FailureOr<std::string> spelling = syntax::parameter(value, *group);
         if (failed(spelling))
           return failure();
         binding.group = *spelling;
@@ -254,7 +76,7 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      binding.lowering = "ct.mma";
+      binding.lowering = syntax::contraction().str();
       binding.lhsSpace = value.getLhsSpace().str();
       binding.rhsSpace = value.getRhsSpace().str();
       binding.accumulatorSpace = value.getAccumulatorSpace().str();
@@ -283,7 +105,7 @@ indexRealization(intent::plan::RealizationOp realization,
       index.streamBindings[value.getStreamNode()] = value;
     }
   }
-  if (failed(target::emission::indexAxisRanges(index, ranges, tileSpelling)) ||
+  if (failed(target::emission::indexAxisRanges(index, ranges, syntax::tile)) ||
       failed(target::emission::indexCanonicalStructure(index, kernel)))
     return failure();
   target::emission::indexAxisRoles(index);
@@ -294,7 +116,7 @@ indexRealization(intent::plan::RealizationOp realization,
         axis ? axis.getRange(binding.getRangePurpose(), binding.getRangeLevel())
              : nullptr;
     FailureOr<std::string> tile =
-        traversal ? tileSpelling(binding.operation, traversal->getTileRole())
+        traversal ? syntax::tile(binding.operation, traversal->getTileRole())
                   : FailureOr<std::string>(failure());
     if (failed(tile))
       return binding.emitOpError("does not bind an ordered physical axis");
@@ -314,13 +136,7 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical reduction");
     plan::ReductionOp binding;
     binding.operation = value;
-    binding.lowering = *role == "reduce_argmax"
-                           ? "ct.max_with_index"
-                       : *role == "reduce_generic" ? "ct.reduce"
-                       : *role == "reduce_maximum" ? "ct.max"
-                       : *role == "reduce_any"     ? "ct.any_via_max"
-                       : *role == "reduce_all"     ? "ct.all_via_min"
-                                                    : "ct.sum";
+    binding.lowering = syntax::reduction(*role).str();
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = *axis;
     index.reductions[value.getNode()] = binding;
@@ -334,9 +150,7 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;
     binding.operation = value;
-    binding.lowering = *role == "scan_generic_inclusive"
-                           ? "ct.scan"
-                           : "ct.cumsum";
+    binding.lowering = syntax::scan(*role).str();
     binding.resultSpace = value.getResultSpace().str();
     binding.axis = value.getTensorAxis();
     binding.axisNode = value.getAxisNode();
@@ -349,7 +163,7 @@ indexRealization(intent::plan::RealizationOp realization,
                   : FailureOr<std::string>(failure());
     FailureOr<StringRef> lowering =
         succeeded(role)
-            ? pointwiseSpelling(value, *role, value.getResultSpace())
+            ? syntax::pointwise(value, *role, value.getResultSpace())
             : FailureOr<StringRef>(failure());
     if (failed(lowering))
       return value.emitOpError("does not bind canonical pointwise semantics");
@@ -431,7 +245,7 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
       OpBuilder builder(searchSpace.getContext());
       for (Attribute attribute : autotune.getParameters()) {
         StringRef role = cast<StringAttr>(attribute).getValue();
-        FailureOr<std::string> spelling = parameterSpelling(autotune, role);
+        FailureOr<std::string> spelling = syntax::parameter(autotune, role);
         if (failed(spelling))
           return failure();
         mappings.push_back(builder.getNamedAttr(*spelling,
@@ -807,11 +621,11 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
     if (!members)
       return stage.emitOpError("has no member enumeration operation");
     FailureOr<std::string> featureTile =
-        tileSpelling(feature.operation, feature.getTile());
+        syntax::tile(feature.operation, feature.getTile());
     FailureOr<std::string> memberTile =
-        tileSpelling(member.operation, member.getTile());
+        syntax::tile(member.operation, member.getTile());
     FailureOr<std::string> reductionTile =
-        tileSpelling(reduction.operation, reduction.getTile());
+        syntax::tile(reduction.operation, reduction.getTile());
     if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
       return failure();
     stageRaggedRuntime[position] = runtimeIndex;
@@ -911,8 +725,8 @@ LogicalResult SourceEmitter::emitHelpers() {
           target::emission::pointwiseRole(operation);
       FailureOr<StringRef> spelling =
           succeeded(role)
-              ? pointwiseSpelling(&operation, *role, "private_fragment")
-                          : FailureOr<StringRef>(failure());
+              ? syntax::pointwise(&operation, *role, "private_fragment")
+              : FailureOr<StringRef>(failure());
       if (failed(spelling))
         return failure();
       return target::emission::renderPythonPointwiseExpression(
@@ -1076,11 +890,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                 "safe_member_offsets = ct.where(member_mask, member_offsets, " +
                     stageMemberDimensions.lookup(stage) + ")");
       if (indices) {
-        stageLine(stage, "routes = ct.gather(" + indices->argument->name +
-                             ", " + addressIndex("member_offsets") +
-                             ", check_bounds=True, "
-                             "padding_value=0)");
-        stageLine(stage, "routes = ct.where(member_mask, routes, 0)");
+        stageLine(stage, "routes = " +
+                             syntax::gather(indices->argument->name,
+                                            addressIndex("member_offsets"), "0",
+                                            "member_mask"));
       } else {
         stageLine(stage, "routes = member_offsets");
       }

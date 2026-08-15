@@ -1,4 +1,5 @@
 #include "Support/Model.h"
+#include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
@@ -2294,21 +2295,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   bool decodeE8M0 = isa<Float8E8M0FNUType>(sourceElementType) &&
                     !isa<Float8E8M0FNUType>(resultElementType);
   auto castExpression = [&](StringRef value, StringRef dtype) {
-    if (!decodeE8M0)
-      return "T.cast(" + value.str() + ", " + dtype.str() + ")";
-    std::string bits = "T.reinterpret(" + value.str() + ", T.uint8)";
-    std::string bits32 = "T.cast(" + bits + ", T.uint32)";
-    std::string normalBits = "T.shift_left(" + bits32 + ", 23)";
-    std::string encoded =
-        "T.if_then_else(" + bits +
-        " == T.cast(255, T.uint8), T.cast(2143289344, T.uint32), "
-        "T.if_then_else(" + bits +
-        " == T.cast(0, T.uint8), T.cast(4194304, T.uint32), " +
-        normalBits + "))";
-    std::string decoded = "T.reinterpret(" + encoded + ", T.float32)";
-    return resultElementType.isF32()
-               ? decoded
-               : "T.cast(" + decoded + ", " + dtype.str() + ")";
+    return syntax::cast(value, dtype, decodeE8M0, resultElementType.isF32());
   };
   if (!tensorResult) {
     if (binding.getLowering() != "T.cast")
