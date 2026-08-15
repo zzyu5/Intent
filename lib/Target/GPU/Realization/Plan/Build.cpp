@@ -312,8 +312,15 @@ private:
     if (!definition)
       return std::nullopt;
     StringRef name = definition->getName().getStringRef();
-    if (name == "intent.view_load")
+    if (name == "intent.view_load") {
+      auto bounded = facts.boundaryDomains.find(definition);
+      auto fill = facts.boundaryFills.find(definition);
+      if (bounded != facts.boundaryDomains.end() &&
+          containsDomain(bounded->second, domain) &&
+          fill != facts.boundaryFills.end() && fill->second != "none")
+        return fill->second;
       return std::nullopt;
+    }
     if (name == "intent.zeros")
       return std::string("zero");
     if (name == "intent.constant") {
@@ -366,7 +373,7 @@ private:
       if (!logical)
         return std::nullopt;
       if (logical.getValue() == "multiply" &&
-          lhs && rhs && *lhs == "zero" && *rhs == "zero")
+          ((lhs && *lhs == "zero") || (rhs && *rhs == "zero")))
         return std::string("zero");
       if (logical.getValue() == "add" && lhs && rhs && *lhs == "zero" &&
           *rhs == "zero")
