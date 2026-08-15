@@ -22,7 +22,7 @@ print(compiled.ir)
 
 Launch policy 由组合 MLIR 中的 Plan 和生成源码共同保存，artifact 不维护第二份 Python launch/Plan 数据模型。
 
-当前 Triton target 的调用形式为：
+以 Triton target 为例，调用形式为：
 
 ```python
 compiled = intent.compile(
@@ -43,7 +43,7 @@ compiled(input, output)
 - 明确显示 Intent 已决定的 tile、grid、ownership 与 storage；surface 要求显式拼写的 layout 或 pipeline 参数也保留在源码中，下层自行推断的部分不伪造出来；
 - 使用结构化 helper，不生成难以阅读的一次性字符串；
 - 可以脱离 Intent 继续编译、调试和人工修改；
-- 成为性能理解与极端 kernel 人工接管的直接接口。
+- 成为检查生成实现与极端 kernel 人工接管的直接接口。
 
 Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，但不是 source language semantics。
 
@@ -59,7 +59,7 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 - 自动融合或拆分 kernels；
 - source variant 的 library policy。
 
-这些仍属于普通 Python wrapper。当前 artifact 额外提供的 `compiled.run(input)` 是一个会执行 `empty_like` 的 convenience wrapper；它用于与同样包含 output allocation 的上游 softmax wrapper 做公平比较，不改变底层 launch 边界。
+这些仍属于普通 Python wrapper。`compiled.run(input)` 可以作为分配 `empty_like` 输出的 convenience wrapper，但不改变底层 launch 边界。
 
 ## Single logical callable invariant
 

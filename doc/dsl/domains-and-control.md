@@ -7,7 +7,7 @@ rows = I.domain(0, M)
 cols = I.domain(0, N)
 ```
 
-Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。rank-one domain 与 region 都采用半开区间 `[begin, end)`；`end <= begin` 时逻辑集合为空。当前正式语言只承诺 unit-step domain；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。Frontend 在构造 IR 前明确拒绝非 unit-step domain；需要 stride、偏移、整除或取模时，使用 unit-step logical identity 加显式 index relation。只有未来真实算法证明这种表达不足时，才重新打开该语义。
+Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。rank-one domain 与 region 都采用半开区间 `[begin, end)`；`end <= begin` 时逻辑集合为空。Core domain 采用 unit-step；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。Stride、偏移、整除或取模通过 unit-step logical identity 加显式 index relation 表达，非 unit-step domain 不属于该 Core 合同。
 
 ## Region 与位置式 tensor 语义
 
@@ -57,9 +57,7 @@ for part, region in I.partition(axis, count=P):
 
 `P` 来自 runtime、shape、`I.Constexpr` 或 wrapper，不接受 `I.auto`。
 
-这是保留的 source 语义，但当前 realizer 尚未实现。Frontend 对 `partition(count=...)` 给出源码定位的明确诊断，不生成一个会在深层失败的 Kernel IR，也不会把它静默改成 `extent` 模式。
-
-显式 `partition` 是算法决定：source body 从“一个 logical element”变成“一个 logical region”，因而可以合法写 region reduction、contraction、scan、区域 mask 或片上复用。Compiler 不能因为某个标量写法性能差，就替作者补一个 partition 并把它改成块算法。
+显式 `partition` 是算法决定：source body 从“一个 logical element”变成“一个 logical region”，因而可以合法写 region reduction、contraction、scan、区域 mask 或片上复用。Compiler 不能因为某个标量写法需要块级结构，就替作者补一个 partition 并把它改成块算法。
 
 ## Parallel
 
@@ -107,9 +105,9 @@ with stream:
 result = stream.result
 ```
 
-Source 固定 streamed axis、carry schema、step body、segment order、state update 与 final projection。当前 `extent` 只能是 compile-time integer 或 `I.auto(...)`；compiler 只在这份合同内选择内部 segment extent 和 physical realization。
+Source 固定 streamed axis、carry schema、step body、segment order、state update 与 final projection。`extent` 是 compile-time integer 或 `I.auto(...)`；compiler 只在这份合同内选择内部 segment extent 和 physical realization。
 
-`state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点，但不能作为 runtime segment extent；若 segment boundary 本身是 runtime-visible 算法决定，当前 frontend 会明确拒绝该写法。
+`state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点，但不能作为 runtime segment extent；runtime-visible segment boundary 必须由 source algorithm 显式表达，不能伪装成 compiler-owned physical extent。
 
 ## 逻辑读取终点
 

@@ -33,7 +33,7 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - pointwise math 与 logical mask；
 - `reduce`、`scan`、它们引用的 typed pure combiner helper，以及 `contract`；
 - logical buffers；
-- atomic、mutable load/store 与 RNG identity。当前语言没有 public fence 构造；没有 scope、ordering 与 participant 合同的同步不会以 no-op 进入 Kernel IR。
+- atomic、mutable load/store 与 RNG identity。语言不定义缺少 scope、ordering 与 participant 合同的 public fence；同步不能以 no-op 进入 Kernel IR。
 
 ### Control 与 state
 
@@ -45,7 +45,7 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - carry schema、initial state、step 与 final projection；
 - 普通 `@intent.fn` 展开的算法 helper relation，以及 structured combiner 保留的 typed、effect-free helper body。
 
-普通 Python loop 的 `break`/`continue` 在 frontend 被改写成结构化 `if`、`for`/`while` 与 carried control state；Kernel IR 不保留独立终止类节点。是否在现有语料中出现不影响这条语言合同。
+普通 Python loop 的 `break`/`continue` 在 frontend 被改写成结构化 `if`、`for`/`while` 与 carried control state；Kernel IR 不保留独立终止类节点。
 
 Python tuple state 在 Kernel IR 中正规化为有序的多 SSA carry/result schema；需要字段身份的复合值使用 `RecordType` 与 `make_record/extract`。Kernel IR 不保留一个无法被后端观察的 opaque tuple object。
 
@@ -59,7 +59,7 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 
 1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel` 和一个 target callable entry；目标 entry 内可以包含多个 compiler-private execution stages。
 2. `I.auto` 只能占据内部 region extent hole，不能成为普通 SSA value。
-3. `partition(count=...)` 是保留但尚未 realization 的 Core 语义，当前 frontend 明确拒绝；启用后 count 必须是 source-visible runtime/shape/`Constexpr`/wrapper value。
+3. `partition(count=...)` 的 count 必须是 source-visible runtime/shape/`Constexpr`/wrapper value，不能由不可观察的 physical worker count 代替。
 4. Physical refinement 不得改变 logical workset、state、effect、ABI 或 wrapper-visible relation。
 5. Pure SSA 可以安全地复制、删除、融合或重算；effectful node 必须保持依赖与执行语义。
 6. `ordered` 与 `state_stream` 的 source 顺序不可降格为 unordered partial merge。

@@ -1,6 +1,6 @@
 # Core 与算法库
 
-## 冻结后的构造分类
+## 构造分类
 
 | 定性 | 构造 | 边界 |
 |---|---|---|
@@ -11,11 +11,11 @@
 | Core indexing/effects | gather、scatter、logical buffer、atomic、RNG、`I.end`、`I.assume_in_bounds` | index relation、effect、前置条件和 logical identity 属算法语义 |
 | Core control | runtime `if/for/while` 与 source specialization branch | Python `break/continue` 在 frontend 正规化，不形成 Kernel IR op |
 | 语法糖 | 固定 `reduce.max/sum`、`any/all`、`arg_reduce.max` | lowering 到同一 canonical reduce/typed combiner 语义；不是第二套 primitive |
-| 过渡语法糖 | `sparse_contract_2to4` | canonical 节点已经是 `sparse_contract`；将收敛为 format descriptor，2:4 intrinsic 保留为 convenience spelling |
-| 已定义但尚未 realization | `partition(count=...)` | source 语义成立，当前 frontend 明确拒绝，不生成假能力 IR |
-| 不属于 public Core | fence、stage、physical barrier、worker/grid identity | fence 尚无共同 scope/ordering/participant 合同；stage 是 compiler-private realization |
+| 格式语法糖 | `sparse_contract_2to4` | canonical 语义显式保存 `two_of_four` format、compressed/metadata/RHS axes、`i16` metadata 与 accumulator schema；2:4 intrinsic 是 convenience spelling |
+| Core source-visible partition | `partition(count=...)` | count 来自 source/runtime/wrapper，不能用 physical worker count 代替 |
+| 不属于 public Core | fence、stage、physical barrier、worker/grid identity | fence 没有完整同步合同；stage 是 compiler-private realization |
 
-某些 target 只承接 Core 的能力子集，不会反过来改变 Core 定性。例如 TileLang 当前不能机械 lower generic reduce/scan closure 或 CAS；Triton/cuTile 当前没有 2:4 sparse contraction projection。具体边界由 [后端 lowering](../compiler/backend-lowering.md) 声明并在 emission 前诊断。
+Target 可以只承接 Core 的能力子集，但不能反过来改变 Core 定性。缺少等价机械投影的构造必须在 emission 前按 target capability 诊断。
 
 Core 不包含 opaque 的：
 
@@ -31,7 +31,7 @@ softmax / FlashAttention / MoE 算子名
 
 ## 算法库边界
 
-当前 public package 没有 `intent.algorithms.*` API。未来算法库若建立，它是普通 host-side library：调用哪个 implementation，就是作者或 wrapper 选择哪个算法，而不是 realizer 根据算子名字替换 Kernel IR。
+算法库属于普通 host-side library：调用哪个 implementation，就是作者或 wrapper 选择哪个算法，而不是 realizer 根据算子名字替换 Kernel IR。
 
 这样的库可以包含：
 

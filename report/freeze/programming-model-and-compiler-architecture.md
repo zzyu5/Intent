@@ -681,7 +681,7 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 
 ---
 
-## 十、冻结结论登记表
+## 十、冻结候选登记表
 
 下面只登记已经有具体证据的问题，不把“可能更漂亮”列成任务。
 
@@ -786,4 +786,4 @@ Intent 的稳定核心不是“跨三种 GPU tile 语言”，而是：
 
 当前 GPU 主线已经证明这不是 rowwise/softmax 特化。Tail correctness、Kernel IR 唯一合同、region/row/stream Plan binding、generic reduce/scan closure 与 stage execution contract 都已闭合；不同 surface 不能机械表达的能力会在 emission 前明确拒绝，而不是形成第二套编译器或慢路径。
 
-编程模型由此冻结。除尚未接入 CPU/RISC-V/RVV target family 外，Intent 已形成完整的算子级语言—Kernel IR—target-family Plan—surface emission 闭环。后续新增 GPU provider 或 RISC-V/RVV backend 不应修改现有编程模型：只新增 target-family realizer、必要的 Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core表达、且不能由下层已有能力承接时，才按修改正式规格的标准进入。
+这些结果使编程模型具备进入正式冻结评审的条件，但本报告不替用户宣告冻结。除尚未接入 CPU/RISC-V/RVV target family 外，Intent 已形成算子级语言—Kernel IR—target-family Plan—surface emission 闭环。新增 GPU provider 或 RISC-V/RVV backend 不应修改现有编程模型：只新增 target-family realizer、必要的 Physical Plan extension、capability 与机械 emission。新的 DSL 构造只有在真实算法无法用现有 Core 表达、且不能由下层已有能力承接时，才按修改正式规格的标准进入。

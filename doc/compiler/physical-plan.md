@@ -36,9 +36,9 @@ Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 
 
 Dependencies、input/output values、effectful terminals、intermediate producer/consumers、lifetime 与 visibility 都可由 `Kernel IR + operation slice + synchronization` 唯一得到，因此不再作为 `StageOp` 字段，也没有独立 `StageBufferOp`。公共 emission index 每次从 def-use 与 memory effects 重算并验证：producer 必须在 consumer 之前、intermediate 只有一个来源、final/intermediate stage 形态不混用、effectful terminal不能被多个 stage 复制。这个 index 是缓存，不是第三层 IR，也没有 serializer 或一致性 verifier。
 
-当前 GPU realization 使用 `same_stream` synchronization；三个 surface 按 Plan 顺序提交 private launches，并以同 stream happens-before 兑现派生 dependency 与 visibility。Stage grouping 已由 operation slices 给出，surface 不得重新分组。
+`same_stream` synchronization 表示 target 必须按 Plan 顺序提交 private launches，并以同一 execution stream 的 happens-before 兑现派生 dependency 与 visibility。Stage grouping 已由 operation slices 给出，surface 不得重新分组。
 
-Plan 不包含 fusion permission，也没有 `target_may_fuse` 一类未来入口。跨 compiler-private stage 或跨 source callable 的融合不属于这个算子编译器；未来若存在更高层图优化，由上层系统产生新的 source/kernel orchestration，而不是在此 schema 中打开开关。CPU/RVV realizer可以为自己的机器选择不同的初始 stage grouping，但同样不能让 leaf 改写已经选定的 Plan。
+跨 compiler-private stage 或跨 source callable 的融合不属于这个算子编译器，Physical Plan 不提供让 leaf 合并 stages 的权限。不同 target family 可以选择不同的初始 stage grouping，但 leaf 都不能改写已经选定的 Plan。
 
 ## Ownership 与 physical identity
 
@@ -72,6 +72,6 @@ Layout 推断、寄存器分配、指令选择以及给定参数后的低层流�
 
 地址索引宽度是正确性不变量，不是搜索参数。地址上界超过某个 surface 的可表达范围时，该 surface 必须明确拒绝；不能窄化、回绕，也不能把宽度放进候选空间。
 
-两个已否决的默认策略不重新引入：卷积式重叠读取可以记录比写区域更大的 access footprint，但显式物化唯一 halo 覆盖在现有目标上更慢；边界也不默认展开成逐元素搬运，优先使用收紧范围、整块守卫、目标原生 checked transfer 或 mask。只有目标能力要求且能保持性能语义时，leaf 才可选择自己的等价拼写。
+卷积式重叠读取可以记录比写区域更大的 access footprint，但 Plan 不要求显式物化唯一 halo 覆盖。边界也不要求展开成逐元素搬运；收紧范围、整块守卫、目标原生 checked transfer 或 mask 都是保持同一 logical validity 的合法投影。Leaf 只能在目标能力允许且保持语义时选择等价拼写。
 
-当前 `private_workspace` 使用外层分配的全局设备内存，这是总能成立的驻留位置，不代表物理 placement 已经选优。Owner 线性化与行主序偏移只有一份共享投影；workspace 应驻留 global、shared 还是目标私有存储仍是明确未决的机器决定。
+`private_workspace` 的 placement 是机器决定；owner 线性化与行主序偏移只有一份共享投影。Leaf 只拼写 Plan 选择的 storage 与地址关系，不得自行重选驻留位置。

@@ -6,7 +6,7 @@ Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、
 
 ## 共享层与 target 叶子
 
-三个 GPU surface 共享：
+各 target surface 共享：
 
 - Kernel IR 的 operation/region/def-use 遍历；
 - ABI、domain、ragged relation、state stream 与 contraction 分析；
@@ -44,18 +44,18 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 | logical view/index | pointer + masked load/store | buffer region + `T.copy` | array/tile load/store |
 | `contract` role | `tl.dot` | `T.gemm` | tile MMA/matmul |
 | fixed `reduce/scan` role | `tl.max` / `tl.sum` / `tl.cumsum` | fixed target reduction/scan | tile reduction/scan |
-| generic `reduce/scan` combiner | typed `@triton.jit` helper | 当前 PrimFunc surface 明确 unsupported | typed function/lambda |
+| generic `reduce/scan` combiner | typed target helper | target-native generic combiner，或 capability rejection | typed target helper/lambda |
 | logical validity | mask / tightened loop | predicate / range | boundary handling |
 | Plan storage | compiler-local representation | shared/fragment/local | tile/register storage |
 | Plan stream | explicit state-carried loop | pipelined state-carried loop | explicit state-carried loop |
 
-使用 target 的高性能内层 primitive，不等于把数学语义交给 target。Reduce/scan closure、contract reduction axes、operand dtype、accumulator dtype 与 result role先由 Kernel IR/Plan 固定；leaf emitter 只选择对应 spelling并让下层完成 collective tree、layout、指令和 machine code generation。Generic reduce/scan不意味着 arbitrary contract semiring；当前矩阵原语只承接正式声明的 multiply/add 与 dtype capability。
+使用 target 的高性能内层 primitive，不等于把数学语义交给 target。Reduce/scan closure、contract reduction axes、operand dtype、accumulator dtype 与 result role 先由 Kernel IR/Plan 固定；leaf emitter 只选择对应 spelling，并让下层完成 collective tree、layout、指令和 machine code generation。Generic reduce/scan 不意味着 arbitrary contract semiring；`contract` 只承接正式声明的 multiply/add 与 dtype capability。
 
 ## Execution-stage 投影
 
 Plan 给出 stage operation slice、stage-axis logical binding、tile/worker 与 `same_stream` synchronization。公共 emission index 从 Kernel IR def-use 和 memory effects 派生 dependency、input/output、terminal、intermediate lifetime/visibility；三个 leaf 共用这份索引并按拓扑顺序发射 private kernels，不各自重建。Leaf 不重新划分 stage、不自行决定 workspace owner，也不允许合并 stages。不同 target family 可以在各自 realizer 中产生不同的初始 grouping，surface provider不能改写同一份 machine Plan。
 
-## 失败边界
+## 诊断边界
 
 Translator 开始前验证 Kernel IR、machine plan 与 target projection。以下情况直接以关联的 source location 报错：
 
@@ -67,14 +67,14 @@ Translator 开始前验证 Kernel IR、machine plan 与 target projection。以�
 
 禁止旁路 Python Plan、根据 kernel 名称套模板、整-kernel matcher，以及 emitter 从 tensor shape 重新猜 physical structure。
 
-明确失败必须区分三种性质：
+诊断必须区分三种性质：
 
-1. **Target capability subset**：目标 API/程序模型没有等价机械投影，在 emission 前以源码位置拒绝。当前例子包括 TileLang 的 CAS、generic reduce/scan closure、部分多轴 checked transfer、single-row contraction 与 runtime-lane FP8 contraction；Triton/cuTile 的 2:4 sparse contraction，以及 cuTile 的 block-scaled matmul。
-2. **Lower compiler cost/failure**：目标源码已经合法生成，但下层首次编译超时、候选资源无效或特定设备/toolchain 失败。这是运行记录，不得冒充 Core 或 target-language 不支持；token-sparse attention 的编译超时和某些超长首次 JIT 属于此类。
-3. **Intent implementation gap**：Kernel IR 能表达、target 也有能力，但缺少 Plan binding、handler 或机械投影。这一类必须明确报“尚未实现”并继续修，不能登记成 target subset。
+1. **Target capability subset**：目标 API 或程序模型没有等价机械投影，在 emission 前以源码位置拒绝。
+2. **Lower compiler cost/failure**：目标源码已经合法生成，但下层 compiler、设备或 toolchain 给出诊断。这是运行状态，不得冒充 Core 或 target-language 不支持。
+3. **Intent implementation gap**：Kernel IR 能表达、target 也有能力，但缺少 Plan binding、handler 或机械投影。这一类必须给出 implementation-gap 诊断，不能登记成 target subset。
 
-同一个 kernel 在一台设备失败而在另一台通过，也不能据此修改 Core；除非能力检查能用设备属性表达，否则它只是具体下层编译结果。CSV 中的 `failed`/`compile_timeout` 是测量状态，不是冻结后的语言能力声明。
+设备或下层 toolchain 的一次编译结果不能修改 Core 语义。只有能由正式 target/device capability 表达的限制才进入能力检查。
 
 ## 与下层系统的关系
 
-Intent 决定依赖算法结构信息的部分：合法 ownership、遍历、tile 关系、片上复用边界、logical validity 与数值角色。Triton、TileLang、cuTile 负责其程序模型能自行推断的 layout、寄存器分配、指令选择、低层流水线和候选评测。下层能力增强时，surface leaf 应变薄；共享 Kernel IR 与 machine decision space 不随某门语言版本改变。
+Intent 决定依赖算法结构信息的部分：合法 ownership、遍历、tile 关系、片上复用边界、logical validity 与数值角色。Target compiler 负责其程序模型能自行推断的 layout、寄存器分配、指令选择、低层流水线和候选评测。下层能力增强时，surface leaf 应变薄；共享 Kernel IR 与 machine decision space 不因 target surface 的实现变化而改变。

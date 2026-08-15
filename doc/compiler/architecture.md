@@ -59,7 +59,7 @@ Physical Plan 是 realizer 的 target realization 结果，是独立于 source l
 
 ## Backend Emitter
 
-Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成目标 program。当前已接入的 surface 是 Triton、TileLang 与 cuTile；CPU SIMD 和 RVV 将由未来各自的 target-family realizer 与 emitter 接入，不是现有 GPU Plan 的另一种拼写。Region argument、row-vector extent、stream/ragged relation 与 stage-axis 的已选物理绑定都进入可验证的 Physical Plan；可重算的数据流边界由公共 KernelModel/SurfacePlan 建一次临时索引。Target leaf 只消费这些来源，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 在同一个 `intent-compile` 进程内连续完成，但仍以组合 MLIR 作为严格阶段边界。Triton backend 的目标语言恰好是可读的 Triton Python source，不等于后端决策在 Python 中实现，也不要求先转换成 Triton MLIR。
+Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成目标 program。每个 target family 提供自己的 realizer 与 emitter；不同 surface 只是同一 machine Plan 的投影，另一类机器则产生自己的 machine Plan。Region argument、row-vector extent、stream/ragged relation 与 stage-axis 的已选物理绑定都进入可验证的 Physical Plan；可重算的数据流边界由公共 KernelModel/SurfacePlan 建一次临时索引。Target leaf 只消费这些来源，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 可以在同一 compiler process 内连续完成，但仍以组合 MLIR 作为严格阶段边界。目标语言即使是可读的 Python source，也不表示后端决定由 Python 实现，更不要求先转换成该目标自己的 MLIR。
 
 ## 每一层的唯一权威来源
 

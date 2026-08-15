@@ -109,7 +109,7 @@ if q_tile == 64:
 I.partition(axis, count=I.auto("PARTS"))
 ```
 
-`partition(count=...)` 的 source 语义要求 part count 来自 runtime、shape、`I.Constexpr` 或 wrapper；完全不可见的 physical worker count 属于 Physical Plan。当前 realizer 尚未闭合 count 模式，因此 frontend 对所有 `partition(count=...)` 明确拒绝，而不是生成一份假能力 IR。
+`partition(count=...)` 的 source 语义要求 part count 来自 runtime、shape、`I.Constexpr` 或 wrapper；完全不可见的 physical worker count 属于 Physical Plan，不能替代 source-visible count。
 
 选择 `auto` 表示作者把内部 region 大小交给编译器。不同合法 Plan 可以因 tile 或归约顺序产生正常浮点低位差异，但不能改变 source-visible algorithm、state、effect、ABI 或 workset。
 

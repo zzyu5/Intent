@@ -81,7 +81,7 @@ Realizer 决定：
 
 因此 pure expression 可以 CSE、融合、重算或 spill；reduction 可以选择不同物理树；f32 contraction 可以使用目标正常支持的机制。只有真正选择了不同算法时，才需要不同 source。
 
-这里的 pure-expression fusion 只发生在一个 source callable 的既定算法内部。跨 source callable 或跨 compiler-private stage 的融合不属于 Intent compiler；Plan 没有 fusion permission 字段，也不预留让 leaf 合并 stages 的入口。
+这里的 pure-expression fusion 只发生在一个 source callable 的既定算法内部。跨 source callable 或跨 compiler-private stage 的融合不属于 Intent compiler；Physical Plan 不授予 leaf 合并 stages 的权限。
 
 ## 明确不属于 Intent Core
 

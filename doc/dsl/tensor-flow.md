@@ -65,11 +65,11 @@ stats = I.reduce(
 )
 ```
 
-上例是当前正式 generic combine 形态。Frontend 把 helper lower 成 canonical Kernel IR 中的 typed combiner body：参数是两组 accumulator components，返回 schema 与 accumulator 完全一致，identity 逐 component 显式给出。Combiner 必须 pure，不能包含 load/store/atomic/RNG；runtime capture 必须通过 `combine_operands=(...)` 成为 reduce/scan 的显式 scalar operand，只有 `Constexpr` 可以直接捕获。
+Generic combine 遵循以下合同：Frontend 把 helper lower 成 canonical Kernel IR 中的 typed combiner body；参数是两组 accumulator components，返回 schema 与 accumulator 完全一致，identity 逐 component 显式给出。Combiner 必须 pure，不能包含 load/store/atomic/RNG；runtime capture 必须通过 `combine_operands=(...)` 成为 reduce/scan 的显式 scalar operand，只有 `Constexpr` 可以直接捕获。
 
 选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。Compiler 只验证 closure 的 typed schema、purity 与显式 capture，然后按 SSA 顺序机械投影；它不分析、重排、替换或特化 closure body，也不会把 ordered/state-stream 程序归一化成 reduce。
 
-一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。Triton/cuTile 将 typed helper 机械投影到原生 generic reduce。TileLang 0.1.13 的 `T.comm_reducer` 能构造 `tirx.Reduce`，但当前 CUDA codegen 对该节点明确报无 lowering；generic closure 因而在 emission 前 unsupported，固定内建 reduction 不受影响。
+一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、tree reduction、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。能机械承接 typed combiner 的 target 将其投影到原生 generic reduce；不能保持 typed/pure/capture 合同的 target 必须在 emission 前拒绝。
 
 `I.arg_reduce.max` 是 convenience sugar：frontend 将 `(value, index)` 与 lowest-index tie closure lower 成同一个 tuple-valued generic reduction。目标可以使用经过语义对齐的原生 `max_with_index`，但 Kernel IR helper仍是权威语义。
 
@@ -87,7 +87,7 @@ prefix = I.scan(
 
 Source 固定 logical prefix relation，realizer 决定物理 scan hierarchy。
 
-`I.scan` 与 `I.reduce` 共用 typed combiner、component identity、purity 和显式 capture 合同。Triton/cuTile 委托给原生 associative scan；长轴可以由 Plan 选择 block-local scan 加 block 间 scalar carry。TileLang 当前只支持固定 combiner的机械投影，generic scan明确 unsupported。
+`I.scan` 与 `I.reduce` 共用 typed combiner、component identity、purity 和显式 capture 合同。Target 可以委托给原生 associative scan；长轴可以由 Plan 选择 block-local scan 加 block 间 scalar carry。不能保持该合同的 target 必须在 emission 前拒绝。
 
 ## Contraction
 
@@ -102,15 +102,15 @@ acc = I.contract(
 
 `reduce` 使用 positional reduction-axis pairs。Source 固定 operand shapes、配对归约轴、operand dtype、multiply-add 数值角色、accumulator dtype 与 epilogue tensor-flow。
 
-Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色。当前 GPU target 将其投影到 MMA/`tl.dot`/`T.gemm`/cuTile matmul；未来 CPU/RVV target 可投影到自己的 FMA microkernel。具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
+Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色。Target family 将其投影到自身的 matrix primitive 或 FMA microkernel；具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
 
-Generic reduce/scan closure 不会使 `contract` 自动变成任意 semiring。当前 `contract` 只覆盖目标矩阵原语支持的 multiply/add 与 dtype/accumulator 组合；其他 semiring 必须由作者显式写成 pointwise + reduce，或由未来 target capability正式扩展。
+Generic reduce/scan closure 不会使 `contract` 自动变成任意 semiring。`contract` 只覆盖正式 target capability 声明的 multiply/add 与 dtype/accumulator 组合；其他 semiring 必须由作者显式写成 pointwise + reduce。
 
-### 稀疏收缩的当前边界
+### 稀疏收缩
 
-当前 `I.sparse_contract_2to4` 是 2:4 structured sparsity 的 format-specific semantic anchor：compressed values、`i16` metadata、compressed/metadata axis、dense RHS reduction axis 与 accumulator dtype 一起进入 canonical `intent.sparse_contract`，而不是伪装成 dense `contract`。公共 verifier 会核对这份固定 schema；当前只有 TileLang 的 native sparse MMA 能机械投影，其他 target 提前明确 unsupported。
+`I.sparse_contract_2to4` 是 2:4 structured sparsity 的 format-specific convenience spelling：compressed values、`i16` metadata、compressed/metadata axis、dense RHS reduction axis 与 accumulator dtype 一起进入 canonical `intent.sparse_contract`，公共 verifier 核对这份固定 schema，而不是伪装成 dense `contract`。
 
-这个 source 名字不是未来所有稀疏格式的通用 API。已经确定的收敛方向是 `sparse_contract + format descriptor`：descriptor 属于算法可见的数据表示，必须显式描述 format identity、压缩轴和 metadata schema；2:4 是第一个 descriptor，现有专用 intrinsic 可继续作为 convenience spelling。当前没有第二种可比格式来确定一份诚实的通用 descriptor schema，因此本轮不制造只换了名字、下游仍硬编码 2:4 的假泛化；这是冻结文档明确登记的过渡边界。
+稀疏收缩的 canonical 语义必须显式描述 format identity、压缩轴和 metadata schema；格式专用 source spelling 只是这份语义的语法糖，不能形成按稀疏格式名称分裂的算法家族。Target 没有等价 sparse primitive 时必须在 emission 前拒绝，不能回退成改变 canonical 语义的伪支持。
 
 显式缩窄必须写在 source 中：
 
@@ -129,7 +129,7 @@ I.scatter_reduce(dst, index=indices, value=values, combine=I.add)
 
 Source 固定 logical index relation、invalid/fill、duplicate conflict semantics、combine 与明确要求的 memory order。Realizer 决定 coalescing、vector gather/scatter、privatization、atomics 与 physical scheduling。
 
-索引关系可以使某个输出块的输入覆盖范围更大并与相邻块重叠。Physical Plan 可以保存该 access footprint，但不会默认先物化一份去重 halo：现有目标上这种物化比直接使用目标原生块读取更慢。类似地，同一个边界谓词不会默认展开成每元素搬运；能用整块守卫、收紧范围、checked transfer 或 mask 时优先保留整块结构。
+索引关系可以使某个输出块的输入覆盖范围更大并与相邻块重叠。Physical Plan 可以保存该 access footprint，但不要求先物化一份去重 halo。类似地，同一个边界谓词不要求展开成每元素搬运；整块守卫、收紧范围、checked transfer 或 mask 都可以是保持同一逻辑语义的目标投影。
 
 Effectful 操作显式写出：
 
@@ -141,7 +141,7 @@ I.mutable_load(...)
 ```
 
 Effects 不能被非法复制、删除或跨依赖重排。
-三个目标语言没有共同的显式 fence 语义，当前 public API 不导出 `I.fence(...)`；未来若加入，必须先定义 scope、ordering 与 participant 合同，不能降成 no-op。
+Fence 不属于没有完整同步合同的语法占位。任何 public fence 都必须先定义 scope、ordering 与 participant 合同，不能降成 no-op。
 
 ## Logical buffer
 
@@ -180,7 +180,7 @@ r = I.random(seed, logical_index)
 
 Counter identity 来自 source logical index，不来自 `program_id` 或 auto-region ordinal。
 
-`I.random` 是纯函数，不持有隐式 RNG 状态。当前 canonical 合同为
+`I.random` 是纯函数，不持有隐式 RNG 状态。Canonical 合同为
 `counter_xorshift32(seed, logical_index)`：计数器与 seed 先转成 `u32`，与
 `1831565813` 异或后依次执行 `x ^= x << 13`、`x ^= x >> 17`、
 `x ^= x << 5`，最终用高 24 bit 生成 `[0, 1)` 的 `f32`。相同 seed 与逻辑

@@ -86,4 +86,4 @@ Target leaf 只把这些决定拼成各自的 matrix/gather/scatter primitive；
 
 `I.ragged` 只解释 `route_offsets` 与 `member_routes`，不执行 grouping，不生成 offsets，也不在 histogram、sort、atomic bucket 或 radix grouping 中做选择。
 
-Routing/grouping 是另一个算法阶段时，由 wrapper 调用明确的 Intent kernel、target-specific kernel 或普通 host-side algorithm-library implementation；当前 public package 不提供 `intent.algorithms.*` namespace。
+Routing/grouping 是另一个算法阶段时，由 wrapper 调用明确的 Intent kernel、target-specific kernel 或普通 host-side algorithm-library implementation；realizer 不在本 kernel 内隐式选择该算法。

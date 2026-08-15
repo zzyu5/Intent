@@ -61,10 +61,10 @@ def gemm(
 - 算法结构要求的 packing、storage/reuse boundary 与 contraction primitive 数值角色；
 - launch ownership 与合法 tuner 参数轴。
 
-当前 GPU target 把 contraction role 拼成 MMA、`tl.dot`、`T.gemm` 或 cuTile matmul；未来 CPU/RVV target 可以选择自己的 microkernel。Fragment layout、寄存器分配、指令选择和给定候选后的低层 pipeline/prefetch 由目标 compiler 决定。
+Target family 把 contraction role 投影到自身的 matrix primitive 或 FMA microkernel；fragment layout、寄存器分配、指令选择和给定候选后的低层 pipeline/prefetch 由目标 compiler 决定。
 
 ## 边界
 
-一个 logical `contract` 可以由多条目标指令、补偿步骤与私有临时量实现。当前 contract 的正式 capability 是目标矩阵原语支持的 multiply/add 与 dtype/accumulator 组合；其他 semiring由作者写成显式 pointwise + reduce。Ordinary GEMM 不能被 realizer 替换成 Strassen。
+一个 logical `contract` 可以由多条目标指令、补偿步骤与私有临时量实现。Contract 的 portable capability 是正式 target capability 声明的 multiply/add 与 dtype/accumulator 组合；其他 semiring 由作者写成显式 pointwise + reduce。Ordinary GEMM 不能被 realizer 替换成 Strassen。
 
 `BLOCK_SIZE_M/N/K`、`GROUP_SIZE_M`、`num_warps` 与 `num_stages` 不进入 source。
