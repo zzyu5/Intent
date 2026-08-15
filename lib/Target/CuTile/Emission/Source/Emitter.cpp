@@ -272,11 +272,6 @@ indexRealization(intent::plan::RealizationOp realization,
       binding.operation = value;
       binding.position = index.stages.size();
       index.stages.push_back(binding);
-    } else if (auto value =
-                   dyn_cast<intent::plan::StageBufferOp>(operation)) {
-      plan::StageBufferOp binding;
-      binding.operation = value;
-      index.stageBuffers[value.getValue()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
       plan::StageAxisOp binding;
       binding.operation = value;
@@ -331,13 +326,15 @@ indexRealization(intent::plan::RealizationOp realization,
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
-    if ((value.getSemantics() != "scan_inclusive_add" &&
-         value.getSemantics() != "scan_generic_inclusive") ||
-        !index.axes.count(value.getAxisNode()))
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    FailureOr<std::string> role =
+        operation ? target::emission::scanRole(*operation)
+                  : FailureOr<std::string>(failure());
+    if (failed(role) || !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;
     binding.operation = value;
-    binding.lowering = value.getSemantics() == "scan_generic_inclusive"
+    binding.lowering = *role == "scan_generic_inclusive"
                            ? "ct.scan"
                            : "ct.cumsum";
     binding.resultSpace = value.getResultSpace().str();

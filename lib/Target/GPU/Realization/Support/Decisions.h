@@ -14,7 +14,6 @@ struct PhysicalDecisions {
   llvm::SmallVector<intent::plan::RegionBindingOp> regionBindings;
   llvm::SmallVector<intent::plan::StreamBindingOp> streamBindings;
   llvm::SmallVector<intent::plan::StageOp> stages;
-  llvm::SmallVector<intent::plan::StageBufferOp> stageBuffers;
   llvm::SmallVector<intent::plan::StageAxisOp> stageAxes;
 };
 

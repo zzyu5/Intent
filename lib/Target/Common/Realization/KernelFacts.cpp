@@ -1072,8 +1072,8 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
     if (!bounded || (lower == 0 && upper == 0)) {
       continue;
     }
-    facts.accessRanges.push_back(AccessRangeFact{
-        &operation, ownership, currentSourceAxis, lower, upper});
+    facts.accessRanges.push_back(
+        AccessRangeFact{&operation, ownership, currentSourceAxis});
   }
   return success();
 }

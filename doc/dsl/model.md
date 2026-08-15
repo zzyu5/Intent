@@ -70,7 +70,7 @@ Realizer 决定：
 - program folding、grid-stride、persistent traversal 与 swizzle；
 - logical validity 的物理兑现、access footprint、tail 与 address formation；
 - 算法结构要求的 storage level、片上复用边界与 target primitive 数值角色；
-- compiler-private stage grouping、dependency、intermediate lifetime、visibility 与 fusion permission；
+- compiler-private stage operation grouping、stage-axis tile/worker binding 与执行同步；
 - 可交给下层 tuner 的合法参数轴与资源上界。
 
 下层 target compiler 决定不依赖 Intent 独有算法信息的部分：layout 推断、寄存器分配、指令选择、给定候选后的低层 pipeline/prefetch/unroll，以及候选值、排序与赢家。Surface 变强时 Intent emitter 应变薄，不把这些决定重新搬进共享 Plan。
@@ -80,6 +80,8 @@ Realizer 决定：
 > Realizer 可以自由改变物理实现，但不能改变 source 的 tensor-flow、logical workset、state、effect、ABI 或 wrapper-visible 约定。
 
 因此 pure expression 可以 CSE、融合、重算或 spill；reduction 可以选择不同物理树；f32 contraction 可以使用目标正常支持的机制。只有真正选择了不同算法时，才需要不同 source。
+
+这里的 pure-expression fusion 只发生在一个 source callable 的既定算法内部。跨 source callable 或跨 compiler-private stage 的融合不属于 Intent compiler；Plan 没有 fusion permission 字段，也不预留让 leaf 合并 stages 的入口。
 
 ## 明确不属于 Intent Core
 

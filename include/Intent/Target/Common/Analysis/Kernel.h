@@ -71,6 +71,10 @@ mlir::FailureOr<int64_t> getValueID(mlir::Value value,
                                     mlir::Operation &consumer,
                                     llvm::StringRef purpose);
 
+mlir::FailureOr<llvm::SmallVector<std::string>>
+getLogicalShape(mlir::Value value, const KernelModel &kernel,
+                mlir::Operation &consumer, llvm::StringRef purpose);
+
 mlir::FailureOr<KernelABI> analyzeKernelABI(mlir::func::FuncOp entry);
 
 mlir::FailureOr<RegionStructure>

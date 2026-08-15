@@ -323,11 +323,6 @@ indexRealization(intent::plan::RealizationOp realization,
       binding.operation = value;
       binding.position = index.stages.size();
       index.stages.push_back(binding);
-    } else if (auto value =
-                   dyn_cast<intent::plan::StageBufferOp>(operation)) {
-      plan::StageBufferOp binding;
-      binding.operation = value;
-      index.stageBuffers[value.getValue()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
       plan::StageAxisOp binding;
       binding.operation = value;
@@ -390,11 +385,15 @@ indexRealization(intent::plan::RealizationOp realization,
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
-    if (value.getSemantics() == "scan_generic_inclusive")
+    Operation *operation = kernel.nodes.lookup(value.getNode());
+    FailureOr<std::string> role =
+        operation ? target::emission::scanRole(*operation)
+                  : FailureOr<std::string>(failure());
+    if (succeeded(role) && *role == "scan_generic_inclusive")
       return value.emitOpError(
           "TileLang 0.1.13 has no mechanically lowerable generic scan "
           "combiner path; generic scan combiners are unsupported");
-    if (value.getSemantics() != "scan_inclusive_add" ||
+    if (failed(role) || *role != "scan_inclusive_add" ||
         !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
     plan::ScanOp binding;

@@ -593,9 +593,9 @@ Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；�
 
 ### 8.1 当前表示
 
-GPU realizer 沿 canonical def-use 形成 physical stage operation slice，并为每个 stage 记录 dependencies、inputs、outputs、operations、terminals、synchronization、fusion 与 grouping policy。
+GPU realizer 沿 canonical def-use 选择 physical stage operation slice，并为每个 stage 只记录 stage identity、operation slice 与 synchronization；stage axis 记录 logical domain/value-dimension binding，以及已选 tile/worker axis。
 
-每个 intermediate 另有唯一 `StageBufferOp`，显式保存 value、唯一 producer、consumer stages、owner roles、single-writer/read-only-consumer access、`producer_to_last_consumer` lifetime 与 visibility。三个 emitter 仍可生成多个私有 target kernels，但调用方只看见一个 logical callable。
+Dependencies、inputs/outputs、effectful terminals、intermediate producer/consumers、lifetime 与 visibility 都能从 `Kernel IR + operation slice + synchronization` 唯一重算，因此不进入 Plan schema，也没有独立 `StageBufferOp`。公共 emission index 派生一次，三个 emitter 共享；调用方仍只看见一个 logical callable。
 
 ### 8.2 它为什么可以属于 physical realization
 
@@ -611,17 +611,17 @@ GPU realizer 沿 canonical def-use 形成 physical stage operation slice，并�
 
 ### 8.3 可验证的 execution contract
 
-Plan 与公共 emission preflight 现在验证：
+公共 emission preflight 现在从 Plan 选择和 Kernel IR 重算并验证：
 
-- dependency 必须引用拓扑上更早的 stage，并且精确等于所有 input buffer 的 producer；
-- 每个 intermediate 只有一个 writer，consumer 必须是后继 stage，owner role 必须存在于 producer stage；
-- intermediate 至少活到最后一个 consumer，当前 visibility/synchronization 合同为 `same_stream`；
-- intermediate stage 必须产出 buffer，final stage 必须拥有唯一 terminal，final stage不能再成为后继依赖；
-- 当前 GPU realization 的 fusion policy 为 `forbidden`、grouping policy 为 `fixed_operation_slice`，三个 surface 在 emission 前拒绝自己不能兑现的其他 policy。
+- dependency 必须由跨 slice def-use 指向拓扑上更早且唯一的 producer；
+- intermediate 必须是 tensor value 且只有一个 physical producer；
+- intermediate stage 与拥有 effectful terminal 的 final stage 不能混用；
+- effectful terminal 不能被多个 stage 复制；
+- 当前 visibility/synchronization 合同为 `same_stream`。
 
-同一 operation 可以出现在多个 stage slice 中，但这表示 Plan 明确选择的 pure recomputation；effectful terminal 与 intermediate writer不能重复。实际 grouping 由每个 target-family realizer产生的 stage operation slice表示，surface leaf 无权重新分组。未来 RVV/CPU 可以产生不同 grouping 的 Plan；不需要在 GPU leaf 中再放一份判断。
+同一 pure operation 可以出现在多个 stage slice 中，表示 Plan 明确选择的 recomputation；effectful operation不能重复。实际 grouping 由每个 target-family realizer产生的 operation slice表示，surface leaf 无权重新分组。未来 RVV/CPU 可以产生不同 grouping 的 Plan；不需要在 GPU leaf 中再放一份判断。
 
-当前三个 GPU surface 都消费 `same_stream + forbidden + fixed_operation_slice` 合同。cuTile 显式把同一 current stream 传给每次 launch；Triton/TileLang 的 runtime launch同样提交到 current stream。CUDA 的同 stream happens-before 与可见性不再是未登记假设，而是 Plan 要求、preflight 检查和 runtime 投影共同兑现的语义。
+当前三个 GPU surface 都消费 `same_stream` 合同。cuTile 显式把同一 current stream 传给每次 launch；Triton/TileLang 的 runtime launch同样提交到 current stream。CUDA 的同 stream happens-before 与可见性不再是未登记假设，而是 Plan 要求、派生 preflight 和 runtime 投影共同兑现的语义。Plan 已删除 fusion permission；跨 stage/source callable fusion 不属于本编译器，也没有预留入口。
 
 冻结结论：
 
@@ -681,7 +681,7 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 
 ---
 
-## 十、冻结前的问题登记表
+## 十、冻结结论登记表
 
 下面只登记已经有具体证据的问题，不把“可能更漂亮”列成任务。
 
@@ -701,7 +701,7 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 | Region argument 未直接绑定 selected range | Physical Plan | 已闭合：Plan 显式保存 argument→axis/range purpose/level，三个 leaf 只消费绑定 |
 | Row-vector final extent binding不完整 | Physical Plan | 已闭合：range 同时保存 logical extent 与已选 tile，leaf 只做目标符号拼写 |
 | Ragged/stream binding在 SurfacePlan 重建 | Common semantic index + Plan | 已闭合：算法 relation/use-def 在 KernelModel 建一次；Plan 只保存已选 stream axis/range/relation |
-| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | 已闭合：dependency、topology、intermediate producer/consumer/owner/lifetime/visibility、sync、fusion 与 grouping policy 都进入 Plan；三个 GPU surface 只消费 `same_stream + forbidden + fixed_operation_slice` 合同 |
+| Stage execution 只靠数组顺序和 CUDA stream | Target-family execution Plan | 已闭合：Plan 保存 operation slice、stage-axis physical binding 与 `same_stream`；dependency、topology、intermediate 与 terminal 从 Kernel IR 唯一派生，三个 GPU surface 共用同一 index；无 fusion hook |
 
 ### C. 语言表面收敛
 

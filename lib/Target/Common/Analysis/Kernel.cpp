@@ -26,6 +26,42 @@ FailureOr<int64_t> getValueID(Value value, const KernelModel &kernel,
   return found->second;
 }
 
+FailureOr<SmallVector<std::string>>
+getLogicalShape(Value value, const KernelModel &kernel, Operation &consumer,
+                StringRef purpose) {
+  ArrayAttr shape;
+  auto argument = llvm::find_if(kernel.abi.arguments,
+                                [&](const ABIArgument &candidate) {
+                                  return candidate.value == value;
+                                });
+  if (argument != kernel.abi.arguments.end())
+    shape = argument->metadata.getAs<ArrayAttr>("shape");
+  else if (Operation *definition = value.getDefiningOp()) {
+    auto shapes =
+        definition->getAttrOfType<ArrayAttr>("intent.result_shapes");
+    auto result = dyn_cast<OpResult>(value);
+    if (result && shapes && result.getResultNumber() < shapes.size())
+      shape = dyn_cast<ArrayAttr>(shapes[result.getResultNumber()]);
+  }
+  if (!shape) {
+    consumer.emitOpError() << "cannot recover canonical logical shape for "
+                           << purpose;
+    return failure();
+  }
+  SmallVector<std::string> result;
+  result.reserve(shape.size());
+  for (Attribute attribute : shape) {
+    auto extent = dyn_cast<StringAttr>(attribute);
+    if (!extent || extent.getValue().empty()) {
+      consumer.emitOpError() << "has malformed canonical logical shape for "
+                             << purpose;
+      return failure();
+    }
+    result.push_back(extent.getValue().str());
+  }
+  return result;
+}
+
 FailureOr<KernelABI> analyzeKernelABI(func::FuncOp entry) {
   auto parameterNodes = entry->getAttrOfType<ArrayAttr>("intent.parameter_nodes");
   auto parameters = entry->getAttrOfType<ArrayAttr>("intent.parameters");

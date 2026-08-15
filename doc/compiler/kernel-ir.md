@@ -70,3 +70,5 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 ## 算法与物理 refinement
 
 Kernel IR 固定 logical node，允许 realizer 为该 node 构造复合实现。例如一个 `contract` 可以变成多条 MMA 和补偿步骤，一个 `reduce` 可以变成多级 private partial；但不能把 ordinary GEMM 变成 Strassen，或把 stable softmax 变成 online recurrence。
+
+Typed combiner body 同样属于 Kernel IR 权威算法：verifier 可以检查类型、effect 与 capture 合同，emitter 可以把它翻译成目标 helper/lambda，下层可以选择 collective tree；Intent 的 analysis/realizer 不拥有改写 closure body 的权限。`ordered`、`state_stream` 和 generic `reduce/scan` 因此始终是不同的 canonical program structures。

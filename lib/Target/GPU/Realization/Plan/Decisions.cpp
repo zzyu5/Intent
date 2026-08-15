@@ -868,21 +868,24 @@ stageMemberDomain(const StageDecision &stage, const target::KernelFacts &facts) 
   return failure();
 }
 
-FailureOr<std::string>
-stageFeatureExtent(const StageDecision &stage,
-                   const target::KernelFacts &facts, Operation *member) {
+FailureOr<std::pair<Value, unsigned>>
+stageFeatureAxis(const StageDecision &stage,
+                 const target::KernelFacts &facts, Operation *member) {
   const target::ContractionFact &contract =
       facts.contractions.lookup(stage.contraction);
-  for (const target::LogicalAxis &axis : llvm::reverse(contract.resultAxes))
+  for (unsigned position = contract.resultAxes.size(); position > 0; --position) {
+    const target::LogicalAxis &axis = contract.resultAxes[position - 1];
     if (axis.domain != member && axis.extent != "1" && !axis.extent.empty())
-      return axis.extent;
+      return std::pair<Value, unsigned>{stage.contraction->getResult(0),
+                                        position - 1};
+  }
   stage.contraction->emitOpError("has no staged feature extent");
   return failure();
 }
 
-FailureOr<std::string>
-stageReductionExtent(const StageDecision &stage,
-                     const target::KernelFacts &facts) {
+FailureOr<std::pair<Value, unsigned>>
+stageReductionAxis(const StageDecision &stage,
+                   const target::KernelFacts &facts) {
   const target::ContractionFact &contract =
       facts.contractions.lookup(stage.contraction);
   if (contract.lhsReductionAxes.empty() ||
@@ -891,7 +894,8 @@ stageReductionExtent(const StageDecision &stage,
     stage.contraction->emitOpError("has no staged reduction extent");
     return failure();
   }
-  return contract.lhsAxes[contract.lhsReductionAxes.front()].extent;
+  return std::pair<Value, unsigned>{stage.contraction->getOperand(0),
+                                    contract.lhsReductionAxes.front()};
 }
 
 } // namespace
@@ -970,8 +974,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
           choice.domain->getLoc(), i64(builder, *domainNode),
           string(builder, range.purpose), i64(builder, range.level),
           string(builder, range.tile), string(builder, *logicalExtent),
-          IntegerAttr(), IntegerAttr(),
-          i64(builder, 0), i64(builder, 0)));
+          IntegerAttr(), IntegerAttr()));
   }
 
   SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
@@ -1070,8 +1073,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         string(builder, ownership->tile),
         string(builder, *logicalExtent),
         i64(builder, *transferNode),
-        i64(builder, access.sourceAxis), i64(builder, access.lowerOffset),
-        i64(builder, access.upperOffset)));
+        i64(builder, access.sourceAxis)));
   }
 
   FailureOr<SmallVector<StageDecision, 0>> stages =
@@ -1082,59 +1084,27 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     FailureOr<int64_t> stageNode = node(*stage.contraction, "stage binding");
     FailureOr<Operation *> member =
         stageMemberDomain(stage, facts);
-    FailureOr<std::string> feature =
+    FailureOr<std::pair<Value, unsigned>> feature =
         succeeded(member)
-            ? stageFeatureExtent(stage, facts, *member)
-            : FailureOr<std::string>(failure());
-    FailureOr<std::string> reduction =
-        stageReductionExtent(stage, facts);
-    FailureOr<std::string> memberExtent =
-        succeeded(member)
-            ? sourceDimensionSymbol(**member, facts)
-            : FailureOr<std::string>(failure());
+            ? stageFeatureAxis(stage, facts, *member)
+            : FailureOr<std::pair<Value, unsigned>>(failure());
+    FailureOr<std::pair<Value, unsigned>> reduction =
+        stageReductionAxis(stage, facts);
     if (failed(stageNode) || failed(member) || failed(feature) ||
-        failed(reduction) || failed(memberExtent))
+        failed(reduction))
       return failure();
-    SmallVector<int64_t> inputs;
-    SmallVector<int64_t> outputs;
-    SmallVector<int64_t> terminals;
-    SmallVector<int64_t> dependencies;
-    for (Operation *dependency : stage.dependencies) {
-      FailureOr<int64_t> id = node(*dependency, "stage dependency binding");
-      if (failed(id))
-        return failure();
-      dependencies.push_back(*id);
-    }
-    llvm::sort(dependencies);
-    for (Value value : stage.inputs) {
-      FailureOr<int64_t> id = valueID(value, facts.kernel,
-                                      *stage.contraction, "stage input binding");
-      if (failed(id))
-        return failure();
-      inputs.push_back(*id);
-    }
-    for (Value value : stage.outputs) {
-      FailureOr<int64_t> id = valueID(value, facts.kernel,
-                                      *stage.contraction, "stage output binding");
-      if (failed(id))
-        return failure();
-      outputs.push_back(*id);
-    }
-    for (Operation *terminal : stage.terminals) {
-      FailureOr<int64_t> id = node(*terminal, "stage terminal binding");
-      if (failed(id))
-        return failure();
-      terminals.push_back(*id);
-    }
+    FailureOr<int64_t> featureValue = valueID(
+        feature->first, facts.kernel, *stage.contraction,
+        "stage feature-axis source binding");
+    FailureOr<int64_t> reductionValue = valueID(
+        reduction->first, facts.kernel, *stage.contraction,
+        "stage reduction-axis source binding");
+    if (failed(featureValue) || failed(reductionValue))
+      return failure();
     decisions.stages.push_back(builder.create<intent::plan::StageOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
-        builder.getDenseI64ArrayAttr(dependencies),
-        builder.getDenseI64ArrayAttr(inputs),
-        builder.getDenseI64ArrayAttr(outputs),
         builder.getDenseI64ArrayAttr(stage.operations),
-        builder.getDenseI64ArrayAttr(terminals), string(builder, "same_stream"),
-        string(builder, "forbidden"),
-        string(builder, "fixed_operation_slice")));
+        string(builder, "same_stream")));
     FailureOr<int64_t> memberNode = node(**member, "stage member axis");
     auto memberChoice =
         llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
@@ -1152,43 +1122,18 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
         string(builder, "member"), i64(builder, *memberNode),
-        string(builder, *memberExtent), string(builder, memberOwnership->tile),
+        IntegerAttr(), IntegerAttr(), string(builder, memberOwnership->tile),
         i64(builder, 1)));
     decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
-        string(builder, "feature"), IntegerAttr(), string(builder, *feature),
-        string(builder, "feature"), i64(builder, 0)));
+        string(builder, "feature"), IntegerAttr(), i64(builder, *featureValue),
+        i64(builder, feature->second), string(builder, "feature"),
+        i64(builder, 0)));
     decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
         stage.contraction->getLoc(), i64(builder, *stageNode),
         string(builder, "reduction"), IntegerAttr(),
-        string(builder, *reduction), string(builder, "reduction"),
-        IntegerAttr()));
-    for (Value output : stage.outputs) {
-      FailureOr<int64_t> outputID = valueID(
-          output, facts.kernel, *stage.contraction, "stage buffer value binding");
-      if (failed(outputID))
-        return failure();
-      SmallVector<int64_t> consumers;
-      for (const StageDecision &consumer : *stages) {
-        if (!llvm::is_contained(consumer.inputs, output))
-          continue;
-        FailureOr<int64_t> consumerNode =
-            node(*consumer.contraction, "stage buffer consumer binding");
-        if (failed(consumerNode))
-          return failure();
-        consumers.push_back(*consumerNode);
-      }
-      llvm::sort(consumers);
-      decisions.stageBuffers.push_back(
-          builder.create<intent::plan::StageBufferOp>(
-              stage.contraction->getLoc(), i64(builder, *outputID),
-              i64(builder, *stageNode),
-              builder.getDenseI64ArrayAttr(consumers),
-              builder.getStrArrayAttr({"member", "feature"}),
-              string(builder, "single_writer_read_only_consumers"),
-              string(builder, "producer_to_last_consumer"),
-              string(builder, "same_stream")));
-    }
+        i64(builder, *reductionValue), i64(builder, reduction->second),
+        string(builder, "reduction"), IntegerAttr()));
   }
   return decisions;
 }
@@ -1220,7 +1165,27 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
   for (intent::plan::BlockExtentOp extent : decisions.blockExtents)
     appendUnique(keys, extent.getLogicalExtent());
   for (intent::plan::StageAxisOp axis : decisions.stageAxes) {
-    appendUnique(keys, axis.getExtent());
+    if (axis.getAxisNodeAttr()) {
+      Operation *domain = facts.kernel.nodes.lookup(axis.getAxisNodeAttr().getInt());
+      FailureOr<std::string> extent =
+          domain ? sourceDimensionSymbol(*domain, facts)
+                 : FailureOr<std::string>(failure());
+      if (failed(extent))
+        return axis.emitOpError("does not resolve a stage domain-axis key");
+      appendUnique(keys, *extent);
+    } else {
+      Value value = facts.kernel.values.lookup(axis.getSourceValueAttr().getInt());
+      FailureOr<SmallVector<std::string>> shape =
+          value ? target::getLogicalShape(value, facts.kernel,
+                                          *axis.getOperation(),
+                                          "stage autotune key")
+                : FailureOr<SmallVector<std::string>>(failure());
+      int64_t dimension = axis.getTensorAxisAttr().getInt();
+      if (!value || failed(shape) || dimension < 0 ||
+          static_cast<size_t>(dimension) >= shape->size())
+        return axis.emitOpError("does not resolve a stage tensor-axis key");
+      appendUnique(keys, (*shape)[dimension]);
+    }
     appendUnique(parameters, axis.getTile());
   }
   if (parameters.empty())

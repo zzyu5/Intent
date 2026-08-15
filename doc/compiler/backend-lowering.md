@@ -11,7 +11,7 @@ Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、
 - Kernel IR 的 operation/region/def-use 遍历；
 - ABI、domain、ragged relation、state stream 与 contraction 分析；
 - ownership、traversal、tile role、storage、boundary 和合法搜索轴的 machine 决策；
-- execution-stage dependency、intermediate lifetime/visibility、同步与 fusion policy；
+- execution-stage operation slice、stage-axis binding、同步，以及由这些内容派生的 dependency/intermediate index；
 - operation handler registry 与 unsupported-op 诊断机制。
 
 每个 target 叶子只提供：
@@ -53,7 +53,7 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 
 ## Execution-stage 投影
 
-Plan 已给出 stage operation slice、dependency、intermediate producer/consumer/owner/lifetime/visibility、synchronization、fusion 与 grouping policy。当前三个 GPU surface 只接受 `same_stream + forbidden + fixed_operation_slice`，按拓扑顺序发射 private kernels；leaf 不从 def-use 重新划分 stage，也不自行决定 workspace owner。不同 target family 可以在各自 realizer 中产生不同 grouping，surface provider不能改写同一份 GPU Plan。
+Plan 给出 stage operation slice、stage-axis logical binding、tile/worker 与 `same_stream` synchronization。公共 emission index 从 Kernel IR def-use 和 memory effects 派生 dependency、input/output、terminal、intermediate lifetime/visibility；三个 leaf 共用这份索引并按拓扑顺序发射 private kernels，不各自重建。Leaf 不重新划分 stage、不自行决定 workspace owner，也不允许合并 stages。不同 target family 可以在各自 realizer 中产生不同的初始 grouping，surface provider不能改写同一份 machine Plan。
 
 ## 失败边界
 
@@ -66,6 +66,14 @@ Translator 开始前验证 Kernel IR、machine plan 与 target projection。以�
 - target spelling 无法保持 dtype、boundary、effect 或 state semantics。
 
 禁止旁路 Python Plan、根据 kernel 名称套模板、整-kernel matcher，以及 emitter 从 tensor shape 重新猜 physical structure。
+
+明确失败必须区分三种性质：
+
+1. **Target capability subset**：目标 API/程序模型没有等价机械投影，在 emission 前以源码位置拒绝。当前例子包括 TileLang 的 CAS、generic reduce/scan closure、部分多轴 checked transfer、single-row contraction 与 runtime-lane FP8 contraction；Triton/cuTile 的 2:4 sparse contraction，以及 cuTile 的 block-scaled matmul。
+2. **Lower compiler cost/failure**：目标源码已经合法生成，但下层首次编译超时、候选资源无效或特定设备/toolchain 失败。这是运行记录，不得冒充 Core 或 target-language 不支持；token-sparse attention 的编译超时和某些超长首次 JIT 属于此类。
+3. **Intent implementation gap**：Kernel IR 能表达、target 也有能力，但缺少 Plan binding、handler 或机械投影。这一类必须明确报“尚未实现”并继续修，不能登记成 target subset。
+
+同一个 kernel 在一台设备失败而在另一台通过，也不能据此修改 Core；除非能力检查能用设备属性表达，否则它只是具体下层编译结果。CSV 中的 `failed`/`compile_timeout` 是测量状态，不是冻结后的语言能力声明。
 
 ## 与下层系统的关系
 

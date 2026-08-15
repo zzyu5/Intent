@@ -66,9 +66,7 @@ def IntentPlan_RangeOp : IntentPlan_Op<"range"> {
     StrAttr:$tile,
     StrAttr:$extent,
     OptionalAttr<I64Attr>:$transfer_node,
-    OptionalAttr<I64Attr>:$source_axis,
-    I64Attr:$lower_offset,
-    I64Attr:$upper_offset
+    OptionalAttr<I64Attr>:$source_axis
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -152,7 +150,6 @@ def IntentPlan_ReductionOp : IntentPlan_Op<"reduction"> {
 def IntentPlan_ScanOp : IntentPlan_Op<"scan"> {
   let arguments = (ins
     I64Attr:$node,
-    StrAttr:$semantics,
     I64Attr:$axis_node,
     I64Attr:$tensor_axis,
     StrAttr:$result_space,
@@ -170,7 +167,6 @@ def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
   let arguments = (ins
     I64Attr:$node,
     StrAttr:$result_space,
-    I64Attr:$reuse_operand,
     BoolAttr:$nonnegative_operands,
     DenseI64ArrayAttr:$axis_nodes
   );
@@ -208,8 +204,7 @@ def IntentPlan_SparseContractOp : IntentPlan_Op<"sparse_contract"> {
 def IntentPlan_StreamAxisOp : IntentPlan_Op<"stream_axis"> {
   let arguments = (ins
     I64Attr:$stream_node,
-    I64Attr:$axis_node,
-    StrAttr:$role
+    I64Attr:$axis_node
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -230,28 +225,8 @@ def IntentPlan_StreamBindingOp : IntentPlan_Op<"stream_binding"> {
 def IntentPlan_StageOp : IntentPlan_Op<"stage"> {
   let arguments = (ins
     I64Attr:$node,
-    DenseI64ArrayAttr:$dependencies,
-    DenseI64ArrayAttr:$inputs,
-    DenseI64ArrayAttr:$outputs,
     DenseI64ArrayAttr:$operations,
-    DenseI64ArrayAttr:$terminals,
-    StrAttr:$synchronization,
-    StrAttr:$fusion,
-    StrAttr:$grouping
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentPlan_StageBufferOp : IntentPlan_Op<"stage_buffer"> {
-  let arguments = (ins
-    I64Attr:$value,
-    I64Attr:$producer_stage,
-    DenseI64ArrayAttr:$consumer_stages,
-    ArrayAttr:$owner_roles,
-    StrAttr:$access,
-    StrAttr:$lifetime,
-    StrAttr:$visibility
+    StrAttr:$synchronization
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -262,7 +237,8 @@ def IntentPlan_StageAxisOp : IntentPlan_Op<"stage_axis"> {
     I64Attr:$stage_node,
     StrAttr:$role,
     OptionalAttr<I64Attr>:$axis_node,
-    StrAttr:$extent,
+    OptionalAttr<I64Attr>:$source_value,
+    OptionalAttr<I64Attr>:$tensor_axis,
     StrAttr:$tile,
     OptionalAttr<I64Attr>:$worker_axis
   );

@@ -1,20 +1,21 @@
 # Core 与算法库
 
-## 小而通用的 Core
+## 冻结后的构造分类
 
-Core 包含：
+| 定性 | 构造 | 边界 |
+|---|---|---|
+| Core definition/ABI | `@intent.kernel`、`@intent.fn`、`In/Out/InOut`、runtime scalar、`Constexpr` | 一个 source kernel 对应一个 logical callable；helper 不产生 dispatch |
+| Core logical allocation | domain、region、view、`partition(extent=...)`、`parallel`、`ordered`、`state_stream`、ragged relation | domain/region/view 是语义对象，不是独立 worker/tile API |
+| Core tensor-flow | positional broadcasting、reshape、transpose、pointwise、mask、cast、record、typed tuple/state | 保留作者的数据流和 shape，不保存 target layout |
+| Core structured computation | `reduce`、`scan`、typed pure combiner、multiply/add `contract` | reduce/scan 允许 reassociation；ordered/state-stream 不允许被归一化成 reduction |
+| Core indexing/effects | gather、scatter、logical buffer、atomic、RNG、`I.end`、`I.assume_in_bounds` | index relation、effect、前置条件和 logical identity 属算法语义 |
+| Core control | runtime `if/for/while` 与 source specialization branch | Python `break/continue` 在 frontend 正规化，不形成 Kernel IR op |
+| 语法糖 | 固定 `reduce.max/sum`、`any/all`、`arg_reduce.max` | lowering 到同一 canonical reduce/typed combiner 语义；不是第二套 primitive |
+| 过渡语法糖 | `sparse_contract_2to4` | canonical 节点已经是 `sparse_contract`；将收敛为 format descriptor，2:4 intrinsic 保留为 convenience spelling |
+| 已定义但尚未 realization | `partition(count=...)` | source 语义成立，当前 frontend 明确拒绝，不生成假能力 IR |
+| 不属于 public Core | fence、stage、physical barrier、worker/grid identity | fence 尚无共同 scope/ordering/participant 合同；stage 是 compiler-private realization |
 
-```text
-domain / region / view
-partition / parallel / ordered / state_stream
-pure tensor expressions
-reduce / scan + typed pure combiner / multiply-add contract
-gather / scatter
-ragged descriptor
-logical buffer
-runtime control flow
-atomic / effect / RNG
-```
+某些 target 只承接 Core 的能力子集，不会反过来改变 Core 定性。例如 TileLang 当前不能机械 lower generic reduce/scan closure 或 CAS；Triton/cuTile 当前没有 2:4 sparse contraction projection。具体边界由 [后端 lowering](../compiler/backend-lowering.md) 声明并在 emission 前诊断。
 
 Core 不包含 opaque 的：
 
@@ -28,22 +29,11 @@ softmax / FlashAttention / MoE 算子名
 
 这些名字可能隐藏不同的 source algorithms，不能成为 realizer 偷换算法的入口。
 
-## 算法库
+## 算法库边界
 
-Intent 可以提供明确命名的算法实现：
+当前 public package 没有 `intent.algorithms.*` API。未来算法库若建立，它是普通 host-side library：调用哪个 implementation，就是作者或 wrapper 选择哪个算法，而不是 realizer 根据算子名字替换 Kernel IR。
 
-```python
-intent.algorithms.bitonic_sort(...)
-intent.algorithms.radix_sort(...)
-intent.algorithms.heap_topk(...)
-intent.algorithms.radix_select(...)
-intent.algorithms.atomic_bucket(...)
-intent.algorithms.count_scan_scatter(...)
-```
-
-调用哪个 implementation，就是选择哪个算法。
-
-算法库可以包含：
+这样的库可以包含：
 
 - portable Intent implementation；
 - target-specific Intent/source variant；

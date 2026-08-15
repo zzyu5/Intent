@@ -2013,8 +2013,7 @@ LogicalResult SourceEmitter::emitReshape(Operation &operation) {
   FailureOr<StringRef> operand = lookupValue(operation, 0);
   FailureOr<std::string> shape = emitTensorShape(operation, 0);
   if (failed(node) || !binding || binding.getLowering() != "ct.reshape" ||
-      binding.getReuseOperandAttr().getInt() != -1 || failed(operand) ||
-      failed(shape) || operation.getNumResults() != 1 ||
+      failed(operand) || failed(shape) || operation.getNumResults() != 1 ||
       !isa<RankedTensorType>(operation.getResult(0).getType()))
     return operation.emitOpError("lacks a mechanical cuTile reshape binding");
   std::string result = makeResultName(operation, 0);
@@ -2031,8 +2030,7 @@ LogicalResult SourceEmitter::emitTranspose(Operation &operation) {
   FailureOr<SmallVector<int64_t>> permutation =
       target::emission::transposePermutation(operation);
   if (failed(node) || !binding || binding.getLowering() != "ct.permute" ||
-      binding.getReuseOperandAttr().getInt() != -1 || failed(operand) ||
-      failed(permutation))
+      failed(operand) || failed(permutation))
     return operation.emitOpError("lacks a mechanical cuTile transpose binding");
   std::string result = makeResultName(operation, 0);
   std::string axes = "(";

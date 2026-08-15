@@ -931,14 +931,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 scalarConsumers
                     ? ArrayRef<int64_t>(scanFact->second.materializedValues)
                     : ArrayRef<int64_t>();
-            StringRef semantics = isa<FlatSymbolRefAttr>(
-                                      operation.getAttr("intent.combine"))
-                                      ? StringRef("scan_generic_inclusive")
-                                      : StringRef("scan_inclusive_add");
             builder.create<intent::plan::ScanOp>(
                 operation.getLoc(), i64(builder, *node),
-                string(builder, semantics), i64(builder, *axisNode),
-                i64(builder, axis.getInt()),
+                i64(builder, *axisNode), i64(builder, axis.getInt()),
                 string(builder, scalarConsumers ? "private_workspace"
                                                 : "private_fragment"),
                 string(builder, "private_scalar"),
@@ -987,7 +982,6 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                   operation.getLoc(), i64(builder, *node),
                   string(builder,
                          tensor ? "private_fragment" : "private_scalar"),
-                  i64(builder, -1),
                   builder.getBoolAttr(
                       target::hasNonnegativeIntegerOperands(operation, facts)),
                   builder.getDenseI64ArrayAttr(axisNodes));
@@ -1066,15 +1060,14 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                       return static_cast<int64_t>(binding.getStreamNode()) ==
                                  *streamNode &&
                              static_cast<int64_t>(binding.getAxisNode()) ==
-                                 axisNode &&
-                             binding.getRole() == "inner_reduction";
+                                 axisNode;
                     });
                 if (existing !=
                     builder.getBlock()->getOps<intent::plan::StreamAxisOp>().end())
                   continue;
                 builder.create<intent::plan::StreamAxisOp>(
                     operation.getLoc(), i64(builder, *streamNode),
-                    i64(builder, axisNode), string(builder, "inner_reduction"));
+                    i64(builder, axisNode));
               }
             }
             return success();

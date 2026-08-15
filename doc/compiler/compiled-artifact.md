@@ -63,4 +63,4 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 
 ## Single logical callable invariant
 
-一个 source kernel invocation 对应一个 target callable invocation。Compiler-private scratch、intermediate buffer 与多个 machine stages 可以存在，但必须由 Plan 显式描述 dependency、lifetime、visibility、synchronization 与 fusion policy，不得改变用户 ABI、effects 或 wrapper-visible调用协议。
+一个 source kernel invocation 对应一个 target callable invocation。Compiler-private scratch、intermediate buffer 与多个 machine stages 可以存在；Plan 显式选择 operation slices、stage-axis physical binding 与 synchronization，dependency、lifetime 和 visibility 则从 Kernel IR def-use 与该选择唯一派生。它们都不得改变用户 ABI、effects 或 wrapper-visible 调用协议。Artifact 不提供跨 stage/source callable fusion 入口。

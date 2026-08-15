@@ -4,9 +4,9 @@ Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 s
 
 ## 两类对象
 
-`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的 execution-stage operation slice 与 intermediate contract。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node ID 引用它们并保存已选物理关系，不复制第二份算法 schema。
+`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的 execution-stage operation slice、stage-axis tile/worker binding 与 synchronization。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node/value/axis 引用保存已选物理关系，不复制第二份算法 schema。
 
-Structured primitive 的 binding 必须把 emitter 机械投影所需的规范角色与逻辑轴引用写进 Plan。例如 scan 保存 canonical semantics、logical axis node、tensor axis 与 result residency；target 不得回到 Kernel op 各自重推这些字段。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
+Structured primitive 的算法语义只从 Kernel IR 读取，Plan 只补充 emitter 机械投影所需的已选物理角色与逻辑引用。例如 scan 的 combine/inclusive semantics 来自 canonical scan op，Plan 绑定 logical axis/tensor axis、result/carry residency、owner 与 materialization slice；leaf 逐 op 同时读取这两个权威来源，但不得根据周围结构重推 axis、owner 或 materialization。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
 
 `intent_plan.search_space` 保存尚未选择、明确委托给目标后端 tuner 的合法轴和参数角色。Realizer 负责证明候选的结构合法性并给出参数关系；候选值、排序和赢家由 Triton、cuTile 或 TileLang 自带 tuner 决定。源码结构选择不进入 search space。
 
@@ -18,7 +18,7 @@ Realizer 不先问“kernel 属于哪一类”，而是逐个逻辑轴回答：�
 
 因此不规则 membership 与 ordered stream、分阶段 contraction 与 ordered traversal、一个轴的外层块和内层顺序都由角色与 range 的组合得到，不需要新增互斥 mapping mode。Relation、def-use 与 provenance 从 Kernel IR 在公共 KernelModel 中派生一次；SurfacePlan 只能索引这份语义事实和 Plan 中已选的物理绑定，不能遍历周围 operation 再重建一份。
 
-每条 range 同时保存 canonical logical extent 与已选 tile。Region block argument 通过稳定 value ID 显式绑定到 axis、range purpose 和 level；state stream 显式绑定到 axis、range purpose/level 以及适用的 ragged relation。Row-vector 上界、stream 上界和 region 归属因此都由 leaf 直接读取，leaf 只负责目标符号和语法拼写。
+每条 range 绑定 canonical logical axis、用途/层级、target specialization extent spelling 与已选 tile。这里的 extent spelling 是 ABI/runtime specialization 的稳定引用，不是独立 shape schema；真实 shape 仍只由 Kernel IR/ABI 定义并集中校验。Region block argument 通过稳定 value ID 显式绑定到 axis、range purpose 和 level；state stream 显式绑定到 axis、range purpose/level 以及适用的 ragged relation。Row-vector 上界、stream 上界和 region 归属因此都由 leaf 直接读取，leaf 只负责目标符号和语法拼写。
 
 ## 稳定引用与验证
 
@@ -32,11 +32,13 @@ Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 
 
 ## Execution stages
 
-一个 logical callable 需要多个 machine stages 时，Plan 显式保存每个 stage 的 dependencies、input/output value、operation slice、terminal、synchronization、fusion 与 grouping policy。每个 intermediate 另有唯一 buffer contract：producer、consumer stages、owner roles、single-writer/read-only-consumer access、从 producer 到最后 consumer 的最短 lifetime，以及 memory visibility。
+一个 logical callable 需要多个 machine stages 时，Plan 只保存真正选择出来的内容：stage identity、operation slice、`same_stream` synchronization，以及每个 stage 轴绑定到哪个 logical domain/value dimension 后选定的 tile 与 worker axis。Operation slice 是物理 grouping 决定；它可以在保持同一 Kernel IR 算法与 effects 的前提下选择 pure recomputation 或 intermediate materialization。
 
-Verifier 要求 dependency 与 input buffer producer 精确一致、拓扑有序、intermediate 只有一个 writer、consumer 位于 producer 之后、final stage 拥有唯一 terminal 且没有后继。Operation slice 可以因 Plan 明确选择 pure recomputation 而重叠，但 effectful terminal 与 intermediate writer不能重复。
+Dependencies、input/output values、effectful terminals、intermediate producer/consumers、lifetime 与 visibility 都可由 `Kernel IR + operation slice + synchronization` 唯一得到，因此不再作为 `StageOp` 字段，也没有独立 `StageBufferOp`。公共 emission index 每次从 def-use 与 memory effects 重算并验证：producer 必须在 consumer 之前、intermediate 只有一个来源、final/intermediate stage 形态不混用、effectful terminal不能被多个 stage 复制。这个 index 是缓存，不是第三层 IR，也没有 serializer 或一致性 verifier。
 
-当前 GPU realization 使用 `same_stream` synchronization/visibility、`forbidden` fusion 与 `fixed_operation_slice` grouping。三个 surface 只能机械兑现这份合同；不能兑现的 policy 在 emission 前拒绝。实际 stage grouping 已由 Plan 的 operation slices 给出，GPU surface 不得重新分组；未来 CPU/RVV realizer可以在构造自己的 target-family Plan 时选择不同 grouping。
+当前 GPU realization 使用 `same_stream` synchronization；三个 surface 按 Plan 顺序提交 private launches，并以同 stream happens-before 兑现派生 dependency 与 visibility。Stage grouping 已由 operation slices 给出，surface 不得重新分组。
+
+Plan 不包含 fusion permission，也没有 `target_may_fuse` 一类未来入口。跨 compiler-private stage 或跨 source callable 的融合不属于这个算子编译器；未来若存在更高层图优化，由上层系统产生新的 source/kernel orchestration，而不是在此 schema 中打开开关。CPU/RVV realizer可以为自己的机器选择不同的初始 stage grouping，但同样不能让 leaf 改写已经选定的 Plan。
 
 ## Ownership 与 physical identity
 

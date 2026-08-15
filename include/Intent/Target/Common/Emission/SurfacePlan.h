@@ -12,6 +12,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringMap.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <optional>
 #include <array>
@@ -745,10 +746,6 @@ struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
   llvm::StringRef getLowering() const { return lowering; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
   llvm::StringRef getSpace() const { return resultSpace; }
-  mlir::IntegerAttr getReuseOperandAttr() const {
-    return operation.getReuseOperandAttr();
-  }
-  int64_t getReuseOperand() const { return operation.getReuseOperand(); }
   bool getNonnegativeOperands() const {
     return operation.getNonnegativeOperands();
   }
@@ -874,46 +871,40 @@ struct RaggedBinding : CanonicalBinding {
 
 struct StageBinding : Binding<intent::plan::StageOp> {
   unsigned position = 0;
+  llvm::SmallVector<int64_t> dependencies;
+  llvm::SmallVector<int64_t> inputs;
+  llvm::SmallVector<int64_t> outputs;
+  llvm::SmallVector<int64_t> terminals;
 
   unsigned getOrdinal() const { return position; }
   int64_t getNode() const { return operation.getNode(); }
-  llvm::ArrayRef<int64_t> getDependencies() const {
-    return operation.getDependencies();
-  }
-  llvm::ArrayRef<int64_t> getInputs() const { return operation.getInputs(); }
-  llvm::ArrayRef<int64_t> getOutputs() const { return operation.getOutputs(); }
+  llvm::ArrayRef<int64_t> getDependencies() const { return dependencies; }
+  llvm::ArrayRef<int64_t> getInputs() const { return inputs; }
+  llvm::ArrayRef<int64_t> getOutputs() const { return outputs; }
   llvm::ArrayRef<int64_t> getOperations() const {
     return operation.getOperations();
   }
-  llvm::ArrayRef<int64_t> getTerminals() const {
-    return operation.getTerminals();
-  }
+  llvm::ArrayRef<int64_t> getTerminals() const { return terminals; }
   llvm::StringRef getSynchronization() const {
     return operation.getSynchronization();
   }
-  llvm::StringRef getFusion() const { return operation.getFusion(); }
-  llvm::StringRef getGrouping() const { return operation.getGrouping(); }
-};
-
-struct StageBufferBinding : Binding<intent::plan::StageBufferOp> {
-  int64_t getValue() const { return operation.getValue(); }
-  int64_t getProducerStage() const { return operation.getProducerStage(); }
-  llvm::ArrayRef<int64_t> getConsumerStages() const {
-    return operation.getConsumerStages();
-  }
-  mlir::ArrayAttr getOwnerRoles() const { return operation.getOwnerRoles(); }
-  llvm::StringRef getAccess() const { return operation.getAccess(); }
-  llvm::StringRef getLifetime() const { return operation.getLifetime(); }
-  llvm::StringRef getVisibility() const { return operation.getVisibility(); }
 };
 
 struct StageAxisBinding : Binding<intent::plan::StageAxisOp> {
+  std::string extent;
+
   int64_t getStageNode() const { return operation.getStageNode(); }
   llvm::StringRef getRole() const { return operation.getRole(); }
   mlir::IntegerAttr getAxisNodeAttr() const {
     return operation.getAxisNodeAttr();
   }
-  llvm::StringRef getExtent() const { return operation.getExtent(); }
+  mlir::IntegerAttr getSourceValueAttr() const {
+    return operation.getSourceValueAttr();
+  }
+  mlir::IntegerAttr getTensorAxisAttr() const {
+    return operation.getTensorAxisAttr();
+  }
+  llvm::StringRef getExtent() const { return extent; }
   llvm::StringRef getTile() const { return operation.getTile(); }
   mlir::IntegerAttr getWorkerAxisAttr() const {
     return operation.getWorkerAxisAttr();
@@ -1277,8 +1268,7 @@ mlir::LogicalResult indexCanonicalStructure(
   for (auto relation : index.streamAxes) {
     auto stream = index.streams.find(relation.getStreamNode());
     auto axis = index.axes.find(relation.getAxisNode());
-    if (stream == index.streams.end() || axis == index.axes.end() ||
-        relation.getRole() != "inner_reduction")
+    if (stream == index.streams.end() || axis == index.axes.end())
       return relation.emitOpError(
           "does not resolve a canonical stream-axis relation");
     stream->second.innerReductionAxes.push_back(relation.getAxisNode());
@@ -1607,41 +1597,46 @@ projectLinearGroupIndex(const PlanIndex &index, llvm::ArrayRef<AxisBinding> grou
 
 template <typename PlanIndex, typename OperationStages>
 mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
-                                         const PlanIndex &index,
+                                         PlanIndex &index,
                                          OperationStages &operationStages) {
+  for (auto &stageAxes : index.stageAxes) {
+    for (auto &roleAndAxis : stageAxes.second) {
+      StageAxisBinding &binding = roleAndAxis.getValue();
+      if (binding.getSourceValueAttr()) {
+        mlir::Value value =
+            kernel.values.lookup(binding.getSourceValueAttr().getInt());
+        mlir::FailureOr<llvm::SmallVector<std::string>> shape =
+            value ? target::getLogicalShape(value, kernel,
+                                            *binding.operation.getOperation(),
+                                            "physical stage-axis binding")
+                  : mlir::FailureOr<llvm::SmallVector<std::string>>(
+                        mlir::failure());
+        int64_t axis = binding.getTensorAxisAttr().getInt();
+        if (!value || mlir::failed(shape) || axis < 0 ||
+            static_cast<size_t>(axis) >= shape->size())
+          return binding.emitOpError(
+              "does not resolve its canonical source tensor dimension");
+        binding.extent = (*shape)[axis];
+        continue;
+      }
+      auto physical = index.axes.find(binding.getAxisNodeAttr().getInt());
+      const RangeBinding *range =
+          physical == index.axes.end()
+              ? nullptr
+              : physical->second.getRange("ownership", 0);
+      if (!range)
+        return binding.emitOpError(
+            "does not resolve its canonical domain-axis extent");
+      binding.extent = range->getExtent().str();
+    }
+  }
   llvm::DenseMap<int64_t, unsigned> stagePositions;
   for (auto [position, stage] : llvm::enumerate(index.stages))
     stagePositions[stage.getNode()] = position;
   for (auto [position, stage] : llvm::enumerate(index.stages)) {
-    if (stage.getSynchronization() != "same_stream" ||
-        stage.getFusion() != "forbidden" ||
-        stage.getGrouping() != "fixed_operation_slice")
+    if (stage.getSynchronization() != "same_stream")
       return stage.emitOpError(
-          "target emitter requires ordered same-stream unfused stages with fixed operation slices");
-    for (int64_t dependency : stage.getDependencies()) {
-      auto found = stagePositions.find(dependency);
-      if (found == stagePositions.end() || found->second >= position)
-        return stage.emitOpError(
-            "references a non-predecessor stage dependency");
-    }
-    for (int64_t input : stage.getInputs()) {
-      auto buffer = index.stageBuffers.find(input);
-      if (buffer == index.stageBuffers.end() ||
-          !llvm::is_contained(buffer->second.getConsumerStages(),
-                              stage.getNode()))
-        return stage.emitOpError(
-            "input lacks a matching stage-buffer read contract");
-    }
-    for (int64_t output : stage.getOutputs()) {
-      mlir::Value value = kernel.values.lookup(output);
-      auto buffer = index.stageBuffers.find(output);
-      if (!value || !mlir::isa<mlir::RankedTensorType>(value.getType()) ||
-          buffer == index.stageBuffers.end() ||
-          buffer->second.getProducerStage() != stage.getNode() ||
-          buffer->second.getVisibility() != "same_stream")
-        return stage.emitOpError(
-            "output lacks a matching visible stage-buffer write contract");
-    }
+          "target emitter requires ordered same-stream physical stages");
     for (int64_t node : stage.getOperations()) {
       mlir::Operation *operation = kernel.nodes.lookup(node);
       if (!operation)
@@ -1650,16 +1645,78 @@ mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
       if (!llvm::is_contained(stages, position))
         stages.push_back(position);
     }
-    for (int64_t node : stage.getTerminals()) {
-      mlir::Operation *terminal = kernel.nodes.lookup(node);
-      if (!terminal ||
-          !llvm::is_contained(operationStages.lookup(terminal), position))
-        return stage.emitOpError(
-            "references a terminal outside its physical operation slice");
-    }
   }
   if (index.stages.empty())
     return mlir::success();
+
+  auto appendUnique = [](auto &values, int64_t value) {
+    if (!llvm::is_contained(values, value))
+      values.push_back(value);
+  };
+  llvm::DenseMap<mlir::Operation *, unsigned> terminalOwners;
+  for (unsigned position = 0; position < index.stages.size(); ++position) {
+    StageBinding &stage = index.stages[position];
+    for (int64_t node : stage.getOperations()) {
+      mlir::Operation *operation = kernel.nodes.lookup(node);
+      if (!operation)
+        return stage.emitOpError("references an unknown operation node");
+      if (operation->getNumRegions() == 0 &&
+          mlir::hasEffect<mlir::MemoryEffects::Write>(operation)) {
+        auto owner = terminalOwners.try_emplace(operation, position);
+        if (!owner.second && owner.first->second != position)
+          return operation->emitOpError(
+              "is assigned as an effectful terminal to multiple physical stages");
+        appendUnique(stage.terminals, node);
+      }
+
+      for (mlir::Value operand : operation->getOperands()) {
+        mlir::Operation *definition = operand.getDefiningOp();
+        if (!definition)
+          continue;
+        llvm::ArrayRef<unsigned> definitionStages =
+            operationStages.lookup(definition);
+        if (definitionStages.empty() ||
+            llvm::is_contained(definitionStages, position))
+          continue;
+        llvm::SmallVector<unsigned> producers;
+        for (unsigned producer : definitionStages)
+          if (producer < position)
+            producers.push_back(producer);
+        if (producers.size() != 1)
+          return operation->emitOpError(
+              "does not resolve one earlier physical stage for a cross-stage value");
+        mlir::FailureOr<int64_t> valueID = target::getValueID(
+            operand, kernel, *operation, "derived physical stage boundary");
+        if (mlir::failed(valueID))
+          return mlir::failure();
+        StageBinding &producer = index.stages[producers.front()];
+        appendUnique(stage.inputs, *valueID);
+        appendUnique(producer.outputs, *valueID);
+        appendUnique(stage.dependencies, producer.getNode());
+      }
+    }
+  }
+  for (StageBinding &stage : index.stages) {
+    llvm::sort(stage.dependencies);
+    llvm::sort(stage.inputs);
+    llvm::sort(stage.outputs);
+    llvm::sort(stage.terminals);
+    if (stage.outputs.empty() == stage.terminals.empty())
+      return stage.emitOpError(
+          "derived stage boundary must have either intermediate outputs or effectful terminals");
+    for (int64_t output : stage.outputs) {
+      mlir::Value value = kernel.values.lookup(output);
+      if (!value || !mlir::isa<mlir::RankedTensorType>(value.getType()))
+        return stage.emitOpError(
+            "derives a non-tensor physical stage intermediate");
+    }
+    for (int64_t dependency : stage.dependencies) {
+      auto found = stagePositions.find(dependency);
+      if (found == stagePositions.end() || found->second >= stage.position)
+        return stage.emitOpError(
+            "derives a non-predecessor physical stage dependency");
+    }
+  }
 
   mlir::Operation *program =
       kernel.nodes.lookup(index.program.getLoopNode());

@@ -67,7 +67,7 @@ stats = I.reduce(
 
 上例是当前正式 generic combine 形态。Frontend 把 helper lower 成 canonical Kernel IR 中的 typed combiner body：参数是两组 accumulator components，返回 schema 与 accumulator 完全一致，identity 逐 component 显式给出。Combiner 必须 pure，不能包含 load/store/atomic/RNG；runtime capture 必须通过 `combine_operands=(...)` 成为 reduce/scan 的显式 scalar operand，只有 `Constexpr` 可以直接捕获。
 
-选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。
+选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。Compiler 只验证 closure 的 typed schema、purity 与显式 capture，然后按 SSA 顺序机械投影；它不分析、重排、替换或特化 closure body，也不会把 ordered/state-stream 程序归一化成 reduce。
 
 一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。Triton/cuTile 将 typed helper 机械投影到原生 generic reduce。TileLang 0.1.13 的 `T.comm_reducer` 能构造 `tirx.Reduce`，但当前 CUDA codegen 对该节点明确报无 lowering；generic closure 因而在 emission 前 unsupported，固定内建 reduction 不受影响。
 
