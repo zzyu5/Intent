@@ -207,6 +207,13 @@ private:
   wholeTileBoundsPredicate(mlir::Operation &operation,
                            llvm::ArrayRef<std::string> tileExtents);
   mlir::FailureOr<std::string>
+  tileFitsViewPredicate(mlir::Operation &operation,
+                        llvm::ArrayRef<std::string> tileExtents);
+  mlir::FailureOr<std::string>
+  tileBoundsPredicate(mlir::Operation &operation,
+                      llvm::ArrayRef<std::string> tileExtents,
+                      bool includeBase);
+  mlir::FailureOr<std::string>
   elementValidityPredicate(llvm::ArrayRef<int64_t> tensorAxes,
                            llvm::ArrayRef<int64_t> domainNodes,
                            llvm::ArrayRef<std::string> elementIndices,

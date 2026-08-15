@@ -435,8 +435,8 @@ indexRealization(intent::plan::RealizationOp realization,
     bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
       return target::emission::isRaggedBoundAxis(index.components, axis);
     });
-    bool plannedValidity = value.getFill() != "none" &&
-                           !value.getValidityDomainNodes().empty();
+    bool plannedValidity = !value.getValidityDomainNodes().empty() &&
+                           (store || value.getFill() != "none");
     bool materializeLogicalBounds =
         (raggedBound || plannedValidity) && !value.getConsumerNeutralized();
     bool packedScalar =
@@ -2619,8 +2619,9 @@ FailureOr<std::string> SourceEmitter::scalarTransferPredicate(
   return result;
 }
 
-FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
-    Operation &operation, ArrayRef<std::string> tileExtents) {
+FailureOr<std::string> SourceEmitter::tileBoundsPredicate(
+    Operation &operation, ArrayRef<std::string> tileExtents,
+    bool includeBase) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
@@ -2646,6 +2647,9 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
       if (tileAxis >= tileExtents.size())
         return operation.emitOpError(
             "whole-tile TileLang transfer has too few tile extents");
+      if (!includeBase)
+        predicates.push_back(tileExtents[tileAxis] + " <= " +
+                             (*view)->shape[axisNumber]);
       ++tileAxis;
       continue;
     }
@@ -2658,6 +2662,8 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
     Value indexed = operation.getOperand(*term.operands.front());
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
+      if (!includeBase)
+        return std::string();
       auto tensor = cast<RankedTensorType>(indexed.getType());
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
@@ -2678,6 +2684,8 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
       if (failed(source))
         return failure();
       if (source->hasDomain() && source->transformed) {
+        if (!includeBase)
+          return std::string();
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
@@ -2714,8 +2722,9 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
     if (base.empty() || failed(extent))
       return operation.emitOpError(
           "whole-tile TileLang transfer has no active axis interval");
-    predicates.push_back(base + " + " + tileExtents[tileAxis++] + " <= " +
-                         *extent);
+    std::string tile = tileExtents[tileAxis++];
+    predicates.push_back(includeBase ? base + " + " + tile + " <= " + *extent
+                                     : tile + " <= " + *extent);
   }
   if (tileAxis != tileExtents.size())
     return operation.emitOpError(
@@ -2726,6 +2735,16 @@ FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
   for (StringRef predicate : llvm::drop_begin(predicates))
     result += " and " + predicate.str();
   return result;
+}
+
+FailureOr<std::string> SourceEmitter::wholeTileBoundsPredicate(
+    Operation &operation, ArrayRef<std::string> tileExtents) {
+  return tileBoundsPredicate(operation, tileExtents, true);
+}
+
+FailureOr<std::string> SourceEmitter::tileFitsViewPredicate(
+    Operation &operation, ArrayRef<std::string> tileExtents) {
+  return tileBoundsPredicate(operation, tileExtents, false);
 }
 
 FailureOr<std::string> SourceEmitter::elementValidityPredicate(

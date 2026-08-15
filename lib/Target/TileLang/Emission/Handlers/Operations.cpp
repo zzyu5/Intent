@@ -1220,7 +1220,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       allocateResult(operation, 0, boundary.getResultSpace());
   if (failed(view) || failed(result))
     return operation.emitOpError("lacks a mechanical TileLang load binding");
-  if (boundary.getTransfer() == "parallel_elements" || expanded) {
+  if (boundary.getTransfer() == "parallel_elements" || expanded ||
+      boundary.getCheckBounds()) {
     StringRef padding = boundary.getPadding();
     if (padding == "none" && expanded)
       padding = *physicalFill;
@@ -3528,8 +3529,43 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
     FailureOr<std::string> physicalPredicate =
         expanded ? elementBoundsPredicate(operation, tileIndices, true)
                  : FailureOr<std::string>(std::string());
-    if (failed(logicalPredicate) || failed(physicalPredicate))
+    FailureOr<SmallVector<target::IndexTerm>> relation =
+        boundary.getCheckBounds()
+            ? target::parseIndexRelation(operation)
+            : FailureOr<SmallVector<target::IndexTerm>>(
+                  SmallVector<target::IndexTerm>());
+    bool tensorIndexed =
+        succeeded(relation) && llvm::any_of(*relation, [&](const auto &term) {
+          return term.kind == "value_index" && term.operands.size() == 1 &&
+                 term.operands.front() &&
+                 isa<RankedTensorType>(
+                     operation.getOperand(*term.operands.front()).getType());
+        });
+    bool mayUseBulkFastPath =
+        boundary.getCheckBounds() && !tensorIndexed &&
+        boundary.getTensorIndexing() == "none";
+    FailureOr<std::string> tileFits =
+        mayUseBulkFastPath
+            ? tileFitsViewPredicate(operation, *extents)
+            : FailureOr<std::string>(std::string());
+    FailureOr<std::string> bulkIndices =
+        mayUseBulkFastPath
+            ? accessIndices(operation)
+            : FailureOr<std::string>(std::string());
+    if (failed(logicalPredicate) || failed(physicalPredicate) ||
+        failed(relation) || failed(tileFits) || failed(bulkIndices))
       return failure();
+    bool hasBulkFastPath =
+        !expanded && !tileFits->empty() && !bulkIndices->empty();
+    if (hasBulkFastPath) {
+      line("if " + *tileFits + ":");
+      ++indentation;
+      line("T.copy(" + stored->str() + ", " + (*view)->argument->name + "[" +
+           *bulkIndices + "])");
+      --indentation;
+      line("else:");
+      ++indentation;
+    }
     line(loop + "):");
     ++indentation;
     if (boundary.getCheckBounds()) {
@@ -3552,6 +3588,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
     if (boundary.getCheckBounds())
       --indentation;
     --indentation;
+    if (hasBulkFastPath)
+      --indentation;
     return success();
   }
   if (boundary.getTransfer() != "bulk_copy")
