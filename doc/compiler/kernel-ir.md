@@ -40,6 +40,8 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - runtime `if`、`for`、`while`；
 - specialization-time branch；
 - `parallel`、`ordered` 与 `state_stream`；
+- rank-one domain/region 的 exclusive `end`，以及由它收紧的 stream logical stop；
+- 支配后续精确 index/view/axis 访问的 unsafe `assume_in_bounds` 前置条件；
 - carry schema、initial state、step 与 final projection；
 - 普通 `@intent.fn` 展开的算法 helper relation，以及 structured combiner 保留的 typed、effect-free helper body。
 

@@ -2517,6 +2517,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           registry, "intent.sparse_contract",
           [&](Operation &operation) -> LogicalResult {
             auto format = operation.getAttrOfType<StringAttr>("intent.format");
+            auto compressedAxis =
+                operation.getAttrOfType<IntegerAttr>("intent.compressed_axis");
+            auto metadataAxis =
+                operation.getAttrOfType<IntegerAttr>("intent.metadata_axis");
+            auto rhsReductionAxis = operation.getAttrOfType<IntegerAttr>(
+                "intent.rhs_reduction_axis");
             auto compressed = operation.getNumOperands() == 3
                                   ? facts.valueAxes.find(operation.getOperand(0))
                                   : facts.valueAxes.end();
@@ -2543,16 +2549,21 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                         operation.getResult(0).getType())
                                   : RankedTensorType();
             if (!format || format.getValue() != "two_of_four" ||
+                !compressedAxis || compressedAxis.getInt() != 1 ||
+                !metadataAxis || metadataAxis.getInt() != 1 ||
+                !rhsReductionAxis || rhsReductionAxis.getInt() != 0 ||
                 !compressedType || !metadataType || !rhsType || !resultType ||
                 compressedType.getRank() != 2 || metadataType.getRank() != 2 ||
                 rhsType.getRank() != 2 || resultType.getRank() != 2 ||
+                compressedType.getElementType() != rhsType.getElementType() ||
+                !metadataType.getElementType().isInteger(16) ||
                 compressed == facts.valueAxes.end() ||
                 metadata == facts.valueAxes.end() || rhs == facts.valueAxes.end() ||
                 compressed->second.size() != 2 || metadata->second.size() != 2 ||
                 rhs->second.size() != 2 ||
                 compressed->second[0] != metadata->second[0])
               return operation.emitOpError(
-                  "2:4 sparse contraction has no canonical compressed/metadata axis provenance");
+                  "2:4 sparse contraction does not match its canonical format, dtype, or axis schema");
             SmallVector<LogicalAxis> resultAxes{
                 compressed->second[0], rhs->second[1]};
             Operation *row = compressed->second[0].domain;

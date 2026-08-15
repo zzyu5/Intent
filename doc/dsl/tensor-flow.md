@@ -69,7 +69,7 @@ stats = I.reduce(
 
 选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。
 
-一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。Triton/cuTile 将 typed helper 机械投影到原生 generic reduce；TileLang 0.1.13 的当前 PrimFunc surface 没有等价入口，因此 generic closure 明确 unsupported，固定内建 reduction 不受影响。
+一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、warp/block tree、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。Triton/cuTile 将 typed helper 机械投影到原生 generic reduce。TileLang 0.1.13 的 `T.comm_reducer` 能构造 `tirx.Reduce`，但当前 CUDA codegen 对该节点明确报无 lowering；generic closure 因而在 emission 前 unsupported，固定内建 reduction 不受影响。
 
 `I.arg_reduce.max` 是 convenience sugar：frontend 将 `(value, index)` 与 lowest-index tie closure lower 成同一个 tuple-valued generic reduction。目标可以使用经过语义对齐的原生 `max_with_index`，但 Kernel IR helper仍是权威语义。
 
@@ -105,6 +105,12 @@ acc = I.contract(
 Realizer 决定依赖算法结构的 reduction subtile、复用边界和 primitive 数值角色。当前 GPU target 将其投影到 MMA/`tl.dot`/`T.gemm`/cuTile matmul；未来 CPU/RVV target 可投影到自己的 FMA microkernel。具体 layout、寄存器分配、指令选择与给定参数后的低层 pipeline 交给目标 compiler。
 
 Generic reduce/scan closure 不会使 `contract` 自动变成任意 semiring。当前 `contract` 只覆盖目标矩阵原语支持的 multiply/add 与 dtype/accumulator 组合；其他 semiring 必须由作者显式写成 pointwise + reduce，或由未来 target capability正式扩展。
+
+### 稀疏收缩的当前边界
+
+当前 `I.sparse_contract_2to4` 是 2:4 structured sparsity 的 format-specific semantic anchor：compressed values、`i16` metadata、compressed/metadata axis、dense RHS reduction axis 与 accumulator dtype 一起进入 canonical `intent.sparse_contract`，而不是伪装成 dense `contract`。公共 verifier 会核对这份固定 schema；当前只有 TileLang 的 native sparse MMA 能机械投影，其他 target 提前明确 unsupported。
+
+这个 source 名字不是未来所有稀疏格式的通用 API。已经确定的收敛方向是 `sparse_contract + format descriptor`：descriptor 属于算法可见的数据表示，必须显式描述 format identity、压缩轴和 metadata schema；2:4 是第一个 descriptor，现有专用 intrinsic 可继续作为 convenience spelling。当前没有第二种可比格式来确定一份诚实的通用 descriptor schema，因此本轮不制造只换了名字、下游仍硬编码 2:4 的假泛化；这是冻结文档明确登记的过渡边界。
 
 显式缩窄必须写在 source 中：
 

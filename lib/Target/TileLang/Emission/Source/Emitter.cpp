@@ -375,8 +375,8 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical reduction");
     if (*role == "reduce_generic")
       return operation->emitOpError(
-          "TileLang 0.1.13 has no mechanical generic reduction combiner "
-          "projection in its current PrimFunc surface");
+          "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced "
+          "by comm_reducer; generic reduction combiners are unsupported");
     plan::ReductionOp binding;
     binding.operation = value;
     binding.lowering = *role == "reduce_argmax"
@@ -394,8 +394,8 @@ indexRealization(intent::plan::RealizationOp realization,
   for (intent::plan::ScanOp value : scans) {
     if (value.getSemantics() == "scan_generic_inclusive")
       return value.emitOpError(
-          "TileLang 0.1.13 has no mechanical generic scan combiner "
-          "projection in its current PrimFunc surface");
+          "TileLang 0.1.13 has no mechanically lowerable generic scan "
+          "combiner path; generic scan combiners are unsupported");
     if (value.getSemantics() != "scan_inclusive_add" ||
         !index.axes.count(value.getAxisNode()))
       return value.emitOpError("does not bind a canonical scan");
@@ -974,8 +974,9 @@ LogicalResult SourceEmitter::emitHelpers() {
     return failure();
   if (!combiners->empty())
     return combiners->front().emitOpError(
-        "TileLang 0.1.13 exposes fixed ReduceKind operations but no mechanical "
-        "generic combiner projection in the current PrimFunc surface");
+        "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced by "
+        "comm_reducer and exposes no generic scan equivalent; generic "
+        "combiners are unsupported");
   return success();
 }
 

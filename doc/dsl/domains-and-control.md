@@ -7,7 +7,7 @@ rows = I.domain(0, M)
 cols = I.domain(0, N)
 ```
 
-Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。当前正式语言只承诺 unit-step domain；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。Frontend 在构造 IR 前明确拒绝非 unit-step domain；需要 stride、偏移、整除或取模时，使用 unit-step logical identity 加显式 index relation。只有未来真实算法证明这种表达不足时，才重新打开该语义。
+Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。rank-one domain 与 region 都采用半开区间 `[begin, end)`；`end <= begin` 时逻辑集合为空。当前正式语言只承诺 unit-step domain；显式 `step=1`、runtime bound、product 与 ragged descriptor 的 outer/member domain 可以保留各自的 IR flavor。Frontend 在构造 IR 前明确拒绝非 unit-step domain；需要 stride、偏移、整除或取模时，使用 unit-step logical identity 加显式 index relation。只有未来真实算法证明这种表达不足时，才重新打开该语义。
 
 ## Region 与位置式 tensor 语义
 
@@ -110,3 +110,29 @@ result = stream.result
 Source 固定 streamed axis、carry schema、step body、segment order、state update 与 final projection。当前 `extent` 只能是 compile-time integer 或 `I.auto(...)`；compiler 只在这份合同内选择内部 segment extent 和 physical realization。
 
 `state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点，但不能作为 runtime segment extent；若 segment boundary 本身是 runtime-visible 算法决定，当前 frontend 会明确拒绝该写法。
+
+## 逻辑读取终点
+
+```python
+stream = I.state_stream(
+    keys,
+    extent=I.auto("K_TILE"),
+    init=state0,
+    stop=I.end(query_region),
+)
+```
+
+`I.end(x)` 只接受 rank-one domain 或 region，并返回 `x` 在自身逻辑坐标系中的 exclusive endpoint；它不是 physical tile end。空 region 的 endpoint 等于它的 begin。把该值用作 `state_stream.stop` 时，实际迭代集合是 streamed axis 与 `(-∞, stop)` 的交集，仍按原 axis 顺序遍历：`stop <= axis.begin` 时不执行 step、结果等于 initial state；`stop >= axis.end` 时不扩展原 axis；最后一个 segment 可以是 partial segment，其无效 lane 不可影响可观察结果。
+
+`stop` 必须来自 `I.end(domain_or_region)`，且其坐标必须能与 streamed axis 建立同一逻辑索引关系。无法证明或投影这种关系的 realizer 必须在发射前拒绝，不能把 endpoint 当成 shape、segment 数或 physical block ordinal 猜回去。它表达的是作者写下的逻辑读取上界，不是“carry 收敛后提前退出”的数据依赖终止条件。
+
+## 调用前置条件
+
+```python
+I.assume_in_bounds(index, view, axis=1)
+value = view[row, index]
+```
+
+`I.assume_in_bounds(index, view, axis=a)` 是 unsafe 的调用前置条件：对 tensor index，它声明每个元素都满足 `0 <= index < view.shape[a]`；对 scalar index，它声明该标量满足同一关系。声明从当前位置支配的后续访问及其嵌套 region 生效，只匹配同一 SSA index、同一 view/logical buffer 与归一化后的同一 axis；它不回溯影响之前的访问，也不靠“形状相同”匹配别的值。
+
+该构造不产生值，不执行 clamp 或 runtime check，也不是性能 hint。违反声明属于调用方错误，程序语义未定义；空 axis 上任何实际索引都无法满足该前置条件。Compiler 可以用它证明访问合法或消除 mask，target 也可以发射自己的 assumption，但不能在缺少声明时凭数据分布猜测索引安全。
