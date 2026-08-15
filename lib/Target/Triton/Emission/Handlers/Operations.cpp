@@ -1917,15 +1917,28 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   Type operandType = operation.getOperand(0).getType();
   if (auto tensor = dyn_cast<RankedTensorType>(operandType))
     operandType = tensor.getElementType();
-  bool e8m0Storage = isa<Float8E8M0FNUType>(operandType);
   Type resultElementType = resultType;
   if (auto tensor = dyn_cast<RankedTensorType>(resultElementType))
     resultElementType = tensor.getElementType();
+  bool decodeE8M0 = isa<Float8E8M0FNUType>(operandType) &&
+                    !isa<Float8E8M0FNUType>(resultElementType);
+  auto castExpression = [&](StringRef value) {
+    if (!decodeE8M0)
+      return "tl.cast(" + value.str() + ", " + targetType.str() + ")";
+    std::string bits = "tl.cast(" + value.str() + ", tl.uint32)";
+    std::string normalBits = "(" + bits + " << 23)";
+    std::string encoded =
+        "tl.where(" + bits + " == 255, tl.cast(2143289344, tl.uint32), "
+        "tl.where(" + bits +
+        " == 0, tl.cast(4194304, tl.uint32), " + normalBits + "))";
+    std::string decoded =
+        "tl.cast(" + encoded + ", tl.float32, bitcast=True)";
+    return resultElementType.isF32()
+               ? decoded
+               : "tl.cast(" + decoded + ", " + targetType.str() + ")";
+  };
   std::string result = makeResultName(operation, 0);
-  std::string expression =
-      e8m0Storage && resultElementType.isF32()
-          ? "tl.exp2(" + operand->str() + ".to(tl.float32) - 127.0)"
-          : "tl.cast(" + operand->str() + ", " + targetType.str() + ")";
+  std::string expression = castExpression(*operand);
   if (target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
     return success();

@@ -2292,17 +2292,23 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
   if (auto tensor = dyn_cast<RankedTensorType>(resultElementType))
     resultElementType = tensor.getElementType();
   bool decodeE8M0 = isa<Float8E8M0FNUType>(sourceElementType) &&
-                    resultElementType.isF32();
+                    !isa<Float8E8M0FNUType>(resultElementType);
   auto castExpression = [&](StringRef value, StringRef dtype) {
     if (!decodeE8M0)
       return "T.cast(" + value.str() + ", " + dtype.str() + ")";
     std::string bits = "T.reinterpret(" + value.str() + ", T.uint8)";
-    std::string normal =
-        "T.exp2(T.cast(" + bits + ", T.float32) - 127.0)";
-    return "T.if_then_else(" + bits +
-           " == T.cast(255, T.uint8), "
-           "T.reinterpret(T.cast(2143289344, T.uint32), T.float32), " +
-           normal + ")";
+    std::string bits32 = "T.cast(" + bits + ", T.uint32)";
+    std::string normalBits = "T.shift_left(" + bits32 + ", 23)";
+    std::string encoded =
+        "T.if_then_else(" + bits +
+        " == T.cast(255, T.uint8), T.cast(2143289344, T.uint32), "
+        "T.if_then_else(" + bits +
+        " == T.cast(0, T.uint8), T.cast(4194304, T.uint32), " +
+        normalBits + "))";
+    std::string decoded = "T.reinterpret(" + encoded + ", T.float32)";
+    return resultElementType.isF32()
+               ? decoded
+               : "T.cast(" + decoded + ", " + dtype.str() + ")";
   };
   if (!tensorResult) {
     if (binding.getLowering() != "T.cast")

@@ -873,13 +873,21 @@ stageFeatureAxis(const StageDecision &stage,
                  const target::KernelFacts &facts, Operation *member) {
   const target::ContractionFact &contract =
       facts.contractions.lookup(stage.contraction);
-  for (unsigned position = contract.resultAxes.size(); position > 0; --position) {
-    const target::LogicalAxis &axis = contract.resultAxes[position - 1];
-    if (axis.domain != member && axis.extent != "1" && !axis.extent.empty())
-      return std::pair<Value, unsigned>{stage.contraction->getResult(0),
-                                        position - 1};
+  std::optional<unsigned> feature;
+  for (auto [position, axis] : llvm::enumerate(contract.resultAxes)) {
+    if (axis.domain == member || axis.extent == "1" || axis.extent.empty())
+      continue;
+    if (feature) {
+      stage.contraction->emitOpError(
+          "has more than one non-member result axis for physical staging");
+      return failure();
+    }
+    feature = position;
   }
-  stage.contraction->emitOpError("has no staged feature extent");
+  if (feature)
+    return std::pair<Value, unsigned>{stage.contraction->getResult(0), *feature};
+  stage.contraction->emitOpError(
+      "has no non-member result axis for physical staging");
   return failure();
 }
 
