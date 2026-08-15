@@ -251,8 +251,14 @@ public:
         domains->second.empty() || fill == facts.boundaryFills.end() ||
         fill->second == "none")
       return false;
+    SmallVector<Operation *> validityDomains;
+    for (Operation *domain : domains->second)
+      if (uniqueAxis(load.getResult(0), domain))
+        validityDomains.push_back(domain);
+    if (validityDomains.empty())
+      return false;
     llvm::DenseSet<Value> active;
-    return proveUses(load.getResult(0), domains->second, active);
+    return proveUses(load.getResult(0), validityDomains, active);
   }
 
 private:

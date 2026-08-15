@@ -1184,7 +1184,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     loadFill = *physicalFill;
   bool materializeValidity = !boundary.getConsumerNeutralized() &&
                              boundary.getAccess() == "gather" &&
-                             boundary.getPadding() != "none" &&
+                             (boundary.getPadding() != "none" ||
+                              boundary.hasDataDependentTensorIndex()) &&
                              !boundary.getValidityDomainNodes().empty();
   FailureOr<std::string> validity =
       materializeValidity
