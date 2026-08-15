@@ -848,8 +848,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
       if (!compact)
         parameter("MAX_ROUTES: ConstInt");
-      for (const auto &parameter : tuningParameters)
-        parameter(parameter.first + ": ConstInt");
+      for (const auto &configParameter : tuningParameters)
+        parameter(configParameter.first + ": ConstInt");
       source << "):\n";
       source.flush();
 
@@ -998,8 +998,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       emitParameter(physicalExtent + ": ConstInt");
     if (searchIndex.autotune)
-      for (const auto &parameter : tuningParameters)
-        emitParameter(parameter.first + ": ConstInt");
+      for (const auto &configParameter : tuningParameters)
+        emitParameter(configParameter.first + ": ConstInt");
   }
   output << "):\n";
   return success();
