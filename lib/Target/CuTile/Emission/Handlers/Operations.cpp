@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringExtras.h"
 
 #include <cmath>
+#include <numeric>
 #include <optional>
 
 using namespace mlir;
@@ -2715,9 +2716,23 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            index.str() + ", shape=" + shape.str() +
            ", padding_mode=ct.PaddingMode.ZERO)");
     }
+    bool permutePhysical = transpose && !gather;
+    if (permutePhysical) {
+      SmallVector<unsigned> permutation(view.tensor.getRank());
+      std::iota(permutation.begin(), permutation.end(), 0);
+      std::swap(permutation[permutation.size() - 2], permutation.back());
+      std::string axes = "(";
+      for (auto [axis, value] : llvm::enumerate(permutation)) {
+        if (axis)
+          axes += ", ";
+        axes += std::to_string(value);
+      }
+      axes += ")";
+      line(physical + " = ct.permute(" + physical + ", " + axes + ")");
+    }
     line(name.str() + " = " + physical + ".reshape(" + resultShape.str() +
          ").astype(" + operandDtype + ")");
-    if (transpose)
+    if (transpose && !permutePhysical)
       line(name.str() + " = ct.transpose(" + name.str() + ")");
   };
   emitOperand(lhs, **lhsView, *lhsIndex, *lhsShape, *lhsResultShape, gatherLhs,
