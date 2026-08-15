@@ -2093,6 +2093,31 @@ LogicalResult SourceEmitter::emitZeros(Operation &operation) {
   return success();
 }
 
+void SourceEmitter::emitGuardedGather(StringRef result, StringRef array,
+                                      StringRef indices, StringRef padding,
+                                      StringRef valid) {
+  auto gather = [&](StringRef mask) {
+    return result.str() + " = " +
+           syntax::gather(array, indices, padding, mask);
+  };
+  if (tuneGatherSpelling) {
+    line("if GATHER_SPELLING:");
+    ++indentation;
+    line(gather(valid));
+    --indentation;
+    line("else:");
+    ++indentation;
+    line(gather(""));
+    line(result.str() + " = ct.where(" + valid.str() + ", " + result.str() +
+         ", " + padding.str() + ")");
+    --indentation;
+    return;
+  }
+  line(gather(""));
+  line(result.str() + " = ct.where(" + valid.str() + ", " + result.str() +
+       ", " + padding.str() + ")");
+}
+
 LogicalResult SourceEmitter::emitGather(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "gather emission");
   plan::PointwiseOp binding =
@@ -2197,9 +2222,8 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     if (failed(index))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = " +
-         syntax::gather((*view)->argument->name, addressIndex(*index), *fill,
-                        "member_mask & " + valid->str()));
+    emitGuardedGather(result, (*view)->argument->name, addressIndex(*index),
+                      *fill, "member_mask & " + valid->str());
     bindResult(operation, 0, result);
     return success();
   }
@@ -2289,9 +2313,8 @@ LogicalResult SourceEmitter::emitMembers(Operation &operation) {
   std::string valid = position + " < sequence_end_" + suffix;
   std::string result = makeResultName(operation, 0);
   if (ragged.indices) {
-    line(result + " = " +
-         syntax::gather(ragged.indices->argument->name, addressIndex(position),
-                        "0", valid));
+    emitGuardedGather(result, ragged.indices->argument->name,
+                      addressIndex(position), "0", valid);
   } else {
     line(result + " = ct.where(" + valid + ", " + position + ", 0)");
   }
@@ -2549,12 +2572,11 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       if (failed(rows))
         return failure();
       lhs = makeResultName(*lhsAccess, 0);
-      line(lhs + " = " +
-           syntax::gather((*lhsView)->argument->name,
-                          "(" + addressIndex(rows->str() + "[:, None]") +
-                              ", " +
-                              addressIndex("offs_reduction[None, :]") + ")",
-                          "0.0", "member_mask[:, None]"));
+      emitGuardedGather(
+          lhs, (*lhsView)->argument->name,
+          "(" + addressIndex(rows->str() + "[:, None]") + ", " +
+              addressIndex("offs_reduction[None, :]") + ")",
+          "0.0", "member_mask[:, None]");
     } else {
       auto workspace = workspaceNames.find(operation.getOperand(0));
       if (workspace == workspaceNames.end())

@@ -434,16 +434,6 @@ assignAxes(const target::KernelFacts &facts) {
         appendRole(ensure(member).roles, "ordered");
   }
 
-  for (AxisChoice &choice : choices) {
-    if (choice.programOrder || choice.roles.size() != 1 ||
-        !hasRole(choice.roles, "lane") ||
-        !canDistributePointwiseLane(choice.domain, facts))
-      continue;
-    choice.programOrder = programOrder++;
-    choice.tiled = true;
-    appendRole(choice.roles, "parallel");
-  }
-
   SmallVector<std::pair<Operation *, Operation *>> matrixAxes;
   auto matrixAxis = [](ArrayRef<target::LogicalAxis> axes,
                        ArrayRef<unsigned> reduced,
@@ -498,6 +488,16 @@ assignAxes(const target::KernelFacts &facts) {
     if (mChoice.programOrder && nChoice.programOrder &&
         *mChoice.programOrder > *nChoice.programOrder)
       std::swap(mChoice.programOrder, nChoice.programOrder);
+  }
+
+  for (AxisChoice &choice : choices) {
+    if (choice.programOrder || choice.roles.size() != 1 ||
+        !hasRole(choice.roles, "lane") ||
+        !canDistributePointwiseLane(choice.domain, facts))
+      continue;
+    choice.programOrder = programOrder++;
+    choice.tiled = true;
+    appendRole(choice.roles, "parallel");
   }
 
   for (AxisChoice &choice : choices) {

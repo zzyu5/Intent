@@ -272,10 +272,30 @@ LogicalResult SourceEmitter::emit() {
 }
 
 LogicalResult SourceEmitter::prepare() {
+  if (searchIndex.autotune)
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+      tuningParameters.emplace_back(
+          parameter.getName().getValue().str(),
+          cast<StringAttr>(parameter.getValue()).getValue().str());
   if (failed(indexABI()))
     return failure();
   if (!planIndex.ragged.empty() && failed(prepareRaggedMetadata()))
     return failure();
+  if (searchIndex.autotune) {
+    bool hasIndexedRagged = llvm::any_of(
+        raggedRuntimes,
+        [](const RaggedRuntime &runtime) { return runtime.indices; });
+    bool hasGuardedGather = false;
+    kernel.entry.walk([&](Operation *operation) {
+      StringRef name = operation->getName().getStringRef();
+      hasGuardedGather |= name == "intent.gather" || name == "intent.members";
+    });
+    if (hasGuardedGather &&
+        (hasIndexedRagged || !planIndex.stages.empty())) {
+      tuneGatherSpelling = true;
+      tuningParameters.emplace_back("GATHER_SPELLING", "gather_spelling");
+    }
+  }
   if (failed(resolvePhysicalBindings()))
     return failure();
   if (failed(target::emission::indexScanProducerOperations(
@@ -674,6 +694,31 @@ void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {
   stageBodies[stage] += "\n";
 }
 
+void SourceEmitter::stageGuardedGather(
+    unsigned stage, StringRef result, StringRef array, StringRef indices,
+    StringRef padding, StringRef valid, unsigned indent) {
+  auto gather = [&](StringRef mask) {
+    return result.str() + " = " +
+           syntax::gather(array, indices, padding, mask);
+  };
+  if (tuneGatherSpelling) {
+    stageLine(stage, "if GATHER_SPELLING:", indent);
+    stageLine(stage, gather(valid), indent + 1);
+    stageLine(stage, "else:", indent);
+    stageLine(stage, gather(""), indent + 1);
+    stageLine(stage,
+              result.str() + " = ct.where(" + valid.str() + ", " +
+                  result.str() + ", " + padding.str() + ")",
+              indent + 1);
+    return;
+  }
+  stageLine(stage, gather(""), indent);
+  stageLine(stage,
+            result.str() + " = ct.where(" + valid.str() + ", " +
+                result.str() + ", " + padding.str() + ")",
+            indent);
+}
+
 void SourceEmitter::bindResult(Operation &operation, unsigned index,
                                StringRef name) {
   Value value = operation.getResult(index);
@@ -698,12 +743,10 @@ void SourceEmitter::emitImports() {
     output << "from cuda.tile.tune import exhaustive_search\n";
     output << "from intent.runtime.tuning.cutile import autotune_configurations, autotune_timeout\n";
     output << "\n_PARAMETER_MAP = {";
-    for (auto [index, mapping] :
-         llvm::enumerate(searchIndex.autotune.getParameterMap())) {
+    for (auto [index, mapping] : llvm::enumerate(tuningParameters)) {
       if (index)
         output << ", ";
-      output << "'" << mapping.getName().getValue() << "': '"
-             << cast<StringAttr>(mapping.getValue()).getValue() << "'";
+      output << "'" << mapping.first << "': '" << mapping.second << "'";
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
     output << "_TUNE_TIMEOUT = autotune_timeout(_PARAMETER_MAP)\n";
@@ -805,8 +848,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
       if (!compact)
         parameter("MAX_ROUTES: ConstInt");
-      for (NamedAttribute config : searchIndex.autotune.getParameterMap())
-        parameter(config.getName().getValue().str() + ": ConstInt");
+      for (const auto &parameter : tuningParameters)
+        parameter(parameter.first + ": ConstInt");
       source << "):\n";
       source.flush();
 
@@ -890,10 +933,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                 "safe_member_offsets = ct.where(member_mask, member_offsets, " +
                     stageMemberDimensions.lookup(stage) + ")");
       if (indices) {
-        stageLine(stage, "routes = " +
-                             syntax::gather(indices->argument->name,
-                                            addressIndex("member_offsets"), "0",
-                                            "member_mask"));
+        stageGuardedGather(stage, "routes", indices->argument->name,
+                           addressIndex("member_offsets"), "0", "member_mask");
       } else {
         stageLine(stage, "routes = member_offsets");
       }
@@ -957,8 +998,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       emitParameter(physicalExtent + ": ConstInt");
     if (searchIndex.autotune)
-      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-        emitParameter(parameter.getName().getValue().str() + ": ConstInt");
+      for (const auto &parameter : tuningParameters)
+        emitParameter(parameter.first + ": ConstInt");
   }
   output << "):\n";
   return success();
@@ -1242,8 +1283,8 @@ LogicalResult SourceEmitter::emitWrapper() {
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       if (!compact)
         output << "max_routes_" << suffix << ", ";
-      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-        output << "cfg." << parameter.getName().getValue() << ", ";
+      for (const auto &parameter : tuningParameters)
+        output << "cfg." << parameter.first << ", ";
       output << "),\n";
       output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
       output << "            )\n";
@@ -1277,8 +1318,8 @@ LogicalResult SourceEmitter::emitWrapper() {
           output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
       if (!compact)
         output << "max_routes_" << suffix << ", ";
-      for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-        output << "best." << parameter.getName().getValue() << ", ";
+      for (const auto &parameter : tuningParameters)
+        output << "best." << parameter.first << ", ";
       output << "))\n";
     }
     output << "    return " << merge->argument->name << "\n\n\n";
@@ -1664,8 +1705,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       output << physicalExtent << ", ";
-    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-      output << "cfg." << parameter.getName().getValue() << ", ";
+    for (const auto &parameter : tuningParameters)
+      output << "cfg." << parameter.first << ", ";
     output << "),\n";
     output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
     output << "                single_run_timeout_sec=_TUNE_TIMEOUT,\n";
@@ -1726,8 +1767,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << dimension << ", ";
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       output << physicalExtent << ", ";
-    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
-      output << "best." << parameter.getName().getValue() << ", ";
+    for (const auto &parameter : tuningParameters)
+      output << "best." << parameter.first << ", ";
     output << "))\n\n\n";
   }
   output << "def run(";

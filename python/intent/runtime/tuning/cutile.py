@@ -29,6 +29,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "program_m": (64, 128),
         "program_n": (64, 128),
         "group_m": (4, 8),
+        "gather_spelling": (0, 1),
     }.get(role)
     if candidates is not None:
         return candidates
@@ -136,11 +137,22 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
                 ],
             )
             for role in roles
+            if role != "gather_spelling"
         }
         key = (tuple(sorted(values.items())), num_ctas, occupancy)
         if key not in seen:
             seen.add(key)
             choices.append((values, num_ctas, occupancy))
+    if "gather_spelling" in roles:
+        choices = [
+            (
+                {**values, "gather_spelling": spelling},
+                num_ctas,
+                occupancy,
+            )
+            for values, num_ctas, occupancy in choices
+            for spelling in _role_candidates("gather_spelling")
+        ]
     return tuple(
         _configuration(
             parameter_map,

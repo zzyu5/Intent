@@ -206,6 +206,13 @@ private:
   mlir::LogicalResult emitProgramBindings();
   void stageLine(unsigned stage, llvm::StringRef text,
                  unsigned indent = 1);
+  void emitGuardedGather(llvm::StringRef result, llvm::StringRef array,
+                         llvm::StringRef indices, llvm::StringRef padding,
+                         llvm::StringRef valid);
+  void stageGuardedGather(unsigned stage, llvm::StringRef result,
+                          llvm::StringRef array, llvm::StringRef indices,
+                          llvm::StringRef padding, llvm::StringRef valid,
+                          unsigned indent = 1);
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
   std::string dtypeName(mlir::Type type, mlir::Operation &consumer);
@@ -235,6 +242,7 @@ private:
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
   llvm::SmallVector<std::string> kernelConstants;
+  llvm::SmallVector<std::pair<std::string, std::string>> tuningParameters;
   llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::DenseMap<mlir::Operation *, std::string> streamOuterAxisIndices;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
@@ -278,6 +286,7 @@ private:
   std::string programIndex;
   std::string vectorIndex;
   bool programBindingsEmitted = false;
+  bool tuneGatherSpelling = false;
   unsigned indentation = 1;
 };
 
