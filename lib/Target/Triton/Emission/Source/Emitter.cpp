@@ -303,6 +303,22 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (!searchSpace && planIndex.stages.empty() &&
+      planIndex.components.reusedAxes.empty()) {
+    auto lane = planIndex.axesByRole.find("lane_0");
+    std::string laneDimension = roleDimensions.lookup("lane_0");
+    bool hasNonIdempotentEffect = false;
+    kernel.entry.walk([&](Operation *operation) {
+      StringRef name = operation->getName().getStringRef();
+      hasNonIdempotentEffect |= name == "intent.scatter_reduce" ||
+                                name == "intent.atomic_add" ||
+                                name == "intent.atomic_cas";
+    });
+    tuneRowVector = lane != planIndex.axesByRole.end() &&
+                    lane->second.getTileRole().starts_with("row_vector") &&
+                    llvm::is_contained(dimensionOrder, laneDimension) &&
+                    !hasNonIdempotentEffect;
+  }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -722,6 +738,9 @@ void SourceEmitter::emitImports() {
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
   }
+  if (tuneRowVector)
+    output << "from intent.runtime.tuning.triton import row_vector_configurations\n"
+              "\n_ROW_VECTOR_CONFIGS = row_vector_configurations()\n";
   output << "\n\n";
 }
 
@@ -940,6 +959,20 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       output << "'" << cast<StringAttr>(attribute).getValue() << "'";
     }
     output << "]";
+    bool firstRestoredView = true;
+    for (ABIView &view : views) {
+      if (view.view.getAccess() != "inout")
+        continue;
+      output << (firstRestoredView ? ",\n    restore_value=[" : ", ")
+             << "'" << view.pointer << "'";
+      firstRestoredView = false;
+    }
+    if (!firstRestoredView)
+      output << "]";
+    output << ",\n)\n";
+  } else if (tuneRowVector) {
+    output << "@triton.autotune(\n    configs=_ROW_VECTOR_CONFIGS,\n    key=['"
+           << roleDimensions.lookup("lane_0") << "']";
     bool firstRestoredView = true;
     for (ABIView &view : views) {
       if (view.view.getAccess() != "inout")

@@ -284,6 +284,7 @@ private:
   std::string programIndex;
   std::string vectorIndex;
   bool programBindingsEmitted = false;
+  bool tuneRowVector = false;
   unsigned indentation = 1;
 };
 
