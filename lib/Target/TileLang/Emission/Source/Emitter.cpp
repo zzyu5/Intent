@@ -225,6 +225,27 @@ bool feedsAtomicValue(Operation &operation) {
          user->getOperand(valueIndex.getInt()) == operation.getResult(0);
 }
 
+bool hasNestedTensorReduction(func::FuncOp entry) {
+  bool nested = false;
+  entry.walk([&](Operation *operation) {
+    if (nested || operation->getName().getStringRef() != "intent.reduce" ||
+        operation->getNumOperands() == 0)
+      return;
+    Operation *producer = operation->getOperand(0).getDefiningOp();
+    if (!producer || producer->getName().getStringRef() != "intent.reduce" ||
+        producer->getNumOperands() == 0)
+      return;
+    auto source = dyn_cast<RankedTensorType>(producer->getOperand(0).getType());
+    auto intermediate =
+        dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+    nested = source && intermediate && result && source.getRank() >= 4 &&
+             intermediate.getRank() + 1 == source.getRank() &&
+             result.getRank() + 1 == intermediate.getRank();
+  });
+  return nested;
+}
+
 } // namespace
 
 FailureOr<RealizationIndex>
@@ -921,14 +942,22 @@ void SourceEmitter::emitImports() {
     output << "from tilelang.autotuner import autotune\n";
     output << "from intent.runtime.tuning.tilelang import autotune_configurations\n";
     output << "\n_PARAMETER_MAP = {";
+    bool programM = false;
+    bool programN = false;
     for (auto [index, mapping] :
          llvm::enumerate(searchIndex.autotune.getParameterMap())) {
       if (index)
         output << ", ";
       output << "'" << mapping.getName().getValue() << "': '"
              << cast<StringAttr>(mapping.getValue()).getValue() << "'";
+      StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
+      programM = programM || role == "program_m";
+      programN = programN || role == "program_n";
     }
-    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
+    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
+    if (programM && programN && hasNestedTensorReduction(kernel.entry))
+      output << ", equal_role_groups=(('program_m', 'program_n'),)";
+    output << ")\n";
     output << "_AUTOTUNE_INPUTS = None\n\n";
     output << "def _fresh_autotune_inputs(_):\n";
     output << "    if _AUTOTUNE_INPUTS is None:\n";

@@ -59,10 +59,19 @@ def _completion_candidates(role: str) -> tuple[int, ...]:
     return candidates
 
 
-def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int]]:
+def autotune_configurations(
+    parameter_map: dict[str, str],
+    *,
+    equal_role_groups: tuple[tuple[str, ...], ...] = (),
+) -> list[dict[str, int]]:
     roles = frozenset(parameter_map.values())
     for role in roles:
         _role_candidates(role)
+    for group in equal_role_groups:
+        if len(group) < 2 or not frozenset(group).issubset(roles):
+            raise ValueError(
+                "TileLang equal-role group must contain at least two configured roles"
+            )
     joint_program_profiles = (
         (
             ({"program_m": 8, "program_n": 8}, 1, 128),
@@ -151,10 +160,19 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[dict[str, int
             )
             for role in roles
         }
+        if any(
+            len({values[role] for role in group}) != 1
+            for group in equal_role_groups
+        ):
+            continue
         key = (tuple(sorted(values.items())), num_stages, threads)
         if key not in seen:
             seen.add(key)
             choices.append((values, num_stages, threads))
+    if not choices:
+        raise NotImplementedError(
+            "TileLang has no legal autotuning configuration for the requested role constraints"
+        )
     return [
         _configuration(
             parameter_map,
