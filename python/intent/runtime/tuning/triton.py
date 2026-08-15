@@ -168,10 +168,15 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     ]
 
 
-def row_vector_configurations() -> list[object]:
-    import triton
-
-    return [triton.Config({}, num_warps=warps) for warps in (4, 8, 16, 32)]
+def row_vector_num_warps(n_columns: int) -> int:
+    block_size = 1 << (n_columns - 1).bit_length()
+    if block_size >= 32768:
+        return 32
+    if block_size >= 8192:
+        return 16
+    if block_size >= 2048:
+        return 8
+    return 4
 
 
 def row_configuration(n_columns: int, properties: dict[str, int]) -> SimpleNamespace:

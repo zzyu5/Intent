@@ -308,16 +308,28 @@ LogicalResult SourceEmitter::prepare() {
     auto lane = planIndex.axesByRole.find("lane_0");
     std::string laneDimension = roleDimensions.lookup("lane_0");
     bool hasNonIdempotentEffect = false;
+    bool hasExternalRead = false;
+    bool hasAggregation = false;
+    bool hasScan = false;
     kernel.entry.walk([&](Operation *operation) {
       StringRef name = operation->getName().getStringRef();
+      hasExternalRead |= name == "intent.view_load";
+      hasScan |= name == "intent.scan";
+      hasAggregation |= name == "intent.reduce" ||
+                        name == "intent.arg_reduce" ||
+                        name == "intent.scan" ||
+                        name == "intent.contract" ||
+                        name == "intent.sparse_contract" ||
+                        name == "intent.state_stream";
       hasNonIdempotentEffect |= name == "intent.scatter_reduce" ||
                                 name == "intent.atomic_add" ||
                                 name == "intent.atomic_cas";
     });
-    tuneRowVector = lane != planIndex.axesByRole.end() &&
-                    lane->second.getTileRole().starts_with("row_vector") &&
-                    llvm::is_contained(dimensionOrder, laneDimension) &&
-                    !hasNonIdempotentEffect;
+    configureRowVector = lane != planIndex.axesByRole.end() &&
+                         lane->second.getTileRole().starts_with("row_vector") &&
+                         llvm::is_contained(dimensionOrder, laneDimension) &&
+                         (hasExternalRead || !hasAggregation) &&
+                         !hasScan && !hasNonIdempotentEffect;
   }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
@@ -738,9 +750,8 @@ void SourceEmitter::emitImports() {
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
   }
-  if (tuneRowVector)
-    output << "from intent.runtime.tuning.triton import row_vector_configurations\n"
-              "\n_ROW_VECTOR_CONFIGS = row_vector_configurations()\n";
+  if (configureRowVector)
+    output << "from intent.runtime.tuning.triton import row_vector_num_warps\n";
   output << "\n\n";
 }
 
@@ -959,20 +970,6 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       output << "'" << cast<StringAttr>(attribute).getValue() << "'";
     }
     output << "]";
-    bool firstRestoredView = true;
-    for (ABIView &view : views) {
-      if (view.view.getAccess() != "inout")
-        continue;
-      output << (firstRestoredView ? ",\n    restore_value=[" : ", ")
-             << "'" << view.pointer << "'";
-      firstRestoredView = false;
-    }
-    if (!firstRestoredView)
-      output << "]";
-    output << ",\n)\n";
-  } else if (tuneRowVector) {
-    output << "@triton.autotune(\n    configs=_ROW_VECTOR_CONFIGS,\n    key=['"
-           << roleDimensions.lookup("lane_0") << "']";
     bool firstRestoredView = true;
     for (ABIView &view : views) {
       if (view.view.getAccess() != "inout")
@@ -1657,6 +1654,9 @@ LogicalResult SourceEmitter::emitWrapper() {
   for (ABIView &view : views)
     for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis)
       emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
+  if (configureRowVector)
+    output << ", num_warps=row_vector_num_warps("
+           << roleDimensions.lookup("lane_0") << ")";
   output << ")\n\n\n";
   output << "def run(";
   firstParameter = true;
