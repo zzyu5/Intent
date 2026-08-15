@@ -1469,23 +1469,23 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   if (!components || components.getInt() <= 0 ||
       operation.getNumResults() != static_cast<unsigned>(components.getInt()))
     return operation.emitOpError("has no canonical scan component schema");
-  SmallVector<std::string> operands;
-  SmallVector<std::string> identities;
-  for (unsigned component = 0;
-       component < static_cast<unsigned>(components.getInt()); ++component) {
-    FailureOr<StringRef> operand = lookupValue(operation, component);
-    FailureOr<StringRef> identity =
-        lookupValue(operation, components.getInt() + component);
-    if (failed(operand) || failed(identity))
-      return failure();
-    operands.push_back(operand->str());
-    identities.push_back(identity->str());
-  }
   if (binding && binding.getResultSpace() == "private_fragment") {
     if (failed(node) ||
         (binding.getLowering() != "ct.cumsum" &&
          binding.getLowering() != "ct.scan"))
       return operation.emitOpError("lacks a fragment cuTile scan binding");
+    SmallVector<std::string> operands;
+    SmallVector<std::string> identities;
+    for (unsigned component = 0;
+         component < static_cast<unsigned>(components.getInt()); ++component) {
+      FailureOr<StringRef> operand = lookupValue(operation, component);
+      FailureOr<StringRef> identity =
+          lookupValue(operation, components.getInt() + component);
+      if (failed(operand) || failed(identity))
+        return failure();
+      operands.push_back(operand->str());
+      identities.push_back(identity->str());
+    }
     if (binding.getLowering() == "ct.scan") {
       FailureOr<target::emission::CombinerUse> combiner =
           target::emission::resolveCombiner(operation);
@@ -1575,6 +1575,14 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
         return failure();
       function = *projection;
     }
+  }
+  SmallVector<std::string> identities;
+  for (unsigned component = 0; component < operation.getNumResults(); ++component) {
+    FailureOr<StringRef> identity =
+        lookupValue(operation, components.getInt() + component);
+    if (failed(identity))
+      return failure();
+    identities.push_back(identity->str());
   }
   SmallVector<std::string> carries;
   for (unsigned component = 0; component < operation.getNumResults(); ++component) {

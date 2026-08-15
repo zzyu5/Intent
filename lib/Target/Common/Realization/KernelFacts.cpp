@@ -153,6 +153,30 @@ FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
   return axis;
 }
 
+bool compatibleLogicalAxis(const LogicalAxis &lhs, const LogicalAxis &rhs) {
+  if (lhs == rhs)
+    return true;
+  return lhs.extent == rhs.extent && (!lhs.domain || !rhs.domain);
+}
+
+LogicalAxis mergeLogicalAxis(const LogicalAxis &lhs, const LogicalAxis &rhs) {
+  return !lhs.domain && rhs.domain ? rhs : lhs;
+}
+
+bool mergeLogicalAxes(ArrayRef<LogicalAxis> lhs, ArrayRef<LogicalAxis> rhs,
+                      SmallVectorImpl<LogicalAxis> &merged) {
+  if (lhs.size() != rhs.size())
+    return false;
+  merged.clear();
+  merged.reserve(lhs.size());
+  for (auto [left, right] : llvm::zip(lhs, rhs)) {
+    if (!compatibleLogicalAxis(left, right))
+      return false;
+    merged.push_back(mergeLogicalAxis(left, right));
+  }
+  return true;
+}
+
 struct AffineIndexExpression {
   llvm::DenseMap<Operation *, int64_t> coefficients;
   int64_t constant = 0;
@@ -1197,8 +1221,7 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
         if (!implicitAlias)
           return operation.emitOpError(
               "pointwise operands have incompatible logical-axis provenance");
-        if (!destination.domain)
-          destination = axis;
+        destination = mergeLogicalAxis(destination, axis);
       }
     }
   }
@@ -1265,7 +1288,10 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
 
   size_t sourceIndex = 0, resultIndex = 0;
   while (sourceIndex < source->second.size() && resultIndex < result->size()) {
-    if (source->second[sourceIndex] == (*result)[resultIndex]) {
+    if (compatibleLogicalAxis(source->second[sourceIndex],
+                              (*result)[resultIndex])) {
+      (*result)[resultIndex] = mergeLogicalAxis(
+          source->second[sourceIndex], (*result)[resultIndex]);
       ++sourceIndex;
       ++resultIndex;
       continue;
@@ -1628,11 +1654,13 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
       Value yielded = terminator.getOperand(index);
       auto initialAxes = facts.valueAxes.find(initial);
       auto yieldedAxes = facts.valueAxes.find(yielded);
+      SmallVector<LogicalAxis> merged;
       if (initialAxes == facts.valueAxes.end() ||
           yieldedAxes == facts.valueAxes.end() ||
-          yieldedAxes->second != initialAxes->second)
+          !mergeLogicalAxes(initialAxes->second, yieldedAxes->second, merged))
         return operation.emitOpError(
             "yielded tensor loop state changes its logical axis identity");
+      facts.valueAxes[operation.getResult(index)] = std::move(merged);
     }
     return success();
   };
@@ -2387,11 +2415,14 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
       Value yielded = terminator.getOperand(index);
       auto initialAxes = facts.valueAxes.find(fact.initialState[index]);
       auto yieldedAxes = facts.valueAxes.find(yielded);
-      if (initialAxes != facts.valueAxes.end() &&
-          (yieldedAxes == facts.valueAxes.end() ||
-           yieldedAxes->second != initialAxes->second))
-        return operation.emitOpError(
-            "yielded state changes its logical axis identity");
+      if (initialAxes != facts.valueAxes.end()) {
+        SmallVector<LogicalAxis> merged;
+        if (yieldedAxes == facts.valueAxes.end() ||
+            !mergeLogicalAxes(initialAxes->second, yieldedAxes->second, merged))
+          return operation.emitOpError(
+              "yielded state changes its logical axis identity");
+        facts.valueAxes[operation.getResult(index)] = std::move(merged);
+      }
     }
     return success();
   };

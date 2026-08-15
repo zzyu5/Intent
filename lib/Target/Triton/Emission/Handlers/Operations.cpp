@@ -1412,19 +1412,19 @@ LogicalResult SourceEmitter::emitScan(Operation &operation) {
   if (!components || components.getInt() <= 0 ||
       operation.getNumResults() != static_cast<unsigned>(components.getInt()))
     return operation.emitOpError("has no canonical scan component schema");
-  SmallVector<std::string> operands;
-  for (unsigned component = 0;
-       component < static_cast<unsigned>(components.getInt()); ++component) {
-    FailureOr<StringRef> operand = lookupValue(operation, component);
-    if (failed(operand))
-      return failure();
-    operands.push_back(operand->str());
-  }
   if (binding && binding.getResultSpace() == "private_fragment") {
     if (failed(node) ||
         (binding.getLowering() != "tl.cumsum" &&
          binding.getLowering() != "tl.associative_scan"))
       return operation.emitOpError("lacks a fragment Triton scan binding");
+    SmallVector<std::string> operands;
+    for (unsigned component = 0;
+         component < static_cast<unsigned>(components.getInt()); ++component) {
+      FailureOr<StringRef> operand = lookupValue(operation, component);
+      if (failed(operand))
+        return failure();
+      operands.push_back(operand->str());
+    }
     if (binding.getLowering() == "tl.associative_scan") {
       FailureOr<target::emission::CombinerUse> combiner =
           target::emission::resolveCombiner(operation);

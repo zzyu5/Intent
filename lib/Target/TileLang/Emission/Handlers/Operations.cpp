@@ -1144,6 +1144,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       }
     }
   }
+  if (!scalarResult && resultElementType.isF16() && *derivedScalar &&
+      boundary.getCheckBounds() && boundary.getPadding() != "none" &&
+      !guardedF16Bulk)
+    return operation.emitOpError(
+        "TileLang 0.1.13 cannot project a transformed scalar-index float16 "
+        "load with per-element padding to a valid CUDA fragment");
   if (guardedF16Bulk) {
     if (expanded) {
       if (failed(view) || failed(relation) ||
