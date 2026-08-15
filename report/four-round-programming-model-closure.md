@@ -53,9 +53,11 @@ Triton / cuTile / TileLang leaf    capability + 机械投影 + runtime 接线
 | 机器 | Triton：pass / unsupported / timeout / failed | cuTile：pass / unsupported / timeout / failed | TileLang：pass / unsupported / timeout / failed |
 |---|---:|---:|---:|
 | RTX 5090 D | 116 / 1 / 1 / 0 | 115 / 2 / 1 / 0 | 104 / 13 / 0 / 1 |
-| H100 | 116 / 1 / 1 / 0 | 114 / 3 / 1 / 0 | 105 / 12 / 0 / 1 |
+| H100 | 116 / 1 / 1 / 0 | 114 / 3 / 1 / 0 | 106 / 12 / 0 / 0 |
 
-合计是 670 个真实数值通过、32 个提前明确不支持、4 个下层首次编译超时、2 个真实失败。没有把 unsupported、compile timeout 或数值失败写成 pass。
+遗留数值问题收口后，合计是 671 个真实数值通过、32 个提前明确不支持、4 个下层首次编译超时、1 个真实失败。没有把 unsupported、compile timeout 或数值失败写成 pass。
+
+这里没有违反本轮“不做全量”的测试范围：118 行主体仍来自第四轮双机全量，只把直接受修复影响、已在 H100 定向复验的 `max_pool2d × TileLang` 单元格从 failed 更新为本轮实测值；其余 707 个单元格没有重跑或改写。
 
 完整数字在：
 
@@ -274,7 +276,7 @@ cuTile：
 
 cuTile identity 必须为常量，所以 runtime capture 通过附加 `(capture, valid)` carrier 适配 tuple ABI：真实 lane 的 `valid=true`，identity lane 的 `valid=false`。它不改变作者 accumulator schema，也不参与数学决策。
 
-TileLang 0.1.13 的当前 PrimFunc surface 只有 fixed `ReduceKind`，没有已核验的机械 generic closure 入口。因此 generic reduce/scan 在 source emission 前明确 unsupported；没有发串行慢路径冒充支持。TVM 更底层 `comm_reducer` 是否能在当前路径闭合仍未验证，不能先写成能力。
+TileLang 0.1.13 的当前 PrimFunc surface 只有 fixed `ReduceKind`。定向验证确认 `T.comm_reducer` 虽能构造 `tirx.Reduce`，当前 CUDA lowering 会明确报 `Do not have a default for tirx.Reduce`；generic reduce/scan 因而在 source emission 前明确 unsupported，没有发串行慢路径冒充支持，也不再保留“更低层或许能闭合”的未验证状态。
 
 ### 4.3 contract 没有因为 reduce 放开而制造假 semiring
 
@@ -397,13 +399,13 @@ H100 TileLang 初次验证曾误用系统 CUDA 11.5 `nvcc`，它不识别 `sm_90
 
 | kernel | 5090 Triton | 5090 cuTile | 5090 TileLang | H100 Triton | H100 cuTile | H100 TileLang |
 |---|---:|---:|---:|---:|---:|---:|
-| max_pool2d | 0.0180 | 0.1060 | 0.0218 | 0.0225 | 0.0497 | FAIL |
+| max_pool2d | 0.0180 | 0.1060 | 0.0218 | 0.0225 | 0.0497 | 0.0279 |
 | softmax_backward | 0.1334 | 0.1457 | 0.1326 | 0.1041 | 0.0797 | 0.1430 |
 | csr_spmm | 0.0460 | 0.0500 | 0.0220 | 0.0423 | 0.0902 | 0.0211 |
 | batch_norm_training | 0.1102 | 0.0747 | 0.0774 | 0.3036 | 0.1645 | 0.1431 |
 | triangular_solve | 0.0312 | 0.0255 | 0.0225 | 0.0411 | 0.0270 | 0.0348 |
 
-新增 30 个单元格中 29 个数值通过；唯一未通过的是 H100 TileLang `max_pool2d`。它不能被写成“语言表达不了”：源码与 target source 可以生成，下层也能运行，但数值对照失败，因此表中保留 `failed`。
+新增 30 个单元格现已全部数值通过。H100 TileLang `max_pool2d` 在第四轮全量时曾如实保留为 failed；后续定向定位与修复见 5.6，没有把旧失败直接改名为 unsupported。
 
 ### 5.2 新算子暴露并修掉的共享问题
 
@@ -442,7 +444,7 @@ TileLang 原路径要么过度逐元素化，明显伤害 transpose 等既有 ke
 - 没有按 `max_pool2d` 或 transpose 名字分支；
 - 没有在 program 内再加动态“猜是否完整块”的分支。
 
-这恢复了现有 transpose：5090 TileLang p50 为 0.0915 ms，H100 为 0.0810 ms，同时保留 tail validity。H100 max pool 仍然失败，说明当前 TileLang 0.1.13 在这一组合上还有真实未闭合边界，没有用更慢或不可信路径掩盖。
+这恢复了现有 transpose：5090 TileLang p50 为 0.0915 ms，H100 为 0.0810 ms，同时保留 tail validity。后续逐候选定位证明 H100 max pool 的错误不在这条 store 分流，而在下层对嵌套 reduction fragment 的一个非对称候选布局；见 5.6。
 
 ### 5.3 既有关键 repro 的恢复值
 
@@ -467,9 +469,23 @@ TileLang 原路径要么过度逐元素化，明显伤害 transpose 等既有 ke
 - 5090 cuTile `block_scaled_matmul`：旧表约 0.0703 ms，当前约 0.1750 ms；
 - 5090 Triton `mamba_chunk_scan`：旧表约 0.022 ms，当前约 0.0302 ms。
 
-在对应旧 commit 上用当前机器同日重跑，分别也得到约 0.175 ms 与 0.0302 ms；因此无法把这两项归因于四轮代码改动。最终表保留当前可复现实测，没有为了维持旧数字把历史值抄回去。
+在对应旧 commit 上用当前机器同日重跑，分别也得到约 0.175 ms 与 0.0302 ms；因此无法把这两项归因于四轮代码改动。对 block-scaled matmul 又重复测得 `0.1761/0.1792 ms` 与 `0.1756/0.1786 ms`，旧 commit 在当前环境也稳定落在同一区间；kernel DSL、runtime 计时范围、shape、候选集以及生成的 `ct.mma` 结构在两个提交间没有改变。历史 `0.0703 ms` 因而是当前环境无法复现的旧测量，而不是当前代码回退。旧测量没有保存当时的 driver/cuTile JIT、时钟/功耗与编译缓存状态，所以不能诚实地把 2.49 倍差异进一步指定给其中某一个因素；“环境”在这里表示已经用旧代码同机 A/B 排除了 compiler diff，但历史环境快照不足以继续分解，而不是泛泛猜测。
 
 这不等于宣称所有微小波动为零，只说明本轮没有找到可由当前代码 diff 解释的既有大幅性能退化。
+
+5090 上 cuTile 的单独赢家从旧表 27 变成 22，也不是“新增五行把比例稀释”——这里计的是绝对个数。逐行比较得到：7 个旧 cuTile 单独赢家不再单独获胜；`grouped_query_head_add` 从并列变成 cuTile 单独赢家，新增 `batch_norm_training` 也由 cuTile 获胜，净变化正好是 `-7 + 2 = -5`。七个转出项里，Conv2D、selective scan 与 conv2d variant 的 cuTile 自身没有退化，分别是 Triton/TileLang 变快；record、FP8 e4m3 与 reshape-cache variant 是数微秒级换位；只有 varlen attention noncausal 的 cuTile 从 `0.3798` 到 `0.4145 ms`，同时 Triton略快，构成一个约 9% 的真实表内失位。结论是赢家下降主要来自其他 provider 改善和短核近似并列，不是一处让 cuTile 普遍退化的共享改动。
+
+### 5.6 四轮后的遗留收口
+
+H100 TileLang max pool 的逐候选 A/B 给出了明确根因。六个候选中，`8×8`、`16×16`、`32×32`、`128×64` 与 `128×128` 都数值正确，只有 `64×128` 在 H100 上产生 `inf` 和大量有限错误；同一个 `64×128` 候选在 5090 上正确。生成源码中的 load validity、两次 `T.reduce_max` 与 checked store 均相同，错误只随 TileLang 对非对称 fragment layout 的 H100 lower 改变；而其 autotuner 使用 `skip_check=True`，只按延迟把这个错误候选选成 winner。
+
+暴露面不是 max pool 名字，而是“rank 至少为 4 的 tensor 连续经过两次降 rank reduction，且两个 program axes 独立可调”。TileLang target indexing 现在为这类结构登记 program tile 的相等约束，runtime tuner 从六个候选缩到四个对称候选；Triton/cuTile 与其他 TileLang kernel 的候选不受影响，也没有按 H100/5090 型号分支。修复后 5090 为 `0.0217/0.0229 ms`，H100 为 `0.0279/0.0283 ms`，两边数值误差均为 0。
+
+另外三处冻结边界同时收口：
+
+- `I.end` 正式定义为 rank-one 半开 domain/region 的 exclusive endpoint；stream stop 取与 streamed axis 的逻辑交集，空交集不执行 step、carry 保持 initial state，stop 不能被解释成物理 tile end 或数据依赖 early-exit；
+- `I.assume_in_bounds` 是支配后续同一 SSA index/view/axis 访问的 unsafe 调用前置条件，违反即未定义行为，不执行 clamp/runtime check；
+- 现有 2:4 sparse contraction 的 format、compressed/metadata/RHS axis 与 dtype schema 由公共 verifier 核对。它仍明确登记为 format-specific convenience/过渡入口；未来收敛到 `sparse_contract + format descriptor`，但在只有一种格式时不制造下游仍硬编码 2:4 的假通用 API。
 
 ---
 
@@ -535,12 +551,11 @@ GPU Plan 中的 program grid/worker 不是未来 RVV Plan 的强制字段。
 以下不是“已经完成”的假象：
 
 1. **CPU/RISC-V/RVV 尚未接入。** 当前冻结的是它们应消费的 Kernel IR 边界，不是后端实现完成。
-2. **TileLang generic reduce/scan closure 明确不支持。** 当前 0.1.13 PrimFunc surface 缺少已经核验的机械入口；固定 combiner仍可使用。
+2. **TileLang generic reduce/scan closure 明确不支持。** 0.1.13 的 `comm_reducer` 会生成当前 CUDA codegen 不处理的 `tirx.Reduce`；固定 combiner仍可使用。
 3. **TileLang lane-owned FP8 MQA 明确不支持。** 已在 emission 前拒绝，不再进入 CUTLASS assertion。
-4. **H100 TileLang `max_pool2d` 是数值失败。** 不能记成 pass，也不能简单归入 source 语言缺口。
-5. **5090 TileLang `grouped_query_head_add` 仍为下层编译失败。** 同一 Plan 在另两个 surface 通过，当前失败保留在 target/toolchain 边界。
-6. **token-sparse MLA 首次编译成本仍过高。** Triton/cuTile 为 compile timeout，TileLang明确 unsupported；没有为编译时间在共享层发明结构。
-7. **部分 target capability 本来就是子集。** 例如 TileLang CAS、二维联合 access footprint、某些 split-K/staged/private-storage 组合；完整状态以两份 CSV 为准。
+4. **5090 TileLang `grouped_query_head_add` 仍为下层编译失败。** 同一 Plan 在另两个 surface 通过，当前失败保留在 target/toolchain 边界。
+5. **token-sparse MLA 首次编译成本仍过高。** Triton/cuTile 为 compile timeout，TileLang明确 unsupported；没有为编译时间在共享层发明结构。
+6. **部分 target capability 本来就是子集。** 例如 TileLang CAS、二维联合 access footprint、某些 split-K/staged/private-storage 组合；完整状态以两份 CSV 为准。
 
 这些边界没有推动新增 kernel-name 分支，也没有让一个 surface 变成第二套 realizer。
 
@@ -565,6 +580,8 @@ GPU Plan 中的 program grid/worker 不是未来 RVV Plan 的强制字段。
 | 小算子语料 | `021beb1` | 五个真实小算子与统一 repro 接线 |
 | 全量修复 | `93df35b`–`4208b48` | axis/scan provenance、validity proof、TileLang store capability 投影 |
 | 双机矩阵 | `b82bdb1` | 刷新两份 118 行全量表，固定 source baseline |
+| 遗留收口 | `c3546a1`、`9e21f00` | TileLang nested-reduction candidate legality，不按算子或架构分支 |
+| 语义收口 | `b729a63` | sparse fixed schema、`end`/precondition 正式语义与 TileLang combine 确定边界 |
 
 ---
 

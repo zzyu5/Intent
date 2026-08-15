@@ -317,7 +317,7 @@ ct.scan(x, axis, func, identity, reverse=False)
 
 `x` 可以是 tuple，`func` 接收两组 0D tiles 并返回同结构结果。官方接口见 [cuTile reduce](https://docs.nvidia.com/cuda/cutile-python/generated/cuda.tile.reduce.html)。
 
-TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs/bitwise 等，没有等价的任意 Python combine 参数。TileLang/TVM 的更低层有 `comm_reducer`，但它是否能在当前 eager/prim-func emission 路径中机械闭合尚未验证；不能先写成“TileLang 已支持”。其当前高层接口见 [TileLang reduce](https://www.tilelang.com/autoapi/tilelang/language/reduce_op/index.html)。
+TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs/bitwise 等，没有等价的任意 Python combine 参数。定向 probe 已验证更低层 `T.comm_reducer`：它能构造合法的 `tirx.Reduce`，但当前 CUDA lowering 明确报 `Do not have a default for tirx.Reduce`；因此这条路在现行 eager/PrimFunc→CUDA 路径不能机械闭合，不再保留“尚未验证”的模糊状态。其当前高层接口见 [TileLang reduce](https://www.tilelang.com/autoapi/tilelang/language/reduce_op/index.html)。
 
 ### 4.4 generic combine 已闭合，但它仍不是算法表达力的唯一入口
 
@@ -326,7 +326,7 @@ TileLang 0.1.13 的高层 `T.reduce` 仍是固定 `ReduceKind`：sum/max/min/abs
 - Welford 等算法仍然可以用 state-stream 表达，所以 generic combine 不是唯一写法；
 - 作者若选择 **一个结构化 reduction/scan，并授权合法 reassociation**，现在可以把 typed combiner 随 Kernel IR 一起交给 compiler；
 - Triton/cuTile 原生接受该委托，Intent 不再把 structured primitive 焊死在固定 add/max/or/and；
-- TileLang 0.1.13 的当前 PrimFunc surface 没有可机械承接任意 closure 的入口，因此在 source emission 前明确 unsupported，而不是生成串行慢路径。
+- TileLang 0.1.13 的 `comm_reducer` 最终落成当前 CUDA codegen 不处理的 `tirx.Reduce`，因此在 source emission 前明确 unsupported，而不是生成串行慢路径。
 
 ### 4.5 正确设计不是“把函数名字符串放开”
 
@@ -426,9 +426,9 @@ RVV 的动态 `vl` 也可以是 target 对 `auto` 的 realization，不需要 so
 
 ### 5.5 `I.end`：真正的 Core 语义
 
-`I.end(domain_or_region)` 表示逻辑区域的 exclusive endpoint，被 causal、varlen、paged、ragged stream 实际使用。它不是 physical tile end，普通 shape arithmetic 也不能替代 ragged member endpoint。
+`I.end(domain_or_region)` 表示 rank-one 半开逻辑区间 `[begin,end)` 的 exclusive endpoint，被 causal、varlen、paged、ragged stream 实际使用。它不是 physical tile end，普通 shape arithmetic 也不能替代 ragged member endpoint。空 region 的 endpoint 等于 begin；作为 stream stop 时，迭代集合取 streamed axis 与 `(-∞,stop)` 的交集，空交集不执行 step、carry 保持 initial state，超过 axis end 也不会扩展原 workset。Stop 必须来自坐标兼容的 domain/region，无法证明这种关系就拒绝；它不是基于 carry 收敛的动态退出。
 
-结论：保留，并正式定义 domain/region、empty region、exclusive endpoint 与 stop 的语义。
+结论：保留，上述半开区间、empty region、exclusive endpoint 与 stop 交集规则已经成为正式语义。
 
 ### 5.6 `I.assume_in_bounds`：真正的调用前置条件
 
@@ -438,7 +438,8 @@ RVV 的动态 `vl` 也可以是 target 对 `auto` 的 realization，不需要 so
 
 - 违反时是调用方错误/undefined behavior；
 - 它不是 compiler 自动推导结果，也不是性能 hint；
-- verifier 只验证声明的类型、view、axis 与支配关系；
+- tensor index 表示每个元素都在指定 axis 内；声明只作用于后续被支配的同一 SSA index、同一 view/buffer 与同一规范化 axis；
+- verifier 只验证声明的类型、view、axis 与支配关系；空 axis 上的实际索引不能满足该声明；
 - target 可以用它消除 mask，也可以只用作 legality proof。
 
 ### 5.7 `I.arg_reduce.max`：真实需求，canonical 形态已收敛
@@ -449,7 +450,7 @@ Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。Publ
 
 2:4 compressed values、metadata interpretation 与 dense RHS 是真实数据格式语义，不能假装成普通 dense contract；有 native primitive 的 target 也需要一个 semantic anchor 才能利用。
 
-但 `sparse_contract_2to4` 直接作为 Core 名字把一个 format 焊进 API，不利于以后 RVV/CPU fallback 与其他 sparse formats。
+但 `sparse_contract_2to4` 直接作为 Core 名字把一个 format 焊进 API，不利于以后 RVV/CPU fallback 与其他 sparse formats。当前 canonical op 虽然名为 `intent.sparse_contract`，真正闭合的仍只有固定 `two_of_four` schema；本轮已让公共 verifier 同时核对 format、compressed/metadata/RHS axis 与 data/metadata dtype，不再让这些 attrs 只是没人消费的装饰。
 
 结论：
 
@@ -458,6 +459,8 @@ Cross entropy 与 nucleus sampling 确实需要 value+index 与确定 tie。Publ
 - 2:4 是第一个 format descriptor，而不是一个永久独立算子家族；
 - GPU target 可用 native sparse MMA，RVV/CPU 可解压+dot 或明确 capability；
 - surface 无原语时提前 unsupported，不能慢路径冒充高性能支持。
+
+当前不凭一个格式发明假的通用 descriptor API：还没有第二种格式来决定 metadata schema 的共同边界。冻结的是上述收敛方向，并明确现有 `I.sparse_contract_2to4` 是 format-specific convenience/过渡入口；以后增加 generic descriptor 是扩展 semantic anchor，不应让下游继续按 2:4 硬编码却只换一个通用名字。
 
 ### 5.9 `I.fence`：当前 public API 应删除
 
@@ -580,7 +583,7 @@ Ragged outer/member、stream stop 是算法结构，应从 Kernel IR 得到；�
 
 当前 Plan 只告诉下层“哪些参数可调”，具体候选值、排序和 winner 由 provider tuner 决定。这符合我们不复制下层知识的原则。
 
-只有当某个合法性约束依赖 Intent 独有算法结构，而下层无法自行筛掉时，Plan 才必须增加参数域/耦合/资源上界。
+只有当某个合法性约束依赖 Intent 独有算法结构，而下层无法自行筛掉时，Plan 或 surface capability projection 才必须增加参数域/耦合/资源上界。H100 TileLang 的嵌套二维 reduction probe 就给出了第一条 surface-specific 证据：其 tuner 只按延迟选择、无法识别一个数值错误的非对称 fragment layout，因此 TileLang projection 对这种 reduction chain 显式要求两个 program tile role 取相同值；没有按 GPU 型号或算子名分支。
 
 结论：不因为 schema 看起来薄就补 candidate list。先保留 names-only delegation；用真实失败决定是否增加约束。
 
@@ -704,16 +707,16 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 
 | 项目 | 决定 |
 |---|---|
-| generic reduce/scan combine | 已闭合：typed helper/closure、component identity、purity、显式 capture 进入 canonical Kernel IR；Triton/cuTile机械委托，TileLang 0.1.13 明确 unsupported |
+| generic reduce/scan combine | 已闭合：typed helper/closure、component identity、purity、显式 capture 进入 canonical Kernel IR；Triton/cuTile机械委托；TileLang 0.1.13 的 `comm_reducer` 会落到 CUDA codegen 不处理的 `tirx.Reduce`，明确 unsupported |
 | arbitrary contract multiply/combine | 正式不随 reduce 一起放开；当前 contract 是目标矩阵原语支持的 multiply/add 与 dtype capability，其他 semiring显式写 pointwise + reduce |
 | `arg_reduce.max` | 已收敛为 frontend sugar + tuple-valued generic reduce；target 原生 argmax 只是经验证的等价 spelling hint，不是第二份语义 |
 | `partition(count)` | 语义合理但当前 realizer 不支持；frontend 在构造 IR 前明确拒绝，不列 correctness blocker |
 | 非 unit-step domain | frontend 明确拒绝；当前使用 unit-step logical domain + 显式 index relation |
 | runtime `state_stream` extent | frontend 明确拒绝；保留 compile-time fixed/auto extent + runtime logical stop |
 | logical buffer | 保留 portable Core；owner-private 是当前 GPU capability，不是永久语言定义 |
-| `end` | 保留并补正式语义 |
-| `assume_in_bounds` | 保留为 unsafe source precondition |
-| sparse 2:4 | 真实需求但当前形态是过渡；以后收敛为 sparse contract + format descriptor，本轮不改 API |
+| `end` | 保留；正式语义是 rank-one 半开区间的 exclusive endpoint，stream stop 取逻辑交集，空交集保持 initial carry |
+| `assume_in_bounds` | 保留为支配后续精确 index/view/axis 访问的 unsafe source precondition，违反即未定义行为 |
+| sparse 2:4 | 当前固定 format/axis/dtype schema 已由公共 verifier 核对；source 形态仍是过渡 convenience，以后收敛为 sparse contract + format descriptor，不制造只有名字通用的假 API |
 | `fence` | 无 scope/ordering/participant 合同的 public API 已删除；未来只从真实 memory model 需求重新设计 |
 
 ### D. 不是当前任务的问题
@@ -736,9 +739,10 @@ Combine region 是算法 closure；RVV realizer可以选择 scalar fold、vector
 | generic record reduce/scan + runtime scalar capture，Triton/cuTile | 通过；长轴 `N=4093`，sum 最大误差 `2.29e-5`、max 误差 `0` | 同样通过，误差一致 |
 | generic Welford record reduction，Triton/cuTile | `M=64,N=257` 通过；mean 误差约 `3e-8`、variance `2.38e-7` | 同样通过，误差一致 |
 | fixed add 的多组件长轴 scan，三个 surface | 通过；两个 component 最大误差分别 `7.63e-6`、`1.53e-5` | 通过；误差一致 |
-| TileLang generic combine capability boundary | emission 前明确 unsupported | emission 前明确 unsupported |
+| TileLang `comm_reducer` / generic combine capability boundary | 0.1.13 CUDA lowering 对 `tirx.Reduce` 明确失败，emission 前 unsupported | 同一软件路径，emission 前 unsupported |
 | `I.arg_reduce.max` sugar 的 cross entropy forward/backward | 三 target 数值通过；旧/新路径分别对 reference 的 loss/prediction/gradient 一致 | 三 target 数值通过 |
 | 两 stage ragged MoE execution contract | 三 target 数值通过 | 三 target 数值通过 |
+| TileLang nested 2-D reduction candidate legality | max pool 数值通过，p50/p95 `0.0217/0.0229 ms` | 排除错误的非对称 candidate 后数值通过，p50/p95 `0.0279/0.0283 ms` |
 
 H100 的 TileLang 初次运行曾调用系统 CUDA 11.5 `nvcc`，该工具不识别 `sm_90a`；切换到机器已有 CUDA 12.2 后，同一生成源码直接通过。这个失败属于运行环境工具链选择，没有转化成 compiler 或 Plan 特判。
 

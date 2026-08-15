@@ -112,7 +112,7 @@ paged_mla_decode,default,K,pass,0.1328,0.1348,,,K,pass,0.2060,0.2084,,,K,unsuppo
 paged_splitk_attention,default,E,pass,0.2493,0.2504,,,E,pass,0.3917,0.4116,,,E,unsupported,,,,
 sparse_2to4_gemm,default,K,unsupported,,,,,K,unsupported,,,,,K,pass,0.1812,0.1860,0.2622,0.2647
 varlen_gqa_decode_logits,default,R,pass,0.0639,0.0687,,,R,pass,0.1189,0.1199,,,R,unsupported,,,,
-max_pool2d,default,K,pass,0.0225,0.0230,,,K,pass,0.0497,0.0508,,,K,failed,,,,
+max_pool2d,default,K,pass,0.0225,0.0230,,,K,pass,0.0497,0.0508,,,K,pass,0.0279,0.0283,,
 softmax_backward,default,K,pass,0.1041,0.1051,,,K,pass,0.0797,0.0812,,,K,pass,0.1430,0.1441,,
 csr_spmm,default,K,pass,0.0423,0.0443,,,K,pass,0.0902,0.0905,,,K,pass,0.0211,0.0226,,
 batch_norm_training,default,K,pass,0.3036,0.3055,,,K,pass,0.1645,0.1662,,,K,pass,0.1431,0.1442,,
