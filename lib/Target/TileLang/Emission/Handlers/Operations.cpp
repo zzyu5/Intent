@@ -2285,6 +2285,25 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
       operation.getNumResults() != 1 ||
       binding.getSpace() != (tensorResult ? "fragment" : "local"))
     return operation.emitOpError("lacks a TileLang cast binding");
+  Type sourceElementType = operation.getOperand(0).getType();
+  if (auto tensor = dyn_cast<RankedTensorType>(sourceElementType))
+    sourceElementType = tensor.getElementType();
+  Type resultElementType = operation.getResult(0).getType();
+  if (auto tensor = dyn_cast<RankedTensorType>(resultElementType))
+    resultElementType = tensor.getElementType();
+  bool decodeE8M0 = isa<Float8E8M0FNUType>(sourceElementType) &&
+                    resultElementType.isF32();
+  auto castExpression = [&](StringRef value, StringRef dtype) {
+    if (!decodeE8M0)
+      return "T.cast(" + value.str() + ", " + dtype.str() + ")";
+    std::string bits = "T.reinterpret(" + value.str() + ", T.uint8)";
+    std::string normal =
+        "T.exp2(T.cast(" + bits + ", T.float32) - 127.0)";
+    return "T.if_then_else(" + bits +
+           " == T.cast(255, T.uint8), "
+           "T.reinterpret(T.cast(2143289344, T.uint32), T.float32), " +
+           normal + ")";
+  };
   if (!tensorResult) {
     if (binding.getLowering() != "T.cast")
       return operation.emitOpError("cannot copy-cast a scalar TileLang value");
@@ -2293,8 +2312,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
     if (failed(operand) || dtype.empty())
       return failure();
     std::string result = makeResultName(operation, 0);
-    std::string expression =
-        "T.cast(" + operand->str() + ", " + dtype + ")";
+    std::string expression = castExpression(*operand, dtype);
     if (target::whileConditionOwner(operation)) {
       bindResult(operation, 0, expression);
       return success();
@@ -2339,7 +2357,7 @@ LogicalResult SourceEmitter::emitCast(Operation &operation) {
       target += ", ";
     target += index;
   }
-  line(target + "] = T.cast(" + *operand + ", " + dtype + ")");
+  line(target + "] = " + castExpression(*operand, dtype));
   --indentation;
   bindResult(operation, 0, *result);
   return success();
