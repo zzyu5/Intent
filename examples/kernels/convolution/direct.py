@@ -9,6 +9,8 @@ CAUSAL_CONV_BATCH = 8
 CAUSAL_CONV_CHANNELS = 2048
 CAUSAL_CONV_LENGTH = 4096
 CAUSAL_CONV_WIDTH = 4
+CAUSAL_UPDATE_BATCH = 64
+CAUSAL_UPDATE_CHANNELS = 4096
 
 CONV2D_BATCH = 16
 CONV2D_HEIGHT = 256
@@ -89,6 +91,40 @@ def causal_depthwise_conv1d(
                 if SILU:
                     reduced = reduced * I.sigmoid(reduced)
                 output[batch, channel, output_region] = I.cast(reduced, I.f16)
+
+
+@intent.kernel
+def causal_depthwise_conv1d_update(
+    x: I.In[I.f16, ("B", "D")],
+    state: I.InOut[I.f16, ("B", "D", CAUSAL_CONV_WIDTH)],
+    weight: I.In[I.f16, ("D", CAUSAL_CONV_WIDTH)],
+    bias: I.In[I.f16, ("D",)],
+    output: I.Out[I.f16, ("B", "D")],
+    SILU: I.Constexpr[bool],
+):
+    B, D = x.shape
+    channels = I.domain(0, D)
+    for batch in I.parallel(I.domain(0, B)):
+        for channel_region in I.parallel(
+            I.partition(channels, extent=I.auto("D_TILE"))
+        ):
+            accumulator = I.cast(bias[channel_region], I.f32)
+            for tap in range(CAUSAL_CONV_WIDTH - 1):
+                shifted = state[batch, channel_region, tap + 1]
+                state[batch, channel_region, tap] = shifted
+                accumulator = accumulator + I.cast(shifted, I.f32) * I.cast(
+                    weight[channel_region, tap],
+                    I.f32,
+                )
+            current = x[batch, channel_region]
+            state[batch, channel_region, CAUSAL_CONV_WIDTH - 1] = current
+            accumulator = accumulator + I.cast(current, I.f32) * I.cast(
+                weight[channel_region, CAUSAL_CONV_WIDTH - 1],
+                I.f32,
+            )
+            if SILU:
+                accumulator = accumulator * I.sigmoid(accumulator)
+            output[batch, channel_region] = I.cast(accumulator, I.f16)
 
 
 @intent.kernel

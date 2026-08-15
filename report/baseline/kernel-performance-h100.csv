@@ -89,11 +89,15 @@ variant_transpose_product_domain,default,K,pass,0.5589,0.5601,,,K,pass,0.5576,0.
 variant_ordered_prefix_nested,default,K,pass,0.0366,0.0381,,,K,pass,0.0580,0.0584,,,K,pass,0.0180,0.0191,,
 variant_attention_full_causal_stream,default,K,pass,0.0336,0.0342,,,K,pass,0.0292,0.0303,,,K,pass,0.0335,0.0342,,
 causal_conv1d,default,K,pass,0.2322,0.2473,,,K,pass,1.1662,1.1677,,,K,pass,0.3219,0.3226,,
+causal_conv1d_update,default,K,pass,0.0413,0.0434,,,K,pass,0.0259,0.0282,,,K,pass,0.0138,0.0151,,
+rope_qk_full,default,K,pass,0.0617,0.0629,,,K,pass,0.0639,0.0651,0.0600,0.0612,K,pass,0.0609,0.0618,,
+rope_qk_partial,default,K,pass,0.0321,0.0337,,,K,pass,0.0393,0.0407,0.0333,0.0349,K,pass,0.0321,0.0335,,
+rope_qk_inverse,default,K,pass,0.0617,0.0629,,,K,pass,0.0641,0.0652,0.0599,0.0611,K,pass,0.0611,0.0623,,
 continuous_gqa_decode,default,K,pass,0.8385,0.8914,,,K,pass,1.8235,1.8266,,,K,unsupported,,,,
 mla_prefill,default,K,pass,0.0233,0.0239,,,K,pass,0.0251,0.0255,0.0195,0.0206,K,pass,0.0271,0.0275,,
 mamba_chunk_scan,default,K,pass,0.0348,0.0359,,,K,pass,0.0185,0.0195,,,K,pass,0.0300,0.0311,,
 w4a8_packed,default,K,pass,0.1604,0.1645,,,K,pass,0.2023,0.2046,,,K,pass,0.2354,0.2371,0.1579,0.1597
-embedding_forward_lookup,default,K,pass,0.1029,0.1038,0.0342,0.0355,K,pass,0.1437,0.1447,,,K,pass,0.1472,0.1485,,
+embedding_forward_lookup,default,K,pass,0.0328,0.0344,0.0342,0.0355,K,pass,0.0530,0.0541,,,K,pass,0.0287,0.0302,,
 block_scaled_matmul,default,K,pass,0.0166,0.0173,,,K,unsupported,,,,,K,pass,0.0412,0.0421,,
 splitk_attention_reduce,default,K,pass,0.0062,0.0067,,,K,pass,0.0064,0.0068,0.0066,0.0076,K,unsupported,,,,
 fp8_gemm,e4m3,K,pass,0.0095,0.0105,,,K,pass,0.0093,0.0099,,,K,pass,0.0143,0.0150,0.0135,0.0142

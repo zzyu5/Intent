@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import math
 
 import torch
@@ -70,6 +71,10 @@ from kernels.convolution.direct import CONV2D_FILTER_HEIGHT
 from kernels.convolution.direct import CONV2D_FILTER_WIDTH
 from kernels.convolution.direct import CONV2D_HEIGHT
 from kernels.convolution.direct import CONV2D_WIDTH
+from kernels.convolution.direct import CAUSAL_CONV_WIDTH
+from kernels.convolution.direct import CAUSAL_UPDATE_BATCH
+from kernels.convolution.direct import CAUSAL_UPDATE_CHANNELS
+from kernels.convolution.direct import causal_depthwise_conv1d_update
 from kernels.convolution.direct import conv2d_same
 from kernels.dynamic_programming.smith_waterman import BATCH as SW_BATCH
 from kernels.dynamic_programming.smith_waterman import GAP_SCORE
@@ -93,7 +98,13 @@ from kernels.normalization.softmax import ROWS as SOFTMAX_ROWS
 from kernels.normalization.softmax import stable_softmax
 from kernels.position.rope import HALF_DIMENSION
 from kernels.position.rope import HEAD_DIMENSION
+from kernels.position.rope import ROPE_BATCH
+from kernels.position.rope import ROPE_KEY_HEADS
+from kernels.position.rope import ROPE_QUERY_HEADS
+from kernels.position.rope import ROPE_SEQUENCE
 from kernels.position.rope import rotary_embedding_flat
+from kernels.position.rope import rotary_qk_inplace
+from kernels.position.rope import rotary_qk_partial_inplace
 from kernels.simulation.monte_carlo import PATHS
 from kernels.simulation.monte_carlo import STEPS
 from kernels.simulation.monte_carlo import barrier_option_paths
@@ -552,6 +563,232 @@ def _run_monte_carlo(compiler: str, target: Target, target_name: str) -> None:
         kernel_name="barrier-option Monte Carlo paths",
         tolerance=3.0e-4,
         cuda_graph=False,
+    )
+
+
+def _run_causal_conv_update(
+    compiler: str, target: Target, target_name: str
+) -> None:
+    x = torch.randn(
+        (CAUSAL_UPDATE_BATCH, CAUSAL_UPDATE_CHANNELS),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    state = torch.randn(
+        (CAUSAL_UPDATE_BATCH, CAUSAL_UPDATE_CHANNELS, CAUSAL_CONV_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    weight = torch.randn(
+        (CAUSAL_UPDATE_CHANNELS, CAUSAL_CONV_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    bias = torch.randn(
+        (CAUSAL_UPDATE_CHANNELS,), device="cuda", dtype=torch.float16
+    ) * 0.1
+    initial_state = state.clone()
+    expected_state = torch.cat((initial_state[:, :, 1:], x[:, :, None]), dim=2)
+    expected_output = (
+        (expected_state.float() * weight.float()[None, :, :]).sum(dim=2)
+        + bias.float()[None, :]
+    )
+    expected_output = (expected_output * torch.sigmoid(expected_output)).half()
+    artifact = intent.compile(
+        causal_depthwise_conv1d_update,
+        target=target,
+        compiler=compiler,
+        constexprs={"SILU": True},
+    )
+    output = artifact.run(x, state, weight, bias)
+    torch.cuda.synchronize()
+    errors = _require_close(
+        actual=(state, output),
+        expected=(expected_state, expected_output),
+        tolerance=(0.0, 2.0e-3),
+        target_name=target_name,
+        kernel_name="state-cache causal convolution update",
+    )
+    launch = prepare_kernel_call(artifact, (x, state, weight, bias), output)
+    _report_pipeline(
+        artifacts=(artifact,),
+        launch=launch,
+        errors=errors,
+        target_name=target_name,
+        kernel_name="state-cache causal convolution update",
+        prepare=lambda: state.copy_(initial_state),
+        performance_scope="kernel-only",
+    )
+
+
+def _run_qk_rope(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    rotary_dimension: int,
+    inverse: bool,
+    upstream: Callable[[tuple[object, ...]], tuple[torch.Tensor, torch.Tensor]]
+    | None = None,
+) -> None:
+    query = torch.randn(
+        (ROPE_BATCH, ROPE_QUERY_HEADS, ROPE_SEQUENCE, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    key = torch.randn(
+        (ROPE_BATCH, ROPE_KEY_HEADS, ROPE_SEQUENCE, HEAD_DIMENSION),
+        device="cuda",
+        dtype=torch.float16,
+    ) * 0.1
+    half = rotary_dimension // 2
+    angles = torch.randn(
+        (1, ROPE_SEQUENCE, half), device="cuda", dtype=torch.float32
+    )
+    cosine_half = torch.cos(angles).half()
+    sine_half = torch.sin(angles).half()
+    if inverse:
+        sine_half = -sine_half
+    cosine = torch.cat((cosine_half, cosine_half), dim=2)
+    sine = torch.cat((sine_half, sine_half), dim=2)
+    initial_query = query.clone()
+    initial_key = key.clone()
+
+    def rotate(values: torch.Tensor) -> torch.Tensor:
+        result = values.clone()
+        first = values[:, :, :, :half].float()
+        second = values[:, :, :, half:rotary_dimension].float()
+        cos = cosine_half.float()[:, None, :, :]
+        sin = sine_half.float()[:, None, :, :]
+        result[:, :, :, :half] = (first * cos - second * sin).half()
+        result[:, :, :, half:rotary_dimension] = (
+            second * cos + first * sin
+        ).half()
+        return result
+
+    expected_query = rotate(initial_query)
+    expected_key = rotate(initial_key)
+    definition = (
+        rotary_qk_inplace
+        if rotary_dimension == HEAD_DIMENSION
+        else rotary_qk_partial_inplace
+    )
+    artifact = intent.compile(definition, target=target, compiler=compiler)
+    artifact.run(query, key, cosine, sine)
+    torch.cuda.synchronize()
+    label = (
+        "inverse Q/K rotary embedding"
+        if inverse
+        else (
+            "full Q/K rotary embedding"
+            if rotary_dimension == HEAD_DIMENSION
+            else "partial Q/K rotary embedding"
+        )
+    )
+    errors = _require_close(
+        actual=(query, key),
+        expected=(expected_query, expected_key),
+        tolerance=(2.0e-3, 2.0e-3),
+        target_name=target_name,
+        kernel_name=label,
+    )
+    launch = prepare_kernel_call(
+        artifact,
+        (query, key, cosine, sine),
+        (),
+    )
+
+    def restore_inputs() -> None:
+        query.copy_(initial_query)
+        key.copy_(initial_key)
+
+    generated_p50, generated_p95 = benchmark(
+        launch,
+        warmup=3,
+        repetitions=100,
+        prepare=restore_inputs,
+    )
+    upstream_errors = None
+    upstream_p50 = None
+    upstream_p95 = None
+    if upstream is not None:
+        upstream_query = initial_query.clone()
+        upstream_key = initial_key.clone()
+        upstream_arguments = (upstream_query, upstream_key, cosine, sine)
+        upstream_output = upstream(upstream_arguments)
+        torch.cuda.synchronize()
+        upstream_errors = _require_close(
+            actual=upstream_output,
+            expected=(expected_query, expected_key),
+            tolerance=(2.0e-3, 2.0e-3),
+            target_name=target_name,
+            kernel_name=f"{label} upstream",
+        )
+
+        def restore_upstream_inputs() -> None:
+            upstream_query.copy_(initial_query)
+            upstream_key.copy_(initial_key)
+
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(upstream_arguments),
+            warmup=3,
+            repetitions=100,
+            prepare=restore_upstream_inputs,
+        )
+
+    print_artifact(artifact, target_name)
+    print(
+        f"{target_name} {label} numerical comparison: PASS "
+        f"(generated/reference={errors})"
+    )
+    print(
+        f"{target_name} {label} kernel-only performance (CUDA Event): "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_p50 is None:
+        print(f"{target_name} {label} upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} {label} upstream comparison: PASS "
+            f"(upstream/reference={upstream_errors}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
+
+
+def _run_qk_rope_full(compiler: str, target: Target, target_name: str) -> None:
+    _run_qk_rope(compiler, target, target_name, HEAD_DIMENSION, False)
+
+
+def _run_qk_rope_partial(compiler: str, target: Target, target_name: str) -> None:
+    _run_qk_rope(compiler, target, target_name, HEAD_DIMENSION // 2, False)
+
+
+def _run_qk_rope_inverse(compiler: str, target: Target, target_name: str) -> None:
+    _run_qk_rope(compiler, target, target_name, HEAD_DIMENSION, True)
+
+
+def _run_qk_rope_full_upstream(
+    compiler: str, target: Target, target_name: str, upstream
+) -> None:
+    _run_qk_rope(
+        compiler, target, target_name, HEAD_DIMENSION, False, upstream=upstream
+    )
+
+
+def _run_qk_rope_partial_upstream(
+    compiler: str, target: Target, target_name: str, upstream
+) -> None:
+    _run_qk_rope(
+        compiler, target, target_name, HEAD_DIMENSION // 2, False, upstream=upstream
+    )
+
+
+def _run_qk_rope_inverse_upstream(
+    compiler: str, target: Target, target_name: str, upstream
+) -> None:
+    _run_qk_rope(
+        compiler, target, target_name, HEAD_DIMENSION, True, upstream=upstream
     )
 
 
@@ -1415,6 +1652,10 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "greedy_nms": _run_nms,
     "roi_align": _run_roi_align,
     "barrier_option": _run_monte_carlo,
+    "causal_conv1d_update": _run_causal_conv_update,
+    "rope_qk_full": _run_qk_rope_full,
+    "rope_qk_partial": _run_qk_rope_partial,
+    "rope_qk_inverse": _run_qk_rope_inverse,
     "nonzero_compact": _run_nonzero_compact,
     "unique_consecutive": _run_unique_consecutive,
     "moe_align_block": _run_moe_align,
@@ -1439,11 +1680,26 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     **DECOMPOSITION_RUNNERS,
 }
 
+UNFAMILIAR_UPSTREAM_RUNNERS = {
+    "rope_qk_full": _run_qk_rope_full_upstream,
+    "rope_qk_partial": _run_qk_rope_partial_upstream,
+    "rope_qk_inverse": _run_qk_rope_inverse_upstream,
+}
+
 
 def run_unfamiliar(
     kernel_name: str,
     compiler: str,
     target: Target,
     target_name: str,
+    upstream=None,
 ) -> None:
+    if upstream is not None:
+        runner = UNFAMILIAR_UPSTREAM_RUNNERS.get(kernel_name)
+        if runner is None:
+            raise ValueError(
+                f"unfamiliar program '{kernel_name}' has no upstream adapter"
+            )
+        runner(compiler, target, target_name, upstream)
+        return
     UNFAMILIAR_RUNNERS[kernel_name](compiler, target, target_name)

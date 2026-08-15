@@ -2729,6 +2729,7 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       transferPhysicalExtentFill(operation);
   bool expanded = succeeded(physicalFill) && !physicalFill->empty();
   bool scatter = boundary.getAccess() == "scatter" ||
+                 boundary.getTensorIndexing() != "none" ||
                  expanded ||
                  target::emission::hasPackedScalarDomain(planIndex, boundary);
   FailureOr<std::string> indices = indexTuple(operation, scatter);

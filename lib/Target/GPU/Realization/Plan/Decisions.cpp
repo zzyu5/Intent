@@ -224,6 +224,36 @@ bool canPackScalarParallel(Operation *parallel, Operation *domain,
   return true;
 }
 
+bool canDistributePointwiseLane(Operation *domain,
+                                const target::KernelFacts &facts) {
+  if (!domain || domain->getNumResults() != 1 || domain->getResult(0).use_empty())
+    return false;
+  Operation *owner = nullptr;
+  for (Operation *user : domain->getResult(0).getUsers()) {
+    StringRef name = user->getName().getStringRef();
+    if (name != "intent.view_load" && name != "intent.view_store" &&
+        name != "intent.gather")
+      return false;
+    Operation *parallel = nearestParallel(user);
+    if (!parallel || (owner && owner != parallel))
+      return false;
+    owner = parallel;
+  }
+  Operation *ownerSource =
+      owner && owner->getNumOperands() == 1
+          ? owner->getOperand(0).getDefiningOp()
+          : nullptr;
+  if (!ownerSource || !facts.partitionDomains.contains(ownerSource))
+    return false;
+  return llvm::none_of(facts.vectorDomains, [&](Operation *other) {
+    if (other == domain || other->getNumResults() != 1)
+      return false;
+    return llvm::any_of(other->getResult(0).getUsers(), [&](Operation *user) {
+      return nearestParallel(user) == owner;
+    });
+  });
+}
+
 void addRange(AxisChoice &choice, StringRef purpose, int64_t level,
               std::string tile) {
   choice.ranges.push_back(
@@ -402,6 +432,16 @@ assignAxes(const target::KernelFacts &facts) {
     if (ordered)
       for (Operation *member : entry.second.memberDomains)
         appendRole(ensure(member).roles, "ordered");
+  }
+
+  for (AxisChoice &choice : choices) {
+    if (choice.programOrder || choice.roles.size() != 1 ||
+        !hasRole(choice.roles, "lane") ||
+        !canDistributePointwiseLane(choice.domain, facts))
+      continue;
+    choice.programOrder = programOrder++;
+    choice.tiled = true;
+    appendRole(choice.roles, "parallel");
   }
 
   SmallVector<std::pair<Operation *, Operation *>> matrixAxes;

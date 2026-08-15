@@ -2065,7 +2065,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     operation.getNumOperands())
               return operation.emitOpError(
                   "has no canonical external-view store schema");
-            return analyzeBoundary(operation, facts, "none");
+            if (failed(analyzeBoundary(operation, facts, "none")))
+              return failure();
+            return classifyTensorIndices(operation, facts);
           })))
     return failure();
 

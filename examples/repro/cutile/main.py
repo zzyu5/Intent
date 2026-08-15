@@ -204,6 +204,27 @@ def _load_extended_upstream(kernel: str, source_path: Path):
     raise NotImplementedError(f"no cuTile upstream adapter for {kernel}")
 
 
+def _load_unfamiliar_upstream(kernel: str, source_path: Path):
+    if kernel not in {"rope_qk_full", "rope_qk_partial", "rope_qk_inverse"}:
+        raise ValueError(f"unfamiliar program '{kernel}' has no cuTile adapter")
+    utils_path = source_path.parents[2] / "support" / "utils.py"
+    _load_module(utils_path, "tilegym.ops.cutile.utils")
+    source = _load_module(source_path, "tilegym.ops.cutile._intent_rope")
+
+    def run(arguments):
+        query, key, cosine, sine = arguments
+        rotary_dimension = cosine.shape[-1]
+        rope_dimension = (
+            None if rotary_dimension == query.shape[-1] else rotary_dimension
+        )
+        output_query, output_key, _, _ = source._rope_forward(
+            query, key, cosine, sine, rope_dim=rope_dimension
+        )
+        return output_query, output_key
+
+    return run
+
+
 def _run_softmax(compiler: str, baseline_source: Path) -> None:
     utils_path = baseline_source.parents[2] / "support" / "utils.py"
     _load_module(utils_path, "tilegym.ops.cutile.utils")
@@ -530,13 +551,17 @@ def main() -> None:
             upstream,
         )
     else:
-        if arguments.baseline_source is not None:
-            parser.error("unfamiliar programs do not accept an upstream adapter")
+        upstream = (
+            _load_unfamiliar_upstream(arguments.kernel, arguments.baseline_source)
+            if arguments.baseline_source is not None
+            else None
+        )
         run_unfamiliar(
             arguments.kernel,
             arguments.compiler,
             intent.CuTileTarget(device=0),
             "cuTile",
+            upstream,
         )
 
 

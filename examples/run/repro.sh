@@ -38,6 +38,7 @@ case "${kernel}" in
   nonzero_compact | unique_consecutive | moe_align_block | nested_ragged_pool | \
   adamw_update | adafactor_update | reshape_and_cache | \
   group_norm_silu_backward | batched_cholesky | batched_householder_qr | \
+  causal_conv1d_update | \
   batch_norm_training | csr_spmm | max_pool2d | softmax_backward | \
   triangular_solve | \
   variant_gemm_loop_interchange | variant_softmax_online | \
@@ -165,6 +166,12 @@ if [[ ${unfamiliar} == false ]]; then
     ;;
   cutile:swiglu_forward)
     baseline=source/cutile/tilegym/activation/silu_and_mul/silu_and_mul.py
+    ;;
+  cutile:rope_qk_full | cutile:rope_qk_partial | cutile:rope_qk_inverse)
+    baseline=source/cutile/tilegym/position/rope/rope.py
+    ;;
+  triton:rope_qk_full | triton:rope_qk_partial | triton:rope_qk_inverse | \
+  tilelang:rope_qk_full | tilelang:rope_qk_partial | tilelang:rope_qk_inverse)
     ;;
   tilelang:softmax)
     baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
