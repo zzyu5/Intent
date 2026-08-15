@@ -2364,6 +2364,11 @@ LogicalResult SourceEmitter::enterStateStream(Operation &operation) {
   std::string streamExtent = raggedStream
                                  ? "sequence_length_" + raggedSuffix
                                  : binding.getExtent().str();
+  if (!raggedStream) {
+    auto owner = dimensionOwners.find(streamExtent);
+    if (owner != dimensionOwners.end())
+      streamExtent = owner->second;
+  }
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
@@ -2735,7 +2740,8 @@ LogicalResult SourceEmitter::emitStore(Operation &operation) {
       failed(view) || failed(physicalFill) || failed(indices))
     return operation.emitOpError("lacks a cuTile store binding");
   std::string scatterMask;
-  if (scatter && !boundary.getValidityTensorAxes().empty()) {
+  if (scatter && boundary.getTensorIndexing() != "none" &&
+      !boundary.getValidityTensorAxes().empty()) {
     FailureOr<std::string> validity = emitValidityExpression(
         boundary.getValidityTensorAxes(), boundary.getValidityDomainNodes(),
         operation.getOperand(valueIndex.getInt()), operation);

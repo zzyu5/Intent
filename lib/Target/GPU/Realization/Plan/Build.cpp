@@ -294,6 +294,10 @@ private:
 
   std::optional<std::string> materializedPadding(Value value,
                                                  Operation *domain) const {
+    Operation *definition = value.getDefiningOp();
+    if (definition &&
+        definition->getName().getStringRef() == "intent.view_load")
+      return std::nullopt;
     std::optional<int64_t> domainNode = nodeOf(domain);
     std::optional<unsigned> tensorAxis = uniqueAxis(value, domain);
     if (!domainNode || !tensorAxis)
@@ -465,6 +469,53 @@ private:
            proveUses(contract.getResult(0), surviving, active);
   }
 
+  bool proveReductionUse(Operation &reduction, Value value,
+                         ArrayRef<Operation *> domains,
+                         llvm::DenseSet<Value> &active) const {
+    auto components =
+        reduction.getAttrOfType<IntegerAttr>("intent.component_count");
+    if (!components || components.getInt() <= 0 ||
+        static_cast<unsigned>(components.getInt()) != reduction.getNumResults())
+      return false;
+    bool consumed = false;
+    for (auto [operandNumber, operand] :
+         llvm::enumerate(reduction.getOperands())) {
+      if (operand != value)
+        continue;
+      if (operandNumber >= static_cast<unsigned>(components.getInt()))
+        return false;
+      consumed = true;
+      Value result = reduction.getResult(operandNumber);
+      if (!valueCarriesDomains(result, domains) ||
+          !proveUses(result, domains, active))
+        return false;
+    }
+    return consumed;
+  }
+
+  bool proveYieldUse(Operation &yield, Value value,
+                     ArrayRef<Operation *> domains,
+                     llvm::DenseSet<Value> &active) const {
+    Operation *owner = yield.getParentOp();
+    StringRef ownerName = owner ? owner->getName().getStringRef() : StringRef();
+    if (!owner ||
+        (ownerName != "intent.state_stream" && ownerName != "intent.for" &&
+         ownerName != "intent.ordered") ||
+        owner->getNumResults() != yield.getNumOperands())
+      return false;
+    bool consumed = false;
+    for (auto [operandNumber, operand] : llvm::enumerate(yield.getOperands())) {
+      if (operand != value)
+        continue;
+      consumed = true;
+      Value result = owner->getResult(operandNumber);
+      if (!valueCarriesDomains(result, domains) ||
+          !proveUses(result, domains, active))
+        return false;
+    }
+    return consumed;
+  }
+
   bool proveUses(Value value, ArrayRef<Operation *> domains,
                  llvm::DenseSet<Value> &active) const {
     SmallVector<Operation *> remaining;
@@ -501,6 +552,16 @@ private:
       }
       if (name == "intent.contract") {
         if (!proveContractUse(*user, value, remaining, active))
+          return finish(false);
+        continue;
+      }
+      if (name == "intent.reduce") {
+        if (!proveReductionUse(*user, value, remaining, active))
+          return finish(false);
+        continue;
+      }
+      if (name == "intent.yield") {
+        if (!proveYieldUse(*user, value, remaining, active))
           return finish(false);
         continue;
       }
