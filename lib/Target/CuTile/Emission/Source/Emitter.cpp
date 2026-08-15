@@ -298,6 +298,21 @@ LogicalResult SourceEmitter::prepare() {
   }
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (!searchSpace && planIndex.stages.empty() &&
+      planIndex.components.reusedAxes.empty() &&
+      !planIndex.program.getPersistent()) {
+    auto lane = planIndex.axesByRole.find("lane_0");
+    bool hasNonIdempotentEffect = false;
+    kernel.entry.walk([&](Operation *operation) {
+      StringRef name = operation->getName().getStringRef();
+      hasNonIdempotentEffect |= name == "intent.scatter_reduce" ||
+                                name == "intent.atomic_add" ||
+                                name == "intent.atomic_cas";
+    });
+    tuneRowOccupancy = lane != planIndex.axesByRole.end() &&
+                       lane->second.getTileRole().starts_with("row_vector") &&
+                       !hasNonIdempotentEffect;
+  }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -751,6 +766,8 @@ void SourceEmitter::emitImports() {
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
     output << "_TUNE_TIMEOUT = autotune_timeout(_PARAMETER_MAP)\n";
   }
+  if (tuneRowOccupancy)
+    output << "from intent.runtime.tuning.cutile import tune_row_occupancy\n";
   output << "\nConstInt = ct.Constant[int]\n";
   output << "\n\n";
 }
@@ -1584,7 +1601,53 @@ LogicalResult SourceEmitter::emitWrapper() {
             });
     output << "    grid = (" << grid[0] << ", " << grid[1] << ", "
            << grid[2] << ")\n";
-    output << "    return ct.launch(stream, grid, " << kernelName << ", (";
+    std::string launchKernel = kernelName;
+    if (tuneRowOccupancy) {
+      output << "    cache_key = (";
+      bool firstCacheKey = true;
+      auto emitCacheKey = [&](const std::string &value) {
+        if (!firstCacheKey)
+          output << ", ";
+        output << value;
+        firstCacheKey = false;
+      };
+      for (const std::string &dimension : dimensionOrder)
+        emitCacheKey(dimension);
+      for (ABIView *input : inputs)
+        emitCacheKey(input->argument->name + ".dtype");
+      emitCacheKey("str(_DEVICE)");
+      output << ")\n";
+      output << "    if cache_key not in _TUNE_CACHE:\n";
+      output << "        _TUNE_CACHE[cache_key] = tune_row_occupancy(\n";
+      output << "            stream, grid, " << kernelName
+             << ", lambda _: (";
+      for (ABIView &view : views) {
+        output << view.argument->name;
+        if (view.view.getAccess() == "inout")
+          output << ".clone()";
+        output << ", ";
+      }
+      for (ABIScalar &scalar : scalars)
+        output << scalar.name << ", ";
+      for (Operation *buffer : privateWorkspaceBuffers)
+        output << workspaceNames.lookup(buffer->getResult(0)) << ", ";
+      for (const auto &entry : planIndex.scans) {
+        if (entry.second.getResultSpace() != "private_workspace")
+          continue;
+        Operation *scan = kernel.nodes.lookup(entry.first);
+        for (Value result : scan->getResults())
+          output << workspaceNames.lookup(result) << ", ";
+        for (int64_t valueID : entry.second.getMaterializedValues())
+          output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
+      }
+      for (const std::string &dimension : kernelConstants)
+        output << dimension << ", ";
+      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+        output << physicalExtent << ", ";
+      output << "))\n";
+      launchKernel = "_TUNE_CACHE[cache_key]";
+    }
+    output << "    return ct.launch(stream, grid, " << launchKernel << ", (";
     for (ABIView &view : views) {
       output << view.argument->name;
       output << ", ";

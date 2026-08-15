@@ -287,6 +287,7 @@ private:
   std::string vectorIndex;
   bool programBindingsEmitted = false;
   bool tuneGatherSpelling = false;
+  bool tuneRowOccupancy = false;
   unsigned indentation = 1;
 };
 

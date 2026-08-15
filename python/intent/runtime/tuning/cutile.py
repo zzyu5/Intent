@@ -184,3 +184,32 @@ def autotune_timeout(parameter_map: dict[str, str]) -> int:
         if "query" in roles and {"stream", "stream_contract"}.intersection(roles)
         else 5
     )
+
+
+def tune_row_occupancy(
+    stream: object,
+    grid: tuple[int, int, int],
+    kernel: object,
+    args_fn: object,
+) -> object:
+    import cuda.tile as ct
+    from cuda.tile.tune import exhaustive_search
+
+    configurations = tuple(
+        SimpleNamespace(occupancy=occupancy) for occupancy in (0, 1, 2, 4)
+    )
+    with ct.compiler_timeout(5):
+        result = exhaustive_search(
+            configurations,
+            stream,
+            lambda _: grid,
+            kernel,
+            args_fn,
+            hints_fn=lambda config: (
+                {} if config.occupancy == 0 else {"occupancy": config.occupancy}
+            ),
+            quiet=True,
+            single_run_timeout_sec=5,
+        )
+    occupancy = result.best.config.occupancy
+    return kernel if occupancy == 0 else kernel.replace_hints(occupancy=occupancy)
