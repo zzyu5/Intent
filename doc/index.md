@@ -1,6 +1,6 @@
 # Intent Kernel DSL 设计文档
 
-这组文档描述 Intent Kernel DSL 的语言语义与编译器模块边界，不记录实现进度、历史版本、测试清单、失败状态或迁移过程。运行与实现状态只进入 `report/`，设计文档只在明确修改规格时更新。
+这组文档描述 Intent Kernel DSL 的语言语义、编译器模块边界与稳定使用方法，不记录实现进度、历史版本、测试清单、失败状态或迁移过程。运行与实现状态只进入 `report/`；设计文档只在明确修改规格时更新，环境文档只维护可复现的依赖与构建合同。
 
 Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL**：用户写一个 logical callable 内的完整算法，编译器补全不可由 source 观察的机器 realization；一个 callable 的目标实现可以包含多个 compiler-private stages。
 
@@ -28,6 +28,7 @@ Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算
 9. [Physical Plan](compiler/physical-plan.md)
 10. [后端 lowering](compiler/backend-lowering.md)
 11. [编译产物与运行边界](compiler/compiled-artifact.md)
+12. [环境、依赖与构建](setup/environment.md)
 
 典型 kernel 的 DSL 写法单独放在 `kernels/`：
 
@@ -43,7 +44,8 @@ Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算
 doc/
 ├── dsl/       source language 的构造与语义
 ├── compiler/  编译器模块、IR、Plan、lowering 与产物
-└── kernels/   按 kernel 类型组织的 canonical DSL 模板
+├── kernels/   按 kernel 类型组织的 canonical DSL 模板
+└── setup/     可复现环境、依赖与构建入口
 ```
 
 每个概念只有一个权威落点。其他文档只引用该定义，不复制出第二套规则。

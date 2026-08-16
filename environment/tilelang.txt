@@ -1,0 +1,9 @@
+# Install the required CUDA build of torch 2.10.0 before this file.
+triton==3.6.0
+numpy==1.26.4
+tilelang==0.1.13
+apache-tvm-ffi==0.1.12
+torch-c-dlpack-ext==0.1.5
+z3-solver==4.15.4.0
+ml-dtypes==0.5.4
+psutil==7.2.2
