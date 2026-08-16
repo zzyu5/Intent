@@ -133,8 +133,17 @@ def autotune_configurations(
         single_program_m_profiles,
         (
             ({"program_m": 128, "program_n": 64, "reduction": 64, "group_m": 8}, 2, 128),
+            ({"program_m": 128, "program_n": 128, "reduction": 32, "group_m": 8}, 2, 256),
             ({"program_m": 128, "program_n": 128, "reduction": 32, "group_m": 8}, 3, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 32, "group_m": 8}, 4, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 64, "group_m": 8}, 2, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 64, "group_m": 8}, 3, 256),
             ({"program_m": 64, "program_n": 128, "reduction": 64, "group_m": 8}, 2, 128),
+            ({"program_m": 128, "program_n": 128, "reduction": 32}, 2, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 32}, 3, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 32}, 4, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 64}, 2, 256),
+            ({"program_m": 128, "program_n": 128, "reduction": 64}, 3, 256),
         ),
         (
             ({"ragged_member": 128, "feature": 64, "reduction": 64}, 2, 128),
