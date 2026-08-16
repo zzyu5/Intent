@@ -116,6 +116,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Value, LogicalAxis> regionArgumentAxes;
   llvm::StringMap<LogicalAxis> axisLabels;
   llvm::DenseSet<mlir::Operation *> vectorDomains;
+  llvm::DenseSet<mlir::Operation *> reductionDomains;
   llvm::DenseSet<mlir::Operation *> contractionDomains;
   llvm::DenseSet<mlir::Operation *> scaledStreamDomains;
   llvm::DenseSet<mlir::Operation *> orderedDomains;

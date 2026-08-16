@@ -2191,8 +2191,10 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         return operation.emitOpError(
             "reduction axis has no logical-axis provenance");
       reducedAxes.push_back(axis.getInt());
-      if (Operation *domain = input->second[axis.getInt()].domain)
+      if (Operation *domain = input->second[axis.getInt()].domain) {
         facts.vectorDomains.insert(domain);
+        facts.reductionDomains.insert(domain);
+      }
     }
     llvm::sort(reducedAxes, std::greater<unsigned>());
     SmallVector<LogicalAxis> resultAxes = input->second;

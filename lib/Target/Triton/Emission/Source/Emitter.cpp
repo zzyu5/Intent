@@ -419,10 +419,15 @@ LogicalResult SourceEmitter::indexABI() {
     auto tensor = dyn_cast<RankedTensorType>(view.getTensor());
     if (!tensor)
       return kernel.entry.emitOpError("Triton emitter requires ranked views");
-    ABIView emitted{&argument, view, tensor, argument.name + "_ptr", {}, {}};
-    for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
-      emitted.strides.push_back(argument.name + "_stride_" +
-                                std::to_string(axis));
+    ABIView emitted{&argument, view, tensor, argument.name + "_ptr", {}, {}, {}};
+    for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
+      std::optional<int64_t> stride =
+          target::emission::staticViewStride(argument, axis);
+      emitted.strides.push_back(
+          stride ? std::to_string(*stride)
+                 : argument.name + "_stride_" + std::to_string(axis));
+      emitted.dynamicStrides.push_back(!stride.has_value());
+    }
     auto shape = argument.metadata.getAs<ArrayAttr>("shape");
     if (!shape || shape.size() != static_cast<size_t>(tensor.getRank()))
       return kernel.entry.emitOpError()
@@ -874,8 +879,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                        ? ": tl.constexpr"
                        : ""));
       for (ABIView &view : views)
-        for (const std::string &stride : view.strides)
-          parameter(stride);
+        for (auto [axis, stride] : llvm::enumerate(view.strides))
+          if (view.dynamicStrides[axis])
+            parameter(stride);
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
@@ -1021,7 +1027,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
           dimension != roleDimensions.lookup("lane_0"))
         emitParameter(dimension + ": tl.constexpr");
     for (ABIView &view : views)
-      emitParameter(view.strides[0]);
+      if (view.dynamicStrides[0])
+        emitParameter(view.strides[0]);
     for (StringRef parameter :
          {"n_rows", "n_cols", "BLOCK_SIZE: tl.constexpr",
           "ROW_OCCUPANCY: tl.constexpr", "PIPELINE_STAGES: tl.constexpr"})
@@ -1063,8 +1070,9 @@ LogicalResult SourceEmitter::emitKernelHeader() {
                                    : ": tl.constexpr"));
   }
   for (ABIView &view : views)
-    for (const std::string &stride : view.strides)
-      emitParameter(stride);
+    for (auto [axis, stride] : llvm::enumerate(view.strides))
+      if (view.dynamicStrides[axis])
+        emitParameter(stride);
   if (searchIndex.autotune)
     for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
       emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
@@ -1285,7 +1293,8 @@ LogicalResult SourceEmitter::emitWrapper() {
         argument(dimension);
       for (ABIView &view : views)
         for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis)
-          argument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
+          if (view.dynamicStrides[axis])
+            argument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
       for (plan::StageOp binding : planIndex.stages)
         for (int64_t valueID : binding.getOutputs())
           argument(workspaceNames.lookup(kernel.values.lookup(valueID)));
@@ -1457,7 +1466,8 @@ LogicalResult SourceEmitter::emitWrapper() {
             dimension != roleDimensions.lookup("lane_0"))
           emitArgument(dimension);
       for (ABIView &view : views)
-        emitArgument(view.argument->name + ".stride(0)");
+        if (view.dynamicStrides[0])
+          emitArgument(view.argument->name + ".stride(0)");
       emitArgument("n_rows");
       emitArgument("n_cols");
       output << ", BLOCK_SIZE=" << *rowTile;
@@ -1675,7 +1685,8 @@ LogicalResult SourceEmitter::emitWrapper() {
       emitArgument(dimension);
     for (ABIView &view : views)
       for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis)
-        emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
+        if (view.dynamicStrides[axis])
+          emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
   };
   if (configureRowVector && hasInOut) {
     output << "    row_tuning_key = (";

@@ -1944,7 +1944,16 @@ def _run_layer_norm_backward(
     db = torch.empty_like(dw)
     rows_call = prepare_kernel_call(
         rows_artifact,
-        (x, dy, weight, mean, rstd, dw_partial, db_partial, inverse_features),
+        (
+            x,
+            dy,
+            weight,
+            mean,
+            rstd,
+            dw_partial,
+            db_partial,
+            inverse_features,
+        ),
         dx,
     )
     reduce_call = prepare_kernel_call(
@@ -1954,8 +1963,7 @@ def _run_layer_norm_backward(
     )
 
     def generated_pipeline() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        dw_partial.zero_()
-        db_partial.zero_()
+        torch._foreach_zero_((dw_partial, db_partial))
         rows_call()
         reduce_call()
         return dx, dw, db

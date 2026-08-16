@@ -5,18 +5,20 @@ import intent.language as I
 ROWS = 4096
 FEATURES = 4096
 PARTIAL_GROUPS = 128
+MATRIX_STRIDES = I.constraints(strides=(None, 1))
+VECTOR_STRIDES = I.constraints(strides=(1,))
 
 
 @intent.kernel
 def layer_norm_backward_rows(
-    x: I.In[I.bf16, ("M", "N")],
-    dy: I.In[I.bf16, ("M", "N")],
-    weight: I.In[I.bf16, ("N",)],
-    mean: I.In[I.f32, ("M",)],
-    rstd: I.In[I.f32, ("M",)],
-    dx: I.Out[I.bf16, ("M", "N")],
-    dw_partial: I.InOut[I.f32, ("G", "N")],
-    db_partial: I.InOut[I.f32, ("G", "N")],
+    x: I.In[I.bf16, ("M", "N"), MATRIX_STRIDES],
+    dy: I.In[I.bf16, ("M", "N"), MATRIX_STRIDES],
+    weight: I.In[I.bf16, ("N",), VECTOR_STRIDES],
+    mean: I.In[I.f32, ("M",), VECTOR_STRIDES],
+    rstd: I.In[I.f32, ("M",), VECTOR_STRIDES],
+    dx: I.Out[I.bf16, ("M", "N"), MATRIX_STRIDES],
+    dw_partial: I.InOut[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    db_partial: I.InOut[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
     inverse_features: I.f32,
 ):
     M, N = x.shape
@@ -46,26 +48,28 @@ def layer_norm_backward_rows(
             I.bf16,
         )
         group = row % PARTIAL_GROUPS
+        dw_value = dy_values * normalized
+        db_value = dy_values
         I.scatter_reduce(
             dw_partial,
             index=(group, columns),
-            value=dy_values * normalized,
+            value=dw_value,
             combine=I.add,
         )
         I.scatter_reduce(
             db_partial,
             index=(group, columns),
-            value=dy_values,
+            value=db_value,
             combine=I.add,
         )
 
 
 @intent.kernel
 def layer_norm_backward_reduce(
-    dw_partial: I.In[I.f32, ("G", "N")],
-    db_partial: I.In[I.f32, ("G", "N")],
-    dw: I.Out[I.f32, ("N",)],
-    db: I.Out[I.f32, ("N",)],
+    dw_partial: I.In[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    db_partial: I.In[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    dw: I.Out[I.f32, ("N",), VECTOR_STRIDES],
+    db: I.Out[I.f32, ("N",), VECTOR_STRIDES],
 ):
     G, N = dw_partial.shape
     rows = I.domain(0, G)

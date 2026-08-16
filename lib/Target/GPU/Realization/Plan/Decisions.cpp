@@ -442,6 +442,8 @@ assignAxes(const target::KernelFacts &facts) {
       appendRole(ensure(entry.second.axis).roles, "ordered");
   for (Operation *domain : facts.contractionDomains)
     appendRole(ensure(domain).roles, "reduction");
+  for (Operation *domain : facts.reductionDomains)
+    appendRole(ensure(domain).roles, "reduction");
   for (Operation *domain : facts.vectorDomains)
     appendRole(ensure(domain).roles, "lane");
   for (const auto &entry : facts.raggedRelations)
@@ -561,6 +563,28 @@ assignAxes(const target::KernelFacts &facts) {
     std::string packedTile = choice.packedLane
                                  ? indexedTile("lane_pack", laneTile)
                                  : std::string();
+    auto nextLaneTile = [&]() {
+      auto extent = facts.staticDomainExtents.find(choice.domain);
+      auto bounds = facts.staticDomainBounds.find(choice.domain);
+      std::optional<int64_t> staticExtent =
+          extent != facts.staticDomainExtents.end()
+              ? std::optional<int64_t>(extent->second)
+          : bounds != facts.staticDomainBounds.end()
+              ? std::optional<int64_t>(bounds->second.second -
+                                       bounds->second.first)
+              : std::nullopt;
+      if (!staticExtent)
+        return indexedTile("row_vector", laneTile);
+      int64_t physical = 1;
+      while (physical < *staticExtent)
+        physical *= 2;
+      return "fixed_" + std::to_string(physical);
+    };
+    std::optional<std::string> explicitReductionLaneTile;
+    if (!choice.packedLane && hasRole(choice.roles, "lane") &&
+        facts.reductionDomains.contains(choice.domain) &&
+        !hasRole(choice.roles, "ordered"))
+      explicitReductionLaneTile = nextLaneTile();
     if (choice.programOrder) {
       std::string tile;
       if (!choice.tiled) {
@@ -613,29 +637,15 @@ assignAxes(const target::KernelFacts &facts) {
                innerExtent
                    ? "fixed_" + std::to_string(*innerExtent)
                    : traversal ? traversal->tile
+                   : explicitReductionLaneTile ? *explicitReductionLaneTile
                                : indexedTile("reduction", reductionTile));
     }
     if (choice.packedLane) {
       addRange(choice, "lane", 0, packedTile);
     } else if (hasRole(choice.roles, "lane")) {
-      auto extent = facts.staticDomainExtents.find(choice.domain);
-      auto bounds = facts.staticDomainBounds.find(choice.domain);
-      std::optional<int64_t> staticExtent =
-          extent != facts.staticDomainExtents.end()
-              ? std::optional<int64_t>(extent->second)
-          : bounds != facts.staticDomainBounds.end()
-              ? std::optional<int64_t>(bounds->second.second -
-                                       bounds->second.first)
-              : std::nullopt;
-      if (staticExtent) {
-        int64_t physical = 1;
-        while (physical < *staticExtent)
-          physical *= 2;
-        addRange(choice, "lane", 0,
-                 "fixed_" + std::to_string(physical));
-      } else {
-        addRange(choice, "lane", 0, indexedTile("row_vector", laneTile));
-      }
+      addRange(choice, "lane", 0,
+               explicitReductionLaneTile ? *explicitReductionLaneTile
+                                         : nextLaneTile());
     }
     if (choice.ranges.empty())
       addRange(choice, "traversal", 0, "one");

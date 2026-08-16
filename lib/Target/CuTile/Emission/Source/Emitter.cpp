@@ -280,6 +280,8 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (!planIndex.ragged.empty() && failed(prepareRaggedMetadata()))
     return failure();
+  if (failed(resolvePhysicalBindings()))
+    return failure();
   if (searchIndex.autotune) {
     bool hasIndexedRagged = llvm::any_of(
         raggedRuntimes,
@@ -287,16 +289,23 @@ LogicalResult SourceEmitter::prepare() {
     bool hasGuardedGather = false;
     kernel.entry.walk([&](Operation *operation) {
       StringRef name = operation->getName().getStringRef();
-      hasGuardedGather |= name == "intent.gather" || name == "intent.members";
+      auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
+      plan::PointwiseOp pointwise =
+          node ? planIndex.pointwise.lookup(node.getInt()) : plan::PointwiseOp();
+      bool stagedIndirect =
+          name == "intent.gather" && !planIndex.stages.empty() && pointwise &&
+          pointwise.getLowering() == "ct.indirect_gather";
+      bool orderedIndexedMembers =
+          name == "intent.members" && hasIndexedRagged && pointwise &&
+          pointwise.getLowering() == "ct.members" &&
+          !planIndex.components.orderedRaggedAxes.empty();
+      hasGuardedGather |= stagedIndirect || orderedIndexedMembers;
     });
-    if (hasGuardedGather &&
-        (hasIndexedRagged || !planIndex.stages.empty())) {
+    if (hasGuardedGather) {
       tuneGatherSpelling = true;
       tuningParameters.emplace_back("GATHER_SPELLING", "gather_spelling");
     }
   }
-  if (failed(resolvePhysicalBindings()))
-    return failure();
   if (!searchSpace && planIndex.stages.empty() &&
       planIndex.components.reusedAxes.empty() &&
       !planIndex.program.getPersistent()) {

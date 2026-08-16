@@ -1234,8 +1234,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       failed(physicalFill))
     return failure();
   std::string result = makeResultName(operation, 0);
-  if (*validity != "True")
-    *mask = "(" + *mask + ") & (" + *validity + ")";
+  if (*validity != "True" && *validity != *mask)
+    *mask = *mask == "True" ? *validity
+                            : "(" + *mask + ") & (" + *validity + ")";
   if (loadFill == "none") {
     line(result + " = tl.load(" + *pointers + ")");
   } else {
@@ -1417,10 +1418,10 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
         "built-in Triton reduction components do not match results");
   for (unsigned component = 0; component < operation.getNumResults(); ++component) {
     std::string result = makeResultName(operation, component);
-  if (binding.getLowering() == "tl.reduce_all")
+    if (binding.getLowering() == "tl.reduce_all")
       line(result + " = ~tl.reduce_or(~(" + operands[component] + "), axis=" +
          std::to_string(binding.getAxis()) + ")");
-  else
+    else
       line(result + " = " + binding.getLowering().str() + "(" + operands[component] +
          ", axis=" + std::to_string(binding.getAxis()) + ")");
     bindResult(operation, component, result);

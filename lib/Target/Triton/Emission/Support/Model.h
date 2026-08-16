@@ -76,6 +76,7 @@ struct ABIView {
   mlir::RankedTensorType tensor;
   std::string pointer;
   llvm::SmallVector<std::string> strides;
+  llvm::SmallVector<bool> dynamicStrides;
   llvm::SmallVector<std::string> shape;
 };
 

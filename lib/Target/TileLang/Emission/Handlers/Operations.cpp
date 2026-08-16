@@ -1109,8 +1109,6 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return failure();
   StringRef zeroFill = isa<IntegerType, IndexType>(resultElementType) ? "0"
                                                                       : "0.0";
-  if (failed(physicalFill))
-    return failure();
   auto accessRanges =
       target::emission::accessRangesForTransfer(planIndex, *node);
   if (accessRanges.size() > 1)

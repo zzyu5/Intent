@@ -22,6 +22,19 @@
 
 namespace intent::target::emission {
 
+inline std::optional<int64_t> staticViewStride(
+    const target::ABIArgument &argument, unsigned axis) {
+  auto constraints = argument.metadata.getAs<mlir::DictionaryAttr>("constraints");
+  auto strides = constraints
+                     ? mlir::dyn_cast_or_null<mlir::ArrayAttr>(
+                           constraints.get("strides"))
+                     : mlir::ArrayAttr();
+  if (!strides || axis >= strides.size())
+    return std::nullopt;
+  auto value = mlir::dyn_cast<mlir::IntegerAttr>(strides[axis]);
+  return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+}
+
 inline bool hasNonReplayableEffect(mlir::Operation *root) {
   bool found = false;
   root->walk([&](mlir::Operation *operation) {
