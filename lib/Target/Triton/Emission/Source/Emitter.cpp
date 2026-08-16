@@ -1836,46 +1836,14 @@ FailureOr<plan::AxisOp> SourceEmitter::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
-  StringRef name = domain.getName().getStringRef();
-  if (name == "intent.ragged_outer") {
-    Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation &&
-                                (relation->getNumOperands() == 3 ||
-                                 relation->getNumOperands() == 4)
-                            ? relation->getOperand(0).getDefiningOp()
-                            : nullptr;
-    if (!source)
-      return failure();
-    return dimensionName(*source);
-  }
-  if (name == "intent.ragged_member") {
-    Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation &&
-                                (relation->getNumOperands() == 3 ||
-                                 relation->getNumOperands() == 4)
-                            ? relation->getOperand(1).getDefiningOp()
-                            : nullptr;
-    if (!source)
-      return failure();
-    return dimensionName(*source);
-  }
-  if (domain.getNumOperands() < 2)
-    return failure();
-  Operation *dim = domain.getOperand(1).getDefiningOp();
-  auto constant = dim ? dim->getAttrOfType<IntegerAttr>("intent.value")
-                      : IntegerAttr();
-  if (dim && dim->getName().getStringRef() == "intent.constant" && constant &&
-      constant.getInt() > 0)
-    return std::to_string(constant.getInt());
-  auto axis = dim ? dim->getAttrOfType<IntegerAttr>("intent.axis") : IntegerAttr();
-  if (!dim || dim->getName().getStringRef() != "intent.dim" || !axis ||
-      dim->getNumOperands() != 1)
-    return failure();
-  FailureOr<ABIView *> view = lookupView(dim->getOperand(0), domain);
-  if (failed(view) || axis.getInt() < 0 ||
-      static_cast<size_t>(axis.getInt()) >= (*view)->shape.size())
-    return failure();
-  return (*view)->shape[axis.getInt()];
+  return target::emission::logicalDomainExtent(
+      domain, [&](Value value,
+                  Operation &consumer) -> FailureOr<ArrayRef<std::string>> {
+        FailureOr<ABIView *> view = lookupView(value, consumer);
+        if (failed(view))
+          return failure();
+        return ArrayRef<std::string>((*view)->shape);
+      });
 }
 
 FailureOr<std::string>

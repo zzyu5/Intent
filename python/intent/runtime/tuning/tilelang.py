@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import product
 from types import SimpleNamespace
 
 DEFAULT_NUM_STAGES = 1
@@ -64,6 +65,7 @@ def autotune_configurations(
     parameter_map: dict[str, str],
     *,
     equal_role_groups: tuple[tuple[str, ...], ...] = (),
+    extra_parameters: dict[str, tuple[int, ...]] | None = None,
 ) -> list[dict[str, int]]:
     roles = frozenset(parameter_map.values())
     for role in roles:
@@ -180,7 +182,7 @@ def autotune_configurations(
         raise NotImplementedError(
             "TileLang has no legal autotuning configuration for the requested role constraints"
         )
-    return [
+    configurations = [
         _configuration(
             parameter_map,
             values,
@@ -188,6 +190,17 @@ def autotune_configurations(
             threads=threads,
         )
         for values, num_stages, threads in choices
+    ]
+    if not extra_parameters:
+        return configurations
+    names = tuple(extra_parameters)
+    candidates = tuple(extra_parameters[name] for name in names)
+    if any(not values for values in candidates):
+        raise ValueError("TileLang extra tuner parameters require candidates")
+    return [
+        {**configuration, **dict(zip(names, values))}
+        for configuration in configurations
+        for values in product(*candidates)
     ]
 
 

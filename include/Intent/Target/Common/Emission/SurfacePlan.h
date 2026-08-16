@@ -32,6 +32,53 @@ inline bool hasNonReplayableEffect(mlir::Operation *root) {
   return found;
 }
 
+template <typename LookupShape>
+inline mlir::FailureOr<std::string>
+logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
+  llvm::StringRef name = domain.getName().getStringRef();
+  if (name == "intent.ragged_outer" || name == "intent.ragged_member") {
+    mlir::Operation *relation =
+        domain.getNumOperands() == 1
+            ? domain.getOperand(0).getDefiningOp()
+            : nullptr;
+    unsigned sourceOperand = name == "intent.ragged_outer" ? 0 : 1;
+    mlir::Operation *source =
+        relation && (relation->getNumOperands() == 3 ||
+                     relation->getNumOperands() == 4)
+            ? relation->getOperand(sourceOperand).getDefiningOp()
+            : nullptr;
+    if (!source)
+      return domain.emitOpError(
+          "has no canonical ragged source-domain extent");
+    return logicalDomainExtent(*source, lookupShape);
+  }
+  if (domain.getNumOperands() < 2)
+    return domain.emitOpError("has no canonical extent operand");
+  mlir::Operation *dimension = domain.getOperand(1).getDefiningOp();
+  auto constant =
+      dimension
+          ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.value")
+          : mlir::IntegerAttr();
+  if (dimension &&
+      dimension->getName().getStringRef() == "intent.constant" && constant &&
+      constant.getInt() > 0)
+    return std::to_string(constant.getInt());
+  auto axis =
+      dimension
+          ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.axis")
+          : mlir::IntegerAttr();
+  if (!dimension ||
+      dimension->getName().getStringRef() != "intent.dim" || !axis ||
+      dimension->getNumOperands() != 1)
+    return domain.emitOpError("has no canonical ABI dimension source");
+  mlir::FailureOr<llvm::ArrayRef<std::string>> shape =
+      lookupShape(dimension->getOperand(0), domain);
+  if (mlir::failed(shape) || axis.getInt() < 0 ||
+      static_cast<size_t>(axis.getInt()) >= shape->size())
+    return domain.emitOpError("references an invalid ABI dimension axis");
+  return (*shape)[axis.getInt()];
+}
+
 inline mlir::FailureOr<std::string>
 reductionRole(mlir::Operation &operation) {
   auto builtin =

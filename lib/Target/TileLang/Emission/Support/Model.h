@@ -182,6 +182,7 @@ private:
   mlir::FailureOr<plan::AxisOp> resolveAxis(mlir::Value indexedValue,
                                            mlir::Operation &consumer);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
+  bool usesMatrixContraction() const;
   std::string addressIndex(llvm::StringRef expression) const;
   std::string logicalExtent(llvm::StringRef extent) const;
   std::string physicalExtent(llvm::StringRef logicalExtent) const;

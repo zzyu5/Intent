@@ -3095,7 +3095,7 @@ LogicalResult SourceEmitter::emitSparseContract(Operation &operation) {
        addressIndex("k_tile") + " * " + reductionAxis.getTile().str() +
        ", " + addressIndex(columnStart) + "], " + rhs + ")");
   line("T.gemm_sp(" + compressed + ", " + metadata + ", " + rhs + ", " +
-       *accumulator + ", policy=T.GemmWarpPolicy.FullRow)");
+       *accumulator + ", policy=GEMM_WARP_POLICY)");
   --indentation;
   bindResult(operation, 0, *accumulator);
   return success();
@@ -3239,7 +3239,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
          " * " + featureTile + "], " +
          rhs + ")");
     line("T.gemm(" + lhs + ", " + rhs + ", " + result +
-         ", policy=T.GemmWarpPolicy.FullRow)");
+         ", policy=GEMM_WARP_POLICY)");
     --indentation;
     bindResult(operation, 0, result);
     return success();
@@ -3327,7 +3327,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       call += ", transpose_A=True";
     if (orientation->rhsTranspose)
       call += ", transpose_B=True";
-    line(call + ", policy=T.GemmWarpPolicy.FullRow)");
+    line(call + ", policy=GEMM_WARP_POLICY)");
     --indentation;
     bindResult(operation, 0, *result);
     return success();
@@ -3425,7 +3425,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     call += ", transpose_A=True";
   if (orientation->rhsTranspose)
     call += ", transpose_B=True";
-  line(call + ", policy=T.GemmWarpPolicy.FullRow)");
+  line(call + ", policy=GEMM_WARP_POLICY)");
   bindResult(operation, 0, *result);
   return success();
 }
@@ -3508,7 +3508,7 @@ LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
       return failure();
     line("T.clear(" + *result + ")");
     line("T.gemm(" + scaledLhs + ", " + scaledRhs + ", " + *result +
-         ", policy=T.GemmWarpPolicy.FullRow)");
+         ", policy=GEMM_WARP_POLICY)");
     bindResult(operation, 0, *result);
     return success();
   }
@@ -3559,7 +3559,7 @@ LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
     return failure();
   line("T.clear(" + *result + ")");
   line("T.gemm(" + scaledLhs + ", " + scaledRhs + ", " + *result +
-       ", policy=T.GemmWarpPolicy.FullRow)");
+       ", policy=GEMM_WARP_POLICY)");
   bindResult(operation, 0, *result);
   return success();
 }

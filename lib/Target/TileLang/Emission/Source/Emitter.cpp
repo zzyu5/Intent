@@ -741,6 +741,7 @@ void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {
 
 void SourceEmitter::emitImports() {
   bool tuneRow = !planIndex.components.reusedAxes.empty() || tuneRowLaunch;
+  bool tuneGemmWarpPolicy = searchSpace && usesMatrixContraction();
   output << "import torch\n";
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
@@ -772,6 +773,8 @@ void SourceEmitter::emitImports() {
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
     if (programM && programN && planIndex.requiresSymmetricProgramTiles)
       output << ", equal_role_groups=(('program_m', 'program_n'),)";
+    if (tuneGemmWarpPolicy)
+      output << ", extra_parameters={'gemm_warp_policy': (0, 1, 2)}";
     output << ")\n";
   }
   if (tuneRow)
@@ -818,6 +821,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     }
     for (int64_t axis : planIndex.components.orderedRaggedProgramAxes)
       parameter("MAX_SEQUENCE_LENGTH_" + std::to_string(axis));
+    if (usesMatrixContraction())
+      parameter("gemm_warp_policy=0");
     if (!planIndex.components.reusedAxes.empty()) {
       parameter("TILE_SIZE");
       parameter("num_stages=DEFAULT_NUM_STAGES");
@@ -941,6 +946,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       stream << "    " << physicalExtent << " = 1 << (" << logicalExtent
              << " - 1).bit_length()\n";
+    if (usesMatrixContraction())
+      stream << "    GEMM_WARP_POLICY = (T.GemmWarpPolicy.FullRow, "
+                "T.GemmWarpPolicy.Square, T.GemmWarpPolicy.FullCol)"
+                "[gemm_warp_policy]\n";
   };
 
   if (!planIndex.stages.empty()) {
@@ -1809,47 +1818,18 @@ FailureOr<plan::AxisOp> SourceEmitter::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> SourceEmitter::dimensionName(Operation &domain) {
-  StringRef name = domain.getName().getStringRef();
-  if (name == "intent.ragged_outer") {
-    Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation &&
-                                (relation->getNumOperands() == 3 ||
-                                 relation->getNumOperands() == 4)
-                            ? relation->getOperand(0).getDefiningOp()
-                            : nullptr;
-    if (!source)
-      return failure();
-    return dimensionName(*source);
-  }
-  if (name == "intent.ragged_member") {
-    Operation *relation = domain.getOperand(0).getDefiningOp();
-    Operation *source = relation &&
-                                (relation->getNumOperands() == 3 ||
-                                 relation->getNumOperands() == 4)
-                            ? relation->getOperand(1).getDefiningOp()
-                            : nullptr;
-    if (!source)
-      return failure();
-    return dimensionName(*source);
-  }
-  if (domain.getNumOperands() < 2)
-    return failure();
-  Operation *dim = domain.getOperand(1).getDefiningOp();
-  auto constant = dim ? dim->getAttrOfType<IntegerAttr>("intent.value")
-                      : IntegerAttr();
-  if (dim && dim->getName().getStringRef() == "intent.constant" && constant &&
-      constant.getInt() > 0)
-    return std::to_string(constant.getInt());
-  auto axis = dim ? dim->getAttrOfType<IntegerAttr>("intent.axis")
-                  : IntegerAttr();
-  if (!dim || dim->getName().getStringRef() != "intent.dim" || !axis ||
-      dim->getNumOperands() != 1)
-    return failure();
-  FailureOr<ABIView *> view = lookupView(dim->getOperand(0), domain);
-  if (failed(view) || axis.getInt() < 0 ||
-      static_cast<size_t>(axis.getInt()) >= (*view)->shape.size())
-    return failure();
-  return (*view)->shape[axis.getInt()];
+  return target::emission::logicalDomainExtent(
+      domain, [&](Value value,
+                  Operation &consumer) -> FailureOr<ArrayRef<std::string>> {
+        FailureOr<ABIView *> view = lookupView(value, consumer);
+        if (failed(view))
+          return failure();
+        return ArrayRef<std::string>((*view)->shape);
+      });
+}
+
+bool SourceEmitter::usesMatrixContraction() const {
+  return !planIndex.contracts.empty() || !planIndex.sparseContracts.empty();
 }
 
 std::string SourceEmitter::addressIndex(StringRef expression) const {
