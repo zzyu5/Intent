@@ -5,6 +5,8 @@
 #include "Intent/Target/Common/Emission/Combiner.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <numeric>
+
 using namespace mlir;
 
 namespace intent::tilelang::emission {
@@ -278,13 +280,6 @@ indexRealization(intent::plan::RealizationOp realization,
       return failure();
     }
     index.boundaries[value.getNode()] = binding;
-  }
-  for (auto &entry : index.boundaries) {
-    Operation *operation = kernel.nodes.lookup(entry.first);
-    entry.second.defer =
-        entry.second.defer ||
-        (operation && target::emission::deferSharedContractionTransfer(
-                          index, *operation, entry.second.getResultSpace()));
   }
   if (!index.target || !index.program) {
     realization.emitOpError("lacks TileLang target or program choices");
@@ -773,6 +768,27 @@ void SourceEmitter::emitImports() {
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
     if (programM && programN && planIndex.requiresSymmetricProgramTiles)
       output << ", equal_role_groups=(('program_m', 'program_n'),)";
+    llvm::StringMap<int64_t> roleDivisors;
+    for (const auto &entry : planIndex.axes) {
+      for (const target::emission::RangeBinding &range : entry.second.ranges) {
+        if (!range.isCompact())
+          continue;
+        int64_t &divisor = roleDivisors[range.getTileRole()];
+        divisor = divisor == 0 ? range.getDivisor()
+                               : std::lcm(divisor, range.getDivisor());
+      }
+    }
+    if (!roleDivisors.empty()) {
+      output << ", role_divisors={";
+      bool first = true;
+      for (const auto &entry : roleDivisors) {
+        if (!first)
+          output << ", ";
+        output << "'" << entry.getKey() << "': " << entry.getValue();
+        first = false;
+      }
+      output << "}";
+    }
     if (tuneGemmWarpPolicy)
       output << ", extra_parameters={'gemm_warp_policy': (0, 1, 2)}";
     output << ")\n";
@@ -1849,13 +1865,20 @@ std::string SourceEmitter::logicalExtent(StringRef extent) const {
 
 FailureOr<std::string>
 SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "physical transfer extent");
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  if (failed(relation) || failed(view))
+  plan::BoundaryOp boundary =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  if (failed(node) || failed(relation) || failed(view) || !boundary)
     return failure();
+  ArrayRef<int64_t> neutralized = boundary.getConsumerNeutralized()
+                                      ? boundary.getValidityTensorAxes()
+                                      : ArrayRef<int64_t>();
   return target::emission::transferPhysicalExtentFill(
-      planIndex, *relation, (*view)->shape, operation);
+      planIndex, *relation, (*view)->shape, operation, neutralized);
 }
 
 FailureOr<std::string> SourceEmitter::structuredIndexExpression(

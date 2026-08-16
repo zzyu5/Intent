@@ -649,6 +649,40 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     return definition &&
            definition->getName().getStringRef() == "intent.view_load";
   };
+  auto hasExactlyOneSharedPhysicalReductionAxis =
+      [&](Operation &contract) -> FailureOr<bool> {
+    if (contract.getNumOperands() < 2)
+      return false;
+    Operation *lhs = contract.getOperand(0).getDefiningOp();
+    Operation *rhs = contract.getOperand(1).getDefiningOp();
+    if (!lhs || !rhs)
+      return false;
+    auto lhsBoundary = facts.boundaryDomains.find(lhs);
+    auto rhsBoundary = facts.boundaryDomains.find(rhs);
+    if (lhsBoundary == facts.boundaryDomains.end() ||
+        rhsBoundary == facts.boundaryDomains.end())
+      return false;
+    ArrayRef<Operation *> lhsDomains = lhsBoundary->second;
+    ArrayRef<Operation *> rhsDomains = rhsBoundary->second;
+    unsigned candidates = 0;
+    for (intent::plan::AxisOp axis : decisions.axes) {
+      bool reduction = llvm::any_of(axis.getRoles(), [](Attribute role) {
+        auto name = dyn_cast<StringAttr>(role);
+        return name && name.getValue() == "reduction";
+      });
+      if (!reduction)
+        continue;
+      auto containsAxis = [&](ArrayRef<Operation *> domains) {
+        return llvm::any_of(domains, [&](Operation *domain) {
+          auto node = domain->getAttrOfType<IntegerAttr>("intent.node");
+          return node && node.getInt() == static_cast<int64_t>(axis.getNode());
+        });
+      };
+      if (containsAxis(lhsDomains) && containsAxis(rhsDomains))
+        ++candidates;
+    }
+    return candidates == 1;
+  };
   auto isContractionDerived = [](Value value) {
     llvm::DenseSet<Value> visited;
     std::function<bool(Value)> reachesContraction = [&](Value current) {
@@ -681,7 +715,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     });
   };
 
-  auto bindTransfer = [&, sharedContractOperand](Operation &operation) -> LogicalResult {
+  auto bindTransfer = [&, sharedContractOperand, isStagedContract,
+                       isDirectViewLoad,
+                       hasExactlyOneSharedPhysicalReductionAxis](
+                          Operation &operation) -> LogicalResult {
     FailureOr<int64_t> node = target::getNodeID(operation, "transfer binding");
     if (failed(node))
       return failure();
@@ -770,11 +807,30 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                               ? StringRef("private_fragment")
                               : StringRef("private_scalar");
     }
+    bool deferToContract = false;
+    if (load && sharedOperand && soleUser) {
+      StringRef consumer = soleUser->getName().getStringRef();
+      if (consumer == "intent.sparse_contract" || isStagedContract(*soleUser)) {
+        deferToContract = true;
+      } else if (consumer == "intent.contract" &&
+                 llvm::all_of(soleUser->getOperands(), isDirectViewLoad)) {
+        FailureOr<bool> sharedPhysicalReduction =
+            hasExactlyOneSharedPhysicalReductionAxis(*soleUser);
+        if (failed(sharedPhysicalReduction))
+          return failure();
+        deferToContract = *sharedPhysicalReduction;
+      }
+    }
+    StringRef materialization =
+        deferToContract ? StringRef("deferred_to_contract")
+                        : StringRef("direct");
     target::TensorIndexingKind tensorIndexing =
         target::tensorIndexingKind(operation, facts);
     StringRef tensorIndexingName =
         tensorIndexing == target::TensorIndexingKind::dataDependent
             ? "data_dependent"
+        : tensorIndexing == target::TensorIndexingKind::compact
+            ? "compact"
         : tensorIndexing == target::TensorIndexingKind::structured
             ? "structured"
             : "none";
@@ -785,6 +841,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         builder.getDenseI64ArrayAttr(validityDomainNodes),
         string(builder, fill),
         builder.getBoolAttr(false),
+        string(builder, materialization),
         string(builder, tensorIndexingName),
         string(builder, resultSpace));
     return success();

@@ -94,6 +94,29 @@ FailureOr<std::string> sourceDimensionSymbol(Operation &domain,
   return symbol.getValue().str();
 }
 
+FailureOr<std::string>
+sourceViewDimensionSymbol(Operation &transfer, unsigned sourceAxis,
+                          const target::KernelFacts &facts) {
+  if (transfer.getNumOperands() == 0)
+    return transfer.emitOpError("has no source view for its access range");
+  Value source = transfer.getOperand(0);
+  auto argument = llvm::find_if(facts.kernel.abi.arguments,
+                                [&](const target::ABIArgument &candidate) {
+                                  return candidate.value == source;
+                                });
+  if (argument == facts.kernel.abi.arguments.end())
+    return transfer.emitOpError(
+        "does not refer to a canonical source-view ABI argument");
+  auto shape = argument->metadata.getAs<ArrayAttr>("shape");
+  auto symbol = shape && sourceAxis < shape.size()
+                    ? dyn_cast<StringAttr>(shape[sourceAxis])
+                    : StringAttr();
+  if (!symbol || symbol.getValue().empty())
+    return transfer.emitOpError(
+        "does not expose its access-range source dimension");
+  return symbol.getValue().str();
+}
+
 bool dependsOn(Value value, Operation &producer,
                const target::KernelModel &kernel,
                llvm::DenseSet<Value> &visited) {
@@ -1025,7 +1048,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
           choice.domain->getLoc(), i64(builder, *domainNode),
           string(builder, range.purpose), i64(builder, range.level),
           string(builder, range.tile), string(builder, *logicalExtent),
-          IntegerAttr(), IntegerAttr()));
+          IntegerAttr(), IntegerAttr(), IntegerAttr(), IntegerAttr()));
   }
 
   SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
@@ -1104,27 +1127,39 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     auto choice = llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
       return candidate.domain == access.axis;
     });
-    const AxisChoice::RangeChoice *ownership =
-        choice == assignments->axes.end()
-            ? nullptr
-            : findRange(*choice, "ownership");
+    const AxisChoice::RangeChoice *ownership = nullptr;
+    if (choice != assignments->axes.end()) {
+      ownership = findRange(*choice, "ownership");
+      if (!ownership)
+        ownership = findRange(*choice, "traversal");
+      if (!ownership)
+        ownership = findRange(*choice, "reduction");
+      if (!ownership)
+        ownership = findRange(*choice, "lane");
+    }
     FailureOr<int64_t> axisNode =
         node(*access.axis, "access-range axis binding");
     FailureOr<int64_t> transferNode =
         node(*access.transfer, "access-range transfer binding");
-    FailureOr<std::string> logicalExtent =
-        sourceDimensionSymbol(*access.axis, facts);
+    FailureOr<std::string> sourceExtent =
+        sourceViewDimensionSymbol(*access.transfer, access.sourceAxis, facts);
     if (!ownership || failed(axisNode) || failed(transferNode) ||
-        failed(logicalExtent))
+        failed(sourceExtent))
       return access.transfer->emitOpError(
           "has no ownership range for its affine access footprint");
+    IntegerAttr divisor = access.divisor > 1
+                              ? i64(builder, access.divisor)
+                              : IntegerAttr();
+    IntegerAttr offset = access.divisor > 1
+                             ? i64(builder, access.offset)
+                             : IntegerAttr();
     decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(
         access.transfer->getLoc(), i64(builder, *axisNode),
         string(builder, "access"), i64(builder, 0),
         string(builder, ownership->tile),
-        string(builder, *logicalExtent),
+        string(builder, *sourceExtent),
         i64(builder, *transferNode),
-        i64(builder, access.sourceAxis)));
+        i64(builder, access.sourceAxis), divisor, offset));
   }
 
   FailureOr<SmallVector<StageDecision, 0>> stages =

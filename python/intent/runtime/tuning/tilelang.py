@@ -65,6 +65,7 @@ def autotune_configurations(
     parameter_map: dict[str, str],
     *,
     equal_role_groups: tuple[tuple[str, ...], ...] = (),
+    role_divisors: dict[str, int] | None = None,
     extra_parameters: dict[str, tuple[int, ...]] | None = None,
 ) -> list[dict[str, int]]:
     roles = frozenset(parameter_map.values())
@@ -74,6 +75,12 @@ def autotune_configurations(
         if len(group) < 2 or not frozenset(group).issubset(roles):
             raise ValueError(
                 "TileLang equal-role group must contain at least two configured roles"
+            )
+    role_divisors = dict(role_divisors or {})
+    for role, divisor in role_divisors.items():
+        if role not in roles or divisor <= 1:
+            raise ValueError(
+                "TileLang role divisibility must constrain a configured role by a divisor greater than one"
             )
     joint_program_profiles = (
         (
@@ -178,6 +185,8 @@ def autotune_configurations(
             len({values[role] for role in group}) != 1
             for group in equal_role_groups
         ):
+            continue
+        if any(values[role] % divisor != 0 for role, divisor in role_divisors.items()):
             continue
         key = (tuple(sorted(values.items())), num_stages, threads)
         if key not in seen:

@@ -83,11 +83,14 @@ struct AccessRangeFact {
   mlir::Operation *transfer = nullptr;
   mlir::Operation *axis = nullptr;
   unsigned sourceAxis = 0;
+  int64_t divisor = 1;
+  int64_t offset = 0;
 };
 
 enum class TensorIndexingKind {
   none,
   structured,
+  compact,
   dataDependent,
 };
 

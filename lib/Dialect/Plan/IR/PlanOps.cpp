@@ -150,7 +150,16 @@ LogicalResult RangeOp::verify() {
                                   "source view axis")))
       return emitOpError(
           "access ranges require a transfer node and source view axis");
-  } else if (getTransferNodeAttr() || getSourceAxisAttr()) {
+    if (getDivisorAttr() && getDivisorAttr().getInt() <= 1)
+      return emitOpError("compact access divisor must be greater than one");
+    if (getOffsetAttr() && getOffsetAttr().getInt() < 0)
+      return emitOpError("compact access offset must be non-negative");
+    if (static_cast<bool>(getDivisorAttr()) !=
+        static_cast<bool>(getOffsetAttr()))
+      return emitOpError(
+          "compact access divisor and offset must be present together");
+  } else if (getTransferNodeAttr() || getSourceAxisAttr() ||
+             getDivisorAttr() || getOffsetAttr()) {
     return emitOpError(
         "non-access ranges cannot carry transfer-relative bindings");
   }
@@ -244,7 +253,11 @@ LogicalResult TransferOp::verify() {
        getResultSpace() == "none"))
     return emitOpError(
         "consumer-neutralized transfer requires a bounded load with a fill");
+  if (getMaterialization() != "direct" &&
+      getMaterialization() != "deferred_to_contract")
+    return emitOpError("contains an unsupported transfer materialization");
   if (getTensorIndexing() != "none" && getTensorIndexing() != "structured" &&
+      getTensorIndexing() != "compact" &&
       getTensorIndexing() != "data_dependent")
     return emitOpError("contains an unsupported tensor-indexing class");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
@@ -544,9 +557,12 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       return range.emitOpError("references an unbound logical axis");
     StringRef purpose = range.getPurpose();
     if (purpose == "access") {
-      if (!axisHasRole(axis->second, "parallel"))
+      bool compactStream = range.getDivisorAttr() &&
+                           (axisHasRole(axis->second, "ordered") ||
+                            axisHasRole(axis->second, "reduction"));
+      if (!axisHasRole(axis->second, "parallel") && !compactStream)
         return range.emitOpError(
-            "access footprint must be anchored to a parallel ownership axis");
+            "access footprint has no compatible physical source axis");
       if (!transfers.contains(range.getTransferNodeAttr().getInt()))
         return range.emitOpError("references an unbound transfer operation");
       continue;

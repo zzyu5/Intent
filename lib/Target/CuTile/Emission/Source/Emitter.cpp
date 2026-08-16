@@ -218,12 +218,6 @@ indexRealization(intent::plan::RealizationOp realization,
         *derivedScalar;
     index.boundaries[value.getNode()] = binding;
   }
-  for (auto &entry : index.boundaries) {
-    Operation *operation = kernel.nodes.lookup(entry.first);
-    entry.second.defer =
-        operation && target::emission::deferSharedContractionTransfer(
-                         index, *operation, entry.second.getResultSpace());
-  }
   for (const auto &entry : index.axes) {
     const plan::AxisOp &axis = entry.second;
     if (axis.hasRole("contraction_m") &&
@@ -2038,13 +2032,20 @@ FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {
 
 FailureOr<std::string>
 SourceEmitter::transferPhysicalExtentFill(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "physical transfer extent");
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  if (failed(relation) || failed(view))
+  plan::BoundaryOp boundary =
+      succeeded(node) ? planIndex.boundaries.lookup(*node) : plan::BoundaryOp();
+  if (failed(node) || failed(relation) || failed(view) || !boundary)
     return failure();
+  ArrayRef<int64_t> neutralized = boundary.getConsumerNeutralized()
+                                      ? boundary.getValidityTensorAxes()
+                                      : ArrayRef<int64_t>();
   return target::emission::transferPhysicalExtentFill(
-      planIndex, *relation, (*view)->shape, operation);
+      planIndex, *relation, (*view)->shape, operation, neutralized);
 }
 
 FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,

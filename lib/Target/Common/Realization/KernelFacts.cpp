@@ -193,6 +193,18 @@ std::optional<int64_t> integerConstant(Value value) {
   return literal ? std::optional<int64_t>(literal.getInt()) : std::nullopt;
 }
 
+std::optional<int64_t> integerSplatConstant(Value value) {
+  while (Operation *definition = value.getDefiningOp()) {
+    StringRef name = definition->getName().getStringRef();
+    if ((name != "intent.broadcast" && name != "intent.reshape" &&
+         name != "intent.cast") ||
+        definition->getNumOperands() != 1)
+      break;
+    value = definition->getOperand(0);
+  }
+  return integerConstant(value);
+}
+
 std::optional<AffineIndexExpression>
 affineIndexExpression(Value value, const KernelFacts &facts,
                       Operation &consumer, llvm::DenseSet<Value> &active) {
@@ -565,6 +577,47 @@ bool hasNonnegativeIntegerOperandsImpl(Operation &operation,
   llvm::DenseMap<Value, int64_t> assumed;
   return proveScalarAtLeast(operation.getOperand(0), 0, facts, operation,
                             proofActive, assumed);
+}
+
+struct CompactQuotientExpression {
+  Operation *domain = nullptr;
+  int64_t divisor = 1;
+  int64_t offset = 0;
+};
+
+std::optional<CompactQuotientExpression>
+compactQuotientExpression(Value value, const KernelFacts &facts,
+                          Operation &consumer) {
+  Operation *definition = value.getDefiningOp();
+  while (definition &&
+         (definition->getName().getStringRef() == "intent.broadcast" ||
+          definition->getName().getStringRef() == "intent.reshape" ||
+          definition->getName().getStringRef() == "intent.cast") &&
+         definition->getNumOperands() == 1) {
+    value = definition->getOperand(0);
+    definition = value.getDefiningOp();
+  }
+  if (!definition || definition->getName().getStringRef() != "intent.binary" ||
+      definition->getNumOperands() != 2)
+    return std::nullopt;
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  std::optional<int64_t> divisor =
+      integerSplatConstant(definition->getOperand(1));
+  if (!logical || logical.getValue() != "floor_divide" || !divisor ||
+      *divisor <= 1 || !hasNonnegativeIntegerOperandsImpl(*definition, facts))
+    return std::nullopt;
+
+  llvm::DenseSet<Value> active;
+  std::optional<AffineIndexExpression> dividend = affineIndexExpression(
+      definition->getOperand(0), facts, consumer, active);
+  if (!dividend || dividend->coefficients.size() != 1 ||
+      dividend->constant < 0)
+    return std::nullopt;
+  auto source = dividend->coefficients.begin();
+  if (!source->first || source->second != 1)
+    return std::nullopt;
+  return CompactQuotientExpression{source->first, *divisor,
+                                   dividend->constant};
 }
 
 std::optional<std::pair<int64_t, int64_t>>
@@ -1024,6 +1077,11 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
       return entry.second == domain;
     });
   };
+  auto hasSelectedPhysicalRange = [&](Operation *domain) {
+    return isPartitionedOwnership(domain) ||
+           facts.orderedDomains.contains(domain) ||
+           facts.contractionDomains.contains(domain);
+  };
   unsigned sourceAxis = 0;
   for (const IndexTerm &term : *relation) {
     if (term.kind == "new_axis")
@@ -1035,6 +1093,14 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
     Value index = operation.getOperand(*term.operands.front());
     if (!isa<RankedTensorType>(index.getType()))
       continue;
+    if (std::optional<CompactQuotientExpression> compact =
+            compactQuotientExpression(index, facts, operation)) {
+      if (hasSelectedPhysicalRange(compact->domain))
+        facts.accessRanges.push_back(AccessRangeFact{
+            &operation, compact->domain, currentSourceAxis,
+            compact->divisor, compact->offset});
+      continue;
+    }
     llvm::DenseSet<Value> active;
     std::optional<AffineIndexExpression> expression =
         affineIndexExpression(index, facts, operation, active);
@@ -1073,7 +1139,7 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
       continue;
     }
     facts.accessRanges.push_back(
-        AccessRangeFact{&operation, ownership, currentSourceAxis});
+        AccessRangeFact{&operation, ownership, currentSourceAxis, 1, 0});
   }
   return success();
 }
@@ -1081,6 +1147,7 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
 struct StructuredTensorIndex {
   bool valid = false;
   bool dependsOnTensorAxis = false;
+  bool compact = false;
 };
 
 StructuredTensorIndex classifyStructuredIndex(Value value,
@@ -1097,7 +1164,7 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
     StringRef name = owner ? owner->getName().getStringRef() : StringRef();
     bool structural = name == "intent.parallel" || name == "intent.ordered" ||
                       name == "intent.for" || name == "intent.state_stream";
-    return finish({structural, false});
+    return finish({structural, false, false});
   }
   Operation *definition = value.getDefiningOp();
   if (!definition)
@@ -1105,14 +1172,14 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
   StringRef name = definition->getName().getStringRef();
   if (name == "intent.constant" || name == "intent.dim" ||
       name == "intent.region_end")
-    return finish({true, false});
+    return finish({true, false, false});
   if (name == "intent.indices") {
     auto axes = facts.valueAxes.find(value);
     bool valid = axes != facts.valueAxes.end() &&
                  llvm::count_if(axes->second, [](const LogicalAxis &axis) {
                    return axis.extent != "1" && axis.domain;
                  }) == 1;
-    return finish({valid, valid});
+    return finish({valid, valid, false});
   }
   if (name == "intent.gather") {
     FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(*definition);
@@ -1149,12 +1216,18 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
     return finish({});
   bool tensorAxis = lhs.dependsOnTensorAxis || rhs.dependsOnTensorAxis;
   if (!tensorAxis)
-    return finish({true, false});
+    return finish({true, false, false});
   if (lhs.dependsOnTensorAxis && rhs.dependsOnTensorAxis)
     return finish({});
+  std::optional<int64_t> divisor =
+      integerSplatConstant(definition->getOperand(1));
+  if (logical.getValue() == "floor_divide" && lhs.dependsOnTensorAxis &&
+      !rhs.dependsOnTensorAxis && divisor && *divisor > 1 &&
+      hasNonnegativeIntegerOperandsImpl(*definition, facts))
+    return finish({true, true, true});
   if (logical.getValue() != "add" && logical.getValue() != "subtract")
     return finish({});
-  return finish({true, true});
+  return finish({true, true, lhs.compact || rhs.compact});
 }
 
 LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
@@ -1163,6 +1236,8 @@ LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
     return failure();
   bool hasTensorIndex = false;
   bool dataDependent = false;
+  bool compact = false;
+  unsigned tensorIndexCount = 0;
   for (const IndexTerm &term : *relation) {
     if (term.kind != "value_index" || term.operands.size() != 1 ||
         !term.operands.front())
@@ -1171,6 +1246,7 @@ LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
     if (!isa<RankedTensorType>(indexed.getType()))
       continue;
     hasTensorIndex = true;
+    ++tensorIndexCount;
     llvm::DenseSet<Value> active;
     StructuredTensorIndex structured =
         classifyStructuredIndex(indexed, facts, active);
@@ -1178,6 +1254,7 @@ LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
       dataDependent = true;
       continue;
     }
+    compact |= structured.compact;
     auto axes = facts.valueAxes.find(indexed);
     if (axes == facts.valueAxes.end() ||
         llvm::count_if(axes->second, [](const LogicalAxis &axis) {
@@ -1185,8 +1262,11 @@ LogicalResult classifyTensorIndices(Operation &operation, KernelFacts &facts) {
         }) != 1)
       dataDependent = true;
   }
+  if (compact && tensorIndexCount != 1)
+    dataDependent = true;
   facts.tensorIndexing[&operation] =
       dataDependent ? TensorIndexingKind::dataDependent
+      : compact ? TensorIndexingKind::compact
       : hasTensorIndex ? TensorIndexingKind::structured
                        : TensorIndexingKind::none;
   return success();

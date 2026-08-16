@@ -1117,6 +1117,240 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return operation.emitOpError(
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
+  if (boundary.hasCompactTensorIndex()) {
+    if (scalarResult || failed(view) || accessRanges.size() != 1 ||
+        !accessRanges.front().isCompact())
+      return operation.emitOpError(
+          "has no proven compact TileLang transfer coverage");
+    const target::emission::RangeBinding &compact = accessRanges.front();
+    int64_t divisor = compact.getDivisor();
+    int64_t offset = compact.getOffset();
+    auto compactAxis = planIndex.axes.find(compact.getAxisNode());
+    std::string logicalBase =
+        compactAxis == planIndex.axes.end()
+            ? std::string()
+            : axisIndices.lookup(compactAxis->second.getNode());
+    std::string logicalTile = compact.getTile().str();
+    if (compactAxis == planIndex.axes.end() || logicalBase.empty() ||
+        logicalTile.empty() || divisor <= 1 || offset < 0)
+      return compact.emitOpError(
+          "has no mechanical compact TileLang source-axis projection");
+
+    FailureOr<SmallVector<target::IndexTerm>> relation =
+        target::parseIndexRelation(operation);
+    FailureOr<SmallVector<std::string>> resultExtents =
+        tensorExtents(operation, 0);
+    auto resultType = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+    if (failed(relation) || failed(resultExtents) || !resultType ||
+        static_cast<size_t>(resultType.getRank()) != resultExtents->size())
+      return operation.emitOpError(
+          "has no ranked compact TileLang transfer result");
+
+    std::string physicalBase = "((" + logicalBase + ") + " +
+                               std::to_string(offset) + ") // " +
+                               std::to_string(divisor);
+    std::string physicalExtent = "T.ceildiv(" + logicalTile + ", " +
+                                 std::to_string(divisor) + ")";
+    SmallVector<std::string> sourceBases;
+    SmallVector<std::string> sourceExtents;
+    SmallVector<int64_t> sourceBufferAxes;
+    SmallVector<std::string> compactShape;
+    unsigned sourceAxis = 0;
+    int64_t bufferAxis = 0;
+    int64_t compactBufferAxis = -1;
+    for (const target::IndexTerm &term : *relation) {
+      if (term.kind == "new_axis")
+        return operation.emitOpError(
+            "compact TileLang transfer does not support inserted axes");
+      if (sourceAxis >= (*view)->shape.size())
+        return operation.emitOpError(
+            "compact TileLang transfer exceeds its source rank");
+      if (term.kind == "static_index") {
+        if (term.staticValues.size() != 1 || !term.staticValues.front())
+          return operation.emitOpError(
+              "compact TileLang transfer has an invalid static index");
+        sourceBases.push_back(std::to_string(*term.staticValues.front()));
+        sourceExtents.emplace_back();
+        sourceBufferAxes.push_back(-1);
+        ++sourceAxis;
+        continue;
+      }
+      if (term.kind == "full_slice") {
+        sourceBases.push_back("0");
+        sourceExtents.push_back((*view)->shape[sourceAxis]);
+        sourceBufferAxes.push_back(bufferAxis++);
+        compactShape.push_back((*view)->shape[sourceAxis]);
+        ++sourceAxis;
+        continue;
+      }
+      if ((term.kind != "region_index" && term.kind != "value_index") ||
+          term.operands.size() != 1 || !term.operands.front())
+        return operation.emitOpError(
+            "compact TileLang transfer has no mechanical index relation");
+      Value indexed = operation.getOperand(*term.operands.front());
+      if (sourceAxis == static_cast<unsigned>(compact.getSourceAxis())) {
+        auto tensor = dyn_cast<RankedTensorType>(indexed.getType());
+        if (term.kind != "value_index" || !tensor || tensor.getRank() != 1)
+          return operation.emitOpError(
+              "compact TileLang source axis requires one rank-one quotient index");
+        sourceBases.push_back(physicalBase);
+        sourceExtents.push_back(physicalExtent);
+        sourceBufferAxes.push_back(bufferAxis);
+        compactBufferAxis = bufferAxis++;
+        compactShape.push_back(physicalExtent);
+        ++sourceAxis;
+        continue;
+      }
+      if (term.kind == "region_index") {
+        FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+        std::string base = succeeded(axis)
+                               ? axisIndices.lookup(axis->getNode())
+                               : std::string();
+        std::string extent = succeeded(axis) ? axis->getTile().str()
+                                             : std::string();
+        if (failed(axis) || base.empty() || extent.empty() || axis->isScalar())
+          return operation.emitOpError(
+              "compact TileLang transfer has no tiled region projection");
+        sourceBases.push_back(base);
+        sourceExtents.push_back(extent);
+        sourceBufferAxes.push_back(bufferAxis++);
+        compactShape.push_back(extent);
+      } else {
+        if (isa<RankedTensorType>(indexed.getType()))
+          return operation.emitOpError(
+              "compact TileLang transfer supports one tensor-valued source index");
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        sourceBases.push_back(exact->str());
+        sourceExtents.emplace_back();
+        sourceBufferAxes.push_back(-1);
+      }
+      ++sourceAxis;
+    }
+    if (sourceAxis != (*view)->shape.size() || compactBufferAxis < 0 ||
+        compactShape.size() != resultExtents->size())
+      return operation.emitOpError(
+          "compact TileLang transfer rank does not match its logical result");
+
+    FailureOr<std::string> result =
+        allocateResult(operation, 0, boundary.getResultSpace());
+    std::string dtype = dtypeName(resultType.getElementType(), operation);
+    if (failed(result) || dtype.empty())
+      return operation.emitOpError(
+          "cannot allocate a compact TileLang transfer result");
+    std::string compactResult = *result + "_compact";
+    std::string compactShapeText = "(";
+    for (auto [axis, extent] : llvm::enumerate(compactShape)) {
+      if (axis)
+        compactShapeText += ", ";
+      compactShapeText += extent;
+    }
+    if (compactShape.size() == 1)
+      compactShapeText += ",";
+    compactShapeText += ")";
+    line(compactResult + " = T.alloc_shared(" + compactShapeText + ", " +
+         dtype + ")");
+
+    auto join = [](ArrayRef<std::string> values) {
+      std::string result;
+      for (auto [index, value] : llvm::enumerate(values)) {
+        if (index)
+          result += ", ";
+        result += value;
+      }
+      return result;
+    };
+    auto conjunction = [](ArrayRef<std::string> values) {
+      std::string result;
+      for (auto [index, value] : llvm::enumerate(values)) {
+        if (index)
+          result += " and ";
+        result += value;
+      }
+      return result;
+    };
+    SmallVector<std::string> sourceSlices;
+    SmallVector<std::string> wholePredicates;
+    for (unsigned axis = 0; axis < sourceBases.size(); ++axis) {
+      if (sourceExtents[axis].empty()) {
+        sourceSlices.push_back(sourceBases[axis]);
+        wholePredicates.push_back("0 <= " + sourceBases[axis] + " and " +
+                                  sourceBases[axis] + " < " +
+                                  (*view)->shape[axis]);
+        continue;
+      }
+      sourceSlices.push_back(sourceBases[axis] + " : " + sourceBases[axis] +
+                             " + " + sourceExtents[axis]);
+      wholePredicates.push_back("0 <= " + sourceBases[axis] + " and " +
+                                sourceBases[axis] + " + " +
+                                sourceExtents[axis] + " <= " +
+                                (*view)->shape[axis]);
+    }
+    line("if " + conjunction(wholePredicates) + ":");
+    ++indentation;
+    line("T.copy(" + (*view)->argument->name + "[" + join(sourceSlices) +
+         "], " + compactResult + ")");
+    --indentation;
+    line("else:");
+    ++indentation;
+    SmallVector<std::string> compactIndices;
+    std::string compactLoop = "for ";
+    for (unsigned axis = 0; axis < compactShape.size(); ++axis) {
+      if (axis)
+        compactLoop += ", ";
+      compactIndices.push_back("compact_load_i" + std::to_string(axis));
+      compactLoop += compactIndices.back();
+    }
+    compactLoop += " in T.Parallel(" + join(compactShape) + "):";
+    line(compactLoop);
+    ++indentation;
+    SmallVector<std::string> sourceElements;
+    SmallVector<std::string> elementPredicates;
+    for (unsigned axis = 0; axis < sourceBases.size(); ++axis) {
+      std::string element = sourceBases[axis];
+      if (sourceBufferAxes[axis] >= 0)
+        element += " + " + compactIndices[sourceBufferAxes[axis]];
+      sourceElements.push_back(element);
+      elementPredicates.push_back("0 <= " + element + " and " + element +
+                                  " < " + (*view)->shape[axis]);
+    }
+    line("if " + conjunction(elementPredicates) + ":");
+    ++indentation;
+    line(compactResult + "[" + join(compactIndices) + "] = " +
+         (*view)->argument->name + "[" + join(sourceElements) + "]");
+    --indentation;
+    line("else:");
+    ++indentation;
+    line(compactResult + "[" + join(compactIndices) + "] = 0");
+    --indentation;
+    --indentation;
+    --indentation;
+    line("T.sync_threads()");
+
+    SmallVector<std::string> logicalIndices;
+    std::string expandLoop = "for ";
+    for (unsigned axis = 0; axis < resultExtents->size(); ++axis) {
+      if (axis)
+        expandLoop += ", ";
+      logicalIndices.push_back("compact_expand_i" + std::to_string(axis));
+      expandLoop += logicalIndices.back();
+    }
+    expandLoop += " in T.Parallel(" + join(*resultExtents) + "):";
+    line(expandLoop);
+    ++indentation;
+    SmallVector<std::string> physicalIndices = logicalIndices;
+    physicalIndices[compactBufferAxis] =
+        "((" + logicalBase + ") + " +
+        logicalIndices[compactBufferAxis] + " + " + std::to_string(offset) +
+        ") // " + std::to_string(divisor) + " - (" + physicalBase + ")";
+    line(*result + "[" + join(logicalIndices) + "] = " + compactResult + "[" +
+         join(physicalIndices) + "]");
+    --indentation;
+    bindResult(operation, 0, *result);
+    return success();
+  }
   bool expanded = !physicalFill->empty();
   bool tensorIndirect = boundary.hasDataDependentTensorIndex();
   bool plannedValidity = !boundary.getConsumerNeutralized() &&
@@ -1142,9 +1376,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
         return failure();
+      bool consumerNeutralizedAxis = boundary.getConsumerNeutralized();
       if (!axis->hasRole("lane") || axis->hasRole("parallel") ||
-          axis->hasRole("ordered") || axis->hasRole("reduction") ||
-          axis->hasRole("ragged_member")) {
+          (!consumerNeutralizedAxis &&
+           (axis->hasRole("ordered") || axis->hasRole("reduction") ||
+            axis->hasRole("ragged_member")))) {
         guardedF16Bulk = false;
         break;
       }
@@ -1158,9 +1394,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
             "cannot resolve guarded float16 bulk extents");
       for (auto [axis, term] : llvm::enumerate(*relation)) {
         auto extent = planIndex.blockExtents.find((*view)->shape[axis]);
-        bool vectorAccess = term.kind == "full_slice" ||
-                            term.kind == "region_index";
-        if (!vectorAccess || extent == planIndex.blockExtents.end())
+        if (term.kind != "full_slice" ||
+            extent == planIndex.blockExtents.end())
           continue;
         if (extent->second.getRounding() != "power_of_two")
           return extent->second.emitOpError(

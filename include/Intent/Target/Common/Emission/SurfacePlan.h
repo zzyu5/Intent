@@ -360,6 +360,15 @@ struct RangeBinding : Binding<intent::plan::RangeOp> {
   int64_t getSourceAxis() const {
     return operation.getSourceAxisAttr().getInt();
   }
+  int64_t getDivisor() const {
+    mlir::IntegerAttr value = operation.getDivisorAttr();
+    return value ? value.getInt() : 1;
+  }
+  int64_t getOffset() const {
+    mlir::IntegerAttr value = operation.getOffsetAttr();
+    return value ? value.getInt() : 0;
+  }
+  bool isCompact() const { return getDivisor() > 1; }
 };
 
 struct AxisBinding : Binding<intent::plan::AxisOp> {
@@ -502,7 +511,8 @@ struct BlockExtentBinding : Binding<intent::plan::BlockExtentOp> {
 template <typename PlanIndex>
 mlir::FailureOr<std::string> transferPhysicalExtentFill(
     const PlanIndex &index, llvm::ArrayRef<target::IndexTerm> relation,
-    llvm::ArrayRef<std::string> viewShape, mlir::Operation &operation) {
+    llvm::ArrayRef<std::string> viewShape, mlir::Operation &operation,
+    llvm::ArrayRef<int64_t> neutralizedTensorAxes = {}) {
   if (static_cast<size_t>(llvm::count_if(
           relation, [](const target::IndexTerm &term) {
             return term.kind != "new_axis";
@@ -511,19 +521,32 @@ mlir::FailureOr<std::string> transferPhysicalExtentFill(
         "physical block-extent projection does not match the external view rank");
   std::string fill;
   unsigned viewAxis = 0;
+  unsigned tensorAxis = 0;
   for (const target::IndexTerm &term : relation) {
-    if (term.kind == "new_axis")
+    if (term.kind == "new_axis") {
+      ++tensorAxis;
       continue;
+    }
     llvm::StringRef viewExtent = viewShape[viewAxis++];
     bool vectorAccess = term.kind == "full_slice";
+    unsigned tensorAxes = vectorAccess ? 1 : 0;
     if ((term.kind == "region_index" || term.kind == "value_index") &&
         term.operands.size() == 1 && term.operands.front()) {
       mlir::Value indexed = operation.getOperand(*term.operands.front());
       vectorAccess = term.kind == "region_index"
                          ? !isSequentialIterator(indexed)
                          : mlir::isa<mlir::RankedTensorType>(indexed.getType());
+      if (vectorAccess) {
+        auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(indexed.getType());
+        tensorAxes = tensor ? tensor.getRank() : 1;
+      }
     }
-    if (!vectorAccess)
+    bool neutralized = false;
+    for (unsigned axis = tensorAxis; axis < tensorAxis + tensorAxes; ++axis)
+      neutralized |= llvm::is_contained(neutralizedTensorAxes,
+                                        static_cast<int64_t>(axis));
+    tensorAxis += tensorAxes;
+    if (!vectorAccess || neutralized)
       continue;
     auto extent = index.blockExtents.find(viewExtent);
     if (extent == index.blockExtents.end())
@@ -1008,8 +1031,14 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   llvm::StringRef getTensorIndexing() const {
     return operation.getTensorIndexing();
   }
+  llvm::StringRef getMaterialization() const {
+    return operation.getMaterialization();
+  }
   bool hasStructuredTensorIndex() const {
     return operation.getTensorIndexing() == "structured";
+  }
+  bool hasCompactTensorIndex() const {
+    return operation.getTensorIndexing() == "compact";
   }
   bool hasDataDependentTensorIndex() const {
     return operation.getTensorIndexing() == "data_dependent";
@@ -1021,7 +1050,9 @@ struct BoundaryBinding : Binding<intent::plan::TransferOp> {
     return operation.getConsumerNeutralized();
   }
   bool getCheckBounds() const { return explicitBounds; }
-  bool getDefer() const { return defer; }
+  bool getDefer() const {
+    return defer || getMaterialization() == "deferred_to_contract";
+  }
 };
 
 template <typename PlanIndex>
@@ -1087,70 +1118,6 @@ bool feedsStagedContraction(const PlanIndex &index, mlir::Operation &operation) 
                       [&](mlir::Operation *user) {
                         return isStagedContraction(index, user);
                       });
-}
-
-template <typename PlanIndex>
-bool deferSharedContractionTransfer(const PlanIndex &index,
-                                    mlir::Operation &operation,
-                                    llvm::StringRef resultSpace) {
-  if (resultSpace != "shared" || operation.getNumResults() != 1 ||
-      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
-    return false;
-  for (mlir::Operation *user : operation.getResult(0).getUsers()) {
-    if (user->getName().getStringRef() == "intent.sparse_contract") {
-      auto node = user->getAttrOfType<mlir::IntegerAttr>("intent.node");
-      auto sparse = node ? index.sparseContracts.find(node.getInt())
-                         : index.sparseContracts.end();
-      if (sparse != index.sparseContracts.end())
-        return true;
-      continue;
-    }
-    if (user->getName().getStringRef() != "intent.contract")
-      continue;
-    if (isStagedContraction(index, user))
-      return true;
-    auto node = user->getAttrOfType<mlir::IntegerAttr>("intent.node");
-    auto contract = node ? index.contracts.find(node.getInt())
-                         : index.contracts.end();
-    if (contract == index.contracts.end() ||
-        contract->second.getLhsSpace() != "shared" ||
-        contract->second.getRhsSpace() != "shared")
-      continue;
-    auto boundary = [&](mlir::Operation &load) -> const BoundaryBinding * {
-      auto loadNode = load.getAttrOfType<mlir::IntegerAttr>("intent.node");
-      auto found = loadNode ? index.boundaries.find(loadNode.getInt())
-                            : index.boundaries.end();
-      return found == index.boundaries.end() ? nullptr : &found->second;
-    };
-    mlir::Operation *lhs = user->getOperand(0).getDefiningOp();
-    mlir::Operation *rhs = user->getOperand(1).getDefiningOp();
-    const BoundaryBinding *lhsBoundary = lhs ? boundary(*lhs) : nullptr;
-    const BoundaryBinding *rhsBoundary = rhs ? boundary(*rhs) : nullptr;
-    if (!lhsBoundary || !rhsBoundary ||
-        lhsBoundary->getResultSpace() != "shared" ||
-        rhsBoundary->getResultSpace() != "shared")
-      continue;
-    auto directLoad = [](mlir::Value operand) {
-      mlir::Operation *definition = operand.getDefiningOp();
-      return definition &&
-             definition->getName().getStringRef() == "intent.view_load";
-    };
-    if (!llvm::all_of(user->getOperands(), directLoad))
-      continue;
-    unsigned reductionAxes = 0;
-    for (const auto &entry : index.axesByRole) {
-      const AxisBinding &axis = entry.getValue();
-      if (!entry.getKey().starts_with("reduction_") ||
-          !llvm::is_contained(lhsBoundary->getDomainNodes(), axis.getNode()) ||
-          !llvm::is_contained(rhsBoundary->getDomainNodes(), axis.getNode()))
-        continue;
-      ++reductionAxes;
-    }
-    if (reductionAxes != 1)
-      return false;
-    return true;
-  }
-  return false;
 }
 
 template <typename PlanIndex>

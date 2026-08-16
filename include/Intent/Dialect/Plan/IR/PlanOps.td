@@ -66,7 +66,9 @@ def IntentPlan_RangeOp : IntentPlan_Op<"range"> {
     StrAttr:$tile,
     StrAttr:$extent,
     OptionalAttr<I64Attr>:$transfer_node,
-    OptionalAttr<I64Attr>:$source_axis
+    OptionalAttr<I64Attr>:$source_axis,
+    OptionalAttr<I64Attr>:$divisor,
+    OptionalAttr<I64Attr>:$offset
   );
   let results = (outs);
   let hasVerifier = 1;
@@ -131,6 +133,7 @@ def IntentPlan_TransferOp : IntentPlan_Op<"transfer"> {
     DenseI64ArrayAttr:$validity_domain_nodes,
     StrAttr:$fill,
     BoolAttr:$consumer_neutralized,
+    StrAttr:$materialization,
     StrAttr:$tensor_indexing,
     StrAttr:$result_space
   );
