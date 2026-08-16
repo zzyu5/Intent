@@ -1,14 +1,14 @@
-# 从边界复审到性能强化：统一推进报告
+# 从边界复审到决策空间形式化：统一推进报告
 
 ## 1. 报告范围
 
-本文统一梳理从用户提出“第一轮：收尾遗留 + 重新自查路径”开始，到最近一次“对有真实 baseline 的算子持续追平上游”的完整推进过程。它替代这一阶段按轮次产生的零散汇报；固定性能数字仍只保存在：
+本文统一梳理从用户提出“第一轮：收尾遗留 + 重新自查路径”开始，到本轮“形式化编译器决策空间 + 算法对齐审计”的完整推进过程。它替代这一阶段按轮次产生的零散汇报；固定性能数字仍只保存在：
 
 - `report/baseline/kernel-performance.csv`：RTX 5090；
 - `report/baseline/kernel-performance-h100.csv`：H100；
 - `report/baseline/compiler-closure.md`：更早的 42-repro 历史快照，不再滚动更新。
 
-编程模型、Kernel IR、Physical Plan 与 target-family 边界的长期判断单独保存在 `report/programming-model-and-compiler-architecture.md`。本文只回答三个问题：每轮要求解决什么、实际怎样修改编译器、当前整体到底处于什么状态。
+本文回答四个问题：每轮要求解决什么、实际怎样修改编译器、每个物理决定为什么属于当前层、以及现有 upstream 数字是否真的与 DSL 算法可比。
 
 这一阶段对应的提交顺序为：
 
@@ -26,6 +26,15 @@
 | 性能强化三 | `6d66d8a` | 用 cuTile `permute` 投影转置 contraction operand |
 | 性能强化收敛 | `88a3742` | 收紧 Triton row launch 的适用结构并稳定选择 |
 | 数字固定 | `29f1e4e` | 只刷新两张 baseline 的受影响 generated 数字 |
+| 正确性探针 | `2e958e4` | 收拢 domain provenance 与 arg-reduction index 语义 |
+| Cross entropy 对齐 | `12b2e8e` | 将 DSL 改成与 Liger 相同的单 kernel fused 算法 |
+| Triton row 参数委托 | `ae02092` | 删除 warp 阶梯常量，改由 Triton autotuner 实测 |
+| 决策空间代码收敛 | `767c2e5` | 委托三家 row launch 参数并加入 canonical scaled contraction |
+| Backward 与 baseline 对齐 | `ba06622` | 使用 forward-saved stats，并直接接上游 backward kernels |
+| Scaled spelling 委托 | `31a776a` | Triton 原生/显式 scaled spelling 共同进入 target-local tuner |
+| 决策审计收口 | `a0f7de7` | 收拢 domain extent 派生查询，并把 TileLang GEMM warp policy 交给 tuner |
+| TileLang 参数空间 | `d82d1f4` | 补齐 contraction 的 K/stage 合法候选 |
+| 候选保真 | `fc17060` | profile 只按当前 roles 覆盖度筛选，不再误删旧合法候选 |
 
 ## 2. 进入第一轮时的真实起点
 
@@ -235,17 +244,11 @@ Embedding 的共享 ownership 修复带来：
 
 ### 7.2 Triton row-vector launch
 
-SwiGLU、softmax、value-select 等 row/pointwise kernel 的生成结构与上游接近，但原 wrapper 对不同 row width 使用近似固定的 warp 配置。第一版把 row launch 放入 runtime tuner；真实运行又暴露出短 kernel 的编译缓存与候选选择会让 `reshape_and_cache` 从约 0.0207 退到约 0.030 ms。
+SwiGLU、softmax、value-select 等 row/pointwise kernel 的生成结构与上游接近，但原 wrapper 把 warp 数钉成一张按 row width 分段的常量表。那张表虽然能跑，却违反“下层能实测的参数不由 Intent 猜”的边界：`num_warps`、`num_stages` 不改变 Kernel IR、grid 结构或 row ownership，只是 Triton launch 参数，属于参数性选择。
 
-最终规则仍是 target-local 的物理 launch 选择，但适用范围被严格写清：
+当前实现保留共享层给出的 row/persistent 结构，删除 warp 阶梯和 `row_configuration` 的固定 launch 值。Triton runtime tuner 现在联合实测 `num_warps`、`num_stages`、persistent row occupancy 与 pipeline stages；普通 row 的 autotune key 覆盖完整 shape，wrapper 的调优 guard key 另外带 ABI dtype 与 device，不能再把同一 lane width、不同外层 shape 的 winner 错误复用。
 
-- 无 compiler-private stage、无 reused program axes；
-- 无 atomic/scatter-reduce 等非幂等 effect；
-- 排除 scan、reduction、contraction、state-stream 等主体真正依赖 region 结构的情况；
-- 仅普通 row-vector，或纯 pointwise、无聚合的 no-read body；
-- warp 数只由已选 physical row extent 的 next-power-of-two 得到：小于 2048 用 4，2048 起 8，8192 起 16，32768 起 32。
-
-这不是把 scalar body升级成 region 算法；作者 body 不变，改变的是一个 Triton program 的 worker 配置。两台机器各 23 个直接消费者均完成数值对照。关键结果：
+调优资格仍由语义安全性限制：含 compiler-private stage、atomic、scatter-reduce 等不可重放 effect 的 kernel 不进入会重复执行 body 的 autotune。这不是性能启发式，而是唯一合法的 replay 合同。作者 body 不变，改变的只是下层 launch 参数。关键结果：
 
 - 5090 softmax：0.3523 ms，对应 source 0.3661 ms；
 - H100 softmax：0.1820 ms，对应 source 0.1886 ms；
@@ -253,11 +256,11 @@ SwiGLU、softmax、value-select 等 row/pointwise kernel 的生成结构与上�
 - H100 SwiGLU forward：0.1455→0.1241 ms，对应 source 0.1210 ms；
 - value-select：5090 0.0887→0.0800 ms，H100 0.0726→0.0607 ms。
 
-`sorted_nucleus_cutoff` 与 boolean reduction 在第一版误入 row rule 后退化，最终通过结构判据排除并恢复到 5090 0.0200/0.0056 ms、H100 0.0176/0.0096 ms。这个过程说明 row width 不是全局门槛，必须先尊重 op 的结构角色。
+`softmax_backward` 的最终 p50 为：5090 Triton/cuTile/TileLang `0.1347/0.1345/0.1306 ms`，H100 为 `0.0924/0.0782/0.1106 ms`。三个 target 的 winner 不同，说明 launch 参数必须委托给各自下层，而不是共享一张 GPU 型号无关的表。
 
 ### 7.3 cuTile row occupancy
 
-cuTile 对同一 row program 可以由下层选择不同 occupancy；该值不改变算法、ownership 或 tile，只是 cuTile launch/compiler 参数。因此 emitter 只在结构上适用的 row path 暴露 occupancy 候选 `(default, 1, 2, 4)`，交给 cuTile tuner 实测，cache key 包含物理维度、输入 dtype 与 device。
+cuTile 对同一 row program 可以由下层选择不同 occupancy；TileLang 可以选择 `threads` 与 `num_stages`。这些值不改变算法、ownership 或 tile，只是 provider launch/compiler 参数。因此两个 leaf 都只在可重放 row path 暴露候选，分别交给 cuTile 和 TileLang tuner 实测；cache key 包含完整 shape、输入 dtype 与 device。
 
 两台机器同一批 23 个 row consumers 都通过数值对照。Softmax 的结果为：
 
@@ -290,9 +293,9 @@ TileLang pointwise single-use expression forwarding 被分别用于 W4A8 与 var
 - W4A8 的 packed index `k // 2` 在 shared facts 中被压成普通 data-dependent indexing，Plan 没有保留“单一来源轴 + 正常数除数 + compact physical span”这类 typed coverage；TileLang 只能逐 logical-K 元素加载。正确方向是共享的受限 quasi-affine compact-coverage fact，而不是 W4A8 特判。
 - varlen/GQA attention 的算法与上游都是 ragged online attention。差距来自 ordered-ragged stream 的 query/K tile、visible-prefix、mask-contraction fusion boundary 与 target layout 没有形成一个完整的联合物理决定；不是把某条算术 inline 就能解决。
 
-## 8. 当前固定表的真实状态
+## 8. 固定表与算法对齐审计
 
-两张 CSV 仍各有 122 条记录、113 个 kernel runner，20 列结构与 source 数字均未改变。最近一轮只刷新受影响 generated p50/p95。
+两张 CSV 仍各有 122 条记录、113 个 kernel runner，20 列结构不变。本轮没有全量重跑，只更新真实受影响的 generated 数字，并撤掉无法和 DSL 算法公平比较的 source 数字。空 source 表示没有可比高性能上游，不表示生成失败。
 
 ### 8.1 状态计数
 
@@ -307,37 +310,195 @@ TileLang pointwise single-use expression forwarding 被分别用于 W4A8 与 var
 
 | 设备 | Triton | cuTile | TileLang | 至少一个 provider 通过 |
 |---|---:|---:|---:|---:|
-| RTX 5090 | 53.17 | 33.17 | 35.67 | 122 |
+| RTX 5090 | 54.17 | 31.17 | 36.67 | 122 |
 | H100 | 56 | 30 | 35 | 121 |
 
 三家在两台机器上仍分别拥有独立赢家，且赢家分布随设备改变。这个结果支持“同一 GPU Plan 的多个 surface 让下层各自发挥”，但不等于三家所有格都同样成熟。
 
-### 8.3 还没有追平的格子必须分性质看
+### 8.3 审计判据
 
-**已定位的通用 compiler/Plan 缺口：**
+每个 source-bearing provider cell 只能落入三类：
 
-- TileLang W4A8 packed：5090 0.1612/0.0895 ms，H100 0.2356/0.1579 ms；缺 shared typed compact quasi-affine coverage，不是 leaf 名字分支能修。
-- TileLang varlen attention：5090 causal 0.3512/0.2535 ms、GQA 9.7634/6.3852 ms；H100 causal 0.4700/0.1695 ms、GQA 9.4668/4.7898 ms；缺 ordered-ragged stream 的联合物理决定与对应投影。
-- H100 Triton dense attention：3.5791/3.1012 ms；5090 基本持平，说明候选/descriptor/warp-specialized 下层 realization 仍需从结构上继续核对。
+- **A：算法、调用数与计时 scope 一致。** source 数字保留；差距归编译器或 provider。
+- **B：算法本应一致，但 DSL 或 adapter 没有照上游写。** 先改 DSL/adapter，再重测；不能继续使用旧数字。
+- **C：上游是另一算法或另一调用编排，且不该把 DSL 改成它。** 撤掉 source 数字，不制造“近似可比”。
 
-**不是公平的“同一实现更慢”：**
+### 8.4 所有保留的 source cells
 
-- `online_softmax` DSL 明确写了两个 state-stream pass，上游 softmax 是单次 load/reduce/store；数字可以观察，但不能把差距冒充同算法 leaf 回归。
-- cuTile `block_scaled_matmul` 的 DSL 是 E8M0 scale 解码、f32 pointwise scale 后普通 contraction，上游使用原生 `ct.mma_scaled`；直接在 leaf pattern-match 并折叠会改写 Kernel IR。只有未来把 scaled contraction 作为正式算法 primitive，或下层自己完成融合，这个比值才可公平追。
-- Cross entropy、部分 grouped/ragged 条目使用 end-to-end 或不同调用编排；必须按各自 scope 解释，不能和 kernel-only 混在一起。
+下表覆盖更新后 CSV 中每一个非空 source cell；同一行列出的 provider 分别是 Triton/cuTile/TileLang。
 
-**较小但仍保留在固定表中的差距：**
+| kernel / case | provider | 结论 | 对齐依据 |
+|---|---|---|---|
+| softmax | Triton、cuTile | A | 单次 row load/reduce/store，kernel-only |
+| layer_norm | Triton、cuTile | A | 同一 forward normalization 与 affine |
+| layer_norm_backward | Triton | B→A | 现在直接调用上游两个 backward kernel，forward-saved mean/rstd 在计时外 |
+| rms_norm | Triton | A | 同一 weighted RMSNorm kernel |
+| fused_add_rms_norm | Triton | A | 同一 fused residual + RMSNorm |
+| cross_entropy | Triton | B→A | DSL 改成单 kernel fused loss/prediction/in-place gradient，与 Liger 同 scope |
+| gemm/base | 三家 | A | 同形状、dtype、单 contraction |
+| bf16_gemm | cuTile、TileLang | A | 同一 bf16 GEMM |
+| batched_gemm NN/TN/NT/TT | cuTile | A | batch、四种 transpose 与调用数一致 |
+| attention | 三家 | A | dense forward attention，同一 QKV/O scope |
+| attention_bias | Triton | A | 同一 fused bias attention |
+| varlen_attention/causal | TileLang | A | 同一 causal varlen online attention |
+| varlen_gqa_prefill | TileLang | A | 同一 varlen GQA prefill |
+| paged_attention | Triton | A | 同一 paged decode attention |
+| online_softmax | TileLang | A | 两边都是 online/two-pass 算法，而不是普通 stable softmax |
+| grouped_gemm/base | 三家 | A | grouped problem 与端到端 list/result scope 一致 |
+| swiglu_forward | Triton、cuTile | A | 同一 fused SiLU×up |
+| swiglu_backward | Triton | A | 同一 backward kernel |
+| rope_qk_full/partial/inverse | cuTile | A | Q/K、旋转维度与方向逐 case 一致 |
+| mla_prefill | cuTile | A | 同一 MLA prefill contraction 结构 |
+| w4a8_packed | TileLang | A | 同一 signed packed-W4/A8 dequant GEMM |
+| embedding_forward_lookup | Triton | A | 同一 embedding gather |
+| embedding_backward_atomic | Triton | A | 同一 atomic embedding gradient；只有有实测值的设备填 source |
+| block_scaled_matmul | cuTile | B→A | 新 Core 直接表达 E8M0 scaled contraction，投影为 `ct.mma_scaled` |
+| splitk_attention_reduce | cuTile | A | 同一 split-K partial reduction |
+| fp8_gemm e4m3/e5m2 | TileLang | A | dtype 和单 GEMM scope 分别一致 |
+| index_select_rows | Triton | A | 同一 row gather |
+| scaled_index_add | Triton | A | 同一 indexed scaled add |
+| sparse_2to4_gemm | TileLang | A | 同一 2:4 metadata contraction |
 
-- 5090 cuTile batched GEMM TT 约慢 2.2%；
-- cuTile inverse RoPE 5090 约慢 6.3%，H100 约慢 6.8%；
-- cuTile MLA prefill 在两台机器分别约慢 4.9% 和 28.2%；
-- H100 cuTile SwiGLU 与若干 provider-specific entry 仍有一成左右差距。
+### 8.5 撤掉的对照
 
-因此，最近一轮确实把 row launch、occupancy 和 transposed-load 三类通用能力推到或超过对应 baseline，但“所有有 baseline 的格子都已不弱于 baseline”还没有完成。剩余项已经从“零散慢值”缩成上述几类可定位问题，不能通过调数字、改测试 scope 或按 kernel 特判宣布结束。
+| kernel | provider | C 类原因 |
+|---|---|---|
+| softmax | TileLang | source 是 online/two-pass 结构，不是 stable single-pass 算法 |
+| rms_norm | TileLang | source kernel 不含相同权重路径，adapter 还在 kernel 外乘权重 |
+| dual_gemm | 三家 | source 是两个独立 GEMM 加外部 epilogue，DSL 是单 fused kernel |
+| online_softmax | Triton、cuTile | source 是普通 stable softmax，DSL 明确选择 online/two-pass |
+| moe | 三家 | source 是两个 grouped GEMM 加 merge，DSL 是一个 fused ragged FFN kernel |
 
-## 9. 当前编译器到底完成了什么
+这些 cell 仍保留 generated 数字，但 source 列为空。没有把某个 provider 的算法反向变成 DSL 的唯一写法。
 
-### 9.1 已经闭合的核心
+## 9. 物理决策空间的正式合同
+
+### 9.1 三类决定与判定顺序
+
+分类对象是“多个候选里必须填一个值的物理决定”，不是所有 compiler facts。判定顺序固定为：
+
+1. **下层 provider 能否只用它已经看见的 target source、shape、dtype 与设备信息实测这个选择？** 能，并且候选只改变参数值或等价 API 拼写，就是 P。
+2. 不能时，问 **算法语义是否只允许一个答案**。若是，就是 U；错了会改变地址、边界、数值或依赖，属于 correctness。
+3. 仍有多个合法答案，但答案会改变 grid、循环、ownership、驻留或 stage 等源码结构，而下层已经看不到 Intent 的 region/use-def/跨 op 结构，就是 S。
+
+正式分类如下：
+
+- **U — 唯一合法解。** 从 Kernel IR 与目标合同只有一个正确兑现结果，错了就会改变地址、边界、数值或依赖；必须在共享 lowering/Plan 形成一处权威来源，leaf 只读取。它和普通 derived fact 的区别是：derived fact 只描述 IR 中已经存在的关系，可随时重算；U 是编译器必须补齐的 correctness 合同。例：索引算术位宽、padding identity、已选 stage 的拓扑依赖与可见性。provenance 本身是 derived fact，不属于 U。
+- **S — 结构性选择。** 多个答案都正确，但改变生成源码的结构，而且 provider 无法仅凭最终 target source 前的局部信息重建。由 target-family realizer 选择并写入 Physical Plan。例：program ownership、persistent traversal、lane promotion、private buffer 驻留。
+- **P — 参数性选择。** 多个答案都正确，不改变 Kernel IR 和 Physical Plan 的结构，只改变 tile/launch 数值或等价 target API 拼写；交给对应 provider tuner 实测。Intent 只声明合法候选。
+
+一条容易混淆但必须保留的边界是：**作者显式写 `partition` 不是 S，而是算法程序结构。** 它决定 body 看见 scalar 还是 region，编译器无权删除或补造。Plan 里选择这个 region 在机器上用多大 physical extent，才是 S/P 边界里的物理工作。
+
+### 9.2 不属于 U/S/P 的四类内容
+
+以下内容不是“决定”，强塞进三类反而会制造假问题：
+
+1. 可从 Kernel IR 重算的 provenance、use-def、result axes 等派生 facts；它们可以做内存索引，但不能成为第二份 schema 真理。
+2. target capability 与 legality，例如 cuTile sm90 不支持 E8M0、TileLang 0.1.13 不接 generic combiner、descriptor 地址上限。
+3. canonical op 到目标 intrinsic 名称、dtype spelling、参数顺序等纯语法映射。
+4. benchmark warmup、timeout、CUDA graph、cache flush 等测量策略。
+
+本轮没有发现用上述判据无法分类的真实物理决定。真正需要补充的是：P 不仅包括数字参数，也包括 **语义与 Plan 完全相同、只在 target 里有不同等价拼写** 的离散候选。
+
+### 9.3 全量物理决定审计
+
+| 决定或事实 | 分类 | 当前权威层 | 审计结论 |
+|---|---|---|---|
+| logical index provenance、地址表达式、domain extent、use-def/result axes | derived fact | Kernel IR + shared facts/query | 不属于 U/S/P；按 SSA/use-def 重算，找不到精确来源直接诊断，不按同 extent 猜轴。本轮把三个 leaf 重复的 domain→ABI extent 回溯收拢为一个共享查询，但没有把结果物化进 Plan |
+| 地址算术宽度 | U + target capability | shared correctness contract + leaf guard | 语义地址先按 i64；Triton 直接投影 i64，cuTile/TileLang 当前 surface 在 launch 前证明 element offset 不超过 `2^31-1` 后才使用其 32-bit descriptor/bulk-copy 表达，超出就明确 unsupported，不窄化回绕 |
+| region argument → logical axis/purpose | derived fact | Kernel IR + shared facts | 不属于 U/S/P；这是作者 region 语义的稳定绑定，不是物理候选 |
+| 已选 physical range → region argument/use 的绑定 | U | Physical Plan binding | 正确；range 一旦选定，消费关系只有一个合法答案，leaf 不从 tensor shape 重建 |
+| affine access footprint → transfer/source-axis 的 access range | U | Physical Plan access binding | 正确；每个 footprint 精确绑定已有 ownership range，不由 leaf 重猜 |
+| validity、reduction identity、padding、tail fill | U | shared proof + Plan padding/transfer | 正确；三个 leaf 只兑现 mask/fill |
+| `BlockExtent(power_of_two, zero)` 与 full-domain row/lane 最小合法 extent | U | shared GPU legalization | 不是 tuner tile：作者 body 已要求看见完整逻辑域；GPU fragment 合同唯一补成能覆盖它的最小 2 次幂，并以 consumer identity 中和尾部 |
+| stage dependency、输入输出归属、same-stream visibility | U | Physical Plan stage contract | 正确；不是 emitter launch 顺序的隐含偶然 |
+| parallel/ordered/reduction/contraction/ragged 等逻辑角色 | derived fact | Kernel IR + shared facts | 不属于 U/S/P；角色由 op、region 和 use-def 唯一推出，而且可以组合 |
+| 逻辑角色到 lane/program/worker/stream 等物理用途的分配 | S | shared GPU realizer | 正确；这是多个合法机器映射中的结构性选择，不按 kernel 类别分支 |
+| indirect-ragged/serial traversal 是否标量化为 `one` | S | shared GPU realizer | 当前是保守结构选择；它改变循环与搬运形态，不冒充可调 tile 数值 |
+| program order、worker folding、program-group membership、reuse-worker | S | shared GPU realizer | 正确；provider tuner 不重新决定 ownership。Plan 中 `group_m` 先记录哪些轴组成一组 |
+| program-group 的具体 group width | P | provider runtime tuner | `GROUP_SIZE_M` 等只改变同一 grouped traversal 的数值；`AxisOp.group` 的组成员是 S，SearchSpace 中同名 parameter 是该组宽度，二者不能混为一类 |
+| persistent traversal 是否存在 | S | shared GPU realizer | 正确；改变循环/grid 结构，不能下放成普通 launch 参数 |
+| pointwise lane promotion eligibility | S | shared GPU realizer | 正确；只对纯逐元素 body，不能自动把 contraction 改成块算法 |
+| logical buffer、transfer result、contraction operand、scan result 的驻留 | S | shared GPU Plan builder | 由 owner、lifetime、reuse 与消费结构选择 private scalar/fragment/shared/workspace；leaf 只拼写。Sparse 2:4 的 shared operands 还受当前 target capability 约束 |
+| ownership/traversal/reduction 的可分块 concrete tile、scan chunk | P | 三个 runtime tuner | 正确；结构用途已经由 Plan 确定，SearchSpace 只给合法参数轴，不钉死 winner；`fixed_*`、`one`、`row_vector*` 明确不进入这张搜索表 |
+| `num_warps`、`num_stages`、TileLang threads、cuTile occupancy/num_ctas | P | provider runtime tuner | 本轮收敛；删除 Triton warp 阶梯与固定 row winner。不能安全 replay 的 effectful kernel 不做 wrapper autotune，这是 runtime legality，不是一个被写死的 Plan winner |
+| TileLang `GemmWarpPolicy` | P | TileLang runtime tuner | 本轮从固定 `FullRow` 改为 FullRow/Square/FullCol 离散候选；target compiler 负责过滤当前 tile/device 无法编译的组合，没有架构分支 |
+| cuTile masked-gather vs gather+where | P | cuTile leaf tuner | 正确；两台机器实测 winner 不同，不进共享 Plan |
+| Triton `tl.dot_scaled` vs 显式 E8M0 decode + `tl.dot` | P | Triton leaf tuner | 同一 scaled-contract op、同一 Plan，由 target tuner 实测 |
+| matrix-unit 可用性、worker 轴最多三维、cuTile 32-bit descriptor、Triton scaled group=32 | capability/legality | target-family/leaf | 不属于 P；不支持时在编译或 launch 前明确拒绝。Triton 当前 native/fallback scaled path 只接受 K-group 32，这是 target 子集，不是 shared Core 限制 |
+| canonical op kind→`tl.*`/`ct.*`/`T.*`、dtype spelling、参数顺序 | target syntax | 各 `Syntax/Spelling`/op handler | 不属于 U/S/P；leaf 读取 canonical op 选择目标 intrinsic 正是机械投影，不能为消除一次 op-name lookup 而把算法 kind 复制进 Plan |
+| row-tuner eligibility、warmup/repetition/timeout/cache key | runtime policy + capability | shared effect query + provider runtime | 不属于物理决定；三家可以因 replay/API 能力而有不同 eligibility，但 cache key 必须覆盖影响 winner 的完整 shape/dtype/device |
+
+审计了共享 realizer 中所有规则、三个 leaf 的常量/阈值和 runtime candidate 表。固定数字现在只承担四种角色：U 的唯一兑现、target capability 上限、S policy 的结构阈值、或 P 搜索空间中的候选值；候选中出现 `8` 不代表 winner 被固定成 `8`。本轮没有发现无法用“derived/capability/syntax/runtime 与 U/S/P”这套顺序归类的残余决定。
+
+### 9.4 本轮实际纠正的错位
+
+1. Triton row `num_warps` 的 `2048/8192/32768` 阶梯、固定 winner `num_warps=8` 和写死的 shared-memory 二选一 stage 被删除；`8` 仍可作为合法候选，最终由 Triton tuner 联合测量 launch 参数后选择。
+2. cuTile row occupancy 与 TileLang row threads/stages 统一进入各自 tuner；不可重放 effect 使用一份共享 derived check。
+3. Triton 普通 row wrapper 的 cache key 从单 lane extent 扩成完整动态 shape；手工 guard key 另外带 ABI dtype/device。Triton 原生 `@autotune` 的 key 仍来自 SearchSpace，ABI dtype 与 device 在同一 generated module 内固定，二者没有被混写成一套 key。
+4. `scaled_contract` 的 target spelling 被证明也是 P：5090 更偏向 native scaled dot，H100 的候选空间必须同时包含单 scale-group 形态。没有写 `if sm90`/`if sm120`。
+5. H100 cuTile 的 E8M0 失败被收敛为 capability：当前 API 在 sm90 不能表示该 dtype，launch 在 tuner 前直接 `NotImplementedError`，不再让所有候选逐个失败。
+6. 三个 leaf 各自递归解析 ragged/domain extent 的 120 余行重复逻辑被删除，改读一份共享 `logicalDomainExtent` 派生查询。它仍从 Kernel IR 与 ABI shape 现算，不进入 Plan schema。
+7. TileLang contraction 的 `GemmWarpPolicy.FullRow` 不再是 leaf 常量；FullRow/Square/FullCol 与 tile、stage、threads 一起由 TileLang tuner 实测。5090 的 dense GEMM 与 sparse GEMM 都选择过非旧默认的赢家，证明它不是纯语法别名。
+8. 扩大 TileLang contraction profile 后，最初的 selector 因 profile 含一个当前 kernel 未消费的字段而误删旧候选，造成 H100 sparse GEMM `0.1807→0.2205 ms`。selector 现在只比较当前 roles 的覆盖度；旧候选和新候选都保留，最终恢复到 `0.1815 ms`。这是候选集合 correctness，不是按设备回撤。
+
+### 9.5 Canonical scaled contraction 为什么是 Core，而不是 pattern
+
+旧 `block_scaled_matmul` 把 E8M0 decode、逐元素 scale 和普通 contraction 手写在 DSL 里，而上游 cuTile 调用原生 `ct.mma_scaled`。把这串普通 op 在 leaf 里 pattern-match 成 MMA 会改写作者 Kernel IR，违反编译器边界；继续挂 baseline 又不可比。
+
+本轮确认 Triton `tl.dot_scaled` 与 cuTile `ct.mma_scaled` 都把“带显式 scale tensor 的 contraction”作为原生算法角色，因此增加 canonical `intent.scaled_contract`。它只保存算法语义：四个 data/scale operands、FP8/E8M0 format、两侧 scale group、reduction pair 与 accumulator dtype；没有 warp、tile、layout、storage 或 provider 字段。普通和 scaled contraction 共用 facts、轴角色、padding proof 与 `intent_plan.contract`；三 leaf 逐 op 投影：
+
+- Triton：`tl.dot_scaled` 与显式 decode+`tl.dot` 都作为 P 候选；
+- cuTile：支持设备上投影 `ct.mma_scaled`；sm90 的 E8M0 capability 明确拒绝；
+- TileLang 0.1.13：没有同级 scaled MMA surface，机械 decode 后调用 `T.gemm`，不向共享层索要 TileLang 专属字段。
+
+定向结果：
+
+| 设备 | Triton | cuTile | TileLang | cuTile source |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 0.0118 ms | 0.0139 ms | 0.0258 ms | 0.1390 ms |
+| H100 | 0.0169 ms | capability unsupported | 0.0280 ms | 不可运行 |
+
+H100 上旧显式算法同机 A/B 为 0.0170 ms，新候选为 0.0169 ms；固定表旧值 0.0164 ms 的差异来自当次环境漂移，不是新 Core 回退。
+
+TileLang warp-policy 委托的定向结果如下；source 数字没有因 generated 侧调优而改动：
+
+| device / case | 旧固定表 generated p50 | 本轮 p50 | 结果 |
+|---|---:|---:|---|
+| RTX 5090 GEMM/base | 2.1181 ms | 2.0475 ms | 数值通过，快 3.3% |
+| RTX 5090 sparse 2:4 | 0.2309 ms | 0.2103 ms | 数值通过，快 8.9% |
+| RTX 5090 block-scaled | 0.0279 ms | 0.0258 ms | 数值通过，快 7.5% |
+| H100 GEMM/base | 1.7485 ms | 1.7468 ms | 数值通过，未退化 |
+| H100 GEMM/tail | 1.8982 ms | 1.8126 ms | 数值通过，快 4.5% |
+| H100 sparse 2:4 | 0.1814 ms | 0.1815 ms | 数值通过，0.1 μs 差异；旧 FullRow winner 仍在候选中 |
+
+## 10. 本轮验证范围与真实性
+
+没有做全量。实际执行的受影响 repro 包括：
+
+- RTX 5090：`block_scaled_matmul` × 3、Triton `layer_norm_backward`、Triton `softmax_backward`，以及本轮前半已执行的 `cross_entropy` × 3、cuTile/TileLang LayerNorm backward；决策审计收口后又执行 TileLang `gemm`（base/tail/degenerate）、`block_scaled_matmul`、`sparse_2to4_gemm`；
+- H100：`block_scaled_matmul` × 3（cuTile 确认 capability）、`cross_entropy` × 3、`layer_norm_backward` × 3、`softmax_backward` × 3；之后在隔离 worktree 用同一补丁执行 TileLang `gemm`（base/tail/degenerate）、`block_scaled_matmul`、`sparse_2to4_gemm`；
+- H100 额外用旧显式 block-scaled 实现做同机 A/B，不使用旧 CSV 猜回归。
+
+所有 pass 项都完成真实 GPU 数值对照。主要结果：
+
+| kernel / device | generated | source | 结论 |
+|---|---:|---:|---|
+| cross entropy / 5090 Triton | 0.3432 | 0.3421 ms | 同算法，约 0.3% 差距 |
+| cross entropy / H100 Triton | 0.1944 | 0.2170 ms | generated 快 10.4% |
+| LayerNorm backward / 5090 Triton | 0.0826 | 0.0625 ms | 真正 compiler/physical-reduction 差距，约 1.32× |
+| LayerNorm backward / H100 Triton | 0.0809 | 0.0858 ms | generated 快约 5.7% |
+| block-scaled / 5090 cuTile | 0.0139 | 0.1390 ms | native scaled Core 明显优于 vendor 固定接线 |
+| GEMM / 5090 TileLang | 2.0475 | 2.3229 ms | warp policy 与扩展参数族由下层实测，generated 快 11.9% |
+| GEMM / H100 TileLang | 1.7468 | 2.1684 ms | 同一候选机制，generated 快 19.4% |
+| sparse 2:4 / 5090 TileLang | 0.2103 | 0.2332 ms | generated 快 9.8% |
+| sparse 2:4 / H100 TileLang | 0.1815 | 0.2622 ms | generated 快 30.8% |
+
+5090 LayerNorm backward 的剩余差距已经不能再归因 adapter：两边都读取 forward-saved stats、执行 grouped partial reduction 与第二阶段归约。当前 generated 的 `scatter_reduce` 需要清零两个 f32 partial buffers；上游用 row-group lock 和 bf16 partial buffer。它是一个需要继续决定 collision/partial-storage realization 的通用编译器问题，不是本轮为了表格增加的 kernel 特例。
+
+## 11. 当前编译器到底完成了什么
+
+### 11.1 已经闭合的核心
 
 1. Python 只做 source frontend 和 lowering 临时状态，直接构造唯一 canonical Intent Kernel MLIR；没有并行 typed Python Kernel IR。
 2. Kernel IR 保存算法、logical region、index/effect、structured primitive、typed closure 与 source callable 合同。
@@ -345,18 +506,22 @@ TileLang pointwise single-use expression forwarding 被分别用于 W4A8 与 var
 4. GPU realizer 按逻辑轴组合 parallel、lane、ordered、reduction、contraction、ragged member 等角色，不按 kernel 类别选择入口。
 5. Triton/cuTile/TileLang 共用 Kernel IR 与 GPU Plan；leaf 只做 capability、逐 op/概念投影、目标内候选和 runtime 接线。
 6. Generic reduce/scan closure、多阶段 execution contract、tail validity、tensor-indexed load/store、复杂 ragged/stream/contraction 组合都有真实 kernel 和双设备数值证据。
-7. 122 条记录覆盖逐元素、归约、dense/ragged/stream attention、GEMM、MoE、卷积、扫描、排序、动态规划、量化、反向、multi-stage、in-place 与等价分解。
+7. `intent.scaled_contract` 使 FP8/E8M0 scaled MMA 成为作者可直接陈述的 Core 算法角色；没有通过 leaf pattern-match 改写普通 op 链。
+8. 122 条记录覆盖逐元素、归约、dense/ragged/stream attention、GEMM、MoE、卷积、扫描、排序、动态规划、量化、反向、multi-stage、in-place 与等价分解。
 
-### 9.2 明确但不伪装成完成的边界
+### 11.2 明确但不伪装成完成的边界
 
 - CPU、RISC-V、RVV target family 尚未接入；当前只能证明 Kernel IR 没把 GPU tile 身份写死，不能证明未来 realizer 已经存在或高性能。
 - `partition(count=P)` 有 source 语义但当前 realizer 未实现，frontend fail-closed。
 - TileLang 0.1.13 的 generic combiner、CAS、二维联合 checked footprint、若干单行/多轴 contraction 形态没有可机械委托的现行 surface 能力，提前 unsupported。
 - Sparse 2:4、E8M0 与 FP8 能力是 provider × device 的真实子集，不被提升成全语言统一假能力。
 - 下层编译表示上限、候选超时、NVCC crash 与 layout/resource failure 分别保留其真实状态，不统一包装成 unsupported。
+- 5090 Triton LayerNorm backward 的 grouped partial reduction 仍比直接上游约慢 1.32×；它是已对齐算法后的真实 realization 差距，不以环境或 scope 遮掩。
 
-## 10. 当前结论
+## 12. 当前结论
 
-从第一轮到现在，推进不是简单增加更多算子，而是依次完成了：边界复审与语义收拢、target spelling 解耦、陌生 vendor 算法施压、双设备全量回归、以及面向真实 baseline 的通用性能强化。
+从第一轮到现在，推进不是简单增加更多算子，而是依次完成了：边界复审与语义收拢、target spelling 解耦、陌生 vendor 算法施压、双设备全量回归、面向真实 baseline 的通用性能强化，以及本轮对所有物理决定和所有 source cell 的正式归类。
 
-当前 GPU 主线已经是一套结构完整、边界显式、能从同一算法和同一 Plan 投影到三个 provider 并真实运行的单算子编译器。它已经具备成熟 compiler 的主要骨架，但性能收尾仍未全部完成：W4A8 compact coverage、ordered-ragged attention realization、H100 dense attention 与若干较小 provider 差距仍需按已定位的共享机制继续推进。准确的状态不是“只剩测试”，也不是“全部 benchmark 已追平”，而是 **correctness 与架构闭环已经建立，当前剩余主线集中在少数可解释的 realization/emission 质量缺口和尚未接入的 CPU/RISC-V/RVV target family**。
+当前 GPU 主线已经是一套结构完整、边界显式、能从同一算法和同一 Plan 投影到三个 provider 并真实运行的单算子编译器。三类决策合同给出了以后修改的硬边界：U 只能有一个来源，S 只能由看得见 Intent 结构的 realizer 选择，P 必须交给 provider 实测。算法审计也使 source 数字重新只表达可比较事实。
+
+它已经具备成熟 compiler 的主要骨架，但性能收尾仍未全部完成：LayerNorm backward 的 grouped-reduction strategy、W4A8 compact coverage、ordered-ragged attention realization、H100 dense attention 与若干较小 provider 差距仍需按已定位的共享机制继续推进。准确状态是：**correctness、编程模型和决策归属已经闭环；当前剩余主线是少数有真实对照支撑的 realization/emission 质量缺口，以及尚未接入的 CPU/RISC-V/RVV target family。**
