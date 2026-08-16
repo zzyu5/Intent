@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 
 def _target_parameters(
     parameter_map: dict[str, str], values: dict[str, int]
@@ -11,7 +9,7 @@ def _target_parameters(
 
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
-        "stream": (32, 64, 128, 256, 512, 1024),
+        "stream": (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
         "query": (1, 2, 16, 32, 64, 128),
@@ -67,6 +65,11 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
             ({"stream": 256}, 4, 4),
             ({"stream": 512}, 3, 8),
             ({"stream": 1024}, 2, 8),
+            ({"stream": 2048}, 2, 8),
+            ({"stream": 4096}, 2, 8),
+            ({"stream": 8192}, 2, 16),
+            ({"stream": 16384}, 1, 32),
+            ({"stream": 32768}, 1, 32),
         ),
         (
             ({"stream_contract": 32}, 4, 4),
@@ -168,38 +171,44 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
     ]
 
 
-def row_vector_num_warps(n_columns: int) -> int:
-    block_size = 1 << (n_columns - 1).bit_length()
-    if block_size >= 32768:
-        return 32
-    if block_size >= 8192:
-        return 16
-    if block_size >= 2048:
-        return 8
-    return 4
-
-
-def row_configuration(n_columns: int, properties: dict[str, int]) -> SimpleNamespace:
+def row_autotune_configurations(*, persistent: bool = False) -> list[object]:
     import triton
 
-    return SimpleNamespace(
-        tile_size=triton.next_power_of_2(n_columns),
-        num_stages=4 if properties["max_shared_mem"] > 200000 else 2,
-        num_warps=8,
-    )
+    if persistent:
+        profiles = (
+            (4, 1, 4),
+            (4, 2, 2),
+            (4, 3, 2),
+            (8, 2, 4),
+            (8, 2, 2),
+            (8, 3, 1),
+            (8, 4, 1),
+            (16, 2, 1),
+            (16, 3, 1),
+            (32, 2, 1),
+        )
+        return [
+            triton.Config(
+                {"ROW_OCCUPANCY": occupancy, "PIPELINE_STAGES": stages},
+                num_stages=stages,
+                num_warps=warps,
+            )
+            for warps, stages, occupancy in profiles
+        ]
 
-
-def row_program_count(
-    n_rows: int,
-    compiled_kernel: object,
-    properties: dict[str, int],
-    warp_size: int,
-    configuration: SimpleNamespace,
-) -> int:
-    occupancy = properties["max_num_regs"] // (
-        compiled_kernel.n_regs * warp_size * configuration.num_warps
+    profiles = (
+        (4, 1),
+        (4, 2),
+        (4, 3),
+        (4, 4),
+        (8, 2),
+        (8, 3),
+        (8, 4),
+        (16, 2),
+        (16, 3),
+        (32, 2),
     )
-    shared = compiled_kernel.metadata.shared
-    if shared:
-        occupancy = min(occupancy, properties["max_shared_mem"] // shared)
-    return min(properties["multiprocessor_count"] * occupancy, n_rows)
+    return [
+        triton.Config({}, num_stages=stages, num_warps=warps)
+        for warps, stages in profiles
+    ]

@@ -734,9 +734,12 @@ void SourceEmitter::emitImports() {
         return entry.second.getLowering() == "libdevice.pow";
       }))
     output << "from triton.language.extra import libdevice\n";
-  if (!planIndex.components.reusedAxes.empty()) {
-    output << "from triton.runtime import driver\n";
-    output << "from intent.runtime.tuning.triton import row_configuration, row_program_count\n";
+  if (!planIndex.components.reusedAxes.empty() || configureRowVector) {
+    output << "from intent.runtime.tuning.triton import row_autotune_configurations\n";
+    output << "\n_ROW_CONFIGS = row_autotune_configurations(persistent="
+           << (!planIndex.components.reusedAxes.empty() ? "True" : "False")
+           << ")\n";
+    output << "_ROW_TUNED_KEYS = set()\n";
   }
   if (searchSpace) {
     output << "from intent.runtime.tuning.triton import autotune_configurations\n";
@@ -750,8 +753,6 @@ void SourceEmitter::emitImports() {
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
   }
-  if (configureRowVector)
-    output << "from intent.runtime.tuning.triton import row_vector_num_warps\n";
   output << "\n\n";
 }
 
@@ -981,6 +982,13 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     if (!firstRestoredView)
       output << "]";
     output << ",\n)\n";
+  } else if (!planIndex.components.reusedAxes.empty() || configureRowVector) {
+    output << "@triton.autotune(\n    configs=_ROW_CONFIGS,\n    key=[";
+    if (!planIndex.components.reusedAxes.empty())
+      output << "'n_rows', 'n_cols'";
+    else
+      output << "'" << roleDimensions.lookup("lane_0") << "'";
+    output << "],\n)\n";
   }
   output << "@triton.jit\n";
   if (!planIndex.components.reusedAxes.empty()) {
@@ -1011,7 +1019,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
       emitParameter(view.strides[0]);
     for (StringRef parameter :
          {"n_rows", "n_cols", "BLOCK_SIZE: tl.constexpr",
-          "num_stages: tl.constexpr"})
+          "ROW_OCCUPANCY: tl.constexpr", "PIPELINE_STAGES: tl.constexpr"})
       emitParameter(parameter);
     output << "):\n";
     return success();
@@ -1338,8 +1346,7 @@ LogicalResult SourceEmitter::emitWrapper() {
           "fixed grid-stride wrapper requires a writable view");
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
-    output << "_PROPERTIES = driver.active.utils.get_device_properties(_DEVICE.index)\n";
-    output << "_WARP_SIZE = torch.cuda.get_device_properties(_DEVICE).warp_size\n\n\n";
+    output << "_NUM_SMS = torch.cuda.get_device_properties(_DEVICE).multi_processor_count\n\n\n";
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -1413,50 +1420,46 @@ LogicalResult SourceEmitter::emitWrapper() {
            << "\n";
     output << "    n_cols = "
            << (columnOwner.empty() ? columnDimension : columnOwner) << "\n";
-    output << "    configuration = row_configuration(n_cols, _PROPERTIES)\n";
-    output << "    kernel = " << kernelName << ".warmup(";
-    bool first = true;
-    auto emitArgument = [&](StringRef argument) {
-      if (!first)
-        output << ", ";
-      output << argument;
-      first = false;
+    output << "    grid = lambda META: (min(_NUM_SMS * META['ROW_OCCUPANCY'], n_rows), 1, 1)\n";
+    auto emitRowLaunchArguments = [&](bool cloneInOut) {
+      bool first = true;
+      auto emitArgument = [&](StringRef argument) {
+        if (!first)
+          output << ", ";
+        output << argument;
+        first = false;
+      };
+      for (ABIView &view : views) {
+        std::string argument = view.argument->name;
+        if (cloneInOut && view.view.getAccess() == "inout")
+          argument += ".clone()";
+        emitArgument(argument);
+      }
+      for (ABIScalar &scalar : scalars)
+        emitArgument(scalar.name);
+      for (const std::string &dimension : dimensionOrder)
+        if (dimension != roleDimensions.lookup("program_0") &&
+            dimension != roleDimensions.lookup("lane_0"))
+          emitArgument(dimension);
+      for (ABIView &view : views)
+        emitArgument(view.argument->name + ".stride(0)");
+      emitArgument("n_rows");
+      emitArgument("n_cols");
+      output << ", BLOCK_SIZE=triton.next_power_of_2(n_cols)";
     };
-    for (ABIView &view : views)
-      emitArgument(view.argument->name);
-    for (ABIScalar &scalar : scalars)
-      emitArgument(scalar.name);
-    for (const std::string &dimension : dimensionOrder)
-      if (dimension != roleDimensions.lookup("program_0") &&
-          dimension != roleDimensions.lookup("lane_0"))
-        emitArgument(dimension);
-    for (ABIView &view : views)
-      emitArgument(view.argument->name + ".stride(0)");
-    for (StringRef argument : {"n_rows", "n_cols"})
-      emitArgument(argument);
-    output << ", BLOCK_SIZE=configuration.tile_size, "
-              "num_stages=configuration.num_stages, "
-              "num_warps=configuration.num_warps, grid=" << programGrid("1")
-           << ")\n";
-    output << "    kernel._init_handles()\n";
-    output << "    num_programs = row_program_count(n_rows, kernel, _PROPERTIES, "
-              "_WARP_SIZE, configuration)\n";
-    output << "    return " << kernelName << "[" << programGrid("num_programs")
-           << "](";
-    first = true;
-    for (ABIView &view : views)
-      emitArgument(view.argument->name);
-    for (ABIScalar &scalar : scalars)
-      emitArgument(scalar.name);
-    for (const std::string &dimension : dimensionOrder)
-      if (dimension != roleDimensions.lookup("program_0") &&
-          dimension != roleDimensions.lookup("lane_0"))
-        emitArgument(dimension);
-    for (ABIView &view : views)
-      emitArgument(view.argument->name + ".stride(0)");
-    for (StringRef argument : {"n_rows", "n_cols", "configuration.tile_size",
-                               "configuration.num_stages"})
-      emitArgument(argument);
+    if (hasInOut) {
+      output << "    row_tuning_key = (n_rows, n_cols";
+      for (ABIView &view : views)
+        output << ", " << view.argument->name << ".dtype";
+      output << ", str(_DEVICE))\n";
+      output << "    if row_tuning_key not in _ROW_TUNED_KEYS:\n";
+      output << "        " << kernelName << "[grid](";
+      emitRowLaunchArguments(true);
+      output << ")\n";
+      output << "        _ROW_TUNED_KEYS.add(row_tuning_key)\n";
+    }
+    output << "    return " << kernelName << "[grid](";
+    emitRowLaunchArguments(false);
     output << ")\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {
@@ -1485,7 +1488,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
     }
     output << "    launch(";
-    first = true;
+    bool first = true;
     for (ABIView &view : views) {
       if (!first)
         output << ", ";
@@ -1626,37 +1629,52 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "    grid = lambda META: (" << grid[0] << ", " << grid[1]
            << ", " << grid[2] << ")\n";
   }
-  output << "    return " << kernelName << "[grid](";
-  bool first = true;
-  auto emitArgument = [&](StringRef argument) {
-    if (!first)
-      output << ", ";
-    output << argument;
-    first = false;
+  auto emitKernelLaunchArguments = [&](bool cloneInOut) {
+    bool first = true;
+    auto emitArgument = [&](StringRef argument) {
+      if (!first)
+        output << ", ";
+      output << argument;
+      first = false;
+    };
+    for (ABIView &view : views) {
+      std::string argument = view.argument->name;
+      if (cloneInOut && view.view.getAccess() == "inout")
+        argument += ".clone()";
+      emitArgument(argument);
+    }
+    for (ABIScalar &scalar : scalars)
+      emitArgument(scalar.name);
+    for (Operation *buffer : privateWorkspaceBuffers)
+      emitArgument(workspaceNames.lookup(buffer->getResult(0)));
+    for (const auto &entry : planIndex.scans) {
+      if (entry.second.getResultSpace() != "private_workspace")
+        continue;
+      Operation *scan = kernel.nodes.lookup(entry.first);
+      for (Value result : scan->getResults())
+        emitArgument(workspaceNames.lookup(result));
+      for (int64_t valueID : entry.second.getMaterializedValues())
+        emitArgument(workspaceNames.lookup(kernel.values.lookup(valueID)));
+    }
+    for (const std::string &dimension : dimensionOrder)
+      emitArgument(dimension);
+    for (ABIView &view : views)
+      for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis)
+        emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
   };
-  for (ABIView &view : views)
-    emitArgument(view.argument->name);
-  for (ABIScalar &scalar : scalars)
-    emitArgument(scalar.name);
-  for (Operation *buffer : privateWorkspaceBuffers)
-    emitArgument(workspaceNames.lookup(buffer->getResult(0)));
-  for (const auto &entry : planIndex.scans) {
-    if (entry.second.getResultSpace() != "private_workspace")
-      continue;
-    Operation *scan = kernel.nodes.lookup(entry.first);
-    for (Value result : scan->getResults())
-      emitArgument(workspaceNames.lookup(result));
-    for (int64_t valueID : entry.second.getMaterializedValues())
-      emitArgument(workspaceNames.lookup(kernel.values.lookup(valueID)));
+  if (configureRowVector && hasInOut) {
+    output << "    row_tuning_key = (" << roleDimensions.lookup("lane_0");
+    for (ABIView &view : views)
+      output << ", " << view.argument->name << ".dtype";
+    output << ", str(_DEVICE))\n";
+    output << "    if row_tuning_key not in _ROW_TUNED_KEYS:\n";
+    output << "        " << kernelName << "[grid](";
+    emitKernelLaunchArguments(true);
+    output << ")\n";
+    output << "        _ROW_TUNED_KEYS.add(row_tuning_key)\n";
   }
-  for (const std::string &dimension : dimensionOrder)
-    emitArgument(dimension);
-  for (ABIView &view : views)
-    for (int64_t axis = 0; axis < view.tensor.getRank(); ++axis)
-      emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
-  if (configureRowVector)
-    output << ", num_warps=row_vector_num_warps("
-           << roleDimensions.lookup("lane_0") << ")";
+  output << "    return " << kernelName << "[grid](";
+  emitKernelLaunchArguments(false);
   output << ")\n\n\n";
   output << "def run(";
   firstParameter = true;
@@ -1691,7 +1709,7 @@ LogicalResult SourceEmitter::emitWrapper() {
     output << "), device=_DEVICE, dtype=" << outputDtype << ")\n";
   }
   output << "    launch(";
-  first = true;
+  bool first = true;
   for (ABIView &view : views) {
     if (!first)
       output << ", ";
