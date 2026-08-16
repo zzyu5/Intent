@@ -72,12 +72,13 @@ if [[ ${unfamiliar} == false ]]; then
   triton:paged_attention)
     baseline=source/triton/xformers/attention/splitk/splitk_kernels_runtime.py
     ;;
-  triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode)
+  triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode | \
+  triton:online_softmax | cutile:online_softmax | tilelang:softmax | \
+  triton:dual_gemm | cutile:dual_gemm | tilelang:dual_gemm | \
+  triton:moe | cutile:moe | tilelang:moe | tilelang:rms_norm | \
+  triton:block_scaled_matmul | tilelang:block_scaled_matmul)
     ;;
   triton:paged_splitk_attention | cutile:paged_splitk_attention | tilelang:paged_splitk_attention)
-    ;;
-  triton:moe)
-    baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
     ;;
   triton:layer_norm)
     baseline=source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py
@@ -107,14 +108,8 @@ if [[ ${unfamiliar} == false ]]; then
   triton:fused_add_rms_norm)
     baseline=source/triton/liger-kernel/normalization/fused_add_rms_norm/fused_add_rms_norm_runtime.py
     ;;
-  triton:dual_gemm)
-    baseline=source/triton/triton/gemm/dense/03-matrix-multiplication.py
-    ;;
   triton:grouped_gemm)
     baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
-    ;;
-  triton:online_softmax)
-    baseline=source/triton/triton/normalization/softmax/02-fused-softmax.py
     ;;
   triton:swiglu_backward)
     baseline=source/triton/liger-kernel/activation/swiglu/swiglu_runtime.py
@@ -149,20 +144,11 @@ if [[ ${unfamiliar} == false ]]; then
   cutile:attention)
     baseline=source/cutile/tilegym/attention/dense/attention_runtime.py
     ;;
-  cutile:moe)
-    baseline=source/cutile/cutile-python/moe/fused/MoE.py
-    ;;
   cutile:layer_norm)
     baseline=source/cutile/cutile-python/normalization/layer_norm/LayerNorm.py
     ;;
-  cutile:dual_gemm)
-    baseline=source/cutile/tilegym/gemm/dense/matmul.py
-    ;;
   cutile:grouped_gemm)
     baseline=source/cutile/tilegym/gemm/grouped/group_gemm.py
-    ;;
-  cutile:online_softmax)
-    baseline=source/cutile/tilegym/normalization/softmax/softmax.py
     ;;
   cutile:swiglu_forward)
     baseline=source/cutile/tilegym/activation/silu_and_mul/silu_and_mul.py
@@ -173,9 +159,6 @@ if [[ ${unfamiliar} == false ]]; then
   triton:rope_qk_full | triton:rope_qk_partial | triton:rope_qk_inverse | \
   tilelang:rope_qk_full | tilelang:rope_qk_partial | tilelang:rope_qk_inverse)
     ;;
-  tilelang:softmax)
-    baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
-    ;;
   tilelang:gemm)
     baseline=source/tilelang/tilelang/gemm/dense/example_gemm.py
     ;;
@@ -184,15 +167,6 @@ if [[ ${unfamiliar} == false ]]; then
     ;;
   tilelang:attention)
     baseline=source/tilelang/tilelang/attention/flash_forward_bshd/example_mha_fwd_bshd.py
-    ;;
-  tilelang:moe)
-    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
-    ;;
-  tilelang:rms_norm)
-    baseline=source/tilelang/tilelang/normalization/rms_norm/rms_norm.py
-    ;;
-  tilelang:dual_gemm)
-    baseline=source/tilelang/tilelang/gemm/dense/example_gemm.py
     ;;
   tilelang:grouped_gemm)
     baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
@@ -245,8 +219,6 @@ if [[ ${unfamiliar} == false ]]; then
   triton:continuous_gqa_decode | cutile:continuous_gqa_decode | tilelang:continuous_gqa_decode)
     ;;
   triton:weight_only_int4 | cutile:weight_only_int4 | tilelang:weight_only_int4)
-    ;;
-  triton:block_scaled_matmul | tilelang:block_scaled_matmul)
     ;;
   cutile:block_scaled_matmul)
     baseline=source/cutile/cutile-python/gemm/block_scaled/BlockScaledMatMul.py

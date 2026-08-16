@@ -1925,6 +1925,10 @@ def _run_layer_norm_backward(
         (BWD_LAYER_FEATURES,), device="cuda", dtype=torch.bfloat16
     )
     bias = torch.randn_like(weight)
+    x_f32 = x.float()
+    mean = x_f32.mean(dim=1)
+    centered = x_f32 - mean[:, None]
+    rstd = torch.rsqrt(centered.square().mean(dim=1) + epsilon)
     rows_artifact = intent.compile(
         layer_norm_backward_rows, target=target, compiler=compiler
     )
@@ -1940,7 +1944,7 @@ def _run_layer_norm_backward(
     db = torch.empty_like(dw)
     rows_call = prepare_kernel_call(
         rows_artifact,
-        (x, dy, weight, dw_partial, db_partial, inverse_features, epsilon),
+        (x, dy, weight, mean, rstd, dw_partial, db_partial, inverse_features),
         dx,
     )
     reduce_call = prepare_kernel_call(
@@ -1956,13 +1960,9 @@ def _run_layer_norm_backward(
         reduce_call()
         return dx, dw, db
 
-    x_f32 = x.float()
     dy_f32 = dy.float()
     weight_f32 = weight.float()
-    mean = x_f32.mean(dim=1, keepdim=True)
-    centered = x_f32 - mean
-    rstd = torch.rsqrt(centered.square().mean(dim=1, keepdim=True) + epsilon)
-    normalized = centered * rstd
+    normalized = centered * rstd[:, None]
     weighted_dy = weight_f32 * dy_f32
     expected = (
         (
@@ -1971,7 +1971,7 @@ def _run_layer_norm_backward(
                 - weighted_dy.mean(dim=1, keepdim=True)
                 - normalized * (weighted_dy * normalized).mean(dim=1, keepdim=True)
             )
-            * rstd
+            * rstd[:, None]
         ).to(torch.bfloat16),
         (dy_f32 * normalized).sum(dim=0),
         dy_f32.sum(dim=0),

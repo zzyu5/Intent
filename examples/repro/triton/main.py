@@ -45,12 +45,16 @@ from repro.common.support import prepare_kernel_call
 from repro.common.support import print_artifact
 
 
-def _load_prefix(source_path: Path, last_line: int, symbol: str, module_name: str):
+def _load_prefix_namespace(source_path: Path, last_line: int, module_name: str):
     tree = ast.parse(source_path.read_text(), filename=str(source_path))
     tree.body = [node for node in tree.body if node.end_lineno <= last_line]
     namespace = {"__file__": str(source_path), "__name__": module_name}
     exec(compile(tree, str(source_path), "exec"), namespace)
-    return namespace[symbol]
+    return namespace
+
+
+def _load_prefix(source_path: Path, last_line: int, symbol: str, module_name: str):
+    return _load_prefix_namespace(source_path, last_line, module_name)[symbol]
 
 
 def _load_module(source_path: Path, module_name: str):
@@ -213,10 +217,9 @@ def _load_extended_upstream(kernel: str, source_path: Path):
             softmax_scale=arguments[4],
         )[0].transpose(1, 2)
     if kernel == "layer_norm_backward":
-        layer_norm = _load_prefix(
+        source = _load_prefix_namespace(
             source_path,
             297,
-            "layer_norm",
             "intent_upstream_triton_layer_norm_backward",
         )
         state = {}
@@ -224,23 +227,72 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         def run(arguments):
             x, dy, weight, bias, epsilon = arguments
             if not state:
-                state["x"] = x.detach().clone().requires_grad_(True)
-                state["weight"] = weight.detach().clone().requires_grad_(True)
-                state["bias"] = bias.detach().clone().requires_grad_(True)
-                state["y"] = layer_norm(
-                    state["x"],
-                    (x.shape[1],),
-                    state["weight"],
-                    state["bias"],
-                    epsilon,
+                rows, features = x.shape
+                x_f32 = x.float()
+                mean = x_f32.mean(dim=1)
+                centered = x_f32 - mean[:, None]
+                rstd = torch.rsqrt(centered.square().mean(dim=1) + epsilon)
+                group_size = 64
+                if features <= 8192:
+                    group_size = 96
+                if features <= 4096:
+                    group_size = 128
+                if features <= 1024:
+                    group_size = 256
+                block_size = min(
+                    65536 // x.element_size(),
+                    source["triton"].next_power_of_2(features),
                 )
-            dx, dw, db = torch.autograd.grad(
-                state["y"],
-                (state["x"], state["weight"], state["bias"]),
+                state.update(
+                    mean=mean,
+                    rstd=rstd,
+                    group_size=group_size,
+                    block_size=block_size,
+                    num_warps=min(max(block_size // 256, 1), 8),
+                    locks=torch.zeros(
+                        2 * group_size, device=x.device, dtype=torch.int32
+                    ),
+                    dw_partial=torch.empty(
+                        (group_size, features), device=x.device, dtype=x.dtype
+                    ),
+                    db_partial=torch.empty(
+                        (group_size, features), device=x.device, dtype=x.dtype
+                    ),
+                    dx=torch.empty_like(x),
+                    dw=torch.empty((features,), device=x.device, dtype=torch.float32),
+                    db=torch.empty((features,), device=x.device, dtype=torch.float32),
+                )
+            state["locks"].zero_()
+            source["_layer_norm_bwd_dx_fused"][(x.shape[0],)](
+                state["dx"],
                 dy,
-                retain_graph=True,
+                state["dw_partial"],
+                state["db_partial"],
+                x,
+                weight,
+                state["mean"],
+                state["rstd"],
+                state["locks"],
+                x.stride(0),
+                x.shape[1],
+                GROUP_SIZE_M=state["group_size"],
+                BLOCK_SIZE_N=state["block_size"],
+                num_warps=state["num_warps"],
             )
-            return dx, dw.float(), db.float()
+            source["_layer_norm_bwd_dwdb"][(
+                source["triton"].cdiv(x.shape[1], 128),
+            )](
+                state["dw_partial"],
+                state["db_partial"],
+                state["dw"],
+                state["db"],
+                min(state["group_size"], x.shape[0]),
+                x.shape[1],
+                BLOCK_SIZE_M=32,
+                BLOCK_SIZE_N=128,
+                num_ctas=1,
+            )
+            return state["dx"], state["dw"], state["db"]
 
         return run
     if kernel == "swiglu_backward":
