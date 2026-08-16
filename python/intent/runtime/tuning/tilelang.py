@@ -152,7 +152,7 @@ def autotune_configurations(
         ),
     )
     score = max(
-        (len(roles.intersection(values)), -len(set(values).difference(roles)))
+        len(roles.intersection(values))
         for family in profiles
         for values, _, _ in family
     )
@@ -160,11 +160,7 @@ def autotune_configurations(
         profile
         for family in profiles
         for profile in family
-        if (
-            len(roles.intersection(profile[0])),
-            -len(set(profile[0]).difference(roles)),
-        )
-        == score
+        if len(roles.intersection(profile[0])) == score
     ]
     choices = []
     seen = set()
