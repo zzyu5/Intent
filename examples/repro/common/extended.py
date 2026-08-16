@@ -106,8 +106,7 @@ from kernels.layout.transpose import matrix_transpose
 from kernels.loss.cross_entropy import IGNORE_INDEX as CROSS_ENTROPY_IGNORE_INDEX
 from kernels.loss.cross_entropy import TOKENS as CROSS_ENTROPY_TOKENS
 from kernels.loss.cross_entropy import VOCABULARY as CROSS_ENTROPY_VOCABULARY
-from kernels.loss.cross_entropy import cross_entropy_backward
-from kernels.loss.cross_entropy import cross_entropy_forward
+from kernels.loss.cross_entropy import fused_cross_entropy
 from kernels.normalization.fused_add_rms_norm import FEATURES as FUSED_RMS_FEATURES
 from kernels.normalization.fused_add_rms_norm import ROWS as FUSED_RMS_ROWS
 from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
@@ -1788,20 +1787,8 @@ def _run_cross_entropy(
         dtype=torch.int32,
     )
     labels[::17] = CROSS_ENTROPY_IGNORE_INDEX
-    dloss = torch.ones(
-        (CROSS_ENTROPY_TOKENS,), device="cuda", dtype=torch.float32
-    )
-    forward_artifact = intent.compile(
-        cross_entropy_forward,
-        constexprs={
-            "IGNORE_INDEX": CROSS_ENTROPY_IGNORE_INDEX,
-            "VOCABULARY": CROSS_ENTROPY_VOCABULARY,
-        },
-        target=target,
-        compiler=compiler,
-    )
-    backward_artifact = intent.compile(
-        cross_entropy_backward,
+    artifact = intent.compile(
+        fused_cross_entropy,
         constexprs={"IGNORE_INDEX": CROSS_ENTROPY_IGNORE_INDEX},
         target=target,
         compiler=compiler,
@@ -1825,15 +1812,16 @@ def _run_cross_entropy(
     expected_gradient[
         torch.arange(CROSS_ENTROPY_TOKENS, device="cuda"), safe_labels
     ] -= valid.float()
-    expected_gradient *= valid[:, None].float() * dloss[:, None]
+    expected_gradient *= valid[:, None].float()
 
-    generated_forward = forward_artifact.run(logits, labels)
-    if not isinstance(generated_forward, tuple) or len(generated_forward) != 2:
+    generated_logits = logits.clone()
+    generated_outputs = artifact.run(generated_logits, labels)
+    if not isinstance(generated_outputs, tuple) or len(generated_outputs) != 2:
         raise RuntimeError(
-            f"{target_name} cross entropy forward did not return two outputs"
+            f"{target_name} fused cross entropy did not return two outputs"
         )
-    generated_loss, generated_prediction = generated_forward
-    generated_gradient = backward_artifact.run(logits, labels, dloss)
+    generated_loss, generated_prediction = generated_outputs
+    generated_gradient = generated_logits
     loss_error = (generated_loss - expected_loss).abs().max().item()
     prediction_matches = torch.equal(
         generated_prediction.long(), expected_prediction.long()
@@ -1846,24 +1834,16 @@ def _run_cross_entropy(
             f"gradient={gradient_error}"
         )
 
-    forward_call = prepare_kernel_call(
-        forward_artifact, (logits, labels), generated_forward
+    generated_call = prepare_kernel_call(
+        artifact, (generated_logits, labels), generated_outputs
     )
-    backward_call = prepare_kernel_call(
-        backward_artifact, (logits, labels, dloss), generated_gradient
-    )
-
-    def generated_pipeline():
-        forward_call()
-        backward_call()
-
     generated_p50, generated_p95 = benchmark(
-        generated_pipeline,
+        generated_call,
         warmup=3,
         repetitions=100,
-        cuda_graph=False,
+        cuda_graph=True,
     )
-    upstream_output = upstream((logits, labels, dloss)) if upstream else None
+    upstream_output = upstream((logits, labels)) if upstream else None
     if upstream_output is not None:
         if not isinstance(upstream_output, tuple) or len(upstream_output) != 3:
             raise RuntimeError(
@@ -1884,20 +1864,19 @@ def _run_cross_entropy(
                 f"{upstream_errors}"
             )
         upstream_p50, upstream_p95 = benchmark(
-            lambda: upstream((logits, labels, dloss)),
+            lambda: upstream((logits, labels)),
             warmup=3,
             repetitions=100,
-            cuda_graph=False,
+            cuda_graph=True,
         )
-    print_artifact(forward_artifact, target_name)
-    print_artifact(backward_artifact, target_name)
+    print_artifact(artifact, target_name)
     print(
-        f"{target_name} cross entropy forward/backward numerical comparison: PASS "
+        f"{target_name} fused cross entropy numerical comparison: PASS "
         f"(loss={loss_error}, prediction={prediction_matches}, "
         f"gradient={gradient_error})"
     )
     print(
-        f"{target_name} cross entropy end-to-end performance (CUDA Event): "
+        f"{target_name} fused cross entropy kernel-only performance (CUDA Graph): "
         f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
     )
     if upstream_output is None:

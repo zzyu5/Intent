@@ -8,60 +8,77 @@ IGNORE_INDEX = -100
 
 
 @intent.kernel
-def cross_entropy_forward(
-    logits: I.In[I.f32, ("M", "V")],
+def fused_cross_entropy(
+    logits: I.InOut[I.f32, ("M", "V")],
     labels: I.In[I.i32, ("M",)],
     loss: I.Out[I.f32, ("M",)],
     prediction: I.Out[I.i32, ("M",)],
     IGNORE_INDEX: I.Constexpr[int],
-    VOCABULARY: I.Constexpr[int],
 ):
     M, V = logits.shape
     classes = I.domain(0, V)
     for row in I.parallel(I.domain(0, M)):
-        values = logits[row, classes]
-        maximum, predicted = I.arg_reduce.max(
-            values,
-            axis=0,
-            identity=-I.inf,
-        )
-        denominator = I.reduce.sum(
-            I.exp(values - maximum),
-            axis=0,
-            identity=0.0,
-        )
         label = labels[row]
-        valid = label != IGNORE_INDEX
-        safe_label = label % VOCABULARY
-        I.assume_in_bounds(safe_label, logits, axis=1)
-        target = logits[row, safe_label]
-        loss[row] = (maximum + I.log(denominator) - target) * I.cast(
-            valid, I.f32
-        )
-        valid_index = I.cast(valid, I.i32)
-        prediction[row] = predicted * valid_index + valid_index - 1
+        if label == IGNORE_INDEX:
+            loss[row] = 0.0
+            prediction[row] = -1
+            clear_stream = I.state_stream(
+                classes,
+                extent=I.auto("CLASS_TILE"),
+                init=(I.cast(0.0, I.f32),),
+            )
+            with clear_stream:
+                for class_region, zero in clear_stream:
+                    logits[row, class_region] = zero
+                    clear_stream.yield_(zero)
+        else:
+            I.assume_in_bounds(label, logits, axis=1)
+            target = logits[row, label]
+            statistics = I.state_stream(
+                classes,
+                extent=I.auto("CLASS_TILE"),
+                init=(
+                    I.cast(-I.inf, I.f32),
+                    I.cast(0.0, I.f32),
+                    I.cast(V, I.i32),
+                ),
+            )
+            with statistics:
+                for class_region, (maximum, denominator, predicted) in statistics:
+                    values = logits[row, class_region]
+                    local_maximum, local_predicted = I.arg_reduce.max(
+                        values,
+                        axis=0,
+                        identity=-I.inf,
+                    )
+                    local_wins = (local_maximum > maximum) or (
+                        (local_maximum == maximum) and (local_predicted < predicted)
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    local_sum = I.reduce.sum(
+                        I.exp(values - next_maximum),
+                        axis=0,
+                        identity=0.0,
+                    )
+                    statistics.yield_(
+                        next_maximum,
+                        denominator * I.exp(maximum - next_maximum) + local_sum,
+                        local_predicted if local_wins else predicted,
+                    )
+            maximum, denominator, predicted = statistics.result
+            loss[row] = maximum + I.log(denominator) - target
+            prediction[row] = predicted
 
-
-@intent.kernel
-def cross_entropy_backward(
-    logits: I.In[I.f32, ("M", "V")],
-    labels: I.In[I.i32, ("M",)],
-    dloss: I.In[I.f32, ("M",)],
-    dlogits: I.Out[I.f32, ("M", "V")],
-    IGNORE_INDEX: I.Constexpr[int],
-):
-    M, V = logits.shape
-    classes = I.domain(0, V)
-    for row in I.parallel(I.domain(0, M)):
-        values = logits[row, classes]
-        maximum = I.reduce.max(values, axis=0, identity=-I.inf)
-        exponentials = I.exp(values - maximum)
-        denominator = I.reduce.sum(exponentials, axis=0, identity=0.0)
-        label = labels[row]
-        valid = label != IGNORE_INDEX
-        is_target = I.cast(I.indices(classes), I.i32) == label
-        probability = exponentials / denominator
-        gradient = (
-            probability - I.cast(is_target, I.f32)
-        ) * dloss[row] * I.cast(valid, I.f32)
-        dlogits[row, classes] = gradient
+            gradient_stream = I.state_stream(
+                classes,
+                extent=I.auto("CLASS_TILE"),
+                init=(maximum, denominator),
+            )
+            with gradient_stream:
+                for class_region, (final_maximum, final_denominator) in gradient_stream:
+                    values = logits[row, class_region]
+                    indices = I.cast(I.indices(class_region), I.i32)
+                    probability = I.exp(values - final_maximum) / final_denominator
+                    gradient = probability - I.cast(indices == label, I.f32)
+                    logits[row, class_region] = gradient
+                    gradient_stream.yield_(final_maximum, final_denominator)

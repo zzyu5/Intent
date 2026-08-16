@@ -152,7 +152,7 @@ def _load_extended_upstream(kernel: str, source_path: Path):
         state = {}
 
         def run(arguments):
-            logits, labels, _ = arguments
+            logits, labels = arguments
             if not state:
                 state["logits"] = logits.clone()
                 state["loss"] = torch.empty(
