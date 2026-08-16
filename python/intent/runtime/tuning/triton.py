@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import product
+
 
 def _target_parameters(
     parameter_map: dict[str, str], values: dict[str, int]
@@ -50,7 +52,10 @@ def _completion_candidates(role: str) -> tuple[int, ...]:
     return candidates
 
 
-def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
+def autotune_configurations(
+    parameter_map: dict[str, str],
+    extra_parameter_candidates: dict[str, tuple[int, ...]] | None = None,
+) -> list[object]:
     import triton
 
     roles = frozenset(parameter_map.values())
@@ -81,6 +86,35 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
             ({"stream_scaled": 2}, 3, 4),
             ({"stream_scaled": 4}, 3, 8),
             ({"stream_scaled": 8}, 2, 8),
+        ),
+        tuple(
+            (
+                {
+                    "program_m": m,
+                    "query": n,
+                    "stream_scaled": groups,
+                    "group_m": 8,
+                },
+                stages,
+                warps,
+            )
+            for m, n, groups, stages, warps in (
+                (64, 16, 1, 4, 4),
+                (64, 32, 1, 4, 4),
+                (64, 32, 2, 4, 4),
+                (64, 64, 1, 4, 4),
+                (64, 64, 2, 4, 4),
+                (64, 64, 4, 3, 4),
+                (64, 128, 1, 4, 4),
+                (64, 128, 2, 3, 4),
+                (128, 16, 1, 4, 4),
+                (128, 32, 1, 4, 4),
+                (128, 32, 2, 4, 4),
+                (128, 64, 1, 4, 4),
+                (128, 64, 2, 3, 4),
+                (128, 128, 1, 4, 4),
+                (128, 128, 2, 3, 8),
+            )
         ),
         tuple(
             ({"query": query, stream_role: stream}, stages, warps)
@@ -168,14 +202,24 @@ def autotune_configurations(parameter_map: dict[str, str]) -> list[object]:
         if key not in seen:
             seen.add(key)
             choices.append((values, stages, warps))
-    return [
-        triton.Config(
-            _target_parameters(parameter_map, values),
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for values, stages, warps in choices
-    ]
+    extras = extra_parameter_candidates or {}
+    extra_names = tuple(extras)
+    extra_values = tuple(product(*(extras[name] for name in extra_names)))
+    if not extra_values:
+        extra_values = ((),)
+    configurations = []
+    for values, stages, warps in choices:
+        for combination in extra_values:
+            target_values = _target_parameters(parameter_map, values)
+            target_values.update(zip(extra_names, combination))
+            configurations.append(
+                triton.Config(
+                    target_values,
+                    num_stages=stages,
+                    num_warps=warps,
+                )
+            )
+    return configurations
 
 
 def row_autotune_configurations(*, persistent: bool = False) -> list[object]:

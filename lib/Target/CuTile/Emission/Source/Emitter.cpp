@@ -1567,6 +1567,9 @@ LogicalResult SourceEmitter::emitWrapper() {
   if (outputs.empty() && !hasInOut)
     return kernel.entry.emitOpError(
         "autotuned cuTile wrapper has no writable views");
+  bool requiresE8M0 = llvm::any_of(planIndex.contracts, [](const auto &entry) {
+    return entry.second.getLowering() == "ct.mma_scaled";
+  });
 
   output << "_TUNE_CACHE = {}\n\n\n";
   output << "def launch(";
@@ -1584,6 +1587,11 @@ LogicalResult SourceEmitter::emitWrapper() {
     firstParameter = false;
   }
   output << "):\n";
+  if (requiresE8M0) {
+    output << "    if torch.cuda.get_device_capability(_DEVICE)[0] < 10:\n";
+    output << "        raise NotImplementedError('cuTile E8M0 scaled MMA is "
+              "not supported by this CUDA device')\n";
+  }
   for (ABIView &view : views) {
     StringRef dtype = torchDtype(view.tensor.getElementType());
     if (dtype.empty())

@@ -754,7 +754,10 @@ void SourceEmitter::emitImports() {
       output << "'" << mapping.getName().getValue() << "': '"
              << cast<StringAttr>(mapping.getValue()).getValue() << "'";
     }
-    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP)\n";
+    output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
+    if (usesScaledContraction())
+      output << ", {'USE_NATIVE_SCALED': (0, 1)}";
+    output << ")\n";
   }
   output << "\n\n";
 }
@@ -1071,6 +1074,8 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   if (searchIndex.autotune)
     for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
       emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
+  if (usesScaledContraction())
+    emitParameter("USE_NATIVE_SCALED: tl.constexpr");
   output << "):\n";
   return success();
 }
@@ -1901,6 +1906,12 @@ std::string SourceEmitter::physicalExtent(StringRef logicalExtent) const {
   if (extent == planIndex.blockExtents.end())
     return logicalExtent.str();
   return "triton.next_power_of_2(" + logicalExtent.str() + ")";
+}
+
+bool SourceEmitter::usesScaledContraction() const {
+  return llvm::any_of(planIndex.contracts, [](const auto &entry) {
+    return entry.second.getLowering() == "tl.dot_scaled";
+  });
 }
 
 FailureOr<std::string> SourceEmitter::physicalAxisTile(plan::AxisOp axis) {

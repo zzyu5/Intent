@@ -2649,10 +2649,39 @@ LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
                      ".shape[1], " + rhs->str() + ".shape[2]))";
   }
   std::string result = makeResultName(operation, 0);
+  line("if USE_NATIVE_SCALED:");
+  ++indentation;
   line(result + " = tl.dot_scaled(" + lhsExpression + ", " + lhsScale->str() +
        ", \"" + *lhsFormat + "\", " + rhsExpression + ", tl.trans(" +
        rhsScale->str() + "), \"" + *rhsFormat +
        "\", out_dtype=tl.float32)");
+  --indentation;
+  line("else:");
+  ++indentation;
+  std::string groupedLhs = lhs->str();
+  std::string groupedRhs = rhs->str();
+  if (lhsType && rhsType && lhsType.getRank() == 2 && rhsType.getRank() == 2) {
+    groupedLhs += ".reshape((" + lhs->str() + ".shape[0], " + lhsScale->str() +
+                  ".shape[1], 32))";
+    groupedRhs += ".reshape((" + rhsScale->str() + ".shape[0], 32, " +
+                  rhs->str() + ".shape[1]))";
+  }
+  std::string decodedLhsScale =
+      syntax::cast(lhsScale->str(), "tl.float32", true, true);
+  std::string decodedRhsScale =
+      syntax::cast(rhsScale->str(), "tl.float32", true, true);
+  std::string expandedLhs = result + "_expanded_lhs";
+  std::string expandedRhs = result + "_expanded_rhs";
+  line(expandedLhs + " = tl.cast(" + groupedLhs +
+       ", tl.float32) * (" + decodedLhsScale + ")[:, :, None]");
+  line(expandedRhs + " = tl.cast(" + groupedRhs +
+       ", tl.float32) * (" + decodedRhsScale + ")[:, None, :]");
+  line(result + " = tl.dot(" + expandedLhs + ".reshape((" + expandedLhs +
+       ".shape[0], " + expandedLhs + ".shape[1] * " + expandedLhs +
+       ".shape[2])), " + expandedRhs + ".reshape((" + expandedRhs +
+       ".shape[0] * " + expandedRhs + ".shape[1], " + expandedRhs +
+       ".shape[2])), out_dtype=tl.float32)");
+  --indentation;
   bindResult(operation, 0, result);
   return success();
 }
