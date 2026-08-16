@@ -92,7 +92,11 @@ bool provePaddedUses(Value value, PaddedValue padded,
         return false;
       continue;
     }
-    if (name == "intent.contract" && padded == PaddedValue::zero) {
+    bool scaledDataOperand =
+        name == "intent.scaled_contract" && user->getNumOperands() == 4 &&
+        (user->getOperand(0) == value || user->getOperand(1) == value);
+    if ((name == "intent.contract" || scaledDataOperand) &&
+        padded == PaddedValue::zero) {
       auto multiply = user->getAttrOfType<StringAttr>("intent.multiply");
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");
       if (multiply && multiply.getValue() == "multiply" && combine &&

@@ -620,7 +620,7 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
       return failure();
     return verifyCombinerUse(true);
   }
-  if (name == "intent.contract") {
+  if (name == "intent.contract" || name == "intent.scaled_contract") {
     if (failed(requireAttribute<ArrayAttr>(operation, "intent.reduce")))
       return failure();
     if (failed(requireAttribute<ArrayAttr>(operation, "intent.batch")) ||
@@ -633,6 +633,38 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
       return operation->emitOpError(
           "supports only the multiply/add semiring; use explicit pointwise "
           "operations and intent.reduce for another semiring");
+    if (name == "intent.scaled_contract") {
+      auto lhsGroup =
+          operation->getAttrOfType<IntegerAttr>("intent.lhs_group_size");
+      auto rhsGroup =
+          operation->getAttrOfType<IntegerAttr>("intent.rhs_group_size");
+      auto lhsFormat =
+          operation->getAttrOfType<StringAttr>("intent.lhs_format");
+      auto rhsFormat =
+          operation->getAttrOfType<StringAttr>("intent.rhs_format");
+      if (operation->getNumOperands() != 4 || operation->getNumResults() != 1 ||
+          !lhsGroup || !rhsGroup || lhsGroup.getInt() <= 0 ||
+          rhsGroup.getInt() <= 0 || !lhsFormat || !rhsFormat)
+        return operation->emitOpError(
+            "has no canonical four-operand scaled-contraction contract");
+      auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
+      auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+      auto lhsScale =
+          dyn_cast<RankedTensorType>(operation->getOperand(2).getType());
+      auto rhsScale =
+          dyn_cast<RankedTensorType>(operation->getOperand(3).getType());
+      bool flat = lhs && rhs && lhs.getRank() == 2 && rhs.getRank() == 2;
+      bool grouped = lhs && rhs && lhs.getRank() == 3 && rhs.getRank() == 3;
+      if (!lhs || !rhs || !lhsScale || !rhsScale || (!flat && !grouped) ||
+          lhsScale.getRank() != 2 || rhsScale.getRank() != 2 ||
+          lhs.getElementType() != rhs.getElementType() ||
+          !isa<Float8E4M3FNType, Float8E5M2Type>(lhs.getElementType()) ||
+          !isa<Float8E8M0FNUType>(lhsScale.getElementType()) ||
+          lhsScale.getElementType() != rhsScale.getElementType())
+        return operation->emitOpError(
+            "requires matching rank-two or grouped rank-three FP8 data and "
+            "rank-two E8M0 scale tensors");
+    }
     return success();
   }
   if (name == "intent.atomic_cas") {

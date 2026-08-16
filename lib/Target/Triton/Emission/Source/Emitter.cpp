@@ -133,7 +133,12 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      binding.lowering = syntax::contraction().str();
+      Operation *contract = kernel.nodes.lookup(value.getNode());
+      binding.lowering =
+          contract && contract->getName().getStringRef() ==
+                          "intent.scaled_contract"
+              ? syntax::scaledContraction().str()
+              : syntax::contraction().str();
       binding.lhsSpace = value.getLhsSpace().str();
       binding.rhsSpace = value.getRhsSpace().str();
       binding.accumulatorSpace = value.getAccumulatorSpace().str();
@@ -307,7 +312,6 @@ LogicalResult SourceEmitter::prepare() {
       planIndex.components.reusedAxes.empty()) {
     auto lane = planIndex.axesByRole.find("lane_0");
     std::string laneDimension = roleDimensions.lookup("lane_0");
-    bool hasNonIdempotentEffect = false;
     bool hasExternalRead = false;
     bool hasAggregation = false;
     bool hasScan = false;
@@ -321,15 +325,14 @@ LogicalResult SourceEmitter::prepare() {
                         name == "intent.contract" ||
                         name == "intent.sparse_contract" ||
                         name == "intent.state_stream";
-      hasNonIdempotentEffect |= name == "intent.scatter_reduce" ||
-                                name == "intent.atomic_add" ||
-                                name == "intent.atomic_cas";
     });
     configureRowVector = lane != planIndex.axesByRole.end() &&
                          lane->second.getTileRole().starts_with("row_vector") &&
                          llvm::is_contained(dimensionOrder, laneDimension) &&
                          (hasExternalRead || !hasAggregation) &&
-                         !hasScan && !hasNonIdempotentEffect;
+                         !hasScan &&
+                         !target::emission::hasNonReplayableEffect(
+                             kernel.entry.getOperation());
   }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
@@ -984,10 +987,15 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     output << ",\n)\n";
   } else if (!planIndex.components.reusedAxes.empty() || configureRowVector) {
     output << "@triton.autotune(\n    configs=_ROW_CONFIGS,\n    key=[";
-    if (!planIndex.components.reusedAxes.empty())
+    if (!planIndex.components.reusedAxes.empty()) {
       output << "'n_rows', 'n_cols'";
-    else
-      output << "'" << roleDimensions.lookup("lane_0") << "'";
+    } else {
+      for (auto [index, dimension] : llvm::enumerate(dimensionOrder)) {
+        if (index)
+          output << ", ";
+        output << "'" << dimension << "'";
+      }
+    }
     output << "],\n)\n";
   }
   output << "@triton.jit\n";
@@ -1344,6 +1352,14 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (outputs.empty() && !hasInOut)
       return kernel.entry.emitOpError(
           "fixed grid-stride wrapper requires a writable view");
+    plan::AxisOp laneAxis = planIndex.axesByRole.lookup("lane_0");
+    if (!laneAxis)
+      return realization.emitOpError(
+          "fixed grid-stride wrapper has no selected lane range");
+    FailureOr<std::string> rowTile = physicalAxisTile(laneAxis);
+    if (failed(rowTile))
+      return realization.emitOpError(
+          "fixed grid-stride wrapper has no selected lane range");
     output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
            << ")\n";
     output << "_NUM_SMS = torch.cuda.get_device_properties(_DEVICE).multi_processor_count\n\n\n";
@@ -1445,7 +1461,7 @@ LogicalResult SourceEmitter::emitWrapper() {
         emitArgument(view.argument->name + ".stride(0)");
       emitArgument("n_rows");
       emitArgument("n_cols");
-      output << ", BLOCK_SIZE=triton.next_power_of_2(n_cols)";
+      output << ", BLOCK_SIZE=" << *rowTile;
     };
     if (hasInOut) {
       output << "    row_tuning_key = (n_rows, n_cols";
@@ -1663,10 +1679,19 @@ LogicalResult SourceEmitter::emitWrapper() {
         emitArgument(view.argument->name + ".stride(" + std::to_string(axis) + ")");
   };
   if (configureRowVector && hasInOut) {
-    output << "    row_tuning_key = (" << roleDimensions.lookup("lane_0");
-    for (ABIView &view : views)
-      output << ", " << view.argument->name << ".dtype";
-    output << ", str(_DEVICE))\n";
+    output << "    row_tuning_key = (";
+    bool firstRowKey = true;
+    for (const std::string &dimension : dimensionOrder) {
+      if (!firstRowKey)
+        output << ", ";
+      output << dimension;
+      firstRowKey = false;
+    }
+    for (ABIView &view : views) {
+      output << (firstRowKey ? "" : ", ") << view.argument->name << ".dtype";
+      firstRowKey = false;
+    }
+    output << (firstRowKey ? "" : ", ") << "str(_DEVICE))\n";
     output << "    if row_tuning_key not in _ROW_TUNED_KEYS:\n";
     output << "        " << kernelName << "[grid](";
     emitKernelLaunchArguments(true);

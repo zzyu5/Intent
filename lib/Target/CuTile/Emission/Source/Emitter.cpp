@@ -76,7 +76,12 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      binding.lowering = syntax::contraction().str();
+      Operation *contract = kernel.nodes.lookup(value.getNode());
+      binding.lowering =
+          contract && contract->getName().getStringRef() ==
+                          "intent.scaled_contract"
+              ? syntax::scaledContraction().str()
+              : syntax::contraction().str();
       binding.lhsSpace = value.getLhsSpace().str();
       binding.rhsSpace = value.getRhsSpace().str();
       binding.accumulatorSpace = value.getAccumulatorSpace().str();
@@ -302,16 +307,10 @@ LogicalResult SourceEmitter::prepare() {
       planIndex.components.reusedAxes.empty() &&
       !planIndex.program.getPersistent()) {
     auto lane = planIndex.axesByRole.find("lane_0");
-    bool hasNonIdempotentEffect = false;
-    kernel.entry.walk([&](Operation *operation) {
-      StringRef name = operation->getName().getStringRef();
-      hasNonIdempotentEffect |= name == "intent.scatter_reduce" ||
-                                name == "intent.atomic_add" ||
-                                name == "intent.atomic_cas";
-    });
     tuneRowOccupancy = lane != planIndex.axesByRole.end() &&
                        lane->second.getTileRole().starts_with("row_vector") &&
-                       !hasNonIdempotentEffect;
+                       !target::emission::hasNonReplayableEffect(
+                           kernel.entry.getOperation());
   }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
@@ -752,7 +751,7 @@ void SourceEmitter::emitImports() {
   output << "import cuda.tile as ct\n";
   output << "import torch\n";
   if (!planIndex.components.reusedAxes.empty())
-    output << "from intent.runtime.tuning.cutile import ROW_OCCUPANCY, row_configuration, row_program_count\n";
+    output << "from intent.runtime.tuning.cutile import tune_persistent_row\n";
   if (searchSpace) {
     output << "from math import ceil\n";
     output << "from cuda.tile.tune import exhaustive_search\n";
@@ -965,7 +964,7 @@ LogicalResult SourceEmitter::emitKernelHeader() {
     return success();
   }
   if (!planIndex.components.reusedAxes.empty()) {
-    output << "@ct.kernel(occupancy=ROW_OCCUPANCY)\n";
+    output << "@ct.kernel\n";
     programIndex = makeRegionArgumentName(*programRoot, 0);
     vectorIndex = makeResultName(*vectorDomain, 0);
     valueNames[programRoot->getRegion(0).front().getArgument(0)] = programIndex;
@@ -1397,6 +1396,15 @@ LogicalResult SourceEmitter::emitWrapper() {
     if (outputs.empty() && !hasInOut)
       return kernel.entry.emitOpError(
           "persistent-row wrapper requires a writable view");
+    plan::AxisOp laneAxis = planIndex.axesByRole.lookup("lane_0");
+    if (!laneAxis)
+      return realization.emitOpError(
+          "persistent-row wrapper has no selected lane range");
+    FailureOr<std::string> rowTile = physicalAxisTile(laneAxis);
+    if (failed(rowTile))
+      return realization.emitOpError(
+          "persistent-row wrapper has no selected lane range");
+    output << "_ROW_TUNE_CACHE = {}\n\n\n";
     output << "def launch(";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
@@ -1448,10 +1456,38 @@ LogicalResult SourceEmitter::emitWrapper() {
            << "\n";
     output << "    n_cols = "
            << (columnOwner.empty() ? columnDimension : columnOwner) << "\n";
-    output << "    configuration = row_configuration(n_cols)\n";
-    output << "    num_programs = row_program_count(n_rows, _DEVICE, configuration.occupancy)\n";
-    output << "    return ct.launch(torch.cuda.current_stream(), (num_programs, 1, 1), "
-           << kernelName << ", (";
+    output << "    tile_size = " << *rowTile << "\n";
+    output << "    cache_key = (n_rows, n_cols";
+    for (ABIView *input : inputs)
+      output << ", " << input->argument->name << ".dtype";
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
+    for (const std::string &dimension : kernelConstants)
+      output << ", " << dimension;
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << ", " << physicalExtent;
+    output << ", str(_DEVICE))\n";
+    output << "    stream = torch.cuda.current_stream()\n";
+    output << "    if cache_key not in _ROW_TUNE_CACHE:\n";
+    output << "        _ROW_TUNE_CACHE[cache_key] = tune_persistent_row(\n";
+    output << "            stream, n_rows, _DEVICE, " << kernelName
+           << ", lambda _: (";
+    for (auto [index, view] : llvm::enumerate(views)) {
+      if (index)
+        output << ", ";
+      output << view.argument->name;
+      if (view.view.getAccess() == "inout")
+        output << ".clone()";
+    }
+    for (ABIScalar &scalar : scalars)
+      output << ", " << scalar.name;
+    for (const std::string &dimension : kernelConstants)
+      output << ", " << dimension;
+    for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
+      output << ", " << physicalExtent;
+    output << ", n_rows, tile_size, n_cols))\n";
+    output << "    selection = _ROW_TUNE_CACHE[cache_key]\n";
+    output << "    return ct.launch(stream, selection.grid, selection.kernel, (";
     for (auto [index, view] : llvm::enumerate(views)) {
       if (index)
         output << ", ";
@@ -1463,7 +1499,7 @@ LogicalResult SourceEmitter::emitWrapper() {
       output << ", " << dimension;
     for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
       output << ", " << physicalExtent;
-    output << ", n_rows, configuration.tile_size, n_cols))\n\n\n";
+    output << ", n_rows, tile_size, n_cols))\n\n\n";
     output << "def run(";
     for (auto [index, view] : llvm::enumerate(inputs)) {
       if (index)

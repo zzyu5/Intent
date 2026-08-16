@@ -18,6 +18,7 @@ mlir::FailureOr<llvm::StringRef> pointwise(mlir::Operation *operation,
 llvm::StringRef reduction(llvm::StringRef role);
 llvm::StringRef scan(llvm::StringRef role);
 llvm::StringRef contraction();
+llvm::StringRef scaledContraction();
 
 std::string gather(llvm::StringRef array, llvm::StringRef indices,
                    llvm::StringRef padding, llvm::StringRef mask = {});

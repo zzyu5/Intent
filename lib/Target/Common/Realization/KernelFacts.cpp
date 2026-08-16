@@ -2445,14 +2445,17 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           OperationHandler{enterStateStream, leaveStateStream})))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
+  auto analyzeContraction = [&](Operation &operation) -> LogicalResult {
+            unsigned operandCount =
+                operation.getName().getStringRef() == "intent.scaled_contract"
+                    ? 4
+                    : 2;
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto batch = operation.getAttrOfType<ArrayAttr>("intent.batch");
-            auto lhs = operation.getNumOperands() == 2
+            auto lhs = operation.getNumOperands() == operandCount
                            ? facts.valueAxes.find(operation.getOperand(0))
                            : facts.valueAxes.end();
-            auto rhs = operation.getNumOperands() == 2
+            auto rhs = operation.getNumOperands() == operandCount
                            ? facts.valueAxes.find(operation.getOperand(1))
                            : facts.valueAxes.end();
             if (!reduce || reduce.empty() || !batch || lhs == facts.valueAxes.end() ||
@@ -2524,8 +2527,23 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             llvm::sort(fact.lhsBatchAxes);
             llvm::sort(fact.rhsBatchAxes);
             facts.contractions[&operation] = std::move(fact);
+            if (operation.getName().getStringRef() == "intent.scaled_contract") {
+              Operation *stream = operation.getParentOp();
+              while (stream && stream->getName().getStringRef() !=
+                                   "intent.state_stream")
+                stream = stream->getParentOp();
+              if (stream && stream->getNumOperands() > 0) {
+                FailureOr<SmallVector<Operation *>> domains =
+                    expandDomainSource(stream->getOperand(0), operation);
+                if (failed(domains))
+                  return failure();
+                facts.scaledStreamDomains.insert(domains->begin(), domains->end());
+              }
+            }
             return bindResultAxes(operation, 0, std::move(resultAxes), facts);
-          })))
+          };
+  if (failed(addHandler(registry, "intent.contract", analyzeContraction)) ||
+      failed(addHandler(registry, "intent.scaled_contract", analyzeContraction)))
     return failure();
   if (failed(addHandler(
           registry, "intent.sparse_contract",

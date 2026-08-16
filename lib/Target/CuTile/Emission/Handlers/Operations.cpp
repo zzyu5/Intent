@@ -231,6 +231,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitContract(op);
                         })) ||
+      failed(addHandler(registry, "intent.scaled_contract",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitScaledContract(op);
+                        })) ||
       failed(addHandler(registry, "intent.view_store",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -2761,6 +2767,51 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression + ", " +
        result + ")");
   --indentation;
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "scaled-contract emission");
+  plan::ContractOp binding =
+      succeeded(node) ? planIndex.contracts.lookup(*node) : plan::ContractOp();
+  if (failed(node) || !binding || binding.getLowering() != "ct.mma_scaled" ||
+      operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
+      target::emission::isPlannedStageNode(planIndex, &operation))
+    return operation.emitOpError("lacks a cuTile scaled-contraction binding");
+  for (Value operand : operation.getOperands())
+    if (deferredLoads.count(operand))
+      return operation.emitOpError(
+          "cuTile scaled contraction requires materialized operand tiles");
+  auto lhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.lhs_group_size");
+  auto rhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.rhs_group_size");
+  FailureOr<StringRef> lhs = lookupValue(operation, 0);
+  FailureOr<StringRef> rhs = lookupValue(operation, 1);
+  FailureOr<StringRef> lhsScale = lookupValue(operation, 2);
+  FailureOr<StringRef> rhsScale = lookupValue(operation, 3);
+  FailureOr<std::string> shape = emitTensorShape(operation, 0);
+  if (!lhsGroup || !rhsGroup || lhsGroup.getInt() != 32 ||
+      rhsGroup.getInt() != 32 || failed(lhs) || failed(rhs) ||
+      failed(lhsScale) || failed(rhsScale) || failed(shape))
+    return operation.emitOpError(
+        "cuTile scaled contraction requires matching K-group size 32");
+  auto lhsType = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operation.getOperand(1).getType());
+  std::string lhsExpression = lhs->str();
+  std::string rhsExpression = rhs->str();
+  if (lhsType && rhsType && lhsType.getRank() == 3 && rhsType.getRank() == 3) {
+    lhsExpression += ".reshape((" + lhs->str() + ".shape[0], " + lhs->str() +
+                     ".shape[1] * " + lhs->str() + ".shape[2]))";
+    rhsExpression += ".reshape((" + rhs->str() + ".shape[0] * " + rhs->str() +
+                     ".shape[1], " + rhs->str() + ".shape[2]))";
+  }
+  std::string result = makeResultName(operation, 0);
+  line(result + " = ct.full(" + *shape + ", 0, dtype=ct.float32)");
+  line(result + " = ct.mma_scaled(" + lhsExpression + ", " + lhsScale->str() +
+       ", " + rhsExpression + ", " + rhsScale->str() + ", " + result + ")");
   bindResult(operation, 0, result);
   return success();
 }

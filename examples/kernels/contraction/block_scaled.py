@@ -30,44 +30,19 @@ def block_scaled_matmul(
         ):
             accumulation = I.state_stream(
                 k_blocks,
-                extent=1,
+                extent=I.auto("SCALE_GROUP_TILE"),
                 init=(I.zeros((row_region, column_region), dtype=I.f32),),
             )
             with accumulation:
                 for k_block_region, accumulator in accumulation:
-                    scaled_lhs = (
-                        I.reshape(
-                            I.cast(
-                                lhs[row_region, k_block_region, k_inner], I.f32
-                            ),
-                            (row_region, 32),
-                        )
-                        * I.reshape(
-                            I.cast(
-                                lhs_scale[row_region, k_block_region], I.f32
-                            ),
-                            (row_region, 1),
-                        )
-                    )
-                    scaled_rhs = (
-                        I.reshape(
-                            I.cast(
-                                rhs[k_block_region, k_inner, column_region], I.f32
-                            ),
-                            (32, column_region),
-                        )
-                        * I.reshape(
-                            I.cast(
-                                rhs_scale[k_block_region, column_region], I.f32
-                            ),
-                            (1, column_region),
-                        )
-                    )
-                    partial = I.contract(
-                        scaled_lhs,
-                        scaled_rhs,
-                        reduce=((1, 0),),
+                    partial = I.scaled_contract(
+                        lhs[row_region, k_block_region, k_inner],
+                        lhs_scale[row_region, k_block_region],
+                        rhs[k_block_region, k_inner, column_region],
+                        rhs_scale[k_block_region, column_region],
                         acc_dtype=I.f32,
+                        lhs_group_size=32,
+                        rhs_group_size=32,
                     )
                     accumulation.yield_(accumulator + partial)
             output[row_region, column_region] = accumulation.result

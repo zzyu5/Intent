@@ -221,6 +221,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitContract(op);
       })) ||
+      failed(addHandler(registry, "intent.scaled_contract", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitScaledContract(op);
+      })) ||
       failed(addHandler(registry, "intent.sparse_contract", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -3421,6 +3426,140 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   if (orientation->rhsTranspose)
     call += ", transpose_B=True";
   line(call + ", policy=T.GemmWarpPolicy.FullRow)");
+  bindResult(operation, 0, *result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "scaled-contract emission");
+  plan::ContractOp binding =
+      succeeded(node) ? planIndex.contracts.lookup(*node) : plan::ContractOp();
+  if (failed(node) || !binding ||
+      binding.getLowering() != "T.scaled_gemm_fallback" ||
+      operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
+      target::emission::isPlannedStageNode(planIndex, &operation))
+    return operation.emitOpError("lacks a TileLang scaled-contraction binding");
+  for (Value operand : operation.getOperands())
+    if (deferredLoads.count(operand))
+      return operation.emitOpError(
+          "TileLang scaled contraction requires materialized operand tiles");
+  auto valueExtents = [&](Value value)
+      -> FailureOr<SmallVector<std::string>> {
+    auto result = dyn_cast<OpResult>(value);
+    if (!result)
+      return failure();
+    return tensorExtents(*result.getOwner(), result.getResultNumber());
+  };
+  FailureOr<SmallVector<std::string>> lhsExtents =
+      valueExtents(operation.getOperand(0));
+  FailureOr<SmallVector<std::string>> rhsExtents =
+      valueExtents(operation.getOperand(1));
+  auto lhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.lhs_group_size");
+  auto rhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.rhs_group_size");
+  if (succeeded(lhsExtents) && succeeded(rhsExtents) &&
+      lhsExtents->size() == 3 && rhsExtents->size() == 3 && lhsGroup &&
+      rhsGroup && lhsGroup.getInt() > 0 && rhsGroup.getInt() > 0) {
+    std::string resultName = makeResultName(operation, 0);
+    std::string scaledLhs = resultName + "_scaled_lhs";
+    std::string scaledRhs = resultName + "_scaled_rhs";
+    std::string lhsReduction = (*lhsExtents)[1] + " * " + (*lhsExtents)[2];
+    std::string rhsReduction = (*rhsExtents)[0] + " * " + (*rhsExtents)[1];
+    line(scaledLhs + " = T.alloc_fragment((" + (*lhsExtents)[0] + ", " +
+         lhsReduction + "), T.float32)");
+    line("for scaled_i, scaled_g, scaled_k in T.Parallel(" +
+         (*lhsExtents)[0] + ", " + (*lhsExtents)[1] + ", " +
+         (*lhsExtents)[2] + "):");
+    ++indentation;
+    FailureOr<std::string> lhs = tensorElement(
+        operation.getOperand(0), {"scaled_i", "scaled_g", "scaled_k"},
+        operation);
+    FailureOr<std::string> lhsScale = tensorElement(
+        operation.getOperand(2), {"scaled_i", "scaled_g"}, operation);
+    if (failed(lhs) || failed(lhsScale))
+      return failure();
+    line(scaledLhs + "[scaled_i, scaled_g * " + (*lhsExtents)[2] +
+         " + scaled_k] = " +
+         syntax::cast(*lhs, "T.float32", false, true) + " * " +
+         syntax::cast(*lhsScale, "T.float32", true, true));
+    --indentation;
+    line(scaledRhs + " = T.alloc_fragment((" + rhsReduction + ", " +
+         (*rhsExtents)[2] + "), T.float32)");
+    line("for scaled_g, scaled_k, scaled_j in T.Parallel(" +
+         (*rhsExtents)[0] + ", " + (*rhsExtents)[1] + ", " +
+         (*rhsExtents)[2] + "):");
+    ++indentation;
+    FailureOr<std::string> rhs = tensorElement(
+        operation.getOperand(1), {"scaled_g", "scaled_k", "scaled_j"},
+        operation);
+    FailureOr<std::string> rhsScale = tensorElement(
+        operation.getOperand(3), {"scaled_g", "scaled_j"}, operation);
+    if (failed(rhs) || failed(rhsScale))
+      return failure();
+    line(scaledRhs + "[scaled_g * " + (*rhsExtents)[1] +
+         " + scaled_k, scaled_j] = " +
+         syntax::cast(*rhs, "T.float32", false, true) + " * " +
+         syntax::cast(*rhsScale, "T.float32", true, true));
+    --indentation;
+    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+    if (failed(result))
+      return failure();
+    line("T.clear(" + *result + ")");
+    line("T.gemm(" + scaledLhs + ", " + scaledRhs + ", " + *result +
+         ", policy=T.GemmWarpPolicy.FullRow)");
+    bindResult(operation, 0, *result);
+    return success();
+  }
+  if (failed(lhsExtents) || failed(rhsExtents) || lhsExtents->size() != 2 ||
+      rhsExtents->size() != 2 || !lhsGroup || !rhsGroup ||
+      lhsGroup.getInt() <= 0 || rhsGroup.getInt() <= 0)
+    return operation.emitOpError(
+        "has no rank-two TileLang scaled-contraction projection");
+  std::string resultName = makeResultName(operation, 0);
+  std::string scaledLhs = resultName + "_scaled_lhs";
+  std::string scaledRhs = resultName + "_scaled_rhs";
+  line(scaledLhs + " = T.alloc_fragment((" + (*lhsExtents)[0] + ", " +
+       (*lhsExtents)[1] + "), T.float32)");
+  line("for scaled_i, scaled_k in T.Parallel(" + (*lhsExtents)[0] + ", " +
+       (*lhsExtents)[1] + "):");
+  ++indentation;
+  FailureOr<std::string> lhs = tensorElement(
+      operation.getOperand(0), {"scaled_i", "scaled_k"}, operation);
+  FailureOr<std::string> lhsScale = tensorElement(
+      operation.getOperand(2),
+      {"scaled_i", "scaled_k // " + std::to_string(lhsGroup.getInt())},
+      operation);
+  if (failed(lhs) || failed(lhsScale))
+    return failure();
+  line(scaledLhs + "[scaled_i, scaled_k] = " +
+       syntax::cast(*lhs, "T.float32", false, true) + " * " +
+       syntax::cast(*lhsScale, "T.float32", true, true));
+  --indentation;
+  line(scaledRhs + " = T.alloc_fragment((" + (*rhsExtents)[0] + ", " +
+       (*rhsExtents)[1] + "), T.float32)");
+  line("for scaled_k, scaled_j in T.Parallel(" + (*rhsExtents)[0] + ", " +
+       (*rhsExtents)[1] + "):");
+  ++indentation;
+  FailureOr<std::string> rhs = tensorElement(
+      operation.getOperand(1), {"scaled_k", "scaled_j"}, operation);
+  FailureOr<std::string> rhsScale = tensorElement(
+      operation.getOperand(3),
+      {"scaled_k // " + std::to_string(rhsGroup.getInt()), "scaled_j"},
+      operation);
+  if (failed(rhs) || failed(rhsScale))
+    return failure();
+  line(scaledRhs + "[scaled_k, scaled_j] = " +
+       syntax::cast(*rhs, "T.float32", false, true) + " * " +
+       syntax::cast(*rhsScale, "T.float32", true, true));
+  --indentation;
+  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  if (failed(result))
+    return failure();
+  line("T.clear(" + *result + ")");
+  line("T.gemm(" + scaledLhs + ", " + scaledRhs + ", " + *result +
+       ", policy=T.GemmWarpPolicy.FullRow)");
   bindResult(operation, 0, *result);
   return success();
 }

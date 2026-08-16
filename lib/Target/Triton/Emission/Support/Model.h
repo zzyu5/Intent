@@ -141,6 +141,7 @@ public:
   mlir::LogicalResult enterStateStream(mlir::Operation &operation);
   mlir::LogicalResult leaveStateStream(mlir::Operation &operation);
   mlir::LogicalResult emitContract(mlir::Operation &operation);
+  mlir::LogicalResult emitScaledContract(mlir::Operation &operation);
   mlir::LogicalResult emitStore(mlir::Operation &operation);
   mlir::LogicalResult emitUniqueStore(mlir::Operation &operation);
   mlir::LogicalResult emitAtomic(mlir::Operation &operation);

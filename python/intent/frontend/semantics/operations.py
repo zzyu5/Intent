@@ -44,6 +44,7 @@ class OperationKind(Enum):
     REDUCE = "reduce"
     SCAN = "scan"
     CONTRACT = "contract"
+    SCALED_CONTRACT = "scaled_contract"
     SPARSE_CONTRACT = "sparse_contract"
 
     RAGGED = "ragged"
@@ -84,6 +85,7 @@ STRUCTURED_OPS = {
     OperationKind.REDUCE,
     OperationKind.SCAN,
     OperationKind.CONTRACT,
+    OperationKind.SCALED_CONTRACT,
     OperationKind.SPARSE_CONTRACT,
     OperationKind.PARALLEL,
     OperationKind.ORDERED,

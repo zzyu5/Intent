@@ -9,6 +9,7 @@ from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics.types import dims_compatible
@@ -23,6 +24,7 @@ from .common import bind_call
 from .common import require_axes
 from .common import require_dtype
 from .common import require_static_bool
+from .common import require_static_int
 from .common import normalize_axes
 
 if TYPE_CHECKING:
@@ -42,6 +44,8 @@ def lower_structured_intrinsic(
         return _scan(lowerer, node)
     if name == "contract":
         return _contract(lowerer, node)
+    if name == "scaled_contract":
+        return _scaled_contract(lowerer, node)
     if name == "sparse_contract_2to4":
         return _sparse_contract_2to4(lowerer, node)
     return NotImplemented
@@ -398,6 +402,130 @@ def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             "acc_dtype": acc_dtype,
             "multiply": multiply,
             "combine": combine,
+        },
+    )
+    return operation.results[0]
+
+
+def _scaled_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(
+        lowerer,
+        node,
+        (
+            "lhs",
+            "lhs_scale",
+            "rhs",
+            "rhs_scale",
+            "acc_dtype",
+            "lhs_group_size",
+            "rhs_group_size",
+        ),
+        required=(
+            "lhs",
+            "lhs_scale",
+            "rhs",
+            "rhs_scale",
+            "acc_dtype",
+            "lhs_group_size",
+            "rhs_group_size",
+        ),
+    )
+    operands = tuple(
+        lowerer.read_value(lowerer.lower_expression(bound[name]), bound[name])
+        for name in ("lhs", "rhs", "lhs_scale", "rhs_scale")
+    )
+    lhs, rhs, lhs_scale, rhs_scale = operands
+    if not all(isinstance(value.type, TensorType) for value in operands):
+        lowerer.error(node, "I.scaled_contract operands must be tensors")
+    flat = lhs.type.rank == 2 and rhs.type.rank == 2
+    grouped = lhs.type.rank == 3 and rhs.type.rank == 3
+    if (lhs_scale.type.rank != 2 or rhs_scale.type.rank != 2 or not (flat or grouped)):
+        lowerer.error(
+            node,
+            "I.scaled_contract requires rank-two scales and rank-two or grouped rank-three data",
+        )
+    if lhs.type.dtype != rhs.type.dtype or lhs.type.dtype.name not in (
+        "f8e4m3fn",
+        "f8e5m2",
+    ):
+        lowerer.error(
+            node,
+            "I.scaled_contract currently requires matching FP8 data operands",
+        )
+    if lhs_scale.type.dtype.name != "f8e8m0fnu" or rhs_scale.type.dtype.name != "f8e8m0fnu":
+        lowerer.error(node, "I.scaled_contract currently requires E8M0 scales")
+    lhs_group = require_static_int(lowerer, bound["lhs_group_size"])
+    rhs_group = require_static_int(lowerer, bound["rhs_group_size"])
+    if lhs_group <= 0 or rhs_group <= 0:
+        lowerer.error(node, "scaled contraction group sizes must be positive")
+    if flat:
+        if not dims_compatible(lhs.type.shape[1], rhs.type.shape[0]):
+            lowerer.error(
+                node, "scaled contraction reduction dimensions are incompatible"
+            )
+        if not dims_compatible(lhs.type.shape[0], lhs_scale.type.shape[0]):
+            lowerer.error(node, "lhs scale rows must match lhs rows")
+        if not dims_compatible(rhs.type.shape[1], rhs_scale.type.shape[1]):
+            lowerer.error(node, "rhs scale columns must match rhs columns")
+        for data_dim, scale_dim, group, side in (
+            (lhs.type.shape[1], lhs_scale.type.shape[1], lhs_group, "lhs"),
+            (rhs.type.shape[0], rhs_scale.type.shape[0], rhs_group, "rhs"),
+        ):
+            if isinstance(data_dim, StaticDim) and isinstance(scale_dim, StaticDim):
+                if (
+                    data_dim.value % group != 0
+                    or data_dim.value // group != scale_dim.value
+                ):
+                    lowerer.error(
+                        node,
+                        f"{side} scale extent does not match its K-group size",
+                    )
+        reduce = ((1, 0),)
+        result_shape = (lhs.type.shape[0], rhs.type.shape[1])
+    else:
+        if not dims_compatible(lhs.type.shape[1], rhs.type.shape[0]) or not dims_compatible(
+            lhs.type.shape[2], rhs.type.shape[1]
+        ):
+            lowerer.error(
+                node, "grouped scaled-contraction K dimensions are incompatible"
+            )
+        if not dims_compatible(lhs.type.shape[0], lhs_scale.type.shape[0]) or not dims_compatible(
+            lhs.type.shape[1], lhs_scale.type.shape[1]
+        ):
+            lowerer.error(node, "lhs grouped scales do not match lhs data")
+        if not dims_compatible(rhs.type.shape[0], rhs_scale.type.shape[0]) or not dims_compatible(
+            rhs.type.shape[2], rhs_scale.type.shape[1]
+        ):
+            lowerer.error(node, "rhs grouped scales do not match rhs data")
+        for inner, group, side in (
+            (lhs.type.shape[2], lhs_group, "lhs"),
+            (rhs.type.shape[1], rhs_group, "rhs"),
+        ):
+            if isinstance(inner, StaticDim) and inner.value != group:
+                lowerer.error(
+                    node,
+                    f"{side} inner K extent must equal its scale group size",
+                )
+        reduce = ((1, 0), (2, 1))
+        result_shape = (lhs.type.shape[0], rhs.type.shape[2])
+    acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
+    operation = lowerer.emit(
+        OperationKind.SCALED_CONTRACT,
+        lowerer.location(node),
+        operands=operands,
+        result_types=(
+            TensorType(acc_dtype, result_shape),
+        ),
+        attributes={
+            "reduce": reduce,
+            "batch": (),
+            "acc_dtype": acc_dtype,
+            "multiply": "multiply",
+            "combine": "add",
+            "lhs_group_size": lhs_group,
+            "rhs_group_size": rhs_group,
+            "lhs_format": lhs.type.dtype.name,
+            "rhs_format": rhs.type.dtype.name,
         },
     )
     return operation.results[0]

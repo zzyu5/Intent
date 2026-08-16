@@ -258,6 +258,12 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitContract(op);
                         })) ||
+      failed(addHandler(registry, "intent.scaled_contract",
+                        [&](Operation &op) {
+                          if (!emitter.selectOperation(op))
+                            return success();
+                          return emitter.emitScaledContract(op);
+                        })) ||
       failed(addHandler(registry, "intent.view_store",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -2590,6 +2596,63 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression + ", " +
        result + ")");
   --indentation;
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult SourceEmitter::emitScaledContract(Operation &operation) {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "scaled-contract emission");
+  plan::ContractOp binding =
+      succeeded(node) ? planIndex.contracts.lookup(*node) : plan::ContractOp();
+  if (failed(node) || !binding || binding.getLowering() != "tl.dot_scaled" ||
+      operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
+      target::emission::isPlannedStageNode(planIndex, &operation))
+    return operation.emitOpError("lacks a Triton scaled-contraction binding");
+  for (Value operand : operation.getOperands())
+    if (deferredLoads.count(operand))
+      return operation.emitOpError(
+          "Triton scaled contraction requires materialized operand tiles");
+  auto format = [&](StringRef attribute) -> FailureOr<std::string> {
+    auto value = operation.getAttrOfType<StringAttr>(attribute);
+    if (!value)
+      return failure();
+    if (value.getValue() == "f8e4m3fn")
+      return std::string("e4m3");
+    if (value.getValue() == "f8e5m2")
+      return std::string("e5m2");
+    return operation.emitOpError("has no Triton microscaling format");
+  };
+  auto lhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.lhs_group_size");
+  auto rhsGroup =
+      operation.getAttrOfType<IntegerAttr>("intent.rhs_group_size");
+  FailureOr<std::string> lhsFormat = format("intent.lhs_format");
+  FailureOr<std::string> rhsFormat = format("intent.rhs_format");
+  FailureOr<StringRef> lhs = lookupValue(operation, 0);
+  FailureOr<StringRef> rhs = lookupValue(operation, 1);
+  FailureOr<StringRef> lhsScale = lookupValue(operation, 2);
+  FailureOr<StringRef> rhsScale = lookupValue(operation, 3);
+  if (!lhsGroup || !rhsGroup || lhsGroup.getInt() != 32 ||
+      rhsGroup.getInt() != 32 || failed(lhsFormat) || failed(rhsFormat) ||
+      failed(lhs) || failed(rhs) || failed(lhsScale) || failed(rhsScale))
+    return operation.emitOpError(
+        "Triton scaled contraction requires matching K-group size 32");
+  auto lhsType = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto rhsType = dyn_cast<RankedTensorType>(operation.getOperand(1).getType());
+  std::string lhsExpression = lhs->str();
+  std::string rhsExpression = rhs->str();
+  if (lhsType && rhsType && lhsType.getRank() == 3 && rhsType.getRank() == 3) {
+    lhsExpression += ".reshape((" + lhs->str() + ".shape[0], " + lhs->str() +
+                     ".shape[1] * " + lhs->str() + ".shape[2]))";
+    rhsExpression += ".reshape((" + rhs->str() + ".shape[0] * " + rhs->str() +
+                     ".shape[1], " + rhs->str() + ".shape[2]))";
+  }
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.dot_scaled(" + lhsExpression + ", " + lhsScale->str() +
+       ", \"" + *lhsFormat + "\", " + rhsExpression + ", tl.trans(" +
+       rhsScale->str() + "), \"" + *rhsFormat +
+       "\", out_dtype=tl.float32)");
   bindResult(operation, 0, result);
   return success();
 }

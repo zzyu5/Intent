@@ -37,6 +37,8 @@ std::optional<std::string> blockParameter(StringRef role) {
     return "BLOCK_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return "BLOCK_SIZE_C";
+  if (role == "stream_scaled")
+    return "BLOCK_SIZE_SCALE_GROUPS";
   if (role.starts_with("stream_contract_"))
     return "BLOCK_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -176,6 +178,8 @@ StringRef scan(StringRef role) {
 }
 
 StringRef contraction() { return "tl.dot"; }
+
+StringRef scaledContraction() { return "tl.dot_scaled"; }
 
 std::string cast(StringRef value, StringRef targetType, bool decodeE8M0,
                  bool resultIsF32) {

@@ -31,6 +31,8 @@ std::optional<std::string> blockParameter(StringRef role) {
     return "TILE_SIZE_SCAN" + role.drop_front(5).str();
   if (role == "stream_contract")
     return "TILE_SIZE_C";
+  if (role == "stream_scaled")
+    return "TILE_SIZE_SCALE_GROUPS";
   if (role.starts_with("stream_contract_"))
     return "TILE_SIZE_C" + role.drop_front(16).str();
   if (role.starts_with("stream_"))
@@ -177,6 +179,8 @@ StringRef scan(StringRef role) {
 }
 
 StringRef contraction() { return "ct.mma"; }
+
+StringRef scaledContraction() { return "ct.mma_scaled"; }
 
 std::string gather(StringRef array, StringRef indices, StringRef padding,
                    StringRef mask) {

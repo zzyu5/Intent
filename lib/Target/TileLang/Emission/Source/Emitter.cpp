@@ -105,7 +105,12 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      binding.lowering = syntax::contraction().str();
+      Operation *contract = kernel.nodes.lookup(value.getNode());
+      binding.lowering =
+          contract && contract->getName().getStringRef() ==
+                          "intent.scaled_contract"
+              ? syntax::scaledContraction().str()
+              : syntax::contraction().str();
       binding.lhsSpace = syntax::bufferSpace(value.getLhsSpace()).str();
       binding.rhsSpace = syntax::bufferSpace(value.getRhsSpace()).str();
       binding.accumulatorSpace =
@@ -332,6 +337,14 @@ LogicalResult SourceEmitter::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
+  if (!searchSpace && planIndex.stages.empty() &&
+      planIndex.components.reusedAxes.empty()) {
+    auto lane = planIndex.axesByRole.find("lane_0");
+    tuneRowLaunch = lane != planIndex.axesByRole.end() &&
+                    lane->second.getTileRole().starts_with("row_vector") &&
+                    !target::emission::hasNonReplayableEffect(
+                        kernel.entry.getOperation());
+  }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -727,15 +740,21 @@ void SourceEmitter::stageLine(unsigned stage, StringRef text, unsigned indent) {
 }
 
 void SourceEmitter::emitImports() {
+  bool tuneRow = !planIndex.components.reusedAxes.empty() || tuneRowLaunch;
   output << "import torch\n";
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
-  output << "from intent.runtime.tuning.tilelang import DEFAULT_NUM_STAGES, DEFAULT_THREADS, row_configuration\n";
+  output << "from intent.runtime.tuning.tilelang import DEFAULT_NUM_STAGES, DEFAULT_THREADS";
+  if (tuneRow)
+    output << ", row_autotune_configurations";
+  output << "\n";
   if (planIndex.program.getPersistent())
     output << "_NUM_SMS = torch.cuda.get_device_properties("
            << planIndex.target.getDevice() << ").multi_processor_count\n";
-  if (searchSpace) {
+  if (searchSpace || tuneRow) {
     output << "from tilelang.autotuner import autotune\n";
+  }
+  if (searchSpace) {
     output << "from intent.runtime.tuning.tilelang import autotune_configurations\n";
     output << "\n_PARAMETER_MAP = {";
     bool programM = false;
@@ -754,6 +773,10 @@ void SourceEmitter::emitImports() {
     if (programM && programN && planIndex.requiresSymmetricProgramTiles)
       output << ", equal_role_groups=(('program_m', 'program_n'),)";
     output << ")\n";
+  }
+  if (tuneRow)
+    output << "_ROW_CONFIGS = row_autotune_configurations()\n";
+  if (searchSpace || tuneRow) {
     output << "_AUTOTUNE_INPUTS = None\n\n";
     output << "def _fresh_autotune_inputs(_):\n";
     output << "    if _AUTOTUNE_INPUTS is None:\n";
@@ -906,8 +929,10 @@ LogicalResult SourceEmitter::emitKernelHeader() {
   };
 
   auto emitDecorator = [&](raw_ostream &stream) {
-    if (searchSpace)
-      stream << "@autotune(configs=_CONFIGS, warmup=3, rep=10, "
+    if (searchSpace || !planIndex.components.reusedAxes.empty() || tuneRowLaunch)
+      stream << "@autotune(configs="
+             << (searchSpace ? "_CONFIGS" : "_ROW_CONFIGS")
+             << ", warmup=3, rep=10, "
                 "timeout=100, skip_check=True, "
                 "supply_prog=_fresh_autotune_inputs)\n";
     stream << "@tilelang.jit\n";
@@ -1430,7 +1455,7 @@ LogicalResult SourceEmitter::emitWrapper() {
   output << "def launch(";
   emitLaunchSignature();
   output << "):\n";
-  if (searchSpace)
+  if (searchSpace || !planIndex.components.reusedAxes.empty() || tuneRowLaunch)
     output << "    global _AUTOTUNE_INPUTS\n";
   if (failed(emitValidation()))
     return failure();
@@ -1626,25 +1651,22 @@ LogicalResult SourceEmitter::emitWrapper() {
   emitCacheKey("str(_DEVICE)");
   output << ")\n";
   output << "    if cache_key not in _KERNEL_CACHE:\n";
-  if (searchSpace) {
+  if (searchSpace || !planIndex.components.reusedAxes.empty() || tuneRowLaunch) {
     output << "        _AUTOTUNE_INPUTS = [";
     emitKernelArguments();
     output << "]\n        try:\n            compiled = " << kernelName << "(";
     emitBuilderArguments(-1);
+    if (!planIndex.components.reusedAxes.empty()) {
+      plan::AxisOp laneAxis = planIndex.axesByRole.lookup("lane_0");
+      std::string rowTile = laneAxis ? laneAxis.getTile().str() : std::string();
+      if (rowTile.empty())
+        return kernel.entry.emitOpError(
+            "TileLang row configuration has no selected lane range");
+      if (!dimensionOrder.empty())
+        output << ", ";
+      output << rowTile;
+    }
     output << ")\n        finally:\n            _AUTOTUNE_INPUTS = None\n";
-  } else if (!planIndex.components.reusedAxes.empty()) {
-    std::string rowDimension = roleDimensions.lookup("lane_0");
-    if (rowDimension.empty())
-      return kernel.entry.emitOpError(
-          "TileLang row configuration requires a lane axis");
-    output << "        compiled = " << kernelName << "(";
-    emitBuilderArguments(-1);
-    if (!dimensionOrder.empty())
-      output << ", ";
-    output << "row_configuration(" << rowDimension << ").tile_size, "
-           << "num_stages=row_configuration(" << rowDimension
-           << ").num_stages, threads=row_configuration(" << rowDimension
-           << ").threads)\n";
   } else {
     output << "        compiled = " << kernelName << "(";
     emitBuilderArguments(-1);

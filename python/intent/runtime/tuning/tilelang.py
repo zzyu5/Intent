@@ -22,6 +22,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream": (32, 64, 128, 256, 512, 1024),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
+        "stream_scaled": (1, 2, 4, 8),
         "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
@@ -108,6 +109,12 @@ def autotune_configurations(
             ({"stream_contract": 32}, 1, 128),
             ({"stream_contract": 64}, 1, 128),
         ),
+        (
+            ({"stream_scaled": 1}, 1, 128),
+            ({"stream_scaled": 2}, 1, 128),
+            ({"stream_scaled": 4}, 2, 128),
+            ({"stream_scaled": 8}, 2, 256),
+        ),
         tuple(
             ({"query": query, stream_role: stream}, num_stages, threads)
             for stream_role in ("stream", "stream_contract")
@@ -184,9 +191,8 @@ def autotune_configurations(
     ]
 
 
-def row_configuration(n_columns: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        tile_size=1 << (n_columns - 1).bit_length(),
-        num_stages=DEFAULT_NUM_STAGES,
-        threads=DEFAULT_THREADS,
-    )
+def row_autotune_configurations() -> list[dict[str, int]]:
+    return [
+        {"num_stages": num_stages, "threads": threads}
+        for num_stages, threads in ((1, 128), (2, 128), (1, 256), (2, 256))
+    ]

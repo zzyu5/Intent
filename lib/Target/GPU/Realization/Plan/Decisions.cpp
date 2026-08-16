@@ -525,6 +525,7 @@ assignAxes(const target::KernelFacts &facts) {
   unsigned raggedTile = 0;
   unsigned streamTile = 0;
   unsigned streamContractionTile = 0;
+  unsigned scaledStreamTile = 0;
   unsigned scanTile = 0;
   unsigned reductionTile = 0;
   unsigned laneTile = 0;
@@ -571,6 +572,8 @@ assignAxes(const target::KernelFacts &facts) {
               ? "fixed_" + std::to_string(fixed->second)
           : hasIndirectRaggedMembership(choice.domain, facts)
               ? "one"
+          : facts.scaledStreamDomains.contains(choice.domain)
+              ? indexedTile("stream_scaled", scaledStreamTile)
           : hasRole(choice.roles, "reduction")
               ? indexedTile("stream_contract", streamContractionTile)
               : indexedTile("stream", streamTile);

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-ROW_OCCUPANCY = 4
-
 
 def _configuration(
     parameter_map: dict[str, str],
@@ -21,6 +19,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "stream": (32, 64, 128, 512, 1024, 2048),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
+        "stream_scaled": (1, 2, 4, 8),
         "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
@@ -77,6 +76,12 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
         (
             ({"stream_contract": 32}, 1, 4),
             ({"stream_contract": 64}, 1, 2),
+        ),
+        (
+            ({"stream_scaled": 1}, 1, 4),
+            ({"stream_scaled": 2}, 1, 2),
+            ({"stream_scaled": 4}, 1, 1),
+            ({"stream_scaled": 8}, 2, 1),
         ),
         tuple(
             ({"query": query, stream_role: stream}, num_ctas, occupancy)
@@ -164,19 +169,6 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
     )
 
 
-def row_configuration(n_columns: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        tile_size=1 << (n_columns - 1).bit_length(), occupancy=ROW_OCCUPANCY
-    )
-
-
-def row_program_count(n_rows: int, device: object, occupancy: int) -> int:
-    import torch
-
-    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
-    return min(compute_units * occupancy, n_rows)
-
-
 def autotune_timeout(parameter_map: dict[str, str]) -> int:
     roles = frozenset(parameter_map.values())
     return (
@@ -213,3 +205,44 @@ def tune_row_occupancy(
         )
     occupancy = result.best.config.occupancy
     return kernel if occupancy == 0 else kernel.replace_hints(occupancy=occupancy)
+
+
+def tune_persistent_row(
+    stream: object,
+    n_rows: int,
+    device: object,
+    kernel: object,
+    args_fn: object,
+) -> SimpleNamespace:
+    import cuda.tile as ct
+    import torch
+    from cuda.tile.tune import exhaustive_search
+
+    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
+    configurations = tuple(
+        SimpleNamespace(occupancy=occupancy, grid_occupancy=max(1, occupancy))
+        for occupancy in (0, 1, 2, 4)
+    )
+    grid_fn = lambda config: (
+        min(compute_units * config.grid_occupancy, n_rows),
+        1,
+        1,
+    )
+    with ct.compiler_timeout(5):
+        result = exhaustive_search(
+            configurations,
+            stream,
+            grid_fn,
+            kernel,
+            args_fn,
+            hints_fn=lambda config: (
+                {} if config.occupancy == 0 else {"occupancy": config.occupancy}
+            ),
+            quiet=True,
+            single_run_timeout_sec=5,
+        )
+    occupancy = result.best.config.occupancy
+    return SimpleNamespace(
+        kernel=(kernel if occupancy == 0 else kernel.replace_hints(occupancy=occupancy)),
+        grid=grid_fn(result.best.config),
+    )

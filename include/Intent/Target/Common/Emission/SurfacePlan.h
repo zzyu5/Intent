@@ -22,6 +22,16 @@
 
 namespace intent::target::emission {
 
+inline bool hasNonReplayableEffect(mlir::Operation *root) {
+  bool found = false;
+  root->walk([&](mlir::Operation *operation) {
+    llvm::StringRef name = operation->getName().getStringRef();
+    found |= name == "intent.scatter_reduce" ||
+             name == "intent.atomic_add" || name == "intent.atomic_cas";
+  });
+  return found;
+}
+
 inline mlir::FailureOr<std::string>
 reductionRole(mlir::Operation &operation) {
   auto builtin =
@@ -776,11 +786,11 @@ struct ContractionOrientation {
 
 inline mlir::FailureOr<ContractionOrientation>
 contractionOrientation(mlir::Operation &operation) {
-  auto lhsType = operation.getNumOperands() == 2
+  auto lhsType = operation.getNumOperands() >= 2
                      ? mlir::dyn_cast<mlir::RankedTensorType>(
                            operation.getOperand(0).getType())
                      : mlir::RankedTensorType();
-  auto rhsType = operation.getNumOperands() == 2
+  auto rhsType = operation.getNumOperands() >= 2
                      ? mlir::dyn_cast<mlir::RankedTensorType>(
                            operation.getOperand(1).getType())
                      : mlir::RankedTensorType();
@@ -1007,13 +1017,20 @@ bool requiresDelegatedTuning(const PlanIndex &index) {
 }
 
 template <typename PlanIndex>
-bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
-  if (!operation || operation->getName().getStringRef() != "intent.contract")
+bool isPlannedStageNode(const PlanIndex &index, mlir::Operation *operation) {
+  if (!operation)
     return false;
   auto node = operation->getAttrOfType<mlir::IntegerAttr>("intent.node");
   return node && llvm::any_of(index.stages, [&](auto stage) {
            return stage.getNode() == node.getInt();
          });
+}
+
+template <typename PlanIndex>
+bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
+  return operation &&
+         operation->getName().getStringRef() == "intent.contract" &&
+         isPlannedStageNode(index, operation);
 }
 
 template <typename PlanIndex>

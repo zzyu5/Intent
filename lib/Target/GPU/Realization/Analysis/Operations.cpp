@@ -452,8 +452,10 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
           })))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.contract", [&](Operation &operation) -> LogicalResult {
+  auto analyzeContraction = [&](Operation &operation) -> LogicalResult {
+            bool scaled =
+                operation.getName().getStringRef() == "intent.scaled_contract";
+            unsigned operandCount = scaled ? 4 : 2;
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto batch = operation.getAttrOfType<ArrayAttr>("intent.batch");
             auto accType =
@@ -462,7 +464,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 operation.getAttrOfType<StringAttr>("intent.multiply");
             auto combine =
                 operation.getAttrOfType<StringAttr>("intent.combine");
-            auto pair = reduce && reduce.size() == 1
+            auto pair = reduce && !reduce.empty()
                             ? dyn_cast<ArrayAttr>(reduce[0])
                             : ArrayAttr();
             auto lhsAxis = pair && pair.size() == 2
@@ -480,11 +482,11 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             auto rhsBatch = batchPair && batchPair.size() == 2
                                 ? dyn_cast<IntegerAttr>(batchPair[1])
                                 : IntegerAttr();
-            auto lhsType = operation.getNumOperands() == 2
+            auto lhsType = operation.getNumOperands() == operandCount
                                ? dyn_cast<RankedTensorType>(
                                      operation.getOperand(0).getType())
                                : RankedTensorType();
-            auto rhsType = operation.getNumOperands() == 2
+            auto rhsType = operation.getNumOperands() == operandCount
                                ? dyn_cast<RankedTensorType>(
                                      operation.getOperand(1).getType())
                                : RankedTensorType();
@@ -495,22 +497,31 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
             bool supportedAccumulator =
                 accType && (accType.getValue() == "f32" ||
                             accType.getValue() == "i32");
-            bool ordinary = batch && batch.empty() && lhsType && rhsType &&
+            bool ordinary = !scaled && batch && batch.empty() && lhsType && rhsType &&
                             resultType && lhsType.getRank() == 2 &&
                             rhsType.getRank() == 2 && resultType.getRank() == 2;
-            bool batched = batch && batch.size() == 1 && lhsBatch && rhsBatch &&
+            bool scaledGrouped =
+                scaled && batch && batch.empty() && reduce && reduce.size() == 2 &&
+                lhsType && rhsType && resultType && lhsType.getRank() == 3 &&
+                rhsType.getRank() == 3 && resultType.getRank() == 2;
+            bool scaledFlat =
+                scaled && batch && batch.empty() && reduce && reduce.size() == 1 &&
+                lhsType && rhsType && resultType && lhsType.getRank() == 2 &&
+                rhsType.getRank() == 2 && resultType.getRank() == 2;
+            bool batched = !scaled && batch && batch.size() == 1 && lhsBatch && rhsBatch &&
                            lhsType && rhsType && resultType &&
                            lhsType.getRank() == 3 && rhsType.getRank() == 3 &&
                            resultType.getRank() == 3 && lhsBatch.getInt() == 0 &&
                            rhsBatch.getInt() == 0 &&
                            (lhsAxis.getInt() == 1 || lhsAxis.getInt() == 2) &&
                            (rhsAxis.getInt() == 1 || rhsAxis.getInt() == 2);
-            if (operation.getNumOperands() != 2 ||
+            if (operation.getNumOperands() != operandCount ||
                 operation.getNumResults() != 1 || !supportedAccumulator ||
                 !multiply ||
                 multiply.getValue() != "multiply" || !combine ||
                 combine.getValue() != "add" || !lhsAxis || !rhsAxis ||
-                (!ordinary && !batched) ||
+                (!ordinary && !batched && !scaledFlat && !scaledGrouped) ||
+                (scaled && accType.getValue() != "f32") ||
                 (accType.getValue() == "f32" &&
                  !resultType.getElementType().isF32()) ||
                 (accType.getValue() == "i32" &&
@@ -521,8 +532,26 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                  rhsAxis.getInt() != 2))
               return operation.emitOpError(
                   "has no semantics-preserving GPU matrix-unit realization");
+            if (scaled) {
+              auto lhsScale = dyn_cast<RankedTensorType>(
+                  operation.getOperand(2).getType());
+              auto rhsScale = dyn_cast<RankedTensorType>(
+                  operation.getOperand(3).getType());
+              auto lhsGroup = operation.getAttrOfType<IntegerAttr>(
+                  "intent.lhs_group_size");
+              auto rhsGroup = operation.getAttrOfType<IntegerAttr>(
+                  "intent.rhs_group_size");
+              if (!batch.empty() || !lhsScale || !rhsScale ||
+                  lhsScale.getRank() != 2 || rhsScale.getRank() != 2 ||
+                  !lhsGroup || !rhsGroup || lhsGroup.getInt() <= 0 ||
+                  rhsGroup.getInt() <= 0)
+                return operation.emitOpError(
+                    "has no supported GPU scaled-matrix realization");
+            }
             return success();
-          })))
+          };
+  if (failed(addHandler(registry, "intent.contract", analyzeContraction)) ||
+      failed(addHandler(registry, "intent.scaled_contract", analyzeContraction)))
     return failure();
   return success();
 }

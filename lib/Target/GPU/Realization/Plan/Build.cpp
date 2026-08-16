@@ -657,7 +657,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       Operation *definition = current.getDefiningOp();
       if (!definition)
         return false;
-      if (definition->getName().getStringRef() == "intent.contract")
+      if (definition->getName().getStringRef() == "intent.contract" ||
+          definition->getName().getStringRef() == "intent.scaled_contract")
         return true;
       return llvm::any_of(definition->getOperands(), [&](Value operand) {
         return isa<RankedTensorType>(operand.getType()) &&
@@ -693,7 +694,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         load && operation.getNumResults() == 1 &&
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {
           StringRef name = user->getName().getStringRef();
-          return name == "intent.contract" || name == "intent.sparse_contract";
+          return name == "intent.contract" || name == "intent.scaled_contract" ||
+                 name == "intent.sparse_contract";
         });
     Operation *soleUser = nullptr;
     if (contractOperand &&
@@ -989,10 +991,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             })))
       return failure();
 
-  if (failed(addHandler(
-          registry, "intent.contract",
-          [&, sharedContractOperand,
-           isStagedContract](Operation &operation) -> LogicalResult {
+  auto bindContraction = [&, sharedContractOperand,
+                          isStagedContract](Operation &operation) -> LogicalResult {
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "contract binding");
             if (failed(node))
@@ -1071,7 +1071,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
               }
             }
             return success();
-          })))
+          };
+  if (failed(addHandler(registry, "intent.contract", bindContraction)) ||
+      failed(addHandler(registry, "intent.scaled_contract", bindContraction)))
     return failure();
 
   if (failed(addHandler(

@@ -129,6 +129,11 @@ def Intent_ScanOp : Intent_Op<"scan", [Pure]> {
   let results = (outs Variadic<AnyType>:$results);
 }
 def Intent_ContractOp : Intent_BinaryOneResultOp<"contract">;
+def Intent_ScaledContractOp : Intent_Op<"scaled_contract", [Pure]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$lhs_scale,
+                       AnyType:$rhs_scale);
+  let results = (outs AnyType:$result);
+}
 def Intent_SparseContractOp : Intent_VariadicOneResultOp<"sparse_contract">;
 
 def Intent_RaggedOp : Intent_Op<"ragged", [Pure]> {

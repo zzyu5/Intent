@@ -71,6 +71,7 @@ reduce = IntrinsicNamespace("reduce", ("max", "sum"))
 arg_reduce = IntrinsicNamespace("arg_reduce", ("max",))
 scan = Intrinsic("scan")
 contract = Intrinsic("contract")
+scaled_contract = Intrinsic("scaled_contract")
 sparse_contract_2to4 = Intrinsic("sparse_contract_2to4")
 
 gather = Intrinsic("gather")
@@ -127,6 +128,7 @@ INTRINSICS = {
         arg_reduce.max,
         scan,
         contract,
+        scaled_contract,
         sparse_contract_2to4,
         gather,
         scatter_unique,

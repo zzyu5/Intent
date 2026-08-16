@@ -20,6 +20,7 @@ llvm::StringRef bufferSpace(llvm::StringRef space);
 llvm::StringRef reduction(llvm::StringRef role);
 llvm::StringRef scan();
 llvm::StringRef contraction();
+llvm::StringRef scaledContraction();
 std::string cast(llvm::StringRef value, llvm::StringRef targetType,
                  bool decodeE8M0, bool resultIsF32);
 
