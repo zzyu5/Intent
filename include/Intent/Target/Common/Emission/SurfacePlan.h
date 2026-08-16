@@ -38,7 +38,7 @@ logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
   llvm::StringRef name = domain.getName().getStringRef();
   if (name == "intent.ragged_outer" || name == "intent.ragged_member") {
     mlir::Operation *relation =
-        domain.getNumOperands() == 1
+        domain.getNumOperands() >= 1
             ? domain.getOperand(0).getDefiningOp()
             : nullptr;
     unsigned sourceOperand = name == "intent.ragged_outer" ? 0 : 1;
