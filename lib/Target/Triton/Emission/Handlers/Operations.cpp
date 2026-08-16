@@ -582,7 +582,7 @@ LogicalResult SourceEmitter::enterParallel(Operation &operation) {
                                            std::to_string(workerAxis) + ")"));
     line("for " + programIndex +
          " in tl.range(program_start, n_rows, program_step, "
-         "num_stages=num_stages):");
+         "num_stages=PIPELINE_STAGES):");
     ++indentation;
     line(vectorIndex + " = tl.arange(0, BLOCK_SIZE)");
     axisIndices[axis.getNode()] = programIndex;
@@ -1239,6 +1239,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
          ", other=" + fill.str() + ")");
   }
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), result, operation);
+  if (failed(padded))
+    return failure();
+  if (*padded != result)
+    line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
 }
@@ -1333,14 +1339,26 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
     operands.push_back(operand->str());
   }
   if (binding.getLowering() == "tl.max_with_index") {
-    if (operation.getNumResults() != 2)
+    FailureOr<StringRef> indexIdentity = lookupValue(operation, 3);
+    if (operation.getNumResults() != 2 || operands.size() != 2 ||
+        failed(indexIdentity))
       return operation.emitOpError(
           "Triton arg-reduction requires value and index results");
     std::string value = makeResultName(operation, 0);
     std::string index = makeResultName(operation, 1);
-    line(value + ", " + index + " = tl.max(" + operands.front() + ", axis=" +
-         std::to_string(binding.getAxis()) +
-         ", return_indices=True, return_indices_tie_break_left=True)");
+    std::string valueKeepDims = value + "_keep_dims";
+    std::string candidates = index + "_candidates";
+    std::string axis = std::to_string(binding.getAxis());
+    StringRef indexDtype = tritonDtype(operation.getResult(1).getType());
+    if (indexDtype.empty())
+      return operation.emitOpError("has an unsupported arg-reduction index type");
+    line(value + " = tl.max(" + operands.front() + ", axis=" + axis + ")");
+    line(valueKeepDims + " = tl.max(" + operands.front() + ", axis=" + axis +
+         ", keep_dims=True)");
+    line(candidates + " = tl.where(" + operands.front() + " == " + valueKeepDims +
+         ", " + operands[1] + ", " + indexIdentity->str() + ")");
+    line(index + " = tl.cast(tl.min(" + candidates + ", axis=" + axis + "), " +
+         indexDtype.str() + ")");
     bindResult(operation, 0, value);
     bindResult(operation, 1, index);
     return success();

@@ -1236,6 +1236,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   if (*validity != "True")
     line(result + " = ct.where(" + *validity + ", " + result + ", " +
          padding.str() + ")");
+  FailureOr<std::string> padded =
+      padExpression(operation.getResult(0), result, operation);
+  if (failed(padded))
+    return failure();
+  if (*padded != result)
+    line(result + " = " + *padded);
   bindResult(operation, 0, result);
   return success();
 }
@@ -1374,16 +1380,23 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
     identities.push_back(identity->str());
   }
   if (binding.getLowering() == "ct.max_with_index") {
-    if (operation.getNumResults() != 2)
+    if (operation.getNumResults() != 2 || operands.size() != 2 ||
+        identities.size() != 2)
       return operation.emitOpError(
           "cuTile arg-reduction requires value and index results");
     std::string value = makeResultName(operation, 0);
     std::string index = makeResultName(operation, 1);
+    std::string valueKeepDims = value + "_keep_dims";
+    std::string candidates = index + "_candidates";
     std::string axis = std::to_string(binding.getAxis());
     std::string keepDims = binding.getKeepDims() ? "True" : "False";
     line(value + " = ct.max(" + operands.front() + ", " + axis +
          ", keepdims=" + keepDims + ")");
-    line(index + " = ct.argmax(" + operands.front() + ", " + axis +
+    line(valueKeepDims + " = ct.max(" + operands.front() + ", " + axis +
+         ", keepdims=True)");
+    line(candidates + " = ct.where(" + operands.front() + " == " +
+         valueKeepDims + ", " + operands[1] + ", " + identities[1] + ")");
+    line(index + " = ct.min(" + candidates + ", " + axis +
          ", keepdims=" + keepDims + ")");
     bindResult(operation, 0, value);
     bindResult(operation, 1, index);

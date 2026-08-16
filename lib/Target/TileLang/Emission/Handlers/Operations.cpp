@@ -1333,7 +1333,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     StringRef fill = padding == "negative_infinity"
                          ? "-T.infinity(T.float32)"
                          : zeroFill;
-    auto emitElementwise = [&](bool includePhysicalBounds) {
+    auto emitElementwise = [&](bool includePhysicalBounds) -> LogicalResult {
       line(loop + "):");
       ++indentation;
       unsigned loopDepth = 1;
@@ -1345,7 +1345,12 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
         line("if " + *physicalPredicate + ":");
         ++indentation;
       }
-      line(target + "] = " + (*view)->argument->name + "[" + *indices + "]");
+      std::string source = (*view)->argument->name + "[" + *indices + "]";
+      FailureOr<std::string> padded = padElementExpression(
+          operation.getResult(0), source, tileIndices, operation);
+      if (failed(padded))
+        return failure();
+      line(target + "] = " + *padded);
       if (includePhysicalBounds) {
         --indentation;
         line("else:");
@@ -1363,8 +1368,10 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       indentation -= loopDepth;
       if (boundary.getResultSpace() == "shared")
         line("T.sync_threads()");
+      return success();
     };
-    emitElementwise(expanded && !stagePhysicalPadding);
+    if (failed(emitElementwise(expanded && !stagePhysicalPadding)))
+      return failure();
     if (stagePhysicalPadding) {
       line("T.clear(" + *result + ")");
       if (boundary.getResultSpace() == "shared")
@@ -1605,13 +1612,14 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
     return success();
   }
   if (argReduction) {
+    FailureOr<StringRef> indexIdentity = lookupValue(operation, 3);
     auto input = dyn_cast<OpResult>(operation.getOperand(0));
     FailureOr<SmallVector<std::string>> inputExtents =
         input ? tensorExtents(*input.getOwner(), input.getResultNumber())
               : FailureOr<SmallVector<std::string>>(failure());
     int64_t axis = binding.getAxis();
     bool tensorResults = isa<RankedTensorType>(operation.getResult(0).getType());
-    if (failed(inputExtents) || axis < 0 ||
+    if (failed(indexIdentity) || operands.size() != 2 || failed(inputExtents) || axis < 0 ||
         static_cast<size_t>(axis) >= inputExtents->size() ||
         tensorResults !=
             isa<RankedTensorType>(operation.getResult(1).getType()))
@@ -1688,7 +1696,7 @@ LogicalResult SourceEmitter::emitReduction(Operation &operation) {
                               : valueStorage + "[0]";
     line(access(candidates, inputIndices) + " = T.if_then_else(" +
          access(operands.front(), inputIndices) + " == " + maximum + ", " +
-         inputIndices[axis] + ", " + (*inputExtents)[axis] + ")");
+         access(operands[1], inputIndices) + ", " + indexIdentity->str() + ")");
     --indentation;
     line("T.reduce_min(" + candidates + ", " + indexStorage + ", dim=" +
          std::to_string(axis) + ", clear=True)");
