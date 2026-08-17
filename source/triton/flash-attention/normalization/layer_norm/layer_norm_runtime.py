@@ -31,6 +31,66 @@ load_package("flash_attn.ops.triton", SOURCE.parent)
 load_module("flash_attn.utils.torch", SOURCE.parent / "support" / "torch.py")
 load_module("flash_attn.utils.library", SOURCE.parent / "support" / "library.py")
 source = load_module("flash_attn.ops.triton.layer_norm", SOURCE)
+STATE = {}
+
+
+def upstream(arguments):
+    x, weight, bias, _, epsilon = arguments
+    rows, features = x.shape
+    key = (tuple(x.shape), x.dtype, x.device, weight.dtype, bias.dtype)
+    if key not in STATE:
+        STATE[key] = (
+            torch.empty_like(x),
+            torch.empty((rows,), device=x.device, dtype=torch.float32),
+            torch.empty((rows,), device=x.device, dtype=torch.float32),
+        )
+    output, mean, rstd = STATE[key]
+    block = min(65536 // x.element_size(), source.triton.next_power_of_2(features))
+    if features > block:
+        raise NotImplementedError(
+            "FlashAttention LayerNorm baseline requires a single fused feature tile"
+        )
+    source._layer_norm_fwd_1pass_kernel[(rows,)](
+        x,
+        output,
+        weight,
+        bias,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        mean,
+        rstd,
+        x.stride(0),
+        output.stride(0),
+        0,
+        0,
+        0,
+        0,
+        rows,
+        features,
+        epsilon,
+        0.0,
+        0,
+        False,
+        block,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+        HAS_X1=False,
+        HAS_W1=False,
+        HAS_B1=False,
+    )
+    return output
 
 
 def main():

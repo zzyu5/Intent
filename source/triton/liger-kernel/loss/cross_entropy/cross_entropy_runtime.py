@@ -13,6 +13,60 @@ source = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = source
 spec.loader.exec_module(source)
 cross_entropy_forward = source.cross_entropy_forward
+STATE = {}
+
+
+def upstream(arguments):
+    logits, target = arguments
+    rows, vocabulary = logits.shape
+    key = (
+        tuple(logits.shape),
+        logits.dtype,
+        logits.device,
+        target.data_ptr(),
+        target._version,
+    )
+    if key not in STATE:
+        non_ignored = int((target != -100).sum().item())
+        STATE[key] = (
+            torch.empty((rows,), device=logits.device, dtype=logits.dtype),
+            torch.empty((rows,), device=logits.device, dtype=torch.int64),
+            non_ignored,
+        )
+    loss, predicted, non_ignored = STATE[key]
+    block = min(source.MAX_FUSED_SIZE, source.triton.next_power_of_2(vocabulary))
+    source.liger_cross_entropy_kernel[(rows,)](
+        X_ptr=logits,
+        X_stride=logits.stride(0),
+        Y_ptr=target,
+        Y_stride=target.stride(0),
+        weight_ptr=None,
+        loss_ptr=loss,
+        z_loss_ptr=None,
+        loss_stride=loss.stride(0),
+        token_accuracy_ptr=None,
+        token_accuracy_stride=0,
+        predicted_tokens_ptr=predicted,
+        predicted_tokens_stride=predicted.stride(0),
+        n_cols=vocabulary,
+        n_non_ignore=non_ignored,
+        sum_non_ignore_weight=non_ignored,
+        ignore_index=-100,
+        weight_sum=0.0,
+        lse_square_scale=0.0,
+        label_smoothing=0.0,
+        reduction="none",
+        softcap=None,
+        RETURN_Z_LOSS=False,
+        RETURN_TOKEN_ACCURACY=False,
+        RETURN_PREDICTED_TOKENS=True,
+        BLOCK_SIZE=block,
+        HAS_WEIGHT=False,
+        HAS_SOFTCAPPING=False,
+        HAS_GRADIENTS=True,
+        num_warps=32 if not source.is_hip() else 16,
+    )
+    return loss, predicted, logits
 
 
 def main():

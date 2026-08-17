@@ -15,6 +15,46 @@ source = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = source
 spec.loader.exec_module(source)
 fused_add_rms_norm_forward = source.fused_add_rms_norm_forward
+STATE = {}
+
+
+def upstream(arguments):
+    x, residual, weight, _, epsilon, weight_offset = arguments
+    shape = tuple(x.shape)
+    features = shape[-1]
+    rows = x.numel() // features
+    key = (shape, x.dtype, x.device, weight.dtype)
+    if key not in STATE:
+        STATE[key] = (
+            torch.empty_like(x).reshape(rows, features),
+            torch.empty_like(x).reshape(rows, features),
+            torch.empty((rows,), device=x.device, dtype=torch.float32),
+        )
+    output, residual_out, rstd = STATE[key]
+    x_rows = x.reshape(rows, features)
+    residual_rows = residual.reshape(rows, features)
+    block, num_warps = source.calculate_settings(features)
+    source._fused_add_rms_norm_forward_kernel[(rows,)](
+        output,
+        output.stride(0),
+        residual_out,
+        residual_out.stride(0),
+        x_rows,
+        x_rows.stride(0),
+        residual_rows,
+        residual_rows.stride(0),
+        weight,
+        weight.stride(0),
+        rstd,
+        rstd.stride(0),
+        features,
+        epsilon,
+        weight_offset,
+        source._str_to_casting_mode["gemma"],
+        BLOCK_SIZE=block,
+        num_warps=num_warps,
+    )
+    return output.view(shape), residual_out.view(shape)
 
 
 def main():

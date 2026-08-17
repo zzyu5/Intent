@@ -235,3 +235,6 @@ def paged_decode(arguments):
         .permute(0, 2, 1, 3)
         .reshape(batch, state["query_heads"], head_dim)
     )
+
+
+upstream = paged_decode

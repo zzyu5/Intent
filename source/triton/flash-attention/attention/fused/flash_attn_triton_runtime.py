@@ -28,6 +28,81 @@ linecache.cache[compat_filename] = (
 source = types.ModuleType("local_flash_attn_triton")
 source.__file__ = compat_filename
 exec(compile(source_text, compat_filename, "exec"), source.__dict__)
+STATE = {}
+
+
+def upstream(arguments):
+    q, k, v, bias, scale = arguments
+    batch, query_length, heads, head_dimension = q.shape
+    key_length = k.shape[1]
+    if k.shape != (batch, key_length, heads, head_dimension):
+        raise RuntimeError("FlashAttention baseline received an incompatible key shape")
+    if v.shape != k.shape:
+        raise RuntimeError("FlashAttention baseline received an incompatible value shape")
+    if bias.shape[2:] != (1, key_length):
+        raise NotImplementedError(
+            "FlashAttention baseline adapter currently requires vector bias"
+        )
+    expanded_bias = bias.expand(batch, heads, query_length, key_length)
+    rounded_query = source.math.ceil(query_length / 128) * 128
+    key = (tuple(q.shape), tuple(k.shape), q.dtype, q.device)
+    if key not in STATE:
+        STATE[key] = (
+            torch.empty_like(q),
+            torch.empty(
+                (batch, heads, rounded_query),
+                device=q.device,
+                dtype=torch.float32,
+            ),
+            torch.empty(
+                (batch, heads, rounded_query),
+                device=q.device,
+                dtype=torch.float32,
+            ),
+        )
+    output, lse, temporary = STATE[key]
+    block_head = max(source.triton.next_power_of_2(head_dimension), 16)
+    grid = (source.triton.cdiv(query_length, 128), batch * heads)
+    source._fwd_kernel[grid](
+        q,
+        k,
+        v,
+        expanded_bias,
+        output,
+        lse,
+        temporary,
+        scale,
+        q.stride(0),
+        q.stride(2),
+        q.stride(1),
+        k.stride(0),
+        k.stride(2),
+        k.stride(1),
+        v.stride(0),
+        v.stride(2),
+        v.stride(1),
+        expanded_bias.stride(0),
+        expanded_bias.stride(1),
+        expanded_bias.stride(2),
+        output.stride(0),
+        output.stride(2),
+        output.stride(1),
+        heads,
+        query_length,
+        key_length,
+        rounded_query,
+        head_dimension,
+        query_length // 32,
+        key_length // 32,
+        "vector",
+        False,
+        block_head,
+        BLOCK_M=128,
+        BLOCK_N=128,
+        num_warps=4 if head_dimension <= 64 else 8,
+        num_stages=1,
+    )
+    return output.transpose(1, 2)
 
 
 def main():

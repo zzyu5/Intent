@@ -63,11 +63,12 @@ def adamw_update_parameter(
     for index in I.parallel(I.domain(0, N)):
         corrected_first = first_moment[index] * inverse_bias1
         corrected_second = second_moment[index] * inverse_bias2
+        denominator = 1.0 / I.rsqrt(corrected_second) + epsilon
         parameter[index] = (
             parameter[index] * (1.0 - learning_rate * weight_decay)
             - learning_rate
             * corrected_first
-            * I.rsqrt(corrected_second + epsilon)
+            / denominator
         )
 
 

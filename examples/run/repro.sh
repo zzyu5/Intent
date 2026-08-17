@@ -143,6 +143,8 @@ if [[ ${unfamiliar} == false ]]; then
     ;;
   triton:paged_splitk_attention | cutile:paged_splitk_attention | tilelang:paged_splitk_attention)
     ;;
+  tilelang:continuous_gqa_decode)
+    ;;
   triton:layer_norm)
     baseline=source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py
     ;;

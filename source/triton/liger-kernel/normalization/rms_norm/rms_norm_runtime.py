@@ -13,6 +13,41 @@ source = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = source
 spec.loader.exec_module(source)
 rms_norm_forward = source.rms_norm_forward
+STATE = {}
+
+
+def upstream(arguments):
+    x, weight, _, epsilon = arguments
+    shape = tuple(x.shape)
+    features = shape[-1]
+    rows = x.numel() // features
+    key = (shape, x.dtype, x.device, weight.dtype)
+    if key not in STATE:
+        STATE[key] = (
+            torch.empty_like(x).reshape(rows, features),
+            torch.empty((rows,), device=x.device, dtype=x.dtype),
+        )
+    output, rstd = STATE[key]
+    x_rows = x.reshape(rows, features)
+    block, num_warps = source.calculate_settings(features)
+    source._rms_norm_forward_kernel[(rows,)](
+        output,
+        output.stride(0),
+        x_rows,
+        x_rows.stride(0),
+        weight,
+        weight.stride(0),
+        rstd,
+        rstd.stride(0),
+        features,
+        epsilon,
+        0.0,
+        source._str_to_casting_mode["none"],
+        elementwise_affine=True,
+        BLOCK_SIZE=block,
+        num_warps=num_warps,
+    )
+    return output.view(shape)
 
 
 def main():

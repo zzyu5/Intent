@@ -141,7 +141,7 @@ def _run_adamw_split_pipeline(
     expected_parameter.mul_(1.0 - learning_rate * weight_decay).add_(
         expected_first
         * inverse_bias1
-        * torch.rsqrt(expected_second * inverse_bias2 + epsilon),
+        / (torch.sqrt(expected_second * inverse_bias2) + epsilon),
         alpha=-learning_rate,
     )
     original_artifact = intent.compile(adamw_update, target=target, compiler=compiler)

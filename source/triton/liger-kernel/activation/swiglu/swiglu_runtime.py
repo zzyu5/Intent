@@ -13,6 +13,56 @@ source = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = source
 spec.loader.exec_module(source)
 swiglu_forward = source.swiglu_forward
+swiglu_backward = source.swiglu_backward
+STATE = {}
+
+
+def upstream(arguments):
+    if len(arguments) == 2 or (
+        len(arguments) == 3
+        and arguments[2].shape[-1] == 2 * arguments[0].shape[-1]
+    ):
+        gate, up = arguments[:2]
+        shape = tuple(gate.shape)
+        features = shape[-1]
+        rows = gate.numel() // features
+        key = (shape, gate.dtype, gate.device)
+        if key not in STATE:
+            STATE[key] = torch.empty_like(gate).reshape(rows, features)
+        output = STATE[key]
+        gate_rows = gate.reshape(rows, features)
+        up_rows = up.reshape(rows, features)
+        block, num_warps = source.calculate_settings(features)
+        source._swiglu_forward_kernel[(rows,)](
+            gate_rows,
+            up_rows,
+            output,
+            output.stride(0),
+            n_cols=features,
+            BLOCK_SIZE=block,
+            num_warps=num_warps,
+        )
+        return output.view(shape)
+    if len(arguments) == 3:
+        gradient, gate, up = arguments
+        shape = tuple(gradient.shape)
+        features = shape[-1]
+        rows = gradient.numel() // features
+        gradient_rows = gradient.reshape(rows, features)
+        gate_rows = gate.reshape(rows, features)
+        up_rows = up.reshape(rows, features)
+        block, num_warps = source.calculate_settings(features)
+        source._swiglu_backward_kernel[(rows,)](
+            gradient_rows,
+            gate_rows,
+            up_rows,
+            gradient_rows.stride(0),
+            n_cols=features,
+            BLOCK_SIZE=block,
+            num_warps=num_warps,
+        )
+        return gate_rows.view(shape), up_rows.view(shape)
+    raise RuntimeError("SwiGLU baseline expects forward or backward arguments")
 
 
 def main():
