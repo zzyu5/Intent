@@ -25,8 +25,8 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "lane_pack": (64, 128, 256),
         "feature": (64, 128),
         "reduction": (16, 32, 64),
-        "program_m": (64, 128),
-        "program_n": (64, 128),
+        "program_m": (16, 32, 64, 128),
+        "program_n": (16, 32, 64, 128),
         "group_m": (4, 8),
         "gather_spelling": (0, 1),
     }.get(role)
@@ -62,6 +62,26 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
     roles = frozenset(parameter_map.values())
     for role in roles:
         _role_candidates(role)
+    joint_program_profiles = (
+        tuple(
+            (
+                {"program_m": program_m, "program_n": program_n},
+                1,
+                occupancy,
+            )
+            for program_m, program_n in (
+                (16, 16),
+                (32, 32),
+                (64, 64),
+                (64, 128),
+                (128, 64),
+                (128, 128),
+            )
+            for occupancy in (1, 2, 4)
+        )
+        if roles == {"program_m", "program_n"}
+        else ()
+    )
     profiles = (
         (
             ({"scan": 64}, 1, 4),
@@ -111,6 +131,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             for reduction in (16, 32, 64)
             for occupancy in (1, 2, 4)
         ),
+        joint_program_profiles,
         (
             ({"ragged_member": 128, "feature": 64, "reduction": 64}, 1, 1),
             ({"ragged_member": 128, "feature": 64, "reduction": 32}, 1, 2),

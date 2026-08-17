@@ -587,6 +587,7 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     FailureOr<std::string> start = failure();
     FailureOr<std::string> stop = failure();
     FailureOr<std::string> step = std::string("1");
+    ABIView *raggedIndices = nullptr;
     if (domain->getName().getStringRef() == "intent.domain" &&
         domain->getNumOperands() >= 2) {
       start = rangeValue(0);
@@ -608,6 +609,7 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
         return operation.emitOpError(
             "ordered ragged traversal has no outer-axis or offsets binding");
       RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+      raggedIndices = ragged.indices;
       std::string suffix = std::to_string(*domainNode);
       std::string begin = "sequence_begin_" + suffix;
       std::string end = "sequence_end_" + suffix;
@@ -629,9 +631,6 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
       return operation.emitOpError(
           "TileLang ordered traversal requires a zero-based domain");
     std::string iterator = makeRegionArgumentName(operation, index);
-    valueNames[body.getArgument(index)] = iterator;
-    if (raggedAxis && succeeded(domainNode))
-      axisIndices[*domainNode] = iterator;
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
@@ -658,6 +657,15 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
            "):");
       ++indentation;
     }
+    std::string logicalIterator = iterator;
+    if (raggedIndices) {
+      logicalIterator = iterator + "_member";
+      line(logicalIterator + " = " + raggedIndices->argument->name + "[" +
+           addressIndex(iterator) + "]");
+    }
+    valueNames[body.getArgument(index)] = logicalIterator;
+    if (raggedAxis && succeeded(domainNode))
+      axisIndices[*domainNode] = logicalIterator;
   }
   return success();
 }

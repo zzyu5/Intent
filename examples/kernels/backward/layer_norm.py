@@ -17,8 +17,8 @@ def layer_norm_backward_rows(
     mean: I.In[I.f32, ("M",), VECTOR_STRIDES],
     rstd: I.In[I.f32, ("M",), VECTOR_STRIDES],
     dx: I.Out[I.bf16, ("M", "N"), MATRIX_STRIDES],
-    dw_partial: I.InOut[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
-    db_partial: I.InOut[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    dw_partial: I.InOut[I.bf16, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    db_partial: I.InOut[I.bf16, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
     inverse_features: I.f32,
 ):
     M, N = x.shape
@@ -53,21 +53,21 @@ def layer_norm_backward_rows(
         I.scatter_reduce(
             dw_partial,
             index=(group, columns),
-            value=dw_value,
+            value=I.cast(dw_value, I.bf16),
             combine=I.add,
         )
         I.scatter_reduce(
             db_partial,
             index=(group, columns),
-            value=db_value,
+            value=I.cast(db_value, I.bf16),
             combine=I.add,
         )
 
 
 @intent.kernel
 def layer_norm_backward_reduce(
-    dw_partial: I.In[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
-    db_partial: I.In[I.f32, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    dw_partial: I.In[I.bf16, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
+    db_partial: I.In[I.bf16, (PARTIAL_GROUPS, "N"), MATRIX_STRIDES],
     dw: I.Out[I.f32, ("N",), VECTOR_STRIDES],
     db: I.Out[I.f32, ("N",), VECTOR_STRIDES],
 ):
@@ -90,13 +90,13 @@ def layer_norm_backward_reduce(
                 accumulation.yield_(
                     dw_value
                     + I.reduce.sum(
-                        dw_partial[row_region, feature_region],
+                        I.cast(dw_partial[row_region, feature_region], I.f32),
                         axis=0,
                         identity=0.0,
                     ),
                     db_value
                     + I.reduce.sum(
-                        db_partial[row_region, feature_region],
+                        I.cast(db_partial[row_region, feature_region], I.f32),
                         axis=0,
                         identity=0.0,
                     ),

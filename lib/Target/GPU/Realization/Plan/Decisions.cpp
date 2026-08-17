@@ -367,16 +367,6 @@ innerStreamContractionExtent(Operation *domain,
   return std::nullopt;
 }
 
-bool hasIndirectRaggedMembership(Operation *domain,
-                                 const target::KernelFacts &facts) {
-  auto member = facts.raggedMembers.find(domain);
-  if (member == facts.raggedMembers.end())
-    return false;
-  auto relation = facts.raggedRelations.find(member->second.relation);
-  return relation != facts.raggedRelations.end() &&
-         static_cast<bool>(relation->second.indices);
-}
-
 SmallVector<unsigned> contractionProgramAxes(
     const target::ContractionFact &contraction,
     const llvm::DenseMap<Operation *, unsigned> &positions,
@@ -617,8 +607,6 @@ assignAxes(const target::KernelFacts &facts) {
           scanAxis ? indexedTile("scan", scanTile)
           : fixed != facts.orderedStreamFixedExtents.end()
               ? "fixed_" + std::to_string(fixed->second)
-          : hasIndirectRaggedMembership(choice.domain, facts)
-              ? "one"
           : facts.scaledStreamDomains.contains(choice.domain)
               ? indexedTile("stream_scaled", scaledStreamTile)
           : hasRole(choice.roles, "reduction")

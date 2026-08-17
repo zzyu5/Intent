@@ -640,6 +640,7 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
     FailureOr<std::string> start = failure();
     FailureOr<std::string> stop = failure();
     FailureOr<std::string> step = std::string("1");
+    ABIView *raggedIndices = nullptr;
     if (domain->getName().getStringRef() == "intent.domain" &&
         domain->getNumOperands() >= 2) {
       start = rangeValue(0);
@@ -661,6 +662,7 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
         return operation.emitOpError(
             "ordered ragged traversal has no outer-axis or offsets binding");
       RaggedRuntime &ragged = raggedRuntimes[runtime->second];
+      raggedIndices = ragged.indices;
       std::string suffix = std::to_string(*domainNode);
       std::string begin = "sequence_begin_" + suffix;
       std::string end = "sequence_end_" + suffix;
@@ -679,9 +681,6 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
       return operation.emitOpError(
           "cuTile ordered traversal requires a zero-based unit-step domain");
     std::string iterator = makeRegionArgumentName(operation, index);
-    valueNames[body.getArgument(index)] = iterator;
-    if (raggedAxis && succeeded(domainNode))
-      axisIndices[*domainNode] = iterator;
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
@@ -708,6 +707,15 @@ LogicalResult SourceEmitter::enterFor(Operation &operation) {
            ", " + *step + "):");
       ++indentation;
     }
+    std::string logicalIterator = iterator;
+    if (raggedIndices) {
+      logicalIterator = iterator + "_member";
+      line(logicalIterator + " = ct.gather(" + raggedIndices->argument->name +
+           ", " + addressIndex(iterator) + ", padding_value=0)");
+    }
+    valueNames[body.getArgument(index)] = logicalIterator;
+    if (raggedAxis && succeeded(domainNode))
+      axisIndices[*domainNode] = logicalIterator;
   }
   return success();
 }
@@ -1239,11 +1247,35 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   } else {
     return boundary.emitOpError("is not a load-like cuTile access");
   }
+  FailureOr<int64_t> resultID = target::getValueID(
+      operation.getResult(0), kernel, operation, "cuTile load padding fusion");
+  plan::PaddingOp plannedPadding =
+      succeeded(resultID) ? planIndex.paddings.lookup(*resultID)
+                          : plan::PaddingOp();
+  bool paddingCoveredByValidity =
+      *validity != "True" && plannedPadding &&
+      plannedPadding.getFill() == loadFill &&
+      llvm::all_of(
+          llvm::zip(plannedPadding.getTensorAxes(),
+                    plannedPadding.getDomainNodes()),
+          [&](auto entry) {
+            auto [paddingAxis, paddingNode] = entry;
+            return llvm::any_of(
+                llvm::zip(boundary.getValidityTensorAxes(),
+                          boundary.getValidityDomainNodes()),
+                [&](auto boundaryEntry) {
+                  auto [boundaryAxis, boundaryNode] = boundaryEntry;
+                  return paddingAxis == boundaryAxis &&
+                         paddingNode == boundaryNode;
+                });
+          });
   if (*validity != "True")
     line(result + " = ct.where(" + *validity + ", " + result + ", " +
          padding.str() + ")");
   FailureOr<std::string> padded =
-      padExpression(operation.getResult(0), result, operation);
+      paddingCoveredByValidity
+          ? FailureOr<std::string>(result)
+          : padExpression(operation.getResult(0), result, operation);
   if (failed(padded))
     return failure();
   if (*padded != result)
@@ -2985,6 +3017,11 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
                  : FailureOr<StringRef>(failure());
   if (!valueIndex || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical cuTile atomic merge");
+  if (isa<BFloat16Type>((*view)->tensor.getElementType()))
+    return operation.emitOpError(
+        "cannot project bfloat16 atomic add with the configured cuTile "
+        "native primitives; the accepted surface operation lowers to a "
+        "non-native implementation");
   if (planIndex.stages.empty()) {
     FailureOr<std::string> indices = indexTuple(operation, true);
     if (failed(indices))
