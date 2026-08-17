@@ -72,10 +72,22 @@ if [[ ${unfamiliar} == false ]]; then
   triton:paged_attention)
     baseline=source/triton/xformers/attention/splitk/splitk_kernels_runtime.py
     ;;
+  triton:moe)
+    baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
+    ;;
+  cutile:moe)
+    baseline=source/cutile/cutile-python/moe/fused/MoE.py
+    ;;
+  tilelang:moe)
+    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
+    ;;
+  tilelang:softmax)
+    baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
+    ;;
   triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode | \
-  triton:online_softmax | cutile:online_softmax | tilelang:softmax | \
+  triton:online_softmax | cutile:online_softmax | \
   triton:dual_gemm | cutile:dual_gemm | tilelang:dual_gemm | \
-  triton:moe | cutile:moe | tilelang:moe | tilelang:rms_norm | \
+  tilelang:rms_norm | \
   triton:block_scaled_matmul | tilelang:block_scaled_matmul)
     ;;
   triton:paged_splitk_attention | cutile:paged_splitk_attention | tilelang:paged_splitk_attention)

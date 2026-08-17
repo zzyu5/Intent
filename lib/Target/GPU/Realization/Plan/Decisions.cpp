@@ -609,7 +609,7 @@ assignAxes(const target::KernelFacts &facts) {
               ? "fixed_" + std::to_string(fixed->second)
           : facts.scaledStreamDomains.contains(choice.domain)
               ? indexedTile("stream_scaled", scaledStreamTile)
-          : hasRole(choice.roles, "reduction")
+          : facts.contractionDomains.contains(choice.domain)
               ? indexedTile("stream_contract", streamContractionTile)
               : indexedTile("stream", streamTile);
       addRange(choice, "traversal", 0, tile);

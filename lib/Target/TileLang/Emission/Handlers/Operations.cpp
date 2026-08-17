@@ -1123,7 +1123,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return operation.emitOpError(
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
-  if (boundary.hasCompactTensorIndex()) {
+  if (boundary.hasCompactTensorIndex() &&
+      boundary.getResultSpace() == "shared") {
     if (scalarResult || failed(view) || accessRanges.size() != 1 ||
         !accessRanges.front().isCompact())
       return operation.emitOpError(
@@ -1358,7 +1359,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return success();
   }
   bool expanded = !physicalFill->empty();
-  bool tensorIndirect = boundary.hasDataDependentTensorIndex();
+  bool tensorIndirect = boundary.hasDataDependentTensorIndex() ||
+                        boundary.hasCompactTensorIndex();
   bool plannedValidity = !boundary.getConsumerNeutralized() &&
                          boundary.getPadding() != "none" &&
                          !boundary.getValidityDomainNodes().empty();
@@ -1382,11 +1384,9 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
       FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
       if (failed(axis))
         return failure();
-      bool consumerNeutralizedAxis = boundary.getConsumerNeutralized();
       if (!axis->hasRole("lane") || axis->hasRole("parallel") ||
-          (!consumerNeutralizedAxis &&
-           (axis->hasRole("ordered") || axis->hasRole("reduction") ||
-            axis->hasRole("ragged_member")))) {
+          axis->hasRole("ordered") || axis->hasRole("reduction") ||
+          axis->hasRole("ragged_member")) {
         guardedF16Bulk = false;
         break;
       }
@@ -1426,13 +1426,53 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     ++indentation;
     line("T.copy(" + (*view)->argument->name + "[" + *indices + "], " +
          *result + ")");
+    if (boundary.getResultSpace() == "shared")
+      line("T.sync_threads()");
     --indentation;
     line("else:");
     ++indentation;
-    if (boundary.getPadding() == "negative_infinity")
-      line("T.fill(" + *result + ", -T.infinity(T.float32))");
-    else
-      line("T.clear(" + *result + ")");
+    SmallVector<std::string> tileIndices;
+    std::string loop = "for ";
+    std::string targetIndices;
+    for (unsigned axis = 0; axis < extents->size(); ++axis) {
+      if (axis) {
+        loop += ", ";
+        targetIndices += ", ";
+      }
+      std::string index = "guarded_transfer_i" + std::to_string(axis);
+      tileIndices.push_back(index);
+      loop += index;
+      targetIndices += index;
+    }
+    loop += " in T.Parallel(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        loop += ", ";
+      loop += extent;
+    }
+    FailureOr<std::string> elementIndices =
+        elementAccessIndices(operation, tileIndices);
+    FailureOr<std::string> elementPredicate =
+        elementBoundsPredicate(operation, tileIndices, false, false);
+    if (failed(elementIndices) || failed(elementPredicate))
+      return failure();
+    line(loop + "):");
+    ++indentation;
+    line("if " + *elementPredicate + ":");
+    ++indentation;
+    line(*result + "[" + targetIndices + "] = " +
+         (*view)->argument->name + "[" + *elementIndices + "]");
+    --indentation;
+    line("else:");
+    ++indentation;
+    StringRef fill = boundary.getPadding() == "negative_infinity"
+                         ? "-T.infinity(T.float32)"
+                         : zeroFill;
+    line(*result + "[" + targetIndices + "] = " + fill.str());
+    --indentation;
+    --indentation;
+    if (boundary.getResultSpace() == "shared")
+      line("T.sync_threads()");
     --indentation;
     bindResult(operation, 0, *result);
     return success();
@@ -1468,7 +1508,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
   if (failed(view) || failed(result))
     return operation.emitOpError("lacks a mechanical TileLang load binding");
   if (boundary.getTransfer() == "parallel_elements" || expanded ||
-      boundary.getCheckBounds()) {
+      boundary.getCheckBounds() || tensorIndirect) {
     StringRef padding = boundary.getPadding();
     if (padding == "none" && expanded)
       padding = *physicalFill;

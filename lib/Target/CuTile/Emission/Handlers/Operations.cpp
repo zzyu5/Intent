@@ -3017,11 +3017,12 @@ LogicalResult SourceEmitter::emitAtomic(Operation &operation) {
                  : FailureOr<StringRef>(failure());
   if (!valueIndex || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical cuTile atomic merge");
-  if (isa<BFloat16Type>((*view)->tensor.getElementType()))
+  if (operation.getName().getStringRef() == "intent.scatter_reduce" &&
+      isa<BFloat16Type>((*view)->tensor.getElementType()))
     return operation.emitOpError(
-        "cannot project bfloat16 atomic add with the configured cuTile "
-        "native primitives; the accepted surface operation lowers to a "
-        "non-native implementation");
+        "cannot project a high-throughput bfloat16 many-to-one scatter "
+        "reduction with the configured cuTile native atomic surface; the "
+        "available tile atomic projection is intentionally unsupported");
   if (planIndex.stages.empty()) {
     FailureOr<std::string> indices = indexTuple(operation, true);
     if (failed(indices))
