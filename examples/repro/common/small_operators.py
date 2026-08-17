@@ -31,6 +31,7 @@ from kernels.vision.max_pool import WIDTH as MAX_POOL_WIDTH
 from kernels.vision.max_pool import max_pool2d
 
 from .evaluation import Runner
+from .evaluation import Upstream
 from .evaluation import report_pipeline
 from .evaluation import require_close
 from .evaluation import run_generated
@@ -64,6 +65,7 @@ def _run_softmax_backward(
     compiler: str,
     target: Target,
     target_name: str,
+    upstream: Upstream | None = None,
 ) -> None:
     logits = torch.randn(
         (SOFTMAX_ROWS, SOFTMAX_COLUMNS),
@@ -71,17 +73,21 @@ def _run_softmax_backward(
         dtype=torch.float32,
     )
     probabilities = torch.softmax(logits, dim=1)
-    upstream = torch.randn_like(probabilities)
+    output_gradient = torch.randn_like(probabilities)
     run_generated(
         definition=softmax_backward,
-        arguments=(probabilities, upstream),
+        arguments=(probabilities, output_gradient),
         reference=lambda: probabilities
-        * (upstream - (probabilities * upstream).sum(dim=1, keepdim=True)),
+        * (
+            output_gradient
+            - (probabilities * output_gradient).sum(dim=1, keepdim=True)
+        ),
         compiler=compiler,
         target=target,
         target_name=target_name,
         kernel_name="softmax backward",
         tolerance=2.0e-6,
+        upstream=upstream,
     )
 
 
@@ -132,6 +138,7 @@ def _run_batch_norm_training(
     compiler: str,
     target: Target,
     target_name: str,
+    upstream: Upstream | None = None,
 ) -> None:
     x = torch.randn(
         (BATCH_NORM_BATCH, BATCH_NORM_CHANNELS, BATCH_NORM_SPATIAL),
@@ -143,8 +150,13 @@ def _run_batch_norm_training(
     )
     bias = torch.randn_like(weight)
     epsilon = 1.0e-5
+    momentum = 0.1
+    running_mean = torch.randn_like(weight) * 0.1
+    running_variance = torch.rand_like(weight) + 0.5
+    initial_running_mean = running_mean.clone()
+    initial_running_variance = running_variance.clone()
 
-    def reference() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def reference() -> tuple[torch.Tensor, ...]:
         values = x.float()
         mean = values.mean(dim=(0, 2))
         variance = values.var(dim=(0, 2), unbiased=False)
@@ -155,18 +167,73 @@ def _run_batch_norm_training(
             * weight[None, :, None]
             + bias[None, :, None]
         ).half()
-        return output, mean, rstd
+        count = BATCH_NORM_BATCH * BATCH_NORM_SPATIAL
+        expected_running_mean = (
+            (1.0 - momentum) * initial_running_mean + momentum * mean
+        )
+        expected_running_variance = (
+            (1.0 - momentum) * initial_running_variance
+            + momentum * variance * count / (count - 1)
+        )
+        return (
+            output,
+            mean,
+            rstd,
+            expected_running_mean,
+            expected_running_variance,
+        )
 
-    run_generated(
-        definition=batch_norm_training,
-        arguments=(x, weight, bias, epsilon),
-        reference=reference,
-        compiler=compiler,
-        target=target,
+    expected = reference()
+    artifact = intent.compile(batch_norm_training, target=target, compiler=compiler)
+    arguments = (
+        x,
+        weight,
+        bias,
+        running_mean,
+        running_variance,
+        epsilon,
+        momentum,
+    )
+    generated = artifact.run(*arguments)
+    torch.cuda.synchronize()
+    generated_errors = require_close(
+        actual=(*generated, running_mean, running_variance),
+        expected=expected,
+        tolerance=(1.0e-2, 2.0e-5, 2.0e-5, 2.0e-5, 2.0e-5),
         target_name=target_name,
         kernel_name="training batch normalization",
-        tolerance=(1.0e-2, 2.0e-4, 2.0e-4),
-        cuda_graph=False,
+    )
+    generated_call = prepare_kernel_call(artifact, arguments, generated)
+
+    def restore_running_statistics() -> None:
+        running_mean.copy_(initial_running_mean)
+        running_variance.copy_(initial_running_variance)
+
+    upstream_errors = None
+    upstream_launch = None
+    if upstream is not None:
+        restore_running_statistics()
+        upstream_output = upstream(arguments)
+        upstream_errors = require_close(
+            actual=(*upstream_output, running_mean, running_variance),
+            expected=expected,
+            tolerance=(1.0e-2, 2.0e-5, 2.0e-5, 2.0e-5, 2.0e-5),
+            target_name=target_name,
+            kernel_name="training batch normalization upstream",
+        )
+        upstream_launch = lambda: upstream(arguments)
+
+    report_pipeline(
+        artifacts=(artifact,),
+        launch=generated_call,
+        errors=generated_errors,
+        target_name=target_name,
+        kernel_name="training batch normalization",
+        prepare=restore_running_statistics,
+        performance_scope="kernel-only",
+        upstream_launch=upstream_launch,
+        upstream_errors=upstream_errors,
+        upstream_prepare=restore_running_statistics if upstream is not None else None,
     )
 
 
@@ -174,6 +241,7 @@ def _run_triangular_solve(
     compiler: str,
     target: Target,
     target_name: str,
+    upstream: Upstream | None = None,
 ) -> None:
     lower = torch.randn(
         (TRIANGULAR_BATCH, TRIANGULAR_SIZE, TRIANGULAR_SIZE),
@@ -210,6 +278,21 @@ def _run_triangular_solve(
         kernel_name="batched lower-triangular solve",
     )
     launch = prepare_kernel_call(artifact, (lower, solution), ())
+    upstream_errors = None
+    upstream_launch = None
+    upstream_prepare = None
+    if upstream is not None:
+        solution.copy_(right_hand_side)
+        upstream_output = upstream((lower, solution))
+        upstream_errors = require_close(
+            actual=upstream_output,
+            expected=expected,
+            tolerance=2.0e-5,
+            target_name=target_name,
+            kernel_name="batched lower-triangular solve upstream",
+        )
+        upstream_launch = lambda: upstream((lower, solution))
+        upstream_prepare = lambda: solution.copy_(right_hand_side)
     report_pipeline(
         artifacts=(artifact,),
         launch=launch,
@@ -218,6 +301,9 @@ def _run_triangular_solve(
         kernel_name="batched lower-triangular solve",
         prepare=lambda: solution.copy_(right_hand_side),
         performance_scope="kernel-only",
+        upstream_launch=upstream_launch,
+        upstream_errors=upstream_errors,
+        upstream_prepare=upstream_prepare,
     )
 
 
@@ -225,6 +311,12 @@ SMALL_OPERATOR_RUNNERS: dict[str, Runner] = {
     "batch_norm_training": _run_batch_norm_training,
     "csr_spmm": _run_csr_spmm,
     "max_pool2d": _run_max_pool2d,
+    "softmax_backward": _run_softmax_backward,
+    "triangular_solve": _run_triangular_solve,
+}
+
+SMALL_OPERATOR_UPSTREAM_RUNNERS = {
+    "batch_norm_training": _run_batch_norm_training,
     "softmax_backward": _run_softmax_backward,
     "triangular_solve": _run_triangular_solve,
 }

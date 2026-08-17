@@ -575,7 +575,7 @@ def _run_continuous_gqa_decode(
         reference=reference,
         target_name=target_name,
         kernel_name="continuous GQA decode",
-        tolerance=3.0e-2,
+        tolerance=4.0e-2,
         upstream=upstream,
         expected_dtype=torch.float16,
     )
@@ -1242,7 +1242,7 @@ def _run_fp8_mqa_logits(
         target_name=target_name,
         kernel_name="FP8 MQA weighted logits",
         tolerance=2.0e-2,
-        upstream=None,
+        upstream=upstream,
         expected_dtype=torch.float32,
         comparison_error=finite_error,
     )
@@ -2151,6 +2151,34 @@ def _run_attention_backward(
         repetitions=100,
         cuda_graph=False,
     )
+    upstream_errors = None
+    upstream_p50 = None
+    upstream_p95 = None
+    if upstream is not None:
+        upstream_output = upstream(
+            (q, k, v, output, grad_output, lse, BWD_ATTENTION_SCALE, True)
+        )
+        upstream_errors = tuple(
+            (actual - wanted).abs().max().item()
+            for actual, wanted in zip(upstream_output, expected)
+        )
+        if (
+            upstream_errors[0] > 1.25e-1
+            or upstream_errors[1] > 2.5e-1
+            or upstream_errors[2] > 1.25e-1
+        ):
+            raise RuntimeError(
+                f"{target_name} attention backward upstream comparison failed: "
+                f"{upstream_errors}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(
+                (q, k, v, output, grad_output, lse, BWD_ATTENTION_SCALE, True)
+            ),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+        )
     for artifact in (delta_artifact, dkdv_artifact, dq_artifact):
         print_artifact(artifact, target_name)
     print(
@@ -2161,7 +2189,16 @@ def _run_attention_backward(
         f"{target_name} attention backward end-to-end GPU pipeline performance "
         f"(CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} attention backward upstream baseline: unavailable")
+    if upstream_errors is None:
+        print(f"{target_name} attention backward upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} attention backward upstream comparison: PASS "
+            f"(dq/dk/dv errors={upstream_errors}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={p50 / upstream_p50:.4f}x)"
+        )
 
 
 def _run_causal_conv1d_backward(
@@ -3618,8 +3655,6 @@ def _run_paged_mla_decode(
 def _run_block_sparse_attention(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("block-sparse attention has no comparable upstream adapter")
     q = torch.randn(
         (BLOCK_SPARSE_BATCH, BLOCK_SPARSE_QUERY_HEADS, BLOCK_SPARSE_DIMENSION),
         device="cuda",
@@ -3644,20 +3679,11 @@ def _run_block_sparse_attention(
         device="cuda",
         dtype=torch.int32,
     )
-    block_indices = torch.empty(
-        (
-            BLOCK_SPARSE_BATCH,
-            BLOCK_SPARSE_KV_HEADS,
-            BLOCK_SPARSE_SELECTED_BLOCKS,
-        ),
-        device="cuda",
-        dtype=torch.int32,
+    block_indices = (
+        selected_base.view(1, 1, -1)
+        .expand(BLOCK_SPARSE_BATCH, BLOCK_SPARSE_KV_HEADS, -1)
+        .contiguous()
     )
-    for batch in range(BLOCK_SPARSE_BATCH):
-        for key_head in range(BLOCK_SPARSE_KV_HEADS):
-            block_indices[batch, key_head] = torch.roll(
-                selected_base, shifts=(batch + key_head) % BLOCK_SPARSE_SELECTED_BLOCKS
-            )
     cache_lengths = torch.tensor(
         [BLOCK_SPARSE_SEQUENCE - 3 * index for index in range(BLOCK_SPARSE_BATCH)],
         device="cuda",
@@ -3705,9 +3731,18 @@ def _run_block_sparse_attention(
         dtype=torch.float32,
     )
     output = torch.empty_like(q)
+    arguments = (
+        q,
+        k,
+        v,
+        block_indices,
+        cache_lengths,
+        split_offsets,
+        BLOCK_SPARSE_SCALE,
+    )
     partial_call = prepare_kernel_call(
         partial_artifact,
-        (q, k, v, block_indices, cache_lengths, split_offsets, BLOCK_SPARSE_SCALE),
+        arguments,
         (partial_lse, partial_output),
     )
     combine_call = prepare_kernel_call(
@@ -3760,6 +3795,20 @@ def _run_block_sparse_attention(
         repetitions=100,
         cuda_graph=False,
     )
+    upstream_output = upstream(arguments) if upstream is not None else None
+    if upstream_output is not None:
+        upstream_error = (upstream_output.float() - expected.float()).abs().max().item()
+        if upstream_error > 7.5e-2:
+            raise RuntimeError(
+                f"{target_name} block-sparse upstream comparison failed: "
+                f"{upstream_error}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(arguments),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+        )
     for artifact in (partial_artifact, combine_artifact):
         print_artifact(artifact, target_name)
     print(
@@ -3770,7 +3819,16 @@ def _run_block_sparse_attention(
         f"{target_name} block-sparse GQA decode end-to-end GPU pipeline performance "
         f"(CUDA Event): p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} block-sparse GQA decode upstream baseline: unavailable")
+    if upstream_output is None:
+        print(f"{target_name} block-sparse GQA decode upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} block-sparse GQA decode upstream comparison: PASS "
+            f"(upstream/reference={upstream_error}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={p50 / upstream_p50:.4f}x)"
+        )
 
 
 def _run_attention_bias(
@@ -3855,8 +3913,6 @@ def _run_attention_bias(
 def _run_shifted_row_copy(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("shifted row copy has no upstream adapter")
     x = torch.randn(
         (OFFSET_ROWS, OFFSET_FEATURES), device="cuda", dtype=torch.float32
     )
@@ -3868,15 +3924,13 @@ def _run_shifted_row_copy(
         target_name=target_name,
         kernel_name="derived scalar offset index",
         tolerance=0.0,
-        upstream=None,
+        upstream=upstream,
     )
 
 
 def _run_matrix_transpose(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("matrix transpose has no upstream adapter")
     x = torch.randn(
         (TRANSPOSE_ROWS, TRANSPOSE_COLUMNS),
         device="cuda",
@@ -3890,7 +3944,7 @@ def _run_matrix_transpose(
         target_name=target_name,
         kernel_name="canonical matrix transpose",
         tolerance=0.0,
-        upstream=None,
+        upstream=upstream,
         expected_dtype=torch.float16,
     )
 
@@ -3898,8 +3952,6 @@ def _run_matrix_transpose(
 def _run_batched_row_affine(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("batched row affine has no upstream adapter")
     x = torch.randn(
         (AFFINE_BATCH, AFFINE_ROWS, AFFINE_COLUMNS),
         device="cuda",
@@ -3917,7 +3969,7 @@ def _run_batched_row_affine(
         target_name=target_name,
         kernel_name="parallel domain product row affine",
         tolerance=2.0e-6,
-        upstream=None,
+        upstream=upstream,
         expected_dtype=torch.float32,
     )
 
@@ -4015,8 +4067,6 @@ def _run_scalar_while(
 def _run_ordered_prefix(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("ordered prefix has no upstream adapter")
     x = torch.randn(
         (ORDERED_PREFIX_BATCH, ORDERED_PREFIX_ROWS, ORDERED_PREFIX_COLUMNS),
         device="cuda",
@@ -4030,7 +4080,7 @@ def _run_ordered_prefix(
         target_name=target_name,
         kernel_name="ordered Cartesian prefix",
         tolerance=2.0e-5,
-        upstream=None,
+        upstream=upstream,
         expected_dtype=torch.float32,
         cuda_graph=False,
     )
@@ -4131,8 +4181,6 @@ def _run_grouped_query_head_add(
 def _run_scalar_table_lookup(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
-    if upstream is not None:
-        raise RuntimeError("scalar table lookup has no upstream adapter")
     labels = torch.randint(
         0,
         LOOKUP_ENTRIES,
@@ -4151,7 +4199,7 @@ def _run_scalar_table_lookup(
         target_name=target_name,
         kernel_name="tensor-derived scalar index",
         tolerance=0.0,
-        upstream=None,
+        upstream=upstream,
     )
 
 

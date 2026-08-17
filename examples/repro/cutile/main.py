@@ -52,7 +52,18 @@ def _load_module(source_path: Path, module_name: str):
     return module
 
 
+def _load_runtime_upstream(kernel: str, source_path: Path):
+    module = _load_module(source_path, f"intent_upstream_cutile_{kernel}_runtime")
+    if not hasattr(module, "upstream"):
+        raise NotImplementedError(
+            f"cuTile runtime adapter for {kernel} does not define upstream()"
+        )
+    return module.upstream
+
+
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if source_path.name.endswith("_runtime.py"):
+        return _load_runtime_upstream(kernel, source_path)
     if kernel == "block_scaled_matmul":
         block_scaled = _load_module(
             source_path, "intent_upstream_cutile_block_scaled"

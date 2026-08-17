@@ -17,13 +17,55 @@ def load_source():
     return namespace
 
 
+SOURCE = load_source()
+STATE = {}
+
+
+def upstream(arguments):
+    q, k, v, mask, _ = arguments
+    key = (
+        tuple(q.shape),
+        q.dtype,
+        q.device,
+        tuple(k.shape),
+        k.dtype,
+        k.device,
+        tuple(v.shape),
+        v.dtype,
+        v.device,
+        tuple(mask.shape),
+        mask.dtype,
+        mask.device,
+    )
+    if key not in STATE:
+        kernel = SOURCE["flashattn"](
+            q.shape[0],
+            q.shape[1],
+            k.shape[2],
+            k.shape[1],
+            q.shape[2],
+            block_N=64,
+            block_H=64,
+            num_split=1,
+            num_stages=2,
+            threads=128,
+        )
+        STATE[key] = (
+            kernel.adapter._get_executable(),
+            torch.empty_like(q),
+        )
+    executable, output = STATE[key]
+    executable(q, k, v, mask, output)
+    return output
+
+
 def main():
     batch, query_heads, kv_heads, kv_length, head_dim = 32, 32, 8, 8192, 128
     q = torch.randn((batch, query_heads, head_dim), device="cuda", dtype=torch.float16)
     k = torch.randn((batch, kv_length, kv_heads, head_dim), device="cuda", dtype=torch.float16)
     v = torch.randn((batch, kv_length, kv_heads, head_dim), device="cuda", dtype=torch.float16)
     mask = torch.ones((batch, kv_length, kv_heads), device="cuda", dtype=torch.uint8)
-    source = load_source()
+    source = SOURCE
     config, _ = source["get_heuristic_config"]()
     config["block_N"] = 64
     kernel = source["flashattn"](batch, query_heads, kv_heads, kv_length, head_dim, **config)

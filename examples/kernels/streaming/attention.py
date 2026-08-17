@@ -148,74 +148,87 @@ def continuous_gqa_decode(
 ):
     B, HQ, D = q.shape
     K = k.shape[1]
+    HK = k.shape[2]
     DV = v.shape[-1]
     key_axis = I.domain(0, K)
+    local_query_heads = I.domain(0, HEAD_GROUP)
     for batch in I.parallel(I.domain(0, B)):
-        for query_head in I.parallel(I.domain(0, HQ)):
-            key_head = query_head // HEAD_GROUP
-            query = q[batch, query_head, :][None, :]
-            stream = I.state_stream(
-                key_axis,
-                extent=I.auto("K_TILE"),
-                init=(
-                    I.full((1,), -I.inf, dtype=I.f32),
-                    I.zeros((1,), dtype=I.f32),
-                    I.zeros((1, DV), dtype=I.f32),
-                ),
-                stop=I.end(key_axis),
-            )
-            with stream:
-                for key_region, (maximum, denominator, accumulator) in stream:
-                    key = k[batch, key_region, key_head, :]
-                    value = v[batch, key_region, key_head, :]
-                    mask_values = valid_mask[batch, key_region, key_head]
-                    mask_values = I.mask(
-                        mask_values,
-                        valid=I.indices(key_region) < K,
-                        fill=I.cast(0, I.u8),
+        for key_head in I.parallel(I.domain(0, HK)):
+            for query_region in I.parallel(
+                I.partition(local_query_heads, extent=HEAD_GROUP)
+            ):
+                query_heads = key_head * HEAD_GROUP + I.indices(query_region)
+                I.assume_in_bounds(query_heads, q, axis=1)
+                query = I.gather(
+                    q,
+                    index=(batch, query_heads, slice(None)),
+                )
+                stream = I.state_stream(
+                    key_axis,
+                    extent=I.auto("K_TILE"),
+                    init=(
+                        I.full((query_region,), -I.inf, dtype=I.f32),
+                        I.zeros((query_region,), dtype=I.f32),
+                        I.zeros((query_region, DV), dtype=I.f32),
+                    ),
+                    stop=I.end(key_axis),
+                )
+                with stream:
+                    for key_region, (maximum, denominator, accumulator) in stream:
+                        key = k[batch, key_region, key_head, :]
+                        value = v[batch, key_region, key_head, :]
+                        mask_values = valid_mask[batch, key_region, key_head]
+                        mask_values = I.mask(
+                            mask_values,
+                            valid=I.indices(key_region) < K,
+                            fill=I.cast(0, I.u8),
+                        )
+                        mask = mask_values != 0
+                        scores = I.contract(
+                            query,
+                            key,
+                            reduce=((1, 1),),
+                            acc_dtype=I.f32,
+                        )
+                        scores = I.mask(
+                            scores * (scale * I.LOG2E),
+                            valid=mask[None, :],
+                            fill=-I.inf,
+                        )
+                        local_maximum = I.reduce.max(
+                            scores, axis=1, identity=-I.inf
+                        )
+                        next_maximum = I.maximum(maximum, local_maximum)
+                        normalization_maximum = I.mask(
+                            next_maximum,
+                            valid=next_maximum != -I.inf,
+                            fill=0.0,
+                        )
+                        next_denominator, next_accumulator = online_attention_accumulate(
+                            maximum,
+                            normalization_maximum,
+                            denominator,
+                            accumulator,
+                            scores,
+                            value,
+                        )
+                        stream.yield_(
+                            next_maximum,
+                            next_denominator,
+                            next_accumulator,
+                        )
+                _, denominator, accumulator = stream.result
+                safe_denominator = I.mask(
+                    denominator, valid=denominator > 0.0, fill=1.0
+                )
+                I.scatter_unique(
+                    output,
+                    index=(batch, query_heads, slice(None)),
+                    value=I.cast(
+                        accumulator / safe_denominator[:, None],
+                        I.f16,
                     )
-                    mask = mask_values != 0
-                    scores = I.contract(
-                        query,
-                        key,
-                        reduce=((1, 1),),
-                        acc_dtype=I.f32,
-                    )
-                    scores = I.mask(
-                        scores * (scale * I.LOG2E),
-                        valid=mask[None, :],
-                        fill=-I.inf,
-                    )
-                    local_maximum = I.reduce.max(
-                        scores, axis=1, identity=-I.inf
-                    )
-                    next_maximum = I.maximum(maximum, local_maximum)
-                    normalization_maximum = I.mask(
-                        next_maximum,
-                        valid=next_maximum != -I.inf,
-                        fill=0.0,
-                    )
-                    next_denominator, next_accumulator = online_attention_accumulate(
-                        maximum,
-                        normalization_maximum,
-                        denominator,
-                        accumulator,
-                        scores,
-                        value,
-                    )
-                    stream.yield_(
-                        next_maximum,
-                        next_denominator,
-                        next_accumulator,
-                    )
-            _, denominator, accumulator = stream.result
-            safe_denominator = I.mask(
-                denominator, valid=denominator > 0.0, fill=1.0
-            )
-            output[batch, query_head, :] = I.reshape(
-                I.cast(accumulator / safe_denominator[:, None], I.f16),
-                (DV,),
-            )
+                )
 
 
 @intent.kernel

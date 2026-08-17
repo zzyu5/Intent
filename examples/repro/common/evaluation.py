@@ -14,6 +14,7 @@ from .support import print_artifact
 
 Runner = Callable[[str, Target, str], None]
 TensorOutputs = torch.Tensor | tuple[torch.Tensor, ...]
+Upstream = Callable[[tuple[object, ...]], TensorOutputs]
 
 
 def outputs(value: TensorOutputs) -> tuple[torch.Tensor, ...]:
@@ -91,6 +92,7 @@ def run_generated(
     tolerance: float | tuple[float, ...],
     constexprs: dict[str, object] | None = None,
     cuda_graph: bool = True,
+    upstream: Upstream | None = None,
 ) -> None:
     artifact = intent.compile(
         definition,
@@ -108,6 +110,15 @@ def run_generated(
         target_name=target_name,
         kernel_name=kernel_name,
     )
+    upstream_output = upstream(arguments) if upstream is not None else None
+    if upstream_output is not None:
+        upstream_errors = require_close(
+            actual=upstream_output,
+            expected=expected,
+            tolerance=tolerance,
+            target_name=target_name,
+            kernel_name=f"{kernel_name} upstream",
+        )
     generated_call = prepare_kernel_call(artifact, arguments, generated)
     p50, p95 = benchmark(
         generated_call,
@@ -115,6 +126,13 @@ def run_generated(
         repetitions=100,
         cuda_graph=cuda_graph,
     )
+    if upstream_output is not None:
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream(arguments),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=cuda_graph,
+        )
     print_artifact(artifact, target_name)
     print(
         f"{target_name} {kernel_name} numerical comparison: PASS "
@@ -125,7 +143,16 @@ def run_generated(
         f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
         f"p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} {kernel_name} upstream baseline: unavailable")
+    if upstream_output is None:
+        print(f"{target_name} {kernel_name} upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} {kernel_name} upstream comparison: PASS "
+            f"(upstream/reference={upstream_errors}, "
+            f"upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={p50 / upstream_p50:.4f}x)"
+        )
 
 
 def report_pipeline(
@@ -138,6 +165,9 @@ def report_pipeline(
     cuda_graph: bool = False,
     prepare: Callable[[], object] | None = None,
     performance_scope: str = "end-to-end GPU pipeline",
+    upstream_launch: Callable[[], object] | None = None,
+    upstream_errors: tuple[float, ...] | None = None,
+    upstream_prepare: Callable[[], object] | None = None,
 ) -> None:
     p50, p95 = benchmark(
         launch,
@@ -157,7 +187,25 @@ def report_pipeline(
         f"({'CUDA Graph' if cuda_graph else 'CUDA Event'}): "
         f"p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} {kernel_name} upstream baseline: unavailable")
+    if upstream_launch is None:
+        print(f"{target_name} {kernel_name} upstream baseline: unavailable")
+        return
+    if upstream_errors is None:
+        raise ValueError("upstream errors are required with an upstream launch")
+    upstream_p50, upstream_p95 = benchmark(
+        upstream_launch,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=cuda_graph,
+        prepare=upstream_prepare,
+    )
+    print(
+        f"{target_name} {kernel_name} upstream comparison: PASS "
+        f"(upstream/reference={upstream_errors}, "
+        f"upstream_p50={upstream_p50:.4f} ms, "
+        f"upstream_p95={upstream_p95:.4f} ms, "
+        f"generated/upstream_p50={p50 / upstream_p50:.4f}x)"
+    )
 
 
 def report_variant_pipeline(

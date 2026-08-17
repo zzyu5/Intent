@@ -10,6 +10,80 @@ sys.path.insert(0, str(SOURCE.parent))
 spec = importlib.util.spec_from_file_location("local_tilelang_sparse_gqa_varlen", SOURCE)
 source = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(source)
+STATE = {}
+
+
+def upstream(arguments):
+    q, k, v, block_indices, cache_seqlens, split_offsets, scale = arguments
+    expected_scale = q.shape[-1] ** -0.5
+    if abs(float(scale) - expected_scale) > 1.0e-12:
+        raise ValueError("TileLang block-sparse source uses head-dimension scaling")
+    splits = split_offsets.numel() - 1
+    key = (
+        tuple(q.shape),
+        q.dtype,
+        q.device,
+        tuple(k.shape),
+        k.dtype,
+        k.device,
+        tuple(v.shape),
+        v.dtype,
+        v.device,
+        tuple(block_indices.shape),
+        block_indices.dtype,
+        block_indices.device,
+        splits,
+    )
+    if key not in STATE:
+        partial_lse = torch.empty(
+            (q.shape[0], q.shape[1], splits),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        partial_output = torch.empty(
+            (q.shape[0], q.shape[1], splits, v.shape[-1]),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        kernel = source.flashattn(
+            q.shape[0],
+            q.shape[1],
+            k.shape[2],
+            q.shape[2],
+            v.shape[3],
+            block_N=64,
+            block_H=64,
+            num_stages=2,
+            threads=128,
+        )
+        output = kernel(
+            q,
+            k,
+            v,
+            block_indices,
+            cache_seqlens,
+            partial_lse,
+            partial_output,
+        )
+        STATE[key] = (
+            kernel.adapter._get_executable(),
+            partial_lse,
+            partial_output,
+            output,
+        )
+        return output
+    executable, partial_lse, partial_output, output = STATE[key]
+    executable(
+        q,
+        k,
+        v,
+        block_indices,
+        cache_seqlens,
+        partial_lse,
+        partial_output,
+        output,
+    )
+    return output
 
 
 def main():

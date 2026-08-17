@@ -12,10 +12,13 @@ def batch_norm_training(
     x: I.In[I.f16, (BATCH, CHANNELS, SPATIAL)],
     weight: I.In[I.f32, (CHANNELS,)],
     bias: I.In[I.f32, (CHANNELS,)],
+    running_mean: I.InOut[I.f32, (CHANNELS,)],
+    running_variance: I.InOut[I.f32, (CHANNELS,)],
     output: I.Out[I.f16, (BATCH, CHANNELS, SPATIAL)],
     saved_mean: I.Out[I.f32, (CHANNELS,)],
     saved_rstd: I.Out[I.f32, (CHANNELS,)],
     epsilon: I.f32,
+    momentum: I.f32,
 ):
     batches = I.domain(0, BATCH)
     spatial = I.domain(0, SPATIAL)
@@ -48,6 +51,16 @@ def batch_norm_training(
             acc_dtype=I.f32,
         ) * inverse_count
         rstd = I.rsqrt(variance + epsilon)
+        running_mean[channel] = (
+            (1.0 - momentum) * running_mean[channel] + momentum * mean
+        )
+        running_variance[channel] = (
+            (1.0 - momentum) * running_variance[channel]
+            + momentum
+            * variance
+            * (BATCH * SPATIAL)
+            / (BATCH * SPATIAL - 1)
+        )
         normalized = centered * rstd
         output[batches, channel, spatial] = I.cast(
             normalized * weight[channel] + bias[channel],

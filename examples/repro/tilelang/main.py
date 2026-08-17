@@ -54,6 +54,15 @@ def _load_module(source_path: Path, module_name: str):
     return module
 
 
+def _load_runtime_upstream(kernel: str, source_path: Path):
+    module = _load_module(source_path, f"intent_upstream_tilelang_{kernel}_runtime")
+    if not hasattr(module, "upstream"):
+        raise NotImplementedError(
+            f"TileLang runtime adapter for {kernel} does not define upstream()"
+        )
+    return module.upstream
+
+
 def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
     tree = ast.parse(source_path.read_text(), filename=str(source_path))
     tree.body = [node for node in tree.body if node.end_lineno <= 45]
@@ -72,6 +81,8 @@ def _load_softmax_baseline(source_path: Path, rows: int, columns: int):
 
 
 def _load_extended_upstream(kernel: str, source_path: Path):
+    if source_path.name.endswith("_runtime.py"):
+        return _load_runtime_upstream(kernel, source_path)
     if kernel == "sparse_2to4_gemm":
         sys.path.insert(0, str(source_path.parent))
         source = _load_module(source_path, "intent_upstream_tilelang_sparse_2to4")
@@ -654,13 +665,17 @@ def main() -> None:
             upstream,
         )
     else:
-        if arguments.baseline_source is not None:
-            parser.error("unfamiliar programs do not accept an upstream adapter")
+        upstream = (
+            _load_runtime_upstream(arguments.kernel, arguments.baseline_source)
+            if arguments.baseline_source is not None
+            else None
+        )
         run_unfamiliar(
             arguments.kernel,
             arguments.compiler,
             intent.TileLangTarget(device=0),
             "TileLang",
+            upstream,
         )
 
 

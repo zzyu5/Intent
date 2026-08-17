@@ -29,11 +29,12 @@ def adamw_update(
         )
         corrected_first = first * inverse_bias1
         corrected_second = second * inverse_bias2
+        denominator = 1.0 / I.rsqrt(corrected_second) + epsilon
         updated = (
             parameter[index] * (1.0 - learning_rate * weight_decay)
             - learning_rate
             * corrected_first
-            * I.rsqrt(corrected_second + epsilon)
+            / denominator
         )
         first_moment[index] = first
         second_moment[index] = second

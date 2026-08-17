@@ -161,14 +161,19 @@ from .evaluation import run_generated as _run_generated
 from .evaluation import run_variant as _run_variant
 from .decomposition import DECOMPOSITION_RUNNERS
 from .small_operators import SMALL_OPERATOR_RUNNERS
+from .small_operators import SMALL_OPERATOR_UPSTREAM_RUNNERS
 
 
-def _run_histogram(compiler: str, target: Target, target_name: str) -> None:
-    samples = torch.randint(0, BINS, (SAMPLES,), device="cuda", dtype=torch.uint8)
-    histogram = torch.zeros((BINS,), device="cuda", dtype=torch.int32)
+def _run_histogram(
+    compiler: str, target: Target, target_name: str, upstream=None
+) -> None:
+    samples = torch.randint(
+        0, BINS, (SAMPLES,), device="cuda", dtype=torch.int32
+    ).to(torch.float32)
+    histogram = torch.zeros((BINS,), device="cuda", dtype=torch.float32)
     artifact = intent.compile(histogram_256, target=target, compiler=compiler)
     artifact.run(samples, histogram)
-    expected = torch.bincount(samples.long(), minlength=BINS).to(torch.int32)
+    expected = torch.bincount(samples.long(), minlength=BINS).to(torch.float32)
     torch.cuda.synchronize()
     errors = _require_close(
         actual=histogram,
@@ -198,7 +203,31 @@ def _run_histogram(compiler: str, target: Target, target_name: str) -> None:
         f"{target_name} 256-bin histogram end-to-end performance (CUDA Event): "
         f"p50={p50:.4f} ms, p95={p95:.4f} ms"
     )
-    print(f"{target_name} 256-bin histogram upstream baseline: unavailable")
+    if upstream is None:
+        print(f"{target_name} 256-bin histogram upstream baseline: unavailable")
+        return
+    upstream_output = upstream((samples, histogram))
+    upstream_errors = _require_close(
+        actual=upstream_output,
+        expected=expected,
+        tolerance=0.0,
+        target_name=target_name,
+        kernel_name="256-bin histogram upstream",
+    )
+    upstream_p50, upstream_p95 = benchmark(
+        lambda: upstream((samples, histogram)),
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    print(
+        f"{target_name} 256-bin histogram upstream numerical comparison: PASS "
+        f"(source/reference={upstream_errors})"
+    )
+    print(
+        f"{target_name} 256-bin histogram upstream performance (CUDA Event): "
+        f"p50={upstream_p50:.4f} ms, p95={upstream_p95:.4f} ms"
+    )
 
 
 def _run_csr_spmv(compiler: str, target: Target, target_name: str) -> None:
@@ -1290,7 +1319,9 @@ def _run_nested_ragged_pool(
     )
 
 
-def _run_adamw(compiler: str, target: Target, target_name: str) -> None:
+def _run_adamw(
+    compiler: str, target: Target, target_name: str, upstream=None
+) -> None:
     gradient = torch.randn(
         (ADAMW_PARAMETERS,), device="cuda", dtype=torch.float32
     ) * 0.01
@@ -1308,11 +1339,10 @@ def _run_adamw(compiler: str, target: Target, target_name: str) -> None:
     epsilon, weight_decay = 1.0e-8, 0.01
     expected_first.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
     expected_second.mul_(beta2).addcmul_(gradient, gradient, value=1.0 - beta2)
-    expected_parameter.mul_(1.0 - learning_rate * weight_decay).add_(
-        expected_first
-        * inverse_bias1
-        * torch.rsqrt(expected_second * inverse_bias2 + epsilon),
-        alpha=-learning_rate,
+    expected_parameter.mul_(1.0 - learning_rate * weight_decay).addcdiv_(
+        expected_first * inverse_bias1,
+        torch.sqrt(expected_second * inverse_bias2) + epsilon,
+        value=-learning_rate,
     )
     artifact = intent.compile(adamw_update, target=target, compiler=compiler)
     arguments = (
@@ -1344,6 +1374,20 @@ def _run_adamw(compiler: str, target: Target, target_name: str) -> None:
         first.copy_(initial_first)
         second.copy_(initial_second)
 
+    upstream_errors = None
+    upstream_launch = None
+    if upstream is not None:
+        restore_state()
+        upstream_output = upstream(arguments)
+        upstream_errors = _require_close(
+            actual=upstream_output,
+            expected=(expected_parameter, expected_first, expected_second),
+            tolerance=(2.0e-6, 2.0e-6, 2.0e-6),
+            target_name=target_name,
+            kernel_name="fused AdamW update upstream",
+        )
+        upstream_launch = lambda: upstream(arguments)
+
     _report_pipeline(
         artifacts=(artifact,),
         launch=launch,
@@ -1352,6 +1396,9 @@ def _run_adamw(compiler: str, target: Target, target_name: str) -> None:
         kernel_name="fused AdamW update",
         prepare=restore_state,
         performance_scope="kernel-only",
+        upstream_launch=upstream_launch,
+        upstream_errors=upstream_errors,
+        upstream_prepare=restore_state if upstream is not None else None,
     )
 
 
@@ -1681,9 +1728,12 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
 }
 
 UNFAMILIAR_UPSTREAM_RUNNERS = {
+    "adamw_update": _run_adamw,
+    "histogram": _run_histogram,
     "rope_qk_full": _run_qk_rope_full_upstream,
     "rope_qk_partial": _run_qk_rope_partial_upstream,
     "rope_qk_inverse": _run_qk_rope_inverse_upstream,
+    **SMALL_OPERATOR_UPSTREAM_RUNNERS,
 }
 
 

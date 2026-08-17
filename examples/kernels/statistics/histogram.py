@@ -8,8 +8,8 @@ BINS = 256
 
 @intent.kernel
 def histogram_256(
-    samples: I.In[I.u8, ("N",)],
-    histogram: I.InOut[I.i32, (BINS,)],
+    samples: I.In[I.f32, ("N",)],
+    histogram: I.InOut[I.f32, (BINS,)],
 ):
     N = samples.shape[0]
     for index in I.parallel(I.domain(0, N)):
@@ -18,5 +18,5 @@ def histogram_256(
         I.atomic_add(
             histogram,
             index=(bin_index,),
-            value=I.cast(1, I.i32),
+            value=I.cast(1.0, I.f32),
         )
