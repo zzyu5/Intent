@@ -1123,8 +1123,13 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     return operation.emitOpError(
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
+  bool privateContiguousCompact =
+      boundary.getResultSpace() == "fragment" && succeeded(view) &&
+      accessRanges.size() == 1 && accessRanges.front().isCompact() &&
+      accessRanges.front().getSourceAxis() + 1 ==
+          static_cast<int64_t>((*view)->shape.size());
   if (boundary.hasCompactTensorIndex() &&
-      boundary.getResultSpace() == "shared") {
+      (boundary.getResultSpace() == "shared" || privateContiguousCompact)) {
     if (scalarResult || failed(view) || accessRanges.size() != 1 ||
         !accessRanges.front().isCompact())
       return operation.emitOpError(
@@ -1257,8 +1262,11 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     if (compactShape.size() == 1)
       compactShapeText += ",";
     compactShapeText += ")";
-    line(compactResult + " = T.alloc_shared(" + compactShapeText + ", " +
-         dtype + ")");
+    StringRef compactAllocator = boundary.getResultSpace() == "shared"
+                                     ? "T.alloc_shared"
+                                     : "T.alloc_fragment";
+    line(compactResult + " = " + compactAllocator.str() + "(" +
+         compactShapeText + ", " + dtype + ")");
 
     auto join = [](ArrayRef<std::string> values) {
       std::string result;
@@ -1334,7 +1342,8 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     --indentation;
     --indentation;
     --indentation;
-    line("T.sync_threads()");
+    if (boundary.getResultSpace() == "shared")
+      line("T.sync_threads()");
 
     SmallVector<std::string> logicalIndices;
     std::string expandLoop = "for ";

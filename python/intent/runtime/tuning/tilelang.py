@@ -20,7 +20,7 @@ def _configuration(
 
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
-        "stream": (32, 64, 128, 256, 512, 1024),
+        "stream": (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
         "scan": (32, 64, 128, 256, 512, 1024),
         "stream_contract": (32, 64, 128),
         "stream_scaled": (1, 2, 4, 8),
@@ -113,6 +113,9 @@ def autotune_configurations(
             ({"stream": 256}, 1, 128),
             ({"stream": 512}, 1, 128),
             ({"stream": 1024}, 2, 256),
+            ({"stream": 2048}, 2, 256),
+            ({"stream": 4096}, 1, 256),
+            ({"stream": 8192}, 1, 128),
         ),
         (
             ({"stream_contract": 32}, 1, 128),

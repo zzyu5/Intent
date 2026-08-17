@@ -30,8 +30,8 @@ varlen_attention,causal,R,pass,0.3337,0.3376,,,R,pass,0.3183,0.3244,,,R,pass,0.3
 varlen_gqa_prefill,default,R,pass,5.2197,5.2394,,,R,pass,5.6807,5.7044,,,R,pass,9.8022,9.8190,6.3852,6.3903
 varlen_gqa_rope_prefill,default,E,pass,5.8034,5.8229,,,E,pass,6.2760,6.2949,,,E,pass,10.2852,10.2940,,
 paged_attention,default,K,pass,0.2248,0.2273,0.2949,0.2976,K,pass,0.3260,0.3293,,,K,unsupported,,,,
-online_softmax,default,K,pass,0.3498,0.3524,,,K,pass,0.3576,0.3607,,,K,pass,0.3924,0.4055,0.3697,0.3748
-ordered_prefix,default,K,pass,0.0398,0.0429,0.0203,0.0230,K,pass,0.0390,0.0408,,,K,pass,0.0236,0.0265,,
+online_softmax,default,K,pass,0.3498,0.3524,,,K,pass,0.3576,0.3607,,,K,pass,0.3604,0.3626,0.3697,0.3748
+ordered_prefix,default,K,pass,0.0191,0.0219,0.0203,0.0230,K,pass,0.0221,0.0256,,,K,pass,0.0286,0.0354,,
 moe,default,E,pass,8.7359,8.7508,,,E,pass,10.0133,10.0962,,,E,pass,11.3604,11.4001,,
 grouped_gemm,base,E,pass,1.4201,1.4332,,,E,pass,1.3461,1.3742,,,E,pass,1.2865,1.2988,1.4895,1.5018
 grouped_gemm,tail,E,pass,1.4354,1.4436,,,E,pass,1.3517,1.3866,,,E,pass,1.2962,1.3018,,
@@ -52,7 +52,7 @@ barrier_option,default,K,pass,0.9100,0.9120,,,K,pass,0.2411,0.2417,,,K,pass,1.16
 bitonic_sort,default,K,pass,1.4041,1.4092,,,K,pass,0.7042,0.7069,,,K,pass,0.5721,0.5733,,
 csr_spmv,default,K,pass,0.0570,0.0585,,,K,pass,0.0605,0.0611,,,K,pass,0.0562,0.0571,,
 greedy_nms,default,K,pass,27.7291,27.7326,,,K,pass,58.0122,58.0184,,,K,pass,45.9255,45.9312,,
-histogram,default,E,pass,3.8923,3.8933,1.2740,1.2762,E,pass,3.8924,3.8943,,,E,pass,3.6430,3.6451,,
+histogram,default,E,pass,1.2746,1.2766,1.2740,1.2762,E,pass,1.2729,1.2740,,,E,pass,1.2741,1.2753,,
 kmeans_assign,default,K,pass,0.9602,0.9615,,,K,pass,0.9233,0.9254,,,K,pass,0.6288,0.6315,,
 radix2_fft,default,K,pass,1.3507,1.3588,,,K,pass,0.7483,0.7506,,,K,pass,0.4792,0.4829,,
 roi_align,default,K,pass,0.5927,0.6284,,,K,pass,0.3069,0.3089,,,K,pass,0.3109,0.3130,,
@@ -68,7 +68,7 @@ variant_rope_index,default,K,pass,0.0357,0.0369,,,K,pass,0.0389,0.0391,,,K,pass,
 variant_softmax_online,default,K,pass,0.3502,0.3523,,,K,pass,0.3584,0.3604,,,K,pass,0.3886,0.3945,,
 variant_swiglu_helper,default,K,pass,0.2253,0.2273,,,K,pass,0.2437,0.2458,,,K,pass,0.2288,0.2304,,
 variant_transpose_scalar_domains,default,K,pass,0.6082,0.6103,,,K,pass,0.6205,0.6235,,,K,pass,0.6103,0.6123,,
-nonzero_compact,default,K,pass,0.1407,0.1410,,,K,pass,0.2638,0.2661,,,K,pass,0.1983,0.1998,,
+nonzero_compact,default,K,pass,0.1405,0.1411,,,K,pass,0.2618,0.2660,,,K,pass,0.1980,0.1985,,
 unique_consecutive,default,E,pass,0.3368,0.3371,,,E,pass,1.0093,1.0103,,,E,pass,0.3720,0.3733,,
 moe_align_block,default,E,pass,0.1789,0.1866,,,E,pass,0.0841,0.0896,,,E,pass,0.0397,0.0430,,
 nested_ragged_pool,default,K,pass,0.2280,0.2292,,,K,pass,0.6400,0.6420,,,K,pass,0.2694,0.2705,,
@@ -90,13 +90,13 @@ variant_ordered_prefix_nested,default,K,pass,0.0378,0.0409,,,K,pass,0.0397,0.040
 variant_attention_full_causal_stream,default,K,pass,0.0717,0.0724,,,K,pass,0.0614,0.0620,,,K,pass,0.0635,0.0644,,
 causal_conv1d,default,K,pass,0.1905,0.1921,,,K,pass,0.7973,0.7988,,,K,pass,0.2657,0.2668,,
 causal_conv1d_update,default,K,pass,0.0444,0.0489,,,K,pass,0.0476,0.0536,,,K,pass,0.0151,0.0199,,
-rope_qk_full,default,K,pass,0.0712,0.0733,,,K,pass,0.0696,0.0716,0.0696,0.0716,K,failed,,,,
-rope_qk_partial,default,K,pass,0.0246,0.0264,,,K,pass,0.0266,0.0267,0.0266,0.0267,K,failed,,,,
-rope_qk_inverse,default,K,pass,0.0712,0.0732,,,K,pass,0.0696,0.0717,0.0655,0.0656,K,failed,,,,
-continuous_gqa_decode,default,K,pass,0.6781,0.6834,,,K,pass,0.6681,0.6773,,,K,pass,0.7491,0.7548,0.6917,0.6964
+rope_qk_full,default,K,pass,0.0717,0.0720,,,K,pass,0.0696,0.0716,0.0696,0.0716,K,pass,0.0697,0.0717,,
+rope_qk_partial,default,K,pass,0.0247,0.0268,,,K,pass,0.0266,0.0267,0.0266,0.0267,K,pass,0.0245,0.0246,,
+rope_qk_inverse,default,K,pass,0.0702,0.0713,,,K,pass,0.0696,0.0716,0.0655,0.0656,K,pass,0.0696,0.0717,,
+continuous_gqa_decode,default,K,pass,0.6781,0.6834,,,K,pass,0.6681,0.6773,,,K,pass,0.7491,0.7548,,
 mla_prefill,default,K,pass,0.0507,0.0515,,,K,pass,0.0431,0.0452,0.0410,0.0416,K,pass,0.0405,0.0412,,
 mamba_chunk_scan,default,K,pass,0.0246,0.0268,,,K,pass,0.0241,0.0249,,,K,pass,0.0279,0.0297,0.0205,0.0220
-w4a8_packed,default,K,pass,0.1039,0.1047,,,K,pass,0.1160,0.1188,,,K,pass,0.0977,0.0986,0.0895,0.0901
+w4a8_packed,default,K,pass,0.1039,0.1047,,,K,pass,0.1160,0.1188,,,K,pass,0.0768,0.0788,0.0895,0.0901
 embedding_forward_lookup,default,K,pass,0.0446,0.0456,0.0430,0.0451,K,pass,0.0548,0.0556,,,K,pass,0.0450,0.0471,,
 block_scaled_matmul,default,K,pass,0.0123,0.0139,,,K,pass,0.0139,0.0146,0.1390,0.1414,K,pass,0.0261,0.0271,,
 splitk_attention_reduce,default,K,pass,0.0056,0.0064,,,K,pass,0.0056,0.0065,0.0061,0.0067,K,unsupported,,,,
@@ -119,5 +119,5 @@ varlen_gqa_decode_logits,default,R,pass,0.0693,0.0744,,,R,pass,0.1050,0.1061,,,R
 max_pool2d,default,K,pass,0.0180,0.0198,,,K,pass,0.0200,0.0208,,,K,pass,0.0220,0.0228,,
 softmax_backward,default,K,pass,0.1347,0.1367,0.1597,0.1633,K,pass,0.1335,0.1372,,,K,pass,0.1306,0.1327,,
 csr_spmm,default,K,pass,0.0450,0.0501,,,K,pass,0.0498,0.0508,,,K,pass,0.0213,0.0234,,
-batch_norm_training,default,K,pass,0.1384,0.1405,0.0673,0.0766,K,pass,0.0717,0.0717,,,K,pass,0.0737,0.0744,,
+batch_norm_training,default,K,pass,0.0579,0.0595,0.0673,0.0766,K,pass,0.0482,0.0526,,,K,pass,0.0280,0.0302,,
 triangular_solve,default,K,pass,0.0511,0.0566,0.0399,0.0442,K,pass,0.0237,0.0248,,,K,pass,0.0225,0.0246,,

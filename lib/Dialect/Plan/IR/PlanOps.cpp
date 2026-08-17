@@ -153,11 +153,10 @@ LogicalResult RangeOp::verify() {
     if (getDivisorAttr() && getDivisorAttr().getInt() <= 1)
       return emitOpError("compact access divisor must be greater than one");
     if (getOffsetAttr() && getOffsetAttr().getInt() < 0)
-      return emitOpError("compact access offset must be non-negative");
-    if (static_cast<bool>(getDivisorAttr()) !=
-        static_cast<bool>(getOffsetAttr()))
+      return emitOpError("access offset must be non-negative");
+    if (getDivisorAttr() && !getOffsetAttr())
       return emitOpError(
-          "compact access divisor and offset must be present together");
+          "compact access divisor requires an offset");
   } else if (getTransferNodeAttr() || getSourceAxisAttr() ||
              getDivisorAttr() || getOffsetAttr()) {
     return emitOpError(
@@ -560,7 +559,11 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       bool compactStream = range.getDivisorAttr() &&
                            (axisHasRole(axis->second, "ordered") ||
                             axisHasRole(axis->second, "reduction"));
-      if (!axisHasRole(axis->second, "parallel") && !compactStream)
+      bool translatedLane = range.getOffsetAttr() &&
+                            !range.getDivisorAttr() &&
+                            axisHasRole(axis->second, "lane");
+      if (!axisHasRole(axis->second, "parallel") && !compactStream &&
+          !translatedLane)
         return range.emitOpError(
             "access footprint has no compatible physical source axis");
       if (!transfers.contains(range.getTransferNodeAttr().getInt()))

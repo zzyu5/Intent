@@ -132,9 +132,6 @@ if [[ ${unfamiliar} == false ]]; then
   tilelang:mamba_chunk_scan)
     baseline=source/tilelang/tilelang/scan/mamba_chunk_scan/example_mamba_chunk_scan_runtime.py
     ;;
-  tilelang:continuous_gqa_decode)
-    baseline=source/tilelang/tilelang/attention/gqa_decode/example_gqa_decode_runtime.py
-    ;;
   tilelang:block_sparse_attention)
     baseline=source/tilelang/tilelang/attention/blocksparse_gqa_decode_varlen/example_tilelang_sparse_gqa_decode_varlen_indice_runtime.py
     ;;

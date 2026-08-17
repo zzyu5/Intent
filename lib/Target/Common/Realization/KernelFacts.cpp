@@ -1107,6 +1107,15 @@ LogicalResult recordAccessRanges(Operation &operation, KernelFacts &facts) {
     if (!expression) {
       continue;
     }
+    if (expression->constant > 0 && expression->coefficients.size() == 1) {
+      const auto &source = *expression->coefficients.begin();
+      if (source.first && source.second == 1) {
+        facts.accessRanges.push_back(AccessRangeFact{
+            &operation, source.first, currentSourceAxis, 1,
+            expression->constant});
+        continue;
+      }
+    }
     Operation *ownership = nullptr;
     for (const auto &coefficient : expression->coefficients) {
       if (!isPartitionedOwnership(coefficient.first))
@@ -2159,7 +2168,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   "has no canonical external-view store schema");
             if (failed(analyzeBoundary(operation, facts, "none")))
               return failure();
-            return classifyTensorIndices(operation, facts);
+            if (failed(classifyTensorIndices(operation, facts)))
+              return failure();
+            return recordAccessRanges(operation, facts);
           })))
     return failure();
 

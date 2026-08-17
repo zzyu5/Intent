@@ -727,8 +727,10 @@ assignAxes(const target::KernelFacts &facts) {
       outerProgram = region.operation;
       break;
     }
+  bool hasMaterializedScan = !facts.scans.empty();
   for (AxisChoice &choice : choices)
     choice.reuse = choice.programOrder && !choice.tiled && !choice.packedLane &&
+                   !hasMaterializedScan &&
                    !hasDelegatedTileChoice &&
                    llvm::all_of(choice.parallels, [&](Operation *parallel) {
                      return parallel == outerProgram;
@@ -1148,7 +1150,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
     IntegerAttr divisor = access.divisor > 1
                               ? i64(builder, access.divisor)
                               : IntegerAttr();
-    IntegerAttr offset = access.divisor > 1
+    IntegerAttr offset = access.divisor > 1 || access.offset != 0
                              ? i64(builder, access.offset)
                              : IntegerAttr();
     decisions.ranges.push_back(builder.create<intent::plan::RangeOp>(

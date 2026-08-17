@@ -73,48 +73,30 @@ def rotary_qk_inplace(
     for batch in I.parallel(I.domain(0, B)):
         for token in I.parallel(I.domain(0, S)):
             paired_phase = I.indices(phase) + HALF_DIMENSION
-            cosine_row = I.cast(cosine[0, token, phase], I.f32)
-            sine_row = I.cast(sine[0, token, phase], I.f32)
+            cosine_row = cosine[0, token, phase]
+            sine_row = sine[0, token, phase]
 
-            query_first = I.cast(query[batch, query_heads, token, phase], I.f32)
-            query_second = I.cast(
-                query[batch, query_heads, token, paired_phase],
-                I.f32,
-            )
+            query_first = query[batch, query_heads, token, phase]
+            query_second = query[batch, query_heads, token, paired_phase]
             rotated_query_first, rotated_query_second = rotate_pair(
                 query_first,
                 query_second,
                 cosine_row,
                 sine_row,
             )
-            query[batch, query_heads, token, phase] = I.cast(
-                rotated_query_first,
-                I.f16,
-            )
-            query[batch, query_heads, token, paired_phase] = I.cast(
-                rotated_query_second,
-                I.f16,
-            )
+            query[batch, query_heads, token, phase] = rotated_query_first
+            query[batch, query_heads, token, paired_phase] = rotated_query_second
 
-            key_first = I.cast(key[batch, key_heads, token, phase], I.f32)
-            key_second = I.cast(
-                key[batch, key_heads, token, paired_phase],
-                I.f32,
-            )
+            key_first = key[batch, key_heads, token, phase]
+            key_second = key[batch, key_heads, token, paired_phase]
             rotated_key_first, rotated_key_second = rotate_pair(
                 key_first,
                 key_second,
                 cosine_row,
                 sine_row,
             )
-            key[batch, key_heads, token, phase] = I.cast(
-                rotated_key_first,
-                I.f16,
-            )
-            key[batch, key_heads, token, paired_phase] = I.cast(
-                rotated_key_second,
-                I.f16,
-            )
+            key[batch, key_heads, token, phase] = rotated_key_first
+            key[batch, key_heads, token, paired_phase] = rotated_key_second
 
 
 @intent.kernel
@@ -138,45 +120,27 @@ def rotary_qk_partial_inplace(
     for batch in I.parallel(I.domain(0, B)):
         for token in I.parallel(I.domain(0, S)):
             paired_phase = I.indices(phase) + PARTIAL_HALF_DIMENSION
-            cosine_row = I.cast(cosine[0, token, phase], I.f32)
-            sine_row = I.cast(sine[0, token, phase], I.f32)
+            cosine_row = cosine[0, token, phase]
+            sine_row = sine[0, token, phase]
 
-            query_first = I.cast(query[batch, query_heads, token, phase], I.f32)
-            query_second = I.cast(
-                query[batch, query_heads, token, paired_phase],
-                I.f32,
-            )
+            query_first = query[batch, query_heads, token, phase]
+            query_second = query[batch, query_heads, token, paired_phase]
             rotated_query_first, rotated_query_second = rotate_pair(
                 query_first,
                 query_second,
                 cosine_row,
                 sine_row,
             )
-            query[batch, query_heads, token, phase] = I.cast(
-                rotated_query_first,
-                I.f16,
-            )
-            query[batch, query_heads, token, paired_phase] = I.cast(
-                rotated_query_second,
-                I.f16,
-            )
+            query[batch, query_heads, token, phase] = rotated_query_first
+            query[batch, query_heads, token, paired_phase] = rotated_query_second
 
-            key_first = I.cast(key[batch, key_heads, token, phase], I.f32)
-            key_second = I.cast(
-                key[batch, key_heads, token, paired_phase],
-                I.f32,
-            )
+            key_first = key[batch, key_heads, token, phase]
+            key_second = key[batch, key_heads, token, paired_phase]
             rotated_key_first, rotated_key_second = rotate_pair(
                 key_first,
                 key_second,
                 cosine_row,
                 sine_row,
             )
-            key[batch, key_heads, token, phase] = I.cast(
-                rotated_key_first,
-                I.f16,
-            )
-            key[batch, key_heads, token, paired_phase] = I.cast(
-                rotated_key_second,
-                I.f16,
-            )
+            key[batch, key_heads, token, phase] = rotated_key_first
+            key[batch, key_heads, token, paired_phase] = rotated_key_second

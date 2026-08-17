@@ -195,7 +195,20 @@ indexRealization(intent::plan::RealizationOp realization,
       return value.emitOpError("does not bind a canonical transfer");
     FailureOr<bool> derivedScalar =
         target::hasDerivedScalarIndex(*operation);
-    bool tensorIndexed = value.getTensorIndexing() != "none";
+    SmallVector<target::emission::RangeBinding> accessRanges =
+        target::emission::accessRangesForTransfer(index, value.getNode());
+    bool translatedUnitStride =
+        value.getTensorIndexing() == "structured" &&
+        accessRanges.size() == 1 && !accessRanges.front().isCompact() &&
+        accessRanges.front().getOffset() > 0 && [&]() {
+          StringRef role = accessRanges.front().getTileRole();
+          int64_t tile = 0;
+          return role.starts_with("fixed_") &&
+                 !role.drop_front(6).getAsInteger(10, tile) && tile > 0 &&
+                 accessRanges.front().getOffset() % tile == 0;
+        }();
+    bool tensorIndexed =
+        value.getTensorIndexing() != "none" && !translatedUnitStride;
     if (failed(derivedScalar))
       return failure();
     bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
@@ -2063,6 +2076,12 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<int64_t> transferNode =
+      target::getNodeID(operation, "cuTile translated access projection");
+  SmallVector<target::emission::RangeBinding> accessRanges =
+      succeeded(transferNode)
+          ? target::emission::accessRangesForTransfer(planIndex, *transferNode)
+          : SmallVector<target::emission::RangeBinding>();
   RankedTensorType projectedTensor;
   if (operation.getNumResults() == 1)
     projectedTensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
@@ -2281,6 +2300,32 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     Value indexed = operation.getOperand(*term.operands.front());
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
+      auto translated = llvm::find_if(accessRanges, [&](const auto &range) {
+        return range.getSourceAxis() == static_cast<int64_t>(indices.size()) &&
+               !range.isCompact() && range.getOffset() > 0;
+      });
+      if (translated != accessRanges.end()) {
+        auto axis = planIndex.axes.find(translated->getAxisNode());
+        if (axis == planIndex.axes.end())
+          return translated->emitOpError(
+              "references an unbound cuTile translated-access axis");
+        std::string base = axisIndices.lookup(axis->second.getNode());
+        if (base.empty() && axis->second.hasRole("lane"))
+          base = "0";
+        if (base.empty())
+          return translated->emitOpError(
+              "has no active cuTile translated-access base");
+        StringRef role = translated->getTileRole();
+        int64_t tile = 0;
+        if (!role.starts_with("fixed_") ||
+            role.drop_front(6).getAsInteger(10, tile) || tile <= 0 ||
+            translated->getOffset() % tile != 0)
+          return translated->emitOpError(
+              "has no tile-aligned cuTile translated-access projection");
+        indices.push_back(addressIndex(
+            base + " + " + std::to_string(translated->getOffset() / tile)));
+        continue;
+      }
       if (!elementwiseAccess)
         return operation.emitOpError(
             "cuTile tensor-index transfer requires element-coordinate projection");
@@ -2334,6 +2379,12 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
+  FailureOr<int64_t> transferNode =
+      target::getNodeID(operation, "cuTile translated tile-shape projection");
+  SmallVector<target::emission::RangeBinding> accessRanges =
+      succeeded(transferNode)
+          ? target::emission::accessRangesForTransfer(planIndex, *transferNode)
+          : SmallVector<target::emission::RangeBinding>();
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(view) || relation->size() != (*view)->shape.size())
     return failure();
@@ -2354,6 +2405,21 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
     Value indexed = operation.getOperand(*term.operands.front());
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
+      auto translated = llvm::find_if(accessRanges, [&](const auto &range) {
+        return range.getSourceAxis() == static_cast<int64_t>(axisNumber) &&
+               !range.isCompact() && range.getOffset() > 0;
+      });
+      if (translated != accessRanges.end()) {
+        auto axis = planIndex.axes.find(translated->getAxisNode());
+        if (axis == planIndex.axes.end())
+          return translated->emitOpError(
+              "references an unbound cuTile translated-access tile");
+        FailureOr<std::string> tile = physicalAxisTile(axis->second);
+        if (failed(tile))
+          return failure();
+        extents.push_back(*tile);
+        continue;
+      }
       auto result = dyn_cast<OpResult>(indexed);
       auto tensor = dyn_cast<RankedTensorType>(indexed.getType());
       auto shapes = result ? result.getOwner()->getAttrOfType<ArrayAttr>(

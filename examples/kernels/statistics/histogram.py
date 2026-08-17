@@ -12,11 +12,14 @@ def histogram_256(
     histogram: I.InOut[I.f32, (BINS,)],
 ):
     N = samples.shape[0]
-    for index in I.parallel(I.domain(0, N)):
-        bin_index = I.cast(samples[index], I.i32)
+    sample_axis = I.domain(0, N)
+    for sample_region in I.parallel(
+        I.partition(sample_axis, extent=I.auto("N_TILE"))
+    ):
+        bin_index = I.cast(samples[sample_region], I.i32)
         I.assume_in_bounds(bin_index, histogram, axis=0)
         I.atomic_add(
             histogram,
             index=(bin_index,),
-            value=I.cast(1.0, I.f32),
+            value=I.full((sample_region,), 1.0, dtype=I.f32),
         )
