@@ -243,22 +243,20 @@ pointwiseRole(mlir::Operation &operation) {
                           ? mlir::dyn_cast<mlir::RankedTensorType>(
                                 operation.getOperand(0).getType())
                           : mlir::RankedTensorType();
-    bool scalarizeStaticUnitTensor =
-        sourceType && operation.getNumResults() == 1 &&
-        llvm::all_of(*relation, [](const target::IndexTerm &term) {
-          return term.kind == "static_index" &&
-                 term.staticValues.size() == 1 &&
-                 term.staticValues.front() &&
-                 *term.staticValues.front() == 0;
-        }) &&
-        llvm::all_of(sourceType.getShape(),
-                     [](int64_t extent) { return extent == 1; });
+    bool extractFirstScalar =
+        sourceType && sourceType.getRank() == 1 &&
+        operation.getNumResults() == 1 &&
+        !mlir::isa<mlir::RankedTensorType>(operation.getResult(0).getType()) &&
+        relation->size() == 1 && relation->front().kind == "static_index" &&
+        relation->front().staticValues.size() == 1 &&
+        relation->front().staticValues.front() &&
+        *relation->front().staticValues.front() == 0;
     if (expand)
       return std::string("expand_dims");
     if (indirect)
       return std::string("indirect_gather");
-    if (scalarizeStaticUnitTensor)
-      return std::string("extract_unit_scalar");
+    if (extractFirstScalar)
+      return std::string("extract_first_scalar");
     return operation.emitOpError("has no supported gather relation");
   }
   auto logical = operation.getAttrOfType<mlir::StringAttr>("intent.operator");
@@ -1122,6 +1120,25 @@ bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
   return operation &&
          operation->getName().getStringRef() == "intent.contract" &&
          isPlannedStageNode(index, operation);
+}
+
+template <typename PlanIndex>
+bool isEnclosingStreamReductionAxis(const PlanIndex &index,
+                                    mlir::Operation &operation,
+                                    int64_t axisNode) {
+  for (mlir::Operation *parent = operation.getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (parent->getName().getStringRef() != "intent.state_stream")
+      continue;
+    auto node = parent->getAttrOfType<mlir::IntegerAttr>("intent.node");
+    if (!node)
+      continue;
+    auto stream = index.streams.find(node.getInt());
+    if (stream != index.streams.end() &&
+        llvm::is_contained(stream->second.getInnerReductionAxes(), axisNode))
+      return true;
+  }
+  return false;
 }
 
 template <typename PlanIndex>

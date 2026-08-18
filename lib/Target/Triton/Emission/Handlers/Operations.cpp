@@ -2116,14 +2116,15 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (binding && binding.getLowering() == "tl.extract_unit_scalar" &&
+  if (binding && binding.getLowering() == "tl.extract_first_scalar" &&
       succeeded(relation) && relation->size() == 1 &&
       (*relation)[0].kind == "static_index") {
     FailureOr<StringRef> source = lookupValue(operation, 0);
     if (failed(source))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = tl.sum(" + source->str() + ", axis=0)");
+    line(result + " = tl.sum(tl.gather(" + source->str() +
+         ", tl.full((1,), 0, tl.int32), axis=0), axis=0)");
     bindResult(operation, 0, result);
     return success();
   }
@@ -2567,6 +2568,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   plan::AxisOp reductionAxis = axes->reduction;
   std::string reductionRole = reductionAxis.getRole().str();
   std::string reductionTile = reductionAxis.getTile().str();
+  bool streamReduction = target::emission::isEnclosingStreamReductionAxis(
+      planIndex, operation, reductionAxis.getNode());
   FailureOr<std::string> lhsTile = physicalAxisTile(axes->lhsResult);
   FailureOr<std::string> rhsTile = physicalAxisTile(axes->rhsResult);
   if (failed(lhsTile) || failed(rhsTile))
@@ -2575,13 +2578,18 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.zeros((" + *lhsTile + ", " + *rhsTile +
        "), dtype=" + accumulatorDtype + ")");
-  line("for reduction_block in range(0, tl.cdiv(" +
-       roleDimensions.lookup(reductionRole) + ", " + reductionTile + ")):");
-  ++indentation;
-  line(reductionOffset + " = " + addressIndex("reduction_block") + " * " +
-       reductionTile + " + " +
-       addressIndex("tl.arange(0, " + reductionTile + ")"));
-  axisIndices[reductionAxis.getNode()] = reductionOffset;
+  if (!streamReduction) {
+    line("for reduction_block in range(0, tl.cdiv(" +
+         roleDimensions.lookup(reductionRole) + ", " + reductionTile + ")):");
+    ++indentation;
+    line(reductionOffset + " = " + addressIndex("reduction_block") + " * " +
+         reductionTile + " + " +
+         addressIndex("tl.arange(0, " + reductionTile + ")"));
+    axisIndices[reductionAxis.getNode()] = reductionOffset;
+  } else if (axisIndices.lookup(reductionAxis.getNode()).empty()) {
+    return operation.emitOpError(
+        "has no active Triton stream-bound reduction range");
+  }
   FailureOr<std::string> lhsPointers =
       emitPointerExpression(*lhsLoad, **lhsView, false);
   FailureOr<std::string> rhsPointers =
@@ -2605,7 +2613,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     rhsExpression = "tl.trans(" + rhsExpression + ")";
   line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression + ", " +
        result + ")");
-  --indentation;
+  if (!streamReduction)
+    --indentation;
   bindResult(operation, 0, result);
   return success();
 }

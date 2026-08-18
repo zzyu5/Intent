@@ -349,18 +349,15 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 operation.getNumOperands() > 0
                     ? operation.getOperand(0).getType()
                     : Type());
-            bool scalarizeStaticUnitTensor =
+            bool extractFirstScalar =
                 operation.getNumOperands() > 0 && operation.getNumResults() == 1 &&
-                sourceType &&
-                llvm::all_of(*relation, [](const target::IndexTerm &term) {
-                  return term.kind == "static_index" &&
-                         term.staticValues.size() == 1 &&
-                         term.staticValues.front() &&
-                         *term.staticValues.front() == 0;
-                }) &&
-                llvm::all_of(sourceType.getShape(),
-                             [](int64_t extent) { return extent == 1; });
-            if (!expand && !indirect && !scalarizeStaticUnitTensor)
+                sourceType && sourceType.getRank() == 1 &&
+                !isa<RankedTensorType>(operation.getResult(0).getType()) &&
+                relation->size() == 1 && relation->front().kind == "static_index" &&
+                relation->front().staticValues.size() == 1 &&
+                relation->front().staticValues.front() &&
+                *relation->front().staticValues.front() == 0;
+            if (!expand && !indirect && !extractFirstScalar)
               return operation.emitOpError(
                   "has no mechanical GPU gather realization");
             return success();

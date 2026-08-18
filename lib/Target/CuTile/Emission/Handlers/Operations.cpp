@@ -2235,14 +2235,15 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (binding && binding.getLowering() == "ct.extract_unit_scalar" &&
+  if (binding && binding.getLowering() == "ct.extract_first_scalar" &&
       succeeded(relation) && relation->size() == 1 &&
       (*relation)[0].kind == "static_index") {
     FailureOr<StringRef> source = lookupValue(operation, 0);
     if (failed(source))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = ct.sum(" + source->str() + ", axis=0)");
+    line(result + " = ct.extract(" + source->str() +
+         ", (0,), shape=(1,)).item()");
     bindResult(operation, 0, result);
     return success();
   }
@@ -2710,7 +2711,13 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       failed(rhsBoundary) || failed(axes))
     return failure();
   plan::AxisOp reductionAxis = axes->reduction;
-  axisIndices[reductionAxis.getNode()] = "k_tile";
+  bool streamReduction = target::emission::isEnclosingStreamReductionAxis(
+      planIndex, operation, reductionAxis.getNode());
+  if (!streamReduction)
+    axisIndices[reductionAxis.getNode()] = "k_tile";
+  else if (axisIndices.lookup(reductionAxis.getNode()).empty())
+    return operation.emitOpError(
+        "has no active cuTile stream-bound reduction range");
   bool gatherLhs = lhsBoundary->getAccess() == "gather";
   bool gatherRhs = rhsBoundary->getAccess() == "gather";
   FailureOr<std::string> lhsIndex = indexTuple(*lhsLoad, gatherLhs);
@@ -2735,20 +2742,24 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     return failure();
 
   std::string result = makeResultName(operation, 0);
-  std::string reductionExtent = roleDimensions.lookup(reductionAxis.getRole());
-  if (reductionExtent.empty())
-    return reductionAxis.emitOpError(
-        "has no cuTile physical reduction extent binding");
-  line("num_tiles_k = ct.cdiv(" + reductionExtent + ", " +
-       reductionAxis.getTile().str() + ")");
+  if (!streamReduction) {
+    std::string reductionExtent = roleDimensions.lookup(reductionAxis.getRole());
+    if (reductionExtent.empty())
+      return reductionAxis.emitOpError(
+          "has no cuTile physical reduction extent binding");
+    line("num_tiles_k = ct.cdiv(" + reductionExtent + ", " +
+         reductionAxis.getTile().str() + ")");
+  }
   line(result + " = ct.full((" + *lhsTile + ", " + *rhsTile +
        "), 0, dtype=" + accumulatorDtype + ")");
   std::string operandDtype =
       dtypeName((*lhsView)->tensor.getElementType(), operation);
   if (operandDtype.empty())
     return failure();
-  line("for k_tile in range(num_tiles_k):");
-  ++indentation;
+  if (!streamReduction) {
+    line("for k_tile in range(num_tiles_k):");
+    ++indentation;
+  }
   std::string lhs = makeResultName(*lhsLoad, 0);
   std::string rhs = makeResultName(*rhsLoad, 0);
   auto emitOperand = [&](StringRef name, ABIView &view, StringRef index,
@@ -2798,7 +2809,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     rhsExpression = "ct.transpose(" + rhsExpression + ")";
   line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression + ", " +
        result + ")");
-  --indentation;
+  if (!streamReduction)
+    --indentation;
   bindResult(operation, 0, result);
   return success();
 }

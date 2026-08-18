@@ -2848,13 +2848,13 @@ LogicalResult SourceEmitter::emitGather(Operation &operation) {
       isa<RankedTensorType>(operation.getOperand(0).getType()) &&
       !isa<RankedTensorType>(operation.getResult(0).getType()) &&
       relation->size() == 1;
-  if (binding.getLowering() == "T.extract_unit_scalar" &&
+  if (binding.getLowering() == "T.extract_first_scalar" &&
       relation->size() == 1 && relation->front().kind == "static_index") {
     FailureOr<StringRef> source = lookupValue(operation, 0);
     if (failed(source))
       return failure();
     std::string result = makeResultName(operation, 0);
-    line(result + " = T.reduce_sum(" + source->str() + ")");
+    line(result + " = " + source->str() + "[0]");
     bindResult(operation, 0, result);
     return success();
   }
@@ -3566,6 +3566,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         isa<Float8E4M3FNType, Float8E5M2Type>(rhsElement);
     if (failed(reductionAxis) || failed(contractionAxes))
       return failure();
+    bool streamReduction = target::emission::isEnclosingStreamReductionAxis(
+        planIndex, operation, reductionAxis->getNode());
     if (fp8Operands && contractionAxes->lhsResult.hasRole("lane"))
       return operation.emitOpError(
           "TileLang 0.1.13 cannot project an FP8 contraction whose matrix-M "
@@ -3586,8 +3588,12 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
         rhsBoundary.hasDataDependentTensorIndex())
       return operation.emitOpError(
           "TileLang cannot bulk-copy a contraction operand with a noncontiguous index tile");
-    axisIndices[reductionAxis->getNode()] =
-        addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
+    if (!streamReduction)
+      axisIndices[reductionAxis->getNode()] =
+          addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
+    else if (axisIndices.lookup(reductionAxis->getNode()).empty())
+      return operation.emitOpError(
+          "has no active TileLang stream-bound reduction range");
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad);
     FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
@@ -3604,10 +3610,12 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     line(rhs + " = T.alloc_shared(" + *rhsShape + ", " +
          dtypeName((*rhsView)->tensor.getElementType(), *rhsLoad) + ")");
     line("T.clear(" + *result + ")");
-    line("for k_tile in T.Pipelined(T.ceildiv(" +
-         roleDimensions.lookup(reductionAxis->getRole()) + ", " +
-         reductionAxis->getTile().str() + "), num_stages=num_stages):");
-    ++indentation;
+    if (!streamReduction) {
+      line("for k_tile in T.Pipelined(T.ceildiv(" +
+           roleDimensions.lookup(reductionAxis->getRole()) + ", " +
+           reductionAxis->getTile().str() + "), num_stages=num_stages):");
+      ++indentation;
+    }
     line("T.copy(" + (*lhsView)->argument->name + "[" + *lhsIndices + "], " +
          lhs + ")");
     line("T.copy(" + (*rhsView)->argument->name + "[" + *rhsIndices + "], " +
@@ -3618,7 +3626,8 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     if (orientation->rhsTranspose)
       call += ", transpose_B=True";
     line(call + ", policy=GEMM_WARP_POLICY)");
-    --indentation;
+    if (!streamReduction)
+      --indentation;
     bindResult(operation, 0, *result);
     return success();
   }

@@ -159,8 +159,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role,
     return StringRef("expand_dims");
   if (role == "indirect_gather")
     return StringRef("ct.indirect_gather");
-  if (role == "extract_unit_scalar")
-    return StringRef("ct.extract_unit_scalar");
+  if (role == "extract_first_scalar")
+    return StringRef("ct.extract_first_scalar");
   operation->emitOpError("has no cuTile pointwise spelling for role ") << role;
   return failure();
 }
