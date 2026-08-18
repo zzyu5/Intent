@@ -4,7 +4,7 @@
 
 Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 
-## baseline-v2 entries（34）
+## baseline-v2 entries（39）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -33,6 +33,8 @@ Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 | V2 | dropout | `tilegym/regularization/dropout/dropout.py` / `dropout` | `8192×4096`, fp16, p=0.1 | `python source/cutile/tilegym/regularization/dropout/dropout_runtime.py` |
 | V2 | attention sink prefill | `tilegym/attention/sink_prefill/attention_sink.py` / `attention_sink` | `B=1,S=4096,QH=32,KVH=8,D=128`, bf16 | `python source/cutile/tilegym/attention/sink_prefill/attention_sink_runtime.py` |
 | V2 | attention sink decode | `tilegym/attention/sink_decode/attention_sink_decode.py` / `attention_sink_decode` | `B=32,S=8192,QH=32,KVH=8,D=128`, bf16 | `python source/cutile/tilegym/attention/sink_decode/attention_sink_decode_runtime.py` |
+| V2 | Gemma prefill attention | `tilegym/attention/gemma_prefill/gemma_attention.py` / `gemma_attention_cutile` | `B=2,S=4096,QH=32,KVH=8,D=128`, window 1024, soft-cap 50, bf16 | `python source/cutile/tilegym/attention/gemma_prefill/gemma_attention_runtime.py` |
+| V2 | Gemma split-K decode attention | `tilegym/attention/gemma_decode/gemma_attention_decode.py` / `gemma_fmha_decode` | `B=32,S=8192,QH=32,KVH=8,D=128`, window 1024, soft-cap 50, bf16 | `python source/cutile/tilegym/attention/gemma_decode/gemma_attention_decode_runtime.py` |
 | V2 | absorbed MLA decode | `tilegym/attention/mla_decode/mla_decoding.py` / `mla_decoding` | `B=8,H=64,S=8192,D=512,PE=64`, fp16 | `python source/cutile/tilegym/attention/mla_decode/mla_decoding_runtime.py` |
 | V2 | split-K MLA decode | `tilegym/attention/mla_decode_split/mla_decoding_split_kv.py` / `mla_decoding_split_kv` | same shape, split 512 | `python source/cutile/tilegym/attention/mla_decode_split/mla_decoding_split_kv_runtime.py` |
 | V2 | sparse MLA prefill | `tilegym/attention/sparse_mla/sparse_mla.py` / `tile_sparse_mla` | `S=2048,SKV=4096,H=64,topk=512,D=128+64`, bf16 | `python source/cutile/tilegym/attention/sparse_mla/sparse_mla_runtime.py` |
@@ -42,6 +44,9 @@ Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 | V2 | RMSNorm | `tilegym/normalization/rms_norm/rms_norm.py` / `rms_norm` | `8192×4096`, bf16 | `python source/cutile/tilegym/normalization/rms_norm/rms_norm_runtime.py` |
 | V2 | fused linear cross entropy | `tilegym/loss/fused_linear_cross_entropy/fused_linear_cross_entropy.py` / fused entry | `B=4,S=2048,H=4096,V=32768`, bf16 | `python source/cutile/tilegym/loss/fused_linear_cross_entropy/fused_linear_cross_entropy_runtime.py` |
 | V2 | NVFP4 quantization | `tilegym/quantization/nvfp4/nvfp4_quantize.py` / `tile_nvfp4_quantize` | `8192×4096`, bf16→packed FP4 | `python source/cutile/tilegym/quantization/nvfp4/nvfp4_quantize_runtime.py` |
+| V2 | mHC GEMM + RMS scaling | `tilegym/mhc/fused/mhc.py` / `mhc_gemm_rms_scale` | 2048 tokens, hidden 4096, 4 residual streams, bf16 | `python source/cutile/tilegym/mhc/fused/mhc_gemm_rms_runtime.py` |
+| V2 | mHC residual mixing | same source / `mhc_apply_residual` | 2048 tokens, hidden 4096, 4 residual streams, bf16 | `python source/cutile/tilegym/mhc/fused/mhc_apply_residual_runtime.py` |
+| V2 | mHC Sinkhorn normalization | same source / `mhc_sinkhorn` | 8192 tokens, 4 residual streams, fp32 | `python source/cutile/tilegym/mhc/fused/mhc_sinkhorn_runtime.py` |
 
 V2 新增部分均直接取自当前公开 NVIDIA TileGym；没有用 PyTorch composition 或手写参考实现冒充 cuTile baseline。
 
@@ -50,5 +55,6 @@ V2 新增部分均直接取自当前公开 NVIDIA TileGym；没有用 PyTorch co
 - `tilegym/support/utils.py`：TileGym kernels 的 `next_power_of_2` 等直接依赖。
 - `tilegym/support/runtime.py` 与 `tilegym/support/runtime_cases.py`：加载本地 vendored source、构造模型级输入并输出一次运行结果。
 - GEGLU 对相邻 `activation/fused/gelu.py` 的依赖、attention-sink/MLA split 对现有 `attention/flash_decode/splitk_reduce.py` 的依赖，均由 runtime 显式装载；没有复制第二份实现。
+- Gemma decode 复用同一份 split-K reduce；mHC 的三个 entry 来自 TileGym 当前 `experimental/mhc.py`，在本地保持一份原始 source、按三个真实 callable 分别计时，并保留上游的 experimental 状态，不冒充 NVIDIA `cutile-python` 正式样例。
 
 除本清单列出的 entry、runtime 和 support 外，`source/cutile/` 不保留其它 Python 文件。

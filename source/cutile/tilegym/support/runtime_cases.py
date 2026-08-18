@@ -18,6 +18,7 @@ def _load(runtime, case, source_path):
         "geglu": {"needs_gelu": True},
         "swiglu": {"needs_utils": True},
         "attention_sink_decode": {"needs_utils": True, "needs_splitk": True},
+        "gemma_decode": {"needs_utils": True, "needs_splitk": True},
         "mla_decode_split": {"needs_utils": True, "needs_splitk": True},
         "recurrent_gated_delta": {"needs_utils": True},
         "rms_norm": {"needs_utils": True},
@@ -73,6 +74,22 @@ def run(case: str, source_path: Path):
         start = torch.full((batch,), sequence - 1, device="cuda", dtype=torch.int32)
         call = lambda: source.attention_sink_decode(q, k, v, sinks, 1.0 / math.sqrt(dim), start_q=start, kv_len_per_split=256)
         detail = f"Q={tuple(q.shape)} K/V={tuple(k.shape)} dtype={q.dtype}"
+    elif case == "gemma_prefill":
+        batch, sequence, heads, kv_heads, dim = 2, 4096, 32, 8, 128
+        q = torch.randn((batch, heads, sequence, dim), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((batch, kv_heads, sequence, dim), device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        call = lambda: source.gemma_attention_cutile(
+            q, k, v, window_size=1024, soft_cap=50.0, is_causal=True, use_autotune=False
+        )
+        detail = f"Q={tuple(q.shape)} K/V={tuple(k.shape)} window=1024 soft_cap=50 dtype={q.dtype}"
+    elif case == "gemma_decode":
+        batch, sequence, heads, kv_heads, dim = 32, 8192, 32, 8, 128
+        q = torch.randn((batch, heads, 1, dim), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((batch, kv_heads, sequence, dim), device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        call = lambda: source.gemma_fmha_decode(q, k, v, window_size=1024, soft_cap=50.0, kv_len_per_split=256)
+        detail = f"Q={tuple(q.shape)} K/V={tuple(k.shape)} window=1024 soft_cap=50 dtype={q.dtype}"
     elif case == "mla_decode":
         batch, heads, sequence, dim, pe = 8, 64, 8192, 512, 64
         q = torch.randn((batch, heads, dim), device="cuda", dtype=torch.float16)
@@ -133,6 +150,26 @@ def run(case: str, source_path: Path):
         x = torch.randn((8192, 4096), device="cuda", dtype=torch.bfloat16)
         call = lambda: source.tile_nvfp4_quantize(x, s_enc=1.0)
         detail = f"x={tuple(x.shape)} dtype={x.dtype}"
+    elif case == "mhc_gemm_rms":
+        tokens, hidden, streams = 2048, 4096, 4
+        x = torch.randn((tokens, streams * hidden), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((streams * hidden, streams * (streams + 2)), device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn((streams * (streams + 2),), device="cuda", dtype=torch.bfloat16)
+        cfg = {"TILE_SIZE_M": 64, "TILE_SIZE_N": 32, "TILE_SIZE_K": 64, "SPLIT_K": 4, "GROUP_SIZE_M": 8}
+        call = lambda: source.mhc_gemm_rms_scale(x, weight, streams, 1.0, 1.0, 1.0, bias, cfg=cfg)
+        detail = f"tokens={tokens} hidden={hidden} streams={streams} dtype={x.dtype}"
+    elif case == "mhc_apply_residual":
+        tokens, hidden, streams = 2048, 4096, 4
+        x = torch.randn((tokens, streams * hidden), device="cuda", dtype=torch.bfloat16)
+        f_out = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+        mixes = torch.randn((tokens, streams * (streams + 2)), device="cuda", dtype=torch.bfloat16)
+        call = lambda: source.mhc_apply_residual(x, f_out, mixes, streams)
+        detail = f"tokens={tokens} hidden={hidden} streams={streams} dtype={x.dtype}"
+    elif case == "mhc_sinkhorn":
+        tokens, streams = 8192, 4
+        mixes = torch.randn((tokens, streams * (streams + 2)), device="cuda", dtype=torch.float32)
+        call = lambda: source.mhc_sinkhorn(mixes, streams)
+        detail = f"tokens={tokens} streams={streams} dtype={mixes.dtype}"
     else:
         raise ValueError(case)
 

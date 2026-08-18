@@ -4,9 +4,9 @@
 
 运行前进入项目的 Triton Python 环境；命令均从仓库根目录执行。`V1` 表示旧表使用，`V2` 表示进入新六表候选，`V1+V2` 表示复用。
 
-Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`、`state-spaces/mamba`、`vllm-project/vllm`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
+Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`、`state-spaces/mamba`、`fla-org/flash-linear-attention`、`vllm-project/vllm`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
 
-## baseline-v2 entries（38）
+## baseline-v2 entries（41）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -35,6 +35,9 @@ Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/
 | V2 | FP8 groupwise quantization | `meta-applied-ai/quantization/fp8_groupwise/float8_groupwise_quant.py` / `float8_groupwise_quantize` | `8192×4096`, group 128, bf16→e4m3 | `python source/triton/meta-applied-ai/quantization/fp8_groupwise/float8_groupwise_quant_runtime.py` |
 | V2 | scaled FP8 split-K GEMM | `meta-applied-ai/gemm/fp8_scaled/scaled_fp8_gemm.py` / `scaled_mm_splitk` | `4096×4096×14336`, e4m3 | `python source/triton/meta-applied-ai/gemm/fp8_scaled/scaled_fp8_gemm_runtime.py` |
 | V2 | causal Conv1D | `meta-applied-ai/convolution/causal_conv1d/causal_1d_conv.py` / `causal_conv1d_fwd` | `B=4,C=4096,S=4096,W=4`, bf16 | `python source/triton/meta-applied-ai/convolution/causal_conv1d/causal_1d_conv_runtime.py` |
+| V2 | varlen causal Conv1D forward | `fla/conv/causal1d/ops.py` + `kernels.py` / `causal_conv1d_fwd` | packed lengths 2048/1536/1024/512, hidden 4096, width 4, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_varlen_runtime.py` |
+| V2 | causal Conv1D decode cache update | same source / `causal_conv1d_update` | decode batch 32, hidden 4096, width 4, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_update_runtime.py` |
+| V2 | causal Conv1D backward | same source / `causal_conv1d_bwd` | `B=2,S=2048,D=4096,W=4`, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_backward_runtime.py` |
 | V2 | modern FlashAttention forward | `meta-applied-ai/attention/flash_backward/flash_backward.py` / `flash` | `B=2,H=16,S=2048,D=128`, fp16 causal | `python source/triton/meta-applied-ai/attention/flash_backward/flash_forward_runtime.py` |
 | V2 | modern FlashAttention backward | same source / `flash_bwd` | same shape, dQ/dK/dV | `python source/triton/meta-applied-ai/attention/flash_backward/flash_backward_runtime.py` |
 | V2 | MoE grouped expert projection | `meta-applied-ai/moe/grouped/v0_moe_fused.py` / `invoke_fused_moe_kernel` | 2048 tokens, 8 experts, top-2, `4096→14336`, bf16 | `python source/triton/meta-applied-ai/moe/grouped/v0_moe_fused_runtime.py` |
@@ -81,6 +84,7 @@ V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只�
 - `xformers/gemm/tiled/matmul_perf_model.py` 与 `xformers/support/triton/{importing.py,vararg_kernel.py}`：xFormers kernels 的直接依赖。
 - `meta-applied-ai/support/runtime.py` 与 `meta-applied-ai/moe/support/projection_runtime.py`：只负责加载 vendored 源码、构造未计时 metadata 与打印一次运行结果。
 - `state-spaces-mamba/mamba_ssm/ops/triton/{ssd_bmm.py,softplus.py,mamba3/utils.py}` 与 `mamba_ssm/utils/determinism.py`：Mamba2/Mamba3 上游 kernel 的直接依赖；`state-spaces-mamba/support/runtime.py` 只接入本地 namespace package。
+- `fla/conv/causal1d/kernels.py` 是三个 FLA causal-conv public entry 的原始 Triton kernel；`fla/support/runtime.py` 只接入上游包边界和 chunk metadata，不改写 kernel。
 - `vllm/support/runtime.py`：只提供原文件导入所需的当前设备 capability 与 Triton module 接线；paged decode 和 MiniMax-M3 算法源码保持上游原样。
 
 除本清单列出的 entry、runtime 和 support 外，`source/triton/` 不保留其它 Python 文件。
