@@ -1,0 +1,179 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# SPDX-License-Identifier: MIT
+
+import math
+
+import cuda.tile as ct
+import torch
+
+from tilegym.backend import register_impl
+
+
+@ct.kernel
+def _dropout_kernel(
+    x,
+    output,
+    P: ct.Constant[float],
+    SEED: ct.Constant[int],
+    TILE_SIZE: ct.Constant[int],
+    TRAINING: ct.Constant[bool],
+):
+    """
+    cuTile kernel for dropout operation.
+
+    Args:
+        x: Input tensor
+        output: Output tensor
+        p: Dropout probability
+        seed: Random seed
+        TILE_SIZE: Tile size for computation
+        training: Whether in training mode
+    """
+    bid = ct.bid(0)
+    tile_start = bid * TILE_SIZE
+    offsets = ct.arange(TILE_SIZE, dtype=ct.int32) + tile_start
+    # For 1D arrays, indices are passed directly (not as tuple)
+    # Use padding_value=0 (int) to avoid dtype mismatch with float16
+    x_tile = ct.gather(x, offsets, padding_value=0)
+
+    # Initialize output tile
+    output_tile = ct.zeros((TILE_SIZE,), dtype=x_tile.dtype)
+
+    # Only apply dropout if training
+    if TRAINING:
+        # Generate pseudo-random numbers using a simple hash function
+        # This is a deterministic approximation since cuTile doesn't have tl.rand
+        # Use a simple hash based on offsets and seed
+        # Combine seed and offsets with a simple formula
+        # 1103515245 is the LCG multiplier used for deterministic hashing.
+        combined = offsets * 1103515245 + ct.full((TILE_SIZE,), SEED, dtype=ct.int32)
+
+        # Apply a simple hash function using available bitwise operations
+        hash_val = ct.bitwise_xor(combined, ct.bitwise_rshift(combined, 16))
+        hash_val = ct.bitwise_xor(hash_val, ct.bitwise_lshift(hash_val, 8))
+        hash_val = ct.bitwise_xor(hash_val, ct.bitwise_rshift(hash_val, 4))
+
+        # Convert to float and normalize to [0, 1)
+        # 2147483647.0 is 2^31 - 1, matching the masked positive hash range.
+        hash_float = ct.astype(ct.bitwise_and(hash_val, 0x7FFFFFFF), ct.float32) / 2147483647.0
+
+        # Create mask for elements to keep
+        keep_mask = hash_float > P
+
+        # Apply dropout: x / (1-p) if kept, 0 otherwise
+        if P >= 1.0:
+            scale = ct.zeros((TILE_SIZE,), dtype=x_tile.dtype)
+        else:
+            scale = ct.full((TILE_SIZE,), 1.0 / (1.0 - P), dtype=x_tile.dtype)
+        scaled_x = x_tile * scale
+        output_tile = ct.where(keep_mask, scaled_x, output_tile)
+    else:
+        # In inference mode, just copy input to output
+        output_tile = x_tile
+    ct.scatter(output, offsets, output_tile)
+
+
+def _mix_seed(seed: int) -> int:
+    """Pre-mix a user-provided seed into a well-spread signed int32.
+
+    The cuTile kernel's internal hash (3 rounds of XOR-shift) does not
+    amplify small seed deltas — e.g. seed=11 vs seed=99 only differ in
+    the low bits of `combined = offsets*prime + seed`, and bit 30 of the
+    final hash (which drives the p=0.5 keep decision) ends up identical
+    across all lanes, so the mask is independent of the seed.
+
+    Multiplying the seed by Knuth's constant 0x9E3779B1 (== floor(2^32 / phi))
+    spreads the bits evenly across all 32 positions. Same input seed still
+    yields the same mixed seed (reproducibility), while different seeds
+    produce bit patterns with large Hamming distance, which the kernel's
+    XOR-shift can then amplify into a proper per-lane mask difference.
+    """
+    mixed = (int(seed) * 2654435761) & 0xFFFFFFFF
+    # Convert unsigned uint32 bit pattern to signed int32 (two's complement)
+    # so it can be passed as a `ct.Constant[int]` to the int32 kernel arg.
+    if mixed >= 0x80000000:
+        mixed -= 0x100000000
+    return mixed
+
+
+class _DropoutCuTileFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, seed, p=0.5, training=True, inplace=False):
+        """
+        Forward pass for dropout.
+
+        Args:
+            x: Input tensor
+            seed: Random seed
+            p: Dropout probability
+            training: Whether in training mode
+            inplace: Whether to perform operation in-place
+
+        Returns:
+            Output tensor with dropout applied
+        """
+        if not training:
+            ctx.mark_dirty(x)
+            return x
+
+        if inplace:
+            ctx.mark_dirty(x)
+            output = x
+        else:
+            output = torch.empty_like(x)
+
+        assert x.is_contiguous()
+
+        n_elements = x.numel()
+        TILE_SIZE = 1024
+        grid = (math.ceil(n_elements / TILE_SIZE), 1, 1)
+        x_flat = x.view(-1)
+        output_flat = output.view(-1)
+
+        # Pre-mix seed into a well-spread int32 so small seed deltas produce
+        # large bit-level perturbations before the kernel's XOR-shift hash.
+        seed_int32 = _mix_seed(seed)
+
+        ct.launch(
+            torch.cuda.current_stream(),
+            grid,
+            _dropout_kernel,
+            (
+                x_flat,
+                output_flat,
+                p,
+                seed_int32,
+                TILE_SIZE,
+                training,
+            ),
+        )
+
+        ctx.p = p
+        ctx.seed = seed
+        return output
+
+    @staticmethod
+    def backward(ctx, dy):
+        raise NotImplementedError("Backward pass for dropout is not implemented")
+
+
+@register_impl("dropout", backend="cutile")
+def dropout(x, seed, p=0.5, training=True, inplace=False, **kwargs):
+    """
+    cuTile implementation of dropout.
+
+    Performs dropout on x.
+
+    Args:
+        x: Input tensor
+        seed: Integer value for initializing random mask
+        p: Dropout probability, default is 0.5
+        training: If True perform dropout, else return x
+        inplace: If True, modify x directly with dropout
+        **kwargs: Additional arguments for backend-specific configurations
+
+    Returns:
+        Tensor with dropout applied
+    """
+    return _DropoutCuTileFunction.apply(x, seed, p, training, inplace)
