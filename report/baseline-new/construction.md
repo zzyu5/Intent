@@ -13,7 +13,7 @@ baseline-v2 回答的是：Intent 针对某一门 target language 发射的代�
 - `tilelang-5090.csv`
 - `tilelang-h100.csv`
 
-每张表至少 30 个非 variant entry；当前 source 清单已提供 Triton 30、cuTile 34、TileLang 30 个候选。三门语言尽量使用同一功能族，但不会为了对齐而伪造 source 或改变 upstream 算法。
+每张表至少 30 个非 variant entry；当前 source 清单已提供 Triton 38、cuTile 34、TileLang 30 个候选。三门语言尽量使用同一功能族，但不会为了对齐而伪造 source 或改变 upstream 算法。30 只是最终表的下限，不是停止扩充现代模型核心路径的上限。
 
 ## 2. 什么可以成为一行
 

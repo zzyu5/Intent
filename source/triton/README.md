@@ -4,9 +4,9 @@
 
 运行前进入项目的 Triton Python 环境；命令均从仓库根目录执行。`V1` 表示旧表使用，`V2` 表示进入新六表候选，`V1+V2` 表示复用。
 
-Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
+Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`、`state-spaces/mamba`、`vllm-project/vllm`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
 
-## baseline-v2 entries（30）
+## baseline-v2 entries（38）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -40,6 +40,14 @@ Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/
 | V2 | MoE grouped expert projection | `meta-applied-ai/moe/grouped/v0_moe_fused.py` / `invoke_fused_moe_kernel` | 2048 tokens, 8 experts, top-2, `4096→14336`, bf16 | `python source/triton/meta-applied-ai/moe/grouped/v0_moe_fused_runtime.py` |
 | V2 | MoE split-K expert projection | `meta-applied-ai/moe/splitk/v1_moe_fused.py` / split-K invoke | same contract | `python source/triton/meta-applied-ai/moe/splitk/v1_moe_fused_runtime.py` |
 | V2 | MoE column-major expert projection | `meta-applied-ai/moe/column_major/v2_moe_fused.py` / column-major invoke | same contract | `python source/triton/meta-applied-ai/moe/column_major/v2_moe_fused_runtime.py` |
+| V2 | Mamba2 SSD chunk state | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_state.py` / `_chunk_state_fwd` | `B=1,S=2048,H=32,P=64,G=8,N=128`, chunk 256, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_state_runtime.py` |
+| V2 | Mamba2 SSD state passing | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_state_passing.py` / `_state_passing_fwd` | 8 chunks, 32 heads, flattened state `64×128`, fp32 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_state_passing_runtime.py` |
+| V2 | Mamba2 SSD chunk scan | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_scan.py` / `_chunk_scan_fwd` | `B=1,S=2048,H=32,P=64,G=8,N=128`, chunk 256, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_scan_runtime.py` |
+| V2 | Mamba3 SISO sequence forward | `state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py` / `mamba3_siso_fwd` | `B=1,S=2048,HQK=4,H=16,DQK=32,DV=64`, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd_runtime.py` |
+| V2 | Mamba3 SISO decode step | `state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py` / `mamba3_siso_step` | decode batch 32, `HQK=4,H=16,DQK=32,DV=64`, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_step_runtime.py` |
+| V2 | paged GQA decode | `vllm/attention/paged_decode/triton_decode_attention.py` / `decode_attention_fwd` | `B=16,QH=32,KVH=8,S=8192,D=128`, page 16, bf16 | `python source/triton/vllm/attention/paged_decode/paged_gqa_decode_runtime.py` |
+| V2 | paged MLA decode | same source / `decode_attention_fwd(..., is_mla=True)` | `B=8,QH=128,KVH=1,S=8192,latent=512,rope=64`, page 16, bf16 | `python source/triton/vllm/attention/paged_decode/paged_mla_decode_runtime.py` |
+| V2 | MiniMax-M3 block-sparse GQA decode | `vllm/attention/minimax_m3/sparse_attn.py` / `minimax_m3_sparse_attn_decode` | `B=8,QH=32,KVH=8,S=8192,D=128`, 32 selected 128-token blocks | `python source/triton/vllm/attention/minimax_m3/sparse_decode_runtime.py` |
 
 V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只计 expert projection，routing/alignment 在计时外预构造，绝不把 Python adapter 时间混成 kernel 时间。
 
@@ -72,5 +80,7 @@ V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只�
 - `liger-kernel/support/liger_kernel/{__init__.py,utils.py,ops/utils.py}`：Liger runtime 的最小包边界。
 - `xformers/gemm/tiled/matmul_perf_model.py` 与 `xformers/support/triton/{importing.py,vararg_kernel.py}`：xFormers kernels 的直接依赖。
 - `meta-applied-ai/support/runtime.py` 与 `meta-applied-ai/moe/support/projection_runtime.py`：只负责加载 vendored 源码、构造未计时 metadata 与打印一次运行结果。
+- `state-spaces-mamba/mamba_ssm/ops/triton/{ssd_bmm.py,softplus.py,mamba3/utils.py}` 与 `mamba_ssm/utils/determinism.py`：Mamba2/Mamba3 上游 kernel 的直接依赖；`state-spaces-mamba/support/runtime.py` 只接入本地 namespace package。
+- `vllm/support/runtime.py`：只提供原文件导入所需的当前设备 capability 与 Triton module 接线；paged decode 和 MiniMax-M3 算法源码保持上游原样。
 
 除本清单列出的 entry、runtime 和 support 外，`source/triton/` 不保留其它 Python 文件。
