@@ -3422,7 +3422,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
     if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        orientation->lhsTranspose || orientation->rhsTranspose)
+        orientation->lhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     auto operandElementType = [](Value value) -> Type {
@@ -3451,8 +3451,10 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     std::string result = makeResultName(operation, 0);
     line(lhs + " = T.alloc_shared((" + memberTile + ", " + reductionTile +
          "), " + matrixDtype + ")");
-    line(rhs + " = T.alloc_shared((" + reductionTile + ", " + featureTile +
-         "), " + matrixDtype + ")");
+    line(rhs + " = T.alloc_shared((" +
+         (orientation->rhsTranspose ? featureTile : reductionTile) + ", " +
+         (orientation->rhsTranspose ? reductionTile : featureTile) + "), " +
+         matrixDtype + ")");
     line(result +
          " = T.alloc_fragment((" + memberTile + ", " + featureTile +
          "), T.float32)");
@@ -3521,15 +3523,26 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "], 0.0)");
       --indentation;
     }
-    line("T.copy(" + (*rhsView)->argument->name +
-         "[" + addressIndex("expert") + ", " + addressIndex("k_tile") +
-         " * " + reductionTile + " : " + addressIndex("k_tile + 1") +
-         " * " + reductionTile + ", " + addressIndex("bid_feature") +
-         " * " + featureTile + " : " + addressIndex("bid_feature + 1") +
-         " * " + featureTile + "], " +
-         rhs + ")");
-    line("T.gemm(" + lhs + ", " + rhs + ", " + result +
-         ", policy=GEMM_WARP_POLICY)");
+    if (orientation->rhsTranspose) {
+      line("T.copy(" + (*rhsView)->argument->name +
+           "[" + addressIndex("expert") + ", " +
+           addressIndex("bid_feature") + " * " + featureTile + " : " +
+           addressIndex("bid_feature + 1") + " * " + featureTile + ", " +
+           addressIndex("k_tile") + " * " + reductionTile + " : " +
+           addressIndex("k_tile + 1") + " * " + reductionTile + "], " +
+           rhs + ")");
+      line("T.gemm(" + lhs + ", " + rhs + ", " + result +
+           ", transpose_B=True, policy=GEMM_WARP_POLICY)");
+    } else {
+      line("T.copy(" + (*rhsView)->argument->name +
+           "[" + addressIndex("expert") + ", " + addressIndex("k_tile") +
+           " * " + reductionTile + " : " + addressIndex("k_tile + 1") +
+           " * " + reductionTile + ", " + addressIndex("bid_feature") +
+           " * " + featureTile + " : " + addressIndex("bid_feature + 1") +
+           " * " + featureTile + "], " + rhs + ")");
+      line("T.gemm(" + lhs + ", " + rhs + ", " + result +
+           ", policy=GEMM_WARP_POLICY)");
+    }
     --indentation;
     bindResult(operation, 0, result);
     return success();
@@ -4082,20 +4095,29 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
     return failure();
   if (!planIndex.stages.empty()) {
     auto storedTensor = dyn_cast<RankedTensorType>(storedValue.getType());
-    if (activeStages.size() != 1 || relation->size() != 2 ||
-        (*relation)[0].kind != "value_index" ||
-        (*relation)[0].operands.size() != 1 ||
-        !(*relation)[0].operands.front() ||
-        !isa<RankedTensorType>(
-            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
-        (*relation)[1].kind != "full_slice" || !storedTensor ||
+    bool memberIndexed =
+        relation->size() ==
+            static_cast<size_t>((*view)->tensor.getRank()) &&
+        relation->size() >= 2 && relation->back().kind == "full_slice";
+    for (const target::IndexTerm &term : llvm::drop_end(*relation))
+      memberIndexed =
+          memberIndexed && term.kind == "value_index" &&
+          term.operands.size() == 1 && term.operands.front() &&
+          isa<RankedTensorType>(
+              operation.getOperand(*term.operands.front()).getType());
+    if (activeStages.size() != 1 || !memberIndexed || !storedTensor ||
         storedTensor.getRank() != 2 || tileIndices.size() != 2)
       return operation.emitOpError(
-          "staged TileLang unique store requires one member-indexed matrix");
-    FailureOr<StringRef> rows =
-        lookupValue(operation, *(*relation)[0].operands.front());
-    if (failed(rows))
-      return failure();
+          "staged TileLang unique store requires member-indexed leading axes "
+          "and one feature slice");
+    SmallVector<std::string> memberIndices;
+    for (const target::IndexTerm &term : llvm::drop_end(*relation)) {
+      FailureOr<StringRef> index =
+          lookupValue(operation, *term.operands.front());
+      if (failed(index))
+        return failure();
+      memberIndices.push_back(index->str());
+    }
     unsigned stage = activeStages.front();
     std::string memberTile = stageMemberTiles.lookup(stage);
     std::string featureTile = stageFeatureTiles.lookup(stage);
@@ -4106,10 +4128,16 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
          featureTile + " + store_j < " +
          stageFeatureDimensions.lookup(stage) + ":");
     ++indentation;
-    line((*view)->argument->name + "[" + rows->str() +
-         "[store_i], " +
-         addressIndex("bid_feature * " + featureTile + " + store_j") +
-         "] = " + stored->str() + "[store_i, store_j]");
+    std::string destination = (*view)->argument->name + "[";
+    for (auto [axis, index] : llvm::enumerate(memberIndices)) {
+      if (axis)
+        destination += ", ";
+      destination += index + "[store_i]";
+    }
+    destination += ", " +
+                   addressIndex("bid_feature * " + featureTile + " + store_j") +
+                   "]";
+    line(destination + " = " + stored->str() + "[store_i, store_j]");
     --indentation;
     --indentation;
     return success();

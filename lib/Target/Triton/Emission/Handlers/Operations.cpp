@@ -2443,7 +2443,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
     if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        orientation->lhsTranspose || orientation->rhsTranspose)
+        orientation->lhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
@@ -2511,12 +2511,16 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "(offs_reduction[None, :] < " + reduction + "), other=0.0)");
     }
     std::string rhs = makeResultName(*rhsLoad, 0);
+    std::string rhsReductionStride =
+        (*rhsView)->strides[orientation->rhsTranspose ? 2 : 1];
+    std::string rhsFeatureStride =
+        (*rhsView)->strides[orientation->rhsTranspose ? 1 : 2];
     line(rhs + " = tl.load(" + (*rhsView)->pointer + " + " +
          addressIndex("expert") + " * " + addressIndex((*rhsView)->strides[0]) +
          " + " + addressIndex("offs_reduction[:, None]") + " * " +
-         addressIndex((*rhsView)->strides[1]) + " + " +
+         addressIndex(rhsReductionStride) + " + " +
          addressIndex("offs_feature[None, :]") + " * " +
-         addressIndex((*rhsView)->strides[2]) +
+         addressIndex(rhsFeatureStride) +
          ", mask=(offs_reduction[:, None] < " + reduction +
          ") & feature_mask[None, :], other=0.0)");
     if (promoteToF32 && !lhsElement.isF32())
@@ -2747,25 +2751,32 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
   if (!planIndex.stages.empty()) {
     auto storedTensor = dyn_cast<RankedTensorType>(
         operation.getOperand(valueIndex.getInt()).getType());
-    if (activeStages.size() != 1 || relation->size() != 2 ||
-        (*relation)[0].kind != "value_index" ||
-        (*relation)[0].operands.size() != 1 ||
-        !(*relation)[0].operands.front() ||
-        !isa<RankedTensorType>(
-            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
-        (*relation)[1].kind != "full_slice" || !storedTensor ||
+    bool memberIndexed =
+        relation->size() ==
+            static_cast<size_t>((*view)->tensor.getRank()) &&
+        relation->size() >= 2 && relation->back().kind == "full_slice";
+    for (const target::IndexTerm &term : llvm::drop_end(*relation))
+      memberIndexed =
+          memberIndexed && term.kind == "value_index" &&
+          term.operands.size() == 1 && term.operands.front() &&
+          isa<RankedTensorType>(
+              operation.getOperand(*term.operands.front()).getType());
+    if (activeStages.size() != 1 || !memberIndexed || !storedTensor ||
         storedTensor.getRank() != 2)
       return operation.emitOpError(
-          "staged Triton unique store requires one member-indexed matrix");
-    FailureOr<StringRef> rows =
-        lookupValue(operation, *(*relation)[0].operands.front());
-    if (failed(rows))
-      return failure();
-    std::string pointer = (*view)->pointer + " + " +
-                          addressIndex(rows->str() + "[:, None]") + " * " +
-                          addressIndex((*view)->strides[0]) + " + " +
-                          addressIndex("offs_feature[None, :]") + " * " +
-                          addressIndex((*view)->strides[1]);
+          "staged Triton unique store requires member-indexed leading axes "
+          "and one feature slice");
+    std::string pointer = (*view)->pointer;
+    for (auto [axis, term] : llvm::enumerate(llvm::drop_end(*relation))) {
+      FailureOr<StringRef> index =
+          lookupValue(operation, *term.operands.front());
+      if (failed(index))
+        return failure();
+      pointer += " + " + addressIndex(index->str() + "[:, None]") + " * " +
+                 addressIndex((*view)->strides[axis]);
+    }
+    pointer += " + " + addressIndex("offs_feature[None, :]") + " * " +
+               addressIndex((*view)->strides.back());
     line("tl.store(" + pointer + ", " + stored->str() +
          ", mask=member_mask[:, None] & feature_mask[None, :])");
     return success();

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from enum import IntEnum
 from dataclasses import dataclass
+from dataclasses import replace
 
 from intent.api import Definition
 from intent.api import DefinitionKind
@@ -12,6 +13,7 @@ from intent.frontend.semantics import ValueType
 from intent.frontend.mlir import ParameterKind
 from intent.frontend.mlir import ParameterSpec
 from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import SymbolDim
 from intent.frontend.semantics import type_from_annotation
 from intent.language import ConstexprSpec
 from intent.language import DType
@@ -113,9 +115,38 @@ def lower_kernel_signature(
             continue
         raise FrontendError(f"unsupported kernel annotation for {name!r}", location)
 
+    parameters = [
+        _resolve_constexpr_shape_dimensions(parameter, values)
+        for parameter in parameters
+    ]
     if signature.return_annotation not in (inspect.Signature.empty, None, type(None)):
         raise FrontendError("kernel entry cannot return a Python/SSA value", source.location(source.function))
     return LoweredSignature(FunctionKind.KERNEL, tuple(parameters), values)
+
+
+def _resolve_constexpr_shape_dimensions(
+    parameter: ParameterSpec,
+    constexpr_values: dict[str, object],
+) -> ParameterSpec:
+    if not isinstance(parameter.type, TensorType):
+        return parameter
+    shape: list[object] = []
+    changed = False
+    for dimension in parameter.type.shape:
+        if not isinstance(dimension, SymbolDim) or dimension.name not in constexpr_values:
+            shape.append(dimension)
+            continue
+        value = constexpr_values[dimension.name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise FrontendError(
+                f"constexpr shape dimension {dimension.name!r} requires a non-negative integer",
+                parameter.location,
+            )
+        shape.append(value)
+        changed = True
+    if not changed:
+        return parameter
+    return replace(parameter, type=TensorType(parameter.type.dtype, tuple(shape)))
 
 
 def lower_helper_parameters(

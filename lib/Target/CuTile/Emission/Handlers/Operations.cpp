@@ -2573,7 +2573,7 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
     if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        orientation->lhsTranspose || orientation->rhsTranspose)
+        orientation->lhsTranspose)
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     auto operandElementType = [](Value value) -> Type {
@@ -2642,12 +2642,22 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
            "check_bounds=True, padding_value=0.0)");
     }
     std::string rhs = makeResultName(*rhsLoad, 0);
-    line(rhs + " = ct.load(" + (*rhsView)->argument->name +
-         ", index=(" + addressIndex("expert") + ", " +
-         addressIndex("k_tile") + ", " + addressIndex("bid_feature") +
-         "), shape=(1, " + reductionTile + ", " + featureTile +
-         "), padding_mode=ct.PaddingMode.ZERO).reshape((" + reductionTile +
-         ", " + featureTile + "))");
+    if (orientation->rhsTranspose) {
+      line(rhs + " = ct.load(" + (*rhsView)->argument->name +
+           ", index=(" + addressIndex("expert") + ", " +
+           addressIndex("bid_feature") + ", " + addressIndex("k_tile") +
+           "), shape=(1, " + featureTile + ", " + reductionTile +
+           "), padding_mode=ct.PaddingMode.ZERO).reshape((" + featureTile +
+           ", " + reductionTile + "))");
+      line(rhs + " = ct.transpose(" + rhs + ")");
+    } else {
+      line(rhs + " = ct.load(" + (*rhsView)->argument->name +
+           ", index=(" + addressIndex("expert") + ", " +
+           addressIndex("k_tile") + ", " + addressIndex("bid_feature") +
+           "), shape=(1, " + reductionTile + ", " + featureTile +
+           "), padding_mode=ct.PaddingMode.ZERO).reshape((" + reductionTile +
+           ", " + featureTile + "))");
+    }
     if (promoteToF32 && !lhsElement.isF32())
       line(lhs + " = " + lhs + ".astype(ct.tfloat32)");
     if (promoteToF32 && !rhsElement.isF32())
@@ -2979,23 +2989,33 @@ LogicalResult SourceEmitter::emitUniqueStore(Operation &operation) {
   if (!planIndex.stages.empty()) {
     auto storedTensor = dyn_cast<RankedTensorType>(
         operation.getOperand(valueIndex.getInt()).getType());
-    if (activeStages.size() != 1 || relation->size() != 2 ||
-        (*relation)[0].kind != "value_index" ||
-        (*relation)[0].operands.size() != 1 ||
-        !(*relation)[0].operands.front() ||
-        !isa<RankedTensorType>(
-            operation.getOperand(*(*relation)[0].operands.front()).getType()) ||
-        (*relation)[1].kind != "full_slice" || !storedTensor ||
+    bool memberIndexed =
+        relation->size() ==
+            static_cast<size_t>((*view)->tensor.getRank()) &&
+        relation->size() >= 2 && relation->back().kind == "full_slice";
+    for (const target::IndexTerm &term : llvm::drop_end(*relation))
+      memberIndexed =
+          memberIndexed && term.kind == "value_index" &&
+          term.operands.size() == 1 && term.operands.front() &&
+          isa<RankedTensorType>(
+              operation.getOperand(*term.operands.front()).getType());
+    if (activeStages.size() != 1 || !memberIndexed || !storedTensor ||
         storedTensor.getRank() != 2)
       return operation.emitOpError(
-          "staged cuTile unique store requires one member-indexed matrix");
-    FailureOr<StringRef> rows =
-        lookupValue(operation, *(*relation)[0].operands.front());
-    if (failed(rows))
-      return failure();
-    indices = "(" + addressIndex(rows->str() + "[:, None]") + ", " +
-              addressIndex("offs_feature[None, :]") +
-              ")";
+          "staged cuTile unique store requires member-indexed leading axes "
+          "and one feature slice");
+    std::string stagedIndices = "(";
+    for (const target::IndexTerm &term : llvm::drop_end(*relation)) {
+      FailureOr<StringRef> index =
+          lookupValue(operation, *term.operands.front());
+      if (failed(index))
+        return failure();
+      if (stagedIndices.size() > 1)
+        stagedIndices += ", ";
+      stagedIndices += addressIndex(index->str() + "[:, None]");
+    }
+    stagedIndices += ", " + addressIndex("offs_feature[None, :]") + ")";
+    indices = FailureOr<std::string>(std::move(stagedIndices));
     mask = "member_mask[:, None] & feature_mask[None, :]";
   } else
     indices = indexTuple(operation, true);
