@@ -2386,10 +2386,20 @@ FailureOr<std::string> SourceEmitter::tileShape(Operation &operation) {
           ? target::emission::accessRangesForTransfer(planIndex, *transferNode)
           : SmallVector<target::emission::RangeBinding>();
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-  if (failed(view) || relation->size() != (*view)->shape.size())
+  if (failed(view))
     return failure();
+  if (static_cast<size_t>(llvm::count_if(
+          *relation, [](const target::IndexTerm &term) {
+            return term.kind != "new_axis";
+          })) != (*view)->shape.size())
+    return operation.emitOpError(
+        "cuTile tile shape does not cover every source view axis");
   SmallVector<std::string> extents;
-  for (auto [axisNumber, term] : llvm::enumerate(*relation)) {
+  unsigned sourceAxis = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
+    unsigned axisNumber = sourceAxis++;
     if (term.kind == "full_slice") {
       extents.push_back(physicalExtent((*view)->shape[axisNumber]));
       continue;

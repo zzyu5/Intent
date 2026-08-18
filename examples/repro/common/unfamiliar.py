@@ -40,6 +40,11 @@ from kernels.optimization.adafactor import adafactor_update_columns
 from kernels.optimization.adafactor import adafactor_update_rows
 from kernels.optimization.adamw import PARAMETERS as ADAMW_PARAMETERS
 from kernels.optimization.adamw import adamw_update
+from kernels.ragged.jagged_mean import BATCH as JAGGED_MEAN_BATCH
+from kernels.ragged.jagged_mean import FEATURES as JAGGED_MEAN_FEATURES
+from kernels.ragged.jagged_mean import MAX_LENGTH as JAGGED_MEAN_MAX_LENGTH
+from kernels.ragged.jagged_mean import TOKENS as JAGGED_MEAN_TOKENS
+from kernels.ragged.jagged_mean import jagged_mean
 from kernels.ragged.nested_pool import DOCUMENTS as NESTED_DOCUMENTS
 from kernels.ragged.nested_pool import FEATURES as NESTED_FEATURES
 from kernels.ragged.nested_pool import SENTENCES as NESTED_SENTENCES
@@ -1319,6 +1324,42 @@ def _run_nested_ragged_pool(
     )
 
 
+def _run_jagged_mean(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream=None,
+) -> None:
+    lengths = (
+        torch.arange(JAGGED_MEAN_BATCH, device="cuda", dtype=torch.int32)
+        % JAGGED_MEAN_MAX_LENGTH
+    ) + 1
+    offsets = torch.empty(
+        JAGGED_MEAN_BATCH + 1, device="cuda", dtype=torch.int32
+    )
+    offsets[0] = 0
+    offsets[1:] = torch.cumsum(lengths, dim=0)
+    if int(offsets[-1].item()) != JAGGED_MEAN_TOKENS:
+        raise RuntimeError("jagged mean shape constants do not match generated lengths")
+    values = torch.randn(
+        (JAGGED_MEAN_TOKENS, JAGGED_MEAN_FEATURES),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    _run_generated(
+        definition=jagged_mean,
+        arguments=(values, offsets),
+        reference=lambda: torch.segment_reduce(values, "mean", lengths=lengths),
+        compiler=compiler,
+        target=target,
+        target_name=target_name,
+        kernel_name="single-level jagged mean",
+        tolerance=2.0e-5,
+        cuda_graph=False,
+        upstream=upstream,
+    )
+
+
 def _run_adamw(
     compiler: str, target: Target, target_name: str, upstream=None
 ) -> None:
@@ -1707,6 +1748,7 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
     "unique_consecutive": _run_unique_consecutive,
     "moe_align_block": _run_moe_align,
     "nested_ragged_pool": _run_nested_ragged_pool,
+    "jagged_mean": _run_jagged_mean,
     "adamw_update": _run_adamw,
     "adafactor_update": _run_adafactor,
     "reshape_and_cache": _run_reshape_cache,
@@ -1730,6 +1772,7 @@ UNFAMILIAR_RUNNERS: dict[str, Runner] = {
 UNFAMILIAR_UPSTREAM_RUNNERS = {
     "adamw_update": _run_adamw,
     "histogram": _run_histogram,
+    "jagged_mean": _run_jagged_mean,
     "rope_qk_full": _run_qk_rope_full_upstream,
     "rope_qk_partial": _run_qk_rope_partial_upstream,
     "rope_qk_inverse": _run_qk_rope_inverse_upstream,

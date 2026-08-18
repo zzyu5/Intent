@@ -38,6 +38,20 @@ bool isShapeOnlyGather(Operation &operation) {
 std::optional<std::string> literalPadding(Value value);
 std::optional<std::string> semanticLiteralPadding(Value value);
 
+bool isArgmaxLowestReduction(Operation &operation) {
+  if (operation.getName().getStringRef() != "intent.reduce")
+    return false;
+  auto builtin =
+      operation.getAttrOfType<StringAttr>("intent.combine_builtin");
+  auto components =
+      operation.getAttrOfType<IntegerAttr>("intent.component_count");
+  auto captures =
+      operation.getAttrOfType<IntegerAttr>("intent.capture_count");
+  return builtin && builtin.getValue() == "argmax_lowest" && components &&
+         components.getInt() == 2 && captures && captures.getInt() == 0 &&
+         operation.getNumOperands() == 4 && operation.getNumResults() == 2;
+}
+
 bool provePaddedUses(Value value, PaddedValue padded,
                      llvm::DenseMap<Value, PaddedValue> &visited) {
   auto found = visited.find(value);
@@ -54,6 +68,13 @@ bool provePaddedUses(Value value, PaddedValue padded,
         user->getNumOperands() == 3 && user->getOperand(0) == value &&
         semanticLiteralPadding(user->getOperand(2)) == "zero")
       continue;
+    if (name == "intent.indices" && user->getNumOperands() == 1 &&
+        user->getOperand(0) == value) {
+      auto mode = user->getAttrOfType<StringAttr>("intent.mode");
+      if (mode && mode.getValue() == "tensor_axis")
+        continue;
+      return false;
+    }
     if (name == "intent.mask" && user->getNumOperands() == 3 &&
         user->getOperand(0) == value) {
       std::optional<std::string> fill =
@@ -70,6 +91,14 @@ bool provePaddedUses(Value value, PaddedValue padded,
       return false;
     }
     if (name == "intent.reduce") {
+      if (isArgmaxLowestReduction(*user)) {
+        if (user->getOperand(0) != value ||
+            padded != PaddedValue::negativeInfinity ||
+            semanticLiteralPadding(user->getOperand(2)) !=
+                "negative_infinity")
+          return false;
+        continue;
+      }
       auto combine = user->getAttrOfType<StringAttr>("intent.combine");
       if (!combine ||
           (combine.getValue() == "add" && padded != PaddedValue::zero) ||
@@ -294,6 +323,16 @@ std::optional<std::string> inferPadding(
         inferPadding(definition->getOperand(2), facts, assumedPadding);
     if (truePadding && falsePadding && *truePadding == *falsePadding)
       return truePadding;
+  }
+  if (name == "intent.reduce" && isArgmaxLowestReduction(*definition) &&
+      value == definition->getResult(0)) {
+    std::optional<std::string> inputPadding =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    std::optional<std::string> identityPadding =
+        inferPadding(definition->getOperand(2), facts, assumedPadding);
+    if (inputPadding && identityPadding && *inputPadding == *identityPadding &&
+        *inputPadding == "negative_infinity")
+      return inputPadding;
   }
   if ((name == "intent.reduce" || name == "intent.scan") &&
       definition->getNumOperands() == 2) {

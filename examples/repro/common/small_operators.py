@@ -29,6 +29,7 @@ from kernels.vision.max_pool import PADDING as MAX_POOL_PADDING
 from kernels.vision.max_pool import STRIDE as MAX_POOL_STRIDE
 from kernels.vision.max_pool import WIDTH as MAX_POOL_WIDTH
 from kernels.vision.max_pool import max_pool2d
+from kernels.vision.max_pool_with_indices import max_pool2d_with_indices
 
 from .evaluation import Runner
 from .evaluation import Upstream
@@ -58,6 +59,36 @@ def _run_max_pool2d(compiler: str, target: Target, target_name: str) -> None:
         target_name=target_name,
         kernel_name="2D max pooling",
         tolerance=0.0,
+    )
+
+
+def _run_max_pool2d_with_indices(
+    compiler: str,
+    target: Target,
+    target_name: str,
+    upstream: Upstream | None = None,
+) -> None:
+    x = torch.randn(
+        (MAX_POOL_BATCH, MAX_POOL_CHANNELS, MAX_POOL_HEIGHT, MAX_POOL_WIDTH),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    run_generated(
+        definition=max_pool2d_with_indices,
+        arguments=(x,),
+        reference=lambda: F.max_pool2d(
+            x,
+            kernel_size=KERNEL_HEIGHT,
+            stride=MAX_POOL_STRIDE,
+            padding=MAX_POOL_PADDING,
+            return_indices=True,
+        ),
+        compiler=compiler,
+        target=target,
+        target_name=target_name,
+        kernel_name="2D max pooling with indices",
+        tolerance=(0.0, 0.0),
+        upstream=upstream,
     )
 
 
@@ -311,12 +342,14 @@ SMALL_OPERATOR_RUNNERS: dict[str, Runner] = {
     "batch_norm_training": _run_batch_norm_training,
     "csr_spmm": _run_csr_spmm,
     "max_pool2d": _run_max_pool2d,
+    "max_pool2d_with_indices": _run_max_pool2d_with_indices,
     "softmax_backward": _run_softmax_backward,
     "triangular_solve": _run_triangular_solve,
 }
 
 SMALL_OPERATOR_UPSTREAM_RUNNERS = {
     "batch_norm_training": _run_batch_norm_training,
+    "max_pool2d_with_indices": _run_max_pool2d_with_indices,
     "softmax_backward": _run_softmax_backward,
     "triangular_solve": _run_triangular_solve,
 }

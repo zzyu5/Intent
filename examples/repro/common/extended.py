@@ -26,6 +26,13 @@ from kernels.backward.causal_conv import LENGTH as BWD_CAUSAL_CONV_LENGTH
 from kernels.backward.causal_conv import WIDTH as BWD_CAUSAL_CONV_WIDTH
 from kernels.backward.causal_conv import causal_conv1d_backward_partials
 from kernels.backward.causal_conv import causal_conv1d_backward_reduce
+from kernels.backward.group_norm import BATCH as BWD_GROUP_NORM_BATCH
+from kernels.backward.group_norm import CHANNELS as BWD_GROUP_NORM_CHANNELS
+from kernels.backward.group_norm import CHANNELS_PER_GROUP as BWD_GROUP_NORM_CHANNELS_PER_GROUP
+from kernels.backward.group_norm import GROUPS as BWD_GROUP_NORM_GROUPS
+from kernels.backward.group_norm import SPATIAL as BWD_GROUP_NORM_SPATIAL
+from kernels.backward.group_norm import group_norm_backward_dx
+from kernels.backward.group_norm import group_norm_backward_weight_bias
 from kernels.activation.swiglu import FEATURES as SWIGLU_FORWARD_FEATURES
 from kernels.activation.swiglu import TOKENS as SWIGLU_FORWARD_TOKENS
 from kernels.activation.swiglu import swiglu_forward
@@ -2045,6 +2052,143 @@ def _run_layer_norm_backward(
     else:
         print(
             f"{target_name} LayerNorm backward upstream comparison: PASS "
+            f"(dx/dw/db errors={upstream_errors}, "
+            f"end-to-end upstream_p50={upstream_p50:.4f} ms, "
+            f"upstream_p95={upstream_p95:.4f} ms, "
+            f"generated/upstream_p50={generated_p50 / upstream_p50:.4f}x)"
+        )
+
+
+def _run_group_norm_backward(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    shape = (
+        BWD_GROUP_NORM_BATCH,
+        BWD_GROUP_NORM_CHANNELS,
+        BWD_GROUP_NORM_SPATIAL,
+    )
+    x = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.5
+    grad_y = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.05
+    weight = torch.randn(
+        (BWD_GROUP_NORM_CHANNELS,), device="cuda", dtype=torch.float16
+    )
+    grouped = x.float().reshape(
+        BWD_GROUP_NORM_BATCH,
+        BWD_GROUP_NORM_GROUPS,
+        BWD_GROUP_NORM_CHANNELS_PER_GROUP,
+        BWD_GROUP_NORM_SPATIAL,
+    )
+    mean = grouped.mean(dim=(2, 3)).to(torch.float16)
+    centered = grouped - mean.float()[:, :, None, None]
+    rstd = torch.rsqrt(centered.square().mean(dim=(2, 3)) + 1.0e-5).to(
+        torch.float16
+    )
+    inverse_group_elements = 1.0 / (
+        BWD_GROUP_NORM_CHANNELS_PER_GROUP * BWD_GROUP_NORM_SPATIAL
+    )
+
+    dx_artifact = intent.compile(
+        group_norm_backward_dx, target=target, compiler=compiler
+    )
+    affine_artifact = intent.compile(
+        group_norm_backward_weight_bias, target=target, compiler=compiler
+    )
+    grad_x = torch.empty_like(x)
+    grad_weight = torch.empty_like(weight)
+    grad_bias = torch.empty_like(weight)
+    dx_call = prepare_kernel_call(
+        dx_artifact,
+        (x, grad_y, weight, mean, rstd, inverse_group_elements),
+        grad_x,
+    )
+    affine_call = prepare_kernel_call(
+        affine_artifact,
+        (x, grad_y, mean, rstd),
+        (grad_weight, grad_bias),
+    )
+
+    def generated_pipeline():
+        dx_call()
+        affine_call()
+        return grad_x, grad_weight, grad_bias
+
+    normalized = centered * rstd.float()[:, :, None, None]
+    gradient = grad_y.float().reshape_as(grouped)
+    weighted_gradient = gradient * weight.float().reshape(
+        BWD_GROUP_NORM_GROUPS,
+        BWD_GROUP_NORM_CHANNELS_PER_GROUP,
+    )[None, :, :, None]
+    group_sum = weighted_gradient.sum(dim=(2, 3), keepdim=True)
+    group_projection = (weighted_gradient * normalized).sum(
+        dim=(2, 3), keepdim=True
+    )
+    expected_dx = (
+        rstd.float()[:, :, None, None]
+        * (
+            weighted_gradient
+            - group_sum * inverse_group_elements
+            - normalized * group_projection * inverse_group_elements
+        )
+    ).reshape_as(x).to(torch.float16)
+    expected_weight = (gradient * normalized).sum(dim=(0, 3)).reshape(-1).to(
+        torch.float16
+    )
+    expected_bias = gradient.sum(dim=(0, 3)).reshape(-1).to(torch.float16)
+    expected = expected_dx, expected_weight, expected_bias
+
+    generated = generated_pipeline()
+    errors = tuple(
+        (actual - wanted).abs().max().item()
+        for actual, wanted in zip(generated, expected)
+    )
+    if errors[0] > 2.0e-2 or any(value > 2.5e-1 for value in errors[1:]):
+        raise RuntimeError(
+            f"{target_name} GroupNorm backward numerical comparison failed: {errors}"
+        )
+    generated_p50, generated_p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+
+    upstream_output = (
+        upstream((x, grad_y, weight, mean, rstd)) if upstream is not None else None
+    )
+    if upstream_output is not None:
+        upstream_errors = tuple(
+            (actual - wanted).abs().max().item()
+            for actual, wanted in zip(upstream_output, expected)
+        )
+        if upstream_errors[0] > 2.0e-2 or any(
+            value > 2.5e-1 for value in upstream_errors[1:]
+        ):
+            raise RuntimeError(
+                f"{target_name} GroupNorm backward upstream comparison failed: "
+                f"{upstream_errors}"
+            )
+        upstream_p50, upstream_p95 = benchmark(
+            lambda: upstream((x, grad_y, weight, mean, rstd)),
+            warmup=3,
+            repetitions=100,
+            cuda_graph=False,
+        )
+
+    print_artifact(dx_artifact, target_name)
+    print_artifact(affine_artifact, target_name)
+    print(
+        f"{target_name} GroupNorm backward pipeline numerical comparison: PASS "
+        f"(dx/dw/db errors={errors})"
+    )
+    print(
+        f"{target_name} GroupNorm backward end-to-end performance (CUDA Event): "
+        f"p50={generated_p50:.4f} ms, p95={generated_p95:.4f} ms"
+    )
+    if upstream_output is None:
+        print(f"{target_name} GroupNorm backward upstream baseline: unavailable")
+    else:
+        print(
+            f"{target_name} GroupNorm backward upstream comparison: PASS "
             f"(dx/dw/db errors={upstream_errors}, "
             f"end-to-end upstream_p50={upstream_p50:.4f} ms, "
             f"upstream_p95={upstream_p95:.4f} ms, "
@@ -4543,6 +4687,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "fused_add_rms_norm": _run_fused_add_rms_norm,
     "grouped_gemm": _run_grouped_gemm,
     "grouped_query_head_add": _run_grouped_query_head_add,
+    "group_norm_backward": _run_group_norm_backward,
     "insertion_top_k": _run_insertion_top_k,
     "index_select_rows": _run_index_select_rows,
     "layer_norm": _run_layer_norm,

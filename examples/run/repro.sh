@@ -35,11 +35,11 @@ unfamiliar=false
 case "${kernel}" in
   histogram | csr_spmv | radix2_fft | bitonic_sort | kmeans_assign | \
   viterbi_decode | smith_waterman | greedy_nms | roi_align | barrier_option | \
-  nonzero_compact | unique_consecutive | moe_align_block | nested_ragged_pool | \
+  nonzero_compact | unique_consecutive | moe_align_block | nested_ragged_pool | jagged_mean | \
   adamw_update | adafactor_update | reshape_and_cache | \
   group_norm_silu_backward | batched_cholesky | batched_householder_qr | \
   causal_conv1d_update | \
-  batch_norm_training | csr_spmm | max_pool2d | softmax_backward | \
+  batch_norm_training | csr_spmm | max_pool2d | max_pool2d_with_indices | softmax_backward | \
   triangular_solve | \
   variant_gemm_loop_interchange | variant_softmax_online | \
   variant_online_softmax_inline | variant_attention_inline | \
@@ -71,6 +71,15 @@ case "${backend}:${kernel}" in
   triton:adamw_update)
     baseline=source/triton/flag-gems/optimization/adamw/fused_adam_runtime.py
     ;;
+  triton:group_norm_backward)
+    baseline=source/triton/flag-gems/normalization/group_norm/groupnorm_runtime.py
+    ;;
+  triton:jagged_mean)
+    baseline=source/triton/tritonbench/ragged/jagged_mean/jagged_mean_runtime.py
+    ;;
+  triton:max_pool2d_with_indices)
+    baseline=source/triton/flag-gems/vision/max_pool2d/max_pool2d_with_indices_runtime.py
+    ;;
   cutile:attention_backward)
     baseline=source/cutile/tilegym/attention/dense/attention_backward_runtime.py
     ;;
@@ -92,18 +101,6 @@ if [[ ${unfamiliar} == false ]]; then
     ;;
   triton:paged_attention)
     baseline=source/triton/xformers/attention/splitk/splitk_kernels_runtime.py
-    ;;
-  triton:moe)
-    baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
-    ;;
-  cutile:moe)
-    baseline=source/cutile/cutile-python/moe/fused/MoE.py
-    ;;
-  tilelang:moe)
-    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
-    ;;
-  tilelang:softmax)
-    baseline=source/tilelang/tilelang/normalization/online_softmax/online_softmax.py
     ;;
   triton:logsumexp)
     baseline=source/triton/flag-gems/normalization/logsumexp/logsumexp_runtime.py
@@ -136,6 +133,8 @@ if [[ ${unfamiliar} == false ]]; then
     baseline=source/tilelang/tilelang/attention/blocksparse_gqa_decode_varlen/example_tilelang_sparse_gqa_decode_varlen_indice_runtime.py
     ;;
   triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode | \
+  triton:group_norm_backward | cutile:group_norm_backward | tilelang:group_norm_backward | \
+  triton:moe | cutile:moe | tilelang:moe | tilelang:softmax | \
   triton:online_softmax | cutile:online_softmax | \
   triton:dual_gemm | cutile:dual_gemm | tilelang:dual_gemm | \
   tilelang:rms_norm | \
