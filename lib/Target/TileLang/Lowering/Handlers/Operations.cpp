@@ -263,8 +263,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
 }
 
 LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
-  if (operation.getBlock() == &kernel.entry.getBody().front())
-    return success();
   if (operation.getNumResults() != 1)
     return operation.emitOpError("constant emission requires one result");
   std::string result = makeResultName(operation, 0);
@@ -286,6 +284,10 @@ LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
       expression = std::to_string(integer.getInt());
   } else {
     return operation.emitOpError("has an unsupported TileLang constant value");
+  }
+  if (operation.getBlock() == &kernel.entry.getBody().front()) {
+    bindResult(operation, 0, expression);
+    return success();
   }
   if (target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
@@ -360,10 +362,10 @@ LogicalResult ProgramMaterializer::emitAssumeInBounds(Operation &operation) {
     FailureOr<SmallVector<std::string>> extents =
         result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                : FailureOr<SmallVector<std::string>>(failure());
-    if (tensor.getRank() != 1 || failed(extents) || extents->size() != 1)
+    if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
       return operation.emitOpError(
           "TileLang in-bounds assumption has no ranked index schema");
-    if (extents->front() != "1")
+    if (tensor.getRank() != 1 || extents->front() != "1")
       return success();
     auto assumed = assumedIndexNames.find(operation.getOperand(0));
     if (assumed == assumedIndexNames.end()) {
@@ -3441,6 +3443,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   if (orientation->batched)
     return operation.emitOpError(
         "TileLang 0.1.13 has no mechanical batched GEMM projection");
+  if (target::lowering::isLoopCarriedContractionAccumulator(operation))
+    return operation.emitOpError(
+        "TileLang 0.1.13 cannot mechanically preserve a contraction that is "
+        "repeatedly accumulated through a tensor loop carrier");
   if (!planIndex.stages.empty()) {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
@@ -3696,6 +3702,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         isa<Float8E4M3FNType, Float8E5M2Type>(rhsElement);
     if (failed(reductionAxis) || failed(contractionAxes))
       return failure();
+    if (raggedRuntimesByAxis.count(reductionAxis->getNode()))
+      return operation.emitOpError(
+          "TileLang has no mechanical masked bulk-copy projection for a "
+          "ragged contraction reduction axis");
     bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
         planIndex, operation, reductionAxis->getNode());
     if (fp8Operands && contractionAxes->lhsResult.hasRole("lane"))

@@ -5,12 +5,17 @@ import torch
 
 
 SOURCE = Path(__file__).with_name("example_convolution.py")
-spec = importlib.util.spec_from_file_location("local_tilelang_convolution", SOURCE)
-source = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(source)
+
+
+def load_source():
+    spec = importlib.util.spec_from_file_location("local_tilelang_convolution", SOURCE)
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    return source
 
 
 def main():
+    source = load_source()
     batch, height, width, channels, filters = 32, 128, 128, 256, 512
     kernel_size, stride, dilation, padding = 3, 1, 1, 1
     data = torch.randn(

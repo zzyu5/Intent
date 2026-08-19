@@ -224,8 +224,9 @@ def block_sparse(context: Context) -> PreparedComparison:
         "source/tilelang/tilelang/gemm/block_sparse/example_blocksparse_gemm_runtime.py",
         "intent_v2_tilelang_block_sparse_runtime",
     )
+    source_kernel = runtime.load_source().blocksparse_matmul
     source = functional_launch(
-        lambda: runtime.source.blocksparse_matmul(
+        lambda: source_kernel(
             lhs, rhs, mask, 128, 128, 32, 2, 128, True
         )
     )
@@ -258,8 +259,9 @@ def grouped_gemm_backward(context: Context) -> PreparedComparison:
         "source/tilelang/tilelang/gemm/grouped_backward/example_grouped_gemm_bwd_runtime.py",
         "intent_v2_tilelang_grouped_gemm_backward_runtime",
     )
+    source_kernel = runtime.load_source().grouped_gemm_bwd
     source = functional_launch(
-        lambda: runtime.source.grouped_gemm_bwd(
+        lambda: source_kernel(
             left,
             right,
             sizes,

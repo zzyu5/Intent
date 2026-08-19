@@ -22,7 +22,7 @@ def online_softmax(context: Context) -> PreparedComparison:
         "source/tilelang/tilelang/normalization/online_softmax/online_softmax_runtime.py",
         "intent_v2_tilelang_online_softmax_runtime",
     )
-    source_kernel = runtime.load_softmax()
+    source_kernel = runtime.load_softmax(*x.shape)
     source = functional_launch(lambda: source_kernel(x))
     return PreparedComparison(
         generated,

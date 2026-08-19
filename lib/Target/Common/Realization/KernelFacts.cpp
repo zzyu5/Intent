@@ -1370,17 +1370,30 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
   if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
     return operation.emitOpError("has no canonical reshape schema");
   auto source = facts.valueAxes.find(operation.getOperand(0));
-  FailureOr<SmallVector<LogicalAxis>> result =
-      axesFromResultShape(operation, 0, facts);
-  if (source == facts.valueAxes.end() || failed(result))
+  FailureOr<SmallVector<StringRef>> labels = resultShapeLabels(operation, 0);
+  if (source == facts.valueAxes.end() || failed(labels))
     return operation.emitOpError("reshape has no logical-axis provenance");
+  SmallVector<LogicalAxis> result;
+  for (StringRef label : *labels) {
+    auto known = facts.axisLabels.find(label);
+    if (known != facts.axisLabels.end()) {
+      result.push_back(known->second);
+      continue;
+    }
+    uint64_t extent = 0;
+    if (label.getAsInteger(10, extent) || extent == 0)
+      return operation.emitOpError()
+             << "reshape result has no exact provenance for symbolic label '"
+             << label << "'";
+    result.push_back(LogicalAxis{nullptr, label.str()});
+  }
 
   size_t sourceIndex = 0, resultIndex = 0;
-  while (sourceIndex < source->second.size() && resultIndex < result->size()) {
+  while (sourceIndex < source->second.size() && resultIndex < result.size()) {
     if (compatibleLogicalAxis(source->second[sourceIndex],
-                              (*result)[resultIndex])) {
-      (*result)[resultIndex] = mergeLogicalAxis(
-          source->second[sourceIndex], (*result)[resultIndex]);
+                              result[resultIndex])) {
+      result[resultIndex] =
+          mergeLogicalAxis(source->second[sourceIndex], result[resultIndex]);
       ++sourceIndex;
       ++resultIndex;
       continue;
@@ -1389,14 +1402,14 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
       ++sourceIndex;
       continue;
     }
-    if (isUnitAxis((*result)[resultIndex], facts)) {
+    if (isUnitAxis(result[resultIndex], facts)) {
       ++resultIndex;
       continue;
     }
     std::optional<uint64_t> sourceProduct =
         staticAxisExtent(source->second[sourceIndex++]);
     std::optional<uint64_t> resultProduct =
-        staticAxisExtent((*result)[resultIndex++]);
+        staticAxisExtent(result[resultIndex++]);
     if (!sourceProduct || !resultProduct)
       return operation.emitOpError(
           "reshape changes a symbolic logical-axis group");
@@ -1411,11 +1424,11 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
           return operation.emitOpError(
               "reshape has an unsupported static source extent group");
       } else {
-        if (resultIndex == result->size())
+        if (resultIndex == result.size())
           return operation.emitOpError(
               "reshape changes the logical element count");
         std::optional<uint64_t> extent =
-            staticAxisExtent((*result)[resultIndex++]);
+            staticAxisExtent(result[resultIndex++]);
         if (!extent || !multiplyExtent(*resultProduct, *extent))
           return operation.emitOpError(
               "reshape has an unsupported static result extent group");
@@ -1425,12 +1438,12 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
   while (sourceIndex < source->second.size() &&
          isUnitAxis(source->second[sourceIndex], facts))
     ++sourceIndex;
-  while (resultIndex < result->size() &&
-         isUnitAxis((*result)[resultIndex], facts))
+  while (resultIndex < result.size() &&
+         isUnitAxis(result[resultIndex], facts))
     ++resultIndex;
-  if (sourceIndex != source->second.size() || resultIndex != result->size())
+  if (sourceIndex != source->second.size() || resultIndex != result.size())
     return operation.emitOpError("reshape changes the logical element count");
-  return bindResultAxes(operation, 0, std::move(*result), facts);
+  return bindResultAxes(operation, 0, std::move(result), facts);
 }
 
 LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,

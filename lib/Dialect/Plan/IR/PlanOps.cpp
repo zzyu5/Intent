@@ -450,7 +450,8 @@ LogicalResult StageAxisOp::verify() {
 }
 
 LogicalResult AutotuneOp::verify() {
-  if (failed(verifyStringArray(*this, getKey(), "specialization key")) ||
+  if ((!getKey().empty() &&
+       failed(verifyStringArray(*this, getKey(), "specialization key"))) ||
       failed(verifyStringArray(*this, getParameters(), "tunable parameter")))
     return failure();
   return success();

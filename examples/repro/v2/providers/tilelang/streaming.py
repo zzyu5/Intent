@@ -89,7 +89,10 @@ def mamba_chunk_state(context: Context) -> PreparedComparison:
     dt = torch.randn(
         (batch, heads, chunks, chunk), device="cuda", dtype=torch.float16
     )
-    cumulative_decay = torch.randn_like(dt)
+    cumulative_decay = torch.cumsum(
+        -torch.rand_like(dt) * 0.1,
+        dim=-1,
+    )
     _, generated = compile_single(
         context,
         mamba_chunk_state_fwd,

@@ -22,44 +22,67 @@ def mhc_gemm_rms_scale(
 ):
     T, K = x.shape
     N = weight.shape[1]
+    tokens = I.domain(0, T)
     columns = I.domain(0, N)
     reduction = I.domain(0, K)
-    for token in I.parallel(I.domain(0, T)):
-        values = I.cast(x[token, reduction], I.f32)
-        root_mean_square = I.rsqrt(
-            I.reduce.sum(values * values, axis=0, identity=0.0) / I.cast(K, I.f32)
-        )
-        linear = I.contract(
-            x[token, reduction],
-            weight[reduction, columns],
-            reduce=((0, 0),),
-            acc_dtype=I.f32,
-        )
-        column_index = I.indices(columns)
-        pre = column_index < STREAMS
-        post = (column_index >= STREAMS) and (column_index < 2 * STREAMS)
-        scale = I.mask(
-            I.full((columns,), ALPHA_PRE, dtype=I.f32),
-            valid=pre,
-            fill=I.full((columns,), ALPHA_RESIDUAL, dtype=I.f32),
-        )
-        scale = I.mask(
-            I.full((columns,), ALPHA_POST, dtype=I.f32),
-            valid=post,
-            fill=scale,
-        )
-        normalized = (
-            linear * scale * root_mean_square + I.cast(bias[columns], I.f32)
-        )
-        sigmoid = 1.0 / (1.0 + I.exp(-normalized))
-        result = I.mask(
-            normalized,
-            valid=(pre == False) and (post == False),
-            fill=sigmoid,
-        )
-        result = I.mask(2.0 * sigmoid, valid=post, fill=result)
-        mixed[token, columns] = I.cast(result, I.bf16)
-        rms[token, 0] = 1.0 / root_mean_square
+    for token_region in I.parallel(
+        I.partition(tokens, extent=I.auto("M_TILE"))
+    ):
+        for column_region in I.parallel(
+            I.partition(columns, extent=I.auto("N_TILE"))
+        ):
+            accumulation = I.state_stream(
+                reduction,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.zeros((token_region,), dtype=I.f32),
+                    I.zeros((token_region, column_region), dtype=I.f32),
+                ),
+            )
+            with accumulation:
+                for reduction_region, (square_sum, linear) in accumulation:
+                    values = I.cast(x[token_region, reduction_region], I.f32)
+                    accumulation.yield_(
+                        square_sum
+                        + I.reduce.sum(values * values, axis=1, identity=0.0),
+                        linear
+                        + I.contract(
+                            x[token_region, reduction_region],
+                            weight[reduction_region, column_region],
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
+                        ),
+                    )
+            square_sum, linear = accumulation.result
+            root_mean_square = I.rsqrt(square_sum / I.cast(K, I.f32))
+            column_index = I.indices(column_region)
+            pre = column_index < STREAMS
+            post = (column_index >= STREAMS) and (column_index < 2 * STREAMS)
+            zero = I.cast(column_index, I.f32) * 0.0
+            scale = I.mask(
+                zero + ALPHA_PRE,
+                valid=pre,
+                fill=zero + ALPHA_RESIDUAL,
+            )
+            scale = I.mask(
+                zero + ALPHA_POST,
+                valid=post,
+                fill=scale,
+            )
+            normalized = (
+                linear * scale * root_mean_square[:, None]
+                + I.cast(bias[column_region], I.f32)
+            )
+            sigmoid = 1.0 / (1.0 + I.exp(-normalized))
+            result = I.mask(
+                normalized,
+                valid=(pre == False) and (post == False),
+                fill=sigmoid,
+            )
+            result = I.mask(2.0 * sigmoid, valid=post, fill=result)
+            mixed[token_region, column_region] = I.cast(result, I.bf16)
+            if column_index[0] == 0:
+                rms[token_region, 0] = 1.0 / root_mean_square
 
 
 @intent.kernel

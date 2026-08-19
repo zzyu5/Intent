@@ -498,14 +498,16 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
         domain->getResult(0), kernel, *domain, "TileLang domain tile binding");
     if (failed(valueID))
       return failure();
+    if (!entry.second.getReuseWorker())
+      for (target::lowering::RangeBinding &range : entry.second.ranges) {
+        if (!range.getTileRole().starts_with("row_vector"))
+          continue;
+        if (!planIndex.blockExtents.count(range.getExtent()))
+          return entry.second.emitOpError(
+              "cannot resolve its row-vector extent");
+        range.tile = physicalExtent(range.getExtent());
+      }
     std::string tile = entry.second.getTile().str();
-    if (!entry.second.getReuseWorker() &&
-        entry.second.getTileRole().starts_with("row_vector")) {
-      const target::lowering::RangeBinding *range = entry.second.roleRange();
-      if (!range || !planIndex.blockExtents.count(range->getExtent()))
-        return entry.second.emitOpError("cannot resolve its row-vector extent");
-      tile = physicalExtent(range->getExtent());
-    }
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
         tile;
   }

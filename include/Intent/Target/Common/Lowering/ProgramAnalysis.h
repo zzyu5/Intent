@@ -46,6 +46,49 @@ inline bool hasNonReplayableEffect(mlir::Operation *root) {
   return found;
 }
 
+inline bool isLoopCarriedContractionAccumulator(mlir::Operation &operation) {
+  if (operation.getName().getStringRef() != "intent.contract" ||
+      operation.getNumResults() != 1 ||
+      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
+    return false;
+  mlir::Operation *binary = *operation.getResult(0).user_begin();
+  auto logical = binary->getAttrOfType<mlir::StringAttr>("intent.operator");
+  if (binary->getName().getStringRef() != "intent.binary" || !logical ||
+      logical.getValue() != "add" || binary->getNumOperands() != 2 ||
+      binary->getNumResults() != 1 ||
+      !llvm::hasSingleElement(binary->getResult(0).getUsers()))
+    return false;
+  mlir::Operation *yield = *binary->getResult(0).user_begin();
+  mlir::Operation *owner = yield->getParentOp();
+  llvm::StringRef ownerName =
+      owner ? owner->getName().getStringRef() : llvm::StringRef();
+  if (yield->getName().getStringRef() != "intent.yield" ||
+      (ownerName != "intent.for" && ownerName != "intent.ordered") ||
+      owner->getNumRegions() != 1 || owner->getRegion(0).empty())
+    return false;
+  std::optional<unsigned> carried;
+  for (auto [index, operand] : llvm::enumerate(yield->getOperands())) {
+    if (operand != binary->getResult(0))
+      continue;
+    if (carried)
+      return false;
+    carried = index;
+  }
+  mlir::Block &body = owner->getRegion(0).front();
+  if (!carried || *carried >= owner->getNumResults() ||
+      body.getNumArguments() < owner->getNumResults())
+    return false;
+  unsigned domainCount = body.getNumArguments() - owner->getNumResults();
+  mlir::Value previous = body.getArgument(domainCount + *carried);
+  bool consumesContract = false;
+  bool consumesPrevious = false;
+  for (mlir::Value operand : binary->getOperands()) {
+    consumesContract |= operand == operation.getResult(0);
+    consumesPrevious |= operand == previous;
+  }
+  return consumesContract && consumesPrevious;
+}
+
 template <typename LookupShape>
 inline mlir::FailureOr<std::string>
 logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {

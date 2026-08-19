@@ -39,6 +39,7 @@ def mhc_pre(context: Context) -> PreparedComparison:
             + torch.arange(streams, device="cuda").mul(0.01).view(1, -1, 1)
         )
     ).flatten(1, 2)
+    source_weight = weight.bfloat16().float()
     scale = torch.randn((3,), device="cuda", dtype=torch.float32) * 0.1
     base = torch.randn(
         (components,), device="cuda", dtype=torch.float32
@@ -97,7 +98,7 @@ def mhc_pre(context: Context) -> PreparedComparison:
     def source_launch():
         source_module.mhc_pre_gemm_sqrsum_tilelang(
             residual_flat,
-            weight,
+            source_weight,
             source_mixes.squeeze(0),
             source_square_sum.squeeze(0),
             components,
@@ -157,6 +158,7 @@ def mhc_post(context: Context) -> PreparedComparison:
     residual_mix = torch.randn(
         (tokens, streams, streams), device="cuda", dtype=torch.float32
     )
+    source_residual_mix = residual_mix.transpose(1, 2).contiguous()
     _, generated = compile_single(
         context,
         mhc_apply_residual,
@@ -175,7 +177,7 @@ def mhc_post(context: Context) -> PreparedComparison:
 
     def source_launch():
         source_module.mhc_post_tilelang(
-            residual_mix,
+            source_residual_mix,
             residual,
             post_mix,
             layer_output,

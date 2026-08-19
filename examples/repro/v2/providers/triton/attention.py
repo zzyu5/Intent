@@ -41,7 +41,10 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
         "intent_v2_triton_flash_attention",
     )
     source_function = runtime.load_attention()
-    source = functional_launch(lambda: source_function(q, k, v, True, scale))
+    warp_specialize = torch.cuda.get_device_capability()[0] >= 10
+    source = functional_launch(
+        lambda: source_function(q, k, v, True, scale, warp_specialize)
+    )
     return PreparedComparison(generated, source, Tolerance(atol=2e-2, rtol=2e-2), cuda_graph=True)
 
 

@@ -391,9 +391,10 @@ def native_sparse_attention_fwd(
                             key_head,
                             I.indices(slot_region),
                         ]
-                        key_indices = block_id[:, None] * BLOCK + I.indices(
-                            block_members
-                        )[None, :]
+                        key_indices = (
+                            I.cast(block_id, I.index)[:, None] * BLOCK
+                            + I.indices(block_members)[None, :]
+                        )
                         I.assume_in_bounds(key_indices, k, axis=1)
                         keys = I.gather(
                             k,

@@ -21,7 +21,7 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
         device="cuda",
         dtype=torch.bfloat16,
     ) * 0.1
-    key = torch.randn_like(query)
+    key = torch.randn_like(query) * 0.1
     value = torch.randn(
         (batch, sequence, heads, value_dimension),
         device="cuda",
