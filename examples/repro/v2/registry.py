@@ -32,6 +32,7 @@ TRITON = (
     Entry("jagged_mean", "B512-T33024-D128-fp32", "jagged_mean", ("ragged/jagged_mean.py:jagged_mean",), "source/triton/tritonbench/ragged/jagged_mean/jagged_mean_runtime.py"),
     Entry("fp8_groupwise_quantize", "8192x4096-group128-bf16-e4m3", "bf16_groupwise_fp8_quantize", ("quantization/fp8.py:bf16_groupwise_fp8_quantize",), "source/triton/meta-applied-ai/quantization/fp8_groupwise/float8_groupwise_quant_runtime.py"),
     Entry("rope_qk", "B4-S4096-QH32-KVH8-D128-fp16", "rope_qk_v2", ("position/rope.py:rotary_qk_inplace",), "source/triton/liger-kernel/position/rope/rope_runtime.py"),
+    Entry("causal_conv1d", "B4-C4096-S4096-W4-bf16-silu", "causal_conv1d_v2", ("convolution/direct.py:causal_depthwise_conv1d_bf16",), "source/triton/meta-applied-ai/convolution/causal_conv1d/causal_1d_conv_runtime.py"),
     Entry("varlen_causal_conv1d", "lengths2048-1536-1024-512-D4096-W4-bf16", "varlen_causal_conv1d", ("convolution/varlen.py:varlen_aligned_causal_depthwise_conv1d", "convolution/varlen.py:varlen_causal_conv1d_final_state"), "source/triton/fla/conv/causal1d/causal_conv_varlen_runtime.py"),
     Entry("causal_conv1d_update", "B32-D4096-W4-bf16", "causal_conv1d_update_v2", ("convolution/direct.py:causal_depthwise_conv1d_update_bf16",), "source/triton/fla/conv/causal1d/causal_conv_update_runtime.py"),
     Entry("mamba3_siso_step", "B32-HQK4-H16-DQK32-DV64-bf16", "mamba3_siso_step", ("streaming/mamba.py:mamba3_siso_step",), "source/triton/state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_step_runtime.py"),

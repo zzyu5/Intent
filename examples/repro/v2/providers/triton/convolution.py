@@ -19,10 +19,10 @@ from ...model import Tolerance
 def causal_conv1d(context: Context) -> PreparedComparison:
     batch, channels, sequence, width = 4, 4096, 4096, 4
     x = torch.randn(
-        (batch, channels, sequence), device="cuda", dtype=torch.bfloat16
-    )
-    weight = torch.randn((channels, width), device="cuda", dtype=torch.float32)
-    bias = torch.randn((channels,), device="cuda", dtype=torch.float32)
+        (batch, sequence, channels), device="cuda", dtype=torch.bfloat16
+    ).transpose(1, 2)
+    weight = torch.randn((channels, width), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((channels,), device="cuda", dtype=torch.bfloat16)
     _, generated = compile_single(
         context,
         causal_depthwise_conv1d_bf16,
@@ -180,6 +180,7 @@ def causal_conv1d_update(context: Context) -> PreparedComparison:
 
 
 CASES = {
+    "causal_conv1d": causal_conv1d,
     "varlen_causal_conv1d": varlen_causal_conv1d,
     "causal_conv1d_update": causal_conv1d_update,
 }

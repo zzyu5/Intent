@@ -101,37 +101,43 @@ def causal_depthwise_conv1d(
 @intent.kernel
 def causal_depthwise_conv1d_bf16(
     x: I.In[I.bf16, ("B", "D", "L")],
-    weight: I.In[I.f32, ("D", "W")],
-    bias: I.In[I.f32, ("D",)],
+    weight: I.In[I.bf16, ("D", "W")],
+    bias: I.In[I.bf16, ("D",)],
     output: I.Out[I.bf16, ("B", "D", "L")],
     SILU: I.Constexpr[bool],
 ):
     B, D, L = x.shape
     W = weight.shape[1]
     positions = I.domain(0, L)
+    channels = I.domain(0, D)
     taps = I.domain(0, W)
     for batch in I.parallel(I.domain(0, B)):
-        for channel in I.parallel(I.domain(0, D)):
-            for output_region in I.parallel(
+        for channel_region in I.parallel(
+            I.partition(channels, extent=I.auto("D_TILE"))
+        ):
+            for position_region in I.parallel(
                 I.partition(positions, extent=I.auto("L_TILE"))
             ):
-                output_index = I.indices(output_region)[:, None]
+                output_index = I.indices(position_region)[:, None]
                 tap_index = I.indices(taps)[None, :]
                 input_index = output_index - (W - 1) + tap_index
                 patch = I.mask(
-                    x[batch, channel, input_index],
-                    valid=input_index >= 0,
+                    x[batch, channel_region, input_index],
+                    valid=(input_index >= 0)[None, :, :],
                     fill=I.cast(0.0, I.bf16),
                 )
                 reduced = I.reduce.sum(
-                    I.cast(patch, I.f32) * weight[channel, taps][None, :],
-                    axis=1,
+                    I.cast(patch, I.f32)
+                    * I.cast(weight[channel_region, taps], I.f32)[:, None, :],
+                    axis=2,
                     identity=0.0,
                     acc_dtype=I.f32,
-                ) + bias[channel]
+                ) + I.cast(bias[channel_region], I.f32)[:, None]
                 if SILU:
                     reduced = reduced * I.sigmoid(reduced)
-                output[batch, channel, output_region] = I.cast(reduced, I.bf16)
+                output[batch, channel_region, position_region] = I.cast(
+                    reduced, I.bf16
+                )
 
 
 @intent.kernel
