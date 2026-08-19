@@ -217,7 +217,6 @@ class RegionType(ValueType):
 
 class PartitionMode(Enum):
     EXTENT = "extent"
-    COUNT = "count"
 
 
 @dataclass(frozen=True, slots=True)

@@ -92,14 +92,9 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 
 
 def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
-    bound = bind_call(lowerer, node, ("axis", "extent", "count"), required=("axis",))
-    if ("extent" in bound) == ("count" in bound):
-        lowerer.error(node, "I.partition requires exactly one of extent= or count=")
-    if "count" in bound:
-        lowerer.error(
-            bound["count"],
-            "I.partition(count=...) is reserved but not supported by the current realization contract; use extent=...",
-        )
+    bound = bind_call(
+        lowerer, node, ("axis", "extent"), required=("axis", "extent")
+    )
     source = lowerer.materialize(lowerer.lower_expression(bound["axis"]), bound["axis"])
     if not isinstance(source.type, (DomainType, RegionType)):
         lowerer.error(node, "partition axis must be a domain or region")
@@ -120,7 +115,24 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     if isinstance(expression, AutoExtent):
         attributes["extent"] = expression
     else:
-        operands.append(_integer_value(lowerer, expression, bound["extent"]))
+        known, value = compile_time_value(expression)
+        if (
+            not known
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            lowerer.error(
+                bound["extent"],
+                "partition extent must be a positive compile-time integer or I.auto(...)",
+            )
+        operands.append(
+            lowerer.materialize(
+                Literal(value),
+                bound["extent"],
+                ScalarType(intent_index),
+            )
+        )
     operation = lowerer.emit(
         OperationKind.PARTITION,
         lowerer.location(node),
