@@ -2135,16 +2135,11 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
       target::parseIndexRelation(operation);
   if (failed(relation))
     return failure();
-  unsigned tensorIndexCount = llvm::count_if(
-      *relation, [&](const target::IndexTerm &term) {
-        return term.kind == "value_index" && term.operands.size() == 1 &&
-               term.operands.front() &&
-               isa<RankedTensorType>(
-                   operation.getOperand(*term.operands.front()).getType());
-      });
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
   SmallVector<std::string> indices;
   unsigned tileAxis = 0;
-  bool advancedTensorAxesCovered = false;
+  std::optional<unsigned> tensorGroupAxis;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "new_axis") {
       if (tileAxis >= tileIndices.size())
@@ -2181,9 +2176,15 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
           lookupValue(operation, *term.operands.front());
       if (failed(exact) && failed(projected))
         return failure();
-      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() > static_cast<int64_t>(tileIndices.size()) ||
-            (tileAxis != 0 && !advancedTensorAxesCovered))
+      if (tensorIndices.requiresBroadcastProjection()) {
+        if (!tensorGroupAxis) {
+          if (tileAxis + tensorIndices.rank > tileIndices.size())
+            return operation.emitOpError(
+                "TileLang broadcasted tensor index exceeds the transfer rank");
+          tensorGroupAxis = tileAxis;
+          tileAxis += tensorIndices.rank;
+        }
+        if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
           return operation.emitOpError(
               "TileLang broadcasted tensor index exceeds the transfer rank");
         auto result = dyn_cast<OpResult>(indexed);
@@ -2193,23 +2194,23 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
         if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor index has no canonical extents");
+        unsigned valueAxis =
+            *tensorGroupAxis + tensorIndices.rank - tensor.getRank();
         std::string element;
         if (succeeded(projected) && tensor.getRank() == 1) {
-          element = *projected + " + " + tileIndices.front();
+          element = *projected + " + " + tileIndices[valueAxis];
         } else {
           element = exact->str() + "[";
           for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
             if (axis)
               element += ", ";
-            element += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+            element += (*extents)[axis] == "1"
+                           ? "0"
+                           : tileIndices[valueAxis + axis];
           }
           element += "]";
         }
         indices.push_back(addressIndex(element));
-        if (!advancedTensorAxesCovered) {
-          tileAxis = tensor.getRank();
-          advancedTensorAxesCovered = true;
-        }
       } else {
         if (tensor.getRank() != 1 || tileAxis >= tileIndices.size())
           return operation.emitOpError(
@@ -2291,17 +2292,12 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
             return term.kind != "new_axis";
           })) != (*view)->shape.size())
     return failure();
-  unsigned tensorIndexCount = llvm::count_if(
-      *relation, [&](const target::IndexTerm &term) {
-        return term.kind == "value_index" && term.operands.size() == 1 &&
-               term.operands.front() &&
-               isa<RankedTensorType>(
-                   operation.getOperand(*term.operands.front()).getType());
-      });
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
   unsigned sourceAxis = 0;
-  bool advancedTensorAxesCovered = false;
+  std::optional<unsigned> tensorGroupAxis;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "new_axis") {
       if (tileAxis >= tileIndices.size())
@@ -2339,9 +2335,15 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
       if (failed(exact) && failed(projected))
         return failure();
       std::string index;
-      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() > static_cast<int64_t>(tileIndices.size()) ||
-            (tileAxis != 0 && !advancedTensorAxesCovered))
+      if (tensorIndices.requiresBroadcastProjection()) {
+        if (!tensorGroupAxis) {
+          if (tileAxis + tensorIndices.rank > tileIndices.size())
+            return operation.emitOpError(
+                "TileLang broadcasted tensor bounds exceed the transfer rank");
+          tensorGroupAxis = tileAxis;
+          tileAxis += tensorIndices.rank;
+        }
+        if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
           return operation.emitOpError(
               "TileLang broadcasted tensor bounds exceed the transfer rank");
         auto result = dyn_cast<OpResult>(indexed);
@@ -2351,20 +2353,20 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
         if (failed(extents) || extents->size() != static_cast<size_t>(tensor.getRank()))
           return operation.emitOpError(
               "TileLang broadcasted tensor bounds have no canonical extents");
+        unsigned valueAxis =
+            *tensorGroupAxis + tensorIndices.rank - tensor.getRank();
         if (succeeded(projected) && tensor.getRank() == 1) {
-          index = *projected + " + " + tileIndices.front();
+          index = *projected + " + " + tileIndices[valueAxis];
         } else {
           index = exact->str() + "[";
           for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
             if (axis)
               index += ", ";
-            index += (*extents)[axis] == "1" ? "0" : tileIndices[axis];
+            index += (*extents)[axis] == "1"
+                         ? "0"
+                         : tileIndices[valueAxis + axis];
           }
           index += "]";
-        }
-        if (!advancedTensorAxesCovered) {
-          tileAxis = tensor.getRank();
-          advancedTensorAxesCovered = true;
         }
       } else {
         if (tensor.getRank() != 1 || tileAxis >= tileIndices.size())

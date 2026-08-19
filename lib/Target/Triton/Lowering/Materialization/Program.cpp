@@ -80,6 +80,23 @@ std::string launchTile(StringRef tile) {
   return "META['" + tile.str() + "']";
 }
 
+std::string projectTensorIndex(StringRef value, unsigned valueRank,
+                               unsigned groupRank, unsigned groupAxis,
+                               unsigned resultRank) {
+  std::string expression = "(" + value.str() + ")";
+  if (valueRank == resultRank && groupAxis == 0)
+    return expression;
+  unsigned valueAxis = groupAxis + groupRank - valueRank;
+  expression += "[";
+  for (unsigned axis = 0; axis < resultRank; ++axis) {
+    if (axis)
+      expression += ", ";
+    expression += axis >= valueAxis && axis < groupAxis + groupRank ? ":"
+                                                                      : "None";
+  }
+  return expression + "]";
+}
+
 } // namespace
 
 FailureOr<PhysicalProgramIndex>
@@ -1944,16 +1961,12 @@ ProgramMaterializer::emitPointerExpression(Operation &operation, ABIView &view,
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
     return failure();
-  unsigned tensorIndexCount = llvm::count_if(*relation, [&](const target::IndexTerm &term) {
-    return term.kind == "value_index" && term.operands.size() == 1 &&
-           term.operands.front() &&
-           isa<RankedTensorType>(
-               operation.getOperand(*term.operands.front()).getType());
-  });
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
   std::string expression = view.pointer;
   unsigned vectorAxis = 0;
   unsigned sourceAxis = 0;
-  bool advancedTensorAxesCovered = false;
+  std::optional<unsigned> tensorGroupAxis;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "new_axis") {
       ++vectorAxis;
@@ -1987,26 +2000,20 @@ ProgramMaterializer::emitPointerExpression(Operation &operation, ABIView &view,
         if (!tensor) {
           index = "(" + exact->str() + ")";
         } else {
-          if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-            if (tensor.getRank() > static_cast<int64_t>(*tensorRank) ||
-                (vectorAxis != 0 && !advancedTensorAxesCovered))
+          if (tensorIndices.requiresBroadcastProjection()) {
+            if (!tensorGroupAxis) {
+              if (vectorAxis + tensorIndices.rank > *tensorRank)
+                return operation.emitOpError(
+                    "Triton broadcasted tensor index exceeds the emitted tensor rank");
+              tensorGroupAxis = vectorAxis;
+              vectorAxis += tensorIndices.rank;
+            }
+            if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
               return operation.emitOpError(
                   "Triton broadcasted tensor index exceeds the emitted tensor rank");
-            index = "(" + exact->str() + ")";
-            if (tensor.getRank() < static_cast<int64_t>(*tensorRank)) {
-              index += "[";
-              for (unsigned axis = 0; axis < *tensorRank; ++axis) {
-                if (axis)
-                  index += ", ";
-                index += axis < static_cast<unsigned>(tensor.getRank()) ? ":"
-                                                                        : "None";
-              }
-              index += "]";
-            }
-            if (!advancedTensorAxesCovered) {
-              vectorAxis = tensor.getRank();
-              advancedTensorAxesCovered = true;
-            }
+            index = projectTensorIndex(*exact, tensor.getRank(),
+                                       tensorIndices.rank, *tensorGroupAxis,
+                                       *tensorRank);
           } else {
             if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
               return operation.emitOpError(
@@ -2076,16 +2083,12 @@ ProgramMaterializer::emitMaskExpression(Operation &operation, bool store) {
   FailureOr<unsigned> tensorRank = emittedTensorRank(operation, store);
   if (failed(tensorRank))
     return failure();
-  unsigned tensorIndexCount = llvm::count_if(*relation, [&](const target::IndexTerm &term) {
-    return term.kind == "value_index" && term.operands.size() == 1 &&
-           term.operands.front() &&
-           isa<RankedTensorType>(
-               operation.getOperand(*term.operands.front()).getType());
-  });
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
   SmallVector<std::string> predicates;
   unsigned vectorAxis = 0;
   unsigned sourceAxis = 0;
-  bool advancedTensorAxesCovered = false;
+  std::optional<unsigned> tensorGroupAxis;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "new_axis") {
       ++vectorAxis;
@@ -2119,26 +2122,19 @@ ProgramMaterializer::emitMaskExpression(Operation &operation, bool store) {
       if (failed(exact))
         return failure();
       std::string index;
-      if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-        if (tensor.getRank() > static_cast<int64_t>(*tensorRank) ||
-            (vectorAxis != 0 && !advancedTensorAxesCovered))
+      if (tensorIndices.requiresBroadcastProjection()) {
+        if (!tensorGroupAxis) {
+          if (vectorAxis + tensorIndices.rank > *tensorRank)
+            return operation.emitOpError(
+                "Triton broadcasted tensor bounds exceed the emitted tensor rank");
+          tensorGroupAxis = vectorAxis;
+          vectorAxis += tensorIndices.rank;
+        }
+        if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
           return operation.emitOpError(
               "Triton broadcasted tensor bounds exceed the emitted tensor rank");
-        index = "(" + exact->str() + ")";
-        if (tensor.getRank() < static_cast<int64_t>(*tensorRank)) {
-          index += "[";
-          for (unsigned axis = 0; axis < *tensorRank; ++axis) {
-            if (axis)
-              index += ", ";
-            index += axis < static_cast<unsigned>(tensor.getRank()) ? ":"
-                                                                    : "None";
-          }
-          index += "]";
-        }
-        if (!advancedTensorAxesCovered) {
-          vectorAxis = tensor.getRank();
-          advancedTensorAxesCovered = true;
-        }
+        index = projectTensorIndex(*exact, tensor.getRank(), tensorIndices.rank,
+                                   *tensorGroupAxis, *tensorRank);
       } else {
         if (tensor.getRank() != 1 || vectorAxis >= *tensorRank)
           return operation.emitOpError(

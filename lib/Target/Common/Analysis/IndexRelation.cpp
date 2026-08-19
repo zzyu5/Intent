@@ -4,6 +4,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include <algorithm>
+
 using namespace mlir;
 
 namespace intent::target {
@@ -120,6 +122,23 @@ expandDomainSource(Value source, Operation &consumer) {
   if (failed(collectDomainSource(source, domains, &consumer)))
     return failure();
   return domains;
+}
+
+TensorIndexGroup tensorIndexGroup(Operation &operation,
+                                  ArrayRef<IndexTerm> relation) {
+  TensorIndexGroup group;
+  for (const IndexTerm &term : relation) {
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    auto tensor = dyn_cast<RankedTensorType>(
+        operation.getOperand(*term.operands.front()).getType());
+    if (!tensor)
+      continue;
+    ++group.count;
+    group.rank = std::max(group.rank, static_cast<unsigned>(tensor.getRank()));
+  }
+  return group;
 }
 
 FailureOr<llvm::SmallVector<IndexTerm>>

@@ -1,6 +1,7 @@
 #ifndef INTENT_TARGET_COMMON_ANALYSIS_INDEXRELATION_H
 #define INTENT_TARGET_COMMON_ANALYSIS_INDEXRELATION_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Operation.h"
 
@@ -25,8 +26,18 @@ struct ScalarIndexSource {
   bool hasDomain() const { return !domains.empty(); }
 };
 
+struct TensorIndexGroup {
+  unsigned count = 0;
+  unsigned rank = 0;
+
+  bool requiresBroadcastProjection() const { return count > 1 || rank > 1; }
+};
+
 mlir::FailureOr<llvm::SmallVector<IndexTerm>>
 parseIndexRelation(mlir::Operation &operation);
+
+TensorIndexGroup tensorIndexGroup(mlir::Operation &operation,
+                                  llvm::ArrayRef<IndexTerm> relation);
 
 mlir::FailureOr<ScalarIndexSource>
 traceScalarIndexSource(mlir::Value value, mlir::Operation &consumer);

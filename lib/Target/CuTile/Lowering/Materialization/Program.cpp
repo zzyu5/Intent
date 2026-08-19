@@ -16,6 +16,22 @@ bool workerReuse(const PhysicalProgramIndex &index) {
   });
 }
 
+std::string projectTensorIndex(StringRef value, unsigned valueRank,
+                               unsigned groupRank, unsigned groupAxis,
+                               unsigned resultRank) {
+  if (valueRank == resultRank && groupAxis == 0)
+    return value.str();
+  unsigned valueAxis = groupAxis + groupRank - valueRank;
+  std::string expression = value.str() + "[";
+  for (unsigned axis = 0; axis < resultRank; ++axis) {
+    if (axis)
+      expression += ", ";
+    expression += axis >= valueAxis && axis < groupAxis + groupRank ? ":"
+                                                                      : "None";
+  }
+  return expression + "]";
+}
+
 } // namespace
 
 FailureOr<PhysicalProgramIndex>
@@ -2124,15 +2140,10 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
       return operation.emitOpError("indirect cuTile gather has ")
              << relation->size() << " index terms for a "
              << (*view)->shape.size() << "-rank external view";
-    unsigned tensorIndexCount = llvm::count_if(
-        *relation, [&](const target::IndexTerm &term) {
-          return term.kind == "value_index" && term.operands.size() == 1 &&
-                 term.operands.front() &&
-                 isa<RankedTensorType>(
-                     operation.getOperand(*term.operands.front()).getType());
-        });
+    target::TensorIndexGroup tensorIndices =
+        target::tensorIndexGroup(operation, *relation);
     unsigned resultAxis = 0;
-    bool advancedTensorAxesCovered = false;
+    std::optional<unsigned> tensorGroupAxis;
     auto broadcast = [&](StringRef value, unsigned axis) {
       if (projectedTensor.getRank() == 1)
         return value.str();
@@ -2184,26 +2195,22 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
         if (term.kind != "value_index" || failed(exact))
           return operation.emitOpError(
               "cuTile indirect tensor index has no canonical value");
-        if (tensorIndexCount > 1 || tensor.getRank() > 1) {
-          if (tensor.getRank() > projectedTensor.getRank() ||
-              (resultAxis != 0 && !advancedTensorAxesCovered))
+        if (tensorIndices.requiresBroadcastProjection()) {
+          if (!tensorGroupAxis) {
+            if (resultAxis + tensorIndices.rank >
+                static_cast<unsigned>(projectedTensor.getRank()))
+              return operation.emitOpError(
+                  "cuTile broadcasted tensor index exceeds the result rank");
+            tensorGroupAxis = resultAxis;
+            resultAxis += tensorIndices.rank;
+          }
+          if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
             return operation.emitOpError(
                 "cuTile broadcasted tensor index exceeds the result rank");
-          std::string projected = exact->str();
-          if (tensor.getRank() < projectedTensor.getRank()) {
-            projected += "[";
-            for (int64_t axis = 0; axis < projectedTensor.getRank(); ++axis) {
-              if (axis)
-                projected += ", ";
-              projected += axis < tensor.getRank() ? ":" : "None";
-            }
-            projected += "]";
-          }
+          std::string projected = projectTensorIndex(
+              *exact, tensor.getRank(), tensorIndices.rank, *tensorGroupAxis,
+              projectedTensor.getRank());
           indices.push_back(addressIndex(projected));
-          if (!advancedTensorAxesCovered) {
-            resultAxis = tensor.getRank();
-            advancedTensorAxesCovered = true;
-          }
         } else {
           if (tensor.getRank() != 1 ||
               resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
