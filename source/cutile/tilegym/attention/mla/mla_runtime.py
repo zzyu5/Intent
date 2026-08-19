@@ -16,11 +16,11 @@ spec.loader.exec_module(source)
 def main():
     batch, q_heads, kv_heads, seqlen = 1, 128, 1, 2048
     head_dim, pe_dim = 128, 64
-    q = torch.randn(batch, q_heads, seqlen, head_dim, device="cuda", dtype=torch.bfloat16)
-    q_pe = torch.randn(batch, q_heads, seqlen, pe_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_heads, seqlen, head_dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(batch, q_heads, seqlen, head_dim, device="cuda", dtype=torch.float16)
+    q_pe = torch.randn(batch, q_heads, seqlen, pe_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(batch, kv_heads, seqlen, head_dim, device="cuda", dtype=torch.float16)
     v = torch.randn_like(k)
-    k_pe = torch.randn(batch, kv_heads, seqlen, pe_dim, device="cuda", dtype=torch.bfloat16)
+    k_pe = torch.randn(batch, kv_heads, seqlen, pe_dim, device="cuda", dtype=torch.float16)
 
     output = source.tile_mla(q, k, v, q_pe, k_pe, True, (head_dim + pe_dim) ** -0.5)
     torch.cuda.synchronize()

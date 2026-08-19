@@ -18,7 +18,7 @@ Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 | V1+V2 | dense attention backward | same source / backward callable | same contract, dQ/dK/dV | `python source/cutile/tilegym/attention/dense/attention_backward_runtime.py` |
 | V2 | grouped flash decode | `tilegym/attention/flash_decode/flash_decode.py` / `fmha_decode` | `B=8,QH=32,KVH=8,S=8192,D=128`, bf16 | `python source/cutile/tilegym/attention/flash_decode/flash_decode_runtime.py` |
 | V1+V2 | split-K attention reduce | `tilegym/attention/flash_decode/splitk_reduce.py` / `splitk_reduce` | `B=8,H=32,splits=16,D=128,S=8192` | `python source/cutile/tilegym/attention/flash_decode/splitk_reduce_runtime.py` |
-| V1+V2 | MLA prefill | `tilegym/attention/mla/mla.py` / `tile_mla` | `B=1,QH=128,KVH=1,S=2048,D=128,PE=64`, bf16 | `python source/cutile/tilegym/attention/mla/mla_runtime.py` |
+| V1+V2 | MLA prefill | `tilegym/attention/mla/mla.py` / `tile_mla` | `B=1,QH=128,KVH=1,S=2048,D=128,PE=64`, fp16 | `python source/cutile/tilegym/attention/mla/mla_runtime.py` |
 | V1+V2 | batched GEMM | `tilegym/gemm/batched/bmm.py` / `bmm` | `B=32,M=N=512,K=1024`, bf16 | `python source/cutile/tilegym/gemm/batched/bmm_runtime.py` |
 | V1+V2 | dense GEMM | `tilegym/gemm/dense/matmul.py` / `matmul` | `M=8192,N=11008,K=4096`, bf16 | `python source/cutile/tilegym/gemm/dense/matmul_runtime.py` |
 | V2 | grouped GEMM | `tilegym/gemm/grouped/group_gemm.py` / `group_gemm` | rows 256/512/1024/2048, `K=N=4096`, bf16 | `python source/cutile/tilegym/gemm/grouped/group_gemm_runtime.py` |

@@ -16,8 +16,8 @@ def main():
     sequence, page_size, splits = 8192, 16, 8
     pages_per_sequence = (sequence + page_size - 1) // page_size
     pages = batch * pages_per_sequence
-    q = torch.randn((batch, query_heads, head_dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((batch, query_heads, head_dim), device="cuda", dtype=torch.float16)
+    k = torch.randn((pages, page_size, kv_heads, head_dim), device="cuda", dtype=torch.float16)
     v = torch.randn_like(k)
     page_table = torch.arange(pages, device="cuda", dtype=torch.int32).view(batch, pages_per_sequence)
     lengths = torch.full((batch,), sequence, device="cuda", dtype=torch.int32)

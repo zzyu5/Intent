@@ -17,12 +17,12 @@ def main():
     page_size, splits = 16, 8
     pages_per_sequence = (sequence + page_size - 1) // page_size
     pages = batch * pages_per_sequence
-    q = torch.randn((batch, query_heads, key_dim), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((pages, page_size, kv_heads, key_dim), device="cuda", dtype=torch.bfloat16)
-    v = torch.randn((pages, page_size, kv_heads, latent_dim), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((batch, query_heads, key_dim), device="cuda", dtype=torch.float16)
+    k = torch.randn((pages, page_size, kv_heads, key_dim), device="cuda", dtype=torch.float16)
+    v = torch.randn((pages, page_size, kv_heads, latent_dim), device="cuda", dtype=torch.float16)
     page_table = torch.arange(pages, device="cuda", dtype=torch.int32).view(batch, pages_per_sequence)
     lengths = torch.full((batch,), sequence, device="cuda", dtype=torch.int32)
-    output = torch.empty((batch, query_heads, latent_dim), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty((batch, query_heads, latent_dim), device="cuda", dtype=torch.float16)
     lse = torch.empty((batch, query_heads), device="cuda", dtype=torch.float32)
     workspace = torch.empty((batch, query_heads, splits, latent_dim + 1), device="cuda", dtype=torch.float32)
 

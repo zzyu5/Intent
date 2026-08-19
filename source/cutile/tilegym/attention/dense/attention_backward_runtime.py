@@ -172,3 +172,52 @@ def upstream(arguments):
             "grad_v": torch.empty_like(v),
         }
     return _launch(STATE[key], q, k, v, output, grad_output, lse, scale, causal)
+
+
+def main():
+    batch, query_heads, kv_heads = 2, 8, 2
+    sequence, head_dimension = 1024, 64
+    scale = head_dimension**-0.5
+    q = torch.randn(
+        (batch, query_heads, sequence, head_dimension),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    k = torch.randn(
+        (batch, kv_heads, sequence, head_dimension),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v = torch.randn_like(k)
+    repeated_k = k.repeat_interleave(query_heads // kv_heads, dim=1)
+    repeated_v = v.repeat_interleave(query_heads // kv_heads, dim=1)
+    scores = torch.matmul(q.float(), repeated_k.float().transpose(-1, -2)) * scale
+    causal = torch.ones(
+        (sequence, sequence), device="cuda", dtype=torch.bool
+    ).tril()
+    scores.masked_fill_(~causal, -torch.inf)
+    lse = torch.logsumexp(scores, dim=-1)
+    output = torch.matmul(torch.softmax(scores, dim=-1), repeated_v.float()).half()
+    grad_output = torch.randn_like(output)
+    arguments = (q, k, v, output, grad_output, lse, scale, True)
+    gradients = upstream(arguments)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    gradients = upstream(arguments)
+    end.record()
+    torch.cuda.synchronize()
+    print(
+        f"B={batch} QH={query_heads} KVH={kv_heads} S={sequence} "
+        f"D={head_dimension} dtype={q.dtype} causal=True"
+    )
+    print(
+        f"gradient_shapes={[tuple(value.shape) for value in gradients]} "
+        f"finite={all(torch.isfinite(value).all().item() for value in gradients)}"
+    )
+    print(f"latency_ms={start.elapsed_time(end):.3f}")
+
+
+if __name__ == "__main__":
+    main()

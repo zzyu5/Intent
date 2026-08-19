@@ -17,8 +17,8 @@ def main():
     block_size = source.SPARSE_BLOCK_SIZE
     blocks_per_sequence = (sequence + block_size - 1) // block_size
     blocks = batch * blocks_per_sequence
-    q = torch.randn((batch, query_heads, head_dim), device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn((blocks, kv_heads, block_size, 2 * head_dim), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((batch, query_heads, head_dim), device="cuda", dtype=torch.float16)
+    kv = torch.randn((blocks, kv_heads, block_size, 2 * head_dim), device="cuda", dtype=torch.float16)
     block_table = torch.arange(blocks, device="cuda", dtype=torch.int32).view(batch, blocks_per_sequence)
     topk = torch.arange(selected_blocks, device="cuda", dtype=torch.int32)
     topk = topk.view(1, 1, selected_blocks).expand(kv_heads, batch, selected_blocks).contiguous()
