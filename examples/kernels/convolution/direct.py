@@ -17,6 +17,11 @@ CONV2D_HEIGHT = 256
 CONV2D_WIDTH = 256
 CONV2D_FILTER_HEIGHT = 3
 CONV2D_FILTER_WIDTH = 3
+CONV2D_NHWC_BATCH = 32
+CONV2D_NHWC_HEIGHT = 128
+CONV2D_NHWC_WIDTH = 128
+CONV2D_NHWC_INPUT_CHANNELS = 256
+CONV2D_NHWC_OUTPUT_CHANNELS = 512
 
 
 @intent.kernel
@@ -94,6 +99,42 @@ def causal_depthwise_conv1d(
 
 
 @intent.kernel
+def causal_depthwise_conv1d_bf16(
+    x: I.In[I.bf16, ("B", "D", "L")],
+    weight: I.In[I.f32, ("D", "W")],
+    bias: I.In[I.f32, ("D",)],
+    output: I.Out[I.bf16, ("B", "D", "L")],
+    SILU: I.Constexpr[bool],
+):
+    B, D, L = x.shape
+    W = weight.shape[1]
+    positions = I.domain(0, L)
+    taps = I.domain(0, W)
+    for batch in I.parallel(I.domain(0, B)):
+        for channel in I.parallel(I.domain(0, D)):
+            for output_region in I.parallel(
+                I.partition(positions, extent=I.auto("L_TILE"))
+            ):
+                output_index = I.indices(output_region)[:, None]
+                tap_index = I.indices(taps)[None, :]
+                input_index = output_index - (W - 1) + tap_index
+                patch = I.mask(
+                    x[batch, channel, input_index],
+                    valid=input_index >= 0,
+                    fill=I.cast(0.0, I.bf16),
+                )
+                reduced = I.reduce.sum(
+                    I.cast(patch, I.f32) * weight[channel, taps][None, :],
+                    axis=1,
+                    identity=0.0,
+                    acc_dtype=I.f32,
+                ) + bias[channel]
+                if SILU:
+                    reduced = reduced * I.sigmoid(reduced)
+                output[batch, channel, output_region] = I.cast(reduced, I.bf16)
+
+
+@intent.kernel
 def causal_depthwise_conv1d_update(
     x: I.In[I.f16, ("B", "D")],
     state: I.InOut[I.f16, ("B", "D", CAUSAL_CONV_WIDTH)],
@@ -125,6 +166,38 @@ def causal_depthwise_conv1d_update(
             if SILU:
                 accumulator = accumulator * I.sigmoid(accumulator)
             output[batch, channel_region] = I.cast(accumulator, I.f16)
+
+
+@intent.kernel
+def causal_depthwise_conv1d_update_bf16(
+    x: I.In[I.bf16, ("B", "D")],
+    state: I.InOut[I.bf16, ("B", "D", CAUSAL_CONV_WIDTH)],
+    weight: I.In[I.f32, ("D", CAUSAL_CONV_WIDTH)],
+    bias: I.In[I.f32, ("D",)],
+    output: I.Out[I.bf16, ("B", "D")],
+    SILU: I.Constexpr[bool],
+):
+    B, D = x.shape
+    channels = I.domain(0, D)
+    for batch in I.parallel(I.domain(0, B)):
+        for channel_region in I.parallel(
+            I.partition(channels, extent=I.auto("D_TILE"))
+        ):
+            accumulator = bias[channel_region]
+            for tap in range(CAUSAL_CONV_WIDTH - 1):
+                shifted = state[batch, channel_region, tap + 1]
+                state[batch, channel_region, tap] = shifted
+                accumulator = accumulator + I.cast(shifted, I.f32) * weight[
+                    channel_region, tap
+                ]
+            current = x[batch, channel_region]
+            state[batch, channel_region, CAUSAL_CONV_WIDTH - 1] = current
+            accumulator = accumulator + I.cast(current, I.f32) * weight[
+                channel_region, CAUSAL_CONV_WIDTH - 1
+            ]
+            if SILU:
+                accumulator = accumulator * I.sigmoid(accumulator)
+            output[batch, channel_region] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel
@@ -187,3 +260,57 @@ def conv2d_same(
                     reduced,
                     I.f16,
                 )
+
+
+@intent.kernel
+def conv2d_nhwc(
+    x: I.In[I.f16, ("B", "H", "W", "CI")],
+    weight: I.In[I.f16, (3, 3, "CI", "CO")],
+    output: I.Out[I.f16, ("B", "H", "W", "CO")],
+):
+    B, H, W, CI = x.shape
+    CO = weight.shape[3]
+    width = I.domain(0, W)
+    input_channels = I.domain(0, CI)
+    output_channels = I.domain(0, CO)
+    for batch in I.parallel(I.domain(0, B)):
+        for output_row in I.parallel(I.domain(0, H)):
+            for output_columns in I.parallel(
+                I.partition(width, extent=I.auto("W_TILE"))
+            ):
+                for output_channel_region in I.parallel(
+                    I.partition(output_channels, extent=I.auto("CO_TILE"))
+                ):
+                    accumulator = I.zeros(
+                        (output_columns, output_channel_region), dtype=I.f32
+                    )
+                    for kernel_row in range(3):
+                        input_row = output_row + kernel_row - 1
+                        for kernel_column in range(3):
+                            input_column = (
+                                I.indices(output_columns) + kernel_column - 1
+                            )
+                            patch = x[
+                                batch,
+                                input_row,
+                                input_column,
+                                input_channels,
+                            ]
+                            filter_values = weight[
+                                kernel_row,
+                                kernel_column,
+                                input_channels,
+                                output_channel_region,
+                            ]
+                            accumulator = accumulator + I.contract(
+                                patch,
+                                filter_values,
+                                reduce=((1, 0),),
+                                acc_dtype=I.f32,
+                            )
+                    output[
+                        batch,
+                        output_row,
+                        output_columns,
+                        output_channel_region,
+                    ] = I.cast(accumulator, I.f16)

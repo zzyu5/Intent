@@ -67,6 +67,31 @@ def online_attention_accumulate(
     return next_denominator, next_accumulator
 
 
+@intent.fn
+def online_attention_accumulate_bf16(
+    maximum,
+    next_maximum,
+    denominator,
+    accumulator,
+    scores,
+    value_block,
+):
+    alpha = I.exp2(maximum - next_maximum)
+    probability = I.exp2(scores - next_maximum[:, None])
+    next_denominator = alpha * denominator + I.reduce.sum(
+        probability,
+        axis=1,
+        identity=0.0,
+    )
+    next_accumulator = alpha[:, None] * accumulator + I.contract(
+        I.cast(probability, I.bf16),
+        value_block,
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    return next_denominator, next_accumulator
+
+
 @intent.kernel
 def flash_attention_fwd(
     q: I.In[I.f16, ("B", "H", "Q", "D")],
@@ -133,6 +158,150 @@ def flash_attention_fwd(
                 _, denominator, accumulator = stream.result
                 output[batch, head, q_region, :] = I.cast(
                     accumulator / denominator[:, None], I.f16
+                )
+
+
+@intent.kernel
+def flash_gqa_attention_fwd(
+    q: I.In[I.f16, ("B", "HQ", "Q", "D")],
+    k: I.In[I.f16, ("B", "HK", "K", "D")],
+    v: I.In[I.f16, ("B", "HK", "K", "DV")],
+    output: I.Out[I.f16, ("B", "HQ", "Q", "DV")],
+    scale: I.f32,
+    HEAD_GROUP: I.Constexpr[int],
+    CAUSAL: I.Constexpr[bool],
+):
+    B, HQ, Q, D = q.shape
+    K = k.shape[2]
+    DV = v.shape[3]
+    q_axis = I.domain(0, Q)
+    k_axis = I.domain(0, K)
+    for batch in I.parallel(I.domain(0, B)):
+        for query_head in I.parallel(I.domain(0, HQ)):
+            key_head = query_head // HEAD_GROUP
+            for q_region in I.parallel(
+                I.partition(q_axis, extent=I.auto("Q_TILE"))
+            ):
+                q_block = q[batch, query_head, q_region, :]
+                stream = I.state_stream(
+                    k_axis,
+                    extent=I.auto("K_TILE"),
+                    init=(
+                        I.full((q_region,), -I.inf, dtype=I.f32),
+                        I.zeros((q_region,), dtype=I.f32),
+                        I.zeros((q_region, DV), dtype=I.f32),
+                    ),
+                    stop=I.end(q_region) if CAUSAL else I.end(k_axis),
+                )
+                with stream:
+                    for k_region, (maximum, denominator, accumulator) in stream:
+                        scores = I.contract(
+                            q_block,
+                            k[batch, key_head, k_region, :],
+                            reduce=((1, 1),),
+                            acc_dtype=I.f32,
+                        ) * (scale * I.LOG2E)
+                        if CAUSAL:
+                            scores = I.mask(
+                                scores,
+                                valid=I.indices(q_region)[:, None]
+                                >= I.indices(k_region)[None, :],
+                                fill=-I.inf,
+                            )
+                        local_maximum = I.reduce.max(
+                            scores, axis=1, identity=-I.inf
+                        )
+                        next_maximum = I.maximum(maximum, local_maximum)
+                        next_denominator, next_accumulator = (
+                            online_attention_accumulate(
+                                maximum,
+                                next_maximum,
+                                denominator,
+                                accumulator,
+                                scores,
+                                v[batch, key_head, k_region, :],
+                            )
+                        )
+                        stream.yield_(
+                            next_maximum,
+                            next_denominator,
+                            next_accumulator,
+                        )
+                _, denominator, accumulator = stream.result
+                output[batch, query_head, q_region, :] = I.cast(
+                    accumulator / denominator[:, None], I.f16
+                )
+
+
+@intent.kernel
+def flash_attention_bf16_fwd(
+    q: I.In[I.bf16, ("B", "HQ", "Q", "D")],
+    k: I.In[I.bf16, ("B", "HK", "K", "D")],
+    v: I.In[I.bf16, ("B", "HK", "K", "DV")],
+    output: I.Out[I.bf16, ("B", "HQ", "Q", "DV")],
+    scale: I.f32,
+    HEAD_GROUP: I.Constexpr[int],
+    CAUSAL: I.Constexpr[bool],
+):
+    B, HQ, Q, D = q.shape
+    K = k.shape[2]
+    DV = v.shape[3]
+    q_axis = I.domain(0, Q)
+    k_axis = I.domain(0, K)
+    for batch in I.parallel(I.domain(0, B)):
+        for query_head in I.parallel(I.domain(0, HQ)):
+            key_head = query_head // HEAD_GROUP
+            for q_region in I.parallel(
+                I.partition(q_axis, extent=I.auto("Q_TILE"))
+            ):
+                q_block = q[batch, query_head, q_region, :]
+                stream = I.state_stream(
+                    k_axis,
+                    extent=I.auto("K_TILE"),
+                    init=(
+                        I.full((q_region,), -I.inf, dtype=I.f32),
+                        I.zeros((q_region,), dtype=I.f32),
+                        I.zeros((q_region, DV), dtype=I.f32),
+                    ),
+                    stop=I.end(q_region) if CAUSAL else I.end(k_axis),
+                )
+                with stream:
+                    for k_region, (maximum, denominator, accumulator) in stream:
+                        scores = I.contract(
+                            q_block,
+                            k[batch, key_head, k_region, :],
+                            reduce=((1, 1),),
+                            acc_dtype=I.f32,
+                        ) * (scale * I.LOG2E)
+                        if CAUSAL:
+                            scores = I.mask(
+                                scores,
+                                valid=I.indices(q_region)[:, None]
+                                >= I.indices(k_region)[None, :],
+                                fill=-I.inf,
+                            )
+                        local_maximum = I.reduce.max(
+                            scores, axis=1, identity=-I.inf
+                        )
+                        next_maximum = I.maximum(maximum, local_maximum)
+                        next_denominator, next_accumulator = (
+                            online_attention_accumulate_bf16(
+                                maximum,
+                                next_maximum,
+                                denominator,
+                                accumulator,
+                                scores,
+                                v[batch, key_head, k_region, :],
+                            )
+                        )
+                        stream.yield_(
+                            next_maximum,
+                            next_denominator,
+                            next_accumulator,
+                        )
+                _, denominator, accumulator = stream.result
+                output[batch, query_head, q_region, :] = I.cast(
+                    accumulator / denominator[:, None], I.bf16
                 )
 
 

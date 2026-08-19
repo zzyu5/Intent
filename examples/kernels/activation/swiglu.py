@@ -22,3 +22,23 @@ def swiglu_forward(
             gate_values * sigmoid * up_values,
             I.bf16,
         )
+
+
+@intent.kernel
+def silu_and_mul_packed(
+    packed: I.In[I.bf16, ("M", 2 * FEATURES)],
+    output: I.Out[I.bf16, ("M", FEATURES)],
+):
+    M = packed.shape[0]
+    columns = I.domain(0, FEATURES)
+    for row in I.parallel(I.domain(0, M)):
+        gate_values = I.cast(packed[row, columns], I.f32)
+        up_values = I.cast(
+            packed[row, I.indices(columns) + FEATURES],
+            I.f32,
+        )
+        sigmoid = 1.0 / (1.0 + I.exp(-gate_values))
+        output[row, columns] = I.cast(
+            gate_values * sigmoid * up_values,
+            I.bf16,
+        )

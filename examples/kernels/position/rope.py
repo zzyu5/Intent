@@ -144,3 +144,82 @@ def rotary_qk_partial_inplace(
             )
             key[batch, key_heads, token, phase] = rotated_key_first
             key[batch, key_heads, token, paired_phase] = rotated_key_second
+
+
+@intent.kernel
+def rotary_embedding_bf16(
+    values: I.In[I.bf16, ("B", "S", "H", HEAD_DIMENSION)],
+    cosine: I.In[I.f32, ("S", HALF_DIMENSION)],
+    sine: I.In[I.f32, ("S", HALF_DIMENSION)],
+    output: I.Out[I.bf16, ("B", "S", "H", HEAD_DIMENSION)],
+):
+    B, S, H, D = values.shape
+    halves = I.domain(0, HALF_DIMENSION)
+    for batch in I.parallel(I.domain(0, B)):
+        for token in I.parallel(I.domain(0, S)):
+            cos = cosine[token, halves]
+            sin = sine[token, halves]
+            for head in I.parallel(I.domain(0, H)):
+                first = I.cast(values[batch, token, head, halves], I.f32)
+                second = I.cast(
+                    values[batch, token, head, I.indices(halves) + HALF_DIMENSION],
+                    I.f32,
+                )
+                output[batch, token, head, halves] = I.cast(
+                    first * cos - second * sin,
+                    I.bf16,
+                )
+                output[
+                    batch,
+                    token,
+                    head,
+                    I.indices(halves) + HALF_DIMENSION,
+                ] = I.cast(second * cos + first * sin, I.bf16)
+
+
+@intent.kernel
+def rotary_qk_bf16_inplace(
+    query: I.InOut[
+        I.bf16,
+        ("B", ROPE_QUERY_HEADS, "S", HEAD_DIMENSION),
+    ],
+    key: I.InOut[
+        I.bf16,
+        ("B", ROPE_KEY_HEADS, "S", HEAD_DIMENSION),
+    ],
+    cosine: I.In[I.bf16, (1, "S", HEAD_DIMENSION)],
+    sine: I.In[I.bf16, (1, "S", HEAD_DIMENSION)],
+):
+    B, _, S, D = query.shape
+    query_heads = I.domain(0, ROPE_QUERY_HEADS)
+    key_heads = I.domain(0, ROPE_KEY_HEADS)
+    halves = I.domain(0, HALF_DIMENSION)
+    for batch in I.parallel(I.domain(0, B)):
+        for token in I.parallel(I.domain(0, S)):
+            cos = I.cast(cosine[0, token, halves], I.f32)
+            sin = I.cast(sine[0, token, halves], I.f32)
+            paired = I.indices(halves) + HALF_DIMENSION
+            query_first = I.cast(
+                query[batch, query_heads, token, halves], I.f32
+            )
+            query_second = I.cast(
+                query[batch, query_heads, token, paired], I.f32
+            )
+            query[batch, query_heads, token, halves] = I.cast(
+                query_first * cos - query_second * sin,
+                I.bf16,
+            )
+            query[batch, query_heads, token, paired] = I.cast(
+                query_second * cos + query_first * sin,
+                I.bf16,
+            )
+            key_first = I.cast(key[batch, key_heads, token, halves], I.f32)
+            key_second = I.cast(key[batch, key_heads, token, paired], I.f32)
+            key[batch, key_heads, token, halves] = I.cast(
+                key_first * cos - key_second * sin,
+                I.bf16,
+            )
+            key[batch, key_heads, token, paired] = I.cast(
+                key_second * cos + key_first * sin,
+                I.bf16,
+            )
