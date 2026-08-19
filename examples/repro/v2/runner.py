@@ -9,6 +9,8 @@ import torch
 import intent
 
 from .measurement import evaluate
+from .measurement import GeneratedCompilationError
+from .measurement import NumericalComparisonError
 from .model import Context
 from .model import ResultRow
 from .providers import load_cases
@@ -102,14 +104,14 @@ def main() -> None:
             rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "unsupported"))
             _write(arguments.output, rows)
             continue
-        except Exception as error:
+        except GeneratedCompilationError as error:
             print(f"{provider}:{entry.kernel}: compile_failed: {error}")
             rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "compile_failed"))
             _write(arguments.output, rows)
             continue
         try:
             generated_p50, source_p50 = evaluate(comparison)
-        except RuntimeError as error:
+        except NumericalComparisonError as error:
             print(f"{provider}:{entry.kernel}: numerical_failed: {error}")
             rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "numerical_failed"))
             _write(arguments.output, rows)
@@ -134,4 +136,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

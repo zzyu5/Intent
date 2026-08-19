@@ -15,6 +15,14 @@ from .model import TensorTree
 from .model import Tolerance
 
 
+class GeneratedCompilationError(RuntimeError):
+    pass
+
+
+class NumericalComparisonError(RuntimeError):
+    pass
+
+
 def compile_single(
     context: Context,
     definition,
@@ -22,15 +30,18 @@ def compile_single(
     *,
     constexprs: dict[str, object] | None = None,
 ) -> tuple[object, PreparedLaunch]:
-    artifact = intent.compile(
-        definition,
-        target=context.target,
-        compiler=context.compiler,
-        constexprs=constexprs,
-    )
-    result = artifact.run(*arguments)
-    launch_outputs = () if result is None else result
-    launch = prepare_kernel_call(artifact, arguments, launch_outputs)
+    try:
+        artifact = intent.compile(
+            definition,
+            target=context.target,
+            compiler=context.compiler,
+            constexprs=constexprs,
+        )
+        result = artifact.run(*arguments)
+        launch_outputs = () if result is None else result
+        launch = prepare_kernel_call(artifact, arguments, launch_outputs)
+    except Exception as error:
+        raise GeneratedCompilationError(str(error)) from error
     return artifact, PreparedLaunch(launch=launch, outputs=lambda: result)
 
 
@@ -77,14 +88,14 @@ def compare_outputs(
     generated_structure = _result_structure(generated)
     source_structure = _result_structure(source)
     if generated_structure != source_structure:
-        raise RuntimeError(
+        raise NumericalComparisonError(
             "generated/source result structure differs: "
             f"{generated_structure!r} != {source_structure!r}"
         )
     generated_values = tuple(_leaves(generated))
     source_values = tuple(_leaves(source))
     if len(generated_values) != len(source_values):
-        raise RuntimeError(
+        raise NumericalComparisonError(
             "generated/source result count differs: "
             f"{len(generated_values)} != {len(source_values)}"
         )
@@ -94,7 +105,7 @@ def compare_outputs(
         else tuple(tolerance for _ in generated_values)
     )
     if len(tolerances) != len(generated_values):
-        raise RuntimeError(
+        raise NumericalComparisonError(
             "tolerance count differs from result count: "
             f"{len(tolerances)} != {len(generated_values)}"
         )
@@ -103,18 +114,20 @@ def compare_outputs(
         generated_values, source_values, tolerances
     ):
         if generated_value.shape != source_value.shape:
-            raise RuntimeError(
+            raise NumericalComparisonError(
                 "generated/source result shape differs: "
                 f"{tuple(generated_value.shape)} != {tuple(source_value.shape)}"
             )
         if generated_value.dtype != source_value.dtype:
-            raise RuntimeError(
+            raise NumericalComparisonError(
                 "generated/source result dtype differs: "
                 f"{generated_value.dtype} != {source_value.dtype}"
             )
         if generated_value.dtype == torch.bool or not generated_value.is_floating_point():
             if not torch.equal(generated_value, source_value):
-                raise RuntimeError("generated/source integer result differs")
+                raise NumericalComparisonError(
+                    "generated/source integer result differs"
+                )
             errors.append(0.0)
             continue
         generated_compare = generated_value.float()
@@ -122,7 +135,9 @@ def compare_outputs(
         generated_finite = torch.isfinite(generated_compare)
         source_finite = torch.isfinite(source_compare)
         if not torch.equal(generated_finite, source_finite):
-            raise RuntimeError("generated/source finite-value masks differ")
+            raise NumericalComparisonError(
+                "generated/source finite-value masks differ"
+            )
         finite = generated_finite & source_finite
         nonfinite = ~finite
         if nonfinite.any():
@@ -142,7 +157,9 @@ def compare_outputs(
                     torch.isneginf(source_nonfinite),
                 )
             ):
-                raise RuntimeError("generated/source non-finite values differ")
+                raise NumericalComparisonError(
+                    "generated/source non-finite values differ"
+                )
         if finite.any():
             difference = (
                 generated_compare[finite] - source_compare[finite]
@@ -153,7 +170,7 @@ def compare_outputs(
             )
             maximum = difference.max().item()
             if torch.any(difference > limit):
-                raise RuntimeError(
+                raise NumericalComparisonError(
                     "generated/source floating result differs: "
                     f"max_abs={maximum}, atol={leaf_tolerance.atol}, "
                     f"rtol={leaf_tolerance.rtol}"
