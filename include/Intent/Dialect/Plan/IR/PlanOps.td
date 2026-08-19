@@ -3,6 +3,7 @@
 
 include "Intent/Dialect/Plan/IR/PlanDialect.td"
 include "mlir/IR/OpBase.td"
+include "mlir/IR/SymbolInterfaces.td"
 
 class IntentPlan_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentPlan_Dialect, mnemonic, traits>;
@@ -12,7 +13,9 @@ def IntentPlan_YieldOp : IntentPlan_Op<"yield", [Terminator]> {
   let results = (outs);
 }
 
-def IntentPlan_RealizationOp : IntentPlan_Op<"realization", [
+def IntentPlan_ProgramOp : IntentPlan_Op<"program", [
+    IsolatedFromAbove,
+    SymbolTable,
     SingleBlock,
     SingleBlockImplicitTerminator<"::intent::plan::YieldOp">
   ]> {
@@ -85,7 +88,7 @@ def IntentPlan_RegionBindingOp : IntentPlan_Op<"region_binding"> {
   let hasVerifier = 1;
 }
 
-def IntentPlan_ProgramOp : IntentPlan_Op<"program"> {
+def IntentPlan_LaunchOp : IntentPlan_Op<"launch"> {
   let arguments = (ins
     I64Attr:$loop_node,
     BoolAttr:$persistent

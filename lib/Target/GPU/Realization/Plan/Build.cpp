@@ -1270,7 +1270,7 @@ LogicalResult emitMachinePlan(ModuleOp module, const DeviceCapabilities &device,
         "requires matrix units unavailable on the selected GPU");
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToEnd(module.getBody());
-  auto realization = builder.create<intent::plan::RealizationOp>(
+  auto realization = builder.create<intent::plan::ProgramOp>(
       entry.getLoc(), FlatSymbolRefAttr::get(module.getContext(), entry.getName()),
       string(builder, "gpu"));
   Block &body = realization.getBody().emplaceBlock();
@@ -1305,7 +1305,9 @@ LogicalResult emitMachinePlan(ModuleOp module, const DeviceCapabilities &device,
   builder.setInsertionPointToEnd(&body);
   emitPaddings(builder, paddings);
   builder.create<intent::plan::YieldOp>(entry.getLoc());
-  if (failed(intent::plan::verifyGpuRealization(realization)))
+  entry->setAttr("intent.kind", string(builder, "physical"));
+  entry->moveBefore(body.getTerminator());
+  if (failed(intent::plan::verifyGpuProgram(realization)))
     return failure();
   return emitSearchSpace(module, facts, *decisions);
 }

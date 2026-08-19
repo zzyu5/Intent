@@ -99,7 +99,7 @@ struct RaggedRuntime {
 class SourceEmitter : public intent::target::TargetSourceEmitter {
 public:
   SourceEmitter(intent::target::KernelModel kernel,
-                intent::plan::RealizationOp realization,
+                intent::plan::ProgramOp realization,
                 intent::plan::SearchSpaceOp searchSpace,
                 RealizationIndex planIndex, SearchIndex searchIndex,
                 llvm::raw_ostream &output);
@@ -230,7 +230,7 @@ private:
   void line(llvm::StringRef text);
 
   intent::target::KernelModel kernel;
-  intent::plan::RealizationOp realization;
+  intent::plan::ProgramOp realization;
   intent::plan::SearchSpaceOp searchSpace;
   RealizationIndex planIndex;
   SearchIndex searchIndex;
@@ -303,7 +303,7 @@ registerEmissionHandlers(intent::target::OperationHandlerRegistry &registry,
                          SourceEmitter &emitter);
 
 mlir::FailureOr<RealizationIndex>
-indexRealization(intent::plan::RealizationOp realization,
+indexRealization(intent::plan::ProgramOp realization,
                  const intent::target::KernelModel &kernel);
 
 mlir::FailureOr<SearchIndex>
@@ -311,7 +311,7 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace);
 
 mlir::LogicalResult emitRealizedKernelSource(
     intent::target::KernelModel kernel,
-    intent::plan::RealizationOp realization,
+    intent::plan::ProgramOp realization,
     intent::plan::SearchSpaceOp searchSpace, llvm::raw_ostream &output);
 
 } // namespace intent::triton::emission

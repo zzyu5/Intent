@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 
@@ -16,7 +17,8 @@ mlir::LogicalResult verifyPaddingFields(mlir::Operation *operation,
                                         llvm::ArrayRef<int64_t> tensorAxes,
                                         llvm::ArrayRef<int64_t> domainNodes,
                                         llvm::StringRef fill);
-mlir::LogicalResult verifyGpuRealization(RealizationOp realization);
+mlir::FailureOr<mlir::func::FuncOp> getPhysicalEntry(ProgramOp program);
+mlir::LogicalResult verifyGpuProgram(ProgramOp program);
 mlir::LogicalResult verifyGpuSearchSpace(SearchSpaceOp searchSpace);
 
 } // namespace intent::plan

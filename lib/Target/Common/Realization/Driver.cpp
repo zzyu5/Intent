@@ -8,7 +8,7 @@ using namespace mlir;
 namespace intent::target {
 
 LogicalResult realizeTarget(ModuleOp module, TargetRealization realize) {
-  if (!module.getOps<plan::RealizationOp>().empty() ||
+  if (!module.getOps<plan::ProgramOp>().empty() ||
       !module.getOps<plan::SearchSpaceOp>().empty())
     return module.emitError("module already contains realization state");
   if (failed(verifyKernelModule(module)))

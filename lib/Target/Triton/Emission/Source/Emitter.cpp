@@ -83,7 +83,7 @@ std::string launchTile(StringRef tile) {
 } // namespace
 
 FailureOr<RealizationIndex>
-indexRealization(intent::plan::RealizationOp realization,
+indexRealization(intent::plan::ProgramOp realization,
                  const target::KernelModel &kernel) {
   RealizationIndex index;
   SmallVector<intent::plan::ReductionOp> reductions;
@@ -111,7 +111,7 @@ indexRealization(intent::plan::RealizationOp realization,
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getArgument()] = value;
-    } else if (auto value = dyn_cast<intent::plan::ProgramOp>(operation)) {
+    } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
       plan::BlockExtentOp binding;
@@ -290,7 +290,7 @@ indexSearchSpace(intent::plan::SearchSpaceOp searchSpace) {
 }
 
 SourceEmitter::SourceEmitter(target::KernelModel kernel,
-                             intent::plan::RealizationOp realization,
+                             intent::plan::ProgramOp realization,
                              intent::plan::SearchSpaceOp searchSpace,
                              RealizationIndex planIndex,
                              SearchIndex searchIndex, raw_ostream &output)
@@ -2448,7 +2448,7 @@ void SourceEmitter::line(StringRef text) {
 
 LogicalResult emitRealizedKernelSource(
     target::KernelModel kernel,
-    intent::plan::RealizationOp realization,
+    intent::plan::ProgramOp realization,
     intent::plan::SearchSpaceOp searchSpace, raw_ostream &output) {
   FailureOr<RealizationIndex> indexed = indexRealization(realization, kernel);
   FailureOr<SearchIndex> indexedSearch = indexSearchSpace(searchSpace);

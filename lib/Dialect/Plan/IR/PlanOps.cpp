@@ -41,18 +41,13 @@ LogicalResult verifyValidityBinding(Operation *operation, ArrayRef<int64_t> axes
   return success();
 }
 
-LogicalResult verifyEnvelope(Operation *operation, FlatSymbolRefAttr entry,
-                             StringRef target, Region &body) {
+LogicalResult verifyTopLevelEnvelope(Operation *operation, StringRef target,
+                                     Region &body) {
   if (target.empty())
     return operation->emitOpError("requires a non-empty target name");
   auto module = operation->getParentOfType<ModuleOp>();
   if (!module || operation->getParentOp() != module)
     return operation->emitOpError("must be nested directly in an MLIR module");
-  auto function = module.lookupSymbol<func::FuncOp>(entry.getValue());
-  auto kind = function ? function->getAttrOfType<StringAttr>("intent.kind")
-                       : StringAttr();
-  if (!function || !kind || kind.getValue() != "kernel")
-    return operation->emitOpError("entry must reference an Intent kernel function");
   if (!llvm::hasSingleElement(body))
     return operation->emitOpError("requires exactly one body block");
   return success();
@@ -86,12 +81,35 @@ bool axisHasRole(AxisOp axis, StringRef expected) {
 
 } // namespace
 
-LogicalResult RealizationOp::verify() {
-  return verifyEnvelope(*this, getEntryAttr(), getTarget(), getBody());
+LogicalResult ProgramOp::verify() {
+  if (failed(verifyTopLevelEnvelope(*this, getTarget(), getBody())))
+    return failure();
+  for (Operation &operation : getBody().front())
+    if (!isa<YieldOp, func::FuncOp>(operation) &&
+        operation.getName().getDialectNamespace() != "intent_plan")
+      return operation.emitOpError("is not legal inside a physical program");
+  FailureOr<func::FuncOp> entry = getPhysicalEntry(*this);
+  if (failed(entry))
+    return failure();
+  if ((*entry).getName() != getEntry())
+    return emitOpError("physical entry name does not match the program entry");
+  auto kind = (*entry)->getAttrOfType<StringAttr>("intent.kind");
+  if (!kind || kind.getValue() != "physical")
+    return emitOpError("must own one physical Intent function");
+  return success();
 }
 
 LogicalResult SearchSpaceOp::verify() {
-  return verifyEnvelope(*this, getEntryAttr(), getTarget(), getBody());
+  if (failed(verifyTopLevelEnvelope(*this, getTarget(), getBody())))
+    return failure();
+  auto module = getOperation()->getParentOfType<ModuleOp>();
+  unsigned matches = 0;
+  for (ProgramOp program : module.getOps<ProgramOp>())
+    matches += program.getEntry() == getEntry() &&
+               program.getTarget() == getTarget();
+  if (matches != 1)
+    return emitOpError("must reference exactly one physical program");
+  return success();
 }
 
 LogicalResult DeviceOp::verify() {
@@ -177,7 +195,7 @@ LogicalResult RegionBindingOp::verify() {
   return success();
 }
 
-LogicalResult ProgramOp::verify() {
+LogicalResult LaunchOp::verify() {
   return requireNode(*this, getLoopNode());
 }
 
@@ -423,12 +441,27 @@ LogicalResult AutotuneOp::verify() {
   return success();
 }
 
-LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
+FailureOr<func::FuncOp> intent::plan::getPhysicalEntry(ProgramOp program) {
+  func::FuncOp entry;
+  for (Operation &operation : program.getBody().front()) {
+    auto function = dyn_cast<func::FuncOp>(operation);
+    if (!function)
+      continue;
+    if (entry)
+      return program.emitOpError("owns more than one physical function");
+    entry = function;
+  }
+  if (!entry)
+    return program.emitOpError("does not own a physical function");
+  return entry;
+}
+
+LogicalResult intent::plan::verifyGpuProgram(ProgramOp realization) {
   if (realization.getTarget() != "gpu")
-    return realization.emitOpError("is not a GPU machine realization");
+    return realization.emitOpError("is not a GPU physical program");
   unsigned devices = 0;
-  unsigned programs = 0;
-  ProgramOp program;
+  unsigned launches = 0;
+  LaunchOp launch;
   llvm::StringSet<> blockExtents;
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::StringSet<> rangeKeys;
@@ -452,9 +485,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   llvm::StringSet<> stageAxisRoles;
   SmallVector<StageAxisOp> stageAxes;
   for (Operation &operation : realization.getBody().front()) {
-    if (isa<YieldOp>(operation) ||
-        operation.getName().getDialectNamespace() != "intent_plan")
+    if (isa<YieldOp, func::FuncOp>(operation))
       continue;
+    if (operation.getName().getDialectNamespace() != "intent_plan")
+      return operation.emitOpError("is not legal inside a GPU physical program");
     if (isa<DeviceOp>(operation))
       ++devices;
     else if (auto axis = dyn_cast<AxisOp>(operation)) {
@@ -478,9 +512,9 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
         return binding.emitOpError(
             "duplicates a region-argument physical binding");
       regionBindings.push_back(binding);
-    } else if (auto choice = dyn_cast<ProgramOp>(operation)) {
-      ++programs;
-      program = choice;
+    } else if (auto choice = dyn_cast<LaunchOp>(operation)) {
+      ++launches;
+      launch = choice;
     } else if (auto extent = dyn_cast<BlockExtentOp>(operation)) {
       if (!blockExtents.insert(extent.getLogicalExtent()).second)
         return extent.emitOpError("duplicates a logical block-extent decision");
@@ -546,10 +580,10 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
     } else
       return operation.emitOpError("is not legal inside a GPU realization");
   }
-  if (devices != 1 || programs != 1)
-    return realization.emitOpError("requires one GPU device and one program mapping");
+  if (devices != 1 || launches != 1)
+    return realization.emitOpError("requires one GPU device and one launch mapping");
   if (programOrders.empty())
-    return program.emitOpError("has no per-axis program-space assignment");
+    return launch.emitOpError("has no per-axis program-space assignment");
   for (RangeOp range : ranges) {
     auto axis = axes.find(range.getAxisNode());
     if (axis == axes.end())
@@ -612,7 +646,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   for (BufferOp buffer : bufferBindings) {
     if (buffer.getSpace() != "private_workspace")
       continue;
-    if (program.getPersistent())
+    if (launch.getPersistent())
       return buffer.emitOpError(
           "owner-private workspace cannot outlive a persistent program mapping");
     if (!stageNodes.empty())
@@ -626,7 +660,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
   for (ScanOp scan : scans) {
     auto axis = axes.find(scan.getAxisNode());
     bool workspaceScan = scan.getResultSpace() == "private_workspace";
-    if (workspaceScan && program.getPersistent())
+    if (workspaceScan && launch.getPersistent())
       return scan.emitOpError(
           "scan workspace cannot outlive a persistent program mapping");
     if (workspaceScan && !stageNodes.empty())
@@ -671,7 +705,7 @@ LogicalResult intent::plan::verifyGpuRealization(RealizationOp realization) {
       return range.emitOpError(
           "nested ordered traversal requires one scalar level after level zero");
   }
-  if (program.getPersistent())
+  if (launch.getPersistent())
     for (const auto &entry : axes) {
       AxisOp axis = entry.second;
       if (!axisHasRole(axis, "parallel"))

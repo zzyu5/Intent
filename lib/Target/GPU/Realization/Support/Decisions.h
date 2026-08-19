@@ -7,7 +7,7 @@
 namespace intent::gpu::realization {
 
 struct PhysicalDecisions {
-  intent::plan::ProgramOp program;
+  intent::plan::LaunchOp program;
   llvm::SmallVector<intent::plan::BlockExtentOp> blockExtents;
   llvm::SmallVector<intent::plan::AxisOp> axes;
   llvm::SmallVector<intent::plan::RangeOp> ranges;

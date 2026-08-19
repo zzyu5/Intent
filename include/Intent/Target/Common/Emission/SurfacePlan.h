@@ -504,7 +504,7 @@ accessRangesForTransfer(const PlanIndex &index, int64_t transferNode) {
   return result;
 }
 
-struct ProgramBinding : Binding<intent::plan::ProgramOp> {
+struct ProgramBinding : Binding<intent::plan::LaunchOp> {
   int64_t getLoopNode() const { return operation.getLoopNode(); }
   bool getPersistent() const { return operation.getPersistent(); }
   mlir::IntegerAttr getLoopNodeAttr() const {

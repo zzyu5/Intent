@@ -80,6 +80,7 @@ mlir::FailureOr<KernelABI> analyzeKernelABI(mlir::func::FuncOp entry);
 mlir::FailureOr<RegionStructure>
 analyzeRegionStructure(mlir::func::FuncOp entry);
 
+mlir::FailureOr<KernelModel> analyzeKernel(mlir::func::FuncOp entry);
 mlir::FailureOr<KernelModel> analyzeKernel(mlir::ModuleOp module);
 
 } // namespace intent::target

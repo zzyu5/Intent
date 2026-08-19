@@ -119,24 +119,13 @@ FailureOr<RegionStructure> analyzeRegionStructure(func::FuncOp entry) {
   return structure;
 }
 
-FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
-  SmallVector<func::FuncOp> entries;
-  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-    auto kind = function->getAttrOfType<StringAttr>("intent.kind");
-    if (kind && kind.getValue() == "kernel")
-      entries.push_back(function);
-  }
-  if (entries.size() != 1) {
-    module.emitError("target lowering requires exactly one Intent kernel entry");
-    return failure();
-  }
-
-  FailureOr<KernelABI> abi = analyzeKernelABI(entries.front());
-  FailureOr<RegionStructure> regions = analyzeRegionStructure(entries.front());
+FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
+  FailureOr<KernelABI> abi = analyzeKernelABI(entry);
+  FailureOr<RegionStructure> regions = analyzeRegionStructure(entry);
   if (failed(abi) || failed(regions))
     return failure();
 
-  KernelModel model{entries.front(),
+  KernelModel model{entry,
                     std::move(*abi),
                     std::move(*regions),
                     llvm::DenseMap<int64_t, Operation *>(),
@@ -312,6 +301,20 @@ FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
     }
   }
   return model;
+}
+
+FailureOr<KernelModel> analyzeKernel(ModuleOp module) {
+  SmallVector<func::FuncOp> entries;
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    auto kind = function->getAttrOfType<StringAttr>("intent.kind");
+    if (kind && kind.getValue() == "kernel")
+      entries.push_back(function);
+  }
+  if (entries.size() != 1) {
+    module.emitError("target lowering requires exactly one Intent kernel entry");
+    return failure();
+  }
+  return analyzeKernel(entries.front());
 }
 
 } // namespace intent::target

@@ -999,7 +999,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
   FailureOr<int64_t> rootNode = node(**root, "program mapping");
   if (failed(rootNode))
     return failure();
-  decisions.program = builder.create<intent::plan::ProgramOp>(
+  decisions.program = builder.create<intent::plan::LaunchOp>(
       (*root)->getLoc(), i64(builder, *rootNode),
       builder.getBoolAttr(assignments->persistent));
 

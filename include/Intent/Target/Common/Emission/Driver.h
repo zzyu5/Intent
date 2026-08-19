@@ -11,7 +11,7 @@
 namespace intent::target {
 
 using KernelSourceEmission = mlir::LogicalResult (*)(
-    KernelModel, intent::plan::RealizationOp, intent::plan::SearchSpaceOp,
+    KernelModel, intent::plan::ProgramOp, intent::plan::SearchSpaceOp,
     llvm::raw_ostream &);
 
 struct EmissionTarget {
