@@ -123,7 +123,7 @@ V1 中的 `variant_*` 只证明同一算法的等价 DSL 分解可以编译，�
 | V2 | Gemma prefill | `B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16` | `streaming/attention_specialized.py:gemma_gqa_prefill` |
 | V2 | mHC Sinkhorn | `T8192-streams4-fp32` | `routing/mhc.py:mhc_sinkhorn` |
 | V2 | absorbed MLA decode | `B8-H64-S8192-C512-R64-fp16` | `streaming/mla.py:absorbed_mla_decode` |
-| V2 | split-K MLA decode | `B8-H64-S8192-C512-R64-split512-fp16` | `streaming/mla.py:splitk_mla_decode_partials+streaming/splitk_reduce.py:splitk_attention_reduce` |
+| V2 | split-K MLA decode | `B8-H64-S8192-C512-R64-split512-fp16` | `streaming/mla.py:splitk_mla_decode_partials+streaming/splitk_reduce.py:splitk_attention_reduce_f16` |
 | V1+V2 | sparse MLA prefill | `S2048-SKV4096-H64-topk512-D128-R64-bf16` | `streaming/mla.py:token_sparse_mla_value_prefill` |
 | V2 | sliding-window attention | `B2-S4096-QH32-KVH8-D128-window1024-fp16` | `streaming/attention_specialized.py:sliding_window_gqa_prefill` |
 | V1+V2 | RMSNorm | `8192x4096-bf16` | `normalization/rms_norm.py:rms_norm_bf16` |

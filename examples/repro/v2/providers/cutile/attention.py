@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import cuda.tile as ct
 import torch
 
 from kernels.backward.attention import attention_backward_delta
@@ -13,9 +14,10 @@ from kernels.streaming.attention_specialized import attention_sink_prefill
 from kernels.streaming.attention_specialized import gemma_gqa_prefill
 from kernels.streaming.attention_specialized import sliding_window_gqa_prefill
 from kernels.streaming.mla import absorbed_mla_decode
-from kernels.streaming.mla import splitk_mla_decode_partials_bf16
+from kernels.streaming.mla import splitk_mla_decode_partials
 from kernels.streaming.mla import token_sparse_mla_value_prefill
 from kernels.streaming.splitk_reduce import splitk_attention_reduce
+from kernels.streaming.splitk_reduce import splitk_attention_reduce_f16
 
 from ...measurement import compile_single
 from ...measurement import functional_launch
@@ -485,14 +487,14 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
     scale = 1.0 / math.sqrt(latent + rope)
     _, partials = compile_single(
         context,
-        splitk_mla_decode_partials_bf16,
+        splitk_mla_decode_partials,
         (query, query_rope, cache, cache_rope, split_offsets, scale),
         constexprs={"SPLITS": splits},
     )
     partial_lse, partial_output = partials.outputs()
     _, reduction = compile_single(
         context,
-        splitk_attention_reduce,
+        splitk_attention_reduce_f16,
         (partial_output, partial_lse),
     )
 
@@ -508,15 +510,51 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
         needs_utils=True,
         needs_splitk=True,
     )
-    source = functional_launch(
-        lambda: source_module.mla_decoding_split_kv(
-            query,
-            query_rope,
-            cache,
-            cache_rope,
-            scale,
-            split_size,
+    source_partial_output = torch.empty(
+        (batch, heads, splits, latent), device="cuda", dtype=torch.float16
+    )
+    source_partial_lse = torch.empty(
+        (batch, heads, splits), device="cuda", dtype=torch.float32
+    )
+    source_output = torch.empty_like(query)
+
+    def source_launch():
+        ct.launch(
+            torch.cuda.current_stream(),
+            ((heads + 15) // 16, batch, splits),
+            source_module._naive_absorb_mla_transpose_kernel,
+            (
+                query,
+                query_rope,
+                cache,
+                cache,
+                cache_rope,
+                source_partial_output,
+                source_partial_lse,
+                scale,
+                batch,
+                heads,
+                sequence,
+                splits,
+                split_size,
+                latent,
+                16,
+                128,
+                rope,
+                True,
+            ),
         )
+        source_module.splitk_reduce(
+            source_partial_output,
+            source_partial_lse,
+            source_output,
+            sequence,
+        )
+
+    source_launch()
+    source = PreparedLaunch(
+        source_launch,
+        lambda: source_output,
     )
     return PreparedComparison(
         generated,

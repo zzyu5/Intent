@@ -607,86 +607,8 @@ def splitk_mla_decode_partials(
     latent_cache: I.In[I.f16, ("B", "K", "C")],
     rope_cache: I.In[I.f16, ("B", "K", "DR")],
     split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
-    partial_lse: I.Out[I.f32, ("B", "H", "SP")],
-    partial_output: I.Out[I.f32, ("B", "H", "SP", "C")],
-    scale: I.f32,
-    SPLITS: I.Constexpr[int],
-):
-    B, H, C = q_latent.shape
-    K = latent_cache.shape[1]
-    DR = q_rope.shape[2]
-    split_keys = I.ragged(
-        outer=I.domain(0, SPLITS),
-        members=I.domain(0, K),
-        offsets=split_offsets,
-    )
-    for batch in I.parallel(I.domain(0, B)):
-        for head in I.parallel(I.domain(0, H)):
-            query = I.reshape(q_latent[batch, head, :], (1, C))
-            query_position = I.reshape(q_rope[batch, head, :], (1, DR))
-            for split in I.parallel(split_keys.outer):
-                stream = I.state_stream(
-                    split_keys[split],
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((1,), -I.inf, dtype=I.f32),
-                        I.zeros((1,), dtype=I.f32),
-                        I.zeros((1, C), dtype=I.f32),
-                    ),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        latent = latent_cache[batch, key_region, :]
-                        scores = (
-                            I.contract(
-                                query,
-                                latent,
-                                reduce=((1, 1),),
-                                acc_dtype=I.f32,
-                            )
-                            + I.contract(
-                                query_position,
-                                rope_cache[batch, key_region, :],
-                                reduce=((1, 1),),
-                                acc_dtype=I.f32,
-                            )
-                        ) * (scale * I.LOG2E)
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            latent,
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                maximum, denominator, accumulator = stream.result
-                partial_lse[batch, head, split] = maximum[0] + I.log(
-                    denominator[0]
-                ) * I.LOG2E
-                partial_output[batch, head, split, :] = I.reshape(
-                    accumulator / denominator[:, None],
-                    (C,),
-                )
-
-
-@intent.kernel
-def splitk_mla_decode_partials_bf16(
-    q_latent: I.In[I.f16, ("B", "H", "C")],
-    q_rope: I.In[I.f16, ("B", "H", "DR")],
-    latent_cache: I.In[I.f16, ("B", "K", "C")],
-    rope_cache: I.In[I.f16, ("B", "K", "DR")],
-    split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
-    partial_lse: I.Out[I.f32, ("B", "H", "SP")],
-    partial_output: I.Out[I.bf16, ("B", "H", "SP", "C")],
+    partial_lse: I.Out[I.f32, ("B", "H", "SPLITS")],
+    partial_output: I.Out[I.f16, ("B", "H", "SPLITS", "C")],
     scale: I.f32,
     SPLITS: I.Constexpr[int],
 ):
@@ -755,5 +677,5 @@ def splitk_mla_decode_partials_bf16(
                         accumulator / denominator[:, None],
                         (C,),
                     ),
-                    I.bf16,
+                    I.f16,
                 )

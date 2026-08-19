@@ -401,6 +401,7 @@ LogicalResult SourceEmitter::registerOperationHandlers(
 }
 
 LogicalResult SourceEmitter::indexABI() {
+  SmallVector<StringRef> requiredDimensions;
   views.reserve(kernel.abi.arguments.size());
   for (const target::ABIArgument &argument : kernel.abi.arguments) {
     auto view = dyn_cast<intent::ViewType>(argument.type);
@@ -434,7 +435,10 @@ LogicalResult SourceEmitter::indexABI() {
         uint64_t staticExtent = 0;
         if (!symbol.getValue().getAsInteger(10, staticExtent))
           continue;
-        if (!dimensionOwners.count(symbol.getValue())) {
+        if (!llvm::is_contained(requiredDimensions, symbol.getValue()))
+          requiredDimensions.push_back(symbol.getValue());
+        if (view.getAccess() != "out" &&
+            !dimensionOwners.count(symbol.getValue())) {
           dimensionOwners[symbol.getValue()] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
           dimensionOrder.push_back(symbol.getValue().str());
@@ -452,6 +456,12 @@ LogicalResult SourceEmitter::indexABI() {
   }
   if (views.empty())
     return kernel.entry.emitOpError("cuTile emitter requires external views");
+  for (StringRef dimension : requiredDimensions) {
+    if (!dimensionOwners.count(dimension))
+      return kernel.entry.emitOpError()
+             << "dynamic output dimension " << dimension
+             << " has no input or inout ABI owner";
+  }
   return success();
 }
 
