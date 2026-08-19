@@ -51,11 +51,12 @@ def mamba_chunk_scan_fwd(
     rows = I.domain(0, S)
     columns = I.domain(0, P)
     state_axis = I.domain(0, N)
-    scan_axis = I.domain(0, S)
     for batch in I.parallel(I.domain(0, B)):
         for chunk in I.parallel(I.domain(0, C)):
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEADS_PER_GROUP
+                I.assume_in_bounds(group, state_matrix, axis=2)
+                I.assume_in_bounds(group, cb, axis=2)
                 for row_region in I.parallel(
                     I.partition(rows, extent=I.auto("M_TILE"))
                 ):
@@ -83,7 +84,7 @@ def mamba_chunk_scan_fwd(
                             * I.LOG2E
                         )
                         scan = I.state_stream(
-                            scan_axis,
+                            rows,
                             extent=I.auto("K_TILE"),
                             init=(state_term,),
                             stop=I.end(row_region),
@@ -93,7 +94,7 @@ def mamba_chunk_scan_fwd(
                                 scan_index = I.indices(scan_region)
                                 global_scan = chunk * S + scan_index
                                 decay = I.exp2(
-                                    (
+                                    I.minimum(
                                         I.cast(
                                             dA_cumsum[
                                                 batch, head, chunk, row_region
@@ -105,7 +106,8 @@ def mamba_chunk_scan_fwd(
                                                 batch, head, chunk, scan_region
                                             ],
                                             I.f32,
-                                        )[None, :]
+                                        )[None, :],
+                                        0.0,
                                     )
                                     * I.LOG2E
                                 )
@@ -188,11 +190,12 @@ def mamba_chunk_scan_bf16_fwd(
     rows = I.domain(0, S)
     columns = I.domain(0, P)
     state_axis = I.domain(0, N)
-    scan_axis = I.domain(0, S)
     for batch in I.parallel(I.domain(0, B)):
         for chunk in I.parallel(I.domain(0, C)):
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEADS_PER_GROUP
+                I.assume_in_bounds(group, state_matrix, axis=2)
+                I.assume_in_bounds(group, cb, axis=2)
                 for row_region in I.parallel(
                     I.partition(rows, extent=I.auto("M_TILE"))
                 ):
@@ -220,7 +223,7 @@ def mamba_chunk_scan_bf16_fwd(
                             * I.LOG2E
                         )
                         scan = I.state_stream(
-                            scan_axis,
+                            rows,
                             extent=I.auto("K_TILE"),
                             init=(state_term,),
                             stop=I.end(row_region),
@@ -230,13 +233,14 @@ def mamba_chunk_scan_bf16_fwd(
                                 scan_index = I.indices(scan_region)
                                 global_scan = chunk * S + scan_index
                                 decay = I.exp2(
-                                    (
+                                    I.minimum(
                                         dA_cumsum[
                                             batch, head, chunk, row_region
                                         ][:, None]
                                         - dA_cumsum[
                                             batch, head, chunk, scan_region
-                                        ][None, :]
+                                        ][None, :],
+                                        0.0,
                                     )
                                     * I.LOG2E
                                 )

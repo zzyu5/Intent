@@ -29,6 +29,7 @@ from .builtins import domain
 from .builtins import end
 from .builtins import exp
 from .builtins import exp2
+from .builtins import floor
 from .builtins import full
 from .builtins import gather
 from .builtins import indices
@@ -124,6 +125,7 @@ __all__ = [
     "f16",
     "f32",
     "f64",
+    "floor",
     "full",
     "gather",
     "i4",

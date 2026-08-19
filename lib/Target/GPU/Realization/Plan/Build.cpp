@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Analysis/ContractReplay.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "Support/Decisions.h"
@@ -701,6 +702,80 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     };
     return reachesContraction(value);
   };
+
+  struct ContractReplayDecision {
+    target::ContractOperandReplay lhs;
+    target::ContractOperandReplay rhs;
+  };
+  llvm::DenseMap<Operation *, ContractReplayDecision> contractReplays;
+  llvm::DenseMap<Operation *, Operation *> replayTransferOwners;
+  auto hasExactlyOneReplayReduction = [&](Operation &contract) -> bool {
+    auto found = facts.contractions.find(&contract);
+    if (found == facts.contractions.end() ||
+        found->second.lhsReductionAxes.size() != 1 ||
+        found->second.rhsReductionAxes.size() != 1)
+      return false;
+    unsigned lhsAxis = found->second.lhsReductionAxes.front();
+    unsigned rhsAxis = found->second.rhsReductionAxes.front();
+    if (lhsAxis >= found->second.lhsAxes.size() ||
+        rhsAxis >= found->second.rhsAxes.size())
+      return false;
+    Operation *lhsDomain = found->second.lhsAxes[lhsAxis].domain;
+    Operation *rhsDomain = found->second.rhsAxes[rhsAxis].domain;
+    if (!lhsDomain || lhsDomain != rhsDomain)
+      return false;
+    for (Operation *parent = contract.getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (parent->getName().getStringRef() != "intent.state_stream" ||
+          parent->getNumOperands() == 0)
+        continue;
+      FailureOr<SmallVector<Operation *>> streamDomains =
+          target::expandDomainSource(parent->getOperand(0), *parent);
+      if (succeeded(streamDomains) &&
+          llvm::is_contained(*streamDomains, lhsDomain))
+        return false;
+    }
+    auto node = lhsDomain->getAttrOfType<IntegerAttr>("intent.node");
+    if (!node)
+      return false;
+    return llvm::count_if(decisions.axes, [&](intent::plan::AxisOp axis) {
+             return static_cast<int64_t>(axis.getNode()) == node.getInt() &&
+                    llvm::any_of(axis.getRoles(), [](Attribute role) {
+                      auto name = dyn_cast<StringAttr>(role);
+                      return name && name.getValue() == "reduction";
+                    });
+           }) == 1;
+  };
+  WalkResult replayWalk = facts.kernel.entry.walk([&](Operation *operation) {
+    if (operation->getName().getStringRef() != "intent.contract" ||
+        operation->getNumOperands() != 2 || isStagedContract(*operation))
+      return WalkResult::advance();
+    std::optional<target::ContractOperandReplay> lhs =
+        target::analyzeContractOperandReplay(operation->getOperand(0), *operation);
+    std::optional<target::ContractOperandReplay> rhs =
+        target::analyzeContractOperandReplay(operation->getOperand(1), *operation);
+    if (!lhs || !rhs ||
+        (isDirectViewLoad(operation->getOperand(0)) &&
+         isDirectViewLoad(operation->getOperand(1))) ||
+        !hasExactlyOneReplayReduction(*operation))
+      return WalkResult::advance();
+    for (Operation *transfer : llvm::concat<Operation *>(lhs->transfers,
+                                                        rhs->transfers)) {
+      auto existing = replayTransferOwners.find(transfer);
+      if (existing != replayTransferOwners.end() &&
+          existing->second != operation) {
+        transfer->emitOpError(
+            "cannot defer one transfer to multiple contractions");
+        return WalkResult::interrupt();
+      }
+      replayTransferOwners[transfer] = operation;
+    }
+    contractReplays[operation] =
+        ContractReplayDecision{std::move(*lhs), std::move(*rhs)};
+    return WalkResult::advance();
+  });
+  if (replayWalk.wasInterrupted())
+    return failure();
   auto sharedContractOperand =
       [isStagedContract, isDirectViewLoad,
        isContractionDerived](Value operand, Operation &contract) {
@@ -717,7 +792,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
 
   auto bindTransfer = [&, sharedContractOperand, isStagedContract,
                        isDirectViewLoad,
-                       hasExactlyOneSharedPhysicalReductionAxis](
+                       hasExactlyOneSharedPhysicalReductionAxis,
+                       replayTransferOwners](
                           Operation &operation) -> LogicalResult {
     FailureOr<int64_t> node = target::getNodeID(operation, "transfer binding");
     if (failed(node))
@@ -731,18 +807,20 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         load && operation.getNumResults() == 1 &&
         llvm::any_of(operation.getResult(0).getUsers(), [](Operation *user) {
           StringRef name = user->getName().getStringRef();
-          return name == "intent.contract" || name == "intent.scaled_contract" ||
+                 return name == "intent.contract" || name == "intent.scaled_contract" ||
                  name == "intent.sparse_contract";
         });
+    bool replayOperand = replayTransferOwners.contains(&operation);
     Operation *soleUser = nullptr;
     if (contractOperand &&
         llvm::hasSingleElement(operation.getResult(0).getUsers()))
       soleUser = *operation.getResult(0).user_begin();
-    bool sharedOperand = soleUser &&
-                         (soleUser->getName().getStringRef() ==
-                              "intent.sparse_contract" ||
-                          sharedContractOperand(operation.getResult(0),
-                                                *soleUser));
+    bool sharedOperand = replayOperand ||
+                         (soleUser &&
+                          (soleUser->getName().getStringRef() ==
+                               "intent.sparse_contract" ||
+                           sharedContractOperand(operation.getResult(0),
+                                                 *soleUser)));
     SmallVector<int64_t> domains;
     for (Operation *domain : facts.boundaryDomains.lookup(&operation)) {
       FailureOr<int64_t> domainNode =
@@ -792,7 +870,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       auto found = facts.boundaryFills.find(&operation);
       if (found != facts.boundaryFills.end())
         fill = found->second;
-      else if (contractOperand)
+      else if (contractOperand || replayOperand)
         fill = "zero";
       else if (domains.empty())
         fill = "none";
@@ -807,7 +885,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                               ? StringRef("private_fragment")
                               : StringRef("private_scalar");
     }
-    bool deferToContract = false;
+    bool deferToContract = replayOperand;
     if (load && sharedOperand && soleUser) {
       StringRef consumer = soleUser->getName().getStringRef();
       if (consumer == "intent.sparse_contract" || isStagedContract(*soleUser)) {
@@ -1049,7 +1127,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       return failure();
 
   auto bindContraction = [&, sharedContractOperand,
-                          isStagedContract](Operation &operation) -> LogicalResult {
+                          isStagedContract,
+                          contractReplays](Operation &operation) -> LogicalResult {
             FailureOr<int64_t> node =
                 target::getNodeID(operation, "contract binding");
             if (failed(node))
@@ -1072,7 +1151,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                     operation.getOperand(1),
                     contraction->second.rhsReductionAxes, "zero", operation)))
               return failure();
+            bool replayed = contractReplays.contains(&operation);
             auto operandSpace = [&](Value operand) -> StringRef {
+              if (replayed)
+                return "shared";
               return sharedContractOperand(operand, operation)
                          ? StringRef("shared")
                          : StringRef("private_fragment");

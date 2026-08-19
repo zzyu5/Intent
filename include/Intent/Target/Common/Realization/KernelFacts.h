@@ -105,6 +105,7 @@ struct KernelFacts {
       staticDomainBounds;
   llvm::DenseSet<mlir::Operation *> runtimeSequentialDomains;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
+  llvm::DenseMap<mlir::Operation *, int64_t> partitionFixedExtents;
   llvm::SmallVector<mlir::Operation *> parallels;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       parallelDomains;

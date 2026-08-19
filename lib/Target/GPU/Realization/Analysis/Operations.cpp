@@ -240,6 +240,7 @@ LogicalResult validatePointwise(Operation &operation) {
   if (name == "intent.unary" &&
       llvm::is_contained({StringRef("exp"), StringRef("exp2"),
                           StringRef("log"), StringRef("sin"), StringRef("cos"),
+                          StringRef("floor"),
                           StringRef("rsqrt"),
                           StringRef("sigmoid"), StringRef("negate"),
                           StringRef("not")},

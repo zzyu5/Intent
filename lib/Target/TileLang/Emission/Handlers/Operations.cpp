@@ -1100,7 +1100,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     bindResult(operation, 0, (*view)->argument->name);
     return success();
   }
-  if (boundary.getDefer()) {
+  if (boundary.getDefer() && !activeDeferredContract) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
@@ -2186,6 +2186,18 @@ LogicalResult SourceEmitter::replayScanProducers(const plan::ScanOp &binding,
     }
   }
   restore();
+  return success();
+}
+
+LogicalResult SourceEmitter::replayContractProducers(
+    ArrayRef<Operation *> producers) {
+  if (!activeDeferredContract || !operationRegistry())
+    return failure();
+  for (Operation *producer : producers)
+    if (!producer || failed(operationRegistry()->dispatch(
+                         *producer,
+                         "TileLang deferred contraction producer replay")))
+      return failure();
   return success();
 }
 
@@ -3545,6 +3557,87 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
     }
     --indentation;
     bindResult(operation, 0, result);
+    return success();
+  }
+
+  auto replay = deferredContractReplays.find(&operation);
+  if (replay != deferredContractReplays.end()) {
+    if (binding.getLhsSpace() != "shared" ||
+        binding.getRhsSpace() != "shared" ||
+        binding.getAccumulatorSpace() != "fragment")
+      return operation.emitOpError(
+          "producer replay has inconsistent TileLang plan spaces");
+    FailureOr<plan::AxisOp> reductionAxis =
+        target::emission::exactContractionReductionAxis(planIndex, kernel,
+                                                        operation);
+    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+    if (failed(reductionAxis) || failed(result))
+      return failure();
+    bool streamReduction = target::emission::isEnclosingStreamReductionAxis(
+        planIndex, operation, reductionAxis->getNode());
+    line("T.clear(" + *result + ")");
+    if (!streamReduction) {
+      line("for k_tile in T.Pipelined(T.ceildiv(" +
+           roleDimensions.lookup(reductionAxis->getRole()) + ", " +
+           reductionAxis->getTile().str() +
+           "), num_stages=num_stages):");
+      ++indentation;
+      axisIndices[reductionAxis->getNode()] =
+          addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
+    } else if (axisIndices.lookup(reductionAxis->getNode()).empty()) {
+      return operation.emitOpError(
+          "has no active TileLang stream-bound reduction range");
+    }
+    llvm::DenseMap<Value, std::optional<std::string>> savedValues;
+    auto saveValues = [&](ArrayRef<Operation *> producers) {
+      for (Operation *producer : producers)
+        for (Value value : producer->getResults())
+          if (!savedValues.count(value)) {
+            auto found = valueNames.find(value);
+            savedValues[value] =
+                found == valueNames.end()
+                    ? std::nullopt
+                    : std::optional<std::string>(found->second);
+          }
+    };
+    saveValues(replay->second.lhsReplayProducers);
+    saveValues(replay->second.rhsReplayProducers);
+    auto restoreValues = [&]() {
+      for (const auto &entry : savedValues)
+        if (entry.second)
+          valueNames[entry.first] = *entry.second;
+        else
+          valueNames.erase(entry.first);
+    };
+    activeDeferredContract = &operation;
+    LogicalResult lhsReplay =
+        replayContractProducers(replay->second.lhsReplayProducers);
+    LogicalResult rhsReplay = succeeded(lhsReplay)
+                                  ? replayContractProducers(
+                                        replay->second.rhsReplayProducers)
+                                  : failure();
+    activeDeferredContract = nullptr;
+    if (failed(lhsReplay) || failed(rhsReplay)) {
+      restoreValues();
+      return failure();
+    }
+    FailureOr<StringRef> lhs = lookupValue(operation, 0);
+    FailureOr<StringRef> rhs = lookupValue(operation, 1);
+    if (failed(lhs) || failed(rhs)) {
+      restoreValues();
+      return failure();
+    }
+    std::string call =
+        "T.gemm(" + lhs->str() + ", " + rhs->str() + ", " + *result;
+    if (orientation->lhsTranspose)
+      call += ", transpose_A=True";
+    if (orientation->rhsTranspose)
+      call += ", transpose_B=True";
+    line(call + ", policy=GEMM_WARP_POLICY)");
+    restoreValues();
+    if (!streamReduction)
+      --indentation;
+    bindResult(operation, 0, *result);
     return success();
   }
 

@@ -343,6 +343,10 @@ LogicalResult SourceEmitter::prepare() {
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
+  if (failed(target::emission::indexDeferredContractReplays(
+          kernel, planIndex, deferredContractReplays,
+          deferredContractProducerOwners)))
+    return failure();
   for (const auto &entry : planIndex.scans)
     if (failed(target::emission::verifyScanMaterializedValues(kernel,
                                                               entry.second)))
@@ -717,6 +721,11 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto contractProducer = deferredContractProducerOwners.find(&operation);
+  if (contractProducer != deferredContractProducerOwners.end())
+    return activeDeferredContract &&
+           llvm::is_contained(contractProducer->second,
+                              activeDeferredContract);
   auto scanProducer = scanProducerOwners.find(&operation);
   if (scanProducer != scanProducerOwners.end())
     return activeScanReplay == scanProducer->second;
@@ -2050,7 +2059,8 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
                             ? addressIndex(exact->str() + "[0]")
                             : addressIndex(assumed->second));
     } else if (term.kind == "value_index" ||
-               target::emission::isSequentialIterator(indexed)) {
+               target::emission::isSequentialIterator(indexed) ||
+               (term.kind == "region_index" && isa<BlockArgument>(indexed))) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -2194,7 +2204,8 @@ SourceEmitter::elementAccessIndices(Operation &operation,
         ++tileAxis;
       }
     } else if (term.kind == "value_index" ||
-               target::emission::isSequentialIterator(indexed)) {
+               target::emission::isSequentialIterator(indexed) ||
+               (term.kind == "region_index" && isa<BlockArgument>(indexed))) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))

@@ -38,15 +38,19 @@ def mamba_chunk_state_fwd(
         for chunk in I.parallel(I.domain(0, C)):
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEAD_GROUP
+                I.assume_in_bounds(group, state_basis, axis=2)
                 for dimension_region in I.parallel(
                     I.partition(dimensions, extent=I.auto("M_TILE"))
                 ):
                     for state_region in I.parallel(
                         I.partition(state_axis, extent=I.auto("N_TILE"))
                     ):
-                        positions = chunk * S + I.indices(chunk_axis)
+                        last_position = S - 1
+                        I.assume_in_bounds(
+                            last_position, cumulative_decay, axis=3
+                        )
                         last_decay = I.cast(
-                            cumulative_decay[batch, head, chunk, S - 1], I.f32
+                            cumulative_decay[batch, head, chunk, last_position], I.f32
                         )
                         scale = I.exp(
                             I.minimum(
@@ -59,10 +63,21 @@ def mamba_chunk_state_fwd(
                             )
                         ) * I.cast(dt[batch, head, chunk, chunk_axis], I.f32)
                         lhs = I.cast(
-                            x[batch, positions, head, dimension_region], I.f16
+                            x[
+                                batch,
+                                chunk * S + I.indices(chunk_axis),
+                                head,
+                                dimension_region,
+                            ],
+                            I.f16,
                         )
                         rhs = I.cast(
-                            state_basis[batch, positions, group, state_region]
+                            state_basis[
+                                batch,
+                                chunk * S + I.indices(chunk_axis),
+                                group,
+                                state_region,
+                            ]
                             * I.cast(scale[:, None], I.f16),
                             I.f16,
                         )
@@ -97,14 +112,20 @@ def mamba_chunk_state_bf16_fwd(
         for chunk in I.parallel(I.domain(0, C)):
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEAD_GROUP
+                I.assume_in_bounds(group, state_basis, axis=2)
                 for dimension_region in I.parallel(
                     I.partition(dimensions, extent=I.auto("M_TILE"))
                 ):
                     for state_region in I.parallel(
                         I.partition(state_axis, extent=I.auto("N_TILE"))
                     ):
-                        positions = chunk * S + I.indices(chunk_axis)
-                        last_decay = cumulative_decay[batch, head, chunk, S - 1]
+                        last_position = S - 1
+                        I.assume_in_bounds(
+                            last_position, cumulative_decay, axis=3
+                        )
+                        last_decay = cumulative_decay[
+                            batch, head, chunk, last_position
+                        ]
                         scale = I.exp(
                             I.minimum(
                                 last_decay
@@ -112,11 +133,19 @@ def mamba_chunk_state_bf16_fwd(
                                 0.0,
                             )
                         ) * dt[batch, head, chunk, chunk_axis]
-                        lhs = x[batch, positions, head, dimension_region]
+                        lhs = x[
+                            batch,
+                            chunk * S + I.indices(chunk_axis),
+                            head,
+                            dimension_region,
+                        ]
                         rhs = I.cast(
                             I.cast(
                                 state_basis[
-                                    batch, positions, group, state_region
+                                    batch,
+                                    chunk * S + I.indices(chunk_axis),
+                                    group,
+                                    state_region,
                                 ],
                                 I.f32,
                             )
@@ -246,15 +275,8 @@ def mamba3_siso_step(
                     angle_delta
                     + input_angle_state[batch, head, angle_region]
                 )
-                angle = I.mask(
-                    angle + 6.283185307179586,
-                    valid=angle < 0.0,
-                    fill=angle,
-                )
-                angle = I.mask(
-                    angle - 6.283185307179586,
-                    valid=angle >= 6.283185307179586,
-                    fill=angle,
+                angle = angle - 6.283185307179586 * I.floor(
+                    angle / 6.283185307179586
                 )
                 output_angle_state[batch, head, angle_region] = angle
                 cosine = I.cos(angle)

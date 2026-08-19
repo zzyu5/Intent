@@ -1634,13 +1634,17 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 operation.getAttrOfType<DictionaryAttr>("intent.extent");
             auto name = extent ? extent.getAs<StringAttr>("name") : StringAttr();
             bool namedAuto = name && !name.getValue().empty();
-            bool fixedExtent = operation.getNumOperands() == 2 &&
-                               integerConstant(operation.getOperand(1));
+            std::optional<int64_t> fixedExtent =
+                operation.getNumOperands() == 2
+                    ? integerConstant(operation.getOperand(1))
+                    : std::nullopt;
             if (!mode || mode.getValue() != "extent" ||
                 (!namedAuto && !fixedExtent))
               return operation.emitOpError(
                   "tiled partitions require a named auto or fixed extent");
             facts.partitionDomains[&operation] = domain;
+            if (fixedExtent)
+              facts.partitionFixedExtents[&operation] = *fixedExtent;
             return success();
           })))
     return failure();

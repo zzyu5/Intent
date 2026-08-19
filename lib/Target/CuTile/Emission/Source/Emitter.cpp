@@ -331,6 +331,10 @@ LogicalResult SourceEmitter::prepare() {
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
+  if (failed(target::emission::indexDeferredContractReplays(
+          kernel, planIndex, deferredContractReplays,
+          deferredContractProducerOwners)))
+    return failure();
   for (const auto &entry : planIndex.scans)
     if (failed(target::emission::verifyScanMaterializedValues(kernel,
                                                               entry.second)))
@@ -707,6 +711,11 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto contractProducer = deferredContractProducerOwners.find(&operation);
+  if (contractProducer != deferredContractProducerOwners.end())
+    return activeDeferredContract &&
+           llvm::is_contained(contractProducer->second,
+                              activeDeferredContract);
   auto scanProducer = scanProducerOwners.find(&operation);
   if (scanProducer != scanProducerOwners.end())
     return activeScanReplay == scanProducer->second;
@@ -2339,7 +2348,8 @@ FailureOr<std::string> SourceEmitter::indexTuple(Operation &operation,
     if ((term.kind == "value_index" &&
          !isa<RankedTensorType>(indexed.getType())) ||
         (term.kind == "region_index" &&
-         target::emission::isSequentialIterator(indexed))) {
+         (target::emission::isSequentialIterator(indexed) ||
+          isa<BlockArgument>(indexed)))) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))

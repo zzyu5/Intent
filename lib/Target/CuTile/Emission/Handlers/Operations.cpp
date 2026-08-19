@@ -1183,7 +1183,7 @@ LogicalResult SourceEmitter::emitLoad(Operation &operation) {
     bindResult(operation, 0, (*view)->argument->name);
     return success();
   }
-  if (boundary.getDefer()) {
+  if (boundary.getDefer() && !activeDeferredContract) {
     deferredLoads[operation.getResult(0)] = &operation;
     return success();
   }
@@ -1822,6 +1822,18 @@ LogicalResult SourceEmitter::replayScanProducers(const plan::ScanOp &binding,
     }
   }
   restore();
+  return success();
+}
+
+LogicalResult SourceEmitter::replayContractProducers(
+    ArrayRef<Operation *> producers) {
+  if (!activeDeferredContract || !operationRegistry())
+    return failure();
+  for (Operation *producer : producers)
+    if (!producer || failed(operationRegistry()->dispatch(
+                         *producer,
+                         "cuTile deferred contraction producer replay")))
+      return failure();
   return success();
 }
 
@@ -2664,6 +2676,90 @@ LogicalResult SourceEmitter::emitContract(Operation &operation) {
       line(rhs + " = " + rhs + ".astype(ct.tfloat32)");
     line(result + " = ct.mma(" + lhs + ", " + rhs + ", " + result + ")");
     --indentation;
+    bindResult(operation, 0, result);
+    return success();
+  }
+  auto replay = deferredContractReplays.find(&operation);
+  if (replay != deferredContractReplays.end()) {
+    if (orientation->batched)
+      return operation.emitOpError(
+          "deferred producer replay does not support batch contraction");
+    FailureOr<plan::AxisOp> reductionAxis =
+        target::emission::exactContractionReductionAxis(planIndex, kernel,
+                                                        operation);
+    FailureOr<std::string> resultShape = emitTensorShape(operation, 0);
+    if (failed(reductionAxis) || failed(resultShape))
+      return failure();
+    bool streamReduction = target::emission::isEnclosingStreamReductionAxis(
+        planIndex, operation, reductionAxis->getNode());
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.full(" + *resultShape + ", 0, dtype=" +
+         accumulatorDtype + ")");
+    if (!streamReduction) {
+      std::string reductionExtent =
+          roleDimensions.lookup(reductionAxis->getRole());
+      if (reductionExtent.empty())
+        return reductionAxis->emitOpError(
+            "has no cuTile physical reduction extent binding");
+      line("num_tiles_k = ct.cdiv(" + reductionExtent + ", " +
+           reductionAxis->getTile().str() + ")");
+      line("for k_tile in range(num_tiles_k):");
+      ++indentation;
+      axisIndices[reductionAxis->getNode()] = "k_tile";
+    } else if (axisIndices.lookup(reductionAxis->getNode()).empty()) {
+      return operation.emitOpError(
+          "has no active cuTile stream-bound reduction range");
+    }
+    llvm::DenseMap<Value, std::optional<std::string>> savedValues;
+    auto saveValues = [&](ArrayRef<Operation *> producers) {
+      for (Operation *producer : producers)
+        for (Value value : producer->getResults())
+          if (!savedValues.count(value)) {
+            auto found = valueNames.find(value);
+            savedValues[value] =
+                found == valueNames.end()
+                    ? std::nullopt
+                    : std::optional<std::string>(found->second);
+          }
+    };
+    saveValues(replay->second.lhsReplayProducers);
+    saveValues(replay->second.rhsReplayProducers);
+    auto restoreValues = [&]() {
+      for (const auto &entry : savedValues)
+        if (entry.second)
+          valueNames[entry.first] = *entry.second;
+        else
+          valueNames.erase(entry.first);
+    };
+    activeDeferredContract = &operation;
+    LogicalResult lhsReplay =
+        replayContractProducers(replay->second.lhsReplayProducers);
+    LogicalResult rhsReplay = succeeded(lhsReplay)
+                                  ? replayContractProducers(
+                                        replay->second.rhsReplayProducers)
+                                  : failure();
+    activeDeferredContract = nullptr;
+    if (failed(lhsReplay) || failed(rhsReplay)) {
+      restoreValues();
+      return failure();
+    }
+    FailureOr<StringRef> lhs = lookupValue(operation, 0);
+    FailureOr<StringRef> rhs = lookupValue(operation, 1);
+    if (failed(lhs) || failed(rhs)) {
+      restoreValues();
+      return failure();
+    }
+    std::string lhsExpression = lhs->str();
+    std::string rhsExpression = rhs->str();
+    if (orientation->lhsTranspose)
+      lhsExpression = "ct.transpose(" + lhsExpression + ")";
+    if (orientation->rhsTranspose)
+      rhsExpression = "ct.transpose(" + rhsExpression + ")";
+    line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression +
+         ", " + result + ")");
+    restoreValues();
+    if (!streamReduction)
+      --indentation;
     bindResult(operation, 0, result);
     return success();
   }

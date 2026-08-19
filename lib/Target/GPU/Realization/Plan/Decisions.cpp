@@ -204,6 +204,7 @@ struct AxisChoice {
   SmallVector<Operation *> parallels;
   SmallVector<std::string> roles;
   bool tiled = false;
+  std::optional<int64_t> fixedOwnershipExtent;
   bool packedLane = false;
   SmallVector<RangeChoice> ranges;
   std::optional<int64_t> programOrder;
@@ -412,11 +413,22 @@ assignAxes(const target::KernelFacts &facts) {
       AxisChoice &choice = ensure(domain);
       if (!llvm::is_contained(choice.parallels, parallel))
         choice.parallels.push_back(parallel);
+      bool tiled = domains->size() == 1 &&
+                   facts.partitionDomains.count(source) != 0;
+      auto fixed = facts.partitionFixedExtents.find(source);
+      if (tiled && fixed != facts.partitionFixedExtents.end()) {
+        if (choice.fixedOwnershipExtent &&
+            *choice.fixedOwnershipExtent != fixed->second) {
+          parallel->emitOpError(
+              "maps one logical axis to conflicting fixed partition extents");
+          return failure();
+        }
+        choice.fixedOwnershipExtent = fixed->second;
+      }
       if (choice.programOrder)
         continue;
       choice.programOrder = programOrder++;
-      choice.tiled = domains->size() == 1 &&
-                     facts.partitionDomains.count(source) != 0;
+      choice.tiled = tiled;
       appendRole(choice.roles, "parallel");
     }
   }
@@ -579,6 +591,8 @@ assignAxes(const target::KernelFacts &facts) {
       std::string tile;
       if (!choice.tiled) {
         tile = choice.packedLane ? packedTile : "one";
+      } else if (choice.fixedOwnershipExtent) {
+        tile = "fixed_" + std::to_string(*choice.fixedOwnershipExtent);
       } else if (ownsOrderedStream(choice, facts)) {
         tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {

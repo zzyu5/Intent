@@ -161,6 +161,8 @@ private:
   mlir::LogicalResult emitConditional(mlir::Operation &operation, bool mask);
   mlir::LogicalResult replayScanProducers(const plan::ScanOp &binding,
                                           llvm::StringRef logicalIndex);
+  mlir::LogicalResult replayContractProducers(
+      llvm::ArrayRef<mlir::Operation *> producers);
   mlir::FailureOr<std::string>
   scanWorkspaceIndex(const plan::ScanOp &binding,
                      llvm::StringRef logicalIndex,
@@ -260,6 +262,11 @@ private:
   llvm::DenseMap<mlir::Value, std::string> valueNames;
   llvm::DenseMap<mlir::Value, std::string> assumedIndexNames;
   llvm::DenseMap<mlir::Value, mlir::Operation *> deferredLoads;
+  llvm::DenseMap<mlir::Operation *, target::emission::DeferredContractReplay>
+      deferredContractReplays;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
+      deferredContractProducerOwners;
+  mlir::Operation *activeDeferredContract = nullptr;
   llvm::StringSet<> usedNames;
   llvm::StringMap<std::string> dimensionOwners;
   llvm::StringMap<std::string> roleDimensions;

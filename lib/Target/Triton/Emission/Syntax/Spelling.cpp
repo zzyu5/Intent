@@ -13,8 +13,10 @@ std::optional<std::string> blockParameter(StringRef role) {
     return "BLOCK_SIZE_L";
   if (role.starts_with("lane_pack_"))
     return "BLOCK_SIZE_L" + role.drop_front(10).str();
-  if (role == "program_m" || role == "ragged_member")
+  if (role == "program_m")
     return "BLOCK_SIZE_M";
+  if (role == "ragged_member")
+    return "BLOCK_SIZE_R";
   if (role.starts_with("ragged_member_"))
     return "BLOCK_SIZE_R" + role.drop_front(14).str();
   if (role == "program_n" || role == "feature")
@@ -97,6 +99,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role) {
     return StringRef("tl.sin");
   if (role == "unary_cos")
     return StringRef("tl.cos");
+  if (role == "unary_floor")
+    return StringRef("tl.floor");
   if (role == "unary_rsqrt")
     return StringRef("tl.rsqrt");
   if (role == "unary_sigmoid")

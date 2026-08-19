@@ -99,6 +99,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role,
     return StringRef("ct.sin");
   if (role == "unary_cos")
     return StringRef("ct.cos");
+  if (role == "unary_floor")
+    return StringRef("ct.floor");
   if (role == "unary_rsqrt")
     return StringRef("ct.rsqrt");
   if (role == "unary_sigmoid")

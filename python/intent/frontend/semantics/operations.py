@@ -122,6 +122,7 @@ class UnaryOperator(Enum):
     LOG = "log"
     SIN = "sin"
     COS = "cos"
+    FLOOR = "floor"
     RSQRT = "rsqrt"
     SIGMOID = "sigmoid"
 

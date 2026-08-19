@@ -73,6 +73,13 @@ combinerExpression(Operation &operation, ArrayRef<std::string> operands) {
       });
 }
 
+std::string launchTile(StringRef tile) {
+  int64_t fixed = 0;
+  if (!tile.getAsInteger(10, fixed))
+    return tile.str();
+  return "META['" + tile.str() + "']";
+}
+
 } // namespace
 
 FailureOr<RealizationIndex>
@@ -330,6 +337,10 @@ LogicalResult SourceEmitter::prepare() {
   }
   if (failed(target::emission::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
+    return failure();
+  if (failed(target::emission::indexDeferredContractReplays(
+          kernel, planIndex, deferredContractReplays,
+          deferredContractProducerOwners)))
     return failure();
   for (const auto &entry : planIndex.scans)
     if (failed(target::emission::verifyScanMaterializedValues(kernel,
@@ -695,6 +706,11 @@ LogicalResult SourceEmitter::prepareRaggedStages() {
 }
 
 bool SourceEmitter::selectOperation(Operation &operation) {
+  auto contractProducer = deferredContractProducerOwners.find(&operation);
+  if (contractProducer != deferredContractProducerOwners.end())
+    return activeDeferredContract &&
+           llvm::is_contained(contractProducer->second,
+                              activeDeferredContract);
   auto scanProducer = scanProducerOwners.find(&operation);
   if (scanProducer != scanProducerOwners.end())
     return activeScanReplay == scanProducer->second;
@@ -1265,16 +1281,16 @@ LogicalResult SourceEmitter::emitWrapper() {
       std::string memberTile = stageMemberTiles.lookup(stage);
       output << "    grid_stage_" << stage
              << " = lambda META: (triton.cdiv(" << feature
-             << ", META['" << featureTile << "']), ";
+             << ", " << launchTile(featureTile) << "), ";
       if (compact)
-        output << "sum(triton.cdiv(length, META['" << memberTile
-               << "']) for length "
+        output << "sum(triton.cdiv(length, " << launchTile(memberTile)
+               << ") for length "
                   "in route_lengths_"
                << suffix << ")";
       else
         output << experts
                << " * triton.cdiv(max_routes_" << suffix
-               << ", META['" << memberTile << "'])";
+               << ", " << launchTile(memberTile) << ")";
       output << ", 1)\n";
       output << "    compiled_stage_" << stage << " = " << kernelName
              << "_stage_" << stage << "[grid_stage_" << stage << "](";
@@ -1634,8 +1650,8 @@ LogicalResult SourceEmitter::emitWrapper() {
                 : roleDimensions.lookup(role);
         return axis.isScalar()
                    ? extent
-                   : "triton.cdiv(" + extent + ", META['" +
-                         axis.getTile().str() + "'])";
+                   : "triton.cdiv(" + extent + ", " +
+                         launchTile(axis.getTile()) + ")";
       });
   if (planIndex.program.getPersistent()) {
     std::string total = target::emission::projectProgramVolume(
@@ -1645,8 +1661,8 @@ LogicalResult SourceEmitter::emitWrapper() {
           std::string extent = roleDimensions.lookup(role);
           return axis.isScalar()
                      ? extent
-                     : "triton.cdiv(" + extent + ", META['" +
-                           axis.getTile().str() + "'])";
+                     : "triton.cdiv(" + extent + ", " +
+                           launchTile(axis.getTile()) + ")";
         });
     output << "    grid = lambda META: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count, "
            << total << "), 1, 1)\n";
@@ -1998,6 +2014,17 @@ SourceEmitter::emitPointerExpression(Operation &operation, ABIView &view,
             index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
           }
         }
+      } else if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+        if (failed(exact) || failed(axis))
+          return failure();
+        if (axis->isScalar()) {
+          index = "(" + exact->str() + ")";
+        } else {
+          index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+        }
       } else if (target::emission::isSequentialIterator(indexed)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
@@ -2195,7 +2222,17 @@ SourceEmitter::emitMaskExpression(Operation &operation, bool store) {
     if (failed(extent))
       return failure();
     FailureOr<std::string> index =
-        indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
+        term.kind == "region_index" && isa<BlockArgument>(indexed)
+            ? [&]() -> FailureOr<std::string> {
+                FailureOr<StringRef> exact =
+                    lookupValue(operation, *term.operands.front());
+                if (failed(exact))
+                  return failure();
+                return axis->isScalar()
+                           ? exact->str()
+                           : broadcastIndex(*exact, vectorAxis, *tensorRank);
+              }()
+            : indexExpression(*axis, store, vectorAxis, *tensorRank, operation);
     if (failed(index))
       return failure();
     ++vectorAxis;

@@ -2,6 +2,7 @@
 #define INTENT_TARGET_COMMON_EMISSION_SURFACEPLAN_H
 
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Analysis/ContractReplay.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
@@ -1122,6 +1123,240 @@ bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
          isPlannedStageNode(index, operation);
 }
 
+inline mlir::FailureOr<llvm::SmallVector<int64_t>>
+exactContractionReductionArguments(const target::KernelModel &kernel,
+                                   mlir::Operation &consumer) {
+  auto reduce = consumer.getAttrOfType<mlir::ArrayAttr>("intent.reduce");
+  auto pair = reduce && reduce.size() == 1
+                  ? mlir::dyn_cast<mlir::ArrayAttr>(reduce[0])
+                  : mlir::ArrayAttr();
+  auto lhsAxis = pair && pair.size() == 2
+                     ? mlir::dyn_cast<mlir::IntegerAttr>(pair[0])
+                     : mlir::IntegerAttr();
+  auto rhsAxis = pair && pair.size() == 2
+                     ? mlir::dyn_cast<mlir::IntegerAttr>(pair[1])
+                     : mlir::IntegerAttr();
+  if (!lhsAxis || !rhsAxis || consumer.getNumOperands() != 2)
+    return consumer.emitOpError(
+        "does not declare one exact contraction reduction pair");
+  auto operandArgument = [&](mlir::Value operand,
+                             int64_t tensorAxis) -> std::optional<int64_t> {
+    mlir::FailureOr<llvm::SmallVector<std::string>> shape =
+        target::getLogicalShape(operand, kernel, consumer,
+                                "contraction reduction-axis projection");
+    if (mlir::succeeded(shape) && tensorAxis >= 0 &&
+        static_cast<size_t>(tensorAxis) < shape->size()) {
+      llvm::StringRef label = (*shape)[tensorAxis];
+      if (label.consume_front("?region_")) {
+        llvm::StringRef argumentText = label.split('_').first;
+        int64_t argument = -1;
+        if (!argumentText.getAsInteger(10, argument))
+          return argument;
+      }
+    }
+    return std::nullopt;
+  };
+  std::optional<int64_t> lhs =
+      operandArgument(consumer.getOperand(0), lhsAxis.getInt());
+  std::optional<int64_t> rhs =
+      operandArgument(consumer.getOperand(1), rhsAxis.getInt());
+  llvm::SmallVector<int64_t> arguments;
+  if (lhs)
+    arguments.push_back(*lhs);
+  if (rhs && (!lhs || *rhs != *lhs))
+    arguments.push_back(*rhs);
+  if (arguments.empty())
+    return consumer.emitOpError(
+        "does not preserve a region identity for its reduction pair");
+  return arguments;
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<AxisBinding>
+exactContractionReductionAxis(const PlanIndex &index,
+                              const target::KernelModel &kernel,
+                              mlir::Operation &consumer) {
+  mlir::FailureOr<llvm::SmallVector<int64_t>> arguments =
+      exactContractionReductionArguments(kernel, consumer);
+  if (mlir::failed(arguments))
+    return mlir::failure();
+  std::optional<int64_t> axisNode;
+  for (int64_t argument : *arguments) {
+    auto binding = index.regionBindings.find(argument);
+    std::optional<int64_t> candidate;
+    if (binding != index.regionBindings.end()) {
+      intent::plan::RegionBindingOp region = binding->second;
+      candidate = static_cast<int64_t>(region.getAxisNode());
+    } else {
+      mlir::Value value = kernel.values.lookup(argument);
+      mlir::Operation *definition = value ? value.getDefiningOp() : nullptr;
+      mlir::FailureOr<int64_t> node =
+          definition
+              ? target::getNodeID(*definition,
+                                  "contraction reduction-region projection")
+              : mlir::FailureOr<int64_t>(mlir::failure());
+      if (mlir::succeeded(node) && index.axes.count(*node))
+        candidate = *node;
+    }
+    if (!candidate)
+      return consumer.emitOpError(
+          "has no selected range for a reduction-region identity");
+    if (axisNode && *axisNode != *candidate)
+      return consumer.emitOpError(
+          "maps its reduction pair to different physical axes");
+    axisNode = *candidate;
+  }
+  auto axis = axisNode ? index.axes.find(*axisNode) : index.axes.end();
+  if (!axisNode || axis == index.axes.end() ||
+      !axis->second.hasRole("reduction"))
+    return consumer.emitOpError(
+        "does not resolve its exact reduction pair to one physical axis");
+  return axis->second;
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<AxisBinding>
+contractionReductionAxis(const PlanIndex &index,
+                         llvm::ArrayRef<mlir::Operation *> lhsTransfers,
+                         llvm::ArrayRef<mlir::Operation *> rhsTransfers,
+                         mlir::Operation &consumer);
+
+struct DeferredContractReplay {
+  target::ContractOperandReplay lhs;
+  target::ContractOperandReplay rhs;
+  llvm::SmallVector<mlir::Operation *> lhsReplayProducers;
+  llvm::SmallVector<mlir::Operation *> rhsReplayProducers;
+};
+
+template <typename PlanIndex>
+mlir::LogicalResult indexDeferredContractReplays(
+    const target::KernelModel &kernel, const PlanIndex &index,
+    llvm::DenseMap<mlir::Operation *, DeferredContractReplay> &replays,
+    llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
+        &producerOwners) {
+  llvm::DenseSet<mlir::Operation *> globallyDeferred;
+  for (const auto &entry : index.contracts) {
+    mlir::Operation *contract = kernel.nodes.lookup(entry.first);
+    if (!contract || contract->getName().getStringRef() != "intent.contract" ||
+        contract->getNumOperands() != 2 ||
+        isPlannedStageNode(index, contract))
+      continue;
+    std::optional<target::ContractOperandReplay> lhs =
+        target::analyzeContractOperandReplay(contract->getOperand(0), *contract);
+    std::optional<target::ContractOperandReplay> rhs =
+        target::analyzeContractOperandReplay(contract->getOperand(1), *contract);
+    bool direct = contract->getOperand(0).getDefiningOp() &&
+                  contract->getOperand(1).getDefiningOp() &&
+                  contract->getOperand(0)
+                          .getDefiningOp()
+                          ->getName()
+                          .getStringRef() == "intent.view_load" &&
+                  contract->getOperand(1)
+                          .getDefiningOp()
+                          ->getName()
+                          .getStringRef() == "intent.view_load";
+    if (!lhs || !rhs || direct)
+      continue;
+    bool anyDeferred = false;
+    bool allDeferred = true;
+    for (mlir::Operation *transfer :
+         llvm::concat<mlir::Operation *>(lhs->transfers, rhs->transfers)) {
+      mlir::FailureOr<int64_t> node =
+          target::getNodeID(*transfer, "deferred contract transfer");
+      auto binding = mlir::succeeded(node) ? index.boundaries.find(*node)
+                                           : index.boundaries.end();
+      if (mlir::failed(node) || binding == index.boundaries.end())
+        return transfer->emitOpError(
+            "lacks a contract-transfer materialization decision");
+      bool deferred =
+          binding->second.getMaterialization() == "deferred_to_contract";
+      anyDeferred |= deferred;
+      allDeferred &= deferred;
+    }
+    if (!anyDeferred)
+      continue;
+    if (!allDeferred)
+      return contract->emitOpError(
+          "has inconsistent producer-replay transfer materialization");
+    if (entry.second.getLhsSpace() != "shared" ||
+        entry.second.getRhsSpace() != "shared")
+      return entry.second.emitOpError(
+          "producer replay requires shared contraction operand bindings");
+    mlir::FailureOr<AxisBinding> reduction =
+        exactContractionReductionAxis(index, kernel, *contract);
+    if (mlir::failed(reduction))
+      return mlir::failure();
+    mlir::FailureOr<llvm::SmallVector<int64_t>> reductionArgumentIDs =
+        exactContractionReductionArguments(kernel, *contract);
+    if (mlir::failed(reductionArgumentIDs))
+      return mlir::failure();
+    llvm::DenseSet<mlir::Value> reductionArguments;
+    for (int64_t argumentID : *reductionArgumentIDs) {
+      mlir::Value argument = kernel.values.lookup(argumentID);
+      if (argument)
+        reductionArguments.insert(argument);
+    }
+    llvm::DenseMap<mlir::Value, bool> reductionDependencies;
+    llvm::DenseSet<mlir::Value> activeDependencies;
+    std::function<bool(mlir::Value)> dependsOnReduction =
+        [&](mlir::Value value) -> bool {
+      if (reductionArguments.contains(value))
+        return true;
+      auto cached = reductionDependencies.find(value);
+      if (cached != reductionDependencies.end())
+        return cached->second;
+      if (!activeDependencies.insert(value).second)
+        return false;
+      mlir::Operation *definition = value.getDefiningOp();
+      bool depends = definition && llvm::any_of(
+                                       definition->getOperands(),
+                                       [&](mlir::Value input) {
+                                         return dependsOnReduction(input);
+                                       });
+      activeDependencies.erase(value);
+      reductionDependencies[value] = depends;
+      return depends;
+    };
+    llvm::DenseSet<mlir::Operation *> deferred;
+    auto collectDeferred = [&](const target::ContractOperandReplay &operand) {
+      deferred.insert(operand.loadDependentProducers.begin(),
+                      operand.loadDependentProducers.end());
+      for (mlir::Operation *producer : operand.exclusiveProducers) {
+        if (dependsOnReduction(producer->getResult(0)))
+          deferred.insert(producer);
+      }
+    };
+    collectDeferred(*lhs);
+    collectDeferred(*rhs);
+    globallyDeferred.insert(deferred.begin(), deferred.end());
+    auto replayProducers = [&](const target::ContractOperandReplay &operand) {
+      llvm::SmallVector<mlir::Operation *> producers;
+      for (mlir::Operation *producer : operand.producers)
+        if (deferred.contains(producer))
+          producers.push_back(producer);
+      return producers;
+    };
+    llvm::SmallVector<mlir::Operation *> lhsProducers = replayProducers(*lhs);
+    llvm::SmallVector<mlir::Operation *> rhsProducers = replayProducers(*rhs);
+    replays[contract] = DeferredContractReplay{
+        std::move(*lhs), std::move(*rhs), std::move(lhsProducers),
+        std::move(rhsProducers)};
+  }
+  for (const auto &entry : replays) {
+    auto bindOwners = [&](llvm::ArrayRef<mlir::Operation *> producers) {
+      for (mlir::Operation *producer : producers)
+        if (globallyDeferred.contains(producer)) {
+          auto &owners = producerOwners[producer];
+          if (!llvm::is_contained(owners, entry.first))
+            owners.push_back(entry.first);
+        }
+    };
+    bindOwners(entry.second.lhsReplayProducers);
+    bindOwners(entry.second.rhsReplayProducers);
+  }
+  return mlir::success();
+}
+
 template <typename PlanIndex>
 bool isEnclosingStreamReductionAxis(const PlanIndex &index,
                                     mlir::Operation &operation,
@@ -1389,27 +1624,28 @@ void indexAxisRoles(PlanIndex &index) {
 
 template <typename PlanIndex>
 mlir::FailureOr<AxisBinding>
-contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
-                         mlir::Operation &rhsLoad,
+contractionReductionAxis(const PlanIndex &index,
+                         llvm::ArrayRef<mlir::Operation *> lhsTransfers,
+                         llvm::ArrayRef<mlir::Operation *> rhsTransfers,
                          mlir::Operation &consumer) {
-  mlir::FailureOr<int64_t> lhsNode =
-      target::getNodeID(lhsLoad, "contraction lhs transfer");
-  mlir::FailureOr<int64_t> rhsNode =
-      target::getNodeID(rhsLoad, "contraction rhs transfer");
-  if (mlir::failed(lhsNode) || mlir::failed(rhsNode))
-    return mlir::failure();
-  auto lhs = index.boundaries.find(*lhsNode);
-  auto rhs = index.boundaries.find(*rhsNode);
-  if (lhs == index.boundaries.end() || rhs == index.boundaries.end())
-    return consumer.emitOpError(
-        "has no physical transfer binding for its contraction operands");
+  auto contains = [&](llvm::ArrayRef<mlir::Operation *> transfers,
+                      int64_t axisNode) {
+    return llvm::any_of(transfers, [&](mlir::Operation *transfer) {
+      mlir::FailureOr<int64_t> node =
+          target::getNodeID(*transfer, "contraction transfer");
+      auto binding = mlir::succeeded(node) ? index.boundaries.find(*node)
+                                           : index.boundaries.end();
+      return mlir::succeeded(node) && binding != index.boundaries.end() &&
+             llvm::is_contained(binding->second.getDomainNodes(), axisNode);
+    });
+  };
 
   llvm::SmallVector<AxisBinding> candidates;
   for (const auto &entry : index.axesByRole) {
     AxisBinding axis = entry.getValue();
     if (!entry.getKey().starts_with("reduction_") ||
-        !llvm::is_contained(lhs->second.getDomainNodes(), axis.getNode()) ||
-        !llvm::is_contained(rhs->second.getDomainNodes(), axis.getNode()))
+        !contains(lhsTransfers, axis.getNode()) ||
+        !contains(rhsTransfers, axis.getNode()))
       continue;
     candidates.push_back(axis);
   }
@@ -1417,6 +1653,16 @@ contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
     return consumer.emitOpError(
         "does not resolve exactly one shared physical reduction axis");
   return candidates.front();
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<AxisBinding>
+contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
+                         mlir::Operation &rhsLoad,
+                         mlir::Operation &consumer) {
+  mlir::Operation *lhs[] = {&lhsLoad};
+  mlir::Operation *rhs[] = {&rhsLoad};
+  return contractionReductionAxis(index, lhs, rhs, consumer);
 }
 
 struct ContractionAxes {
@@ -1427,34 +1673,34 @@ struct ContractionAxes {
 
 template <typename PlanIndex>
 mlir::FailureOr<ContractionAxes>
-contractionAxes(const PlanIndex &index, mlir::Operation &lhsLoad,
-                mlir::Operation &rhsLoad, mlir::Operation &consumer) {
+contractionAxes(const PlanIndex &index,
+                llvm::ArrayRef<mlir::Operation *> lhsTransfers,
+                llvm::ArrayRef<mlir::Operation *> rhsTransfers,
+                mlir::Operation &consumer) {
   mlir::FailureOr<AxisBinding> reduction =
-      contractionReductionAxis(index, lhsLoad, rhsLoad, consumer);
-  mlir::FailureOr<int64_t> lhsNode =
-      target::getNodeID(lhsLoad, "contraction lhs transfer");
-  mlir::FailureOr<int64_t> rhsNode =
-      target::getNodeID(rhsLoad, "contraction rhs transfer");
-  if (mlir::failed(reduction) || mlir::failed(lhsNode) ||
-      mlir::failed(rhsNode))
+      contractionReductionAxis(index, lhsTransfers, rhsTransfers, consumer);
+  if (mlir::failed(reduction))
     return mlir::failure();
-  auto lhs = index.boundaries.find(*lhsNode);
-  auto rhs = index.boundaries.find(*rhsNode);
-  if (lhs == index.boundaries.end() || rhs == index.boundaries.end())
-    return consumer.emitOpError(
-        "has no physical transfer binding for its contraction operands");
-  auto resultAxis = [&](llvm::ArrayRef<int64_t> domains,
+  auto resultAxis = [&](llvm::ArrayRef<mlir::Operation *> transfers,
                         llvm::StringRef side) -> mlir::FailureOr<AxisBinding> {
     llvm::SmallVector<AxisBinding> candidates;
-    for (int64_t node : domains) {
-      auto found = index.axes.find(node);
-      if (found == index.axes.end() || node == reduction->getNode() ||
-          found->second.isScalar())
-        continue;
-      if (!llvm::any_of(candidates, [&](const AxisBinding &candidate) {
-            return candidate.getNode() == found->second.getNode();
-          }))
-        candidates.push_back(found->second);
+    for (mlir::Operation *transfer : transfers) {
+      mlir::FailureOr<int64_t> node =
+          target::getNodeID(*transfer, "contraction transfer");
+      auto binding = mlir::succeeded(node) ? index.boundaries.find(*node)
+                                           : index.boundaries.end();
+      if (mlir::failed(node) || binding == index.boundaries.end())
+        return mlir::failure();
+      for (int64_t domainNode : binding->second.getDomainNodes()) {
+        auto found = index.axes.find(domainNode);
+        if (found == index.axes.end() || domainNode == reduction->getNode() ||
+            found->second.isScalar())
+          continue;
+        if (!llvm::any_of(candidates, [&](const AxisBinding &candidate) {
+              return candidate.getNode() == found->second.getNode();
+            }))
+          candidates.push_back(found->second);
+      }
     }
     if (candidates.size() != 1)
       return consumer.emitOpError()
@@ -1463,12 +1709,21 @@ contractionAxes(const PlanIndex &index, mlir::Operation &lhsLoad,
     return candidates.front();
   };
   mlir::FailureOr<AxisBinding> lhsResult =
-      resultAxis(lhs->second.getDomainNodes(), "lhs");
+      resultAxis(lhsTransfers, "lhs");
   mlir::FailureOr<AxisBinding> rhsResult =
-      resultAxis(rhs->second.getDomainNodes(), "rhs");
+      resultAxis(rhsTransfers, "rhs");
   if (mlir::failed(lhsResult) || mlir::failed(rhsResult))
     return mlir::failure();
   return ContractionAxes{*lhsResult, *rhsResult, *reduction};
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<ContractionAxes>
+contractionAxes(const PlanIndex &index, mlir::Operation &lhsLoad,
+                mlir::Operation &rhsLoad, mlir::Operation &consumer) {
+  mlir::Operation *lhs[] = {&lhsLoad};
+  mlir::Operation *rhs[] = {&rhsLoad};
+  return contractionAxes(index, lhs, rhs, consumer);
 }
 
 template <typename PlanIndex>
