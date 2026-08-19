@@ -1,10 +1,12 @@
 import importlib.util
+import os
 from pathlib import Path
 
 import torch
 
 
 def main():
+    os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"
     root = next(parent for parent in Path(__file__).parents if parent.name == "meta-applied-ai")
     helper_path = root / "support" / "runtime.py"
     spec = importlib.util.spec_from_file_location("intent_meta_runtime", helper_path)

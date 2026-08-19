@@ -24,8 +24,8 @@ def block_sparse_gqa_decode_partials(
     block_indices: I.In[I.i32, ("B", "HK", "S")],
     cache_lengths: I.In[I.i32, ("B",)],
     split_offsets: I.In[I.i32, ("P_PLUS_1",)],
-    partial_lse: I.Out[I.f32, ("B", "HQ", "P")],
-    partial_output: I.Out[I.f32, ("B", "HQ", "P", "D")],
+    partial_lse: I.Out[I.f32, ("B", "HQ", "SPLITS")],
+    partial_output: I.Out[I.f32, ("B", "HQ", "SPLITS", "D")],
     scale: I.f32,
     HEAD_GROUP: I.Constexpr[int],
     BLOCK_SIZE: I.Constexpr[int],
@@ -191,9 +191,10 @@ def block_sparse_gqa_decode_partials(
 
 @intent.kernel
 def block_sparse_gqa_decode_combine(
-    partial_lse: I.In[I.f32, ("B", "HQ", "P")],
-    partial_output: I.In[I.f32, ("B", "HQ", "P", "D")],
+    partial_lse: I.In[I.f32, ("B", "HQ", "SPLITS")],
+    partial_output: I.In[I.f32, ("B", "HQ", "SPLITS", "D")],
     output: I.Out[I.f16, ("B", "HQ", "D")],
+    SPLITS: I.Constexpr[int],
 ):
     B, HQ, P, D = partial_output.shape
     splits = I.domain(0, P)

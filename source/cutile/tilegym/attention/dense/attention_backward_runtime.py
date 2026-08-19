@@ -196,7 +196,7 @@ def main():
         (sequence, sequence), device="cuda", dtype=torch.bool
     ).tril()
     scores.masked_fill_(~causal, -torch.inf)
-    lse = torch.logsumexp(scores, dim=-1)
+    lse = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
     output = torch.matmul(torch.softmax(scores, dim=-1), repeated_v.float()).half()
     grad_output = torch.randn_like(output)
     arguments = (q, k, v, output, grad_output, lse, scale, True)

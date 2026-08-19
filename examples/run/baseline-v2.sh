@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "usage: $0 <triton|cutile|tilelang> <output.csv> [kernel ...]" >&2
+  exit 2
+fi
+
+provider=$1
+output=$2
+shift 2
+
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+build_root=${INTENT_BUILD_ROOT:-/tmp/intentdsl-build}
+cmake_generator=${INTENT_CMAKE_GENERATOR:-Ninja}
+mlir_dir=${INTENT_MLIR_DIR:-/usr/lib/llvm-20/lib/cmake/mlir}
+llvm_dir=${INTENT_LLVM_DIR:-/usr/lib/llvm-20/lib/cmake/llvm}
+
+case "${provider}" in
+  triton)
+    default_python=/home/kingdom/.venvs/intentdsl-mlir20/bin/python
+    ;;
+  cutile)
+    default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
+    ;;
+  tilelang)
+    default_python=/home/kingdom/.venvs/intentdsl-tilelang/bin/python
+    ;;
+  *)
+    echo "unsupported provider: ${provider}" >&2
+    exit 2
+    ;;
+esac
+
+cmake \
+  -S "${project_root}" \
+  -B "${build_root}" \
+  -G "${cmake_generator}" \
+  -DMLIR_DIR="${mlir_dir}" \
+  -DLLVM_DIR="${llvm_dir}"
+cmake --build "${build_root}" --target intent-compile
+
+arguments=(
+  "${provider}"
+  --compiler "${build_root}/tools/intent-compile/intent-compile"
+  --output "${output}"
+)
+for kernel in "$@"; do
+  arguments+=(--kernel "${kernel}")
+done
+
+(
+  cd /tmp
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="${project_root}/python:${project_root}/examples" \
+  "${INTENT_PYTHON:-${default_python}}" \
+    -m repro.v2.runner "${arguments[@]}"
+)
+

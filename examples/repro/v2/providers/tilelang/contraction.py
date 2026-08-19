@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import torch
+
+from kernels.contraction.block_sparse import block_sparse_matmul
+from kernels.contraction.block_scaled import deepgemm_fp8_2xacc
+from kernels.contraction.gemm import Activation
+from kernels.contraction.gemm import gemm
+from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
+from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
+from kernels.contraction.weight_only_int4 import w4a8_packed_matmul
+from kernels.ragged.grouped_gemm import ragged_grouped_gemm
+from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
+
+from ...measurement import compile_single
+from ...measurement import functional_launch
+from ...model import Context
+from ...model import PreparedComparison
+from ...model import Tolerance
+from .common import runtime_module
+from .common import source_from_runtime
+
+
+def dense_gemm(context: Context) -> PreparedComparison:
+    m, k, n = 4096, 4096, 14336
+    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
+    _, generated = compile_single(
+        context,
+        gemm,
+        (a, b),
+        constexprs={"ACTIVATION": Activation.NONE},
+    )
+    _, source_module = source_from_runtime(
+        context,
+        "source/tilelang/tilelang/gemm/dense/example_gemm_runtime.py",
+        "intent_v2_tilelang_dense_gemm",
+    )
+    source_kernel = source_module.matmul.compile(
+        M=m,
+        N=n,
+        K=k,
+        block_M=128,
+        block_N=128,
+        block_K=32,
+    )
+    source = functional_launch(lambda: source_kernel(a, b))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-2, rtol=1e-2),
+        cuda_graph=True,
+    )
+
+
+def w4a8_gemm(context: Context) -> PreparedComparison:
+    m, k, n = 4096, 4096, 14336
+    activation = torch.randint(
+        -128, 128, (m, k), device="cuda", dtype=torch.int8
+    )
+    packed = torch.randint(
+        0, 256, (n, k // 2), device="cuda", dtype=torch.uint8
+    )
+    _, generated = compile_single(
+        context, w4a8_packed_matmul, (activation, packed)
+    )
+    _, source_module = source_from_runtime(
+        context,
+        "source/tilelang/tilelang/gemm/dequantize_w4a8/example_dequant_gemm_w4a8_runtime.py",
+        "intent_v2_tilelang_w4a8",
+    )
+    source_kernel = source_module.matmul_int8xint4(
+        m,
+        n,
+        k,
+        source_module.T.int8,
+        source_module.T.int32,
+        source_module.T.int32,
+        num_bits=4,
+        block_M=128,
+        block_N=128,
+        block_K=128,
+        num_stages=2,
+        threads=256,
+    )
+    source = functional_launch(lambda: source_kernel(activation, packed))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=0.0),
+        cuda_graph=True,
+    )
+
+
+def fp8_gemm(context: Context) -> PreparedComparison:
+    m, k, n = 4096, 4096, 14336
+    _, source_module = source_from_runtime(
+        context,
+        "source/tilelang/tilelang/gemm/fp8/example_tilelang_gemm_fp8_runtime.py",
+        "intent_v2_tilelang_fp8_gemm",
+    )
+    dtype = source_module.determine_fp8_type()
+    torch_dtype = source_module.T.dtype(dtype).as_torch()
+    lhs = torch.randn((m, k), device="cuda", dtype=torch.float16).to(torch_dtype)
+    rhs = torch.randn((n, k), device="cuda", dtype=torch.float16).to(torch_dtype)
+    _, generated = compile_single(context, fp8_e4m3_matmul, (lhs, rhs))
+    source_kernel = source_module.matmul.compile(
+        M=m,
+        N=n,
+        K=k,
+        block_M=128,
+        block_N=128,
+        block_K=64,
+        dtype=dtype,
+    )
+    source = functional_launch(lambda: source_kernel(lhs, rhs))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=0.5, rtol=5e-2),
+        cuda_graph=True,
+    )
+
+
+def grouped_gemm(context: Context) -> PreparedComparison:
+    rows = (256, 512, 1024, 2048)
+    hidden = output = 4096
+    runtime = runtime_module(
+        context,
+        "source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd_runtime.py",
+        "intent_v2_tilelang_grouped_gemm_runtime",
+    )
+    a, b, sizes, offsets, padded_offsets = runtime.source.construct_inputs(
+        rows,
+        hidden,
+        output,
+        False,
+        64,
+        torch.device("cuda"),
+        torch.float16,
+    )
+    group_offsets = torch.cat(
+        (offsets, torch.tensor((sum(rows),), device="cuda", dtype=torch.int32))
+    )
+    _, generated = compile_single(
+        context, ragged_grouped_gemm, (a, group_offsets, b)
+    )
+    source = functional_launch(
+        lambda: runtime.source.grouped_gemm(
+            a,
+            b,
+            sizes,
+            offsets,
+            padded_offsets,
+            rows,
+            64,
+            128,
+            64,
+            False,
+            2,
+            256,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=1e-2),
+        cuda_graph=False,
+    )
+
+
+def sparse_2to4(context: Context) -> PreparedComparison:
+    m, n, k = 8192, 14336, 8192
+    runtime = runtime_module(
+        context,
+        "source/tilelang/tilelang/gemm/sparse_2to4/example_gemm_sp_runtime.py",
+        "intent_v2_tilelang_sparse_2to4_runtime",
+    )
+    dense = runtime.source.randn_semi_sparse(
+        m, k, device="cuda", dtype=torch.float16
+    )
+    rhs = torch.randn((k, n), device="cuda", dtype=torch.float16)
+    compressed, metadata = runtime.sparse_utils.torch_compress(
+        dense, meta_dtype=torch.int16
+    )
+    _, generated = compile_single(
+        context, sparse_2to4_gemm, (compressed, metadata, rhs)
+    )
+    source_kernel = runtime.source.matmul_sp_fp16(
+        m,
+        n,
+        k,
+        runtime.source.T.float,
+        runtime.source.T.int16,
+        128,
+        128,
+        64,
+        2,
+        128,
+        runtime.source.T.GemmWarpPolicy.Square,
+        True,
+    )
+    source = functional_launch(lambda: source_kernel(compressed, metadata, rhs))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
+        cuda_graph=True,
+    )
+
+
+def block_sparse(context: Context) -> PreparedComparison:
+    dimension = 4096
+    lhs = torch.randn(
+        (dimension, dimension), device="cuda", dtype=torch.float16
+    )
+    rhs = torch.randn_like(lhs)
+    mask = torch.rand((32, 32, 128), device="cuda") > 0.5
+    _, generated = compile_single(
+        context, block_sparse_matmul, (lhs, rhs, mask.to(torch.uint8))
+    )
+    runtime = runtime_module(
+        context,
+        "source/tilelang/tilelang/gemm/block_sparse/example_blocksparse_gemm_runtime.py",
+        "intent_v2_tilelang_block_sparse_runtime",
+    )
+    source = functional_launch(
+        lambda: runtime.source.blocksparse_matmul(
+            lhs, rhs, mask, 128, 128, 32, 2, 128, True
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
+        cuda_graph=False,
+    )
+
+
+def grouped_gemm_backward(context: Context) -> PreparedComparison:
+    rows = (256, 512, 1024, 2048)
+    hidden = output = 4096
+    total = sum(rows)
+    left = torch.randn((total, hidden), device="cuda", dtype=torch.float16)
+    right = torch.randn((total, output), device="cuda", dtype=torch.float16)
+    sizes = torch.tensor(rows, device="cuda", dtype=torch.int32)
+    offsets = torch.tensor((0, 256, 768, 1792), device="cuda", dtype=torch.int32)
+    group_offsets = torch.cat(
+        (offsets, torch.tensor((total,), device="cuda", dtype=torch.int32))
+    )
+    _, generated = compile_single(
+        context,
+        ragged_grouped_gemm_backward_weight,
+        (left, right, group_offsets),
+    )
+    runtime = runtime_module(
+        context,
+        "source/tilelang/tilelang/gemm/grouped_backward/example_grouped_gemm_bwd_runtime.py",
+        "intent_v2_tilelang_grouped_gemm_backward_runtime",
+    )
+    source = functional_launch(
+        lambda: runtime.source.grouped_gemm_bwd(
+            left,
+            right,
+            sizes,
+            offsets,
+            64,
+            128,
+            64,
+            num_stages=2,
+            threads=256,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
+        cuda_graph=False,
+    )
+
+
+def deepgemm_fp8(context: Context) -> PreparedComparison:
+    m = n = k = 4096
+    support = runtime_module(
+        context,
+        "source/tilelang/tilelang/support/runtime.py",
+        "intent_v2_tilelang_runtime_support",
+    )
+    source_module = support.load_source(
+        context.project_root
+        / "source/tilelang/tilelang/gemm/fp8_2xacc/example_deepgemm_fp8_2xAcc.py",
+        "intent_v2_tilelang_deepgemm_fp8",
+    )
+    lhs, lhs_scale = source_module.per_token_cast_to_fp8(
+        torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    )
+    rhs, rhs_scale = source_module.per_block_cast_to_fp8(
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    )
+    _, generated = compile_single(
+        context,
+        deepgemm_fp8_2xacc,
+        (
+            lhs.view(m, k // 128, 128),
+            rhs.view(n, k // 128, 128),
+            lhs_scale,
+            rhs_scale,
+        ),
+    )
+    source = functional_launch(
+        lambda: source_module.tl_gemm(
+            lhs,
+            rhs,
+            lhs_scale,
+            rhs_scale,
+            128,
+            source_module.T.float8_e4m3fn,
+            source_module.T.bfloat16,
+            source_module.T.float32,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1.0, rtol=2e-2),
+        cuda_graph=False,
+    )
+
+
+CASES = {
+    "dense_gemm": dense_gemm,
+    "w4a8_gemm": w4a8_gemm,
+    "fp8_gemm": fp8_gemm,
+    "grouped_gemm": grouped_gemm,
+    "sparse_2to4_gemm": sparse_2to4,
+    "block_sparse_gemm": block_sparse,
+    "grouped_gemm_backward": grouped_gemm_backward,
+    "deepgemm_fp8_2xacc": deepgemm_fp8,
+}

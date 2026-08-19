@@ -29,7 +29,7 @@ def upstream(arguments):
     if key not in STATE:
         non_ignored = int((target != -100).sum().item())
         STATE[key] = (
-            torch.empty((rows,), device=logits.device, dtype=logits.dtype),
+            torch.empty((rows,), device=logits.device, dtype=torch.float32),
             torch.empty((rows,), device=logits.device, dtype=torch.int64),
             non_ignored,
         )
