@@ -1,7 +1,7 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
 #include "Intent/Target/CuTile/Emission/Translate.h"
-#include "Intent/Target/GPU/Realization/Realize.h"
+#include "Intent/Target/GPU/Transforms/Passes.h"
 #include "Intent/Target/TileLang/Emission/Translate.h"
 #include "Intent/Target/Triton/Emission/Translate.h"
 #include "mlir/IR/AsmState.h"
@@ -22,7 +22,7 @@ enum class TargetKind { Triton, CuTile, TileLang };
 mlir::LogicalResult realize(
     mlir::ModuleOp module,
     const intent::gpu::DeviceCapabilities &device) {
-  return intent::gpu::realizeKernel(module, device);
+  return intent::gpu::runPhysicalProgramPipeline(module, device);
 }
 
 mlir::LogicalResult emit(mlir::ModuleOp module, TargetKind target,

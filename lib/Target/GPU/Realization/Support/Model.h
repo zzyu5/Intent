@@ -12,9 +12,9 @@ using KernelFacts = intent::target::KernelFacts;
 
 mlir::LogicalResult analyzeOperations(KernelFacts &facts);
 
-mlir::LogicalResult emitMachinePlan(mlir::ModuleOp module,
-                                    const DeviceCapabilities &device,
-                                    const KernelFacts &facts);
+mlir::LogicalResult buildPhysicalProgram(mlir::ModuleOp module,
+                                         const DeviceCapabilities &device,
+                                         const KernelFacts &facts);
 
 } // namespace intent::gpu::realization
 

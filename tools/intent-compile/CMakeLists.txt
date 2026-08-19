@@ -9,6 +9,7 @@ target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentCuTileEmission
   MLIRIntentGPURealization
+  MLIRIntentGPUTransforms
   MLIRIntentDialect
   MLIRIntentPlanDialect
   MLIRIntentTileLangEmission

@@ -1262,8 +1262,9 @@ void emitPaddings(OpBuilder &builder, ArrayRef<PaddingDecision> paddings) {
 
 } // namespace
 
-LogicalResult emitMachinePlan(ModuleOp module, const DeviceCapabilities &device,
-                              const KernelFacts &facts) {
+LogicalResult buildPhysicalProgram(ModuleOp module,
+                                   const DeviceCapabilities &device,
+                                   const KernelFacts &facts) {
   func::FuncOp entry = facts.kernel.entry;
   if (!device.matrixUnits && !facts.contractions.empty())
     return entry.emitOpError(

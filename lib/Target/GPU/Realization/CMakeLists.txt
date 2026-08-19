@@ -1,6 +1,6 @@
 add_mlir_library(MLIRIntentGPURealization
   Analysis/Operations.cpp
-  Driver/Realize.cpp
+  Driver/Construct.cpp
   Plan/Build.cpp
   Plan/Decisions.cpp
 
