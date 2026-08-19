@@ -53,8 +53,13 @@ def online_attention_accumulate(
     scores,
     value_block,
 ):
-    alpha = I.exp2(maximum - normalization_maximum)
-    probability = I.exp2(scores - normalization_maximum[:, None])
+    safe_maximum = I.mask(
+        normalization_maximum,
+        valid=normalization_maximum != -I.inf,
+        fill=0.0,
+    )
+    alpha = I.exp2(maximum - safe_maximum)
+    probability = I.exp2(scores - safe_maximum[:, None])
     next_denominator = alpha * denominator + I.reduce.sum(
         probability, axis=1, identity=0.0
     )
@@ -76,8 +81,13 @@ def online_attention_accumulate_bf16(
     scores,
     value_block,
 ):
-    alpha = I.exp2(maximum - next_maximum)
-    probability = I.exp2(scores - next_maximum[:, None])
+    safe_maximum = I.mask(
+        next_maximum,
+        valid=next_maximum != -I.inf,
+        fill=0.0,
+    )
+    alpha = I.exp2(maximum - safe_maximum)
+    probability = I.exp2(scores - safe_maximum[:, None])
     next_denominator = alpha * denominator + I.reduce.sum(
         probability,
         axis=1,

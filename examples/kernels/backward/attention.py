@@ -94,6 +94,7 @@ def attention_backward_dkdv(
                             probability = I.exp2(
                                 scores * (scale * I.LOG2E)
                                 - lse[batch, query_head, query_region][None, :]
+                                * I.LOG2E
                             )
                             if CAUSAL:
                                 probability = I.mask(
@@ -181,7 +182,7 @@ def attention_backward_dq(
                             acc_dtype=I.f32,
                         )
                         probability = I.exp2(
-                            scores * (scale * I.LOG2E) - query_lse
+                            scores * (scale * I.LOG2E) - query_lse * I.LOG2E
                         )
                         if CAUSAL:
                             q_index = I.indices(query_region)

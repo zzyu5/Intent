@@ -2058,9 +2058,15 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
       indices.push_back(assumed == assumedIndexNames.end()
                             ? addressIndex(exact->str() + "[0]")
                             : addressIndex(assumed->second));
-    } else if (term.kind == "value_index" ||
-               target::emission::isSequentialIterator(indexed) ||
-               (term.kind == "region_index" && isa<BlockArgument>(indexed))) {
+    }
+    FailureOr<bool> traversalRegion =
+        term.kind == "region_index"
+            ? isTraversalRegionArgument(indexed, operation)
+            : FailureOr<bool>(false);
+    if (failed(traversalRegion))
+      return failure();
+    if (term.kind == "value_index" ||
+        target::emission::isSequentialIterator(indexed) || *traversalRegion) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -2104,6 +2110,22 @@ FailureOr<std::string> SourceEmitter::accessIndices(Operation &operation) {
     result += value;
   }
   return result;
+}
+
+FailureOr<bool>
+SourceEmitter::isTraversalRegionArgument(Value value, Operation &consumer) {
+  if (!isa<BlockArgument>(value))
+    return false;
+  FailureOr<int64_t> valueID = target::getValueID(
+      value, kernel, consumer, "TileLang region argument range lookup");
+  if (failed(valueID))
+    return failure();
+  auto binding = planIndex.regionBindings.find(*valueID);
+  if (binding == planIndex.regionBindings.end()) {
+    consumer.emitOpError("indexes a region argument without a physical binding");
+    return failure();
+  }
+  return binding->second.getPurpose() == "traversal";
 }
 
 FailureOr<std::string>
@@ -2203,9 +2225,16 @@ SourceEmitter::elementAccessIndices(Operation &operation,
                                          tileIndices[tileAxis] + "]"));
         ++tileAxis;
       }
-    } else if (term.kind == "value_index" ||
-               target::emission::isSequentialIterator(indexed) ||
-               (term.kind == "region_index" && isa<BlockArgument>(indexed))) {
+      continue;
+    }
+    FailureOr<bool> traversalRegion =
+        term.kind == "region_index"
+            ? isTraversalRegionArgument(indexed, operation)
+            : FailureOr<bool>(false);
+    if (failed(traversalRegion))
+      return failure();
+    if (term.kind == "value_index" ||
+        target::emission::isSequentialIterator(indexed) || *traversalRegion) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
