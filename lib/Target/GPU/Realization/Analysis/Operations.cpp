@@ -3,7 +3,7 @@
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
-#include "Intent/Target/Common/Emission/Combiner.h"
+#include "Intent/Target/Common/Lowering/Combiner.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -32,7 +32,7 @@ LogicalResult validateReduction(Operation &operation) {
   auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
   if (!axes || axes.size() != 1 || !isa<IntegerAttr>(axes[0]))
     return operation.emitOpError("has no canonical single-axis reduction");
-  if (target::emission::hasGenericCombiner(operation))
+  if (target::lowering::hasGenericCombiner(operation))
     return success();
   if (!combine)
     return operation.emitOpError("has no canonical built-in reduction combiner");
@@ -88,7 +88,7 @@ bool isLiteralZero(Value value) {
 }
 
 LogicalResult validateScan(Operation &operation) {
-  if (target::emission::hasGenericCombiner(operation)) {
+  if (target::lowering::hasGenericCombiner(operation)) {
     auto axis = operation.getAttrOfType<IntegerAttr>("intent.axis");
     auto inclusive = operation.getAttrOfType<BoolAttr>("intent.inclusive");
     if (!axis || axis.getInt() < 0 || !inclusive || !inclusive.getValue())

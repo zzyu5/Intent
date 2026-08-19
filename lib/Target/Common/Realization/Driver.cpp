@@ -10,7 +10,7 @@ namespace intent::target {
 LogicalResult realizeTarget(ModuleOp module, TargetRealization realize) {
   if (!module.getOps<plan::ProgramOp>().empty() ||
       !module.getOps<plan::SearchSpaceOp>().empty())
-    return module.emitError("module already contains realization state");
+    return module.emitError("module already contains a physical program");
   if (failed(verifyKernelModule(module)))
     return failure();
 

@@ -18,6 +18,8 @@ mlir::LogicalResult verifyPaddingFields(mlir::Operation *operation,
                                         llvm::ArrayRef<int64_t> domainNodes,
                                         llvm::StringRef fill);
 mlir::FailureOr<mlir::func::FuncOp> getPhysicalEntry(ProgramOp program);
+mlir::FailureOr<TargetProgramOp> getTargetProgram(ProgramOp program,
+                                                 llvm::StringRef provider);
 mlir::LogicalResult verifyGpuProgram(ProgramOp program);
 mlir::LogicalResult verifyGpuSearchSpace(SearchSpaceOp searchSpace);
 

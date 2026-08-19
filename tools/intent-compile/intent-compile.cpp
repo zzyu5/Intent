@@ -1,9 +1,9 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Plan/IR/PlanDialect.h"
-#include "Intent/Target/CuTile/Emission/Translate.h"
+#include "Intent/Target/CuTile/Lowering/TargetProgram.h"
 #include "Intent/Target/GPU/Transforms/Passes.h"
-#include "Intent/Target/TileLang/Emission/Translate.h"
-#include "Intent/Target/Triton/Emission/Translate.h"
+#include "Intent/Target/TileLang/Lowering/TargetProgram.h"
+#include "Intent/Target/Triton/Lowering/TargetProgram.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Verifier.h"
@@ -25,15 +25,27 @@ mlir::LogicalResult realize(
   return intent::gpu::runPhysicalProgramPipeline(module, device);
 }
 
-mlir::LogicalResult emit(mlir::ModuleOp module, TargetKind target,
-                         llvm::raw_ostream &output) {
+mlir::LogicalResult materialize(mlir::ModuleOp module, TargetKind target) {
   switch (target) {
   case TargetKind::Triton:
-    return intent::triton::emitTritonSource(module, output);
+    return intent::triton::materializeTritonProgram(module);
   case TargetKind::CuTile:
-    return intent::cutile::emitCuTileSource(module, output);
+    return intent::cutile::materializeCuTileProgram(module);
   case TargetKind::TileLang:
-    return intent::tilelang::emitTileLangSource(module, output);
+    return intent::tilelang::materializeTileLangProgram(module);
+  }
+  llvm_unreachable("unknown Intent target");
+}
+
+mlir::LogicalResult translate(mlir::ModuleOp module, TargetKind target,
+                              llvm::raw_ostream &output) {
+  switch (target) {
+  case TargetKind::Triton:
+    return intent::triton::translateTritonProgram(module, output);
+  case TargetKind::CuTile:
+    return intent::cutile::translateCuTileProgram(module, output);
+  case TargetKind::TileLang:
+    return intent::tilelang::translateTileLangProgram(module, output);
   }
   llvm_unreachable("unknown Intent target");
 }
@@ -72,7 +84,7 @@ int main(int argc, char **argv) {
       llvm::cl::desc("GPU worker vector width is dynamic"),
       llvm::cl::Required);
   llvm::cl::opt<std::string> irOutputFilename(
-      "ir-output", llvm::cl::desc("realized Intent MLIR output"),
+      "ir-output", llvm::cl::desc("physical and target-program MLIR output"),
       llvm::cl::Required);
   llvm::cl::opt<std::string> sourceOutputFilename(
       "source-output", llvm::cl::desc("generated target source output"),
@@ -97,17 +109,26 @@ int main(int argc, char **argv) {
   if (!module)
     return 1;
   if (mlir::failed(realize(*module, capabilities))) {
-    llvm::errs() << "Intent realization failed\n";
+    llvm::errs() << "Intent physical-program pipeline failed\n";
     return 1;
   }
   if (mlir::failed(mlir::verify(*module))) {
-    llvm::errs() << "realized Intent module verification failed\n";
+    llvm::errs() << "Intent physical program verification failed\n";
+    return 1;
+  }
+
+  if (mlir::failed(materialize(*module, target))) {
+    llvm::errs() << "Intent target-program materialization failed\n";
+    return 1;
+  }
+  if (mlir::failed(mlir::verify(*module))) {
+    llvm::errs() << "materialized target program verification failed\n";
     return 1;
   }
 
   std::string source;
   llvm::raw_string_ostream sourceStream(source);
-  if (mlir::failed(emit(*module, target, sourceStream)))
+  if (mlir::failed(translate(*module, target, sourceStream)))
     return 1;
   sourceStream.flush();
 
@@ -115,7 +136,7 @@ int main(int argc, char **argv) {
   llvm::ToolOutputFile irOutput(irOutputFilename, irError,
                                 llvm::sys::fs::OF_Text);
   if (irError) {
-    llvm::errs() << "cannot open realized MLIR output: " << irError.message()
+    llvm::errs() << "cannot open physical-program MLIR output: " << irError.message()
                  << '\n';
     return 1;
   }

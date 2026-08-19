@@ -1271,10 +1271,10 @@ LogicalResult buildPhysicalProgram(ModuleOp module,
         "requires matrix units unavailable on the selected GPU");
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToEnd(module.getBody());
-  auto realization = builder.create<intent::plan::ProgramOp>(
+  auto program = builder.create<intent::plan::ProgramOp>(
       entry.getLoc(), FlatSymbolRefAttr::get(module.getContext(), entry.getName()),
       string(builder, "gpu"));
-  Block &body = realization.getBody().emplaceBlock();
+  Block &body = program.getBody().emplaceBlock();
   builder.setInsertionPointToStart(&body);
   builder.create<intent::plan::DeviceOp>(
       entry.getLoc(), i64(builder, device.device));
@@ -1308,7 +1308,7 @@ LogicalResult buildPhysicalProgram(ModuleOp module,
   builder.create<intent::plan::YieldOp>(entry.getLoc());
   entry->setAttr("intent.kind", string(builder, "physical"));
   entry->moveBefore(body.getTerminator());
-  if (failed(intent::plan::verifyGpuProgram(realization)))
+  if (failed(intent::plan::verifyGpuProgram(program)))
     return failure();
   return emitSearchSpace(module, facts, *decisions);
 }

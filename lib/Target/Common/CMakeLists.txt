@@ -1,9 +1,9 @@
 add_mlir_library(MLIRIntentTargetCommon
   Analysis/IndexRelation.cpp
   Analysis/Kernel.cpp
-  Emission/Combiner.cpp
-  Emission/Driver.cpp
-  Emission/Lifecycle.cpp
+  Lowering/Combiner.cpp
+  Lowering/Driver.cpp
+  Lowering/Lifecycle.cpp
   Realization/Driver.cpp
   Realization/KernelFacts.cpp
   Realization/Proofs.cpp

@@ -6,11 +6,12 @@ include "mlir/IR/DialectBase.td"
 def IntentPlan_Dialect : Dialect {
   let name = "intent_plan";
   let cppNamespace = "::intent::plan";
-  let summary = "Machine realization envelopes for Intent Kernel IR";
+  let summary = "Executable physical programs for Intent Kernel IR";
   let description = [{
-    IntentPlan separates one resolved machine realization from the legal axes
-    of a search space. GPU machine decisions are shared here; a surface target
-    dialect only projects those decisions and records what it delegates.
+    IntentPlan owns the current executable physical program, its selected GPU
+    decisions, the legal parameter search space, and the provider program
+    produced by target materialization. Once constructed, this program is the
+    only executable authority consumed by later lowering stages.
   }];
 }
 

@@ -112,6 +112,17 @@ LogicalResult SearchSpaceOp::verify() {
   return success();
 }
 
+LogicalResult TargetProgramOp::verify() {
+  if (getProvider() != "triton" && getProvider() != "cutile" &&
+      getProvider() != "tilelang")
+    return emitOpError("contains an unknown provider");
+  if (getSource().empty())
+    return emitOpError("requires a non-empty materialized target program");
+  if (!getOperation()->getParentOfType<ProgramOp>())
+    return emitOpError("must be nested in an Intent physical program");
+  return success();
+}
+
 LogicalResult DeviceOp::verify() {
   return requireNonNegative(*this, getDevice(), "device index");
 }
@@ -456,11 +467,29 @@ FailureOr<func::FuncOp> intent::plan::getPhysicalEntry(ProgramOp program) {
   return entry;
 }
 
-LogicalResult intent::plan::verifyGpuProgram(ProgramOp realization) {
-  if (realization.getTarget() != "gpu")
-    return realization.emitOpError("is not a GPU physical program");
+FailureOr<TargetProgramOp>
+intent::plan::getTargetProgram(ProgramOp program, StringRef provider) {
+  TargetProgramOp result;
+  for (TargetProgramOp candidate : program.getBody().getOps<TargetProgramOp>()) {
+    if (candidate.getProvider() != provider)
+      continue;
+    if (result)
+      return candidate.emitOpError(
+          "duplicates the materialized target program for this provider");
+    result = candidate;
+  }
+  if (!result)
+    return program.emitOpError()
+           << "has no materialized target program for " << provider;
+  return result;
+}
+
+LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
+  if (program.getTarget() != "gpu")
+    return program.emitOpError("is not a GPU physical program");
   unsigned devices = 0;
   unsigned launches = 0;
+  unsigned targetPrograms = 0;
   LaunchOp launch;
   llvm::StringSet<> blockExtents;
   llvm::DenseMap<int64_t, AxisOp> axes;
@@ -484,13 +513,15 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp realization) {
   SmallVector<StreamBindingOp> streamBindings;
   llvm::StringSet<> stageAxisRoles;
   SmallVector<StageAxisOp> stageAxes;
-  for (Operation &operation : realization.getBody().front()) {
+  for (Operation &operation : program.getBody().front()) {
     if (isa<YieldOp, func::FuncOp>(operation))
       continue;
     if (operation.getName().getDialectNamespace() != "intent_plan")
       return operation.emitOpError("is not legal inside a GPU physical program");
     if (isa<DeviceOp>(operation))
       ++devices;
+    else if (isa<TargetProgramOp>(operation))
+      ++targetPrograms;
     else if (auto axis = dyn_cast<AxisOp>(operation)) {
       if (!axes.try_emplace(axis.getNode(), axis).second)
         return axis.emitOpError("duplicates a logical-axis physical decision");
@@ -578,12 +609,15 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp realization) {
         return binding.emitOpError("duplicates a stage-axis role");
       stageAxes.push_back(binding);
     } else
-      return operation.emitOpError("is not legal inside a GPU realization");
+      return operation.emitOpError("is not legal inside a GPU physical program");
   }
   if (devices != 1 || launches != 1)
-    return realization.emitOpError("requires one GPU device and one launch mapping");
+    return program.emitOpError("requires one GPU device and one launch mapping");
   if (programOrders.empty())
     return launch.emitOpError("has no per-axis program-space assignment");
+  if (targetPrograms > 1)
+    return program.emitOpError(
+        "cannot contain more than one materialized provider program");
   for (RangeOp range : ranges) {
     auto axis = axes.find(range.getAxisNode());
     if (axis == axes.end())

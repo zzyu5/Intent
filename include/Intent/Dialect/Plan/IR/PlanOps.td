@@ -41,6 +41,15 @@ def IntentPlan_SearchSpaceOp : IntentPlan_Op<"search_space", [
   let hasVerifier = 1;
 }
 
+def IntentPlan_TargetProgramOp : IntentPlan_Op<"target_program"> {
+  let arguments = (ins
+    StrAttr:$provider,
+    StrAttr:$source
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentPlan_DeviceOp : IntentPlan_Op<"device"> {
   let arguments = (ins I64Attr:$device);
   let results = (outs);
