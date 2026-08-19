@@ -239,7 +239,8 @@ LogicalResult validatePointwise(Operation &operation) {
     return operation.emitOpError("has no canonical pointwise operator");
   if (name == "intent.unary" &&
       llvm::is_contained({StringRef("exp"), StringRef("exp2"),
-                          StringRef("log"), StringRef("rsqrt"),
+                          StringRef("log"), StringRef("sin"), StringRef("cos"),
+                          StringRef("rsqrt"),
                           StringRef("sigmoid"), StringRef("negate"),
                           StringRef("not")},
                          logical.getValue()))

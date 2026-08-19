@@ -22,6 +22,7 @@ from .builtins import auto
 from .builtins import buffer
 from .builtins import cast
 from .builtins import contract
+from .builtins import cos
 from .builtins import scaled_contract
 from .builtins import sparse_contract_2to4
 from .builtins import domain
@@ -48,6 +49,7 @@ from .builtins import reduce
 from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import sigmoid
+from .builtins import sin
 from .builtins import scan
 from .builtins import scatter_reduce
 from .builtins import scatter_unique
@@ -108,6 +110,7 @@ __all__ = [
     "cast",
     "constraints",
     "contract",
+    "cos",
     "scaled_contract",
     "sparse_contract_2to4",
     "domain",
@@ -147,6 +150,7 @@ __all__ = [
     "reshape",
     "rsqrt",
     "sigmoid",
+    "sin",
     "scan",
     "scatter_reduce",
     "scatter_unique",

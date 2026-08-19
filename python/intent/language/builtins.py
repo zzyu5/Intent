@@ -59,6 +59,8 @@ mask = Intrinsic("mask")
 exp = Intrinsic("exp")
 exp2 = Intrinsic("exp2")
 log = Intrinsic("log")
+sin = Intrinsic("sin")
+cos = Intrinsic("cos")
 rsqrt = Intrinsic("rsqrt")
 sigmoid = Intrinsic("sigmoid")
 maximum = Intrinsic("maximum")
@@ -114,6 +116,8 @@ INTRINSICS = {
         exp,
         exp2,
         log,
+        sin,
+        cos,
         rsqrt,
         sigmoid,
         maximum,

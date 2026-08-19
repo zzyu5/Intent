@@ -120,6 +120,8 @@ class UnaryOperator(Enum):
     EXP = "exp"
     EXP2 = "exp2"
     LOG = "log"
+    SIN = "sin"
+    COS = "cos"
     RSQRT = "rsqrt"
     SIGMOID = "sigmoid"
 
