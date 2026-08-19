@@ -54,7 +54,7 @@ def official_fmha(context: Context) -> PreparedComparison:
         "intent_v2_cutile_official_fmha",
     )
     source = functional_launch(
-        lambda: source_module.cutile_fmha(
+        lambda: source_module["cutile_fmha"](
             q,
             k,
             v,

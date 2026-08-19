@@ -3,6 +3,7 @@ import intent.language as I
 
 from kernels.activation.pointwise import tanh_value
 from kernels.streaming.attention import online_attention_accumulate
+from kernels.streaming.attention import online_attention_accumulate_bf16
 
 
 SINK_BATCH = 1
@@ -90,7 +91,7 @@ def attention_sink_prefill(
                             scores, axis=1, identity=-I.inf
                         )
                         next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
+                        next_denominator, next_accumulator = online_attention_accumulate_bf16(
                             maximum,
                             next_maximum,
                             denominator,
@@ -156,7 +157,7 @@ def gemma_gqa_prefill(
                         query_index = I.indices(query_region)
                         key_index = I.indices(key_region)
                         valid = (key_index[None, :] <= query_index[:, None]) and (
-                            key_index[None, :] > query_index[:, None] - WINDOW
+                            key_index[None, :] >= query_index[:, None] - WINDOW
                         )
                         scores = I.mask(
                             scores * I.LOG2E,
@@ -167,7 +168,7 @@ def gemma_gqa_prefill(
                             scores, axis=1, identity=-I.inf
                         )
                         next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
+                        next_denominator, next_accumulator = online_attention_accumulate_bf16(
                             maximum,
                             next_maximum,
                             denominator,

@@ -50,7 +50,7 @@ CUTILE = (
     Entry("official_fmha", "B4-QH32-KVH8-S4096-D128-fp16-causal", "official_fmha", ("streaming/attention.py:flash_gqa_attention_fwd",), "source/cutile/cutile-python/attention/fmha/AttentionFMHA_runtime.py"),
     Entry("block_scaled_gemm", "M4096-N14336-K4096-fp8-block32", "block_scaled_gemm_v2", ("contraction/block_scaled.py:block_scaled_matmul",), "source/cutile/cutile-python/gemm/block_scaled/BlockScaledMatMul_runtime.py"),
     Entry("dense_gemm", "M4096-N14336-K4096-fp16", "dense_gemm", ("contraction/gemm.py:gemm",), "source/cutile/cutile-python/gemm/dense/MatMul_runtime.py"),
-    Entry("moe_expert_projection", "T4096-E8-top2-4096x14336-bf16", "moe_projection_v2", ("ragged/grouped_gemm.py:aligned_expert_projection_bf16",), "source/cutile/tilegym/moe/fused/moe_runtime.py"),
+    Entry("moe_expert_projection", "T4096-E8-top2-4096x14336-bf16", "moe_projection_v2", ("ragged/grouped_gemm.py:routed_expert_projection_bf16",), "source/cutile/tilegym/moe/fused/moe_runtime.py"),
     Entry("layer_norm", "8192x4096-bf16", "layer_norm_bf16", ("normalization/layer_norm.py:layer_norm_bf16",), "source/cutile/cutile-python/normalization/layer_norm/LayerNorm_runtime.py"),
     Entry("silu_and_mul", "4096x28672-to14336-bf16", "silu_and_mul", ("activation/swiglu.py:silu_and_mul_packed",), "source/cutile/tilegym/activation/silu_and_mul/silu_and_mul_runtime.py"),
     Entry("attention_backward", "B2-QH8-KVH2-S1024-D64-fp16-causal", "attention_backward_cutile_v2", ("backward/attention.py:attention_backward_delta", "backward/attention.py:attention_backward_dkdv", "backward/attention.py:attention_backward_dq"), "source/cutile/tilegym/attention/dense/attention_backward_runtime.py"),

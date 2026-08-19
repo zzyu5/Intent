@@ -115,7 +115,7 @@ def scaled_fp8_splitk_matmul(
                                 split,
                                 reduction,
                             ],
-                            (row_region, 256),
+                            (row_region, reduction),
                         )
                         rhs_block = I.reshape(
                             rhs[
@@ -124,7 +124,7 @@ def scaled_fp8_splitk_matmul(
                                 reduction,
                                 column_region,
                             ],
-                            (256, column_region),
+                            (reduction, column_region),
                         )
                         partial = I.contract(
                             lhs_block,

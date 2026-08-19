@@ -27,7 +27,7 @@ def mhc_gemm_rms_scale(
     for token in I.parallel(I.domain(0, T)):
         values = I.cast(x[token, reduction], I.f32)
         root_mean_square = I.rsqrt(
-            I.reduce.sum(values * values, axis=0, identity=0.0) / K
+            I.reduce.sum(values * values, axis=0, identity=0.0) / I.cast(K, I.f32)
         )
         linear = I.contract(
             x[token, reduction],
@@ -41,7 +41,7 @@ def mhc_gemm_rms_scale(
         scale = I.mask(
             I.full((columns,), ALPHA_PRE, dtype=I.f32),
             valid=pre,
-            fill=ALPHA_RESIDUAL,
+            fill=I.full((columns,), ALPHA_RESIDUAL, dtype=I.f32),
         )
         scale = I.mask(
             I.full((columns,), ALPHA_POST, dtype=I.f32),
@@ -78,7 +78,7 @@ def mhc_apply_residual(
             for source_stream in range(STREAMS):
                 mixed_residual = mixed_residual + I.cast(
                     residual[token, source_stream, dimensions], I.f32
-                ) * residual_mix[token, source_stream, output_stream]
+                ) * residual_mix[token, output_stream, source_stream]
             output[token, output_stream, dimensions] = I.cast(
                 mixed_residual
                 + post_mix[token, output_stream]

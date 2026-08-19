@@ -12,6 +12,7 @@ from ...measurement import compile_single
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
+from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import tilegym_source
 
@@ -73,7 +74,8 @@ def gelu(context: Context) -> PreparedComparison:
 def geglu(context: Context) -> PreparedComparison:
     x = torch.randn((4096, 28672), device="cuda", dtype=torch.float16)
     output = torch.empty((4096, 14336), device="cuda", dtype=torch.float16)
-    _, generated = compile_single(context, geglu_tanh, (x, output))
+    _, generated_base = compile_single(context, geglu_tanh, (x, output))
+    generated = PreparedLaunch(generated_base.launch, lambda: output)
     source_module = tilegym_source(
         context,
         "source/cutile/tilegym/activation/fused/geglu.py",

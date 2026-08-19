@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from kernels.ragged.grouped_gemm import aligned_expert_projection_bf16
+from kernels.ragged.grouped_gemm import routed_expert_projection_bf16
 from kernels.routing.moe_align import BLOCK_SIZE
 from kernels.routing.moe_align import EXPERT_BLOCKS
 from kernels.routing.moe_align import EXPERTS
@@ -29,6 +29,25 @@ def _runtime(context: Context):
     )
 
 
+def _canonical_alignment(
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    total: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    total_value = int(total[0].item())
+    blocks = total_value // BLOCK_SIZE
+    canonical_ids = sorted_ids[:total_value].clone()
+    active_experts = expert_ids[:blocks]
+    for expert in range(EXPERTS):
+        expert_blocks = torch.nonzero(active_experts == expert).flatten()
+        if expert_blocks.numel() == 0:
+            continue
+        begin = int(expert_blocks[0].item()) * BLOCK_SIZE
+        end = (int(expert_blocks[-1].item()) + 1) * BLOCK_SIZE
+        canonical_ids[begin:end] = torch.sort(canonical_ids[begin:end]).values
+    return canonical_ids, active_experts, total
+
+
 def expert_projection(context: Context) -> PreparedComparison:
     tokens, hidden, intermediate, experts, topk = 4096, 4096, 14336, 8, 2
     hidden_states = torch.randn(
@@ -50,25 +69,25 @@ def expert_projection(context: Context) -> PreparedComparison:
     sorted_ids, expert_ids, padded_tokens, _, _ = runtime.align.moe_align_block_size(
         topk_ids, BLOCK_SIZE, experts
     )
-    generated_output = torch.empty(
-        (tokens * topk, intermediate), device="cuda", dtype=torch.bfloat16
+    flat_experts = topk_ids.flatten()
+    member_routes = torch.argsort(flat_experts, stable=True).to(torch.int32)
+    expert_offsets = torch.empty(
+        (experts + 1,), device="cuda", dtype=torch.int32
     )
-    _, generated_base = compile_single(
+    expert_offsets[0] = 0
+    expert_offsets[1:] = torch.cumsum(
+        torch.bincount(flat_experts, minlength=experts), dim=0
+    ).to(torch.int32)
+    _, generated = compile_single(
         context,
-        aligned_expert_projection_bf16,
+        routed_expert_projection_bf16,
         (
             hidden_states,
-            sorted_ids,
-            expert_ids,
-            padded_tokens,
+            expert_offsets,
+            member_routes,
             weights,
-            generated_output,
         ),
-        constexprs={"TOP_K": topk, "BLOCK_SIZE": BLOCK_SIZE},
-    )
-    generated = PreparedLaunch(
-        generated_base.launch,
-        lambda: generated_output,
+        constexprs={"TOP_K": topk},
     )
     source_output = torch.empty(
         (tokens, topk, intermediate), device="cuda", dtype=torch.bfloat16
@@ -102,12 +121,12 @@ def expert_projection(context: Context) -> PreparedComparison:
         )
 
     source_launch()
-    source = PreparedLaunch(source_launch, lambda: source_output.view(tokens * topk, intermediate))
+    source = PreparedLaunch(source_launch, lambda: source_output)
     return PreparedComparison(
         generated,
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
-        cuda_graph=True,
+        cuda_graph=False,
     )
 
 
@@ -150,9 +169,7 @@ def alignment(context: Context) -> PreparedComparison:
         mark.launch()
 
     def generated_outputs():
-        total = int(total_padded[0].item())
-        blocks = total // BLOCK_SIZE
-        return sorted_routes[:total], expert_blocks[:blocks], total_padded
+        return _canonical_alignment(sorted_routes, expert_blocks, total_padded)
 
     generated_prepare()
     generated_launch()
@@ -171,9 +188,7 @@ def alignment(context: Context) -> PreparedComparison:
 
     def source_outputs():
         sorted_ids, expert_ids, total, _, _ = source_state["outputs"]
-        total_value = int(total[0].item())
-        blocks = total_value // BLOCK_SIZE
-        return sorted_ids[:total_value], expert_ids[:blocks], total
+        return _canonical_alignment(sorted_ids, expert_ids, total)
 
     source_launch()
     source = PreparedLaunch(source_launch, source_outputs)

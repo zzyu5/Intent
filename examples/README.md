@@ -101,7 +101,7 @@ V1 中的 `variant_*` 只证明同一算法的等价 DSL 分解可以编译，�
 | V2 | official FMHA | `B4-QH32-KVH8-S4096-D128-fp16-causal` | `streaming/attention.py:flash_gqa_attention_fwd` |
 | V1+V2 | block-scaled GEMM | `M4096-N14336-K4096-fp8-block32` | `contraction/block_scaled.py:block_scaled_matmul` |
 | V1+V2 | dense GEMM | `M4096-N14336-K4096-fp16` | `contraction/gemm.py:gemm` |
-| V2 | MoE expert projection | `T4096-E8-top2-4096x14336-bf16` | `ragged/grouped_gemm.py:aligned_expert_projection_bf16` |
+| V2 | MoE expert projection | `T4096-E8-top2-4096x14336-bf16` | `ragged/grouped_gemm.py:routed_expert_projection_bf16` |
 | V1+V2 | LayerNorm | `8192x4096-bf16` | `normalization/layer_norm.py:layer_norm_bf16` |
 | V2 | SiLU-and-mul | `4096x28672-to14336-bf16` | `activation/swiglu.py:silu_and_mul_packed` |
 | V1+V2 | attention backward | `B2-QH8-KVH2-S1024-D64-fp16-causal` | `backward/attention.py:attention_backward_delta+attention_backward_dkdv+attention_backward_dq` |

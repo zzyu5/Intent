@@ -11,6 +11,9 @@ output=$2
 shift 2
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+if [[ "${output}" != /* ]]; then
+  output="${PWD}/${output}"
+fi
 build_root=${INTENT_BUILD_ROOT:-/tmp/intentdsl-build}
 cmake_generator=${INTENT_CMAKE_GENERATOR:-Ninja}
 mlir_dir=${INTENT_MLIR_DIR:-/usr/lib/llvm-20/lib/cmake/mlir}
@@ -56,4 +59,3 @@ done
   "${INTENT_PYTHON:-${default_python}}" \
     -m repro.v2.runner "${arguments[@]}"
 )
-

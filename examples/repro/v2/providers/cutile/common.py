@@ -29,9 +29,14 @@ def tilegym_source(
         "source/cutile/tilegym/support/runtime.py",
         "intent_v2_cutile_tilegym_runtime",
     )
+    module_name = (
+        f"tilegym.ops.cutile.activation._intent_v2_{name}"
+        if needs_gelu
+        else f"tilegym.ops.cutile._intent_v2_{name}"
+    )
     return runtime.load_source(
         Path(context.project_root / source_path),
-        f"tilegym.ops.cutile._intent_v2_{name}",
+        module_name,
         needs_utils=needs_utils,
         needs_splitk=needs_splitk,
         needs_gelu=needs_gelu,
