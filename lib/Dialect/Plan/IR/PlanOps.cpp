@@ -360,6 +360,10 @@ LogicalResult ContractOp::verify() {
   if (!validOperand(getLhsSpace()) || !validOperand(getRhsSpace()) ||
       getAccumulatorSpace() != "private_fragment")
     return emitOpError("contains an invalid matrix operand residency");
+  if (getProducerReplay() &&
+      (getLhsSpace() != "shared" || getRhsSpace() != "shared"))
+    return emitOpError(
+        "producer replay requires shared matrix operand residency");
   return success();
 }
 

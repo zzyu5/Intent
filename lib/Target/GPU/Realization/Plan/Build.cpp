@@ -1163,7 +1163,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 operation.getLoc(), i64(builder, *node),
                 string(builder, operandSpace(operation.getOperand(0))),
                 string(builder, operandSpace(operation.getOperand(1))),
-                string(builder, "private_fragment"));
+                string(builder, "private_fragment"),
+                builder.getBoolAttr(replayed));
             Operation *stream = nullptr;
             for (Operation *parent = operation.getParentOp(); parent;
                  parent = parent->getParentOp())

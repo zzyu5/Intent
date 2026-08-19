@@ -194,7 +194,8 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
     I64Attr:$node,
     StrAttr:$lhs_space,
     StrAttr:$rhs_space,
-    StrAttr:$accumulator_space
+    StrAttr:$accumulator_space,
+    BoolAttr:$producer_replay
   );
   let results = (outs);
   let hasVerifier = 1;

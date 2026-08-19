@@ -858,6 +858,7 @@ struct ContractBinding : Binding<intent::plan::ContractOp> {
   llvm::StringRef getLhsSpace() const { return lhsSpace; }
   llvm::StringRef getRhsSpace() const { return rhsSpace; }
   llvm::StringRef getAccumulatorSpace() const { return accumulatorSpace; }
+  bool getProducerReplay() const { return operation.getProducerReplay(); }
 };
 
 struct ContractionOrientation {
@@ -1236,27 +1237,21 @@ mlir::LogicalResult indexDeferredContractReplays(
         &producerOwners) {
   llvm::DenseSet<mlir::Operation *> globallyDeferred;
   for (const auto &entry : index.contracts) {
+    if (!entry.second.getProducerReplay())
+      continue;
     mlir::Operation *contract = kernel.nodes.lookup(entry.first);
     if (!contract || contract->getName().getStringRef() != "intent.contract" ||
         contract->getNumOperands() != 2 ||
         isPlannedStageNode(index, contract))
-      continue;
+      return entry.second.emitOpError(
+          "producer replay does not bind one unstaged canonical contraction");
     std::optional<target::ContractOperandReplay> lhs =
         target::analyzeContractOperandReplay(contract->getOperand(0), *contract);
     std::optional<target::ContractOperandReplay> rhs =
         target::analyzeContractOperandReplay(contract->getOperand(1), *contract);
-    bool direct = contract->getOperand(0).getDefiningOp() &&
-                  contract->getOperand(1).getDefiningOp() &&
-                  contract->getOperand(0)
-                          .getDefiningOp()
-                          ->getName()
-                          .getStringRef() == "intent.view_load" &&
-                  contract->getOperand(1)
-                          .getDefiningOp()
-                          ->getName()
-                          .getStringRef() == "intent.view_load";
-    if (!lhs || !rhs || direct)
-      continue;
+    if (!lhs || !rhs)
+      return entry.second.emitOpError(
+          "selected producer replay has no canonical producer chain");
     bool anyDeferred = false;
     bool allDeferred = true;
     for (mlir::Operation *transfer :
@@ -1273,11 +1268,9 @@ mlir::LogicalResult indexDeferredContractReplays(
       anyDeferred |= deferred;
       allDeferred &= deferred;
     }
-    if (!anyDeferred)
-      continue;
-    if (!allDeferred)
-      return contract->emitOpError(
-          "has inconsistent producer-replay transfer materialization");
+    if (!anyDeferred || !allDeferred)
+      return entry.second.emitOpError(
+          "producer replay requires every source transfer to be deferred");
     if (entry.second.getLhsSpace() != "shared" ||
         entry.second.getRhsSpace() != "shared")
       return entry.second.emitOpError(
