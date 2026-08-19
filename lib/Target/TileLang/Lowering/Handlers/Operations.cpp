@@ -3042,10 +3042,34 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
   FailureOr<StringRef> source = lookupValue(operation, 0);
   FailureOr<StringRef> valid = lookupValue(operation, validIndex.getInt());
   FailureOr<StringRef> fill = lookupValue(operation, fillIndex.getInt());
-  FailureOr<std::string> result = resultStorage();
   FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
-  if (failed(source) || failed(valid) || failed(fill) || failed(result) ||
-      failed(extents) || extents->size() != relation->size())
+  if (failed(source) || failed(valid) || failed(fill) || failed(extents) ||
+      extents->size() != relation->size())
+    return failure();
+  Operation *validDefinition =
+      operation.getOperand(validIndex.getInt()).getDefiningOp();
+  auto validConstant =
+      validDefinition &&
+              validDefinition->getName().getStringRef() == "intent.constant"
+          ? validDefinition->getAttrOfType<BoolAttr>("intent.value")
+          : BoolAttr();
+  if (validConstant && validConstant.getValue()) {
+    std::string shape = "(";
+    for (auto [axis, extent] : llvm::enumerate(*extents)) {
+      if (axis)
+        shape += ", ";
+      shape += extent;
+    }
+    if (extents->size() == 1)
+      shape += ",";
+    shape += ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = T.reshape(" + source->str() + ", " + shape + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  FailureOr<std::string> result = resultStorage();
+  if (failed(result))
     return failure();
   SmallVector<std::string> indices;
   std::string loop = "for ";

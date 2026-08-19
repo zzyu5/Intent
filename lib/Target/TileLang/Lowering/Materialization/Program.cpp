@@ -2059,14 +2059,25 @@ FailureOr<std::string> ProgramMaterializer::accessIndices(Operation &operation) 
                             ? addressIndex(exact->str() + "[0]")
                             : addressIndex(assumed->second));
     }
-    FailureOr<bool> traversalRegion =
-        term.kind == "region_index"
-            ? isTraversalRegionArgument(indexed, operation)
-            : FailureOr<bool>(false);
-    if (failed(traversalRegion))
-      return failure();
+    if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> selected =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      if (failed(selected))
+        return failure();
+      std::string base = axisIndices.lookup(selected->axis.getNode());
+      if (base.empty())
+        return operation.emitOpError(
+            "has no active TileLang index for its selected region range");
+      base = addressIndex(base);
+      indices.push_back(selected->range.getTileRole() == "one"
+                            ? base
+                            : base + " : " + base + " + " +
+                                  selected->range.getTile().str());
+      continue;
+    }
     if (term.kind == "value_index" ||
-        target::lowering::isSequentialIterator(indexed) || *traversalRegion) {
+        target::lowering::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -2110,22 +2121,6 @@ FailureOr<std::string> ProgramMaterializer::accessIndices(Operation &operation) 
     result += value;
   }
   return result;
-}
-
-FailureOr<bool>
-ProgramMaterializer::isTraversalRegionArgument(Value value, Operation &consumer) {
-  if (!isa<BlockArgument>(value))
-    return false;
-  FailureOr<int64_t> valueID = target::getValueID(
-      value, kernel, consumer, "TileLang region argument range lookup");
-  if (failed(valueID))
-    return failure();
-  auto binding = planIndex.regionBindings.find(*valueID);
-  if (binding == planIndex.regionBindings.end()) {
-    consumer.emitOpError("indexes a region argument without a physical binding");
-    return failure();
-  }
-  return binding->second.getPurpose() == "traversal";
 }
 
 FailureOr<std::string>
@@ -2228,14 +2223,29 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
       }
       continue;
     }
-    FailureOr<bool> traversalRegion =
-        term.kind == "region_index"
-            ? isTraversalRegionArgument(indexed, operation)
-            : FailureOr<bool>(false);
-    if (failed(traversalRegion))
-      return failure();
+    if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> selected =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      if (failed(selected))
+        return failure();
+      std::string base = axisIndices.lookup(selected->axis.getNode());
+      if (base.empty())
+        return operation.emitOpError(
+            "has no active TileLang index for its selected region range");
+      if (selected->range.getTileRole() == "one") {
+        indices.push_back(addressIndex(base));
+      } else {
+        if (tileAxis >= tileIndices.size())
+          return operation.emitOpError(
+              "parallel TileLang transfer has too few region indices");
+        indices.push_back(addressIndex(base) + " + " +
+                          addressIndex(tileIndices[tileAxis++]));
+      }
+      continue;
+    }
     if (term.kind == "value_index" ||
-        target::lowering::isSequentialIterator(indexed) || *traversalRegion) {
+        target::lowering::isSequentialIterator(indexed)) {
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -2524,9 +2534,12 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
             return term.kind != "new_axis";
           })) != (*view)->shape.size())
     return failure();
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
   SmallVector<std::string> predicates;
   unsigned tileAxis = 0;
   unsigned sourceAxis = 0;
+  std::optional<unsigned> tensorGroupAxis;
   for (const target::IndexTerm &term : *relation) {
     if (term.kind == "new_axis") {
       if (tileAxis >= tileExtents.size())
@@ -2558,16 +2571,57 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
       if (!includeBase)
         return std::string();
       auto tensor = cast<RankedTensorType>(indexed.getType());
-      FailureOr<StringRef> exact =
-          lookupValue(operation, *term.operands.front());
-      if (tensor.getRank() != 1 || failed(exact) ||
-          tileAxis >= tileExtents.size() || tileExtents[tileAxis] != "1")
+      if (!tensorIndices.requiresBroadcastProjection()) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (tensor.getRank() != 1 || failed(exact) ||
+            tileAxis >= tileExtents.size() || tileExtents[tileAxis] != "1")
+          return operation.emitOpError(
+              "TileLang bulk bounds require one singleton indirect index tile");
+        ++tileAxis;
+        std::string index = exact->str() + "[0]";
+        predicates.push_back("0 <= " + index);
+        predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+        continue;
+      }
+      if (!tensorGroupAxis) {
+        if (tileAxis + tensorIndices.rank > tileExtents.size())
+          return operation.emitOpError(
+              "TileLang structured bulk bounds exceed the transfer rank");
+        tensorGroupAxis = tileAxis;
+        tileAxis += tensorIndices.rank;
+      }
+      if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
         return operation.emitOpError(
-            "TileLang bulk bounds require one singleton indirect index tile");
-      ++tileAxis;
-      std::string index = exact->str() + "[0]";
-      predicates.push_back("0 <= " + index);
-      predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
+            "TileLang structured bulk bounds exceed the transfer rank");
+      auto result = dyn_cast<OpResult>(indexed);
+      FailureOr<SmallVector<std::string>> extents =
+          result ? tensorExtents(*result.getOwner(), result.getResultNumber())
+                 : FailureOr<SmallVector<std::string>>(failure());
+      FailureOr<std::string> base =
+          structuredIndexExpression(indexed, operation);
+      if (failed(extents) || failed(base) ||
+          extents->size() != static_cast<size_t>(tensor.getRank()))
+        return operation.emitOpError(
+            "TileLang structured bulk bounds have no canonical index span");
+      std::optional<unsigned> varyingAxis;
+      for (auto [axis, extent] : llvm::enumerate(*extents)) {
+        if (extent == "1")
+          continue;
+        if (varyingAxis)
+          return operation.emitOpError(
+              "TileLang structured bulk index varies along multiple axes");
+        varyingAxis = axis;
+      }
+      predicates.push_back("0 <= " + *base);
+      if (varyingAxis) {
+        unsigned valueAxis = *tensorGroupAxis + tensorIndices.rank -
+                             tensor.getRank() + *varyingAxis;
+        predicates.push_back(*base + " + " + tileExtents[valueAxis] +
+                             " <= " + (*view)->shape[axisNumber]);
+      } else {
+        predicates.push_back(*base + " < " + (*view)->shape[axisNumber]);
+      }
       continue;
     }
     if (term.kind == "value_index" &&

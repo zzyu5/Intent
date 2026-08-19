@@ -191,8 +191,6 @@ private:
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string> accessIndices(mlir::Operation &operation);
-  mlir::FailureOr<bool>
-  isTraversalRegionArgument(mlir::Value value, mlir::Operation &consumer);
   mlir::FailureOr<std::string>
   structuredIndexExpression(mlir::Value value, mlir::Operation &consumer);
   mlir::FailureOr<std::string>

@@ -458,6 +458,42 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
   llvm::StringRef getGroupSpelling() const { return group; }
 };
 
+struct RegionRangeBinding {
+  AxisBinding axis;
+  RangeBinding range;
+};
+
+template <typename PlanIndex>
+mlir::FailureOr<RegionRangeBinding>
+selectedRegionArgumentRange(const PlanIndex &index,
+                            const target::KernelModel &kernel,
+                            mlir::Value value, mlir::Operation &consumer) {
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  mlir::FailureOr<int64_t> valueID =
+      argument ? target::getValueID(value, kernel, consumer,
+                                    "selected region-argument range")
+               : mlir::FailureOr<int64_t>(mlir::failure());
+  auto binding = mlir::succeeded(valueID)
+                     ? index.regionBindings.find(*valueID)
+                     : index.regionBindings.end();
+  intent::plan::RegionBindingOp region =
+      binding != index.regionBindings.end() ? binding->second
+                                            : intent::plan::RegionBindingOp();
+  auto axis = binding != index.regionBindings.end()
+                  ? index.axes.find(region.getAxisNode())
+                  : index.axes.end();
+  const RangeBinding *range =
+      axis != index.axes.end()
+          ? axis->second.getRange(region.getPurpose(), region.getLevel())
+          : nullptr;
+  if (!argument || mlir::failed(valueID) ||
+      binding == index.regionBindings.end() || axis == index.axes.end() ||
+      !range)
+    return consumer.emitOpError(
+        "has no selected physical range for its region argument");
+  return RegionRangeBinding{axis->second, *range};
+}
+
 inline bool isPackedScalarAxis(const AxisBinding &axis) {
   return axis.hasRole("parallel") && axis.hasRole("lane") &&
          axis.hasRole("packed_lane");
