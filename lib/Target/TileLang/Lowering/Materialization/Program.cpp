@@ -1902,21 +1902,9 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
       active.erase(current);
       return result;
     };
-    if (auto argument = dyn_cast<BlockArgument>(current)) {
-      Operation *owner = argument.getOwner()->getParentOp();
-      if (owner && argument.getArgNumber() == 0 &&
-          (owner->getName().getStringRef() == "intent.parallel" ||
-           owner->getName().getStringRef() == "intent.ordered" ||
-           owner->getName().getStringRef() == "intent.for" ||
-           owner->getName().getStringRef() == "intent.state_stream")) {
-        FailureOr<plan::AxisOp> axis = resolveAxis(current, consumer);
-        std::string spelling =
-            succeeded(axis) ? axisIndices.lookup(axis->getNode()) : std::string();
-        if (!spelling.empty())
-          return finish(spelling);
-      }
-      auto emitted = valueNames.find(current);
-      return finish(emitted == valueNames.end()
+    if (isa<BlockArgument>(current)) {
+      auto emitted = regionIndices.find(current);
+      return finish(emitted == regionIndices.end()
                         ? FailureOr<std::string>(failure())
                         : FailureOr<std::string>(emitted->second));
     }
@@ -2067,10 +2055,11 @@ FailureOr<std::string> ProgramMaterializer::accessIndices(Operation &operation) 
                                                         indexed, operation);
       if (failed(selected))
         return failure();
-      std::string base = axisIndices.lookup(selected->axis.getNode());
-      if (base.empty())
+      auto exact = regionIndices.find(indexed);
+      if (exact == regionIndices.end())
         return operation.emitOpError(
             "has no active TileLang index for its selected region range");
+      std::string base = exact->second;
       base = addressIndex(base);
       indices.push_back(selected->range.getTileRole() == "one"
                             ? base
@@ -2231,10 +2220,11 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
                                                         indexed, operation);
       if (failed(selected))
         return failure();
-      std::string base = axisIndices.lookup(selected->axis.getNode());
-      if (base.empty())
+      auto exact = regionIndices.find(indexed);
+      if (exact == regionIndices.end())
         return operation.emitOpError(
             "has no active TileLang index for its selected region range");
+      std::string base = exact->second;
       if (selected->range.getTileRole() == "one") {
         indices.push_back(addressIndex(base));
       } else {

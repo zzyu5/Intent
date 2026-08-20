@@ -507,6 +507,10 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
       axisIndices[axis.getNode()] = value;
     }
     valueNames[argument] = value;
+    std::string regionIndex = axisIndices.lookup(axis.getNode());
+    if (regionIndex.empty())
+      return axis.emitOpError("has no emitted ownership-range index");
+    regionIndices[argument] = std::move(regionIndex);
   }
   return success();
 }
@@ -666,6 +670,7 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
            addressIndex(iterator) + "]");
     }
     valueNames[body.getArgument(index)] = logicalIterator;
+    regionIndices[body.getArgument(index)] = logicalIterator;
     if (raggedAxis && succeeded(domainNode))
       axisIndices[*domainNode] = logicalIterator;
   }
@@ -706,12 +711,53 @@ LogicalResult ProgramMaterializer::enterIf(Operation &operation) {
     return operation.emitOpError("lacks a mechanical TileLang scalar branch");
   SmallVector<std::string> results;
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
-    std::string dtype = dtypeName(operation.getResult(index).getType(), operation);
-    if (dtype.empty())
-      return failure();
-    std::string result = makeResultName(operation, index) + "_branch";
-    line(result + " = T.alloc_local((1,), " + dtype + ")");
-    results.push_back(std::move(result));
+    Type type = operation.getResult(index).getType();
+    if (isa<RankedTensorType>(type)) {
+      std::optional<std::string> carried;
+      bool ambiguous = false;
+      for (const auto &entry : planIndex.contracts) {
+        plan::ContractOp contract = entry.second;
+        std::optional<int64_t> conditional =
+            contract.getAccumulatorConditionalNode();
+        std::optional<int64_t> conditionalResult =
+            contract.getAccumulatorConditionalResult();
+        std::optional<int64_t> previousValue =
+            contract.getAccumulatorValue();
+        if (contract.getAccumulatorFlow() != "loop_carried" || !conditional ||
+            !conditionalResult || !previousValue || *conditional != *node ||
+            *conditionalResult != static_cast<int64_t>(index))
+          continue;
+        Value previous = kernel.values.lookup(*previousValue);
+        auto previousName = valueNames.find(previous);
+        if (!previous || previousName == valueNames.end())
+          return operation.emitOpError(
+              "cannot resolve its planned TileLang loop-carried accumulator");
+        if (carried) {
+          ambiguous = true;
+          continue;
+        }
+        carried = previousName->second;
+      }
+      if (ambiguous)
+        return operation.emitOpError(
+            "has multiple TileLang in-place accumulator flows for one result");
+      if (carried) {
+        results.push_back(std::move(*carried));
+      } else {
+        FailureOr<std::string> result =
+            allocateResult(operation, index, "fragment");
+        if (failed(result))
+          return failure();
+        results.push_back(std::move(*result));
+      }
+    } else {
+      std::string dtype = dtypeName(type, operation);
+      if (dtype.empty())
+        return failure();
+      std::string result = makeResultName(operation, index) + "_branch";
+      line(result + " = T.alloc_local((1,), " + dtype + ")");
+      results.push_back(std::move(result));
+    }
   }
   ifResults[&operation] = std::move(results);
   line("if " + condition->str() + ":");
@@ -724,8 +770,12 @@ LogicalResult ProgramMaterializer::leaveIf(Operation &operation) {
   if (results == ifResults.end())
     return operation.emitOpError("has no active TileLang scalar branch");
   --indentation;
-  for (unsigned index = 0; index < operation.getNumResults(); ++index)
-    bindResult(operation, index, results->second[index] + "[0]");
+  for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+    bool tensor = isa<RankedTensorType>(operation.getResult(index).getType());
+    bindResult(operation, index,
+               results->second[index] + (tensor ? "" : "[0]"));
+  }
+  ifResults.erase(results);
   return success();
 }
 
@@ -826,12 +876,22 @@ LogicalResult ProgramMaterializer::emitYield(Operation &operation) {
     return operation.emitOpError("does not match its TileLang branch results");
   if (operation.getNumOperands() == 0)
     line("pass");
+  bool emitted = false;
   for (unsigned index = 0; index < operation.getNumOperands(); ++index) {
     FailureOr<StringRef> yielded = lookupValue(operation, index);
     if (failed(yielded))
       return failure();
-    line(results->second[index] + "[0] = " + yielded->str());
+    bool tensor = isa<RankedTensorType>(owner->getResult(index).getType());
+    if (tensor && *yielded != results->second[index]) {
+      line("T.copy(" + yielded->str() + ", " + results->second[index] + ")");
+      emitted = true;
+    } else if (!tensor) {
+      line(results->second[index] + "[0] = " + yielded->str());
+      emitted = true;
+    }
   }
+  if (operation.getNumOperands() != 0 && !emitted)
+    line("pass");
   if (operation.getParentRegion() == &owner->getRegion(0)) {
     --indentation;
     line("else:");
@@ -1125,13 +1185,8 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     return operation.emitOpError(
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
-  bool privateContiguousCompact =
-      boundary.getResultSpace() == "fragment" && succeeded(view) &&
-      accessRanges.size() == 1 && accessRanges.front().isCompact() &&
-      accessRanges.front().getSourceAxis() + 1 ==
-          static_cast<int64_t>((*view)->shape.size());
   if (boundary.hasCompactTensorIndex() &&
-      (boundary.getResultSpace() == "shared" || privateContiguousCompact)) {
+      boundary.getCoverageSpace() != "none") {
     if (scalarResult || failed(view) || accessRanges.size() != 1 ||
         !accessRanges.front().isCompact())
       return operation.emitOpError(
@@ -1264,7 +1319,7 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     if (compactShape.size() == 1)
       compactShapeText += ",";
     compactShapeText += ")";
-    StringRef compactAllocator = boundary.getResultSpace() == "shared"
+    StringRef compactAllocator = boundary.getCoverageSpace() == "shared"
                                      ? "T.alloc_shared"
                                      : "T.alloc_fragment";
     line(compactResult + " = " + compactAllocator.str() + "(" +
@@ -1344,7 +1399,7 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     --indentation;
     --indentation;
     --indentation;
-    if (boundary.getResultSpace() == "shared")
+    if (boundary.getCoverageSpace() == "shared")
       line("T.sync_threads()");
 
     SmallVector<std::string> logicalIndices;
@@ -2352,6 +2407,13 @@ LogicalResult ProgramMaterializer::emitBinary(Operation &operation) {
   if (failed(node) || !binding || operation.getNumResults() != 1 ||
       binding.getSpace() != (tensorResult ? "fragment" : "local"))
     return operation.emitOpError("lacks a TileLang binary binding");
+  auto inPlace = inPlacePointwiseResults.find(&operation);
+  if (inPlace != inPlacePointwiseResults.end()) {
+    std::string result = inPlace->second;
+    inPlacePointwiseResults.erase(inPlace);
+    bindResult(operation, 0, result);
+    return success();
+  }
   std::string resultName = makeResultName(operation, 0);
   auto makeExpression = [&](StringRef lhs,
                             StringRef rhs) -> FailureOr<std::string> {
@@ -3303,6 +3365,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
        addressIndex(streamTile) + " * " + binding.getTile().str());
   axisIndices[binding.getAxisNode()] = streamStart;
   valueNames[body.getArgument(0)] = streamStart;
+  regionIndices[body.getArgument(0)] = streamStart;
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -3443,10 +3506,42 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   if (orientation->batched)
     return operation.emitOpError(
         "TileLang 0.1.13 has no mechanical batched GEMM projection");
-  if (target::lowering::isLoopCarriedContractionAccumulator(operation))
+  bool carriedFlow = binding.getAccumulatorFlow() == "loop_carried";
+  std::optional<int64_t> accumulatorOwner =
+      binding.getAccumulatorOwnerNode();
+  std::optional<int64_t> accumulatorUpdate =
+      binding.getAccumulatorUpdateNode();
+  std::optional<int64_t> accumulatorValue = binding.getAccumulatorValue();
+  std::optional<int64_t> accumulatorConditional =
+      binding.getAccumulatorConditionalNode();
+  bool producerReplay = deferredContractReplays.contains(&operation);
+  bool oneSidedDeferredOperand =
+      deferredLoads.contains(operation.getOperand(0)) !=
+      deferredLoads.contains(operation.getOperand(1));
+  bool reuseCarriedAccumulator =
+      carriedFlow &&
+      (accumulatorConditional || producerReplay ||
+       (accumulatorOwner && planIndex.streams.count(*accumulatorOwner) &&
+        oneSidedDeferredOperand));
+  if (reuseCarriedAccumulator &&
+      target::lowering::isPlannedStageNode(planIndex, &operation))
     return operation.emitOpError(
-        "TileLang 0.1.13 cannot mechanically preserve a contraction that is "
-        "repeatedly accumulated through a tensor loop carrier");
+        "TileLang 0.1.13 cannot mechanically combine a planned private "
+        "stage with conditional loop-carried contraction accumulation");
+  std::optional<std::string> carriedAccumulator;
+  if (reuseCarriedAccumulator) {
+    if (!accumulatorUpdate || !accumulatorValue)
+      return operation.emitOpError(
+          "has an incomplete planned loop-carried accumulator binding");
+    Value previous = kernel.values.lookup(*accumulatorValue);
+    Operation *update = kernel.nodes.lookup(*accumulatorUpdate);
+    auto previousName = valueNames.find(previous);
+    if (!previous || !update || previousName == valueNames.end())
+      return operation.emitOpError(
+          "has no emitted TileLang loop-carried contraction accumulator");
+    carriedAccumulator = previousName->second;
+    inPlacePointwiseResults[update] = *carriedAccumulator;
+  }
   if (!planIndex.stages.empty()) {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
@@ -3592,20 +3687,26 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
 
   auto replay = deferredContractReplays.find(&operation);
   if (replay != deferredContractReplays.end()) {
-    if (binding.getLhsSpace() != "shared" ||
-        binding.getRhsSpace() != "shared" ||
+    if ((binding.getLhsSpace() != "shared" &&
+         binding.getLhsSpace() != "fragment") ||
+        (binding.getRhsSpace() != "shared" &&
+         binding.getRhsSpace() != "fragment") ||
         binding.getAccumulatorSpace() != "fragment")
       return operation.emitOpError(
           "producer replay has inconsistent TileLang plan spaces");
     FailureOr<plan::AxisOp> reductionAxis =
         target::lowering::exactContractionReductionAxis(planIndex, kernel,
                                                         operation);
-    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+    FailureOr<std::string> result =
+        carriedAccumulator
+            ? FailureOr<std::string>(*carriedAccumulator)
+            : allocateResult(operation, 0, "fragment");
     if (failed(reductionAxis) || failed(result))
       return failure();
     bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
         planIndex, operation, reductionAxis->getNode());
-    line("T.clear(" + *result + ")");
+    if (!carriedAccumulator)
+      line("T.clear(" + *result + ")");
     if (!streamReduction) {
       line("for k_tile in T.Pipelined(T.ceildiv(" +
            roleDimensions.lookup(reductionAxis->getRole()) + ", " +
@@ -3674,9 +3775,70 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
   if (lhsLoad || rhsLoad) {
-    if (!lhsLoad || !rhsLoad)
-      return operation.emitOpError(
-          "deferred TileLang contraction has inconsistent operand residency");
+    if (!lhsLoad || !rhsLoad) {
+      Operation *load = lhsLoad ? lhsLoad : rhsLoad;
+      unsigned loadOperand = lhsLoad ? 0 : 1;
+      unsigned directOperand = lhsLoad ? 1 : 0;
+      StringRef loadSpace = lhsLoad ? binding.getLhsSpace()
+                                    : binding.getRhsSpace();
+      StringRef directSpace = lhsLoad ? binding.getRhsSpace()
+                                      : binding.getLhsSpace();
+      if (loadSpace != "shared" || directSpace != "fragment" ||
+          binding.getAccumulatorSpace() != "fragment")
+        return operation.emitOpError(
+            "one-sided deferred TileLang contraction has inconsistent plan "
+            "spaces");
+      FailureOr<plan::AxisOp> reductionAxis =
+          target::lowering::exactContractionReductionAxis(planIndex, kernel,
+                                                          operation);
+      if (failed(reductionAxis))
+        return failure();
+      if (!target::lowering::isEnclosingStreamReductionAxis(
+              planIndex, operation, reductionAxis->getNode()))
+        return operation.emitOpError(
+            "one-sided deferred TileLang contraction requires an active "
+            "stream-bound reduction range");
+      if (axisIndices.lookup(reductionAxis->getNode()).empty())
+        return operation.emitOpError(
+            "has no active TileLang stream-bound reduction range");
+      FailureOr<int64_t> loadNode =
+          target::getNodeID(*load, "TileLang contraction transfer");
+      plan::BoundaryOp boundary =
+          succeeded(loadNode) ? planIndex.boundaries.lookup(*loadNode)
+                              : plan::BoundaryOp();
+      FailureOr<ABIView *> view = lookupView(load->getOperand(0), *load);
+      FailureOr<std::string> indices = accessIndices(*load);
+      FailureOr<std::string> shape = tensorShape(*load, 0);
+      FailureOr<StringRef> direct = lookupValue(operation, directOperand);
+      FailureOr<std::string> result =
+          carriedAccumulator
+              ? FailureOr<std::string>(*carriedAccumulator)
+              : allocateResult(operation, 0, "fragment");
+      if (failed(loadNode) || !boundary || failed(view) || failed(indices) ||
+          failed(shape) || failed(direct) || failed(result))
+        return failure();
+      if (boundary.hasDataDependentTensorIndex())
+        return operation.emitOpError(
+            "TileLang cannot bulk-copy a stream contraction operand with a "
+            "noncontiguous index tile");
+      std::string shared = makeResultName(*load, 0) + "_shared";
+      line(shared + " = T.alloc_shared(" + *shape + ", " +
+           dtypeName((*view)->tensor.getElementType(), *load) + ")");
+      line("T.copy(" + (*view)->argument->name + "[" + *indices + "], " +
+           shared + ")");
+      if (!carriedAccumulator)
+        line("T.clear(" + *result + ")");
+      std::string lhs = loadOperand == 0 ? shared : direct->str();
+      std::string rhs = loadOperand == 1 ? shared : direct->str();
+      std::string call = "T.gemm(" + lhs + ", " + rhs + ", " + *result;
+      if (orientation->lhsTranspose)
+        call += ", transpose_A=True";
+      if (orientation->rhsTranspose)
+        call += ", transpose_B=True";
+      line(call + ", policy=GEMM_WARP_POLICY)");
+      bindResult(operation, 0, *result);
+      return success();
+    }
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
         binding.getAccumulatorSpace() != "fragment")
@@ -3738,7 +3900,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     FailureOr<std::string> rhsIndices = accessIndices(*rhsLoad);
     FailureOr<std::string> lhsShape = tensorShape(*lhsLoad, 0);
     FailureOr<std::string> rhsShape = tensorShape(*rhsLoad, 0);
-    FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+    FailureOr<std::string> result =
+        carriedAccumulator
+            ? FailureOr<std::string>(*carriedAccumulator)
+            : allocateResult(operation, 0, "fragment");
     if (failed(lhsView) || failed(rhsView) || failed(lhsIndices) ||
         failed(rhsIndices) || failed(lhsShape) || failed(rhsShape) ||
         failed(result))
@@ -3749,7 +3914,8 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
          dtypeName((*lhsView)->tensor.getElementType(), *lhsLoad) + ")");
     line(rhs + " = T.alloc_shared(" + *rhsShape + ", " +
          dtypeName((*rhsView)->tensor.getElementType(), *rhsLoad) + ")");
-    line("T.clear(" + *result + ")");
+    if (!carriedAccumulator)
+      line("T.clear(" + *result + ")");
     if (!streamReduction) {
       line("for k_tile in T.Pipelined(T.ceildiv(" +
            roleDimensions.lookup(reductionAxis->getRole()) + ", " +
@@ -3848,7 +4014,9 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         "TileLang 0.1.13 has no native single-row contraction projection; "
         "the scalar product-and-reduce fallback is intentionally unsupported");
   }
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  FailureOr<std::string> result =
+      carriedAccumulator ? FailureOr<std::string>(*carriedAccumulator)
+                         : allocateResult(operation, 0, "fragment");
   if (failed(lhs) || failed(rhs) || failed(result))
     return failure();
   FailureOr<std::string> isolatedLhs =
@@ -3857,7 +4025,8 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       isolateRepeatedContractionOperand(operation.getOperand(1), *rhs, 1);
   if (failed(isolatedLhs) || failed(isolatedRhs))
     return failure();
-  line("T.clear(" + *result + ")");
+  if (!carriedAccumulator)
+    line("T.clear(" + *result + ")");
   std::string call =
       "T.gemm(" + *isolatedLhs + ", " + *isolatedRhs + ", " + *result;
   if (orientation->lhsTranspose)

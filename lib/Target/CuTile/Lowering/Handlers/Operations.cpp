@@ -2789,9 +2789,107 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!lhsLoad || !rhsLoad)
-    return operation.emitOpError(
-        "deferred cuTile contraction has inconsistent operand residency");
+  if (static_cast<bool>(lhsLoad) != static_cast<bool>(rhsLoad)) {
+    if (orientation->batched)
+      return operation.emitOpError(
+          "one-sided deferred cuTile batch contraction is not supported");
+    Operation *load = lhsLoad ? lhsLoad : rhsLoad;
+    unsigned loadOperand = lhsLoad ? 0 : 1;
+    unsigned directOperand = lhsLoad ? 1 : 0;
+    StringRef loadSpace =
+        lhsLoad ? binding.getLhsSpace() : binding.getRhsSpace();
+    StringRef directSpace =
+        lhsLoad ? binding.getRhsSpace() : binding.getLhsSpace();
+    if (loadSpace != "shared" || directSpace != "private_fragment" ||
+        binding.getAccumulatorSpace() != "private_fragment")
+      return operation.emitOpError(
+          "one-sided deferred cuTile contraction has inconsistent plan spaces");
+    FailureOr<plan::AxisOp> reductionAxis =
+        target::lowering::exactContractionReductionAxis(planIndex, kernel,
+                                                        operation);
+    if (failed(reductionAxis))
+      return failure();
+    if (!target::lowering::isEnclosingStreamReductionAxis(
+            planIndex, operation, reductionAxis->getNode()) ||
+        axisIndices.lookup(reductionAxis->getNode()).empty())
+      return operation.emitOpError(
+          "one-sided deferred cuTile contraction requires an active "
+          "stream-bound reduction range");
+    FailureOr<int64_t> loadNode =
+        target::getNodeID(*load, "cuTile contraction transfer");
+    plan::BoundaryOp boundary =
+        succeeded(loadNode) ? planIndex.boundaries.lookup(*loadNode)
+                            : plan::BoundaryOp();
+    FailureOr<ABIView *> view = lookupView(load->getOperand(0), *load);
+    bool gather = boundary && boundary.getAccess() == "gather";
+    FailureOr<std::string> index =
+        boundary ? indexTuple(*load, gather)
+                 : FailureOr<std::string>(failure());
+    FailureOr<std::string> shape =
+        gather ? FailureOr<std::string>(std::string()) : tileShape(*load);
+    bool transpose = loadOperand == 0 ? orientation->lhsTranspose
+                                      : orientation->rhsTranspose;
+    bool permutePhysical = transpose && succeeded(view) &&
+                           (*view)->tensor.getRank() > 2 && !gather;
+    FailureOr<std::string> resultShape =
+        emitTensorShape(*load, 0, permutePhysical);
+    FailureOr<std::string> contractShape = emitTensorShape(operation, 0);
+    FailureOr<StringRef> direct = lookupValue(operation, directOperand);
+    if (failed(loadNode) || !boundary ||
+        (boundary.getAccess() != "load" && !gather) || failed(view) ||
+        failed(index) || failed(shape) || failed(resultShape) ||
+        failed(contractShape) || failed(direct))
+      return operation.emitOpError(
+          "has no one-sided deferred cuTile contraction transfer binding");
+    std::string dtype =
+        dtypeName((*view)->tensor.getElementType(), operation);
+    if (dtype.empty())
+      return failure();
+    std::string loaded = makeResultName(*load, 0);
+    std::string physical = loaded + "_physical";
+    if (gather) {
+      StringRef padding =
+          isa<IntegerType, IndexType>((*view)->tensor.getElementType()) ? "0"
+                                                                       : "0.0";
+      line(physical + " = ct.gather(" + (*view)->argument->name + ", " +
+           *index + ", check_bounds=True, padding_value=" + padding.str() +
+           ")");
+    } else {
+      line(physical + " = ct.load(" + (*view)->argument->name +
+           ", index=" + *index + ", shape=" + *shape +
+           ", padding_mode=ct.PaddingMode.ZERO)");
+    }
+    if (permutePhysical) {
+      SmallVector<unsigned> permutation((*view)->tensor.getRank());
+      std::iota(permutation.begin(), permutation.end(), 0);
+      std::swap(permutation[permutation.size() - 2], permutation.back());
+      std::string axes = "(";
+      for (auto [axis, value] : llvm::enumerate(permutation)) {
+        if (axis)
+          axes += ", ";
+        axes += std::to_string(value);
+      }
+      axes += ")";
+      line(physical + " = ct.permute(" + physical + ", " + axes + ")");
+    }
+    line(loaded + " = " + physical + ".reshape(" + *resultShape +
+         ").astype(" + dtype + ")");
+    if (transpose && !permutePhysical)
+      line(loaded + " = ct.transpose(" + loaded + ")");
+    std::string lhsExpression = loadOperand == 0 ? loaded : direct->str();
+    std::string rhsExpression = loadOperand == 1 ? loaded : direct->str();
+    if (directOperand == 0 && orientation->lhsTranspose)
+      lhsExpression = "ct.transpose(" + lhsExpression + ")";
+    if (directOperand == 1 && orientation->rhsTranspose)
+      rhsExpression = "ct.transpose(" + rhsExpression + ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = ct.full(" + *contractShape + ", 0, dtype=" +
+         accumulatorDtype + ")");
+    line(result + " = ct.mma(" + lhsExpression + ", " + rhsExpression +
+         ", " + result + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (orientation->batched)
     return operation.emitOpError(
         "deferred cuTile batch contraction is not supported");

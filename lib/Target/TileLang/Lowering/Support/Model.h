@@ -260,6 +260,7 @@ private:
   llvm::SmallVector<ABIScalar> scalars;
   llvm::DenseMap<mlir::Value, unsigned> viewPositions;
   llvm::DenseMap<mlir::Value, std::string> valueNames;
+  llvm::DenseMap<mlir::Value, std::string> regionIndices;
   llvm::DenseMap<mlir::Value, std::string> assumedIndexNames;
   llvm::DenseMap<mlir::Value, mlir::Operation *> deferredLoads;
   llvm::DenseMap<mlir::Operation *, target::lowering::DeferredContractReplay>
@@ -285,6 +286,7 @@ private:
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       whileCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
+  llvm::DenseMap<mlir::Operation *, std::string> inPlacePointwiseResults;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string>> scalarBuffers;
   llvm::DenseMap<mlir::Value, std::string> localBuffers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>

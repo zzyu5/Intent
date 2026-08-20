@@ -147,6 +147,7 @@ def IntentPlan_TransferOp : IntentPlan_Op<"transfer"> {
     BoolAttr:$consumer_neutralized,
     StrAttr:$materialization,
     StrAttr:$tensor_indexing,
+    StrAttr:$coverage_space,
     StrAttr:$result_space
   );
   let results = (outs);
@@ -195,6 +196,12 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
     StrAttr:$lhs_space,
     StrAttr:$rhs_space,
     StrAttr:$accumulator_space,
+    StrAttr:$accumulator_flow,
+    OptionalAttr<I64Attr>:$accumulator_owner_node,
+    OptionalAttr<I64Attr>:$accumulator_update_node,
+    OptionalAttr<I64Attr>:$accumulator_value,
+    OptionalAttr<I64Attr>:$accumulator_conditional_node,
+    OptionalAttr<I64Attr>:$accumulator_conditional_result,
     BoolAttr:$producer_replay
   );
   let results = (outs);

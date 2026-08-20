@@ -1873,6 +1873,82 @@ FailureOr<plan::AxisOp> ProgramMaterializer::resolveAxis(Value indexedValue,
   return axis;
 }
 
+FailureOr<plan::AxisOp>
+ProgramMaterializer::packedScalarAxis(Value indexedValue,
+                                      Operation &consumer) {
+  FailureOr<target::ScalarIndexSource> source =
+      target::traceScalarIndexSource(indexedValue, consumer);
+  if (failed(source))
+    return failure();
+  if (!source->domain)
+    return plan::AxisOp();
+  FailureOr<int64_t> node =
+      target::getNodeID(*source->domain, "packed scalar projection");
+  auto axis = succeeded(node) ? planIndex.axes.find(*node) : planIndex.axes.end();
+  if (failed(node))
+    return failure();
+  if (axis == planIndex.axes.end() ||
+      !target::lowering::isPackedScalarAxis(axis->second))
+    return plan::AxisOp();
+  return axis->second;
+}
+
+FailureOr<SmallVector<unsigned>>
+ProgramMaterializer::packedScalarInsertions(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation))
+    return failure();
+  target::TensorIndexGroup tensorIndices =
+      target::tensorIndexGroup(operation, *relation);
+  SmallVector<unsigned> insertions;
+  llvm::DenseSet<int64_t> packedAxes;
+  unsigned logicalAxis = 0;
+  bool tensorGroupConsumed = false;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis" || term.kind == "full_slice") {
+      ++logicalAxis;
+      continue;
+    }
+    if (term.kind == "static_index")
+      continue;
+    if (term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "packed scalar projection requires value-bound index terms");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index") {
+      if (isa<RankedTensorType>(indexed.getType())) {
+        if (tensorIndices.requiresBroadcastProjection()) {
+          if (!tensorGroupConsumed) {
+            logicalAxis += tensorIndices.rank;
+            tensorGroupConsumed = true;
+          }
+        } else {
+          ++logicalAxis;
+        }
+        continue;
+      }
+      FailureOr<plan::AxisOp> packed = packedScalarAxis(indexed, operation);
+      if (failed(packed))
+        return failure();
+      if (*packed && packedAxes.insert(packed->getNode()).second)
+        insertions.push_back(logicalAxis);
+      continue;
+    }
+    if (term.kind != "region_index")
+      return operation.emitOpError(
+          "has no mechanical packed scalar index projection");
+    if (target::lowering::isSequentialIterator(indexed))
+      continue;
+    FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+    if (failed(axis))
+      return failure();
+    if (!axis->isScalar())
+      ++logicalAxis;
+  }
+  return insertions;
+}
+
 FailureOr<std::string> ProgramMaterializer::dimensionName(Operation &domain) {
   return target::lowering::logicalDomainExtent(
       domain, [&](Value value,
@@ -1998,7 +2074,18 @@ ProgramMaterializer::emitPointerExpression(Operation &operation, ABIView &view,
           return failure();
         auto tensor = dyn_cast<RankedTensorType>(indexed.getType());
         if (!tensor) {
-          index = "(" + exact->str() + ")";
+          FailureOr<plan::AxisOp> packed =
+              packedScalarAxis(indexed, operation);
+          if (failed(packed))
+            return failure();
+          if (*packed) {
+            if (vectorAxis >= *tensorRank)
+              return operation.emitOpError(
+                  "packed scalar index exceeds the emitted Triton tensor rank");
+            index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+          } else {
+            index = "(" + exact->str() + ")";
+          }
         } else {
           if (tensorIndices.requiresBroadcastProjection()) {
             if (!tensorGroupAxis) {
@@ -2158,24 +2245,24 @@ ProgramMaterializer::emitMaskExpression(Operation &operation, bool store) {
           target::traceScalarIndexSource(indexed, operation);
       if (failed(source))
         return failure();
-      bool packedScalar = false;
-      if (source->domain) {
-        FailureOr<int64_t> node =
-            target::getNodeID(*source->domain, "packed scalar bounds");
-        auto axis = succeeded(node) ? planIndex.axes.find(*node)
-                                    : planIndex.axes.end();
-        if (failed(node))
-          return failure();
-        packedScalar =
-            axis != planIndex.axes.end() &&
-            target::lowering::isPackedScalarAxis(axis->second);
-      }
+      FailureOr<plan::AxisOp> packed = packedScalarAxis(indexed, operation);
+      if (failed(packed))
+        return failure();
+      bool packedScalar = static_cast<bool>(*packed);
       if (source->hasDomain() && (source->transformed || packedScalar)) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
         if (failed(exact))
           return failure();
-        std::string index = "(" + exact->str() + ")";
+        std::string index;
+        if (packedScalar) {
+          if (vectorAxis >= *tensorRank)
+            return operation.emitOpError(
+                "packed scalar bounds exceed the emitted Triton tensor rank");
+          index = broadcastIndex(*exact, vectorAxis++, *tensorRank);
+        } else {
+          index = "(" + exact->str() + ")";
+        }
         std::string extent = (*view)->shape[axisNumber];
         if (!planIndex.components.reusedAxes.empty()) {
           if (roleDimensions.lookup("program_0") == extent)
@@ -2249,6 +2336,11 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
   if (!tensor || tensorAxes.size() != domainNodes.size())
     return consumer.emitOpError(
         "has no ranked Triton value-validity binding");
+  FailureOr<SmallVector<unsigned>> packedInsertions =
+      packedScalarInsertions(consumer);
+  if (failed(packedInsertions))
+    return failure();
+  unsigned emittedRank = tensor.getRank() + packedInsertions->size();
   SmallVector<std::string> predicates;
   for (auto [tensorAxis, domainNode] : llvm::zip(tensorAxes, domainNodes)) {
     auto domain = kernel.nodes.find(domainNode);
@@ -2274,8 +2366,11 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
         return failure();
       extent = "sequence_end_" + std::to_string(*ordered);
     }
-    FailureOr<std::string> index = indexExpression(
-        axis, false, tensorAxis, tensor.getRank(), consumer);
+    unsigned physicalTensorAxis = tensorAxis;
+    for (unsigned insertion : *packedInsertions)
+      physicalTensorAxis += insertion <= static_cast<unsigned>(tensorAxis);
+    FailureOr<std::string> index =
+        indexExpression(axis, false, physicalTensorAxis, emittedRank, consumer);
     if (failed(extent) || failed(index))
       return failure();
     predicates.push_back("(" + *index + " < " + *extent + ")");
@@ -2334,11 +2429,17 @@ FailureOr<unsigned> ProgramMaterializer::emittedTensorRank(Operation &operation,
   } else if (operation.getNumResults() == 1) {
     type = operation.getResult(0).getType();
   }
+  unsigned rank = 0;
   if (auto tensor = dyn_cast<RankedTensorType>(type))
-    return static_cast<unsigned>(tensor.getRank());
-  if (type.isIntOrIndexOrFloat())
-    return 0;
-  return operation.emitOpError("boundary value is neither a tensor nor a scalar");
+    rank = tensor.getRank();
+  else if (!type.isIntOrIndexOrFloat())
+    return operation.emitOpError("boundary value is neither a tensor nor a scalar");
+
+  FailureOr<SmallVector<unsigned>> insertions =
+      packedScalarInsertions(operation);
+  if (failed(insertions))
+    return failure();
+  return rank + insertions->size();
 }
 
 FailureOr<std::string>

@@ -108,14 +108,11 @@ def w4a8_packed_matmul(
                         ),
                         I.i8,
                     )
-                    partial = I.transpose(
-                        I.contract(
-                            activation[row_region, k_region],
-                            signed,
-                            reduce=((1, 1),),
-                            acc_dtype=I.i32,
-                        ),
-                        (1, 0),
+                    partial = I.contract(
+                        signed,
+                        activation[row_region, k_region],
+                        reduce=((1, 1),),
+                        acc_dtype=I.i32,
                     )
                     accumulation.yield_(accumulator + partial)
             output[column_region, row_region] = accumulation.result

@@ -2652,9 +2652,52 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!lhsLoad || !rhsLoad)
-    return operation.emitOpError(
-        "deferred Triton contraction has inconsistent operand residency");
+  if (static_cast<bool>(lhsLoad) != static_cast<bool>(rhsLoad)) {
+    Operation *load = lhsLoad ? lhsLoad : rhsLoad;
+    unsigned loadOperand = lhsLoad ? 0 : 1;
+    unsigned directOperand = lhsLoad ? 1 : 0;
+    StringRef loadSpace =
+        lhsLoad ? binding.getLhsSpace() : binding.getRhsSpace();
+    StringRef directSpace =
+        lhsLoad ? binding.getRhsSpace() : binding.getLhsSpace();
+    if (loadSpace != "shared" || directSpace != "private_fragment" ||
+        binding.getAccumulatorSpace() != "private_fragment")
+      return operation.emitOpError(
+          "one-sided deferred Triton contraction has inconsistent plan spaces");
+    FailureOr<plan::AxisOp> reductionAxis =
+        target::lowering::exactContractionReductionAxis(planIndex, kernel,
+                                                        operation);
+    if (failed(reductionAxis))
+      return failure();
+    if (!target::lowering::isEnclosingStreamReductionAxis(
+            planIndex, operation, reductionAxis->getNode()) ||
+        axisIndices.lookup(reductionAxis->getNode()).empty())
+      return operation.emitOpError(
+          "one-sided deferred Triton contraction requires an active "
+          "stream-bound reduction range");
+    FailureOr<ABIView *> view = lookupView(load->getOperand(0), *load);
+    FailureOr<std::string> pointers =
+        succeeded(view) ? emitPointerExpression(*load, **view, false)
+                        : FailureOr<std::string>(failure());
+    FailureOr<std::string> mask = emitMaskExpression(*load, false);
+    FailureOr<StringRef> direct = lookupValue(operation, directOperand);
+    if (failed(view) || failed(pointers) || failed(mask) || failed(direct))
+      return failure();
+    std::string loaded = makeResultName(*load, 0);
+    line(loaded + " = tl.load(" + *pointers + ", mask=" + *mask +
+         ", other=0.0)");
+    std::string lhsExpression = loadOperand == 0 ? loaded : direct->str();
+    std::string rhsExpression = loadOperand == 1 ? loaded : direct->str();
+    if (orientation->lhsTranspose)
+      lhsExpression = "tl.trans(" + lhsExpression + ")";
+    if (orientation->rhsTranspose)
+      rhsExpression = "tl.trans(" + rhsExpression + ")";
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression +
+         ", out_dtype=" + accumulatorDtype + ")");
+    bindResult(operation, 0, result);
+    return success();
+  }
   if (orientation->batched)
     return operation.emitOpError(
         "deferred Triton batch contraction is not supported");

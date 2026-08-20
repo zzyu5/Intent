@@ -42,16 +42,15 @@ def block_sparse_matmul(
                         block_mask[row_block, column_block, reduction_block]
                         != 0
                     )
-                    partial = I.contract(
-                        lhs[row_region, reduction_region],
-                        rhs[reduction_region, column_region],
-                        reduce=((1, 0),),
-                        acc_dtype=I.f32,
-                    )
-                    accumulation.yield_(
-                        accumulator
-                        + I.mask(partial, valid=enabled, fill=0.0)
-                    )
+                    if enabled:
+                        partial = I.contract(
+                            lhs[row_region, reduction_region],
+                            rhs[reduction_region, column_region],
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
+                        )
+                        accumulator = accumulator + partial
+                    accumulation.yield_(accumulator)
             output[row_region, column_region] = I.cast(
                 accumulation.result, I.f16
             )

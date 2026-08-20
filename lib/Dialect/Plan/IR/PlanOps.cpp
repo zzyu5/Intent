@@ -288,6 +288,12 @@ LogicalResult TransferOp::verify() {
       getTensorIndexing() != "compact" &&
       getTensorIndexing() != "data_dependent")
     return emitOpError("contains an unsupported tensor-indexing class");
+  if (getCoverageSpace() != "none" && getCoverageSpace() != "shared" &&
+      !isPrivateSpace(getCoverageSpace()))
+    return emitOpError("contains an unsupported physical coverage residency");
+  if ((getTensorIndexing() == "compact") != (getCoverageSpace() != "none"))
+    return emitOpError(
+        "requires a physical coverage residency exactly for compact indexing");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
       !isPrivateSpace(getResultSpace()))
     return emitOpError("contains an unsupported result residency");
@@ -360,10 +366,39 @@ LogicalResult ContractOp::verify() {
   if (!validOperand(getLhsSpace()) || !validOperand(getRhsSpace()) ||
       getAccumulatorSpace() != "private_fragment")
     return emitOpError("contains an invalid matrix operand residency");
-  if (getProducerReplay() &&
-      (getLhsSpace() != "shared" || getRhsSpace() != "shared"))
+  bool carried = getAccumulatorFlow() == "loop_carried";
+  if (!carried && getAccumulatorFlow() != "none")
+    return emitOpError("contains an unsupported accumulator flow binding");
+  bool hasOwner = static_cast<bool>(getAccumulatorOwnerNodeAttr());
+  bool hasUpdate = static_cast<bool>(getAccumulatorUpdateNodeAttr());
+  bool hasValue = static_cast<bool>(getAccumulatorValueAttr());
+  bool hasConditional =
+      static_cast<bool>(getAccumulatorConditionalNodeAttr());
+  bool hasConditionalResult =
+      static_cast<bool>(getAccumulatorConditionalResultAttr());
+  if (carried != hasOwner || carried != hasUpdate || carried != hasValue)
     return emitOpError(
-        "producer replay requires shared matrix operand residency");
+        "loop-carried accumulator flow requires owner, update, and value bindings");
+  if (hasConditional != hasConditionalResult)
+    return emitOpError(
+        "conditional accumulator flow requires node and result bindings");
+  if (!carried && hasConditional)
+    return emitOpError(
+        "an absent accumulator flow cannot carry conditional bindings");
+  if ((hasOwner &&
+       failed(requireNode(*this, getAccumulatorOwnerNodeAttr().getInt()))) ||
+      (hasUpdate &&
+       failed(requireNode(*this, getAccumulatorUpdateNodeAttr().getInt()))) ||
+      (hasValue &&
+       failed(requireNonNegative(*this, getAccumulatorValueAttr().getInt(),
+                                 "accumulator Kernel IR value ID"))) ||
+      (hasConditional &&
+       failed(requireNode(*this, getAccumulatorConditionalNodeAttr().getInt()))) ||
+      (hasConditionalResult &&
+       failed(requireNonNegative(
+           *this, getAccumulatorConditionalResultAttr().getInt(),
+           "accumulator conditional result"))))
+    return failure();
   return success();
 }
 

@@ -36,6 +36,109 @@ struct PrivateBufferCandidate {
   bool scalarized = false;
 };
 
+struct ContractionAccumulatorFlow {
+  Operation *owner = nullptr;
+  Operation *binary = nullptr;
+  Operation *conditional = nullptr;
+  unsigned conditionalResult = 0;
+  Value previous;
+};
+
+std::optional<ContractionAccumulatorFlow>
+contractionAccumulatorFlow(Operation &operation) {
+  if (operation.getName().getStringRef() != "intent.contract" ||
+      operation.getNumResults() != 1 ||
+      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
+    return std::nullopt;
+  Operation *binary = *operation.getResult(0).user_begin();
+  auto logical = binary->getAttrOfType<StringAttr>("intent.operator");
+  if (binary->getName().getStringRef() != "intent.binary" || !logical ||
+      logical.getValue() != "add" || binary->getNumOperands() != 2 ||
+      binary->getNumResults() != 1 ||
+      !llvm::hasSingleElement(binary->getResult(0).getUsers()))
+    return std::nullopt;
+  Operation *updateYield = *binary->getResult(0).user_begin();
+  if (updateYield->getName().getStringRef() != "intent.yield")
+    return std::nullopt;
+
+  Operation *conditional = nullptr;
+  Operation *yield = updateYield;
+  unsigned conditionalResult = 0;
+  Operation *updateOwner = updateYield->getParentOp();
+  if (updateOwner && updateOwner->getName().getStringRef() == "intent.if") {
+    conditional = updateOwner;
+    std::optional<unsigned> resultIndex;
+    for (auto [index, operand] : llvm::enumerate(updateYield->getOperands())) {
+      if (operand != binary->getResult(0))
+        continue;
+      if (resultIndex)
+        return std::nullopt;
+      resultIndex = index;
+    }
+    if (!resultIndex || *resultIndex >= conditional->getNumResults() ||
+        !llvm::hasSingleElement(
+            conditional->getResult(*resultIndex).getUsers()))
+      return std::nullopt;
+    conditionalResult = *resultIndex;
+    yield = *conditional->getResult(*resultIndex).user_begin();
+    if (yield->getName().getStringRef() != "intent.yield")
+      return std::nullopt;
+  }
+
+  Operation *owner = yield->getParentOp();
+  StringRef ownerName =
+      owner ? owner->getName().getStringRef() : StringRef();
+  if (yield->getName().getStringRef() != "intent.yield" ||
+      (ownerName != "intent.for" && ownerName != "intent.ordered" &&
+       ownerName != "intent.state_stream") ||
+      owner->getNumRegions() != 1 || owner->getRegion(0).empty())
+    return std::nullopt;
+  std::optional<unsigned> carried;
+  for (auto [index, operand] : llvm::enumerate(yield->getOperands())) {
+    Value expected = conditional ? conditional->getResult(conditionalResult)
+                                 : binary->getResult(0);
+    if (operand != expected)
+      continue;
+    if (carried)
+      return std::nullopt;
+    carried = index;
+  }
+  Block &body = owner->getRegion(0).front();
+  if (!carried || *carried >= owner->getNumResults() ||
+      body.getNumArguments() < owner->getNumResults())
+    return std::nullopt;
+  unsigned domainCount = body.getNumArguments() - owner->getNumResults();
+  Value previous = body.getArgument(domainCount + *carried);
+  bool consumesContract = false;
+  bool consumesPrevious = false;
+  if (binary->getOperand(0) == binary->getOperand(1))
+    return std::nullopt;
+  for (Value operand : binary->getOperands()) {
+    consumesContract |= operand == operation.getResult(0);
+    consumesPrevious |= operand == previous;
+  }
+  if (!consumesContract || !consumesPrevious)
+    return std::nullopt;
+
+  if (conditional) {
+    Region *updateRegion = updateYield->getParentRegion();
+    if (updateRegion != &conditional->getRegion(0) &&
+        updateRegion != &conditional->getRegion(1))
+      return std::nullopt;
+    unsigned updateRegionIndex =
+        updateRegion == &conditional->getRegion(0) ? 0 : 1;
+    Operation &otherYield =
+        conditional->getRegion(1 - updateRegionIndex).front().back();
+    if (otherYield.getName().getStringRef() != "intent.yield" ||
+        otherYield.getNumOperands() != conditional->getNumResults() ||
+        otherYield.getOperand(conditionalResult) != previous)
+      return std::nullopt;
+  }
+
+  return ContractionAccumulatorFlow{owner, binary, conditional,
+                                    conditionalResult, previous};
+}
+
 FailureOr<int64_t> privateBufferRegisterUnits(
     Operation &operation, const target::LogicalBufferInfo &info,
     bool roundToVectorExtent) {
@@ -709,7 +812,47 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   };
   llvm::DenseMap<Operation *, ContractReplayDecision> contractReplays;
   llvm::DenseMap<Operation *, Operation *> replayTransferOwners;
-  auto hasExactlyOneReplayReduction = [&](Operation &contract) -> bool {
+  auto hasExactlyOneReplayReduction =
+      [&](Operation &contract, bool permitStreamedReduction) -> bool {
+    auto found = facts.contractions.find(&contract);
+    if (found == facts.contractions.end() ||
+        found->second.lhsReductionAxes.size() != 1 ||
+        found->second.rhsReductionAxes.size() != 1)
+      return false;
+    unsigned lhsAxis = found->second.lhsReductionAxes.front();
+    unsigned rhsAxis = found->second.rhsReductionAxes.front();
+    if (lhsAxis >= found->second.lhsAxes.size() ||
+        rhsAxis >= found->second.rhsAxes.size())
+      return false;
+    Operation *lhsDomain = found->second.lhsAxes[lhsAxis].domain;
+    Operation *rhsDomain = found->second.rhsAxes[rhsAxis].domain;
+    if (!lhsDomain || lhsDomain != rhsDomain)
+      return false;
+    if (!permitStreamedReduction) {
+      for (Operation *parent = contract.getParentOp(); parent;
+           parent = parent->getParentOp()) {
+        if (parent->getName().getStringRef() != "intent.state_stream" ||
+            parent->getNumOperands() == 0)
+          continue;
+        FailureOr<SmallVector<Operation *>> streamDomains =
+            target::expandDomainSource(parent->getOperand(0), *parent);
+        if (succeeded(streamDomains) &&
+            llvm::is_contained(*streamDomains, lhsDomain))
+          return false;
+      }
+    }
+    auto node = lhsDomain->getAttrOfType<IntegerAttr>("intent.node");
+    if (!node)
+      return false;
+    return llvm::count_if(decisions.axes, [&](intent::plan::AxisOp axis) {
+             return static_cast<int64_t>(axis.getNode()) == node.getInt() &&
+                    llvm::any_of(axis.getRoles(), [](Attribute role) {
+                      auto name = dyn_cast<StringAttr>(role);
+                      return name && name.getValue() == "reduction";
+                    });
+           }) == 1;
+  };
+  auto hasExactlyOneStreamedReduction = [&](Operation &contract) -> bool {
     auto found = facts.contractions.find(&contract);
     if (found == facts.contractions.end() ||
         found->second.lhsReductionAxes.size() != 1 ||
@@ -733,18 +876,9 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           target::expandDomainSource(parent->getOperand(0), *parent);
       if (succeeded(streamDomains) &&
           llvm::is_contained(*streamDomains, lhsDomain))
-        return false;
+        return true;
     }
-    auto node = lhsDomain->getAttrOfType<IntegerAttr>("intent.node");
-    if (!node)
-      return false;
-    return llvm::count_if(decisions.axes, [&](intent::plan::AxisOp axis) {
-             return static_cast<int64_t>(axis.getNode()) == node.getInt() &&
-                    llvm::any_of(axis.getRoles(), [](Attribute role) {
-                      auto name = dyn_cast<StringAttr>(role);
-                      return name && name.getValue() == "reduction";
-                    });
-           }) == 1;
+    return false;
   };
   WalkResult replayWalk = facts.kernel.entry.walk([&](Operation *operation) {
     if (operation->getName().getStringRef() != "intent.contract" ||
@@ -754,10 +888,17 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         target::analyzeContractOperandReplay(operation->getOperand(0), *operation);
     std::optional<target::ContractOperandReplay> rhs =
         target::analyzeContractOperandReplay(operation->getOperand(1), *operation);
+    bool compactReplay =
+        lhs && rhs &&
+        llvm::any_of(llvm::concat<Operation *>(lhs->transfers, rhs->transfers),
+                     [&](Operation *transfer) {
+                       return target::tensorIndexingKind(*transfer, facts) ==
+                              target::TensorIndexingKind::compact;
+                     });
     if (!lhs || !rhs ||
         (isDirectViewLoad(operation->getOperand(0)) &&
          isDirectViewLoad(operation->getOperand(1))) ||
-        !hasExactlyOneReplayReduction(*operation))
+        !hasExactlyOneReplayReduction(*operation, compactReplay))
       return WalkResult::advance();
     for (Operation *transfer : llvm::concat<Operation *>(lhs->transfers,
                                                         rhs->transfers)) {
@@ -777,8 +918,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
   if (replayWalk.wasInterrupted())
     return failure();
   auto sharedContractOperand =
-      [isStagedContract, isDirectViewLoad,
-       isContractionDerived](Value operand, Operation &contract) {
+      [isStagedContract, isDirectViewLoad, isContractionDerived,
+       hasExactlyOneStreamedReduction](Value operand, Operation &contract) {
     if (isStagedContract(contract))
       return true;
     if (!isDirectViewLoad(operand))
@@ -786,13 +927,19 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     if (llvm::all_of(contract.getOperands(), isDirectViewLoad))
       return true;
     return llvm::any_of(contract.getOperands(), [&](Value other) {
-      return other != operand && isContractionDerived(other);
+      if (other == operand)
+        return false;
+      if (isContractionDerived(other))
+        return true;
+      return hasExactlyOneStreamedReduction(contract) &&
+             target::analyzeContractOperandReplay(other, contract).has_value();
     });
   };
 
   auto bindTransfer = [&, sharedContractOperand, isStagedContract,
                        isDirectViewLoad,
                        hasExactlyOneSharedPhysicalReductionAxis,
+                       hasExactlyOneStreamedReduction,
                        replayTransferOwners](
                           Operation &operation) -> LogicalResult {
     FailureOr<int64_t> node = target::getNodeID(operation, "transfer binding");
@@ -811,11 +958,23 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                  name == "intent.sparse_contract";
         });
     bool replayOperand = replayTransferOwners.contains(&operation);
+    Operation *replayOwner = replayTransferOwners.lookup(&operation);
     Operation *soleUser = nullptr;
     if (contractOperand &&
         llvm::hasSingleElement(operation.getResult(0).getUsers()))
       soleUser = *operation.getResult(0).user_begin();
-    bool sharedOperand = replayOperand ||
+    bool finalReplayOperand =
+        replayOwner && operation.getNumResults() == 1 &&
+        llvm::is_contained(replayOwner->getOperands(), operation.getResult(0));
+    target::TensorIndexingKind tensorIndexing =
+        target::tensorIndexingKind(operation, facts);
+    if (!load && tensorIndexing == target::TensorIndexingKind::compact)
+      return operation.emitOpError(
+          "compact tensor-indexed stores have no physical coverage realization");
+    bool compactReplaySource =
+        replayOperand && tensorIndexing == target::TensorIndexingKind::compact &&
+        !finalReplayOperand;
+    bool sharedOperand = (replayOperand && !compactReplaySource) ||
                          (soleUser &&
                           (soleUser->getName().getStringRef() ==
                                "intent.sparse_contract" ||
@@ -897,13 +1056,15 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         if (failed(sharedPhysicalReduction))
           return failure();
         deferToContract = *sharedPhysicalReduction;
+      } else if (consumer == "intent.contract" &&
+                 sharedContractOperand(operation.getResult(0), *soleUser) &&
+                 hasExactlyOneStreamedReduction(*soleUser)) {
+        deferToContract = true;
       }
     }
     StringRef materialization =
         deferToContract ? StringRef("deferred_to_contract")
                         : StringRef("direct");
-    target::TensorIndexingKind tensorIndexing =
-        target::tensorIndexingKind(operation, facts);
     StringRef tensorIndexingName =
         tensorIndexing == target::TensorIndexingKind::dataDependent
             ? "data_dependent"
@@ -912,6 +1073,10 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         : tensorIndexing == target::TensorIndexingKind::structured
             ? "structured"
             : "none";
+    StringRef coverageSpace =
+        tensorIndexing == target::TensorIndexingKind::compact
+            ? compactReplaySource ? StringRef("shared") : resultSpace
+            : StringRef("none");
     builder.create<intent::plan::TransferOp>(
         operation.getLoc(), i64(builder, *node),
         builder.getDenseI64ArrayAttr(domains),
@@ -921,6 +1086,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
         builder.getBoolAttr(false),
         string(builder, materialization),
         string(builder, tensorIndexingName),
+        string(builder, coverageSpace),
         string(builder, resultSpace));
     return success();
   };
@@ -1154,16 +1320,52 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
             bool replayed = contractReplays.contains(&operation);
             auto operandSpace = [&](Value operand) -> StringRef {
               if (replayed)
-                return "shared";
+                return isDirectViewLoad(operand) ? StringRef("shared")
+                                                 : StringRef("private_fragment");
               return sharedContractOperand(operand, operation)
                          ? StringRef("shared")
                          : StringRef("private_fragment");
             };
+            std::optional<ContractionAccumulatorFlow> accumulatorFlow =
+                contractionAccumulatorFlow(operation);
+            IntegerAttr accumulatorOwner;
+            IntegerAttr accumulatorUpdate;
+            IntegerAttr accumulatorValue;
+            IntegerAttr accumulatorConditional;
+            IntegerAttr accumulatorConditionalResult;
+            if (accumulatorFlow) {
+              FailureOr<int64_t> ownerNode = target::getNodeID(
+                  *accumulatorFlow->owner, "contract accumulator owner binding");
+              FailureOr<int64_t> updateNode = target::getNodeID(
+                  *accumulatorFlow->binary, "contract accumulator update binding");
+              FailureOr<int64_t> previousValue = target::getValueID(
+                  accumulatorFlow->previous, facts.kernel, operation,
+                  "contract accumulator value binding");
+              if (failed(ownerNode) || failed(updateNode) ||
+                  failed(previousValue))
+                return failure();
+              accumulatorOwner = i64(builder, *ownerNode);
+              accumulatorUpdate = i64(builder, *updateNode);
+              accumulatorValue = i64(builder, *previousValue);
+              if (accumulatorFlow->conditional) {
+                FailureOr<int64_t> conditionalNode = target::getNodeID(
+                    *accumulatorFlow->conditional,
+                    "contract accumulator conditional binding");
+                if (failed(conditionalNode))
+                  return failure();
+                accumulatorConditional = i64(builder, *conditionalNode);
+                accumulatorConditionalResult =
+                    i64(builder, accumulatorFlow->conditionalResult);
+              }
+            }
             builder.create<intent::plan::ContractOp>(
                 operation.getLoc(), i64(builder, *node),
                 string(builder, operandSpace(operation.getOperand(0))),
                 string(builder, operandSpace(operation.getOperand(1))),
                 string(builder, "private_fragment"),
+                string(builder, accumulatorFlow ? "loop_carried" : "none"),
+                accumulatorOwner, accumulatorUpdate, accumulatorValue,
+                accumulatorConditional, accumulatorConditionalResult,
                 builder.getBoolAttr(replayed));
             Operation *stream = nullptr;
             for (Operation *parent = operation.getParentOp(); parent;

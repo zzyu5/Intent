@@ -139,6 +139,30 @@ def autotune_configurations(
                 (128, 128, 1, 128),
             )
         ),
+        (
+            (
+                {
+                    "program_m": 64,
+                    "query": 64,
+                    "stream_contract": 32,
+                    "reduction": 64,
+                    "group_m": 8,
+                },
+                2,
+                128,
+            ),
+            (
+                {
+                    "program_m": 64,
+                    "query": 64,
+                    "stream_contract": 64,
+                    "reduction": 64,
+                    "group_m": 8,
+                },
+                2,
+                128,
+            ),
+        ),
         joint_program_profiles,
         single_program_m_profiles,
         (
@@ -195,23 +219,6 @@ def autotune_configurations(
         if key not in seen:
             seen.add(key)
             choices.append((values, num_stages, threads))
-    split_reduction_stream = {
-        "program_m",
-        "query",
-        "stream_contract",
-        "reduction",
-    }.issubset(roles)
-    if split_reduction_stream:
-        choices = [
-            choice
-            for choice in choices
-            if choice[0]["program_m"] == 64
-            and choice[0]["query"] == 64
-            and choice[0]["stream_contract"] == 32
-            and choice[0]["reduction"] == 64
-            and choice[1] == 2
-            and choice[2] == 128
-        ]
     if not choices:
         raise NotImplementedError(
             "TileLang has no legal autotuning configuration for the requested role constraints"

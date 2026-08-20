@@ -230,19 +230,13 @@ bool canPackScalarParallel(Operation *parallel, Operation *domain,
         name == "intent.constant" || name == "intent.dim" ||
         name == "intent.assume_in_bounds" || name == "intent.view_load" ||
         name == "intent.view_store" || name == "intent.gather" ||
+        name == "intent.indices" || name == "intent.broadcast" ||
         name == "intent.make_record" || name == "intent.extract" ||
         name == "intent.unary" || name == "intent.binary" ||
         name == "intent.compare" || name == "intent.select" ||
         name == "intent.cast" || name == "intent.random" ||
         name == "intent.yield";
     if (operation.getNumRegions() != 0 || !scalarPointwise)
-      return false;
-    if (llvm::any_of(operation.getOperands(), [](Value value) {
-          return isa<RankedTensorType>(value.getType());
-        }) ||
-        llvm::any_of(operation.getResults(), [](Value value) {
-          return isa<RankedTensorType>(value.getType());
-        }))
       return false;
   }
   return true;
@@ -298,10 +292,11 @@ struct AxisAssignments {
   bool persistent = false;
 };
 
-unsigned independentLaneCount(const AxisChoice &choice,
-                              const target::KernelFacts &facts) {
+SmallVector<Operation *>
+independentLanes(const AxisChoice &choice,
+                 const target::KernelFacts &facts) {
   if (choice.parallels.empty())
-    return 0;
+    return {};
   auto isOwnedByChoice = [&](Operation *operation) {
     return llvm::is_contained(choice.parallels, nearestParallel(operation));
   };
@@ -328,7 +323,31 @@ unsigned independentLaneCount(const AxisChoice &choice,
     for (const target::LogicalAxis &axis : entry.second)
       collect(axis.domain);
   }
-  return lanes.size();
+  return lanes;
+}
+
+unsigned independentLaneCount(const AxisChoice &choice,
+                              const target::KernelFacts &facts) {
+  return independentLanes(choice, facts).size();
+}
+
+bool hasPackableIndependentLanes(const AxisChoice &choice,
+                                 const target::KernelFacts &facts) {
+  SmallVector<Operation *> lanes = independentLanes(choice, facts);
+  if (lanes.empty())
+    return true;
+  if (lanes.size() != 1)
+    return false;
+  Operation *lane = lanes.front();
+  std::optional<int64_t> extent;
+  if (auto found = facts.staticDomainExtents.find(lane);
+      found != facts.staticDomainExtents.end())
+    extent = found->second;
+  else if (auto found = facts.staticDomainBounds.find(lane);
+           found != facts.staticDomainBounds.end())
+    extent = found->second.second - found->second.first;
+  constexpr int64_t maximumNarrowLaneExtent = 128;
+  return extent && *extent > 0 && *extent <= maximumNarrowLaneExtent;
 }
 
 bool ownsOrderedStream(const AxisChoice &choice,
@@ -530,7 +549,8 @@ assignAxes(const target::KernelFacts &facts) {
   for (AxisChoice &choice : choices) {
     bool scalarParallel = choice.programOrder && !choice.tiled &&
                           choice.roles.size() == 1 &&
-                          hasRole(choice.roles, "parallel");
+                          hasRole(choice.roles, "parallel") &&
+                          hasPackableIndependentLanes(choice, facts);
     choice.packedLane =
         scalarParallel && !choice.parallels.empty() &&
         llvm::all_of(choice.parallels, [&](Operation *parallel) {
@@ -752,10 +772,24 @@ assignAxes(const target::KernelFacts &facts) {
                    llvm::all_of(choice.parallels, ownsOneDomain) &&
                    independentLaneCount(choice, facts) == 1;
 
+  auto spansMultipleOwnershipTiles = [&](const AxisChoice &choice) {
+    if (!choice.tiled)
+      return false;
+    if (!choice.fixedOwnershipExtent)
+      return true;
+    auto extent = facts.staticDomainExtents.find(choice.domain);
+    if (extent != facts.staticDomainExtents.end())
+      return extent->second > *choice.fixedOwnershipExtent;
+    auto bounds = facts.staticDomainBounds.find(choice.domain);
+    if (bounds != facts.staticDomainBounds.end())
+      return bounds->second.second - bounds->second.first >
+             *choice.fixedOwnershipExtent;
+    return true;
+  };
   bool persistent = llvm::any_of(facts.contractions, [&](const auto &entry) {
     llvm::DenseSet<unsigned> owned;
     unsigned parallel = 0;
-    unsigned tiled = 0;
+    unsigned multiTile = 0;
     bool ragged = false;
     for (Operation *parent = entry.first->getParentOp(); parent;
          parent = parent->getParentOp()) {
@@ -773,10 +807,10 @@ assignAxes(const target::KernelFacts &facts) {
           continue;
         ragged |= facts.raggedMembers.count(domain);
         ++parallel;
-        tiled += choices[found->second].tiled;
+        multiTile += spansMultipleOwnershipTiles(choices[found->second]);
       }
     }
-    return !ragged && parallel >= 3 && tiled >= 2;
+    return !ragged && parallel >= 3 && multiTile >= 2;
   });
   if (persistent) {
     SmallVector<unsigned> programAxes;

@@ -178,6 +178,10 @@ private:
   resolveDomain(mlir::Value indexedValue, mlir::Operation &consumer);
   mlir::FailureOr<plan::AxisOp> resolveAxis(mlir::Value indexedValue,
                                            mlir::Operation &consumer);
+  mlir::FailureOr<plan::AxisOp>
+  packedScalarAxis(mlir::Value indexedValue, mlir::Operation &consumer);
+  mlir::FailureOr<llvm::SmallVector<unsigned>>
+  packedScalarInsertions(mlir::Operation &operation);
   mlir::FailureOr<std::string> dimensionName(mlir::Operation &domain);
   std::string addressIndex(llvm::StringRef expression) const;
   std::string physicalExtent(llvm::StringRef logicalExtent) const;

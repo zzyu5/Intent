@@ -1788,8 +1788,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
       failed(registry.add("intent.ordered", sequentialLoopHandler)))
     return failure();
 
-  if (failed(addHandler(
-          registry, "intent.if", [&](Operation &operation) -> LogicalResult {
+  auto analyzeIf = [&](Operation &operation) -> LogicalResult {
             if (operation.getNumOperands() != 1 ||
                 !operation.getOperand(0).getType().isInteger(1) ||
                 operation.getNumRegions() != 2)
@@ -1806,13 +1805,33 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     "scalar if branches must yield every result");
               for (auto [yielded, result] :
                    llvm::zip(terminator.getOperands(), operation.getResults()))
-                if (!result.getType().isIntOrIndexOrFloat() ||
+                if ((!result.getType().isIntOrIndexOrFloat() &&
+                     !isa<RankedTensorType>(result.getType())) ||
                     yielded.getType() != result.getType())
                   return operation.emitOpError(
-                      "scalar if currently requires scalar type-stable results");
+                      "scalar if requires type-stable scalar or tensor results");
             }
             return success();
-          })))
+          };
+  auto leaveIf = [&](Operation &operation) -> LogicalResult {
+    for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+      if (!isa<RankedTensorType>(operation.getResult(index).getType()))
+        continue;
+      Value thenValue = operation.getRegion(0).front().back().getOperand(index);
+      Value elseValue = operation.getRegion(1).front().back().getOperand(index);
+      auto thenAxes = facts.valueAxes.find(thenValue);
+      auto elseAxes = facts.valueAxes.find(elseValue);
+      SmallVector<LogicalAxis> merged;
+      if (thenAxes == facts.valueAxes.end() ||
+          elseAxes == facts.valueAxes.end() ||
+          !mergeLogicalAxes(thenAxes->second, elseAxes->second, merged))
+        return operation.emitOpError(
+            "tensor if branches change their logical axis identity");
+      facts.valueAxes[operation.getResult(index)] = std::move(merged);
+    }
+    return success();
+  };
+  if (failed(registry.add("intent.if", OperationHandler{analyzeIf, leaveIf})))
     return failure();
 
   if (failed(addHandler(
