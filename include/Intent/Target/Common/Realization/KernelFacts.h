@@ -87,6 +87,15 @@ struct AccessRangeFact {
   int64_t offset = 0;
 };
 
+struct CountPartitionFact {
+  mlir::Operation *partition = nullptr;
+  mlir::Operation *iteration = nullptr;
+  mlir::Operation *domain = nullptr;
+  mlir::Value count;
+  mlir::Value partArgument;
+  mlir::Value regionArgument;
+};
+
 enum class TensorIndexingKind {
   none,
   structured,
@@ -106,6 +115,9 @@ struct KernelFacts {
   llvm::DenseSet<mlir::Operation *> runtimeSequentialDomains;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
   llvm::DenseMap<mlir::Operation *, int64_t> partitionFixedExtents;
+  llvm::DenseMap<mlir::Operation *, mlir::Value> partitionCounts;
+  llvm::DenseMap<mlir::Value, mlir::Operation *> partitionPartArguments;
+  llvm::SmallVector<CountPartitionFact> countPartitions;
   llvm::SmallVector<mlir::Operation *> parallels;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       parallelDomains;

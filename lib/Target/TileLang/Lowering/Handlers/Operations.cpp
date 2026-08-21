@@ -428,6 +428,23 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
     return operation.emitOpError(
         "TileLang parallel ownership requires region arguments");
   Block &body = operation.getRegion(0).front();
+  plan::PartitionBindingOp partition =
+      target::lowering::countPartitionForIteration(planIndex, kernel, operation);
+  if (partition) {
+    if (!planIndex.stages.empty() || !planIndex.components.reusedAxes.empty())
+      return partition.emitOpError(
+          "count partition cannot use staged or worker-reused TileLang ownership");
+    plan::AxisOp axis = planIndex.axes.lookup(partition.getAxisNode());
+    std::string part = programBlocks.lookup(partition.getAxisNode());
+    std::string region = axisIndices.lookup(partition.getAxisNode());
+    if (!axis || part.empty() || region.empty())
+      return partition.emitOpError(
+          "has no emitted TileLang part and region projection");
+    valueNames[body.getArgument(0)] = part;
+    valueNames[body.getArgument(1)] = region;
+    regionIndices[body.getArgument(1)] = region;
+    return success();
+  }
   SmallVector<plan::AxisOp> axes;
   for (BlockArgument argument : body.getArguments()) {
     FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
@@ -548,6 +565,11 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
 }
 
 LogicalResult ProgramMaterializer::leaveParallel(Operation &operation) {
+  if (target::lowering::countPartitionForIteration(planIndex, kernel, operation)) {
+    if (&operation == programRoot && planIndex.program.getPersistent())
+      indentation -= 2;
+    return success();
+  }
   if (operation.getNumRegions() == 1 &&
       llvm::hasSingleElement(operation.getRegion(0))) {
     for (BlockArgument argument : operation.getRegion(0).front().getArguments()) {
@@ -1685,9 +1707,18 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
         target += ", ";
       target += index;
     }
-    StringRef fill = padding == "negative_infinity"
-                         ? "-T.infinity(T.float32)"
-                         : zeroFill;
+    std::string physicalFallback =
+        padding == "negative_infinity" ? "-T.infinity(T.float32)"
+                                        : zeroFill.str();
+    FailureOr<std::string> semanticFallback =
+        paddingFillExpression(operation.getResult(0), operation);
+    if (failed(semanticFallback))
+      return failure();
+    if (!semanticFallback->empty())
+      physicalFallback = *semanticFallback;
+    std::string logicalFallback = semanticFallback->empty()
+                                      ? physicalFallback
+                                      : *semanticFallback;
     auto emitElementwise = [&](bool includePhysicalBounds) -> LogicalResult {
       line(loop + "):");
       ++indentation;
@@ -1710,14 +1741,14 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
         --indentation;
         line("else:");
         ++indentation;
-        line(target + "] = " + fill.str());
+        line(target + "] = " + physicalFallback);
         --indentation;
       }
       if (materializeLogicalBounds) {
         --indentation;
         line("else:");
         ++indentation;
-        line(target + "] = " + fill.str());
+        line(target + "] = " + logicalFallback);
         --indentation;
       }
       indentation -= loopDepth;
@@ -1805,7 +1836,17 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
   }
   if (failed(axis))
     return failure();
-  std::string base = axisIndices.lookup(axis->getNode());
+  std::string base;
+  if (auto argument = dyn_cast<BlockArgument>(operation.getOperand(0))) {
+    FailureOr<target::lowering::RegionRangeBinding> region =
+        target::lowering::selectedRegionArgumentRange(planIndex, kernel, argument,
+                                                      operation);
+    if (failed(region))
+      return failure();
+    base = regionIndices.lookup(argument);
+  } else {
+    base = axisIndices.lookup(axis->getNode());
+  }
   if (base.empty() && axis->hasRole("lane")) {
     base = "0";
     axisIndices[axis->getNode()] = base;
@@ -3210,6 +3251,16 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
       return operation.emitOpError(
           "cannot mix ordered and staged ragged member projection");
     std::string position = axisIndices.lookup(memberAxis->getNode());
+    if (auto argument = dyn_cast<BlockArgument>(operation.getOperand(0))) {
+      FailureOr<target::lowering::RegionRangeBinding> selected =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        argument, operation);
+      if (failed(selected) ||
+          selected->axis.getNode() != memberAxis->getNode())
+        return operation.emitOpError(
+            "has no exact TileLang region projection for ragged members");
+      position = regionIndices.lookup(argument);
+    }
     if (position.empty())
       return operation.emitOpError("has no ordered ragged runtime position");
     FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
@@ -3303,8 +3354,6 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     }
   }
   streamCarriers[&operation] = carriers;
-  streamOuterAxisIndices[&operation] =
-      axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
@@ -3363,7 +3412,6 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
   line(streamStart + " = " +
        std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
        addressIndex(streamTile) + " * " + binding.getTile().str());
-  axisIndices[binding.getAxisNode()] = streamStart;
   valueNames[body.getArgument(0)] = streamStart;
   regionIndices[body.getArgument(0)] = streamStart;
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
@@ -3381,12 +3429,10 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
 
 LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   auto carriers = streamCarriers.find(&operation);
-  auto outerIndex = streamOuterAxisIndices.find(&operation);
   FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
-  if (carriers == streamCarriers.end() ||
-      outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
+  if (carriers == streamCarriers.end() || failed(node) || !binding)
     return operation.emitOpError("has no active TileLang stream state");
   Operation &terminator = operation.getRegion(0).front().back();
   if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
@@ -3410,14 +3456,9 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
     valueNames[operation.getResult(index)] =
         carriers->second[index] + (scalar ? "[0]" : "");
   }
-  if (outerIndex->second.empty())
-    axisIndices.erase(binding.getAxisNode());
-  else
-    axisIndices[binding.getAxisNode()] = outerIndex->second;
   for (int64_t axisNode : binding.getInnerReductionAxes())
     if (axisNode != binding.getAxisNode())
       axisIndices.erase(axisNode);
-  streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
 
@@ -4486,8 +4527,6 @@ LogicalResult ProgramMaterializer::emitUniqueStore(Operation &operation) {
 LogicalResult ProgramMaterializer::emitAtomic(Operation &operation) {
   auto valueIndex =
       operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
-  FailureOr<SmallVector<target::IndexTerm>> relation =
-      target::parseIndexRelation(operation);
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   Operation *deferredValue =
       planIndex.stages.empty() && valueIndex
@@ -4603,35 +4642,8 @@ LogicalResult ProgramMaterializer::emitAtomic(Operation &operation) {
     --indentation;
     return success();
   }
-  if (!valueIndex || activeStages.size() != 1 || failed(relation) ||
-      relation->size() != 2 ||
-      (*relation)[0].kind != "value_index" ||
-      (*relation)[0].operands.size() != 1 ||
-      !(*relation)[0].operands.front() ||
-      (*relation)[1].kind != "full_slice" || failed(view) || failed(stored))
-    return operation.emitOpError("lacks a mechanical TileLang atomic merge");
-  FailureOr<StringRef> rows =
-      lookupValue(operation, *(*relation)[0].operands.front());
-  if (failed(rows))
-    return failure();
-  unsigned stage = activeStages.front();
-  std::string memberTile = stageMemberTiles.lookup(stage);
-  std::string featureTile = stageFeatureTiles.lookup(stage);
-  line("for atomic_i, atomic_j in T.Parallel(" + memberTile + ", " +
-       featureTile + "):");
-  ++indentation;
-  line("if member_start + atomic_i < route_end and bid_feature * " +
-       featureTile + " + atomic_j < " + stageFeatureDimensions.lookup(stage) +
-       ":");
-  ++indentation;
-  line("T.atomic_add(" + (*view)->argument->name + "[" + rows->str() +
-       "[atomic_i], " +
-       addressIndex("bid_feature * " + featureTile + " + atomic_j") +
-       "], " + stored->str() +
-       "[atomic_i, atomic_j], memory_order=\"relaxed\")");
-  --indentation;
-  --indentation;
-  return success();
+  return operation.emitOpError(
+      "reached terminal emission with an unlegalized staged atomic merge");
 }
 
 } // namespace intent::tilelang::lowering

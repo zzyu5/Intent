@@ -52,7 +52,7 @@ Intent 不引入额外的 named-axis/reaxis 类型系统。
 ### 按 extent
 
 ```python
-for region in I.partition(axis, extent=B):
+for region in I.parallel(I.partition(axis, extent=B)):
     ...
 ```
 
@@ -61,13 +61,21 @@ for region in I.partition(axis, extent=B):
 ### 按 count
 
 ```python
-for part, region in I.partition(axis, count=P):
+for part, region in I.parallel(I.partition(axis, count=P)):
     ...
 ```
 
-将 axis 分成 source-visible 的 `P` 个连续 regions。它适用于 split-K、partial buffer、host-visible shard 或多-kernel 共同观察的 part identity。
+设 axis 长度为 `N`，`block = ceil(N / P)`。`partition(axis, count=P)` 产生 source-visible 的 part identity `i ∈ [0, P)`；第 `i` 个 region 是半开区间
 
-`P` 来自 runtime、shape、`I.Constexpr` 或 wrapper。Part identity 是 source 值，不能由 physical worker count 替代。
+```text
+[min(i * block, N), min((i + 1) * block, N))
+```
+
+因此它与 `partition(axis, extent=ceil(N/P))` 使用同一套连续切分和普通 tail 语义。尾部 part 可以较短或为空；特别地，`P > N` 时多出来的 part 为空。空 part 保留 identity 和 wrapper-visible ABI slot，但不执行 body，也不产生写出或 effect。需要读取全部 `P` 个 partial slots 的后续 kernel，wrapper 必须先按该 reduction 的 identity 初始化 buffer。
+
+它适用于 split-K、partial buffer、host-visible shard 或多-kernel 共同观察的 part identity。
+
+`P` 来自 runtime、shape、`I.Constexpr` 或 wrapper，并满足 `P >= 1`；runtime 非正值在 launch specialization 时拒绝。Part identity 是 source 值，不能由 physical worker count 替代。Target 可以不启动空 part 对应的 physical worker，但不能压缩或重编号非空 part identity。
 
 `I.partition(..., extent=I.auto(...))` 不属于作者编程模型。它让作者预先决定“这里必须存在某层 physical blocking”，却没有给出 source-visible boundary。需要任意 segment composition 的 recurrence 使用 `state_stream`；普通 tensor computation 直接使用完整 domain，由 compiler 形成 physical regions。
 

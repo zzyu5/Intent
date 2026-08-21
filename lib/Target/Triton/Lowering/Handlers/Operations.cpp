@@ -566,6 +566,24 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
       operation.getRegion(0).front().getNumArguments() == 0)
     return operation.emitOpError("parallel ownership requires region arguments");
   Block &body = operation.getRegion(0).front();
+  plan::PartitionBindingOp partition =
+      target::lowering::countPartitionForIteration(planIndex, kernel, operation);
+  if (partition) {
+    if (!planIndex.stages.empty() || !planIndex.components.reusedAxes.empty())
+      return partition.emitOpError(
+          "count partition cannot use staged or worker-reused Triton ownership");
+    if (&operation == programRoot && failed(emitProgramBindings()))
+      return failure();
+    plan::AxisOp axis = planIndex.axes.lookup(partition.getAxisNode());
+    std::string part = programBlocks.lookup(partition.getAxisNode());
+    std::string region = axisIndices.lookup(partition.getAxisNode());
+    if (!axis || part.empty() || region.empty())
+      return partition.emitOpError(
+          "has no emitted Triton part and region projection");
+    valueNames[body.getArgument(0)] = part;
+    valueNames[body.getArgument(1)] = region;
+    return success();
+  }
   SmallVector<plan::AxisOp> axes;
   for (BlockArgument argument : body.getArguments()) {
     FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
@@ -1313,7 +1331,24 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
     axis = planIndex.axes.lookup(binding.getAxisNodes()[tensorAxis.getInt()]);
     emittedAxis = tensorAxis.getInt();
   } else if (operation.getNumOperands() == 1) {
-    axis = resolveAxis(operation.getOperand(0), operation);
+    Value indexed = operation.getOperand(0);
+    if (isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> region =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      FailureOr<StringRef> projected = lookupValue(operation, 0);
+      if (failed(region) || failed(projected))
+        return failure();
+      FailureOr<std::string> padded =
+          padExpression(operation.getResult(0), projected->str(), operation);
+      if (failed(padded))
+        return failure();
+      std::string emitted = makeResultName(operation, 0);
+      line(emitted + " = " + *padded);
+      bindResult(operation, 0, emitted);
+      return success();
+    }
+    axis = resolveAxis(indexed, operation);
   }
   if (failed(axis) ||
       ((!mode || mode.getValue() != "tensor_axis") && result.getRank() != 1) ||
@@ -2282,6 +2317,17 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
                      ? raggedRuntimeByRelation.find(relation->getNode())
                      : raggedRuntimeByRelation.end();
   std::string position = axisIndices.lookup(memberAxis->getNode());
+  if (auto argument = dyn_cast<BlockArgument>(operation.getOperand(0))) {
+    FailureOr<target::lowering::RegionRangeBinding> selected =
+        target::lowering::selectedRegionArgumentRange(planIndex, kernel, argument,
+                                                      operation);
+    FailureOr<StringRef> projected = lookupValue(operation, 0);
+    if (failed(selected) || failed(projected) ||
+        selected->axis.getNode() != memberAxis->getNode())
+      return operation.emitOpError(
+          "has no exact Triton region projection for ragged members");
+    position = projected->str();
+  }
   if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
       position.empty())
     return operation.emitOpError("has no ordered ragged runtime position");
@@ -2329,8 +2375,6 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
-  streamOuterAxisIndices[&operation] =
-      axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
@@ -2391,7 +2435,6 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
        std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
        addressIndex(block) + " * " + binding.getTile().str() + " + " +
        addressIndex("tl.arange(0, " + binding.getTile().str() + ")"));
-  axisIndices[binding.getAxisNode()] = offsets;
   valueNames[body.getArgument(0)] = offsets;
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
@@ -2409,12 +2452,10 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
 
 LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   auto carriers = streamCarriers.find(&operation);
-  auto outerIndex = streamOuterAxisIndices.find(&operation);
   FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
-  if (carriers == streamCarriers.end() ||
-      outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
+  if (carriers == streamCarriers.end() || failed(node) || !binding)
     return operation.emitOpError("has no active Triton stream state");
   Operation &terminator = operation.getRegion(0).front().back();
   if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
@@ -2429,14 +2470,9 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
-  if (outerIndex->second.empty())
-    axisIndices.erase(binding.getAxisNode());
-  else
-    axisIndices[binding.getAxisNode()] = outerIndex->second;
   for (int64_t axisNode : binding.getInnerReductionAxes())
     if (axisNode != binding.getAxisNode())
       axisIndices.erase(axisNode);
-  streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
 

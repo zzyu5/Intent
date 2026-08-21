@@ -88,6 +88,9 @@ bool needsGuardedGatherTuning(gpu::PhysicalProgramAnalysis &analysis,
                        !analysis.getFacts().orderedDomains.empty();
   bool guarded = false;
   analysis.getKernel().entry.walk([&](Operation *operation) {
+    StringRef name = ::intent::target::semanticOperationName(*operation);
+    if (name != "intent.gather" && name != "intent.members")
+      return;
     FailureOr<std::string> role = target::lowering::pointwiseRole(*operation);
     if (failed(role))
       return;

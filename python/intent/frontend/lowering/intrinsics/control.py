@@ -92,8 +92,10 @@ def _domain(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 
 def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
-        lowerer, node, ("axis", "extent"), required=("axis", "extent")
+        lowerer, node, ("axis", "extent", "count"), required=("axis",)
     )
+    if ("extent" in bound) == ("count" in bound):
+        lowerer.error(node, "partition requires exactly one of extent= or count=")
     source = lowerer.materialize(lowerer.lower_expression(bound["axis"]), bound["axis"])
     if not isinstance(source.type, (DomainType, RegionType)):
         lowerer.error(node, "partition axis must be a domain or region")
@@ -107,27 +109,37 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         relation = "domain"
     region_type = RegionType(source.type.rank, relation)
     operands = [source]
-    expression = lowerer.lower_expression(bound["extent"])
-    mode = PartitionMode.EXTENT
+    parameter = "extent" if "extent" in bound else "count"
+    expression = lowerer.lower_expression(bound[parameter])
+    mode = PartitionMode.EXTENT if parameter == "extent" else PartitionMode.COUNT
     known, value = compile_time_value(expression)
-    if (
-        not known
-        or isinstance(value, bool)
-        or not isinstance(value, int)
-        or value <= 0
-    ):
-        lowerer.error(
-            bound["extent"],
-            "partition extent must be a positive source-visible compile-time integer; "
-            "I.auto(...) is reserved for segment-parametric structured operations",
+    if mode is PartitionMode.EXTENT:
+        if (
+            not known
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            lowerer.error(
+                bound["extent"],
+                "partition extent must be a positive source-visible compile-time integer; "
+                "I.auto(...) is reserved for segment-parametric structured operations",
+            )
+        parameter_value = lowerer.materialize(
+            Literal(value), bound["extent"], ScalarType(intent_index)
         )
-    operands.append(
-        lowerer.materialize(
-            Literal(value),
-            bound["extent"],
-            ScalarType(intent_index),
-        )
-    )
+    else:
+        if isinstance(expression, AutoExtent):
+            lowerer.error(
+                bound["count"],
+                "partition count must be a source-visible integer, not I.auto(...)",
+            )
+        if known and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            lowerer.error(bound["count"], "partition count must be positive")
+        parameter_value = _integer_value(lowerer, expression, bound["count"])
+    operands.append(parameter_value)
     operation = lowerer.emit(
         OperationKind.PARTITION,
         lowerer.location(node),

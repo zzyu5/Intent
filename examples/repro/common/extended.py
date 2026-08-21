@@ -155,6 +155,11 @@ from kernels.routing.mqa_logits import fp8_mqa_logits
 from kernels.reduction.boolean import COLUMNS as BOOLEAN_REDUCTION_COLUMNS
 from kernels.reduction.boolean import ROWS as BOOLEAN_REDUCTION_ROWS
 from kernels.reduction.boolean import row_boolean_reduction
+from kernels.reduction.two_pass import COLUMNS as PARTITIONED_MAX_COLUMNS
+from kernels.reduction.two_pass import PARTS as PARTITIONED_MAX_PARTS
+from kernels.reduction.two_pass import ROWS as PARTITIONED_MAX_ROWS
+from kernels.reduction.two_pass import partitioned_max_partial
+from kernels.reduction.two_pass import partitioned_max_reduce
 from kernels.sampling.nucleus import CANDIDATES as NUCLEUS_CANDIDATES
 from kernels.sampling.nucleus import ROWS as NUCLEUS_ROWS
 from kernels.sampling.nucleus import THRESHOLD as NUCLEUS_THRESHOLD
@@ -4257,6 +4262,63 @@ def _run_boolean_reduction(
     )
 
 
+def _run_partitioned_two_pass_max(
+    compiler: str, target: Target, target_name: str, upstream: Upstream | None
+) -> None:
+    if upstream is not None:
+        raise RuntimeError("partitioned two-pass max has no upstream adapter")
+    x = -torch.rand(
+        (PARTITIONED_MAX_ROWS, PARTITIONED_MAX_COLUMNS),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    partial = torch.full(
+        (PARTITIONED_MAX_ROWS, PARTITIONED_MAX_PARTS),
+        -torch.inf,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    output = torch.empty(
+        (PARTITIONED_MAX_ROWS,), device="cuda", dtype=torch.float32
+    )
+    partial_artifact = intent.compile(
+        partitioned_max_partial, target=target, compiler=compiler
+    )
+    reduce_artifact = intent.compile(
+        partitioned_max_reduce, target=target, compiler=compiler
+    )
+    partial_call = prepare_kernel_call(partial_artifact, (x,), partial)
+    reduce_call = prepare_kernel_call(reduce_artifact, (partial,), output)
+
+    def generated_pipeline() -> torch.Tensor:
+        partial.fill_(-torch.inf)
+        partial_call()
+        reduce_call()
+        return output
+
+    expected = torch.amax(x, dim=1)
+    generated = generated_pipeline()
+    torch.cuda.synchronize()
+    error = (generated - expected).abs().max().item()
+    if error != 0.0:
+        raise RuntimeError(
+            f"{target_name} partitioned two-pass max numerical comparison failed: "
+            f"{error}"
+        )
+    p50, p95 = benchmark(
+        generated_pipeline,
+        warmup=3,
+        repetitions=100,
+        cuda_graph=False,
+    )
+    print_artifact(partial_artifact, target_name)
+    print_artifact(reduce_artifact, target_name)
+    print(
+        f"{target_name} partitioned two-pass max passed "
+        f"(generated p50={p50:.4f} ms, p95={p95:.4f} ms, max_error={error})"
+    )
+
+
 def _run_value_select(
     compiler: str, target: Target, target_name: str, upstream: Upstream | None
 ) -> None:
@@ -4703,6 +4765,7 @@ EXTENDED_RUNNERS: dict[str, Runner] = {
     "paged_attention": _run_paged_attention,
     "paged_mla_decode": _run_paged_mla_decode,
     "paged_splitk_attention": _run_paged_splitk_attention,
+    "partitioned_two_pass_max": _run_partitioned_two_pass_max,
     "quantized_gemm": _run_quantized_gemm,
     "rms_norm": _run_rms_norm,
     "record_fields": _run_record_fields,

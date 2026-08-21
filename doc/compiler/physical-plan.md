@@ -64,7 +64,9 @@ W=\{\text{program / CTA / thread / task}\}
 \operatorname{own}:W\rightarrow\operatorname{Seq}(R_p)
 \]
 
-算法可见 segment 必须保持原 boundary/identity；普通 physical region 则只需完整、无非法重复地覆盖对应 logical instances。`program_id`、`ct.bid` 或 `T.Kernel` block binding 是 target surface 对这份 ownership 的拼写，不是 portable source identity。Sequential/state-stream order 由 Kernel IR 固定，Plan 只选择 grouped ordering、persistent traversal 等物理兑现方式；这份选择只做一次，各 surface 只投影与渲染。
+算法可见 segment 必须保持原 boundary/identity；普通 physical region 则只需完整、无非法重复地覆盖对应 logical instances。对 `partition(count=P)`，Plan 显式绑定 canonical partition、source axis、count SSA value、part block argument、region block argument和已选 ownership range；segment extent 只能是 canonical `ceil(N/P)` 的稳定派生引用，不能由 leaf 从 worker count 或相同 shape 反猜。空 part 没有 logical body execution，Plan 可以不为其启动 physical worker，但不能重编号非空 part，也不能删除 wrapper-visible 的 `P` 个 slots 或 identity-initialization relation。
+
+`program_id`、`ct.bid` 或 `T.Kernel` block binding 是 target surface 对这份 ownership 的拼写，不是 portable source identity。Sequential/state-stream order 由 Kernel IR 固定，Plan 只选择 grouped ordering、persistent traversal 等物理兑现方式；这份选择只做一次，各 surface 只投影与渲染。
 
 ## 数值与实现边界
 
@@ -72,7 +74,7 @@ Kernel IR 保存数学角色、dtype、累加语义、logical validity、state t
 
 Layout 推断、寄存器分配、指令选择以及给定参数后的低层流水线尽量委托给下层。某个 surface 中不存在的概念不会为“字段对齐”而被抬到共享 Plan；它要求显式打印的机器决定则必须来自同一份 realization，不能在 emitter 中重新选择。
 
-Source partition 只在 part identity 或 boundary 被算法、effect、ABI 或 wrapper 观察时改变算法结构。语法上让 body 拿到一个 region 并不足以证明这一点：如果 region 只用于把若干独立实例凑成 tensor operand，换一种合法机器实现时它无需保留，就应由 Plan 从完整 logical domain 引入。
+Source partition 只在 part identity 或 boundary 被算法、effect、ABI 或 wrapper 观察时改变算法结构。`count=P` 的边界公式、空 part 无执行、part identity 和 wrapper slots 都属于这份 source 语义，不是 Plan 的候选决定。语法上让 body 拿到一个 region 并不足以证明 source partition：如果 region 只用于把若干独立实例凑成 tensor operand，换一种合法机器实现时它无需保留，就应由 Plan 从完整 logical domain 引入。
 
 把多个 `parallel` 实例装进一个 physical program、lane 或 tensor primitive 属于 realization，即使每个 source 实例内部含 reduction、contract、scan、logical buffer 或 effect。合法性判据是实例间没有 source-defined happens-before、逐实例 value/state/effect identity 与冲突语义保持不变，且 source body 不观察新建 region 的 ordinal/boundary；不能以“body 含 structured op”为全局门槛，也不能借物理批处理引入跨实例 reduction、state 或 effect。目标无法保持 effect 合同时，该 batching realization 不合法。
 

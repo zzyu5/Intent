@@ -146,6 +146,7 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
                     llvm::DenseMap<int64_t, RaggedStructure>(),
                     llvm::DenseMap<int64_t, StateStreamStructure>(),
                     llvm::DenseMap<Value, SmallVector<Value, 2>>(),
+                    llvm::DenseMap<Value, SmallVector<Value, 2>>(),
                     llvm::DenseMap<Value, SmallVector<Value, 2>>()};
   auto indexValue = [&](int64_t id, Value value, Operation &owner) {
     if (id < 0 || !model.values.try_emplace(id, value).second ||
@@ -216,6 +217,59 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
                               *operation)))
           return WalkResult::interrupt();
       }
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+
+  result = model.entry.walk([&](Operation *operation) {
+    auto shapes = operation->getAttrOfType<ArrayAttr>("intent.result_shapes");
+    if (!shapes)
+      return WalkResult::advance();
+    if (shapes.size() != operation->getNumResults()) {
+      operation->emitOpError(
+          "has result-axis provenance misaligned with canonical results");
+      return WalkResult::interrupt();
+    }
+    for (auto [resultIndex, shapeAttribute] : llvm::enumerate(shapes)) {
+      auto shape = dyn_cast<ArrayAttr>(shapeAttribute);
+      if (!shape) {
+        operation->emitOpError(
+            "has malformed canonical result-axis provenance");
+        return WalkResult::interrupt();
+      }
+      SmallVector<Value, 2> arguments(shape.size());
+      for (auto [tensorAxis, extentAttribute] : llvm::enumerate(shape)) {
+        auto extent = dyn_cast<StringAttr>(extentAttribute);
+        if (!extent) {
+          operation->emitOpError(
+              "has non-symbolic canonical result-axis provenance");
+          return WalkResult::interrupt();
+        }
+        StringRef spelling = extent.getValue();
+        if (!spelling.consume_front("?region_"))
+          continue;
+        auto [valueSpelling, regionAxisSpelling] = spelling.rsplit('_');
+        int64_t valueID = -1;
+        int64_t regionAxis = -1;
+        if (valueSpelling.getAsInteger(10, valueID) ||
+            regionAxisSpelling.getAsInteger(10, regionAxis) || regionAxis < 0) {
+          operation->emitOpError(
+              "has malformed canonical region-axis provenance");
+          return WalkResult::interrupt();
+        }
+        Value source = model.values.lookup(valueID);
+        if (!source) {
+          operation->emitOpError(
+              "references an unknown value as result-axis provenance");
+          return WalkResult::interrupt();
+        }
+        if (isa<BlockArgument>(source))
+          arguments[tensorAxis] = source;
+      }
+      model.resultAxisRegionArguments[operation->getResult(resultIndex)] =
+          std::move(arguments);
+    }
     return WalkResult::advance();
   });
   if (result.wasInterrupted())

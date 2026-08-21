@@ -207,6 +207,22 @@ LogicalResult RegionBindingOp::verify() {
   return success();
 }
 
+LogicalResult PartitionBindingOp::verify() {
+  if (failed(requireNode(*this, getPartitionNode())) ||
+      failed(requireNode(*this, getAxisNode())) ||
+      failed(requireNonNegative(*this, getCountValue(),
+                                "partition count value ID")) ||
+      failed(requireNonNegative(*this, getPartArgument(),
+                                "partition part value ID")) ||
+      failed(requireNonNegative(*this, getRegionArgument(),
+                                "partition region value ID")) ||
+      getSegmentExtent().empty())
+    return failure();
+  if (getPartArgument() == getRegionArgument())
+    return emitOpError("must bind distinct part and region arguments");
+  return success();
+}
+
 LogicalResult LaunchOp::verify() {
   if (!getLoopNodeAttr())
     return success();
@@ -299,7 +315,8 @@ LogicalResult TransferOp::verify() {
         "requires a physical coverage residency exactly for compact indexing");
   if (getResultSpace() != "none" && getResultSpace() != "shared" &&
       !isPrivateSpace(getResultSpace()))
-    return emitOpError("contains an unsupported result residency");
+    return emitOpError() << "contains unsupported result residency "
+                         << getResultSpace();
   return success();
 }
 
@@ -574,6 +591,9 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   SmallVector<RangeOp> ranges;
   llvm::DenseSet<int64_t> regionArguments;
   SmallVector<RegionBindingOp> regionBindings;
+  llvm::DenseSet<int64_t> partitionPartArguments;
+  llvm::DenseSet<int64_t> partitionRegionArguments;
+  SmallVector<PartitionBindingOp> partitionBindings;
   SmallVector<ScanOp> scans;
   SmallVector<PointwiseOp> pointwise;
   llvm::DenseSet<int64_t> programOrders;
@@ -620,6 +640,14 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
         return binding.emitOpError(
             "duplicates a region-argument physical binding");
       regionBindings.push_back(binding);
+    } else if (auto binding = dyn_cast<PartitionBindingOp>(operation)) {
+      if (!partitionPartArguments.insert(binding.getPartArgument()).second)
+        return binding.emitOpError(
+            "duplicates a count-partition part binding");
+      if (!partitionRegionArguments.insert(binding.getRegionArgument()).second)
+        return binding.emitOpError(
+            "duplicates a count-partition region binding");
+      partitionBindings.push_back(binding);
     } else if (auto choice = dyn_cast<LaunchOp>(operation)) {
       ++launches;
       launch = choice;
@@ -773,6 +801,31 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
                   binding.getLevel()))
       return binding.emitOpError(
           "references an unbound selected physical range");
+  }
+  for (PartitionBindingOp binding : partitionBindings) {
+    auto axis = axes.find(binding.getAxisNode());
+    if (axis == axes.end() || !axisHasRole(axis->second, "parallel"))
+      return binding.emitOpError(
+          "references a non-program count-partition axis");
+    auto ownership = llvm::find_if(ranges, [&](RangeOp range) {
+      return range.getAxisNode() == binding.getAxisNode() &&
+             range.getPurpose() == "ownership" && range.getLevel() == 0;
+    });
+    if (ownership == ranges.end() ||
+        ownership->getTile() != binding.getSegmentExtent())
+      return binding.emitOpError(
+          "does not match the selected count-partition ownership extent");
+    auto region = llvm::find_if(regionBindings, [&](RegionBindingOp candidate) {
+      return candidate.getArgument() == binding.getRegionArgument();
+    });
+    if (region == regionBindings.end() ||
+        region->getAxisNode() != binding.getAxisNode() ||
+        region->getPurpose() != "ownership" || region->getLevel() != 0)
+      return binding.emitOpError(
+          "does not bind its region argument to the selected ownership range");
+    if (regionArguments.contains(binding.getPartArgument()))
+      return binding.emitOpError(
+          "part identity cannot also be a physical region argument");
   }
   for (StreamBindingOp binding : streamBindings) {
     auto axis = axes.find(binding.getAxisNode());

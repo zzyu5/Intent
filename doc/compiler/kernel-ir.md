@@ -14,7 +14,7 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 - symbolic shape、dtype、stride/layout constraint；
 - runtime scalar 与 `I.Constexpr`；
 - alias、alignment 与 effects；
-- wrapper-visible partition 与 workspace relation。
+- wrapper-visible partition、全部 source part identities、workspace shape 与 identity-initialization relation。
 
 ### Logical indexing
 
@@ -59,7 +59,7 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 
 1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel` 和一个 target callable entry；目标 entry 内可以包含多个 compiler-private execution stages。
 2. `I.auto` 只能作为明确声明 segment-parametric recurrence 的 structured extent hole，不能成为普通 SSA value，也不能用于普通 partition。
-3. Source-visible partition 的 extent/count 必须来自 runtime/shape/`Constexpr`/wrapper value，并被算法、effect、ABI 或 wrapper 观察；不可观察的 physical tile/worker count 不进入 Kernel IR。
+3. Source-visible partition 的 extent/count 必须来自 runtime/shape/`Constexpr`/wrapper value，并被算法、effect、ABI 或 wrapper 观察；不可观察的 physical tile/worker count 不进入 Kernel IR。对长度 `N` 的 count partition，Kernel IR 的唯一语义是 `block=ceil(N/P)`、part `i` 的范围为 `[min(i*block,N), min((i+1)*block,N))`。`P` 个 identity 和 wrapper slots 都保留；空 part 不执行 body，未写 slot 由 wrapper 保持作者算法指定的 identity 初值。
 4. Physical refinement 不得改变 logical workset、state、effect、ABI 或 wrapper-visible relation。
 5. Pure SSA 可以安全地复制、删除、融合或重算；effectful node 必须保持依赖与执行语义。
 6. 普通顺序循环与 `state_stream` 的 source 顺序不可降格为 unordered partial merge；内部 ordered operation 只保存这项语义，不是作者授予优化权限的标志。

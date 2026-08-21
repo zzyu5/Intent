@@ -59,6 +59,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getArgument()] = value;
+    } else if (auto value =
+                   dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
+      index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
@@ -145,7 +148,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   target::lowering::indexAxisRoles(index);
   for (auto &entry : index.streams) {
     plan::StreamOp &binding = entry.second;
-    auto tile = binding.operation->getAttrOfType<StringAttr>(streamTileAttr);
+    auto tile = binding.physical->getAttrOfType<StringAttr>(streamTileAttr);
     if (!tile)
       return binding.emitOpError("has no realized cuTile stream-tile spelling");
     binding.tile = tile.getValue().str();
@@ -381,11 +384,11 @@ LogicalResult ProgramMaterializer::indexABI() {
           continue;
         if (!llvm::is_contained(requiredDimensions, symbol.getValue()))
           requiredDimensions.push_back(symbol.getValue());
-        if (view.getAccess() != "out" &&
-            !dimensionOwners.count(symbol.getValue())) {
+        if (!dimensionOwners.count(symbol.getValue())) {
           dimensionOwners[symbol.getValue()] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
           dimensionOrder.push_back(symbol.getValue().str());
+          requiresPreallocatedOutputs |= view.getAccess() == "out";
         }
       } else if (auto integer = dyn_cast<IntegerAttr>(extent)) {
         emitted.shape.push_back(std::to_string(integer.getInt()));
@@ -430,6 +433,10 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  if (failed(target::lowering::indexPartitionExtents(
+          planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
+          syntax::tile)))
+    return failure();
   for (const auto &entry : planIndex.axes) {
     plan::AxisOp axis = entry.second;
     Operation *domain = kernel.nodes.lookup(axis.getNode());
@@ -684,6 +691,8 @@ LogicalResult ProgramMaterializer::prepareRaggedStages() {
 }
 
 bool ProgramMaterializer::selectOperation(Operation &operation) {
+  if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
+    return false;
   auto contractProducer = deferredContractProducerOwners.find(&operation);
   if (contractProducer != deferredContractProducerOwners.end())
     return activeDeferredContract &&
@@ -695,9 +704,7 @@ bool ProgramMaterializer::selectOperation(Operation &operation) {
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty() &&
-         !target::lowering::isAbsorbedStagedAccessMetadata(planIndex,
-                                                           operation);
+  return !activeStages.empty();
 }
 
 void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned indent) {
@@ -748,6 +755,11 @@ void ProgramMaterializer::emitImports() {
   output << "import math\n";
   output << "import cuda.tile as ct\n";
   output << "import torch\n";
+  if (!planIndex.partitionBindings.empty())
+    output << "\n\ndef _intent_partition_extent(logical_extent, count):\n"
+              "    if count < 1:\n"
+              "        raise ValueError('partition count must be positive')\n"
+              "    return (logical_extent + count - 1) // count\n";
   if (!planIndex.components.reusedAxes.empty())
     output << "from intent.runtime.tuning.cutile import tune_persistent_row\n";
   if (searchSpace) {
@@ -1632,16 +1644,24 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   if (!searchIndex.autotune) {
     SmallVector<plan::AxisOp> axes =
         target::lowering::orderedProgramAxes(planIndex);
-    if (planIndex.program.getPersistent() ||
-        llvm::any_of(axes, [](plan::AxisOp axis) { return !axis.isScalar(); }))
+    bool unsupportedTiledAxis = llvm::any_of(axes, [](plan::AxisOp axis) {
+      return !axis.isScalar() &&
+             !axis.getTileRole().starts_with("fixed_") &&
+             !axis.getTileRole().starts_with("partition_extent_");
+    });
+    if (planIndex.program.getPersistent() || unsupportedTiledAxis)
       return physicalProgram.emitOpError(
-          "untuned cuTile launch requires scalar non-persistent program axes");
+          "untuned cuTile launch requires scalar or source-fixed non-persistent program axes");
     std::array<std::string, 3> grid =
         target::lowering::projectProgramGrid(
             planIndex, [&](plan::AxisOp axis) {
               std::string role =
                   "program_" + std::to_string(axis.getProgramOrder());
-              return roleDimensions.lookup(role);
+              std::string extent = roleDimensions.lookup(role);
+              return axis.isScalar()
+                         ? extent
+                         : "(" + extent + " + " + axis.getTile().str() +
+                               " - 1) // " + axis.getTile().str();
             });
     output << "    grid = (" << grid[0] << ", " << grid[1] << ", "
            << grid[2] << ")\n";
@@ -1893,6 +1913,10 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     firstParameter = false;
   }
   output << "):\n";
+  if (requiresPreallocatedOutputs) {
+    output << "    raise NotImplementedError('this callable requires preallocated output views; use launch')\n\n\n";
+    return success();
+  }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
            << "\n";
@@ -2510,7 +2534,22 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
       predicates.push_back(std::move(predicate));
       continue;
     }
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        region = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, value, tensorAxis, consumer);
+    if (failed(region))
+      return failure();
+    if (*region && (*region)->selected.axis.getNode() != domainNode)
+      return consumer.emitOpError(
+          "binds one result axis to conflicting logical and physical axes");
     std::string base = axisIndices.lookup(axis.getNode());
+    if (*region) {
+      auto projected = valueNames.find((*region)->argument);
+      if (projected == valueNames.end())
+        return consumer.emitOpError(
+            "has no active cuTile region projection for its validity axis");
+      base = projected->second;
+    }
     if (base.empty())
       return consumer.emitOpError(
           "has no active cuTile index for its planned validity axis");
@@ -2518,7 +2557,22 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
                       planIndex.components, axis.getNode()) ||
                   (!planIndex.components.reusedAxes.empty() &&
                    kernel.nodes.lookup(axis.getNode()) == vectorDomain);
-    FailureOr<std::string> tile = physicalAxisTile(axis);
+    FailureOr<std::string> tile = failure();
+    if (*region) {
+      const target::lowering::RegionRangeBinding &selected =
+          (*region)->selected;
+      if (!selected.axis.getReuseWorker() &&
+          selected.range.getTileRole().starts_with("row_vector")) {
+        if (!planIndex.blockExtents.count(selected.range.getExtent()))
+          return consumer.emitOpError(
+              "row-vector validity region lacks its selected physical extent");
+        tile = physicalExtent(selected.range.getExtent());
+      } else {
+        tile = selected.range.getTile().str();
+      }
+    } else {
+      tile = physicalAxisTile(axis);
+    }
     if (failed(tile))
       return failure();
     std::string index =

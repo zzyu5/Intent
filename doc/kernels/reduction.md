@@ -45,7 +45,12 @@ def pass2(
 ```python
 def two_pass_max(x):
     parts = choose_parts(x.shape[-1], x.device)
-    partial = torch.empty((x.shape[0], parts), device=x.device)
+    partial = torch.full(
+        (x.shape[0], parts),
+        -torch.inf,
+        device=x.device,
+        dtype=x.dtype,
+    )
     out = torch.empty((x.shape[0],), device=x.device)
 
     pass1(x, partial)
@@ -61,11 +66,11 @@ def two_pass_max(x):
 - source-visible `P` 和 `partition(count=P)`；
 - 两个 kernel 内各自的 logical reduction。
 
-`parts` 被 wrapper 和两个 kernels 共同观察，因此绝不是 `I.auto`。
+`parts` 被 wrapper 和两个 kernels 共同观察，因此绝不是 `I.auto`。设 `block = ceil(N/P)`，part `p` 的输入范围是 `[min(p*block,N), min((p+1)*block,N))`。Partial ABI 始终保留全部 `P` 个槽位；空 part 不执行 pass1 body，未写槽位继续保持 wrapper 预填的 reduction identity，pass2 仍然归约全部 `P` 个槽位。
 
 ## Physical Plan 决定
 
-每个 kernel 内部仍可独立决定 region ownership、internal extent、reduction tree、storage、target collective 与 launch。
+每个 kernel 内部仍可独立决定 region ownership、reduction tree、storage、target collective 与 launch。Plan 可以省去空 part 的 physical worker，但必须保持非空 part 的 source identity、公式边界以及全部 `P` 个 wrapper-visible partial slots。
 
 ## 边界
 

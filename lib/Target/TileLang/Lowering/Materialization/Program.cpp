@@ -41,6 +41,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getArgument()] = value;
+    } else if (auto value =
+                   dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
+      index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
       index.program.operation = value;
       auto equal = value->getAttrOfType<BoolAttr>(equalProgramTilesAttr);
@@ -136,7 +139,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   target::lowering::indexAxisRoles(index);
   for (auto &entry : index.streams) {
     plan::StreamOp &binding = entry.second;
-    auto tile = binding.operation->getAttrOfType<StringAttr>(streamTileAttr);
+    auto tile = binding.physical->getAttrOfType<StringAttr>(streamTileAttr);
     if (!tile)
       return binding.emitOpError("has no realized TileLang stream-tile spelling");
     binding.tile = tile.getValue().str();
@@ -385,6 +388,7 @@ LogicalResult ProgramMaterializer::indexABI() {
           dimensionOwners[spelling] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
           dimensionOrder.push_back(std::move(spelling));
+          requiresPreallocatedOutputs |= view.getAccess() == "out";
         }
       } else if (auto integer = dyn_cast<IntegerAttr>(extent)) {
         emitted.shape.push_back(std::to_string(integer.getInt()));
@@ -423,6 +427,10 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  if (failed(target::lowering::indexPartitionExtents(
+          planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
+          syntax::tile)))
+    return failure();
   for (auto &entry : planIndex.axes) {
     Operation *domain = kernel.nodes.lookup(entry.first);
     if (!domain)
@@ -673,6 +681,8 @@ LogicalResult ProgramMaterializer::prepareRaggedStages() {
 }
 
 bool ProgramMaterializer::selectOperation(Operation &operation) {
+  if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
+    return false;
   auto contractProducer = deferredContractProducerOwners.find(&operation);
   if (contractProducer != deferredContractProducerOwners.end())
     return activeDeferredContract &&
@@ -684,9 +694,7 @@ bool ProgramMaterializer::selectOperation(Operation &operation) {
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty() &&
-         !target::lowering::isAbsorbedStagedAccessMetadata(planIndex,
-                                                           operation);
+  return !activeStages.empty();
 }
 
 void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned indent) {
@@ -705,6 +713,11 @@ void ProgramMaterializer::emitImports() {
   output << "import torch\n";
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
+  if (!planIndex.partitionBindings.empty())
+    output << "\n\ndef _intent_partition_extent(logical_extent, count):\n"
+              "    if count < 1:\n"
+              "        raise ValueError('partition count must be positive')\n"
+              "    return (logical_extent + count - 1) // count\n";
   output << "from intent.runtime.tuning.tilelang import DEFAULT_NUM_STAGES, DEFAULT_THREADS";
   if (tuneRow)
     output << ", row_autotune_configurations";
@@ -1688,6 +1701,10 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     first = false;
   }
   output << "):\n";
+  if (requiresPreallocatedOutputs) {
+    output << "    raise NotImplementedError('this callable requires preallocated output views; use launch')\n\n\n";
+    return success();
+  }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = "
            << dimensionOwners.lookup(dimension) << "\n";
@@ -1884,6 +1901,13 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
                         : FailureOr<std::string>(emitted->second));
     }
     if (name == "intent.indices" && definition->getNumOperands() == 1) {
+      if (auto argument =
+              dyn_cast<BlockArgument>(definition->getOperand(0))) {
+        auto emitted = regionIndices.find(argument);
+        return finish(emitted == regionIndices.end()
+                          ? FailureOr<std::string>(failure())
+                          : FailureOr<std::string>(emitted->second));
+      }
       FailureOr<plan::AxisOp> axis =
           resolveAxis(definition->getOperand(0), consumer);
       std::string base =
@@ -2136,8 +2160,24 @@ ProgramMaterializer::elementAccessIndices(Operation &operation,
         unsigned valueAxis =
             *tensorGroupAxis + tensorIndices.rank - tensor.getRank();
         std::string element;
-        if (succeeded(projected) && tensor.getRank() == 1) {
-          element = *projected + " + " + tileIndices[valueAxis];
+        std::optional<unsigned> varyingAxis;
+        for (auto [axis, extent] : llvm::enumerate(*extents)) {
+          if (extent == "1")
+            continue;
+          if (varyingAxis) {
+            varyingAxis.reset();
+            break;
+          }
+          varyingAxis = axis;
+        }
+        bool structured = succeeded(projected) &&
+                          llvm::count_if(*extents, [](const std::string &extent) {
+                            return extent != "1";
+                          }) <= 1;
+        if (structured) {
+          element = *projected;
+          if (varyingAxis)
+            element += " + " + tileIndices[valueAxis + *varyingAxis];
         } else {
           element = exact->str() + "[";
           for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
@@ -2310,8 +2350,24 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
               "TileLang broadcasted tensor bounds have no canonical extents");
         unsigned valueAxis =
             *tensorGroupAxis + tensorIndices.rank - tensor.getRank();
-        if (succeeded(projected) && tensor.getRank() == 1) {
-          index = *projected + " + " + tileIndices[valueAxis];
+        std::optional<unsigned> varyingAxis;
+        for (auto [axis, extent] : llvm::enumerate(*extents)) {
+          if (extent == "1")
+            continue;
+          if (varyingAxis) {
+            varyingAxis.reset();
+            break;
+          }
+          varyingAxis = axis;
+        }
+        bool structured = succeeded(projected) &&
+                          llvm::count_if(*extents, [](const std::string &extent) {
+                            return extent != "1";
+                          }) <= 1;
+        if (structured) {
+          index = *projected;
+          if (varyingAxis)
+            index += " + " + tileIndices[valueAxis + *varyingAxis];
         } else {
           index = exact->str() + "[";
           for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
@@ -2392,6 +2448,15 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
       return operation.emitOpError(
           "bounded TileLang transfer has too few tile indices");
     std::string base = axisIndices.lookup(axis->getNode());
+    if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> region =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      if (failed(region) || region->axis.getNode() != axis->getNode())
+        return operation.emitOpError(
+            "has no exact TileLang region interval for bounded transfer");
+      base = regionIndices.lookup(indexed);
+    }
     Operation *domain = kernel.nodes.lookup(axis->getNode());
     FailureOr<std::string> extent = failure();
     if (target::lowering::isRaggedBoundAxis(planIndex.components,
@@ -2657,7 +2722,17 @@ FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
     plan::AxisOp axis = physical->second;
     if (axis.isScalar())
       continue;
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        region = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, consumer.getResult(0), tensorAxis, consumer);
+    if (failed(region))
+      return failure();
+    if (*region && (*region)->selected.axis.getNode() != domainNode)
+      return consumer.emitOpError(
+          "binds one result axis to conflicting logical and physical axes");
     std::string base = axisIndices.lookup(axis.getNode());
+    if (*region)
+      base = regionIndices.lookup((*region)->argument);
     if (base.empty())
       return consumer.emitOpError(
           "has no active TileLang index for its planned validity axis");
@@ -2686,6 +2761,37 @@ FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
   return result;
 }
 
+FailureOr<std::string>
+ProgramMaterializer::paddingFillExpression(Value value, Operation &consumer) {
+  FailureOr<int64_t> valueID =
+      target::getValueID(value, kernel, consumer, "TileLang padding lookup");
+  if (failed(valueID))
+    return failure();
+  plan::PaddingOp padding = planIndex.paddings.lookup(*valueID);
+  if (!padding)
+    return std::string();
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor)
+    return consumer.emitOpError(
+        "cannot apply TileLang padding to a non-tensor value");
+  std::string dtype = dtypeName(tensor.getElementType(), consumer);
+  if (dtype.empty())
+    return failure();
+  StringRef planned = padding.getFill();
+  return planned == "negative_infinity"
+             ? "-T.infinity(" + dtype + ")"
+         : planned == "positive_infinity"
+             ? "T.infinity(" + dtype + ")"
+         : planned == "nan" ? "float('nan')"
+         : planned == "true" ? "True"
+         : planned == "false" ? "False"
+         : planned.starts_with("literal_integer:")
+             ? planned.drop_front(16).str()
+         : planned.starts_with("literal_float:")
+             ? planned.drop_front(14).str()
+         : isa<IntegerType, IndexType>(tensor.getElementType()) ? "0" : "0.0";
+}
+
 FailureOr<std::string> ProgramMaterializer::padElementExpression(
     Value value, StringRef expression, ArrayRef<std::string> elementIndices,
     Operation &consumer) {
@@ -2696,35 +2802,14 @@ FailureOr<std::string> ProgramMaterializer::padElementExpression(
   plan::PaddingOp padding = planIndex.paddings.lookup(*valueID);
   if (!padding)
     return expression.str();
-  auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  if (!tensor)
-    return consumer.emitOpError(
-        "cannot apply TileLang padding to a non-tensor value");
-  std::string dtype = dtypeName(tensor.getElementType(), consumer);
-  if (dtype.empty())
-    return failure();
   FailureOr<std::string> predicate = elementValidityPredicate(
       padding.getTensorAxes(), padding.getDomainNodes(), elementIndices,
       consumer);
-  if (failed(predicate))
+  FailureOr<std::string> fill = paddingFillExpression(value, consumer);
+  if (failed(predicate) || failed(fill) || fill->empty())
     return failure();
-  StringRef planned = padding.getFill();
-  std::string fill = planned == "negative_infinity"
-                         ? "-T.infinity(" + dtype + ")"
-                     : planned == "positive_infinity"
-                         ? "T.infinity(" + dtype + ")"
-                     : planned == "nan" ? "float('nan')"
-                     : planned == "true" ? "True"
-                     : planned == "false" ? "False"
-                     : planned.starts_with("literal_integer:")
-                         ? planned.drop_front(16).str()
-                     : planned.starts_with("literal_float:")
-                         ? planned.drop_front(14).str()
-                     : isa<IntegerType, IndexType>(tensor.getElementType())
-                         ? "0"
-                         : "0.0";
   return "T.if_then_else(" + *predicate + ", " + expression.str() + ", " +
-         fill + ")";
+         *fill + ")";
 }
 
 FailureOr<SmallVector<std::string>>

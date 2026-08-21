@@ -130,6 +130,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getArgument()] = value;
+    } else if (auto value =
+                   dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
+      index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
       index.program.operation = value;
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
@@ -252,7 +255,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   }
   for (auto &entry : index.streams) {
     plan::StreamOp &binding = entry.second;
-    auto tile = binding.operation->getAttrOfType<StringAttr>(streamTileAttr);
+    auto tile = binding.physical->getAttrOfType<StringAttr>(streamTileAttr);
     if (!tile)
       return binding.emitOpError("has no realized Triton stream-tile spelling");
     binding.tile = tile.getValue().str();
@@ -443,6 +446,7 @@ LogicalResult ProgramMaterializer::indexABI() {
           dimensionOwners[symbol.getValue()] =
               argument.name + ".shape[" + std::to_string(axis) + "]";
           dimensionOrder.push_back(symbol.getValue().str());
+          requiresPreallocatedOutputs |= view.getAccess() == "out";
         }
       } else if (auto integer = dyn_cast<IntegerAttr>(extent)) {
         emitted.shape.push_back(std::to_string(integer.getInt()));
@@ -482,6 +486,10 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  if (failed(target::lowering::indexPartitionExtents(
+          planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
+          syntax::tile)))
+    return failure();
   for (const auto &entry : planIndex.axes) {
     plan::AxisOp axis = entry.second;
     Operation *domain = kernel.nodes.lookup(axis.getNode());
@@ -715,6 +723,8 @@ LogicalResult ProgramMaterializer::prepareRaggedStages() {
 }
 
 bool ProgramMaterializer::selectOperation(Operation &operation) {
+  if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
+    return false;
   auto contractProducer = deferredContractProducerOwners.find(&operation);
   if (contractProducer != deferredContractProducerOwners.end())
     return activeDeferredContract &&
@@ -726,9 +736,7 @@ bool ProgramMaterializer::selectOperation(Operation &operation) {
   if (planIndex.stages.empty())
     return true;
   activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty() &&
-         !target::lowering::isAbsorbedStagedAccessMetadata(planIndex,
-                                                           operation);
+  return !activeStages.empty();
 }
 
 void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned indent) {
@@ -757,6 +765,11 @@ void ProgramMaterializer::emitImports() {
   output << "import torch\n";
   output << "import triton\n";
   output << "import triton.language as tl\n";
+  if (!planIndex.partitionBindings.empty())
+    output << "\n\ndef _intent_partition_extent(logical_extent, count):\n"
+              "    if count < 1:\n"
+              "        raise ValueError('partition count must be positive')\n"
+              "    return (logical_extent + count - 1) // count\n";
   if (llvm::any_of(planIndex.pointwise, [](const auto &entry) {
         return entry.second.getLowering() == "libdevice.pow";
       }))
@@ -1753,6 +1766,10 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     firstParameter = false;
   }
   output << "):\n";
+  if (requiresPreallocatedOutputs) {
+    output << "    raise NotImplementedError('this callable requires preallocated output views; use launch')\n\n\n";
+    return success();
+  }
   for (const std::string &dimension : dimensionOrder)
     output << "    " << dimension << " = " << dimensionOwners.lookup(dimension)
            << "\n";
@@ -2195,6 +2212,23 @@ ProgramMaterializer::emitMaskExpression(Operation &operation, bool store) {
       return failure();
     }
     Value indexed = operation.getOperand(*term.operands.front());
+    if (plan::PartitionBindingOp partition =
+            target::lowering::countPartitionForPartValue(planIndex, kernel,
+                                                         indexed)) {
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      Value countValue = kernel.values.lookup(partition.getCountValue());
+      Operation *source = kernel.nodes.lookup(partition.getPartitionNode());
+      FailureOr<std::string> count =
+          countValue && source
+              ? target::lowering::sourceIntegerSpelling(countValue, kernel,
+                                                        *source)
+              : FailureOr<std::string>(failure());
+      if (failed(exact) || failed(count))
+        return failure();
+      predicates.push_back("(" + exact->str() + " < " + *count + ")");
+      continue;
+    }
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
       auto tensor = cast<RankedTensorType>(indexed.getType());
@@ -2374,8 +2408,25 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
     unsigned physicalTensorAxis = tensorAxis;
     for (unsigned insertion : packedInsertions)
       physicalTensorAxis += insertion <= static_cast<unsigned>(tensorAxis);
-    FailureOr<std::string> index =
-        indexExpression(axis, false, physicalTensorAxis, emittedRank, consumer);
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        region = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, value, tensorAxis, consumer);
+    if (failed(region))
+      return failure();
+    FailureOr<std::string> index = failure();
+    if (*region) {
+      if ((*region)->selected.axis.getNode() != domainNode)
+        return consumer.emitOpError(
+            "binds one result axis to conflicting logical and physical axes");
+      auto projected = valueNames.find((*region)->argument);
+      if (projected == valueNames.end())
+        return consumer.emitOpError(
+            "has no active Triton region projection for its validity axis");
+      index = broadcastIndex(projected->second, physicalTensorAxis, emittedRank);
+    } else {
+      index =
+          indexExpression(axis, false, physicalTensorAxis, emittedRank, consumer);
+    }
     if (failed(extent) || failed(index))
       return failure();
     predicates.push_back("(" + *index + " < " + *extent + ")");

@@ -313,6 +313,21 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     }
   }
 
+  for (const auto &entry : kernel.nodes) {
+    Operation *operation = entry.second;
+    if (!operation || ::intent::target::semanticOperationName(*operation) !=
+                          "intent.scatter_reduce")
+      continue;
+    FailureOr<int64_t> node =
+        target::getNodeID(*operation, "TileLang scatter-reduce capability");
+    if (failed(node))
+      return failure();
+    if (stagedOperations.contains(*node))
+      return operation->emitOpError(
+          "TileLang 0.1.13 cannot project staged dynamic-row scatter reduction "
+          "without a layout-unsafe or serial atomic path");
+  }
+
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
     if (stream->hasAttr(streamTileAttr))

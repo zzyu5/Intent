@@ -58,6 +58,8 @@ struct KernelModel {
   llvm::DenseMap<int64_t, RaggedStructure> raggedRelations;
   llvm::DenseMap<int64_t, StateStreamStructure> stateStreams;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>>
+      resultAxisRegionArguments;
+  llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>>
       structuredResultSources;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<mlir::Value, 2>>
       structuredValueUsers;

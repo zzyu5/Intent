@@ -25,7 +25,7 @@ Python DSL
 - Triton、cuTile、TileLang 的主要 program-form 选择进入 provider passes，terminal translator 不再各自反推 contraction axes、gather form、ragged route 等结构；
 - 旧的 contraction physical-axis 推导路径已经删除，只保留 Plan 中的一份已选绑定。
 
-本轮没有完成 `partition(count=P)`。原因不是实现困难，而是当前规格没有定义可观察分段的精确边界公式，详见第 9 节。
+随后第三轮已经冻结并闭合 `partition(count=P)`，并用 split-style 两阶段归约实际压过 frontend、Kernel IR、Physical Program、三家 provider 与 wrapper ABI。真实算子接纳还暴露并修复了同一 logical axis 同时承担 ownership、ordered traversal 与 reduction 时的用途覆盖，以及 result-axis region provenance 在 lowering 中被压扁的问题，详见第 9 至 11 节。
 
 ## 2. 编程模型迁移
 
@@ -108,14 +108,14 @@ KIR 仍然是算法语义来源，但进入 physical-program 阶段后，执行�
 - 创建一份完整且能通过 verifier 的 Physical Program；
 - 为尚未 refinement 的字段提供保守初值。
 
-compiler-owned ranges 初始使用单 logical element，program axes 初始映射到同一 worker，不启用 reuse/group/persistent。Source-visible fixed partition 和 fixed state-stream segmentation 不会被抹掉，因为它们属于算法语义。
+compiler-owned ranges 初始使用单 logical element，program axes 初始映射到同一 worker，不启用 reuse/group/persistent。Ranked transfer、reduction 与 pointwise result 先用合法的 `private_fragment`，scalar result 使用 `private_scalar`；这些都是可被后续 pass 覆盖的完整初值。Source-visible fixed partition、count partition 和 fixed state-stream segmentation 不会被抹掉，因为它们属于算法语义。
 
 ### 4.2 不再由 Build 持有最终值
 
 为了确认 Build 中的值确实只是 baseline，而不是隐藏的最终权威，本轮让若干初值与最终值明确不同：
 
-- tensor transfer/reduction/pointwise 初始 residency 使用保守 workspace；
-- transfer realization pass 再选择 fragment/scalar、direct materialization 与 compact coverage；
+- tensor transfer/reduction/pointwise 初始 residency 使用合法 fragment/scalar；
+- transfer realization pass 再选择 fragment/scalar/workspace、direct materialization 与 compact coverage；
 - value realization pass 再选择 pointwise、reduction、scan carry 和 sparse-contraction residency；
 - contraction、scan 和 buffer 的完整形态分别由其独立 passes 覆盖。
 
@@ -239,26 +239,70 @@ Translator 仍需读取 physical executable op 的 SSA operands、result type、
 
 没有增加 compatibility flag、legacy fallback 或 kernel-name matcher。
 
-## 9. 尚未闭合：`partition(count=P)`
+## 9. `partition(count=P)` 已闭合
 
-当前文档只规定：
+### 9.1 唯一 source 语义
 
-- axis 被分为 source-visible 的 `P` 个连续 regions；
-- part identity 可被 partial buffer、wrapper 或多个 kernel 观察；
-- `P` 不是 compiler-owned worker count。
-
-但尚未规定长度为 `N` 的 axis 第 `i` 个 part 的精确边界。至少存在两种都满足“P 个连续 regions”的定义：
+对长度为 `N` 的 axis 和 source-visible count `P >= 1`：
 
 ```text
-begin_i = floor(i * N / P)
-end_i   = floor((i + 1) * N / P)
+block   = ceil(N / P)
+begin_i = min(i * block, N)
+end_i   = min((i + 1) * block, N)
 ```
 
-以及基于 `ceil(N/P)` 的固定最大 extent 切法。两者在 `N % P != 0` 时产生不同 part contents；part result 又是 source-visible 的，因此这是算法语义，不能由 realizer 临时选择。
+Part identity 是 `i ∈ [0, P)`。尾部 part 可以较短或为空；空 part 保留 wrapper-visible slot，但不执行 body、不写出、不产生 effect。后续 kernel 读取全部 `P` 个 partial slots 时，wrapper 必须先按 reduction identity 初始化 buffer。Target 可以不启动空 part 的 worker，但不能压缩或重编号非空 identity。
 
-在精确公式冻结之前，frontend 继续明确拒绝 `partition(count=P)`，而不是生成一份语义不确定的 IR。需要同时确定 `P > N` 时是否保留空 parts。
+### 9.2 编译链中的唯一表示
 
-## 10. 验证范围与证据
+- frontend 接受 `extent=`/`count=` 二选一；count iteration body 固定接收 `(part, region)`，`part` 是 logical index；
+- Kernel IR verifier 检查 canonical 两 operand schema、mode/result type 对齐和静态 count 正数约束；
+- `KernelFacts` 保存 partition、source domain、count SSA、part argument、region argument，不从 shape 猜 part identity；
+- Physical Program 使用 `intent_plan.partition_binding` 显式绑定上述身份，并让 ownership range 引用稳定的 `partition_extent_<node>`；
+- 这个 extent 是 source 公式的唯一派生值，不进入 tuner search space；
+- 三家 provider 都从同一 binding 生成 `ceil(N/P)`、program ordinal、region index 与 launch grid；grid 只覆盖非空 prefix，wrapper ABI 仍保留全部 `P` slots；
+- 只由输出 view 才能确定 `P` 的 callable 必须走预分配 `launch`。自动分配的 `run` 不再引用一个不存在的 output 参数，而是明确拒绝。
+
+Count 必须是 launch-visible 的 literal、ABI dimension、runtime scalar 或 constexpr。它不能是在 kernel body 执行后才得到的值，因为 launch grid 在 body 运行前就必须确定。
+
+## 10. 真实算子接纳暴露并修复的问题
+
+### 10.1 同一 logical axis 的多种 physical purpose
+
+Mamba chunk scan 的同一 `rows` axis 同时承担：
+
+- output ownership；
+- state-stream ordered traversal；
+- contraction reduction；
+- row-vector lane。
+
+Plan 原本已经分别保存 `ownership`、`traversal`、`reduction` 与 `lane` ranges，但三个 materializer 都把 stream traversal index 回写到按 axis node 单键索引的全局表，覆盖了 output ownership index。结果是一个 tile 的 global offset 被另一个 purpose 的局部 offset 替代。
+
+修复没有增加新的算法字段：stream body 只使用 `StreamBindingOp` 选择的 traversal range；普通 axis value 继续使用 ownership range；region block argument 按 `RegionBindingOp` 的 purpose 取精确投影。同一 logical axis 不再只有一个“当前物理索引”。
+
+### 10.2 result-axis region provenance 不再由 leaf 解析字符串
+
+Tensor result 的动态 axis 标签可能来自完整 domain，也可能来自 nested region block argument。后者必须继续绑定到该 argument 的 selected physical range，否则 validity、padding、`I.indices(region)` 与 ragged member projection 会退回逻辑 shape 或另一个 purpose 的 range。
+
+现在 canonical shape metadata 只在公共 `KernelModel` analysis 中解析一次，形成结构化的 result-axis→region block argument provenance。Shared lowering 再把它与 `RegionBindingOp` 结合，三个 provider 只消费查询结果；terminal leaf 不再解析 `?region_*` 字符串，也不再按相同 extent 猜 axis。
+
+### 10.3 staged ragged 与 TileLang 投影
+
+MoE 接纳暴露了三处共享问题：ragged member 的 compiler-selected ownership 没被 staged contraction 接受；descriptor load 与 valid/fill producer 被一个过宽的“staged metadata absorbed”判定一起删除；cuTile gather candidate 使用了错误的 tuning role。修复均基于 ownership/use-def/operand role，不含 kernel-name 分支。
+
+TileLang 对 rank>1、但只有一个非 singleton 轴变化的 structured index，原来退化成 materialized broadcast fragment，导致下层 layout inference 冲突。现在 leaf 直接投影精确的结构化索引；这只是目标语法兑现，不改变 shared physical decision。
+
+TileLang 0.1.13 对 staged dynamic-row scatter reduction 的向量 atomic 会产生错误地址，而串行 fallback 会成为数量级更慢的伪支持。Provider pass 现在在 emission 前明确拒绝该 form；实验性的 terminal 慢路径已经删除。
+
+### 10.4 source inventory 与历史失败的边界
+
+上一轮确认的口径是 119 个 runtime-visible source entries、baseline-new registry 92 个，尚缺 27 个。这个数字本轮没有被 adapter 名称或相近算法虚假缩小：除上一轮已经进入 registry 的 Triton split-K paged attention 外，本轮没有新增 baseline-new registry row，因此剩余仍是 Triton 9、cuTile 9、TileLang 9。
+
+本轮给旧 repro 接上 official cuTile MoE、Triton grouped GEMM 与 TileLang grouped GEMM source，目的是在同一 DSL 上观察 provider projection，并不等于把 cuTile official fused MoE、TileLang fused routed/shared MoE 或 Triton 两种现代 MoE projection 接入 baseline-new。它们的算法、shape、routing/partial ABI 或调用结构并不相同；只有新增相应 DSL/adapter、进入 registry、真实运行并与该 source 对照后，才能从 27 中扣除。
+
+历史 `compile_failed` 也没有与 inventory 相加。本轮定向重跑只更新被重构路径直接触及的事实：Mamba 三家通过；MoE 两家通过、TileLang 提前明确拒绝；Triton split-K 与 in-place 通过；attention 的普通和非二次幂 head dimension 通过、`D=256` 是资源失败。其余历史失败仍是旧全量状态，不能由这些定向结果推断已经消失。
+
+## 11. 验证范围与证据
 
 遵守仓库验证纪律，本轮没有建立 test 目录、pytest、fixture 或全量回归设施。
 
@@ -267,35 +311,59 @@ end_i   = floor((i + 1) * N / P)
 1. C++/TableGen 完整构建：
 
    ```bash
-   cmake --build /tmp/intentdsl-build -j2
+   cmake --build /tmp/intentdsl-build --target intent-compile -j8
    ```
 
-   `intent-opt` 与 `intent-compile` 均成功链接。
+   `intent-compile` 成功链接。
 
-2. 唯一端到端 repro：
+2. `partition(count)` 两阶段归约：
 
    ```bash
-   examples/run/repro.sh triton bf16_gemm
+   examples/run/repro.sh triton partitioned_two_pass_max
+   examples/run/repro.sh cutile partitioned_two_pass_max
+   examples/run/repro.sh tilelang partitioned_two_pass_max
    ```
 
-   该命令完成 DSL → KIR → Physical Program → shared/provider passes → Triton source → JIT → GPU 数值对照；结果为 PASS，最大误差 `0.03125`，generated `p50 = 2.0239 ms`、`p95 = 2.0281 ms`。
+   三家都完成两份 DSL → KIR → Physical Program → provider source → JIT → 两次 GPU launch，`P=300 > N=257`，partial 预填 `-inf`，最大误差均为 `0.0`。最近一次 Triton 复验为 `p50=0.0627 ms`、`p95=0.0675 ms`；本轮 cuTile 与 TileLang 运行分别为 `p50=0.0424 ms`、`0.0465 ms`。
 
-3. 静态一致性：
+3. stateful streaming：
+
+   ```bash
+   examples/run/repro.sh triton mamba_chunk_scan
+   examples/run/repro.sh cutile mamba_chunk_scan
+   examples/run/repro.sh tilelang mamba_chunk_scan
+   ```
+
+   三家数值均通过；Triton/cuTile 最大误差 `0.0006580352783203125`，TileLang 最大误差 `0.0137786865234375`。最近一次 Triton 复验为 `p50=0.0220 ms`；本轮 cuTile 为 `0.0220 ms`，TileLang 为 `0.0258 ms`。这条链真实制造了同轴 ownership/traversal/reduction/lane 组合。
+
+4. ragged、split-K 与 in-place：
+
+   - MoE：Triton 与 cuTile 数值通过，最大误差 `9.05944e-06`；Triton generated/upstream `0.8549x`，cuTile `1.0262x`；TileLang 在 provider pass 明确拒绝 staged dynamic-row scatter reduction；
+   - `triton paged_splitk_attention`：数值通过，最大误差 `0.0001220703125`，`p50=0.1713 ms`；
+   - `triton reshape_and_cache`：两个输出最大误差均为 `0.0`，`p50=0.0302 ms`。
+
+5. attention 与非典型 head dimension：
+
+   - base attention 数值通过，最大误差 `3.0518e-05`；
+   - `D=64/80/96` 且 `Q=127, K=131` 的 tail 均数值通过；
+   - `D=256` 当前候选需要 `116736 B` shared memory，超过本机 `101376 B`，下层明确报资源不足；没有用慢路径伪装支持。
+
+6. 静态一致性：
 
    - canonical op 与 physical executable op 为 49 对 49；
    - public/corpus 中没有 `I.ordered`；
    - public/corpus 中没有 `partition(..., I.auto(...))`；
    - `git diff --check` 通过。
 
-这些证据证明新主链能够实际构建并运行一个完整 contraction kernel，但不等价于两台机器的全量矩阵回归；本轮按要求没有做全量测试。
+这些证据覆盖 count partition、stateful streaming、ragged staged contraction、split-K、in-place 与 attention tail；不等价于两台机器的全量矩阵回归，本轮按要求没有做全量测试。
 
-## 11. 当前准确状态
+## 12. 当前准确状态
 
-当前已经不再是“一个 unary physical op 加少量纵向切片”的 V2 演示：physical executable op、shared pass pipeline、provider-form passes 和 terminal translation 已经横向覆盖现有 op 家族。
+当前已经不再是“一个 unary physical op 加少量纵向切片”的 V2 演示：physical executable op、shared pass pipeline、provider-form passes 和 terminal translation 已经横向覆盖现有 op 家族；`partition(count=P)` 也已从 source 语义闭合到三家真实 GPU execution。
 
 仍需严格区分两件事：
 
-- 架构主链已经闭合，并且已有一个真实 GPU repro 通过；
+- 架构主链已经闭合，并且已有多种结构的定向 GPU repro 通过；
 - 全部历史 kernel 是否都没有数值或性能回退，本轮没有通过全量矩阵证明。
 
-`partition(count=P)` 是当前唯一明确的 public programming-model 语义阻塞。它需要先冻结 source-visible 分段公式，然后才能继续 frontend、KIR、facts、Physical Program 与三家 lowering 的端到端闭合。
+目前留下的是有证据的 provider/resource 边界，不是未定义语言语义：TileLang 0.1.13 无法安全、高吞吐地兑现 staged dynamic-row scatter reduction；本机 attention `D=256` 候选超过 shared-memory 容量。二者均显式失败，没有 fallback 或静默错误。历史全量能力与性能是否完全无退化，仍需要后续明确要求的全量轮证明。

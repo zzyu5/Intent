@@ -97,6 +97,75 @@ logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
 }
 
 inline mlir::FailureOr<std::string>
+sourceIntegerSpelling(mlir::Value value, const target::KernelModel &kernel,
+                      mlir::Operation &consumer) {
+  if (mlir::Operation *definition = value.getDefiningOp()) {
+    llvm::StringRef name = ::intent::target::semanticOperationName(*definition);
+    if (name == "intent.constant") {
+      auto literal = definition->getAttrOfType<mlir::IntegerAttr>("intent.value");
+      if (literal)
+        return std::to_string(literal.getInt());
+    }
+    if (name == "intent.dim" && definition->getNumOperands() == 1) {
+      auto axis = definition->getAttrOfType<mlir::IntegerAttr>("intent.axis");
+      mlir::FailureOr<llvm::SmallVector<std::string>> shape =
+          target::getLogicalShape(definition->getOperand(0), kernel, consumer,
+                                  "partition count dimension");
+      if (axis && mlir::succeeded(shape) && axis.getInt() >= 0 &&
+          static_cast<size_t>(axis.getInt()) < shape->size())
+        return (*shape)[axis.getInt()];
+    }
+  }
+  auto argument = llvm::find_if(kernel.abi.arguments,
+                                [&](const target::ABIArgument &candidate) {
+                                  return candidate.value == value;
+                                });
+  if (argument != kernel.abi.arguments.end()) {
+    auto kind = argument->metadata.getAs<mlir::StringAttr>("kind");
+    if (kind && (kind.getValue() == "runtime_scalar" ||
+                 kind.getValue() == "constexpr"))
+      return argument->name;
+  }
+  consumer.emitOpError(
+      "requires a count from an integer literal, ABI dimension, or scalar parameter");
+  return mlir::failure();
+}
+
+template <typename PlanIndex, typename SpellTile>
+mlir::LogicalResult indexPartitionExtents(
+    const PlanIndex &index, const target::KernelModel &kernel,
+    const llvm::DenseMap<int64_t, std::string> &axisDimensions,
+    llvm::StringMap<std::string> &dimensionOwners,
+    llvm::SmallVectorImpl<std::string> &dimensionOrder,
+    SpellTile spellTile) {
+  for (intent::plan::PartitionBindingOp binding : index.partitionBindings) {
+    std::string logicalExtent = axisDimensions.lookup(binding.getAxisNode());
+    mlir::Value countValue = kernel.values.lookup(binding.getCountValue());
+    mlir::Operation *partition = kernel.nodes.lookup(binding.getPartitionNode());
+    mlir::FailureOr<std::string> count =
+        countValue && partition
+            ? sourceIntegerSpelling(countValue, kernel, *partition)
+            : mlir::FailureOr<std::string>(mlir::failure());
+    mlir::FailureOr<std::string> physical =
+        spellTile(binding.getOperation(), binding.getSegmentExtent());
+    if (logicalExtent.empty() || mlir::failed(count) || mlir::failed(physical))
+      return binding.emitOpError(
+          "cannot project its source count into a physical segment extent");
+    std::string expression = "_intent_partition_extent(" + logicalExtent +
+                             ", " + *count + ")";
+    auto existing = dimensionOwners.find(*physical);
+    if (existing != dimensionOwners.end() && existing->second != expression)
+      return binding.emitOpError(
+          "selects conflicting source counts for one physical extent");
+    if (existing == dimensionOwners.end()) {
+      dimensionOwners[*physical] = std::move(expression);
+      dimensionOrder.push_back(*physical);
+    }
+  }
+  return mlir::success();
+}
+
+inline mlir::FailureOr<std::string>
 reductionRole(mlir::Operation &operation) {
   auto builtin =
       operation.getAttrOfType<mlir::StringAttr>("intent.combine_builtin");
@@ -521,6 +590,11 @@ struct RegionRangeBinding {
   RangeBinding range;
 };
 
+struct ResultAxisRegionRangeBinding {
+  mlir::Value argument;
+  RegionRangeBinding selected;
+};
+
 template <typename PlanIndex>
 mlir::FailureOr<RegionRangeBinding>
 selectedRegionArgumentRange(const PlanIndex &index,
@@ -550,6 +624,35 @@ selectedRegionArgumentRange(const PlanIndex &index,
     return consumer.emitOpError(
         "has no selected physical range for its region argument");
   return RegionRangeBinding{axis->second, *range};
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<std::optional<ResultAxisRegionRangeBinding>>
+selectedResultAxisRegionRange(const PlanIndex &index,
+                              const target::KernelModel &kernel,
+                              mlir::Value value, unsigned tensorAxis,
+                              mlir::Operation &consumer) {
+  auto result = mlir::dyn_cast<mlir::OpResult>(value);
+  if (!result)
+    return std::optional<ResultAxisRegionRangeBinding>();
+  auto provenance = kernel.resultAxisRegionArguments.find(value);
+  if (provenance == kernel.resultAxisRegionArguments.end() ||
+      tensorAxis >= provenance->second.size())
+    return consumer.emitOpError(
+        "has no canonical result-axis shape provenance");
+  mlir::Value argumentValue = provenance->second[tensorAxis];
+  if (!argumentValue)
+    return std::optional<ResultAxisRegionRangeBinding>();
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(argumentValue);
+  if (!argument)
+    return consumer.emitOpError(
+        "references a non-region result-axis provenance value");
+  mlir::FailureOr<RegionRangeBinding> selected =
+      selectedRegionArgumentRange(index, kernel, argument, consumer);
+  if (mlir::failed(selected))
+    return mlir::failure();
+  return std::optional<ResultAxisRegionRangeBinding>(
+      ResultAxisRegionRangeBinding{argument, *selected});
 }
 
 inline bool isPackedScalarAxis(const AxisBinding &axis) {
@@ -1110,6 +1213,7 @@ struct CanonicalBinding {
 };
 
 struct StreamBinding : CanonicalBinding {
+  intent::plan::StreamBindingOp physical;
   int64_t node = -1;
   int64_t axisNode = -1;
   mlir::IntegerAttr stopValue;
@@ -1289,7 +1393,8 @@ bool requiresDelegatedTuning(const PlanIndex &index) {
     return llvm::any_of(entry.second.ranges, [](const RangeBinding &range) {
       llvm::StringRef tile = range.getTileRole();
       return tile != "one" && !tile.starts_with("row_vector") &&
-             !tile.starts_with("fixed_");
+             !tile.starts_with("fixed_") &&
+             !tile.starts_with("partition_extent_");
     });
   });
 }
@@ -1329,19 +1434,14 @@ exactContractionReductionArguments(const target::KernelModel &kernel,
         "does not declare one exact contraction reduction pair");
   auto operandArgument = [&](mlir::Value operand,
                              int64_t tensorAxis) -> std::optional<int64_t> {
-    mlir::FailureOr<llvm::SmallVector<std::string>> shape =
-        target::getLogicalShape(operand, kernel, consumer,
-                                "contraction reduction-axis projection");
-    if (mlir::succeeded(shape) && tensorAxis >= 0 &&
-        static_cast<size_t>(tensorAxis) < shape->size()) {
-      llvm::StringRef label = (*shape)[tensorAxis];
-      if (label.consume_front("?region_")) {
-        llvm::StringRef argumentText = label.split('_').first;
-        int64_t argument = -1;
-        if (!argumentText.getAsInteger(10, argument))
-          return argument;
-      }
-    }
+    auto provenance = kernel.resultAxisRegionArguments.find(operand);
+    if (tensorAxis < 0 || provenance == kernel.resultAxisRegionArguments.end() ||
+        static_cast<size_t>(tensorAxis) >= provenance->second.size())
+      return std::nullopt;
+    mlir::Value argument = provenance->second[tensorAxis];
+    auto valueID = kernel.valueIDs.find(argument);
+    if (argument && valueID != kernel.valueIDs.end())
+      return valueID->second;
     return std::nullopt;
   };
   std::optional<int64_t> lhs =
@@ -1500,45 +1600,15 @@ bool isEnclosingStreamReductionAxis(const PlanIndex &index,
   return false;
 }
 
-template <typename PlanIndex>
-bool feedsStagedContraction(const PlanIndex &index, mlir::Operation &operation) {
-  auto node = operation.getAttrOfType<mlir::IntegerAttr>("intent.node");
-  return node && llvm::any_of(index.stages, [&](const StageBinding &stage) {
-           return llvm::is_contained(stage.getOperations(), node.getInt());
-         });
-}
-
-template <typename PlanIndex>
-bool isAbsorbedStagedAccessMetadata(const PlanIndex &index,
-                                    mlir::Operation &operation) {
-  if (index.stages.empty() || operation.getNumResults() == 0)
+inline bool isAbsorbedRaggedDescriptorLoad(mlir::Operation &operation) {
+  if (::intent::target::semanticOperationName(operation) != "intent.view_load" ||
+      operation.getNumResults() != 1 || operation.getResult(0).use_empty())
     return false;
-  llvm::DenseSet<mlir::Value> visited;
-  std::function<bool(mlir::Value)> absorbed = [&](mlir::Value value) {
-    if (!visited.insert(value).second || value.use_empty())
-      return false;
-    for (mlir::Operation *user : value.getUsers()) {
-      bool consumed = false;
-      if (::intent::target::semanticOperationName(*user) == "intent.gather" &&
-          feedsStagedContraction(index, *user)) {
-        auto valid =
-            user->getAttrOfType<mlir::IntegerAttr>("intent.valid_operand_index");
-        auto fill =
-            user->getAttrOfType<mlir::IntegerAttr>("intent.fill_operand_index");
-        for (auto [operand, candidate] : llvm::enumerate(user->getOperands()))
-          if (candidate == value &&
-              ((valid && valid.getInt() == static_cast<int64_t>(operand)) ||
-               (fill && fill.getInt() == static_cast<int64_t>(operand))))
-            consumed = true;
-      } else if (user->getNumResults() == 1) {
-        consumed = absorbed(user->getResult(0));
-      }
-      if (!consumed)
-        return false;
-    }
-    return true;
-  };
-  return llvm::all_of(operation.getResults(), absorbed);
+  return llvm::all_of(operation.getResult(0).getUses(), [](mlir::OpOperand &use) {
+    return ::intent::target::semanticOperationName(*use.getOwner()) ==
+               "intent.ragged" &&
+           use.getOperandNumber() >= 2;
+  });
 }
 
 template <typename PlanIndex>
@@ -1590,8 +1660,71 @@ template <typename PlanIndex>
 llvm::SmallVector<AxisBinding> orderedProgramAxes(const PlanIndex &index);
 
 template <typename PlanIndex>
+intent::plan::PartitionBindingOp countPartitionForIteration(
+    const PlanIndex &index, const target::KernelModel &kernel,
+    mlir::Operation &iteration) {
+  for (intent::plan::PartitionBindingOp binding : index.partitionBindings) {
+    auto part = mlir::dyn_cast<mlir::BlockArgument>(
+        kernel.values.lookup(binding.getPartArgument()));
+    if (part && part.getOwner()->getParentOp() == &iteration)
+      return binding;
+  }
+  return {};
+}
+
+template <typename PlanIndex>
+intent::plan::PartitionBindingOp countPartitionForPartValue(
+    const PlanIndex &index, const target::KernelModel &kernel,
+    mlir::Value value) {
+  auto id = kernel.valueIDs.find(value);
+  if (id == kernel.valueIDs.end())
+    return {};
+  for (intent::plan::PartitionBindingOp binding : index.partitionBindings)
+    if (static_cast<int64_t>(binding.getPartArgument()) == id->second)
+      return binding;
+  return {};
+}
+
+template <typename PlanIndex>
 mlir::LogicalResult indexCanonicalStructure(
     PlanIndex &index, const target::KernelModel &kernel) {
+  for (intent::plan::PartitionBindingOp binding : index.partitionBindings) {
+    mlir::Operation *partition = kernel.nodes.lookup(binding.getPartitionNode());
+    mlir::Operation *axis = kernel.nodes.lookup(binding.getAxisNode());
+    mlir::Value count = kernel.values.lookup(binding.getCountValue());
+    mlir::Value partValue = kernel.values.lookup(binding.getPartArgument());
+    mlir::Value regionValue = kernel.values.lookup(binding.getRegionArgument());
+    auto part = mlir::dyn_cast<mlir::BlockArgument>(partValue);
+    auto region = mlir::dyn_cast<mlir::BlockArgument>(regionValue);
+    mlir::Operation *owner = part ? part.getOwner()->getParentOp() : nullptr;
+    auto selectedAxis = index.axes.find(binding.getAxisNode());
+    const RangeBinding *ownership =
+        selectedAxis == index.axes.end()
+            ? nullptr
+            : selectedAxis->second.getRange("ownership", 0);
+    auto regionBinding = index.regionBindings.find(binding.getRegionArgument());
+    if (!partition ||
+        ::intent::target::semanticOperationName(*partition) !=
+            "intent.partition" ||
+        partition->getNumOperands() != 2 || partition->getNumResults() != 1 ||
+        !partition->getAttrOfType<mlir::StringAttr>("intent.mode") ||
+        partition->getAttrOfType<mlir::StringAttr>("intent.mode").getValue() !=
+            "count" ||
+        partition->getOperand(0).getDefiningOp() != axis ||
+        partition->getOperand(1) != count || !part || !region ||
+        part.getOwner() != region.getOwner() || part.getArgNumber() != 0 ||
+        region.getArgNumber() != 1 || !owner ||
+        ::intent::target::semanticOperationName(*owner) != "intent.parallel" ||
+        owner->getNumOperands() != 1 ||
+        owner->getOperand(0).getDefiningOp() != partition || !ownership ||
+        ownership->getTileRole() != binding.getSegmentExtent() ||
+        regionBinding == index.regionBindings.end() ||
+        regionBinding->second.getAxisNode() != binding.getAxisNode() ||
+        regionBinding->second.getPurpose() != "ownership" ||
+        regionBinding->second.getLevel() != 0)
+      return binding.emitOpError(
+          "does not preserve the canonical count-partition identity and range");
+  }
   for (const auto &entry : index.regionBindings) {
     intent::plan::RegionBindingOp binding = entry.second;
     mlir::Value value = kernel.values.lookup(entry.first);
@@ -1665,6 +1798,7 @@ mlir::LogicalResult indexCanonicalStructure(
           "does not select a physical range for the state-stream axis");
     StreamBinding binding;
     binding.operation = stream.operation;
+    binding.physical = physical;
     binding.node = stream.node;
     binding.axisNode = physical.getAxisNode();
     binding.rangePurpose = physical.getPurpose().str();

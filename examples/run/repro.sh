@@ -126,6 +126,15 @@ if [[ ${unfamiliar} == false ]]; then
   triton:ordered_prefix)
     baseline=source/triton/flag-gems/scan/cumsum/cumsum_runtime.py
     ;;
+  triton:moe)
+    baseline=source/triton/triton/gemm/grouped/08-grouped-gemm.py
+    ;;
+  cutile:moe)
+    baseline=source/cutile/cutile-python/moe/fused/MoE.py
+    ;;
+  tilelang:moe)
+    baseline=source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd.py
+    ;;
   tilelang:mamba_chunk_scan)
     baseline=source/tilelang/tilelang/scan/mamba_chunk_scan/example_mamba_chunk_scan_runtime.py
     ;;
@@ -134,7 +143,7 @@ if [[ ${unfamiliar} == false ]]; then
     ;;
   triton:paged_mla_decode | cutile:paged_mla_decode | tilelang:paged_mla_decode | \
   triton:group_norm_backward | cutile:group_norm_backward | tilelang:group_norm_backward | \
-  triton:moe | cutile:moe | tilelang:moe | tilelang:softmax | \
+  tilelang:softmax | \
   triton:online_softmax | cutile:online_softmax | \
   triton:dual_gemm | cutile:dual_gemm | tilelang:dual_gemm | \
   tilelang:rms_norm | \
@@ -299,6 +308,8 @@ if [[ ${unfamiliar} == false ]]; then
   cutile:matrix_transpose | tilelang:matrix_transpose)
     ;;
   triton:boolean_reduction | cutile:boolean_reduction | tilelang:boolean_reduction)
+    ;;
+  triton:partitioned_two_pass_max | cutile:partitioned_two_pass_max | tilelang:partitioned_two_pass_max)
     ;;
   triton:value_select | cutile:value_select | tilelang:value_select)
     ;;

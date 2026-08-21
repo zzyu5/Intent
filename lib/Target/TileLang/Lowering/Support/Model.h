@@ -20,6 +20,7 @@ namespace intent::tilelang::plan {
 using TargetOp = target::lowering::TargetBinding;
 using AxisOp = target::lowering::AxisBinding;
 using RegionBindingOp = intent::plan::RegionBindingOp;
+using PartitionBindingOp = intent::plan::PartitionBindingOp;
 using ProgramOp = target::lowering::ProgramBinding;
 using BlockExtentOp = target::lowering::BlockExtentBinding;
 using BufferOp = target::lowering::BufferBinding;
@@ -47,6 +48,7 @@ struct PhysicalProgramIndex {
   llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::DenseMap<int64_t, plan::RegionBindingOp> regionBindings;
+  llvm::SmallVector<plan::PartitionBindingOp> partitionBindings;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
   llvm::DenseMap<int64_t, plan::BufferOp> buffers;
@@ -223,6 +225,8 @@ private:
                            llvm::ArrayRef<std::string> elementIndices,
                            mlir::Operation &consumer);
   mlir::FailureOr<std::string>
+  paddingFillExpression(mlir::Value value, mlir::Operation &consumer);
+  mlir::FailureOr<std::string>
   padElementExpression(mlir::Value value, llvm::StringRef expression,
                        llvm::ArrayRef<std::string> elementIndices,
                        mlir::Operation &consumer);
@@ -277,9 +281,9 @@ private:
   llvm::DenseMap<int64_t, std::string> axisIndices;
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
+  bool requiresPreallocatedOutputs = false;
   llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::StringSet<> exactBulkExtents;
-  llvm::DenseMap<mlir::Operation *, std::string> streamOuterAxisIndices;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>

@@ -476,8 +476,33 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
     return requireAttribute<IntegerAttr>(operation, "intent.axis");
   if (name == "intent.assume_in_bounds")
     return requireAttribute<IntegerAttr>(operation, "intent.axis");
-  if (name == "intent.partition")
-    return requireAttribute<StringAttr>(operation, "intent.mode");
+  if (name == "intent.partition") {
+    auto mode = operation->getAttrOfType<StringAttr>("intent.mode");
+    if (!mode || (mode.getValue() != "extent" && mode.getValue() != "count"))
+      return operation->emitOpError("requires extent or count partition semantics");
+    if (operation->getNumOperands() != 2 || operation->getNumResults() != 1 ||
+        !isa<intent::DomainType, intent::RegionType>(
+            operation->getOperand(0).getType()) ||
+        !isa<IntegerType, IndexType>(operation->getOperand(1).getType()))
+      return operation->emitOpError("has no canonical partition operand schema");
+    auto result = dyn_cast<intent::PartitionType>(operation->getResult(0).getType());
+    std::string resultPrefix =
+        (Twine("partition<") + mode.getValue() + ",").str();
+    if (!result || !result.getSpec().starts_with(resultPrefix))
+      return operation->emitOpError(
+          "partition result type does not match its semantic mode");
+    Operation *definition = operation->getOperand(1).getDefiningOp();
+    auto fixed = definition && definition->getName().getStringRef() ==
+                                   "intent.constant"
+                     ? definition->getAttrOfType<IntegerAttr>("intent.value")
+                     : IntegerAttr();
+    if (mode.getValue() == "extent" && (!fixed || fixed.getInt() <= 0))
+      return operation->emitOpError(
+          "extent partition requires a positive constant extent");
+    if (mode.getValue() == "count" && fixed && fixed.getInt() <= 0)
+      return operation->emitOpError("partition count must be positive");
+    return success();
+  }
   if (name == "intent.transpose")
     return requireAttribute<ArrayAttr>(operation, "intent.permutation");
   if (name == "intent.make_record")

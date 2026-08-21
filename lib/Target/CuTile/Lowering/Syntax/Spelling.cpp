@@ -55,6 +55,8 @@ FailureOr<std::string> tile(Operation *operation, StringRef role) {
     return std::string("1");
   if (role.starts_with("fixed_"))
     return role.drop_front(6).str();
+  if (role.starts_with("partition_extent_"))
+    return "PARTITION_EXTENT_" + role.drop_front(17).str();
   if (role == "row_vector")
     return std::string("TILE_SIZE");
   if (role.starts_with("row_vector_"))

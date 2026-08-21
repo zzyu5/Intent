@@ -30,7 +30,7 @@ LogicalResult collectDomainSource(Value source,
     return success();
   }
   if (name == "intent.partition") {
-    if (definition->getNumOperands() < 1 || definition->getNumOperands() > 2)
+    if (definition->getNumOperands() != 2)
       return fail();
     return collectDomainSource(definition->getOperand(0), domains, consumer);
   }
@@ -66,11 +66,23 @@ Operation *structuralDomain(Value value) {
   }
   if (name != "intent.parallel" || owner->getNumOperands() != 1)
     return nullptr;
+  Operation *source = owner->getOperand(0).getDefiningOp();
+  auto mode = source &&
+                      ::intent::target::semanticOperationName(*source) ==
+                          "intent.partition"
+                  ? source->getAttrOfType<StringAttr>("intent.mode")
+                  : StringAttr();
   SmallVector<Operation *> domains;
   if (failed(collectDomainSource(owner->getOperand(0), domains, nullptr)) ||
-      argument.getArgNumber() >= domains.size())
+      domains.empty())
     return nullptr;
-  return domains[argument.getArgNumber()];
+  if (mode && mode.getValue() == "count")
+    return argument.getArgNumber() < 2 && domains.size() == 1
+               ? domains.front()
+               : nullptr;
+  return argument.getArgNumber() < domains.size()
+             ? domains[argument.getArgNumber()]
+             : nullptr;
 }
 
 FailureOr<ScalarIndexSource>

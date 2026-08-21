@@ -289,7 +289,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     StringRef resultSpace = "none";
     if (load || returnedAtomic) {
       resultSpace = isa<RankedTensorType>(operation.getResult(0).getType())
-                        ? StringRef("private_workspace")
+                        ? StringRef("private_fragment")
                         : StringRef("private_scalar");
     }
     StringRef materialization = "direct";
@@ -373,7 +373,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
       return failure();
     builder.create<intent::plan::ReductionOp>(
         operation.getLoc(), i64(builder, *node),
-        string(builder, "private_workspace"));
+        string(builder, "private_fragment"));
     return success();
   };
   if (failed(addHandler(registry, "intent.reduce", bindReduction)))
@@ -502,7 +502,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
               builder.create<intent::plan::PointwiseOp>(
                   operation.getLoc(), i64(builder, *node),
                   string(builder,
-                         tensor ? "private_workspace" : "private_scalar"),
+                         tensor ? "private_fragment" : "private_scalar"),
                   builder.getBoolAttr(
                       target::hasNonnegativeIntegerOperands(operation, facts)),
                   builder.getDenseI64ArrayAttr(axisNodes));

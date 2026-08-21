@@ -40,7 +40,7 @@ inline constexpr llvm::StringLiteral streamTileAttr =
 inline constexpr llvm::StringLiteral raggedRouteAttr =
     "intent_plan.cutile.ragged_route";
 inline constexpr llvm::StringLiteral gatherSpellingRole =
-    "cutile_gather_spelling";
+    "gather_spelling";
 
 void addProviderPasses(mlir::PassManager &manager);
 mlir::LogicalResult verifyProviderProgram(

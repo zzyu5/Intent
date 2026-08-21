@@ -533,6 +533,24 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
       operation.getRegion(0).front().getNumArguments() == 0)
     return operation.emitOpError("parallel ownership requires region arguments");
   Block &body = operation.getRegion(0).front();
+  plan::PartitionBindingOp partition =
+      target::lowering::countPartitionForIteration(planIndex, kernel, operation);
+  if (partition) {
+    if (!planIndex.stages.empty() || !planIndex.components.reusedAxes.empty())
+      return partition.emitOpError(
+          "count partition cannot use staged or worker-reused cuTile ownership");
+    if (&operation == programRoot && failed(emitProgramBindings()))
+      return failure();
+    plan::AxisOp axis = planIndex.axes.lookup(partition.getAxisNode());
+    std::string part = programBlocks.lookup(partition.getAxisNode());
+    std::string region = axisIndices.lookup(partition.getAxisNode());
+    if (!axis || part.empty() || region.empty())
+      return partition.emitOpError(
+          "has no emitted cuTile part and region projection");
+    valueNames[body.getArgument(0)] = part;
+    valueNames[body.getArgument(1)] = region;
+    return success();
+  }
   SmallVector<plan::AxisOp> axes;
   for (BlockArgument argument : body.getArguments()) {
     FailureOr<plan::AxisOp> axis = resolveAxis(argument, operation);
@@ -1327,6 +1345,7 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
   auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
   auto tensorAxis = operation.getAttrOfType<IntegerAttr>("intent.axis");
   FailureOr<plan::AxisOp> axis = failure();
+  std::optional<target::lowering::RegionRangeBinding> region;
   unsigned emittedAxis = 0;
   if (mode && mode.getValue() == "tensor_axis") {
     if (!tensorAxis || tensorAxis.getInt() < 0 ||
@@ -1338,7 +1357,18 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
   } else {
     if (result.getRank() != 1)
       return operation.emitOpError("domain indices require one result axis");
-    axis = resolveAxis(operation.getOperand(0), operation);
+    Value indexed = operation.getOperand(0);
+    if (isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> selected =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      if (failed(selected))
+        return failure();
+      region = *selected;
+      axis = region->axis;
+    } else {
+      axis = resolveAxis(indexed, operation);
+    }
   }
   if (failed(axis))
     return failure();
@@ -1350,14 +1380,31 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
     return success();
   }
   std::string expression;
-  if (axis->hasRole("lane") && !axis->getReuseWorker() &&
+  std::string selectedTile;
+  if (region) {
+    selectedTile = region->range.getTile().str();
+    if (!region->axis.getReuseWorker() &&
+        region->range.getTileRole().starts_with("row_vector")) {
+      if (!planIndex.blockExtents.count(region->range.getExtent()))
+        return operation.emitOpError(
+            "row-vector region indices lack their selected physical extent");
+      selectedTile = physicalExtent(region->range.getExtent());
+    }
+  }
+  if (!region && axis->hasRole("lane") && !axis->getReuseWorker() &&
       axis->getTileRole().starts_with("row_vector")) {
     FailureOr<std::string> tile = physicalAxisTile(*axis);
     if (failed(tile))
       return failure();
     expression = addressIndex("ct.arange(" + *tile + ", dtype=ct.int32)");
   } else {
-    std::string base = axisIndices.lookup(axis->getNode());
+    FailureOr<StringRef> projected =
+        region ? lookupValue(operation, 0) : FailureOr<StringRef>(failure());
+    std::string base = region && succeeded(projected)
+                           ? projected->str()
+                           : axisIndices.lookup(axis->getNode());
+    if (region && failed(projected))
+      return failure();
     if (base.empty() && axis->hasRole("lane")) {
       base = "0";
       axisIndices[axis->getNode()] = base;
@@ -1369,17 +1416,19 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
                                             axis->getNode()) ||
         (axis->hasRole("lane") &&
          kernel.nodes.lookup(axis->getNode()) == vectorDomain);
-    FailureOr<std::string> tile = physicalAxisTile(*axis);
-    if (failed(tile))
+    FailureOr<std::string> axisTile =
+        region ? FailureOr<std::string>(selectedTile) : physicalAxisTile(*axis);
+    if (failed(axisTile))
       return failure();
     expression = directVector
                      ? addressIndex(base)
-                     : addressIndex(base) + " * " + *tile + " + " +
-                           addressIndex("ct.arange(" + *tile +
+                     : addressIndex(base) + " * " + *axisTile + " + " +
+                           addressIndex("ct.arange(" + *axisTile +
                                         ", dtype=ct.int32)");
   }
   if (result.getRank() > 1) {
-    FailureOr<std::string> tile = physicalAxisTile(*axis);
+    FailureOr<std::string> tile =
+        region ? FailureOr<std::string>(selectedTile) : physicalAxisTile(*axis);
     if (failed(tile))
       return failure();
     SmallVector<std::string> shape(result.getRank(), "1");
@@ -2405,6 +2454,17 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
                      ? raggedRuntimeByRelation.find(relation->getNode())
                      : raggedRuntimeByRelation.end();
   std::string position = axisIndices.lookup(memberAxis->getNode());
+  if (auto argument = dyn_cast<BlockArgument>(operation.getOperand(0))) {
+    FailureOr<target::lowering::RegionRangeBinding> selected =
+        target::lowering::selectedRegionArgumentRange(planIndex, kernel, argument,
+                                                      operation);
+    FailureOr<StringRef> projected = lookupValue(operation, 0);
+    if (failed(selected) || failed(projected) ||
+        selected->axis.getNode() != memberAxis->getNode())
+      return operation.emitOpError(
+          "has no exact cuTile region projection for ragged members");
+    position = projected->str();
+  }
   if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
       position.empty())
     return operation.emitOpError("has no ordered ragged runtime position");
@@ -2450,8 +2510,6 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     valueNames[body.getArgument(index + 1)] = carrier;
   }
   streamCarriers[&operation] = carriers;
-  streamOuterAxisIndices[&operation] =
-      axisIndices.lookup(binding.getAxisNode());
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
@@ -2508,6 +2566,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     streamExtent = "max(0, min(" + stop->str() + ", " + streamExtent + "))";
   }
   std::string streamTile = "stream_tile_" + std::to_string(*node);
+  std::string projectedRegion = streamTile;
   line("for " + streamTile + " in range(" + addressIndex("0") + ", " +
        addressIndex("ct.cdiv(" + streamExtent + ", " +
                     binding.getTile().str() + ")") +
@@ -2528,11 +2587,9 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
          raggedSuffix + ", " + offsets + ", " +
          ragged.membersView->argument->name +
          ".shape[0])");
-    axisIndices[binding.getAxisNode()] = offsets;
-  } else {
-    axisIndices[binding.getAxisNode()] = streamTile;
+    projectedRegion = offsets;
   }
-  valueNames[body.getArgument(0)] = streamTile;
+  valueNames[body.getArgument(0)] = projectedRegion;
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -2548,12 +2605,10 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
 
 LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   auto carriers = streamCarriers.find(&operation);
-  auto outerIndex = streamOuterAxisIndices.find(&operation);
   FailureOr<int64_t> node = target::getNodeID(operation, "stream emission");
   plan::StreamOp binding =
       succeeded(node) ? planIndex.streams.lookup(*node) : plan::StreamOp();
-  if (carriers == streamCarriers.end() ||
-      outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
+  if (carriers == streamCarriers.end() || failed(node) || !binding)
     return operation.emitOpError("has no active cuTile stream state");
   Operation &terminator = operation.getRegion(0).front().back();
   if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
@@ -2568,14 +2623,9 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
-  if (outerIndex->second.empty())
-    axisIndices.erase(binding.getAxisNode());
-  else
-    axisIndices[binding.getAxisNode()] = outerIndex->second;
   for (int64_t axisNode : binding.getInnerReductionAxes())
     if (axisNode != binding.getAxisNode())
       axisIndices.erase(axisNode);
-  streamOuterAxisIndices.erase(outerIndex);
   return success();
 }
 

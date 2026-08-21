@@ -11,6 +11,7 @@ from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import PartitionMode
 from intent.frontend.semantics import PartitionType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ResourceKind
@@ -654,6 +655,8 @@ def _lower_assert(lowerer: object, node: ast.Assert) -> None:
 
 def _iteration_argument_types(lowerer: object, source: MlirValue) -> tuple[object, ...]:
     if isinstance(source.type, PartitionType):
+        if source.type.mode is PartitionMode.COUNT:
+            return (LogicalIndexType("partition_part"), source.type.region_type)
         return (source.type.region_type,)
     if isinstance(source.type, DomainType):
         return tuple(

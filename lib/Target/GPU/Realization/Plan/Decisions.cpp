@@ -208,6 +208,7 @@ struct AxisChoice {
   SmallVector<std::string> roles;
   bool tiled = false;
   std::optional<int64_t> fixedOwnershipExtent;
+  Operation *countPartition = nullptr;
   bool packedLane = false;
   SmallVector<RangeChoice> ranges;
   std::optional<int64_t> programOrder;
@@ -447,6 +448,19 @@ assignAxes(const target::KernelFacts &facts) {
         }
         choice.fixedOwnershipExtent = fixed->second;
       }
+      if (tiled && facts.partitionCounts.count(source)) {
+        if (choice.countPartition && choice.countPartition != source) {
+          parallel->emitOpError(
+              "maps one logical axis to conflicting count partitions");
+          return failure();
+        }
+        if (choice.fixedOwnershipExtent) {
+          parallel->emitOpError(
+              "maps one logical axis to fixed-extent and count partitions");
+          return failure();
+        }
+        choice.countPartition = source;
+      }
       if (choice.programOrder)
         continue;
       choice.programOrder = programOrder++;
@@ -560,9 +574,12 @@ assignAxes(const target::KernelFacts &facts) {
     if (axes == facts.valueAxes.end())
       return;
     for (const target::LogicalAxis &axis : axes->second) {
-      if (!axis.domain || facts.contractionDomains.contains(axis.domain) ||
-          facts.reductionDomains.contains(axis.domain) ||
-          facts.orderedDomains.contains(axis.domain))
+      bool innerRole = axis.domain &&
+                       (facts.contractionDomains.contains(axis.domain) ||
+                        facts.reductionDomains.contains(axis.domain) ||
+                        facts.orderedDomains.contains(axis.domain));
+      if (!axis.domain ||
+          (innerRole && !facts.vectorDomains.contains(axis.domain)))
         continue;
       AxisChoice &choice = ensure(axis.domain);
       if (choice.programOrder)
@@ -654,6 +671,12 @@ assignAxes(const target::KernelFacts &facts) {
       std::string tile;
       if (!choice.tiled) {
         tile = choice.packedLane ? packedTile : "one";
+      } else if (choice.countPartition) {
+        FailureOr<int64_t> partitionNode =
+            node(*choice.countPartition, "count-partition extent binding");
+        if (failed(partitionNode))
+          return failure();
+        tile = "partition_extent_" + std::to_string(*partitionNode);
       } else if (choice.fixedOwnershipExtent) {
         tile = "fixed_" + std::to_string(*choice.fixedOwnershipExtent);
       } else if (ownsOrderedStream(choice, facts)) {
@@ -950,16 +973,17 @@ contractionStages(const target::KernelFacts &facts) {
 }
 
 FailureOr<Operation *>
-stageMemberDomain(const StageDecision &stage, const target::KernelFacts &facts) {
+stageMemberDomain(
+    const StageDecision &stage, const target::KernelFacts &facts,
+    const llvm::DenseMap<int64_t, intent::plan::RangeOp> &ownership) {
   const target::ContractionFact &contract =
       facts.contractions.lookup(stage.contraction);
   auto ownedMember = [&](const target::LogicalAxis &axis) {
-    return axis.domain && facts.raggedMembers.count(axis.domain) &&
-           llvm::any_of(facts.parallels, [&](Operation *parallel) {
-             FailureOr<ArrayRef<Operation *>> owned =
-                 ownedDomains(*parallel, facts);
-             return succeeded(owned) && llvm::is_contained(*owned, axis.domain);
-           });
+    auto node = axis.domain
+                    ? axis.domain->getAttrOfType<IntegerAttr>("intent.node")
+                    : IntegerAttr();
+    return axis.domain && facts.raggedMembers.count(axis.domain) && node &&
+           ownership.count(node.getInt());
   };
   for (const target::LogicalAxis &axis : contract.resultAxes)
     if (ownedMember(axis))
@@ -1038,7 +1062,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
       for (AxisChoice::RangeChoice &range : choice.ranges) {
         bool sourceVisibleFixedOwnership =
             range.purpose == "ownership" && range.level == 0 &&
-            choice.fixedOwnershipExtent.has_value();
+            (choice.fixedOwnershipExtent.has_value() || choice.countPartition);
         bool sourceVisibleFixedTraversal =
             range.purpose == "traversal" && range.level == 0 &&
             facts.orderedStreamFixedExtents.contains(choice.domain);
@@ -1162,6 +1186,33 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
             facts.kernel.entry.getLoc(), i64(builder, argument),
             i64(builder, axis), string(builder, purpose), i64(builder, 0)));
 
+  for (const target::CountPartitionFact &partition : facts.countPartitions) {
+    FailureOr<int64_t> partitionNode =
+        node(*partition.partition, "count-partition binding");
+    FailureOr<int64_t> axisNode =
+        node(*partition.domain, "count-partition axis binding");
+    FailureOr<int64_t> countValue =
+        valueID(partition.count, facts.kernel, *partition.partition,
+                "count-partition count binding");
+    FailureOr<int64_t> partArgument =
+        valueID(partition.partArgument, facts.kernel, *partition.iteration,
+                "count-partition part binding");
+    FailureOr<int64_t> regionArgument =
+        valueID(partition.regionArgument, facts.kernel, *partition.iteration,
+                "count-partition region binding");
+    if (failed(partitionNode) || failed(axisNode) || failed(countValue) ||
+        failed(partArgument) || failed(regionArgument))
+      return failure();
+    std::string segmentExtent =
+        "partition_extent_" + std::to_string(*partitionNode);
+    decisions.partitionBindings.push_back(
+        builder.create<intent::plan::PartitionBindingOp>(
+            partition.partition->getLoc(), i64(builder, *partitionNode),
+            i64(builder, *axisNode), i64(builder, *countValue),
+            i64(builder, *partArgument), i64(builder, *regionArgument),
+            string(builder, segmentExtent)));
+  }
+
   SmallVector<int64_t> streamNodes;
   for (const auto &entry : facts.kernel.stateStreams)
     streamNodes.push_back(entry.first);
@@ -1245,7 +1296,8 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
   SmallVector<std::string> parameters;
   auto tunable = [](StringRef tile) {
     return tile != "one" && !tile.starts_with("row_vector") &&
-           !tile.starts_with("fixed_");
+           !tile.starts_with("fixed_") &&
+           !tile.starts_with("partition_extent_");
   };
   for (intent::plan::RangeOp range : decisions.ranges) {
     if (tunable(range.getTile())) {
@@ -1349,6 +1401,7 @@ mlir::LogicalResult intent::gpu::formAutomaticBlocking(
     } else if (mlir::isa<intent::plan::LaunchOp, intent::plan::BlockExtentOp,
                   intent::plan::AxisOp, intent::plan::RangeOp,
                   intent::plan::RegionBindingOp,
+                  intent::plan::PartitionBindingOp,
                   intent::plan::StreamBindingOp>(operation))
       previous.push_back(&operation);
 
@@ -1386,7 +1439,7 @@ mlir::LogicalResult intent::gpu::reconcileStages(
     mlir::FailureOr<int64_t> stageNode =
         realization::node(*stage.contraction, "stage realization");
     mlir::FailureOr<mlir::Operation *> member =
-        realization::stageMemberDomain(stage, facts);
+        realization::stageMemberDomain(stage, facts, ownership);
     mlir::FailureOr<std::pair<mlir::Value, unsigned>> feature =
         succeeded(member)
             ? realization::stageFeatureAxis(stage, facts, *member)
