@@ -45,7 +45,7 @@ struct StateStreamStructure {
   mlir::Operation *operation;
   int64_t node;
   int64_t axisNode;
-  int64_t stopNode;
+  int64_t stopValue;
 };
 
 struct KernelModel {

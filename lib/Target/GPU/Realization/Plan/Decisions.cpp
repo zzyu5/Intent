@@ -1,5 +1,7 @@
 #include "Support/Decisions.h"
 
+#include "Intent/Target/Common/Analysis/Operation.h"
+#include "Intent/Target/GPU/Realization/PhysicalProgram.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -42,24 +44,25 @@ FailureOr<ArrayRef<Operation *>> ownedDomains(
 FailureOr<Operation *> programRoot(const target::KernelFacts &facts) {
   SmallVector<Operation *> roots;
   for (const target::RegionNode &region : facts.kernel.regions.nodes) {
-    if (region.operation->getName().getStringRef() != "intent.parallel" ||
+    if (::intent::target::semanticOperationName(*region.operation) !=
+            "intent.parallel" ||
         region.parent)
       continue;
     roots.push_back(region.operation);
   }
-  if (roots.size() != 1) {
+  if (roots.size() > 1) {
     facts.kernel.entry.emitOpError(
-        "one GPU kernel function must contain exactly one outer program region; "
+        "one GPU kernel function cannot contain multiple outer program regions; "
         "multiple launches require separate kernel functions");
     return failure();
   }
-  return roots.front();
+  return roots.empty() ? nullptr : roots.front();
 }
 
 Operation *nearestParallel(Operation *operation) {
   for (Operation *parent = operation->getParentOp(); parent;
        parent = parent->getParentOp())
-    if (parent->getName().getStringRef() == "intent.parallel")
+    if (::intent::target::semanticOperationName(*parent) == "intent.parallel")
       return parent;
   return nullptr;
 }
@@ -225,7 +228,7 @@ bool canPackScalarParallel(Operation *parallel, Operation *domain,
 
   Block &body = parallel->getRegion(0).front();
   for (Operation &operation : body) {
-    StringRef name = operation.getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(operation);
     bool scalarPointwise =
         name == "intent.constant" || name == "intent.dim" ||
         name == "intent.assume_in_bounds" || name == "intent.view_load" ||
@@ -248,7 +251,7 @@ bool canDistributePointwiseLane(Operation *domain,
     return false;
   Operation *owner = nullptr;
   for (Operation *user : domain->getResult(0).getUsers()) {
-    StringRef name = user->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*user);
     if (name != "intent.view_load" && name != "intent.view_store" &&
         name != "intent.gather")
       return false;
@@ -374,7 +377,7 @@ innerStreamContractionExtent(Operation *domain,
     bool nested = false;
     for (Operation *parent = entry.first->getParentOp(); parent;
          parent = parent->getParentOp())
-      if (parent->getName().getStringRef() == "intent.state_stream") {
+      if (::intent::target::semanticOperationName(*parent) == "intent.state_stream") {
         nested = true;
         break;
       }
@@ -451,11 +454,6 @@ assignAxes(const target::KernelFacts &facts) {
       appendRole(choice.roles, "parallel");
     }
   }
-  if (programOrder == 0) {
-    facts.kernel.entry.emitOpError("has no parallel axis to assign");
-    return failure();
-  }
-
   for (Operation *domain : facts.orderedDomains)
     appendRole(ensure(domain).roles, "ordered");
   for (const auto &entry : facts.scans)
@@ -534,6 +532,51 @@ assignAxes(const target::KernelFacts &facts) {
     if (mChoice.programOrder && nChoice.programOrder &&
         *mChoice.programOrder > *nChoice.programOrder)
       std::swap(mChoice.programOrder, nChoice.programOrder);
+  }
+
+  // Full-domain tensor programs do not expose an author-written blocking
+  // skeleton.  Their result axes are nevertheless independent ownership axes:
+  // each physical program writes one disjoint result tile.  Introduce those
+  // ownership decisions from value provenance, while preserving explicit
+  // scalar parallel loops exactly as authored.
+  facts.kernel.entry.walk([&](Operation *operation) {
+    StringRef name = ::intent::target::semanticOperationName(*operation);
+    if (name != "intent.view_store" && name != "intent.scatter_unique" &&
+        name != "intent.scatter_reduce")
+      return;
+    auto valueIndex =
+        operation->getAttrOfType<IntegerAttr>("intent.value_operand_index");
+    unsigned index = valueIndex && valueIndex.getInt() >= 0
+                         ? static_cast<unsigned>(valueIndex.getInt())
+                         : name == "intent.view_store" &&
+                                   operation->getNumOperands() > 1
+                               ? 1u
+                               : operation->getNumOperands() > 0
+                                   ? operation->getNumOperands() - 1
+                                   : 0u;
+    if (index >= operation->getNumOperands())
+      return;
+    auto axes = facts.valueAxes.find(operation->getOperand(index));
+    if (axes == facts.valueAxes.end())
+      return;
+    for (const target::LogicalAxis &axis : axes->second) {
+      if (!axis.domain || facts.contractionDomains.contains(axis.domain) ||
+          facts.reductionDomains.contains(axis.domain) ||
+          facts.orderedDomains.contains(axis.domain))
+        continue;
+      AxisChoice &choice = ensure(axis.domain);
+      if (choice.programOrder)
+        continue;
+      choice.programOrder = programOrder++;
+      choice.tiled = true;
+      appendRole(choice.roles, "parallel");
+    }
+  });
+
+  if (programOrder == 0) {
+    facts.kernel.entry.emitOpError(
+        "has no independent output axis for GPU program ownership");
+    return failure();
   }
 
   for (AxisChoice &choice : choices) {
@@ -756,7 +799,8 @@ assignAxes(const target::KernelFacts &facts) {
   });
   Operation *outerProgram = nullptr;
   for (const target::RegionNode &region : facts.kernel.regions.nodes)
-    if (region.operation->getName().getStringRef() == "intent.parallel" &&
+    if (::intent::target::semanticOperationName(*region.operation) ==
+            "intent.parallel" &&
         !region.parent) {
       outerProgram = region.operation;
       break;
@@ -969,18 +1013,51 @@ stageReductionAxis(const StageDecision &stage,
 } // namespace
 
 FailureOr<PhysicalDecisions>
-emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
+emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
+                      bool conservativeAutomaticBlocking) {
   PhysicalDecisions decisions;
   FailureOr<Operation *> root = programRoot(facts);
   FailureOr<AxisAssignments> assignments = assignAxes(facts);
   if (failed(root) || failed(assignments))
     return failure();
 
-  FailureOr<int64_t> rootNode = node(**root, "program mapping");
-  if (failed(rootNode))
-    return failure();
+  // Construction establishes a complete executable baseline, not the final
+  // GPU schedule.  Every compiler-owned range begins as one logical element,
+  // all program axes share one worker, and no reuse/grouping is assumed.  A
+  // source-visible fixed partition remains fixed because changing it would
+  // change what the authored body observes.  AutomaticBlocking replaces this
+  // conservative mapping with the selected GPU structure in a later pass.
+  if (conservativeAutomaticBlocking) {
+    for (AxisChoice &choice : assignments->axes) {
+      if (choice.programOrder) {
+        choice.worker = 0;
+        choice.fold = *choice.programOrder;
+      }
+      choice.reuse = false;
+      choice.group.clear();
+      for (AxisChoice::RangeChoice &range : choice.ranges) {
+        bool sourceVisibleFixedOwnership =
+            range.purpose == "ownership" && range.level == 0 &&
+            choice.fixedOwnershipExtent.has_value();
+        bool sourceVisibleFixedTraversal =
+            range.purpose == "traversal" && range.level == 0 &&
+            facts.orderedStreamFixedExtents.contains(choice.domain);
+        if (!sourceVisibleFixedOwnership && !sourceVisibleFixedTraversal)
+          range.tile = "one";
+      }
+    }
+    assignments->persistent = false;
+  }
+
+  IntegerAttr rootNode;
+  if (*root) {
+    FailureOr<int64_t> resolved = node(**root, "program mapping");
+    if (failed(resolved))
+      return failure();
+    rootNode = i64(builder, *resolved);
+  }
   decisions.program = builder.create<intent::plan::LaunchOp>(
-      (*root)->getLoc(), i64(builder, *rootNode),
+      *root ? (*root)->getLoc() : facts.kernel.entry.getLoc(), rootNode,
       builder.getBoolAttr(assignments->persistent));
 
   llvm::StringSet<> roundedBlockExtents;
@@ -1059,8 +1136,8 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
           "has a region argument without a canonical region owner");
       return failure();
     }
-    StringRef name = owner->getName().getStringRef();
-    if (name == "intent.for" || name == "intent.ordered")
+    StringRef name = ::intent::target::semanticOperationName(*owner);
+    if (name == "intent.for")
       continue;
     if (name != "intent.parallel" && name != "intent.state_stream")
       return owner->emitOpError(
@@ -1110,14 +1187,18 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         return failure();
       relationNode = i64(builder, *id);
     }
+    IntegerAttr stopValue;
+    if (stream.stopValue >= 0)
+      stopValue = i64(builder, stream.stopValue);
     decisions.streamBindings.push_back(
         builder.create<intent::plan::StreamBindingOp>(
             stream.operation->getLoc(), i64(builder, stream.node),
             i64(builder, stream.axisNode), string(builder, "traversal"),
-            i64(builder, 0), relationNode));
+            i64(builder, 0), stopValue, relationNode));
   }
 
-  for (const target::AccessRangeFact &access : facts.accessRanges) {
+  if (conservativeAutomaticBlocking)
+    for (const target::AccessRangeFact &access : facts.accessRanges) {
     auto choice = llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
       return candidate.domain == access.axis;
     });
@@ -1154,67 +1235,7 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts) {
         string(builder, *sourceExtent),
         i64(builder, *transferNode),
         i64(builder, access.sourceAxis), divisor, offset));
-  }
-
-  FailureOr<SmallVector<StageDecision, 0>> stages =
-      contractionStages(facts);
-  if (failed(stages))
-    return failure();
-  for (const StageDecision &stage : *stages) {
-    FailureOr<int64_t> stageNode = node(*stage.contraction, "stage binding");
-    FailureOr<Operation *> member =
-        stageMemberDomain(stage, facts);
-    FailureOr<std::pair<Value, unsigned>> feature =
-        succeeded(member)
-            ? stageFeatureAxis(stage, facts, *member)
-            : FailureOr<std::pair<Value, unsigned>>(failure());
-    FailureOr<std::pair<Value, unsigned>> reduction =
-        stageReductionAxis(stage, facts);
-    if (failed(stageNode) || failed(member) || failed(feature) ||
-        failed(reduction))
-      return failure();
-    FailureOr<int64_t> featureValue = valueID(
-        feature->first, facts.kernel, *stage.contraction,
-        "stage feature-axis source binding");
-    FailureOr<int64_t> reductionValue = valueID(
-        reduction->first, facts.kernel, *stage.contraction,
-        "stage reduction-axis source binding");
-    if (failed(featureValue) || failed(reductionValue))
-      return failure();
-    decisions.stages.push_back(builder.create<intent::plan::StageOp>(
-        stage.contraction->getLoc(), i64(builder, *stageNode),
-        builder.getDenseI64ArrayAttr(stage.operations),
-        string(builder, "same_stream")));
-    FailureOr<int64_t> memberNode = node(**member, "stage member axis");
-    auto memberChoice =
-        llvm::find_if(assignments->axes, [&](const AxisChoice &candidate) {
-          return candidate.domain == *member;
-        });
-    const AxisChoice::RangeChoice *memberOwnership =
-        memberChoice == assignments->axes.end()
-            ? nullptr
-            : findRange(*memberChoice, "ownership");
-    if (failed(memberNode))
-      return failure();
-    if (!memberOwnership)
-      return stage.contraction->emitOpError(
-          "has no selected ownership range for its stage member axis");
-    decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), i64(builder, *stageNode),
-        string(builder, "member"), i64(builder, *memberNode),
-        IntegerAttr(), IntegerAttr(), string(builder, memberOwnership->tile),
-        i64(builder, 1)));
-    decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), i64(builder, *stageNode),
-        string(builder, "feature"), IntegerAttr(), i64(builder, *featureValue),
-        i64(builder, feature->second), string(builder, "feature"),
-        i64(builder, 0)));
-    decisions.stageAxes.push_back(builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), i64(builder, *stageNode),
-        string(builder, "reduction"), IntegerAttr(),
-        i64(builder, *reductionValue), i64(builder, reduction->second),
-        string(builder, "reduction"), IntegerAttr()));
-  }
+    }
   return decisions;
 }
 
@@ -1293,3 +1314,199 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
 }
 
 } // namespace intent::gpu::realization
+
+mlir::LogicalResult intent::gpu::materializeSearchSpace(
+    mlir::ModuleOp module, const intent::target::KernelFacts &facts,
+    intent::plan::ProgramOp program) {
+  realization::PhysicalDecisions decisions;
+  for (mlir::Operation &operation : program.getBody().front()) {
+    if (auto axis = mlir::dyn_cast<intent::plan::AxisOp>(operation))
+      decisions.axes.push_back(axis);
+    else if (auto range = mlir::dyn_cast<intent::plan::RangeOp>(operation))
+      decisions.ranges.push_back(range);
+    else if (auto extent =
+                 mlir::dyn_cast<intent::plan::BlockExtentOp>(operation))
+      decisions.blockExtents.push_back(extent);
+    else if (auto stageAxis =
+                 mlir::dyn_cast<intent::plan::StageAxisOp>(operation))
+      decisions.stageAxes.push_back(stageAxis);
+  }
+  return realization::emitSearchSpace(module, facts, decisions);
+}
+
+mlir::LogicalResult intent::gpu::formAutomaticBlocking(
+    intent::plan::ProgramOp program,
+    const intent::target::KernelFacts &facts) {
+  mlir::SmallVector<mlir::Operation *> previous;
+  for (mlir::Operation &operation : program.getBody().front())
+    if (auto range = mlir::dyn_cast<intent::plan::RangeOp>(operation)) {
+      if (range.getPurpose() != "access")
+        previous.push_back(&operation);
+    } else if (mlir::isa<intent::plan::StageOp,
+                         intent::plan::StageAxisOp>(operation)) {
+      return operation.emitOpError(
+          "automatic blocking must run before physical stage formation");
+    } else if (mlir::isa<intent::plan::LaunchOp, intent::plan::BlockExtentOp,
+                  intent::plan::AxisOp, intent::plan::RangeOp,
+                  intent::plan::RegionBindingOp,
+                  intent::plan::StreamBindingOp>(operation))
+      previous.push_back(&operation);
+
+  mlir::OpBuilder builder(program.getContext());
+  builder.setInsertionPoint(program.getBody().front().getTerminator());
+  mlir::FailureOr<realization::PhysicalDecisions> decisions =
+      realization::emitPhysicalDecisions(builder, facts, false);
+  if (mlir::failed(decisions))
+    return mlir::failure();
+  for (mlir::Operation *operation : previous)
+    operation->erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult intent::gpu::reconcileStages(
+    intent::plan::ProgramOp program,
+    const intent::target::KernelFacts &facts) {
+  mlir::SmallVector<intent::plan::StageOp> oldStages(
+      program.getBody().getOps<intent::plan::StageOp>());
+  mlir::SmallVector<intent::plan::StageAxisOp> oldAxes(
+      program.getBody().getOps<intent::plan::StageAxisOp>());
+  llvm::DenseMap<int64_t, intent::plan::RangeOp> ownership;
+  for (intent::plan::RangeOp range :
+       program.getBody().getOps<intent::plan::RangeOp>())
+    if (range.getPurpose() == "ownership" && range.getLevel() == 0)
+      ownership[range.getAxisNode()] = range;
+
+  mlir::FailureOr<mlir::SmallVector<realization::StageDecision, 0>> stages =
+      realization::contractionStages(facts);
+  if (mlir::failed(stages))
+    return mlir::failure();
+  mlir::OpBuilder builder(program.getContext());
+  builder.setInsertionPoint(program.getBody().front().getTerminator());
+  for (const realization::StageDecision &stage : *stages) {
+    mlir::FailureOr<int64_t> stageNode =
+        realization::node(*stage.contraction, "stage realization");
+    mlir::FailureOr<mlir::Operation *> member =
+        realization::stageMemberDomain(stage, facts);
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> feature =
+        succeeded(member)
+            ? realization::stageFeatureAxis(stage, facts, *member)
+            : mlir::FailureOr<std::pair<mlir::Value, unsigned>>(mlir::failure());
+    mlir::FailureOr<std::pair<mlir::Value, unsigned>> reduction =
+        realization::stageReductionAxis(stage, facts);
+    if (failed(stageNode) || failed(member) || failed(feature) ||
+        failed(reduction))
+      return mlir::failure();
+    mlir::FailureOr<int64_t> memberNode =
+        realization::node(**member, "stage member-axis realization");
+    mlir::FailureOr<int64_t> featureValue = realization::valueID(
+        feature->first, facts.kernel, *stage.contraction,
+        "stage feature-axis realization");
+    mlir::FailureOr<int64_t> reductionValue = realization::valueID(
+        reduction->first, facts.kernel, *stage.contraction,
+        "stage reduction-axis realization");
+    intent::plan::RangeOp memberRange =
+        succeeded(memberNode) ? ownership.lookup(*memberNode)
+                              : intent::plan::RangeOp();
+    if (failed(memberNode) || failed(featureValue) || failed(reductionValue) ||
+        !memberRange)
+      return stage.contraction->emitOpError(
+          "has no selected ownership range for its stage member axis");
+    auto stageOp = builder.create<intent::plan::StageOp>(
+        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
+        builder.getDenseI64ArrayAttr(stage.operations),
+        builder.getStringAttr("same_stream"));
+    (void)stageOp;
+    builder.create<intent::plan::StageAxisOp>(
+        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
+        builder.getStringAttr("member"), builder.getI64IntegerAttr(*memberNode),
+        mlir::IntegerAttr(), mlir::IntegerAttr(),
+        builder.getStringAttr(memberRange.getTile()), builder.getI64IntegerAttr(1));
+    builder.create<intent::plan::StageAxisOp>(
+        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
+        builder.getStringAttr("feature"), mlir::IntegerAttr(),
+        builder.getI64IntegerAttr(*featureValue),
+        builder.getI64IntegerAttr(feature->second),
+        builder.getStringAttr("feature"), builder.getI64IntegerAttr(0));
+    builder.create<intent::plan::StageAxisOp>(
+        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
+        builder.getStringAttr("reduction"), mlir::IntegerAttr(),
+        builder.getI64IntegerAttr(*reductionValue),
+        builder.getI64IntegerAttr(reduction->second),
+        builder.getStringAttr("reduction"), mlir::IntegerAttr());
+  }
+  for (intent::plan::StageAxisOp axis : oldAxes)
+    axis.erase();
+  for (intent::plan::StageOp stage : oldStages)
+    stage.erase();
+  return mlir::success();
+}
+
+mlir::LogicalResult intent::gpu::reconcileAccessRanges(
+    intent::plan::ProgramOp program,
+    const intent::target::KernelFacts &facts) {
+  mlir::SmallVector<intent::plan::RangeOp> old;
+  for (intent::plan::RangeOp range :
+       program.getBody().getOps<intent::plan::RangeOp>())
+    if (range.getPurpose() == "access")
+      old.push_back(range);
+
+  llvm::DenseMap<int64_t, intent::plan::AxisOp> axes;
+  llvm::DenseMap<int64_t, llvm::SmallVector<intent::plan::RangeOp>> ranges;
+  for (mlir::Operation &operation : program.getBody().front()) {
+    if (auto axis = mlir::dyn_cast<intent::plan::AxisOp>(operation))
+      axes[axis.getNode()] = axis;
+    else if (auto range = mlir::dyn_cast<intent::plan::RangeOp>(operation);
+             range && range.getPurpose() != "access")
+      ranges[range.getAxisNode()].push_back(range);
+  }
+  auto selectedRange = [&](int64_t node) -> intent::plan::RangeOp {
+    auto found = ranges.find(node);
+    if (found == ranges.end())
+      return {};
+    for (llvm::StringRef purpose : {llvm::StringRef("ownership"),
+                                    llvm::StringRef("traversal"),
+                                    llvm::StringRef("reduction"),
+                                    llvm::StringRef("lane")}) {
+      auto selected = llvm::find_if(found->second, [&](intent::plan::RangeOp range) {
+        return range.getPurpose() == purpose && range.getLevel() == 0;
+      });
+      if (selected != found->second.end())
+        return *selected;
+    }
+    return {};
+  };
+
+  mlir::OpBuilder builder(program.getContext());
+  builder.setInsertionPoint(program.getBody().front().getTerminator());
+  mlir::SmallVector<intent::plan::RangeOp> created;
+  for (const target::AccessRangeFact &access : facts.accessRanges) {
+    mlir::FailureOr<int64_t> axisNode =
+        realization::node(*access.axis, "access-range axis realization");
+    mlir::FailureOr<int64_t> transferNode =
+        realization::node(*access.transfer, "access-range transfer realization");
+    mlir::FailureOr<std::string> extent =
+        realization::sourceViewDimensionSymbol(*access.transfer,
+                                               access.sourceAxis, facts);
+    intent::plan::RangeOp source =
+        succeeded(axisNode) ? selectedRange(*axisNode) : intent::plan::RangeOp();
+    if (failed(axisNode) || failed(transferNode) || failed(extent) || !source)
+      return access.transfer->emitOpError(
+          "has no selected physical range for its affine access footprint");
+    mlir::IntegerAttr divisor =
+        access.divisor > 1 ? builder.getI64IntegerAttr(access.divisor)
+                           : mlir::IntegerAttr();
+    mlir::IntegerAttr offset =
+        access.divisor > 1 || access.offset != 0
+            ? builder.getI64IntegerAttr(access.offset)
+            : mlir::IntegerAttr();
+    created.push_back(builder.create<intent::plan::RangeOp>(
+        access.transfer->getLoc(), builder.getI64IntegerAttr(*axisNode),
+        builder.getStringAttr("access"), builder.getI64IntegerAttr(0),
+        builder.getStringAttr(source.getTile()), builder.getStringAttr(*extent),
+        builder.getI64IntegerAttr(*transferNode),
+        builder.getI64IntegerAttr(access.sourceAxis), divisor, offset));
+  }
+  for (intent::plan::RangeOp range : old)
+    range.erase();
+  return mlir::success();
+}

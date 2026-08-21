@@ -105,12 +105,9 @@ def causal_conv1d_backward_reduce(
             identity=0.0,
             acc_dtype=I.f32,
         )
-        for tap_region in I.parallel(
-            I.partition(taps, extent=I.auto("W_TILE"))
-        ):
-            grad_weight[channel, tap_region] = I.reduce.sum(
-                grad_weight_partial[batches, channel, tap_region],
-                axis=0,
-                identity=0.0,
-                acc_dtype=I.f32,
-            )
+        grad_weight[channel, taps] = I.reduce.sum(
+            grad_weight_partial[batches, channel, taps],
+            axis=0,
+            identity=0.0,
+            acc_dtype=I.f32,
+        )

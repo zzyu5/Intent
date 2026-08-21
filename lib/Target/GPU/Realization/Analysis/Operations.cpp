@@ -4,6 +4,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
@@ -23,7 +24,7 @@ LogicalResult addHandler(target::OperationHandlerRegistry &registry,
 bool isLiteralBool(Value value, bool expected) {
   Operation *definition = value.getDefiningOp();
   if (!value.getType().isInteger(1) || !definition ||
-      definition->getName().getStringRef() != "intent.constant")
+      ::intent::target::semanticOperationName(*definition) != "intent.constant")
     return false;
   auto literal = definition->getAttrOfType<IntegerAttr>("intent.value");
   return literal && (!literal.getValue().isZero()) == expected;
@@ -66,10 +67,10 @@ LogicalResult validateReduction(Operation &operation) {
 bool isLiteralZero(Value value) {
   Operation *definition = value.getDefiningOp();
   while (definition) {
-    if (definition->getName().getStringRef() == "intent.cast" &&
+    if (::intent::target::semanticOperationName(*definition) == "intent.cast" &&
         definition->getNumOperands() == 1)
       value = definition->getOperand(0);
-    else if (definition->getName().getStringRef() == "intent.extract") {
+    else if (::intent::target::semanticOperationName(*definition) == "intent.extract") {
       FailureOr<Value> field = target::resolveRecordField(*definition);
       if (failed(field))
         return false;
@@ -79,7 +80,7 @@ bool isLiteralZero(Value value) {
     definition = value.getDefiningOp();
   }
   if (!definition ||
-      definition->getName().getStringRef() != "intent.constant")
+      ::intent::target::semanticOperationName(*definition) != "intent.constant")
     return false;
   Attribute literal = definition->getAttr("intent.value");
   if (auto integer = dyn_cast_or_null<IntegerAttr>(literal))
@@ -132,7 +133,7 @@ LogicalResult validateScan(Operation &operation) {
 }
 
 LogicalResult validatePointwise(Operation &operation) {
-  StringRef name = operation.getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(operation);
   if (name == "intent.random") {
     auto algorithm =
         operation.getAttrOfType<StringAttr>("intent.algorithm");
@@ -236,11 +237,10 @@ LogicalResult validatePointwise(Operation &operation) {
       return success();
     return operation.emitOpError("has no supported GPU comparison predicate");
   }
-  auto logical = operation.getAttrOfType<StringAttr>(
-      name == "intent_plan.unary" ? "semantic" : "intent.operator");
+  auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
   if (!logical)
     return operation.emitOpError("has no canonical pointwise operator");
-  if ((name == "intent.unary" || name == "intent_plan.unary") &&
+  if (name == "intent.unary" &&
       llvm::is_contained({StringRef("exp"), StringRef("exp2"),
                           StringRef("log"), StringRef("sin"), StringRef("cos"),
                           StringRef("floor"),
@@ -289,7 +289,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                          "intent.region_end",
                          "intent.assume_in_bounds",
                          "intent.partition", "intent.parallel",
-                         "intent.for", "intent.ordered", "intent.if", "intent.while",
+                         "intent.for", "intent.if", "intent.while",
                          "intent.condition", "intent.buffer",
                          "intent.make_record", "intent.extract",
                          "intent.buffer_load", "intent.buffer_store",
@@ -319,7 +319,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
-                         "intent_plan.unary", "intent.binary", "intent.compare",
+                         "intent.binary", "intent.compare",
                          "intent.mask", "intent.select", "intent.cast",
                          "intent.reshape", "intent.transpose", "intent.random"})
     if (failed(addHandler(
@@ -456,7 +456,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
 
   auto analyzeContraction = [&](Operation &operation) -> LogicalResult {
             bool scaled =
-                operation.getName().getStringRef() == "intent.scaled_contract";
+                ::intent::target::semanticOperationName(operation) == "intent.scaled_contract";
             unsigned operandCount = scaled ? 4 : 2;
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
             auto batch = operation.getAttrOfType<ArrayAttr>("intent.batch");

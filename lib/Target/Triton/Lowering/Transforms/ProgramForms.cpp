@@ -1,8 +1,12 @@
 #include "Intent/Target/Triton/Lowering/Passes.h"
 
+#include "Syntax/Spelling.h"
+
 #include "Intent/Target/Common/Lowering/ProgramAnalysis.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseSet.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
@@ -75,7 +79,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   bool hasAggregation = false;
   bool hasScan = false;
   (*analysis)->getKernel().entry.walk([&](Operation *operation) {
-    StringRef name = operation->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*operation);
     hasExternalRead |= name == "intent.view_load";
     hasScan |= name == "intent.scan";
     hasAggregation |= name == "intent.reduce" || name == "intent.arg_reduce" ||
@@ -94,6 +98,149 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   OpBuilder builder(program.getContext());
   launch->setAttr(rowLaunchAttr,
                   builder.getStringAttr(configured ? "configured" : "generic"));
+
+  llvm::DenseSet<int64_t> stagedOperations;
+  for (intent::plan::StageOp stage :
+       program.getBody().getOps<intent::plan::StageOp>())
+    stagedOperations.insert(stage.getOperations().begin(),
+                            stage.getOperations().end());
+  target::KernelModel &kernel = (*analysis)->getKernel();
+  for (const auto &entry : kernel.raggedRelations) {
+    Operation *ragged = entry.second.operation;
+    if (!ragged || ragged->hasAttr(raggedRouteAttr))
+      return program.emitOpError(
+          "has an invalid or duplicate Triton ragged-route decision");
+    FailureOr<StringRef> route =
+        target::lowering::classifyRaggedProjection(*ragged);
+    if (failed(route))
+      return failure();
+    ragged->setAttr(raggedRouteAttr, builder.getStringAttr(*route));
+  }
+  for (intent::plan::ContractOp contract :
+       program.getBody().getOps<intent::plan::ContractOp>()) {
+    if (contract->hasAttr(contractLoweringAttr) ||
+        contract->hasAttr(contractOrientationAttr) ||
+        contract->hasAttr(contractBatchedAttr) ||
+        contract->hasAttr(scaledContractLayoutAttr))
+      return contract.emitOpError("already has a Triton contraction spelling");
+    Operation *operation = kernel.nodes.lookup(contract.getNode());
+    FailureOr<target::lowering::ContractionOrientation> orientation =
+        operation ? target::lowering::contractionOrientation(*operation)
+                  : FailureOr<target::lowering::ContractionOrientation>(failure());
+    if (failed(orientation))
+      return contract.emitOpError(
+          "does not bind canonical contraction orientation");
+    if ((orientation->batched && contract.getForm() != "direct") ||
+        (contract.getForm() == "staged" && orientation->lhsTranspose))
+      return contract.emitOpError(
+          "Triton cannot project the selected contraction form and orientation");
+    StringRef lowering = contract.getForm() == "scaled_direct"
+                             ? syntax::scaledContraction()
+                             : syntax::contraction();
+    contract->setAttr(contractLoweringAttr, builder.getStringAttr(lowering));
+    contract->setAttr(contractOrientationAttr,
+                      builder.getStringAttr(
+                          target::lowering::contractionOrientationName(
+                              *orientation)));
+    contract->setAttr(contractBatchedAttr,
+                      builder.getBoolAttr(orientation->batched));
+    if (contract.getForm() == "scaled_direct") {
+      FailureOr<StringRef> layout =
+          target::lowering::scaledContractionLayout(*operation);
+      if (failed(layout))
+        return failure();
+      contract->setAttr(scaledContractLayoutAttr,
+                        builder.getStringAttr(*layout));
+    }
+  }
+  for (intent::plan::ReductionOp reduction :
+       program.getBody().getOps<intent::plan::ReductionOp>()) {
+    if (reduction->hasAttr(reductionLoweringAttr) ||
+        reduction->hasAttr(reductionAxisAttr))
+      return reduction.emitOpError("already has a Triton reduction spelling");
+    Operation *operation = kernel.nodes.lookup(reduction.getNode());
+    FailureOr<std::string> role =
+        operation ? target::lowering::reductionRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<int64_t> axis =
+        operation ? target::lowering::reductionAxis(*operation)
+                  : FailureOr<int64_t>(failure());
+    if (failed(role) || failed(axis))
+      return reduction.emitOpError("does not bind canonical reduction semantics");
+    reduction->setAttr(reductionLoweringAttr,
+                       builder.getStringAttr(syntax::reduction(*role)));
+    reduction->setAttr(reductionAxisAttr, builder.getI64IntegerAttr(*axis));
+  }
+  for (intent::plan::ScanOp scan :
+       program.getBody().getOps<intent::plan::ScanOp>()) {
+    if (scan->hasAttr(scanLoweringAttr))
+      return scan.emitOpError("already has a Triton scan spelling");
+    Operation *operation = kernel.nodes.lookup(scan.getNode());
+    FailureOr<std::string> role =
+        operation ? target::lowering::scanRole(*operation)
+                  : FailureOr<std::string>(failure());
+    if (failed(role))
+      return scan.emitOpError("does not bind canonical scan semantics");
+    scan->setAttr(scanLoweringAttr,
+                  builder.getStringAttr(syntax::scan(*role)));
+  }
+  for (intent::plan::PointwiseOp pointwise :
+       program.getBody().getOps<intent::plan::PointwiseOp>()) {
+    if (pointwise->hasAttr(pointwiseLoweringAttr) ||
+        pointwise->hasAttr(pointwiseDeferredAttr))
+      return pointwise.emitOpError("already has a Triton pointwise spelling");
+    Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    FailureOr<std::string> role =
+        operation ? target::lowering::pointwiseRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<StringRef> lowering =
+        succeeded(role) ? syntax::pointwise(operation, *role)
+                        : FailureOr<StringRef>(failure());
+    if (failed(lowering))
+      return pointwise.emitOpError("does not bind canonical pointwise semantics");
+    pointwise->setAttr(pointwiseLoweringAttr,
+                       builder.getStringAttr(*lowering));
+    bool deferred = stagedOperations.contains(
+        static_cast<int64_t>(pointwise.getNode()));
+    pointwise->setAttr(pointwiseDeferredAttr, builder.getBoolAttr(deferred));
+    if (target::semanticOperationName(*operation) == "intent.gather") {
+      FailureOr<std::string> gather = target::lowering::classifyGatherProjection(
+          *operation, deferred, deferred);
+      if (failed(gather))
+        return failure();
+      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
+    }
+  }
+  for (intent::plan::TransferOp transfer :
+       program.getBody().getOps<intent::plan::TransferOp>()) {
+    if (transfer->hasAttr(transferAccessAttr))
+      return transfer.emitOpError("already has a Triton transfer spelling");
+    Operation *operation = kernel.nodes.lookup(transfer.getNode());
+    StringRef name = operation ? target::semanticOperationName(*operation)
+                               : StringRef();
+    bool load = name == "intent.view_load";
+    bool store = name == "intent.view_store" ||
+                 name == "intent.scatter_unique" ||
+                 name == "intent.atomic_add" || name == "intent.atomic_cas";
+    if (!load && !store)
+      return transfer.emitOpError("does not bind canonical transfer semantics");
+    transfer->setAttr(transferAccessAttr,
+                      builder.getStringAttr(load ? "load" : "store"));
+  }
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>()) {
+    if (stream->hasAttr(streamTileAttr))
+      return stream.emitOpError("already has a Triton stream-tile spelling");
+    intent::plan::RangeOp range = (*analysis)->getRange(
+        stream.getAxisNode(), stream.getPurpose(), stream.getLevel());
+    FailureOr<std::string> tile =
+        range ? syntax::tile(stream.getOperation(), range.getTile())
+              : FailureOr<std::string>(failure());
+    if (failed(tile))
+      return stream.emitOpError("does not bind one Triton stream tile");
+    stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
+  }
+
   return success();
 }
 
@@ -147,7 +294,15 @@ public:
 LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                     intent::plan::ProgramOp program,
                                     intent::plan::SearchSpaceOp searchSpace) {
-  (void)kernel;
+  for (const auto &entry : kernel.raggedRelations) {
+    Operation *ragged = entry.second.operation;
+    auto route = ragged ? ragged->getAttrOfType<StringAttr>(raggedRouteAttr)
+                        : StringAttr();
+    if (!route || (route.getValue() != "compact" &&
+                   route.getValue() != "indexed"))
+      return program.emitOpError(
+          "has no complete Triton ragged-route form");
+  }
   auto launches = program.getBody().getOps<intent::plan::LaunchOp>();
   if (!llvm::hasSingleElement(launches))
     return program.emitOpError(
@@ -166,6 +321,64 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     if (searchSpace || hasStages || hasReuse)
       return launch.emitOpError(
           "configured Triton row launch is incompatible with search, stages, or worker reuse");
+  }
+  for (intent::plan::ContractOp contract :
+       program.getBody().getOps<intent::plan::ContractOp>()) {
+    auto lowering = contract->getAttrOfType<StringAttr>(contractLoweringAttr);
+    auto orientation =
+        contract->getAttrOfType<StringAttr>(contractOrientationAttr);
+    auto batched = contract->getAttrOfType<BoolAttr>(contractBatchedAttr);
+    auto layout = contract->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
+    if (!lowering || lowering.getValue().empty() || !orientation || !batched ||
+        (orientation.getValue() != "nn" && orientation.getValue() != "nt" &&
+         orientation.getValue() != "tn" && orientation.getValue() != "tt") ||
+        (contract.getForm() == "scaled_direct" &&
+         (!layout || (layout.getValue() != "grouped_rank_two" &&
+                      layout.getValue() != "flattened_rank_three"))) ||
+        (contract.getForm() != "scaled_direct" && layout))
+      return contract.emitOpError(
+          "has no complete Triton contraction provider form");
+  }
+  for (intent::plan::ReductionOp reduction :
+       program.getBody().getOps<intent::plan::ReductionOp>()) {
+    auto lowering = reduction->getAttrOfType<StringAttr>(reductionLoweringAttr);
+    auto axis = reduction->getAttrOfType<IntegerAttr>(reductionAxisAttr);
+    if (!lowering || lowering.getValue().empty() || !axis || axis.getInt() < 0 ||
+        !kernel.nodes.lookup(reduction.getNode()))
+      return reduction.emitOpError("has no complete Triton reduction spelling");
+  }
+  for (intent::plan::ScanOp scan :
+       program.getBody().getOps<intent::plan::ScanOp>()) {
+    auto lowering = scan->getAttrOfType<StringAttr>(scanLoweringAttr);
+    if (!lowering || lowering.getValue().empty() ||
+        !kernel.nodes.lookup(scan.getNode()))
+      return scan.emitOpError("has no complete Triton scan spelling");
+  }
+  for (intent::plan::PointwiseOp pointwise :
+       program.getBody().getOps<intent::plan::PointwiseOp>()) {
+    auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
+    auto deferred = pointwise->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
+    Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
+    bool requiresGather =
+        operation && target::semanticOperationName(*operation) == "intent.gather";
+    if (!lowering || lowering.getValue().empty() || !deferred || !operation ||
+        (requiresGather && (!gather || gather.getValue().empty())))
+      return pointwise.emitOpError("has no complete Triton pointwise spelling");
+  }
+  for (intent::plan::TransferOp transfer :
+       program.getBody().getOps<intent::plan::TransferOp>()) {
+    auto access = transfer->getAttrOfType<StringAttr>(transferAccessAttr);
+    if (!access || (access.getValue() != "load" &&
+                    access.getValue() != "store") ||
+        !kernel.nodes.lookup(transfer.getNode()))
+      return transfer.emitOpError("has no complete Triton transfer spelling");
+  }
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>()) {
+    auto tile = stream->getAttrOfType<StringAttr>(streamTileAttr);
+    if (!tile || tile.getValue().empty())
+      return stream.emitOpError("has no complete Triton stream-tile spelling");
   }
   return success();
 }

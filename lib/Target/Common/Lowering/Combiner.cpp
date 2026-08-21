@@ -3,6 +3,7 @@
 #include "Intent/Target/Common/Lowering/Literal.h"
 
 #include "Intent/Target/Common/Analysis/Record.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -155,7 +156,7 @@ renderPythonCombiner(func::FuncOp function, StringRef emittedName,
   unsigned returnCount = 0;
   SmallVector<std::string> returns;
   for (Operation &operation : function.getBody().front()) {
-    StringRef name = operation.getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(operation);
     if (name == "intent.make_record")
       continue;
     if (name == "intent.return") {

@@ -30,29 +30,26 @@ def moe_expert_ffn(
         indices=member_routes,
     )
     for expert in I.parallel(groups.outer):
-        for route_region in I.parallel(
-            I.partition(groups[expert], extent=I.auto("ROUTE_TILE"))
-        ):
-            routes = I.members(route_region)
-            token = I.gather(route_token, index=routes)
-            weight = I.gather(route_weights, index=routes)
-            values = I.gather(x, index=(token, slice(None)))
-            hidden = I.contract(
-                values,
-                w1[expert, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            hidden = I.cast(I.maximum(hidden, 0.0), I.f16)
-            route_output = I.contract(
-                hidden,
-                w2[expert, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            I.scatter_reduce(
-                y,
-                index=(token, slice(None)),
-                value=weight[:, None] * route_output,
-                combine=I.add,
-            )
+        routes = I.members(groups[expert])
+        token = I.gather(route_token, index=routes)
+        weight = I.gather(route_weights, index=routes)
+        values = I.gather(x, index=(token, slice(None)))
+        hidden = I.contract(
+            values,
+            w1[expert, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        hidden = I.cast(I.maximum(hidden, 0.0), I.f16)
+        route_output = I.contract(
+            hidden,
+            w2[expert, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        I.scatter_reduce(
+            y,
+            index=(token, slice(None)),
+            value=weight[:, None] * route_output,
+            combine=I.add,
+        )

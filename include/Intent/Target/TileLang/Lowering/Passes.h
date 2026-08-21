@@ -29,6 +29,30 @@ inline constexpr llvm::StringLiteral isolateRhsAttr =
     "intent_plan.tilelang.isolate_rhs";
 inline constexpr llvm::StringLiteral gemmWarpPolicyAttr =
     "intent_plan.tilelang.gemm_warp_policy";
+inline constexpr llvm::StringLiteral contractLoweringAttr =
+    "intent_plan.tilelang.contract_lowering";
+inline constexpr llvm::StringLiteral contractOrientationAttr =
+    "intent_plan.tilelang.contract_orientation";
+inline constexpr llvm::StringLiteral contractBatchedAttr =
+    "intent_plan.tilelang.contract_batched";
+inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
+    "intent_plan.tilelang.scaled_contract_layout";
+inline constexpr llvm::StringLiteral reductionLoweringAttr =
+    "intent_plan.tilelang.reduction_lowering";
+inline constexpr llvm::StringLiteral reductionAxisAttr =
+    "intent_plan.tilelang.reduction_axis";
+inline constexpr llvm::StringLiteral scanLoweringAttr =
+    "intent_plan.tilelang.scan_lowering";
+inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
+    "intent_plan.tilelang.pointwise_lowering";
+inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
+    "intent_plan.tilelang.pointwise_deferred";
+inline constexpr llvm::StringLiteral gatherFormAttr =
+    "intent_plan.tilelang.gather_form";
+inline constexpr llvm::StringLiteral streamTileAttr =
+    "intent_plan.tilelang.stream_tile";
+inline constexpr llvm::StringLiteral raggedRouteAttr =
+    "intent_plan.tilelang.ragged_route";
 
 void addProviderPasses(mlir::PassManager &manager);
 mlir::LogicalResult verifyProviderProgram(

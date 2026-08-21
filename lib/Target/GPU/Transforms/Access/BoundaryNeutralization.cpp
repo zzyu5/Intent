@@ -1,6 +1,7 @@
 #include "Intent/Target/GPU/Transforms/Passes.h"
 
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -78,7 +79,7 @@ private:
                                                  Operation *domain) const {
     Operation *definition = value.getDefiningOp();
     if (definition &&
-        definition->getName().getStringRef() == "intent.view_load")
+        ::intent::target::semanticOperationName(*definition) == "intent.view_load")
       return std::nullopt;
     std::optional<int64_t> domainNode = nodeOf(domain);
     std::optional<unsigned> tensorAxis = uniqueAxis(value, domain);
@@ -102,7 +103,7 @@ private:
     Operation *definition = value.getDefiningOp();
     if (!definition)
       return std::nullopt;
-    StringRef name = definition->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*definition);
     if (name == "intent.view_load") {
       auto bounded = facts.boundaryDomains.find(definition);
       auto fill = facts.boundaryFills.find(definition);
@@ -141,12 +142,12 @@ private:
          name == "intent.reshape" || name == "intent.transpose") &&
         definition->getNumOperands() >= 1)
       return paddingForDomain(definition->getOperand(0), domain);
-    if ((name == "intent.unary" || name == "intent_plan.unary") &&
+    if (name == "intent.unary" &&
         definition->getNumOperands() == 1) {
       std::optional<std::string> operand =
           paddingForDomain(definition->getOperand(0), domain);
-      auto logical = definition->getAttrOfType<StringAttr>(
-          name == "intent_plan.unary" ? "semantic" : "intent.operator");
+      auto logical =
+          definition->getAttrOfType<StringAttr>("intent.operator");
       if (operand && *operand == "negative_infinity" && logical &&
           (logical.getValue() == "exp" || logical.getValue() == "exp2"))
         return std::string("zero");
@@ -277,10 +278,9 @@ private:
                      ArrayRef<Operation *> domains,
                      llvm::DenseSet<Value> &active) const {
     Operation *owner = yield.getParentOp();
-    StringRef ownerName = owner ? owner->getName().getStringRef() : StringRef();
+    StringRef ownerName = owner ? ::intent::target::semanticOperationName(*owner) : StringRef();
     if (!owner ||
-        (ownerName != "intent.state_stream" && ownerName != "intent.for" &&
-         ownerName != "intent.ordered") ||
+        (ownerName != "intent.state_stream" && ownerName != "intent.for") ||
         owner->getNumResults() != yield.getNumOperands())
       return false;
     bool consumed = false;
@@ -313,7 +313,7 @@ private:
     if (value.use_empty())
       return finish(false);
     for (Operation *user : value.getUsers()) {
-      StringRef name = user->getName().getStringRef();
+      StringRef name = ::intent::target::semanticOperationName(*user);
       if (name == "intent.view_store" || name == "intent.scatter_unique" ||
           name == "intent.scatter_reduce" || name == "intent.atomic_add") {
         auto valueIndex =
@@ -347,7 +347,7 @@ private:
       }
       if (name != "intent.cast" && name != "intent.broadcast" &&
           name != "intent.reshape" && name != "intent.transpose" &&
-          name != "intent.unary" && name != "intent_plan.unary" &&
+          name != "intent.unary" &&
           name != "intent.binary" && name != "intent.compare" &&
           name != "intent.select" && name != "intent.mask")
         return finish(false);
@@ -413,7 +413,7 @@ private:
       Operation *operation = kernel.nodes.lookup(transfer.getNode());
       bool neutralized =
           operation &&
-          operation->getName().getStringRef() == "intent.view_load" &&
+          ::intent::target::semanticOperationName(*operation) == "intent.view_load" &&
           proof.prove(*operation);
       transfer->setAttr("consumer_neutralized",
                         builder.getBoolAttr(neutralized));

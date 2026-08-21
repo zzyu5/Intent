@@ -39,57 +39,51 @@ def mamba_chunk_state_fwd(
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEAD_GROUP
                 I.assume_in_bounds(group, state_basis, axis=2)
-                for dimension_region in I.parallel(
-                    I.partition(dimensions, extent=I.auto("M_TILE"))
-                ):
-                    for state_region in I.parallel(
-                        I.partition(state_axis, extent=I.auto("N_TILE"))
-                    ):
-                        last_position = S - 1
-                        I.assume_in_bounds(
-                            last_position, cumulative_decay, axis=3
-                        )
-                        last_decay = I.cast(
-                            cumulative_decay[batch, head, chunk, last_position], I.f32
-                        )
-                        scale = I.exp(
-                            I.minimum(
-                                last_decay
-                                - I.cast(
-                                    cumulative_decay[batch, head, chunk, chunk_axis],
-                                    I.f32,
-                                ),
-                                0.0,
-                            )
-                        ) * I.cast(dt[batch, head, chunk, chunk_axis], I.f32)
-                        lhs = I.cast(
-                            x[
-                                batch,
-                                chunk * S + I.indices(chunk_axis),
-                                head,
-                                dimension_region,
-                            ],
-                            I.f16,
-                        )
-                        rhs = I.cast(
-                            state_basis[
-                                batch,
-                                chunk * S + I.indices(chunk_axis),
-                                group,
-                                state_region,
-                            ]
-                            * I.cast(scale[:, None], I.f16),
-                            I.f16,
-                        )
-                        result = I.contract(
-                            lhs,
-                            rhs,
-                            reduce=((0, 0),),
-                            acc_dtype=I.f32,
-                        )
-                        states[batch, chunk, head, dimension_region, state_region] = (
-                            I.cast(result, I.f16)
-                        )
+                last_position = S - 1
+                I.assume_in_bounds(
+                    last_position, cumulative_decay, axis=3
+                )
+                last_decay = I.cast(
+                    cumulative_decay[batch, head, chunk, last_position], I.f32
+                )
+                scale = I.exp(
+                    I.minimum(
+                        last_decay
+                        - I.cast(
+                            cumulative_decay[batch, head, chunk, chunk_axis],
+                            I.f32,
+                        ),
+                        0.0,
+                    )
+                ) * I.cast(dt[batch, head, chunk, chunk_axis], I.f32)
+                lhs = I.cast(
+                    x[
+                        batch,
+                        chunk * S + I.indices(chunk_axis),
+                        head,
+                        dimensions,
+                    ],
+                    I.f16,
+                )
+                rhs = I.cast(
+                    state_basis[
+                        batch,
+                        chunk * S + I.indices(chunk_axis),
+                        group,
+                        state_axis,
+                    ]
+                    * I.cast(scale[:, None], I.f16),
+                    I.f16,
+                )
+                result = I.contract(
+                    lhs,
+                    rhs,
+                    reduce=((0, 0),),
+                    acc_dtype=I.f32,
+                )
+                states[batch, chunk, head, dimensions, state_axis] = (
+                    I.cast(result, I.f16)
+                )
 
 
 @intent.kernel
@@ -113,57 +107,51 @@ def mamba_chunk_state_bf16_fwd(
             for head in I.parallel(I.domain(0, H)):
                 group = head // HEAD_GROUP
                 I.assume_in_bounds(group, state_basis, axis=2)
-                for dimension_region in I.parallel(
-                    I.partition(dimensions, extent=I.auto("M_TILE"))
-                ):
-                    for state_region in I.parallel(
-                        I.partition(state_axis, extent=I.auto("N_TILE"))
-                    ):
-                        last_position = S - 1
-                        I.assume_in_bounds(
-                            last_position, cumulative_decay, axis=3
-                        )
-                        last_decay = cumulative_decay[
-                            batch, head, chunk, last_position
-                        ]
-                        scale = I.exp(
-                            I.minimum(
-                                last_decay
-                                - cumulative_decay[batch, head, chunk, chunk_axis],
-                                0.0,
-                            )
-                        ) * dt[batch, head, chunk, chunk_axis]
-                        lhs = x[
+                last_position = S - 1
+                I.assume_in_bounds(
+                    last_position, cumulative_decay, axis=3
+                )
+                last_decay = cumulative_decay[
+                    batch, head, chunk, last_position
+                ]
+                scale = I.exp(
+                    I.minimum(
+                        last_decay
+                        - cumulative_decay[batch, head, chunk, chunk_axis],
+                        0.0,
+                    )
+                ) * dt[batch, head, chunk, chunk_axis]
+                lhs = x[
+                    batch,
+                    chunk * S + I.indices(chunk_axis),
+                    head,
+                    dimensions,
+                ]
+                rhs = I.cast(
+                    I.cast(
+                        state_basis[
                             batch,
                             chunk * S + I.indices(chunk_axis),
-                            head,
-                            dimension_region,
-                        ]
-                        rhs = I.cast(
-                            I.cast(
-                                state_basis[
-                                    batch,
-                                    chunk * S + I.indices(chunk_axis),
-                                    group,
-                                    state_region,
-                                ],
-                                I.f32,
-                            )
-                            * scale[:, None],
-                            I.bf16,
-                        )
-                        states[
-                            batch,
-                            chunk,
-                            head,
-                            dimension_region,
-                            state_region,
-                        ] = I.contract(
-                            lhs,
-                            rhs,
-                            reduce=((0, 0),),
-                            acc_dtype=I.f32,
-                        )
+                            group,
+                            state_axis,
+                        ],
+                        I.f32,
+                    )
+                    * scale[:, None],
+                    I.bf16,
+                )
+                states[
+                    batch,
+                    chunk,
+                    head,
+                    dimensions,
+                    state_axis,
+                ] = I.contract(
+                    lhs,
+                    rhs,
+                    reduce=((0, 0),),
+                    acc_dtype=I.f32,
+                )
 
 
 @intent.kernel
@@ -179,7 +167,7 @@ def mamba_state_passing_fwd(
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
             state = I.cast(initial_states[batch, head, dimensions], I.f32)
-            for chunk in I.ordered(I.domain(0, C)):
+            for chunk in I.domain(0, C):
                 states_before_chunk[batch, chunk, head, dimensions] = state
                 state = (
                     I.exp(chunk_decay[batch, head, chunk]) * state

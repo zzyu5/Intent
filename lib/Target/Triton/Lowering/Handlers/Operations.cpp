@@ -1,8 +1,10 @@
 #include "Support/Model.h"
 #include "Syntax/Spelling.h"
 
+#include "Intent/Target/Triton/Lowering/Passes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
 #include "Intent/Target/Common/Lowering/Literal.h"
@@ -59,7 +61,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.domain", "intent.domain_product",
                          "intent.make_record",
-                         "intent.region_end",
                          "intent.assume_in_bounds", "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
@@ -80,6 +81,9 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitExtract(op);
       })) ||
+      failed(addHandler(registry, "intent.region_end", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitRegionEnd(op) : success();
+      })) ||
       failed(addHandler(
           registry, "intent.parallel",
           [&](Operation &op) {
@@ -92,14 +96,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           })) ||
       failed(addHandler(
           registry, "intent.for",
-          [&](Operation &op) {
-            return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
-          },
-          [&](Operation &op) {
-            return emitter.selectOperation(op) ? emitter.leaveFor(op) : success();
-          })) ||
-      failed(addHandler(
-          registry, "intent.ordered",
           [&](Operation &op) {
             return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
           },
@@ -174,7 +170,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitBroadcast(op);
                         })) ||
-      failed(addHandler(registry, "intent_plan.unary",
+      failed(addHandler(registry, "intent.unary",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
                             return success();
@@ -335,6 +331,40 @@ LogicalResult ProgramMaterializer::emitExtract(Operation &operation) {
   if (found == valueNames.end())
     return operation.emitOpError("record field has no emitted Triton SSA value");
   bindResult(operation, 0, found->second);
+  return success();
+}
+
+LogicalResult ProgramMaterializer::emitRegionEnd(Operation &operation) {
+  if (operation.getNumOperands() != 1 || operation.getNumResults() != 1 ||
+      !operation.getResult(0).getType().isIntOrIndex())
+    return operation.emitOpError("lacks a mechanical Triton region-end binding");
+  FailureOr<plan::AxisOp> axis = resolveAxis(operation.getOperand(0), operation);
+  if (failed(axis))
+    return failure();
+  std::string extent = axisDimensions.lookup(axis->getNode());
+  if (extent.empty())
+    return operation.emitOpError("has no planned logical extent for region end");
+  std::string expression = extent;
+  if (isa<intent::RegionType>(operation.getOperand(0).getType())) {
+    if (axis->hasRole("parallel") && !axis->isScalar()) {
+      std::string block = programBlocks.lookup(axis->getNode());
+      if (block.empty())
+        return operation.emitOpError(
+            "has no planned program block for parallel region end");
+      expression = "tl.minimum((" + block + " + 1) * " +
+                   axis->getTile().str() + ", " + extent + ")";
+    } else if (axis->hasRole("ordered")) {
+      const target::lowering::RangeBinding *range =
+          axis->getRange("traversal", 0);
+      std::string start = axisIndices.lookup(axis->getNode());
+      if (!range || start.empty())
+        return operation.emitOpError(
+            "has no planned ordered range for region end");
+      expression = "tl.minimum((" + start + ") + " + range->getTile().str() +
+                   ", " + extent + ")";
+    }
+  }
+  bindResult(operation, 0, expression);
   return success();
 }
 
@@ -623,9 +653,8 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
       operation.getNumOperands() > 0
           ? target::expandDomainSource(operation.getOperand(0), operation)
           : FailureOr<SmallVector<Operation *>>(failure());
-  bool ordered = operation.getName().getStringRef() == "intent.ordered";
   if (failed(node) || failed(domains) || domains->empty() ||
-      (!ordered && domains->size() != 1) || operation.getNumRegions() != 1 ||
+      operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical Triton sequential loop");
   Block &body = operation.getRegion(0).front();
@@ -649,14 +678,14 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     FailureOr<int64_t> domainNode =
         target::getNodeID(*domain, "ordered traversal range");
     bool raggedAxis =
-        domain->getName().getStringRef() == "intent.ragged_member";
+        ::intent::target::semanticOperationName(*domain) == "intent.ragged_member";
     auto rangeValue = [&](unsigned operand) -> FailureOr<std::string> {
       Operation *definition = domain->getOperand(operand).getDefiningOp();
       auto literal = definition
                          ? definition->getAttrOfType<IntegerAttr>("intent.value")
                          : IntegerAttr();
       if (definition &&
-          definition->getName().getStringRef() == "intent.constant" && literal)
+          ::intent::target::semanticOperationName(*definition) == "intent.constant" && literal)
         return std::to_string(literal.getInt());
       auto found = valueNames.find(domain->getOperand(operand));
       if (found == valueNames.end()) {
@@ -669,13 +698,13 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     FailureOr<std::string> stop = failure();
     FailureOr<std::string> step = std::string("1");
     ABIView *raggedIndices = nullptr;
-    if (domain->getName().getStringRef() == "intent.domain" &&
+    if (::intent::target::semanticOperationName(*domain) == "intent.domain" &&
         domain->getNumOperands() >= 2) {
       start = rangeValue(0);
       stop = rangeValue(1);
       if (domain->getNumOperands() == 3)
         step = rangeValue(2);
-    } else if (ordered && raggedAxis && succeeded(domainNode)) {
+    } else if (raggedAxis && succeeded(domainNode)) {
       FailureOr<plan::RaggedOp> relation =
           target::lowering::uniqueRaggedRelation(planIndex, *domainNode,
                                                   operation);
@@ -707,19 +736,17 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     }
     if (failed(start) || failed(stop) || failed(step))
       return failure();
-    if (ordered && ((!raggedAxis && *start != "0") || *step != "1"))
-      return operation.emitOpError(
-          "Triton ordered traversal requires a zero-based unit-step domain");
     std::string iterator = makeRegionArgumentName(operation, index);
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
     const target::lowering::RangeBinding *outer =
-        ordered && axis ? axis.getRange("traversal", 0) : nullptr;
+        axis ? axis.getRange("traversal", 0) : nullptr;
     const target::lowering::RangeBinding *inner =
-        ordered && axis ? axis.getRange("traversal", 1) : nullptr;
+        axis ? axis.getRange("traversal", 1) : nullptr;
     if (inner) {
-      if (!outer || inner->getTileRole() != "one")
+      if (!outer || inner->getTileRole() != "one" ||
+          (!raggedAxis && *start != "0") || *step != "1")
         return operation.emitOpError(
             "has an invalid two-level Triton ordered traversal");
       std::string chunk = iterator + "_chunk";
@@ -760,14 +787,13 @@ LogicalResult ProgramMaterializer::leaveFor(Operation &operation) {
   if (failed(domains) || domains->empty())
     return failure();
   unsigned depth = 0;
-  bool ordered = operation.getName().getStringRef() == "intent.ordered";
   for (Operation *domain : *domains) {
     FailureOr<int64_t> domainNode =
         target::getNodeID(*domain, "ordered traversal range");
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
-    depth += ordered && axis && axis.getRange("traversal", 1) ? 2 : 1;
+    depth += axis && axis.getRange("traversal", 1) ? 2 : 1;
   }
   indentation -= depth;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
@@ -848,8 +874,8 @@ LogicalResult ProgramMaterializer::emitYield(Operation &operation) {
   Operation *owner = operation.getParentOp();
   if (!owner)
     return operation.emitOpError("has no structured-control owner");
-  StringRef name = owner->getName().getStringRef();
-  if (name == "intent.for" || name == "intent.ordered") {
+  StringRef name = ::intent::target::semanticOperationName(*owner);
+  if (name == "intent.for") {
     auto carriers = loopCarriers.find(owner);
     if (carriers == loopCarriers.end() ||
         carriers->second.size() != operation.getNumOperands())
@@ -2067,6 +2093,10 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "gather emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  auto formAttr = binding
+                      ? binding.operation->getAttrOfType<StringAttr>(gatherFormAttr)
+                      : StringAttr();
+  StringRef form = formAttr ? formAttr.getValue() : StringRef();
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   auto validIndex =
@@ -2074,7 +2104,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
   bool scalarFragmentGather =
-      binding && binding.getLowering() == "tl.indirect_gather" &&
+      form == "scalar_fragment" &&
       isa<RankedTensorType>(operation.getOperand(0).getType()) &&
       !isa<RankedTensorType>(operation.getResult(0).getType()) &&
       succeeded(relation) && relation->size() == 1 &&
@@ -2128,7 +2158,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (binding && binding.getLowering() == "tl.extract_first_scalar" &&
+  if (form == "extract_first_scalar" &&
       succeeded(relation) && relation->size() == 1 &&
       (*relation)[0].kind == "static_index") {
     FailureOr<StringRef> source = lookupValue(operation, 0);
@@ -2140,12 +2170,14 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!planIndex.stages.empty() && binding &&
-      binding.getLowering() == "tl.indirect_gather") {
+  if (form == "staged_deferred" || form == "staged_vector") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view) || failed(relation))
       return failure();
-    if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
+    if (form == "staged_deferred") {
+      if (!binding.getDefer() || (*view)->tensor.getRank() != 2)
+        return operation.emitOpError(
+            "has an inconsistent deferred Triton gather form");
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
@@ -2184,7 +2216,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
   if (failed(node) || !binding || failed(relation) || failed(valid) ||
       failed(fill))
     return operation.emitOpError("lacks a mechanical Triton gather binding");
-  if (binding.getLowering() == "tl.indirect_gather" &&
+  if (form == "view_indirect" &&
       isa<intent::ViewType>(operation.getOperand(0).getType())) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     FailureOr<std::string> pointer =
@@ -2200,7 +2232,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     return success();
   }
   FailureOr<StringRef> source = lookupValue(operation, 0);
-  bool expand = binding.getLowering() == "expand_dims" &&
+  bool expand = form == "expand_dims" &&
                 llvm::any_of(*relation, [](const target::IndexTerm &term) {
                   return term.kind == "new_axis";
                 }) &&
@@ -2276,7 +2308,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical Triton stream binding");
   Block &body = operation.getRegion(0).front();
-  bool hasStop = static_cast<bool>(binding.getStopNodeAttr());
+  bool hasStop = static_cast<bool>(binding.getStopValueAttr());
   bool hasRuntimeExtent = static_cast<bool>(
       operation.getAttrOfType<IntegerAttr>("intent.extent_operand_index"));
   if (operation.getNumOperands() !=
@@ -2334,30 +2366,21 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
     int64_t expectedStop = operation.getNumResults() + 1 +
                            (hasRuntimeExtent ? 1 : 0);
-    auto stop = kernel.nodes.find(binding.getStopNodeAttr().getInt());
-    Operation *stopOperation =
-        stop == kernel.nodes.end() ? nullptr : stop->second;
     if (!stopIndex || stopIndex.getInt() != expectedStop ||
-        !stopOperation ||
-        stopOperation->getName().getStringRef() != "intent.region_end" ||
-        stopOperation->getNumOperands() != 1 ||
-        operation.getOperand(stopIndex.getInt()).getDefiningOp() != stopOperation)
+        !binding.getStopValueAttr())
       return operation.emitOpError(
           "does not match its planned logical stream stop");
-    FailureOr<plan::AxisOp> stopAxis =
-        resolveAxis(stopOperation->getOperand(0), operation);
-    if (failed(stopAxis))
-      return failure();
-    if (stopAxis->hasRole("parallel") && !stopAxis->isScalar()) {
-      std::string block = programBlocks.lookup(stopAxis->getNode());
-      if (block.empty())
-        return stopAxis->emitOpError("has no physical program block index");
-      streamExtent = "tl.minimum((" + block + " + 1) * " +
-                     stopAxis->getTile().str() + ", " + streamExtent + ")";
-    } else if (stopAxis->getNode() != binding.getAxisNode()) {
+    Value stopValue = operation.getOperand(stopIndex.getInt());
+    auto valueID = kernel.valueIDs.find(stopValue);
+    FailureOr<StringRef> stop = lookupValue(operation, stopIndex.getInt());
+    if (valueID == kernel.valueIDs.end() ||
+        valueID->second != binding.getStopValueAttr().getInt())
       return operation.emitOpError(
-          "has no Triton spelling for its planned logical stream stop");
-    }
+          "does not consume the planned logical stream stop value");
+    if (failed(stop))
+      return failure();
+    streamExtent = "tl.maximum(0, tl.minimum(" + stop->str() + ", " +
+                   streamExtent + "))";
   }
   std::string block = "stream_block_" + std::to_string(*node);
   std::string offsets = "stream_axis_index_" + std::to_string(*node);
@@ -2394,7 +2417,7 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
       outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
     return operation.emitOpError("has no active Triton stream state");
   Operation &terminator = operation.getRegion(0).front().back();
-  if (terminator.getName().getStringRef() != "intent.yield" ||
+  if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
       terminator.getNumOperands() != operation.getNumResults())
     return operation.emitOpError("does not yield every Triton stream state");
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
@@ -2423,10 +2446,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       succeeded(node) ? planIndex.contracts.lookup(*node) : plan::ContractOp();
   if (failed(node) || !binding || binding.getLowering() != "tl.dot")
     return operation.emitOpError("lacks a Triton contraction binding");
+  StringRef form = binding.getForm();
   if (operation.getNumOperands() != 2)
     return operation.emitOpError("Triton contraction requires two operands");
   FailureOr<target::lowering::ContractionOrientation> orientation =
-      target::lowering::contractionOrientation(operation);
+      target::lowering::selectedContractionOrientation(binding);
   if (failed(orientation))
     return failure();
   auto resultTensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
@@ -2440,22 +2464,23 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   };
   Type lhsElement = operandElementType(operation.getOperand(0));
   Type rhsElement = operandElementType(operation.getOperand(1));
-  if (!planIndex.stages.empty()) {
-    if (orientation->batched)
-      return operation.emitOpError(
-          "Triton staged batch contraction is not supported");
+  if (form == "staged") {
     if (activeStages.size() != 1)
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");
     unsigned stage = activeStages.front();
+    if ((binding.getLhsForm() != "member_row_gather" &&
+         binding.getLhsForm() != "workspace") ||
+        binding.getRhsForm() != "expert_matrix")
+      return operation.emitOpError(
+          "has no selected Triton staged operand forms");
     Operation *lhsAccess = deferredLoads.lookup(operation.getOperand(0));
     Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
     FailureOr<ABIView *> rhsView =
         rhsLoad && rhsLoad->getNumOperands() > 0
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
-    if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        orientation->lhsTranspose)
+    if (!rhsLoad || failed(rhsView))
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
@@ -2482,8 +2507,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
          addressIndex("tl.arange(0, " + reductionTile + ")"));
 
     std::string lhs;
-    if (lhsAccess) {
-      if (lhsAccess->getName().getStringRef() != "intent.gather")
+    if (binding.getLhsForm() == "member_row_gather") {
+      if (!lhsAccess)
+        return operation.emitOpError(
+            "selected staged row-gather input is not deferred");
+      if (::intent::target::semanticOperationName(*lhsAccess) != "intent.gather")
         return lhsAccess->emitOpError(
             "is not a staged indirect contraction input");
       FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -2545,21 +2573,21 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     return success();
   }
   auto replay = deferredContractReplays.find(&operation);
-  if (replay != deferredContractReplays.end()) {
-    if (orientation->batched)
+  if (form == "replay") {
+    if (replay == deferredContractReplays.end())
       return operation.emitOpError(
-          "deferred producer replay does not support batch contraction");
-    FailureOr<plan::AxisOp> reductionAxis =
-        target::lowering::contractionReductionAxis(
-            planIndex, replay->second.lhs.transfers,
-            replay->second.rhs.transfers, operation);
+          "Triton replay form has no physical producer slice");
+    std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+    plan::AxisOp reductionAxis =
+        reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
     FailureOr<std::string> resultShape = emitTensorShape(operation, 0);
-    if (failed(reductionAxis) || failed(resultShape))
-      return failure();
-    std::string reductionRole = reductionAxis->getRole().str();
-    std::string reductionTile = reductionAxis->getTile().str();
+    if (!reductionAxis || failed(resultShape))
+      return operation.emitOpError(
+          "replay form has no selected Triton reduction axis");
+    std::string reductionRole = reductionAxis.getRole().str();
+    std::string reductionTile = reductionAxis.getTile().str();
     bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
-        planIndex, operation, reductionAxis->getNode());
+        planIndex, operation, reductionAxis.getNode());
     std::string result = makeResultName(operation, 0);
     std::string reductionOffset = "offs_" + reductionRole;
     line(result + " = tl.zeros(" + *resultShape + ", dtype=" +
@@ -2571,8 +2599,8 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       line(reductionOffset + " = " + addressIndex("reduction_block") + " * " +
            reductionTile + " + " +
            addressIndex("tl.arange(0, " + reductionTile + ")"));
-      axisIndices[reductionAxis->getNode()] = reductionOffset;
-    } else if (axisIndices.lookup(reductionAxis->getNode()).empty()) {
+      axisIndices[reductionAxis.getNode()] = reductionOffset;
+    } else if (axisIndices.lookup(reductionAxis.getNode()).empty()) {
       return operation.emitOpError(
           "has no active Triton stream-bound reduction range");
     }
@@ -2631,7 +2659,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   }
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
-  if (!lhsLoad && !rhsLoad) {
+  if (form == "direct") {
+    if (lhsLoad || rhsLoad)
+      return operation.emitOpError(
+          "Triton direct contraction unexpectedly owns deferred operands");
     FailureOr<StringRef> lhs = lookupValue(operation, 0);
     FailureOr<StringRef> rhs = lookupValue(operation, 1);
     if (failed(lhs) || failed(rhs))
@@ -2652,7 +2683,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (static_cast<bool>(lhsLoad) != static_cast<bool>(rhsLoad)) {
+  if (form == "deferred_one") {
+    if (static_cast<bool>(lhsLoad) == static_cast<bool>(rhsLoad))
+      return operation.emitOpError(
+          "Triton one-sided deferred form does not own exactly one deferred operand");
     Operation *load = lhsLoad ? lhsLoad : rhsLoad;
     unsigned loadOperand = lhsLoad ? 0 : 1;
     unsigned directOperand = lhsLoad ? 1 : 0;
@@ -2664,14 +2698,15 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         binding.getAccumulatorSpace() != "private_fragment")
       return operation.emitOpError(
           "one-sided deferred Triton contraction has inconsistent plan spaces");
-    FailureOr<plan::AxisOp> reductionAxis =
-        target::lowering::exactContractionReductionAxis(planIndex, kernel,
-                                                        operation);
-    if (failed(reductionAxis))
-      return failure();
+    std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+    plan::AxisOp reductionAxis =
+        reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
+    if (!reductionAxis)
+      return operation.emitOpError(
+          "one-sided deferred Triton form has no selected reduction axis");
     if (!target::lowering::isEnclosingStreamReductionAxis(
-            planIndex, operation, reductionAxis->getNode()) ||
-        axisIndices.lookup(reductionAxis->getNode()).empty())
+            planIndex, operation, reductionAxis.getNode()) ||
+        axisIndices.lookup(reductionAxis.getNode()).empty())
       return operation.emitOpError(
           "one-sided deferred Triton contraction requires an active "
           "stream-bound reduction range");
@@ -2698,24 +2733,29 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (orientation->batched)
-    return operation.emitOpError(
-        "deferred Triton batch contraction is not supported");
+  if (form != "deferred_two" || !lhsLoad || !rhsLoad)
+    return operation.emitOpError("has an inconsistent Triton contraction form");
   FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
   FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-  FailureOr<target::lowering::ContractionAxes> axes =
-      target::lowering::contractionAxes(planIndex, *lhsLoad, *rhsLoad,
-                                        operation);
-  if (failed(lhsView) || failed(rhsView) || failed(axes))
+  std::optional<int64_t> lhsAxisNode = binding.getLhsResultAxisNode();
+  std::optional<int64_t> rhsAxisNode = binding.getRhsResultAxisNode();
+  std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+  plan::AxisOp lhsResult =
+      lhsAxisNode ? planIndex.axes.lookup(*lhsAxisNode) : plan::AxisOp();
+  plan::AxisOp rhsResult =
+      rhsAxisNode ? planIndex.axes.lookup(*rhsAxisNode) : plan::AxisOp();
+  plan::AxisOp reductionAxis =
+      reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
+  if (failed(lhsView) || failed(rhsView) || !lhsResult || !rhsResult ||
+      !reductionAxis)
     return failure();
 
-  plan::AxisOp reductionAxis = axes->reduction;
   std::string reductionRole = reductionAxis.getRole().str();
   std::string reductionTile = reductionAxis.getTile().str();
   bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
       planIndex, operation, reductionAxis.getNode());
-  FailureOr<std::string> lhsTile = physicalAxisTile(axes->lhsResult);
-  FailureOr<std::string> rhsTile = physicalAxisTile(axes->rhsResult);
+  FailureOr<std::string> lhsTile = physicalAxisTile(lhsResult);
+  FailureOr<std::string> rhsTile = physicalAxisTile(rhsResult);
   if (failed(lhsTile) || failed(rhsTile))
     return failure();
   std::string reductionOffset = "offs_" + reductionRole;
@@ -2772,6 +2812,9 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
       operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
       target::lowering::isPlannedStageNode(planIndex, &operation))
     return operation.emitOpError("lacks a Triton scaled-contraction binding");
+  if (binding.getForm() != "scaled_direct")
+    return operation.emitOpError(
+        "has no realized direct Triton scaled-contraction form");
   for (Value operand : operation.getOperands())
     if (deferredLoads.count(operand))
       return operation.emitOpError(
@@ -2801,11 +2844,13 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
       failed(lhs) || failed(rhs) || failed(lhsScale) || failed(rhsScale))
     return operation.emitOpError(
         "Triton scaled contraction requires matching K-group size 32");
-  auto lhsType = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
-  auto rhsType = dyn_cast<RankedTensorType>(operation.getOperand(1).getType());
+  StringRef layout = binding.getScaledLayout();
+  if (layout != "grouped_rank_two" && layout != "flattened_rank_three")
+    return operation.emitOpError(
+        "has no selected Triton scaled-contraction layout");
   std::string lhsExpression = lhs->str();
   std::string rhsExpression = rhs->str();
-  if (lhsType && rhsType && lhsType.getRank() == 3 && rhsType.getRank() == 3) {
+  if (layout == "flattened_rank_three") {
     lhsExpression += ".reshape((" + lhs->str() + ".shape[0], " + lhs->str() +
                      ".shape[1] * " + lhs->str() + ".shape[2]))";
     rhsExpression += ".reshape((" + rhs->str() + ".shape[0] * " + rhs->str() +
@@ -2823,7 +2868,7 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
   ++indentation;
   std::string groupedLhs = lhs->str();
   std::string groupedRhs = rhs->str();
-  if (lhsType && rhsType && lhsType.getRank() == 2 && rhsType.getRank() == 2) {
+  if (layout == "grouped_rank_two") {
     groupedLhs += ".reshape((" + lhs->str() + ".shape[0], " + lhsScale->str() +
                   ".shape[1], 32))";
     groupedRhs += ".reshape((" + rhsScale->str() + ".shape[0], 32, " +

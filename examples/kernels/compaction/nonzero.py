@@ -15,7 +15,7 @@ def compact_nonzero_rows(
     M, N = values.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        for column in I.ordered(columns):
+        for column in columns:
             indices[row, column] = -1
         flags = I.cast(values[row, columns] != 0.0, I.i32)
         inclusive = I.scan(
@@ -26,7 +26,7 @@ def compact_nonzero_rows(
             inclusive=True,
             acc_dtype=I.i32,
         )
-        for column in I.ordered(columns):
+        for column in columns:
             if flags[column] != 0:
                 indices[row, inclusive[column] - 1] = I.cast(column, I.i32)
         counts[row] = inclusive[N - 1]

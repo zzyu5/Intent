@@ -21,16 +21,13 @@ def csr_spmm(
     for row in I.parallel(I.domain(0, ROWS)):
         start = row_offsets[row]
         stop = row_offsets[row + 1]
-        for feature_region in I.parallel(
-            I.partition(features, extent=I.auto("N_TILE"))
-        ):
-            accumulation = I.zeros((feature_region,), dtype=I.f32)
-            for nonzero in range(start, stop):
-                I.assume_in_bounds(nonzero, column_indices, axis=0)
-                I.assume_in_bounds(nonzero, values, axis=0)
-                column = column_indices[nonzero]
-                I.assume_in_bounds(column, dense, axis=0)
-                accumulation = accumulation + (
-                    values[nonzero] * dense[column, feature_region]
-                )
-            output[row, feature_region] = accumulation
+        accumulation = I.zeros((features,), dtype=I.f32)
+        for nonzero in range(start, stop):
+            I.assume_in_bounds(nonzero, column_indices, axis=0)
+            I.assume_in_bounds(nonzero, values, axis=0)
+            column = column_indices[nonzero]
+            I.assume_in_bounds(column, dense, axis=0)
+            accumulation = accumulation + (
+                values[nonzero] * dense[column, features]
+            )
+        output[row, features] = accumulation

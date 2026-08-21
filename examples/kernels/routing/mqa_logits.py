@@ -24,33 +24,30 @@ def fp8_mqa_logits(
     reduction_axis = I.domain(0, D)
     key_axis = I.domain(0, K)
     for query in I.parallel(I.domain(0, Q)):
-        for key_region in I.parallel(
-            I.partition(key_axis, extent=I.auto("K_TILE"))
-        ):
-            head_logits = I.contract(
-                q[query, head_axis, reduction_axis],
-                kv[key_region, reduction_axis],
-                reduce=((1, 1),),
-                acc_dtype=I.f32,
-            )
-            weighted = I.maximum(head_logits, 0.0) * head_weight[
-                query, head_axis, None
-            ]
-            logits = I.reduce.sum(
-                weighted,
-                axis=0,
-                identity=0.0,
-            ) * kv_scale[key_region]
-            key_index = I.indices(key_region)
-            begin = I.cast(key_start[query], I.index)
-            end = I.cast(key_end[query], I.index)
-            valid = (
-                key_index >= begin
-            ) and (
-                key_index < end
-            )
-            output[query, key_region] = I.mask(
-                logits,
-                valid=valid,
-                fill=-I.inf,
-            )
+        head_logits = I.contract(
+            q[query, head_axis, reduction_axis],
+            kv[key_axis, reduction_axis],
+            reduce=((1, 1),),
+            acc_dtype=I.f32,
+        )
+        weighted = I.maximum(head_logits, 0.0) * head_weight[
+            query, head_axis, None
+        ]
+        logits = I.reduce.sum(
+            weighted,
+            axis=0,
+            identity=0.0,
+        ) * kv_scale[key_axis]
+        key_index = I.indices(key_axis)
+        begin = I.cast(key_start[query], I.index)
+        end = I.cast(key_end[query], I.index)
+        valid = (
+            key_index >= begin
+        ) and (
+            key_index < end
+        )
+        output[query, key_axis] = I.mask(
+            logits,
+            valid=valid,
+            fill=-I.inf,
+        )

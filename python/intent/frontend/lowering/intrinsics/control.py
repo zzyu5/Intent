@@ -42,7 +42,6 @@ def lower_control_intrinsic(
         "domain": _domain,
         "partition": _partition,
         "parallel": _parallel,
-        "ordered": _ordered,
         "state_stream": _state_stream,
         "indices": _indices,
         "end": _region_end,
@@ -108,37 +107,33 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         relation = "domain"
     region_type = RegionType(source.type.rank, relation)
     operands = [source]
-    attributes: dict[str, object]
     expression = lowerer.lower_expression(bound["extent"])
     mode = PartitionMode.EXTENT
-    attributes = {"mode": mode}
-    if isinstance(expression, AutoExtent):
-        attributes["extent"] = expression
-    else:
-        known, value = compile_time_value(expression)
-        if (
-            not known
-            or isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-        ):
-            lowerer.error(
-                bound["extent"],
-                "partition extent must be a positive compile-time integer or I.auto(...)",
-            )
-        operands.append(
-            lowerer.materialize(
-                Literal(value),
-                bound["extent"],
-                ScalarType(intent_index),
-            )
+    known, value = compile_time_value(expression)
+    if (
+        not known
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+    ):
+        lowerer.error(
+            bound["extent"],
+            "partition extent must be a positive source-visible compile-time integer; "
+            "I.auto(...) is reserved for segment-parametric structured operations",
         )
+    operands.append(
+        lowerer.materialize(
+            Literal(value),
+            bound["extent"],
+            ScalarType(intent_index),
+        )
+    )
     operation = lowerer.emit(
         OperationKind.PARTITION,
         lowerer.location(node),
         operands=tuple(operands),
         result_types=(PartitionType(mode, region_type),),
-        attributes=attributes,
+        attributes={"mode": mode},
     )
     return operation.results[0]
 
@@ -146,11 +141,6 @@ def _partition(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 def _parallel(lowerer: FunctionLowerer, node: ast.Call) -> IterationSpec:
     source = _iteration_source(lowerer, node)
     return IterationSpec(OperationKind.PARALLEL, source)
-
-
-def _ordered(lowerer: FunctionLowerer, node: ast.Call) -> IterationSpec:
-    source = _iteration_source(lowerer, node)
-    return IterationSpec(OperationKind.ORDERED, source)
 
 
 def _iteration_source(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:

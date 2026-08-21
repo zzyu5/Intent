@@ -19,19 +19,13 @@ def linear_logits_chunk(
     rows = I.domain(0, M)
     vocabulary = I.domain(0, V)
     reduction = I.domain(0, K)
-    for row_region in I.parallel(
-        I.partition(rows, extent=I.auto("M_TILE"))
-    ):
-        for vocabulary_region in I.parallel(
-            I.partition(vocabulary, extent=I.auto("N_TILE"))
-        ):
-            value = I.contract(
-                hidden[row_region, reduction],
-                weight[vocabulary_region, reduction],
-                reduce=((1, 1),),
-                acc_dtype=I.f32,
-            )
-            logits[row_region, vocabulary_region] = I.cast(value, I.bf16)
+    value = I.contract(
+        hidden[rows, reduction],
+        weight[vocabulary, reduction],
+        reduce=((1, 1),),
+        acc_dtype=I.f32,
+    )
+    logits[rows, vocabulary] = I.cast(value, I.bf16)
 
 
 @intent.kernel

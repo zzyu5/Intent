@@ -2,6 +2,7 @@
 #include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
 #include "Intent/Target/TileLang/Lowering/Passes.h"
 #include "llvm/ADT/STLExtras.h"
@@ -53,7 +54,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       index.blockExtents[value.getLogicalExtent()] = binding;
     } else if (auto value = dyn_cast<intent::plan::BufferOp>(operation)) {
       Operation *buffer = kernel.nodes.lookup(value.getNode());
-      if (!buffer || buffer->getName().getStringRef() != "intent.buffer" ||
+      if (!buffer || ::intent::target::semanticOperationName(*buffer) != "intent.buffer" ||
           (value.getSpace() != "private_scalar_array" &&
            value.getSpace() != "private_vector" &&
            value.getSpace() != "private_workspace"))
@@ -74,12 +75,16 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     } else if (auto value = dyn_cast<intent::plan::ContractOp>(operation)) {
       plan::ContractOp binding;
       binding.operation = value;
-      Operation *contract = kernel.nodes.lookup(value.getNode());
-      binding.lowering =
-          contract && contract->getName().getStringRef() ==
-                          "intent.scaled_contract"
-              ? syntax::scaledContraction().str()
-              : syntax::contraction().str();
+      auto lowering = value->getAttrOfType<StringAttr>(contractLoweringAttr);
+      auto orientation =
+          value->getAttrOfType<StringAttr>(contractOrientationAttr);
+      auto batched = value->getAttrOfType<BoolAttr>(contractBatchedAttr);
+      auto layout = value->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
+      if (!lowering || !orientation || !batched ||
+          (value.getForm() == "scaled_direct" && !layout))
+        return value.emitOpError(
+            "has no realized TileLang contraction provider form");
+      binding.lowering = lowering.getValue().str();
       binding.lhsSpace = syntax::bufferSpace(value.getLhsSpace()).str();
       binding.rhsSpace = syntax::bufferSpace(value.getRhsSpace()).str();
       binding.accumulatorSpace =
@@ -89,6 +94,10 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
         value.emitOpError("has no TileLang contraction residency spelling");
         return failure();
       }
+      binding.orientation = orientation.getValue().str();
+      binding.batched = batched.getValue();
+      if (layout)
+        binding.scaledLayout = layout.getValue().str();
       index.contracts[value.getNode()] = binding;
     } else if (auto value = dyn_cast<intent::plan::SparseContractOp>(operation)) {
       if (value.getFormat() != "two_of_four")
@@ -115,59 +124,45 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   if (failed(target::lowering::indexAxisRanges(index, ranges, syntax::tile)) ||
       failed(target::lowering::indexCanonicalStructure(index, kernel)))
     return failure();
+  for (plan::RaggedOp &ragged : index.ragged) {
+    auto route = ragged.operation
+                     ? ragged.operation->getAttrOfType<StringAttr>(raggedRouteAttr)
+                     : StringAttr();
+    if (!route)
+      return physicalProgram.emitOpError(
+          "has no realized TileLang ragged-route form");
+    ragged.route = route.getValue().str();
+  }
   target::lowering::indexAxisRoles(index);
   for (auto &entry : index.streams) {
     plan::StreamOp &binding = entry.second;
-    plan::AxisOp axis = index.axes.lookup(binding.getAxisNode());
-    const target::lowering::RangeBinding *traversal =
-        axis ? axis.getRange(binding.getRangePurpose(), binding.getRangeLevel())
-             : nullptr;
-    FailureOr<std::string> tile =
-        traversal ? syntax::tile(binding.operation, traversal->getTileRole())
-                  : FailureOr<std::string>(failure());
-    if (failed(tile))
-      return binding.emitOpError("does not bind an ordered physical axis");
-    binding.tile = *tile;
+    auto tile = binding.operation->getAttrOfType<StringAttr>(streamTileAttr);
+    if (!tile)
+      return binding.emitOpError("has no realized TileLang stream-tile spelling");
+    binding.tile = tile.getValue().str();
   }
   index.components = target::lowering::indexPhysicalComponents(index);
   for (intent::plan::ReductionOp value : reductions) {
-    Operation *operation = kernel.nodes.lookup(value.getNode());
-    FailureOr<std::string> role =
-        operation ? target::lowering::reductionRole(*operation)
-                  : FailureOr<std::string>(failure());
-    FailureOr<int64_t> axis =
-        operation ? target::lowering::reductionAxis(*operation)
-                  : FailureOr<int64_t>(failure());
-    if (failed(role) || failed(axis))
-      return value.emitOpError("does not bind a canonical reduction");
-    if (*role == "reduce_generic")
-      return operation->emitOpError(
-          "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced "
-          "by comm_reducer; generic reduction combiners are unsupported");
+    auto lowering = value->getAttrOfType<StringAttr>(reductionLoweringAttr);
+    auto axis = value->getAttrOfType<IntegerAttr>(reductionAxisAttr);
+    if (!lowering || !axis)
+      return value.emitOpError("has no realized TileLang reduction spelling");
     plan::ReductionOp binding;
     binding.operation = value;
-    binding.lowering = syntax::reduction(*role).str();
+    binding.lowering = lowering.getValue().str();
     binding.resultSpace = syntax::bufferSpace(value.getResultSpace()).str();
-    binding.axis = *axis;
+    binding.axis = axis.getInt();
     if (binding.resultSpace.empty())
       return value.emitOpError("has no TileLang reduction residency spelling");
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {
-    Operation *operation = kernel.nodes.lookup(value.getNode());
-    FailureOr<std::string> role =
-        operation ? target::lowering::scanRole(*operation)
-                  : FailureOr<std::string>(failure());
-    if (succeeded(role) && *role == "scan_generic_inclusive")
-      return value.emitOpError(
-          "TileLang 0.1.13 has no mechanically lowerable generic scan "
-          "combiner path; generic scan combiners are unsupported");
-    if (failed(role) || *role != "scan_inclusive_add" ||
-        !index.axes.count(value.getAxisNode()))
-      return value.emitOpError("does not bind a canonical scan");
+    auto lowering = value->getAttrOfType<StringAttr>(scanLoweringAttr);
+    if (!lowering || !index.axes.count(value.getAxisNode()))
+      return value.emitOpError("has no realized TileLang scan spelling");
     plan::ScanOp binding;
     binding.operation = value;
-    binding.lowering = syntax::scan().str();
+    binding.lowering = lowering.getValue().str();
     binding.resultSpace = value.getResultSpace() == "private_workspace"
                               ? "global"
                               : syntax::bufferSpace(value.getResultSpace()).str();
@@ -178,35 +173,26 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     index.scans[value.getNode()] = binding;
   }
   for (intent::plan::PointwiseOp value : pointwise) {
-    Operation *operation = kernel.nodes.lookup(value.getNode());
-    FailureOr<std::string> role =
-        operation ? target::lowering::pointwiseRole(*operation)
-                  : FailureOr<std::string>(failure());
-    auto materialization = value->getAttrOfType<StringAttr>(pointwiseFormAttr);
-    if (!materialization)
-      return value.emitOpError("has no realized TileLang pointwise form");
-    FailureOr<StringRef> lowering =
-        succeeded(role)
-            ? syntax::pointwise(value, *role, materialization.getValue())
-            : FailureOr<StringRef>(failure());
+    auto lowering = value->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
+    auto deferred = value->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
     plan::PointwiseOp binding;
     binding.operation = value;
     binding.resultSpace = syntax::bufferSpace(value.getResultSpace()).str();
-    if (failed(lowering) || binding.resultSpace.empty())
-      return value.emitOpError("does not bind canonical pointwise semantics");
-    binding.lowering = lowering->str();
-    binding.defer = target::lowering::feedsStagedContraction(index, *operation);
+    if (!lowering || !deferred || binding.resultSpace.empty())
+      return value.emitOpError("has no realized TileLang pointwise spelling");
+    binding.lowering = lowering.getValue().str();
+    binding.defer = deferred.getValue();
     index.pointwise[value.getNode()] = binding;
   }
   for (intent::plan::TransferOp value : transfers) {
     Operation *operation = kernel.nodes.lookup(value.getNode());
     bool load = operation &&
-                operation->getName().getStringRef() == "intent.view_load";
+                ::intent::target::semanticOperationName(*operation) == "intent.view_load";
     bool store = operation &&
-                 (operation->getName().getStringRef() == "intent.view_store" ||
-                  operation->getName().getStringRef() == "intent.scatter_unique" ||
-                  operation->getName().getStringRef() == "intent.atomic_add" ||
-                  operation->getName().getStringRef() == "intent.atomic_cas");
+                 (::intent::target::semanticOperationName(*operation) == "intent.view_store" ||
+                  ::intent::target::semanticOperationName(*operation) == "intent.scatter_unique" ||
+                  ::intent::target::semanticOperationName(*operation) == "intent.atomic_add" ||
+                  ::intent::target::semanticOperationName(*operation) == "intent.atomic_cas");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
     auto access = value->getAttrOfType<StringAttr>(accessAttr);
@@ -329,7 +315,7 @@ LogicalResult ProgramMaterializer::preparePrivateWorkspaces() {
       continue;
     Operation *scan = kernel.nodes.lookup(entry.first);
     std::string extent = axisDimensions.lookup(binding.getAxisNode());
-    if (!scan || scan->getName().getStringRef() != "intent.scan" ||
+    if (!scan || ::intent::target::semanticOperationName(*scan) != "intent.scan" ||
         scan->getNumResults() == 0 || extent.empty())
       return binding.emitOpError(
           "does not bind a workspace-backed TileLang scan tensor");
@@ -417,15 +403,19 @@ LogicalResult ProgramMaterializer::indexABI() {
 }
 
 LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
-  programRoot = kernel.nodes.lookup(planIndex.program.getLoopNode());
-  if (!programRoot || programRoot->getName().getStringRef() != "intent.parallel")
-    return planIndex.program.emitOpError("does not bind an intent.parallel op");
+  std::optional<int64_t> rootNode = planIndex.program.getLoopNode();
+  programRoot = rootNode ? kernel.nodes.lookup(*rootNode) : nullptr;
+  if (programRoot &&
+      ::intent::target::semanticOperationName(*programRoot) !=
+          "intent.parallel")
+    return planIndex.program.emitOpError(
+        "binds a non-parallel explicit program root");
   for (auto &entry : planIndex.axesByRole) {
     Operation *domain = kernel.nodes.lookup(entry.getValue().getNode());
     if (!domain ||
-        (domain->getName().getStringRef() != "intent.domain" &&
-         domain->getName().getStringRef() != "intent.ragged_outer" &&
-         domain->getName().getStringRef() != "intent.ragged_member"))
+        (::intent::target::semanticOperationName(*domain) != "intent.domain" &&
+         ::intent::target::semanticOperationName(*domain) != "intent.ragged_outer" &&
+         ::intent::target::semanticOperationName(*domain) != "intent.ragged_member"))
       return entry.getValue().emitOpError("does not bind a logical domain op");
     FailureOr<std::string> dimension = dimensionName(*domain);
     if (failed(dimension))
@@ -455,6 +445,14 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     std::string tile = entry.second.getTile().str();
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
         tile;
+    StringRef dimension = axisDimensions.lookup(entry.second.getNode());
+    auto existing = regionTiles.find(dimension);
+    if (!dimension.empty() && existing != regionTiles.end() &&
+        existing->getValue() != tile)
+      return entry.second.emitOpError(
+          "selects conflicting physical tiles for one logical extent");
+    if (!dimension.empty())
+      regionTiles[dimension] = tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -523,11 +521,12 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
     runtime.binding = ragged;
     runtime.relation = kernel.nodes.lookup(ragged.getNode());
     runtime.outer = kernel.nodes.lookup(ragged.getOuterNode());
-    StringRef outerName = runtime.outer
-                              ? runtime.outer->getName().getStringRef()
-                              : StringRef();
+    StringRef outerName =
+        runtime.outer ? ::intent::target::semanticOperationName(*runtime.outer)
+                      : StringRef();
     if (!runtime.relation ||
-        runtime.relation->getName().getStringRef() != "intent.ragged" ||
+        ::intent::target::semanticOperationName(*runtime.relation) !=
+            "intent.ragged" ||
         (outerName != "intent.ragged_outer" &&
          outerName != "intent.ragged_member") ||
         ragged.getMemberNodes().empty())
@@ -537,7 +536,7 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
       Operation *member = kernel.nodes.lookup(memberNode);
       plan::AxisOp axis = planIndex.axes.lookup(memberNode);
       if (!member ||
-          member->getName().getStringRef() != "intent.ragged_member" || !axis)
+          ::intent::target::semanticOperationName(*member) != "intent.ragged_member" || !axis)
         return ragged.emitOpError(
             "references a non-canonical ragged member domain");
       runtime.members.push_back(member);
@@ -549,7 +548,7 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
                                  : nullptr;
     FailureOr<ABIView *> offsets =
         offsetsLoad &&
-                offsetsLoad->getName().getStringRef() == "intent.view_load" &&
+                ::intent::target::semanticOperationName(*offsetsLoad) == "intent.view_load" &&
                 offsetsLoad->getNumOperands() == 1
             ? lookupView(offsetsLoad->getOperand(0), *runtime.relation)
             : FailureOr<ABIView *>(failure());
@@ -557,11 +556,14 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
       return runtime.relation->emitOpError(
           "requires a canonical rank-one offsets view");
     runtime.offsets = *offsets;
-    if (runtime.relation->getNumOperands() == 4) {
+    if (ragged.getRoute() == "indexed") {
+      if (runtime.relation->getNumOperands() != 4)
+        return runtime.relation->emitOpError(
+            "does not match its selected indexed TileLang ragged route");
       Operation *indicesLoad = runtime.relation->getOperand(3).getDefiningOp();
       FailureOr<ABIView *> indices =
           indicesLoad &&
-                  indicesLoad->getName().getStringRef() == "intent.view_load" &&
+                  ::intent::target::semanticOperationName(*indicesLoad) == "intent.view_load" &&
                   indicesLoad->getNumOperands() == 1
               ? lookupView(indicesLoad->getOperand(0), *runtime.relation)
               : FailureOr<ABIView *>(failure());
@@ -569,7 +571,10 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
         return runtime.relation->emitOpError(
             "requires a canonical rank-one member-index view");
       runtime.indices = *indices;
-    }
+    } else if (ragged.getRoute() != "compact" ||
+               runtime.relation->getNumOperands() != 3)
+      return runtime.relation->emitOpError(
+          "does not match its selected compact TileLang ragged route");
     unsigned position = raggedRuntimes.size();
     raggedRuntimeByRelation[ragged.getNode()] = position;
     raggedRuntimesByAxis[ragged.getOuterNode()].push_back(position);
@@ -587,7 +592,7 @@ LogicalResult ProgramMaterializer::prepareRaggedStages() {
   stageBodies.resize(planIndex.stages.size());
   for (auto [position, stage] : llvm::enumerate(planIndex.stages)) {
     Operation *contract = kernel.nodes.lookup(stage.getNode());
-    if (!contract || contract->getName().getStringRef() != "intent.contract" ||
+    if (!contract || ::intent::target::semanticOperationName(*contract) != "intent.contract" ||
         contract->getNumResults() != 1)
       return stage.emitOpError("does not bind one canonical contraction");
     auto axes = planIndex.stageAxes.find(stage.getNode());
@@ -625,7 +630,7 @@ LogicalResult ProgramMaterializer::prepareRaggedStages() {
     for (int64_t operationNode : stage.getOperations()) {
       Operation *candidate = kernel.nodes.lookup(operationNode);
       if (!candidate ||
-          candidate->getName().getStringRef() != "intent.members")
+          ::intent::target::semanticOperationName(*candidate) != "intent.members")
         continue;
       if (members)
         return stage.emitOpError("contains multiple member enumeration ops");
@@ -1770,9 +1775,9 @@ FailureOr<Operation *> ProgramMaterializer::resolveDomain(Value indexedValue,
     return failure();
   }
   if (Operation *definition = indexedValue.getDefiningOp())
-    if (definition->getName().getStringRef() == "intent.domain" ||
-        definition->getName().getStringRef() == "intent.ragged_outer" ||
-        definition->getName().getStringRef() == "intent.ragged_member")
+    if (::intent::target::semanticOperationName(*definition) == "intent.domain" ||
+        ::intent::target::semanticOperationName(*definition) == "intent.ragged_outer" ||
+        ::intent::target::semanticOperationName(*definition) == "intent.ragged_member")
       return definition;
   consumer.emitOpError("cannot resolve index ownership during TileLang emission");
   return failure();
@@ -1860,7 +1865,7 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
     Operation *definition = current.getDefiningOp();
     if (!definition)
       return finish(failure());
-    StringRef name = definition->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*definition);
     if (name == "intent.constant") {
       if (auto integer =
               definition->getAttrOfType<IntegerAttr>("intent.value"))
@@ -1893,8 +1898,8 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
          name == "intent.cast") &&
         definition->getNumOperands() == 1)
       return finish(self(self, definition->getOperand(0)));
-    if (name == "intent_plan.unary" && definition->getNumOperands() == 1) {
-      auto logical = definition->getAttrOfType<StringAttr>("semantic");
+    if (name == "intent.unary" && definition->getNumOperands() == 1) {
+      auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
       FailureOr<std::string> operand = self(self, definition->getOperand(0));
       if (!logical || logical.getValue() != "negate" || failed(operand))
         return finish(failure());

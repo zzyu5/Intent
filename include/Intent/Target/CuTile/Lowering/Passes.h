@@ -15,6 +15,30 @@ inline constexpr llvm::StringLiteral boundsAttr =
     "intent_plan.cutile.bounds";
 inline constexpr llvm::StringLiteral rowOccupancyAttr =
     "intent_plan.cutile.row_occupancy";
+inline constexpr llvm::StringLiteral contractLoweringAttr =
+    "intent_plan.cutile.contract_lowering";
+inline constexpr llvm::StringLiteral contractOrientationAttr =
+    "intent_plan.cutile.contract_orientation";
+inline constexpr llvm::StringLiteral contractBatchedAttr =
+    "intent_plan.cutile.contract_batched";
+inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
+    "intent_plan.cutile.scaled_contract_layout";
+inline constexpr llvm::StringLiteral reductionLoweringAttr =
+    "intent_plan.cutile.reduction_lowering";
+inline constexpr llvm::StringLiteral reductionAxisAttr =
+    "intent_plan.cutile.reduction_axis";
+inline constexpr llvm::StringLiteral scanLoweringAttr =
+    "intent_plan.cutile.scan_lowering";
+inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
+    "intent_plan.cutile.pointwise_lowering";
+inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
+    "intent_plan.cutile.pointwise_deferred";
+inline constexpr llvm::StringLiteral gatherFormAttr =
+    "intent_plan.cutile.gather_form";
+inline constexpr llvm::StringLiteral streamTileAttr =
+    "intent_plan.cutile.stream_tile";
+inline constexpr llvm::StringLiteral raggedRouteAttr =
+    "intent_plan.cutile.ragged_route";
 inline constexpr llvm::StringLiteral gatherSpellingRole =
     "cutile_gather_spelling";
 

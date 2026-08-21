@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentGPURealization
   Driver/Construct.cpp
   Plan/Build.cpp
   Plan/Decisions.cpp
+  Plan/Operations.cpp
 
   LINK_LIBS PUBLIC
   MLIRFuncDialect

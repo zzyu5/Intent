@@ -1,6 +1,7 @@
 #include "Intent/Target/Common/Realization/KernelFacts.h"
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -39,7 +40,7 @@ std::optional<std::string> literalPadding(Value value);
 std::optional<std::string> semanticLiteralPadding(Value value);
 
 bool isArgmaxLowestReduction(Operation &operation) {
-  if (operation.getName().getStringRef() != "intent.reduce")
+  if (::intent::target::semanticOperationName(operation) != "intent.reduce")
     return false;
   auto builtin =
       operation.getAttrOfType<StringAttr>("intent.combine_builtin");
@@ -60,7 +61,7 @@ bool provePaddedUses(Value value, PaddedValue padded,
   visited[value] = padded;
 
   for (Operation *user : value.getUsers()) {
-    StringRef name = user->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*user);
     if (name == "intent.view_store" || name == "intent.scatter_unique" ||
         name == "intent.scatter_reduce" || name == "intent.atomic_add")
       continue;
@@ -192,7 +193,7 @@ bool proveFill(Value loaded, PaddedValue padded) {
 
 std::optional<std::string> literalPadding(Value value) {
   Operation *definition = value.getDefiningOp();
-  if (!definition || definition->getName().getStringRef() != "intent.constant")
+  if (!definition || ::intent::target::semanticOperationName(*definition) != "intent.constant")
     return std::nullopt;
   Attribute literal = definition->getAttr("intent.value");
   if (value.getType().isInteger(1)) {
@@ -228,7 +229,7 @@ std::optional<std::string> semanticLiteralPadding(Value value) {
   Operation *definition = value.getDefiningOp();
   if (!definition || definition->getNumOperands() != 1)
     return std::nullopt;
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name != "intent.cast" && name != "intent.broadcast" &&
       name != "intent.reshape")
     return std::nullopt;
@@ -246,7 +247,7 @@ std::optional<std::string> inferPadding(
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return std::nullopt;
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.view_load") {
     auto fill = facts.boundaryFills.find(definition);
     return fill == facts.boundaryFills.end()

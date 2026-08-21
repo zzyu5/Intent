@@ -31,39 +31,36 @@ def varlen_aligned_causal_depthwise_conv1d(
         sequence_start = I.cast(sequence_offsets[sequence], I.index)
         token_start = sequence_start + local_chunk * CHUNK_SIZE
         tokens = I.domain(0, CHUNK_SIZE)
-        for channel_region in I.parallel(
-            I.partition(channels, extent=I.auto("FEATURE_TILE"))
-        ):
-            token_indices = token_start + I.indices(tokens)
-            channel_indices = I.indices(channel_region)
-            accumulation = I.zeros((tokens, channel_region), dtype=I.f32)
-            for tap in range(WIDTH):
-                source_index = (
-                    token_indices
-                    - I.cast(WIDTH - 1, I.index)
-                    + I.cast(tap, I.index)
-                )
-                valid = source_index >= sequence_start
-                safe_index = I.maximum(source_index, sequence_start)
-                value = I.gather(
-                    x,
-                    index=(safe_index[:, None], channel_indices[None, :]),
-                )
-                accumulation = accumulation + I.mask(
-                    I.cast(value, I.f32)
-                    * weight[channel_region, tap][None, :],
-                    valid=valid[:, None],
-                    fill=0.0,
-                )
-            accumulation = accumulation + I.cast(
-                bias[channel_region], I.f32
-            )[None, :]
-            sigmoid = 1.0 / (1.0 + I.exp(-accumulation))
-            I.scatter_unique(
-                output,
-                index=(token_indices[:, None], channel_indices[None, :]),
-                value=I.cast(accumulation * sigmoid, I.bf16),
+        token_indices = token_start + I.indices(tokens)
+        channel_indices = I.indices(channels)
+        accumulation = I.zeros((tokens, channels), dtype=I.f32)
+        for tap in range(WIDTH):
+            source_index = (
+                token_indices
+                - I.cast(WIDTH - 1, I.index)
+                + I.cast(tap, I.index)
             )
+            valid = source_index >= sequence_start
+            safe_index = I.maximum(source_index, sequence_start)
+            value = I.gather(
+                x,
+                index=(safe_index[:, None], channel_indices[None, :]),
+            )
+            accumulation = accumulation + I.mask(
+                I.cast(value, I.f32)
+                * weight[channels, tap][None, :],
+                valid=valid[:, None],
+                fill=0.0,
+            )
+        accumulation = accumulation + I.cast(
+            bias[channels], I.f32
+        )[None, :]
+        sigmoid = 1.0 / (1.0 + I.exp(-accumulation))
+        I.scatter_unique(
+            output,
+            index=(token_indices[:, None], channel_indices[None, :]),
+            value=I.cast(accumulation * sigmoid, I.bf16),
+        )
 
 
 @intent.kernel
@@ -80,20 +77,17 @@ def varlen_causal_conv1d_final_state(
         I.assume_in_bounds(next_sequence, sequence_offsets, axis=0)
         sequence_start = I.cast(sequence_offsets[sequence], I.index)
         sequence_end = I.cast(sequence_offsets[next_sequence], I.index)
-        for channel_region in I.parallel(
-            I.partition(channels, extent=I.auto("FEATURE_TILE"))
-        ):
-            channel_indices = I.indices(channel_region)
-            for history in I.parallel(I.domain(0, WIDTH)):
-                source_index = (
-                    sequence_end
-                    - I.cast(WIDTH, I.index)
-                    + I.cast(history, I.index)
-                )
-                values = I.gather(
-                    x,
-                    index=(source_index, channel_indices),
-                    valid=source_index >= sequence_start,
-                    fill=I.cast(0.0, I.bf16),
-                )
-                final_state[sequence, history, channel_region] = values
+        channel_indices = I.indices(channels)
+        for history in I.parallel(I.domain(0, WIDTH)):
+            source_index = (
+                sequence_end
+                - I.cast(WIDTH, I.index)
+                + I.cast(history, I.index)
+            )
+            values = I.gather(
+                x,
+                index=(source_index, channel_indices),
+                valid=source_index >= sequence_start,
+                fill=I.cast(0.0, I.bf16),
+            )
+            final_state[sequence, history, channels] = values

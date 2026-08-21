@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/Plan/IR/PlanOps.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -88,7 +89,7 @@ private:
       bool ragged = false;
       for (Operation *parent = entry.first->getParentOp(); parent;
            parent = parent->getParentOp()) {
-        if (parent->getName().getStringRef() != "intent.parallel" ||
+        if (::intent::target::semanticOperationName(*parent) != "intent.parallel" ||
             parent->getNumOperands() != 1)
           continue;
         auto domains = facts.parallelDomains.find(parent);

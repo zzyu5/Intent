@@ -40,7 +40,6 @@ from .builtins import maximum
 from .builtins import minimum
 from .builtins import members
 from .builtins import mutable_load
-from .builtins import ordered
 from .builtins import parallel
 from .builtins import partition
 from .builtins import ragged
@@ -142,7 +141,6 @@ __all__ = [
     "minimum",
     "members",
     "mutable_load",
-    "ordered",
     "parallel",
     "partition",
     "ragged",

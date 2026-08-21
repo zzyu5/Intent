@@ -426,8 +426,8 @@ LogicalResult verifyRegionTerminator(Operation *operation, Region &region,
 
 LogicalResult verifyStructuredRegions(Operation *operation) {
   StringRef name = operation->getName().getStringRef();
-  if (name == "intent.parallel" || name == "intent.ordered" ||
-      name == "intent.state_stream" || name == "intent.for") {
+  if (name == "intent.parallel" || name == "intent.state_stream" ||
+      name == "intent.for") {
     if (operation->getNumRegions() != 1)
       return operation->emitOpError("requires exactly one structured body");
     return verifyRegionTerminator(operation, operation->getRegion(0),

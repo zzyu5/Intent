@@ -393,7 +393,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
         opcode = OperationKind.FOR
         source = iteration
     else:
-        lowerer.error(node, "for iterator must be domain/partition/I.parallel/I.ordered")
+        lowerer.error(node, "for iterator must be a domain, partition, or I.parallel")
     has_break, has_continue = (
         _loop_exit_kinds(node.body)
         if opcode is OperationKind.FOR
@@ -431,7 +431,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
             node,
             f"parallel body cannot carry outer SSA value {sorted(assigned_existing)[0]!r}",
         )
-    carried_names = tuple(sorted(assigned_existing)) if opcode in (OperationKind.ORDERED, OperationKind.FOR) else ()
+    carried_names = tuple(sorted(assigned_existing)) if opcode is OperationKind.FOR else ()
     initial_values = tuple(
         lowerer.materialize(snapshot[name], node) for name in carried_names
     )

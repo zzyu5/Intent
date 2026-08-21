@@ -20,15 +20,13 @@ def batched_gemm_nn(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-            for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-                accumulator = I.contract(
-                    a[batch, mr, k_axis],
-                    b[batch, k_axis, nr],
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                )
-                c[batch, mr, nr] = I.cast(accumulator, I.bf16)
+        accumulator = I.contract(
+            a[batch, m_axis, k_axis],
+            b[batch, k_axis, n_axis],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel
@@ -43,15 +41,13 @@ def batched_gemm_tn(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-            for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-                accumulator = I.contract(
-                    a[batch, k_axis, mr],
-                    b[batch, k_axis, nr],
-                    reduce=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                c[batch, mr, nr] = I.cast(accumulator, I.bf16)
+        accumulator = I.contract(
+            a[batch, k_axis, m_axis],
+            b[batch, k_axis, n_axis],
+            reduce=((0, 0),),
+            acc_dtype=I.f32,
+        )
+        c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel
@@ -66,15 +62,13 @@ def batched_gemm_nt(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-            for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-                accumulator = I.contract(
-                    a[batch, mr, k_axis],
-                    b[batch, nr, k_axis],
-                    reduce=((1, 1),),
-                    acc_dtype=I.f32,
-                )
-                c[batch, mr, nr] = I.cast(accumulator, I.bf16)
+        accumulator = I.contract(
+            a[batch, m_axis, k_axis],
+            b[batch, n_axis, k_axis],
+            reduce=((1, 1),),
+            acc_dtype=I.f32,
+        )
+        c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel
@@ -89,12 +83,10 @@ def batched_gemm_tt(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, Q)):
-        for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-            for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-                accumulator = I.contract(
-                    a[batch, k_axis, mr],
-                    b[batch, nr, k_axis],
-                    reduce=((0, 1),),
-                    acc_dtype=I.f32,
-                )
-                c[batch, mr, nr] = I.cast(accumulator, I.bf16)
+        accumulator = I.contract(
+            a[batch, k_axis, m_axis],
+            b[batch, n_axis, k_axis],
+            reduce=((0, 1),),
+            acc_dtype=I.f32,
+        )
+        c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)

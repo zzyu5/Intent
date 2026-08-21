@@ -11,7 +11,32 @@ namespace intent::triton::lowering {
 
 inline constexpr llvm::StringLiteral rowLaunchAttr =
     "intent_plan.triton.row_launch";
-
+inline constexpr llvm::StringLiteral contractLoweringAttr =
+    "intent_plan.triton.contract_lowering";
+inline constexpr llvm::StringLiteral contractOrientationAttr =
+    "intent_plan.triton.contract_orientation";
+inline constexpr llvm::StringLiteral contractBatchedAttr =
+    "intent_plan.triton.contract_batched";
+inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
+    "intent_plan.triton.scaled_contract_layout";
+inline constexpr llvm::StringLiteral reductionLoweringAttr =
+    "intent_plan.triton.reduction_lowering";
+inline constexpr llvm::StringLiteral reductionAxisAttr =
+    "intent_plan.triton.reduction_axis";
+inline constexpr llvm::StringLiteral scanLoweringAttr =
+    "intent_plan.triton.scan_lowering";
+inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
+    "intent_plan.triton.pointwise_lowering";
+inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
+    "intent_plan.triton.pointwise_deferred";
+inline constexpr llvm::StringLiteral gatherFormAttr =
+    "intent_plan.triton.gather_form";
+inline constexpr llvm::StringLiteral transferAccessAttr =
+    "intent_plan.triton.transfer_access";
+inline constexpr llvm::StringLiteral streamTileAttr =
+    "intent_plan.triton.stream_tile";
+inline constexpr llvm::StringLiteral raggedRouteAttr =
+    "intent_plan.triton.ragged_route";
 void addProviderPasses(mlir::PassManager &manager);
 mlir::LogicalResult verifyProviderProgram(
     const intent::target::KernelModel &kernel,

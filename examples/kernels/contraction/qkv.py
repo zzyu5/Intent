@@ -26,42 +26,30 @@ def fused_qkv_projection(
     q_columns = I.domain(0, NQ)
     k_columns = I.domain(0, NK)
     v_columns = I.domain(0, NV)
-    for row_region in I.parallel(
-        I.partition(rows, extent=I.auto("M_TILE"))
-    ):
-        for q_region in I.parallel(
-            I.partition(q_columns, extent=I.auto("NQ_TILE"))
-        ):
-            q_output[row_region, q_region] = I.cast(
-                I.contract(
-                    x[row_region, reduction],
-                    q_weight[reduction, q_region],
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                ),
-                I.f16,
-            )
-        for k_region in I.parallel(
-            I.partition(k_columns, extent=I.auto("NK_TILE"))
-        ):
-            k_output[row_region, k_region] = I.cast(
-                I.contract(
-                    x[row_region, reduction],
-                    k_weight[reduction, k_region],
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                ),
-                I.f16,
-            )
-        for v_region in I.parallel(
-            I.partition(v_columns, extent=I.auto("NV_TILE"))
-        ):
-            v_output[row_region, v_region] = I.cast(
-                I.contract(
-                    x[row_region, reduction],
-                    v_weight[reduction, v_region],
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                ),
-                I.f16,
-            )
+    q_output[rows, q_columns] = I.cast(
+        I.contract(
+            x[rows, reduction],
+            q_weight[reduction, q_columns],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        ),
+        I.f16,
+    )
+    k_output[rows, k_columns] = I.cast(
+        I.contract(
+            x[rows, reduction],
+            k_weight[reduction, k_columns],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        ),
+        I.f16,
+    )
+    v_output[rows, v_columns] = I.cast(
+        I.contract(
+            x[rows, reduction],
+            v_weight[reduction, v_columns],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        ),
+        I.f16,
+    )

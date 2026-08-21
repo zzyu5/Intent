@@ -136,10 +136,10 @@ def nested_jagged_mean_pool_identity(
         for feature in I.parallel(I.domain(0, D)):
             document_sum = I.cast(0.0, I.f32)
             document_tokens = I.cast(0, I.i32)
-            for sentence in I.ordered(documents[document]):
+            for sentence in documents[document]:
                 sentence_sum = I.cast(0.0, I.f32)
                 sentence_tokens = I.cast(0, I.i32)
-                for token in I.ordered(sentences[sentence]):
+                for token in sentences[sentence]:
                     sentence_sum = sentence_sum + values[token, feature]
                     sentence_tokens = sentence_tokens + 1
                 sentence_means[sentence, feature] = sentence_sum / I.maximum(
@@ -172,7 +172,7 @@ def nested_sentence_pool(
         for feature in I.parallel(I.domain(0, D)):
             total = I.cast(0.0, I.f32)
             count = I.cast(0, I.i32)
-            for token in I.ordered(sentences[sentence]):
+            for token in sentences[sentence]:
                 total = total + values[token, feature]
                 count = count + 1
             sentence_sums[sentence, feature] = total
@@ -200,7 +200,7 @@ def nested_document_pool(
         for feature in I.parallel(I.domain(0, D)):
             total = I.cast(0.0, I.f32)
             count = I.cast(0, I.i32)
-            for sentence in I.ordered(documents[document]):
+            for sentence in documents[document]:
                 next_sentence = sentence + 1
                 I.assume_in_bounds(sentence, sentence_offsets, axis=0)
                 I.assume_in_bounds(next_sentence, sentence_offsets, axis=0)
@@ -283,7 +283,7 @@ def ordered_prefix_nested(
     columns = I.domain(0, N)
     for batch in I.parallel(I.domain(0, B)):
         prefix = I.cast(0.0, I.f32)
-        for row in I.ordered(rows):
-            for column in I.ordered(columns):
+        for row in rows:
+            for column in columns:
                 prefix = prefix + x[batch, row, column]
                 output[batch, row, column] = prefix

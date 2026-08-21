@@ -19,15 +19,9 @@ def sparse_2to4_gemm(
     rows = I.domain(0, M)
     columns = I.domain(0, N)
     reduction = I.domain(0, K)
-    for row_region in I.parallel(
-        I.partition(rows, extent=I.auto("M_TILE"))
-    ):
-        for column_region in I.parallel(
-            I.partition(columns, extent=I.auto("N_TILE"))
-        ):
-            output[row_region, column_region] = I.sparse_contract_2to4(
-                compressed[row_region, :],
-                metadata[row_region, :],
-                rhs[reduction, column_region],
-                acc_dtype=I.f32,
-            )
+    output[rows, columns] = I.sparse_contract_2to4(
+        compressed[rows, :],
+        metadata[rows, :],
+        rhs[reduction, columns],
+        acc_dtype=I.f32,
+    )

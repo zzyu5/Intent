@@ -1,5 +1,6 @@
 #include "Intent/Target/Common/Analysis/Kernel.h"
 
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -222,13 +223,13 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
 
   for (const auto &entry : model.nodes) {
     Operation *operation = entry.second;
-    StringRef name = operation->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*operation);
     if (name == "intent.ragged") {
       if (operation->getNumResults() != 1)
         return operation->emitOpError("has no canonical ragged result");
       RaggedStructure relation{operation, entry.first, -1, {}};
       for (Operation *user : operation->getResult(0).getUsers()) {
-        StringRef userName = user->getName().getStringRef();
+        StringRef userName = ::intent::target::semanticOperationName(*user);
         if (userName != "intent.ragged_outer" &&
             userName != "intent.ragged_member")
           continue;
@@ -251,7 +252,7 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
                 ? owner->getOperand(0).getDefiningOp()
                 : nullptr;
         if (relation.outerNode < 0 && outer &&
-            outer->getName().getStringRef() == "intent.ragged_member") {
+            ::intent::target::semanticOperationName(*outer) == "intent.ragged_member") {
           FailureOr<int64_t> outerNode =
               getNodeID(*outer, "nested ragged outer analysis");
           if (failed(outerNode))
@@ -276,29 +277,27 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
              : FailureOr<int64_t>(failure());
     if (failed(axisNode))
       return operation->emitOpError("has no canonical state-stream axis");
-    int64_t stopNode = -1;
+    int64_t stopValue = -1;
     if (auto stopIndex = operation->getAttrOfType<IntegerAttr>(
             "intent.stop_operand_index")) {
       int64_t operand = stopIndex.getInt();
-      Operation *stop =
-          operand >= 0 && static_cast<unsigned>(operand) < operation->getNumOperands()
-              ? operation->getOperand(operand).getDefiningOp()
-              : nullptr;
       FailureOr<int64_t> stopID =
-          stop ? getNodeID(*stop, "canonical state-stream stop analysis")
-               : FailureOr<int64_t>(failure());
+          operand >= 0 && static_cast<unsigned>(operand) < operation->getNumOperands()
+              ? getValueID(operation->getOperand(operand), model, *operation,
+                           "canonical state-stream stop analysis")
+              : FailureOr<int64_t>(failure());
       if (failed(stopID))
         return operation->emitOpError("has no canonical logical stream stop");
-      stopNode = *stopID;
+      stopValue = *stopID;
     }
     model.stateStreams[entry.first] =
-        StateStreamStructure{operation, entry.first, *axisNode, stopNode};
+        StateStreamStructure{operation, entry.first, *axisNode, stopValue};
     if (operation->getNumRegions() != 1 ||
         !llvm::hasSingleElement(operation->getRegion(0)))
       return operation->emitOpError(
           "has no canonical single-block state-stream body");
     Operation *terminator = operation->getRegion(0).front().getTerminator();
-    if (!terminator || terminator->getName().getStringRef() != "intent.yield" ||
+    if (!terminator || ::intent::target::semanticOperationName(*terminator) != "intent.yield" ||
         terminator->getNumOperands() != operation->getNumResults() ||
         operation->getNumOperands() < operation->getNumResults() + 1)
       return operation->emitOpError(

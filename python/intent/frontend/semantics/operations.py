@@ -16,7 +16,6 @@ class OperationKind(Enum):
     ASSUME_IN_BOUNDS = "assume_in_bounds"
 
     PARALLEL = "parallel"
-    ORDERED = "ordered"
     STATE_STREAM = "state_stream"
     IF = "if"
     FOR = "for"
@@ -74,7 +73,6 @@ TERMINATORS = {
 
 REGION_OPS = {
     OperationKind.PARALLEL,
-    OperationKind.ORDERED,
     OperationKind.STATE_STREAM,
     OperationKind.IF,
     OperationKind.FOR,
@@ -88,7 +86,6 @@ STRUCTURED_OPS = {
     OperationKind.SCALED_CONTRACT,
     OperationKind.SPARSE_CONTRACT,
     OperationKind.PARALLEL,
-    OperationKind.ORDERED,
     OperationKind.STATE_STREAM,
 }
 

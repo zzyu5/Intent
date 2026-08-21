@@ -68,12 +68,27 @@ LogicalResult runPhysicalProgramPipeline(ModuleOp module,
   manager.enableVerifier(true);
   manager.addPass(createConstructPhysicalProgramPass(device));
   manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createFormAutomaticBlockingPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createReconcileAccessRangesPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefineTransferRealizationPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createFormStagesPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefineContractionRealizationPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefineScanRealizationPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefineValueRealizationPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefinePrivateBufferResidencyPass(device));
   manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefinePersistentTraversalPass());
   manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefineBoundaryNeutralizationPass());
   manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createMaterializeSearchSpacePass());
   return manager.run(module);
 }
 

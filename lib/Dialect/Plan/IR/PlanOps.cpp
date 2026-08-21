@@ -3,6 +3,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -207,7 +208,9 @@ LogicalResult RegionBindingOp::verify() {
 }
 
 LogicalResult LaunchOp::verify() {
-  return requireNode(*this, getLoopNode());
+  if (!getLoopNodeAttr())
+    return success();
+  return requireNode(*this, getLoopNodeAttr().getInt());
 }
 
 LogicalResult BlockExtentOp::verify() {
@@ -357,24 +360,38 @@ LogicalResult PointwiseOp::verify() {
   return success();
 }
 
-LogicalResult UnaryOp::verify() {
+LogicalResult ContractOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
   if (!llvm::is_contained(
-          {StringRef("exp"), StringRef("exp2"), StringRef("log"),
-           StringRef("sin"), StringRef("cos"), StringRef("floor"),
-           StringRef("rsqrt"), StringRef("sigmoid"), StringRef("negate"),
-           StringRef("not")},
-          getSemantic()))
-    return emitOpError() << "contains unsupported unary semantics "
-                         << getSemantic();
-  if (getInput().getType() != getResult().getType())
-    return emitOpError("requires identical input and result types");
-  return success();
-}
-
-LogicalResult ContractOp::verify() {
-  if (failed(requireNode(*this, getNode())))
+          {StringRef("direct"), StringRef("staged"), StringRef("replay"),
+           StringRef("deferred_one"), StringRef("deferred_two"),
+           StringRef("scaled_direct")},
+          getForm()))
+    return emitOpError("contains an unsupported contraction realization form");
+  bool stagedForm = getForm() == "staged";
+  bool validStagedLhs =
+      getLhsForm() == "member_row_gather" || getLhsForm() == "workspace";
+  if ((stagedForm && (!validStagedLhs || getRhsForm() != "expert_matrix")) ||
+      (!stagedForm && (getLhsForm() != "none" || getRhsForm() != "none")))
+    return emitOpError(
+        "does not carry operand forms consistent with its contraction form");
+  bool needsReduction = getForm() == "replay" || getForm() == "deferred_one" ||
+                        getForm() == "deferred_two";
+  bool needsResultAxes = getForm() == "deferred_two";
+  bool hasReduction = static_cast<bool>(getReductionAxisNodeAttr());
+  bool hasLhsResult = static_cast<bool>(getLhsResultAxisNodeAttr());
+  bool hasRhsResult = static_cast<bool>(getRhsResultAxisNodeAttr());
+  if (needsReduction != hasReduction || needsResultAxes != hasLhsResult ||
+      needsResultAxes != hasRhsResult)
+    return emitOpError(
+        "does not carry the physical axes required by its realization form");
+  if ((hasReduction &&
+       failed(requireNode(*this, getReductionAxisNodeAttr().getInt()))) ||
+      (hasLhsResult &&
+       failed(requireNode(*this, getLhsResultAxisNodeAttr().getInt()))) ||
+      (hasRhsResult &&
+       failed(requireNode(*this, getRhsResultAxisNodeAttr().getInt()))))
     return failure();
   auto validOperand = [](StringRef space) {
     return space == "shared" || space == "private_fragment";
@@ -447,6 +464,10 @@ LogicalResult StreamBindingOp::verify() {
     return emitOpError("state streams require a traversal range binding");
   if (getRelationNodeAttr() &&
       failed(requireNode(*this, getRelationNodeAttr().getInt())))
+    return failure();
+  if (getStopValueAttr() &&
+      failed(requireNonNegative(*this, getStopValueAttr().getInt(),
+                                "logical stream stop value ID")))
     return failure();
   return success();
 }
@@ -677,33 +698,42 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   FailureOr<func::FuncOp> physicalEntry = getPhysicalEntry(program);
   if (failed(physicalEntry))
     return failure();
-  llvm::DenseMap<int64_t, PointwiseOp> pointwiseByNode;
-  for (PointwiseOp decision : pointwise)
-    pointwiseByNode[decision.getNode()] = decision;
-  llvm::DenseSet<int64_t> physicalUnaryNodes;
+  llvm::DenseSet<int64_t> physicalOperationNodes;
   WalkResult physicalResult =
       physicalEntry->walk([&](Operation *operation) -> WalkResult {
-        if (operation->getName().getStringRef() == "intent.unary") {
+        StringRef name = operation->getName().getStringRef();
+        if (operation->getName().getDialectNamespace() == "intent") {
           operation->emitOpError(
-              "is residual Kernel IR inside the physical program; expected "
-              "intent_plan.unary");
+              "is residual Kernel IR inside the physical program");
           return WalkResult::interrupt();
         }
-        auto unary = dyn_cast<UnaryOp>(operation);
-        if (!unary)
+        if (!name.starts_with("intent_plan.exec_"))
           return WalkResult::advance();
-        if (!physicalUnaryNodes.insert(unary.getNode()).second) {
-          unary.emitOpError("duplicates a physical unary node");
+        auto source = operation->getAttrOfType<StringAttr>("intent_plan.source_op");
+        constexpr StringLiteral prefix = "intent_plan.exec_";
+        std::string expected =
+            (Twine("intent.") + name.drop_front(prefix.size())).str();
+        if (!source || source.getValue() != expected) {
+          operation->emitOpError(
+              "has no canonical source-operation provenance");
           return WalkResult::interrupt();
         }
-        if (!pointwiseByNode.count(unary.getNode())) {
-          unary.emitOpError("has no pointwise physical decision");
+        auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
+        if (!node || node.getInt() < 0 ||
+            !physicalOperationNodes.insert(node.getInt()).second) {
+          operation->emitOpError(
+              "requires a unique non-negative physical operation node ID");
           return WalkResult::interrupt();
         }
         return WalkResult::advance();
       });
   if (physicalResult.wasInterrupted())
     return failure();
+  for (int64_t operation : operations)
+    if (!physicalOperationNodes.contains(operation))
+      return program.emitOpError()
+             << "has a physical decision for missing executable node "
+             << operation;
   for (RangeOp range : ranges) {
     auto axis = axes.find(range.getAxisNode());
     if (axis == axes.end())

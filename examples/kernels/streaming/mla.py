@@ -87,67 +87,64 @@ def absorbed_mla_prefill(
     key_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                latent_query = q_latent[batch, query_region, head, :]
-                position_query = q_rope[batch, query_region, head, :]
-                stream = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, C), dtype=I.f32),
-                    ),
-                    stop=I.end(query_region),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        latent_block = latent_cache[batch, key_region, :]
-                        content_scores = I.contract(
-                            latent_query,
-                            latent_block,
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        )
-                        position_scores = I.contract(
-                            position_query,
-                            rope_cache[batch, key_region, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        )
-                        scores = (content_scores + position_scores) * (
-                            scale * I.LOG2E
-                        )
-                        valid = I.indices(query_region)[:, None] >= I.indices(
-                            key_region
-                        )[None, :]
-                        scores = I.mask(scores, valid=valid, fill=-I.inf)
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = (
-                            online_attention_accumulate(
-                                maximum,
-                                next_maximum,
-                                denominator,
-                                accumulator,
-                                scores,
-                                latent_block,
-                            )
-                        )
-                        stream.yield_(
+            latent_query = q_latent[batch, query_axis, head, :]
+            position_query = q_rope[batch, query_axis, head, :]
+            stream = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((query_axis,), -I.inf, dtype=I.f32),
+                    I.zeros((query_axis,), dtype=I.f32),
+                    I.zeros((query_axis, C), dtype=I.f32),
+                ),
+                stop=I.end(query_axis),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    latent_block = latent_cache[batch, key_region, :]
+                    content_scores = I.contract(
+                        latent_query,
+                        latent_block,
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    position_scores = I.contract(
+                        position_query,
+                        rope_cache[batch, key_region, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    scores = (content_scores + position_scores) * (
+                        scale * I.LOG2E
+                    )
+                    valid = I.indices(query_axis)[:, None] >= I.indices(
+                        key_region
+                    )[None, :]
+                    scores = I.mask(scores, valid=valid, fill=-I.inf)
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = (
+                        online_attention_accumulate(
+                            maximum,
                             next_maximum,
-                            next_denominator,
-                            next_accumulator,
+                            denominator,
+                            accumulator,
+                            scores,
+                            latent_block,
                         )
-                _, denominator, accumulator = stream.result
-                output[batch, query_region, head, :] = I.cast(
-                    accumulator / denominator[:, None],
-                    I.f16,
-                )
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[batch, query_axis, head, :] = I.cast(
+                accumulator / denominator[:, None],
+                I.f16,
+            )
 
 
 @intent.kernel
@@ -167,96 +164,93 @@ def token_sparse_mla_prefill(
     T = selected_tokens.shape[1]
     query_axis = I.domain(0, Q)
     selection_axis = I.domain(0, T)
-    for query_region in I.parallel(
-        I.partition(query_axis, extent=I.auto("Q_TILE"))
-    ):
-        latent_query = q_latent[query_region, :, :]
-        position_query = q_rope[query_region, :, :]
-        stream = I.state_stream(
-            selection_axis,
-            extent=I.auto("K_TILE"),
-            init=(
-                I.full((query_region, H), -I.inf, dtype=I.f32),
-                I.zeros((query_region, H), dtype=I.f32),
-                I.zeros((query_region, H, C), dtype=I.f32),
-            ),
-        )
-        with stream:
-            for selection_region, (maximum, denominator, accumulator) in stream:
-                token = selected_tokens[query_region, selection_region]
-                token_index = I.cast(token, I.index)
-                valid_token = (token_index >= 0) and (token_index < K)
-                safe_token = I.mask(
-                    token_index,
-                    valid=valid_token,
-                    fill=I.cast(0, I.index),
-                )
-                latent_block = I.gather(
-                    latent_cache,
-                    index=(safe_token, slice(None)),
-                    valid=valid_token[:, :, None],
-                    fill=I.cast(0.0, I.bf16),
-                )
-                rope_block = I.gather(
-                    rope_cache,
-                    index=(safe_token, slice(None)),
-                    valid=valid_token[:, :, None],
-                    fill=I.cast(0.0, I.bf16),
-                )
-                content_scores = I.contract(
-                    latent_query,
-                    latent_block,
-                    reduce=((2, 2),),
-                    batch=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                position_scores = I.contract(
-                    position_query,
-                    rope_block,
-                    reduce=((2, 2),),
-                    batch=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                scores = (content_scores + position_scores) * (scale * I.LOG2E)
-                scores = I.mask(
-                    scores,
-                    valid=valid_token[:, None, :],
-                    fill=-I.inf,
-                )
-                local_maximum = I.reduce.max(
-                    scores, axis=2, identity=-I.inf
-                )
-                next_maximum = I.maximum(maximum, local_maximum)
-                normalization_maximum = I.mask(
-                    next_maximum,
-                    valid=next_maximum != -I.inf,
-                    fill=0.0,
-                )
-                next_denominator, next_accumulator = online_sparse_mla_accumulate(
-                    maximum,
-                    normalization_maximum,
-                    denominator,
-                    accumulator,
-                    scores,
-                    latent_block,
-                )
-                stream.yield_(
-                    next_maximum,
-                    next_denominator,
-                    next_accumulator,
-                )
-        maximum, denominator, accumulator = stream.result
-        safe_denominator = I.mask(
-            denominator,
-            valid=denominator > 0.0,
-            fill=1.0,
-        )
-        output[query_region, :, :] = I.cast(
-            accumulator / safe_denominator[:, :, None],
-            I.bf16,
-        )
-        maximum_output[query_region, :] = maximum
-        lse_output[query_region, :] = maximum + I.log(safe_denominator) * I.LOG2E
+    latent_query = q_latent[query_axis, :, :]
+    position_query = q_rope[query_axis, :, :]
+    stream = I.state_stream(
+        selection_axis,
+        extent=I.auto("K_TILE"),
+        init=(
+            I.full((query_axis, H), -I.inf, dtype=I.f32),
+            I.zeros((query_axis, H), dtype=I.f32),
+            I.zeros((query_axis, H, C), dtype=I.f32),
+        ),
+    )
+    with stream:
+        for selection_region, (maximum, denominator, accumulator) in stream:
+            token = selected_tokens[query_axis, selection_region]
+            token_index = I.cast(token, I.index)
+            valid_token = (token_index >= 0) and (token_index < K)
+            safe_token = I.mask(
+                token_index,
+                valid=valid_token,
+                fill=I.cast(0, I.index),
+            )
+            latent_block = I.gather(
+                latent_cache,
+                index=(safe_token, slice(None)),
+                valid=valid_token[:, :, None],
+                fill=I.cast(0.0, I.bf16),
+            )
+            rope_block = I.gather(
+                rope_cache,
+                index=(safe_token, slice(None)),
+                valid=valid_token[:, :, None],
+                fill=I.cast(0.0, I.bf16),
+            )
+            content_scores = I.contract(
+                latent_query,
+                latent_block,
+                reduce=((2, 2),),
+                batch=((0, 0),),
+                acc_dtype=I.f32,
+            )
+            position_scores = I.contract(
+                position_query,
+                rope_block,
+                reduce=((2, 2),),
+                batch=((0, 0),),
+                acc_dtype=I.f32,
+            )
+            scores = (content_scores + position_scores) * (scale * I.LOG2E)
+            scores = I.mask(
+                scores,
+                valid=valid_token[:, None, :],
+                fill=-I.inf,
+            )
+            local_maximum = I.reduce.max(
+                scores, axis=2, identity=-I.inf
+            )
+            next_maximum = I.maximum(maximum, local_maximum)
+            normalization_maximum = I.mask(
+                next_maximum,
+                valid=next_maximum != -I.inf,
+                fill=0.0,
+            )
+            next_denominator, next_accumulator = online_sparse_mla_accumulate(
+                maximum,
+                normalization_maximum,
+                denominator,
+                accumulator,
+                scores,
+                latent_block,
+            )
+            stream.yield_(
+                next_maximum,
+                next_denominator,
+                next_accumulator,
+            )
+    maximum, denominator, accumulator = stream.result
+    safe_denominator = I.mask(
+        denominator,
+        valid=denominator > 0.0,
+        fill=1.0,
+    )
+    output[query_axis, :, :] = I.cast(
+        accumulator / safe_denominator[:, :, None],
+        I.bf16,
+    )
+    maximum_output[query_axis, :] = maximum
+    lse_output[query_axis, :] = maximum + I.log(safe_denominator) * I.LOG2E
 
 
 @intent.kernel
@@ -276,98 +270,95 @@ def token_sparse_mla_value_prefill(
     T = selected_tokens.shape[1]
     query_axis = I.domain(0, Q)
     selection_axis = I.domain(0, T)
-    for query_region in I.parallel(
-        I.partition(query_axis, extent=I.auto("Q_TILE"))
-    ):
-        content_query = query_content[query_region, :, :]
-        position_query = query_rope[query_region, :, :]
-        stream = I.state_stream(
-            selection_axis,
-            extent=I.auto("K_TILE"),
-            init=(
-                I.full((query_region, H), -I.inf, dtype=I.f32),
-                I.zeros((query_region, H), dtype=I.f32),
-                I.zeros((query_region, H, DV), dtype=I.f32),
-            ),
-        )
-        with stream:
-            for selection_region, (maximum, denominator, accumulator) in stream:
-                token = selected_tokens[query_region, selection_region]
-                token_index = I.cast(token, I.index)
-                valid_token = (token_index >= 0) and (token_index < K)
-                safe_token = I.mask(
-                    token_index,
-                    valid=valid_token,
-                    fill=I.cast(0, I.index),
-                )
-                key_block = I.gather(
-                    key_content,
-                    index=(safe_token, slice(None)),
-                    valid=valid_token[:, :, None],
-                    fill=I.cast(0.0, I.bf16),
-                )
-                value_block = I.gather(
-                    value_cache,
-                    index=(safe_token, slice(None)),
-                    valid=valid_token[:, :, None],
-                    fill=I.cast(0.0, I.bf16),
-                )
-                rope_block = I.gather(
-                    key_rope,
-                    index=(safe_token, slice(None)),
-                    valid=valid_token[:, :, None],
-                    fill=I.cast(0.0, I.bf16),
-                )
-                content_scores = I.contract(
-                    content_query,
-                    key_block,
-                    reduce=((2, 2),),
-                    batch=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                position_scores = I.contract(
-                    position_query,
-                    rope_block,
-                    reduce=((2, 2),),
-                    batch=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                scores = (content_scores + position_scores) * (scale * I.LOG2E)
-                scores = I.mask(
-                    scores,
-                    valid=valid_token[:, None, :],
-                    fill=-I.inf,
-                )
-                local_maximum = I.reduce.max(scores, axis=2, identity=-I.inf)
-                next_maximum = I.maximum(maximum, local_maximum)
-                normalization_maximum = I.mask(
-                    next_maximum,
-                    valid=next_maximum != -I.inf,
-                    fill=0.0,
-                )
-                next_denominator, next_accumulator = online_sparse_mla_accumulate(
-                    maximum,
-                    normalization_maximum,
-                    denominator,
-                    accumulator,
-                    scores,
-                    value_block,
-                )
-                stream.yield_(
-                    next_maximum,
-                    next_denominator,
-                    next_accumulator,
-                )
-        _, denominator, accumulator = stream.result
-        safe_denominator = I.mask(
-            denominator,
-            valid=denominator > 0.0,
-            fill=1.0,
-        )
-        output[query_region, :, :] = I.cast(
-            accumulator / safe_denominator[:, :, None],
-            I.bf16,
-        )
+    content_query = query_content[query_axis, :, :]
+    position_query = query_rope[query_axis, :, :]
+    stream = I.state_stream(
+        selection_axis,
+        extent=I.auto("K_TILE"),
+        init=(
+            I.full((query_axis, H), -I.inf, dtype=I.f32),
+            I.zeros((query_axis, H), dtype=I.f32),
+            I.zeros((query_axis, H, DV), dtype=I.f32),
+        ),
+    )
+    with stream:
+        for selection_region, (maximum, denominator, accumulator) in stream:
+            token = selected_tokens[query_axis, selection_region]
+            token_index = I.cast(token, I.index)
+            valid_token = (token_index >= 0) and (token_index < K)
+            safe_token = I.mask(
+                token_index,
+                valid=valid_token,
+                fill=I.cast(0, I.index),
+            )
+            key_block = I.gather(
+                key_content,
+                index=(safe_token, slice(None)),
+                valid=valid_token[:, :, None],
+                fill=I.cast(0.0, I.bf16),
+            )
+            value_block = I.gather(
+                value_cache,
+                index=(safe_token, slice(None)),
+                valid=valid_token[:, :, None],
+                fill=I.cast(0.0, I.bf16),
+            )
+            rope_block = I.gather(
+                key_rope,
+                index=(safe_token, slice(None)),
+                valid=valid_token[:, :, None],
+                fill=I.cast(0.0, I.bf16),
+            )
+            content_scores = I.contract(
+                content_query,
+                key_block,
+                reduce=((2, 2),),
+                batch=((0, 0),),
+                acc_dtype=I.f32,
+            )
+            position_scores = I.contract(
+                position_query,
+                rope_block,
+                reduce=((2, 2),),
+                batch=((0, 0),),
+                acc_dtype=I.f32,
+            )
+            scores = (content_scores + position_scores) * (scale * I.LOG2E)
+            scores = I.mask(
+                scores,
+                valid=valid_token[:, None, :],
+                fill=-I.inf,
+            )
+            local_maximum = I.reduce.max(scores, axis=2, identity=-I.inf)
+            next_maximum = I.maximum(maximum, local_maximum)
+            normalization_maximum = I.mask(
+                next_maximum,
+                valid=next_maximum != -I.inf,
+                fill=0.0,
+            )
+            next_denominator, next_accumulator = online_sparse_mla_accumulate(
+                maximum,
+                normalization_maximum,
+                denominator,
+                accumulator,
+                scores,
+                value_block,
+            )
+            stream.yield_(
+                next_maximum,
+                next_denominator,
+                next_accumulator,
+            )
+    _, denominator, accumulator = stream.result
+    safe_denominator = I.mask(
+        denominator,
+        valid=denominator > 0.0,
+        fill=1.0,
+    )
+    output[query_axis, :, :] = I.cast(
+        accumulator / safe_denominator[:, :, None],
+        I.bf16,
+    )
 
 
 @intent.kernel

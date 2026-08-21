@@ -23,18 +23,15 @@ def attention_backward_delta(
     query_axis = I.domain(0, Q)
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                output_block = I.cast(output[batch, query_head, query_region, :], I.f32)
-                grad_output_block = I.cast(
-                    grad_output[batch, query_head, query_region, :], I.f32
-                )
-                delta[batch, query_head, query_region] = I.reduce.sum(
-                    output_block * grad_output_block,
-                    axis=1,
-                    identity=0.0,
-                )
+            output_block = I.cast(output[batch, query_head, query_axis, :], I.f32)
+            grad_output_block = I.cast(
+                grad_output[batch, query_head, query_axis, :], I.f32
+            )
+            delta[batch, query_head, query_axis] = I.reduce.sum(
+                output_block * grad_output_block,
+                axis=1,
+                identity=0.0,
+            )
 
 
 @intent.kernel
@@ -57,83 +54,80 @@ def attention_backward_dkdv(
     key_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, HK)):
-            for key_region in I.parallel(
-                I.partition(key_axis, extent=I.auto("K_TILE"))
-            ):
-                key_block = k[batch, key_head, key_region, :]
-                value_block = v[batch, key_head, key_region, :]
-                accumulation = I.state_stream(
-                    query_axis,
-                    extent=I.auto("Q_TILE"),
-                    init=(
-                        I.zeros((key_region, D), dtype=I.f32),
-                        I.zeros((key_region, D), dtype=I.f32),
-                    ),
-                    stop=I.end(query_axis),
-                )
-                with accumulation:
-                    for query_region, (grad_k_value, grad_v_value) in accumulation:
-                        q_index = I.indices(query_region)
-                        k_index = I.indices(key_region)
-                        next_grad_k = grad_k_value
-                        next_grad_v = grad_v_value
-                        for query_head_offset in range(HEAD_GROUP):
-                            query_head = key_head * HEAD_GROUP + query_head_offset
-                            query_block = q[
-                                batch, query_head, query_region, :
-                            ]
-                            grad_output_block = grad_output[
-                                batch, query_head, query_region, :
-                            ]
-                            scores = I.contract(
-                                key_block,
-                                query_block,
-                                reduce=((1, 1),),
-                                acc_dtype=I.f32,
+            key_block = k[batch, key_head, key_axis, :]
+            value_block = v[batch, key_head, key_axis, :]
+            accumulation = I.state_stream(
+                query_axis,
+                extent=I.auto("Q_TILE"),
+                init=(
+                    I.zeros((key_axis, D), dtype=I.f32),
+                    I.zeros((key_axis, D), dtype=I.f32),
+                ),
+                stop=I.end(query_axis),
+            )
+            with accumulation:
+                for query_region, (grad_k_value, grad_v_value) in accumulation:
+                    q_index = I.indices(query_region)
+                    k_index = I.indices(key_axis)
+                    next_grad_k = grad_k_value
+                    next_grad_v = grad_v_value
+                    for query_head_offset in range(HEAD_GROUP):
+                        query_head = key_head * HEAD_GROUP + query_head_offset
+                        query_block = q[
+                            batch, query_head, query_region, :
+                        ]
+                        grad_output_block = grad_output[
+                            batch, query_head, query_region, :
+                        ]
+                        scores = I.contract(
+                            key_block,
+                            query_block,
+                            reduce=((1, 1),),
+                            acc_dtype=I.f32,
+                        )
+                        probability = I.exp2(
+                            scores * (scale * I.LOG2E)
+                            - lse[batch, query_head, query_region][None, :]
+                            * I.LOG2E
+                        )
+                        if CAUSAL:
+                            probability = I.mask(
+                                probability,
+                                valid=k_index[:, None] <= q_index[None, :],
+                                fill=0.0,
                             )
-                            probability = I.exp2(
-                                scores * (scale * I.LOG2E)
-                                - lse[batch, query_head, query_region][None, :]
-                                * I.LOG2E
-                            )
-                            if CAUSAL:
-                                probability = I.mask(
-                                    probability,
-                                    valid=k_index[:, None] <= q_index[None, :],
-                                    fill=0.0,
-                                )
-                            next_grad_v = next_grad_v + I.contract(
-                                I.cast(probability, I.f16),
-                                grad_output_block,
-                                reduce=((1, 0),),
-                                acc_dtype=I.f32,
-                            )
-                            grad_probability = I.contract(
-                                value_block,
-                                grad_output_block,
-                                reduce=((1, 1),),
-                                acc_dtype=I.f32,
-                            )
-                            grad_scores = probability * (
-                                grad_probability
-                                - delta[
-                                    batch, query_head, query_region
-                                ][None, :]
-                            )
-                            next_grad_k = next_grad_k + I.contract(
-                                I.cast(grad_scores, I.f16),
-                                query_block,
-                                reduce=((1, 0),),
-                                acc_dtype=I.f32,
-                            )
-                        accumulation.yield_(next_grad_k, next_grad_v)
-                grad_k_value, grad_v_value = accumulation.result
-                grad_k[batch, key_head, key_region, :] = I.cast(
-                    grad_k_value * scale, I.f16
-                )
-                grad_v[batch, key_head, key_region, :] = I.cast(
-                    grad_v_value, I.f16
-                )
+                        next_grad_v = next_grad_v + I.contract(
+                            I.cast(probability, I.f16),
+                            grad_output_block,
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
+                        )
+                        grad_probability = I.contract(
+                            value_block,
+                            grad_output_block,
+                            reduce=((1, 1),),
+                            acc_dtype=I.f32,
+                        )
+                        grad_scores = probability * (
+                            grad_probability
+                            - delta[
+                                batch, query_head, query_region
+                            ][None, :]
+                        )
+                        next_grad_k = next_grad_k + I.contract(
+                            I.cast(grad_scores, I.f16),
+                            query_block,
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
+                        )
+                    accumulation.yield_(next_grad_k, next_grad_v)
+            grad_k_value, grad_v_value = accumulation.result
+            grad_k[batch, key_head, key_axis, :] = I.cast(
+                grad_k_value * scale, I.f16
+            )
+            grad_v[batch, key_head, key_axis, :] = I.cast(
+                grad_v_value, I.f16
+            )
 
 
 @intent.kernel
@@ -156,60 +150,57 @@ def attention_backward_dq(
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                query_block = q[batch, query_head, query_region, :]
-                grad_output_block = grad_output[
-                    batch, query_head, query_region, :
-                ]
-                query_lse = lse[batch, query_head, query_region][:, None]
-                query_delta = delta[batch, query_head, query_region][:, None]
-                accumulation = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(I.zeros((query_region, D), dtype=I.f32),),
-                    stop=I.end(query_region) if CAUSAL else I.end(key_axis),
-                )
-                with accumulation:
-                    for key_region, grad_q_value in accumulation:
-                        key_block = k[batch, key_head, key_region, :]
-                        value_block = v[batch, key_head, key_region, :]
-                        scores = I.contract(
-                            query_block,
+            query_block = q[batch, query_head, query_axis, :]
+            grad_output_block = grad_output[
+                batch, query_head, query_axis, :
+            ]
+            query_lse = lse[batch, query_head, query_axis][:, None]
+            query_delta = delta[batch, query_head, query_axis][:, None]
+            accumulation = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(I.zeros((query_axis, D), dtype=I.f32),),
+                stop=I.end(query_axis) if CAUSAL else I.end(key_axis),
+            )
+            with accumulation:
+                for key_region, grad_q_value in accumulation:
+                    key_block = k[batch, key_head, key_region, :]
+                    value_block = v[batch, key_head, key_region, :]
+                    scores = I.contract(
+                        query_block,
+                        key_block,
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    probability = I.exp2(
+                        scores * (scale * I.LOG2E) - query_lse * I.LOG2E
+                    )
+                    if CAUSAL:
+                        q_index = I.indices(query_axis)
+                        k_index = I.indices(key_region)
+                        probability = I.mask(
+                            probability,
+                            valid=q_index[:, None] >= k_index[None, :],
+                            fill=0.0,
+                        )
+                    grad_probability = I.contract(
+                        grad_output_block,
+                        value_block,
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    )
+                    grad_scores = probability * (
+                        grad_probability - query_delta
+                    )
+                    accumulation.yield_(
+                        grad_q_value
+                        + I.contract(
+                            I.cast(grad_scores, I.f16),
                             key_block,
-                            reduce=((1, 1),),
+                            reduce=((1, 0),),
                             acc_dtype=I.f32,
                         )
-                        probability = I.exp2(
-                            scores * (scale * I.LOG2E) - query_lse * I.LOG2E
-                        )
-                        if CAUSAL:
-                            q_index = I.indices(query_region)
-                            k_index = I.indices(key_region)
-                            probability = I.mask(
-                                probability,
-                                valid=q_index[:, None] >= k_index[None, :],
-                                fill=0.0,
-                            )
-                        grad_probability = I.contract(
-                            grad_output_block,
-                            value_block,
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        )
-                        grad_scores = probability * (
-                            grad_probability - query_delta
-                        )
-                        accumulation.yield_(
-                            grad_q_value
-                            + I.contract(
-                                I.cast(grad_scores, I.f16),
-                                key_block,
-                                reduce=((1, 0),),
-                                acc_dtype=I.f32,
-                            )
-                        )
-                grad_q[batch, query_head, query_region, :] = I.cast(
-                    accumulation.result * scale, I.f16
-                )
+                    )
+            grad_q[batch, query_head, query_axis, :] = I.cast(
+                accumulation.result * scale, I.f16
+            )

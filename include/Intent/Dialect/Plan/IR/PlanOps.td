@@ -9,6 +9,209 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentPlan_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentPlan_Dialect, mnemonic, traits>;
 
+class IntentPlan_ExecNullaryOneResultOp<string mnemonic,
+                                        list<Trait> traits = [Pure]>
+    : IntentPlan_Op<mnemonic, traits> {
+  let arguments = (ins);
+  let results = (outs AnyType:$result);
+}
+
+class IntentPlan_ExecUnaryOneResultOp<string mnemonic,
+                                      list<Trait> traits = [Pure]>
+    : IntentPlan_Op<mnemonic, traits> {
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$result);
+}
+
+class IntentPlan_ExecBinaryOneResultOp<string mnemonic,
+                                       list<Trait> traits = [Pure]>
+    : IntentPlan_Op<mnemonic, traits> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+  let results = (outs AnyType:$result);
+}
+
+class IntentPlan_ExecVariadicOneResultOp<string mnemonic,
+                                         list<Trait> traits = [Pure]>
+    : IntentPlan_Op<mnemonic, traits> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs AnyType:$result);
+}
+
+class IntentPlan_ExecVariadicNoResultOp<string mnemonic,
+                                        list<Trait> traits = []>
+    : IntentPlan_Op<mnemonic, traits> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs);
+}
+
+class IntentPlan_ExecTerminatorOp<string mnemonic>
+    : IntentPlan_Op<mnemonic, [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs);
+}
+
+// Executable physical operations.  These mirror the algorithmic arity and
+// region contracts of canonical Intent operations while living in the sole
+// mutable physical program.  Their attributes retain stable KIR provenance;
+// shared and provider passes may refine only physical representation fields.
+def IntentPlan_ExecConstantOp
+    : IntentPlan_ExecNullaryOneResultOp<"exec_constant">;
+def IntentPlan_ExecDimOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_dim">;
+def IntentPlan_ExecDomainOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_domain">;
+def IntentPlan_ExecDomainProductOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_domain_product">;
+def IntentPlan_ExecPartitionOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_partition">;
+def IntentPlan_ExecIndicesOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_indices">;
+def IntentPlan_ExecRegionEndOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_region_end">;
+def IntentPlan_ExecAssumeInBoundsOp
+    : IntentPlan_Op<"exec_assume_in_bounds"> {
+  let arguments = (ins AnyType:$index, AnyType:$view);
+  let results = (outs);
+}
+
+def IntentPlan_ExecParallelOp
+    : IntentPlan_Op<"exec_parallel", [RecursiveMemoryEffects]> {
+  let arguments = (ins AnyType:$source);
+  let results = (outs);
+  let regions = (region AnyRegion:$body);
+}
+def IntentPlan_ExecStateStreamOp
+    : IntentPlan_Op<"exec_state_stream", [RecursiveMemoryEffects]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region AnyRegion:$body);
+}
+def IntentPlan_ExecIfOp
+    : IntentPlan_Op<"exec_if", [RecursiveMemoryEffects]> {
+  let arguments = (ins AnyType:$condition);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region VariadicRegion<AnyRegion>:$branches);
+}
+def IntentPlan_ExecForOp
+    : IntentPlan_Op<"exec_for", [RecursiveMemoryEffects]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region AnyRegion:$body);
+}
+def IntentPlan_ExecWhileOp
+    : IntentPlan_Op<"exec_while", [RecursiveMemoryEffects]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region AnyRegion:$before, AnyRegion:$after);
+}
+def IntentPlan_ExecYieldOp : IntentPlan_ExecTerminatorOp<"exec_yield">;
+def IntentPlan_ExecConditionOp
+    : IntentPlan_ExecTerminatorOp<"exec_condition">;
+
+def IntentPlan_ExecViewLoadOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_view_load",
+                                                [MemoryEffects<[MemRead]>]>;
+def IntentPlan_ExecViewStoreOp
+    : IntentPlan_ExecVariadicNoResultOp<"exec_view_store",
+                                               [MemoryEffects<[MemWrite]>]>;
+def IntentPlan_ExecReshapeOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_reshape">;
+def IntentPlan_ExecTransposeOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_transpose">;
+def IntentPlan_ExecBroadcastOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_broadcast">;
+def IntentPlan_ExecFullOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_full">;
+def IntentPlan_ExecZerosOp
+    : IntentPlan_ExecNullaryOneResultOp<"exec_zeros">;
+def IntentPlan_ExecMakeRecordOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_make_record">;
+def IntentPlan_ExecExtractOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_extract">;
+
+def IntentPlan_ExecUnaryOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_unary">;
+def IntentPlan_ExecBinaryOp
+    : IntentPlan_ExecBinaryOneResultOp<"exec_binary">;
+def IntentPlan_ExecCompareOp
+    : IntentPlan_ExecBinaryOneResultOp<"exec_compare">;
+def IntentPlan_ExecSelectOp : IntentPlan_Op<"exec_select", [Pure]> {
+  let arguments = (ins AnyType:$condition, AnyType:$true_value,
+                        AnyType:$false_value);
+  let results = (outs AnyType:$result);
+}
+def IntentPlan_ExecCastOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_cast">;
+def IntentPlan_ExecMaskOp : IntentPlan_Op<"exec_mask", [Pure]> {
+  let arguments = (ins AnyType:$value, AnyType:$predicate, AnyType:$fill);
+  let results = (outs AnyType:$result);
+}
+
+def IntentPlan_ExecReduceOp : IntentPlan_Op<"exec_reduce", [Pure]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+}
+def IntentPlan_ExecScanOp : IntentPlan_Op<"exec_scan", [Pure]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+}
+def IntentPlan_ExecContractOp
+    : IntentPlan_ExecBinaryOneResultOp<"exec_contract">;
+def IntentPlan_ExecScaledContractOp
+    : IntentPlan_Op<"exec_scaled_contract", [Pure]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$lhs_scale,
+                        AnyType:$rhs_scale);
+  let results = (outs AnyType:$result);
+}
+def IntentPlan_ExecSparseContractOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_sparse_contract">;
+
+def IntentPlan_ExecRaggedOp : IntentPlan_Op<"exec_ragged", [Pure]> {
+  let arguments = (ins AnyType:$outer, AnyType:$members, AnyType:$offsets,
+                        Optional<AnyType>:$indices);
+  let results = (outs AnyType:$result);
+}
+def IntentPlan_ExecRaggedOuterOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_ragged_outer">;
+def IntentPlan_ExecRaggedMemberOp
+    : IntentPlan_ExecBinaryOneResultOp<"exec_ragged_member">;
+def IntentPlan_ExecMembersOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_members">;
+
+def IntentPlan_ExecGatherOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_gather",
+                                                [MemoryEffects<[MemRead]>]>;
+def IntentPlan_ExecScatterUniqueOp
+    : IntentPlan_ExecVariadicNoResultOp<"exec_scatter_unique",
+                                               [MemoryEffects<[MemWrite]>]>;
+def IntentPlan_ExecScatterReduceOp
+    : IntentPlan_ExecVariadicNoResultOp<"exec_scatter_reduce",
+                                               [MemoryEffects<[MemWrite]>]>;
+
+def IntentPlan_ExecBufferOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_buffer">;
+def IntentPlan_ExecBufferLoadOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_buffer_load",
+                                                [MemoryEffects<[MemRead]>]>;
+def IntentPlan_ExecBufferStoreOp
+    : IntentPlan_ExecVariadicNoResultOp<"exec_buffer_store",
+                                               [MemoryEffects<[MemWrite]>]>;
+def IntentPlan_ExecAtomicAddOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_atomic_add",
+                                                [MemoryEffects<[MemRead, MemWrite]>]>;
+def IntentPlan_ExecAtomicCasOp
+    : IntentPlan_ExecVariadicOneResultOp<"exec_atomic_cas",
+                                                [MemoryEffects<[MemRead, MemWrite]>]>;
+def IntentPlan_ExecRandomOp : IntentPlan_Op<"exec_random", [Pure]> {
+  let arguments = (ins AnyType:$seed, AnyType:$logical_index);
+  let results = (outs AnyType:$result);
+}
+def IntentPlan_ExecReturnOp
+    : IntentPlan_Op<"exec_return", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs);
+}
+
 def IntentPlan_YieldOp : IntentPlan_Op<"yield", [Terminator]> {
   let arguments = (ins);
   let results = (outs);
@@ -100,7 +303,7 @@ def IntentPlan_RegionBindingOp : IntentPlan_Op<"region_binding"> {
 
 def IntentPlan_LaunchOp : IntentPlan_Op<"launch"> {
   let arguments = (ins
-    I64Attr:$loop_node,
+    OptionalAttr<I64Attr>:$loop_node,
     BoolAttr:$persistent
   );
   let results = (outs);
@@ -191,19 +394,15 @@ def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
   let hasVerifier = 1;
 }
 
-def IntentPlan_UnaryOp : IntentPlan_Op<"unary", [Pure]> {
-  let arguments = (ins
-    AnyType:$input,
-    I64Attr:$node,
-    StrAttr:$semantic
-  );
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
 def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
   let arguments = (ins
     I64Attr:$node,
+    StrAttr:$form,
+    StrAttr:$lhs_form,
+    StrAttr:$rhs_form,
+    OptionalAttr<I64Attr>:$reduction_axis_node,
+    OptionalAttr<I64Attr>:$lhs_result_axis_node,
+    OptionalAttr<I64Attr>:$rhs_result_axis_node,
     StrAttr:$lhs_space,
     StrAttr:$rhs_space,
     StrAttr:$accumulator_space,
@@ -250,6 +449,7 @@ def IntentPlan_StreamBindingOp : IntentPlan_Op<"stream_binding"> {
     I64Attr:$axis_node,
     StrAttr:$purpose,
     I64Attr:$level,
+    OptionalAttr<I64Attr>:$stop_value,
     OptionalAttr<I64Attr>:$relation_node
   );
   let results = (outs);

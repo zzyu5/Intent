@@ -1,5 +1,6 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -22,7 +23,7 @@ LogicalResult collectDomainSource(Value source,
   };
   if (!definition)
     return fail();
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.domain" || name == "intent.ragged_outer" ||
       name == "intent.ragged_member") {
     domains.push_back(definition);
@@ -43,7 +44,7 @@ LogicalResult collectDomainSource(Value source,
 
 Operation *structuralDomain(Value value) {
   if (Operation *definition = value.getDefiningOp()) {
-    StringRef name = definition->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*definition);
     if (name == "intent.domain" || name == "intent.ragged_outer" ||
         name == "intent.ragged_member")
       return definition;
@@ -52,14 +53,11 @@ Operation *structuralDomain(Value value) {
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
   if (!owner)
     return nullptr;
-  StringRef name = owner->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*owner);
   if (name == "intent.state_stream" && argument.getArgNumber() == 0 &&
       owner->getNumOperands() > 0)
     return owner->getOperand(0).getDefiningOp();
-  if (name == "intent.for" && argument.getArgNumber() == 0 &&
-      owner->getNumOperands() > 0)
-    return owner->getOperand(0).getDefiningOp();
-  if (name == "intent.ordered" && owner->getNumOperands() > 0) {
+  if (name == "intent.for" && owner->getNumOperands() > 0) {
     SmallVector<Operation *> domains;
     if (failed(collectDomainSource(owner->getOperand(0), domains, nullptr)) ||
         argument.getArgNumber() >= domains.size())
@@ -89,7 +87,7 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return finish(ScalarIndexSource{nullptr, {}, true, false});
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.constant")
     return finish(ScalarIndexSource{});
   bool transparent = name == "intent.binary" || name == "intent.unary" ||
@@ -204,7 +202,7 @@ bool hasInBoundsPrecondition(Value index, Value view, unsigned axis,
     for (Operation &candidate : *block) {
       if (&candidate == position)
         break;
-      if (candidate.getName().getStringRef() != "intent.assume_in_bounds" ||
+      if (::intent::target::semanticOperationName(candidate) != "intent.assume_in_bounds" ||
           candidate.getNumOperands() != 2 || candidate.getOperand(0) != index ||
           candidate.getOperand(1) != view)
         continue;

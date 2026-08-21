@@ -23,22 +23,19 @@ def ragged_grouped_gemm(
         offsets=group_offsets,
     )
     for group in I.parallel(groups.outer):
-        for member_region in I.parallel(
-            I.partition(groups[group], extent=I.auto("MEMBER_TILE"))
-        ):
-            rows = I.members(member_region)
-            values = I.gather(x, index=(rows, slice(None)))
-            result = I.contract(
-                values,
-                weight[group, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            I.scatter_unique(
-                y,
-                index=(rows, slice(None)),
-                value=I.cast(result, I.f16),
-            )
+        rows = I.members(groups[group])
+        values = I.gather(x, index=(rows, slice(None)))
+        result = I.contract(
+            values,
+            weight[group, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        I.scatter_unique(
+            y,
+            index=(rows, slice(None)),
+            value=I.cast(result, I.f16),
+        )
 
 
 @intent.kernel
@@ -56,22 +53,19 @@ def ragged_grouped_gemm_bf16(
         offsets=group_offsets,
     )
     for group in I.parallel(groups.outer):
-        for member_region in I.parallel(
-            I.partition(groups[group], extent=I.auto("MEMBER_TILE"))
-        ):
-            rows = I.members(member_region)
-            values = I.gather(x, index=(rows, slice(None)))
-            result = I.contract(
-                values,
-                weight[group, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            I.scatter_unique(
-                y,
-                index=(rows, slice(None)),
-                value=I.cast(result, I.bf16),
-            )
+        rows = I.members(groups[group])
+        values = I.gather(x, index=(rows, slice(None)))
+        result = I.contract(
+            values,
+            weight[group, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        I.scatter_unique(
+            y,
+            index=(rows, slice(None)),
+            value=I.cast(result, I.bf16),
+        )
 
 
 @intent.kernel
@@ -92,20 +86,14 @@ def ragged_grouped_gemm_backward_weight(
     k_axis = I.domain(0, K)
     n_axis = I.domain(0, N)
     for group in I.parallel(groups.outer):
-        for k_region in I.parallel(
-            I.partition(k_axis, extent=I.auto("M_TILE"))
-        ):
-            for n_region in I.parallel(
-                I.partition(n_axis, extent=I.auto("N_TILE"))
-            ):
-                members = groups[group]
-                result = I.contract(
-                    left[members, k_region],
-                    right[members, n_region],
-                    reduce=((0, 0),),
-                    acc_dtype=I.f32,
-                )
-                grad_weight[group, k_region, n_region] = I.cast(result, I.f16)
+        members = groups[group]
+        result = I.contract(
+            left[members, k_axis],
+            right[members, n_axis],
+            reduce=((0, 0),),
+            acc_dtype=I.f32,
+        )
+        grad_weight[group, k_axis, n_axis] = I.cast(result, I.f16)
 
 
 @intent.kernel
@@ -126,22 +114,19 @@ def routed_expert_projection_bf16(
         indices=member_routes,
     )
     for expert in I.parallel(experts.outer):
-        for route_region in I.parallel(
-            I.partition(experts[expert], extent=I.auto("MEMBER_TILE"))
-        ):
-            routes = I.members(route_region)
-            token = routes // TOP_K
-            slot = routes % TOP_K
-            I.assume_in_bounds(token, x, axis=0)
-            values = I.gather(x, index=(token, slice(None)))
-            result = I.contract(
-                values,
-                weight[expert, :, :],
-                reduce=((1, 1),),
-                acc_dtype=I.f32,
-            )
-            I.scatter_unique(
-                output,
-                index=(token, slot, slice(None)),
-                value=I.cast(result, I.bf16),
-            )
+        routes = I.members(experts[expert])
+        token = routes // TOP_K
+        slot = routes % TOP_K
+        I.assume_in_bounds(token, x, axis=0)
+        values = I.gather(x, index=(token, slice(None)))
+        result = I.contract(
+            values,
+            weight[expert, :, :],
+            reduce=((1, 1),),
+            acc_dtype=I.f32,
+        )
+        I.scatter_unique(
+            output,
+            index=(token, slot, slice(None)),
+            value=I.cast(result, I.bf16),
+        )

@@ -58,58 +58,55 @@ def attention_sink_prefill(
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                query = q[batch, query_head, query_region, :]
-                sink_log2 = I.cast(sinks[query_head], I.f32) * I.LOG2E
-                stream = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), sink_log2, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                    stop=I.end(query_region),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        scores = I.contract(
-                            query,
-                            k[batch, key_head, key_region, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        ) * (scale * I.LOG2E)
-                        scores = I.mask(
-                            scores,
-                            valid=I.indices(query_region)[:, None]
-                            >= I.indices(key_region)[None, :],
-                            fill=-I.inf,
-                        )
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate_bf16(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            v[batch, key_head, key_region, :],
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                maximum, denominator, accumulator = stream.result
-                sink_weight = I.exp2(sink_log2 - maximum)
-                output[batch, query_head, query_region, :] = I.cast(
-                    accumulator / (denominator + sink_weight)[:, None],
-                    I.bf16,
-                )
+            query = q[batch, query_head, query_axis, :]
+            sink_log2 = I.cast(sinks[query_head], I.f32) * I.LOG2E
+            stream = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((query_axis,), sink_log2, dtype=I.f32),
+                    I.zeros((query_axis,), dtype=I.f32),
+                    I.zeros((query_axis, DV), dtype=I.f32),
+                ),
+                stop=I.end(query_axis),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    scores = I.contract(
+                        query,
+                        k[batch, key_head, key_region, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    ) * (scale * I.LOG2E)
+                    scores = I.mask(
+                        scores,
+                        valid=I.indices(query_axis)[:, None]
+                        >= I.indices(key_region)[None, :],
+                        fill=-I.inf,
+                    )
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate_bf16(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[batch, key_head, key_region, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            maximum, denominator, accumulator = stream.result
+            sink_weight = I.exp2(sink_log2 - maximum)
+            output[batch, query_head, query_axis, :] = I.cast(
+                accumulator / (denominator + sink_weight)[:, None],
+                I.bf16,
+            )
 
 
 @intent.kernel
@@ -131,60 +128,57 @@ def gemma_gqa_prefill(
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                query = q[batch, query_head, query_region, :]
-                stream = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                    stop=I.end(query_region),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        raw_scores = I.contract(
-                            query,
-                            k[batch, key_head, key_region, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        ) * scale
-                        scores = SOFT_CAP * tanh_value(raw_scores / SOFT_CAP)
-                        query_index = I.indices(query_region)
-                        key_index = I.indices(key_region)
-                        valid = (key_index[None, :] <= query_index[:, None]) and (
-                            key_index[None, :] >= query_index[:, None] - WINDOW
-                        )
-                        scores = I.mask(
-                            scores * I.LOG2E,
-                            valid=valid,
-                            fill=-I.inf,
-                        )
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate_bf16(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            v[batch, key_head, key_region, :],
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                _, denominator, accumulator = stream.result
-                output[batch, query_head, query_region, :] = I.cast(
-                    accumulator / denominator[:, None], I.bf16
-                )
+            query = q[batch, query_head, query_axis, :]
+            stream = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((query_axis,), -I.inf, dtype=I.f32),
+                    I.zeros((query_axis,), dtype=I.f32),
+                    I.zeros((query_axis, DV), dtype=I.f32),
+                ),
+                stop=I.end(query_axis),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    raw_scores = I.contract(
+                        query,
+                        k[batch, key_head, key_region, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    ) * scale
+                    scores = SOFT_CAP * tanh_value(raw_scores / SOFT_CAP)
+                    query_index = I.indices(query_axis)
+                    key_index = I.indices(key_region)
+                    valid = (key_index[None, :] <= query_index[:, None]) and (
+                        key_index[None, :] >= query_index[:, None] - WINDOW
+                    )
+                    scores = I.mask(
+                        scores * I.LOG2E,
+                        valid=valid,
+                        fill=-I.inf,
+                    )
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate_bf16(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[batch, key_head, key_region, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[batch, query_head, query_axis, :] = I.cast(
+                accumulator / denominator[:, None], I.bf16
+            )
 
 
 @intent.kernel
@@ -205,55 +199,52 @@ def sliding_window_gqa_prefill(
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                query = q[batch, query_head, query_region, :]
-                stream = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                    stop=I.end(query_region),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        scores = I.contract(
-                            query,
-                            k[batch, key_head, key_region, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        ) * (scale * I.LOG2E)
-                        query_index = I.indices(query_region)
-                        key_index = I.indices(key_region)
-                        valid = (key_index[None, :] <= query_index[:, None]) and (
-                            key_index[None, :] > query_index[:, None] - WINDOW
-                        )
-                        scores = I.mask(scores, valid=valid, fill=-I.inf)
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            v[batch, key_head, key_region, :],
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                _, denominator, accumulator = stream.result
-                output[batch, query_head, query_region, :] = I.cast(
-                    accumulator / I.maximum(denominator, 1e-6)[:, None], I.f16
-                )
+            query = q[batch, query_head, query_axis, :]
+            stream = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((query_axis,), -I.inf, dtype=I.f32),
+                    I.zeros((query_axis,), dtype=I.f32),
+                    I.zeros((query_axis, DV), dtype=I.f32),
+                ),
+                stop=I.end(query_axis),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    scores = I.contract(
+                        query,
+                        k[batch, key_head, key_region, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    ) * (scale * I.LOG2E)
+                    query_index = I.indices(query_axis)
+                    key_index = I.indices(key_region)
+                    valid = (key_index[None, :] <= query_index[:, None]) and (
+                        key_index[None, :] > query_index[:, None] - WINDOW
+                    )
+                    scores = I.mask(scores, valid=valid, fill=-I.inf)
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[batch, key_head, key_region, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[batch, query_head, query_axis, :] = I.cast(
+                accumulator / I.maximum(denominator, 1e-6)[:, None], I.f16
+            )
 
 
 @intent.kernel
@@ -273,84 +264,81 @@ def block_causal_attention_fwd(
     key_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
-            for query_region in I.parallel(
-                I.partition(query_axis, extent=I.auto("Q_TILE"))
-            ):
-                query = q[batch, query_region, head, :]
-                stream = I.state_stream(
-                    key_axis,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        scores = I.contract(
-                            query,
-                            k[batch, key_region, head, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        ) * (scale * I.LOG2E)
-                        query_index = I.indices(query_region)
-                        key_index = I.indices(key_region)
-                        query_clean = query_index >= half
-                        key_clean = key_index >= half
-                        query_local = I.mask(
-                            query_index - half,
-                            valid=query_clean,
-                            fill=query_index,
-                        )
-                        key_local = I.mask(
-                            key_index - half,
-                            valid=key_clean,
-                            fill=key_index,
-                        )
-                        query_block = query_local // BLOCK
-                        key_block = key_local // BLOCK
-                        noisy_diagonal = (
-                            (query_block[:, None] == key_block[None, :])
-                            and (query_clean[:, None] == False)
-                            and (key_clean[None, :] == False)
-                        )
-                        offset_causal = (
-                            (query_block[:, None] > key_block[None, :])
-                            and (query_clean[:, None] == False)
-                            and key_clean[None, :]
-                        )
-                        clean_causal = (
-                            (query_block[:, None] >= key_block[None, :])
-                            and query_clean[:, None]
-                            and key_clean[None, :]
-                        )
-                        scores = I.mask(
-                            scores,
-                            valid=noisy_diagonal or offset_causal or clean_causal,
-                            fill=-I.inf,
-                        )
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            v[batch, key_region, head, :],
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                _, denominator, accumulator = stream.result
-                output[batch, query_region, head, :] = I.cast(
-                    accumulator / denominator[:, None], I.f16
-                )
+            query = q[batch, query_axis, head, :]
+            stream = I.state_stream(
+                key_axis,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((query_axis,), -I.inf, dtype=I.f32),
+                    I.zeros((query_axis,), dtype=I.f32),
+                    I.zeros((query_axis, DV), dtype=I.f32),
+                ),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    scores = I.contract(
+                        query,
+                        k[batch, key_region, head, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    ) * (scale * I.LOG2E)
+                    query_index = I.indices(query_axis)
+                    key_index = I.indices(key_region)
+                    query_clean = query_index >= half
+                    key_clean = key_index >= half
+                    query_local = I.mask(
+                        query_index - half,
+                        valid=query_clean,
+                        fill=query_index,
+                    )
+                    key_local = I.mask(
+                        key_index - half,
+                        valid=key_clean,
+                        fill=key_index,
+                    )
+                    query_block = query_local // BLOCK
+                    key_block = key_local // BLOCK
+                    noisy_diagonal = (
+                        (query_block[:, None] == key_block[None, :])
+                        and (query_clean[:, None] == False)
+                        and (key_clean[None, :] == False)
+                    )
+                    offset_causal = (
+                        (query_block[:, None] > key_block[None, :])
+                        and (query_clean[:, None] == False)
+                        and key_clean[None, :]
+                    )
+                    clean_causal = (
+                        (query_block[:, None] >= key_block[None, :])
+                        and query_clean[:, None]
+                        and key_clean[None, :]
+                    )
+                    scores = I.mask(
+                        scores,
+                        valid=noisy_diagonal or offset_causal or clean_causal,
+                        fill=-I.inf,
+                    )
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[batch, key_region, head, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[batch, query_axis, head, :] = I.cast(
+                accumulator / denominator[:, None], I.f16
+            )
 
 
 @intent.kernel
@@ -475,75 +463,72 @@ def varlen_block_causal_attention_fwd(
         sequence_start = I.indices(members)[0]
         half = (I.end(members) - sequence_start) // 2
         for head in I.parallel(I.domain(0, H)):
-            for query_region in I.parallel(
-                I.partition(members, extent=I.auto("Q_TILE"))
-            ):
-                query = q[query_region, head, :]
-                stream = I.state_stream(
-                    members,
-                    extent=I.auto("K_TILE"),
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                )
-                with stream:
-                    for key_region, (maximum, denominator, accumulator) in stream:
-                        scores = I.contract(
-                            query,
-                            k[key_region, head, :],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        ) * (scale * I.LOG2E)
-                        query_index = I.indices(query_region) - sequence_start
-                        key_index = I.indices(key_region) - sequence_start
-                        query_clean = query_index >= half
-                        key_clean = key_index >= half
-                        query_local = I.mask(
-                            query_index - half,
-                            valid=query_clean,
-                            fill=query_index,
-                        )
-                        key_local = I.mask(
-                            key_index - half,
-                            valid=key_clean,
-                            fill=key_index,
-                        )
-                        query_block = query_local // BLOCK
-                        key_block = key_local // BLOCK
-                        valid = (
-                            (query_block[:, None] == key_block[None, :])
-                            and (query_clean[:, None] == False)
-                            and (key_clean[None, :] == False)
-                        ) or (
-                            (query_block[:, None] > key_block[None, :])
-                            and (query_clean[:, None] == False)
-                            and key_clean[None, :]
-                        ) or (
-                            (query_block[:, None] >= key_block[None, :])
-                            and query_clean[:, None]
-                            and key_clean[None, :]
-                        )
-                        scores = I.mask(scores, valid=valid, fill=-I.inf)
-                        local_maximum = I.reduce.max(
-                            scores, axis=1, identity=-I.inf
-                        )
-                        next_maximum = I.maximum(maximum, local_maximum)
-                        next_denominator, next_accumulator = online_attention_accumulate(
-                            maximum,
-                            next_maximum,
-                            denominator,
-                            accumulator,
-                            scores,
-                            v[key_region, head, :],
-                        )
-                        stream.yield_(
-                            next_maximum,
-                            next_denominator,
-                            next_accumulator,
-                        )
-                _, denominator, accumulator = stream.result
-                output[query_region, head, :] = I.cast(
-                    accumulator / denominator[:, None], I.f16
-                )
+            query = q[members, head, :]
+            stream = I.state_stream(
+                members,
+                extent=I.auto("K_TILE"),
+                init=(
+                    I.full((members,), -I.inf, dtype=I.f32),
+                    I.zeros((members,), dtype=I.f32),
+                    I.zeros((members, DV), dtype=I.f32),
+                ),
+            )
+            with stream:
+                for key_region, (maximum, denominator, accumulator) in stream:
+                    scores = I.contract(
+                        query,
+                        k[key_region, head, :],
+                        reduce=((1, 1),),
+                        acc_dtype=I.f32,
+                    ) * (scale * I.LOG2E)
+                    query_index = I.indices(members) - sequence_start
+                    key_index = I.indices(key_region) - sequence_start
+                    query_clean = query_index >= half
+                    key_clean = key_index >= half
+                    query_local = I.mask(
+                        query_index - half,
+                        valid=query_clean,
+                        fill=query_index,
+                    )
+                    key_local = I.mask(
+                        key_index - half,
+                        valid=key_clean,
+                        fill=key_index,
+                    )
+                    query_block = query_local // BLOCK
+                    key_block = key_local // BLOCK
+                    valid = (
+                        (query_block[:, None] == key_block[None, :])
+                        and (query_clean[:, None] == False)
+                        and (key_clean[None, :] == False)
+                    ) or (
+                        (query_block[:, None] > key_block[None, :])
+                        and (query_clean[:, None] == False)
+                        and key_clean[None, :]
+                    ) or (
+                        (query_block[:, None] >= key_block[None, :])
+                        and query_clean[:, None]
+                        and key_clean[None, :]
+                    )
+                    scores = I.mask(scores, valid=valid, fill=-I.inf)
+                    local_maximum = I.reduce.max(
+                        scores, axis=1, identity=-I.inf
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    next_denominator, next_accumulator = online_attention_accumulate(
+                        maximum,
+                        next_maximum,
+                        denominator,
+                        accumulator,
+                        scores,
+                        v[key_region, head, :],
+                    )
+                    stream.yield_(
+                        next_maximum,
+                        next_denominator,
+                        next_accumulator,
+                    )
+            _, denominator, accumulator = stream.result
+            output[members, head, :] = I.cast(
+                accumulator / denominator[:, None], I.f16
+            )

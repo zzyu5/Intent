@@ -74,33 +74,30 @@ def layer_norm_backward_reduce(
     G, N = dw_partial.shape
     rows = I.domain(0, G)
     features = I.domain(0, N)
-    for feature_region in I.parallel(
-        I.partition(features, extent=I.auto("FEATURE_TILE"))
-    ):
-        accumulation = I.state_stream(
-            rows,
-            extent=I.auto("ROW_TILE"),
-            init=(
-                I.zeros((feature_region,), dtype=I.f32),
-                I.zeros((feature_region,), dtype=I.f32),
-            ),
-        )
-        with accumulation:
-            for row_region, (dw_value, db_value) in accumulation:
-                accumulation.yield_(
-                    dw_value
-                    + I.reduce.sum(
-                        I.cast(dw_partial[row_region, feature_region], I.f32),
-                        axis=0,
-                        identity=0.0,
-                    ),
-                    db_value
-                    + I.reduce.sum(
-                        I.cast(db_partial[row_region, feature_region], I.f32),
-                        axis=0,
-                        identity=0.0,
-                    ),
-                )
-        dw_value, db_value = accumulation.result
-        dw[feature_region] = dw_value
-        db[feature_region] = db_value
+    accumulation = I.state_stream(
+        rows,
+        extent=I.auto("ROW_TILE"),
+        init=(
+            I.zeros((features,), dtype=I.f32),
+            I.zeros((features,), dtype=I.f32),
+        ),
+    )
+    with accumulation:
+        for row_region, (dw_value, db_value) in accumulation:
+            accumulation.yield_(
+                dw_value
+                + I.reduce.sum(
+                    I.cast(dw_partial[row_region, features], I.f32),
+                    axis=0,
+                    identity=0.0,
+                ),
+                db_value
+                + I.reduce.sum(
+                    I.cast(db_partial[row_region, features], I.f32),
+                    axis=0,
+                    identity=0.0,
+                ),
+            )
+    dw_value, db_value = accumulation.result
+    dw[features] = dw_value
+    db[features] = db_value

@@ -47,7 +47,7 @@ def moe_prefix_routes(
             acc_dtype=I.i32,
         )
         expert_offsets[singleton] = 0
-        for expert in I.ordered(experts):
+        for expert in experts:
             expert_offsets[expert + 1] = prefix[expert]
         total_padded[singleton] = prefix[EXPERTS - 1]
 

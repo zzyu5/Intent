@@ -1,9 +1,13 @@
 #include "Intent/Target/TileLang/Lowering/Passes.h"
 
+#include "Syntax/Spelling.h"
+
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Lowering/ProgramAnalysis.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Pass/Pass.h"
 
@@ -56,7 +60,7 @@ bool feedsAtomicValue(Operation &operation) {
   Operation *user = *operation.getResult(0).user_begin();
   auto valueIndex =
       user->getAttrOfType<IntegerAttr>("intent.value_operand_index");
-  return user->getName().getStringRef() == "intent.atomic_add" && valueIndex &&
+  return ::intent::target::semanticOperationName(*user) == "intent.atomic_add" && valueIndex &&
          valueIndex.getInt() >= 0 &&
          static_cast<unsigned>(valueIndex.getInt()) < user->getNumOperands() &&
          user->getOperand(valueIndex.getInt()) == operation.getResult(0);
@@ -157,18 +161,55 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     autotune->setAttr(gemmWarpPolicyAttr, builder.getBoolAttr(tuneGemm));
   }
 
+  llvm::DenseSet<int64_t> stagedOperations;
+  for (intent::plan::StageOp stage :
+       program.getBody().getOps<intent::plan::StageOp>())
+    for (int64_t node : stage.getOperations())
+      stagedOperations.insert(node);
+  target::KernelModel &kernel = (*analysis)->getKernel();
+
+  for (const auto &entry : kernel.raggedRelations) {
+    Operation *ragged = entry.second.operation;
+    if (!ragged || ragged->hasAttr(raggedRouteAttr))
+      return program.emitOpError(
+          "has an invalid or duplicate TileLang ragged-route decision");
+    FailureOr<StringRef> route =
+        target::lowering::classifyRaggedProjection(*ragged);
+    if (failed(route))
+      return failure();
+    ragged->setAttr(raggedRouteAttr, builder.getStringAttr(*route));
+  }
+
   for (intent::plan::ContractOp contract :
        program.getBody().getOps<intent::plan::ContractOp>()) {
-    if (contract->hasAttr(isolateLhsAttr) || contract->hasAttr(isolateRhsAttr))
+    if (contract->hasAttr(isolateLhsAttr) || contract->hasAttr(isolateRhsAttr) ||
+        contract->hasAttr(contractLoweringAttr) ||
+        contract->hasAttr(contractOrientationAttr) ||
+        contract->hasAttr(contractBatchedAttr) ||
+        contract->hasAttr(scaledContractLayoutAttr))
       return contract.emitOpError(
           "already has TileLang contraction-operand forms");
     Operation *operation =
-        (*analysis)->getKernel().nodes.lookup(contract.getNode());
-    if (!operation || operation->getNumOperands() != 2)
+        kernel.nodes.lookup(contract.getNode());
+    if (!operation ||
+        (operation->getNumOperands() != 2 &&
+         (contract.getForm() != "scaled_direct" ||
+          operation->getNumOperands() != 4)))
       return contract.emitOpError("does not bind canonical contraction operands");
+    FailureOr<target::lowering::ContractionOrientation> orientation =
+        target::lowering::contractionOrientation(*operation);
+    if (failed(orientation))
+      return contract.emitOpError(
+          "does not bind canonical contraction orientation");
+    if (orientation->batched)
+      return contract.emitOpError(
+          "TileLang 0.1.13 has no mechanical batched GEMM projection");
+    if (contract.getForm() == "staged" && orientation->lhsTranspose)
+      return contract.emitOpError(
+          "TileLang cannot project the selected staged contraction orientation");
     auto repeatedContractionOperand = [](Value operand) {
       return llvm::count_if(operand.getUsers(), [](Operation *user) {
-               return user->getName().getStringRef() == "intent.contract";
+               return ::intent::target::semanticOperationName(*user) == "intent.contract";
              }) > 1;
     };
     contract->setAttr(isolateLhsAttr, builder.getBoolAttr(
@@ -177,22 +218,113 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     contract->setAttr(isolateRhsAttr, builder.getBoolAttr(
                                            repeatedContractionOperand(
                                                operation->getOperand(1))));
+    StringRef lowering = contract.getForm() == "scaled_direct"
+                             ? syntax::scaledContraction()
+                             : syntax::contraction();
+    contract->setAttr(contractLoweringAttr, builder.getStringAttr(lowering));
+    contract->setAttr(contractOrientationAttr,
+                      builder.getStringAttr(
+                          target::lowering::contractionOrientationName(
+                              *orientation)));
+    contract->setAttr(contractBatchedAttr,
+                      builder.getBoolAttr(orientation->batched));
+    if (contract.getForm() == "scaled_direct") {
+      FailureOr<StringRef> layout =
+          target::lowering::scaledContractionLayout(*operation);
+      if (failed(layout))
+        return failure();
+      contract->setAttr(scaledContractLayoutAttr,
+                        builder.getStringAttr(*layout));
+    }
+  }
+
+  for (intent::plan::ReductionOp reduction :
+       program.getBody().getOps<intent::plan::ReductionOp>()) {
+    if (reduction->hasAttr(reductionLoweringAttr) ||
+        reduction->hasAttr(reductionAxisAttr))
+      return reduction.emitOpError("already has a TileLang reduction spelling");
+    Operation *operation = kernel.nodes.lookup(reduction.getNode());
+    FailureOr<std::string> role =
+        operation ? target::lowering::reductionRole(*operation)
+                  : FailureOr<std::string>(failure());
+    FailureOr<int64_t> axis =
+        operation ? target::lowering::reductionAxis(*operation)
+                  : FailureOr<int64_t>(failure());
+    if (failed(role) || failed(axis))
+      return reduction.emitOpError("does not bind canonical reduction semantics");
+    if (*role == "reduce_generic")
+      return reduction.emitOpError(
+          "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced "
+          "by comm_reducer; generic reduction combiners are unsupported");
+    reduction->setAttr(reductionLoweringAttr,
+                       builder.getStringAttr(syntax::reduction(*role)));
+    reduction->setAttr(reductionAxisAttr, builder.getI64IntegerAttr(*axis));
+  }
+
+  for (intent::plan::ScanOp scan :
+       program.getBody().getOps<intent::plan::ScanOp>()) {
+    if (scan->hasAttr(scanLoweringAttr))
+      return scan.emitOpError("already has a TileLang scan spelling");
+    Operation *operation = kernel.nodes.lookup(scan.getNode());
+    FailureOr<std::string> role =
+        operation ? target::lowering::scanRole(*operation)
+                  : FailureOr<std::string>(failure());
+    if (succeeded(role) && *role == "scan_generic_inclusive")
+      return scan.emitOpError(
+          "TileLang 0.1.13 has no mechanically lowerable generic scan "
+          "combiner path; generic scan combiners are unsupported");
+    if (failed(role) || *role != "scan_inclusive_add")
+      return scan.emitOpError("does not bind a supported TileLang scan form");
+    scan->setAttr(scanLoweringAttr, builder.getStringAttr(syntax::scan()));
   }
 
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
-    if (pointwise->hasAttr(pointwiseFormAttr))
+    if (pointwise->hasAttr(pointwiseFormAttr) ||
+        pointwise->hasAttr(pointwiseLoweringAttr) ||
+        pointwise->hasAttr(pointwiseDeferredAttr))
       return pointwise.emitOpError(
           "already has a TileLang pointwise-form decision");
     Operation *operation =
-        (*analysis)->getKernel().nodes.lookup(pointwise.getNode());
+        kernel.nodes.lookup(pointwise.getNode());
     if (!operation)
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
-    pointwise->setAttr(
-        pointwiseFormAttr,
-        builder.getStringAttr(target::lowering::feedsContraction(*operation)
-                                  ? "contract_operand"
-                                  : "elementwise"));
+    StringRef form = target::lowering::feedsContraction(*operation)
+                         ? StringRef("contract_operand")
+                         : StringRef("elementwise");
+    FailureOr<std::string> role = target::lowering::pointwiseRole(*operation);
+    FailureOr<StringRef> lowering =
+        succeeded(role) ? syntax::pointwise(pointwise.getOperation(), *role, form)
+                        : FailureOr<StringRef>(failure());
+    if (failed(lowering))
+      return pointwise.emitOpError("does not bind canonical pointwise semantics");
+    pointwise->setAttr(pointwiseFormAttr, builder.getStringAttr(form));
+    pointwise->setAttr(pointwiseLoweringAttr,
+                       builder.getStringAttr(*lowering));
+    bool deferred = stagedOperations.contains(
+        static_cast<int64_t>(pointwise.getNode()));
+    pointwise->setAttr(pointwiseDeferredAttr, builder.getBoolAttr(deferred));
+    if (target::semanticOperationName(*operation) == "intent.gather") {
+      FailureOr<std::string> gather = target::lowering::classifyGatherProjection(
+          *operation, deferred, deferred);
+      if (failed(gather))
+        return failure();
+      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
+    }
+  }
+
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>()) {
+    if (stream->hasAttr(streamTileAttr))
+      return stream.emitOpError("already has a TileLang stream-tile spelling");
+    intent::plan::RangeOp range = (*analysis)->getRange(
+        stream.getAxisNode(), stream.getPurpose(), stream.getLevel());
+    FailureOr<std::string> tile =
+        range ? syntax::tile(stream.getOperation(), range.getTile())
+              : FailureOr<std::string>(failure());
+    if (failed(tile))
+      return stream.emitOpError("does not bind one TileLang stream tile");
+    stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
   }
 
   for (intent::plan::TransferOp transfer :
@@ -203,7 +335,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
           "already has a TileLang transfer-form decision");
     Operation *operation =
         (*analysis)->getKernel().nodes.lookup(transfer.getNode());
-    StringRef name = operation ? operation->getName().getStringRef() : StringRef();
+    StringRef name = operation ? ::intent::target::semanticOperationName(*operation) : StringRef();
     bool load = name == "intent.view_load";
     bool store = name == "intent.view_store" || name == "intent.scatter_unique" ||
                  name == "intent.atomic_add" || name == "intent.atomic_cas";
@@ -228,20 +360,66 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
           return (*analysis)->isPackedScalarAxis(node);
         });
     bool elementwise = *derivedScalar || tensorIndirect || logicalBounds;
+    bool bounds = (*analysis)->hasWorkerReuse() || raggedBound ||
+                  (logicalBounds && !physicalValidity) ||
+                  (!(*analysis)->getStages().empty() && store) ||
+                  *derivedScalar || tensorIndirect || packedScalar;
+    bool scalarResult = operation->getNumResults() == 1 &&
+                        !isa<RankedTensorType>(operation->getResult(0).getType());
+    Type resultElement =
+        scalarResult
+            ? operation->getResult(0).getType()
+            : operation->getNumResults() == 1
+                  ? cast<RankedTensorType>(operation->getResult(0).getType())
+                        .getElementType()
+                  : Type();
+    bool compact = load && transfer.getTensorIndexing() == "compact" &&
+                   transfer.getCoverageSpace() != "none";
+    bool guardedF16Bulk =
+        load && !scalarResult && resultElement.isF16() && *derivedScalar &&
+        !tensorIndirect && !logicalBounds && bounds && transfer.getFill() != "none";
+    if (guardedF16Bulk) {
+      FailureOr<SmallVector<target::IndexTerm>> relation =
+          target::parseIndexRelation(*operation);
+      if (failed(relation))
+        return failure();
+      for (const target::IndexTerm &term : *relation) {
+        if (term.kind != "region_index")
+          continue;
+        if (term.operands.size() != 1 || !term.operands.front())
+          return operation->emitOpError(
+              "has no guarded float16 region projection");
+        Value indexed = operation->getOperand(*term.operands.front());
+        auto source = (*analysis)->getFacts().regionArgumentAxes.find(indexed);
+        Operation *domain = source == (*analysis)->getFacts().regionArgumentAxes.end()
+                                ? nullptr
+                                : source->second.domain;
+        auto node = domain
+                        ? domain->getAttrOfType<IntegerAttr>("intent.node")
+                        : IntegerAttr();
+        if (!node || !(*analysis)->axisHasRole(node.getInt(), "lane") ||
+            (*analysis)->axisHasRole(node.getInt(), "parallel") ||
+            (*analysis)->axisHasRole(node.getInt(), "ordered") ||
+            (*analysis)->axisHasRole(node.getInt(), "reduction") ||
+            (*analysis)->axisHasRole(node.getInt(), "ragged_member")) {
+          guardedF16Bulk = false;
+          break;
+        }
+      }
+    }
     transfer->setAttr(
         accessAttr,
         builder.getStringAttr((*analysis)->hasWorkerReuse()
                                   ? (load ? "gather" : "scatter")
                                   : (load ? "load" : "store")));
-    transfer->setAttr(transferAttr,
-                      builder.getStringAttr(elementwise ? "parallel_elements"
-                                                        : "bulk_copy"));
-    transfer->setAttr(
-        boundsAttr,
-        builder.getBoolAttr((*analysis)->hasWorkerReuse() || raggedBound ||
-                            (logicalBounds && !physicalValidity) ||
-                            (!(*analysis)->getStages().empty() && store) ||
-                            *derivedScalar || tensorIndirect || packedScalar));
+    StringRef transferForm = compact
+                                 ? StringRef("compact")
+                             : guardedF16Bulk
+                                 ? StringRef("guarded_f16_bulk")
+                             : elementwise ? StringRef("parallel_elements")
+                                           : StringRef("bulk_copy");
+    transfer->setAttr(transferAttr, builder.getStringAttr(transferForm));
+    transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
     transfer->setAttr(
         deferredAttr,
         builder.getBoolAttr(load && (*analysis)->getStages().empty() &&
@@ -299,6 +477,15 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                     intent::plan::ProgramOp program,
                                     intent::plan::SearchSpaceOp searchSpace) {
   (void)searchSpace;
+  for (const auto &entry : kernel.raggedRelations) {
+    Operation *ragged = entry.second.operation;
+    auto route = ragged ? ragged->getAttrOfType<StringAttr>(raggedRouteAttr)
+                        : StringAttr();
+    if (!route || (route.getValue() != "compact" &&
+                   route.getValue() != "indexed"))
+      return program.emitOpError(
+          "has no complete TileLang ragged-route form");
+  }
   auto launches = program.getBody().getOps<intent::plan::LaunchOp>();
   if (!llvm::hasSingleElement(launches))
     return program.emitOpError(
@@ -320,9 +507,16 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     auto form = pointwise->getAttrOfType<StringAttr>(pointwiseFormAttr);
+    auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
+    auto deferred = pointwise->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
+    Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
+    bool requiresGather =
+        operation && target::semanticOperationName(*operation) == "intent.gather";
     if (!form || (form.getValue() != "elementwise" &&
                   form.getValue() != "contract_operand") ||
-        !kernel.nodes.lookup(pointwise.getNode()))
+        !lowering || lowering.getValue().empty() || !deferred || !operation ||
+        (requiresGather && (!gather || gather.getValue().empty())))
       return pointwise.emitOpError(
           "has no complete TileLang pointwise-form decision");
   }
@@ -330,10 +524,47 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
        program.getBody().getOps<intent::plan::ContractOp>()) {
     auto lhs = contract->getAttrOfType<BoolAttr>(isolateLhsAttr);
     auto rhs = contract->getAttrOfType<BoolAttr>(isolateRhsAttr);
+    auto lowering = contract->getAttrOfType<StringAttr>(contractLoweringAttr);
+    auto orientation =
+        contract->getAttrOfType<StringAttr>(contractOrientationAttr);
+    auto batched = contract->getAttrOfType<BoolAttr>(contractBatchedAttr);
+    auto layout = contract->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
     Operation *operation = kernel.nodes.lookup(contract.getNode());
-    if (!lhs || !rhs || !operation || operation->getNumOperands() != 2)
+    if (!lhs || !rhs || !lowering || lowering.getValue().empty() ||
+        !orientation || !batched || batched.getValue() ||
+        (orientation.getValue() != "nn" && orientation.getValue() != "nt" &&
+         orientation.getValue() != "tn" && orientation.getValue() != "tt") ||
+        (contract.getForm() == "scaled_direct" &&
+         (!layout || (layout.getValue() != "grouped_rank_two" &&
+                      layout.getValue() != "flattened_rank_three"))) ||
+        (contract.getForm() != "scaled_direct" && layout) || !operation ||
+        (operation->getNumOperands() != 2 &&
+         (contract.getForm() != "scaled_direct" ||
+          operation->getNumOperands() != 4)))
       return contract.emitOpError(
-          "has no complete TileLang contraction-operand form");
+          "has no complete TileLang contraction provider form");
+  }
+  for (intent::plan::ReductionOp reduction :
+       program.getBody().getOps<intent::plan::ReductionOp>()) {
+    auto lowering = reduction->getAttrOfType<StringAttr>(reductionLoweringAttr);
+    auto axis = reduction->getAttrOfType<IntegerAttr>(reductionAxisAttr);
+    if (!lowering || lowering.getValue().empty() || !axis || axis.getInt() < 0 ||
+        !kernel.nodes.lookup(reduction.getNode()))
+      return reduction.emitOpError(
+          "has no complete TileLang reduction spelling");
+  }
+  for (intent::plan::ScanOp scan :
+       program.getBody().getOps<intent::plan::ScanOp>()) {
+    auto lowering = scan->getAttrOfType<StringAttr>(scanLoweringAttr);
+    if (!lowering || lowering.getValue().empty() ||
+        !kernel.nodes.lookup(scan.getNode()))
+      return scan.emitOpError("has no complete TileLang scan spelling");
+  }
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>()) {
+    auto tile = stream->getAttrOfType<StringAttr>(streamTileAttr);
+    if (!tile || tile.getValue().empty())
+      return stream.emitOpError("has no complete TileLang stream-tile spelling");
   }
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
@@ -342,7 +573,7 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto bounds = transfer->getAttrOfType<BoolAttr>(boundsAttr);
     auto deferred = transfer->getAttrOfType<BoolAttr>(deferredAttr);
     Operation *operation = kernel.nodes.lookup(transfer.getNode());
-    StringRef name = operation ? operation->getName().getStringRef() : StringRef();
+    StringRef name = operation ? ::intent::target::semanticOperationName(*operation) : StringRef();
     bool load = name == "intent.view_load";
     bool validAccess = access &&
                        ((load && (access.getValue() == "load" ||
@@ -351,7 +582,9 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                    access.getValue() == "scatter")));
     bool validTransfer = form &&
                          (form.getValue() == "bulk_copy" ||
-                          form.getValue() == "parallel_elements");
+                          form.getValue() == "parallel_elements" ||
+                          form.getValue() == "compact" ||
+                          form.getValue() == "guarded_f16_bulk");
     if (!operation || !validAccess || !validTransfer || !bounds || !deferred)
       return transfer.emitOpError(
           "has no complete legal TileLang transfer-form decision");

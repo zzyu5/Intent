@@ -24,7 +24,7 @@ def selective_state_scan(
     positions = I.domain(0, L)
     for batch in I.parallel(I.domain(0, B)):
         state = I.cast(0.0, I.f32)
-        for position in I.ordered(positions):
+        for position in positions:
             state = (
                 decay[batch, position] * state
                 + drive[batch, position] * x[batch, position]
@@ -57,118 +57,112 @@ def mamba_chunk_scan_fwd(
                 group = head // HEADS_PER_GROUP
                 I.assume_in_bounds(group, state_matrix, axis=2)
                 I.assume_in_bounds(group, cb, axis=2)
-                for row_region in I.parallel(
-                    I.partition(rows, extent=I.auto("M_TILE"))
-                ):
-                    for column_region in I.parallel(
-                        I.partition(columns, extent=I.auto("N_TILE"))
-                    ):
-                        row_index = I.indices(row_region)
-                        column_index = I.indices(column_region)
-                        global_row = chunk * S + row_index
-                        state_term = I.contract(
-                            state_matrix[
-                                batch, global_row, group, state_axis
-                            ],
-                            previous_states[
-                                batch, chunk, head, column_index, state_axis
-                            ],
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        )
-                        state_term = state_term * I.exp2(
-                            I.cast(
-                                dA_cumsum[batch, head, chunk, row_region],
-                                I.f32,
-                            )[:, None]
+                row_index = I.indices(rows)
+                column_index = I.indices(columns)
+                global_row = chunk * S + row_index
+                state_term = I.contract(
+                    state_matrix[
+                        batch, global_row, group, state_axis
+                    ],
+                    previous_states[
+                        batch, chunk, head, column_index, state_axis
+                    ],
+                    reduce=((1, 1),),
+                    acc_dtype=I.f32,
+                )
+                state_term = state_term * I.exp2(
+                    I.cast(
+                        dA_cumsum[batch, head, chunk, rows],
+                        I.f32,
+                    )[:, None]
+                    * I.LOG2E
+                )
+                scan = I.state_stream(
+                    rows,
+                    extent=I.auto("K_TILE"),
+                    init=(state_term,),
+                    stop=I.end(rows),
+                )
+                with scan:
+                    for scan_region, accumulator in scan:
+                        scan_index = I.indices(scan_region)
+                        global_scan = chunk * S + scan_index
+                        decay = I.exp2(
+                            I.minimum(
+                                I.cast(
+                                    dA_cumsum[
+                                        batch, head, chunk, rows
+                                    ],
+                                    I.f32,
+                                )[:, None]
+                                - I.cast(
+                                    dA_cumsum[
+                                        batch, head, chunk, scan_region
+                                    ],
+                                    I.f32,
+                                )[None, :],
+                                0.0,
+                            )
                             * I.LOG2E
                         )
-                        scan = I.state_stream(
-                            rows,
-                            extent=I.auto("K_TILE"),
-                            init=(state_term,),
-                            stop=I.end(row_region),
-                        )
-                        with scan:
-                            for scan_region, accumulator in scan:
-                                scan_index = I.indices(scan_region)
-                                global_scan = chunk * S + scan_index
-                                decay = I.exp2(
-                                    I.minimum(
-                                        I.cast(
-                                            dA_cumsum[
-                                                batch, head, chunk, row_region
-                                            ],
-                                            I.f32,
-                                        )[:, None]
-                                        - I.cast(
-                                            dA_cumsum[
-                                                batch, head, chunk, scan_region
-                                            ],
-                                            I.f32,
-                                        )[None, :],
-                                        0.0,
-                                    )
-                                    * I.LOG2E
-                                )
-                                coefficient = (
-                                    I.cast(
-                                        cb[
-                                            batch,
-                                            chunk,
-                                            group,
-                                            row_region,
-                                            scan_region,
-                                        ],
-                                        I.f32,
-                                    )
-                                    * decay
-                                    * I.cast(
-                                        dt[batch, head, chunk, scan_region],
-                                        I.f32,
-                                    )[None, :]
-                                )
-                                coefficient = I.mask(
-                                    coefficient,
-                                    valid=global_row[:, None]
-                                    >= global_scan[None, :],
-                                    fill=0.0,
-                                )
-                                partial = I.contract(
-                                    I.cast(coefficient, I.f16),
-                                    x[
-                                        batch,
-                                        chunk * S + scan_index[:, None],
-                                        head,
-                                        column_index[None, :],
-                                    ],
-                                    reduce=((1, 0),),
-                                    acc_dtype=I.f32,
-                                )
-                                scan.yield_(accumulator + partial)
-                        scan_term = scan.result
-                        residual = (
+                        coefficient = (
                             I.cast(
-                                x[
+                                cb[
                                     batch,
-                                    global_row[:, None],
-                                    head,
-                                    column_index[None, :],
+                                    chunk,
+                                    group,
+                                    rows,
+                                    scan_region,
                                 ],
                                 I.f32,
                             )
-                            * I.cast(residual_scale[head], I.f32)
+                            * decay
+                            * I.cast(
+                                dt[batch, head, chunk, scan_region],
+                                I.f32,
+                            )[None, :]
                         )
-                        I.scatter_unique(
-                            output,
-                            index=(
+                        coefficient = I.mask(
+                            coefficient,
+                            valid=global_row[:, None]
+                            >= global_scan[None, :],
+                            fill=0.0,
+                        )
+                        partial = I.contract(
+                            I.cast(coefficient, I.f16),
+                            x[
                                 batch,
-                                global_row[:, None],
+                                chunk * S + scan_index[:, None],
                                 head,
                                 column_index[None, :],
-                            ),
-                            value=I.cast(scan_term + residual, I.f16),
+                            ],
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
                         )
+                        scan.yield_(accumulator + partial)
+                scan_term = scan.result
+                residual = (
+                    I.cast(
+                        x[
+                            batch,
+                            global_row[:, None],
+                            head,
+                            column_index[None, :],
+                        ],
+                        I.f32,
+                    )
+                    * I.cast(residual_scale[head], I.f32)
+                )
+                I.scatter_unique(
+                    output,
+                    index=(
+                        batch,
+                        global_row[:, None],
+                        head,
+                        column_index[None, :],
+                    ),
+                    value=I.cast(scan_term + residual, I.f16),
+                )
 
 
 @intent.kernel
@@ -196,106 +190,100 @@ def mamba_chunk_scan_bf16_fwd(
                 group = head // HEADS_PER_GROUP
                 I.assume_in_bounds(group, state_matrix, axis=2)
                 I.assume_in_bounds(group, cb, axis=2)
-                for row_region in I.parallel(
-                    I.partition(rows, extent=I.auto("M_TILE"))
-                ):
-                    for column_region in I.parallel(
-                        I.partition(columns, extent=I.auto("N_TILE"))
-                    ):
-                        row_index = I.indices(row_region)
-                        column_index = I.indices(column_region)
-                        global_row = chunk * S + row_index
-                        state_term = I.contract(
-                            state_matrix[
-                                batch, global_row, group, state_axis
-                            ],
-                            I.cast(
-                                previous_states[
-                                    batch, chunk, head, column_index, state_axis
-                                ],
-                                I.bf16,
-                            ),
-                            reduce=((1, 1),),
-                            acc_dtype=I.f32,
-                        )
-                        state_term = state_term * I.exp2(
-                            dA_cumsum[batch, head, chunk, row_region][:, None]
+                row_index = I.indices(rows)
+                column_index = I.indices(columns)
+                global_row = chunk * S + row_index
+                state_term = I.contract(
+                    state_matrix[
+                        batch, global_row, group, state_axis
+                    ],
+                    I.cast(
+                        previous_states[
+                            batch, chunk, head, column_index, state_axis
+                        ],
+                        I.bf16,
+                    ),
+                    reduce=((1, 1),),
+                    acc_dtype=I.f32,
+                )
+                state_term = state_term * I.exp2(
+                    dA_cumsum[batch, head, chunk, rows][:, None]
+                    * I.LOG2E
+                )
+                scan = I.state_stream(
+                    rows,
+                    extent=I.auto("K_TILE"),
+                    init=(state_term,),
+                    stop=I.end(rows),
+                )
+                with scan:
+                    for scan_region, accumulator in scan:
+                        scan_index = I.indices(scan_region)
+                        global_scan = chunk * S + scan_index
+                        decay = I.exp2(
+                            I.minimum(
+                                dA_cumsum[
+                                    batch, head, chunk, rows
+                                ][:, None]
+                                - dA_cumsum[
+                                    batch, head, chunk, scan_region
+                                ][None, :],
+                                0.0,
+                            )
                             * I.LOG2E
                         )
-                        scan = I.state_stream(
-                            rows,
-                            extent=I.auto("K_TILE"),
-                            init=(state_term,),
-                            stop=I.end(row_region),
-                        )
-                        with scan:
-                            for scan_region, accumulator in scan:
-                                scan_index = I.indices(scan_region)
-                                global_scan = chunk * S + scan_index
-                                decay = I.exp2(
-                                    I.minimum(
-                                        dA_cumsum[
-                                            batch, head, chunk, row_region
-                                        ][:, None]
-                                        - dA_cumsum[
-                                            batch, head, chunk, scan_region
-                                        ][None, :],
-                                        0.0,
-                                    )
-                                    * I.LOG2E
-                                )
-                                coefficient = (
-                                    I.cast(
-                                        cb[
-                                            batch,
-                                            chunk,
-                                            group,
-                                            row_region,
-                                            scan_region,
-                                        ],
-                                        I.f32,
-                                    )
-                                    * decay
-                                    * dt[batch, head, chunk, scan_region][None, :]
-                                )
-                                coefficient = I.mask(
-                                    coefficient,
-                                    valid=global_row[:, None]
-                                    >= global_scan[None, :],
-                                    fill=0.0,
-                                )
-                                partial = I.contract(
-                                    I.cast(coefficient, I.bf16),
-                                    x[
-                                        batch,
-                                        chunk * S + scan_index[:, None],
-                                        head,
-                                        column_index[None, :],
-                                    ],
-                                    reduce=((1, 0),),
-                                    acc_dtype=I.f32,
-                                )
-                                scan.yield_(accumulator + partial)
-                        scan_term = scan.result
-                        residual = (
+                        coefficient = (
                             I.cast(
-                                x[
+                                cb[
                                     batch,
-                                    global_row[:, None],
-                                    head,
-                                    column_index[None, :],
+                                    chunk,
+                                    group,
+                                    rows,
+                                    scan_region,
                                 ],
                                 I.f32,
                             )
-                            * residual_scale[head]
+                            * decay
+                            * dt[batch, head, chunk, scan_region][None, :]
                         )
-                        I.scatter_unique(
-                            output,
-                            index=(
+                        coefficient = I.mask(
+                            coefficient,
+                            valid=global_row[:, None]
+                            >= global_scan[None, :],
+                            fill=0.0,
+                        )
+                        partial = I.contract(
+                            I.cast(coefficient, I.bf16),
+                            x[
                                 batch,
-                                global_row[:, None],
+                                chunk * S + scan_index[:, None],
                                 head,
                                 column_index[None, :],
-                            ),
-                            value=I.cast(scan_term + residual, I.bf16),
+                            ],
+                            reduce=((1, 0),),
+                            acc_dtype=I.f32,
                         )
+                        scan.yield_(accumulator + partial)
+                scan_term = scan.result
+                residual = (
+                    I.cast(
+                        x[
+                            batch,
+                            global_row[:, None],
+                            head,
+                            column_index[None, :],
+                        ],
+                        I.f32,
+                    )
+                    * residual_scale[head]
+                )
+                I.scatter_unique(
+                    output,
+                    index=(
+                        batch,
+                        global_row[:, None],
+                        head,
+                        column_index[None, :],
+                    ),
+                    value=I.cast(scan_term + residual, I.bf16),
+                )

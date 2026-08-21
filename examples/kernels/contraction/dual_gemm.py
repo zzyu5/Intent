@@ -19,18 +19,16 @@ def gated_dual_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-        for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-            gate = I.contract(
-                x[mr, k_axis],
-                gate_weight[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            value = I.contract(
-                x[mr, k_axis],
-                value_weight[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            y[mr, nr] = I.cast(I.maximum(gate, 0.0) * value, I.f16)
+    gate = I.contract(
+        x[m_axis, k_axis],
+        gate_weight[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    value = I.contract(
+        x[m_axis, k_axis],
+        value_weight[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    y[m_axis, n_axis] = I.cast(I.maximum(gate, 0.0) * value, I.f16)

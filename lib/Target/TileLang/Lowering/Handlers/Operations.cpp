@@ -5,6 +5,7 @@
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Analysis/StructuredControl.h"
 #include "Intent/Target/Common/Lowering/Literal.h"
@@ -32,7 +33,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
   auto noOp = [](Operation &) { return success(); };
   for (StringRef name : {"intent.domain", "intent.domain_product",
                          "intent.make_record",
-                         "intent.region_end",
                          "intent.partition", "intent.return", "intent.ragged",
                          "intent.ragged_outer", "intent.ragged_member"})
     if (failed(addHandler(registry, name, noOp)))
@@ -52,6 +52,9 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitExtract(op);
       })) ||
+      failed(addHandler(registry, "intent.region_end", [&](Operation &op) {
+        return emitter.selectOperation(op) ? emitter.emitRegionEnd(op) : success();
+      })) ||
       failed(addHandler(
           registry, "intent.parallel",
           [&](Operation &op) {
@@ -64,14 +67,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           })) ||
       failed(addHandler(
           registry, "intent.for",
-          [&](Operation &op) {
-            return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
-          },
-          [&](Operation &op) {
-            return emitter.selectOperation(op) ? emitter.leaveFor(op) : success();
-          })) ||
-      failed(addHandler(
-          registry, "intent.ordered",
           [&](Operation &op) {
             return emitter.selectOperation(op) ? emitter.enterFor(op) : success();
           },
@@ -148,7 +143,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitBroadcast(op);
       })) ||
-      failed(addHandler(registry, "intent_plan.unary", [&](Operation &op) {
+      failed(addHandler(registry, "intent.unary", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitUnary(op);
@@ -308,6 +303,41 @@ LogicalResult ProgramMaterializer::emitExtract(Operation &operation) {
   if (found == valueNames.end())
     return operation.emitOpError("record field has no emitted TileLang SSA value");
   bindResult(operation, 0, found->second);
+  return success();
+}
+
+LogicalResult ProgramMaterializer::emitRegionEnd(Operation &operation) {
+  if (operation.getNumOperands() != 1 || operation.getNumResults() != 1 ||
+      !operation.getResult(0).getType().isIntOrIndex())
+    return operation.emitOpError(
+        "lacks a mechanical TileLang region-end binding");
+  FailureOr<plan::AxisOp> axis = resolveAxis(operation.getOperand(0), operation);
+  if (failed(axis))
+    return failure();
+  std::string extent = axisDimensions.lookup(axis->getNode());
+  if (extent.empty())
+    return operation.emitOpError("has no planned logical extent for region end");
+  std::string expression = extent;
+  if (isa<intent::RegionType>(operation.getOperand(0).getType())) {
+    if (axis->hasRole("parallel") && !axis->isScalar()) {
+      std::string block = programBlocks.lookup(axis->getNode());
+      if (block.empty())
+        return operation.emitOpError(
+            "has no planned program block for parallel region end");
+      expression = "T.min((" + block + " + 1) * " + axis->getTile().str() +
+                   ", " + extent + ")";
+    } else if (axis->hasRole("ordered")) {
+      const target::lowering::RangeBinding *range =
+          axis->getRange("traversal", 0);
+      std::string start = axisIndices.lookup(axis->getNode());
+      if (!range || start.empty())
+        return operation.emitOpError(
+            "has no planned ordered range for region end");
+      expression = "T.min((" + start + ") + " + range->getTile().str() +
+                   ", " + extent + ")";
+    }
+  }
+  bindResult(operation, 0, expression);
   return success();
 }
 
@@ -537,9 +567,8 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
       operation.getNumOperands() > 0
           ? target::expandDomainSource(operation.getOperand(0), operation)
           : FailureOr<SmallVector<Operation *>>(failure());
-  bool ordered = operation.getName().getStringRef() == "intent.ordered";
   if (failed(node) || failed(domains) || domains->empty() ||
-      (!ordered && domains->size() != 1) || operation.getNumRegions() != 1 ||
+      operation.getNumRegions() != 1 ||
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang sequential loop");
   Block &body = operation.getRegion(0).front();
@@ -576,14 +605,14 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     FailureOr<int64_t> domainNode =
         target::getNodeID(*domain, "ordered traversal range");
     bool raggedAxis =
-        domain->getName().getStringRef() == "intent.ragged_member";
+        ::intent::target::semanticOperationName(*domain) == "intent.ragged_member";
     auto rangeValue = [&](unsigned operand) -> FailureOr<std::string> {
       Operation *definition = domain->getOperand(operand).getDefiningOp();
       auto literal = definition
                          ? definition->getAttrOfType<IntegerAttr>("intent.value")
                          : IntegerAttr();
       if (definition &&
-          definition->getName().getStringRef() == "intent.constant" && literal)
+          ::intent::target::semanticOperationName(*definition) == "intent.constant" && literal)
         return std::to_string(literal.getInt());
       auto found = valueNames.find(domain->getOperand(operand));
       if (found == valueNames.end()) {
@@ -596,13 +625,13 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     FailureOr<std::string> stop = failure();
     FailureOr<std::string> step = std::string("1");
     ABIView *raggedIndices = nullptr;
-    if (domain->getName().getStringRef() == "intent.domain" &&
+    if (::intent::target::semanticOperationName(*domain) == "intent.domain" &&
         domain->getNumOperands() >= 2) {
       start = rangeValue(0);
       stop = rangeValue(1);
       if (domain->getNumOperands() == 3)
         step = rangeValue(2);
-    } else if (ordered && raggedAxis && succeeded(domainNode)) {
+    } else if (raggedAxis && succeeded(domainNode)) {
       FailureOr<plan::RaggedOp> relation =
           target::lowering::uniqueRaggedRelation(planIndex, *domainNode,
                                                   operation);
@@ -635,19 +664,17 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
     if (*step != "1")
       return operation.emitOpError(
           "TileLang serial traversal requires a unit-step domain");
-    if (ordered && !raggedAxis && *start != "0")
-      return operation.emitOpError(
-          "TileLang ordered traversal requires a zero-based domain");
     std::string iterator = makeRegionArgumentName(operation, index);
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
     const target::lowering::RangeBinding *outer =
-        ordered && axis ? axis.getRange("traversal", 0) : nullptr;
+        axis ? axis.getRange("traversal", 0) : nullptr;
     const target::lowering::RangeBinding *inner =
-        ordered && axis ? axis.getRange("traversal", 1) : nullptr;
+        axis ? axis.getRange("traversal", 1) : nullptr;
     if (inner) {
-      if (!outer || inner->getTileRole() != "one")
+      if (!outer || inner->getTileRole() != "one" ||
+          (!raggedAxis && *start != "0"))
         return operation.emitOpError(
             "has an invalid two-level TileLang ordered traversal");
       std::string chunk = iterator + "_chunk";
@@ -688,14 +715,13 @@ LogicalResult ProgramMaterializer::leaveFor(Operation &operation) {
   if (failed(domains) || domains->empty())
     return failure();
   unsigned depth = 0;
-  bool ordered = operation.getName().getStringRef() == "intent.ordered";
   for (Operation *domain : *domains) {
     FailureOr<int64_t> domainNode =
         target::getNodeID(*domain, "ordered traversal range");
     plan::AxisOp axis = succeeded(domainNode)
                             ? planIndex.axes.lookup(*domainNode)
                             : plan::AxisOp();
-    depth += ordered && axis && axis.getRange("traversal", 1) ? 2 : 1;
+    depth += axis && axis.getRange("traversal", 1) ? 2 : 1;
   }
   indentation -= depth;
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
@@ -833,8 +859,8 @@ LogicalResult ProgramMaterializer::emitYield(Operation &operation) {
   Operation *owner = operation.getParentOp();
   if (!owner)
     return operation.emitOpError("has no structured-control owner");
-  StringRef name = owner->getName().getStringRef();
-  if (name == "intent.for" || name == "intent.ordered") {
+  StringRef name = ::intent::target::semanticOperationName(*owner);
+  if (name == "intent.for") {
     auto carriers = loopCarriers.find(owner);
     if (carriers == loopCarriers.end() ||
         carriers->second.size() != operation.getNumOperands())
@@ -1176,9 +1202,6 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
                                : cast<RankedTensorType>(
                                      operation.getResult(0).getType())
                                      .getElementType();
-  FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(operation);
-  if (failed(derivedScalar))
-    return failure();
   StringRef zeroFill = isa<IntegerType, IndexType>(resultElementType) ? "0"
                                                                       : "0.0";
   auto accessRanges =
@@ -1187,8 +1210,7 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     return operation.emitOpError(
         "TileLang cannot project a multi-axis checked access footprint as one "
         "cooperative transfer");
-  if (boundary.hasCompactTensorIndex() &&
-      boundary.getCoverageSpace() != "none") {
+  if (boundary.getTransfer() == "compact") {
     if (scalarResult || failed(view) || accessRanges.size() != 1 ||
         !accessRanges.front().isCompact())
       return operation.emitOpError(
@@ -1432,33 +1454,12 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
   bool plannedValidity = !boundary.getConsumerNeutralized() &&
                          boundary.getPadding() != "none" &&
                          !boundary.getValidityDomainNodes().empty();
-  bool guardedF16Bulk = !scalarResult && resultElementType.isF16() &&
-                        *derivedScalar && !tensorIndirect &&
-                        !plannedValidity &&
-                        boundary.getCheckBounds() &&
-                        boundary.getPadding() != "none";
+  bool guardedF16Bulk = boundary.getTransfer() == "guarded_f16_bulk";
   FailureOr<SmallVector<target::IndexTerm>> relation = failure();
   if (guardedF16Bulk) {
     relation = target::parseIndexRelation(operation);
     if (failed(relation))
       return failure();
-    for (const target::IndexTerm &term : *relation) {
-      if (term.kind != "region_index")
-        continue;
-      if (term.operands.size() != 1 || !term.operands.front())
-        return operation.emitOpError(
-            "has no mechanical guarded float16 region relation");
-      Value indexed = operation.getOperand(*term.operands.front());
-      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
-      if (failed(axis))
-        return failure();
-      if (!axis->hasRole("lane") || axis->hasRole("parallel") ||
-          axis->hasRole("ordered") || axis->hasRole("reduction") ||
-          axis->hasRole("ragged_member")) {
-        guardedF16Bulk = false;
-        break;
-      }
-    }
   }
   if (guardedF16Bulk) {
     if (expanded) {
@@ -2910,6 +2911,10 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "gather emission");
   plan::PointwiseOp binding =
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  auto formAttr = binding
+                      ? binding.operation->getAttrOfType<StringAttr>(gatherFormAttr)
+                      : StringAttr();
+  StringRef form = formAttr ? formAttr.getValue() : StringRef();
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   auto validIndex =
@@ -2922,11 +2927,11 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     return allocateResult(operation, 0, "fragment");
   };
   bool scalarFragmentGather =
-      binding.getLowering() == "T.indirect_gather" &&
+      form == "scalar_fragment" &&
       isa<RankedTensorType>(operation.getOperand(0).getType()) &&
       !isa<RankedTensorType>(operation.getResult(0).getType()) &&
       relation->size() == 1;
-  if (binding.getLowering() == "T.extract_first_scalar" &&
+  if (form == "extract_first_scalar" &&
       relation->size() == 1 && relation->front().kind == "static_index") {
     FailureOr<StringRef> source = lookupValue(operation, 0);
     if (failed(source))
@@ -2991,11 +2996,14 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (!planIndex.stages.empty() && binding.getLowering() == "T.indirect_gather") {
+  if (form == "staged_deferred" || form == "staged_vector") {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     if (failed(view))
       return failure();
-    if (binding.getDefer() && (*view)->tensor.getRank() == 2) {
+    if (form == "staged_deferred") {
+      if (!binding.getDefer() || (*view)->tensor.getRank() != 2)
+        return operation.emitOpError(
+            "has an inconsistent deferred TileLang gather form");
       deferredLoads[operation.getResult(0)] = &operation;
       return success();
     }
@@ -3046,7 +3054,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (binding.getLowering() == "T.indirect_gather" &&
+  if (form == "view_indirect" &&
       isa<intent::ViewType>(operation.getOperand(0).getType())) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
     FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
@@ -3096,7 +3104,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, *result);
     return success();
   }
-  bool expand = binding.getLowering() == "expand_dims" &&
+  bool expand = form == "expand_dims" &&
                 llvm::any_of(*relation, [](const target::IndexTerm &term) {
                   return term.kind == "new_axis";
                 }) &&
@@ -3116,7 +3124,7 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
       operation.getOperand(validIndex.getInt()).getDefiningOp();
   auto validConstant =
       validDefinition &&
-              validDefinition->getName().getStringRef() == "intent.constant"
+              ::intent::target::semanticOperationName(*validDefinition) == "intent.constant"
           ? validDefinition->getAttrOfType<BoolAttr>("intent.value")
           : BoolAttr();
   if (validConstant && validConstant.getValue()) {
@@ -3261,7 +3269,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
       !llvm::hasSingleElement(operation.getRegion(0)))
     return operation.emitOpError("lacks a mechanical TileLang stream binding");
   Block &body = operation.getRegion(0).front();
-  bool hasStop = static_cast<bool>(binding.getStopNodeAttr());
+  bool hasStop = static_cast<bool>(binding.getStopValueAttr());
   bool hasRuntimeExtent = static_cast<bool>(
       operation.getAttrOfType<IntegerAttr>("intent.extent_operand_index"));
   if (operation.getNumOperands() !=
@@ -3331,30 +3339,20 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
     int64_t expectedStop = operation.getNumResults() + 1 +
                            (hasRuntimeExtent ? 1 : 0);
-    auto stop = kernel.nodes.find(binding.getStopNodeAttr().getInt());
-    Operation *stopOperation =
-        stop == kernel.nodes.end() ? nullptr : stop->second;
     if (!stopIndex || stopIndex.getInt() != expectedStop ||
-        !stopOperation ||
-        stopOperation->getName().getStringRef() != "intent.region_end" ||
-        stopOperation->getNumOperands() != 1 ||
-        operation.getOperand(stopIndex.getInt()).getDefiningOp() != stopOperation)
+        !binding.getStopValueAttr())
       return operation.emitOpError(
           "does not match its planned logical stream stop");
-    FailureOr<plan::AxisOp> stopAxis =
-        resolveAxis(stopOperation->getOperand(0), operation);
-    if (failed(stopAxis))
-      return failure();
-    if (stopAxis->hasRole("parallel") && !stopAxis->isScalar()) {
-      std::string block = programBlocks.lookup(stopAxis->getNode());
-      if (block.empty())
-        return stopAxis->emitOpError("has no physical program block index");
-      streamExtent = "T.min((" + block + " + 1) * " +
-                     stopAxis->getTile().str() + ", " + streamExtent + ")";
-    } else if (stopAxis->getNode() != binding.getAxisNode()) {
+    Value stopValue = operation.getOperand(stopIndex.getInt());
+    auto valueID = kernel.valueIDs.find(stopValue);
+    FailureOr<StringRef> stop = lookupValue(operation, stopIndex.getInt());
+    if (valueID == kernel.valueIDs.end() ||
+        valueID->second != binding.getStopValueAttr().getInt())
       return operation.emitOpError(
-          "has no TileLang spelling for its planned logical stream stop");
-    }
+          "does not consume the planned logical stream stop value");
+    if (failed(stop))
+      return failure();
+    streamExtent = "T.max(0, T.min(" + stop->str() + ", " + streamExtent + "))";
   }
   std::string streamTile = "stream_tile_" + std::to_string(*node);
   line("for " + streamTile + " in T.Pipelined(T.ceildiv(" + streamExtent +
@@ -3391,7 +3389,7 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
       outerIndex == streamOuterAxisIndices.end() || failed(node) || !binding)
     return operation.emitOpError("has no active TileLang stream state");
   Operation &terminator = operation.getRegion(0).front().back();
-  if (terminator.getName().getStringRef() != "intent.yield" ||
+  if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
       terminator.getNumOperands() != operation.getNumResults())
     return operation.emitOpError("does not yield every TileLang stream state");
   for (unsigned index = 0; index < operation.getNumResults(); ++index) {
@@ -3501,13 +3499,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   if (failed(node) || !binding || binding.getLowering() != "T.gemm" ||
       operation.getNumOperands() != 2)
     return operation.emitOpError("lacks a TileLang contraction binding");
+  StringRef form = binding.getForm();
   FailureOr<target::lowering::ContractionOrientation> orientation =
-      target::lowering::contractionOrientation(operation);
+      target::lowering::selectedContractionOrientation(binding);
   if (failed(orientation))
     return failure();
-  if (orientation->batched)
-    return operation.emitOpError(
-        "TileLang 0.1.13 has no mechanical batched GEMM projection");
   bool carriedFlow = binding.getAccumulatorFlow() == "loop_carried";
   std::optional<int64_t> accumulatorOwner =
       binding.getAccumulatorOwnerNode();
@@ -3516,10 +3512,8 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   std::optional<int64_t> accumulatorValue = binding.getAccumulatorValue();
   std::optional<int64_t> accumulatorConditional =
       binding.getAccumulatorConditionalNode();
-  bool producerReplay = deferredContractReplays.contains(&operation);
-  bool oneSidedDeferredOperand =
-      deferredLoads.contains(operation.getOperand(0)) !=
-      deferredLoads.contains(operation.getOperand(1));
+  bool producerReplay = form == "replay";
+  bool oneSidedDeferredOperand = form == "deferred_one";
   bool reuseCarriedAccumulator =
       carriedFlow &&
       (accumulatorConditional || producerReplay ||
@@ -3544,7 +3538,7 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     carriedAccumulator = previousName->second;
     inPlacePointwiseResults[update] = *carriedAccumulator;
   }
-  if (!planIndex.stages.empty()) {
+  if (form == "staged") {
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
         binding.getAccumulatorSpace() != "fragment")
@@ -3554,14 +3548,18 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       return operation.emitOpError(
           "must belong to exactly one resolved physical stage");
     unsigned stage = activeStages.front();
+    if ((binding.getLhsForm() != "member_row_gather" &&
+         binding.getLhsForm() != "workspace") ||
+        binding.getRhsForm() != "expert_matrix")
+      return operation.emitOpError(
+          "has no selected TileLang staged operand forms");
     Operation *lhsAccess = deferredLoads.lookup(operation.getOperand(0));
     Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
     FailureOr<ABIView *> rhsView =
         rhsLoad && rhsLoad->getNumOperands() > 0
             ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
             : FailureOr<ABIView *>(failure());
-    if (!rhsLoad || failed(rhsView) || (*rhsView)->tensor.getRank() != 3 ||
-        orientation->lhsTranspose)
+    if (!rhsLoad || failed(rhsView))
       return operation.emitOpError(
           "staged contraction requires one expert-selected rank-three weight");
     auto operandElementType = [](Value value) -> Type {
@@ -3601,8 +3599,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     line("for k_tile in T.Pipelined(T.ceildiv(" + reduction +
          ", " + reductionTile + "), num_stages=num_stages):");
     ++indentation;
-    if (lhsAccess) {
-      if (lhsAccess->getName().getStringRef() != "intent.gather")
+    if (binding.getLhsForm() == "member_row_gather") {
+      if (!lhsAccess)
+        return operation.emitOpError(
+            "selected staged row-gather input is not deferred");
+      if (::intent::target::semanticOperationName(*lhsAccess) != "intent.gather")
         return lhsAccess->emitOpError(
             "is not a staged indirect contraction input");
       FailureOr<SmallVector<target::IndexTerm>> relation =
@@ -3688,7 +3689,10 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   }
 
   auto replay = deferredContractReplays.find(&operation);
-  if (replay != deferredContractReplays.end()) {
+  if (form == "replay") {
+    if (replay == deferredContractReplays.end())
+      return operation.emitOpError(
+          "TileLang replay form has no physical producer slice");
     if ((binding.getLhsSpace() != "shared" &&
          binding.getLhsSpace() != "fragment") ||
         (binding.getRhsSpace() != "shared" &&
@@ -3696,28 +3700,29 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         binding.getAccumulatorSpace() != "fragment")
       return operation.emitOpError(
           "producer replay has inconsistent TileLang plan spaces");
-    FailureOr<plan::AxisOp> reductionAxis =
-        target::lowering::exactContractionReductionAxis(planIndex, kernel,
-                                                        operation);
+    std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+    plan::AxisOp reductionAxis =
+        reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
     FailureOr<std::string> result =
         carriedAccumulator
             ? FailureOr<std::string>(*carriedAccumulator)
             : allocateResult(operation, 0, "fragment");
-    if (failed(reductionAxis) || failed(result))
-      return failure();
+    if (!reductionAxis || failed(result))
+      return operation.emitOpError(
+          "replay form has no selected physical reduction axis");
     bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
-        planIndex, operation, reductionAxis->getNode());
+        planIndex, operation, reductionAxis.getNode());
     if (!carriedAccumulator)
       line("T.clear(" + *result + ")");
     if (!streamReduction) {
       line("for k_tile in T.Pipelined(T.ceildiv(" +
-           roleDimensions.lookup(reductionAxis->getRole()) + ", " +
-           reductionAxis->getTile().str() +
+           roleDimensions.lookup(reductionAxis.getRole()) + ", " +
+           reductionAxis.getTile().str() +
            "), num_stages=num_stages):");
       ++indentation;
-      axisIndices[reductionAxis->getNode()] =
-          addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
-    } else if (axisIndices.lookup(reductionAxis->getNode()).empty()) {
+      axisIndices[reductionAxis.getNode()] =
+          addressIndex("k_tile") + " * " + reductionAxis.getTile().str();
+    } else if (axisIndices.lookup(reductionAxis.getNode()).empty()) {
       return operation.emitOpError(
           "has no active TileLang stream-bound reduction range");
     }
@@ -3776,8 +3781,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
 
   Operation *lhsLoad = deferredLoads.lookup(operation.getOperand(0));
   Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
-  if (lhsLoad || rhsLoad) {
-    if (!lhsLoad || !rhsLoad) {
+  if (form == "deferred_one" || form == "deferred_two") {
+    if (form == "deferred_one") {
+      if (static_cast<bool>(lhsLoad) == static_cast<bool>(rhsLoad))
+        return operation.emitOpError(
+            "TileLang one-sided deferred form does not own exactly one deferred operand");
       Operation *load = lhsLoad ? lhsLoad : rhsLoad;
       unsigned loadOperand = lhsLoad ? 0 : 1;
       unsigned directOperand = lhsLoad ? 1 : 0;
@@ -3790,17 +3798,18 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         return operation.emitOpError(
             "one-sided deferred TileLang contraction has inconsistent plan "
             "spaces");
-      FailureOr<plan::AxisOp> reductionAxis =
-          target::lowering::exactContractionReductionAxis(planIndex, kernel,
-                                                          operation);
-      if (failed(reductionAxis))
-        return failure();
+      std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+      plan::AxisOp reductionAxis =
+          reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
+      if (!reductionAxis)
+        return operation.emitOpError(
+            "one-sided deferred form has no selected physical reduction axis");
       if (!target::lowering::isEnclosingStreamReductionAxis(
-              planIndex, operation, reductionAxis->getNode()))
+              planIndex, operation, reductionAxis.getNode()))
         return operation.emitOpError(
             "one-sided deferred TileLang contraction requires an active "
             "stream-bound reduction range");
-      if (axisIndices.lookup(reductionAxis->getNode()).empty())
+      if (axisIndices.lookup(reductionAxis.getNode()).empty())
         return operation.emitOpError(
             "has no active TileLang stream-bound reduction range");
       FailureOr<int64_t> loadNode =
@@ -3841,6 +3850,9 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       bindResult(operation, 0, *result);
       return success();
     }
+    if (!lhsLoad || !rhsLoad)
+      return operation.emitOpError(
+          "TileLang two-sided deferred form does not own both deferred operands");
     if (binding.getLhsSpace() != "shared" ||
         binding.getRhsSpace() != "shared" ||
         binding.getAccumulatorSpace() != "fragment")
@@ -3848,12 +3860,15 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
           "deferred TileLang contraction has inconsistent plan spaces");
     FailureOr<ABIView *> lhsView = lookupView(lhsLoad->getOperand(0), *lhsLoad);
     FailureOr<ABIView *> rhsView = lookupView(rhsLoad->getOperand(0), *rhsLoad);
-    FailureOr<plan::AxisOp> reductionAxis =
-        target::lowering::contractionReductionAxis(planIndex, *lhsLoad,
-                                                   *rhsLoad, operation);
-    FailureOr<target::lowering::ContractionAxes> contractionAxes =
-        target::lowering::contractionAxes(planIndex, *lhsLoad, *rhsLoad,
-                                          operation);
+    std::optional<int64_t> reductionNode = binding.getReductionAxisNode();
+    std::optional<int64_t> lhsResultNode = binding.getLhsResultAxisNode();
+    std::optional<int64_t> rhsResultNode = binding.getRhsResultAxisNode();
+    plan::AxisOp reductionAxis =
+        reductionNode ? planIndex.axes.lookup(*reductionNode) : plan::AxisOp();
+    plan::AxisOp lhsResult =
+        lhsResultNode ? planIndex.axes.lookup(*lhsResultNode) : plan::AxisOp();
+    plan::AxisOp rhsResult =
+        rhsResultNode ? planIndex.axes.lookup(*rhsResultNode) : plan::AxisOp();
     auto operandElementType = [](Value value) -> Type {
       auto tensor = dyn_cast<RankedTensorType>(value.getType());
       return tensor ? tensor.getElementType() : Type();
@@ -3864,15 +3879,16 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
         lhsElement && rhsElement &&
         isa<Float8E4M3FNType, Float8E5M2Type>(lhsElement) &&
         isa<Float8E4M3FNType, Float8E5M2Type>(rhsElement);
-    if (failed(reductionAxis) || failed(contractionAxes))
-      return failure();
-    if (raggedRuntimesByAxis.count(reductionAxis->getNode()))
+    if (!reductionAxis || !lhsResult || !rhsResult)
+      return operation.emitOpError(
+          "two-sided deferred form has incomplete selected physical axes");
+    if (raggedRuntimesByAxis.count(reductionAxis.getNode()))
       return operation.emitOpError(
           "TileLang has no mechanical masked bulk-copy projection for a "
           "ragged contraction reduction axis");
     bool streamReduction = target::lowering::isEnclosingStreamReductionAxis(
-        planIndex, operation, reductionAxis->getNode());
-    if (fp8Operands && contractionAxes->lhsResult.hasRole("lane"))
+        planIndex, operation, reductionAxis.getNode());
+    if (fp8Operands && lhsResult.hasRole("lane"))
       return operation.emitOpError(
           "TileLang 0.1.13 cannot project an FP8 contraction whose matrix-M "
           "axis is a runtime lane extent to a supported MMA primitive");
@@ -3893,9 +3909,9 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       return operation.emitOpError(
           "TileLang cannot bulk-copy a contraction operand with a noncontiguous index tile");
     if (!streamReduction)
-      axisIndices[reductionAxis->getNode()] =
-          addressIndex("k_tile") + " * " + reductionAxis->getTile().str();
-    else if (axisIndices.lookup(reductionAxis->getNode()).empty())
+      axisIndices[reductionAxis.getNode()] =
+          addressIndex("k_tile") + " * " + reductionAxis.getTile().str();
+    else if (axisIndices.lookup(reductionAxis.getNode()).empty())
       return operation.emitOpError(
           "has no active TileLang stream-bound reduction range");
     FailureOr<std::string> lhsIndices = accessIndices(*lhsLoad);
@@ -3920,8 +3936,8 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       line("T.clear(" + *result + ")");
     if (!streamReduction) {
       line("for k_tile in T.Pipelined(T.ceildiv(" +
-           roleDimensions.lookup(reductionAxis->getRole()) + ", " +
-           reductionAxis->getTile().str() + "), num_stages=num_stages):");
+           roleDimensions.lookup(reductionAxis.getRole()) + ", " +
+           reductionAxis.getTile().str() + "), num_stages=num_stages):");
       ++indentation;
     }
     line("T.copy(" + (*lhsView)->argument->name + "[" + *lhsIndices + "], " +
@@ -3939,6 +3955,9 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bindResult(operation, 0, *result);
     return success();
   }
+
+  if (form != "direct" || lhsLoad || rhsLoad)
+    return operation.emitOpError("has an inconsistent TileLang contraction form");
 
   FailureOr<StringRef> lhs = lookupValue(operation, 0);
   FailureOr<StringRef> rhs = lookupValue(operation, 1);
@@ -4051,6 +4070,9 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
       operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
       target::lowering::isPlannedStageNode(planIndex, &operation))
     return operation.emitOpError("lacks a TileLang scaled-contraction binding");
+  if (binding.getForm() != "scaled_direct")
+    return operation.emitOpError(
+        "has no realized direct TileLang scaled-contraction form");
   for (Value operand : operation.getOperands())
     if (deferredLoads.count(operand))
       return operation.emitOpError(
@@ -4070,7 +4092,9 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.lhs_group_size");
   auto rhsGroup =
       operation.getAttrOfType<IntegerAttr>("intent.rhs_group_size");
-  if (succeeded(lhsExtents) && succeeded(rhsExtents) &&
+  StringRef layout = binding.getScaledLayout();
+  if (layout == "flattened_rank_three" && succeeded(lhsExtents) &&
+      succeeded(rhsExtents) &&
       lhsExtents->size() == 3 && rhsExtents->size() == 3 && lhsGroup &&
       rhsGroup && lhsGroup.getInt() > 0 && rhsGroup.getInt() > 0) {
     std::string resultName = makeResultName(operation, 0);
@@ -4123,7 +4147,8 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
     bindResult(operation, 0, *result);
     return success();
   }
-  if (failed(lhsExtents) || failed(rhsExtents) || lhsExtents->size() != 2 ||
+  if (layout != "grouped_rank_two" || failed(lhsExtents) ||
+      failed(rhsExtents) || lhsExtents->size() != 2 ||
       rhsExtents->size() != 2 || !lhsGroup || !rhsGroup ||
       lhsGroup.getInt() <= 0 || rhsGroup.getInt() <= 0)
     return operation.emitOpError(

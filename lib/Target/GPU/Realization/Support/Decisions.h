@@ -18,7 +18,8 @@ struct PhysicalDecisions {
 };
 
 mlir::FailureOr<PhysicalDecisions>
-emitPhysicalDecisions(mlir::OpBuilder &builder, const KernelFacts &facts);
+emitPhysicalDecisions(mlir::OpBuilder &builder, const KernelFacts &facts,
+                      bool conservativeAutomaticBlocking);
 
 mlir::LogicalResult
 emitSearchSpace(mlir::ModuleOp module, const KernelFacts &facts,

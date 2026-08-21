@@ -16,12 +16,9 @@ def embedding_forward_lookup(
     M = indices.shape[0]
     D = embedding_table.shape[1]
     features = I.domain(0, D)
-    for token_region in I.parallel(
-        I.partition(I.domain(0, M), extent=I.auto("M_TILE"))
-    ):
-        rows = indices[token_region]
-        I.assume_in_bounds(rows, embedding_table, axis=0)
-        output[token_region, features] = embedding_table[rows, features]
+    rows = indices[I.domain(0, M)]
+    I.assume_in_bounds(rows, embedding_table, axis=0)
+    output[I.domain(0, M), features] = embedding_table[rows, features]
 
 
 @intent.kernel
@@ -33,12 +30,9 @@ def embedding_forward_lookup_bf16(
     M = indices.shape[0]
     D = embedding_table.shape[1]
     features = I.domain(0, D)
-    for token_region in I.parallel(
-        I.partition(I.domain(0, M), extent=I.auto("M_TILE"))
-    ):
-        rows = indices[token_region]
-        I.assume_in_bounds(rows, embedding_table, axis=0)
-        output[token_region, features] = embedding_table[rows, features]
+    rows = indices[I.domain(0, M)]
+    I.assume_in_bounds(rows, embedding_table, axis=0)
+    output[I.domain(0, M), features] = embedding_table[rows, features]
 
 
 @intent.kernel

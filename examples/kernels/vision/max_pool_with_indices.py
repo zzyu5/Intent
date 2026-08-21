@@ -27,44 +27,38 @@ def max_pool2d_with_indices(
     filter_elements = I.domain(0, KERNEL_ELEMENTS)
     for batch in I.parallel(I.domain(0, BATCH)):
         for channel in I.parallel(I.domain(0, CHANNELS)):
-            for row_region in I.parallel(
-                I.partition(output_rows, extent=I.auto("H_TILE"))
-            ):
-                for column_region in I.parallel(
-                    I.partition(output_columns, extent=I.auto("W_TILE"))
-                ):
-                    local_index = I.indices(filter_elements)
-                    filter_row = local_index // KERNEL_WIDTH
-                    filter_column = local_index % KERNEL_WIDTH
-                    input_rows = I.reshape(
-                        I.indices(row_region) * STRIDE - PADDING,
-                        (row_region, 1, 1),
-                    ) + I.reshape(filter_row, (1, 1, filter_elements))
-                    input_columns = I.reshape(
-                        I.indices(column_region) * STRIDE - PADDING,
-                        (1, column_region, 1),
-                    ) + I.reshape(filter_column, (1, 1, filter_elements))
-                    patch = x[batch, channel, input_rows, input_columns]
-                    maximum, winner = I.arg_reduce.max(
-                        patch,
-                        axis=2,
-                        identity=-I.inf,
-                    )
-                    winner_index = I.cast(winner, I.index)
-                    winner_row = winner_index // KERNEL_WIDTH
-                    winner_column = winner_index % KERNEL_WIDTH
-                    global_row = (
-                        I.indices(row_region)[:, None] * STRIDE
-                        - PADDING
-                        + winner_row
-                    )
-                    global_column = (
-                        I.indices(column_region)[None, :] * STRIDE
-                        - PADDING
-                        + winner_column
-                    )
-                    output[batch, channel, row_region, column_region] = maximum
-                    indices[batch, channel, row_region, column_region] = I.cast(
-                        global_row * WIDTH + global_column,
-                        I.i64,
-                    )
+            local_index = I.indices(filter_elements)
+            filter_row = local_index // KERNEL_WIDTH
+            filter_column = local_index % KERNEL_WIDTH
+            input_rows = I.reshape(
+                I.indices(output_rows) * STRIDE - PADDING,
+                (output_rows, 1, 1),
+            ) + I.reshape(filter_row, (1, 1, filter_elements))
+            input_columns = I.reshape(
+                I.indices(output_columns) * STRIDE - PADDING,
+                (1, output_columns, 1),
+            ) + I.reshape(filter_column, (1, 1, filter_elements))
+            patch = x[batch, channel, input_rows, input_columns]
+            maximum, winner = I.arg_reduce.max(
+                patch,
+                axis=2,
+                identity=-I.inf,
+            )
+            winner_index = I.cast(winner, I.index)
+            winner_row = winner_index // KERNEL_WIDTH
+            winner_column = winner_index % KERNEL_WIDTH
+            global_row = (
+                I.indices(output_rows)[:, None] * STRIDE
+                - PADDING
+                + winner_row
+            )
+            global_column = (
+                I.indices(output_columns)[None, :] * STRIDE
+                - PADDING
+                + winner_column
+            )
+            output[batch, channel, output_rows, output_columns] = maximum
+            indices[batch, channel, output_rows, output_columns] = I.cast(
+                global_row * WIDTH + global_column,
+                I.i64,
+            )

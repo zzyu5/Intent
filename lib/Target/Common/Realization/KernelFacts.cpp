@@ -3,6 +3,7 @@
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 #include "llvm/ADT/STLExtras.h"
@@ -23,21 +24,18 @@ LogicalResult addHandler(OperationHandlerRegistry &registry, StringRef name,
 }
 
 bool isUnaryOperation(Operation &operation) {
-  StringRef name = operation.getName().getStringRef();
-  return name == "intent.unary" || name == "intent_plan.unary";
+  StringRef name = ::intent::target::semanticOperationName(operation);
+  return name == "intent.unary";
 }
 
 StringAttr unarySemantic(Operation &operation) {
-  return operation.getAttrOfType<StringAttr>(
-      operation.getName().getStringRef() == "intent_plan.unary"
-          ? "semantic"
-          : "intent.operator");
+  return operation.getAttrOfType<StringAttr>("intent.operator");
 }
 
 Operation *nearestParallelOwner(Operation &operation) {
   for (Operation *parent = operation.getParentOp(); parent;
        parent = parent->getParentOp())
-    if (parent->getName().getStringRef() == "intent.parallel")
+    if (::intent::target::semanticOperationName(*parent) == "intent.parallel")
       return parent;
   return nullptr;
 }
@@ -197,7 +195,7 @@ struct AffineIndexExpression {
 std::optional<int64_t> integerConstant(Value value) {
   Operation *definition = value.getDefiningOp();
   if (!definition ||
-      definition->getName().getStringRef() != "intent.constant")
+      ::intent::target::semanticOperationName(*definition) != "intent.constant")
     return std::nullopt;
   if (auto literal = definition->getAttrOfType<BoolAttr>("intent.value"))
     return literal.getValue() ? 1 : 0;
@@ -207,7 +205,7 @@ std::optional<int64_t> integerConstant(Value value) {
 
 std::optional<int64_t> integerSplatConstant(Value value) {
   while (Operation *definition = value.getDefiningOp()) {
-    StringRef name = definition->getName().getStringRef();
+    StringRef name = ::intent::target::semanticOperationName(*definition);
     if ((name != "intent.broadcast" && name != "intent.reshape" &&
          name != "intent.cast") ||
         definition->getNumOperands() != 1)
@@ -242,7 +240,7 @@ affineIndexExpression(Value value, const KernelFacts &facts,
     expression.coefficients[source->domain] = 1;
     return finish(std::move(expression));
   }
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.indices") {
     auto axes = facts.valueAxes.find(value);
     if (axes == facts.valueAxes.end() || axes->second.size() != 1 ||
@@ -375,7 +373,7 @@ affineLowerBound(const AffineIndexExpression &expression,
       } else if (facts.domainSources.count(domain)) {
         domainLower = 0;
       } else if (domain &&
-                 domain->getName().getStringRef() == "intent.domain" &&
+                 ::intent::target::semanticOperationName(*domain) == "intent.domain" &&
                  domain->getNumOperands() >= 2) {
         domainLower = integerConstant(domain->getOperand(0));
         std::optional<int64_t> stop = integerConstant(domain->getOperand(1));
@@ -426,7 +424,7 @@ bool proveScalarAtLeast(Value value, int64_t minimum,
   auto argument = dyn_cast<BlockArgument>(value);
   if (argument) {
     Operation *loop = argument.getOwner()->getParentOp();
-    if (!loop || loop->getName().getStringRef() != "intent.for" ||
+    if (!loop || ::intent::target::semanticOperationName(*loop) != "intent.for" ||
         loop->getNumRegions() != 1 || !llvm::hasSingleElement(loop->getRegion(0)) ||
         loop->getNumOperands() != loop->getNumResults() + 1)
       return finish(false);
@@ -438,7 +436,7 @@ bool proveScalarAtLeast(Value value, int64_t minimum,
     if (carried >= loop->getNumResults())
       return finish(false);
     Operation &yield = loop->getRegion(0).front().back();
-    if (yield.getName().getStringRef() != "intent.yield" ||
+    if (::intent::target::semanticOperationName(yield) != "intent.yield" ||
         yield.getNumOperands() != loop->getNumResults())
       return finish(false);
     Value initial = loop->getOperand(carried + 1);
@@ -455,7 +453,7 @@ bool proveScalarAtLeast(Value value, int64_t minimum,
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return finish(false);
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.cast" && definition->getNumOperands() == 1 &&
       isa<intent::LogicalIndexType>(definition->getOperand(0).getType())) {
     llvm::DenseSet<Value> sourceActive;
@@ -557,7 +555,7 @@ bool proveScalarAtLeast(Value value, int64_t minimum,
 
 bool hasNonnegativeIntegerOperandsImpl(Operation &operation,
                                        const KernelFacts &facts) {
-  if (operation.getName().getStringRef() != "intent.binary" ||
+  if (::intent::target::semanticOperationName(operation) != "intent.binary" ||
       operation.getNumOperands() != 2)
     return false;
   auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
@@ -602,14 +600,14 @@ compactQuotientExpression(Value value, const KernelFacts &facts,
                           Operation &consumer) {
   Operation *definition = value.getDefiningOp();
   while (definition &&
-         (definition->getName().getStringRef() == "intent.broadcast" ||
-          definition->getName().getStringRef() == "intent.reshape" ||
-          definition->getName().getStringRef() == "intent.cast") &&
+         (::intent::target::semanticOperationName(*definition) == "intent.broadcast" ||
+          ::intent::target::semanticOperationName(*definition) == "intent.reshape" ||
+          ::intent::target::semanticOperationName(*definition) == "intent.cast") &&
          definition->getNumOperands() == 1) {
     value = definition->getOperand(0);
     definition = value.getDefiningOp();
   }
-  if (!definition || definition->getName().getStringRef() != "intent.binary" ||
+  if (!definition || ::intent::target::semanticOperationName(*definition) != "intent.binary" ||
       definition->getNumOperands() != 2)
     return std::nullopt;
   auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
@@ -1182,15 +1180,15 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
   };
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
-    StringRef name = owner ? owner->getName().getStringRef() : StringRef();
-    bool structural = name == "intent.parallel" || name == "intent.ordered" ||
-                      name == "intent.for" || name == "intent.state_stream";
+    StringRef name = owner ? ::intent::target::semanticOperationName(*owner) : StringRef();
+    bool structural = name == "intent.parallel" || name == "intent.for" ||
+                      name == "intent.state_stream";
     return finish({structural, false, false});
   }
   Operation *definition = value.getDefiningOp();
   if (!definition)
     return finish({});
-  StringRef name = definition->getName().getStringRef();
+  StringRef name = ::intent::target::semanticOperationName(*definition);
   if (name == "intent.constant" || name == "intent.dim" ||
       name == "intent.region_end")
     return finish({true, false, false});
@@ -1359,7 +1357,7 @@ bool isUnitAxis(const LogicalAxis &axis, const KernelFacts &facts) {
     auto value = extent
                      ? extent->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
-    return extent && extent->getName().getStringRef() == "intent.constant" &&
+    return extent && ::intent::target::semanticOperationName(*extent) == "intent.constant" &&
            value && value.getInt() == 1;
   });
 }
@@ -1571,7 +1569,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             auto stepValue =
                 step ? step->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
-            if (step && (step->getName().getStringRef() != "intent.constant" ||
+            if (step && (::intent::target::semanticOperationName(*step) != "intent.constant" ||
                          !stepValue || stepValue.getInt() != 1))
               return operation.emitOpError(
                   "runtime sequential domains currently require unit step");
@@ -1579,10 +1577,10 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 stop ? stop->getAttrOfType<IntegerAttr>("intent.value")
                      : IntegerAttr();
             bool staticStart =
-                start && start->getName().getStringRef() == "intent.constant" &&
+                start && ::intent::target::semanticOperationName(*start) == "intent.constant" &&
                 startValue;
             if (staticStart && stop &&
-                stop->getName().getStringRef() == "intent.constant" &&
+                ::intent::target::semanticOperationName(*stop) == "intent.constant" &&
                 stopValue && stopValue.getInt() > startValue.getInt()) {
               int64_t extent;
               if (llvm::SubOverflow(stopValue.getInt(), startValue.getInt(),
@@ -1596,7 +1594,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             }
             bool zeroBased = staticStart && startValue.getInt() == 0;
             if (zeroBased && stop &&
-                stop->getName().getStringRef() == "intent.dim" && axis &&
+                ::intent::target::semanticOperationName(*stop) == "intent.dim" && axis &&
                 stop->getNumOperands() == 1) {
               facts.domainSources[&operation] = stop->getOperand(0);
               facts.domainSourceAxes[&operation] = axis.getInt();
@@ -1608,7 +1606,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             if (!validLoopBound(operation.getOperand(0).getType()) ||
                 !validLoopBound(operation.getOperand(1).getType()) ||
                 !llvm::all_of(operation.getResult(0).getUsers(), [](Operation *user) {
-                  return user->getName().getStringRef() == "intent.for";
+                  return ::intent::target::semanticOperationName(*user) == "intent.for";
                 }))
               return operation.emitOpError(
                   "runtime-bounded domains require an ordinary scalar sequential loop");
@@ -1655,21 +1653,16 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "tiled partitions currently require a source domain");
             auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
-            auto extent =
-                operation.getAttrOfType<DictionaryAttr>("intent.extent");
-            auto name = extent ? extent.getAs<StringAttr>("name") : StringAttr();
-            bool namedAuto = name && !name.getValue().empty();
             std::optional<int64_t> fixedExtent =
                 operation.getNumOperands() == 2
                     ? integerConstant(operation.getOperand(1))
                     : std::nullopt;
             if (!mode || mode.getValue() != "extent" ||
-                (!namedAuto && !fixedExtent))
+                !fixedExtent || *fixedExtent <= 0)
               return operation.emitOpError(
-                  "tiled partitions require a named auto or fixed extent");
+                  "source partitions require a positive fixed logical extent");
             facts.partitionDomains[&operation] = domain;
-            if (fixedExtent)
-              facts.partitionFixedExtents[&operation] = *fixedExtent;
+            facts.partitionFixedExtents[&operation] = *fixedExtent;
             return success();
           })))
     return failure();
@@ -1704,19 +1697,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   auto analyzeSequentialLoop = [&](Operation &operation) -> LogicalResult {
-            bool ordered =
-                operation.getName().getStringRef() == "intent.ordered";
             FailureOr<SmallVector<Operation *>> domains =
                 operation.getNumOperands() > 0
                     ? expandDomainSource(operation.getOperand(0), operation)
                     : FailureOr<SmallVector<Operation *>>(failure());
-            Operation *source = operation.getNumOperands() > 0
-                                    ? operation.getOperand(0).getDefiningOp()
-                                    : nullptr;
             if (failed(domains) || domains->empty() ||
-                (!ordered &&
-                 (domains->size() != 1 || !source ||
-                  source->getName().getStringRef() != "intent.domain")) ||
                 operation.getNumRegions() != 1 ||
                 !llvm::hasSingleElement(operation.getRegion(0)) ||
                 operation.getNumOperands() != operation.getNumResults() + 1 ||
@@ -1736,7 +1721,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     "sequential loop has an unrealized logical axis");
             }
             Operation &terminator = operation.getRegion(0).front().back();
-            if (terminator.getName().getStringRef() != "intent.yield" ||
+            if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
                 terminator.getNumOperands() != operation.getNumResults())
               return operation.emitOpError(
                   "sequential loop must yield every carried value");
@@ -1764,11 +1749,22 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 facts.valueAxes[operation.getResult(index)] = axes->second;
               }
             }
-            if (ordered)
-              for (Operation *domain : *domains) {
-                facts.orderedDomains.insert(domain);
+            for (Operation *domain : *domains) {
+              facts.orderedDomains.insert(domain);
+              bool unitStep =
+                  ::intent::target::semanticOperationName(*domain) ==
+                      "intent.ragged_member" ||
+                  (::intent::target::semanticOperationName(*domain) ==
+                       "intent.domain" &&
+                   domain->getNumOperands() >= 2 &&
+                   integerConstant(domain->getOperand(0)) ==
+                       std::optional<int64_t>(0) &&
+                   (domain->getNumOperands() == 2 ||
+                    integerConstant(domain->getOperand(2)) ==
+                        std::optional<int64_t>(1)));
+              if (unitStep)
                 facts.serialLoopDomains.insert(domain);
-              }
+            }
             return success();
           };
   auto leaveSequentialLoop = [&](Operation &operation) -> LogicalResult {
@@ -1796,8 +1792,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
   };
   OperationHandler sequentialLoopHandler{analyzeSequentialLoop,
                                          leaveSequentialLoop};
-  if (failed(registry.add("intent.for", sequentialLoopHandler)) ||
-      failed(registry.add("intent.ordered", sequentialLoopHandler)))
+  if (failed(registry.add("intent.for", sequentialLoopHandler)))
     return failure();
 
   auto analyzeIf = [&](Operation &operation) -> LogicalResult {
@@ -1811,7 +1806,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 return operation.emitOpError(
                     "scalar if requires two single-block branches");
               Operation &terminator = branch.front().back();
-              if (terminator.getName().getStringRef() != "intent.yield" ||
+              if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
                   terminator.getNumOperands() != operation.getNumResults())
                 return operation.emitOpError(
                     "scalar if branches must yield every result");
@@ -1871,7 +1866,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                     "while requires scalar type-stable carried values");
             }
             Operation &condition = before.back();
-            if (condition.getName().getStringRef() != "intent.condition" ||
+            if (::intent::target::semanticOperationName(condition) != "intent.condition" ||
                 condition.getNumOperands() != operation.getNumResults() + 1 ||
                 !condition.getOperand(0).getType().isInteger(1))
               return operation.emitOpError(
@@ -1881,7 +1876,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 return operation.emitOpError(
                     "while condition must forward every carried value unchanged");
             Operation &yield = after.back();
-            if (yield.getName().getStringRef() != "intent.yield" ||
+            if (::intent::target::semanticOperationName(yield) != "intent.yield" ||
                 yield.getNumOperands() != operation.getNumResults())
               return operation.emitOpError(
                   "while body must yield every carried value");
@@ -1891,12 +1886,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 return operation.emitOpError(
                     "while body changes a carried value type");
             for (Operation &nested : before.without_terminator()) {
-              StringRef name = nested.getName().getStringRef();
+              StringRef name = ::intent::target::semanticOperationName(nested);
               if (!llvm::is_contained(
                       {StringRef("intent.constant"), StringRef("intent.dim"),
                        StringRef("intent.make_record"),
                        StringRef("intent.extract"), StringRef("intent.unary"),
-                       StringRef("intent_plan.unary"),
                        StringRef("intent.binary"), StringRef("intent.compare"),
                        StringRef("intent.select"), StringRef("intent.cast")},
                       name))
@@ -1958,7 +1952,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         auto iterator = dyn_cast<BlockArgument>(indexed);
         Operation *loop = iterator ? iterator.getOwner()->getParentOp() : nullptr;
         Operation *domain =
-            loop && loop->getName().getStringRef() == "intent.for" &&
+            loop && ::intent::target::semanticOperationName(*loop) == "intent.for" &&
                     iterator.getArgNumber() == 0 && loop->getNumOperands() > 0
                 ? loop->getOperand(0).getDefiningOp()
                 : nullptr;
@@ -1990,7 +1984,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                << "private logical buffer static index for axis " << axis
                << " is outside its extent";
     }
-    bool load = operation.getName().getStringRef() == "intent.buffer_load";
+    bool load = ::intent::target::semanticOperationName(operation) == "intent.buffer_load";
     if (load &&
         (operation.getNumResults() != 1 ||
          operation.getResult(0).getType() != found->second.info.elementType))
@@ -2180,7 +2174,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             }
             bool feedsContract = llvm::any_of(
                 operation.getResult(0).getUsers(), [](Operation *user) {
-                  return user->getName().getStringRef() == "intent.contract";
+                  return ::intent::target::semanticOperationName(*user) == "intent.contract";
                 });
             FailureOr<bool> masked = requiresRuntimeBoundary(operation, facts);
             if (failed(masked))
@@ -2305,7 +2299,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary",
-                         "intent_plan.unary", "intent.binary", "intent.cast",
+                         "intent.binary", "intent.cast",
                          "intent.compare", "intent.select", "intent.mask",
                          "intent.random"})
     if (failed(addHandler(
@@ -2423,7 +2417,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     auto valueIndex =
         operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
     bool reduction =
-        operation.getName().getStringRef() == "intent.scatter_reduce";
+        ::intent::target::semanticOperationName(operation) == "intent.scatter_reduce";
     auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
     if (!valueIndex || valueIndex.getInt() <= 0 ||
         static_cast<unsigned>(valueIndex.getInt()) >=
@@ -2518,7 +2512,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                           ? extentValue->getAttrOfType<IntegerAttr>("intent.value")
                           : IntegerAttr();
       if (!extentValue ||
-          extentValue->getName().getStringRef() != "intent.constant" ||
+          ::intent::target::semanticOperationName(*extentValue) != "intent.constant" ||
           !constant || constant.getInt() <= 0)
         return operation.emitOpError(
             "state stream runtime extent must be a positive constant");
@@ -2529,13 +2523,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             "assigns incompatible fixed extents to one ordered axis");
       facts.orderedStreamFixedExtents[axisDomain] = constant.getInt();
     }
-    Operation *stopBound = nullptr;
     if (stopIndex) {
-      stopBound = operation.getOperand(stopIndex.getInt()).getDefiningOp();
-      if (!stopBound ||
-          stopBound->getName().getStringRef() != "intent.region_end")
+      Type stopType = operation.getOperand(stopIndex.getInt()).getType();
+      if (!stopType.isIntOrIndex())
         return operation.emitOpError(
-            "state stream stop must come from I.end(domain_or_region)");
+            "state stream stop must be an integer logical endpoint");
     }
     Block &body = operation.getRegion(0).front();
     if (body.getNumArguments() !=
@@ -2564,7 +2556,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
   auto leaveStateStream = [&](Operation &operation) -> LogicalResult {
     StateStreamFact &fact = facts.stateStreams[&operation];
     Operation &terminator = fact.body->back();
-    if (terminator.getName().getStringRef() != "intent.yield" ||
+    if (::intent::target::semanticOperationName(terminator) != "intent.yield" ||
         terminator.getNumOperands() != static_cast<unsigned>(fact.stateCount))
       return operation.emitOpError(
           "state stream must yield every carried value");
@@ -2590,7 +2582,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
 
   auto analyzeContraction = [&](Operation &operation) -> LogicalResult {
             unsigned operandCount =
-                operation.getName().getStringRef() == "intent.scaled_contract"
+                ::intent::target::semanticOperationName(operation) == "intent.scaled_contract"
                     ? 4
                     : 2;
             auto reduce = operation.getAttrOfType<ArrayAttr>("intent.reduce");
@@ -2670,9 +2662,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             llvm::sort(fact.lhsBatchAxes);
             llvm::sort(fact.rhsBatchAxes);
             facts.contractions[&operation] = std::move(fact);
-            if (operation.getName().getStringRef() == "intent.scaled_contract") {
+            if (::intent::target::semanticOperationName(operation) == "intent.scaled_contract") {
               Operation *stream = operation.getParentOp();
-              while (stream && stream->getName().getStringRef() !=
+              while (stream && ::intent::target::semanticOperationName(*stream) !=
                                    "intent.state_stream")
                 stream = stream->getParentOp();
               if (stream && stream->getNumOperands() > 0) {
@@ -2765,7 +2757,7 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
       return definition;
   auto argument = dyn_cast<BlockArgument>(indexedValue);
   Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-  if (owner && owner->getName().getStringRef() == "intent.state_stream" &&
+  if (owner && ::intent::target::semanticOperationName(*owner) == "intent.state_stream" &&
       argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
     Operation *domain = owner->getOperand(0).getDefiningOp();
     if (domain && facts.domainSourceAxes.count(domain))
@@ -2773,25 +2765,16 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
     consumer.emitOpError("cannot resolve a state stream to its source domain");
     return failure();
   }
-  if (owner && owner->getName().getStringRef() == "intent.for" &&
-      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
-    Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain && (facts.domainSourceAxes.count(domain) ||
-                   facts.staticDomainExtents.count(domain)))
-      return domain;
-    consumer.emitOpError("cannot resolve a sequential for to its source domain");
-    return failure();
-  }
-  if (owner && owner->getName().getStringRef() == "intent.ordered" &&
+  if (owner && ::intent::target::semanticOperationName(*owner) == "intent.for" &&
       owner->getNumOperands() > 0) {
     FailureOr<SmallVector<Operation *>> domains =
         expandDomainSource(owner->getOperand(0), consumer);
     if (succeeded(domains) && argument.getArgNumber() < domains->size())
       return (*domains)[argument.getArgNumber()];
-    consumer.emitOpError("cannot resolve an ordered loop to its source domain");
+    consumer.emitOpError("cannot resolve a sequential loop to its source domain");
     return failure();
   }
-  if (!owner || owner->getName().getStringRef() != "intent.parallel" ||
+  if (!owner || ::intent::target::semanticOperationName(*owner) != "intent.parallel" ||
       owner->getNumOperands() != 1) {
     consumer.emitOpError("indexes with a value not owned by a parallel region");
     return failure();
@@ -2871,14 +2854,13 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
       Operation *producer = value.getDefiningOp();
       if (!producer)
         return success();
-      StringRef name = producer->getName().getStringRef();
+      StringRef name = ::intent::target::semanticOperationName(*producer);
       if (name == "intent.constant" || name == "intent.dim" ||
           name == "intent.domain" || name == "intent.domain_product" ||
           name == "intent.partition")
         return success();
       bool pure = name == "intent.view_load" || name == "intent.indices" ||
                   name == "intent.broadcast" || name == "intent.unary" ||
-                  name == "intent_plan.unary" ||
                   name == "intent.binary" || name == "intent.compare" ||
                   name == "intent.mask" || name == "intent.select" ||
                   name == "intent.cast" || name == "intent.full" ||
@@ -2907,7 +2889,7 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
     fact.axis = axes->second[axis.getInt()].domain;
     fact.scalarConsumers = llvm::all_of(scan.getResults(), [&](Value result) {
       return !result.use_empty() && llvm::all_of(result.getUsers(), [&](Operation *user) {
-        return user->getName().getStringRef() == "intent.gather" &&
+        return ::intent::target::semanticOperationName(*user) == "intent.gather" &&
                user->getNumOperands() > 0 && user->getOperand(0) == result &&
                user->getNumResults() == 1 &&
                !isa<RankedTensorType>(user->getResult(0).getType());
@@ -2924,15 +2906,15 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
       Value result = producer->getResult(0);
       bool escapes = llvm::any_of(result.getUsers(), [&](Operation *user) {
         return user != &scan && !slice.contains(user) &&
-               user->getName().getStringRef() != "intent.assume_in_bounds";
+               ::intent::target::semanticOperationName(*user) != "intent.assume_in_bounds";
       });
       if (escapes) {
         if (fact.scalarConsumers &&
             llvm::any_of(result.getUsers(), [&](Operation *user) {
               if (user == &scan || slice.contains(user) ||
-                  user->getName().getStringRef() == "intent.assume_in_bounds")
+                  ::intent::target::semanticOperationName(*user) == "intent.assume_in_bounds")
                 return false;
-              return user->getName().getStringRef() != "intent.gather" ||
+              return ::intent::target::semanticOperationName(*user) != "intent.gather" ||
                      user->getNumOperands() == 0 ||
                      user->getOperand(0) != result ||
                      user->getNumResults() != 1 ||
@@ -2953,7 +2935,7 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
     return success();
   };
   WalkResult scanWalk = facts.kernel.entry.walk([&](Operation *operation) {
-    if (operation->getName().getStringRef() != "intent.scan")
+    if (::intent::target::semanticOperationName(*operation) != "intent.scan")
       return WalkResult::advance();
     return failed(collectScanProducers(*operation)) ? WalkResult::interrupt()
                                                      : WalkResult::advance();

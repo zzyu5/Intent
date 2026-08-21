@@ -6,6 +6,7 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Kernel.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -39,7 +40,7 @@ inline std::optional<int64_t> staticViewStride(
 inline bool hasNonReplayableEffect(mlir::Operation *root) {
   bool found = false;
   root->walk([&](mlir::Operation *operation) {
-    llvm::StringRef name = operation->getName().getStringRef();
+    llvm::StringRef name = ::intent::target::semanticOperationName(*operation);
     found |= name == "intent.scatter_reduce" ||
              name == "intent.atomic_add" || name == "intent.atomic_cas";
   });
@@ -49,7 +50,7 @@ inline bool hasNonReplayableEffect(mlir::Operation *root) {
 template <typename LookupShape>
 inline mlir::FailureOr<std::string>
 logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
-  llvm::StringRef name = domain.getName().getStringRef();
+  llvm::StringRef name = ::intent::target::semanticOperationName(domain);
   if (name == "intent.ragged_outer" || name == "intent.ragged_member") {
     mlir::Operation *relation =
         domain.getNumOperands() >= 1
@@ -74,7 +75,8 @@ logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
           ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.value")
           : mlir::IntegerAttr();
   if (dimension &&
-      dimension->getName().getStringRef() == "intent.constant" && constant &&
+      ::intent::target::semanticOperationName(*dimension) == "intent.constant" &&
+      constant &&
       constant.getInt() > 0)
     return std::to_string(constant.getInt());
   auto axis =
@@ -82,7 +84,8 @@ logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
           ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.axis")
           : mlir::IntegerAttr();
   if (!dimension ||
-      dimension->getName().getStringRef() != "intent.dim" || !axis ||
+      ::intent::target::semanticOperationName(*dimension) != "intent.dim" ||
+      !axis ||
       dimension->getNumOperands() != 1)
     return domain.emitOpError("has no canonical ABI dimension source");
   mlir::FailureOr<llvm::ArrayRef<std::string>> shape =
@@ -177,7 +180,7 @@ inline mlir::FailureOr<int64_t> scanAxis(mlir::Operation &operation) {
 
 inline mlir::FailureOr<std::string>
 pointwiseRole(mlir::Operation &operation) {
-  llvm::StringRef name = operation.getName().getStringRef();
+  llvm::StringRef name = ::intent::target::semanticOperationName(operation);
   if (name == "intent.indices")
     return std::string("indices");
   if (name == "intent.random") {
@@ -260,8 +263,9 @@ pointwiseRole(mlir::Operation &operation) {
       return std::string("extract_first_scalar");
     return operation.emitOpError("has no supported gather relation");
   }
-  if (name == "intent_plan.unary") {
-    auto semantic = operation.getAttrOfType<mlir::StringAttr>("semantic");
+  if (name == "intent.unary") {
+    auto semantic =
+        operation.getAttrOfType<mlir::StringAttr>("intent.operator");
     if (semantic)
       return ("unary_" + semantic.getValue()).str();
     return operation.emitOpError("has no physical unary semantics");
@@ -275,14 +279,60 @@ pointwiseRole(mlir::Operation &operation) {
 inline bool feedsContraction(mlir::Operation &operation) {
   return operation.getNumResults() == 1 &&
          llvm::any_of(operation.getResult(0).getUsers(), [](mlir::Operation *user) {
-           llvm::StringRef name = user->getName().getStringRef();
+           llvm::StringRef name = ::intent::target::semanticOperationName(*user);
            return name == "intent.contract" || name == "intent.sparse_contract";
          });
 }
 
+inline mlir::FailureOr<std::string>
+classifyGatherProjection(mlir::Operation &operation, bool staged,
+                         bool deferred) {
+  mlir::FailureOr<std::string> role = pointwiseRole(operation);
+  if (mlir::failed(role))
+    return mlir::failure();
+  if (*role == "extract_first_scalar")
+    return std::string("extract_first_scalar");
+  if (*role == "expand_dims")
+    return std::string("expand_dims");
+  if (*role != "indirect_gather")
+    return operation.emitOpError("is not an indirect gather projection");
+
+  mlir::Type sourceType = operation.getOperand(0).getType();
+  if (mlir::isa<mlir::RankedTensorType>(sourceType) &&
+      !mlir::isa<mlir::RankedTensorType>(operation.getResult(0).getType()))
+    return std::string("scalar_fragment");
+  auto view = mlir::dyn_cast<intent::ViewType>(sourceType);
+  auto tensor = view ? mlir::dyn_cast<mlir::RankedTensorType>(view.getTensor())
+                     : mlir::RankedTensorType();
+  if (!tensor)
+    return operation.emitOpError("has no ranked gather source");
+  if (staged) {
+    if (deferred && tensor.getRank() == 2)
+      return std::string("staged_deferred");
+    if (tensor.getRank() == 1)
+      return std::string("staged_vector");
+    return operation.emitOpError(
+        "has no provider-neutral staged gather projection");
+  }
+  return std::string("view_indirect");
+}
+
+inline mlir::FailureOr<llvm::StringRef>
+classifyRaggedProjection(mlir::Operation &operation) {
+  if (::intent::target::semanticOperationName(operation) != "intent.ragged")
+    return operation.emitOpError("is not a canonical ragged relation");
+  if (operation.getNumOperands() == 3)
+    return llvm::StringRef("compact");
+  if (operation.getNumOperands() == 4)
+    return llvm::StringRef("indexed");
+  return operation.emitOpError(
+      "has no provider-neutral ragged projection form");
+}
+
 inline bool isNestedInStateStream(mlir::Operation *operation) {
   for (mlir::Operation *parent = operation; parent; parent = parent->getParentOp())
-    if (parent->getName().getStringRef() == "intent.state_stream")
+    if (::intent::target::semanticOperationName(*parent) ==
+        "intent.state_stream")
       return true;
   return false;
 }
@@ -291,7 +341,8 @@ inline bool isSequentialIterator(mlir::Value value) {
   auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
   mlir::Operation *owner =
       argument ? argument.getOwner()->getParentOp() : nullptr;
-  return owner && owner->getName().getStringRef() == "intent.for" &&
+  return owner && ::intent::target::semanticOperationName(*owner) ==
+                      "intent.for" &&
          argument.getArgNumber() == 0;
 }
 
@@ -300,7 +351,8 @@ inline bool dependsOnStateStream(mlir::Value value,
   if (!visited.insert(value).second)
     return false;
   if (mlir::Operation *definition = value.getDefiningOp()) {
-    if (definition->getName().getStringRef() == "intent.state_stream" ||
+    if (::intent::target::semanticOperationName(*definition) ==
+            "intent.state_stream" ||
         isNestedInStateStream(definition))
       return true;
     return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
@@ -310,7 +362,8 @@ inline bool dependsOnStateStream(mlir::Value value,
   auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
   mlir::Operation *owner =
       argument ? argument.getOwner()->getParentOp() : nullptr;
-  return owner && owner->getName().getStringRef() == "intent.state_stream";
+  return owner && ::intent::target::semanticOperationName(*owner) ==
+                      "intent.state_stream";
 }
 
 inline bool feedsStateStream(mlir::Value value,
@@ -318,7 +371,8 @@ inline bool feedsStateStream(mlir::Value value,
   if (!visited.insert(value).second)
     return false;
   for (mlir::Operation *user : value.getUsers()) {
-    if (user->getName().getStringRef() == "intent.state_stream" ||
+    if (::intent::target::semanticOperationName(*user) ==
+            "intent.state_stream" ||
         isNestedInStateStream(user))
       return true;
     for (mlir::Value result : user->getResults())
@@ -545,7 +599,10 @@ accessRangesForTransfer(const PlanIndex &index, int64_t transferNode) {
 }
 
 struct ProgramBinding : Binding<intent::plan::LaunchOp> {
-  int64_t getLoopNode() const { return operation.getLoopNode(); }
+  std::optional<int64_t> getLoopNode() const {
+    mlir::IntegerAttr node = operation.getLoopNodeAttr();
+    return node ? std::optional<int64_t>(node.getInt()) : std::nullopt;
+  }
   bool getPersistent() const { return operation.getPersistent(); }
   mlir::IntegerAttr getLoopNodeAttr() const {
     return operation.getLoopNodeAttr();
@@ -693,7 +750,7 @@ logicalBufferPythonInitializer(mlir::Operation &buffer) {
                                   ? buffer.getOperand(0).getDefiningOp()
                                   : nullptr;
   if (!constant ||
-      constant->getName().getStringRef() != "intent.constant")
+      ::intent::target::semanticOperationName(*constant) != "intent.constant")
     return buffer.emitOpError(
         "private workspace initializer must be a scalar constant");
   if (auto integer =
@@ -892,12 +949,33 @@ struct ContractBinding : Binding<intent::plan::ContractOp> {
   std::string lhsSpace;
   std::string rhsSpace;
   std::string accumulatorSpace;
+  std::string orientation;
+  std::string scaledLayout;
+  bool batched = false;
 
   int64_t getNode() const { return operation.getNode(); }
+  llvm::StringRef getForm() const { return operation.getForm(); }
+  llvm::StringRef getLhsForm() const { return operation.getLhsForm(); }
+  llvm::StringRef getRhsForm() const { return operation.getRhsForm(); }
+  std::optional<int64_t> getReductionAxisNode() const {
+    auto value = operation.getReductionAxisNodeAttr();
+    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+  }
+  std::optional<int64_t> getLhsResultAxisNode() const {
+    auto value = operation.getLhsResultAxisNodeAttr();
+    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+  }
+  std::optional<int64_t> getRhsResultAxisNode() const {
+    auto value = operation.getRhsResultAxisNodeAttr();
+    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+  }
   llvm::StringRef getLowering() const { return lowering; }
   llvm::StringRef getLhsSpace() const { return lhsSpace; }
   llvm::StringRef getRhsSpace() const { return rhsSpace; }
   llvm::StringRef getAccumulatorSpace() const { return accumulatorSpace; }
+  llvm::StringRef getOrientation() const { return orientation; }
+  llvm::StringRef getScaledLayout() const { return scaledLayout; }
+  bool isBatched() const { return batched; }
   llvm::StringRef getAccumulatorFlow() const {
     return operation.getAccumulatorFlow();
   }
@@ -978,6 +1056,46 @@ contractionOrientation(mlir::Operation &operation) {
                                 batched};
 }
 
+inline llvm::StringRef
+contractionOrientationName(const ContractionOrientation &orientation) {
+  if (orientation.lhsTranspose)
+    return orientation.rhsTranspose ? "tt" : "tn";
+  return orientation.rhsTranspose ? "nt" : "nn";
+}
+
+inline mlir::FailureOr<llvm::StringRef>
+scaledContractionLayout(mlir::Operation &operation) {
+  auto lhsType = operation.getNumOperands() >= 2
+                     ? mlir::dyn_cast<mlir::RankedTensorType>(
+                           operation.getOperand(0).getType())
+                     : mlir::RankedTensorType();
+  auto rhsType = operation.getNumOperands() >= 2
+                     ? mlir::dyn_cast<mlir::RankedTensorType>(
+                           operation.getOperand(1).getType())
+                     : mlir::RankedTensorType();
+  if (!lhsType || !rhsType || lhsType.getRank() != rhsType.getRank())
+    return operation.emitOpError(
+        "has no uniform scaled-contraction operand layout");
+  if (lhsType.getRank() == 2)
+    return llvm::StringRef("grouped_rank_two");
+  if (lhsType.getRank() == 3)
+    return llvm::StringRef("flattened_rank_three");
+  return operation.emitOpError(
+      "has no supported scaled-contraction operand layout");
+}
+
+inline mlir::FailureOr<ContractionOrientation>
+selectedContractionOrientation(const ContractBinding &binding) {
+  llvm::StringRef orientation = binding.getOrientation();
+  if (orientation != "nn" && orientation != "nt" && orientation != "tn" &&
+      orientation != "tt")
+    return binding.emitOpError(
+        "has no selected provider contraction orientation");
+  return ContractionOrientation{orientation.front() == 't',
+                                orientation.back() == 't',
+                                binding.isBatched()};
+}
+
 struct CanonicalBinding {
   mlir::Operation *operation = nullptr;
 
@@ -994,7 +1112,7 @@ struct CanonicalBinding {
 struct StreamBinding : CanonicalBinding {
   int64_t node = -1;
   int64_t axisNode = -1;
-  mlir::IntegerAttr stopNode;
+  mlir::IntegerAttr stopValue;
   int64_t relationNode = -1;
   std::string rangePurpose;
   int64_t rangeLevel = 0;
@@ -1004,7 +1122,7 @@ struct StreamBinding : CanonicalBinding {
 
   int64_t getNode() const { return node; }
   int64_t getAxisNode() const { return axisNode; }
-  mlir::IntegerAttr getStopNodeAttr() const { return stopNode; }
+  mlir::IntegerAttr getStopValueAttr() const { return stopValue; }
   int64_t getRelationNode() const { return relationNode; }
   llvm::StringRef getRangePurpose() const { return rangePurpose; }
   int64_t getRangeLevel() const { return rangeLevel; }
@@ -1019,10 +1137,12 @@ struct RaggedBinding : CanonicalBinding {
   int64_t node = -1;
   int64_t outerNode = -1;
   llvm::SmallVector<int64_t> memberNodes;
+  std::string route;
 
   int64_t getNode() const { return node; }
   int64_t getOuterNode() const { return outerNode; }
   llvm::ArrayRef<int64_t> getMemberNodes() const { return memberNodes; }
+  llvm::StringRef getRoute() const { return route; }
 };
 
 struct StageBinding : Binding<intent::plan::StageOp> {
@@ -1072,7 +1192,8 @@ inline bool stageUsesScatterReduction(const StageBinding &stage,
   return llvm::any_of(stage.getTerminals(), [&](int64_t node) {
     mlir::Operation *terminal = kernel.nodes.lookup(node);
     return terminal &&
-           terminal->getName().getStringRef() == "intent.scatter_reduce";
+           ::intent::target::semanticOperationName(*terminal) ==
+               "intent.scatter_reduce";
   });
 }
 
@@ -1186,7 +1307,7 @@ bool isPlannedStageNode(const PlanIndex &index, mlir::Operation *operation) {
 template <typename PlanIndex>
 bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
   return operation &&
-         operation->getName().getStringRef() == "intent.contract" &&
+         ::intent::target::semanticOperationName(*operation) == "intent.contract" &&
          isPlannedStageNode(index, operation);
 }
 
@@ -1238,56 +1359,6 @@ exactContractionReductionArguments(const target::KernelModel &kernel,
   return arguments;
 }
 
-template <typename PlanIndex>
-mlir::FailureOr<AxisBinding>
-exactContractionReductionAxis(const PlanIndex &index,
-                              const target::KernelModel &kernel,
-                              mlir::Operation &consumer) {
-  mlir::FailureOr<llvm::SmallVector<int64_t>> arguments =
-      exactContractionReductionArguments(kernel, consumer);
-  if (mlir::failed(arguments))
-    return mlir::failure();
-  std::optional<int64_t> axisNode;
-  for (int64_t argument : *arguments) {
-    auto binding = index.regionBindings.find(argument);
-    std::optional<int64_t> candidate;
-    if (binding != index.regionBindings.end()) {
-      intent::plan::RegionBindingOp region = binding->second;
-      candidate = static_cast<int64_t>(region.getAxisNode());
-    } else {
-      mlir::Value value = kernel.values.lookup(argument);
-      mlir::Operation *definition = value ? value.getDefiningOp() : nullptr;
-      mlir::FailureOr<int64_t> node =
-          definition
-              ? target::getNodeID(*definition,
-                                  "contraction reduction-region projection")
-              : mlir::FailureOr<int64_t>(mlir::failure());
-      if (mlir::succeeded(node) && index.axes.count(*node))
-        candidate = *node;
-    }
-    if (!candidate)
-      return consumer.emitOpError(
-          "has no selected range for a reduction-region identity");
-    if (axisNode && *axisNode != *candidate)
-      return consumer.emitOpError(
-          "maps its reduction pair to different physical axes");
-    axisNode = *candidate;
-  }
-  auto axis = axisNode ? index.axes.find(*axisNode) : index.axes.end();
-  if (!axisNode || axis == index.axes.end() ||
-      !axis->second.hasRole("reduction"))
-    return consumer.emitOpError(
-        "does not resolve its exact reduction pair to one physical axis");
-  return axis->second;
-}
-
-template <typename PlanIndex>
-mlir::FailureOr<AxisBinding>
-contractionReductionAxis(const PlanIndex &index,
-                         llvm::ArrayRef<mlir::Operation *> lhsTransfers,
-                         llvm::ArrayRef<mlir::Operation *> rhsTransfers,
-                         mlir::Operation &consumer);
-
 struct DeferredContractReplay {
   target::ContractOperandReplay lhs;
   target::ContractOperandReplay rhs;
@@ -1306,7 +1377,8 @@ mlir::LogicalResult indexDeferredContractReplays(
     if (!entry.second.getProducerReplay())
       continue;
     mlir::Operation *contract = kernel.nodes.lookup(entry.first);
-    if (!contract || contract->getName().getStringRef() != "intent.contract" ||
+    if (!contract || ::intent::target::semanticOperationName(*contract) !=
+                         "intent.contract" ||
         contract->getNumOperands() != 2 ||
         isPlannedStageNode(index, contract))
       return entry.second.emitOpError(
@@ -1337,10 +1409,6 @@ mlir::LogicalResult indexDeferredContractReplays(
     if (!anyDeferred || !allDeferred)
       return entry.second.emitOpError(
           "producer replay requires every source transfer to be deferred");
-    mlir::FailureOr<AxisBinding> reduction =
-        exactContractionReductionAxis(index, kernel, *contract);
-    if (mlir::failed(reduction))
-      return mlir::failure();
     mlir::FailureOr<llvm::SmallVector<int64_t>> reductionArgumentIDs =
         exactContractionReductionArguments(kernel, *contract);
     if (mlir::failed(reductionArgumentIDs))
@@ -1418,7 +1486,8 @@ bool isEnclosingStreamReductionAxis(const PlanIndex &index,
                                     int64_t axisNode) {
   for (mlir::Operation *parent = operation.getParentOp(); parent;
        parent = parent->getParentOp()) {
-    if (parent->getName().getStringRef() != "intent.state_stream")
+    if (::intent::target::semanticOperationName(*parent) !=
+        "intent.state_stream")
       continue;
     auto node = parent->getAttrOfType<mlir::IntegerAttr>("intent.node");
     if (!node)
@@ -1450,7 +1519,7 @@ bool isAbsorbedStagedAccessMetadata(const PlanIndex &index,
       return false;
     for (mlir::Operation *user : value.getUsers()) {
       bool consumed = false;
-      if (user->getName().getStringRef() == "intent.gather" &&
+      if (::intent::target::semanticOperationName(*user) == "intent.gather" &&
           feedsStagedContraction(index, *user)) {
         auto valid =
             user->getAttrOfType<mlir::IntegerAttr>("intent.valid_operand_index");
@@ -1535,9 +1604,11 @@ mlir::LogicalResult indexCanonicalStructure(
     mlir::Operation *owner =
         argument ? argument.getOwner()->getParentOp() : nullptr;
     llvm::StringRef expected =
-        owner && owner->getName().getStringRef() == "intent.parallel"
+        owner && ::intent::target::semanticOperationName(*owner) ==
+                     "intent.parallel"
             ? llvm::StringRef("ownership")
-        : owner && owner->getName().getStringRef() == "intent.state_stream"
+        : owner && ::intent::target::semanticOperationName(*owner) ==
+                       "intent.state_stream"
             ? llvm::StringRef("traversal")
             : llvm::StringRef();
     mlir::FailureOr<target::ScalarIndexSource> source =
@@ -1599,10 +1670,12 @@ mlir::LogicalResult indexCanonicalStructure(
     binding.rangePurpose = physical.getPurpose().str();
     binding.rangeLevel = physical.getLevel();
     binding.extent = range->getExtent().str();
-    if (stream.stopNode >= 0)
-      binding.stopNode = mlir::IntegerAttr::get(
-          mlir::IntegerType::get(stream.operation->getContext(), 64),
-          stream.stopNode);
+    if ((stream.stopValue >= 0) != static_cast<bool>(physical.getStopValueAttr()) ||
+        (stream.stopValue >= 0 &&
+         physical.getStopValueAttr().getInt() != stream.stopValue))
+      return physical.emitOpError(
+          "does not bind the canonical logical stream stop value");
+    binding.stopValue = physical.getStopValueAttr();
     if (physical.getRelationNodeAttr()) {
       binding.relationNode = physical.getRelationNodeAttr().getInt();
       auto relation = kernel.raggedRelations.find(binding.relationNode);
@@ -1674,110 +1747,6 @@ void indexAxisRoles(PlanIndex &index) {
       if (axis.hasRole(role))
         bind(role.str() + "_" + std::to_string(ordinal++), axis);
   }
-}
-
-template <typename PlanIndex>
-mlir::FailureOr<AxisBinding>
-contractionReductionAxis(const PlanIndex &index,
-                         llvm::ArrayRef<mlir::Operation *> lhsTransfers,
-                         llvm::ArrayRef<mlir::Operation *> rhsTransfers,
-                         mlir::Operation &consumer) {
-  auto contains = [&](llvm::ArrayRef<mlir::Operation *> transfers,
-                      int64_t axisNode) {
-    return llvm::any_of(transfers, [&](mlir::Operation *transfer) {
-      mlir::FailureOr<int64_t> node =
-          target::getNodeID(*transfer, "contraction transfer");
-      auto binding = mlir::succeeded(node) ? index.boundaries.find(*node)
-                                           : index.boundaries.end();
-      return mlir::succeeded(node) && binding != index.boundaries.end() &&
-             llvm::is_contained(binding->second.getDomainNodes(), axisNode);
-    });
-  };
-
-  llvm::SmallVector<AxisBinding> candidates;
-  for (const auto &entry : index.axesByRole) {
-    AxisBinding axis = entry.getValue();
-    if (!entry.getKey().starts_with("reduction_") ||
-        !contains(lhsTransfers, axis.getNode()) ||
-        !contains(rhsTransfers, axis.getNode()))
-      continue;
-    candidates.push_back(axis);
-  }
-  if (candidates.size() != 1)
-    return consumer.emitOpError(
-        "does not resolve exactly one shared physical reduction axis");
-  return candidates.front();
-}
-
-template <typename PlanIndex>
-mlir::FailureOr<AxisBinding>
-contractionReductionAxis(const PlanIndex &index, mlir::Operation &lhsLoad,
-                         mlir::Operation &rhsLoad,
-                         mlir::Operation &consumer) {
-  mlir::Operation *lhs[] = {&lhsLoad};
-  mlir::Operation *rhs[] = {&rhsLoad};
-  return contractionReductionAxis(index, lhs, rhs, consumer);
-}
-
-struct ContractionAxes {
-  AxisBinding lhsResult;
-  AxisBinding rhsResult;
-  AxisBinding reduction;
-};
-
-template <typename PlanIndex>
-mlir::FailureOr<ContractionAxes>
-contractionAxes(const PlanIndex &index,
-                llvm::ArrayRef<mlir::Operation *> lhsTransfers,
-                llvm::ArrayRef<mlir::Operation *> rhsTransfers,
-                mlir::Operation &consumer) {
-  mlir::FailureOr<AxisBinding> reduction =
-      contractionReductionAxis(index, lhsTransfers, rhsTransfers, consumer);
-  if (mlir::failed(reduction))
-    return mlir::failure();
-  auto resultAxis = [&](llvm::ArrayRef<mlir::Operation *> transfers,
-                        llvm::StringRef side) -> mlir::FailureOr<AxisBinding> {
-    llvm::SmallVector<AxisBinding> candidates;
-    for (mlir::Operation *transfer : transfers) {
-      mlir::FailureOr<int64_t> node =
-          target::getNodeID(*transfer, "contraction transfer");
-      auto binding = mlir::succeeded(node) ? index.boundaries.find(*node)
-                                           : index.boundaries.end();
-      if (mlir::failed(node) || binding == index.boundaries.end())
-        return mlir::failure();
-      for (int64_t domainNode : binding->second.getDomainNodes()) {
-        auto found = index.axes.find(domainNode);
-        if (found == index.axes.end() || domainNode == reduction->getNode() ||
-            found->second.isScalar())
-          continue;
-        if (!llvm::any_of(candidates, [&](const AxisBinding &candidate) {
-              return candidate.getNode() == found->second.getNode();
-            }))
-          candidates.push_back(found->second);
-      }
-    }
-    if (candidates.size() != 1)
-      return consumer.emitOpError()
-             << "does not resolve exactly one physical " << side
-             << " result axis";
-    return candidates.front();
-  };
-  mlir::FailureOr<AxisBinding> lhsResult =
-      resultAxis(lhsTransfers, "lhs");
-  mlir::FailureOr<AxisBinding> rhsResult =
-      resultAxis(rhsTransfers, "rhs");
-  if (mlir::failed(lhsResult) || mlir::failed(rhsResult))
-    return mlir::failure();
-  return ContractionAxes{*lhsResult, *rhsResult, *reduction};
-}
-
-template <typename PlanIndex>
-mlir::FailureOr<ContractionAxes>
-contractionAxes(const PlanIndex &index, mlir::Operation &lhsLoad,
-                mlir::Operation &rhsLoad, mlir::Operation &consumer) {
-  mlir::Operation *lhs[] = {&lhsLoad};
-  mlir::Operation *rhs[] = {&rhsLoad};
-  return contractionAxes(index, lhs, rhs, consumer);
 }
 
 template <typename PlanIndex>
@@ -2088,8 +2057,9 @@ mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
     }
   }
 
+  std::optional<int64_t> programNode = index.program.getLoopNode();
   mlir::Operation *program =
-      kernel.nodes.lookup(index.program.getLoopNode());
+      programNode ? kernel.nodes.lookup(*programNode) : nullptr;
   if (!program)
     return index.program.emitOpError("references an unknown program root");
   auto nestedInProgram = [&](mlir::Operation *operation) {

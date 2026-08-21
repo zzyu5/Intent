@@ -64,12 +64,6 @@ def Intent_ParallelOp : Intent_Op<"parallel", [RecursiveMemoryEffects]> {
   let regions = (region AnyRegion:$body);
 }
 
-def Intent_OrderedOp : Intent_Op<"ordered", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region AnyRegion:$body);
-}
-
 def Intent_StateStreamOp : Intent_Op<"state_stream", [RecursiveMemoryEffects]> {
   let arguments = (ins Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>:$results);

@@ -217,21 +217,18 @@ def block_sparse_gqa_decode_combine(
                 valid=denominator > 0.0,
                 fill=1.0,
             )
-            for dimension_region in I.parallel(
-                I.partition(dimensions, extent=I.auto("D_TILE"))
-            ):
-                numerator = I.reshape(
-                    I.reduce.sum(
-                        weights[:, None]
-                        * partial_output[
-                            batch, query_head, splits, dimension_region
-                        ],
-                        axis=0,
-                        identity=0.0,
-                        acc_dtype=I.f32,
-                    ),
-                    (dimension_region,),
-                )
-                output[batch, query_head, dimension_region] = I.cast(
-                    numerator / safe_denominator, I.f16
-                )
+            numerator = I.reshape(
+                I.reduce.sum(
+                    weights[:, None]
+                    * partial_output[
+                        batch, query_head, splits, dimensions
+                    ],
+                    axis=0,
+                    identity=0.0,
+                    acc_dtype=I.f32,
+                ),
+                (dimensions,),
+            )
+            output[batch, query_head, dimensions] = I.cast(
+                numerator / safe_denominator, I.f16
+            )

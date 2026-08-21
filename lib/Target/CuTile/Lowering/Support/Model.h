@@ -105,6 +105,7 @@ public:
   mlir::LogicalResult emitConstant(mlir::Operation &operation);
   mlir::LogicalResult emitDimension(mlir::Operation &operation);
   mlir::LogicalResult emitExtract(mlir::Operation &operation);
+  mlir::LogicalResult emitRegionEnd(mlir::Operation &operation);
   mlir::LogicalResult enterParallel(mlir::Operation &operation);
   mlir::LogicalResult leaveParallel(mlir::Operation &operation);
   mlir::LogicalResult enterFor(mlir::Operation &operation);

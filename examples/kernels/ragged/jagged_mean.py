@@ -25,20 +25,17 @@ def jagged_mean(
         offsets=offsets,
     )
     for batch in I.parallel(rows.outer):
-        for feature_region in I.parallel(
-            I.partition(features, extent=I.auto("FEATURE_TILE"))
-        ):
-            accumulation = I.state_stream(
-                rows[batch],
-                extent=I.auto("RAGGED_TILE"),
-                init=(I.zeros((feature_region,), dtype=I.f32),),
-            )
-            with accumulation:
-                for token_region, total in accumulation:
-                    chunk = values[token_region, feature_region]
-                    accumulation.yield_(
-                        total + I.reduce.sum(chunk, axis=0, identity=0.0)
-                    )
-            total = accumulation.result
-            count = I.cast(offsets[batch + 1] - offsets[batch], I.f32)
-            output[batch, feature_region] = total / count
+        accumulation = I.state_stream(
+            rows[batch],
+            extent=I.auto("RAGGED_TILE"),
+            init=(I.zeros((features,), dtype=I.f32),),
+        )
+        with accumulation:
+            for token_region, total in accumulation:
+                chunk = values[token_region, features]
+                accumulation.yield_(
+                    total + I.reduce.sum(chunk, axis=0, identity=0.0)
+                )
+        total = accumulation.result
+        count = I.cast(offsets[batch + 1] - offsets[batch], I.f32)
+        output[batch, features] = total / count

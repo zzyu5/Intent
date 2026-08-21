@@ -24,17 +24,15 @@ def gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-        for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-            accumulator = I.contract(
-                a[mr, k_axis],
-                b[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            if ACTIVATION == Activation.RELU:
-                accumulator = I.maximum(accumulator, 0.0)
-            c[mr, nr] = I.cast(accumulator, I.f16)
+    accumulator = I.contract(
+        a[m_axis, k_axis],
+        b[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    if ACTIVATION == Activation.RELU:
+        accumulator = I.maximum(accumulator, 0.0)
+    c[m_axis, n_axis] = I.cast(accumulator, I.f16)
 
 
 @intent.kernel
@@ -48,15 +46,13 @@ def bf16_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-        for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-            accumulator = I.contract(
-                a[mr, k_axis],
-                b[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            c[mr, nr] = I.cast(accumulator, I.bf16)
+    accumulator = I.contract(
+        a[m_axis, k_axis],
+        b[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    c[m_axis, n_axis] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel
@@ -73,16 +69,14 @@ def quantized_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    for mr in I.parallel(I.partition(m_axis, extent=I.auto("M_TILE"))):
-        for nr in I.parallel(I.partition(n_axis, extent=I.auto("N_TILE"))):
-            accumulator = I.contract(
-                a[mr, k_axis],
-                b[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            activated = I.maximum(accumulator + bias[nr], 0.0)
-            fused = activated + I.cast(residual[mr, nr], I.f32)
-            scaled = fused / output_scale[nr]
-            saturated = I.minimum(I.maximum(scaled, -128.0), 127.0)
-            output[mr, nr] = I.cast(saturated, I.i8)
+    accumulator = I.contract(
+        a[m_axis, k_axis],
+        b[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    activated = I.maximum(accumulator + bias[n_axis], 0.0)
+    fused = activated + I.cast(residual[m_axis, n_axis], I.f32)
+    scaled = fused / output_scale[n_axis]
+    saturated = I.minimum(I.maximum(scaled, -128.0), 127.0)
+    output[m_axis, n_axis] = I.cast(saturated, I.i8)

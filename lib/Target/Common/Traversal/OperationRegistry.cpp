@@ -1,5 +1,7 @@
 #include "Intent/Target/Common/Traversal/OperationRegistry.h"
 
+#include "Intent/Target/Common/Analysis/Operation.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/Block.h"
 
@@ -13,7 +15,7 @@ LogicalResult traverseBlock(Block &block,
                             StringRef stage) {
   for (Operation &operation : block) {
     const OperationHandler *handler =
-        registry.lookup(operation.getName().getStringRef());
+        registry.lookup(semanticOperationName(operation));
     if (!handler)
       return operation.emitOpError()
              << "has no registered handler during " << stage;
@@ -46,7 +48,7 @@ OperationHandlerRegistry::lookup(StringRef operationName) const {
 
 LogicalResult OperationHandlerRegistry::dispatch(Operation &operation,
                                                  StringRef stage) const {
-  const OperationHandler *handler = lookup(operation.getName().getStringRef());
+  const OperationHandler *handler = lookup(semanticOperationName(operation));
   if (!handler)
     return operation.emitOpError() << "has no registered handler during " << stage;
   if (handler->enter && failed(handler->enter(operation)))

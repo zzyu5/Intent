@@ -42,7 +42,6 @@ auto = Intrinsic("auto")
 domain = Intrinsic("domain")
 partition = Intrinsic("partition")
 parallel = Intrinsic("parallel")
-ordered = Intrinsic("ordered")
 state_stream = Intrinsic("state_stream")
 indices = Intrinsic("indices")
 end = Intrinsic("end")
@@ -102,7 +101,6 @@ INTRINSICS = {
         domain,
         partition,
         parallel,
-        ordered,
         state_stream,
         indices,
         end,

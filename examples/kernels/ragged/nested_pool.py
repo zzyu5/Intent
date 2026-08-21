@@ -34,10 +34,10 @@ def nested_jagged_mean_pool(
         for feature in I.parallel(I.domain(0, D)):
             document_sum = I.cast(0.0, I.f32)
             document_tokens = I.cast(0, I.i32)
-            for sentence in I.ordered(documents[document]):
+            for sentence in documents[document]:
                 sentence_sum = I.cast(0.0, I.f32)
                 sentence_tokens = I.cast(0, I.i32)
-                for token in I.ordered(sentences[sentence]):
+                for token in sentences[sentence]:
                     sentence_sum = sentence_sum + values[token, feature]
                     sentence_tokens = sentence_tokens + 1
                 denominator = I.maximum(I.cast(sentence_tokens, I.f32), 1.0)

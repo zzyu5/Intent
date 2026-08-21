@@ -17,7 +17,7 @@ def unique_consecutive_rows(
     M, N = values.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        for column in I.ordered(columns):
+        for column in columns:
             unique_values[row, column] = 0
         positions = I.indices(columns)
         previous_positions = I.maximum(positions - 1, 0)
@@ -38,7 +38,7 @@ def unique_consecutive_rows(
             inclusive=True,
             acc_dtype=I.i32,
         )
-        for column in I.ordered(columns):
+        for column in columns:
             group = groups[column] - 1
             inverse[row, column] = group
             I.atomic_add(
