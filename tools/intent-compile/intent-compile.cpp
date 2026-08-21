@@ -19,6 +19,20 @@ namespace {
 
 enum class TargetKind { Triton, CuTile, TileLang };
 
+enum class ExitCode : int {
+  Success = 0,
+  Invocation = 1,
+  KernelIR = 2,
+  PhysicalProgram = 3,
+  PhysicalVerification = 4,
+  ProviderProgram = 5,
+  ProviderVerification = 6,
+  TerminalTranslation = 7,
+  Output = 8,
+};
+
+int exitCode(ExitCode code) { return static_cast<int>(code); }
+
 mlir::LogicalResult realize(
     mlir::ModuleOp module,
     const intent::gpu::DeviceCapabilities &device) {
@@ -93,7 +107,7 @@ int main(int argc, char **argv) {
 
   if (irOutputFilename == sourceOutputFilename) {
     llvm::errs() << "Intent compiler outputs must use distinct paths\n";
-    return 1;
+    return exitCode(ExitCode::Invocation);
   }
 
   mlir::DialectRegistry registry;
@@ -107,29 +121,31 @@ int main(int argc, char **argv) {
       device, computeUnits, sharedMemoryPerUnit, registersPerUnit, matrixUnits,
       dynamicVectorWidth};
   if (!module)
-    return 1;
+    return exitCode(ExitCode::KernelIR);
   if (mlir::failed(realize(*module, capabilities))) {
     llvm::errs() << "Intent physical-program pipeline failed\n";
-    return 1;
+    return exitCode(ExitCode::PhysicalProgram);
   }
   if (mlir::failed(mlir::verify(*module))) {
     llvm::errs() << "Intent physical program verification failed\n";
-    return 1;
+    return exitCode(ExitCode::PhysicalVerification);
   }
 
   if (mlir::failed(materialize(*module, target))) {
     llvm::errs() << "Intent target-program materialization failed\n";
-    return 1;
+    return exitCode(ExitCode::ProviderProgram);
   }
   if (mlir::failed(mlir::verify(*module))) {
     llvm::errs() << "materialized target program verification failed\n";
-    return 1;
+    return exitCode(ExitCode::ProviderVerification);
   }
 
   std::string source;
   llvm::raw_string_ostream sourceStream(source);
-  if (mlir::failed(translate(*module, target, sourceStream)))
-    return 1;
+  if (mlir::failed(translate(*module, target, sourceStream))) {
+    llvm::errs() << "Intent terminal target translation failed\n";
+    return exitCode(ExitCode::TerminalTranslation);
+  }
   sourceStream.flush();
 
   std::error_code irError;
@@ -138,7 +154,7 @@ int main(int argc, char **argv) {
   if (irError) {
     llvm::errs() << "cannot open physical-program MLIR output: " << irError.message()
                  << '\n';
-    return 1;
+    return exitCode(ExitCode::Output);
   }
   std::error_code sourceError;
   llvm::ToolOutputFile sourceOutput(sourceOutputFilename, sourceError,
@@ -146,7 +162,7 @@ int main(int argc, char **argv) {
   if (sourceError) {
     llvm::errs() << "cannot open target source output: "
                  << sourceError.message() << '\n';
-    return 1;
+    return exitCode(ExitCode::Output);
   }
 
   mlir::OpPrintingFlags flags;
@@ -156,5 +172,5 @@ int main(int argc, char **argv) {
   sourceOutput.os() << source;
   irOutput.keep();
   sourceOutput.keep();
-  return 0;
+  return exitCode(ExitCode::Success);
 }

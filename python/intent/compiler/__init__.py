@@ -1,4 +1,5 @@
 from .pipeline import compile
+from .toolchain import CompilationStageError
 
 
-__all__ = ["compile"]
+__all__ = ["CompilationStageError", "compile"]

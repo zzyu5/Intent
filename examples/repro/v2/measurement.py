@@ -15,8 +15,10 @@ from .model import TensorTree
 from .model import Tolerance
 
 
-class GeneratedCompilationError(RuntimeError):
-    pass
+class PipelineStageError(RuntimeError):
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 class NumericalComparisonError(RuntimeError):
@@ -37,11 +39,19 @@ def compile_single(
             compiler=context.compiler,
             constexprs=constexprs,
         )
+    except intent.CompilationStageError as error:
+        raise PipelineStageError(error.stage, str(error)) from error
+    try:
         result = artifact.run(*arguments)
+    except Exception as error:
+        raise PipelineStageError(
+            "provider_jit_or_initial_launch", str(error)
+        ) from error
+    try:
         launch_outputs = () if result is None else result
         launch = prepare_kernel_call(artifact, arguments, launch_outputs)
     except Exception as error:
-        raise GeneratedCompilationError(str(error)) from error
+        raise PipelineStageError("launcher_preparation", str(error)) from error
     return artifact, PreparedLaunch(launch=launch, outputs=lambda: result)
 
 
@@ -52,7 +62,12 @@ def functional_launch(function) -> PreparedLaunch:
         state["output"] = function()
         return state["output"]
 
-    launch()
+    try:
+        launch()
+    except Exception as error:
+        raise PipelineStageError(
+            "source_provider_jit_or_initial_launch", str(error)
+        ) from error
     return PreparedLaunch(launch=launch, outputs=lambda: state["output"])
 
 
@@ -182,30 +197,43 @@ def compare_outputs(
 
 
 def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
-    if comparison.generated.prepare is not None:
-        comparison.generated.prepare()
-    comparison.generated.launch()
-    if comparison.source.prepare is not None:
-        comparison.source.prepare()
-    comparison.source.launch()
-    torch.cuda.synchronize()
+    try:
+        if comparison.generated.prepare is not None:
+            comparison.generated.prepare()
+        comparison.generated.launch()
+        torch.cuda.synchronize()
+    except Exception as error:
+        raise PipelineStageError("generated_launch", str(error)) from error
+    try:
+        if comparison.source.prepare is not None:
+            comparison.source.prepare()
+        comparison.source.launch()
+        torch.cuda.synchronize()
+    except Exception as error:
+        raise PipelineStageError("source_launch", str(error)) from error
     compare_outputs(
         comparison.generated.outputs(),
         comparison.source.outputs(),
         comparison.tolerance,
     )
-    generated_p50, _ = benchmark(
-        comparison.generated.launch,
-        warmup=3,
-        repetitions=100,
-        cuda_graph=comparison.cuda_graph,
-        prepare=comparison.generated.prepare,
-    )
-    source_p50, _ = benchmark(
-        comparison.source.launch,
-        warmup=3,
-        repetitions=100,
-        cuda_graph=comparison.cuda_graph,
-        prepare=comparison.source.prepare,
-    )
+    try:
+        generated_p50, _ = benchmark(
+            comparison.generated.launch,
+            warmup=3,
+            repetitions=100,
+            cuda_graph=comparison.cuda_graph,
+            prepare=comparison.generated.prepare,
+        )
+    except Exception as error:
+        raise PipelineStageError("generated_benchmark", str(error)) from error
+    try:
+        source_p50, _ = benchmark(
+            comparison.source.launch,
+            warmup=3,
+            repetitions=100,
+            cuda_graph=comparison.cuda_graph,
+            prepare=comparison.source.prepare,
+        )
+    except Exception as error:
+        raise PipelineStageError("source_benchmark", str(error)) from error
     return generated_p50, source_p50

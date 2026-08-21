@@ -7,6 +7,7 @@ from intent.frontend import lower_to_mlir
 from intent.runtime import CompiledArtifact
 from intent.targets.base import Target
 
+from .toolchain import CompilationStageError
 from .toolchain import run_compiler
 
 
@@ -17,12 +18,23 @@ def compile(
     compiler: str | Path,
     constexprs: dict[str, object] | None = None,
 ) -> CompiledArtifact:
-    kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
-    resolved = target.resolve()
+    try:
+        kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
+    except Exception as error:
+        raise CompilationStageError("frontend_kir", str(error)) from error
+    try:
+        resolved = target.resolve()
+    except Exception as error:
+        raise CompilationStageError("target_resolution", str(error)) from error
     source, realized_mlir = run_compiler(
         compiler,
         kernel_mlir,
         resolved.compiler_options,
         resolved.compiler_role,
     )
-    return resolved.materialize(source, realized_mlir, definition.__name__)
+    try:
+        return resolved.materialize(source, realized_mlir, definition.__name__)
+    except Exception as error:
+        raise CompilationStageError(
+            "generated_source_materialization", str(error)
+        ) from error

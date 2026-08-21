@@ -42,6 +42,7 @@ TRITON = (
     Entry("mamba_state_passing", "B1-C8-H32-state8192-fp32", "mamba_state_passing", ("streaming/mamba.py:mamba_state_passing_fwd",), "source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_state_passing_runtime.py"),
     Entry("mamba_chunk_scan", "B1-S2048-H32-G8-P64-N128-C256-bf16", "mamba_chunk_scan_v2", ("streaming/selective_scan.py:mamba_chunk_scan_bf16_fwd",), "source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_scan_runtime.py"),
     Entry("paged_gqa_decode", "B16-QH32-KVH8-S8192-D128-page16-fp16", "paged_gqa_decode_v2", ("streaming/paged_attention.py:paged_gqa_decode_attention",), "source/triton/vllm/attention/paged_decode/paged_gqa_decode_runtime.py"),
+    Entry("splitk_paged_attention", "B16-QH32-KVH8-S8192-D128-page16-split8-fp16", "splitk_paged_attention", ("streaming/paged_attention.py:paged_gqa_decode_partials", "streaming/splitk_reduce.py:splitk_attention_weighted_sum_reduce"), "source/triton/xformers/attention/splitk/splitk_kernels_runtime.py"),
     Entry("paged_mla_decode", "B8-QH128-KVH1-S8192-C512-R64-page16-fp16", "paged_mla_decode_v2", ("streaming/mla.py:paged_mla_decode",), "source/triton/vllm/attention/paged_decode/paged_mla_decode_runtime.py"),
     Entry("block_sparse_gqa_decode", "B8-QH32-KVH8-S8192-D128-blocks32x128", "block_sparse_gqa_decode_v2", ("streaming/block_sparse_attention.py:block_sparse_gqa_decode_partials", "streaming/block_sparse_attention.py:block_sparse_gqa_decode_combine"), "source/triton/vllm/attention/minimax_m3/sparse_decode_runtime.py"),
 )

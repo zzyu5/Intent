@@ -9,8 +9,8 @@ import torch
 import intent
 
 from .measurement import evaluate
-from .measurement import GeneratedCompilationError
 from .measurement import NumericalComparisonError
+from .measurement import PipelineStageError
 from .model import Context
 from .model import ResultRow
 from .providers import load_cases
@@ -104,9 +104,16 @@ def main() -> None:
             rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "unsupported"))
             _write(arguments.output, rows)
             continue
-        except GeneratedCompilationError as error:
-            print(f"{provider}:{entry.kernel}: compile_failed: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "compile_failed"))
+        except PipelineStageError as error:
+            status = f"{error.stage}_failed"
+            print(f"{provider}:{entry.kernel}: {status}: {error}")
+            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
+            _write(arguments.output, rows)
+            continue
+        except Exception as error:
+            status = "adapter_preparation_failed"
+            print(f"{provider}:{entry.kernel}: {status}: {error}")
+            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
             _write(arguments.output, rows)
             continue
         try:
@@ -114,6 +121,12 @@ def main() -> None:
         except NumericalComparisonError as error:
             print(f"{provider}:{entry.kernel}: numerical_failed: {error}")
             rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "numerical_failed"))
+            _write(arguments.output, rows)
+            continue
+        except PipelineStageError as error:
+            status = f"{error.stage}_failed"
+            print(f"{provider}:{entry.kernel}: {status}: {error}")
+            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
             _write(arguments.output, rows)
             continue
         ratio = generated_p50 / source_p50

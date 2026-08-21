@@ -84,26 +84,40 @@ def _prepare(arguments):
         value_cache.reshape(physical_tokens, kv_heads, head_dim)[None, :, None, :, :]
         .expand(1, physical_tokens, groups, kv_heads, head_dim)
     )
+    splits = 8
     output_source = torch.empty(
-        (batch, groups, kv_heads, 1, 1, head_dim),
+        (batch, groups, kv_heads, splits, 1, head_dim),
         device=q.device,
-        dtype=q.dtype,
+        dtype=torch.bfloat16,
     )
     lse = torch.empty(
-        (batch, groups, kv_heads, 1, 1),
+        (batch, groups, kv_heads, splits, 1),
+        device=q.device,
+        dtype=torch.float64,
+    )
+    output = torch.empty(
+        (batch, groups, kv_heads, 1, head_dim),
+        device=q.device,
+        dtype=torch.bfloat16,
+    )
+    output_lse = torch.empty(
+        (batch, groups, kv_heads, 1),
         device=q.device,
         dtype=torch.float64,
     )
     source = load_splitk_source()
     return {
         "forward": source._get_splitk_kernel(1),
+        "reduce": source._splitK_reduce,
         "q": q_source,
         "key_source": key_source,
         "value_source": value_source,
         "block_table": block_table,
         "sequence_lengths": sequence_lengths,
-        "output": output_source,
-        "lse": lse,
+        "partial_output": output_source,
+        "partial_lse": lse,
+        "output": output,
+        "output_lse": output_lse,
         "batch": batch,
         "query_heads": query_heads,
         "kv_heads": kv_heads,
@@ -111,6 +125,7 @@ def _prepare(arguments):
         "head_dim": head_dim,
         "page_size": page_size,
         "max_tokens": max_pages * page_size,
+        "splits": splits,
     }
 
 
@@ -135,8 +150,10 @@ def paged_decode(arguments):
     q_source = state["q"]
     key_source = state["key_source"]
     value_source = state["value_source"]
+    partial_output = state["partial_output"]
+    partial_lse = state["partial_lse"]
     output = state["output"]
-    lse = state["lse"]
+    output_lse = state["output_lse"]
     block_table = state["block_table"]
     batch = state["batch"]
     kv_heads = state["kv_heads"]
@@ -144,14 +161,18 @@ def paged_decode(arguments):
     head_dim = state["head_dim"]
     page_size = state["page_size"]
     max_tokens = state["max_tokens"]
-    grid = (1, batch * groups * kv_heads, 1)
+    splits = state["splits"]
+    block_n_per_split = (
+        (max_tokens + splits * page_size - 1) // (splits * page_size)
+    ) * page_size
+    grid = (1, batch * groups * kv_heads, splits)
     forward[grid](
         Q=q_source,
         K=key_source,
         V=value_source,
         sm_scale=scale,
-        Out_splitK=output,
-        LSE_splitk=lse,
+        Out_splitK=partial_output,
+        LSE_splitk=partial_lse,
         block_tables=block_table,
         Seq_len=sequence_lengths,
         Seq_starts_k=None,
@@ -175,17 +196,17 @@ def paged_decode(arguments):
         stride_vg=value_source.stride(2),
         stride_vh=value_source.stride(3),
         stride_vk=value_source.stride(4),
-        stride_osk_z=output.stride(0),
-        stride_osk_g=output.stride(1),
-        stride_osk_h=output.stride(2),
-        stride_osk_s=output.stride(3),
-        stride_osk_m=output.stride(4),
-        stride_osk_k=output.stride(5),
-        stride_lsek_z=lse.stride(0),
-        stride_lsek_g=lse.stride(1),
-        stride_lsek_h=lse.stride(2),
-        stride_lsek_s=lse.stride(3),
-        stride_lsek_m=lse.stride(4),
+        stride_osk_z=partial_output.stride(0),
+        stride_osk_g=partial_output.stride(1),
+        stride_osk_h=partial_output.stride(2),
+        stride_osk_s=partial_output.stride(3),
+        stride_osk_m=partial_output.stride(4),
+        stride_osk_k=partial_output.stride(5),
+        stride_lsek_z=partial_lse.stride(0),
+        stride_lsek_g=partial_lse.stride(1),
+        stride_lsek_h=partial_lse.stride(2),
+        stride_lsek_s=partial_lse.stride(3),
+        stride_lsek_m=partial_lse.stride(4),
         stride_blocktablesz=block_table.stride(0),
         stride_blocktablesl=block_table.stride(1),
         stride_bias_b=None,
@@ -207,7 +228,7 @@ def paged_decode(arguments):
         G=groups,
         N_CTX_Q=1,
         N_CTX_K=max_tokens,
-        BLOCK_N_PER_SPLIT=max_tokens,
+        BLOCK_N_PER_SPLIT=block_n_per_split,
         BLOCK_DMODEL=head_dim,
         USE_SEQ_LEN=True,
         PACKED_PER_VAL=1,
@@ -215,23 +236,57 @@ def paged_decode(arguments):
         IS_CAUSAL=True,
         IS_LOCAL=False,
         NUM_QUERIES_CAUSAL=1,
-        IS_SPLITK=False,
-        SPLIT_K_EARLY_EXIT=False,
+        IS_SPLITK=True,
+        SPLIT_K_EARLY_EXIT=True,
         USE_PAGED_ATTENTION=True,
         PAGE_SIZE=page_size,
         WINDOW_LEFT=-1,
         WINDOW_RIGHT=-1,
-        WRITE_LSE=False,
+        WRITE_LSE=True,
         HAS_ADDITIVE_BIAS=False,
-        NUM_PROGRAMS_DIM2_CONST=1,
+        NUM_PROGRAMS_DIM2_CONST=splits,
         IS_HIP=False,
         BLOCK_M=16,
         BLOCK_N=page_size,
         num_warps=4,
         num_stages=1,
     )
+    splitk_pow2 = 1 << (splits - 1).bit_length()
+    state["reduce"][(1, batch * groups * kv_heads, 1)](
+        partial_output,
+        partial_lse,
+        output,
+        output_lse,
+        splits,
+        splitk_pow2,
+        partial_output.stride(0),
+        partial_output.stride(1),
+        partial_output.stride(2),
+        partial_output.stride(3),
+        partial_output.stride(4),
+        partial_output.stride(5),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        partial_lse.stride(3),
+        partial_lse.stride(4),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        output.stride(4),
+        output_lse.stride(0),
+        output_lse.stride(1),
+        output_lse.stride(2),
+        output_lse.stride(3),
+        head_dim,
+        head_dim,
+        kv_heads,
+        groups,
+        False,
+    )
     return (
-        output[:, :, :, 0, 0, :]
+        output[:, :, :, 0, :]
         .permute(0, 2, 1, 3)
         .reshape(batch, state["query_heads"], head_dim)
     )

@@ -12,6 +12,8 @@ from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_com
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.mla import paged_mla_decode
 from kernels.streaming.paged_attention import paged_gqa_decode_attention
+from kernels.streaming.paged_attention import paged_gqa_decode_partials
+from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce
 
 from ...loading import load_module
 from ...measurement import compile_single
@@ -130,6 +132,95 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         generated,
         source,
         Tolerance(atol=5e-2, rtol=5e-2),
+        cuda_graph=False,
+    )
+
+
+def splitk_paged_attention(context: Context) -> PreparedComparison:
+    batch, query_heads, kv_heads, dimension = 16, 32, 8, 128
+    sequence, page_size, splits = 8192, 16, 8
+    pages_per_sequence = sequence // page_size
+    pages_per_split = pages_per_sequence // splits
+    pages = batch * pages_per_sequence
+    q = torch.randn(
+        (batch, query_heads, dimension), device="cuda", dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        (pages, page_size, kv_heads, dimension),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    value_cache = torch.randn_like(key_cache)
+    page_indices = torch.arange(pages, device="cuda", dtype=torch.int32)
+    page_offsets = torch.arange(
+        0,
+        pages + 1,
+        pages_per_sequence,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    split_offsets = torch.arange(
+        0,
+        pages + 1,
+        pages_per_split,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    lengths = torch.full(
+        (batch,), sequence, device="cuda", dtype=torch.int32
+    )
+    scale = dimension**-0.5
+    _, partials = compile_single(
+        context,
+        paged_gqa_decode_partials,
+        (
+            q,
+            key_cache,
+            value_cache,
+            page_offsets,
+            page_indices,
+            lengths,
+            split_offsets,
+            scale,
+        ),
+        constexprs={
+            "PAGE_SIZE": page_size,
+            "HEAD_GROUP": query_heads // kv_heads,
+            "SPLITS": splits,
+            "BATCH_SIZE": batch,
+        },
+    )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_weighted_sum_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(generated_launch, reduction.outputs)
+    runtime = load_module(
+        context.project_root
+        / "source/triton/xformers/attention/splitk/splitk_kernels_runtime.py",
+        "intent_v2_triton_xformers_splitk_runtime",
+    )
+    arguments = (
+        q,
+        key_cache,
+        value_cache,
+        page_offsets,
+        page_indices,
+        lengths,
+        scale,
+    )
+    source = functional_launch(lambda: runtime.upstream(arguments))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
     )
 
@@ -417,6 +508,7 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
 CASES = {
     "flash_attention_forward": flash_attention_forward,
     "paged_gqa_decode": paged_gqa_decode,
+    "splitk_paged_attention": splitk_paged_attention,
     "paged_mla_decode": paged_mla,
     "block_sparse_gqa_decode": block_sparse_gqa_decode,
     "flash_attention_backward": flash_attention_backward,

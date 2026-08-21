@@ -4,6 +4,7 @@ from .api import HelperDefinition
 from .api import KernelDefinition
 from .api import fn
 from .api import kernel
+from .compiler import CompilationStageError
 from .compiler import compile
 from .diagnostics import DefinitionError
 from .diagnostics import IntentError
@@ -24,6 +25,7 @@ __all__ = [
     "IntentError",
     "KernelDefinition",
     "LanguageUseError",
+    "CompilationStageError",
     "fn",
     "kernel",
     "compile",
