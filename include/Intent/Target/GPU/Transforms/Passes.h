@@ -12,6 +12,10 @@ namespace intent::gpu {
 
 std::unique_ptr<mlir::Pass>
 createConstructPhysicalProgramPass(const DeviceCapabilities &device);
+std::unique_ptr<mlir::Pass>
+createRefinePrivateBufferResidencyPass(const DeviceCapabilities &device);
+std::unique_ptr<mlir::Pass> createRefinePersistentTraversalPass();
+std::unique_ptr<mlir::Pass> createRefineBoundaryNeutralizationPass();
 std::unique_ptr<mlir::Pass> createVerifyPhysicalProgramPass();
 
 mlir::LogicalResult runPhysicalProgramPipeline(

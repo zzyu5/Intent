@@ -357,6 +357,22 @@ LogicalResult PointwiseOp::verify() {
   return success();
 }
 
+LogicalResult UnaryOp::verify() {
+  if (failed(requireNode(*this, getNode())))
+    return failure();
+  if (!llvm::is_contained(
+          {StringRef("exp"), StringRef("exp2"), StringRef("log"),
+           StringRef("sin"), StringRef("cos"), StringRef("floor"),
+           StringRef("rsqrt"), StringRef("sigmoid"), StringRef("negate"),
+           StringRef("not")},
+          getSemantic()))
+    return emitOpError() << "contains unsupported unary semantics "
+                         << getSemantic();
+  if (getInput().getType() != getResult().getType())
+    return emitOpError("requires identical input and result types");
+  return success();
+}
+
 LogicalResult ContractOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
@@ -658,6 +674,36 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   if (targetPrograms > 1)
     return program.emitOpError(
         "cannot contain more than one materialized provider program");
+  FailureOr<func::FuncOp> physicalEntry = getPhysicalEntry(program);
+  if (failed(physicalEntry))
+    return failure();
+  llvm::DenseMap<int64_t, PointwiseOp> pointwiseByNode;
+  for (PointwiseOp decision : pointwise)
+    pointwiseByNode[decision.getNode()] = decision;
+  llvm::DenseSet<int64_t> physicalUnaryNodes;
+  WalkResult physicalResult =
+      physicalEntry->walk([&](Operation *operation) -> WalkResult {
+        if (operation->getName().getStringRef() == "intent.unary") {
+          operation->emitOpError(
+              "is residual Kernel IR inside the physical program; expected "
+              "intent_plan.unary");
+          return WalkResult::interrupt();
+        }
+        auto unary = dyn_cast<UnaryOp>(operation);
+        if (!unary)
+          return WalkResult::advance();
+        if (!physicalUnaryNodes.insert(unary.getNode()).second) {
+          unary.emitOpError("duplicates a physical unary node");
+          return WalkResult::interrupt();
+        }
+        if (!pointwiseByNode.count(unary.getNode())) {
+          unary.emitOpError("has no pointwise physical decision");
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+  if (physicalResult.wasInterrupted())
+    return failure();
   for (RangeOp range : ranges) {
     auto axis = axes.find(range.getAxisNode());
     if (axis == axes.end())

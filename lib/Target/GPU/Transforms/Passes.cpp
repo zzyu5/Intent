@@ -68,6 +68,12 @@ LogicalResult runPhysicalProgramPipeline(ModuleOp module,
   manager.enableVerifier(true);
   manager.addPass(createConstructPhysicalProgramPass(device));
   manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefinePrivateBufferResidencyPass(device));
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefinePersistentTraversalPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
+  manager.addPass(createRefineBoundaryNeutralizationPass());
+  manager.addPass(createVerifyPhysicalProgramPass());
   return manager.run(module);
 }
 

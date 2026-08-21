@@ -1,6 +1,8 @@
 #include "Support/Model.h"
 #include "Syntax/Spelling.h"
 
+#include "Intent/Target/TileLang/Lowering/Passes.h"
+
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/LogicalBuffer.h"
 #include "Intent/Target/Common/Analysis/Record.h"
@@ -146,7 +148,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitBroadcast(op);
       })) ||
-      failed(addHandler(registry, "intent.unary", [&](Operation &op) {
+      failed(addHandler(registry, "intent_plan.unary", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
         return emitter.emitUnary(op);
@@ -3963,11 +3965,12 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   auto isolateRepeatedContractionOperand =
       [&](Value operand, StringRef emitted,
           unsigned operandNumber) -> FailureOr<std::string> {
-    unsigned contractionUses = llvm::count_if(
-        operand.getUsers(), [](Operation *user) {
-          return user->getName().getStringRef() == "intent.contract";
-        });
-    if (contractionUses <= 1)
+    auto isolate = binding.operation->getAttrOfType<BoolAttr>(
+        operandNumber == 0 ? isolateLhsAttr : isolateRhsAttr);
+    if (!isolate)
+      return binding.emitOpError(
+          "has no realized TileLang contraction-operand form");
+    if (!isolate.getValue())
       return emitted.str();
     auto tensor = dyn_cast<RankedTensorType>(operand.getType());
     FailureOr<SmallVector<std::string>> extents = valueExtents(operand);

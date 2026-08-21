@@ -3,6 +3,7 @@
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
+#include "Intent/Target/TileLang/Lowering/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <numeric>
@@ -10,45 +11,6 @@
 using namespace mlir;
 
 namespace intent::tilelang::lowering {
-namespace {
-
-bool workerReuse(const PhysicalProgramIndex &index) {
-  return llvm::any_of(index.axesByRole, [](const auto &binding) {
-    return binding.getValue().getReuseWorker();
-  });
-}
-
-bool feedsAtomicValue(Operation &operation) {
-  if (operation.getNumResults() != 1 ||
-      !llvm::hasSingleElement(operation.getResult(0).getUsers()))
-    return false;
-  Operation *user = *operation.getResult(0).user_begin();
-  auto valueIndex =
-      user->getAttrOfType<IntegerAttr>("intent.value_operand_index");
-  return user->getName().getStringRef() == "intent.atomic_add" && valueIndex &&
-         valueIndex.getInt() >= 0 &&
-         static_cast<unsigned>(valueIndex.getInt()) < user->getNumOperands() &&
-         user->getOperand(valueIndex.getInt()) == operation.getResult(0);
-}
-
-bool isRankReducingReductionChain(Operation &operation) {
-  if (operation.getNumOperands() == 0 || operation.getNumResults() != 1)
-    return false;
-  Operation *producer = operation.getOperand(0).getDefiningOp();
-  if (!producer || producer->getName().getStringRef() != "intent.reduce" ||
-      producer->getNumOperands() == 0)
-    return false;
-  auto source = dyn_cast<RankedTensorType>(producer->getOperand(0).getType());
-  auto intermediate =
-      dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
-  auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
-  return source && intermediate && result && source.getRank() >= 4 &&
-         intermediate.getRank() + 1 == source.getRank() &&
-         result.getRank() + 1 == intermediate.getRank();
-}
-
-} // namespace
-
 FailureOr<PhysicalProgramIndex>
 indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                  const target::KernelModel &kernel) {
@@ -80,6 +42,11 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       index.regionBindings[value.getArgument()] = value;
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
       index.program.operation = value;
+      auto equal = value->getAttrOfType<BoolAttr>(equalProgramTilesAttr);
+      if (!equal)
+        return value.emitOpError(
+            "has no realized TileLang program-tile constraint");
+      index.requiresSymmetricProgramTiles = equal.getValue();
     } else if (auto value = dyn_cast<intent::plan::BlockExtentOp>(operation)) {
       plan::BlockExtentOp binding;
       binding.operation = value;
@@ -163,7 +130,6 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     binding.tile = *tile;
   }
   index.components = target::lowering::indexPhysicalComponents(index);
-  bool rowStrided = workerReuse(index);
   for (intent::plan::ReductionOp value : reductions) {
     Operation *operation = kernel.nodes.lookup(value.getNode());
     FailureOr<std::string> role =
@@ -174,9 +140,6 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                   : FailureOr<int64_t>(failure());
     if (failed(role) || failed(axis))
       return value.emitOpError("does not bind a canonical reduction");
-    index.requiresSymmetricProgramTiles =
-        index.requiresSymmetricProgramTiles ||
-        isRankReducingReductionChain(*operation);
     if (*role == "reduce_generic")
       return operation->emitOpError(
           "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced "
@@ -219,13 +182,12 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     FailureOr<std::string> role =
         operation ? target::lowering::pointwiseRole(*operation)
                   : FailureOr<std::string>(failure());
-    std::string materialization =
-        operation && target::lowering::feedsContraction(*operation)
-            ? "contract_operand"
-            : "elementwise";
+    auto materialization = value->getAttrOfType<StringAttr>(pointwiseFormAttr);
+    if (!materialization)
+      return value.emitOpError("has no realized TileLang pointwise form");
     FailureOr<StringRef> lowering =
         succeeded(role)
-            ? syntax::pointwise(value, *role, materialization)
+            ? syntax::pointwise(value, *role, materialization.getValue())
             : FailureOr<StringRef>(failure());
     plan::PointwiseOp binding;
     binding.operation = value;
@@ -247,34 +209,19 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                   operation->getName().getStringRef() == "intent.atomic_cas");
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
-    FailureOr<bool> derivedScalar =
-        target::hasDerivedScalarIndex(*operation);
-    bool tensorIndirect = value.getTensorIndexing() == "data_dependent";
-    if (failed(derivedScalar))
-      return failure();
+    auto access = value->getAttrOfType<StringAttr>(accessAttr);
+    auto transfer = value->getAttrOfType<StringAttr>(transferAttr);
+    auto bounds = value->getAttrOfType<BoolAttr>(boundsAttr);
+    auto deferred = value->getAttrOfType<BoolAttr>(deferredAttr);
+    if (!access || !transfer || !bounds || !deferred)
+      return value.emitOpError("has no realized TileLang transfer form");
     plan::BoundaryOp binding;
     binding.operation = value;
-    binding.access = rowStrided ? (load ? "gather" : "scatter")
-                                : (load ? "load" : "store");
-    bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
-      return target::lowering::isRaggedBoundAxis(index.components, axis);
-    });
-    bool plannedValidity = !value.getValidityDomainNodes().empty() &&
-                           (store || value.getFill() != "none");
-    bool materializeLogicalBounds =
-        (raggedBound || plannedValidity) && !value.getConsumerNeutralized();
-    bool packedScalar =
-        target::lowering::hasPackedScalarDomain(index, binding);
-    binding.transfer = *derivedScalar || tensorIndirect ||
-                               materializeLogicalBounds
-                           ? "parallel_elements"
-                           : "bulk_copy";
+    binding.access = access.getValue().str();
+    binding.transfer = transfer.getValue().str();
     binding.resultSpace = syntax::bufferSpace(value.getResultSpace()).str();
-    binding.defer = load && index.stages.empty() && feedsAtomicValue(*operation);
-    binding.explicitBounds =
-        rowStrided || materializeLogicalBounds ||
-        (!index.stages.empty() && store) || *derivedScalar || tensorIndirect ||
-        packedScalar;
+    binding.defer = deferred.getValue();
+    binding.explicitBounds = bounds.getValue();
     if (binding.resultSpace.empty()) {
       value.emitOpError("has no TileLang transfer residency spelling");
       return failure();
@@ -332,14 +279,12 @@ LogicalResult ProgramMaterializer::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (!searchSpace && planIndex.stages.empty() &&
-      planIndex.components.reusedAxes.empty()) {
-    auto lane = planIndex.axesByRole.find("lane_0");
-    tuneRowLaunch = lane != planIndex.axesByRole.end() &&
-                    lane->second.getTileRole().starts_with("row_vector") &&
-                    !target::lowering::hasNonReplayableEffect(
-                        kernel.entry.getOperation());
-  }
+  auto rowForm =
+      planIndex.program.operation->getAttrOfType<StringAttr>(rowLaunchAttr);
+  if (!rowForm)
+    return planIndex.program.emitOpError(
+        "has no realized TileLang row-launch form");
+  tuneRowLaunch = rowForm.getValue() == "delegated";
   if (failed(target::lowering::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -747,7 +692,11 @@ void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned ind
 
 void ProgramMaterializer::emitImports() {
   bool tuneRow = !planIndex.components.reusedAxes.empty() || tuneRowLaunch;
-  bool tuneGemmWarpPolicy = searchSpace && usesMatrixContraction();
+  auto tuneGemm = searchIndex.autotune
+                      ? searchIndex.autotune.operation
+                            ->getAttrOfType<BoolAttr>(gemmWarpPolicyAttr)
+                      : BoolAttr();
+  bool tuneGemmWarpPolicy = tuneGemm && tuneGemm.getValue();
   output << "import torch\n";
   output << "import tilelang\n";
   output << "import tilelang.language as T\n";
@@ -1944,9 +1893,8 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
          name == "intent.cast") &&
         definition->getNumOperands() == 1)
       return finish(self(self, definition->getOperand(0)));
-    if (name == "intent.unary" && definition->getNumOperands() == 1) {
-      auto logical =
-          definition->getAttrOfType<StringAttr>("intent.operator");
+    if (name == "intent_plan.unary" && definition->getNumOperands() == 1) {
+      auto logical = definition->getAttrOfType<StringAttr>("semantic");
       FailureOr<std::string> operand = self(self, definition->getOperand(0));
       if (!logical || logical.getValue() != "negate" || failed(operand))
         return finish(failure());

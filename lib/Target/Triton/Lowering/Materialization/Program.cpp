@@ -3,6 +3,7 @@
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
+#include "Intent/Target/Triton/Lowering/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cmath>
@@ -326,32 +327,12 @@ LogicalResult ProgramMaterializer::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (!searchSpace && planIndex.stages.empty() &&
-      planIndex.components.reusedAxes.empty()) {
-    auto lane = planIndex.axesByRole.find("lane_0");
-    std::string laneDimension = roleDimensions.lookup("lane_0");
-    bool hasExternalRead = false;
-    bool hasAggregation = false;
-    bool hasScan = false;
-    kernel.entry.walk([&](Operation *operation) {
-      StringRef name = operation->getName().getStringRef();
-      hasExternalRead |= name == "intent.view_load";
-      hasScan |= name == "intent.scan";
-      hasAggregation |= name == "intent.reduce" ||
-                        name == "intent.arg_reduce" ||
-                        name == "intent.scan" ||
-                        name == "intent.contract" ||
-                        name == "intent.sparse_contract" ||
-                        name == "intent.state_stream";
-    });
-    configureRowVector = lane != planIndex.axesByRole.end() &&
-                         lane->second.getTileRole().starts_with("row_vector") &&
-                         llvm::is_contained(dimensionOrder, laneDimension) &&
-                         (hasExternalRead || !hasAggregation) &&
-                         !hasScan &&
-                         !target::lowering::hasNonReplayableEffect(
-                             kernel.entry.getOperation());
-  }
+  auto rowForm =
+      planIndex.program.operation->getAttrOfType<StringAttr>(rowLaunchAttr);
+  if (!rowForm)
+    return planIndex.program.emitOpError(
+        "has no realized Triton row-launch form");
+  configureRowVector = rowForm.getValue() == "configured";
   if (failed(target::lowering::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -2336,11 +2317,22 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
   if (!tensor || tensorAxes.size() != domainNodes.size())
     return consumer.emitOpError(
         "has no ranked Triton value-validity binding");
-  FailureOr<SmallVector<unsigned>> packedInsertions =
-      packedScalarInsertions(consumer);
-  if (failed(packedInsertions))
-    return failure();
-  unsigned emittedRank = tensor.getRank() + packedInsertions->size();
+  SmallVector<unsigned> packedInsertions;
+  if (consumer.hasAttr("intent.index")) {
+    FailureOr<SmallVector<unsigned>> projected =
+        packedScalarInsertions(consumer);
+    if (failed(projected))
+      return failure();
+    packedInsertions = std::move(*projected);
+  } else if (llvm::any_of(domainNodes, [&](int64_t node) {
+               auto axis = planIndex.axes.find(node);
+               return axis != planIndex.axes.end() &&
+                      target::lowering::isPackedScalarAxis(axis->second);
+             })) {
+    return consumer.emitOpError(
+        "has padded packed-scalar results without an explicit physical-axis projection");
+  }
+  unsigned emittedRank = tensor.getRank() + packedInsertions.size();
   SmallVector<std::string> predicates;
   for (auto [tensorAxis, domainNode] : llvm::zip(tensorAxes, domainNodes)) {
     auto domain = kernel.nodes.find(domainNode);
@@ -2367,7 +2359,7 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
       extent = "sequence_end_" + std::to_string(*ordered);
     }
     unsigned physicalTensorAxis = tensorAxis;
-    for (unsigned insertion : *packedInsertions)
+    for (unsigned insertion : packedInsertions)
       physicalTensorAxis += insertion <= static_cast<unsigned>(tensorAxis);
     FailureOr<std::string> index =
         indexExpression(axis, false, physicalTensorAxis, emittedRank, consumer);

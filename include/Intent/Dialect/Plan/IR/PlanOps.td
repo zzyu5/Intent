@@ -4,6 +4,7 @@
 include "Intent/Dialect/Plan/IR/PlanDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class IntentPlan_Op<string mnemonic, list<Trait> traits = []>
     : Op<IntentPlan_Dialect, mnemonic, traits>;
@@ -187,6 +188,16 @@ def IntentPlan_PointwiseOp : IntentPlan_Op<"pointwise"> {
     DenseI64ArrayAttr:$axis_nodes
   );
   let results = (outs);
+  let hasVerifier = 1;
+}
+
+def IntentPlan_UnaryOp : IntentPlan_Op<"unary", [Pure]> {
+  let arguments = (ins
+    AnyType:$input,
+    I64Attr:$node,
+    StrAttr:$semantic
+  );
+  let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 

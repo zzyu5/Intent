@@ -1,5 +1,7 @@
 #include "Support/Model.h"
 
+#include "Intent/Target/GPU/Realization/Analysis.h"
+
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Record.h"
@@ -234,10 +236,11 @@ LogicalResult validatePointwise(Operation &operation) {
       return success();
     return operation.emitOpError("has no supported GPU comparison predicate");
   }
-  auto logical = operation.getAttrOfType<StringAttr>("intent.operator");
+  auto logical = operation.getAttrOfType<StringAttr>(
+      name == "intent_plan.unary" ? "semantic" : "intent.operator");
   if (!logical)
     return operation.emitOpError("has no canonical pointwise operator");
-  if (name == "intent.unary" &&
+  if ((name == "intent.unary" || name == "intent_plan.unary") &&
       llvm::is_contained({StringRef("exp"), StringRef("exp2"),
                           StringRef("log"), StringRef("sin"), StringRef("cos"),
                           StringRef("floor"),
@@ -316,9 +319,9 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
     return failure();
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
-                         "intent.binary", "intent.compare", "intent.mask",
-                         "intent.select", "intent.cast", "intent.reshape",
-                         "intent.transpose", "intent.random"})
+                         "intent_plan.unary", "intent.binary", "intent.compare",
+                         "intent.mask", "intent.select", "intent.cast",
+                         "intent.reshape", "intent.transpose", "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();

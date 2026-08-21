@@ -260,9 +260,13 @@ pointwiseRole(mlir::Operation &operation) {
       return std::string("extract_first_scalar");
     return operation.emitOpError("has no supported gather relation");
   }
+  if (name == "intent_plan.unary") {
+    auto semantic = operation.getAttrOfType<mlir::StringAttr>("semantic");
+    if (semantic)
+      return ("unary_" + semantic.getValue()).str();
+    return operation.emitOpError("has no physical unary semantics");
+  }
   auto logical = operation.getAttrOfType<mlir::StringAttr>("intent.operator");
-  if (name == "intent.unary" && logical)
-    return ("unary_" + logical.getValue()).str();
   if (name == "intent.binary" && logical)
     return ("binary_" + logical.getValue()).str();
   return operation.emitOpError("has no supported pointwise semantics");
@@ -1429,11 +1433,10 @@ bool isEnclosingStreamReductionAxis(const PlanIndex &index,
 
 template <typename PlanIndex>
 bool feedsStagedContraction(const PlanIndex &index, mlir::Operation &operation) {
-  return operation.getNumResults() == 1 &&
-         llvm::any_of(operation.getResult(0).getUsers(),
-                      [&](mlir::Operation *user) {
-                        return isStagedContraction(index, user);
-                      });
+  auto node = operation.getAttrOfType<mlir::IntegerAttr>("intent.node");
+  return node && llvm::any_of(index.stages, [&](const StageBinding &stage) {
+           return llvm::is_contained(stage.getOperations(), node.getInt());
+         });
 }
 
 template <typename PlanIndex>

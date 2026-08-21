@@ -174,7 +174,7 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitBroadcast(op);
                         })) ||
-      failed(addHandler(registry, "intent.unary",
+      failed(addHandler(registry, "intent_plan.unary",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
                             return success();

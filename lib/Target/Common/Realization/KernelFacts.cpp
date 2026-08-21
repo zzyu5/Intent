@@ -22,6 +22,18 @@ LogicalResult addHandler(OperationHandlerRegistry &registry, StringRef name,
   return registry.add(name, OperationHandler{std::move(enter), {}});
 }
 
+bool isUnaryOperation(Operation &operation) {
+  StringRef name = operation.getName().getStringRef();
+  return name == "intent.unary" || name == "intent_plan.unary";
+}
+
+StringAttr unarySemantic(Operation &operation) {
+  return operation.getAttrOfType<StringAttr>(
+      operation.getName().getStringRef() == "intent_plan.unary"
+          ? "semantic"
+          : "intent.operator");
+}
+
 Operation *nearestParallelOwner(Operation &operation) {
   for (Operation *parent = operation.getParentOp(); parent;
        parent = parent->getParentOp())
@@ -262,8 +274,8 @@ affineIndexExpression(Value value, const KernelFacts &facts,
                                         consumer, active));
   }
 
-  if (name == "intent.unary" && definition->getNumOperands() == 1) {
-    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  if (isUnaryOperation(*definition) && definition->getNumOperands() == 1) {
+    auto logical = unarySemantic(*definition);
     std::optional<AffineIndexExpression> operand = affineIndexExpression(
         definition->getOperand(0), facts, consumer, active);
     if (!logical || !operand || logical.getValue() != "negate")
@@ -1205,8 +1217,8 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
       definition->getNumOperands() == 1)
     return finish(classifyStructuredIndex(definition->getOperand(0), facts,
                                           active));
-  if (name == "intent.unary" && definition->getNumOperands() == 1) {
-    auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  if (isUnaryOperation(*definition) && definition->getNumOperands() == 1) {
+    auto logical = unarySemantic(*definition);
     StructuredTensorIndex operand =
         classifyStructuredIndex(definition->getOperand(0), facts, active);
     if (!logical || !operand.valid ||
@@ -1884,6 +1896,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                       {StringRef("intent.constant"), StringRef("intent.dim"),
                        StringRef("intent.make_record"),
                        StringRef("intent.extract"), StringRef("intent.unary"),
+                       StringRef("intent_plan.unary"),
                        StringRef("intent.binary"), StringRef("intent.compare"),
                        StringRef("intent.select"), StringRef("intent.cast")},
                       name))
@@ -2291,9 +2304,10 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
           })))
     return failure();
 
-  for (StringRef name : {"intent.broadcast", "intent.unary", "intent.binary",
-                         "intent.cast", "intent.compare", "intent.select",
-                         "intent.mask", "intent.random"})
+  for (StringRef name : {"intent.broadcast", "intent.unary",
+                         "intent_plan.unary", "intent.binary", "intent.cast",
+                         "intent.compare", "intent.select", "intent.mask",
+                         "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               return propagatePointwiseAxes(operation, facts);
@@ -2864,6 +2878,7 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
         return success();
       bool pure = name == "intent.view_load" || name == "intent.indices" ||
                   name == "intent.broadcast" || name == "intent.unary" ||
+                  name == "intent_plan.unary" ||
                   name == "intent.binary" || name == "intent.compare" ||
                   name == "intent.mask" || name == "intent.select" ||
                   name == "intent.cast" || name == "intent.full" ||

@@ -1,5 +1,7 @@
 #include "Syntax/Spelling.h"
 
+#include "Intent/Target/CuTile/Lowering/Passes.h"
+
 #include <optional>
 
 using namespace mlir;
@@ -64,6 +66,8 @@ FailureOr<std::string> tile(Operation *operation, StringRef role) {
 }
 
 FailureOr<std::string> parameter(Operation *operation, StringRef role) {
+  if (role == gatherSpellingRole)
+    return std::string("GATHER_SPELLING");
   if (role == "group_m")
     return std::string("GROUP_SIZE_M");
   if (role.starts_with("group_"))

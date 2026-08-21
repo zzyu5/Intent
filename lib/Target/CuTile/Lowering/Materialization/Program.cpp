@@ -3,18 +3,13 @@
 
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Lowering/Combiner.h"
+#include "Intent/Target/CuTile/Lowering/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 
 namespace intent::cutile::lowering {
 namespace {
-
-bool workerReuse(const PhysicalProgramIndex &index) {
-  return llvm::any_of(index.axesByRole, [](const auto &binding) {
-    return binding.getValue().getReuseWorker();
-  });
-}
 
 std::string projectTensorIndex(StringRef value, unsigned valueRank,
                                unsigned groupRank, unsigned groupAxis,
@@ -144,7 +139,6 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     binding.tile = *tile;
   }
   index.components = target::lowering::indexPhysicalComponents(index);
-  bool rowStrided = workerReuse(index);
   for (intent::plan::ReductionOp value : reductions) {
     Operation *operation = kernel.nodes.lookup(value.getNode());
     FailureOr<std::string> role =
@@ -204,47 +198,17 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                   operation->getName().getStringRef() == "intent.scatter_unique" ||
                   operation->getName().getStringRef() == "intent.atomic_add" ||
                   operation->getName().getStringRef() == "intent.atomic_cas");
-    bool uniqueStore = operation &&
-                       operation->getName().getStringRef() ==
-                           "intent.scatter_unique";
     if (!load && !store)
       return value.emitOpError("does not bind a canonical transfer");
-    FailureOr<bool> derivedScalar =
-        target::hasDerivedScalarIndex(*operation);
-    SmallVector<target::lowering::RangeBinding> accessRanges =
-        target::lowering::accessRangesForTransfer(index, value.getNode());
-    bool translatedUnitStride =
-        value.getTensorIndexing() == "structured" &&
-        accessRanges.size() == 1 && !accessRanges.front().isCompact() &&
-        accessRanges.front().getOffset() > 0 && [&]() {
-          StringRef role = accessRanges.front().getTileRole();
-          int64_t tile = 0;
-          return role.starts_with("fixed_") &&
-                 !role.drop_front(6).getAsInteger(10, tile) && tile > 0 &&
-                 accessRanges.front().getOffset() % tile == 0;
-        }();
-    bool tensorIndexed =
-        value.getTensorIndexing() != "none" && !translatedUnitStride;
-    if (failed(derivedScalar))
-      return failure();
-    bool vectorized = llvm::any_of(value.getDomainNodes(), [&](int64_t node) {
-      auto axis = index.axes.find(node);
-      return axis != index.axes.end() && !axis->second.isScalar();
-    });
-    bool raggedBound = llvm::any_of(value.getDomainNodes(), [&](int64_t axis) {
-      return target::lowering::isRaggedBoundAxis(index.components, axis);
-    });
+    auto access = value->getAttrOfType<StringAttr>(accessAttr);
+    auto bounds = value->getAttrOfType<BoolAttr>(boundsAttr);
+    if (!access || !bounds)
+      return value.emitOpError("has no realized cuTile transfer form");
     plan::BoundaryOp binding;
     binding.operation = value;
-    binding.access = !uniqueStore &&
-                             (tensorIndexed ||
-                              ((rowStrided || raggedBound) && vectorized))
-                         ? (load ? "gather" : "scatter")
-                         : (load ? "load" : "store");
+    binding.access = access.getValue().str();
     binding.resultSpace = value.getResultSpace().str();
-    binding.explicitBounds =
-        rowStrided || raggedBound || (!index.stages.empty() && store) ||
-        *derivedScalar;
+    binding.explicitBounds = bounds.getValue();
     index.boundaries[value.getNode()] = binding;
   }
   for (const auto &entry : index.axes) {
@@ -311,39 +275,15 @@ LogicalResult ProgramMaterializer::prepare() {
     return failure();
   if (failed(resolvePhysicalBindings()))
     return failure();
-  if (searchIndex.autotune) {
-    bool hasIndexedRagged = llvm::any_of(
-        raggedRuntimes,
-        [](const RaggedRuntime &runtime) { return runtime.indices; });
-    bool hasGuardedGather = false;
-    kernel.entry.walk([&](Operation *operation) {
-      StringRef name = operation->getName().getStringRef();
-      auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
-      plan::PointwiseOp pointwise =
-          node ? planIndex.pointwise.lookup(node.getInt()) : plan::PointwiseOp();
-      bool stagedIndirect =
-          name == "intent.gather" && !planIndex.stages.empty() && pointwise &&
-          pointwise.getLowering() == "ct.indirect_gather";
-      bool orderedIndexedMembers =
-          name == "intent.members" && hasIndexedRagged && pointwise &&
-          pointwise.getLowering() == "ct.members" &&
-          !planIndex.components.orderedRaggedAxes.empty();
-      hasGuardedGather |= stagedIndirect || orderedIndexedMembers;
-    });
-    if (hasGuardedGather) {
-      tuneGatherSpelling = true;
-      tuningParameters.emplace_back("GATHER_SPELLING", "gather_spelling");
-    }
-  }
-  if (!searchSpace && planIndex.stages.empty() &&
-      planIndex.components.reusedAxes.empty() &&
-      !planIndex.program.getPersistent()) {
-    auto lane = planIndex.axesByRole.find("lane_0");
-    tuneRowOccupancy = lane != planIndex.axesByRole.end() &&
-                       lane->second.getTileRole().starts_with("row_vector") &&
-                       !target::lowering::hasNonReplayableEffect(
-                           kernel.entry.getOperation());
-  }
+  tuneGatherSpelling = searchIndex.autotune &&
+                       static_cast<bool>(searchIndex.autotune.getParameterMap().get(
+                           "GATHER_SPELLING"));
+  auto rowForm = planIndex.program.operation->getAttrOfType<StringAttr>(
+      rowOccupancyAttr);
+  if (!rowForm)
+    return planIndex.program.emitOpError(
+        "has no realized cuTile row-occupancy form");
+  tuneRowOccupancy = rowForm.getValue() == "delegated";
   if (failed(target::lowering::indexScanProducerOperations(
           kernel, planIndex, scanProducerOwners)))
     return failure();
@@ -2078,8 +2018,7 @@ FailureOr<std::string> ProgramMaterializer::physicalAxisTile(plan::AxisOp axis) 
   auto scanTile = scanAxisTiles.find(axis.getNode());
   if (scanTile != scanAxisTiles.end())
     return scanTile->second;
-  if (axis.getReuseWorker() ||
-      !axis.getTileRole().starts_with("row_vector"))
+  if (axis.getReuseWorker() || !axis.getTileRole().starts_with("row_vector"))
     return axis.getTile().str();
   const target::lowering::RangeBinding *range = axis.roleRange();
   if (!range || !planIndex.blockExtents.count(range->getExtent()))

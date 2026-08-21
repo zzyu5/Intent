@@ -3,12 +3,14 @@ add_mlir_library(MLIRIntentTritonLowering
   Handlers/Operations.cpp
   Materialization/Program.cpp
   Syntax/Spelling.cpp
+  Transforms/ProgramForms.cpp
 
   LINK_LIBS PUBLIC
   MLIRFuncDialect
   MLIRIR
   MLIRIntentDialect
   MLIRIntentPlanDialect
+  MLIRIntentGPUTransforms
   MLIRIntentTransforms
   MLIRIntentTargetCommon
   MLIRSupport

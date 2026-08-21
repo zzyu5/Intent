@@ -772,61 +772,7 @@ assignAxes(const target::KernelFacts &facts) {
                    llvm::all_of(choice.parallels, ownsOneDomain) &&
                    independentLaneCount(choice, facts) == 1;
 
-  auto spansMultipleOwnershipTiles = [&](const AxisChoice &choice) {
-    if (!choice.tiled)
-      return false;
-    if (!choice.fixedOwnershipExtent)
-      return true;
-    auto extent = facts.staticDomainExtents.find(choice.domain);
-    if (extent != facts.staticDomainExtents.end())
-      return extent->second > *choice.fixedOwnershipExtent;
-    auto bounds = facts.staticDomainBounds.find(choice.domain);
-    if (bounds != facts.staticDomainBounds.end())
-      return bounds->second.second - bounds->second.first >
-             *choice.fixedOwnershipExtent;
-    return true;
-  };
-  bool persistent = llvm::any_of(facts.contractions, [&](const auto &entry) {
-    llvm::DenseSet<unsigned> owned;
-    unsigned parallel = 0;
-    unsigned multiTile = 0;
-    bool ragged = false;
-    for (Operation *parent = entry.first->getParentOp(); parent;
-         parent = parent->getParentOp()) {
-      if (parent->getName().getStringRef() != "intent.parallel" ||
-          parent->getNumOperands() != 1)
-        continue;
-      auto domains = facts.parallelDomains.find(parent);
-      if (domains == facts.parallelDomains.end())
-        continue;
-      for (Operation *domain : domains->second) {
-        auto found = positions.find(domain);
-        if (found == positions.end() ||
-            !choices[found->second].programOrder ||
-            !owned.insert(found->second).second)
-          continue;
-        ragged |= facts.raggedMembers.count(domain);
-        ++parallel;
-        multiTile += spansMultipleOwnershipTiles(choices[found->second]);
-      }
-    }
-    return !ragged && parallel >= 3 && multiTile >= 2;
-  });
-  if (persistent) {
-    SmallVector<unsigned> programAxes;
-    for (auto [position, choice] : llvm::enumerate(choices))
-      if (choice.programOrder)
-        programAxes.push_back(position);
-    llvm::sort(programAxes, [&](unsigned lhs, unsigned rhs) {
-      return *choices[lhs].programOrder < *choices[rhs].programOrder;
-    });
-    for (auto [fold, position] : llvm::enumerate(programAxes)) {
-      choices[position].worker = 0;
-      choices[position].fold = fold;
-      choices[position].reuse = false;
-    }
-  }
-  return AxisAssignments{std::move(choices), persistent};
+  return AxisAssignments{std::move(choices), false};
 }
 
 struct StageDecision {

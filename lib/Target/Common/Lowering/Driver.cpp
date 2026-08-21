@@ -11,7 +11,8 @@ namespace {
 
 LogicalResult materializeTargetProgram(ModuleOp module,
                                        const MaterializationTarget &target) {
-  if (target.provider.empty() || !target.materializeProgramSource)
+  if (target.provider.empty() || !target.addProviderPasses ||
+      !target.verifyProviderProgram || !target.materializeProgramSource)
     return module.emitError(
         "target materialization has an incomplete implementation");
   if (failed(verify(module)))
@@ -46,6 +47,9 @@ LogicalResult materializeTargetProgram(ModuleOp module,
       succeeded(entry) ? analyzeKernel(*entry)
                        : FailureOr<KernelModel>(failure());
   if (failed(entry) || failed(kernel))
+    return failure();
+  if (failed(target.verifyProviderProgram(*kernel, programs.front(),
+                                          searchSpace)))
     return failure();
   std::string source;
   llvm::raw_string_ostream stream(source);
@@ -96,6 +100,7 @@ LogicalResult runTargetMaterializationPipeline(
     ModuleOp module, const MaterializationTarget &target) {
   PassManager manager(module.getContext());
   manager.enableVerifier(true);
+  target.addProviderPasses(manager);
   manager.addPass(createMaterializeTargetProgramPass(target));
   return manager.run(module);
 }

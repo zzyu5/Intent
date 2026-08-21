@@ -5,11 +5,22 @@
 using namespace mlir;
 
 namespace intent::target {
+namespace {
+
+IntegerAttr nodeAttribute(Operation &operation) {
+  if (auto node = operation.getAttrOfType<IntegerAttr>("intent.node"))
+    return node;
+  if (operation.getName().getDialectNamespace() == "intent_plan")
+    return operation.getAttrOfType<IntegerAttr>("node");
+  return {};
+}
+
+} // namespace
 
 FailureOr<int64_t> getNodeID(Operation &operation, StringRef consumer) {
-  auto node = operation.getAttrOfType<IntegerAttr>("intent.node");
+  IntegerAttr node = nodeAttribute(operation);
   if (!node) {
-    operation.emitOpError() << "requires intent.node for " << consumer;
+    operation.emitOpError() << "requires a stable node ID for " << consumer;
     return failure();
   }
   return node.getInt();
@@ -148,9 +159,9 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
                           *model.entry.getOperation())))
       return failure();
   WalkResult result = model.entry.walk([&](Operation *operation) {
-    auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
+    IntegerAttr node = nodeAttribute(*operation);
     if (node && !model.nodes.try_emplace(node.getInt(), operation).second) {
-      operation->emitOpError("duplicates an intent.node in canonical Kernel IR");
+      operation->emitOpError("duplicates a stable node ID in the executable function");
       return WalkResult::interrupt();
     }
     if (operation != model.entry.getOperation() &&

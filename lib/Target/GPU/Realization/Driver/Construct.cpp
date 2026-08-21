@@ -1,6 +1,7 @@
 #include "Intent/Target/GPU/Realization/PhysicalProgram.h"
 
 #include "Intent/Target/Common/Realization/Driver.h"
+#include "Intent/Target/GPU/Realization/Analysis.h"
 #include "Support/Model.h"
 
 using namespace mlir;
