@@ -2,9 +2,9 @@
 
 ## 定义
 
-Intent 是一门 Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL。
+Intent 是一门 Python-hosted、跨后端、面向 logical domain 与结构化 tensor-flow 的算子 kernel DSL。
 
-用户在一个 `@intent.kernel` 中写出完整的 kernel 内算法：logical domain、region、tensor-flow、顺序或独立工作、carry state、structured computation、控制流与 effects。用户不写物理 worker identity、内部 tile、grid、地址运算、storage placement、fragment layout 或 pipeline。
+用户在一个 `@intent.kernel` 中写出完整的 kernel 内算法：logical domain、算法可见的 segment/region、tensor-flow、顺序或独立工作、carry state、structured computation、控制流与 effects。用户不先替编译器搭建 blocking skeleton，也不写物理 worker identity、tile、grid、地址运算、storage placement、fragment layout 或 pipeline。
 
 最短定义是：
 
@@ -48,25 +48,27 @@ Python / framework wrapper
 
 多 source-kernel 算法仍由 wrapper 明确表达，Intent 不自动融合 source callables。单个 callable 内部可以 materialize 作者已经写下的数据依赖为多个私有 stages，但这些 stage 不改变 ABI、effects、调用次数或 wrapper-visible orchestration。
 
-## 权限分界
+## 语义与实现分层
+
+Compiler 的实现自由来自语言语义和可证明事实，不来自作者额外授予“可以分块、可以重排、可以向量化”的权限。一个 source construct 只有在改变 body 可观察的 logical workset、state、effect、数值合同或 ABI 时才属于语言；只决定 GPU program 怎样分块的内容属于 Physical Program。
 
 Source 固定：
 
 - kernel ABI、输入输出、alias 与 effects；
 - 算法阶段、数据遍数、状态 schema 与更新；
-- logical domain、region 与 indexing relation；
-- `parallel`、`ordered`、`state_stream`；
-- `reduce`、`scan`、typed pure combiner，以及目标矩阵原语支持的 `contract` 语义；
+- logical domain、作者可观察的 segment/region 与 indexing relation；
+- 普通顺序 `for`、`parallel` 的实例独立性，以及 `state_stream` 的 segment/carry/stop 语义；
+- `reduce`、`scan`、typed pure combiner，以及目标矩阵原语支持的 `contract` 语义；这些 structured op 自身不定义一棵 source 物理树；
 - stable、online、multi-pass 等算法选择；
 - 显式 dtype、`cast` 与数学表达；
 - gather/scatter 的索引和冲突语义；
 - runtime control flow 与用户 specialization；
-- wrapper、输出或其他 kernel 可见的 partition count/extent。
+- wrapper、输出、RNG identity、effect 或其他 kernel 可见的 partition count/extent。
 
 Realizer 决定：
 
-- 内部 `auto` extent、逐轴角色与合法 sub-tiling 关系；
-- region 到 program、CTA、thread、task 的 ownership，以及不改变 source body 视野的 scalar lane packing；
+- 从完整 logical domain 和 structured op 引入哪些 physical regions、它们如何嵌套，以及逐轴角色与合法 sub-tiling 关系；
+- logical instance/segment 到 program、CTA、thread、task 的 ownership，以及不改变 source 实例语义的 batching、lane packing 与 tensorization；
 - program folding、grid-stride、persistent traversal 与 swizzle；
 - logical validity 的物理兑现、access footprint、tail 与 address formation；
 - 算法结构要求的 storage level、片上复用边界与 target primitive 数值角色；
@@ -79,9 +81,9 @@ Realizer 决定：
 
 > Realizer 可以自由改变物理实现，但不能改变 source 的 tensor-flow、logical workset、state、effect、ABI 或 wrapper-visible 约定。
 
-因此 pure expression 可以 CSE、融合、重算或 spill；reduction 可以选择不同物理树；f32 contraction 可以使用目标正常支持的机制。只有真正选择了不同算法时，才需要不同 source。
+因此 pure expression 可以 CSE、融合、重算或 spill；`parallel` instances 可以被物理批处理；reduction/scan/contract 可以选择其语义允许的物理层次；f32 contraction 可以使用目标正常支持的机制。只有真正改变 logical workset、state transition、effect 或数值算法时，才需要不同 source。
 
-这里的 pure-expression fusion 只发生在一个 source callable 的既定算法内部。跨 source callable 或跨 compiler-private stage 的融合不属于 Intent compiler；Physical Plan 不授予 leaf 合并 stages 的权限。
+这里的 pure-expression fusion 只发生在一个 source callable 的既定算法内部。跨 source callable 或跨 compiler-private stage 的融合不属于 Intent compiler；已经选定的 stage grouping 也不能由 leaf 改写。
 
 ## 明确不属于 Intent Core
 

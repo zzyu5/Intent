@@ -11,7 +11,7 @@ Domain 是逻辑索引集合，不是 physical thread、block 或 launch grid。
 
 ## Region 与位置式 tensor 语义
 
-Region 是 domain 的逻辑子区域，可用于 tensor view slice、parallel work item、reduction/contraction 轴片段、state stream segment 与 gather/scatter indexing relation。
+Domain 可以直接作为 tensor indexing 的完整逻辑维度；作者不需要先把它切成 region 才能写 tensor expression、reduction 或 contraction。Source region 是 domain 的作者可观察子区域，用于真正依赖 segment identity/boundary 的 tensor view、partial result、state transition、window/page 或 gather/scatter relation；compiler 从完整 domain 引入的 physical region 不形成 source Region，也不能被 source body 观察。
 
 ```python
 m = I.full((q_region,), -I.inf, dtype=I.f32)
@@ -35,7 +35,19 @@ I.reshape(x, ...)
 
 Intent 不引入额外的 named-axis/reaxis 类型系统。
 
-## Partition
+## Source-visible partition
+
+`partition` 只表达作者可观察的逻辑分段，不承担普通 GPU blocking。判断标准不是 body 是否在语法上拿到了一个 region，而是换一种合法机器实现后，part identity 和 boundary 是否仍必须保持。
+
+下面这些情况属于 source partition：
+
+- part index 写入输出或索引 wrapper-visible partial buffer；
+- region boundary 进入 mask、RNG identity、effect 或显式 index relation；
+- body 在一个 part 内共同归约、扫描或维护跨成员 state，并且该 part result 可观察；
+- page、window、chunk 或稀疏 block 是输入数据格式/算法本身的一部分；
+- 多个 source kernels 或 wrapper 共同观察同一 partition count/identity。
+
+仅仅为了把完整 GEMM 的 M/N 轴、MoE route 轴或独立 query 轴凑成块张量，不构成 source partition。Compiler 可以从完整 logical domain、`parallel` independence 和 structured op 自行形成 physical region。
 
 ### 按 extent
 
@@ -44,7 +56,7 @@ for region in I.partition(axis, extent=B):
     ...
 ```
 
-将 axis 切成连续 regions，每个 region 的最大逻辑长度为 `B`。`B` 可以来自 runtime、`I.Constexpr`，或内部的 `I.auto("TILE")`。
+将 axis 切成连续 regions，每个 region 的最大逻辑长度为作者可观察的 `B`。`B` 来自 runtime、shape、`I.Constexpr` 或 wrapper，并参与 source specialization/ABI/algorithm relation。纯 compiler-owned tile 不使用这个构造。
 
 ### 按 count
 
@@ -55,9 +67,9 @@ for part, region in I.partition(axis, count=P):
 
 将 axis 分成 source-visible 的 `P` 个连续 regions。它适用于 split-K、partial buffer、host-visible shard 或多-kernel 共同观察的 part identity。
 
-`P` 来自 runtime、shape、`I.Constexpr` 或 wrapper，不接受 `I.auto`。
+`P` 来自 runtime、shape、`I.Constexpr` 或 wrapper。Part identity 是 source 值，不能由 physical worker count 替代。
 
-显式 `partition` 是算法决定：source body 从“一个 logical element”变成“一个 logical region”，因而可以合法写 region reduction、contraction、scan、区域 mask 或片上复用。Compiler 不能因为某个标量写法需要块级结构，就替作者补一个 partition 并把它改成块算法。
+`I.partition(..., extent=I.auto(...))` 不属于作者编程模型。它让作者预先决定“这里必须存在某层 physical blocking”，却没有给出 source-visible boundary。需要任意 segment composition 的 recurrence 使用 `state_stream`；普通 tensor computation 直接使用完整 domain，由 compiler 形成 physical regions。
 
 ## Parallel
 
@@ -66,27 +78,20 @@ for row in I.parallel(rows):
     ...
 ```
 
-表示 logical iterations 相互独立。Compiler 可以顺序执行、分配给不同 workers、persistent traversal、SIMD 打包或把同构 point-level 运算 tensorize，但不能给 source body 增加新的可观察 region、state 或 effect。
+表示 logical iterations 相互独立：一个实例不读取另一个实例的 private state，也不存在由 source iteration order 定义的依赖。它不指定 program id、grid、worker、lane 或 tile。
 
-其中 scalar lane packing 只允许在 body 没有任何依赖“看见一块区域”的语义时使用：每条 physical lane 仍执行一个 source scalar instance。出现 reduction、contract、scan、tensor-valued中间量、logical buffer、atomic/scatter 或 region-level mask 时，必须保持作者写下的 element/region 边界，不能自动打包成另一种算法。
+Compiler 可以顺序执行、分配给不同 workers、persistent traversal、SIMD 打包，或把多个独立实例批处理成一个 tensor/matrix primitive。即使单个实例包含 reduction、contract、scan、logical buffer 或 effect，也不因为物理 batching 就自动成为另一种算法；前提是实例之间没有 source-defined happens-before，并且目标实现逐实例保持 value/state/effect identity、冲突语义和结果。Compiler 不能让 source body 观察到新建 physical region，也不能引入跨实例 reduction/state/effect；目标无法保持完整 effect 合同时必须拒绝该 realization。
 
-Region-level algorithm 必须在 source 中显式写出 region：
-
-```python
-for qr in I.parallel(
-    I.partition(q_axis, extent=I.auto("Q_TILE"))
-):
-    ...
-```
-
-## Ordered
+## 普通顺序循环
 
 ```python
-for i in I.ordered(axis):
+for i in axis:
     state = update(state, x[i])
 ```
 
-`ordered` 固定逐元素 source 顺序。Compiler 可以保持顺序地 strip-mine、unroll、vectorize 或 pipeline，但不能改成 parallel partial reduction。
+普通 `for` 按 logical iteration order 执行，并自然携带循环中的 SSA state 与 effects。Compiler 可以在保持逐实例 happens-before 的前提下 strip-mine、unroll、vectorize 或 pipeline，但不能改成 unordered partial merge。
+
+顺序不是作者额外授予或拒绝并行化的标签。Frontend 必须从普通循环建立内部 sequential/ordered fact；public source 不要求再包一层 `I.ordered(...)`。需要没有 source order 的独立实例时，作者明确使用 `I.parallel(...)`。
 
 ## State stream
 
@@ -105,9 +110,11 @@ with stream:
 result = stream.result
 ```
 
-Source 固定 streamed axis、carry schema、step body、segment order、state update 与 final projection。`extent` 是 compile-time integer 或 `I.auto(...)`；compiler 只在这份合同内选择内部 segment extent 和 physical realization。
+Source 固定 streamed axis、carry schema、step body、segment order、state update 与 final projection。`state_stream` 的 body 看见一个 segment，并可以在 segment 内执行 reduction/contraction 后把 state 合并到下一段；因此“存在分段”是算法结构，不是普通 blocking hint。
 
-`state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点，但不能作为 runtime segment extent；runtime-visible segment boundary 必须由 source algorithm 显式表达，不能伪装成 compiler-owned physical extent。
+固定正整数/`I.Constexpr` extent 表达作者可观察的固定 segmentation。`I.auto(...)` 表达 segment-parametric recurrence：作者声明任意合法连续 segmentation 依序组合都满足同一 source 数值合同，具体 segment extent 由 compiler 绑定；若算法要求固定逐元素舍入顺序或 boundary-dependent 行为，就不能使用 `auto`。这是 `state_stream` 自身的语义维度，不是为普通 loop 发放优化权限；它仍保持 segment order，也不等同于 unordered reduction。严格逐元素 recurrence 使用普通 `for`。
+
+`state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点；runtime-visible fixed segment boundary 必须由 source algorithm 显式表达，不能伪装成 compiler-owned extent。
 
 ## 逻辑读取终点
 
@@ -116,13 +123,13 @@ stream = I.state_stream(
     keys,
     extent=I.auto("K_TILE"),
     init=state0,
-    stop=I.end(query_region),
+    stop=query_index + 1,
 )
 ```
 
-`I.end(x)` 只接受 rank-one domain 或 region，并返回 `x` 在自身逻辑坐标系中的 exclusive endpoint；它不是 physical tile end。空 region 的 endpoint 等于它的 begin。把该值用作 `state_stream.stop` 时，实际迭代集合是 streamed axis 与 `(-∞, stop)` 的交集，仍按原 axis 顺序遍历：`stop <= axis.begin` 时不执行 step、结果等于 initial state；`stop >= axis.end` 时不扩展原 axis；最后一个 segment 可以是 partial segment，其无效 lane 不可影响可观察结果。
+`state_stream.stop` 是与 streamed axis 同一逻辑坐标系中的 exclusive integer endpoint，可以来自普通 index expression；`I.end(x)` 是从 rank-one domain 或 region 取得其 exclusive endpoint 的 convenience，它不是 physical tile end。空 region 的 endpoint 等于它的 begin。实际迭代集合是 streamed axis 与 `(-∞, stop)` 的交集，仍按原 axis 顺序遍历：`stop <= axis.begin` 时不执行 step、结果等于 initial state；`stop >= axis.end` 时不扩展原 axis；最后一个 segment 可以是 partial segment，其无效 lane 不可影响可观察结果。
 
-`stop` 必须来自 `I.end(domain_or_region)`，且其坐标必须能与 streamed axis 建立同一逻辑索引关系。无法证明或投影这种关系的 realizer 必须在发射前拒绝，不能把 endpoint 当成 shape、segment 数或 physical block ordinal 猜回去。它表达的是作者写下的逻辑读取上界，不是“carry 收敛后提前退出”的数据依赖终止条件。
+Frontend/KIR 必须保存 stop expression 的 SSA provenance；realizer 必须证明它能投影到 streamed axis 的坐标关系。无法证明或投影时必须在发射前拒绝，不能把 endpoint 当成 shape、segment 数或 physical block ordinal 猜回去。它表达的是作者写下的逻辑读取上界，不是“carry 收敛后提前退出”的数据依赖终止条件。
 
 ## 调用前置条件
 

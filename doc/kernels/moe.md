@@ -18,46 +18,42 @@ def moe_expert_ffn(
 ):
     T, D = x.shape
     E, _, F = w1.shape
+    R = member_routes.shape[0]
 
     groups = I.ragged(
         outer=I.domain(0, E),
+        members=I.domain(0, R),
         offsets=route_offsets,
         indices=member_routes,
     )
 
     for expert in I.parallel(groups.outer):
-        for rr in I.parallel(
-            I.partition(
-                groups[expert],
-                extent=I.auto("ROUTE_TILE"),
-            )
-        ):
-            routes = I.members(rr)
-            token = I.gather(route_token, index=routes)
-            rw = I.gather(route_weights, index=routes)
-            xv = I.gather(x, index=(token, slice(None)))
+        routes = I.members(groups[expert])
+        token = I.gather(route_token, index=routes)
+        rw = I.gather(route_weights, index=routes)
+        xv = I.gather(x, index=(token, slice(None)))
 
-            h = I.contract(
-                xv,
-                w1[expert, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            h = I.maximum(h, 0.0)
+        h = I.contract(
+            xv,
+            w1[expert, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
+        h = I.maximum(h, 0.0)
 
-            route_out = I.contract(
-                h,
-                w2[expert, :, :],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
+        route_out = I.contract(
+            h,
+            w2[expert, :, :],
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        )
 
-            I.scatter_reduce(
-                y,
-                index=(token, slice(None)),
-                value=rw[:, None] * route_out,
-                combine=I.add,
-            )
+        I.scatter_reduce(
+            y,
+            index=(token, slice(None)),
+            value=rw[:, None] * route_out,
+            combine=I.add,
+        )
 ```
 
 Wrapper 按该算法的调用约定初始化 `y`，例如在 invocation 前清零。
@@ -74,7 +70,7 @@ Wrapper 按该算法的调用约定初始化 `y`，例如在 invocation 前清�
 
 ## Physical Plan 决定
 
-- ragged route tile；
+- 从完整 ragged member domain 引入的 physical route region 与 tile；
 - static 或 persistent ownership；
 - expert scheduling；
 - contraction primitive 数值角色与算法结构要求的 storage/reuse boundary；

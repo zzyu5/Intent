@@ -32,7 +32,7 @@ Frontend 读取受限 Python eDSL，解析：
 
 - `@intent.kernel` 与 `@intent.fn`；
 - signature、view kind、symbolic shape、dtype 与 specialization；
-- domain/region、tensor expressions、控制流、structured primitives；
+- 完整 logical domain、作者可观察的 segment/region、tensor expressions、控制流与 structured primitives；
 - logical buffers 与 effects。
 
 Frontend 在 AST lowering 期间只维护 symbol、shape、region、constexpr 与源码位置等临时状态，并直接构造注册过的 canonical Intent Kernel MLIR。Python 不维护一套与 MLIR 平行的 typed Kernel IR；MLIR 进入 backend boundary 后，后端也不得绕回 Python object 重新解释算法。
@@ -45,7 +45,7 @@ Kernel IR 是 source-visible kernel algorithm 的权威表示。它保存 ABI、
 
 ## Realizer
 
-Realizer 接收 Kernel IR、机器能力与 compile policy，只选择依赖算法结构才能确定的物理事实：逐轴角色与 range、program ownership、遍历关系、logical validity 的兑现方式、必要的 storage class、primitive 数值角色、execution-stage operation grouping/axis binding/synchronization，以及合法搜索轴。候选值由下层 tuner 选择；layout 推断、寄存器分配、指令选择和给定参数后的低层流水线继续交给下层。
+Realizer 接收 Kernel IR、机器能力与 compile policy，从完整 logical domain、独立实例和 structured operation 构造 source 中不存在的 physical regions，再选择依赖算法结构才能确定的物理事实：逐轴角色与 range、program ownership、遍历关系、logical validity 的兑现方式、必要的 storage class、primitive 数值角色、execution-stage operation grouping/axis binding/synchronization，以及合法搜索轴。候选值由下层 tuner 选择；layout 推断、寄存器分配、指令选择和给定参数后的低层流水线继续交给下层。
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 

@@ -69,4 +69,4 @@ def two_pass_max(x):
 
 ## 边界
 
-Compiler 不把两个 source kernels 融合，也不改变 wrapper-visible 的两次调用与 partial ABI。单个 source callable 的 realizer可以为其已有数据依赖选择 compiler-private stages，但这些 stages 必须由 Physical Plan 显式约束且对 wrapper不可见。完全内部的 tiling 使用 `extent=I.auto(...)`；Core 不提供 `count=I.auto(...)`。
+Compiler 不把两个 source kernels 融合，也不改变 wrapper-visible 的两次调用与 partial ABI。单个 source callable 的 realizer 可以为其已有数据依赖选择 compiler-private stages，但这些 stages 必须由 Physical Plan 显式约束且对 wrapper 不可见。完全内部的 tiling 由 Physical Plan 直接引入，不形成 source partition；Core 不提供 `count=I.auto(...)`。

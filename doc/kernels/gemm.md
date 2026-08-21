@@ -26,28 +26,22 @@ def gemm(
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
 
-    for mr in I.parallel(
-        I.partition(m_axis, extent=I.auto("M_TILE"))
-    ):
-        for nr in I.parallel(
-            I.partition(n_axis, extent=I.auto("N_TILE"))
-        ):
-            acc = I.contract(
-                a[mr, k_axis],
-                b[k_axis, nr],
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
+    acc = I.contract(
+        a[m_axis, k_axis],
+        b[k_axis, n_axis],
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
 
-            if ACTIVATION == Activation.RELU:
-                acc = I.maximum(acc, 0.0)
+    if ACTIVATION == Activation.RELU:
+        acc = I.maximum(acc, 0.0)
 
-            c[mr, nr] = I.cast(acc, I.f16)
+    c[m_axis, n_axis] = I.cast(acc, I.f16)
 ```
 
 ## Source 固定
 
-- M/N region-level output algorithm；
+- 完整 M/N result domains；
 - K contraction 与 positional reduction axes；
 - source operand dtype 与 f32 accumulator；
 - activation specialization 与 epilogue；
@@ -55,7 +49,7 @@ def gemm(
 
 ## Physical Plan 决定
 
-- M/N/K physical tile；
+- 从完整 contraction 引入的 M/N/K physical regions 与 tile；
 - program mapping、grid 与 grouped swizzle；
 - worker hierarchy；
 - 算法结构要求的 packing、storage/reuse boundary 与 contraction primitive 数值角色；

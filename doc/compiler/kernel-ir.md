@@ -39,8 +39,8 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 
 - runtime `if`、`for`、`while`；
 - specialization-time branch；
-- `parallel`、`ordered` 与 `state_stream`；
-- rank-one domain/region 的 exclusive `end`，以及由它收紧的 stream logical stop；
+- `parallel`、普通顺序循环与 `state_stream`；frontend 可以把普通顺序循环正规化成内部 sequential/ordered operation，但 public source 不需要额外的 `ordered` 标志；
+- stream logical stop 的整数 SSA expression，以及 rank-one domain/region 的 exclusive `end` convenience；
 - 支配后续精确 index/view/axis 访问的 unsafe `assume_in_bounds` 前置条件；
 - carry schema、initial state、step 与 final projection；
 - 普通 `@intent.fn` 展开的算法 helper relation，以及 structured combiner 保留的 typed、effect-free helper body。
@@ -58,12 +58,12 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 ## 关键不变量
 
 1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel` 和一个 target callable entry；目标 entry 内可以包含多个 compiler-private execution stages。
-2. `I.auto` 只能占据内部 region extent hole，不能成为普通 SSA value。
-3. `partition(count=...)` 的 count 必须是 source-visible runtime/shape/`Constexpr`/wrapper value，不能由不可观察的 physical worker count 代替。
+2. `I.auto` 只能作为明确声明 segment-parametric recurrence 的 structured extent hole，不能成为普通 SSA value，也不能用于普通 partition。
+3. Source-visible partition 的 extent/count 必须来自 runtime/shape/`Constexpr`/wrapper value，并被算法、effect、ABI 或 wrapper 观察；不可观察的 physical tile/worker count 不进入 Kernel IR。
 4. Physical refinement 不得改变 logical workset、state、effect、ABI 或 wrapper-visible relation。
 5. Pure SSA 可以安全地复制、删除、融合或重算；effectful node 必须保持依赖与执行语义。
-6. `ordered` 与 `state_stream` 的 source 顺序不可降格为 unordered partial merge。
-7. `reduce`、`scan` 与 `contract` 保持为 structured nodes，直到后端选择 physical implementation；generic reduce/scan combiner 是 typed、effect-free 的 Kernel IR helper，不是 opaque callable。
+6. 普通顺序循环与 `state_stream` 的 source 顺序不可降格为 unordered partial merge；内部 ordered operation 只保存这项语义，不是作者授予优化权限的标志。
+7. `reduce`、`scan` 与 `contract` 保持为 structured nodes，直到后端选择 physical implementation；这些 op 的语义本身不固定某一棵物理树。Generic reduce/scan combiner 是 typed、effect-free 的 Kernel IR helper，不是 opaque callable。
 8. Logical identity 来自原始 domain index，不来自 physical worker 或 auto-region ordinal。
 9. Address-forming index 的宽度必须覆盖已声明 shape/stride 的可达地址范围；不能依赖目标默认整数宽度静默回绕。
 
@@ -71,4 +71,4 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 
 Kernel IR 固定 logical node，允许 realizer 为该 node 构造复合实现。例如一个 `contract` 可以变成多条 MMA 和补偿步骤，一个 `reduce` 可以变成多级 private partial；但不能把 ordinary GEMM 变成 Strassen，或把 stable softmax 变成 online recurrence。
 
-Typed combiner body 同样属于 Kernel IR 权威算法：verifier 可以检查类型、effect 与 capture 合同，emitter 可以把它翻译成目标 helper/lambda，下层可以选择 collective tree；Intent 的 analysis/realizer 不拥有改写 closure body 的权限。`ordered`、`state_stream` 和 generic `reduce/scan` 因此始终是不同的 canonical program structures。
+Typed combiner body 同样属于 Kernel IR 权威算法：verifier 可以检查类型、effect 与 capture 合同，emitter 可以把它翻译成目标 helper/lambda，下层可以选择 collective tree；Intent 的 analysis/realizer 不拥有改写 closure body 的权限。普通顺序循环、`state_stream` 和 generic `reduce/scan` 因此始终是不同的 canonical program structures。

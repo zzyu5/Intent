@@ -14,7 +14,7 @@ Structured primitive 的算法语义只从 Kernel IR 读取，Plan 只补充 emi
 
 ## 组合式逐轴决策
 
-Realizer 不先问“kernel 属于哪一类”，而是逐个逻辑轴回答：是否 parallel、ordered、reduction、ragged member 或 lane；哪一个 range 用于 program ownership、块内 lane、ordered traversal、reduction，哪一个 access range 描述某次读取的覆盖范围；多级 traversal 则在同一轴上保留不同 level。
+Realizer 不先问“kernel 属于哪一类”。它从 Kernel IR 读取 parallel independence、sequential/ordered traversal、reduction 与 ragged membership 等算法事实，再逐个逻辑轴选择：哪一个 physical range 用于 program ownership、块内 lane、ordered traversal 或 reduction，哪一个 access range 描述某次读取的覆盖范围；多级 traversal 则在同一轴上保留不同 level。
 
 因此不规则 membership 与 ordered stream、分阶段 contraction 与 ordered traversal、一个轴的外层块和内层顺序都由角色与 range 的组合得到，不需要新增互斥 mapping mode。Relation、def-use 与 provenance 从 Kernel IR 在公共 KernelModel 中派生一次；SurfacePlan 只能索引这份语义事实和 Plan 中已选的物理绑定，不能遍历周围 operation 再重建一份。
 
@@ -38,17 +38,21 @@ Dependencies、input/output values、effectful terminals、intermediate producer
 
 `same_stream` synchronization 表示 target 必须按 Plan 顺序提交 private launches，并以同一 execution stream 的 happens-before 兑现派生 dependency 与 visibility。Stage grouping 已由 operation slices 给出，surface 不得重新分组。
 
-跨 compiler-private stage 或跨 source callable 的融合不属于这个算子编译器，Physical Plan 不提供让 leaf 合并 stages 的权限。不同 target family 可以选择不同的初始 stage grouping，但 leaf 都不能改写已经选定的 Plan。
+跨 compiler-private stage 或跨 source callable 的融合不属于这个算子编译器，Physical Plan 不提供 leaf 合并 stages 的入口。不同 target family 可以选择不同的初始 stage grouping，但 leaf 都不能改写已经选定的 Plan。
 
 ## Ownership 与 physical identity
 
-Source 定义 logical region space：
+Source 定义 logical instance space：
 
 \[
-R=\{\text{logical region instances}\}
+L=\{\text{logical index / algorithm-visible segment instances}\}
 \]
 
-Plan 构造 physical worker space：
+Plan 可以从 \(L\) 构造 source 中不存在的 physical regions，再构造 physical worker space：
+
+\[
+R_p=\{\text{physical regions over subsets of }L\}
+\]
 
 \[
 W=\{\text{program / CTA / thread / task}\}
@@ -57,10 +61,10 @@ W=\{\text{program / CTA / thread / task}\}
 并定义：
 
 \[
-\operatorname{own}:W\rightarrow\operatorname{Seq}(R)
+\operatorname{own}:W\rightarrow\operatorname{Seq}(R_p)
 \]
 
-`program_id`、`ct.bid` 或 `T.Kernel` block binding 是 target surface 对这份 ownership 的拼写，不是 portable source identity。Grouped ordering、persistent traversal 和 ordered state stream 同理：决定在 machine plan 中只做一次，各 surface 只投影与渲染。
+算法可见 segment 必须保持原 boundary/identity；普通 physical region 则只需完整、无非法重复地覆盖对应 logical instances。`program_id`、`ct.bid` 或 `T.Kernel` block binding 是 target surface 对这份 ownership 的拼写，不是 portable source identity。Sequential/state-stream order 由 Kernel IR 固定，Plan 只选择 grouped ordering、persistent traversal 等物理兑现方式；这份选择只做一次，各 surface 只投影与渲染。
 
 ## 数值与实现边界
 
@@ -68,7 +72,9 @@ Kernel IR 保存数学角色、dtype、累加语义、logical validity、state t
 
 Layout 推断、寄存器分配、指令选择以及给定参数后的低层流水线尽量委托给下层。某个 surface 中不存在的概念不会为“字段对齐”而被抬到共享 Plan；它要求显式打印的机器决定则必须来自同一份 realization，不能在 emitter 中重新选择。
 
-`I.partition(...)` 改变 source body 看见的对象：作者选择的是一个 region 而不是一个元素，因此属于算法结构。相反，当 body 只含逐点标量 SSA、没有 reduction、contract、scan、region mask、logical buffer、atomic/scatter 或 tensor-valued 中间量时，把多个独立标量实例装进一个 physical program 的 lane 只是 realization；body 仍只看见一个元素。Realizer 不得跨过这条判据把标量 contraction 自动升级成块 contraction。
+Source partition 只在 part identity 或 boundary 被算法、effect、ABI 或 wrapper 观察时改变算法结构。语法上让 body 拿到一个 region 并不足以证明这一点：如果 region 只用于把若干独立实例凑成 tensor operand，换一种合法机器实现时它无需保留，就应由 Plan 从完整 logical domain 引入。
+
+把多个 `parallel` 实例装进一个 physical program、lane 或 tensor primitive 属于 realization，即使每个 source 实例内部含 reduction、contract、scan、logical buffer 或 effect。合法性判据是实例间没有 source-defined happens-before、逐实例 value/state/effect identity 与冲突语义保持不变，且 source body 不观察新建 region 的 ordinal/boundary；不能以“body 含 structured op”为全局门槛，也不能借物理批处理引入跨实例 reduction、state 或 effect。目标无法保持 effect 合同时，该 batching realization 不合法。
 
 地址索引宽度是正确性不变量，不是搜索参数。地址上界超过某个 surface 的可表达范围时，该 surface 必须明确拒绝；不能窄化、回绕，也不能把宽度放进候选空间。
 

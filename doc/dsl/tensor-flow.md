@@ -67,7 +67,7 @@ stats = I.reduce(
 
 Generic combine 遵循以下合同：Frontend 把 helper lower 成 canonical Kernel IR 中的 typed combiner body；参数是两组 accumulator components，返回 schema 与 accumulator 完全一致，identity 逐 component 显式给出。Combiner 必须 pure，不能包含 load/store/atomic/RNG；runtime capture 必须通过 `combine_operands=(...)` 成为 reduce/scan 的显式 scalar operand，只有 `Constexpr` 可以直接捕获。
 
-选择 `reduce` 表示作者接受合法 reassociation，compiler 不反向证明 closure 的数学结合律或 identity law，可以选择物理 reduction tree 与 hierarchy。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity自然保持零 mean/M2。需要严格逐元素顺序时使用 `ordered` 或 `state_stream`，不增加 `mergeable` 或 `@associative` 合同。Compiler 只验证 closure 的 typed schema、purity 与显式 capture，然后按 SSA 顺序机械投影；它不分析、重排、替换或特化 closure body，也不会把 ordered/state-stream 程序归一化成 reduce。
+`reduce` 的 source 语义是 logical domain 上由 identity/combiner 定义、但不指定某一棵物理树的 reduction；它不是先写一棵顺序树、再额外授权 compiler reassociate。Compiler 不反向证明 closure 的数学结合律或 identity law。作者给出的 identity 必须对 closure 真正中性，closure 也必须能处理 identity 与 identity 的组合；上例用 `safe_n` 保证物理尾块中的空 partial 不产生除零，同时零 identity 自然保持零 mean/M2。需要严格逐元素顺序时使用普通 `for`；需要算法可见的 segment/carry recurrence 时使用 `state_stream`。Compiler 只验证 closure 的 typed schema、purity 与显式 capture，然后机械投影 closure；它不分析、替换或特化 closure body，也不会把顺序 loop/state-stream 程序归一化成 reduce。
 
 一个 logical reduction 可以在同一 callable 内使用 serial strip-mine、SIMD horizontal reduction、tree reduction、private partial、compiler-private scratch 或 target 允许的 atomic accumulation。能机械承接 typed combiner 的 target 将其投影到原生 generic reduce；不能保持 typed/pure/capture 合同的 target 必须在 emission 前拒绝。
 
@@ -85,7 +85,7 @@ prefix = I.scan(
 )
 ```
 
-Source 固定 logical prefix relation，realizer 决定物理 scan hierarchy。
+Source 固定 logical prefix relation；scan 语义不指定每个 prefix 内部的物理 combine tree，realizer 决定物理 hierarchy。
 
 `I.scan` 与 `I.reduce` 共用 typed combiner、component identity、purity 和显式 capture 合同。Target 可以委托给原生 associative scan；长轴可以由 Plan 选择 block-local scan 加 block 间 scalar carry。不能保持该合同的 target 必须在 emission 前拒绝。
 
@@ -93,8 +93,8 @@ Source 固定 logical prefix relation，realizer 决定物理 scan hierarchy。
 
 ```python
 acc = I.contract(
-    a_block,
-    b_block,
+    a[m_axis, k_axis],
+    b[k_axis, n_axis],
     reduce=((1, 0),),
     acc_dtype=I.f32,
 )
@@ -156,6 +156,7 @@ work = I.buffer(shape=(region, D), dtype=I.f32, init=0.0)
 ```python
 groups = I.ragged(
     outer=I.domain(0, E),
+    members=I.domain(0, R),
     offsets=expert_offsets,
     indices=route_ids,
 )
@@ -163,14 +164,14 @@ groups = I.ragged(
 
 `I.ragged` 只描述调用方已提供的 membership，不执行 grouping、不生成 offsets，也不在 histogram、sort 与 atomic bucket 之间选择算法。
 
-Member domain 可以继续内部 partition：
+当 segment boundary 不进入算法时，作者直接使用完整 member domain：
 
 ```python
-for rr in I.parallel(
-    I.partition(groups[expert], extent=I.auto("ROUTE_TILE"))
-):
-    ...
+routes = I.members(groups[expert])
+values = I.gather(x, index=routes)
 ```
+
+Realizer 可以为该完整 member domain 引入 physical route region。只有当 part identity、partial result、state、mask、effect 或输入格式真正观察 segment boundary 时，source 才显式 partition；不能为了给 gather/contract 凑出块张量而使用 `partition(auto)`。
 
 ## RNG
 
