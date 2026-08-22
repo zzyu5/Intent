@@ -50,6 +50,46 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
     return PreparedComparison(generated, source, Tolerance(atol=2e-2, rtol=2e-2), cuda_graph=True)
 
 
+def modern_flash_attention_forward(context: Context) -> PreparedComparison:
+    batch, heads, sequence, dimension = 2, 16, 2048, 128
+    shape = (batch, heads, sequence, dimension)
+    q = torch.randn(shape, device="cuda", dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    scale = dimension**-0.5
+    _, generated = compile_single(
+        context,
+        flash_attention_fwd,
+        (q, k, v, scale),
+        constexprs={"CAUSAL": True},
+    )
+    runtime = load_module(
+        context.project_root / "source/triton/meta-applied-ai/support/runtime.py",
+        "intent_v2_triton_modern_flash_runtime",
+    )
+    source_module = runtime.load_source(
+        context.project_root
+        / "source/triton/meta-applied-ai/attention/flash_backward/flash_backward.py",
+        "intent_v2_triton_modern_flash_source",
+    )
+    source_output = torch.empty_like(q)
+    source_lse = torch.empty(
+        (batch, heads, sequence), device="cuda", dtype=torch.float32
+    )
+
+    def source_launch():
+        source_module.flash(q, k, v, source_output, source_lse)
+
+    source_launch()
+    source = PreparedLaunch(source_launch, lambda: source_output)
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=2e-2),
+        cuda_graph=True,
+    )
+
+
 def paged_gqa_decode(context: Context) -> PreparedComparison:
     batch, query_heads, kv_heads, dimension = 16, 32, 8, 128
     sequence, page_size, splits = 8192, 16, 8
@@ -507,6 +547,7 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
 
 CASES = {
     "flash_attention_forward": flash_attention_forward,
+    "modern_flash_attention_forward": modern_flash_attention_forward,
     "paged_gqa_decode": paged_gqa_decode,
     "splitk_paged_attention": splitk_paged_attention,
     "paged_mla_decode": paged_mla,

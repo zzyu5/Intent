@@ -27,6 +27,7 @@ from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import runtime_module
 from .common import source_from_runtime
+from .. import implementation_gap
 
 
 def dense_flash_attention(context: Context) -> PreparedComparison:
@@ -709,5 +710,15 @@ CASES = {
     "native_sparse_attention_forward": native_sparse_forward,
     "native_sparse_attention_decode": native_sparse_decode,
     "paged_mla_decode": paged_mla,
+    "persistent_mla_decode": implementation_gap(
+        "the source is one cooperative persistent kernel with grid-wide "
+        "synchronization; the existing Intent MLA entry is a different "
+        "two-kernel split-K program"
+    ),
     "gqa_attention_backward": gqa_attention_backward,
+    "sparse_mla_backward": implementation_gap(
+        "the backward requires indexed sparse probability recomputation and "
+        "many-to-one dKV scatter accumulation, which the current DSL corpus "
+        "does not express as this source pipeline"
+    ),
 }

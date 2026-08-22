@@ -6,7 +6,7 @@
 
 Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`、`state-spaces/mamba`、`fla-org/flash-linear-attention`、`vllm-project/vllm`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
 
-## baseline-v2 entries（41）
+## baseline-v2 entries（38）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -21,7 +21,6 @@ Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/
 | V1+V2 | SwiGLU | `liger-kernel/activation/swiglu/swiglu.py` / `swiglu_forward` | `8192×14336`, bf16 | `python source/triton/liger-kernel/activation/swiglu/swiglu_runtime.py` |
 | V1+V2 | embedding lookup | `liger-kernel/embedding/lookup/embedding.py` / `LigerEmbeddingFunction` | vocab `32768×4096`, tokens `8×2048`, bf16 | `python source/triton/liger-kernel/embedding/lookup/embedding_runtime.py` |
 | V1+V2 | cross entropy | `liger-kernel/loss/cross_entropy/cross_entropy.py` / `LigerCrossEntropyFunction` | `8192×32768`, bf16 | `python source/triton/liger-kernel/loss/cross_entropy/cross_entropy_runtime.py` |
-| V2 | fused linear cross entropy | `liger-kernel/loss/fused_linear_cross_entropy/fused_linear_cross_entropy.py` / `LigerFusedLinearCrossEntropyFunction` | hidden `2048×4096`, vocab `32768`, bf16 | `python source/triton/liger-kernel/loss/fused_linear_cross_entropy/fused_linear_cross_entropy_runtime.py` |
 | V1+V2 | fused add RMSNorm | `liger-kernel/normalization/fused_add_rms_norm/fused_add_rms_norm.py` / forward function | `8192×4096`, bf16 | `python source/triton/liger-kernel/normalization/fused_add_rms_norm/fused_add_rms_norm_runtime.py` |
 | V1+V2 | RMSNorm | `liger-kernel/normalization/rms_norm/rms_norm.py` / `rms_norm_forward` | `8192×4096`, bf16 | `python source/triton/liger-kernel/normalization/rms_norm/rms_norm_runtime.py` |
 | V2 | RoPE | `liger-kernel/position/rope/rope.py` / `_triton_rope` | model Q/K sequence tensors, bf16 | `python source/triton/liger-kernel/position/rope/rope_runtime.py` |
@@ -37,12 +36,10 @@ Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/
 | V2 | causal Conv1D | `meta-applied-ai/convolution/causal_conv1d/causal_1d_conv.py` / `causal_conv1d_fwd` | `B=4,C=4096,S=4096,W=4`, bf16 | `python source/triton/meta-applied-ai/convolution/causal_conv1d/causal_1d_conv_runtime.py` |
 | V2 | varlen causal Conv1D forward | `fla/conv/causal1d/ops.py` + `kernels.py` / `causal_conv1d_fwd` | packed lengths 2048/1536/1024/512, hidden 4096, width 4, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_varlen_runtime.py` |
 | V2 | causal Conv1D decode cache update | same source / `causal_conv1d_update` | decode batch 32, hidden 4096, width 4, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_update_runtime.py` |
-| V2 | causal Conv1D backward | same source / `causal_conv1d_bwd` | `B=2,S=2048,D=4096,W=4`, bf16 | `python source/triton/fla/conv/causal1d/causal_conv_backward_runtime.py` |
 | V2 | modern FlashAttention forward | `meta-applied-ai/attention/flash_backward/flash_backward.py` / `flash` | `B=2,H=16,S=2048,D=128`, fp16 causal | `python source/triton/meta-applied-ai/attention/flash_backward/flash_forward_runtime.py` |
 | V2 | modern FlashAttention backward | same source / `flash_bwd` | same shape, dQ/dK/dV | `python source/triton/meta-applied-ai/attention/flash_backward/flash_backward_runtime.py` |
 | V2 | MoE grouped expert projection | `meta-applied-ai/moe/grouped/v0_moe_fused.py` / `invoke_fused_moe_kernel` | 2048 tokens, 8 experts, top-2, `4096→14336`, bf16 | `python source/triton/meta-applied-ai/moe/grouped/v0_moe_fused_runtime.py` |
 | V2 | MoE split-K expert projection | `meta-applied-ai/moe/splitk/v1_moe_fused.py` / split-K invoke | same contract | `python source/triton/meta-applied-ai/moe/splitk/v1_moe_fused_runtime.py` |
-| V2 | MoE column-major expert projection | `meta-applied-ai/moe/column_major/v2_moe_fused.py` / column-major invoke | same contract | `python source/triton/meta-applied-ai/moe/column_major/v2_moe_fused_runtime.py` |
 | V2 | Mamba2 SSD chunk state | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_state.py` / `_chunk_state_fwd` | `B=1,S=2048,H=32,P=64,G=8,N=128`, chunk 256, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_state_runtime.py` |
 | V2 | Mamba2 SSD state passing | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_state_passing.py` / `_state_passing_fwd` | 8 chunks, 32 heads, flattened state `64×128`, fp32 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_state_passing_runtime.py` |
 | V2 | Mamba2 SSD chunk scan | `state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_scan.py` / `_chunk_scan_fwd` | `B=1,S=2048,H=32,P=64,G=8,N=128`, chunk 256, bf16 | `python source/triton/state-spaces-mamba/mamba_ssm/ops/triton/ssd_chunk_scan_runtime.py` |
@@ -56,7 +53,7 @@ V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只�
 
 ## 冻结在 baseline-v1 的来源
 
-以下源码继续存在，是因为旧 CSV 的 source 数字确实由它们产生；它们不进入 V2 的 30 个高性能入口。
+以下源码继续存在，是因为旧 CSV 的 source 数字确实由它们产生；它们不进入上面的 baseline-v2 inventory。
 
 | V1 entry | source | runtime |
 |---|---|---|
@@ -84,7 +81,7 @@ V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只�
 - `xformers/gemm/tiled/matmul_perf_model.py` 与 `xformers/support/triton/{importing.py,vararg_kernel.py}`：xFormers kernels 的直接依赖。
 - `meta-applied-ai/support/runtime.py` 与 `meta-applied-ai/moe/support/projection_runtime.py`：只负责加载 vendored 源码、构造未计时 metadata 与打印一次运行结果。
 - `state-spaces-mamba/mamba_ssm/ops/triton/{ssd_bmm.py,softplus.py,mamba3/utils.py}` 与 `mamba_ssm/utils/determinism.py`：Mamba2/Mamba3 上游 kernel 的直接依赖；`state-spaces-mamba/support/runtime.py` 只接入本地 namespace package。
-- `fla/conv/causal1d/kernels.py` 是三个 FLA causal-conv public entry 的原始 Triton kernel；`fla/support/runtime.py` 只接入上游包边界和 chunk metadata，不改写 kernel。
+- `fla/conv/causal1d/kernels.py` 是两个已纳入 FLA causal-conv public entry 的原始 Triton kernel；`fla/support/runtime.py` 只接入上游包边界和 chunk metadata，不改写 kernel。
 - `vllm/support/runtime.py`：只提供原文件导入所需的当前设备 capability 与 Triton module 接线；paged decode 和 MiniMax-M3 算法源码保持上游原样。
 
 除本清单列出的 entry、runtime 和 support 外，`source/triton/` 不保留其它 Python 文件。

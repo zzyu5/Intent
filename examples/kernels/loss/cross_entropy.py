@@ -153,3 +153,55 @@ def fused_cross_entropy_bf16(
                         I.bf16,
                     )
                     writer.yield_(final_maximum, final_denominator)
+
+
+@intent.kernel
+def flash_cross_entropy_bf16(
+    logits: I.In[I.bf16, ("M", "V")],
+    labels: I.In[I.i64, ("M",)],
+    loss: I.Out[I.f32, ("M",)],
+    z_loss: I.Out[I.f32, ("M",)],
+    IGNORE_INDEX: I.Constexpr[int],
+    Z_LOSS_SCALE: I.Constexpr[float],
+):
+    M, V = logits.shape
+    classes = I.domain(0, V)
+    for row in I.parallel(I.domain(0, M)):
+        label = labels[row]
+        if label == IGNORE_INDEX:
+            loss[row] = 0.0
+            z_loss[row] = 0.0
+        else:
+            I.assume_in_bounds(label, logits, axis=1)
+            target = I.cast(I.gather(logits, index=(row, label)), I.f32)
+            statistics = I.state_stream(
+                classes,
+                extent=I.auto("CLASS_TILE"),
+                init=(
+                    I.cast(-I.inf, I.f32),
+                    I.cast(0.0, I.f32),
+                ),
+            )
+            with statistics:
+                for class_region, (maximum, denominator) in statistics:
+                    values = I.cast(logits[row, class_region], I.f32)
+                    local_maximum = I.reduce.max(
+                        values,
+                        axis=0,
+                        identity=-I.inf,
+                    )
+                    next_maximum = I.maximum(maximum, local_maximum)
+                    statistics.yield_(
+                        next_maximum,
+                        denominator * I.exp(maximum - next_maximum)
+                        + I.reduce.sum(
+                            I.exp(values - next_maximum),
+                            axis=0,
+                            identity=0.0,
+                        ),
+                    )
+            maximum, denominator = statistics.result
+            lse = maximum + I.log(denominator)
+            regularizer = Z_LOSS_SCALE * lse * lse
+            z_loss[row] = regularizer
+            loss[row] = lse - target + regularizer

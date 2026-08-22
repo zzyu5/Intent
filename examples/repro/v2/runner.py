@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
 
 import torch
 
@@ -12,6 +17,7 @@ from .measurement import evaluate
 from .measurement import NumericalComparisonError
 from .measurement import PipelineStageError
 from .model import Context
+from .model import ComparisonUnavailable
 from .model import ResultRow
 from .providers import load_cases
 from .registry import BY_PROVIDER
@@ -25,6 +31,8 @@ FIELDS = (
     "ratio",
     "status",
 )
+
+WORKER_TIMEOUT_SECONDS = 300
 
 
 def _target(provider: str):
@@ -61,16 +69,100 @@ def _write(path: Path, rows: list[ResultRow]) -> None:
     temporary.replace(path)
 
 
+def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
+    torch.cuda.set_device(0)
+    torch.manual_seed(0)
+    project_root = Path(__file__).resolve().parents[3]
+    context = Context(
+        compiler=compiler,
+        project_root=project_root,
+        target=_target(provider),
+        provider=provider,
+    )
+    try:
+        cases = load_cases(provider)
+    except Exception as error:
+        status = "adapter_loading_failed"
+        print(f"{provider}:{entry.kernel}: {status}: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+
+    factory = cases.get(entry.kernel)
+    if factory is None:
+        status = "adapter_missing"
+        print(f"{provider}:{entry.kernel}: {status}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+    try:
+        comparison = factory(context)
+    except ComparisonUnavailable as error:
+        print(f"{provider}:{entry.kernel}: {error.status}: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, error.status)
+    except NotImplementedError as error:
+        print(f"{provider}:{entry.kernel}: unsupported: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, "unsupported")
+    except PipelineStageError as error:
+        status = f"{error.stage}_failed"
+        print(f"{provider}:{entry.kernel}: {status}: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+    except Exception as error:
+        status = "adapter_preparation_failed"
+        print(f"{provider}:{entry.kernel}: {status}: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+
+    try:
+        generated_p50, source_p50 = evaluate(comparison)
+    except NumericalComparisonError as error:
+        print(f"{provider}:{entry.kernel}: numerical_failed: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, "numerical_failed")
+    except PipelineStageError as error:
+        status = f"{error.stage}_failed"
+        print(f"{provider}:{entry.kernel}: {status}: {error}")
+        return ResultRow(entry.kernel, entry.case, None, None, None, status)
+
+    ratio = generated_p50 / source_p50
+    print(
+        f"{provider}:{entry.kernel}: pass "
+        f"generated={generated_p50:.6f} ms source={source_p50:.6f} ms ratio={ratio:.6f}"
+    )
+    return ResultRow(
+        entry.kernel,
+        entry.case,
+        generated_p50,
+        source_p50,
+        ratio,
+        "pass",
+    )
+
+
+def _read_worker_row(path: Path) -> ResultRow:
+    with path.open(newline="") as stream:
+        records = tuple(csv.DictReader(stream))
+    if len(records) != 1:
+        raise RuntimeError(f"worker produced {len(records)} result rows")
+    record = records[0]
+
+    def optional_float(name: str) -> float | None:
+        value = record[name]
+        return None if value == "" else float(value)
+
+    return ResultRow(
+        record["kernel"],
+        record["case"],
+        optional_float("generated_p50_ms"),
+        optional_float("source_p50_ms"),
+        optional_float("ratio"),
+        record["status"],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("provider", choices=sorted(BY_PROVIDER))
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--kernel", action="append")
+    parser.add_argument("--worker-entry", type=int, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
 
-    torch.cuda.set_device(0)
-    torch.manual_seed(0)
     provider = arguments.provider
     selected = set(arguments.kernel or ())
     entries = tuple(
@@ -82,68 +174,69 @@ def main() -> None:
         unknown = ", ".join(sorted(selected - {entry.kernel for entry in entries}))
         parser.error(f"unknown {provider} V2 kernel(s): {unknown}")
 
-    project_root = Path(__file__).resolve().parents[3]
-    context = Context(
-        compiler=arguments.compiler,
-        project_root=project_root,
-        target=_target(provider),
-        provider=provider,
-    )
-    cases = load_cases(provider)
+    if arguments.worker_entry is not None:
+        entry = BY_PROVIDER[provider][arguments.worker_entry]
+        _write(arguments.output, [_run_entry(provider, arguments.compiler, entry)])
+        return
+
     rows: list[ResultRow] = []
-    for entry in entries:
-        factory = cases.get(entry.kernel)
-        if factory is None:
-            raise NotImplementedError(
-                f"{provider} V2 case adapter is missing for {entry.kernel}"
+    selected_indexes = (
+        index
+        for index, entry in enumerate(BY_PROVIDER[provider])
+        if not selected or entry.kernel in selected
+    )
+    for index in selected_indexes:
+        entry = BY_PROVIDER[provider][index]
+        with tempfile.TemporaryDirectory(prefix="intentdsl-baseline-v2-") as directory:
+            worker_output = Path(directory) / "result.csv"
+            worker = subprocess.Popen(
+                (
+                    sys.executable,
+                    "-m",
+                    "repro.v2.runner",
+                    provider,
+                    "--compiler",
+                    arguments.compiler,
+                    "--output",
+                    str(worker_output),
+                    "--worker-entry",
+                    str(index),
+                ),
+                start_new_session=True,
             )
-        try:
-            comparison = factory(context)
-        except NotImplementedError as error:
-            print(f"{provider}:{entry.kernel}: unsupported: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "unsupported"))
-            _write(arguments.output, rows)
-            continue
-        except PipelineStageError as error:
-            status = f"{error.stage}_failed"
-            print(f"{provider}:{entry.kernel}: {status}: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
-            _write(arguments.output, rows)
-            continue
-        except Exception as error:
-            status = "adapter_preparation_failed"
-            print(f"{provider}:{entry.kernel}: {status}: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
-            _write(arguments.output, rows)
-            continue
-        try:
-            generated_p50, source_p50 = evaluate(comparison)
-        except NumericalComparisonError as error:
-            print(f"{provider}:{entry.kernel}: numerical_failed: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, "numerical_failed"))
-            _write(arguments.output, rows)
-            continue
-        except PipelineStageError as error:
-            status = f"{error.stage}_failed"
-            print(f"{provider}:{entry.kernel}: {status}: {error}")
-            rows.append(ResultRow(entry.kernel, entry.case, None, None, None, status))
-            _write(arguments.output, rows)
-            continue
-        ratio = generated_p50 / source_p50
-        print(
-            f"{provider}:{entry.kernel}: pass "
-            f"generated={generated_p50:.6f} ms source={source_p50:.6f} ms ratio={ratio:.6f}"
-        )
-        rows.append(
-            ResultRow(
-                entry.kernel,
-                entry.case,
-                generated_p50,
-                source_p50,
-                ratio,
-                "pass",
-            )
-        )
+            try:
+                returncode = worker.wait(timeout=WORKER_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                os.killpg(worker.pid, signal.SIGTERM)
+                try:
+                    worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(worker.pid, signal.SIGKILL)
+                    worker.wait()
+                status = "worker_timeout"
+                print(
+                    f"{provider}:{entry.kernel}: {status}: "
+                    f"exceeded {WORKER_TIMEOUT_SECONDS} seconds"
+                )
+                row = ResultRow(entry.kernel, entry.case, None, None, None, status)
+            else:
+                if returncode != 0 or not worker_output.exists():
+                    status = "worker_process_failed"
+                    print(
+                        f"{provider}:{entry.kernel}: {status}: "
+                        f"worker exited with code {returncode}"
+                    )
+                    row = ResultRow(entry.kernel, entry.case, None, None, None, status)
+                else:
+                    try:
+                        row = _read_worker_row(worker_output)
+                    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+                        status = "worker_result_failed"
+                        print(f"{provider}:{entry.kernel}: {status}: {error}")
+                        row = ResultRow(
+                            entry.kernel, entry.case, None, None, None, status
+                        )
+        rows.append(row)
         _write(arguments.output, rows)
 
 

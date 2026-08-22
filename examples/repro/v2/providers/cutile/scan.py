@@ -12,6 +12,7 @@ from ...model import Context
 from ...model import PreparedComparison
 from ...model import Tolerance
 from .common import tilegym_source
+from .. import implementation_gap
 
 
 def recurrent_gated_delta(context: Context) -> PreparedComparison:
@@ -67,4 +68,10 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
     )
 
 
-CASES = {"recurrent_gated_delta": recurrent_gated_delta}
+CASES = {
+    "recurrent_gated_delta": recurrent_gated_delta,
+    "chunk_gated_delta": implementation_gap(
+        "the chunk algorithm materializes an intra-chunk triangular solve and "
+        "a second inter-chunk recurrence; it is not the recurrent step callable"
+    ),
+}

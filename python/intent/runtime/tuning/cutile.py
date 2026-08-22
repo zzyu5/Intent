@@ -23,6 +23,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
+        "pointwise_lane": (256, 512, 1024, 2048, 4096, 8192, 16384),
         "feature": (64, 128),
         "reduction": (16, 32, 64),
         "program_m": (16, 32, 64, 128),
@@ -102,6 +103,15 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             ({"stream_scaled": 2}, 1, 2),
             ({"stream_scaled": 4}, 1, 1),
             ({"stream_scaled": 8}, 2, 1),
+        ),
+        (
+            ({"pointwise_lane": 256}, 1, 4),
+            ({"pointwise_lane": 512}, 1, 4),
+            ({"pointwise_lane": 1024}, 1, 4),
+            ({"pointwise_lane": 2048}, 1, 2),
+            ({"pointwise_lane": 4096}, 1, 1),
+            ({"pointwise_lane": 8192}, 1, 1),
+            ({"pointwise_lane": 16384}, 1, 1),
         ),
         tuple(
             ({"query": query, stream_role: stream}, num_ctas, occupancy)

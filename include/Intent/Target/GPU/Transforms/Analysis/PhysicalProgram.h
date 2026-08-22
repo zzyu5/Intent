@@ -32,6 +32,7 @@ public:
   bool axisHasRole(int64_t node, llvm::StringRef role) const;
   bool isScalarAxis(int64_t node) const;
   bool isPackedScalarAxis(int64_t node) const;
+  intent::plan::AxisOp getPurePointwiseProgramLane() const;
 
 private:
   explicit PhysicalProgramAnalysis(intent::target::KernelModel model);

@@ -9,6 +9,62 @@ def _target_parameters(
     return {target: values[role] for target, role in parameter_map.items()}
 
 
+def _power_of_two_ceiling(value: int) -> int:
+    if value < 1:
+        raise ValueError("Triton parameter extents must be positive")
+    return 1 << (value - 1).bit_length()
+
+
+def runtime_extent_pruning(
+    parameter_extents: dict[str, tuple[str, ...]],
+) -> dict[str, object]:
+    bindings = {
+        parameter: tuple(extents)
+        for parameter, extents in parameter_extents.items()
+    }
+
+    def early_config_prune(configs, named_args, **kwargs):
+        arguments = {**named_args, **kwargs}
+        limits = {}
+        for parameter, extents in bindings.items():
+            if not extents:
+                raise ValueError(
+                    f"Triton runtime extent constraint for {parameter!r} is empty"
+                )
+            missing = tuple(extent for extent in extents if extent not in arguments)
+            if missing:
+                raise ValueError(
+                    f"Triton runtime extent constraint for {parameter!r} "
+                    f"references unknown kernel arguments {missing!r}"
+                )
+            minimum_candidate = min(
+                config.kwargs[parameter] for config in configs
+            )
+            limits[parameter] = max(
+                minimum_candidate,
+                _power_of_two_ceiling(
+                    min(int(arguments[extent]) for extent in extents)
+                ),
+            )
+
+        accepted = [
+            config
+            for config in configs
+            if all(
+                config.kwargs[parameter] <= limit
+                for parameter, limit in limits.items()
+            )
+        ]
+        if not accepted:
+            raise ValueError(
+                "no Triton autotune configuration satisfies the runtime "
+                "extent constraints"
+            )
+        return accepted
+
+    return {"early_config_prune": early_config_prune}
+
+
 def _role_candidates(role: str) -> tuple[int, ...]:
     candidates = {
         "stream": (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
@@ -18,6 +74,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "query": (1, 2, 16, 32, 64, 128),
         "ragged_member": (32, 64, 128),
         "lane_pack": (64, 128, 256, 512),
+        "pointwise_lane": (128, 256, 512, 1024, 2048, 4096, 8192, 16384),
         "feature": (64, 128, 256),
         "reduction": (32, 64, 128),
         "program_m": (32, 64, 128, 256),
@@ -33,6 +90,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "query",
         "ragged_member",
         "lane_pack",
+        "pointwise_lane",
         "feature",
         "reduction",
     ):
@@ -55,6 +113,8 @@ def _completion_candidates(role: str) -> tuple[int, ...]:
 def autotune_configurations(
     parameter_map: dict[str, str],
     extra_parameter_candidates: dict[str, tuple[int, ...]] | None = None,
+    *,
+    parameter_extents: dict[str, int] | None = None,
 ) -> list[object]:
     import triton
 
@@ -86,6 +146,36 @@ def autotune_configurations(
             ({"stream_scaled": 2}, 3, 4),
             ({"stream_scaled": 4}, 3, 8),
             ({"stream_scaled": 8}, 2, 8),
+        ),
+        (
+            ({"pointwise_lane": 128}, 1, 4),
+            ({"pointwise_lane": 256}, 1, 4),
+            ({"pointwise_lane": 512}, 1, 4),
+            ({"pointwise_lane": 1024}, 1, 8),
+            ({"pointwise_lane": 2048}, 1, 8),
+            ({"pointwise_lane": 4096}, 1, 8),
+            ({"pointwise_lane": 8192}, 1, 8),
+            ({"pointwise_lane": 16384}, 1, 8),
+        ),
+        (
+            ({"program_m": 1, "pointwise_lane_n": 128}, 1, 4),
+            ({"program_m": 1, "pointwise_lane_n": 256}, 1, 4),
+            ({"program_m": 1, "pointwise_lane_n": 512}, 1, 4),
+            ({"program_m": 1, "pointwise_lane_n": 1024}, 1, 8),
+            ({"program_m": 2, "pointwise_lane_n": 256}, 1, 4),
+            ({"program_m": 4, "pointwise_lane_n": 256}, 1, 4),
+            ({"program_m": 8, "pointwise_lane_n": 256}, 1, 4),
+            ({"program_m": 16, "pointwise_lane_n": 256}, 1, 4),
+        ),
+        (
+            ({"pointwise_lane": 128, "program_n": 1}, 1, 4),
+            ({"pointwise_lane": 256, "program_n": 1}, 1, 4),
+            ({"pointwise_lane": 512, "program_n": 1}, 1, 4),
+            ({"pointwise_lane": 1024, "program_n": 1}, 1, 8),
+            ({"pointwise_lane": 256, "program_n": 2}, 1, 4),
+            ({"pointwise_lane": 256, "program_n": 4}, 1, 4),
+            ({"pointwise_lane": 256, "program_n": 8}, 1, 4),
+            ({"pointwise_lane": 256, "program_n": 16}, 1, 4),
         ),
         tuple(
             (
@@ -165,6 +255,7 @@ def autotune_configurations(
             (256, 64, 128, 8, 4, 4),
             (64, 256, 128, 8, 4, 4),
             (128, 128, 128, 8, 4, 4),
+            (64, 64, 256, 8, 3, 8),
             (128, 64, 64, 8, 4, 4),
             (64, 128, 64, 8, 4, 4),
             (128, 32, 64, 8, 4, 4),
@@ -207,11 +298,24 @@ def autotune_configurations(
     extra_values = tuple(product(*(extras[name] for name in extra_names)))
     if not extra_values:
         extra_values = ((),)
+    extents = parameter_extents or {}
     configurations = []
+    emitted = set()
     for values, stages, warps in choices:
         for combination in extra_values:
             target_values = _target_parameters(parameter_map, values)
             target_values.update(zip(extra_names, combination))
+            for parameter, extent in extents.items():
+                if parameter not in target_values:
+                    raise ValueError(
+                        f"Triton extent constraint names unknown parameter {parameter!r}"
+                    )
+                limit = _power_of_two_ceiling(extent)
+                target_values[parameter] = min(target_values[parameter], limit)
+            key = (tuple(sorted(target_values.items())), stages, warps)
+            if key in emitted:
+                continue
+            emitted.add(key)
             configurations.append(
                 triton.Config(
                     target_values,

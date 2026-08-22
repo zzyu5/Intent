@@ -22,6 +22,7 @@ from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics import dims_compatible
 from intent.frontend.semantics.types import is_integer
 from intent.language import bool as intent_bool
 from intent.language import DTypeCategory
@@ -55,7 +56,10 @@ def validate_indexed_value(
         broadcasted = broadcast_shape(value_shape, indexed_shape)
     except ValueError as error:
         lowerer.error(node, str(error))
-    if tuple(broadcasted) != tuple(indexed_shape):
+    if len(broadcasted) != len(indexed_shape) or not all(
+        dims_compatible(source, destination)
+        for source, destination in zip(broadcasted, indexed_shape)
+    ):
         lowerer.error(node, "stored/scattered value cannot broadcast to indexed shape")
     return lowerer.broadcast_value(value, tuple(indexed_shape), node)
 

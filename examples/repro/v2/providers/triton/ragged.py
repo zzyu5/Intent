@@ -38,7 +38,11 @@ def jagged_mean_case(context: Context) -> PreparedComparison:
     return PreparedComparison(generated, source, Tolerance(atol=2e-5, rtol=1e-5), cuda_graph=True)
 
 
-def moe_expert_projection(context: Context) -> PreparedComparison:
+def _moe_expert_projection(
+    context: Context,
+    *,
+    variant: str,
+) -> PreparedComparison:
     tokens, hidden, output, experts, topk = 2048, 4096, 14336, 8, 2
     x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(
@@ -73,21 +77,35 @@ def moe_expert_projection(context: Context) -> PreparedComparison:
         "intent_v2_triton_moe_projection_runtime",
     )
     runtime = projection_runtime._runtime_module()
+    if variant == "grouped":
+        source_path = "source/triton/meta-applied-ai/moe/grouped/v0_moe_fused.py"
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
+        block_m = config["BLOCK_SIZE_M"]
+    elif variant == "splitk":
+        source_path = "source/triton/meta-applied-ai/moe/splitk/v1_moe_fused.py"
+        config = {
+            "block_m": 32,
+            "block_n": 64,
+            "block_k": 64,
+            "group_m": 8,
+            "split_k": 2,
+        }
+        block_m = config["block_m"]
+    else:
+        raise ValueError(variant)
     source_module = runtime.load_source(
-        context.project_root
-        / "source/triton/meta-applied-ai/moe/grouped/v0_moe_fused.py",
-        "intent_v2_triton_moe_grouped_source",
+        context.project_root / source_path,
+        f"intent_v2_triton_moe_{variant}_source",
         stub_vllm=True,
     )
-    config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 8,
-    }
     sorted_ids, expert_ids, padded = projection_runtime._balanced_metadata(
         ids,
-        config["BLOCK_SIZE_M"],
+        block_m,
         experts,
     )
     routed_weight = torch.full(
@@ -113,17 +131,29 @@ def moe_expert_projection(context: Context) -> PreparedComparison:
         )
 
     launch()
-    source = PreparedLaunch(launch=launch, outputs=lambda: source_output)
+    source = PreparedLaunch(
+        launch=launch,
+        outputs=lambda: source_output,
+        prepare=source_output.zero_ if variant == "splitk" else None,
+    )
     return PreparedComparison(
         generated,
         source,
-        Tolerance(atol=1e-1, rtol=5e-2),
+        Tolerance(atol=2.5 if variant == "splitk" else 1e-1, rtol=5e-2),
         cuda_graph=False,
     )
+
+
+def moe_expert_projection(context: Context) -> PreparedComparison:
+    return _moe_expert_projection(context, variant="grouped")
+
+
+def moe_splitk_expert_projection(context: Context) -> PreparedComparison:
+    return _moe_expert_projection(context, variant="splitk")
 
 
 CASES = {
     "jagged_mean": jagged_mean_case,
     "moe_expert_projection": moe_expert_projection,
+    "moe_splitk_expert_projection": moe_splitk_expert_projection,
 }
-

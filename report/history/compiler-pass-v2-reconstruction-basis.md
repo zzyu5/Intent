@@ -887,7 +887,7 @@ TMA 只修补一种 Triton access surface。它不能回答 region、execution�
 
 - `report/compiler-space-v1.md`：V1 的有限编译空间、性能来源与 leaf 边界。
 - `report/compiler-pass-v2.md`：executable Physical IR、shared/provider passes、verifier 与 terminal translator 的成熟态定义。
-- `report/compiler-pass-v2-five-round-progress.md`：五轮真实实现、固定矩阵、定向 A/B、inventory 与当前缺口。
+- `report/history/compiler-pass-v2-five-round-progress.md`：五轮真实实现、固定矩阵、定向 A/B、inventory 与当前缺口。
 - `doc/dsl/model.md`、`doc/dsl/domains-and-control.md`、`doc/dsl/tensor-flow.md`：当前 DSL/KIR 语义合同。
 - `lib/Target/GPU/Transforms/Passes.cpp`、`Construct.cpp`、`Build.cpp`：当前 construct/verify pipeline 与 monolithic physical construction。
 - `include/intent/IR/PlanOps.td`、`lib/IR/PlanOps.cpp`：当前 Physical Program、decision ops、TargetProgram source string 与 verifier。

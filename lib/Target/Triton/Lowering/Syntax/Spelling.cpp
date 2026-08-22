@@ -13,6 +13,12 @@ std::optional<std::string> blockParameter(StringRef role) {
     return "BLOCK_SIZE_L";
   if (role.starts_with("lane_pack_"))
     return "BLOCK_SIZE_L" + role.drop_front(10).str();
+  if (role == "pointwise_lane")
+    return "BLOCK_SIZE_M";
+  if (role == "pointwise_lane_n")
+    return "BLOCK_SIZE_N";
+  if (role.starts_with("pointwise_lane_"))
+    return "BLOCK_SIZE_P" + role.drop_front(15).str();
   if (role == "program_m")
     return "BLOCK_SIZE_M";
   if (role == "ragged_member")

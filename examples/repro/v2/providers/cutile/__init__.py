@@ -9,6 +9,7 @@ from .position import CASES as POSITION_CASES
 from .regularization import CASES as REGULARIZATION_CASES
 from .routing import CASES as ROUTING_CASES
 from .scan import CASES as SCAN_CASES
+from .quantization import CASES as QUANTIZATION_CASES
 
 
 CASES = {
@@ -21,4 +22,5 @@ CASES = {
     **REGULARIZATION_CASES,
     **ROUTING_CASES,
     **SCAN_CASES,
+    **QUANTIZATION_CASES,
 }

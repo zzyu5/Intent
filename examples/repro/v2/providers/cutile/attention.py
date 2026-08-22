@@ -9,6 +9,7 @@ from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
 from kernels.streaming.attention import flash_gqa_attention_fwd
+from kernels.streaming.attention import flash_attention_bf16_fwd
 from kernels.streaming.attention import mla_prefill
 from kernels.streaming.attention_specialized import attention_sink_prefill
 from kernels.streaming.attention_specialized import gemma_gqa_prefill
@@ -28,6 +29,7 @@ from ...model import Tolerance
 from .common import official_source
 from .common import runtime_module
 from .common import tilegym_source
+from .. import implementation_gap
 
 
 def official_fmha(context: Context) -> PreparedComparison:
@@ -64,6 +66,42 @@ def official_fmha(context: Context) -> PreparedComparison:
             query_group_size=query_heads // key_heads,
             causal=True,
         )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
+        cuda_graph=True,
+    )
+
+
+def dense_attention_forward(context: Context) -> PreparedComparison:
+    batch, query_heads, key_heads, sequence, dimension = 2, 32, 8, 4096, 128
+    q = torch.randn(
+        (batch, query_heads, sequence, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, key_heads, sequence, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    scale = dimension**-0.5
+    _, generated = compile_single(
+        context,
+        flash_attention_bf16_fwd,
+        (q, k, v, scale),
+        constexprs={"HEAD_GROUP": query_heads // key_heads, "CAUSAL": True},
+    )
+    source_module = tilegym_source(
+        context,
+        "source/cutile/tilegym/attention/dense/attention.py",
+        "dense_attention_forward",
+    )
+    source = functional_launch(
+        lambda: source_module.tile_fmha(q, k, v, is_causal=True)
     )
     return PreparedComparison(
         generated,
@@ -566,10 +604,25 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
 
 CASES = {
     "official_fmha": official_fmha,
+    "dense_attention_forward": dense_attention_forward,
+    "grouped_flash_decode": implementation_gap(
+        "the source callable realizes one decode algorithm as compiler-private "
+        "split-K partial and reduction stages; the Physical Program does not yet "
+        "introduce that staging from the unsplit Intent algorithm"
+    ),
     "splitk_attention_reduce": splitk_reduce,
     "mla_prefill": mla_prefill_case,
     "attention_sink_prefill": attention_sink,
+    "attention_sink_decode": implementation_gap(
+        "the source callable realizes sink decode as compiler-private split-K "
+        "stages; encoding split offsets and partial buffers in author DSL would "
+        "move a physical decision into the algorithm"
+    ),
     "gemma_prefill": gemma_prefill,
+    "gemma_decode": implementation_gap(
+        "the source callable realizes windowed soft-cap decode as compiler-private "
+        "split-K stages; the Physical Program does not yet introduce that staging"
+    ),
     "absorbed_mla_decode": absorbed_mla,
     "sliding_window_attention": sliding_window,
     "attention_backward": attention_backward,

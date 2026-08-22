@@ -51,3 +51,9 @@ class ResultRow:
 
 
 CaseFactory: TypeAlias = Callable[[Context], PreparedComparison]
+
+
+class ComparisonUnavailable(RuntimeError):
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status

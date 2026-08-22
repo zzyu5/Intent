@@ -469,7 +469,9 @@ assignAxes(const target::KernelFacts &facts) {
     }
   }
   for (Operation *domain : facts.orderedDomains)
-    appendRole(ensure(domain).roles, "ordered");
+    if (!facts.serialLoopDomains.contains(domain) &&
+        !facts.runtimeSequentialDomains.contains(domain))
+      appendRole(ensure(domain).roles, "ordered");
   for (const auto &entry : facts.scans)
     if (entry.second.scalarConsumers)
       appendRole(ensure(entry.second.axis).roles, "ordered");
@@ -531,11 +533,16 @@ assignAxes(const target::KernelFacts &facts) {
   }
   for (const auto &entry : facts.sparseContractions) {
     const target::SparseContractionFact &contract = entry.second;
+    if (!contract.rowDomain || !contract.columnDomain ||
+        !contract.reductionDomain)
+      return entry.first->emitOpError(
+          "has incomplete canonical sparse-contraction axes");
     if (failed(assignMatrixRole(contract.rowDomain, "contraction_m",
                                 *entry.first)) ||
         failed(assignMatrixRole(contract.columnDomain, "contraction_n",
                                 *entry.first)))
       return failure();
+    appendRole(ensure(contract.reductionDomain).roles, "reduction");
     if (contract.rowDomain && contract.columnDomain &&
         contract.rowDomain != contract.columnDomain)
       matrixAxes.emplace_back(contract.rowDomain, contract.columnDomain);
@@ -556,7 +563,8 @@ assignAxes(const target::KernelFacts &facts) {
   facts.kernel.entry.walk([&](Operation *operation) {
     StringRef name = ::intent::target::semanticOperationName(*operation);
     if (name != "intent.view_store" && name != "intent.scatter_unique" &&
-        name != "intent.scatter_reduce")
+        name != "intent.scatter_reduce" && name != "intent.atomic_add" &&
+        name != "intent.atomic_cas")
       return;
     auto valueIndex =
         operation->getAttrOfType<IntegerAttr>("intent.value_operand_index");
@@ -574,12 +582,13 @@ assignAxes(const target::KernelFacts &facts) {
     if (axes == facts.valueAxes.end())
       return;
     for (const target::LogicalAxis &axis : axes->second) {
-      bool innerRole = axis.domain &&
-                       (facts.contractionDomains.contains(axis.domain) ||
-                        facts.reductionDomains.contains(axis.domain) ||
-                        facts.orderedDomains.contains(axis.domain));
-      if (!axis.domain ||
-          (innerRole && !facts.vectorDomains.contains(axis.domain)))
+      bool reductionRole =
+          axis.domain && (facts.contractionDomains.contains(axis.domain) ||
+                          facts.reductionDomains.contains(axis.domain));
+      bool orderedRole =
+          axis.domain && facts.orderedDomains.contains(axis.domain);
+      if (!axis.domain || reductionRole ||
+          (orderedRole && !facts.vectorDomains.contains(axis.domain)))
         continue;
       AxisChoice &choice = ensure(axis.domain);
       if (choice.programOrder)
@@ -590,13 +599,47 @@ assignAxes(const target::KernelFacts &facts) {
     }
   });
 
+  // Once a contraction result axis owns program space, its ownership range is
+  // also the local matrix-fragment extent.  Keeping the earlier derived lane
+  // role would describe a second, runtime-sized fragment range for the same
+  // logical axis and lets provider lowering observe two conflicting physical
+  // answers.  Intermediate contraction axes that do not own programs retain
+  // their lane role.
+  for (AxisChoice &choice : choices) {
+    bool matrixOwnership =
+        choice.programOrder && choice.tiled &&
+        (hasRole(choice.roles, "contraction_m") ||
+         hasRole(choice.roles, "contraction_n"));
+    if (matrixOwnership)
+      llvm::erase_if(choice.roles,
+                     [](const std::string &role) { return role == "lane"; });
+  }
+
+  SmallVector<unsigned> canonicalOrder(choices.size());
+  SmallVector<int64_t> canonicalNodes(choices.size());
+  std::iota(canonicalOrder.begin(), canonicalOrder.end(), 0);
+  for (unsigned position : canonicalOrder) {
+    auto node =
+        choices[position].domain->getAttrOfType<IntegerAttr>("intent.node");
+    if (!node) {
+      choices[position].domain->emitOpError(
+          "has no canonical Kernel IR node for physical axis ordering");
+      return failure();
+    }
+    canonicalNodes[position] = node.getInt();
+  }
+  llvm::sort(canonicalOrder, [&](unsigned lhs, unsigned rhs) {
+    return canonicalNodes[lhs] < canonicalNodes[rhs];
+  });
+
   if (programOrder == 0) {
     facts.kernel.entry.emitOpError(
         "has no independent output axis for GPU program ownership");
     return failure();
   }
 
-  for (AxisChoice &choice : choices) {
+  for (unsigned position : canonicalOrder) {
+    AxisChoice &choice = choices[position];
     if (choice.programOrder || choice.roles.size() != 1 ||
         !hasRole(choice.roles, "lane") ||
         !canDistributePointwiseLane(choice.domain, facts))
@@ -641,7 +684,18 @@ assignAxes(const target::KernelFacts &facts) {
     return current == 0 ? base.str()
                         : base.str() + "_" + std::to_string(current);
   };
-  for (AxisChoice &choice : choices) {
+  SmallVector<unsigned> physicalOrder(canonicalOrder);
+  llvm::sort(physicalOrder, [&](unsigned lhs, unsigned rhs) {
+    const std::optional<int64_t> &lhsOrder = choices[lhs].programOrder;
+    const std::optional<int64_t> &rhsOrder = choices[rhs].programOrder;
+    if (lhsOrder && rhsOrder)
+      return *lhsOrder < *rhsOrder;
+    if (lhsOrder || rhsOrder)
+      return lhsOrder.has_value();
+    return canonicalNodes[lhs] < canonicalNodes[rhs];
+  });
+  for (unsigned position : physicalOrder) {
+    AxisChoice &choice = choices[position];
     std::string packedTile = choice.packedLane
                                  ? indexedTile("lane_pack", laneTile)
                                  : std::string();
@@ -711,6 +765,8 @@ assignAxes(const target::KernelFacts &facts) {
               ? indexedTile("stream_scaled", scaledStreamTile)
           : facts.contractionDomains.contains(choice.domain)
               ? indexedTile("stream_contract", streamContractionTile)
+          : hasRole(choice.roles, "ragged_member")
+              ? indexedTile("ragged_member", raggedTile)
               : indexedTile("stream", streamTile);
       addRange(choice, "traversal", 0, tile);
       if (facts.serialLoopDomains.contains(choice.domain))
@@ -794,7 +850,8 @@ assignAxes(const target::KernelFacts &facts) {
   }
   SmallVector<unsigned> tiled;
   SmallVector<unsigned> scalar;
-  for (auto [position, choice] : llvm::enumerate(choices)) {
+  for (unsigned position : physicalOrder) {
+    const AxisChoice &choice = choices[position];
     if (!choice.programOrder || assigned.contains(position))
       continue;
     (choice.tiled ? tiled : scalar).push_back(position);
@@ -1406,7 +1463,15 @@ mlir::LogicalResult intent::gpu::formAutomaticBlocking(
       previous.push_back(&operation);
 
   mlir::OpBuilder builder(program.getContext());
-  builder.setInsertionPoint(program.getBody().front().getTerminator());
+  // Replace the conservative declarations in place.  Appending the refined
+  // declarations after operation bindings leaves consumers such as sparse
+  // contraction ahead of the AxisOps they reference, so the program is no
+  // longer a declaration-before-use physical program once the old decisions
+  // are erased.
+  if (previous.empty())
+    builder.setInsertionPoint(program.getBody().front().getTerminator());
+  else
+    builder.setInsertionPoint(previous.front());
   mlir::FailureOr<realization::PhysicalDecisions> decisions =
       realization::emitPhysicalDecisions(builder, facts, false);
   if (mlir::failed(decisions))

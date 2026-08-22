@@ -1,8 +1,6 @@
 # 后端 lowering
 
-Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、已经确定的 machine realization 与可选 search space，构造具体目标程序。
-
-完整 semantic path 位于 C++：`intent-compile` 分析 Kernel IR、构造并验证 machine plan，再由共享遍历框架按照 target capability 与 spelling table 逐 op 发射 Triton、cuTile 或 TileLang 源码。中间不物化第三份 target dialect。Python 只负责调用 compiler、加载产物和运行 entry。
+Backend lowering 先在同一 MLIR module 中运行 shared Physical Program construction/refinement，再运行 provider-local ProgramForms 与 materialization，得到 provider-legal Program。Terminal translator 只验证并序列化该 program 为 Triton、cuTile 或 TileLang source。Python 只负责调用 compiler、加载产物和运行 entry。
 
 ## 共享层与 target 叶子
 
@@ -14,11 +12,12 @@ Backend translator 接收同一 MLIR module 中的 canonical Intent Kernel IR、
 - execution-stage operation slice、stage-axis binding、同步，以及由这些内容派生的 dependency/intermediate index；
 - operation handler registry 与 unsupported-op 诊断机制。
 
-每个 target 叶子只提供：
+每个 provider 叶子提供：
 
-- capability check：这门 surface 能表达 realization 的哪个子集；
-- projection：共享物理概念在该 surface 中的 capability 与 spelling；
-- emission：canonical operation 加 Physical Plan 到目标语法的逐 op 机械映射；
+- provider-local ProgramForms/refinement：选择有 shared obligation 来源的 target form；
+- provider materialization：把已选 form 兑现为 provider-legal Program；
+- capability/verifier：拒绝无法表达或不合法的 form；
+- terminal translation：只序列化 provider-legal Program；
 - compile/run 接线以及对下层 tuner 的显式委托。
 
 接入第四门 GPU tile surface 不应增加 kernel 分析路径，也不应修改共享 emitter traversal；只新增 capability/spelling、leaf handlers 与 runtime adapter。
@@ -35,7 +34,7 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 | access footprint / logical validity | pointer mask 或收紧范围 | guarded copy / range predicate | checked load、gather 或 scatter |
 | persistent program choice | grid-stride program loop | persistent block loop | persistent block loop |
 
-一条 realization 可以让不规则 membership、ordered stream、head mapping 与尾块同时作用；target 不得把组合重新压回 kernel 类别字符串。Region argument、row-vector logical extent 与 stream/ragged relation 都由 Plan 显式绑定；target surface 只可读取并拼写，或拒绝自己不能表达的组合，不能另选 tile、ownership、流终点或遍历。
+一条 realization 可以让不规则 membership、ordered stream、head mapping 与尾块同时作用；provider 不得把组合重新压回 kernel 类别字符串。Region argument、row-vector logical extent 与 stream/ragged relation 都由 shared Physical Program 显式绑定；provider-local passes 可以在这些 obligation 下选择 target-specific access/storage/primitive form，但不能另选 shared ownership、流终点或遍历。
 
 ## Operation 对应关系
 
@@ -53,7 +52,7 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 
 ## Execution-stage 投影
 
-Plan 给出 stage operation slice、stage-axis logical binding、tile/worker 与 `same_stream` synchronization。公共 emission index 从 Kernel IR def-use 和 memory effects 派生 dependency、input/output、terminal、intermediate lifetime/visibility；三个 leaf 共用这份索引并按拓扑顺序发射 private kernels，不各自重建。Leaf 不重新划分 stage、不自行决定 workspace owner，也不允许合并 stages。不同 target family 可以在各自 realizer 中产生不同的初始 grouping，surface provider不能改写同一份 machine Plan。
+Shared Physical Program 给出 stage operation slice、stage-axis logical binding、tile/worker 与 `same_stream` synchronization。公共 analysis index 从 Kernel IR def-use 和 memory effects 派生 dependency、input/output、terminal、intermediate lifetime/visibility。Provider-local passes 可以建立 provider-specific materialization index并兑现对应 forms；terminal translator 不重新划分 stage、不重选 workspace owner，也不重建 shared physical decisions。不同 target family 可以在各自 realizer 中产生不同的初始 grouping，surface provider 不能改写同一份 shared grouping。
 
 ## 诊断边界
 

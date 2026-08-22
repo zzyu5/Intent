@@ -11,6 +11,7 @@ from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import runtime_module
+from .. import implementation_gap
 
 
 def per_token_fp8(context: Context) -> PreparedComparison:
@@ -53,4 +54,10 @@ def per_token_fp8(context: Context) -> PreparedComparison:
     )
 
 
-CASES = {"per_token_fp8": per_token_fp8}
+CASES = {
+    "per_token_fp8": per_token_fp8,
+    "block_fp4_quant": implementation_gap(
+        "the source output is a packed float4_e2m1fn_x2 tensor with explicit "
+        "nibble ordering; that storage contract is not a current Intent dtype"
+    ),
+}

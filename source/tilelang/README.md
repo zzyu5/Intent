@@ -4,7 +4,7 @@
 
 Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch reference 充当 TileLang source。
 
-## baseline-v2 entries（39）
+## baseline-v2 entries（37）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -21,7 +21,6 @@ Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch r
 | V1+V2 | FP8 GEMM | `tilelang/gemm/fp8/example_tilelang_gemm_fp8.py` / `matmul` | `4096×4096×14336`, FP8 | `python source/tilelang/tilelang/gemm/fp8/example_tilelang_gemm_fp8_runtime.py` |
 | V1+V2 | grouped GEMM | `tilelang/gemm/grouped/example_grouped_gemm_fwd.py` / `grouped_gemm` | group rows 256/512/1024/2048, `K=N=4096`, fp16 | `python source/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd_runtime.py` |
 | V1+V2 | 2:4 sparse GEMM | `tilelang/gemm/sparse_2to4/example_gemm_sp.py` / `matmul_sp_fp16` | `M=8192,N=14336,K=8192`, fp16 | `python source/tilelang/tilelang/gemm/sparse_2to4/example_gemm_sp_runtime.py` |
-| V2 | fused routed/shared MoE | `tilelang/moe/fused/example_fusedmoe_tilelang.py` / `custom_kernel` | DeepSeek widths, 8192 tokens, 8 routed experts, top-4 | `python source/tilelang/tilelang/moe/fused/example_fusedmoe_tilelang_runtime.py` |
 | V1+V2 | online softmax | `tilelang/normalization/online_softmax/online_softmax.py` / `softmax_kernel` | `8192×8192`, fp16 | `python source/tilelang/tilelang/normalization/online_softmax/online_softmax_runtime.py` |
 | V2 | RMSNorm | `tilelang/normalization/rms_norm/rms_norm.py` / `rms_norm` | `8192×4096`, fp32 | `python source/tilelang/tilelang/normalization/rms_norm/rms_norm_runtime.py` |
 | V2 | DeepSeek V3.2 top-k selector | `tilelang/routing/deepseek_v32_topk/topk_selector.py` / `tl_topk` | `32×32768`, top-k 2048, fp32 | `python source/tilelang/tilelang/routing/deepseek_v32_topk/topk_selector_runtime.py` |
@@ -30,7 +29,6 @@ Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch r
 | V2 | fused chunk linear attention forward | `tilelang/linear_attention/fused_chunk_forward/example_linear_attn_fwd.py` / `tl_fused_chunk_fwd_kernel` | `B=1,S=2048,H=16,D=128`, fp16 | `python source/tilelang/tilelang/linear_attention/fused_chunk_forward/example_linear_attn_fwd_runtime.py` |
 | V2 | fused chunk linear attention backward | `tilelang/linear_attention/fused_chunk_backward/example_linear_attn_bwd.py` / `tl_fused_chunk_bwd_kernel` | same model shape, dQ/dK/dV | `python source/tilelang/tilelang/linear_attention/fused_chunk_backward/example_linear_attn_bwd_runtime.py` |
 | V2 | chunk retention forward | `tilelang/linear_attention/retention/example_retention_fwd.py` / `chunk_retention_fwd_kernel` | `B=1,S=2048,H=16,D=128`, fp16 | `python source/tilelang/tilelang/linear_attention/retention/example_retention_fwd_runtime.py` |
-| V2 | attention-sink backward | `tilelang/attention/attention_sink_backward/example_mha_sink_bwd_bhsd.py` / `flashattn_bwd` | `B=2,H=16,S=2048,D=128`, fp16 | `python source/tilelang/tilelang/attention/attention_sink_backward/example_mha_sink_bwd_bhsd_runtime.py` |
 | V2 | block-causal attention | `tilelang/attention/block_causal/block_causal_attention.py` / `block_causal_attention` | `B=2,S=4096,H=16,D=128`, fp16 | `python source/tilelang/tilelang/attention/block_causal/block_causal_attention_runtime.py` |
 | V2 | varlen block-causal attention | `tilelang/attention/block_causal_varlen/block_causal_attention_varlen.py` / varlen wrapper | packed lengths 4096/3840/3584/3328, `H=16,D=128` | `python source/tilelang/tilelang/attention/block_causal_varlen/block_causal_attention_varlen_runtime.py` |
 | V2 | native sparse attention forward | `tilelang/attention/native_sparse_forward/example_tilelang_nsa_fwd.py` / `native_sparse_attention` | `B=2,S=4096,QH=32,KVH=4,D=128`, 64 blocks | `python source/tilelang/tilelang/attention/native_sparse_forward/example_tilelang_nsa_fwd_runtime.py` |
@@ -56,7 +54,6 @@ Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch r
 - `tilelang/attention/native_sparse_decode/reference.py`：decode example 的原始 reference import；不进入 V2 计时。
 - `tilelang/attention/sparse_mla_backward/sparse_mla_fwd.py` 与 `tilelang/attention/support/deepseek_v32_utils.py`：backward 的 forward state 与上游工具依赖。
 - `tilelang/gemm/sparse_2to4/sparse_utils.py`、`tilelang/gemm/dequant_bf16_fp4/dequantize_utils.py`：压缩 metadata / 解包参考依赖。
-- `tilelang/moe/fused/example_fusedmoe_torch.py`：上游 source 的 reference import；不作为 baseline。
 - `tilelang/support/{runtime.py,runtime_cases.py}`：加载 vendored 源码、构造模型级输入并输出一次运行结果。
 - 两个 fused linear-attention 文件只在导入时引用 FLA reference；runtime 为这些未计时 reference symbols 提供明确拒绝的包边界，实际运行的 TileLang kernel 源码保持原样。
 

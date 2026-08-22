@@ -1,6 +1,7 @@
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 
 #include "Intent/Target/GPU/Realization/Analysis.h"
+#include "Intent/Target/Common/Lowering/ProgramAnalysis.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -60,6 +61,31 @@ bool PhysicalProgramAnalysis::isScalarAxis(int64_t node) const {
 bool PhysicalProgramAnalysis::isPackedScalarAxis(int64_t node) const {
   return axisHasRole(node, "parallel") && axisHasRole(node, "lane") &&
          axisHasRole(node, "packed_lane");
+}
+
+plan::AxisOp PhysicalProgramAnalysis::getPurePointwiseProgramLane() const {
+  if (facts->parallels.empty() || !facts->scans.empty() ||
+      !facts->stateStreams.empty() || !facts->raggedRelations.empty() ||
+      !facts->contractions.empty() || !facts->sparseContractions.empty() ||
+      !facts->logicalBuffers.empty() || !facts->reductionDomains.empty() ||
+      !facts->countPartitions.empty() || !stages.empty() ||
+      target::lowering::hasNonReplayableEffect(
+          kernel->entry.getOperation()))
+    return {};
+
+  plan::AxisOp pointwise;
+  for (const auto &entry : axes) {
+    plan::AxisOp axis = entry.second;
+    if (!axis.getProgramOrderAttr() || isScalarAxis(axis.getNode()))
+      continue;
+    if (!axisHasRole(axis.getNode(), "parallel") ||
+        !axisHasRole(axis.getNode(), "lane"))
+      return {};
+    if (!pointwise ||
+        axis.getProgramOrder().value() > pointwise.getProgramOrder().value())
+      pointwise = axis;
+  }
+  return pointwise;
 }
 
 FailureOr<std::unique_ptr<PhysicalProgramAnalysis>>

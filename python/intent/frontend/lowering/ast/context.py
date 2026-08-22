@@ -24,6 +24,7 @@ from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics import dims_compatible
 from intent.language import ViewKind
 from intent.language import DType
 from intent.language import DTypeCategory
@@ -311,7 +312,10 @@ class FunctionLowerer:
             broadcasted = tuple(broadcast_shape(source_shape, target_shape))
         except ValueError as error:
             self.error(node, str(error))
-        if broadcasted != target_shape:
+        if len(broadcasted) != len(target_shape) or not all(
+            dims_compatible(source, destination)
+            for source, destination in zip(broadcasted, target_shape)
+        ):
             self.error(node, "value cannot broadcast to the required result shape")
         operation = self.emit(
             OperationKind.BROADCAST,

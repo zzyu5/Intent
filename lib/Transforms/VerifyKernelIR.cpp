@@ -869,12 +869,6 @@ LogicalResult verifyKernelModule(ModuleOp module) {
       if (!isIntentOperation(operation))
         return operation->emitOpError("is not legal inside an Intent function"),
                WalkResult::interrupt();
-      if (kind.getValue() == "kernel" &&
-          operation->getName().getStringRef() == "intent.indices" &&
-          operation->getParentOp() == function.getOperation())
-        return operation->emitOpError(
-                   "requires an enclosing execution region that selects the indexed range"),
-               WalkResult::interrupt();
       auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
       if (!node || node.getInt() < 0 ||
           !operationIDs.insert(node.getInt()).second) {

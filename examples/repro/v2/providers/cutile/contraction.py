@@ -5,6 +5,7 @@ import torch
 from kernels.contraction.batched_gemm import batched_gemm_nn
 from kernels.contraction.block_scaled import block_scaled_matmul
 from kernels.contraction.gemm import Activation
+from kernels.contraction.gemm import bf16_gemm
 from kernels.contraction.gemm import gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_bf16
 
@@ -76,6 +77,37 @@ def dense_gemm(context: Context) -> PreparedComparison:
         generated,
         source,
         Tolerance(atol=1e-2, rtol=1e-2),
+        cuda_graph=True,
+    )
+
+
+def tilegym_dense_gemm(context: Context) -> PreparedComparison:
+    m, k, n = 8192, 4096, 11008
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
+    _, generated = compile_single(
+        context,
+        bf16_gemm,
+        (a, b),
+    )
+    source_module = tilegym_source(
+        context,
+        "source/cutile/tilegym/gemm/dense/matmul.py",
+        "tilegym_dense_gemm",
+    )
+    source = functional_launch(
+        lambda: source_module.matmul(
+            a,
+            b,
+            trans_a=False,
+            trans_b=False,
+            static_persistent=True,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=True,
     )
 
@@ -161,6 +193,7 @@ def grouped_gemm(context: Context) -> PreparedComparison:
 CASES = {
     "block_scaled_gemm": block_scaled_gemm,
     "dense_gemm": dense_gemm,
+    "tilegym_dense_gemm": tilegym_dense_gemm,
     "batched_gemm": batched_gemm,
     "grouped_gemm": grouped_gemm,
 }

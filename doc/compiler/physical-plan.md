@@ -1,16 +1,16 @@
-# Physical Plan
+# Physical Program 与 Plan decisions
 
-Physical Plan 是 compiler-owned 的机器实现决定，不是用户填写的 schedule DSL，也不复制 Kernel IR 中的算法。
+Physical Program 是 compiler-owned、可由 pass 改写的 executable MLIR；其中的 Plan decisions 记录多个合法机器方案中已经选定的实现决定。二者都不是用户填写的 schedule DSL，也不复制 Kernel IR 中的算法。
 
-## 两类对象
+## Executable program 与搜索空间
 
-`intent_plan.realization` 保存已经确定、发射器必须机械兑现的决定：逐轴角色与 range、program-space 映射、block extent、logical buffer residency、transfer/padding、structured primitive 的物理角色，以及确有需要的 execution-stage operation slice、stage-axis tile/worker binding 与 synchronization。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生一次语义索引，Plan 通过稳定 node/value/axis 引用保存已选物理关系，不复制第二份算法 schema。
+`intent_plan.program` 是 compiler-owned、唯一可持续改写的 executable Physical Program。Shared passes 在其中确定跨 provider 仍成立的 execution、value、access/validity 与 structured-operation obligations；provider-local ProgramForms 再在同一 program 中选择并物化 provider-specific forms。Ragged relation、state stream、def-use 和算法阶段仍以 Kernel IR 为唯一真理；公共 KernelModel 只派生语义索引，Physical Program 通过稳定 node/value/axis 引用保存已选物理关系，不复制第二份算法 schema。
 
-Structured primitive 的算法语义只从 Kernel IR 读取，Plan 只补充 emitter 机械投影所需的已选物理角色与逻辑引用。例如 scan 的 combine/inclusive semantics 来自 canonical scan op，Plan 绑定 logical axis/tensor axis、result/carry residency、owner 与 materialization slice；leaf 逐 op 同时读取这两个权威来源，但不得根据周围结构重推 axis、owner 或 materialization。Chunk/carry/materialization 尚未选择时则明确缺失，不能由某个 leaf 私自补成自己的实现策略。
+Structured primitive 的算法语义只从 Kernel IR 读取，Physical Program 只补充 lowering 所需的已选物理角色与逻辑引用。例如 scan 的 combine/inclusive semantics 来自 canonical scan op，shared passes 绑定 logical axis/tensor axis、result/carry residency、owner 与 operation slice；provider-local passes 可以在这些绑定下选择 target materialization form，但不得根据周围结构重推 shared axis、owner 或算法语义。
 
 `intent_plan.search_space` 保存尚未选择、明确委托给目标后端 tuner 的合法轴和参数角色。Realizer 负责证明候选的结构合法性并给出参数关系；候选值、排序和赢家由 Triton、cuTile 或 TileLang 自带 tuner 决定。源码结构选择不进入 search space。
 
-两类对象不能混用：realization 中不存在“运行时再猜”的字段，search space 也不能改变 ownership、遍历顺序、边界语义或数值语义。
+两类对象不能混用：Physical Program 中不存在“运行时再猜”的字段，search space 也不能改变 ownership、遍历顺序、边界语义或数值语义。
 
 ## 组合式逐轴决策
 
@@ -28,7 +28,7 @@ Physical Plan 使用 Kernel IR 的稳定 operation/value ID 引用逻辑节点�
 - machine realization 保持 logical workset、def-use、effect、state 与 ABI；
 - target projection 只使用该表面真实能表达的 realization 子集。
 
-Plan 只由 C++ `intent-compile` 的 realization 阶段构造。Python frontend 到 canonical Kernel MLIR 为止；项目中没有 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
+Shared Physical Program 由 C++ `intent-compile` 的 construction/refinement pipeline 构造并验证；provider-local passes 随后在同一 MLIR program 上完成 form selection/materialization。Python frontend 到 canonical Kernel MLIR 为止；项目中没有 Python `PhysicalPlan`、Python Plan verifier 或 Python Plan serializer。
 
 ## Execution stages
 
@@ -70,7 +70,7 @@ W=\{\text{program / CTA / thread / task}\}
 
 ## 数值与实现边界
 
-Kernel IR 保存数学角色、dtype、累加语义、logical validity、state transition 与 effect。Plan 可以选择 tile、ownership、遍历、storage、target primitive、stage 和合法搜索轴；不能改变 tensor-flow、logical workset、wrapper-visible ABI 或数值角色。
+Kernel IR 保存数学角色、dtype、累加语义、logical validity、state transition 与 effect。Shared Physical Program 可以选择跨 provider 成立的 granularity、ownership、遍历、storage obligation、stage 和合法搜索轴；target primitive、target-specific access/storage form 等 provider choices 由 provider-local ProgramForms 选择并记录。任何一层都不能改变 tensor-flow、logical workset、wrapper-visible ABI 或数值角色。
 
 Layout 推断、寄存器分配、指令选择以及给定参数后的低层流水线尽量委托给下层。某个 surface 中不存在的概念不会为“字段对齐”而被抬到共享 Plan；它要求显式打印的机器决定则必须来自同一份 realization，不能在 emitter 中重新选择。
 

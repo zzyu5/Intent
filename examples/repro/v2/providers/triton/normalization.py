@@ -5,6 +5,7 @@ import torch
 from kernels.activation.swiglu import swiglu_forward
 from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
 from kernels.normalization.layer_norm import layer_norm_f16
+from kernels.normalization.layer_norm import layer_norm_bf16
 from kernels.normalization.rms_norm import rms_norm_bf16
 from kernels.normalization.softmax import stable_softmax_f16
 
@@ -50,6 +51,27 @@ def layer_norm(context: Context) -> PreparedComparison:
         lambda: source_function(x, (hidden,), weight, bias, 1e-5)
     )
     return PreparedComparison(generated, source, Tolerance(atol=1e-2), cuda_graph=True)
+
+
+def flash_layer_norm(context: Context) -> PreparedComparison:
+    hidden = 4096
+    x = torch.randn((8192, hidden), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
+    arguments = (x, weight, bias, 1.0 / hidden, 1e-5)
+    _, generated = compile_single(context, layer_norm_bf16, arguments)
+    runtime = _runtime(
+        context,
+        "source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py",
+        "intent_v2_triton_flash_layer_norm",
+    )
+    source = functional_launch(lambda: runtime.upstream(arguments))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=1e-2),
+        cuda_graph=True,
+    )
 
 
 def swiglu(context: Context) -> PreparedComparison:
@@ -98,11 +120,35 @@ def rms_norm(context: Context) -> PreparedComparison:
     return PreparedComparison(generated, source, Tolerance(atol=2e-2, rtol=1e-2), cuda_graph=True)
 
 
+def xformers_rms_norm(context: Context) -> PreparedComparison:
+    hidden = 4096
+    x = torch.randn((8192, hidden), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
+    arguments = (x, weight, 1.0 / hidden, 1e-6)
+    _, generated = compile_single(context, rms_norm_bf16, arguments)
+    runtime = _runtime(
+        context,
+        "source/triton/xformers/normalization/rms_norm/rmsnorm_kernels_runtime.py",
+        "intent_v2_triton_xformers_rms_norm",
+    )
+    source_module = runtime.load_source()
+    source = functional_launch(
+        lambda: source_module._rms_norm_forward(x, weight, 1e-6)
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=1e-2),
+        cuda_graph=True,
+    )
+
+
 CASES = {
     "fused_softmax": fused_softmax,
     "layer_norm": layer_norm,
+    "flash_layer_norm": flash_layer_norm,
     "swiglu": swiglu,
     "fused_add_rms_norm": fused_add_rms,
     "rms_norm": rms_norm,
+    "xformers_rms_norm": xformers_rms_norm,
 }
-

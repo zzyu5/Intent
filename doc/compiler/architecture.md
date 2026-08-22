@@ -9,11 +9,15 @@ Source Frontend
           ↓
 Canonical Intent Kernel MLIR
           ↓
-Realizer
+Shared Physical Program construction/refinement
           ↓
-Physical Plan MLIR
+Shared Physical Program MLIR
           ↓
-MLIR verifier + Backend Translator
+Provider-local ProgramForms + materialization
+          ↓
+Provider-legal Program + verifier
+          ↓
+Terminal translator
           ↓
 Generated target source
           ↓
@@ -49,17 +53,17 @@ Realizer 接收 Kernel IR、机器能力与 compile policy，从完整 logical d
 
 Realizer 不修改 source algorithm，不执行 graph-level fusion/fission，也不改变 wrapper-visible ABI。
 
-Backend boundary 从 Intent Kernel MLIR 开始。C++/MLIR compiler 解析并验证 Kernel MLIR，通过共享分析、per-op handler、合法性证明与 target policy 构造 `intent_plan` dialect。Python compiler 只负责把 Kernel MLIR 送入该工具，不保存 Physical Plan 对象，也不执行 tile、pipeline 或 launch 决策。
+Backend boundary 从 Intent Kernel MLIR 开始。C++/MLIR compiler 解析并验证 Kernel MLIR，先由 shared passes 构造并逐步细化唯一的 `intent_plan.program` Physical Program；provider-local ProgramForms 与 materialization 随后把它变成 provider-legal Program，terminal translator 只序列化该结果。Python compiler 只负责把 Kernel MLIR 送入该工具，不保存 Physical Program 对象，也不执行 tile、pipeline 或 launch 决策。
 
-## Physical Plan
+## Physical Program 与 Plan decisions
 
-Physical Plan 是 realizer 的 target realization 结果，是独立于 source language 的 MLIR dialect。它通过稳定 node/value ID 把已选物理决定绑定到 Kernel IR，可以验证逐轴 range、operation binding、stage slice/synchronization 与 target capability，再交给 backend lowering。由 Kernel IR 与 stage slice 唯一得到的 dependency、boundary values、terminal、lifetime 和 visibility 只存在于可重算的公共 emission index，不进入 Plan schema。正式边界中只有 MLIR Plan；不存在 Python Plan、Python Plan serializer 或绕过 MLIR verifier 的旁路输入。
+Physical Program 是 compiler-owned、可由 passes 持续改写的 executable MLIR。Shared passes 通过稳定 node/value ID 把跨 provider 成立的已选物理决定绑定到 Kernel IR，并验证逐轴 range、operation binding、stage slice 与 synchronization；provider-local passes 再选择和物化各 surface 所需的合法 form。由 Kernel IR 与 stage slice 唯一得到的 dependency、boundary values、terminal、lifetime 和 visibility 只存在于可重算的公共 analysis index，不进入第二份 schema。不存在 Python Plan、Python Plan serializer 或绕过 MLIR verifier 的旁路输入。
 
-详见 [Physical Plan](physical-plan.md)。
+详见 [Physical Program 与 Plan decisions](physical-plan.md)。
 
-## Backend Emitter
+## Provider lowering 与 terminal translation
 
-Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physical Plan MLIR`，通过共享遍历和 target spelling table 直接生成目标 program。每个 target family 提供自己的 realizer 与 emitter；不同 surface 只是同一 machine Plan 的投影，另一类机器则产生自己的 machine Plan。Region argument、row-vector extent、stream/ragged relation 与 stage-axis 的已选物理绑定都进入可验证的 Physical Plan；可重算的数据流边界由公共 KernelModel/SurfacePlan 建一次临时索引。Target leaf 只消费这些来源，不再重选。Kernel IR 与 Physical Plan 之外没有第三份 target IR。Realization 与 emission 可以在同一 compiler process 内连续完成，但仍以组合 MLIR 作为严格阶段边界。目标语言即使是可读的 Python source，也不表示后端决定由 Python 实现，更不要求先转换成该目标自己的 MLIR。
+Provider leaf 由 provider-local ProgramForms/refinement、provider materialization 和 terminal translator 组成。前两者读取并改写同一 Physical Program，选择并物化该 surface 所需的合法 form；terminal translator 只把已经合法化的 provider Program 序列化为目标 source、entry 与 wrapper。不同 GPU surface 共享同一算法与 shared physical obligations，但不要求具有同样粒度的 provider forms；另一类机器则拥有自己的 physical pipeline。Region argument、row-vector extent、stream/ragged relation 与 stage-axis 的 shared 绑定进入可验证的 Physical Program，可重算的数据流边界由公共 KernelModel/analysis index 建一次临时索引。Provider-local passes 可以作有来源的 target-form 选择；terminal translator 不再作结构选择。目标语言即使是可读的 Python source，也不表示物理决定由 Python frontend 实现。
 
 ## 每一层的唯一权威来源
 
@@ -67,14 +71,15 @@ Target emitter 只接收经过 MLIR parser 与 verifier 的 `Kernel IR + Physica
 |---|---|---|
 | Kernel IR | ABI、logical workset、tensor-flow、typed combiner、state/control、index relation、effects | tile、worker、storage、target spelling |
 | KernelModel / analysis index | 从 Kernel IR 重算的 provenance、def-use、shape、ragged/stream relation、stage boundary | 独立 schema、serializer、与 Kernel IR 一致性 verifier、物理选择 |
-| Physical Plan | 多个合法机器方案中已经选定的 axis/range、ownership、tile、storage、operation slice、stage-axis binding、synchronization | 可从 Kernel IR 与所选决定唯一重算的第二份算法事实 |
-| Target leaf | capability declaration、Plan concept 到目标 API/语法的映射、compile/run 接线 | kernel 分类、ownership/tile/流终点重选、算法改写 |
+| Shared Physical Program | 多个合法机器方案中已经选定的 axis/range、ownership、granularity、storage obligation、operation slice、stage-axis binding、synchronization | 可从 Kernel IR 与所选决定唯一重算的第二份算法事实 |
+| Provider-local ProgramForms | target capability 下的 access/storage/primitive form 与 materialization | kernel 分类、shared ownership/流终点重选、算法改写 |
+| Terminal translator | provider-legal Program 到目标 API/语法的确定性序列化与 compile/run 接线 | 结构选择、shape/provenance 反推、算法改写 |
 | 下层 compiler/tuner | layout、寄存器、指令、低层 pipeline，以及已委托候选的评测和赢家 | Intent source algorithm 与 wrapper orchestration |
 
 详见 [后端 lowering](backend-lowering.md)。
 
 ## Compiled Artifact 与 runtime
 
-Artifact 保存组合 MLIR、可读生成源码、可调用 entry，以及首次真实 JIT 后得到的后端/低层 IR。Launch 与 execution-stage policy 位于 Physical Plan 和生成源码中，不再以第二套 Python 配置对象保存。Runtime 只负责物化并提交这个 logical entry；完整图与多 source-kernel 调度仍在 Python wrapper。
+Artifact 保存组合 MLIR、可读生成源码、可调用 entry，以及首次真实 JIT 后得到的后端/低层 IR。Launch 与 execution-stage policy 位于 Physical Program 和生成源码中，不再以第二套 Python 配置对象保存。Runtime 只负责物化并提交这个 logical entry；完整图与多 source-kernel 调度仍在 Python wrapper。
 
 详见 [编译产物与运行边界](compiled-artifact.md)。

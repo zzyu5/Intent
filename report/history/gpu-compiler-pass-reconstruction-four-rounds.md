@@ -12,7 +12,7 @@
 共同的设计依据是：
 
 ```text
-report/compiler-pass-v2-reconstruction-basis.md
+report/history/compiler-pass-v2-reconstruction-basis.md
 ```
 
 本报告不以新增文件数、pass 数量或 registry 数量判断完成度，而是逐层回答：

@@ -279,6 +279,12 @@ private:
   llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
   llvm::DenseMap<int64_t, std::string> axisIndices;
+  llvm::DenseMap<int64_t, llvm::SmallVector<std::string>>
+      activeTraversalIndices;
+  llvm::DenseMap<
+      mlir::Operation *,
+      llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>
+      streamAxisRestores;
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
   bool requiresPreallocatedOutputs = false;

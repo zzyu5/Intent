@@ -15,10 +15,11 @@ def embedding_forward_lookup(
 ):
     M = indices.shape[0]
     D = embedding_table.shape[1]
+    tokens = I.domain(0, M)
     features = I.domain(0, D)
-    rows = indices[I.domain(0, M)]
+    rows = indices[tokens]
     I.assume_in_bounds(rows, embedding_table, axis=0)
-    output[I.domain(0, M), features] = embedding_table[rows, features]
+    output[tokens, features] = embedding_table[rows, features]
 
 
 @intent.kernel
@@ -29,10 +30,11 @@ def embedding_forward_lookup_bf16(
 ):
     M = indices.shape[0]
     D = embedding_table.shape[1]
+    tokens = I.domain(0, M)
     features = I.domain(0, D)
-    rows = indices[I.domain(0, M)]
+    rows = indices[tokens]
     I.assume_in_bounds(rows, embedding_table, axis=0)
-    output[I.domain(0, M), features] = embedding_table[rows, features]
+    output[tokens, features] = embedding_table[rows, features]
 
 
 @intent.kernel

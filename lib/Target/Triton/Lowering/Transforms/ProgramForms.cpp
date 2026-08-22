@@ -59,10 +59,60 @@ bool isRuntimeABIDimension(const target::KernelModel &kernel,
   return false;
 }
 
+LogicalResult realizePointwiseLaneForm(
+    gpu::PhysicalProgramAnalysis &analysis,
+    intent::plan::SearchSpaceOp searchSpace) {
+  if (!searchSpace)
+    return success();
+  intent::plan::AxisOp pointwiseAxis =
+      analysis.getPurePointwiseProgramLane();
+  if (!pointwiseAxis)
+    return success();
+  intent::plan::RangeOp ownership =
+      analysis.getRange(pointwiseAxis.getNode(), "ownership");
+  if (!ownership || !ownership.getTile().starts_with("program_"))
+    return success();
+  StringRef ownershipRole = ownership.getTile();
+  std::string pointwiseRole = ownershipRole == "program_m"
+                                  ? "pointwise_lane"
+                              : ownershipRole == "program_n"
+                                  ? "pointwise_lane_n"
+                                  : "pointwise_lane_" +
+                                        ownershipRole.drop_front(8).str();
+
+  auto declarations = searchSpace.getBody().getOps<intent::plan::AutotuneOp>();
+  if (!llvm::hasSingleElement(declarations))
+    return searchSpace.emitOpError(
+        "Triton pointwise-lane form requires one autotune declaration");
+  intent::plan::AutotuneOp autotune = *declarations.begin();
+  OpBuilder builder(searchSpace.getContext());
+  SmallVector<Attribute> parameters(autotune.getParameters().begin(),
+                                    autotune.getParameters().end());
+  unsigned replaced = 0;
+  for (Attribute &parameter : parameters) {
+    auto role = dyn_cast<StringAttr>(parameter);
+    if (role && role.getValue() == ownership.getTile()) {
+      parameter = builder.getStringAttr(pointwiseRole);
+      ++replaced;
+    }
+  }
+  if (replaced != 1)
+    return autotune.emitOpError(
+        "does not declare exactly one innermost pointwise-lane parameter");
+  ownership->setAttr("tile", builder.getStringAttr(pointwiseRole));
+  autotune->setAttr("parameters", builder.getArrayAttr(parameters));
+  return success();
+}
+
 LogicalResult realizeProgram(intent::plan::ProgramOp program,
                              intent::plan::SearchSpaceOp searchSpace) {
   FailureOr<std::unique_ptr<gpu::PhysicalProgramAnalysis>> analysis =
       gpu::PhysicalProgramAnalysis::compute(program);
+  if (failed(analysis))
+    return failure();
+  if (failed(realizePointwiseLaneForm(**analysis, searchSpace)))
+    return failure();
+  analysis = gpu::PhysicalProgramAnalysis::compute(program);
   if (failed(analysis))
     return failure();
   intent::plan::LaunchOp launch = (*analysis)->getLaunch();

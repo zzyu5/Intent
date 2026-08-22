@@ -1,6 +1,7 @@
 #ifndef INTENT_TARGET_COMMON_ANALYSIS_CONTRACTREPLAY_H
 #define INTENT_TARGET_COMMON_ANALYSIS_CONTRACTREPLAY_H
 
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -23,7 +24,7 @@ struct ContractOperandReplay {
 inline bool isReplayableContractProducer(mlir::Operation &operation) {
   if (operation.getNumRegions() != 0 || operation.getNumResults() != 1)
     return false;
-  llvm::StringRef name = operation.getName().getStringRef();
+  llvm::StringRef name = semanticOperationName(operation);
   return name == "intent.view_load" || name == "intent.indices" ||
          name == "intent.broadcast" || name == "intent.unary" ||
          name == "intent.binary" || name == "intent.compare" ||
@@ -53,7 +54,7 @@ analyzeContractOperandReplay(mlir::Value operand,
       if (!collect(input))
         return false;
     replay.producers.push_back(definition);
-    if (definition->getName().getStringRef() == "intent.view_load")
+    if (semanticOperationName(*definition) == "intent.view_load")
       replay.transfers.push_back(definition);
     return true;
   };
@@ -63,7 +64,7 @@ analyzeContractOperandReplay(mlir::Value operand,
   llvm::DenseSet<mlir::Operation *> loadDependent;
   for (mlir::Operation *producer : replay.producers) {
     bool dependsOnLoad =
-        producer->getName().getStringRef() == "intent.view_load" ||
+        semanticOperationName(*producer) == "intent.view_load" ||
         llvm::any_of(producer->getOperands(), [&](mlir::Value input) {
           mlir::Operation *definition = input.getDefiningOp();
           return definition && loadDependent.contains(definition);

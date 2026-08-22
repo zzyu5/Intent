@@ -808,6 +808,20 @@ FailureOr<LogicalAxis> axisFromLabel(StringRef label, KernelFacts &facts,
   return failure();
 }
 
+LogicalResult bindDomainAxisLabel(Operation &operation, KernelFacts &facts) {
+  if (operation.getNumResults() != 1)
+    return operation.emitOpError("has no canonical domain result");
+  FailureOr<int64_t> value = getValueID(
+      operation.getResult(0), facts.kernel, operation,
+      "domain result logical-axis binding");
+  FailureOr<LogicalAxis> logical =
+      axisFromDomain(operation, facts, operation);
+  if (failed(value) || failed(logical))
+    return failure();
+  facts.axisLabels["?region_" + std::to_string(*value) + "_0"] = *logical;
+  return success();
+}
+
 LogicalResult bindResultAxes(Operation &operation, unsigned resultIndex,
                              SmallVector<LogicalAxis> axes,
                              KernelFacts &facts) {
@@ -1544,18 +1558,6 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                  operation.getNumOperands() != 3) ||
                 operation.getNumResults() != 1)
               return operation.emitOpError("has no canonical domain schema");
-            auto bindDomainResultAxis = [&]() -> LogicalResult {
-              FailureOr<int64_t> node = getValueID(
-                  operation.getResult(0), facts.kernel, operation,
-                  "domain result logical-axis binding");
-              FailureOr<LogicalAxis> logical =
-                  axisFromDomain(operation, facts, operation);
-              if (failed(node) || failed(logical))
-                return failure();
-              facts.axisLabels["?region_" + std::to_string(*node) + "_0"] =
-                  *logical;
-              return success();
-            };
             Operation *start = operation.getOperand(0).getDefiningOp();
             Operation *stop = operation.getOperand(1).getDefiningOp();
             auto startValue =
@@ -1590,7 +1592,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               facts.staticDomainExtents[&operation] = extent;
               facts.staticDomainBounds[&operation] =
                   {startValue.getInt(), stopValue.getInt()};
-              return bindDomainResultAxis();
+              return bindDomainAxisLabel(operation, facts);
             }
             bool zeroBased = staticStart && startValue.getInt() == 0;
             if (zeroBased && stop &&
@@ -1598,7 +1600,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 stop->getNumOperands() == 1) {
               facts.domainSources[&operation] = stop->getOperand(0);
               facts.domainSourceAxes[&operation] = axis.getInt();
-              return bindDomainResultAxis();
+              return bindDomainAxisLabel(operation, facts);
             }
             auto validLoopBound = [](Type type) {
               return type.isIntOrIndex() || isa<intent::LogicalIndexType>(type);
@@ -2099,7 +2101,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             }
             found->second.outerDomain = &operation;
             facts.raggedOuterRelations[&operation] = relation;
-            return success();
+            return bindDomainAxisLabel(operation, facts);
           })))
     return failure();
 
@@ -2149,7 +2151,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
             facts.raggedMembers[&operation] =
                 RaggedMemberFact{relation, &operation, operation.getOperand(1)};
             found->second.memberDomains.push_back(&operation);
-            return success();
+            return bindDomainAxisLabel(operation, facts);
           })))
     return failure();
 

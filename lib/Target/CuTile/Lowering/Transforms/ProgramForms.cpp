@@ -78,6 +78,54 @@ bool hasIndexedRagged(const target::KernelFacts &facts) {
   });
 }
 
+LogicalResult realizePointwiseLaneForm(
+    gpu::PhysicalProgramAnalysis &analysis,
+    intent::plan::SearchSpaceOp searchSpace) {
+  if (!searchSpace)
+    return success();
+  intent::plan::AxisOp pointwiseAxis =
+      analysis.getPurePointwiseProgramLane();
+  if (!pointwiseAxis)
+    return success();
+  unsigned vectorProgramAxes = llvm::count_if(
+      analysis.getProgram().getBody().getOps<intent::plan::AxisOp>(),
+      [&](intent::plan::AxisOp axis) {
+        return axis.getProgramOrderAttr() &&
+               !analysis.isScalarAxis(axis.getNode());
+      });
+  if (vectorProgramAxes != 1)
+    return success();
+
+  intent::plan::RangeOp ownership =
+      analysis.getRange(pointwiseAxis.getNode(), "ownership");
+  if (!ownership || !ownership.getTile().starts_with("program_"))
+    return success();
+  StringRef pointwiseRole = "pointwise_lane";
+
+  auto declarations = searchSpace.getBody().getOps<intent::plan::AutotuneOp>();
+  if (!llvm::hasSingleElement(declarations))
+    return searchSpace.emitOpError(
+        "cuTile pointwise-lane form requires one autotune declaration");
+  intent::plan::AutotuneOp autotune = *declarations.begin();
+  OpBuilder builder(searchSpace.getContext());
+  SmallVector<Attribute> parameters(autotune.getParameters().begin(),
+                                    autotune.getParameters().end());
+  unsigned replaced = 0;
+  for (Attribute &parameter : parameters) {
+    auto role = dyn_cast<StringAttr>(parameter);
+    if (role && role.getValue() == ownership.getTile()) {
+      parameter = builder.getStringAttr(pointwiseRole);
+      ++replaced;
+    }
+  }
+  if (replaced != 1)
+    return autotune.emitOpError(
+        "does not declare exactly one innermost pointwise-lane parameter");
+  ownership->setAttr("tile", builder.getStringAttr(pointwiseRole));
+  autotune->setAttr("parameters", builder.getArrayAttr(parameters));
+  return success();
+}
+
 bool needsGuardedGatherTuning(gpu::PhysicalProgramAnalysis &analysis,
                               intent::plan::SearchSpaceOp searchSpace) {
   if (!searchSpace)
@@ -136,6 +184,11 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   if (failed(analysis))
     return failure();
   OpBuilder builder(program.getContext());
+  if (failed(realizePointwiseLaneForm(**analysis, searchSpace)))
+    return failure();
+  analysis = gpu::PhysicalProgramAnalysis::compute(program);
+  if (failed(analysis))
+    return failure();
   intent::plan::LaunchOp launch = (*analysis)->getLaunch();
   if (!launch)
     return program.emitOpError("has no launch decision for cuTile realization");

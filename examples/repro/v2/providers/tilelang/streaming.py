@@ -16,6 +16,7 @@ from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import runtime_module
+from .. import implementation_gap
 
 
 def mamba_chunk_scan(context: Context) -> PreparedComparison:
@@ -231,5 +232,10 @@ CASES = {
     "mamba_chunk_scan": mamba_chunk_scan,
     "mamba_chunk_state": mamba_chunk_state,
     "linear_attention_forward": linear_attention,
+    "linear_attention_backward": implementation_gap(
+        "the source uses a forward carried-state traversal for dQ and a reverse "
+        "carried-state traversal for dK/dV; the current Intent source has only "
+        "the forward algorithm"
+    ),
     "retention_forward": retention,
 }

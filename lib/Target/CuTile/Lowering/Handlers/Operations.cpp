@@ -264,8 +264,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
 }
 
 LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
-  if (operation.getBlock() == &kernel.entry.getBody().front())
-    return success();
   if (operation.getNumResults() != 1)
     return operation.emitOpError("constant emission requires one result");
   std::string result = makeResultName(operation, 0);
@@ -290,7 +288,8 @@ LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
   } else {
     return operation.emitOpError("has an unsupported cuTile constant value");
   }
-  if (target::whileConditionOwner(operation)) {
+  if (operation.getBlock() == &kernel.entry.getBody().front() ||
+      target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
     return success();
   }
@@ -522,6 +521,13 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     std::string extent = roleDimensions.lookup(entry.getKey());
     if (extent.empty())
       return axis.emitOpError("has no cuTile lane extent");
+    axisIndices[axis.getNode()] = "0";
+  }
+  for (const auto &entry : planIndex.axes) {
+    plan::AxisOp axis = entry.second;
+    if (!axisIndices.lookup(axis.getNode()).empty() ||
+        !axis.getRange("reduction", 0))
+      continue;
     axisIndices[axis.getNode()] = "0";
   }
   return success();
@@ -2590,6 +2596,15 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     projectedRegion = offsets;
   }
   valueNames[body.getArgument(0)] = projectedRegion;
+  auto bindScopedAxis = [&](int64_t axisNode, std::string value) {
+    auto previous = axisIndices.find(axisNode);
+    std::optional<std::string> restore;
+    if (previous != axisIndices.end())
+      restore = previous->second;
+    streamAxisRestores[&operation].emplace_back(axisNode, std::move(restore));
+    axisIndices[axisNode] = std::move(value);
+  };
+  bindScopedAxis(binding.getAxisNode(), projectedRegion);
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -2598,7 +2613,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
         axis ? axis.getRange("reduction", 0) : nullptr;
     if (!range)
       return binding.emitOpError("has no inner reduction range");
-    axisIndices[axisNode] = "0";
+    bindScopedAxis(axisNode, "0");
   }
   return success();
 }
@@ -2623,9 +2638,17 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
-  for (int64_t axisNode : binding.getInnerReductionAxes())
-    if (axisNode != binding.getAxisNode())
-      axisIndices.erase(axisNode);
+  if (auto restores = streamAxisRestores.find(&operation);
+      restores != streamAxisRestores.end()) {
+    for (auto value = restores->second.rbegin();
+         value != restores->second.rend(); ++value) {
+      if (value->second)
+        axisIndices[value->first] = *value->second;
+      else
+        axisIndices.erase(value->first);
+    }
+    streamAxisRestores.erase(restores);
+  }
   return success();
 }
 

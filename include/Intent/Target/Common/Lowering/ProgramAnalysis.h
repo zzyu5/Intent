@@ -585,6 +585,14 @@ struct AxisBinding : Binding<intent::plan::AxisOp> {
   llvm::StringRef getGroupSpelling() const { return group; }
 };
 
+inline const RangeBinding *canonicalDomainRange(const AxisBinding &axis) {
+  if (const RangeBinding *ownership = axis.getRange("ownership", 0))
+    return ownership;
+  if (const RangeBinding *lane = axis.getRange("lane", 0))
+    return lane;
+  return axis.roleRange();
+}
+
 struct RegionRangeBinding {
   AxisBinding axis;
   RangeBinding range;
@@ -1141,6 +1149,30 @@ contractionOrientation(mlir::Operation &operation) {
   auto rhsBatch = batchPair && batchPair.size() == 2
                       ? mlir::dyn_cast<mlir::IntegerAttr>(batchPair[1])
                       : mlir::IntegerAttr();
+  if (::intent::target::semanticOperationName(operation) ==
+          "intent.scaled_contract" &&
+      lhsType && rhsType && lhsType.getRank() == 3 &&
+      rhsType.getRank() == 3 && batch && batch.empty() && reduce &&
+      reduce.size() == 2) {
+    auto first = mlir::dyn_cast<mlir::ArrayAttr>(reduce[0]);
+    auto second = mlir::dyn_cast<mlir::ArrayAttr>(reduce[1]);
+    auto firstLhs = first && first.size() == 2
+                        ? mlir::dyn_cast<mlir::IntegerAttr>(first[0])
+                        : mlir::IntegerAttr();
+    auto firstRhs = first && first.size() == 2
+                        ? mlir::dyn_cast<mlir::IntegerAttr>(first[1])
+                        : mlir::IntegerAttr();
+    auto secondLhs = second && second.size() == 2
+                         ? mlir::dyn_cast<mlir::IntegerAttr>(second[0])
+                         : mlir::IntegerAttr();
+    auto secondRhs = second && second.size() == 2
+                         ? mlir::dyn_cast<mlir::IntegerAttr>(second[1])
+                         : mlir::IntegerAttr();
+    if (firstLhs && firstRhs && secondLhs && secondRhs &&
+        firstLhs.getInt() == 1 && firstRhs.getInt() == 0 &&
+        secondLhs.getInt() == 2 && secondRhs.getInt() == 1)
+      return ContractionOrientation{false, false, false};
+  }
   bool ordinary = batch && batch.empty() && lhsType && rhsType &&
                   lhsType.getRank() == 2 && rhsType.getRank() == 2;
   bool batched = batch && batch.size() == 1 && lhsBatch && rhsBatch &&
@@ -1418,7 +1450,8 @@ bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
 
 inline mlir::FailureOr<llvm::SmallVector<int64_t>>
 exactContractionReductionArguments(const target::KernelModel &kernel,
-                                   mlir::Operation &consumer) {
+                                   mlir::Operation &consumer,
+                                   std::optional<int64_t> reductionAxisNode) {
   auto reduce = consumer.getAttrOfType<mlir::ArrayAttr>("intent.reduce");
   auto pair = reduce && reduce.size() == 1
                   ? mlir::dyn_cast<mlir::ArrayAttr>(reduce[0])
@@ -1453,9 +1486,21 @@ exactContractionReductionArguments(const target::KernelModel &kernel,
     arguments.push_back(*lhs);
   if (rhs && (!lhs || *rhs != *lhs))
     arguments.push_back(*rhs);
+  if (reductionAxisNode) {
+    mlir::Operation *domain = kernel.nodes.lookup(*reductionAxisNode);
+    if (!domain || domain->getNumResults() != 1)
+      return consumer.emitOpError(
+          "does not preserve its planned logical reduction domain");
+    auto valueID = kernel.valueIDs.find(domain->getResult(0));
+    if (valueID == kernel.valueIDs.end())
+      return consumer.emitOpError(
+          "has no canonical value for its planned logical reduction domain");
+    if (!llvm::is_contained(arguments, valueID->second))
+      arguments.push_back(valueID->second);
+  }
   if (arguments.empty())
     return consumer.emitOpError(
-        "does not preserve a region identity for its reduction pair");
+        "does not preserve an exact logical identity for its reduction pair");
   return arguments;
 }
 
@@ -1510,7 +1555,8 @@ mlir::LogicalResult indexDeferredContractReplays(
       return entry.second.emitOpError(
           "producer replay requires every source transfer to be deferred");
     mlir::FailureOr<llvm::SmallVector<int64_t>> reductionArgumentIDs =
-        exactContractionReductionArguments(kernel, *contract);
+        exactContractionReductionArguments(kernel, *contract,
+                                           entry.second.getReductionAxisNode());
     if (mlir::failed(reductionArgumentIDs))
       return mlir::failure();
     llvm::DenseSet<mlir::Value> reductionArguments;

@@ -450,17 +450,13 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
               "cannot resolve its row-vector extent");
         range.tile = physicalExtent(range.getExtent());
       }
-    std::string tile = entry.second.getTile().str();
+    const target::lowering::RangeBinding *canonical =
+        target::lowering::canonicalDomainRange(entry.second);
+    if (!canonical)
+      return entry.second.emitOpError("has no canonical TileLang domain range");
+    std::string tile = canonical->getTile().str();
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] =
         tile;
-    StringRef dimension = axisDimensions.lookup(entry.second.getNode());
-    auto existing = regionTiles.find(dimension);
-    if (!dimension.empty() && existing != regionTiles.end() &&
-        existing->getValue() != tile)
-      return entry.second.emitOpError(
-          "selects conflicting physical tiles for one logical extent");
-    if (!dimension.empty())
-      regionTiles[dimension] = tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -1218,6 +1214,13 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     programBlocks[axis.getNode()] = block;
     axisIndices[axis.getNode()] =
         axis.isScalar() ? block : block + " * " + axis.getTile().str();
+  }
+  for (const auto &entry : planIndex.axes) {
+    plan::AxisOp axis = entry.second;
+    if (!axisIndices.lookup(axis.getNode()).empty() ||
+        !axis.getRange("reduction", 0))
+      continue;
+    axisIndices[axis.getNode()] = "0";
   }
   return success();
 }
@@ -2822,11 +2825,26 @@ ProgramMaterializer::tensorExtents(Operation &operation, unsigned resultIndex,
   if (!shape)
     return operation.emitOpError("has no canonical tensor shape metadata");
   SmallVector<std::string> extents;
-  for (Attribute attribute : shape) {
+  Value resultValue = operation.getResult(resultIndex);
+  for (auto [tensorAxis, attribute] : llvm::enumerate(shape)) {
     auto label = dyn_cast<StringAttr>(attribute);
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, resultValue, tensorAxis, operation);
+    if (failed(selected))
+      return failure();
+    if (*selected) {
+      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RangeBinding &range = binding.range;
+      bool rounded = physical && !binding.axis.getReuseWorker() &&
+                     range.getTileRole().starts_with("row_vector");
+      extents.push_back(rounded ? physicalExtent(range.getExtent())
+                                : range.getTile().str());
+      continue;
+    }
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());

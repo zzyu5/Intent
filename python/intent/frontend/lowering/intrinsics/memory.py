@@ -15,6 +15,7 @@ from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
+from intent.frontend.semantics import dims_compatible
 from intent.frontend.semantics.types import is_integer
 from intent.language import f32
 from intent.language import bool as intent_bool
@@ -94,7 +95,10 @@ def _gather(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             broadcasted = tuple(broadcast_shape(shape, result_shape))
         except ValueError as error:
             lowerer.error(node, str(error))
-        if broadcasted != result_shape:
+        if len(broadcasted) != len(result_shape) or not all(
+            dims_compatible(source, destination)
+            for source, destination in zip(broadcasted, result_shape)
+        ):
             lowerer.error(node, f"gather {subject} cannot broadcast to indexed shape")
     valid = lowerer.broadcast_value(valid, result_shape, node)
     fill = lowerer.broadcast_value(fill, result_shape, node)

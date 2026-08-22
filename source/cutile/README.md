@@ -4,14 +4,13 @@
 
 Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 
-## baseline-v2 entries（39）
+## baseline-v2 entries（37）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
 | V2 | official FMHA | `cutile-python/attention/fmha/AttentionFMHA.py` / `cutile_fmha` | `B=4,QH=32,KVH=8,S=4096,D=128`, fp16 causal | `python source/cutile/cutile-python/attention/fmha/AttentionFMHA_runtime.py` |
 | V1+V2 | block-scaled GEMM | `cutile-python/gemm/block_scaled/BlockScaledMatMul.py` / block-scaled matmul | `4096×4096×14336`, FP8, scale block 32 | `python source/cutile/cutile-python/gemm/block_scaled/BlockScaledMatMul_runtime.py` |
 | V2 | official dense/persistent GEMM | `cutile-python/gemm/dense/MatMul.py` / `cutile_matmul` | `4096×4096×14336`, fp16 | `python source/cutile/cutile-python/gemm/dense/MatMul_runtime.py` |
-| V2 | official fused MoE | `cutile-python/moe/fused/MoE.py` / `cutile_moe` | 8192 tokens, hidden 7168, 8 experts, top-4, bf16 | `python source/cutile/cutile-python/moe/fused/MoE_runtime.py` |
 | V1+V2 | official LayerNorm fwd/bwd | `cutile-python/normalization/layer_norm/LayerNorm.py` / `cutile_layer_norm` | `8192×4096`, bf16 | `python source/cutile/cutile-python/normalization/layer_norm/LayerNorm_runtime.py` |
 | V1+V2 | SiLU-and-mul forward | `tilegym/activation/silu_and_mul/silu_and_mul.py` / `silu_and_mul` | `4096×28672`, bf16 | `python source/cutile/tilegym/activation/silu_and_mul/silu_and_mul_runtime.py` |
 | V1+V2 | dense attention forward | `tilegym/attention/dense/attention.py` / `tile_fmha` | `B=2,QH=32,KVH=8,S=4096,D=128`, bf16 causal | `python source/cutile/tilegym/attention/dense/attention_runtime.py` |
@@ -42,7 +41,6 @@ Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 | V2 | chunk gated delta rule | `tilegym/scan/gated_delta_chunk/chunk_gated_delta_rule.py` / `chunk_gated_delta_rule` | `B=2,T=2048,H=8,K=V=128`, bf16 | `python source/cutile/tilegym/scan/gated_delta_chunk/chunk_gated_delta_rule_runtime.py` |
 | V2 | recurrent gated delta rule | `tilegym/scan/gated_delta_recurrent/recurrent_gated_delta_rule.py` / recurrent entry | same model shape | `python source/cutile/tilegym/scan/gated_delta_recurrent/recurrent_gated_delta_rule_runtime.py` |
 | V2 | RMSNorm | `tilegym/normalization/rms_norm/rms_norm.py` / `rms_norm` | `8192×4096`, bf16 | `python source/cutile/tilegym/normalization/rms_norm/rms_norm_runtime.py` |
-| V2 | fused linear cross entropy | `tilegym/loss/fused_linear_cross_entropy/fused_linear_cross_entropy.py` / fused entry | `B=4,S=2048,H=4096,V=32768`, bf16 | `python source/cutile/tilegym/loss/fused_linear_cross_entropy/fused_linear_cross_entropy_runtime.py` |
 | V2 | NVFP4 quantization | `tilegym/quantization/nvfp4/nvfp4_quantize.py` / `tile_nvfp4_quantize` | `8192×4096`, bf16→packed FP4 | `python source/cutile/tilegym/quantization/nvfp4/nvfp4_quantize_runtime.py` |
 | V2 | mHC GEMM + RMS scaling | `tilegym/mhc/fused/mhc.py` / `mhc_gemm_rms_scale` | 2048 tokens, hidden 4096, 4 residual streams, bf16 | `python source/cutile/tilegym/mhc/fused/mhc_gemm_rms_runtime.py` |
 | V2 | mHC residual mixing | same source / `mhc_apply_residual` | 2048 tokens, hidden 4096, 4 residual streams, bf16 | `python source/cutile/tilegym/mhc/fused/mhc_apply_residual_runtime.py` |
@@ -50,11 +48,19 @@ Upstream roots：`NVIDIA/cutile-python` 与 `NVIDIA/TileGym`。
 
 V2 新增部分均直接取自当前公开 NVIDIA TileGym；没有用 PyTorch composition 或手写参考实现冒充 cuTile baseline。
 
+## 冻结在 baseline-v1 的来源
+
+以下完整 MoE wrapper 继续保留，因为旧 repro 明确调用它；它包含 PyTorch routing、多个 cuTile kernel 与最终归并，不进入上面的 baseline-v2 inventory。
+
+| V1 entry | source | runtime |
+|---|---|---|
+| MoE | `cutile-python/moe/fused/MoE.py` | `python source/cutile/cutile-python/moe/fused/MoE_runtime.py` |
+
 ## Necessary support
 
 - `tilegym/support/utils.py`：TileGym kernels 的 `next_power_of_2` 等直接依赖。
 - `tilegym/support/runtime.py` 与 `tilegym/support/runtime_cases.py`：加载本地 vendored source、构造模型级输入并输出一次运行结果。
 - GEGLU 对相邻 `activation/fused/gelu.py` 的依赖、attention-sink/MLA split 对现有 `attention/flash_decode/splitk_reduce.py` 的依赖，均由 runtime 显式装载；没有复制第二份实现。
-- Gemma decode 复用同一份 split-K reduce；mHC 的三个 entry 来自 TileGym 当前 `experimental/mhc.py`，在本地保持一份原始 source、按三个真实 callable 分别计时，并保留上游的 experimental 状态，不冒充 NVIDIA `cutile-python` 正式样例。
+- Gemma decode 复用同一份 split-K reduce；mHC 的三个 entry 来自 TileGym 当前 `tilegym/mhc/fused/mhc.py`，在本地保持一份原始 source、按三个真实 callable 分别计时，并保留上游的 experimental 状态，不冒充 NVIDIA `cutile-python` 正式样例。
 
 除本清单列出的 entry、runtime 和 support 外，`source/cutile/` 不保留其它 Python 文件。

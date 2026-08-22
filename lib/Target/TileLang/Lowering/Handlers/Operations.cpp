@@ -1241,8 +1241,11 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     int64_t divisor = compact.getDivisor();
     int64_t offset = compact.getOffset();
     auto compactAxis = planIndex.axes.find(compact.getAxisNode());
+    auto active = activeTraversalIndices.find(compact.getAxisNode());
     std::string logicalBase =
-        compactAxis == planIndex.axes.end()
+        active != activeTraversalIndices.end() && !active->second.empty()
+            ? active->second.back()
+        : compactAxis == planIndex.axes.end()
             ? std::string()
             : axisIndices.lookup(compactAxis->second.getNode());
     std::string logicalTile = compact.getTile().str();
@@ -3414,6 +3417,16 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
        addressIndex(streamTile) + " * " + binding.getTile().str());
   valueNames[body.getArgument(0)] = streamStart;
   regionIndices[body.getArgument(0)] = streamStart;
+  activeTraversalIndices[binding.getAxisNode()].push_back(streamStart);
+  auto bindScopedAxis = [&](int64_t axisNode, std::string value) {
+    auto previous = axisIndices.find(axisNode);
+    std::optional<std::string> restore;
+    if (previous != axisIndices.end())
+      restore = previous->second;
+    streamAxisRestores[&operation].emplace_back(axisNode, std::move(restore));
+    axisIndices[axisNode] = std::move(value);
+  };
+  bindScopedAxis(binding.getAxisNode(), streamStart);
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -3422,7 +3435,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
         axis ? axis.getRange("reduction", 0) : nullptr;
     if (!range)
       return binding.emitOpError("has no inner reduction range");
-    axisIndices[axisNode] = "0";
+    bindScopedAxis(axisNode, "0");
   }
   return success();
 }
@@ -3456,9 +3469,23 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
     valueNames[operation.getResult(index)] =
         carriers->second[index] + (scalar ? "[0]" : "");
   }
-  for (int64_t axisNode : binding.getInnerReductionAxes())
-    if (axisNode != binding.getAxisNode())
-      axisIndices.erase(axisNode);
+  auto active = activeTraversalIndices.find(binding.getAxisNode());
+  if (active == activeTraversalIndices.end() || active->second.empty())
+    return operation.emitOpError("has no active TileLang traversal projection");
+  active->second.pop_back();
+  if (active->second.empty())
+    activeTraversalIndices.erase(active);
+  if (auto restores = streamAxisRestores.find(&operation);
+      restores != streamAxisRestores.end()) {
+    for (auto value = restores->second.rbegin();
+         value != restores->second.rend(); ++value) {
+      if (value->second)
+        axisIndices[value->first] = *value->second;
+      else
+        axisIndices.erase(value->first);
+    }
+    streamAxisRestores.erase(restores);
+  }
   return success();
 }
 

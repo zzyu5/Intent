@@ -502,14 +502,6 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     if (failed(valueID) || failed(tile))
       return failure();
     regionTiles["?region_" + std::to_string(*valueID) + "_0"] = *tile;
-    StringRef dimension = axisDimensions.lookup(axis.getNode());
-    auto existing = regionTiles.find(dimension);
-    if (!dimension.empty() && existing != regionTiles.end() &&
-        existing->getValue() != *tile)
-      return axis.emitOpError(
-          "selects conflicting physical tiles for one logical extent");
-    if (!dimension.empty())
-      regionTiles[dimension] = *tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -782,7 +774,36 @@ void ProgramMaterializer::emitImports() {
     output << "_ROW_TUNED_KEYS = set()\n";
   }
   if (searchSpace) {
-    output << "from intent.runtime.tuning.triton import autotune_configurations\n";
+    llvm::StringMap<uint64_t> staticRoleExtents;
+    llvm::StringMap<SmallVector<std::string>> runtimeRoleExtents;
+    auto recordExtent = [&](StringRef role, StringRef extent) {
+      uint64_t value = 0;
+      if (role.empty())
+        return;
+      if (!extent.getAsInteger(10, value)) {
+        if (value == 0)
+          return;
+        auto found = staticRoleExtents.find(role);
+        if (found == staticRoleExtents.end() || value < found->second)
+          staticRoleExtents[role] = value;
+        return;
+      }
+      if (!dimensionOwners.count(extent))
+        return;
+      SmallVector<std::string> &extents = runtimeRoleExtents[role];
+      if (!llvm::is_contained(extents, extent))
+        extents.push_back(extent.str());
+    };
+    for (const auto &entry : planIndex.axes)
+      for (const target::lowering::RangeBinding &range : entry.second.ranges)
+        if (range.getPurpose() != "access")
+          recordExtent(range.getTileRole(), range.getExtent());
+    for (const auto &stageAxes : planIndex.stageAxes)
+      for (const auto &roleAndAxis : stageAxes.second)
+        recordExtent(roleAndAxis.getValue().getTile(),
+                     roleAndAxis.getValue().getExtent());
+
+    output << "from intent.runtime.tuning.triton import autotune_configurations, runtime_extent_pruning\n";
     output << "\n_PARAMETER_MAP = {";
     for (auto [index, mapping] :
          llvm::enumerate(searchIndex.autotune.getParameterMap())) {
@@ -791,10 +812,43 @@ void ProgramMaterializer::emitImports() {
       output << "'" << mapping.getName().getValue() << "': '"
              << cast<StringAttr>(mapping.getValue()).getValue() << "'";
     }
+    output << "}\n_PARAMETER_EXTENTS = {";
+    bool firstExtent = true;
+    for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
+      StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
+      auto extent = staticRoleExtents.find(role);
+      if (extent == staticRoleExtents.end())
+        continue;
+      if (!firstExtent)
+        output << ", ";
+      output << "'" << mapping.getName().getValue() << "': "
+             << extent->second;
+      firstExtent = false;
+    }
+    output << "}\n_PARAMETER_RUNTIME_EXTENTS = {";
+    bool firstRuntimeExtent = true;
+    for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
+      StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
+      auto extents = runtimeRoleExtents.find(role);
+      if (extents == runtimeRoleExtents.end())
+        continue;
+      if (!firstRuntimeExtent)
+        output << ", ";
+      output << "'" << mapping.getName().getValue() << "': (";
+      for (auto [index, extent] : llvm::enumerate(extents->second)) {
+        if (index)
+          output << ", ";
+        output << "'" << extent << "'";
+      }
+      if (extents->second.size() == 1)
+        output << ",";
+      output << ")";
+      firstRuntimeExtent = false;
+    }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
     if (usesScaledContraction())
       output << ", {'USE_NATIVE_SCALED': (0, 1)}";
-    output << ")\n";
+    output << ", parameter_extents=_PARAMETER_EXTENTS)\n";
   }
   output << "\n\n";
 }
@@ -886,6 +940,8 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
         source << "'" << cast<StringAttr>(attribute).getValue() << "'";
       }
       source << "]";
+      source << ",\n    prune_configs_by=runtime_extent_pruning("
+                "_PARAMETER_RUNTIME_EXTENTS)";
       if (planIndex.stages[stage].getOutputs().empty() && restoreDestination)
         source << ",\n    restore_value=['" << terminalDestination->pointer
                << "']";
@@ -1015,6 +1071,8 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
       output << "'" << cast<StringAttr>(attribute).getValue() << "'";
     }
     output << "]";
+    output << ",\n    prune_configs_by=runtime_extent_pruning("
+              "_PARAMETER_RUNTIME_EXTENTS)";
     bool firstRestoredView = true;
     for (ABIView &view : views) {
       if (view.view.getAccess() != "inout")
@@ -2008,9 +2066,13 @@ bool ProgramMaterializer::usesScaledContraction() const {
 }
 
 FailureOr<std::string> ProgramMaterializer::physicalAxisTile(plan::AxisOp axis) {
-  if (axis.getReuseWorker() || !axis.getTileRole().starts_with("row_vector"))
-    return axis.getTile().str();
-  const target::lowering::RangeBinding *range = axis.roleRange();
+  const target::lowering::RangeBinding *range =
+      target::lowering::canonicalDomainRange(axis);
+  if (!range)
+    return axis.emitOpError("has no canonical Triton domain range");
+  if (axis.getReuseWorker() ||
+      !range->getTileRole().starts_with("row_vector"))
+    return range->getTile().str();
   if (!range || !planIndex.blockExtents.count(range->getExtent()))
     return axis.emitOpError("cannot resolve its row-vector physical extent");
   return physicalExtent(range->getExtent());
@@ -2507,11 +2569,26 @@ ProgramMaterializer::emitTensorShape(Operation &operation, unsigned resultIndex)
   if (!shape)
     return operation.emitOpError("has no canonical tensor shape metadata");
   SmallVector<std::string> extents;
-  for (Attribute attribute : shape) {
+  Value resultValue = operation.getResult(resultIndex);
+  for (auto [tensorAxis, attribute] : llvm::enumerate(shape)) {
     auto label = dyn_cast<StringAttr>(attribute);
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, resultValue, tensorAxis, operation);
+    if (failed(selected))
+      return failure();
+    if (*selected) {
+      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RangeBinding &range = binding.range;
+      bool rounded = !binding.axis.getReuseWorker() &&
+                     range.getTileRole().starts_with("row_vector");
+      extents.push_back(rounded ? physicalExtent(range.getExtent())
+                                : range.getTile().str());
+      continue;
+    }
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());

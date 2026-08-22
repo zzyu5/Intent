@@ -454,14 +454,6 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
       return failure();
     regionTiles["?region_" + std::to_string(resultNode.getInt()) + "_0"] =
         *tile;
-    StringRef dimension = axisDimensions.lookup(axis.getNode());
-    auto existing = regionTiles.find(dimension);
-    if (!dimension.empty() && existing != regionTiles.end() &&
-        existing->getValue() != *tile)
-      return axis.emitOpError(
-          "selects conflicting physical tiles for one logical extent");
-    if (!dimension.empty())
-      regionTiles[dimension] = *tile;
   }
   for (auto &entry : planIndex.paddings) {
     Value value = kernel.values.lookup(entry.first);
@@ -2051,9 +2043,13 @@ FailureOr<std::string> ProgramMaterializer::physicalAxisTile(plan::AxisOp axis) 
   auto scanTile = scanAxisTiles.find(axis.getNode());
   if (scanTile != scanAxisTiles.end())
     return scanTile->second;
-  if (axis.getReuseWorker() || !axis.getTileRole().starts_with("row_vector"))
-    return axis.getTile().str();
-  const target::lowering::RangeBinding *range = axis.roleRange();
+  const target::lowering::RangeBinding *range =
+      target::lowering::canonicalDomainRange(axis);
+  if (!range)
+    return axis.emitOpError("has no canonical cuTile domain range");
+  if (axis.getReuseWorker() ||
+      !range->getTileRole().starts_with("row_vector"))
+    return range->getTile().str();
   if (!range || !planIndex.blockExtents.count(range->getExtent()))
     return axis.emitOpError("cannot resolve its row-vector physical extent");
   return physicalExtent(range->getExtent());
@@ -2161,6 +2157,26 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
         return operation.emitOpError(
             "indirect cuTile gather has no mechanical index relation");
       Value indexed = operation.getOperand(*term.operands.front());
+      if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        FailureOr<target::lowering::RegionRangeBinding> selected =
+            target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                          indexed, operation);
+        if (failed(exact) || failed(selected) ||
+            resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
+          return failure();
+        const target::lowering::RangeBinding &range = selected->range;
+        bool ragged = planIndex.components.orderedRaggedAxes.contains(
+            selected->axis.getNode());
+        std::string index = addressIndex(*exact);
+        if (!ragged)
+          index += " * " + range.getTile().str() + " + " +
+                   addressIndex("ct.arange(" + range.getTile().str() +
+                                ", dtype=ct.int32)");
+        indices.push_back(broadcast(index, resultAxis++));
+        continue;
+      }
       if (auto tensor = dyn_cast<RankedTensorType>(indexed.getType())) {
         FailureOr<StringRef> exact =
             lookupValue(operation, *term.operands.front());
@@ -2412,6 +2428,19 @@ FailureOr<std::string> ProgramMaterializer::tileShape(Operation &operation) {
       return operation.emitOpError(
           "cuTile tile has no mechanical shape relation");
     Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "region_index" && isa<BlockArgument>(indexed)) {
+      FailureOr<target::lowering::RegionRangeBinding> selected =
+          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
+                                                        indexed, operation);
+      if (failed(selected))
+        return failure();
+      const target::lowering::RangeBinding &range = selected->range;
+      bool rounded = !selected->axis.getReuseWorker() &&
+                     range.getTileRole().starts_with("row_vector");
+      extents.push_back(rounded ? physicalExtent(range.getExtent())
+                                : range.getTile().str());
+      continue;
+    }
     if (term.kind == "value_index" &&
         isa<RankedTensorType>(indexed.getType())) {
       auto translated = llvm::find_if(accessRanges, [&](const auto &range) {
@@ -2665,11 +2694,26 @@ ProgramMaterializer::emitTensorShape(Operation &operation, unsigned resultIndex,
   if (!shape)
     return operation.emitOpError("has no canonical tensor shape metadata");
   SmallVector<std::string> extents;
-  for (Attribute attribute : shape) {
+  Value resultValue = operation.getResult(resultIndex);
+  for (auto [tensorAxis, attribute] : llvm::enumerate(shape)) {
     auto label = dyn_cast<StringAttr>(attribute);
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, resultValue, tensorAxis, operation);
+    if (failed(selected))
+      return failure();
+    if (*selected) {
+      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RangeBinding &range = binding.range;
+      bool rounded = !binding.axis.getReuseWorker() &&
+                     range.getTileRole().starts_with("row_vector");
+      extents.push_back(rounded ? physicalExtent(range.getExtent())
+                                : range.getTile().str());
+      continue;
+    }
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());

@@ -25,7 +25,7 @@ Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算
 6. [数值与确定性](dsl/numerics.md)
 7. [编译器模块架构](compiler/architecture.md)
 8. [Kernel IR](compiler/kernel-ir.md)
-9. [Physical Plan](compiler/physical-plan.md)
+9. [Physical Program 与 Plan decisions](compiler/physical-plan.md)
 10. [后端 lowering](compiler/backend-lowering.md)
 11. [编译产物与运行边界](compiler/compiled-artifact.md)
 12. [环境、依赖与构建](setup/environment.md)

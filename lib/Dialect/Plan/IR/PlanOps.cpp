@@ -689,11 +689,15 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
     } else if (auto binding = dyn_cast<SparseContractOp>(operation)) {
       if (!operations.insert(binding.getNode()).second)
         return binding.emitOpError("duplicates an operation decision");
-      if (!axes.count(binding.getRowAxisNode()) ||
-          !axes.count(binding.getColumnAxisNode()) ||
-          !axes.count(binding.getReductionAxisNode()))
-        return binding.emitOpError(
-            "references an unbound sparse-contraction axis");
+      bool rowBound = axes.count(binding.getRowAxisNode());
+      bool columnBound = axes.count(binding.getColumnAxisNode());
+      bool reductionBound = axes.count(binding.getReductionAxisNode());
+      if (!rowBound || !columnBound || !reductionBound)
+        return binding.emitOpError()
+               << "references an unbound sparse-contraction axis (row="
+               << (rowBound ? "bound" : "missing") << ", column="
+               << (columnBound ? "bound" : "missing") << ", reduction="
+               << (reductionBound ? "bound" : "missing") << ")";
     } else if (auto binding = dyn_cast<StreamAxisOp>(operation)) {
       std::string key = std::to_string(binding.getStreamNode()) + ":" +
                         std::to_string(binding.getAxisNode());

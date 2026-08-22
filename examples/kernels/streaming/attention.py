@@ -742,17 +742,18 @@ def flash_varlen_gqa_prefill(
     for sequence in I.parallel(sequences.outer):
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            q_block = q[sequences[sequence], query_head, :]
-            k_axis = sequences[sequence]
+            query_positions = sequences[sequence]
+            key_positions = sequences[sequence]
+            q_block = q[query_positions, query_head, :]
             stream = I.state_stream(
-                k_axis,
+                key_positions,
                 extent=I.auto("K_TILE"),
                 init=(
-                    I.full((sequences[sequence],), -I.inf, dtype=I.f32),
-                    I.zeros((sequences[sequence],), dtype=I.f32),
-                    I.zeros((sequences[sequence], DV), dtype=I.f32),
+                    I.full((query_positions,), -I.inf, dtype=I.f32),
+                    I.zeros((query_positions,), dtype=I.f32),
+                    I.zeros((query_positions, DV), dtype=I.f32),
                 ),
-                stop=I.end(sequences[sequence]),
+                stop=I.end(key_positions),
             )
             with stream:
                 for k_region, (maximum, denominator, accumulator) in stream:
@@ -765,7 +766,7 @@ def flash_varlen_gqa_prefill(
                         acc_dtype=I.f32,
                     )
                     scores = scores * (scale * I.LOG2E)
-                    q_index = I.indices(sequences[sequence])
+                    q_index = I.indices(query_positions)
                     k_index = I.indices(k_region)
                     valid = q_index[:, None] >= k_index[None, :]
                     scores = I.mask(scores, valid=valid, fill=-I.inf)
@@ -787,6 +788,6 @@ def flash_varlen_gqa_prefill(
                         next_accumulator,
                     )
             _, denominator, accumulator = stream.result
-            output[sequences[sequence], query_head, :] = I.cast(
+            output[query_positions, query_head, :] = I.cast(
                 accumulator / denominator[:, None], I.f16
             )

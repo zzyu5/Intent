@@ -291,8 +291,6 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
 }
 
 LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
-  if (operation.getBlock() == &kernel.entry.getBody().front())
-    return success();
   if (operation.getNumResults() != 1)
     return operation.emitOpError("constant emission requires one result");
   std::string result = makeResultName(operation, 0);
@@ -314,7 +312,8 @@ LogicalResult ProgramMaterializer::emitConstant(Operation &operation) {
   } else {
     return operation.emitOpError("has an unsupported Triton constant value");
   }
-  if (target::whileConditionOwner(operation)) {
+  if (operation.getBlock() == &kernel.entry.getBody().front() ||
+      target::whileConditionOwner(operation)) {
     bindResult(operation, 0, expression);
     return success();
   }
@@ -555,6 +554,18 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
                                ? axis.getTile().str()
                                : physicalExtent(extent);
     line(value + " = tl.arange(0, " + physical + ")");
+    axisIndices[axis.getNode()] = value;
+  }
+  for (const auto &entry : planIndex.axes) {
+    plan::AxisOp axis = entry.second;
+    if (!axisIndices.lookup(axis.getNode()).empty())
+      continue;
+    const target::lowering::RangeBinding *range =
+        axis.getRange("reduction", 0);
+    if (!range)
+      continue;
+    std::string value = "axis_index_" + std::to_string(axis.getNode());
+    line(value + " = tl.arange(0, " + range->getTile().str() + ")");
     axisIndices[axis.getNode()] = value;
   }
   return success();
@@ -1328,6 +1339,31 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
         tensorAxis.getInt() >= result.getRank() ||
         static_cast<size_t>(tensorAxis.getInt()) >= binding.getAxisNodes().size())
       return operation.emitOpError("has no tensor-axis indices binding");
+    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisRegionRange(
+            planIndex, kernel, operation.getOperand(0), tensorAxis.getInt(),
+            operation);
+    if (failed(selected))
+      return failure();
+    if (*selected) {
+      auto projected = valueNames.find((*selected)->argument);
+      if (projected == valueNames.end())
+        return operation.emitOpError(
+            "has no active region projection for tensor-axis indices");
+      std::string expression =
+          (*selected)->selected.axis.isScalar()
+              ? projected->second
+              : broadcastIndex(projected->second, tensorAxis.getInt(),
+                               result.getRank());
+      FailureOr<std::string> padded =
+          padExpression(operation.getResult(0), expression, operation);
+      if (failed(padded))
+        return failure();
+      std::string emitted = makeResultName(operation, 0);
+      line(emitted + " = " + *padded);
+      bindResult(operation, 0, emitted);
+      return success();
+    }
     axis = planIndex.axes.lookup(binding.getAxisNodes()[tensorAxis.getInt()]);
     emittedAxis = tensorAxis.getInt();
   } else if (operation.getNumOperands() == 1) {
@@ -2436,6 +2472,16 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
        addressIndex(block) + " * " + binding.getTile().str() + " + " +
        addressIndex("tl.arange(0, " + binding.getTile().str() + ")"));
   valueNames[body.getArgument(0)] = offsets;
+  auto bindScopedAxis = [&](int64_t axisNode, std::string value) {
+    auto previous = axisIndices.find(axisNode);
+    std::optional<std::string> restore;
+    if (previous != axisIndices.end())
+      restore = previous->second;
+    streamAxisRestores[&operation].emplace_back(axisNode, std::move(restore));
+    axisIndices[axisNode] = std::move(value);
+  };
+  if (axisIndices.lookup(binding.getAxisNode()).empty())
+    bindScopedAxis(binding.getAxisNode(), offsets);
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -2444,8 +2490,9 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
         axis ? axis.getRange("reduction", 0) : nullptr;
     if (!range)
       return binding.emitOpError("has no inner reduction range");
-    axisIndices[axisNode] =
-        addressIndex("tl.arange(0, " + range->getTile().str() + ")");
+    bindScopedAxis(
+        axisNode,
+        addressIndex("tl.arange(0, " + range->getTile().str() + ")"));
   }
   return success();
 }
@@ -2470,9 +2517,17 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
   --indentation;
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
-  for (int64_t axisNode : binding.getInnerReductionAxes())
-    if (axisNode != binding.getAxisNode())
-      axisIndices.erase(axisNode);
+  if (auto restores = streamAxisRestores.find(&operation);
+      restores != streamAxisRestores.end()) {
+    for (auto value = restores->second.rbegin();
+         value != restores->second.rend(); ++value) {
+      if (value->second)
+        axisIndices[value->first] = *value->second;
+      else
+        axisIndices.erase(value->first);
+    }
+    streamAxisRestores.erase(restores);
+  }
   return success();
 }
 

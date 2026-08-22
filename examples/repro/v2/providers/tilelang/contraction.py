@@ -19,6 +19,7 @@ from ...model import PreparedComparison
 from ...model import Tolerance
 from .common import runtime_module
 from .common import source_from_runtime
+from .. import implementation_gap
 
 
 def dense_gemm(context: Context) -> PreparedComparison:
@@ -338,4 +339,13 @@ CASES = {
     "block_sparse_gemm": block_sparse,
     "grouped_gemm_backward": grouped_gemm_backward,
     "deepgemm_fp8_2xacc": deepgemm_fp8,
+    "bitnet_int2_decode": implementation_gap(
+        "the source requires packed-int2 storage semantics and an imported "
+        "lop3/dp4a decode intrinsic; ordinary bitwise ops plus contract do not "
+        "preserve that callable"
+    ),
+    "dequant_bf16_fp4": implementation_gap(
+        "the source requires packed FP4 E2M1 storage, bit reinterpretation, and "
+        "a provider intrinsic before the BF16 contraction"
+    ),
 }

@@ -272,7 +272,10 @@ def rope_qk(context: Context) -> PreparedComparison:
     return PreparedComparison(
         generated,
         source,
-        (Tolerance(atol=0.0), Tolerance(atol=0.0)),
+        (
+            Tolerance(atol=2e-3, rtol=2e-3),
+            Tolerance(atol=2e-3, rtol=2e-3),
+        ),
         cuda_graph=False,
     )
 

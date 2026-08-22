@@ -10,17 +10,26 @@ source = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(source)
 
 
+def upstream(arguments):
+    logits, labels = arguments
+    return source.cross_entropy_loss(
+        logits,
+        labels,
+        lse_square_scale=1.0e-4,
+    )
+
+
 def main():
     tokens, vocab_size = 8192, 32768
     logits = torch.randn(tokens, vocab_size, device="cuda", dtype=torch.bfloat16)
     labels = torch.randint(0, vocab_size, (tokens,), device="cuda", dtype=torch.long)
 
-    losses, z_losses = source.cross_entropy_loss(logits, labels, lse_square_scale=1.0e-4)
+    losses, z_losses = upstream((logits, labels))
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    losses, z_losses = source.cross_entropy_loss(logits, labels, lse_square_scale=1.0e-4)
+    losses, z_losses = upstream((logits, labels))
     end.record()
     torch.cuda.synchronize()
 

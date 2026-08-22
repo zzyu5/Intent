@@ -14,6 +14,7 @@ from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import runtime_module
+from .. import implementation_gap
 
 
 def mhc_pre(context: Context) -> PreparedComparison:
@@ -262,4 +263,8 @@ CASES = {
     "mhc_pre": mhc_pre,
     "mhc_post": mhc_post,
     "fp8_lighting_indexer": fp8_lighting_indexer,
+    "deepseek_topk_selector": implementation_gap(
+        "the radix selector requires typed float-bit reinterpretation, shared "
+        "histograms, and thread barriers that are not Kernel IR capabilities"
+    ),
 }

@@ -71,7 +71,7 @@ def run(case: str, source_path: Path):
         k = torch.randn((batch, sequence, kv_heads, dim), device="cuda", dtype=q.dtype)
         v = torch.randn_like(k)
         sinks = torch.randn((kv_heads * repeats,), device="cuda", dtype=q.dtype)
-        start = torch.full((batch,), sequence - 1, device="cuda", dtype=torch.int32)
+        start = torch.tensor([sequence - 1], device="cuda", dtype=torch.int32)
         call = lambda: source.attention_sink_decode(q, k, v, sinks, 1.0 / math.sqrt(dim), start_q=start, kv_len_per_split=256)
         detail = f"Q={tuple(q.shape)} K/V={tuple(k.shape)} dtype={q.dtype}"
     elif case == "gemma_prefill":
@@ -140,12 +140,6 @@ def run(case: str, source_path: Path):
         weight = torch.randn((4096,), device="cuda", dtype=x.dtype)
         call = lambda: source.rms_norm(x, (4096,), weight, 1e-5, mode="multi_wave_reload")
         detail = f"x={tuple(x.shape)} dtype={x.dtype}"
-    elif case == "fused_linear_cross_entropy":
-        hidden = torch.randn((4, 2048, 4096), device="cuda", dtype=torch.bfloat16)
-        weight = torch.randn((32768, 4096), device="cuda", dtype=hidden.dtype)
-        target = torch.randint(0, 32768, (4, 2048), device="cuda", dtype=torch.long)
-        call = lambda: source.fused_linear_cross_entropy(hidden, weight, target, chunk_size=1024, reduction="mean")
-        detail = f"hidden={tuple(hidden.shape)} vocab={weight.shape[0]} dtype={hidden.dtype}"
     elif case == "nvfp4_quantize":
         x = torch.randn((8192, 4096), device="cuda", dtype=torch.bfloat16)
         call = lambda: source.tile_nvfp4_quantize(x, s_enc=1.0)

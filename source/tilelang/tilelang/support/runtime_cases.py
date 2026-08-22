@@ -30,11 +30,6 @@ def run(case: str, source_path: Path):
     runtime = _runtime()
     source = _load(runtime, case, source_path)
 
-    if case == "attention_sink_backward":
-        latency = source.run_regression_perf(BATCH=2, H=16, N_CTX=2048, D_HEAD=128, dtype="float16")
-        print("algorithm=attention_sink_backward B=2 H=16 S=2048 D=128 dtype=float16")
-        print(f"latency_ms={latency:.3f}")
-        return
     if case == "sparse_mla_backward":
         latency = source.run_regression_perf(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048)
         print("algorithm=sparse_mla_backward B=1 S=4096 SKV=8192 H=64 topk=2048 dtype=bf16")

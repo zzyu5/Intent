@@ -16,6 +16,7 @@ from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
+from .. import implementation_gap
 
 
 def _activate(context: Context, runtime_path: str, name: str):
@@ -269,8 +270,12 @@ def chunk_scan(context: Context) -> PreparedComparison:
 
 CASES = {
     "mamba3_siso_step": mamba3_step,
+    "mamba3_siso_forward": implementation_gap(
+        "the full Mamba3 SISO sequence kernel contains chunk preprocessing, "
+        "causal chunk contractions, and ordered cross-chunk state; the existing "
+        "Intent entry expresses only the decode step"
+    ),
     "mamba_chunk_state": chunk_state,
     "mamba_state_passing": state_passing,
     "mamba_chunk_scan": chunk_scan,
 }
-
