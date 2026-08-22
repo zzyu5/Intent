@@ -29,11 +29,13 @@ Intent Kernel MLIR 是 Kernel IR 的正式 backend-boundary 表示。Function pa
 ### Tensor-flow
 
 - pure tensor SSA；
-- explicit dtype 与 `cast`；
+- explicit dtype、数值 `cast` 与保持 shape/bit width 的 `bitcast`；
 - pointwise math 与 logical mask；
 - `reduce`、`scan`、它们引用的 typed pure combiner helper，以及 `contract`；
 - logical buffers；
 - atomic、mutable load/store 与 RNG identity。语言不定义缺少 scope、ordering 与 participant 合同的 public fence；同步不能以 no-op 进入 Kernel IR。
+
+Packed storage 的整数 ABI view、logical-element 到 storage-element/bit-field 的索引关系，以及 decode/encode 的 SSA 算术都保留在 Kernel IR。Kernel IR 不把它们折叠成 target layout；provider 可以选择等价的 native decode intrinsic，但不能改变作者写下的 format relation。
 
 ### Control 与 state
 
@@ -57,7 +59,7 @@ Kernel IR 不保存 Python wrapper、完整计算图、physical worker id、grid
 
 ## 关键不变量
 
-1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel` 和一个 target callable entry；目标 entry 内可以包含多个 compiler-private execution stages。
+1. 一个 Kernel IR module entry 对应一个 source `@intent.kernel`、一个 target kernel entry 和一次 launch；compiler 不把它拆成多个 target kernels。
 2. `I.auto` 只能作为明确声明 segment-parametric recurrence 的 structured extent hole，不能成为普通 SSA value，也不能用于普通 partition。
 3. Source-visible partition 的 extent/count 必须来自 runtime/shape/`Constexpr`/wrapper value，并被算法、effect、ABI 或 wrapper 观察；不可观察的 physical tile/worker count 不进入 Kernel IR。对长度 `N` 的 count partition，Kernel IR 的唯一语义是 `block=ceil(N/P)`、part `i` 的范围为 `[min(i*block,N), min((i+1)*block,N))`。`P` 个 identity 和 wrapper slots 都保留；空 part 不执行 body，未写 slot 由 wrapper 保持作者算法指定的 identity 初值。
 4. Physical refinement 不得改变 logical workset、state、effect、ABI 或 wrapper-visible relation。

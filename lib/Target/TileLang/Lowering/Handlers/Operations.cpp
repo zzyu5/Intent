@@ -173,6 +173,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
           return success();
         return emitter.emitCast(op);
       })) ||
+      failed(addHandler(registry, "intent.bitcast", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitBitcast(op);
+      })) ||
       failed(addHandler(registry, "intent.reshape", [&](Operation &op) {
         if (!emitter.selectOperation(op))
           return success();
@@ -431,9 +436,9 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
   plan::PartitionBindingOp partition =
       target::lowering::countPartitionForIteration(planIndex, kernel, operation);
   if (partition) {
-    if (!planIndex.stages.empty() || !planIndex.components.reusedAxes.empty())
+    if (!planIndex.components.reusedAxes.empty())
       return partition.emitOpError(
-          "count partition cannot use staged or worker-reused TileLang ownership");
+          "count partition cannot use worker-reused TileLang ownership");
     plan::AxisOp axis = planIndex.axes.lookup(partition.getAxisNode());
     std::string part = programBlocks.lookup(partition.getAxisNode());
     std::string region = axisIndices.lookup(partition.getAxisNode());
@@ -451,34 +456,6 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
     if (failed(axis))
       return failure();
     axes.push_back(*axis);
-  }
-
-  if (!planIndex.stages.empty()) {
-    if (axes.size() != 1)
-      return operation.emitOpError(
-          "staged TileLang ownership requires one logical axis");
-    BlockArgument argument = body.getArgument(0);
-    plan::AxisOp axis = axes.front();
-    bool outer = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
-      unsigned position = stage.getOrdinal();
-      auto runtime = stageRaggedRuntime.find(position);
-      return runtime != stageRaggedRuntime.end() &&
-             raggedRuntimes[runtime->second].binding.getOuterNode() ==
-                 axis.getNode();
-    });
-    bool member = llvm::any_of(planIndex.stages, [&](plan::StageOp stage) {
-      auto stageAxes = planIndex.stageAxes.find(stage.getNode());
-      plan::StageAxisOp binding =
-          stageAxes == planIndex.stageAxes.end()
-              ? plan::StageAxisOp()
-              : stageAxes->second.lookup("member");
-      return binding && binding.getAxisNodeAttr() &&
-             binding.getAxisNodeAttr().getInt() == axis.getNode();
-    });
-    if (outer == member)
-      return operation.emitOpError("has no staged program-axis binding");
-    valueNames[argument] = outer ? "expert" : "member_start";
-    return success();
   }
 
   if (&operation == programRoot &&
@@ -2782,6 +2759,71 @@ LogicalResult ProgramMaterializer::emitCast(Operation &operation) {
   return success();
 }
 
+LogicalResult ProgramMaterializer::emitBitcast(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "bitcast emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  bool tensorResult = operation.getNumResults() == 1 &&
+                      isa<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(node) || !binding || binding.getLowering() != "T.reinterpret" ||
+      operation.getNumResults() != 1 ||
+      binding.getSpace() != (tensorResult ? "fragment" : "local"))
+    return operation.emitOpError("lacks a TileLang bitcast binding");
+  if (!tensorResult) {
+    FailureOr<StringRef> operand = lookupValue(operation, 0);
+    std::string dtype = dtypeName(operation.getResult(0).getType(), operation);
+    if (failed(operand) || dtype.empty())
+      return failure();
+    std::string result = makeResultName(operation, 0);
+    std::string expression = syntax::bitcast(*operand, dtype);
+    if (target::whileConditionOwner(operation)) {
+      bindResult(operation, 0, expression);
+      return success();
+    }
+    line(result + " = " + expression);
+    bindResult(operation, 0, result);
+    return success();
+  }
+  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
+  FailureOr<SmallVector<std::string>> extents = tensorExtents(operation, 0);
+  auto tensor = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  if (failed(result) || failed(extents) || !tensor)
+    return operation.emitOpError("lacks a TileLang bitcast binding");
+  std::string dtype = dtypeName(tensor.getElementType(), operation);
+  if (dtype.empty())
+    return failure();
+  SmallVector<std::string> indices;
+  std::string loop = "for ";
+  for (unsigned axis = 0; axis < extents->size(); ++axis) {
+    if (axis)
+      loop += ", ";
+    indices.push_back("bitcast_i" + std::to_string(axis));
+    loop += indices.back();
+  }
+  loop += " in T.Parallel(";
+  for (auto [axis, extent] : llvm::enumerate(*extents)) {
+    if (axis)
+      loop += ", ";
+    loop += extent;
+  }
+  line(loop + "):");
+  ++indentation;
+  FailureOr<std::string> operand =
+      tensorElement(operation.getOperand(0), indices, operation);
+  if (failed(operand))
+    return failure();
+  std::string target = *result + "[";
+  for (auto [axis, index] : llvm::enumerate(indices)) {
+    if (axis)
+      target += ", ";
+    target += index;
+  }
+  line(target + "] = " + syntax::bitcast(*operand, dtype));
+  --indentation;
+  bindResult(operation, 0, *result);
+  return success();
+}
+
 LogicalResult ProgramMaterializer::emitReshape(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "reshape emission");
   plan::PointwiseOp binding =
@@ -3040,64 +3082,6 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     bindResult(operation, 0, result);
     return success();
   }
-  if (form == "staged_deferred" || form == "staged_vector") {
-    FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
-    if (failed(view))
-      return failure();
-    if (form == "staged_deferred") {
-      if (!binding.getDefer() || (*view)->tensor.getRank() != 2)
-        return operation.emitOpError(
-            "has an inconsistent deferred TileLang gather form");
-      deferredLoads[operation.getResult(0)] = &operation;
-      return success();
-    }
-    if ((*view)->tensor.getRank() != 1 || relation->size() != 1 ||
-        (*relation)[0].kind != "value_index" ||
-        (*relation)[0].operands.size() != 1 ||
-        !(*relation)[0].operands.front())
-      return operation.emitOpError(
-          "staged indirect gather requires one indexed vector source");
-    FailureOr<StringRef> indices =
-        lookupValue(operation, *(*relation)[0].operands.front());
-    auto element = [&](IntegerAttr operandIndex) -> FailureOr<std::string> {
-      FailureOr<StringRef> value = lookupValue(operation, operandIndex.getInt());
-      if (failed(value))
-        return failure();
-      auto tensor = dyn_cast<RankedTensorType>(
-          operation.getOperand(operandIndex.getInt()).getType());
-      if (!tensor)
-        return value->str();
-      if (tensor.getRank() != 1) {
-        operation.emitOpError(
-            "requires scalar or rank-one ragged gather predicates and fills");
-        return failure();
-      }
-      return value->str() + "[gather_i]";
-    };
-    FailureOr<std::string> valid = element(validIndex);
-    FailureOr<std::string> fill = element(fillIndex);
-    FailureOr<std::string> allocated = resultStorage();
-    if (failed(indices) || failed(valid) || failed(fill) || failed(allocated))
-      return failure();
-    if (activeStages.empty())
-      return operation.emitOpError("has no active staged member tile");
-    std::string memberTile = stageMemberTiles.lookup(activeStages.front());
-    for (unsigned stage : llvm::drop_begin(activeStages))
-      if (stageMemberTiles.lookup(stage) != memberTile)
-        return operation.emitOpError(
-            "is shared by stages with inconsistent member tiles");
-    std::string result = *allocated;
-    line("for gather_i in T.Parallel(" + memberTile + "):");
-    ++indentation;
-    line(result + "[gather_i] = T.if_then_else(member_start + gather_i < "
-         "route_end and " + *valid + ", " +
-         (*view)->argument->name + "[" +
-         addressIndex(indices->str() + "[gather_i]") + "], " +
-         *fill + ")");
-    --indentation;
-    bindResult(operation, 0, result);
-    return success();
-  }
   if (form == "view_indirect" &&
       isa<intent::ViewType>(operation.getOperand(0).getType())) {
     FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
@@ -3234,7 +3218,7 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
       succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
   if (failed(node) || !binding || binding.getLowering() != "T.members" ||
       operation.getNumOperands() != 1 || operation.getNumResults() != 1)
-    return operation.emitOpError("lacks a staged TileLang members binding");
+    return operation.emitOpError("lacks a TileLang members binding");
   FailureOr<plan::AxisOp> memberAxis =
       resolveAxis(operation.getOperand(0), operation);
   FailureOr<plan::RaggedOp> relation =
@@ -3250,9 +3234,6 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
     return operation.emitOpError("has no ragged runtime for its member axis");
   RaggedRuntime &ragged = raggedRuntimes[runtime->second];
   if (planIndex.components.orderedRaggedAxes.contains(memberAxis->getNode())) {
-    if (!activeStages.empty())
-      return operation.emitOpError(
-          "cannot mix ordered and staged ragged member projection");
     std::string position = axisIndices.lookup(memberAxis->getNode());
     if (auto argument = dyn_cast<BlockArgument>(operation.getOperand(0))) {
       FailureOr<target::lowering::RegionRangeBinding> selected =
@@ -3285,34 +3266,8 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
     bindResult(operation, 0, *result);
     return success();
   }
-  if (activeStages.empty())
-    return operation.emitOpError(
-        "has neither ordered traversal nor staged ragged ownership");
-  for (unsigned stage : activeStages)
-    if (!stageRaggedRuntime.count(stage) ||
-        stageRaggedRuntime.lookup(stage) != runtime->second)
-      return operation.emitOpError(
-          "is shared by stages with inconsistent ragged ownership");
-  std::string memberTile = stageMemberTiles.lookup(activeStages.front());
-  for (unsigned stage : llvm::drop_begin(activeStages))
-    if (stageMemberTiles.lookup(stage) != memberTile)
-      return operation.emitOpError(
-          "is shared by stages with inconsistent member tiles");
-  FailureOr<std::string> result = allocateResult(operation, 0, "fragment");
-  if (failed(result))
-    return failure();
-  line("for member_i in T.Parallel(" + memberTile + "):");
-  ++indentation;
-  std::string member = ragged.indices
-                           ? ragged.indices->argument->name +
-                                 "[" + addressIndex("member_start + member_i") +
-                                 "]"
-                           : "member_start + member_i";
-  line(*result + "[member_i] = T.if_then_else(member_start + member_i < "
-       "route_end, " + member + ", 0)");
-  --indentation;
-  bindResult(operation, 0, *result);
-  return success();
+  return operation.emitOpError(
+      "has no single-launch ordered ragged traversal realization");
 }
 
 LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
@@ -3359,6 +3314,10 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
   streamCarriers[&operation] = carriers;
   bool raggedStream =
       planIndex.components.orderedRaggedAxes.contains(binding.getAxisNode());
+  bool partitionedStream = binding.hasPartition();
+  if (raggedStream && partitionedStream)
+    return binding.emitOpError(
+        "cannot mechanically combine ragged and count-partition stream bounds");
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
   if (raggedStream) {
     FailureOr<plan::RaggedOp> relation =
@@ -3383,9 +3342,33 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     line("sequence_length_" + raggedSuffix + " = sequence_end_" +
          raggedSuffix + " - sequence_begin_" + raggedSuffix);
   }
+  std::string partitionBegin;
+  std::string partitionEnd;
+  std::string activeEnd;
   std::string streamExtent =
       raggedStream ? "sequence_length_" + raggedSuffix
                    : logicalExtent(binding.getExtent());
+  if (partitionedStream) {
+    plan::PartitionBindingOp partition = binding.getPartition();
+    plan::AxisOp axis = planIndex.axes.lookup(partition.getAxisNode());
+    const target::lowering::RangeBinding *ownership =
+        axis ? axis.getRange("ownership", 0) : nullptr;
+    std::string part = programBlocks.lookup(partition.getAxisNode());
+    std::string logical = axisDimensions.lookup(partition.getAxisNode());
+    if (!axis || !ownership || part.empty() || logical.empty())
+      return binding.emitOpError(
+          "has no exact TileLang count-partition stream interval");
+    std::string suffix = std::to_string(*node);
+    partitionBegin = "stream_segment_begin_" + suffix;
+    partitionEnd = "stream_segment_end_" + suffix;
+    line(partitionBegin + " = T.min(" + addressIndex(part) + " * " +
+         ownership->getTile().str() + ", " + logical + ")");
+    line(partitionEnd + " = T.min(" + partitionBegin + " + " +
+         ownership->getTile().str() + ", " + logical + ")");
+    streamExtent =
+        "T.max(0, " + partitionEnd + " - " + partitionBegin + ")";
+    activeEnd = partitionEnd;
+  }
   if (hasStop) {
     auto stopIndex =
         operation.getAttrOfType<IntegerAttr>("intent.stop_operand_index");
@@ -3404,7 +3387,24 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
           "does not consume the planned logical stream stop value");
     if (failed(stop))
       return failure();
-    streamExtent = "T.max(0, T.min(" + stop->str() + ", " + streamExtent + "))";
+    if (partitionedStream) {
+      activeEnd = "stream_effective_end_" + std::to_string(*node);
+      line(activeEnd + " = T.min(" + stop->str() + ", " + partitionEnd + ")");
+      streamExtent =
+          "T.max(0, " + activeEnd + " - " + partitionBegin + ")";
+    } else {
+      streamExtent =
+          "T.max(0, T.min(" + stop->str() + ", " + streamExtent + "))";
+    }
+  }
+  if (partitionedStream) {
+    auto previous = activeTraversalEnds.find(binding.getAxisNode());
+    std::optional<std::string> restore;
+    if (previous != activeTraversalEnds.end())
+      restore = previous->second;
+    streamEndRestores[&operation].emplace_back(binding.getAxisNode(),
+                                                std::move(restore));
+    activeTraversalEnds[binding.getAxisNode()] = activeEnd;
   }
   std::string streamTile = "stream_tile_" + std::to_string(*node);
   line("for " + streamTile + " in T.Pipelined(T.ceildiv(" + streamExtent +
@@ -3413,7 +3413,10 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
   ++indentation;
   std::string streamStart = "stream_axis_index_" + std::to_string(*node);
   line(streamStart + " = " +
-       std::string(raggedStream ? "sequence_begin_" + raggedSuffix + " + " : "") +
+       std::string(partitionedStream
+                       ? partitionBegin + " + "
+                       : raggedStream ? "sequence_begin_" + raggedSuffix + " + "
+                                      : "") +
        addressIndex(streamTile) + " * " + binding.getTile().str());
   valueNames[body.getArgument(0)] = streamStart;
   regionIndices[body.getArgument(0)] = streamStart;
@@ -3485,6 +3488,17 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
         axisIndices.erase(value->first);
     }
     streamAxisRestores.erase(restores);
+  }
+  if (auto restores = streamEndRestores.find(&operation);
+      restores != streamEndRestores.end()) {
+    for (auto value = restores->second.rbegin();
+         value != restores->second.rend(); ++value) {
+      if (value->second)
+        activeTraversalEnds[value->first] = *value->second;
+      else
+        activeTraversalEnds.erase(value->first);
+    }
+    streamEndRestores.erase(restores);
   }
   return success();
 }
@@ -3587,11 +3601,6 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       (accumulatorConditional || producerReplay ||
        (accumulatorOwner && planIndex.streams.count(*accumulatorOwner) &&
         oneSidedDeferredOperand));
-  if (reuseCarriedAccumulator &&
-      target::lowering::isPlannedStageNode(planIndex, &operation))
-    return operation.emitOpError(
-        "TileLang 0.1.13 cannot mechanically combine a planned private "
-        "stage with conditional loop-carried contraction accumulation");
   std::optional<std::string> carriedAccumulator;
   if (reuseCarriedAccumulator) {
     if (!accumulatorUpdate || !accumulatorValue)
@@ -3606,156 +3615,6 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     carriedAccumulator = previousName->second;
     inPlacePointwiseResults[update] = *carriedAccumulator;
   }
-  if (form == "staged") {
-    if (binding.getLhsSpace() != "shared" ||
-        binding.getRhsSpace() != "shared" ||
-        binding.getAccumulatorSpace() != "fragment")
-      return operation.emitOpError(
-          "staged TileLang contraction has inconsistent operand spaces");
-    if (activeStages.size() != 1)
-      return operation.emitOpError(
-          "must belong to exactly one resolved physical stage");
-    unsigned stage = activeStages.front();
-    if ((binding.getLhsForm() != "member_row_gather" &&
-         binding.getLhsForm() != "workspace") ||
-        binding.getRhsForm() != "expert_matrix")
-      return operation.emitOpError(
-          "has no selected TileLang staged operand forms");
-    Operation *lhsAccess = deferredLoads.lookup(operation.getOperand(0));
-    Operation *rhsLoad = deferredLoads.lookup(operation.getOperand(1));
-    FailureOr<ABIView *> rhsView =
-        rhsLoad && rhsLoad->getNumOperands() > 0
-            ? lookupView(rhsLoad->getOperand(0), *rhsLoad)
-            : FailureOr<ABIView *>(failure());
-    if (!rhsLoad || failed(rhsView))
-      return operation.emitOpError(
-          "staged contraction requires one expert-selected rank-three weight");
-    auto operandElementType = [](Value value) -> Type {
-      auto tensor = dyn_cast<RankedTensorType>(value.getType());
-      return tensor ? tensor.getElementType() : Type();
-    };
-    Type lhsElement = operandElementType(operation.getOperand(0));
-    Type rhsElement = operandElementType(operation.getOperand(1));
-    bool promoteToF32 = lhsElement.isF32() || rhsElement.isF32();
-    if (!lhsElement || !rhsElement ||
-        (!promoteToF32 && lhsElement != rhsElement) ||
-        (!lhsElement.isF16() && !lhsElement.isBF16() && !lhsElement.isF32()) ||
-        (!rhsElement.isF16() && !rhsElement.isBF16() && !rhsElement.isF32()))
-      return operation.emitOpError(
-          "has unsupported staged matrix operand types");
-    std::string reduction = stageReductionDimensions.lookup(stage);
-    std::string memberTile = stageMemberTiles.lookup(stage);
-    std::string featureTile = stageFeatureTiles.lookup(stage);
-    std::string reductionTile = stageReductionTiles.lookup(stage);
-    std::string matrixDtype =
-        promoteToF32 ? "T.float32" : dtypeName(lhsElement, operation);
-    if (matrixDtype.empty())
-      return failure();
-    std::string lhs = makeResultName(operation, 0) + "_lhs";
-    std::string rhs = makeResultName(*rhsLoad, 0) + "_shared";
-    std::string result = makeResultName(operation, 0);
-    line(lhs + " = T.alloc_shared((" + memberTile + ", " + reductionTile +
-         "), " + matrixDtype + ")");
-    line(rhs + " = T.alloc_shared((" +
-         (orientation->rhsTranspose ? featureTile : reductionTile) + ", " +
-         (orientation->rhsTranspose ? reductionTile : featureTile) + "), " +
-         matrixDtype + ")");
-    line(result +
-         " = T.alloc_fragment((" + memberTile + ", " + featureTile +
-         "), T.float32)");
-    line("T.clear(" + result + ")");
-    line("for k_tile in T.Pipelined(T.ceildiv(" + reduction +
-         ", " + reductionTile + "), num_stages=num_stages):");
-    ++indentation;
-    if (binding.getLhsForm() == "member_row_gather") {
-      if (!lhsAccess)
-        return operation.emitOpError(
-            "selected staged row-gather input is not deferred");
-      if (::intent::target::semanticOperationName(*lhsAccess) != "intent.gather")
-        return lhsAccess->emitOpError(
-            "is not a staged indirect contraction input");
-      FailureOr<SmallVector<target::IndexTerm>> relation =
-          target::parseIndexRelation(*lhsAccess);
-      FailureOr<ABIView *> lhsView =
-          lookupView(lhsAccess->getOperand(0), *lhsAccess);
-      auto runtime = stageRaggedRuntime.find(stage);
-      bool contiguous =
-          runtime != stageRaggedRuntime.end() &&
-          runtime->second < raggedRuntimes.size() &&
-          !raggedRuntimes[runtime->second].indices;
-      if (failed(relation) || failed(lhsView) || relation->size() != 2 ||
-          (*relation)[0].kind != "value_index" ||
-          (*relation)[0].operands.size() != 1 ||
-          !(*relation)[0].operands.front() ||
-          (*relation)[1].kind != "full_slice")
-        return lhsAccess->emitOpError(
-            "has no staged row-gather contraction relation");
-      FailureOr<StringRef> rows =
-          lookupValue(*lhsAccess, *(*relation)[0].operands.front());
-      if (failed(rows))
-        return failure();
-      if (contiguous) {
-        line("T.copy(" + (*lhsView)->argument->name +
-             "[" + addressIndex("member_start") + " : " +
-             addressIndex("member_start") + " + " + memberTile + ", " +
-             addressIndex("k_tile") + " * " + reductionTile + " : " +
-             addressIndex("k_tile + 1") + " * " + reductionTile + "], " +
-             lhs + ")");
-      } else {
-        line("for load_i, load_k in T.Parallel(" + memberTile + ", " +
-             reductionTile + "):");
-        ++indentation;
-        line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
-             "route_end and k_tile * " + reductionTile + " + load_k < " +
-             reduction +
-             ", " + (*lhsView)->argument->name + "[" +
-             addressIndex(rows->str() + "[load_i]") + ", " +
-             addressIndex("k_tile * " + reductionTile + " + load_k") +
-             "], 0.0)");
-        --indentation;
-      }
-    } else {
-      auto workspace = workspaceNames.find(operation.getOperand(0));
-      if (workspace == workspaceNames.end())
-        return operation.emitOpError(
-            "staged contraction input has no materialized workspace");
-      line("for load_i, load_k in T.Parallel(" + memberTile + ", " +
-           reductionTile + "):");
-      ++indentation;
-      line(lhs + "[load_i, load_k] = T.if_then_else(member_start + load_i < "
-           "route_end and k_tile * " + reductionTile + " + load_k < " +
-           reduction +
-           ", " + workspace->second + "[" +
-           addressIndex("member_start + load_i") + ", " +
-           addressIndex("k_tile * " + reductionTile + " + load_k") +
-           "], 0.0)");
-      --indentation;
-    }
-    if (orientation->rhsTranspose) {
-      line("T.copy(" + (*rhsView)->argument->name +
-           "[" + addressIndex("expert") + ", " +
-           addressIndex("bid_feature") + " * " + featureTile + " : " +
-           addressIndex("bid_feature + 1") + " * " + featureTile + ", " +
-           addressIndex("k_tile") + " * " + reductionTile + " : " +
-           addressIndex("k_tile + 1") + " * " + reductionTile + "], " +
-           rhs + ")");
-      line("T.gemm(" + lhs + ", " + rhs + ", " + result +
-           ", transpose_B=True, policy=GEMM_WARP_POLICY)");
-    } else {
-      line("T.copy(" + (*rhsView)->argument->name +
-           "[" + addressIndex("expert") + ", " + addressIndex("k_tile") +
-           " * " + reductionTile + " : " + addressIndex("k_tile + 1") +
-           " * " + reductionTile + ", " + addressIndex("bid_feature") +
-           " * " + featureTile + " : " + addressIndex("bid_feature + 1") +
-           " * " + featureTile + "], " + rhs + ")");
-      line("T.gemm(" + lhs + ", " + rhs + ", " + result +
-           ", policy=GEMM_WARP_POLICY)");
-    }
-    --indentation;
-    bindResult(operation, 0, result);
-    return success();
-  }
-
   auto replay = deferredContractReplays.find(&operation);
   if (form == "replay") {
     if (replay == deferredContractReplays.end())
@@ -4135,8 +3994,7 @@ LogicalResult ProgramMaterializer::emitScaledContract(Operation &operation) {
       succeeded(node) ? planIndex.contracts.lookup(*node) : plan::ContractOp();
   if (failed(node) || !binding ||
       binding.getLowering() != "T.scaled_gemm_fallback" ||
-      operation.getNumOperands() != 4 || operation.getNumResults() != 1 ||
-      target::lowering::isPlannedStageNode(planIndex, &operation))
+      operation.getNumOperands() != 4 || operation.getNumResults() != 1)
     return operation.emitOpError("lacks a TileLang scaled-contraction binding");
   if (binding.getForm() != "scaled_direct")
     return operation.emitOpError(
@@ -4449,7 +4307,7 @@ LogicalResult ProgramMaterializer::emitUniqueStore(Operation &operation) {
          *indices + "])");
     return success();
   }
-  if (binding.getTensorIndexing() == "structured" && planIndex.stages.empty()) {
+  if (binding.getTensorIndexing() == "structured") {
     FailureOr<std::string> indices = accessIndices(operation);
     if (failed(indices))
       return failure();
@@ -4485,55 +4343,6 @@ LogicalResult ProgramMaterializer::emitUniqueStore(Operation &operation) {
       elementBoundsPredicate(operation, tileIndices, false, false);
   if (failed(indices) || failed(predicate))
     return failure();
-  if (!planIndex.stages.empty()) {
-    auto storedTensor = dyn_cast<RankedTensorType>(storedValue.getType());
-    bool memberIndexed =
-        relation->size() ==
-            static_cast<size_t>((*view)->tensor.getRank()) &&
-        relation->size() >= 2 && relation->back().kind == "full_slice";
-    for (const target::IndexTerm &term : llvm::drop_end(*relation))
-      memberIndexed =
-          memberIndexed && term.kind == "value_index" &&
-          term.operands.size() == 1 && term.operands.front() &&
-          isa<RankedTensorType>(
-              operation.getOperand(*term.operands.front()).getType());
-    if (activeStages.size() != 1 || !memberIndexed || !storedTensor ||
-        storedTensor.getRank() != 2 || tileIndices.size() != 2)
-      return operation.emitOpError(
-          "staged TileLang unique store requires member-indexed leading axes "
-          "and one feature slice");
-    SmallVector<std::string> memberIndices;
-    for (const target::IndexTerm &term : llvm::drop_end(*relation)) {
-      FailureOr<StringRef> index =
-          lookupValue(operation, *term.operands.front());
-      if (failed(index))
-        return failure();
-      memberIndices.push_back(index->str());
-    }
-    unsigned stage = activeStages.front();
-    std::string memberTile = stageMemberTiles.lookup(stage);
-    std::string featureTile = stageFeatureTiles.lookup(stage);
-    line("for store_i, store_j in T.Parallel(" + memberTile + ", " +
-         featureTile + "):");
-    ++indentation;
-    line("if member_start + store_i < route_end and bid_feature * " +
-         featureTile + " + store_j < " +
-         stageFeatureDimensions.lookup(stage) + ":");
-    ++indentation;
-    std::string destination = (*view)->argument->name + "[";
-    for (auto [axis, index] : llvm::enumerate(memberIndices)) {
-      if (axis)
-        destination += ", ";
-      destination += index + "[store_i]";
-    }
-    destination += ", " +
-                   addressIndex("bid_feature * " + featureTile + " + store_j") +
-                   "]";
-    line(destination + " = " + stored->str() + "[store_i, store_j]");
-    --indentation;
-    --indentation;
-    return success();
-  }
   line(loop);
   ++indentation;
   line("if " + *predicate + ":");
@@ -4556,17 +4365,16 @@ LogicalResult ProgramMaterializer::emitAtomic(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.value_operand_index");
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   Operation *deferredValue =
-      planIndex.stages.empty() && valueIndex
-          ? deferredLoads.lookup(operation.getOperand(valueIndex.getInt()))
-          : nullptr;
+      valueIndex ? deferredLoads.lookup(operation.getOperand(valueIndex.getInt()))
+                 : nullptr;
   FailureOr<StringRef> stored =
       deferredValue ? FailureOr<StringRef>(StringRef())
       : valueIndex  ? lookupValue(operation, valueIndex.getInt())
                     : FailureOr<StringRef>(failure());
   if (!valueIndex || failed(view) || failed(stored))
     return operation.emitOpError("lacks a mechanical TileLang atomic merge");
-  if (planIndex.stages.empty()) {
-    Value storedValue = operation.getOperand(valueIndex.getInt());
+  Value storedValue = operation.getOperand(valueIndex.getInt());
+  {
     if (!isa<RankedTensorType>(storedValue.getType())) {
       FailureOr<int64_t> node =
           target::getNodeID(operation, "atomic emission");
@@ -4669,8 +4477,6 @@ LogicalResult ProgramMaterializer::emitAtomic(Operation &operation) {
     --indentation;
     return success();
   }
-  return operation.emitOpError(
-      "reached terminal emission with an unlegalized staged atomic merge");
 }
 
 } // namespace intent::tilelang::lowering

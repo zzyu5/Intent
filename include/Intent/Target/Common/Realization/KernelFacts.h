@@ -117,6 +117,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, int64_t> partitionFixedExtents;
   llvm::DenseMap<mlir::Operation *, mlir::Value> partitionCounts;
   llvm::DenseMap<mlir::Value, mlir::Operation *> partitionPartArguments;
+  llvm::DenseMap<mlir::Value, mlir::Operation *> partitionRegionArguments;
   llvm::SmallVector<CountPartitionFact> countPartitions;
   llvm::SmallVector<mlir::Operation *> parallels;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>

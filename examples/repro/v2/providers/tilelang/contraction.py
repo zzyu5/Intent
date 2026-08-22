@@ -8,6 +8,7 @@ from kernels.contraction.gemm import Activation
 from kernels.contraction.gemm import gemm
 from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
+from kernels.contraction.weight_only_int4 import bitnet_int2_matmul
 from kernels.contraction.weight_only_int4 import w4a8_packed_matmul
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
@@ -85,6 +86,75 @@ def w4a8_gemm(context: Context) -> PreparedComparison:
         threads=256,
     )
     source = functional_launch(lambda: source_kernel(activation, packed))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=0.0),
+        cuda_graph=True,
+    )
+
+
+def bitnet_int2(context: Context) -> PreparedComparison:
+    rows, output_dimension, reduction = 1, 4096, 4096
+    activation = torch.randint(
+        -8,
+        8,
+        (rows, reduction),
+        device="cuda",
+        dtype=torch.int8,
+    )
+    support = runtime_module(
+        context,
+        "source/tilelang/tilelang/support/runtime.py",
+        "intent_v2_tilelang_runtime_support",
+    )
+    source_module = support.load_source(
+        context.project_root
+        / "source/tilelang/tilelang/gemm/bitnet_int2_decode/tilelang_bitnet_158_int8xint2_decode.py",
+        "intent_v2_tilelang_bitnet_int2",
+    )
+    logical_weight = torch.randint(
+        0,
+        2,
+        (output_dimension, reduction),
+        dtype=torch.int8,
+    ).numpy()
+    packed_numpy = source_module.general_compress(
+        logical_weight,
+        source_bits=2,
+    )
+    packed_numpy = source_module.interleave_weight(
+        packed_numpy,
+        2,
+        target_dtype=source_module.T.int8,
+    )
+    packed_i8 = torch.from_numpy(packed_numpy).to(device="cuda")
+    packed_u8 = packed_i8.view(torch.uint8)
+    _, generated = compile_single(
+        context,
+        bitnet_int2_matmul,
+        (activation, packed_u8),
+    )
+    source_program = source_module.bitnet_158_int8xint2_decode(
+        rows,
+        output_dimension,
+        reduction,
+        source_module.T.int8,
+        source_module.T.int32,
+        source_module.T.int32,
+    )
+    source_kernel = source_module.tilelang.compile(source_program)
+    source_output = torch.empty(
+        (rows, output_dimension),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def source_call():
+        source_kernel(activation, packed_i8, source_output)
+        return source_output
+
+    source = functional_launch(source_call)
     return PreparedComparison(
         generated,
         source,
@@ -339,13 +409,10 @@ CASES = {
     "block_sparse_gemm": block_sparse,
     "grouped_gemm_backward": grouped_gemm_backward,
     "deepgemm_fp8_2xacc": deepgemm_fp8,
-    "bitnet_int2_decode": implementation_gap(
-        "the source requires packed-int2 storage semantics and an imported "
-        "lop3/dp4a decode intrinsic; ordinary bitwise ops plus contract do not "
-        "preserve that callable"
-    ),
+    "bitnet_int2_decode": bitnet_int2,
     "dequant_bf16_fp4": implementation_gap(
-        "the source requires packed FP4 E2M1 storage, bit reinterpretation, and "
-        "a provider intrinsic before the BF16 contraction"
+        "the DSL expresses the registered twiddled packed ABI and equal-width "
+        "bit reinterpretation, but the imported source callable depends on an "
+        "external decode-intrinsic module that is not present beside the source"
     ),
 }

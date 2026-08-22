@@ -20,6 +20,7 @@ from .builtins import atomic_add
 from .builtins import atomic_cas
 from .builtins import auto
 from .builtins import buffer
+from .builtins import bitcast
 from .builtins import cast
 from .builtins import contract
 from .builtins import cos
@@ -107,6 +108,7 @@ __all__ = [
     "bf16",
     "bool",
     "buffer",
+    "bitcast",
     "cast",
     "constraints",
     "contract",

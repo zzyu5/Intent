@@ -33,6 +33,8 @@ struct TensorIndexGroup {
   bool requiresBroadcastProjection() const { return count > 1 || rank > 1; }
 };
 
+mlir::Operation *resolveStructuralDomain(mlir::Value value);
+
 mlir::FailureOr<llvm::SmallVector<IndexTerm>>
 parseIndexRelation(mlir::Operation &operation);
 

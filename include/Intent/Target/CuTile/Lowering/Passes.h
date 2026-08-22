@@ -31,8 +31,6 @@ inline constexpr llvm::StringLiteral scanLoweringAttr =
     "intent_plan.cutile.scan_lowering";
 inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
     "intent_plan.cutile.pointwise_lowering";
-inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
-    "intent_plan.cutile.pointwise_deferred";
 inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.cutile.gather_form";
 inline constexpr llvm::StringLiteral streamTileAttr =

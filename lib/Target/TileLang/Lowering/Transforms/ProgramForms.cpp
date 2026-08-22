@@ -125,8 +125,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   intent::plan::RangeOp laneRange =
       lane ? (*analysis)->getRange(lane.getNode(), "lane")
            : intent::plan::RangeOp();
-  bool tuneRows = !searchSpace && (*analysis)->getStages().empty() &&
-                  !(*analysis)->hasWorkerReuse() && laneRange &&
+  bool tuneRows = !searchSpace && !(*analysis)->hasWorkerReuse() && laneRange &&
                   laneRange.getTile().starts_with("row_vector") &&
                   !target::lowering::hasNonReplayableEffect(
                       (*analysis)->getKernel().entry.getOperation());
@@ -161,11 +160,6 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     autotune->setAttr(gemmWarpPolicyAttr, builder.getBoolAttr(tuneGemm));
   }
 
-  llvm::DenseSet<int64_t> stagedOperations;
-  for (intent::plan::StageOp stage :
-       program.getBody().getOps<intent::plan::StageOp>())
-    for (int64_t node : stage.getOperations())
-      stagedOperations.insert(node);
   target::KernelModel &kernel = (*analysis)->getKernel();
 
   for (const auto &entry : kernel.raggedRelations) {
@@ -204,9 +198,6 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (orientation->batched)
       return contract.emitOpError(
           "TileLang 0.1.13 has no mechanical batched GEMM projection");
-    if (contract.getForm() == "staged" && orientation->lhsTranspose)
-      return contract.emitOpError(
-          "TileLang cannot project the selected staged contraction orientation");
     auto repeatedContractionOperand = [](Value operand) {
       return llvm::count_if(operand.getUsers(), [](Operation *user) {
                return ::intent::target::semanticOperationName(*user) == "intent.contract";
@@ -281,8 +272,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     if (pointwise->hasAttr(pointwiseFormAttr) ||
-        pointwise->hasAttr(pointwiseLoweringAttr) ||
-        pointwise->hasAttr(pointwiseDeferredAttr))
+        pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError(
           "already has a TileLang pointwise-form decision");
     Operation *operation =
@@ -301,31 +291,13 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     pointwise->setAttr(pointwiseFormAttr, builder.getStringAttr(form));
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    bool deferred = stagedOperations.contains(
-        static_cast<int64_t>(pointwise.getNode()));
-    pointwise->setAttr(pointwiseDeferredAttr, builder.getBoolAttr(deferred));
     if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather = target::lowering::classifyGatherProjection(
-          *operation, deferred, deferred);
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
       if (failed(gather))
         return failure();
       pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
     }
-  }
-
-  for (const auto &entry : kernel.nodes) {
-    Operation *operation = entry.second;
-    if (!operation || ::intent::target::semanticOperationName(*operation) !=
-                          "intent.scatter_reduce")
-      continue;
-    FailureOr<int64_t> node =
-        target::getNodeID(*operation, "TileLang scatter-reduce capability");
-    if (failed(node))
-      return failure();
-    if (stagedOperations.contains(*node))
-      return operation->emitOpError(
-          "TileLang 0.1.13 cannot project staged dynamic-row scatter reduction "
-          "without a layout-unsafe or serial atomic path");
   }
 
   for (intent::plan::StreamBindingOp stream :
@@ -376,9 +348,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         });
     bool elementwise = *derivedScalar || tensorIndirect || logicalBounds;
     bool bounds = (*analysis)->hasWorkerReuse() || raggedBound ||
-                  (logicalBounds && !physicalValidity) ||
-                  (!(*analysis)->getStages().empty() && store) ||
-                  *derivedScalar || tensorIndirect || packedScalar;
+                  (logicalBounds && !physicalValidity) || *derivedScalar ||
+                  tensorIndirect || packedScalar;
     bool scalarResult = operation->getNumResults() == 1 &&
                         !isa<RankedTensorType>(operation->getResult(0).getType());
     Type resultElement =
@@ -437,8 +408,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
     transfer->setAttr(
         deferredAttr,
-        builder.getBoolAttr(load && (*analysis)->getStages().empty() &&
-                            feedsAtomicValue(*operation)));
+        builder.getBoolAttr(load && feedsAtomicValue(*operation)));
   }
   return success();
 }
@@ -523,14 +493,13 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     auto form = pointwise->getAttrOfType<StringAttr>(pointwiseFormAttr);
     auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
-    auto deferred = pointwise->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
     bool requiresGather =
         operation && target::semanticOperationName(*operation) == "intent.gather";
     if (!form || (form.getValue() != "elementwise" &&
                   form.getValue() != "contract_operand") ||
-        !lowering || lowering.getValue().empty() || !deferred || !operation ||
+        !lowering || lowering.getValue().empty() || !operation ||
         (requiresGather && (!gather || gather.getValue().empty())))
       return pointwise.emitOpError(
           "has no complete TileLang pointwise-form decision");

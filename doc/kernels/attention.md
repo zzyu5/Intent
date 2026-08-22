@@ -114,6 +114,12 @@ def flash_attention_fwd(
 
 Fragment layout、寄存器分配、指令选择以及给定候选后的低层 pipeline、prefetch 与 warp specialization 交给目标 compiler。
 
+## 作者显式的 split-K decode
+
+上游算法若以多个 launches 组成 split-K decode，Intent source 也写成多个 `@intent.kernel`。第一段用 `partition(keys, count=P)` 的 source part identity 分别写出 partial LSE/normalizer 与 partial output；第二段读取全部 `P` 个 slots，按同一 online-normalization 代数合并。Wrapper 负责初始化 partial buffer、依次 launch 两个 kernels 并传递中间张量。
+
+这里的 `P`、part 边界和 partial-buffer ABI 是作者算法可观察内容；每个 part 内进一步采用多大的 physical K tile、worker/grid、storage 与 pipeline 仍由 realizer/provider 决定。Compiler 不把一个单-kernel attention 自动拆成 split-K，也不把作者的两个 kernels 融成一个 launch。
+
 Packed varlen 形式不引入另一类 attention schedule。Source 用一个 ragged relation
 把 `sequence -> packed token range` 写进 Kernel IR；同一 relation 的 outer domain
 由 parallel ownership range 拥有，query member instances 彼此独立，另一个 member domain 由

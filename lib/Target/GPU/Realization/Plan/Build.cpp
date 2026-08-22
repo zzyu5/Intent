@@ -469,7 +469,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
 
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare", "intent.mask",
-                         "intent.select", "intent.cast", "intent.full",
+                         "intent.select", "intent.cast", "intent.bitcast",
+                         "intent.full",
                          "intent.zeros", "intent.members", "intent.gather",
                          "intent.reshape", "intent.transpose", "intent.random"})
     if (failed(addHandler(
@@ -539,7 +540,6 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                                "intent.scaled_contract"
                            ? "scaled_direct"
                            : "direct"),
-                string(builder, "none"), string(builder, "none"),
                 IntegerAttr(), IntegerAttr(), IntegerAttr(),
                 string(builder, "private_fragment"),
                 string(builder, "private_fragment"),

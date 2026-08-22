@@ -38,6 +38,7 @@ class OperationKind(Enum):
     COMPARE = "compare"
     SELECT = "select"
     CAST = "cast"
+    BITCAST = "bitcast"
     MASK = "mask"
 
     REDUCE = "reduce"

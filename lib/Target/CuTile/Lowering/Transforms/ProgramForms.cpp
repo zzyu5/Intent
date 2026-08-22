@@ -131,7 +131,6 @@ bool needsGuardedGatherTuning(gpu::PhysicalProgramAnalysis &analysis,
   if (!searchSpace)
     return false;
   bool indexedRagged = hasIndexedRagged(analysis.getFacts());
-  bool staged = !analysis.getStages().empty();
   bool orderedRagged = indexedRagged &&
                        !analysis.getFacts().orderedDomains.empty();
   bool guarded = false;
@@ -142,8 +141,7 @@ bool needsGuardedGatherTuning(gpu::PhysicalProgramAnalysis &analysis,
     FailureOr<std::string> role = target::lowering::pointwiseRole(*operation);
     if (failed(role))
       return;
-    guarded |= (staged && *role == "indirect_gather") ||
-               (orderedRagged && *role == "members");
+    guarded |= orderedRagged && *role == "members";
   });
   return guarded;
 }
@@ -199,19 +197,14 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   intent::plan::RangeOp laneRange =
       lane ? (*analysis)->getRange(lane.getNode(), "lane")
            : intent::plan::RangeOp();
-  bool tuneRows = !searchSpace && (*analysis)->getStages().empty() &&
-                  !(*analysis)->hasWorkerReuse() && !launch.getPersistent() &&
+  bool tuneRows = !searchSpace && !(*analysis)->hasWorkerReuse() &&
+                  !launch.getPersistent() &&
                   laneRange && laneRange.getTile().starts_with("row_vector") &&
                   !target::lowering::hasNonReplayableEffect(
                       (*analysis)->getKernel().entry.getOperation());
   launch->setAttr(rowOccupancyAttr,
                   builder.getStringAttr(tuneRows ? "delegated" : "fixed"));
 
-  llvm::DenseSet<int64_t> stagedOperations;
-  for (intent::plan::StageOp stage :
-       program.getBody().getOps<intent::plan::StageOp>())
-    for (int64_t node : stage.getOperations())
-      stagedOperations.insert(node);
   target::KernelModel &kernel = (*analysis)->getKernel();
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
@@ -238,8 +231,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(orientation))
       return contract.emitOpError(
           "does not bind canonical contraction orientation");
-    if ((orientation->batched && contract.getForm() != "direct") ||
-        (contract.getForm() == "staged" && orientation->lhsTranspose))
+    if (orientation->batched && contract.getForm() != "direct")
       return contract.emitOpError(
           "cuTile cannot project the selected contraction form and orientation");
     StringRef lowering = contract.getForm() == "scaled_direct"
@@ -294,8 +286,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   }
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
-    if (pointwise->hasAttr(pointwiseLoweringAttr) ||
-        pointwise->hasAttr(pointwiseDeferredAttr))
+    if (pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError("already has a cuTile pointwise spelling");
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     FailureOr<std::string> role =
@@ -310,12 +301,9 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    bool deferred = stagedOperations.contains(
-        static_cast<int64_t>(pointwise.getNode()));
-    pointwise->setAttr(pointwiseDeferredAttr, builder.getBoolAttr(deferred));
     if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather = target::lowering::classifyGatherProjection(
-          *operation, deferred, deferred);
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
       if (failed(gather))
         return failure();
       pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
@@ -334,6 +322,12 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return stream.emitOpError("does not bind one cuTile stream tile");
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
   }
+
+  llvm::DenseSet<int64_t> partitionedStreams;
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>())
+    if (stream.getPartitionNodeAttr())
+      partitionedStreams.insert(stream.getStreamNode());
 
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
@@ -362,15 +356,25 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         transfer.getDomainNodes(), [&](int64_t node) {
           return isRaggedBoundAxis(**analysis, node);
         });
+    bool partitionStream = false;
+    for (Operation *parent = operation->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (::intent::target::semanticOperationName(*parent) !=
+          "intent.state_stream")
+        continue;
+      auto node = parent->getAttrOfType<IntegerAttr>("intent.node");
+      partitionStream = node && partitionedStreams.contains(node.getInt());
+      break;
+    }
     bool indirect = !uniqueStore &&
                     (tensorIndexed ||
-                     (((*analysis)->hasWorkerReuse() || raggedBound) &&
+                     (((*analysis)->hasWorkerReuse() || raggedBound ||
+                       partitionStream) &&
                       vectorized));
     StringRef access = indirect ? (load ? "gather" : "scatter")
                                 : (load ? "load" : "store");
     bool bounds = (*analysis)->hasWorkerReuse() || raggedBound ||
-                  (!(*analysis)->getStages().empty() && store) ||
-                  *derivedScalar;
+                  partitionStream || *derivedScalar;
     transfer->setAttr(accessAttr, builder.getStringAttr(access));
     transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
   }
@@ -479,12 +483,11 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
-    auto deferred = pointwise->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
     bool requiresGather =
         operation && target::semanticOperationName(*operation) == "intent.gather";
-    if (!lowering || lowering.getValue().empty() || !deferred || !operation ||
+    if (!lowering || lowering.getValue().empty() || !operation ||
         (requiresGather && (!gather || gather.getValue().empty())))
       return pointwise.emitOpError("has no complete cuTile pointwise spelling");
   }

@@ -21,9 +21,6 @@ mlir::LogicalResult formAutomaticBlocking(
 mlir::LogicalResult reconcileAccessRanges(
     intent::plan::ProgramOp program,
     const intent::target::KernelFacts &facts);
-mlir::LogicalResult reconcileStages(
-    intent::plan::ProgramOp program,
-    const intent::target::KernelFacts &facts);
 
 } // namespace intent::gpu
 

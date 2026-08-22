@@ -227,6 +227,37 @@ LogicalResult validatePointwise(Operation &operation) {
           "rounding semantics only apply to float-to-integer casts");
     return success();
   }
+  if (name == "intent.bitcast") {
+    if (operation.getNumOperands() != 1 || operation.getNumResults() != 1)
+      return operation.emitOpError("has no canonical bitcast schema");
+    Type source = operation.getOperand(0).getType();
+    Type result = operation.getResult(0).getType();
+    auto sourceTensor = dyn_cast<RankedTensorType>(source);
+    auto resultTensor = dyn_cast<RankedTensorType>(result);
+    if (static_cast<bool>(sourceTensor) != static_cast<bool>(resultTensor) ||
+        (sourceTensor && sourceTensor.getShape() != resultTensor.getShape()))
+      return operation.emitOpError(
+          "bitcast requires identical source and result logical shapes");
+    Type sourceElement =
+        sourceTensor ? sourceTensor.getElementType() : source;
+    Type resultElement =
+        resultTensor ? resultTensor.getElementType() : result;
+    auto bitWidth = [](Type type) -> std::optional<unsigned> {
+      if (auto integer = dyn_cast<IntegerType>(type))
+        return integer.getWidth();
+      if (auto floating = dyn_cast<FloatType>(type))
+        return floating.getWidth();
+      return std::nullopt;
+    };
+    std::optional<unsigned> sourceWidth = bitWidth(sourceElement);
+    std::optional<unsigned> resultWidth = bitWidth(resultElement);
+    if (isa<IndexType>(sourceElement) || isa<IndexType>(resultElement) ||
+        sourceElement.isInteger(1) || resultElement.isInteger(1) ||
+        !sourceWidth || !resultWidth || *sourceWidth != *resultWidth)
+      return operation.emitOpError(
+          "bitcast requires equal-width non-bool integer or floating element types");
+    return success();
+  }
   if (name == "intent.compare") {
     auto predicate =
         operation.getAttrOfType<StringAttr>("intent.predicate");
@@ -321,6 +352,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
   for (StringRef name : {"intent.indices", "intent.broadcast", "intent.unary",
                          "intent.binary", "intent.compare",
                          "intent.mask", "intent.select", "intent.cast",
+                         "intent.bitcast",
                          "intent.reshape", "intent.transpose", "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))

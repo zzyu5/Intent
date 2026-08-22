@@ -5,6 +5,7 @@ import importlib
 import torch
 
 from kernels.streaming.mamba import mamba3_siso_step
+from kernels.streaming.mamba import mamba3_siso_forward as mamba3_siso_forward_kernel
 from kernels.streaming.mamba import mamba_chunk_state_bf16_fwd
 from kernels.streaming.mamba import mamba_state_passing_fwd
 from kernels.streaming.selective_scan import mamba_chunk_scan_bf16_fwd
@@ -126,6 +127,91 @@ def mamba3_step(context: Context) -> PreparedComparison:
             Tolerance(atol=1e-4, rtol=1e-4),
             Tolerance(atol=5e-3, rtol=5e-2),
         ),
+        cuda_graph=False,
+    )
+
+
+def mamba3_siso_forward(context: Context) -> PreparedComparison:
+    batch, sequence, qk_heads, heads = 1, 2048, 4, 16
+    qk_dimension, value_dimension, angle_dimension = 32, 64, 16
+    dtype = torch.bfloat16
+    query = torch.randn(
+        (batch, sequence, qk_heads, qk_dimension), device="cuda", dtype=dtype
+    ) * 0.1
+    key = torch.randn_like(query) * 0.1
+    value = torch.randn(
+        (batch, sequence, heads, value_dimension), device="cuda", dtype=dtype
+    ) * 0.1
+    adt = -torch.rand(
+        (batch, heads, sequence), device="cuda", dtype=torch.float32
+    ) * 0.1
+    dt = torch.rand_like(adt) * 0.1
+    trap = torch.rand_like(adt) * 0.1
+    query_bias = torch.randn(
+        (heads, qk_dimension), device="cuda", dtype=dtype
+    ) * 0.01
+    key_bias = torch.randn_like(query_bias) * 0.01
+    angles = torch.randn(
+        (batch, sequence, heads, angle_dimension),
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.01
+    residual = torch.randn((heads,), device="cuda", dtype=torch.float32) * 0.01
+    gate = torch.randn(
+        (batch, sequence, heads, value_dimension), device="cuda", dtype=dtype
+    ) * 0.1
+    arguments = (
+        query,
+        key,
+        value,
+        adt,
+        dt,
+        trap,
+        query_bias,
+        key_bias,
+        angles,
+        residual,
+        gate,
+    )
+    _, generated_base = compile_single(
+        context,
+        mamba3_siso_forward_kernel,
+        arguments,
+        constexprs={"HEAD_GROUP": heads // qk_heads},
+    )
+    generated = PreparedLaunch(
+        generated_base.launch,
+        lambda: generated_base.outputs()[0],
+    )
+    _activate(
+        context,
+        "source/triton/state-spaces-mamba/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd_runtime.py",
+        "intent_v2_triton_mamba3_siso_forward_runtime",
+    )
+    source_function = importlib.import_module(
+        "mamba_ssm.ops.triton.mamba3.mamba3_siso_fwd"
+    ).mamba3_siso_fwd
+    source_base = functional_launch(
+        lambda: source_function(
+            query,
+            key,
+            value,
+            adt,
+            dt,
+            trap,
+            query_bias,
+            key_bias,
+            angles,
+            D=residual,
+            Z=gate,
+            chunk_size=64,
+        )
+    )
+    source = PreparedLaunch(source_base.launch, lambda: source_base.outputs()[0])
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
     )
 
@@ -270,11 +356,7 @@ def chunk_scan(context: Context) -> PreparedComparison:
 
 CASES = {
     "mamba3_siso_step": mamba3_step,
-    "mamba3_siso_forward": implementation_gap(
-        "the full Mamba3 SISO sequence kernel contains chunk preprocessing, "
-        "causal chunk contractions, and ordered cross-chunk state; the existing "
-        "Intent entry expresses only the decode step"
-    ),
+    "mamba3_siso_forward": mamba3_siso_forward,
     "mamba_chunk_state": chunk_state,
     "mamba_state_passing": state_passing,
     "mamba_chunk_scan": chunk_scan,

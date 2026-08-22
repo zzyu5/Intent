@@ -74,8 +74,6 @@ LogicalResult runPhysicalProgramPipeline(ModuleOp module,
   manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefineTransferRealizationPass());
   manager.addPass(createVerifyPhysicalProgramPass());
-  manager.addPass(createFormStagesPass());
-  manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefineContractionRealizationPass());
   manager.addPass(createVerifyPhysicalProgramPass());
   manager.addPass(createRefineScanRealizationPass());

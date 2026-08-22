@@ -381,18 +381,11 @@ LogicalResult ContractOp::verify() {
   if (failed(requireNode(*this, getNode())))
     return failure();
   if (!llvm::is_contained(
-          {StringRef("direct"), StringRef("staged"), StringRef("replay"),
+          {StringRef("direct"), StringRef("replay"),
            StringRef("deferred_one"), StringRef("deferred_two"),
            StringRef("scaled_direct")},
           getForm()))
     return emitOpError("contains an unsupported contraction realization form");
-  bool stagedForm = getForm() == "staged";
-  bool validStagedLhs =
-      getLhsForm() == "member_row_gather" || getLhsForm() == "workspace";
-  if ((stagedForm && (!validStagedLhs || getRhsForm() != "expert_matrix")) ||
-      (!stagedForm && (getLhsForm() != "none" || getRhsForm() != "none")))
-    return emitOpError(
-        "does not carry operand forms consistent with its contraction form");
   bool needsReduction = getForm() == "replay" || getForm() == "deferred_one" ||
                         getForm() == "deferred_two";
   bool needsResultAxes = getForm() == "deferred_two";
@@ -486,55 +479,9 @@ LogicalResult StreamBindingOp::verify() {
       failed(requireNonNegative(*this, getStopValueAttr().getInt(),
                                 "logical stream stop value ID")))
     return failure();
-  return success();
-}
-
-LogicalResult StageOp::verify() {
-  if (failed(requireNode(*this, getNode())))
+  if (getPartitionNodeAttr() &&
+      failed(requireNode(*this, getPartitionNodeAttr().getInt())))
     return failure();
-  if (getOperations().empty())
-    return emitOpError("requires an explicit physical operation slice");
-  llvm::DenseSet<int64_t> operations;
-  for (int64_t operation : getOperations())
-    if (failed(requireNode(*this, operation)) ||
-        !operations.insert(operation).second)
-      return emitOpError("stage operation nodes must be unique");
-  if (getSynchronization() != "same_stream")
-    return emitOpError(
-        "contains an unsupported stage synchronization contract");
-  return success();
-}
-
-LogicalResult StageAxisOp::verify() {
-  if (failed(requireNode(*this, getStageNode())) || getRole().empty() ||
-      getTile().empty())
-    return failure();
-  if (getAxisNodeAttr() && failed(requireNode(*this, getAxisNodeAttr().getInt())))
-    return failure();
-  if (getSourceValueAttr() &&
-      failed(requireNonNegative(*this, getSourceValueAttr().getInt(),
-                                "stage-axis source value ID")))
-    return failure();
-  if (getTensorAxisAttr() &&
-      failed(requireNonNegative(*this, getTensorAxisAttr().getInt(),
-                                "stage-axis tensor dimension")))
-    return failure();
-  bool domainAxis = static_cast<bool>(getAxisNodeAttr());
-  bool tensorAxis = static_cast<bool>(getSourceValueAttr()) &&
-                    static_cast<bool>(getTensorAxisAttr());
-  if (domainAxis == tensorAxis ||
-      static_cast<bool>(getSourceValueAttr()) !=
-          static_cast<bool>(getTensorAxisAttr()))
-    return emitOpError(
-        "must bind exactly one logical domain axis or value tensor dimension");
-  if ((getRole() == "member" && !domainAxis) ||
-      ((getRole() == "feature" || getRole() == "reduction") && !tensorAxis) ||
-      (getRole() != "member" && getRole() != "feature" &&
-       getRole() != "reduction"))
-    return emitOpError("contains an unsupported stage-axis role binding");
-  if (getWorkerAxisAttr() &&
-      (getWorkerAxisAttr().getInt() < 0 || getWorkerAxisAttr().getInt() > 2))
-    return emitOpError("contains an invalid stage worker axis");
   return success();
 }
 
@@ -593,6 +540,7 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   SmallVector<RegionBindingOp> regionBindings;
   llvm::DenseSet<int64_t> partitionPartArguments;
   llvm::DenseSet<int64_t> partitionRegionArguments;
+  llvm::DenseMap<int64_t, PartitionBindingOp> partitionsByNode;
   SmallVector<PartitionBindingOp> partitionBindings;
   SmallVector<ScanOp> scans;
   SmallVector<PointwiseOp> pointwise;
@@ -603,13 +551,10 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   SmallVector<PaddingOp> paddings;
   llvm::DenseSet<int64_t> operations;
   llvm::DenseSet<int64_t> transfers;
-  llvm::DenseSet<int64_t> stageNodes;
   llvm::StringSet<> streamAxisRoles;
   SmallVector<StreamAxisOp> streamAxes;
   llvm::DenseSet<int64_t> streamNodes;
   SmallVector<StreamBindingOp> streamBindings;
-  llvm::StringSet<> stageAxisRoles;
-  SmallVector<StageAxisOp> stageAxes;
   for (Operation &operation : program.getBody().front()) {
     if (isa<YieldOp, func::FuncOp>(operation))
       continue;
@@ -641,6 +586,8 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
             "duplicates a region-argument physical binding");
       regionBindings.push_back(binding);
     } else if (auto binding = dyn_cast<PartitionBindingOp>(operation)) {
+      if (!partitionsByNode.try_emplace(binding.getPartitionNode(), binding).second)
+        return binding.emitOpError("duplicates a count-partition physical binding");
       if (!partitionPartArguments.insert(binding.getPartArgument()).second)
         return binding.emitOpError(
             "duplicates a count-partition part binding");
@@ -708,15 +655,6 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
       if (!streamNodes.insert(binding.getStreamNode()).second)
         return binding.emitOpError("duplicates a state-stream physical binding");
       streamBindings.push_back(binding);
-    } else if (auto binding = dyn_cast<StageOp>(operation)) {
-      if (!stageNodes.insert(binding.getNode()).second)
-        return binding.emitOpError("duplicates a physical stage decision");
-    } else if (auto binding = dyn_cast<StageAxisOp>(operation)) {
-      std::string key = std::to_string(binding.getStageNode()) + ":" +
-                        binding.getRole().str();
-      if (!stageAxisRoles.insert(key).second)
-        return binding.emitOpError("duplicates a stage-axis role");
-      stageAxes.push_back(binding);
     } else
       return operation.emitOpError("is not legal inside a GPU physical program");
   }
@@ -838,6 +776,16 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
                   binding.getLevel()))
       return binding.emitOpError(
           "references an unbound ordered traversal range");
+    if (binding.getPartitionNodeAttr()) {
+      auto partition =
+          partitionsByNode.find(binding.getPartitionNodeAttr().getInt());
+      if (partition == partitionsByNode.end())
+        return binding.emitOpError(
+            "references a missing count-partition physical binding");
+      if (partition->second.getAxisNode() != binding.getAxisNode())
+        return binding.emitOpError(
+            "references a count partition on a different physical axis");
+    }
   }
   auto isScalarUnreusedProgramOwner = [&](int64_t node) {
     auto axis = axes.find(node);
@@ -856,9 +804,6 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
     if (launch.getPersistent())
       return buffer.emitOpError(
           "owner-private workspace cannot outlive a persistent program mapping");
-    if (!stageNodes.empty())
-      return buffer.emitOpError(
-          "owner-private workspace cannot cross physical stage boundaries");
     for (int64_t owner : buffer.getOwnerNodes())
       if (!isScalarUnreusedProgramOwner(owner))
         return buffer.emitOpError(
@@ -870,9 +815,6 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
     if (workspaceScan && launch.getPersistent())
       return scan.emitOpError(
           "scan workspace cannot outlive a persistent program mapping");
-    if (workspaceScan && !stageNodes.empty())
-      return scan.emitOpError(
-          "scan workspace cannot cross physical stage boundaries");
     if (axis == axes.end() ||
         (workspaceScan && (!axisHasRole(axis->second, "ordered") ||
                            !hasRange(scan.getAxisNode(), "traversal"))))
@@ -925,12 +867,6 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
     for (int64_t domain : padding.getDomainNodes())
       if (!axes.count(domain))
         return padding.emitOpError("references an unbound validity domain");
-  for (StageAxisOp axis : stageAxes) {
-    if (!stageNodes.contains(axis.getStageNode()))
-      return axis.emitOpError("references an unknown physical stage");
-    if (axis.getAxisNodeAttr() && !axes.count(axis.getAxisNodeAttr().getInt()))
-      return axis.emitOpError("references an unbound logical axis");
-  }
   for (StreamAxisOp relation : streamAxes) {
     auto axis = axes.find(relation.getAxisNode());
     if (axis == axes.end() || !axisHasRole(axis->second, "reduction") ||

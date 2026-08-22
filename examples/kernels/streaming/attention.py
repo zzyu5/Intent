@@ -307,6 +307,87 @@ def flash_attention_bf16_fwd(
 
 
 @intent.kernel
+def grouped_flash_decode_partials(
+    q: I.In[I.bf16, ("B", "HQ", 1, "D")],
+    k: I.In[I.bf16, ("B", "HK", "K", "D")],
+    v: I.In[I.bf16, ("B", "HK", "K", "DV")],
+    partial_lse: I.Out[I.f32, ("B", "HQ", "P")],
+    partial_output: I.Out[I.bf16, ("B", "HQ", "P", "DV")],
+    scale: I.f32,
+    HEAD_GROUP: I.Constexpr[int],
+    P: I.Constexpr[int],
+):
+    B, HQ, _, D = q.shape
+    HK = k.shape[1]
+    K = k.shape[2]
+    DV = v.shape[3]
+    key_axis = I.domain(0, K)
+    local_query_heads = I.domain(0, HEAD_GROUP)
+    for batch in I.parallel(I.domain(0, B)):
+        for key_head in I.parallel(I.domain(0, HK)):
+            for query_region in I.parallel(
+                I.partition(local_query_heads, extent=HEAD_GROUP)
+            ):
+                query_heads = key_head * HEAD_GROUP + I.indices(query_region)
+                I.assume_in_bounds(query_heads, q, axis=1)
+                query = I.gather(
+                    q,
+                    index=(batch, query_heads, 0, slice(None)),
+                )
+                for part, part_keys in I.parallel(I.partition(key_axis, count=P)):
+                    stream = I.state_stream(
+                        part_keys,
+                        extent=I.auto("K_TILE"),
+                        init=(
+                            I.full((query_region,), -I.inf, dtype=I.f32),
+                            I.zeros((query_region,), dtype=I.f32),
+                            I.zeros((query_region, DV), dtype=I.f32),
+                        ),
+                    )
+                    with stream:
+                        for key_region, (maximum, denominator, accumulator) in stream:
+                            scores = I.contract(
+                                query,
+                                k[batch, key_head, key_region, :],
+                                reduce=((1, 1),),
+                                acc_dtype=I.f32,
+                            ) * (scale * I.LOG2E)
+                            local_maximum = I.reduce.max(
+                                scores, axis=1, identity=-I.inf
+                            )
+                            next_maximum = I.maximum(maximum, local_maximum)
+                            next_denominator, next_accumulator = (
+                                online_attention_accumulate_bf16(
+                                    maximum,
+                                    next_maximum,
+                                    denominator,
+                                    accumulator,
+                                    scores,
+                                    v[batch, key_head, key_region, :],
+                                )
+                            )
+                            stream.yield_(
+                                next_maximum,
+                                next_denominator,
+                                next_accumulator,
+                            )
+                    maximum, denominator, accumulator = stream.result
+                    I.scatter_unique(
+                        partial_lse,
+                        index=(batch, query_heads, part),
+                        value=maximum + I.log(denominator) * I.LOG2E,
+                    )
+                    I.scatter_unique(
+                        partial_output,
+                        index=(batch, query_heads, part, slice(None)),
+                        value=I.cast(
+                            accumulator / denominator[:, None],
+                            I.bf16,
+                        ),
+                    )
+
+
+@intent.kernel
 def continuous_gqa_decode(
     q: I.In[I.f16, ("B", "HQ", "D")],
     k: I.In[I.f16, ("B", "K", "HK", "D")],

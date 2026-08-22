@@ -21,5 +21,6 @@ llvm::StringRef scaledContraction();
 
 std::string cast(llvm::StringRef value, llvm::StringRef targetType,
                  bool decodeE8M0, bool resultIsF32);
+std::string bitcast(llvm::StringRef value, llvm::StringRef targetType);
 
 } // namespace intent::triton::lowering::syntax

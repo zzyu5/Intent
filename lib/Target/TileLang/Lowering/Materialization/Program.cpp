@@ -108,15 +108,6 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       index.sparseContracts[value.getNode()] = value;
     } else if (auto value = dyn_cast<intent::plan::TransferOp>(operation)) {
       transfers.push_back(value);
-    } else if (auto value = dyn_cast<intent::plan::StageOp>(operation)) {
-      plan::StageOp binding;
-      binding.operation = value;
-      binding.position = index.stages.size();
-      index.stages.push_back(binding);
-    } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
-      plan::StageAxisOp binding;
-      binding.operation = value;
-      index.stageAxes[value.getStageNode()][value.getRole()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
       index.streamAxes.push_back(value);
     } else if (auto value =
@@ -177,14 +168,12 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   }
   for (intent::plan::PointwiseOp value : pointwise) {
     auto lowering = value->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
-    auto deferred = value->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
     plan::PointwiseOp binding;
     binding.operation = value;
     binding.resultSpace = syntax::bufferSpace(value.getResultSpace()).str();
-    if (!lowering || !deferred || binding.resultSpace.empty())
+    if (!lowering || binding.resultSpace.empty())
       return value.emitOpError("has no realized TileLang pointwise spelling");
     binding.lowering = lowering.getValue().str();
-    binding.defer = deferred.getValue();
     index.pointwise[value.getNode()] = binding;
   }
   for (intent::plan::TransferOp value : transfers) {
@@ -287,8 +276,6 @@ LogicalResult ProgramMaterializer::prepare() {
       return failure();
   if (failed(preparePrivateWorkspaces()))
     return failure();
-  if (!planIndex.stages.empty())
-    return prepareRaggedStages();
   return success();
 }
 
@@ -589,93 +576,6 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
   return success();
 }
 
-LogicalResult ProgramMaterializer::prepareRaggedStages() {
-  if (failed(target::lowering::indexStageOperations(
-          kernel, planIndex, operationStages)))
-    return failure();
-  stageBodies.resize(planIndex.stages.size());
-  for (auto [position, stage] : llvm::enumerate(planIndex.stages)) {
-    Operation *contract = kernel.nodes.lookup(stage.getNode());
-    if (!contract || ::intent::target::semanticOperationName(*contract) != "intent.contract" ||
-        contract->getNumResults() != 1)
-      return stage.emitOpError("does not bind one canonical contraction");
-    auto axes = planIndex.stageAxes.find(stage.getNode());
-    plan::StageAxisOp feature =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("feature");
-    plan::StageAxisOp reduction =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("reduction");
-    plan::StageAxisOp member =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("member");
-    if (!feature || !reduction || !member || !feature.getWorkerAxisAttr() ||
-        !member.getWorkerAxisAttr() || !member.getAxisNodeAttr())
-      return stage.emitOpError("has incomplete physical stage-axis decisions");
-    auto runtimes =
-        raggedRuntimesByAxis.find(member.getAxisNodeAttr().getInt());
-    if (runtimes == raggedRuntimesByAxis.end() ||
-        runtimes->second.size() != 1)
-      return stage.emitOpError(
-          "does not resolve one ragged relation for its member axis");
-    unsigned runtimeIndex = runtimes->second.front();
-    RaggedRuntime &runtime = raggedRuntimes[runtimeIndex];
-    bool owned = llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
-      auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-      return node && node.getInt() == member.getAxisNodeAttr().getInt();
-    });
-    if (!owned)
-      return stage.emitOpError("uses a ragged member without program ownership");
-    if (runtime.memberDimension.empty())
-      runtime.memberDimension = member.getExtent().str();
-    else if (runtime.memberDimension != member.getExtent())
-      return stage.emitOpError("changes its staged ragged member extent");
-    Operation *members = nullptr;
-    for (int64_t operationNode : stage.getOperations()) {
-      Operation *candidate = kernel.nodes.lookup(operationNode);
-      if (!candidate ||
-          ::intent::target::semanticOperationName(*candidate) != "intent.members")
-        continue;
-      if (members)
-        return stage.emitOpError("contains multiple member enumeration ops");
-      members = candidate;
-    }
-    if (!members)
-      return stage.emitOpError("has no member enumeration operation");
-    FailureOr<std::string> featureTile =
-        syntax::tile(feature.operation, feature.getTile());
-    FailureOr<std::string> memberTile =
-        syntax::tile(member.operation, member.getTile());
-    FailureOr<std::string> reductionTile =
-        syntax::tile(reduction.operation, reduction.getTile());
-    if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
-      return failure();
-    stageRaggedRuntime[position] = runtimeIndex;
-    stageFeatureDimensions[position] = feature.getExtent().str();
-    stageMemberDimensions[position] = member.getExtent().str();
-    stageReductionDimensions[position] = reduction.getExtent().str();
-    stageFeatureTiles[position] = *featureTile;
-    stageMemberTiles[position] = *memberTile;
-    stageReductionTiles[position] = *reductionTile;
-    stageFeatureWorkers[position] = feature.getWorkerAxisAttr().getInt();
-    stageMemberWorkers[position] = member.getWorkerAxisAttr().getInt();
-    for (int64_t valueID : stage.getInputs())
-      if (!kernel.values.count(valueID))
-        return stage.emitOpError("references an unknown stage input value");
-    for (int64_t valueID : stage.getOutputs()) {
-      auto found = kernel.values.find(valueID);
-      if (found == kernel.values.end() ||
-          !stageOutputOwners.try_emplace(found->second, position).second)
-        return stage.emitOpError("has an invalid stage output value");
-      workspaceNames[found->second] =
-          "workspace_" + std::to_string(valueID);
-    }
-    if (!llvm::is_contained(operationStages.lookup(contract), position))
-      return stage.emitOpError("stage roots do not depend on its contraction");
-  }
-  return success();
-}
-
 bool ProgramMaterializer::selectOperation(Operation &operation) {
   if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
     return false;
@@ -687,16 +587,7 @@ bool ProgramMaterializer::selectOperation(Operation &operation) {
   auto scanProducer = scanProducerOwners.find(&operation);
   if (scanProducer != scanProducerOwners.end())
     return activeScanReplay == scanProducer->second;
-  if (planIndex.stages.empty())
-    return true;
-  activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty();
-}
-
-void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned indent) {
-  stageBodies[stage].append(indent * 4, ' ');
-  stageBodies[stage] += text.str();
-  stageBodies[stage] += "\n";
+  return true;
 }
 
 void ProgramMaterializer::emitImports() {
@@ -794,7 +685,7 @@ LogicalResult ProgramMaterializer::emitHelpers() {
 
 LogicalResult ProgramMaterializer::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  auto emitBuilderParameters = [&](raw_ostream &stream, int64_t stage) {
+  auto emitBuilderParameters = [&](raw_ostream &stream) {
     bool first = true;
     auto parameter = [&](StringRef value) {
       if (!first)
@@ -804,11 +695,6 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     };
     for (const std::string &dimension : dimensionOrder)
       parameter(dimension);
-    if (stage >= 0) {
-      RaggedRuntime &ragged =
-          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
-      parameter(ragged.indices ? "MAX_ROUTES" : "ROUTE_LENGTHS");
-    }
     for (int64_t axis : planIndex.components.orderedRaggedProgramAxes)
       parameter("MAX_SEQUENCE_LENGTH_" + std::to_string(axis));
     if (usesMatrixContraction())
@@ -905,21 +791,6 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
                   ",), " + valueDtype + ")");
       }
     }
-    for (plan::StageOp stage : planIndex.stages)
-      for (int64_t valueID : stage.getOutputs()) {
-        Value value = kernel.values.lookup(valueID);
-        auto tensor = dyn_cast<RankedTensorType>(value.getType());
-        std::string dtype = tensor
-                                ? dtypeName(tensor.getElementType(),
-                                            *kernel.entry.getOperation())
-                                   : std::string();
-        if (!tensor || tensor.getRank() != 2 || dtype.empty())
-          return stage.emitOpError("has an unsupported TileLang workspace");
-        parameter(workspaceNames.lookup(value) + ": T.Tensor((" +
-                  stageMemberDimensions.lookup(stage.getOrdinal()) + ", " +
-                  stageFeatureDimensions.lookup(stage.getOrdinal()) + "), " +
-                  dtype + ")");
-      }
     return success();
   };
 
@@ -942,110 +813,9 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
                 "[gemm_warp_policy]\n";
   };
 
-  if (!planIndex.stages.empty()) {
-    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
-      RaggedRuntime &ragged =
-          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
-      bool compact = !ragged.indices;
-      llvm::raw_string_ostream source(stageBodies[stage]);
-      emitDecorator(source);
-      source << "def " << kernelName << "_stage_" << stage << "(";
-      emitBuilderParameters(source, stage);
-      source << "):\n";
-      emitBlockExtentConstants(source);
-      std::string featureTile = stageFeatureTiles.lookup(stage);
-      std::string memberTile = stageMemberTiles.lookup(stage);
-      if (compact)
-        source << "    total_route_tiles = sum((length + " << memberTile
-               << " - 1) // " << memberTile << " for length in ROUTE_LENGTHS)\n";
-      source << "    @T.prim_func\n    def main(";
-      if (failed(emitMainParameters(source)))
-        return failure();
-      source << "):\n";
-      std::string feature = stageFeatureDimensions.lookup(stage);
-      int64_t featureWorker = stageFeatureWorkers.lookup(stage);
-      int64_t memberWorker = stageMemberWorkers.lookup(stage);
-      if (featureWorker < 0 || featureWorker > 1 || memberWorker < 0 ||
-          memberWorker > 1 || featureWorker == memberWorker)
-        return planIndex.stages[stage].emitOpError(
-            "has invalid TileLang stage worker-axis decisions");
-      SmallVector<std::string> grids(2);
-      SmallVector<std::string> names(2);
-      grids[featureWorker] =
-          "T.ceildiv(" + feature + ", " + featureTile + ")";
-      plan::AxisOp outerAxis =
-          planIndex.axes.lookup(ragged.binding.getOuterNode());
-      std::string experts =
-          outerAxis ? roleDimensions.lookup(
-                          "program_" + std::to_string(outerAxis.getProgramOrder()))
-                    : std::string();
-      if (experts.empty())
-        return ragged.binding.emitOpError(
-            "has no program-owned outer-axis dimension");
-      grids[memberWorker] = compact
-                                ? "total_route_tiles"
-                                : experts +
-                                      " * T.ceildiv(MAX_ROUTES, " + memberTile +
-                                      ")";
-      names[featureWorker] = "bid_feature";
-      names[memberWorker] = "bid_expert_route";
-      source << "        with T.Kernel(" << grids[0] << ", " << grids[1]
-             << ", threads=threads) as (" << names[0] << ", " << names[1]
-             << "):\n";
-      source.flush();
-      if (compact) {
-        stageLine(stage, "expert = T.alloc_var(dtype=T.int32)");
-        stageLine(stage, "route_tile = T.alloc_var(dtype=T.int32)");
-        stageLine(stage, "tile_cursor = T.alloc_var(dtype=T.int32)");
-        stageLine(stage, "expert = 0");
-        stageLine(stage, "route_tile = 0");
-        stageLine(stage, "tile_cursor = 0");
-        stageLine(stage,
-                  "for candidate in range(" + experts + "):");
-        stageLine(stage, "candidate_begin = " +
-                             ragged.offsets->argument->name + "[" +
-                             addressIndex("candidate") + "]",
-                  4);
-        stageLine(stage, "candidate_end = " +
-                             ragged.offsets->argument->name +
-                             "[" + addressIndex("candidate + 1") + "]",
-                  4);
-        stageLine(stage,
-                  "candidate_tiles = T.ceildiv(candidate_end - "
-                  "candidate_begin, " + memberTile + ")",
-                  4);
-        stageLine(stage,
-                  "owns_tile = bid_expert_route >= tile_cursor and "
-                  "bid_expert_route < tile_cursor + candidate_tiles",
-                  4);
-        stageLine(stage,
-                  "expert = T.if_then_else(owns_tile, candidate, expert)", 4);
-        stageLine(stage,
-                  "route_tile = T.if_then_else(owns_tile, bid_expert_route - "
-                  "tile_cursor, route_tile)",
-                  4);
-        stageLine(stage, "tile_cursor = tile_cursor + candidate_tiles", 4);
-      } else {
-        stageLine(stage,
-                  "num_route_tiles = T.ceildiv(MAX_ROUTES, " + memberTile +
-                      ")");
-        stageLine(stage, "expert = bid_expert_route // num_route_tiles");
-        stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
-      }
-      stageLine(stage, "route_begin = " + ragged.offsets->argument->name +
-                           "[" + addressIndex("expert") + "]");
-      stageLine(stage, "route_end = " + ragged.offsets->argument->name +
-                           "[" + addressIndex("expert + 1") + "]");
-      stageLine(stage,
-                "member_start = " + addressIndex("route_begin") + " + " +
-                    addressIndex("route_tile") + " * " + memberTile);
-    }
-    return success();
-  }
-
   emitDecorator(output);
   output << "def " << kernelName << "(";
-  emitBuilderParameters(output, -1);
+  emitBuilderParameters(output);
   output << "):\n";
   emitBlockExtentConstants(output);
   output << "    @T.prim_func\n    def main(";
@@ -1418,30 +1188,14 @@ LogicalResult ProgramMaterializer::emitWrapper() {
         output << ", " << workspaceNames.lookup(kernel.values.lookup(valueID));
       }
     }
-    for (plan::StageOp stage : planIndex.stages)
-      for (int64_t valueID : stage.getOutputs()) {
-        if (!first)
-          output << ", ";
-        output << workspaceNames.lookup(kernel.values.lookup(valueID));
-        first = false;
-      }
   };
-  auto emitBuilderArguments = [&](int64_t stage) {
+  auto emitBuilderArguments = [&]() {
     bool first = true;
     for (const std::string &dimension : dimensionOrder) {
       if (!first)
         output << ", ";
       output << dimension;
       first = false;
-    }
-    if (stage >= 0) {
-      RaggedRuntime &ragged =
-          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
-      if (!first)
-        output << ", ";
-      std::string suffix = std::to_string(ragged.binding.getNode());
-      output << (ragged.indices ? "max_routes_" : "route_lengths_")
-             << suffix;
     }
     for (int64_t axis : planIndex.components.orderedRaggedProgramAxes) {
       if (!first)
@@ -1451,11 +1205,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     }
   };
 
-  if (!planIndex.stages.empty()) {
-    for (const std::string &body : stageBodies)
-      output << body << "    return main\n\n\n";
-  } else
-    output << "    return main\n\n\n";
+  output << "    return main\n\n\n";
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n_KERNEL_CACHE = {}\n\n\n";
   output << "def launch(";
@@ -1467,147 +1217,6 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     return failure();
   if (failed(emitPrivateWorkspaceAllocations()))
     return failure();
-
-  if (!planIndex.stages.empty()) {
-    SmallVector<ABIView *> inputs;
-    ABIView *merge = nullptr;
-    for (ABIView &view : views) {
-      if (view.view.getAccess() == "in")
-        inputs.push_back(&view);
-      else if ((view.view.getAccess() == "out" ||
-                view.view.getAccess() == "inout") &&
-               !merge)
-        merge = &view;
-      else
-        return kernel.entry.emitOpError(
-            "ragged TileLang stages require inputs and one inout merge view");
-    }
-    if (!merge)
-      return kernel.entry.emitOpError("ragged TileLang stages have no merge view");
-    llvm::DenseSet<unsigned> preparedRagged;
-    for (const auto &entry : stageRaggedRuntime) {
-      if (!preparedRagged.insert(entry.second).second)
-        continue;
-      RaggedRuntime &ragged = raggedRuntimes[entry.second];
-      std::string suffix = std::to_string(ragged.binding.getNode());
-      if (!ragged.indices)
-        output << "    route_lengths_" << suffix
-               << " = tuple(int(length) for length in ("
-               << ragged.offsets->argument->name << "[1:] - "
-               << ragged.offsets->argument->name << "[:-1]).tolist())\n";
-      else
-        output << "    max_routes_" << suffix << " = int(("
-               << ragged.offsets->argument->name << "[1:] - "
-               << ragged.offsets->argument->name
-               << "[:-1]).max().item())\n";
-    }
-    for (plan::StageOp stage : planIndex.stages)
-      for (int64_t valueID : stage.getOutputs()) {
-        Value value = kernel.values.lookup(valueID);
-        auto tensor = dyn_cast<RankedTensorType>(value.getType());
-        StringRef dtype =
-            tensor ? torchDtype(tensor.getElementType()) : StringRef();
-        if (!tensor || tensor.getRank() != 2 || dtype.empty())
-          return stage.emitOpError("has an unsupported TileLang workspace");
-        output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
-               << stageMemberDimensions.lookup(stage.getOrdinal()) << ", "
-               << stageFeatureDimensions.lookup(stage.getOrdinal())
-               << "), device=_DEVICE, dtype=" << dtype << ")\n";
-      }
-    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
-      RaggedRuntime &ragged =
-          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
-      bool compact = !ragged.indices;
-      std::string suffix = std::to_string(ragged.binding.getNode());
-      output << "    cache_key = (" << stage;
-      for (const std::string &dimension : dimensionOrder)
-        output << ", " << dimension;
-      output << ", " << (compact ? "route_lengths_" : "max_routes_")
-             << suffix;
-      for (ABIView *input : inputs)
-        output << ", " << input->argument->name << ".dtype";
-      output << ", str(_DEVICE))\n";
-      output << "    if cache_key not in _KERNEL_CACHE:\n";
-      output << "        _AUTOTUNE_INPUTS = [";
-      bool first = true;
-      for (ABIView &view : views) {
-        if (!first)
-          output << ", ";
-        if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
-          output << (target::lowering::stageUsesScatterReduction(
-                         planIndex.stages[stage], kernel)
-                         ? "torch.zeros_like("
-                         : "torch.empty_like(")
-                 << view.argument->name << ")";
-        else
-          output << view.argument->name;
-        first = false;
-      }
-      for (ABIScalar &scalar : scalars) {
-        if (!first)
-          output << ", ";
-        output << scalar.name;
-        first = false;
-      }
-      for (plan::StageOp binding : planIndex.stages)
-        for (int64_t valueID : binding.getOutputs()) {
-          if (!first)
-            output << ", ";
-          output << workspaceNames.lookup(kernel.values.lookup(valueID));
-          first = false;
-        }
-      output << "]\n        try:\n            compiled = " << kernelName << "_stage_" << stage
-             << "(";
-      emitBuilderArguments(stage);
-      output << ")\n        finally:\n            _AUTOTUNE_INPUTS = None\n";
-      output << "        _KERNEL_CACHE[cache_key] = compiled\n";
-      output << "    compiled = _KERNEL_CACHE[cache_key]\n    compiled(";
-      emitKernelArguments();
-      output << ")\n";
-    }
-    output << "    return " << merge->argument->name << "\n\n\n";
-    output << "def run(";
-    bool first = true;
-    for (ABIView *view : inputs) {
-      if (!first)
-        output << ", ";
-      output << view->argument->name;
-      first = false;
-    }
-    for (ABIScalar &scalar : scalars) {
-      if (!first)
-        output << ", ";
-      output << scalar.name;
-      first = false;
-    }
-    output << "):\n";
-    for (const std::string &dimension : dimensionOrder)
-      output << "    " << dimension << " = "
-             << dimensionOwners.lookup(dimension) << "\n";
-    output << "    " << merge->argument->name << " = torch."
-           << (target::lowering::planUsesScatterReduction(planIndex, kernel)
-                   ? "zeros"
-                   : "empty")
-           << "((";
-    for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
-      if (axis)
-        output << ", ";
-      output << extent;
-    }
-    output << "), device=_DEVICE, dtype="
-           << torchDtype(merge->tensor.getElementType()) << ")\n    launch(";
-    first = true;
-    for (ABIView &view : views) {
-      if (!first)
-        output << ", ";
-      output << view.argument->name;
-      first = false;
-    }
-    for (ABIScalar &scalar : scalars)
-      output << ", " << scalar.name;
-    output << ")\n    return " << merge->argument->name << "\n";
-    return success();
-  }
 
   SmallVector<ABIView *> inputs;
   SmallVector<ABIView *> outputs;
@@ -1661,7 +1270,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     output << "        _AUTOTUNE_INPUTS = [";
     emitKernelArguments();
     output << "]\n        try:\n            compiled = " << kernelName << "(";
-    emitBuilderArguments(-1);
+    emitBuilderArguments();
     if (!planIndex.components.reusedAxes.empty()) {
       plan::AxisOp laneAxis = planIndex.axesByRole.lookup("lane_0");
       std::string rowTile = laneAxis ? laneAxis.getTile().str() : std::string();
@@ -1675,7 +1284,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     output << ")\n        finally:\n            _AUTOTUNE_INPUTS = None\n";
   } else {
     output << "        compiled = " << kernelName << "(";
-    emitBuilderArguments(-1);
+    emitBuilderArguments();
     output << ")\n";
   }
   output << "        _KERNEL_CACHE[cache_key] = compiled\n";
@@ -2679,6 +2288,9 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
       if (domain)
         extent = dimensionName(*domain);
     }
+    if (auto active = activeTraversalEnds.find(axis->getNode());
+        active != activeTraversalEnds.end())
+      extent = active->second;
     if (base.empty() || failed(extent))
       return operation.emitOpError(
           "whole-tile TileLang transfer has no active axis interval");
@@ -2751,6 +2363,9 @@ FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
     } else {
       extent = dimensionName(*domain->second);
     }
+    if (auto active = activeTraversalEnds.find(axis.getNode());
+        active != activeTraversalEnds.end())
+      extent = active->second;
     if (failed(extent))
       return failure();
     predicates.push_back(base + " + " + elementIndices[tensorAxis] + " < " +
@@ -2848,10 +2463,6 @@ ProgramMaterializer::tensorExtents(Operation &operation, unsigned resultIndex,
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());
-    else if (!planIndex.stages.empty() && activeStages.size() == 1 &&
-             label.getValue() ==
-                 stageFeatureDimensions.lookup(activeStages.front()))
-      extents.push_back(stageFeatureTiles.lookup(activeStages.front()));
     else if (label.getValue().starts_with("?region_"))
       return operation.emitOpError(
           "tensor shape region has no TileLang tile binding");
@@ -2949,10 +2560,10 @@ std::string ProgramMaterializer::dtypeName(Type type, Operation &consumer) {
     return integer.isUnsigned() ? "T.uint16" : "T.int16";
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 32)
-    return "T.int32";
+    return integer.isUnsigned() ? "T.uint32" : "T.int32";
   if (auto integer = dyn_cast<IntegerType>(type);
-      integer && integer.getWidth() == 64 && !integer.isUnsigned())
-    return "T.int64";
+      integer && integer.getWidth() == 64)
+    return integer.isUnsigned() ? "T.uint64" : "T.int64";
   if (isa<IndexType>(type))
     return "T.int32";
   consumer.emitOpError("uses an unsupported TileLang dtype");
@@ -2963,24 +2574,6 @@ void ProgramMaterializer::bindResult(Operation &operation, unsigned index,
                                StringRef name) {
   Value value = operation.getResult(index);
   valueNames[value] = name.str();
-  auto owner = stageOutputOwners.find(value);
-  if (planIndex.stages.empty() || owner == stageOutputOwners.end())
-    return;
-  std::string memberTile = stageMemberTiles.lookup(owner->second);
-  std::string featureTile = stageFeatureTiles.lookup(owner->second);
-  std::string feature = stageFeatureDimensions.lookup(owner->second);
-  line("for store_i, store_j in T.Parallel(" + memberTile + ", " +
-       featureTile + "):");
-  ++indentation;
-  line("if member_start + store_i < route_end and "
-       "bid_feature * " + featureTile + " + store_j < " + feature + ":");
-  ++indentation;
-  line(workspaceNames.lookup(value) +
-       "[" + addressIndex("member_start + store_i") + ", " +
-       addressIndex("bid_feature * " + featureTile + " + store_j") + "] = " +
-       name.str() + "[store_i, store_j]");
-  --indentation;
-  --indentation;
 }
 
 std::string ProgramMaterializer::uniqueName(StringRef candidate, int64_t node) {
@@ -3020,11 +2613,6 @@ std::string ProgramMaterializer::makeRegionArgumentName(Operation &operation,
 }
 
 void ProgramMaterializer::line(StringRef text) {
-  if (!planIndex.stages.empty()) {
-    for (unsigned stage : activeStages)
-      stageLine(stage, text, indentation);
-    return;
-  }
   output.indent(indentation * 4) << text << "\n";
 }
 

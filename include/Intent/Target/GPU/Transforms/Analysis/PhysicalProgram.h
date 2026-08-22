@@ -27,7 +27,6 @@ public:
   }
   intent::plan::RangeOp getRange(int64_t axisNode, llvm::StringRef purpose,
                                  int64_t level = 0) const;
-  llvm::ArrayRef<intent::plan::StageOp> getStages() const { return stages; }
   bool hasWorkerReuse() const;
   bool axisHasRole(int64_t node, llvm::StringRef role) const;
   bool isScalarAxis(int64_t node) const;
@@ -43,7 +42,6 @@ private:
   intent::plan::LaunchOp launch;
   llvm::DenseMap<int64_t, intent::plan::AxisOp> axes;
   llvm::DenseMap<int64_t, llvm::SmallVector<intent::plan::RangeOp>> ranges;
-  llvm::SmallVector<intent::plan::StageOp> stages;
 };
 
 } // namespace intent::gpu

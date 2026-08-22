@@ -142,6 +142,8 @@ def IntentPlan_ExecSelectOp : IntentPlan_Op<"exec_select", [Pure]> {
 }
 def IntentPlan_ExecCastOp
     : IntentPlan_ExecUnaryOneResultOp<"exec_cast">;
+def IntentPlan_ExecBitcastOp
+    : IntentPlan_ExecUnaryOneResultOp<"exec_bitcast">;
 def IntentPlan_ExecMaskOp : IntentPlan_Op<"exec_mask", [Pure]> {
   let arguments = (ins AnyType:$value, AnyType:$predicate, AnyType:$fill);
   let results = (outs AnyType:$result);
@@ -411,8 +413,6 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
   let arguments = (ins
     I64Attr:$node,
     StrAttr:$form,
-    StrAttr:$lhs_form,
-    StrAttr:$rhs_form,
     OptionalAttr<I64Attr>:$reduction_axis_node,
     OptionalAttr<I64Attr>:$lhs_result_axis_node,
     OptionalAttr<I64Attr>:$rhs_result_axis_node,
@@ -463,31 +463,8 @@ def IntentPlan_StreamBindingOp : IntentPlan_Op<"stream_binding"> {
     StrAttr:$purpose,
     I64Attr:$level,
     OptionalAttr<I64Attr>:$stop_value,
-    OptionalAttr<I64Attr>:$relation_node
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentPlan_StageOp : IntentPlan_Op<"stage"> {
-  let arguments = (ins
-    I64Attr:$node,
-    DenseI64ArrayAttr:$operations,
-    StrAttr:$synchronization
-  );
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def IntentPlan_StageAxisOp : IntentPlan_Op<"stage_axis"> {
-  let arguments = (ins
-    I64Attr:$stage_node,
-    StrAttr:$role,
-    OptionalAttr<I64Attr>:$axis_node,
-    OptionalAttr<I64Attr>:$source_value,
-    OptionalAttr<I64Attr>:$tensor_axis,
-    StrAttr:$tile,
-    OptionalAttr<I64Attr>:$worker_axis
+    OptionalAttr<I64Attr>:$relation_node,
+    OptionalAttr<I64Attr>:$partition_node
   );
   let results = (outs);
   let hasVerifier = 1;

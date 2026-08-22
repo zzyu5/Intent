@@ -93,6 +93,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role) {
     return StringRef("alias");
   if (role == "cast")
     return StringRef("tl.cast");
+  if (role == "bitcast")
+    return StringRef("tl.bitcast");
   if (role == "reshape")
     return StringRef("tl.reshape");
   if (role == "transpose")
@@ -212,6 +214,11 @@ std::string cast(StringRef value, StringRef targetType, bool decodeE8M0,
   return resultIsF32
              ? decoded
              : "tl.cast(" + decoded + ", " + targetType.str() + ")";
+}
+
+std::string bitcast(StringRef value, StringRef targetType) {
+  return "tl.cast(" + value.str() + ", " + targetType.str() +
+         ", bitcast=True)";
 }
 
 } // namespace intent::triton::lowering::syntax

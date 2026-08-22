@@ -24,5 +24,6 @@ std::string gather(llvm::StringRef array, llvm::StringRef indices,
                    llvm::StringRef padding, llvm::StringRef mask = {});
 std::string cast(llvm::StringRef lowering, llvm::StringRef value,
                  llvm::StringRef targetType);
+std::string bitcast(llvm::StringRef value, llvm::StringRef targetType);
 
 } // namespace intent::cutile::lowering::syntax

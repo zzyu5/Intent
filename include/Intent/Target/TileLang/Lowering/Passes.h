@@ -45,8 +45,6 @@ inline constexpr llvm::StringLiteral scanLoweringAttr =
     "intent_plan.tilelang.scan_lowering";
 inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
     "intent_plan.tilelang.pointwise_lowering";
-inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
-    "intent_plan.tilelang.pointwise_deferred";
 inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.tilelang.gather_form";
 inline constexpr llvm::StringLiteral streamTileAttr =

@@ -93,6 +93,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role,
   if (role == "cast")
     return resultSpace == "private_scalar" ? StringRef("ct.full_cast")
                                             : StringRef("ct.astype");
+  if (role == "bitcast")
+    return StringRef("ct.bitcast");
   if (role == "reshape")
     return StringRef("ct.reshape");
   if (role == "transpose")
@@ -208,6 +210,10 @@ std::string cast(StringRef lowering, StringRef value, StringRef targetType) {
   if (lowering == "ct.full_cast")
     return "ct.full((), " + value.str() + ", dtype=" + targetType.str() + ")";
   return "ct.astype(" + value.str() + ", " + targetType.str() + ")";
+}
+
+std::string bitcast(StringRef value, StringRef targetType) {
+  return "ct.bitcast(" + value.str() + ", " + targetType.str() + ")";
 }
 
 } // namespace intent::cutile::lowering::syntax

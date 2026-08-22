@@ -263,6 +263,8 @@ pointwiseRole(mlir::Operation &operation) {
     return std::string("broadcast");
   if (name == "intent.cast")
     return std::string("cast");
+  if (name == "intent.bitcast")
+    return std::string("bitcast");
   if (name == "intent.reshape")
     return std::string("reshape");
   if (name == "intent.transpose")
@@ -354,8 +356,7 @@ inline bool feedsContraction(mlir::Operation &operation) {
 }
 
 inline mlir::FailureOr<std::string>
-classifyGatherProjection(mlir::Operation &operation, bool staged,
-                         bool deferred) {
+classifyGatherProjection(mlir::Operation &operation) {
   mlir::FailureOr<std::string> role = pointwiseRole(operation);
   if (mlir::failed(role))
     return mlir::failure();
@@ -375,14 +376,6 @@ classifyGatherProjection(mlir::Operation &operation, bool staged,
                      : mlir::RankedTensorType();
   if (!tensor)
     return operation.emitOpError("has no ranked gather source");
-  if (staged) {
-    if (deferred && tensor.getRank() == 2)
-      return std::string("staged_deferred");
-    if (tensor.getRank() == 1)
-      return std::string("staged_vector");
-    return operation.emitOpError(
-        "has no provider-neutral staged gather projection");
-  }
   return std::string("view_indirect");
 }
 
@@ -1040,7 +1033,6 @@ inline mlir::FailureOr<std::string> projectScanWorkspaceOffset(
 struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
   std::string lowering;
   std::string resultSpace;
-  bool defer = false;
 
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getLowering() const { return lowering; }
@@ -1052,7 +1044,6 @@ struct PointwiseBinding : Binding<intent::plan::PointwiseOp> {
   llvm::ArrayRef<int64_t> getAxisNodes() const {
     return operation.getAxisNodes();
   }
-  bool getDefer() const { return defer; }
 };
 
 struct ContractBinding : Binding<intent::plan::ContractOp> {
@@ -1066,8 +1057,6 @@ struct ContractBinding : Binding<intent::plan::ContractOp> {
 
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getForm() const { return operation.getForm(); }
-  llvm::StringRef getLhsForm() const { return operation.getLhsForm(); }
-  llvm::StringRef getRhsForm() const { return operation.getRhsForm(); }
   std::optional<int64_t> getReductionAxisNode() const {
     auto value = operation.getReductionAxisNodeAttr();
     return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
@@ -1246,6 +1235,7 @@ struct CanonicalBinding {
 
 struct StreamBinding : CanonicalBinding {
   intent::plan::StreamBindingOp physical;
+  intent::plan::PartitionBindingOp partition;
   int64_t node = -1;
   int64_t axisNode = -1;
   mlir::IntegerAttr stopValue;
@@ -1260,6 +1250,8 @@ struct StreamBinding : CanonicalBinding {
   int64_t getAxisNode() const { return axisNode; }
   mlir::IntegerAttr getStopValueAttr() const { return stopValue; }
   int64_t getRelationNode() const { return relationNode; }
+  intent::plan::PartitionBindingOp getPartition() const { return partition; }
+  bool hasPartition() const { return static_cast<bool>(partition); }
   llvm::StringRef getRangePurpose() const { return rangePurpose; }
   int64_t getRangeLevel() const { return rangeLevel; }
   llvm::StringRef getExtent() const { return extent; }
@@ -1280,66 +1272,6 @@ struct RaggedBinding : CanonicalBinding {
   llvm::ArrayRef<int64_t> getMemberNodes() const { return memberNodes; }
   llvm::StringRef getRoute() const { return route; }
 };
-
-struct StageBinding : Binding<intent::plan::StageOp> {
-  unsigned position = 0;
-  llvm::SmallVector<int64_t> dependencies;
-  llvm::SmallVector<int64_t> inputs;
-  llvm::SmallVector<int64_t> outputs;
-  llvm::SmallVector<int64_t> terminals;
-
-  unsigned getOrdinal() const { return position; }
-  int64_t getNode() const { return operation.getNode(); }
-  llvm::ArrayRef<int64_t> getDependencies() const { return dependencies; }
-  llvm::ArrayRef<int64_t> getInputs() const { return inputs; }
-  llvm::ArrayRef<int64_t> getOutputs() const { return outputs; }
-  llvm::ArrayRef<int64_t> getOperations() const {
-    return operation.getOperations();
-  }
-  llvm::ArrayRef<int64_t> getTerminals() const { return terminals; }
-  llvm::StringRef getSynchronization() const {
-    return operation.getSynchronization();
-  }
-};
-
-struct StageAxisBinding : Binding<intent::plan::StageAxisOp> {
-  std::string extent;
-
-  int64_t getStageNode() const { return operation.getStageNode(); }
-  llvm::StringRef getRole() const { return operation.getRole(); }
-  mlir::IntegerAttr getAxisNodeAttr() const {
-    return operation.getAxisNodeAttr();
-  }
-  mlir::IntegerAttr getSourceValueAttr() const {
-    return operation.getSourceValueAttr();
-  }
-  mlir::IntegerAttr getTensorAxisAttr() const {
-    return operation.getTensorAxisAttr();
-  }
-  llvm::StringRef getExtent() const { return extent; }
-  llvm::StringRef getTile() const { return operation.getTile(); }
-  mlir::IntegerAttr getWorkerAxisAttr() const {
-    return operation.getWorkerAxisAttr();
-  }
-};
-
-inline bool stageUsesScatterReduction(const StageBinding &stage,
-                                      const target::KernelModel &kernel) {
-  return llvm::any_of(stage.getTerminals(), [&](int64_t node) {
-    mlir::Operation *terminal = kernel.nodes.lookup(node);
-    return terminal &&
-           ::intent::target::semanticOperationName(*terminal) ==
-               "intent.scatter_reduce";
-  });
-}
-
-template <typename PlanIndex>
-bool planUsesScatterReduction(const PlanIndex &index,
-                              const target::KernelModel &kernel) {
-  return llvm::any_of(index.stages, [&](const StageBinding &stage) {
-    return stageUsesScatterReduction(stage, kernel);
-  });
-}
 
 struct BoundaryBinding : Binding<intent::plan::TransferOp> {
   std::string access;
@@ -1431,23 +1363,6 @@ bool requiresDelegatedTuning(const PlanIndex &index) {
   });
 }
 
-template <typename PlanIndex>
-bool isPlannedStageNode(const PlanIndex &index, mlir::Operation *operation) {
-  if (!operation)
-    return false;
-  auto node = operation->getAttrOfType<mlir::IntegerAttr>("intent.node");
-  return node && llvm::any_of(index.stages, [&](auto stage) {
-           return stage.getNode() == node.getInt();
-         });
-}
-
-template <typename PlanIndex>
-bool isStagedContraction(const PlanIndex &index, mlir::Operation *operation) {
-  return operation &&
-         ::intent::target::semanticOperationName(*operation) == "intent.contract" &&
-         isPlannedStageNode(index, operation);
-}
-
 inline mlir::FailureOr<llvm::SmallVector<int64_t>>
 exactContractionReductionArguments(const target::KernelModel &kernel,
                                    mlir::Operation &consumer,
@@ -1524,10 +1439,9 @@ mlir::LogicalResult indexDeferredContractReplays(
     mlir::Operation *contract = kernel.nodes.lookup(entry.first);
     if (!contract || ::intent::target::semanticOperationName(*contract) !=
                          "intent.contract" ||
-        contract->getNumOperands() != 2 ||
-        isPlannedStageNode(index, contract))
+        contract->getNumOperands() != 2)
       return entry.second.emitOpError(
-          "producer replay does not bind one unstaged canonical contraction");
+          "producer replay does not bind one canonical contraction");
     std::optional<target::ContractOperandReplay> lhs =
         target::analyzeContractOperandReplay(contract->getOperand(0), *contract);
     std::optional<target::ContractOperandReplay> rhs =
@@ -1856,6 +1770,24 @@ mlir::LogicalResult indexCanonicalStructure(
       return physical.emitOpError(
           "does not bind the canonical logical stream stop value");
     binding.stopValue = physical.getStopValueAttr();
+    if (physical.getPartitionNodeAttr()) {
+      auto partition = llvm::find_if(
+          index.partitionBindings,
+          [&](intent::plan::PartitionBindingOp candidate) {
+            return static_cast<int64_t>(candidate.getPartitionNode()) ==
+                   physical.getPartitionNodeAttr().getInt();
+          });
+      auto regionID = stream.operation->getNumOperands() == 0
+                          ? kernel.valueIDs.end()
+                          : kernel.valueIDs.find(stream.operation->getOperand(0));
+      if (partition == index.partitionBindings.end() ||
+          partition->getAxisNode() != physical.getAxisNode() ||
+          regionID == kernel.valueIDs.end() ||
+          static_cast<int64_t>(partition->getRegionArgument()) != regionID->second)
+        return physical.emitOpError(
+            "does not bind the exact count-partition source region");
+      binding.partition = *partition;
+    }
     if (physical.getRelationNodeAttr()) {
       binding.relationNode = physical.getRelationNodeAttr().getInt();
       auto relation = kernel.raggedRelations.find(binding.relationNode);
@@ -2112,160 +2044,6 @@ projectLinearGroupIndex(const PlanIndex &index, llvm::ArrayRef<AxisBinding> grou
     expression = "(" + expression + ") % (" + groupVolume + ")";
   }
   return expression;
-}
-
-template <typename PlanIndex, typename OperationStages>
-mlir::LogicalResult indexStageOperations(const target::KernelModel &kernel,
-                                         PlanIndex &index,
-                                         OperationStages &operationStages) {
-  for (auto &stageAxes : index.stageAxes) {
-    for (auto &roleAndAxis : stageAxes.second) {
-      StageAxisBinding &binding = roleAndAxis.getValue();
-      if (binding.getSourceValueAttr()) {
-        mlir::Value value =
-            kernel.values.lookup(binding.getSourceValueAttr().getInt());
-        mlir::FailureOr<llvm::SmallVector<std::string>> shape =
-            value ? target::getLogicalShape(value, kernel,
-                                            *binding.operation.getOperation(),
-                                            "physical stage-axis binding")
-                  : mlir::FailureOr<llvm::SmallVector<std::string>>(
-                        mlir::failure());
-        int64_t axis = binding.getTensorAxisAttr().getInt();
-        if (!value || mlir::failed(shape) || axis < 0 ||
-            static_cast<size_t>(axis) >= shape->size())
-          return binding.emitOpError(
-              "does not resolve its canonical source tensor dimension");
-        binding.extent = (*shape)[axis];
-        continue;
-      }
-      auto physical = index.axes.find(binding.getAxisNodeAttr().getInt());
-      const RangeBinding *range =
-          physical == index.axes.end()
-              ? nullptr
-              : physical->second.getRange("ownership", 0);
-      if (!range)
-        return binding.emitOpError(
-            "does not resolve its canonical domain-axis extent");
-      binding.extent = range->getExtent().str();
-    }
-  }
-  llvm::DenseMap<int64_t, unsigned> stagePositions;
-  for (auto [position, stage] : llvm::enumerate(index.stages))
-    stagePositions[stage.getNode()] = position;
-  for (auto [position, stage] : llvm::enumerate(index.stages)) {
-    if (stage.getSynchronization() != "same_stream")
-      return stage.emitOpError(
-          "target emitter requires ordered same-stream physical stages");
-    for (int64_t node : stage.getOperations()) {
-      mlir::Operation *operation = kernel.nodes.lookup(node);
-      if (!operation)
-        return stage.emitOpError("references an unknown operation node");
-      auto &stages = operationStages[operation];
-      if (!llvm::is_contained(stages, position))
-        stages.push_back(position);
-    }
-  }
-  if (index.stages.empty())
-    return mlir::success();
-
-  auto appendUnique = [](auto &values, int64_t value) {
-    if (!llvm::is_contained(values, value))
-      values.push_back(value);
-  };
-  llvm::DenseMap<mlir::Operation *, unsigned> terminalOwners;
-  for (unsigned position = 0; position < index.stages.size(); ++position) {
-    StageBinding &stage = index.stages[position];
-    for (int64_t node : stage.getOperations()) {
-      mlir::Operation *operation = kernel.nodes.lookup(node);
-      if (!operation)
-        return stage.emitOpError("references an unknown operation node");
-      if (operation->getNumRegions() == 0 &&
-          mlir::hasEffect<mlir::MemoryEffects::Write>(operation)) {
-        auto owner = terminalOwners.try_emplace(operation, position);
-        if (!owner.second && owner.first->second != position)
-          return operation->emitOpError(
-              "is assigned as an effectful terminal to multiple physical stages");
-        appendUnique(stage.terminals, node);
-      }
-
-      for (mlir::Value operand : operation->getOperands()) {
-        mlir::Operation *definition = operand.getDefiningOp();
-        if (!definition)
-          continue;
-        llvm::ArrayRef<unsigned> definitionStages =
-            operationStages.lookup(definition);
-        if (definitionStages.empty() ||
-            llvm::is_contained(definitionStages, position))
-          continue;
-        llvm::SmallVector<unsigned> producers;
-        for (unsigned producer : definitionStages)
-          if (producer < position)
-            producers.push_back(producer);
-        if (producers.size() != 1)
-          return operation->emitOpError(
-              "does not resolve one earlier physical stage for a cross-stage value");
-        mlir::FailureOr<int64_t> valueID = target::getValueID(
-            operand, kernel, *operation, "derived physical stage boundary");
-        if (mlir::failed(valueID))
-          return mlir::failure();
-        StageBinding &producer = index.stages[producers.front()];
-        appendUnique(stage.inputs, *valueID);
-        appendUnique(producer.outputs, *valueID);
-        appendUnique(stage.dependencies, producer.getNode());
-      }
-    }
-  }
-  for (StageBinding &stage : index.stages) {
-    llvm::sort(stage.dependencies);
-    llvm::sort(stage.inputs);
-    llvm::sort(stage.outputs);
-    llvm::sort(stage.terminals);
-    if (stage.outputs.empty() == stage.terminals.empty())
-      return stage.emitOpError(
-          "derived stage boundary must have either intermediate outputs or effectful terminals");
-    for (int64_t output : stage.outputs) {
-      mlir::Value value = kernel.values.lookup(output);
-      if (!value || !mlir::isa<mlir::RankedTensorType>(value.getType()))
-        return stage.emitOpError(
-            "derives a non-tensor physical stage intermediate");
-    }
-    for (int64_t dependency : stage.dependencies) {
-      auto found = stagePositions.find(dependency);
-      if (found == stagePositions.end() || found->second >= stage.position)
-        return stage.emitOpError(
-            "derives a non-predecessor physical stage dependency");
-    }
-  }
-
-  std::optional<int64_t> programNode = index.program.getLoopNode();
-  mlir::Operation *program =
-      programNode ? kernel.nodes.lookup(*programNode) : nullptr;
-  if (!program)
-    return index.program.emitOpError("references an unknown program root");
-  auto nestedInProgram = [&](mlir::Operation *operation) {
-    for (mlir::Operation *parent = operation; parent;
-         parent = parent->getParentOp())
-      if (parent == program)
-        return true;
-    return false;
-  };
-  auto requireCovered = [&](const auto &bindings) -> mlir::LogicalResult {
-    for (const auto &entry : bindings) {
-      mlir::Operation *operation = kernel.nodes.lookup(entry.first);
-      if (operation && nestedInProgram(operation) &&
-          operationStages.lookup(operation).empty())
-        return entry.second.emitOpError(
-            "is inside a staged program but absent from every physical stage");
-    }
-    return mlir::success();
-  };
-  if (mlir::failed(requireCovered(index.boundaries)) ||
-      mlir::failed(requireCovered(index.reductions)) ||
-      mlir::failed(requireCovered(index.scans)) ||
-      mlir::failed(requireCovered(index.pointwise)) ||
-      mlir::failed(requireCovered(index.contracts)))
-    return mlir::failure();
-  return mlir::success();
 }
 
 } // namespace intent::target::lowering

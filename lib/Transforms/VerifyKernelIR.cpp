@@ -509,6 +509,38 @@ LogicalResult verifySemanticAttributeShape(Operation *operation) {
     return requireAttribute<ArrayAttr>(operation, "intent.fields");
   if (name == "intent.extract")
     return requireAttribute<StringAttr>(operation, "intent.key");
+  if (name == "intent.bitcast") {
+    if (operation->getNumOperands() != 1 || operation->getNumResults() != 1)
+      return operation->emitOpError(
+          "requires exactly one source and one result");
+    Type source = operation->getOperand(0).getType();
+    Type result = operation->getResult(0).getType();
+    auto sourceTensor = dyn_cast<RankedTensorType>(source);
+    auto resultTensor = dyn_cast<RankedTensorType>(result);
+    if (static_cast<bool>(sourceTensor) != static_cast<bool>(resultTensor) ||
+        (sourceTensor && sourceTensor.getShape() != resultTensor.getShape()))
+      return operation->emitOpError(
+          "requires identical source and result logical shapes");
+    Type sourceElement =
+        sourceTensor ? sourceTensor.getElementType() : source;
+    Type resultElement =
+        resultTensor ? resultTensor.getElementType() : result;
+    auto bitWidth = [](Type type) -> std::optional<unsigned> {
+      if (auto integer = dyn_cast<IntegerType>(type))
+        return integer.getWidth();
+      if (auto floating = dyn_cast<FloatType>(type))
+        return floating.getWidth();
+      return std::nullopt;
+    };
+    std::optional<unsigned> sourceWidth = bitWidth(sourceElement);
+    std::optional<unsigned> resultWidth = bitWidth(resultElement);
+    if (isa<IndexType>(sourceElement) || isa<IndexType>(resultElement) ||
+        sourceElement.isInteger(1) || resultElement.isInteger(1) ||
+        !sourceWidth || !resultWidth || *sourceWidth != *resultWidth)
+      return operation->emitOpError(
+          "requires equal-width non-bool integer or floating element types");
+    return success();
+  }
   if (name == "intent.unary" || name == "intent.binary")
     return requireAttribute<StringAttr>(operation, "intent.operator");
   if (name == "intent.compare")
@@ -772,6 +804,7 @@ LogicalResult verifyCombinerHelper(func::FuncOp function) {
              StringRef("intent.extract"), StringRef("intent.unary"),
              StringRef("intent.binary"), StringRef("intent.compare"),
              StringRef("intent.select"), StringRef("intent.cast"),
+             StringRef("intent.bitcast"),
              StringRef("intent.return")},
             name))
       return operation.emitOpError(

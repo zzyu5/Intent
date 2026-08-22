@@ -42,7 +42,7 @@ LogicalResult collectDomainSource(Value source,
   return success();
 }
 
-Operation *structuralDomain(Value value) {
+Operation *structuralDomainImpl(Value value) {
   if (Operation *definition = value.getDefiningOp()) {
     StringRef name = ::intent::target::semanticOperationName(*definition);
     if (name == "intent.domain" || name == "intent.ragged_outer" ||
@@ -56,7 +56,7 @@ Operation *structuralDomain(Value value) {
   StringRef name = ::intent::target::semanticOperationName(*owner);
   if (name == "intent.state_stream" && argument.getArgNumber() == 0 &&
       owner->getNumOperands() > 0)
-    return owner->getOperand(0).getDefiningOp();
+    return structuralDomainImpl(owner->getOperand(0));
   if (name == "intent.for" && owner->getNumOperands() > 0) {
     SmallVector<Operation *> domains;
     if (failed(collectDomainSource(owner->getOperand(0), domains, nullptr)) ||
@@ -94,7 +94,7 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
     active.erase(value);
     return source;
   };
-  if (Operation *domain = structuralDomain(value))
+  if (Operation *domain = structuralDomainImpl(value))
     return finish(ScalarIndexSource{domain, {domain}, false, false});
   Operation *definition = value.getDefiningOp();
   if (!definition)
@@ -125,6 +125,10 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
 }
 
 } // namespace
+
+Operation *resolveStructuralDomain(Value value) {
+  return structuralDomainImpl(value);
+}
 
 FailureOr<SmallVector<Operation *>>
 expandDomainSource(Value source, Operation &consumer) {

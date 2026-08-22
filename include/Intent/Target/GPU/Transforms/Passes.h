@@ -15,7 +15,6 @@ createConstructPhysicalProgramPass(const DeviceCapabilities &device);
 std::unique_ptr<mlir::Pass> createFormAutomaticBlockingPass();
 std::unique_ptr<mlir::Pass> createReconcileAccessRangesPass();
 std::unique_ptr<mlir::Pass> createRefineTransferRealizationPass();
-std::unique_ptr<mlir::Pass> createFormStagesPass();
 std::unique_ptr<mlir::Pass>
 createRefinePrivateBufferResidencyPass(const DeviceCapabilities &device);
 std::unique_ptr<mlir::Pass> createRefineContractionRealizationPass();

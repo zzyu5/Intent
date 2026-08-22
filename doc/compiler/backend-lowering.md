@@ -9,7 +9,6 @@ Backend lowering 先在同一 MLIR module 中运行 shared Physical Program cons
 - Kernel IR 的 operation/region/def-use 遍历；
 - ABI、domain、ragged relation、state stream 与 contraction 分析；
 - ownership、traversal、tile role、storage、boundary 和合法搜索轴的 machine 决策；
-- execution-stage operation slice、stage-axis binding、同步，以及由这些内容派生的 dependency/intermediate index；
 - operation handler registry 与 unsupported-op 诊断机制。
 
 每个 provider 叶子提供：
@@ -50,9 +49,9 @@ Machine realization 不保存 row/tiled/ragged 之类的 kernel 类别。它逐�
 
 使用 target 的高性能内层 primitive，不等于把数学语义交给 target。Reduce/scan closure、contract reduction axes、operand dtype、accumulator dtype 与 result role 先由 Kernel IR/Plan 固定；leaf emitter 只选择对应 spelling，并让下层完成 collective tree、layout、指令和 machine code generation。Generic reduce/scan 不意味着 arbitrary contract semiring；`contract` 只承接正式声明的 multiply/add 与 dtype capability。
 
-## Execution-stage 投影
+## Single-launch 投影
 
-Shared Physical Program 给出 stage operation slice、stage-axis logical binding、tile/worker 与 `same_stream` synchronization。公共 analysis index 从 Kernel IR def-use 和 memory effects 派生 dependency、input/output、terminal、intermediate lifetime/visibility。Provider-local passes 可以建立 provider-specific materialization index并兑现对应 forms；terminal translator 不重新划分 stage、不重选 workspace owner，也不重建 shared physical decisions。不同 target family 可以在各自 realizer 中产生不同的初始 grouping，surface provider 不能改写同一份 shared grouping。
+Shared Physical Program 给出一次 launch 内的 ownership、traversal、range、storage 与 access obligations。公共 analysis index 从 Kernel IR def-use 和 memory effects 派生 value lifetime、terminal 与 visibility；provider-local passes 兑现对应 forms，terminal translator 不重选 workspace owner 或重建 shared physical decisions。任何 provider 都不能在投影期间新增 target kernel、跨-launch workspace 或 host synchronization。
 
 ## 诊断边界
 

@@ -16,6 +16,7 @@ MAMBA3_HEADS = 16
 MAMBA3_QK_DIMENSION = 32
 MAMBA3_VALUE_DIMENSION = 64
 MAMBA3_ANGLE_DIMENSION = 16
+MAMBA3_CHUNK_SIZE = 64
 
 
 @intent.kernel
@@ -363,3 +364,224 @@ def mamba3_siso_step(
                     * I.sigmoid(gate_value),
                     I.bf16,
                 )
+
+
+@intent.kernel
+def mamba3_siso_forward(
+    query: I.In[I.bf16, ("B", "S", MAMBA3_QK_HEADS, MAMBA3_QK_DIMENSION)],
+    key: I.In[I.bf16, ("B", "S", MAMBA3_QK_HEADS, MAMBA3_QK_DIMENSION)],
+    value: I.In[I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_VALUE_DIMENSION)],
+    adt: I.In[I.f32, ("B", MAMBA3_HEADS, "S")],
+    dt: I.In[I.f32, ("B", MAMBA3_HEADS, "S")],
+    trap: I.In[I.f32, ("B", MAMBA3_HEADS, "S")],
+    query_bias: I.In[I.bf16, (MAMBA3_HEADS, MAMBA3_QK_DIMENSION)],
+    key_bias: I.In[I.bf16, (MAMBA3_HEADS, MAMBA3_QK_DIMENSION)],
+    angles: I.In[
+        I.f32, ("B", "S", MAMBA3_HEADS, MAMBA3_ANGLE_DIMENSION)
+    ],
+    residual_scale: I.In[I.f32, (MAMBA3_HEADS,)],
+    gate: I.In[I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_VALUE_DIMENSION)],
+    output: I.Out[I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_VALUE_DIMENSION)],
+    query_store: I.Out[
+        I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_QK_DIMENSION)
+    ],
+    key_store: I.Out[
+        I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_QK_DIMENSION)
+    ],
+    qk_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
+    scale_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
+    gamma_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
+    HEAD_GROUP: I.Constexpr[int],
+):
+    B, S, _, _ = query.shape
+    chunks = (S + MAMBA3_CHUNK_SIZE - 1) // MAMBA3_CHUNK_SIZE
+    positions = I.domain(0, MAMBA3_CHUNK_SIZE)
+    pairs = I.domain(0, MAMBA3_QK_DIMENSION // 2)
+    qk_dimensions = I.domain(0, MAMBA3_QK_DIMENSION)
+    value_dimensions = I.domain(0, MAMBA3_VALUE_DIMENSION)
+    local = I.indices(positions)
+    pair = I.indices(pairs)
+    even = pair * 2
+    odd = even + 1
+    strict_lower = local[:, None] > local[None, :]
+    for batch in I.parallel(I.domain(0, B)):
+        for head in I.parallel(I.domain(0, MAMBA3_HEADS)):
+            query_head = head // HEAD_GROUP
+            for chunk in I.domain(0, chunks):
+                source_positions = chunk * MAMBA3_CHUNK_SIZE + local
+                query_first = I.cast(
+                    query[batch, source_positions, query_head, even], I.f32
+                ) + I.cast(query_bias[head, even], I.f32)[None, :]
+                query_second = I.cast(
+                    query[batch, source_positions, query_head, odd], I.f32
+                ) + I.cast(query_bias[head, odd], I.f32)[None, :]
+                key_first = I.cast(
+                    key[batch, source_positions, query_head, even], I.f32
+                ) + I.cast(key_bias[head, even], I.f32)[None, :]
+                key_second = I.cast(
+                    key[batch, source_positions, query_head, odd], I.f32
+                ) + I.cast(key_bias[head, odd], I.f32)[None, :]
+                current_dt = dt[batch, head, source_positions]
+                shifted_positions = source_positions + 1
+                shifted_valid = shifted_positions < S
+                shifted_dt = I.mask(
+                    dt[batch, head, shifted_positions],
+                    valid=shifted_valid,
+                    fill=0.0,
+                )
+                current_trap = I.sigmoid(trap[batch, head, source_positions])
+                shifted_trap = I.sigmoid(
+                    I.mask(
+                        trap[batch, head, shifted_positions],
+                        valid=shifted_valid,
+                        fill=0.0,
+                    )
+                )
+                gamma = current_dt * current_trap
+                shifted_gamma = shifted_dt * (1.0 - shifted_trap)
+                transition_scale = gamma + shifted_gamma
+                angle = angles[batch, source_positions, head, pairs]
+                cosine = I.cos(angle)
+                sine = I.sin(angle)
+                rotated_query_first = I.cast(
+                    query_first * cosine - query_second * sine, I.bf16
+                )
+                rotated_query_second = I.cast(
+                    query_first * sine + query_second * cosine, I.bf16
+                )
+                rotated_key_first = I.cast(
+                    key_first * cosine - key_second * sine, I.bf16
+                )
+                rotated_key_second = I.cast(
+                    key_first * sine + key_second * cosine, I.bf16
+                )
+                qk_dot = I.reduce.sum(
+                    query_first * key_first + query_second * key_second,
+                    axis=1,
+                    identity=0.0,
+                    acc_dtype=I.f32,
+                ) * gamma
+                I.scatter_unique(
+                    query_store,
+                    index=(batch, source_positions, head, even),
+                    value=rotated_query_first,
+                )
+                I.scatter_unique(
+                    query_store,
+                    index=(batch, source_positions, head, odd),
+                    value=rotated_query_second,
+                )
+                I.scatter_unique(
+                    key_store,
+                    index=(batch, source_positions, head, even),
+                    value=rotated_key_first * I.cast(
+                        transition_scale[:, None], I.bf16
+                    ),
+                )
+                I.scatter_unique(
+                    key_store,
+                    index=(batch, source_positions, head, odd),
+                    value=rotated_key_second * I.cast(
+                        transition_scale[:, None], I.bf16
+                    ),
+                )
+                qk_store[batch, head, source_positions] = qk_dot
+                scale_store[batch, head, source_positions] = transition_scale
+                gamma_store[batch, head, source_positions] = gamma
+
+            state = I.zeros(
+                (MAMBA3_VALUE_DIMENSION, MAMBA3_QK_DIMENSION),
+                dtype=I.f32,
+            )
+            for chunk in I.domain(0, chunks):
+                source_positions = chunk * MAMBA3_CHUNK_SIZE + local
+                query_block = query_store[
+                    batch,
+                    source_positions,
+                    head,
+                    qk_dimensions,
+                ]
+                key_block = key_store[
+                    batch,
+                    source_positions,
+                    head,
+                    qk_dimensions,
+                ]
+                value_block = value[
+                    batch,
+                    source_positions,
+                    head,
+                    value_dimensions,
+                ]
+                decay = I.scan(
+                    adt[batch, head, source_positions] * I.LOG2E,
+                    axis=0,
+                    identity=0.0,
+                    combine=I.add,
+                    inclusive=True,
+                    acc_dtype=I.f32,
+                )
+                decay_sum = I.reduce.sum(
+                    adt[batch, head, source_positions] * I.LOG2E,
+                    axis=0,
+                    identity=0.0,
+                    acc_dtype=I.f32,
+                )
+                carried = I.contract(
+                    query_block,
+                    I.cast(state, I.bf16),
+                    reduce=((1, 1),),
+                    acc_dtype=I.f32,
+                ) * I.exp2(decay)[:, None]
+                scores = I.contract(
+                    query_block,
+                    key_block,
+                    reduce=((1, 1),),
+                    acc_dtype=I.f32,
+                )
+                scores = I.mask(
+                    scores
+                    * I.exp2(
+                        I.minimum(decay[:, None] - decay[None, :], 0.0)
+                    ),
+                    valid=strict_lower,
+                    fill=0.0,
+                )
+                current = I.contract(
+                    I.cast(scores, I.bf16),
+                    value_block,
+                    reduce=((1, 0),),
+                    acc_dtype=I.f32,
+                )
+                skip = (
+                    residual_scale[head]
+                    + qk_store[batch, head, source_positions]
+                )[:, None] * I.cast(value_block, I.f32)
+                result = carried + current + skip
+                gate_value = I.cast(
+                    gate[
+                        batch,
+                        source_positions,
+                        head,
+                        value_dimensions,
+                    ],
+                    I.f32,
+                )
+                result = result * gate_value * I.sigmoid(gate_value)
+                output[
+                    batch,
+                    source_positions,
+                    head,
+                    value_dimensions,
+                ] = I.cast(result, I.bf16)
+                reverse_decay = decay_sum - decay
+                weighted_value = I.cast(value_block, I.f32) * I.exp2(
+                    reverse_decay
+                )[:, None]
+                update = I.contract(
+                    I.cast(weighted_value, I.bf16),
+                    key_block,
+                    reduce=((0, 0),),
+                    acc_dtype=I.f32,
+                )
+                state = state * I.exp2(decay_sum) + update

@@ -24,39 +24,6 @@ struct AccumulatorFlow {
   Value previous;
 };
 
-FailureOr<std::pair<StringRef, StringRef>>
-stagedOperandForms(Operation &operation) {
-  if (operation.getNumOperands() != 2)
-    return operation.emitOpError(
-        "staged contraction requires two physical operands");
-  StringRef lhsForm = "workspace";
-  if (Operation *lhs = operation.getOperand(0).getDefiningOp();
-      lhs && target::semanticOperationName(*lhs) == "intent.gather") {
-    FailureOr<SmallVector<target::IndexTerm>> relation =
-        target::parseIndexRelation(*lhs);
-    if (failed(relation) || relation->size() != 2 ||
-        (*relation)[0].kind != "value_index" ||
-        (*relation)[0].operands.size() != 1 ||
-        !(*relation)[0].operands.front() ||
-        (*relation)[1].kind != "full_slice")
-      return lhs->emitOpError(
-          "has no canonical member-row gather for staged contraction");
-    lhsForm = "member_row_gather";
-  }
-  Operation *rhs = operation.getOperand(1).getDefiningOp();
-  auto rhsView = rhs && rhs->getNumOperands() > 0
-                     ? dyn_cast<intent::ViewType>(rhs->getOperand(0).getType())
-                     : intent::ViewType();
-  auto rhsTensor = rhsView
-                       ? dyn_cast<RankedTensorType>(rhsView.getTensor())
-                       : RankedTensorType();
-  if (!rhs || target::semanticOperationName(*rhs) != "intent.view_load" ||
-      !rhsTensor || rhsTensor.getRank() != 3)
-    return operation.emitOpError(
-        "staged contraction requires an expert-selected rank-three weight");
-  return std::pair<StringRef, StringRef>{lhsForm, "expert_matrix"};
-}
-
 std::optional<AccumulatorFlow> findAccumulatorFlow(Operation &operation) {
   if (target::semanticOperationName(operation) != "intent.contract" ||
       operation.getNumResults() != 1 ||
@@ -243,25 +210,18 @@ LogicalResult refineContractions(plan::ProgramOp program) {
   target::KernelFacts &facts = (*analysis)->getFacts();
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::TransferOp> transfers;
-  llvm::DenseSet<int64_t> staged;
   for (Operation &operation : program.getBody().front()) {
     if (auto binding = dyn_cast<plan::ContractOp>(operation))
       contracts[binding.getNode()] = binding;
     else if (auto binding = dyn_cast<plan::TransferOp>(operation))
       transfers[binding.getNode()] = binding;
-    else if (auto binding = dyn_cast<plan::StageOp>(operation))
-      staged.insert(binding.getNode());
   }
-  auto isStaged = [&](Operation &operation) {
-    auto node = operation.getAttrOfType<IntegerAttr>("intent.node");
-    return node && staged.contains(node.getInt());
-  };
 
   llvm::DenseMap<Operation *, ReplayChoice> replays;
   llvm::DenseMap<Operation *, Operation *> replayOwners;
   WalkResult replayWalk = kernel.entry.walk([&](Operation *operation) {
     if (target::semanticOperationName(*operation) != "intent.contract" ||
-        operation->getNumOperands() != 2 || isStaged(*operation))
+        operation->getNumOperands() != 2)
       return WalkResult::advance();
     std::optional<target::ContractOperandReplay> lhs =
         target::analyzeContractOperandReplay(operation->getOperand(0), *operation);
@@ -302,8 +262,6 @@ LogicalResult refineContractions(plan::ProgramOp program) {
     return failure();
 
   auto sharedOperand = [&](Value operand, Operation &contract) {
-    if (isStaged(contract))
-      return true;
     if (!isDirectViewLoad(operand))
       return false;
     if (llvm::all_of(contract.getOperands(), isDirectViewLoad))
@@ -418,7 +376,7 @@ LogicalResult refineContractions(plan::ProgramOp program) {
     bool defer = replay;
     if (load && shared && soleUser) {
       StringRef consumer = target::semanticOperationName(*soleUser);
-      if (consumer == "intent.sparse_contract" || isStaged(*soleUser)) {
+      if (consumer == "intent.sparse_contract") {
         defer = true;
       } else if (consumer == "intent.contract" &&
                  llvm::all_of(soleUser->getOperands(), isDirectViewLoad)) {
@@ -451,24 +409,12 @@ LogicalResult refineContractions(plan::ProgramOp program) {
     for (StringRef attribute : {"reduction_axis_node", "lhs_result_axis_node",
                                 "rhs_result_axis_node"})
       binding->removeAttr(attribute);
-    binding->setAttr("lhs_form", builder.getStringAttr("none"));
-    binding->setAttr("rhs_form", builder.getStringAttr("none"));
     StringRef semantic = target::semanticOperationName(operation);
     if (semantic == "intent.scaled_contract") {
-      if (staged.contains(*node) || binding.getProducerReplay())
+      if (binding.getProducerReplay())
         return binding.emitOpError(
-            "scaled contraction has no legal staged or replay realization");
+            "scaled contraction has no legal replay realization");
       binding->setAttr("form", builder.getStringAttr("scaled_direct"));
-      continue;
-    }
-    if (staged.contains(*node)) {
-      FailureOr<std::pair<StringRef, StringRef>> forms =
-          stagedOperandForms(operation);
-      if (failed(forms))
-        return failure();
-      binding->setAttr("form", builder.getStringAttr("staged"));
-      binding->setAttr("lhs_form", builder.getStringAttr(forms->first));
-      binding->setAttr("rhs_form", builder.getStringAttr(forms->second));
       continue;
     }
     if (binding.getProducerReplay()) {

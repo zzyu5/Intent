@@ -29,7 +29,8 @@ inline bool isReplayableContractProducer(mlir::Operation &operation) {
          name == "intent.broadcast" || name == "intent.unary" ||
          name == "intent.binary" || name == "intent.compare" ||
          name == "intent.mask" || name == "intent.select" ||
-         name == "intent.cast" || name == "intent.full" ||
+         name == "intent.cast" || name == "intent.bitcast" ||
+         name == "intent.full" ||
          name == "intent.zeros" || name == "intent.gather" ||
          name == "intent.reshape" || name == "intent.transpose";
 }

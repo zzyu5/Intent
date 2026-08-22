@@ -1714,6 +1714,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               Value part = operation.getRegion(0).front().getArgument(0);
               Value region = operation.getRegion(0).front().getArgument(1);
               facts.partitionPartArguments[part] = partition;
+              facts.partitionRegionArguments[region] = partition;
               facts.countPartitions.push_back(CountPartitionFact{
                   partition, &operation, domains->front(),
                   facts.partitionCounts.lookup(partition), part, region});
@@ -1920,7 +1921,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                        StringRef("intent.make_record"),
                        StringRef("intent.extract"), StringRef("intent.unary"),
                        StringRef("intent.binary"), StringRef("intent.compare"),
-                       StringRef("intent.select"), StringRef("intent.cast")},
+                       StringRef("intent.select"), StringRef("intent.cast"),
+                       StringRef("intent.bitcast")},
                       name))
                 return nested.emitOpError(
                     "cannot be inlined into a scalar while condition");
@@ -2327,7 +2329,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     return failure();
 
   for (StringRef name : {"intent.broadcast", "intent.unary",
-                         "intent.binary", "intent.cast",
+                         "intent.binary", "intent.cast", "intent.bitcast",
                          "intent.compare", "intent.select", "intent.mask",
                          "intent.random"})
     if (failed(addHandler(
@@ -2527,7 +2529,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
     }
     if (operation.getNumOperands() != static_cast<unsigned>(trailingIndex))
       return operation.emitOpError("has no canonical state-stream operand layout");
-    Operation *axisDomain = operation.getOperand(0).getDefiningOp();
+    Operation *axisDomain = resolveStructuralDomain(operation.getOperand(0));
     if (!axisDomain || !facts.domainSourceAxes.count(axisDomain))
       return operation.emitOpError(
           "state stream requires a canonical source domain");
@@ -2788,48 +2790,12 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
         "cannot resolve a partition identity to its source domain");
     return failure();
   }
-  if (Operation *definition = indexedValue.getDefiningOp())
-    if (facts.domainSourceAxes.count(definition) ||
-        facts.staticDomainExtents.count(definition))
-      return definition;
-  auto argument = dyn_cast<BlockArgument>(indexedValue);
-  Operation *owner = argument ? argument.getOwner()->getParentOp() : nullptr;
-  if (owner && ::intent::target::semanticOperationName(*owner) == "intent.state_stream" &&
-      argument.getArgNumber() == 0 && owner->getNumOperands() > 0) {
-    Operation *domain = owner->getOperand(0).getDefiningOp();
-    if (domain && facts.domainSourceAxes.count(domain))
-      return domain;
-    consumer.emitOpError("cannot resolve a state stream to its source domain");
-    return failure();
-  }
-  if (owner && ::intent::target::semanticOperationName(*owner) == "intent.for" &&
-      owner->getNumOperands() > 0) {
-    FailureOr<SmallVector<Operation *>> domains =
-        expandDomainSource(owner->getOperand(0), consumer);
-    if (succeeded(domains) && argument.getArgNumber() < domains->size())
-      return (*domains)[argument.getArgNumber()];
-    consumer.emitOpError("cannot resolve a sequential loop to its source domain");
-    return failure();
-  }
-  if (!owner || ::intent::target::semanticOperationName(*owner) != "intent.parallel" ||
-      owner->getNumOperands() != 1) {
-    consumer.emitOpError("indexes with a value not owned by a parallel region");
-    return failure();
-  }
-  auto domains = facts.parallelDomains.find(owner);
-  if (domains != facts.parallelDomains.end()) {
-    Operation *source = owner->getOperand(0).getDefiningOp();
-    bool countPartition =
-        source && facts.partitionCounts.count(source) != 0;
-    unsigned index = argument.getArgNumber();
-    if (countPartition) {
-      if (index < 2 && domains->second.size() == 1)
-        return domains->second.front();
-    } else if (index < domains->second.size()) {
-      return domains->second[index];
-    }
-  }
-  consumer.emitOpError("cannot resolve an indexed region to its source domain");
+  Operation *domain = resolveStructuralDomain(indexedValue);
+  if (domain && (facts.domainSourceAxes.count(domain) ||
+                 facts.staticDomainExtents.count(domain)))
+    return domain;
+  consumer.emitOpError(
+      "cannot resolve an indexed value to its structural source domain");
   return failure();
 }
 
@@ -2923,7 +2889,8 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
                   name == "intent.broadcast" || name == "intent.unary" ||
                   name == "intent.binary" || name == "intent.compare" ||
                   name == "intent.mask" || name == "intent.select" ||
-                  name == "intent.cast" || name == "intent.full" ||
+                  name == "intent.cast" || name == "intent.bitcast" ||
+                  name == "intent.full" ||
                   name == "intent.zeros" || name == "intent.reshape" ||
                   name == "intent.transpose" ||
                   name == "intent.make_record" || name == "intent.extract";

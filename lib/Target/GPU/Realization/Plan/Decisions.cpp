@@ -120,71 +120,9 @@ sourceViewDimensionSymbol(Operation &transfer, unsigned sourceAxis,
   return symbol.getValue().str();
 }
 
-bool dependsOn(Value value, Operation &producer,
-               const target::KernelModel &kernel,
-               llvm::DenseSet<Value> &visited) {
-  if (!visited.insert(value).second)
-    return false;
-  if (value.getDefiningOp() == &producer)
-    return true;
-  auto semantic = kernel.structuredResultSources.find(value);
-  if (semantic != kernel.structuredResultSources.end() &&
-      llvm::any_of(semantic->second, [&](Value source) {
-        return dependsOn(source, producer, kernel, visited);
-      }))
-    return true;
-  Operation *definition = value.getDefiningOp();
-  return definition && llvm::any_of(definition->getOperands(), [&](Value operand) {
-           return dependsOn(operand, producer, kernel, visited);
-         });
-}
-
-bool reachesTerminal(Value value, const target::KernelModel &kernel,
-                     const llvm::DenseSet<Operation *> &terminals,
-                     llvm::DenseSet<Operation *> &visitedOperations,
-                     llvm::DenseSet<Value> &visitedValues);
-
-bool reachesTerminal(Operation &operation, const target::KernelModel &kernel,
-                     const llvm::DenseSet<Operation *> &terminals,
-                     llvm::DenseSet<Operation *> &visitedOperations,
-                     llvm::DenseSet<Value> &visitedValues) {
-  if (!visitedOperations.insert(&operation).second)
-    return false;
-  if (terminals.contains(&operation))
-    return true;
-  for (Value result : operation.getResults())
-    if (reachesTerminal(result, kernel, terminals, visitedOperations,
-                        visitedValues))
-      return true;
-  return false;
-}
-
-bool reachesTerminal(Value value, const target::KernelModel &kernel,
-                     const llvm::DenseSet<Operation *> &terminals,
-                     llvm::DenseSet<Operation *> &visitedOperations,
-                     llvm::DenseSet<Value> &visitedValues) {
-  if (!visitedValues.insert(value).second)
-    return false;
-  for (Operation *user : value.getUsers())
-    if (reachesTerminal(*user, kernel, terminals, visitedOperations,
-                        visitedValues))
-      return true;
-  auto semantic = kernel.structuredValueUsers.find(value);
-  return semantic != kernel.structuredValueUsers.end() &&
-         llvm::any_of(semantic->second, [&](Value result) {
-           return reachesTerminal(result, kernel, terminals, visitedOperations,
-                                  visitedValues);
-         });
-}
-
 void appendUnique(SmallVectorImpl<std::string> &values, StringRef value) {
   if (!value.empty() && !llvm::is_contained(values, value))
     values.push_back(value.str());
-}
-
-void appendUnique(SmallVectorImpl<Value> &values, Value value) {
-  if (!llvm::is_contained(values, value))
-    values.push_back(value);
 }
 
 void appendRole(SmallVectorImpl<std::string> &roles, StringRef role) {
@@ -238,7 +176,8 @@ bool canPackScalarParallel(Operation *parallel, Operation *domain,
         name == "intent.make_record" || name == "intent.extract" ||
         name == "intent.unary" || name == "intent.binary" ||
         name == "intent.compare" || name == "intent.select" ||
-        name == "intent.cast" || name == "intent.random" ||
+        name == "intent.cast" || name == "intent.bitcast" ||
+        name == "intent.random" ||
         name == "intent.yield";
     if (operation.getNumRegions() != 0 || !scalarPointwise)
       return false;
@@ -899,198 +838,6 @@ assignAxes(const target::KernelFacts &facts) {
   return AxisAssignments{std::move(choices), false};
 }
 
-struct StageDecision {
-  Operation *contraction = nullptr;
-  SmallVector<Operation *> dependencies;
-  SmallVector<Value> inputs;
-  SmallVector<Value> outputs;
-  SmallVector<Operation *> terminals;
-  SmallVector<int64_t> operations;
-};
-
-bool hasRaggedAxis(const target::ContractionFact &contraction,
-                   const target::KernelFacts &facts) {
-  auto contains = [&](ArrayRef<target::LogicalAxis> axes) {
-    return llvm::any_of(axes, [&](const target::LogicalAxis &axis) {
-      return axis.domain && facts.raggedMembers.count(axis.domain);
-    });
-  };
-  return contains(contraction.lhsAxes) || contains(contraction.rhsAxes) ||
-         contains(contraction.resultAxes);
-}
-
-void collectSlice(Value value, const target::KernelModel &kernel,
-                  const llvm::DenseSet<Value> &inputs,
-                  llvm::DenseSet<Value> &visited,
-                  llvm::DenseSet<int64_t> &operations) {
-  if (inputs.contains(value) || !visited.insert(value).second)
-    return;
-  auto semantic = kernel.structuredResultSources.find(value);
-  if (semantic != kernel.structuredResultSources.end())
-    for (Value source : semantic->second)
-      collectSlice(source, kernel, inputs, visited, operations);
-  Operation *definition = value.getDefiningOp();
-  if (!definition)
-    return;
-  auto node = definition->getAttrOfType<IntegerAttr>("intent.node");
-  if (node)
-    operations.insert(node.getInt());
-  for (Value operand : definition->getOperands())
-    collectSlice(operand, kernel, inputs, visited, operations);
-}
-
-FailureOr<SmallVector<StageDecision, 0>>
-contractionStages(const target::KernelFacts &facts) {
-  llvm::DenseSet<Operation *> terminals = facts.scatterWrites;
-  SmallVector<Operation *> contractions;
-  for (const auto &entry : facts.contractions) {
-    llvm::DenseSet<Operation *> visitedOperations;
-    llvm::DenseSet<Value> visitedValues;
-    if (hasRaggedAxis(entry.second, facts) &&
-        reachesTerminal(*entry.first, facts.kernel, terminals,
-                        visitedOperations, visitedValues))
-      contractions.push_back(entry.first);
-  }
-  llvm::sort(contractions, [](Operation *lhs, Operation *rhs) {
-    return lhs->getAttrOfType<IntegerAttr>("intent.node").getInt() <
-           rhs->getAttrOfType<IntegerAttr>("intent.node").getInt();
-  });
-  if (contractions.empty())
-    return SmallVector<StageDecision, 0>();
-
-  SmallVector<StageDecision, 0> stages;
-  llvm::DenseMap<Operation *, unsigned> stagePositions;
-  for (Operation *contraction : contractions) {
-    stagePositions[contraction] = stages.size();
-    stages.push_back(StageDecision{contraction});
-  }
-  for (Operation *consumer : contractions) {
-    StageDecision &consumerStage = stages[stagePositions.lookup(consumer)];
-    for (Value operand : consumer->getOperands()) {
-      for (Operation *producer : contractions) {
-        if (producer == consumer)
-          continue;
-        llvm::DenseSet<Value> visited;
-        if (!dependsOn(operand, *producer, facts.kernel, visited))
-          continue;
-        if (!llvm::is_contained(consumerStage.dependencies, producer))
-          consumerStage.dependencies.push_back(producer);
-        appendUnique(consumerStage.inputs, operand);
-        appendUnique(stages[stagePositions.lookup(producer)].outputs, operand);
-      }
-    }
-  }
-  for (StageDecision &stage : stages) {
-    if (stage.outputs.empty())
-      for (Operation *terminal : terminals) {
-        bool dependent = llvm::any_of(terminal->getOperands(), [&](Value operand) {
-          llvm::DenseSet<Value> visited;
-          return dependsOn(operand, *stage.contraction, facts.kernel, visited);
-        });
-        if (dependent)
-          stage.terminals.push_back(terminal);
-      }
-    if (stage.outputs.empty() && stage.terminals.empty())
-      return stage.contraction->emitOpError(
-          "has no physical stage output or terminal");
-
-    llvm::DenseSet<Value> inputs(stage.inputs.begin(), stage.inputs.end());
-    llvm::DenseSet<Value> visited;
-    llvm::DenseSet<int64_t> operationNodes;
-    for (Value output : stage.outputs)
-      collectSlice(output, facts.kernel, inputs, visited, operationNodes);
-    for (Operation *terminal : stage.terminals) {
-      FailureOr<int64_t> terminalNode = node(*terminal, "stage terminal");
-      if (failed(terminalNode))
-        return failure();
-      operationNodes.insert(*terminalNode);
-      for (Value operand : terminal->getOperands())
-        collectSlice(operand, facts.kernel, inputs, visited, operationNodes);
-    }
-    FailureOr<int64_t> rootNode = node(*stage.contraction, "stage root");
-    if (failed(rootNode))
-      return failure();
-    operationNodes.insert(*rootNode);
-    SmallVector<int64_t> dataflowNodes(operationNodes.begin(),
-                                      operationNodes.end());
-    for (int64_t operationNode : dataflowNodes) {
-      Operation *operation = facts.kernel.nodes.lookup(operationNode);
-      for (Operation *parent = operation ? operation->getParentOp() : nullptr;
-           parent && parent != facts.kernel.entry.getOperation();
-           parent = parent->getParentOp()) {
-        auto parentNode = parent->getAttrOfType<IntegerAttr>("intent.node");
-        if (parentNode)
-          operationNodes.insert(parentNode.getInt());
-      }
-    }
-    stage.operations.assign(operationNodes.begin(), operationNodes.end());
-    llvm::sort(stage.operations);
-  }
-  return stages;
-}
-
-FailureOr<Operation *>
-stageMemberDomain(
-    const StageDecision &stage, const target::KernelFacts &facts,
-    const llvm::DenseMap<int64_t, intent::plan::RangeOp> &ownership) {
-  const target::ContractionFact &contract =
-      facts.contractions.lookup(stage.contraction);
-  auto ownedMember = [&](const target::LogicalAxis &axis) {
-    auto node = axis.domain
-                    ? axis.domain->getAttrOfType<IntegerAttr>("intent.node")
-                    : IntegerAttr();
-    return axis.domain && facts.raggedMembers.count(axis.domain) && node &&
-           ownership.count(node.getInt());
-  };
-  for (const target::LogicalAxis &axis : contract.resultAxes)
-    if (ownedMember(axis))
-      return axis.domain;
-  for (const target::LogicalAxis &axis : contract.lhsAxes)
-    if (ownedMember(axis))
-      return axis.domain;
-  stage.contraction->emitOpError(
-      "has no program-owned ragged member axis for physical staging");
-  return failure();
-}
-
-FailureOr<std::pair<Value, unsigned>>
-stageFeatureAxis(const StageDecision &stage,
-                 const target::KernelFacts &facts, Operation *member) {
-  const target::ContractionFact &contract =
-      facts.contractions.lookup(stage.contraction);
-  std::optional<unsigned> feature;
-  for (auto [position, axis] : llvm::enumerate(contract.resultAxes)) {
-    if (axis.domain == member || axis.extent == "1" || axis.extent.empty())
-      continue;
-    if (feature) {
-      stage.contraction->emitOpError(
-          "has more than one non-member result axis for physical staging");
-      return failure();
-    }
-    feature = position;
-  }
-  if (feature)
-    return std::pair<Value, unsigned>{stage.contraction->getResult(0), *feature};
-  stage.contraction->emitOpError(
-      "has no non-member result axis for physical staging");
-  return failure();
-}
-
-FailureOr<std::pair<Value, unsigned>>
-stageReductionAxis(const StageDecision &stage,
-                   const target::KernelFacts &facts) {
-  const target::ContractionFact &contract =
-      facts.contractions.lookup(stage.contraction);
-  if (contract.lhsReductionAxes.empty() ||
-      contract.lhsReductionAxes.front() >= contract.lhsAxes.size() ||
-      contract.lhsAxes[contract.lhsReductionAxes.front()].extent.empty()) {
-    stage.contraction->emitOpError("has no staged reduction extent");
-    return failure();
-  }
-  return std::pair<Value, unsigned>{stage.contraction->getOperand(0),
-                                    contract.lhsReductionAxes.front()};
-}
-
 } // namespace
 
 FailureOr<PhysicalDecisions>
@@ -1298,11 +1045,21 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
     IntegerAttr stopValue;
     if (stream.stopValue >= 0)
       stopValue = i64(builder, stream.stopValue);
+    IntegerAttr partitionNode;
+    auto partition =
+        facts.partitionRegionArguments.find(stream.operation->getOperand(0));
+    if (partition != facts.partitionRegionArguments.end()) {
+      FailureOr<int64_t> id =
+          node(*partition->second, "state-stream count-partition binding");
+      if (failed(id))
+        return failure();
+      partitionNode = i64(builder, *id);
+    }
     decisions.streamBindings.push_back(
         builder.create<intent::plan::StreamBindingOp>(
             stream.operation->getLoc(), i64(builder, stream.node),
             i64(builder, stream.axisNode), string(builder, "traversal"),
-            i64(builder, 0), stopValue, relationNode));
+            i64(builder, 0), stopValue, relationNode, partitionNode));
   }
 
   if (conservativeAutomaticBlocking)
@@ -1374,30 +1131,6 @@ LogicalResult emitSearchSpace(ModuleOp module, const KernelFacts &facts,
   }
   for (intent::plan::BlockExtentOp extent : decisions.blockExtents)
     appendUnique(keys, extent.getLogicalExtent());
-  for (intent::plan::StageAxisOp axis : decisions.stageAxes) {
-    if (axis.getAxisNodeAttr()) {
-      Operation *domain = facts.kernel.nodes.lookup(axis.getAxisNodeAttr().getInt());
-      FailureOr<std::string> extent =
-          domain ? sourceDimensionSymbol(*domain, facts)
-                 : FailureOr<std::string>(failure());
-      if (failed(extent))
-        return axis.emitOpError("does not resolve a stage domain-axis key");
-      appendUnique(keys, *extent);
-    } else {
-      Value value = facts.kernel.values.lookup(axis.getSourceValueAttr().getInt());
-      FailureOr<SmallVector<std::string>> shape =
-          value ? target::getLogicalShape(value, facts.kernel,
-                                          *axis.getOperation(),
-                                          "stage autotune key")
-                : FailureOr<SmallVector<std::string>>(failure());
-      int64_t dimension = axis.getTensorAxisAttr().getInt();
-      if (!value || failed(shape) || dimension < 0 ||
-          static_cast<size_t>(dimension) >= shape->size())
-        return axis.emitOpError("does not resolve a stage tensor-axis key");
-      appendUnique(keys, (*shape)[dimension]);
-    }
-    appendUnique(parameters, axis.getTile());
-  }
   if (parameters.empty())
     return success();
 
@@ -1436,9 +1169,6 @@ mlir::LogicalResult intent::gpu::materializeSearchSpace(
     else if (auto extent =
                  mlir::dyn_cast<intent::plan::BlockExtentOp>(operation))
       decisions.blockExtents.push_back(extent);
-    else if (auto stageAxis =
-                 mlir::dyn_cast<intent::plan::StageAxisOp>(operation))
-      decisions.stageAxes.push_back(stageAxis);
   }
   return realization::emitSearchSpace(module, facts, decisions);
 }
@@ -1451,10 +1181,6 @@ mlir::LogicalResult intent::gpu::formAutomaticBlocking(
     if (auto range = mlir::dyn_cast<intent::plan::RangeOp>(operation)) {
       if (range.getPurpose() != "access")
         previous.push_back(&operation);
-    } else if (mlir::isa<intent::plan::StageOp,
-                         intent::plan::StageAxisOp>(operation)) {
-      return operation.emitOpError(
-          "automatic blocking must run before physical stage formation");
     } else if (mlir::isa<intent::plan::LaunchOp, intent::plan::BlockExtentOp,
                   intent::plan::AxisOp, intent::plan::RangeOp,
                   intent::plan::RegionBindingOp,
@@ -1478,84 +1204,6 @@ mlir::LogicalResult intent::gpu::formAutomaticBlocking(
     return mlir::failure();
   for (mlir::Operation *operation : previous)
     operation->erase();
-  return mlir::success();
-}
-
-mlir::LogicalResult intent::gpu::reconcileStages(
-    intent::plan::ProgramOp program,
-    const intent::target::KernelFacts &facts) {
-  mlir::SmallVector<intent::plan::StageOp> oldStages(
-      program.getBody().getOps<intent::plan::StageOp>());
-  mlir::SmallVector<intent::plan::StageAxisOp> oldAxes(
-      program.getBody().getOps<intent::plan::StageAxisOp>());
-  llvm::DenseMap<int64_t, intent::plan::RangeOp> ownership;
-  for (intent::plan::RangeOp range :
-       program.getBody().getOps<intent::plan::RangeOp>())
-    if (range.getPurpose() == "ownership" && range.getLevel() == 0)
-      ownership[range.getAxisNode()] = range;
-
-  mlir::FailureOr<mlir::SmallVector<realization::StageDecision, 0>> stages =
-      realization::contractionStages(facts);
-  if (mlir::failed(stages))
-    return mlir::failure();
-  mlir::OpBuilder builder(program.getContext());
-  builder.setInsertionPoint(program.getBody().front().getTerminator());
-  for (const realization::StageDecision &stage : *stages) {
-    mlir::FailureOr<int64_t> stageNode =
-        realization::node(*stage.contraction, "stage realization");
-    mlir::FailureOr<mlir::Operation *> member =
-        realization::stageMemberDomain(stage, facts, ownership);
-    mlir::FailureOr<std::pair<mlir::Value, unsigned>> feature =
-        succeeded(member)
-            ? realization::stageFeatureAxis(stage, facts, *member)
-            : mlir::FailureOr<std::pair<mlir::Value, unsigned>>(mlir::failure());
-    mlir::FailureOr<std::pair<mlir::Value, unsigned>> reduction =
-        realization::stageReductionAxis(stage, facts);
-    if (failed(stageNode) || failed(member) || failed(feature) ||
-        failed(reduction))
-      return mlir::failure();
-    mlir::FailureOr<int64_t> memberNode =
-        realization::node(**member, "stage member-axis realization");
-    mlir::FailureOr<int64_t> featureValue = realization::valueID(
-        feature->first, facts.kernel, *stage.contraction,
-        "stage feature-axis realization");
-    mlir::FailureOr<int64_t> reductionValue = realization::valueID(
-        reduction->first, facts.kernel, *stage.contraction,
-        "stage reduction-axis realization");
-    intent::plan::RangeOp memberRange =
-        succeeded(memberNode) ? ownership.lookup(*memberNode)
-                              : intent::plan::RangeOp();
-    if (failed(memberNode) || failed(featureValue) || failed(reductionValue) ||
-        !memberRange)
-      return stage.contraction->emitOpError(
-          "has no selected ownership range for its stage member axis");
-    auto stageOp = builder.create<intent::plan::StageOp>(
-        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
-        builder.getDenseI64ArrayAttr(stage.operations),
-        builder.getStringAttr("same_stream"));
-    (void)stageOp;
-    builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
-        builder.getStringAttr("member"), builder.getI64IntegerAttr(*memberNode),
-        mlir::IntegerAttr(), mlir::IntegerAttr(),
-        builder.getStringAttr(memberRange.getTile()), builder.getI64IntegerAttr(1));
-    builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
-        builder.getStringAttr("feature"), mlir::IntegerAttr(),
-        builder.getI64IntegerAttr(*featureValue),
-        builder.getI64IntegerAttr(feature->second),
-        builder.getStringAttr("feature"), builder.getI64IntegerAttr(0));
-    builder.create<intent::plan::StageAxisOp>(
-        stage.contraction->getLoc(), builder.getI64IntegerAttr(*stageNode),
-        builder.getStringAttr("reduction"), mlir::IntegerAttr(),
-        builder.getI64IntegerAttr(*reductionValue),
-        builder.getI64IntegerAttr(reduction->second),
-        builder.getStringAttr("reduction"), mlir::IntegerAttr());
-  }
-  for (intent::plan::StageAxisOp axis : oldAxes)
-    axis.erase();
-  for (intent::plan::StageOp stage : oldStages)
-    stage.erase();
   return mlir::success();
 }
 

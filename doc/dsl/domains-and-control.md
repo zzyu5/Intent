@@ -124,6 +124,8 @@ Source 固定 streamed axis、carry schema、step body、segment order、state u
 
 `state_stream` 不暗示 parallel partial-state merge。Runtime 数据可以通过 logical stop 收紧实际读取终点；runtime-visible fixed segment boundary 必须由 source algorithm 显式表达，不能伪装成 compiler-owned extent。
 
+当 streamed axis 是一个 source partition region 时，stream 的逻辑遍历集合就是该 region 与 `stop` 的交集，carry 只跨该 part 内的连续 segments 传播；part identity、空 part 和 count ABI 仍按上节规则保留。不同 parts 的 carry 不会被 compiler 自动合并，跨 part 的 partial 合并必须由作者在后续 kernel 或 wrapper 中明确写出。这是 `partition(count)` 与 `state_stream` 的组合语义，不是 compiler-private split-K。
+
 ## 逻辑读取终点
 
 ```python

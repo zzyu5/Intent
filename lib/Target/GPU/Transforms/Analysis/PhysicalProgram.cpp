@@ -68,7 +68,7 @@ plan::AxisOp PhysicalProgramAnalysis::getPurePointwiseProgramLane() const {
       !facts->stateStreams.empty() || !facts->raggedRelations.empty() ||
       !facts->contractions.empty() || !facts->sparseContractions.empty() ||
       !facts->logicalBuffers.empty() || !facts->reductionDomains.empty() ||
-      !facts->countPartitions.empty() || !stages.empty() ||
+      !facts->countPartitions.empty() ||
       target::lowering::hasNonReplayableEffect(
           kernel->entry.getOperation()))
     return {};
@@ -108,8 +108,6 @@ PhysicalProgramAnalysis::compute(plan::ProgramOp program) {
       analysis->axes[axis.getNode()] = axis;
     else if (auto range = dyn_cast<plan::RangeOp>(operation))
       analysis->ranges[range.getAxisNode()].push_back(range);
-    else if (auto stage = dyn_cast<plan::StageOp>(operation))
-      analysis->stages.push_back(stage);
   }
   return analysis;
 }

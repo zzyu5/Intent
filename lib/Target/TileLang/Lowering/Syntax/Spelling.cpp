@@ -91,6 +91,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role,
   if (role == "cast")
     return materialization == "contract_operand" ? StringRef("T.copy_cast")
                                                    : StringRef("T.cast");
+  if (role == "bitcast")
+    return StringRef("T.reinterpret");
   if (role == "reshape")
     return StringRef("T.reshape");
   if (role == "transpose")
@@ -222,6 +224,10 @@ std::string cast(StringRef value, StringRef targetType, bool decodeE8M0,
   return resultIsF32
              ? decoded
              : "T.cast(" + decoded + ", " + targetType.str() + ")";
+}
+
+std::string bitcast(StringRef value, StringRef targetType) {
+  return "T.reinterpret(" + value.str() + ", " + targetType.str() + ")";
 }
 
 } // namespace intent::tilelang::lowering::syntax

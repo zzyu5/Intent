@@ -37,6 +37,7 @@ def lower_tensor_intrinsic(
         "zeros": _zeros,
         "record": _record,
         "cast": _cast,
+        "bitcast": _bitcast,
         "mask": _mask,
         "exp": lambda context, call: _unary(context, call, UnaryOperator.EXP),
         "exp2": lambda context, call: _unary(context, call, UnaryOperator.EXP2),
@@ -168,6 +169,26 @@ def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         operands=(source,),
         result_types=(lowerer.value_result_type(dtype, shape),),
         attributes=attributes,
+    )
+    return operation.results[0]
+
+
+def _bitcast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(lowerer, node, ("value", "dtype"), required=("value", "dtype"))
+    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    dtype = require_dtype(lowerer, bound["dtype"])
+    source_dtype, shape = lowerer.dtype_and_shape(source.type, node)
+    if source_dtype.category in (DTypeCategory.BOOL, DTypeCategory.INDEX) or (
+        dtype.category in (DTypeCategory.BOOL, DTypeCategory.INDEX)
+    ):
+        lowerer.error(node, "I.bitcast does not accept bool or index dtypes")
+    if source_dtype.bits is None or source_dtype.bits != dtype.bits:
+        lowerer.error(node, "I.bitcast requires equal source and result bit widths")
+    operation = lowerer.emit(
+        OperationKind.BITCAST,
+        lowerer.location(node),
+        operands=(source,),
+        result_types=(lowerer.value_result_type(dtype, shape),),
     )
     return operation.results[0]
 

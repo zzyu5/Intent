@@ -109,6 +109,7 @@ def Intent_SelectOp : Intent_Op<"select", [Pure]> {
   let results = (outs AnyType:$result);
 }
 def Intent_CastOp : Intent_UnaryOneResultOp<"cast">;
+def Intent_BitcastOp : Intent_UnaryOneResultOp<"bitcast">;
 def Intent_MaskOp : Intent_Op<"mask", [Pure]> {
   let arguments = (ins AnyType:$value, AnyType:$predicate, AnyType:$fill);
   let results = (outs AnyType:$result);

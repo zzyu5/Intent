@@ -117,15 +117,6 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
           "cuTile has no native 2:4 sparse contraction projection");
     } else if (auto value = dyn_cast<intent::plan::TransferOp>(operation)) {
       transfers.push_back(value);
-    } else if (auto value = dyn_cast<intent::plan::StageOp>(operation)) {
-      plan::StageOp binding;
-      binding.operation = value;
-      binding.position = index.stages.size();
-      index.stages.push_back(binding);
-    } else if (auto value = dyn_cast<intent::plan::StageAxisOp>(operation)) {
-      plan::StageAxisOp binding;
-      binding.operation = value;
-      index.stageAxes[value.getStageNode()][value.getRole()] = binding;
     } else if (auto value = dyn_cast<intent::plan::StreamAxisOp>(operation)) {
       index.streamAxes.push_back(value);
     } else if (auto value =
@@ -180,14 +171,12 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   }
   for (intent::plan::PointwiseOp value : pointwise) {
     auto lowering = value->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
-    auto deferred = value->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
-    if (!lowering || !deferred)
+    if (!lowering)
       return value.emitOpError("has no realized cuTile pointwise spelling");
     plan::PointwiseOp binding;
     binding.operation = value;
     binding.lowering = lowering.getValue().str();
     binding.resultSpace = value.getResultSpace().str();
-    binding.defer = deferred.getValue();
     index.pointwise[value.getNode()] = binding;
   }
   for (intent::plan::TransferOp value : transfers) {
@@ -288,8 +277,6 @@ LogicalResult ProgramMaterializer::prepare() {
       return failure();
   if (failed(preparePrivateWorkspaces()))
     return failure();
-  if (!planIndex.stages.empty())
-    return prepareRaggedStages();
   return success();
 }
 
@@ -594,94 +581,6 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
   return success();
 }
 
-LogicalResult ProgramMaterializer::prepareRaggedStages() {
-  if (failed(target::lowering::indexStageOperations(
-          kernel, planIndex, operationStages)))
-    return failure();
-  stageBodies.resize(planIndex.stages.size());
-  for (auto [position, stage] : llvm::enumerate(planIndex.stages)) {
-    Operation *contract = kernel.nodes.lookup(stage.getNode());
-    if (!contract || ::intent::target::semanticOperationName(*contract) != "intent.contract" ||
-        contract->getNumResults() != 1)
-      return stage.emitOpError("does not bind one canonical contraction");
-    auto resultType = dyn_cast<RankedTensorType>(contract->getResult(0).getType());
-    if (!resultType || resultType.getRank() != 2)
-      return stage.emitOpError("requires a rank-two staged contraction result");
-    auto axes = planIndex.stageAxes.find(stage.getNode());
-    plan::StageAxisOp feature =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("feature");
-    plan::StageAxisOp reduction =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("reduction");
-    plan::StageAxisOp member =
-        axes == planIndex.stageAxes.end() ? plan::StageAxisOp()
-                                         : axes->second.lookup("member");
-    if (!feature || !reduction || !member || !feature.getWorkerAxisAttr() ||
-        !member.getWorkerAxisAttr() || !member.getAxisNodeAttr())
-      return stage.emitOpError("has incomplete physical stage-axis decisions");
-    auto runtimes =
-        raggedRuntimesByAxis.find(member.getAxisNodeAttr().getInt());
-    if (runtimes == raggedRuntimesByAxis.end() ||
-        runtimes->second.size() != 1)
-      return stage.emitOpError(
-          "does not resolve one ragged relation for its member axis");
-    unsigned runtimeIndex = runtimes->second.front();
-    RaggedRuntime &runtime = raggedRuntimes[runtimeIndex];
-    bool owned = llvm::any_of(runtime.ownedMembers, [&](Operation *candidate) {
-      auto node = candidate->getAttrOfType<IntegerAttr>("intent.node");
-      return node && node.getInt() == member.getAxisNodeAttr().getInt();
-    });
-    if (!owned)
-      return stage.emitOpError("uses a ragged member without program ownership");
-    Operation *members = nullptr;
-    for (int64_t operationNode : stage.getOperations()) {
-      Operation *candidate = kernel.nodes.lookup(operationNode);
-      if (!candidate ||
-          ::intent::target::semanticOperationName(*candidate) != "intent.members")
-        continue;
-      if (members)
-        return stage.emitOpError("contains multiple member enumeration ops");
-      members = candidate;
-    }
-    if (!members)
-      return stage.emitOpError("has no member enumeration operation");
-    FailureOr<std::string> featureTile =
-        syntax::tile(feature.operation, feature.getTile());
-    FailureOr<std::string> memberTile =
-        syntax::tile(member.operation, member.getTile());
-    FailureOr<std::string> reductionTile =
-        syntax::tile(reduction.operation, reduction.getTile());
-    if (failed(featureTile) || failed(memberTile) || failed(reductionTile))
-      return failure();
-    stageRaggedRuntime[position] = runtimeIndex;
-    stageFeatureDimensions[position] = feature.getExtent().str();
-    stageMemberDimensions[position] = member.getExtent().str();
-    stageReductionDimensions[position] = reduction.getExtent().str();
-    stageFeatureTiles[position] = *featureTile;
-    stageMemberTiles[position] = *memberTile;
-    stageReductionTiles[position] = *reductionTile;
-    stageFeatureWorkers[position] = feature.getWorkerAxisAttr().getInt();
-    stageMemberWorkers[position] = member.getWorkerAxisAttr().getInt();
-
-    for (int64_t valueID : stage.getInputs())
-      if (!kernel.values.count(valueID))
-        return stage.emitOpError("references an unknown stage input value");
-    for (int64_t valueID : stage.getOutputs()) {
-      auto found = kernel.values.find(valueID);
-      if (found == kernel.values.end() ||
-          !isa<RankedTensorType>(found->second.getType()) ||
-          !stageOutputOwners.try_emplace(found->second, position).second)
-        return stage.emitOpError("has an invalid stage output value");
-      workspaceNames[found->second] =
-          "workspace_" + std::to_string(valueID);
-    }
-    if (!llvm::is_contained(operationStages.lookup(contract), position))
-      return stage.emitOpError("stage roots do not depend on its contraction");
-  }
-  return success();
-}
-
 bool ProgramMaterializer::selectOperation(Operation &operation) {
   if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
     return false;
@@ -693,54 +592,13 @@ bool ProgramMaterializer::selectOperation(Operation &operation) {
   auto scanProducer = scanProducerOwners.find(&operation);
   if (scanProducer != scanProducerOwners.end())
     return activeScanReplay == scanProducer->second;
-  if (planIndex.stages.empty())
-    return true;
-  activeStages = operationStages.lookup(&operation);
-  return !activeStages.empty();
-}
-
-void ProgramMaterializer::stageLine(unsigned stage, StringRef text, unsigned indent) {
-  stageBodies[stage].append(indent * 4, ' ');
-  stageBodies[stage] += text.str();
-  stageBodies[stage] += "\n";
-}
-
-void ProgramMaterializer::stageGuardedGather(
-    unsigned stage, StringRef result, StringRef array, StringRef indices,
-    StringRef padding, StringRef valid, unsigned indent) {
-  auto gather = [&](StringRef mask) {
-    return result.str() + " = " +
-           syntax::gather(array, indices, padding, mask);
-  };
-  if (tuneGatherSpelling) {
-    stageLine(stage, "if GATHER_SPELLING:", indent);
-    stageLine(stage, gather(valid), indent + 1);
-    stageLine(stage, "else:", indent);
-    stageLine(stage, gather(""), indent + 1);
-    stageLine(stage,
-              result.str() + " = ct.where(" + valid.str() + ", " +
-                  result.str() + ", " + padding.str() + ")",
-              indent + 1);
-    return;
-  }
-  stageLine(stage, gather(""), indent);
-  stageLine(stage,
-            result.str() + " = ct.where(" + valid.str() + ", " +
-                result.str() + ", " + padding.str() + ")",
-            indent);
+  return true;
 }
 
 void ProgramMaterializer::bindResult(Operation &operation, unsigned index,
                                StringRef name) {
   Value value = operation.getResult(index);
   valueNames[value] = name.str();
-  auto outputStage = stageOutputOwners.find(value);
-  if (planIndex.stages.empty() || outputStage == stageOutputOwners.end())
-    return;
-  line("ct.scatter(" + workspaceNames.lookup(value) +
-       ", (" + addressIndex("safe_member_offsets[:, None]") + ", " +
-       addressIndex("offs_feature[None, :]") + "), " + name.str() +
-       ", check_bounds=True)");
 }
 
 void ProgramMaterializer::emitImports() {
@@ -829,142 +687,6 @@ LogicalResult ProgramMaterializer::emitHelpers() {
 
 LogicalResult ProgramMaterializer::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  if (!planIndex.stages.empty()) {
-    if (!searchIndex.autotune)
-      return physicalProgram.emitOpError(
-          "cannot resolve the delegated staged tuner");
-    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
-      auto runtime = stageRaggedRuntime.find(stage);
-      if (runtime == stageRaggedRuntime.end())
-        return planIndex.stages[stage].emitOpError(
-            "has no staged ragged runtime binding");
-      RaggedRuntime &ragged = raggedRuntimes[runtime->second];
-      bool compact = !ragged.indices;
-      ABIView *offsets = ragged.offsets;
-      ABIView *indices = ragged.indices;
-      llvm::raw_string_ostream source(stageBodies[stage]);
-      source << "@ct.kernel\ndef " << kernelName << "_stage_" << stage << "(";
-      bool first = true;
-      auto parameter = [&](StringRef value) {
-        if (!first)
-          source << ", ";
-        source << value;
-        first = false;
-      };
-      for (ABIView &view : views)
-        parameter(view.argument->name);
-      for (ABIScalar &scalar : scalars) {
-        StringRef annotation = isa<FloatType>(scalar.type) ? "float" : "int";
-        parameter(scalar.name + ": " + annotation.str());
-      }
-      for (const std::string &dimension : dimensionOrder)
-        parameter(dimension + ": ConstInt");
-      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
-        parameter(physicalExtent + ": ConstInt");
-      for (plan::StageOp binding : planIndex.stages)
-        for (int64_t valueID : binding.getOutputs())
-          parameter(workspaceNames.lookup(kernel.values.lookup(valueID)));
-      if (!compact)
-        parameter("MAX_ROUTES: ConstInt");
-      for (const auto &configParameter : tuningParameters)
-        parameter(configParameter.first + ": ConstInt");
-      source << "):\n";
-      source.flush();
-
-      std::string feature = stageFeatureDimensions.lookup(stage);
-      std::string featureTile = stageFeatureTiles.lookup(stage);
-      std::string memberTile = stageMemberTiles.lookup(stage);
-      stageLine(stage, "bid_feature = " +
-                           addressIndex("ct.bid(" +
-                                        std::to_string(
-                                            stageFeatureWorkers.lookup(stage)) +
-                                        ")"));
-      stageLine(stage, "bid_expert_route = " +
-                           addressIndex("ct.bid(" +
-                                        std::to_string(
-                                            stageMemberWorkers.lookup(stage)) +
-                                        ")"));
-      if (compact) {
-        plan::AxisOp outerAxis =
-            planIndex.axes.lookup(ragged.binding.getOuterNode());
-        std::string experts =
-            outerAxis ? roleDimensions.lookup(
-                            "program_" +
-                            std::to_string(outerAxis.getProgramOrder()))
-                      : std::string();
-        if (experts.empty())
-          return ragged.binding.emitOpError(
-              "has no program-owned outer-axis dimension");
-        stageLine(stage, "expert = " + addressIndex("0"));
-        stageLine(stage, "route_tile = " + addressIndex("0"));
-        stageLine(stage, "tile_cursor = " + addressIndex("0"));
-        stageLine(stage, "for candidate in range(" + experts + "):");
-        stageLine(stage, "candidate_begin = ct.load(" +
-                             offsets->argument->name +
-                             ", index=" + addressIndex("candidate") +
-                             ", shape=())",
-                  2);
-        stageLine(stage, "candidate_end = ct.load(" +
-                             offsets->argument->name +
-                             ", index=" + addressIndex("candidate + 1") +
-                             ", shape=())",
-                  2);
-        stageLine(stage,
-                  "candidate_tiles = " +
-                      addressIndex("ct.cdiv(candidate_end - candidate_begin, " +
-                                   memberTile + ")"),
-                  2);
-        stageLine(stage,
-                  "owns_tile = (bid_expert_route >= tile_cursor) & "
-                  "(bid_expert_route < tile_cursor + candidate_tiles)",
-                  2);
-        stageLine(stage,
-                  "expert = ct.where(owns_tile, " + addressIndex("candidate") +
-                      ", expert)",
-                  2);
-        stageLine(stage,
-                  "route_tile = ct.where(owns_tile, bid_expert_route - "
-                  "tile_cursor, route_tile)",
-                  2);
-        stageLine(stage, "tile_cursor += candidate_tiles", 2);
-      } else {
-        stageLine(stage,
-                  "num_route_tiles = ct.cdiv(MAX_ROUTES, " + memberTile + ")");
-        stageLine(stage, "expert = bid_expert_route // num_route_tiles");
-        stageLine(stage, "route_tile = bid_expert_route % num_route_tiles");
-      }
-      stageLine(stage, "route_begin = ct.load(" +
-                           offsets->argument->name +
-                           ", index=" + addressIndex("expert") +
-                           ", shape=())");
-      stageLine(stage, "route_end = ct.load(" +
-                           offsets->argument->name +
-                           ", index=" + addressIndex("expert + 1") +
-                           ", shape=())");
-      stageLine(stage,
-                "member_offsets = " + addressIndex("route_begin") + " + " +
-                    addressIndex("route_tile") + " * " + memberTile + " + " +
-                    addressIndex("ct.arange(" + memberTile +
-                                 ", dtype=ct.int32)"));
-      stageLine(stage, "member_mask = member_offsets < route_end");
-      stageLine(stage,
-                "safe_member_offsets = ct.where(member_mask, member_offsets, " +
-                    stageMemberDimensions.lookup(stage) + ")");
-      if (indices) {
-        stageGuardedGather(stage, "routes", indices->argument->name,
-                           addressIndex("member_offsets"), "0", "member_mask");
-      } else {
-        stageLine(stage, "routes = member_offsets");
-      }
-      stageLine(stage,
-                "offs_feature = " + addressIndex("bid_feature") +
-                    " * " + featureTile + " + " +
-                    addressIndex("ct.arange(" + featureTile +
-                                 ", dtype=ct.int32)"));
-      stageLine(stage, "feature_mask = offs_feature < " + feature);
-    }
-    return success();
-  }
   if (!planIndex.components.reusedAxes.empty()) {
     output << "@ct.kernel\n";
     programIndex = makeRegionArgumentName(*programRoot, 0);
@@ -1132,252 +854,6 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   };
   output << "_DEVICE = torch.device('cuda', " << planIndex.target.getDevice()
          << ")\n";
-
-  if (!planIndex.stages.empty()) {
-    SmallVector<ABIView *> inputs;
-    ABIView *merge = nullptr;
-    for (ABIView &view : views) {
-      StringRef access = view.view.getAccess();
-      if (access == "in") {
-        inputs.push_back(&view);
-        continue;
-      }
-      if (access == "out" || access == "inout") {
-        if (merge)
-          return kernel.entry.emitOpError(
-              "ragged stages require input views and one inout merge view");
-        merge = &view;
-        continue;
-      }
-      return kernel.entry.emitOpError(
-          "ragged stages require input views and one inout merge view");
-    }
-    if (!merge)
-      return kernel.entry.emitOpError("ragged stages have no merge destination");
-    for (const std::string &body : stageBodies)
-      output << "\n" << body;
-
-    output << "\n_TUNE_CACHE = {}\n\n\n";
-
-    output << "def launch(";
-    bool firstParameter = true;
-    for (ABIView &view : views) {
-      if (!firstParameter)
-        output << ", ";
-      output << view.argument->name;
-      firstParameter = false;
-    }
-    for (ABIScalar &scalar : scalars) {
-      if (!firstParameter)
-        output << ", ";
-      output << scalar.name;
-      firstParameter = false;
-    }
-    output << "):\n";
-    for (ABIView &view : views) {
-      StringRef dtype = torchDtype(view.tensor.getElementType());
-      if (dtype.empty())
-        return kernel.entry.emitOpError("has an unsupported staged ABI dtype");
-      output << "    if " << view.argument->name << ".device != _DEVICE:\n";
-      output << "        raise ValueError('" << view.argument->name
-             << " must reside on the realized CUDA device')\n";
-      output << "    if " << view.argument->name << ".ndim != "
-             << view.tensor.getRank() << ":\n";
-      output << "        raise ValueError('" << view.argument->name
-             << " has the wrong rank')\n";
-      output << "    if " << view.argument->name << ".dtype != " << dtype
-             << ":\n";
-      output << "        raise ValueError('" << view.argument->name
-             << " has the wrong dtype')\n";
-      emitViewCapabilityCheck(view);
-    }
-    for (const std::string &dimension : dimensionOrder)
-      output << "    " << dimension << " = "
-             << dimensionOwners.lookup(dimension) << "\n";
-    emitBlockExtentConstants();
-    for (ABIView &view : views) {
-      output << "    if tuple(" << view.argument->name << ".shape) != (";
-      for (auto [axis, extent] : llvm::enumerate(view.shape)) {
-        if (axis)
-          output << ", ";
-        output << extent;
-      }
-      if (view.shape.size() == 1)
-        output << ",";
-      output << "):\n";
-      output << "        raise ValueError('" << view.argument->name
-             << " shape violates the kernel symbols')\n";
-    }
-    llvm::DenseSet<unsigned> preparedRagged;
-    for (const auto &entry : stageRaggedRuntime) {
-      if (!preparedRagged.insert(entry.second).second)
-        continue;
-      RaggedRuntime &ragged = raggedRuntimes[entry.second];
-      std::string suffix = std::to_string(ragged.binding.getNode());
-      if (!ragged.indices)
-        output << "    route_lengths_" << suffix
-               << " = tuple(int(length) for length in ("
-               << ragged.offsets->argument->name << "[1:] - "
-               << ragged.offsets->argument->name << "[:-1]).tolist())\n";
-      else
-        output << "    max_routes_" << suffix << " = int(("
-               << ragged.offsets->argument->name << "[1:] - "
-               << ragged.offsets->argument->name
-               << "[:-1]).max().item())\n";
-    }
-    for (plan::StageOp stage : planIndex.stages)
-      for (int64_t valueID : stage.getOutputs()) {
-        Value value = kernel.values.lookup(valueID);
-        auto tensor = dyn_cast<RankedTensorType>(value.getType());
-        StringRef dtype =
-            tensor ? torchDtype(tensor.getElementType()) : StringRef();
-        if (!tensor || tensor.getRank() != 2 || dtype.empty())
-          return stage.emitOpError("has an unsupported workspace tensor");
-        output << "    " << workspaceNames.lookup(value) << " = torch.empty(("
-               << stageMemberDimensions.lookup(stage.getOrdinal()) << ", "
-               << stageFeatureDimensions.lookup(stage.getOrdinal())
-               << "), device=_DEVICE, dtype=" << dtype << ")\n";
-      }
-    output << "    stream = torch.cuda.current_stream()\n";
-    for (unsigned stage = 0; stage < planIndex.stages.size(); ++stage) {
-      RaggedRuntime &ragged =
-          raggedRuntimes[stageRaggedRuntime.lookup(stage)];
-      bool compact = !ragged.indices;
-      std::string suffix = std::to_string(ragged.binding.getNode());
-      plan::AxisOp outerAxis = planIndex.axes.lookup(ragged.binding.getOuterNode());
-      std::string experts =
-          outerAxis ? roleDimensions.lookup(
-                          "program_" + std::to_string(outerAxis.getProgramOrder()))
-                    : std::string();
-      if (experts.empty())
-        return ragged.binding.emitOpError(
-            "has no program-owned outer-axis dimension");
-      std::string feature = stageFeatureDimensions.lookup(stage);
-      std::string featureTile = stageFeatureTiles.lookup(stage);
-      std::string memberTile = stageMemberTiles.lookup(stage);
-      output << "    cache_key_" << stage << " = (" << stage;
-      for (const std::string &dimension : dimensionOrder)
-        output << ", " << dimension;
-      if (compact)
-        output << ", route_lengths_" << suffix;
-      for (ABIView *input : inputs)
-        output << ", " << input->argument->name << ".dtype";
-      output << ", str(_DEVICE))\n";
-      output << "    if cache_key_" << stage << " not in _TUNE_CACHE:\n";
-      output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
-      output << "            result = exhaustive_search(\n";
-      output << "                _CONFIGS,\n                stream,\n";
-      output << "                lambda cfg: (ceil(" << feature
-             << " / cfg." << featureTile << "), ";
-      if (compact)
-        output << "sum(ceil(length / cfg." << memberTile << ") for length in "
-                  "route_lengths_"
-               << suffix << ")";
-      else
-        output << experts << " * ceil(max_routes_" << suffix
-               << " / cfg." << memberTile << ")";
-      output << ", 1),\n";
-      output << "                " << kernelName << "_stage_" << stage
-             << ",\n";
-      output << "                lambda cfg: (";
-      for (ABIView &view : views) {
-        if (planIndex.stages[stage].getOutputs().empty() && &view == merge)
-          output << (target::lowering::stageUsesScatterReduction(
-                         planIndex.stages[stage], kernel)
-                         ? "torch.zeros_like("
-                         : "torch.empty_like(")
-                 << view.argument->name << "), ";
-        else if (view.view.getAccess() == "inout")
-          output << view.argument->name << ".clone(), ";
-        else
-          output << view.argument->name << ", ";
-      }
-      for (ABIScalar &scalar : scalars)
-        output << scalar.name << ", ";
-      for (const std::string &dimension : dimensionOrder)
-        output << dimension << ", ";
-      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
-        output << physicalExtent << ", ";
-      for (plan::StageOp binding : planIndex.stages)
-        for (int64_t valueID : binding.getOutputs())
-          output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
-      if (!compact)
-        output << "max_routes_" << suffix << ", ";
-      for (const auto &parameter : tuningParameters)
-        output << "cfg." << parameter.first << ", ";
-      output << "),\n";
-      output << "                lambda cfg: {'num_ctas': cfg.num_ctas, 'occupancy': cfg.occupancy},\n";
-      output << "            )\n";
-      output << "        best = result.best.config\n";
-      output << "        _TUNE_CACHE[cache_key_" << stage << "] = (best, "
-             << kernelName << "_stage_" << stage
-             << ".replace_hints(num_ctas=best.num_ctas, occupancy=best.occupancy))\n";
-      output << "    best, tuned_kernel = _TUNE_CACHE[cache_key_" << stage
-             << "]\n";
-      output << "    grid = (ceil(" << feature
-             << " / best." << featureTile << "), ";
-      if (compact)
-        output << "sum(ceil(length / best." << memberTile << ") for length in "
-                  "route_lengths_"
-               << suffix << ")";
-      else
-        output << experts << " * ceil(max_routes_" << suffix
-               << " / best." << memberTile << ")";
-      output << ", 1)\n";
-      output << "    ct.launch(stream, grid, tuned_kernel, (";
-      for (ABIView &view : views)
-        output << view.argument->name << ", ";
-      for (ABIScalar &scalar : scalars)
-        output << scalar.name << ", ";
-      for (const std::string &dimension : dimensionOrder)
-        output << dimension << ", ";
-      for (const auto &[physicalExtent, logicalExtent] : blockExtentConstants)
-        output << physicalExtent << ", ";
-      for (plan::StageOp binding : planIndex.stages)
-        for (int64_t valueID : binding.getOutputs())
-          output << workspaceNames.lookup(kernel.values.lookup(valueID)) << ", ";
-      if (!compact)
-        output << "max_routes_" << suffix << ", ";
-      for (const auto &parameter : tuningParameters)
-        output << "best." << parameter.first << ", ";
-      output << "))\n";
-    }
-    output << "    return " << merge->argument->name << "\n\n\n";
-    output << "def run(";
-    for (auto [index, view] : llvm::enumerate(inputs)) {
-      if (index)
-        output << ", ";
-      output << view->argument->name;
-    }
-    output << "):\n";
-    for (const std::string &dimension : dimensionOrder)
-      output << "    " << dimension << " = "
-             << dimensionOwners.lookup(dimension) << "\n";
-    output << "    " << merge->argument->name << " = torch."
-           << (target::lowering::planUsesScatterReduction(planIndex, kernel)
-                   ? "zeros"
-                   : "empty")
-           << "((";
-    for (auto [axis, extent] : llvm::enumerate(merge->shape)) {
-      if (axis)
-        output << ", ";
-      output << extent;
-    }
-    output << "), device=_DEVICE, dtype="
-           << torchDtype(merge->tensor.getElementType()) << ")\n";
-    output << "    launch(";
-    bool first = true;
-    for (ABIView &view : views) {
-      if (!first)
-        output << ", ";
-      output << view.argument->name;
-      first = false;
-    }
-    for (ABIScalar &scalar : scalars)
-      output << ", " << scalar.name;
-    output << ")\n    return " << merge->argument->name << "\n";
-    return success();
-  }
 
   if (!planIndex.components.reusedAxes.empty()) {
     SmallVector<ABIView *> inputs;
@@ -1767,6 +1243,13 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
     output << "            result = exhaustive_search(\n";
     output << "                _CONFIGS,\n                stream,\n";
+    auto projectedTile = [&](plan::AxisOp axis, StringRef configuration) {
+      std::string tile = axis.getTile().str();
+      bool tuned = llvm::any_of(
+          tuningParameters,
+          [&](const auto &parameter) { return parameter.first == tile; });
+      return tuned ? configuration.str() + "." + tile : tile;
+    };
     std::array<std::string, 3> candidateGrid =
         target::lowering::projectProgramGrid(
             planIndex, [&](plan::AxisOp axis) {
@@ -1779,8 +1262,8 @@ LogicalResult ProgramMaterializer::emitWrapper() {
                       : roleDimensions.lookup(role);
               return axis.isScalar()
                          ? extent
-                         : "ceil(" + extent + " / cfg." +
-                               axis.getTile().str() + ")";
+                         : "ceil(" + extent + " / " +
+                               projectedTile(axis, "cfg") + ")";
             });
     if (planIndex.program.getPersistent()) {
       std::string total = target::lowering::projectProgramVolume(
@@ -1790,8 +1273,8 @@ LogicalResult ProgramMaterializer::emitWrapper() {
             std::string extent = roleDimensions.lookup(role);
             return axis.isScalar()
                        ? extent
-                       : "ceil(" + extent + " / cfg." +
-                             axis.getTile().str() + ")";
+                       : "ceil(" + extent + " / " +
+                             projectedTile(axis, "cfg") + ")";
           });
       output << "                lambda cfg: (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // cfg.num_ctas, "
              << total << ") * cfg.occupancy, 1, 1),\n";
@@ -1846,8 +1329,8 @@ LogicalResult ProgramMaterializer::emitWrapper() {
                       : roleDimensions.lookup(role);
               return axis.isScalar()
                          ? extent
-                         : "ceil(" + extent + " / best." +
-                               axis.getTile().str() + ")";
+                         : "ceil(" + extent + " / " +
+                               projectedTile(axis, "best") + ")";
             });
     if (planIndex.program.getPersistent()) {
       std::string total = target::lowering::projectProgramVolume(
@@ -1857,8 +1340,8 @@ LogicalResult ProgramMaterializer::emitWrapper() {
             std::string extent = roleDimensions.lookup(role);
             return axis.isScalar()
                        ? extent
-                       : "ceil(" + extent + " / best." +
-                             axis.getTile().str() + ")";
+                       : "ceil(" + extent + " / " +
+                             projectedTile(axis, "best") + ")";
           });
       output << "    grid = (min(torch.cuda.get_device_properties(_DEVICE).multi_processor_count // best.num_ctas, "
              << total << ") * best.occupancy, 1, 1)\n";
@@ -2167,10 +1650,11 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
             resultAxis >= static_cast<unsigned>(projectedTensor.getRank()))
           return failure();
         const target::lowering::RangeBinding &range = selected->range;
-        bool ragged = planIndex.components.orderedRaggedAxes.contains(
-            selected->axis.getNode());
+        bool direct = planIndex.components.orderedRaggedAxes.contains(
+                          selected->axis.getNode()) ||
+                      absoluteRegionArguments.contains(indexed);
         std::string index = addressIndex(*exact);
-        if (!ragged)
+        if (!direct)
           index += " * " + range.getTile().str() + " + " +
                    addressIndex("ct.arange(" + range.getTile().str() +
                                 ", dtype=ct.int32)");
@@ -2534,35 +2018,6 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
     plan::AxisOp axis = physical->second;
     if (axis.isScalar())
       continue;
-    bool stagedMember = llvm::any_of(activeStages, [&](unsigned ordinal) {
-      auto stage = llvm::find_if(planIndex.stages, [&](plan::StageOp candidate) {
-        return candidate.getOrdinal() == ordinal;
-      });
-      if (stage == planIndex.stages.end())
-        return false;
-      auto axes = planIndex.stageAxes.find(stage->getNode());
-      plan::StageAxisOp member =
-          axes == planIndex.stageAxes.end()
-              ? plan::StageAxisOp()
-              : axes->second.lookup("member");
-      return member && member.getAxisNodeAttr() &&
-             member.getAxisNodeAttr().getInt() == domainNode;
-    });
-    if (stagedMember) {
-      std::string predicate = "member_mask";
-      if (tensor.getRank() > 1) {
-        predicate += "[";
-        for (int64_t axisNumber = 0; axisNumber < tensor.getRank();
-             ++axisNumber) {
-          if (axisNumber)
-            predicate += ", ";
-          predicate += axisNumber == tensorAxis ? ":" : "None";
-        }
-        predicate += "]";
-      }
-      predicates.push_back(std::move(predicate));
-      continue;
-    }
     FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
         region = target::lowering::selectedResultAxisRegionRange(
             planIndex, kernel, value, tensorAxis, consumer);
@@ -2584,6 +2039,8 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
           "has no active cuTile index for its planned validity axis");
     bool direct = target::lowering::isRaggedBoundAxis(
                       planIndex.components, axis.getNode()) ||
+                  (*region &&
+                   absoluteRegionArguments.contains((*region)->argument)) ||
                   (!planIndex.components.reusedAxes.empty() &&
                    kernel.nodes.lookup(axis.getNode()) == vectorDomain);
     FailureOr<std::string> tile = failure();
@@ -2629,9 +2086,16 @@ FailureOr<std::string> ProgramMaterializer::emitValidityExpression(
         return failure();
       extent = "sequence_end_" + std::to_string(*ordered);
     }
+    bool activeExtent = false;
+    if (auto active = activeTraversalEnds.find(axis.getNode());
+        active != activeTraversalEnds.end()) {
+      extent = active->second;
+      activeExtent = true;
+    }
     if (failed(extent))
       return failure();
-    if (!target::lowering::isRaggedBoundAxis(planIndex.components,
+    if (!activeExtent &&
+        !target::lowering::isRaggedBoundAxis(planIndex.components,
                                              axis.getNode())) {
       auto owner = dimensionOwners.find(*extent);
       int64_t staticExtent;
@@ -2717,10 +2181,6 @@ ProgramMaterializer::emitTensorShape(Operation &operation, unsigned resultIndex,
     auto tile = regionTiles.find(label.getValue());
     if (tile != regionTiles.end())
       extents.push_back(tile->getValue());
-    else if (!planIndex.stages.empty() && activeStages.size() == 1 &&
-             label.getValue() ==
-                 stageFeatureDimensions.lookup(activeStages.front()))
-      extents.push_back(stageFeatureTiles.lookup(activeStages.front()));
     else if (label.getValue().starts_with("?region_"))
       return operation.emitOpError(
           "tensor shape region has no cuTile tile binding");
@@ -2782,10 +2242,15 @@ std::string ProgramMaterializer::dtypeName(Type type, Operation &consumer) {
   if (auto integer = dyn_cast<IntegerType>(type);
       integer && integer.getWidth() == 8)
     return integer.isUnsigned() ? "ct.uint8" : "ct.int8";
-  if (type.isInteger(32))
-    return "ct.int32";
-  if (type.isInteger(64))
-    return "ct.int64";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 16)
+    return integer.isUnsigned() ? "ct.uint16" : "ct.int16";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 32)
+    return integer.isUnsigned() ? "ct.uint32" : "ct.int32";
+  if (auto integer = dyn_cast<IntegerType>(type);
+      integer && integer.getWidth() == 64)
+    return integer.isUnsigned() ? "ct.uint64" : "ct.int64";
   if (isa<IndexType>(type))
     return "ct.int64";
   consumer.emitOpError("uses an unsupported cuTile dtype");
@@ -2825,11 +2290,6 @@ std::string ProgramMaterializer::makeRegionArgumentName(Operation &operation,
 }
 
 void ProgramMaterializer::line(StringRef text) {
-  if (!planIndex.stages.empty()) {
-    for (unsigned stage : activeStages)
-      stageLine(stage, text, indentation);
-    return;
-  }
   output.indent(indentation * 4) << text << "\n";
 }
 

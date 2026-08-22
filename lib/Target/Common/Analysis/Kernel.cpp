@@ -1,5 +1,6 @@
 #include "Intent/Target/Common/Analysis/Kernel.h"
 
+#include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -324,7 +325,7 @@ FailureOr<KernelModel> analyzeKernel(func::FuncOp entry) {
     if (name != "intent.state_stream")
       continue;
     Operation *axis = operation->getNumOperands() > 0
-                          ? operation->getOperand(0).getDefiningOp()
+                          ? resolveStructuralDomain(operation->getOperand(0))
                           : nullptr;
     FailureOr<int64_t> axisNode =
         axis ? getNodeID(*axis, "canonical state-stream axis analysis")

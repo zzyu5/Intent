@@ -15,7 +15,7 @@ print(compiled.ir)
 
 编译产物至少包含：
 
-- 一个对调用方可见的 callable target entry，以及必要时只在 entry 内部使用的 private stage kernels；
+- 一个对调用方可见、对应一次 launch 的 target kernel entry；
 - 包含 Kernel IR 与 Physical Plan 的组合 MLIR；
 - 可读、可导出的 target source；
 - 第一次真实 launch 后由 Triton JIT 产生的 backend 或 lower-level IR。
@@ -49,7 +49,7 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 
 ## Runtime invocation
 
-调用 Intent kernel 时，用户不提供 `[grid]`。Runtime 根据 compiled artifact 的 entry 与 Physical Plan，在当前 device/stream 提交一次 logical callable invocation；entry 内部可以按显式 stage dependency 顺序提交多个 private launches。
+调用 Intent kernel 时，用户不提供 `[grid]`。Runtime 根据 compiled artifact 的 entry 与 Physical Program，在当前 device/stream 提交一次 target kernel launch。
 
 底层 `compiled(input, output)` launch 不负责：
 
@@ -63,4 +63,4 @@ Profiling、cost breakdown 或 `plan.explain()` 可以作为 compiler tooling，
 
 ## Single logical callable invariant
 
-一个 source kernel invocation 对应一个 target callable invocation。Compiler-private scratch、intermediate buffer 与多个 machine stages 可以存在；Plan 显式选择 operation slices、stage-axis physical binding 与 synchronization，dependency、lifetime 和 visibility 则从 Kernel IR def-use 与该选择唯一派生。它们都不得改变用户 ABI、effects 或 wrapper-visible 调用协议。Artifact 不提供跨 stage/source callable fusion 入口。
+一个 source kernel invocation 对应一个 target kernel invocation。Compiler-private scratch 与 intermediate value 只能服务于这一次 launch；dependency、lifetime 和 visibility 从 Kernel IR def-use 与已选 physical realization 派生。Artifact 不提供自动 kernel fission、跨-launch workspace 或跨 source-callable fusion 入口。

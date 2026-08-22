@@ -138,8 +138,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                       name == "intent.state_stream";
   });
   bool configured =
-      !searchSpace && (*analysis)->getStages().empty() &&
-      !(*analysis)->hasWorkerReuse() && laneRange &&
+      !searchSpace && !(*analysis)->hasWorkerReuse() && laneRange &&
       laneRange.getTile().starts_with("row_vector") &&
       isRuntimeABIDimension((*analysis)->getKernel(), laneRange.getExtent()) &&
       (hasExternalRead || !hasAggregation) && !hasScan &&
@@ -149,11 +148,6 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   launch->setAttr(rowLaunchAttr,
                   builder.getStringAttr(configured ? "configured" : "generic"));
 
-  llvm::DenseSet<int64_t> stagedOperations;
-  for (intent::plan::StageOp stage :
-       program.getBody().getOps<intent::plan::StageOp>())
-    stagedOperations.insert(stage.getOperations().begin(),
-                            stage.getOperations().end());
   target::KernelModel &kernel = (*analysis)->getKernel();
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
@@ -180,8 +174,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(orientation))
       return contract.emitOpError(
           "does not bind canonical contraction orientation");
-    if ((orientation->batched && contract.getForm() != "direct") ||
-        (contract.getForm() == "staged" && orientation->lhsTranspose))
+    if (orientation->batched && contract.getForm() != "direct")
       return contract.emitOpError(
           "Triton cannot project the selected contraction form and orientation");
     StringRef lowering = contract.getForm() == "scaled_direct"
@@ -236,8 +229,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   }
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
-    if (pointwise->hasAttr(pointwiseLoweringAttr) ||
-        pointwise->hasAttr(pointwiseDeferredAttr))
+    if (pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError("already has a Triton pointwise spelling");
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     FailureOr<std::string> role =
@@ -250,12 +242,9 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    bool deferred = stagedOperations.contains(
-        static_cast<int64_t>(pointwise.getNode()));
-    pointwise->setAttr(pointwiseDeferredAttr, builder.getBoolAttr(deferred));
     if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather = target::lowering::classifyGatherProjection(
-          *operation, deferred, deferred);
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
       if (failed(gather))
         return failure();
       pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
@@ -364,13 +353,12 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     return launch.emitOpError(
         "requires one realized Triton row-launch form");
   if (form.getValue() == "configured") {
-    bool hasStages = !program.getBody().getOps<intent::plan::StageOp>().empty();
     bool hasReuse = llvm::any_of(
         program.getBody().getOps<intent::plan::AxisOp>(),
         [](intent::plan::AxisOp axis) { return axis.getReuseWorker(); });
-    if (searchSpace || hasStages || hasReuse)
+    if (searchSpace || hasReuse)
       return launch.emitOpError(
-          "configured Triton row launch is incompatible with search, stages, or worker reuse");
+          "configured Triton row launch is incompatible with search or worker reuse");
   }
   for (intent::plan::ContractOp contract :
        program.getBody().getOps<intent::plan::ContractOp>()) {
@@ -407,12 +395,11 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
-    auto deferred = pointwise->getAttrOfType<BoolAttr>(pointwiseDeferredAttr);
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
     bool requiresGather =
         operation && target::semanticOperationName(*operation) == "intent.gather";
-    if (!lowering || lowering.getValue().empty() || !deferred || !operation ||
+    if (!lowering || lowering.getValue().empty() || !operation ||
         (requiresGather && (!gather || gather.getValue().empty())))
       return pointwise.emitOpError("has no complete Triton pointwise spelling");
   }

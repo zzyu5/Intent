@@ -8,6 +8,9 @@ import torch
 from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
+from kernels.backward.sparse_mla import sparse_mla_backward_delta
+from kernels.backward.sparse_mla import sparse_mla_backward_main
+from kernels.backward.sparse_mla import sparse_mla_grad_kv_cast
 from kernels.streaming.attention import continuous_gqa_decode
 from kernels.streaming.attention import flash_attention_fwd
 from kernels.streaming.attention import flash_varlen_gqa_prefill
@@ -699,6 +702,129 @@ def gqa_attention_backward(context: Context) -> PreparedComparison:
     )
 
 
+def sparse_mla_backward(context: Context) -> PreparedComparison:
+    batch, sequence, key_value_sequence = 1, 4096, 8192
+    heads, key_value_groups = 64, 1
+    query_dimension, value_dimension, topk = 576, 512, 2048
+    query = torch.randn(
+        (batch, sequence, heads, query_dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    key_value = torch.randn(
+        (batch, key_value_sequence, key_value_groups, query_dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    grad_output = torch.randn(
+        (batch, sequence, heads, value_dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    positions = torch.arange(sequence, device="cuda", dtype=torch.int32)
+    offsets = torch.arange(topk, device="cuda", dtype=torch.int32)
+    causal_indices = positions[:, None] - offsets[None, :] - 1
+    causal_indices = torch.where(
+        offsets[None, :] < positions[:, None],
+        causal_indices,
+        torch.full_like(causal_indices, key_value_sequence),
+    )
+    selected_indices = causal_indices.view(
+        1, sequence, 1, topk
+    ).contiguous()
+    scale = query_dimension**-0.5
+    support = runtime_module(
+        context,
+        "source/tilelang/tilelang/support/runtime.py",
+        "intent_v2_tilelang_runtime_support",
+    )
+    source_root = (
+        context.project_root
+        / "source/tilelang/tilelang/attention/sparse_mla_backward"
+    )
+    utilities = (
+        context.project_root
+        / "source/tilelang/tilelang/attention/support/deepseek_v32_utils.py"
+    )
+    forward_module = support.load_source(
+        source_root / "sparse_mla_fwd.py",
+        "intent_v2_tilelang_sparse_mla_forward",
+        aliases=(("utils", utilities),),
+    )
+    source_output, source_lse = forward_module.sparse_mla_fwd_interface(
+        query,
+        key_value,
+        selected_indices,
+        sm_scale=scale,
+    )
+    source_module = support.load_source(
+        source_root / "sparse_mla_bwd.py",
+        "intent_v2_tilelang_sparse_mla_backward",
+        aliases=(
+            ("utils", utilities),
+            ("sparse_mla_fwd", source_root / "sparse_mla_fwd.py"),
+        ),
+    )
+    _, delta = compile_single(
+        context,
+        sparse_mla_backward_delta,
+        (source_output, grad_output),
+    )
+    grad_key_value = torch.zeros_like(key_value, dtype=torch.float32)
+    _, main = compile_single(
+        context,
+        sparse_mla_backward_main,
+        (
+            query,
+            key_value,
+            grad_output,
+            selected_indices,
+            source_lse,
+            delta.outputs(),
+            grad_key_value,
+            scale,
+        ),
+        constexprs={"HEAD_GROUP": heads // key_value_groups},
+    )
+    _, postprocess = compile_single(
+        context,
+        sparse_mla_grad_kv_cast,
+        (grad_key_value,),
+    )
+
+    def generated_launch():
+        grad_key_value.zero_()
+        delta.launch()
+        main.launch()
+        postprocess.launch()
+
+    generated = PreparedLaunch(
+        generated_launch,
+        lambda: (main.outputs(), postprocess.outputs()),
+    )
+    source = functional_launch(
+        lambda: source_module.sparse_mla_bwd(
+            query,
+            key_value,
+            source_output,
+            grad_output,
+            selected_indices,
+            source_lse,
+            sm_scale=scale,
+            is_casual=True,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        (
+            Tolerance(atol=2.5e-1, rtol=5e-2),
+            Tolerance(atol=2.5e-1, rtol=5e-2),
+        ),
+        cuda_graph=False,
+    )
+
+
 CASES = {
     "block_sparse_gqa_decode": block_sparse_gqa_decode,
     "dense_flash_attention": dense_flash_attention,
@@ -716,9 +842,5 @@ CASES = {
         "two-kernel split-K program"
     ),
     "gqa_attention_backward": gqa_attention_backward,
-    "sparse_mla_backward": implementation_gap(
-        "the backward requires indexed sparse probability recomputation and "
-        "many-to-one dKV scatter accumulation, which the current DSL corpus "
-        "does not express as this source pipeline"
-    ),
+    "sparse_mla_backward": sparse_mla_backward,
 }

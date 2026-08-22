@@ -10,8 +10,11 @@ from kernels.backward.attention import attention_backward_dkdv
 from kernels.backward.attention import attention_backward_dq
 from kernels.streaming.attention import flash_gqa_attention_fwd
 from kernels.streaming.attention import flash_attention_bf16_fwd
+from kernels.streaming.attention import grouped_flash_decode_partials
 from kernels.streaming.attention import mla_prefill
+from kernels.streaming.attention_specialized import attention_sink_decode_partials
 from kernels.streaming.attention_specialized import attention_sink_prefill
+from kernels.streaming.attention_specialized import gemma_gqa_decode_partials
 from kernels.streaming.attention_specialized import gemma_gqa_prefill
 from kernels.streaming.attention_specialized import sliding_window_gqa_prefill
 from kernels.streaming.mla import absorbed_mla_decode
@@ -29,7 +32,6 @@ from ...model import Tolerance
 from .common import official_source
 from .common import runtime_module
 from .common import tilegym_source
-from .. import implementation_gap
 
 
 def official_fmha(context: Context) -> PreparedComparison:
@@ -602,27 +604,241 @@ def splitk_mla_decode(context: Context) -> PreparedComparison:
     )
 
 
+def grouped_flash_decode(context: Context) -> PreparedComparison:
+    batch, query_heads, key_heads, sequence, dimension, split_size = (
+        8,
+        32,
+        8,
+        8192,
+        128,
+        256,
+    )
+    splits = (sequence + split_size - 1) // split_size
+    q = torch.randn(
+        (batch, query_heads, 1, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, key_heads, sequence, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    scale = 1.0 / math.sqrt(dimension)
+    _, partials = compile_single(
+        context,
+        grouped_flash_decode_partials,
+        (q, k, v, scale),
+        constexprs={
+            "HEAD_GROUP": query_heads // key_heads,
+            "P": splits,
+        },
+    )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(
+        generated_launch,
+        lambda: reduction.outputs().unsqueeze(2),
+    )
+    source_module = tilegym_source(
+        context,
+        "source/cutile/tilegym/attention/flash_decode/flash_decode.py",
+        "grouped_flash_decode",
+        needs_utils=True,
+        needs_splitk=True,
+    )
+    source = functional_launch(
+        lambda: source_module.fmha_decode(
+            q,
+            k,
+            v,
+            scale,
+            kv_len_per_split=split_size,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-1, rtol=5e-2),
+        cuda_graph=False,
+    )
+
+
+def attention_sink_decode(context: Context) -> PreparedComparison:
+    batch, sequence, key_heads, head_group, dimension, split_size = (
+        32,
+        8192,
+        8,
+        4,
+        128,
+        256,
+    )
+    query_heads = key_heads * head_group
+    splits = (sequence + split_size - 1) // split_size
+    q_source = torch.randn(
+        (batch, 1, key_heads, head_group, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q = q_source.view(batch, query_heads, dimension)
+    k = torch.randn(
+        (batch, sequence, key_heads, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    sinks = torch.randn(
+        (query_heads,), device="cuda", dtype=torch.bfloat16
+    )
+    start_q = torch.tensor(
+        [sequence - 1], device="cuda", dtype=torch.int32
+    )
+    scale = 1.0 / math.sqrt(dimension)
+    _, partials = compile_single(
+        context,
+        attention_sink_decode_partials,
+        (q, k, v, sinks, start_q, scale),
+        constexprs={
+            "HEAD_GROUP": head_group,
+            "WINDOW": 0,
+            "P": splits,
+        },
+    )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(
+        generated_launch,
+        lambda: reduction.outputs().reshape(batch, 1, query_heads * dimension),
+    )
+    source_module = tilegym_source(
+        context,
+        "source/cutile/tilegym/attention/sink_decode/attention_sink_decode.py",
+        "attention_sink_decode",
+        needs_utils=True,
+        needs_splitk=True,
+    )
+    source = functional_launch(
+        lambda: source_module.attention_sink_decode(
+            q_source,
+            k,
+            v,
+            sinks,
+            scale,
+            start_q=start_q,
+            kv_len_per_split=split_size,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-1, rtol=5e-2),
+        cuda_graph=False,
+    )
+
+
+def gemma_decode(context: Context) -> PreparedComparison:
+    batch, query_heads, key_heads, sequence, dimension, split_size = (
+        32,
+        32,
+        8,
+        8192,
+        128,
+        256,
+    )
+    splits = (sequence + split_size - 1) // split_size
+    q = torch.randn(
+        (batch, query_heads, 1, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, key_heads, sequence, dimension),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    scale = 1.0 / math.sqrt(dimension)
+    _, partials = compile_single(
+        context,
+        gemma_gqa_decode_partials,
+        (q, k, v, scale),
+        constexprs={
+            "HEAD_GROUP": query_heads // key_heads,
+            "WINDOW": 1024,
+            "SOFT_CAP": 50.0,
+            "P": splits,
+        },
+    )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(
+        generated_launch,
+        lambda: reduction.outputs().unsqueeze(2),
+    )
+    source_module = tilegym_source(
+        context,
+        "source/cutile/tilegym/attention/gemma_decode/gemma_attention_decode.py",
+        "gemma_decode",
+        needs_utils=True,
+        needs_splitk=True,
+    )
+    source = functional_launch(
+        lambda: source_module.gemma_fmha_decode(
+            q,
+            k,
+            v,
+            sm_scale=scale,
+            window_size=1024,
+            soft_cap=50.0,
+            kv_len_per_split=split_size,
+        )
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-1, rtol=5e-2),
+        cuda_graph=False,
+    )
+
+
 CASES = {
     "official_fmha": official_fmha,
     "dense_attention_forward": dense_attention_forward,
-    "grouped_flash_decode": implementation_gap(
-        "the source callable realizes one decode algorithm as compiler-private "
-        "split-K partial and reduction stages; the Physical Program does not yet "
-        "introduce that staging from the unsplit Intent algorithm"
-    ),
+    "grouped_flash_decode": grouped_flash_decode,
     "splitk_attention_reduce": splitk_reduce,
     "mla_prefill": mla_prefill_case,
     "attention_sink_prefill": attention_sink,
-    "attention_sink_decode": implementation_gap(
-        "the source callable realizes sink decode as compiler-private split-K "
-        "stages; encoding split offsets and partial buffers in author DSL would "
-        "move a physical decision into the algorithm"
-    ),
+    "attention_sink_decode": attention_sink_decode,
     "gemma_prefill": gemma_prefill,
-    "gemma_decode": implementation_gap(
-        "the source callable realizes windowed soft-cap decode as compiler-private "
-        "split-K stages; the Physical Program does not yet introduce that staging"
-    ),
+    "gemma_decode": gemma_decode,
     "absorbed_mla_decode": absorbed_mla,
     "sliding_window_attention": sliding_window,
     "attention_backward": attention_backward,

@@ -2,7 +2,7 @@
 
 这组文档描述 Intent Kernel DSL 的语言语义、编译器模块边界与稳定使用方法，不记录实现进度、历史版本、测试清单、失败状态或迁移过程。运行与实现状态只进入 `report/`；设计文档只在明确修改规格时更新，环境文档只维护可复现的依赖与构建合同。
 
-Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL**：用户写一个 logical callable 内的完整算法，编译器补全不可由 source 观察的机器 realization；一个 callable 的目标实现可以包含多个 compiler-private stages。
+Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL**：用户写一个 runtime-visible kernel 内的完整算法，编译器补全不可由 source 观察的单次 kernel launch realization。需要多个 launches 的算法由作者用多个 kernels 和普通 Python wrapper 明确编排。
 
 ## 设计变更门槛
 

@@ -53,6 +53,7 @@ full = Intrinsic("full")
 zeros = Intrinsic("zeros")
 record = Intrinsic("record")
 cast = Intrinsic("cast")
+bitcast = Intrinsic("bitcast")
 mask = Intrinsic("mask")
 
 exp = Intrinsic("exp")
@@ -111,6 +112,7 @@ INTRINSICS = {
         zeros,
         record,
         cast,
+        bitcast,
         mask,
         exp,
         exp2,

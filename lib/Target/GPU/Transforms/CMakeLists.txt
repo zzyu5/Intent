@@ -7,7 +7,6 @@ add_mlir_library(MLIRIntentGPUTransforms
   Execution/AutomaticBlocking.cpp
   Passes.cpp
   Search/SearchSpace.cpp
-  Structured/StageFormation.cpp
   Value/PrivateBufferResidency.cpp
   Value/ContractionRealization.cpp
   Value/ScanRealization.cpp

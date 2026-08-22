@@ -33,8 +33,6 @@ using ContractOp = target::lowering::ContractBinding;
 using SparseContractOp = intent::plan::SparseContractOp;
 using StreamOp = target::lowering::StreamBinding;
 using RaggedOp = target::lowering::RaggedBinding;
-using StageOp = target::lowering::StageBinding;
-using StageAxisOp = target::lowering::StageAxisBinding;
 using StreamAxisOp = intent::plan::StreamAxisOp;
 using StreamBindingOp = intent::plan::StreamBindingOp;
 using BoundaryOp = target::lowering::BoundaryBinding;
@@ -62,8 +60,6 @@ struct PhysicalProgramIndex {
   llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
-  llvm::SmallVector<plan::StageOp, 0> stages;
-  llvm::DenseMap<int64_t, llvm::StringMap<plan::StageAxisOp>> stageAxes;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::lowering::PhysicalComponents components;
 };
@@ -136,6 +132,7 @@ public:
   mlir::LogicalResult emitMask(mlir::Operation &operation);
   mlir::LogicalResult emitSelect(mlir::Operation &operation);
   mlir::LogicalResult emitCast(mlir::Operation &operation);
+  mlir::LogicalResult emitBitcast(mlir::Operation &operation);
   mlir::LogicalResult emitReshape(mlir::Operation &operation);
   mlir::LogicalResult emitTranspose(mlir::Operation &operation);
   mlir::LogicalResult emitFull(mlir::Operation &operation);
@@ -223,10 +220,7 @@ private:
   std::string broadcastIndex(llvm::StringRef base, unsigned axis,
                              unsigned rank);
   mlir::LogicalResult prepareRaggedMetadata();
-  mlir::LogicalResult prepareRaggedStages();
   mlir::LogicalResult emitProgramBindings();
-  void stageLine(unsigned stage, llvm::StringRef text,
-                 unsigned indent = 1);
   void bindResult(mlir::Operation &operation, unsigned index,
                   llvm::StringRef name);
   std::string makeResultName(mlir::Operation &operation, unsigned index);
@@ -262,6 +256,11 @@ private:
       mlir::Operation *,
       llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>
       streamAxisRestores;
+  llvm::DenseMap<int64_t, std::string> activeTraversalEnds;
+  llvm::DenseMap<
+      mlir::Operation *,
+      llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>
+      streamEndRestores;
   llvm::DenseMap<int64_t, std::string> programBlocks;
   llvm::SmallVector<std::string> dimensionOrder;
   bool requiresPreallocatedOutputs = false;
@@ -274,9 +273,6 @@ private:
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
   llvm::DenseMap<mlir::Value, llvm::SmallVector<std::string>> scalarBuffers;
   llvm::DenseMap<mlir::Value, std::string> vectorBuffers;
-  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<unsigned>>
-      operationStages;
-  llvm::DenseMap<mlir::Value, unsigned> stageOutputOwners;
   llvm::DenseMap<mlir::Value, std::string> workspaceNames;
   llvm::DenseMap<mlir::Value, plan::ScanOp> scanResults;
   llvm::DenseMap<mlir::Value, plan::ScanOp> scanMaterializedValues;
@@ -284,20 +280,9 @@ private:
   llvm::DenseMap<mlir::Operation *, int64_t> scanProducerOwners;
   int64_t activeScanReplay = -1;
   llvm::SmallVector<mlir::Operation *> privateWorkspaceBuffers;
-  llvm::SmallVector<std::string> stageBodies;
-  llvm::SmallVector<unsigned> activeStages;
-  llvm::DenseMap<unsigned, std::string> stageFeatureDimensions;
-  llvm::DenseMap<unsigned, std::string> stageMemberDimensions;
-  llvm::DenseMap<unsigned, std::string> stageReductionDimensions;
-  llvm::DenseMap<unsigned, std::string> stageFeatureTiles;
-  llvm::DenseMap<unsigned, std::string> stageMemberTiles;
-  llvm::DenseMap<unsigned, std::string> stageReductionTiles;
-  llvm::DenseMap<unsigned, int64_t> stageFeatureWorkers;
-  llvm::DenseMap<unsigned, int64_t> stageMemberWorkers;
   llvm::SmallVector<RaggedRuntime, 0> raggedRuntimes;
   llvm::DenseMap<int64_t, unsigned> raggedRuntimeByRelation;
   llvm::DenseMap<int64_t, llvm::SmallVector<unsigned>> raggedRuntimesByAxis;
-  llvm::DenseMap<unsigned, unsigned> stageRaggedRuntime;
   mlir::Operation *programRoot = nullptr;
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;

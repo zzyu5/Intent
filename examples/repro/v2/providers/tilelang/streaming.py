@@ -5,6 +5,7 @@ import math
 import torch
 
 from kernels.streaming.linear_attention import chunk_retention_fwd
+from kernels.streaming.linear_attention import fused_chunk_linear_attention_bwd
 from kernels.streaming.linear_attention import fused_chunk_linear_attention_fwd
 from kernels.streaming.mamba import mamba_chunk_state_fwd
 from kernels.streaming.selective_scan import mamba_chunk_scan_fwd
@@ -228,14 +229,74 @@ def retention(context: Context) -> PreparedComparison:
     )
 
 
+def linear_attention_backward(context: Context) -> PreparedComparison:
+    batch, sequence, heads, dimension = 1, 2048, 16, 128
+    q = torch.randn(
+        (batch, sequence, heads, dimension), device="cuda", dtype=torch.float16
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    grad_output = torch.randn_like(q)
+    scale = 1.0 / math.sqrt(dimension)
+    _, generated = compile_single(
+        context,
+        fused_chunk_linear_attention_bwd,
+        (q, k, v, grad_output, scale),
+    )
+    support = runtime_module(
+        context,
+        "source/tilelang/tilelang/support/runtime.py",
+        "intent_v2_tilelang_runtime_support",
+    )
+    source_module = support.load_source(
+        context.project_root
+        / "source/tilelang/tilelang/linear_attention/fused_chunk_backward/example_linear_attn_bwd.py",
+        "intent_v2_tilelang_linear_attention_backward",
+        needs_fla_linear=True,
+    )
+    source_kernel = source_module.tl_fused_chunk_bwd_kernel(
+        batch, sequence, heads, dimension, dimension
+    )
+    source_grad_q = torch.zeros_like(q, dtype=torch.float32)
+    source_grad_k = torch.zeros_like(k, dtype=torch.float32)
+    source_grad_v = torch.zeros_like(v, dtype=torch.float32)
+
+    def prepare():
+        source_grad_q.zero_()
+        source_grad_k.zero_()
+        source_grad_v.zero_()
+
+    def source_launch():
+        source_kernel(
+            q,
+            k,
+            v,
+            grad_output,
+            source_grad_q,
+            source_grad_k,
+            source_grad_v,
+        )
+
+    prepare()
+    source_launch()
+    source = PreparedLaunch(
+        source_launch,
+        lambda: (source_grad_q, source_grad_k, source_grad_v),
+        prepare=prepare,
+    )
+    tolerance = Tolerance(atol=1e-1, rtol=5e-2)
+    return PreparedComparison(
+        generated,
+        source,
+        (tolerance, tolerance, tolerance),
+        cuda_graph=False,
+    )
+
+
 CASES = {
     "mamba_chunk_scan": mamba_chunk_scan,
     "mamba_chunk_state": mamba_chunk_state,
     "linear_attention_forward": linear_attention,
-    "linear_attention_backward": implementation_gap(
-        "the source uses a forward carried-state traversal for dQ and a reverse "
-        "carried-state traversal for dK/dV; the current Intent source has only "
-        "the forward algorithm"
-    ),
+    "linear_attention_backward": linear_attention_backward,
     "retention_forward": retention,
 }

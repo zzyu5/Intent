@@ -9,8 +9,9 @@ Intent 是高性能 kernel DSL，不是逐项审批 compiler 数值自由的合�
 3. Reduction tree、contraction mechanism、tile、物理执行顺序与 target 不同，可以产生正常浮点差异。
 4. 默认不承诺跨 target、跨 Plan、跨 compiler 或跨运行逐 bit 相同。
 5. 真正的 dtype narrowing 使用显式 `I.cast`。
-6. Base-2 exponential 使用显式 `I.exp2`。
-7. 严格数学或确定性路径属于 host/backend compile policy，不是每个 primitive 的 source 参数。
+6. `I.bitcast(value, dtype)` 保持 shape 和全部 bit，只允许非 bool/index 的等宽 source/result dtype；它不执行数值转换。
+7. Base-2 exponential 使用显式 `I.exp2`。
+8. 严格数学或确定性路径属于 host/backend compile policy，不是每个 primitive 的 source 参数。
 
 Numerics policy 属于 compiler/target policy，并进入 realizer 的正式能力合同；无法兑现的 policy 必须令编译失败，不能在 Python wrapper 中静默替换算法。
 
@@ -25,6 +26,8 @@ per-op determinism contracts
 ```
 
 Backend 在 f32 contraction 内选择 IEEE、TF32、TF32x3 或其他 target-native mechanism，与 source 显式把一个 f32 value cast 成 f16/bf16 是两件事。
+
+低位 packed format 不由 dtype 名字隐式决定。作者必须用整数 storage view、索引关系、位运算、数值转换或 `bitcast` 写出完整 decode/encode 合同；例如普通 low/high nibble FP4、BitNet 的 interleaved INT2 与带 swizzled scale 的 NVFP4 是不同格式，不能共享一个省略布局的“FP4/INT2”语义。
 
 Logical validity 与数值 mask 分开。Realizer 可以依据 logical predicate 消除完全无效的 physical region；无法整体证明时生成 target predicate、tail loop 或 `vsetvl`。
 

@@ -27,8 +27,6 @@ inline constexpr llvm::StringLiteral scanLoweringAttr =
     "intent_plan.triton.scan_lowering";
 inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
     "intent_plan.triton.pointwise_lowering";
-inline constexpr llvm::StringLiteral pointwiseDeferredAttr =
-    "intent_plan.triton.pointwise_deferred";
 inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.triton.gather_form";
 inline constexpr llvm::StringLiteral transferAccessAttr =
