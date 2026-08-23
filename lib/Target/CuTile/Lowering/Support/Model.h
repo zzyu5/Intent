@@ -161,6 +161,7 @@ private:
                                           llvm::StringRef offsets);
   mlir::LogicalResult replayContractProducers(
       llvm::ArrayRef<mlir::Operation *> producers);
+  mlir::LogicalResult replayBlock(mlir::Block &block);
   void emitImports() override;
   mlir::LogicalResult emitHelpers() override;
   mlir::LogicalResult emitKernelHeader() override;
@@ -263,6 +264,14 @@ private:
   llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
+  struct PrefixBoundaryStream {
+    std::string block;
+    std::string extent;
+    std::string prefixBlocks;
+    llvm::SmallVector<int64_t> neutralMasks;
+  };
+  llvm::DenseMap<mlir::Operation *, PrefixBoundaryStream> prefixBoundaryStreams;
+  llvm::DenseSet<int64_t> activeNeutralMasks;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       loopCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>

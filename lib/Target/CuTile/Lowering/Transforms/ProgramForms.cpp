@@ -425,7 +425,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   }
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
-    if (stream->hasAttr(streamTileAttr))
+    if (stream->hasAttr(streamTileAttr) || stream->hasAttr(streamFormAttr))
       return stream.emitOpError("already has a cuTile stream-tile spelling");
     intent::plan::RangeOp range = (*analysis)->getRange(
         stream.getAxisNode(), stream.getPurpose(), stream.getLevel());
@@ -435,6 +435,20 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(tile))
       return stream.emitOpError("does not bind one cuTile stream tile");
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
+    bool compoundBounds = stream.getPartitionNodeAttr() ||
+                          isRaggedBoundAxis(**analysis, stream.getAxisNode());
+    std::optional<target::lowering::PrefixBoundaryForm> prefix =
+        compoundBounds
+            ? std::nullopt
+            : target::lowering::classifyPrefixBoundaryStream(**analysis, stream);
+    stream->setAttr(streamFormAttr,
+                    builder.getStringAttr(prefix ? "prefix_boundary" : "single"));
+    if (prefix) {
+      stream->setAttr(streamBoundaryAxisAttr,
+                      builder.getI64IntegerAttr(prefix->boundaryAxis));
+      stream->setAttr(streamNeutralMasksAttr,
+                      builder.getDenseI64ArrayAttr(prefix->neutralMasks));
+    }
   }
 
   for (intent::plan::TransferOp transfer :
@@ -647,7 +661,31 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
     auto tile = stream->getAttrOfType<StringAttr>(streamTileAttr);
-    if (!tile || tile.getValue().empty())
+    auto form = stream->getAttrOfType<StringAttr>(streamFormAttr);
+    auto boundary = stream->getAttrOfType<IntegerAttr>(streamBoundaryAxisAttr);
+    auto masks = stream->getAttrOfType<DenseI64ArrayAttr>(streamNeutralMasksAttr);
+    bool validBoundary = !boundary || llvm::any_of(
+                                          program.getBody().getOps<
+                                              intent::plan::AxisOp>(),
+                                          [&](intent::plan::AxisOp axis) {
+                                            return axis.getNode() ==
+                                                   static_cast<uint64_t>(
+                                                       boundary.getInt());
+                                          });
+    bool validMasks = !masks || llvm::all_of(
+                                    masks.asArrayRef(), [&](int64_t node) {
+                                      Operation *operation = kernel.nodes.lookup(node);
+                                      return operation &&
+                                             target::semanticOperationName(*operation) ==
+                                                 "intent.mask";
+                                    });
+    if (!tile || tile.getValue().empty() || !form ||
+        (form.getValue() != "single" &&
+         form.getValue() != "prefix_boundary") ||
+        (form.getValue() == "prefix_boundary" &&
+         (!boundary || !masks || masks.empty() || !validBoundary ||
+          !validMasks)) ||
+        (form.getValue() != "prefix_boundary" && (boundary || masks)))
       return stream.emitOpError("has no complete cuTile stream-tile spelling");
   }
   for (intent::plan::TransferOp transfer :

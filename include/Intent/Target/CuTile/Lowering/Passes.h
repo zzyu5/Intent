@@ -41,6 +41,12 @@ inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.cutile.gather_form";
 inline constexpr llvm::StringLiteral streamTileAttr =
     "intent_plan.cutile.stream_tile";
+inline constexpr llvm::StringLiteral streamFormAttr =
+    "intent_plan.cutile.stream_form";
+inline constexpr llvm::StringLiteral streamBoundaryAxisAttr =
+    "intent_plan.cutile.stream_boundary_axis";
+inline constexpr llvm::StringLiteral streamNeutralMasksAttr =
+    "intent_plan.cutile.stream_neutral_masks";
 inline constexpr llvm::StringLiteral raggedRouteAttr =
     "intent_plan.cutile.ragged_route";
 inline constexpr llvm::StringLiteral gatherSpellingRole =

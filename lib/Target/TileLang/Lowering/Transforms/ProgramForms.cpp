@@ -561,6 +561,36 @@ bool hasSubwarpRowContraction(gpu::PhysicalProgramAnalysis &analysis,
          (rhsReduction.getInt() == 0 || rhsReduction.getInt() == 1);
 }
 
+bool hasStructuredReductionReplayTransfer(
+    gpu::PhysicalProgramAnalysis &analysis, const target::KernelModel &kernel,
+    intent::plan::ContractOp contract, Operation &operation) {
+  if (!contract.getProducerReplay())
+    return false;
+  std::optional<int64_t> reductionNode = contract.getReductionAxisNode();
+  if (!reductionNode)
+    return false;
+  llvm::DenseMap<int64_t, intent::plan::TransferOp> transfers;
+  for (intent::plan::TransferOp transfer :
+       analysis.getProgram().getBody().getOps<intent::plan::TransferOp>())
+    transfers[transfer.getNode()] = transfer;
+  for (Value operand : operation.getOperands()) {
+    std::optional<target::ContractOperandReplay> replay =
+        target::analyzeContractOperandReplay(operand, operation);
+    if (!replay)
+      continue;
+    for (Operation *producer : replay->transfers) {
+      auto node = producer->getAttrOfType<IntegerAttr>("intent.node");
+      intent::plan::TransferOp transfer =
+          node ? transfers.lookup(node.getInt()) : intent::plan::TransferOp();
+      if (transfer && transfer.getTensorIndexing() == "structured" &&
+          transfer.getMaterialization() == "deferred_to_contract" &&
+          llvm::is_contained(transfer.getDomainNodes(), *reductionNode))
+        return true;
+    }
+  }
+  return false;
+}
+
 LogicalResult realizeProgram(intent::plan::ProgramOp program,
                              intent::plan::SearchSpaceOp searchSpace) {
   FailureOr<std::unique_ptr<gpu::PhysicalProgramAnalysis>> analysis =
@@ -714,8 +744,13 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         hasSubwarpRowContraction(**analysis, contract, *operation);
     if (subwarpRows)
       return contract.emitOpError(
-          "the current TileLang provider form cannot pad a logical contraction "
-          "row extent smaller than 16 to a native MMA fragment");
+          "the current TileLang provider program has no subwarp SIMT GEMV form "
+          "for a logical contraction row smaller than 16");
+    if (hasStructuredReductionReplayTransfer(**analysis, kernel, contract,
+                                             *operation))
+      return contract.emitOpError(
+          "the current TileLang producer-replay form cannot retile a structured "
+          "indirect transfer along the contraction reduction axis");
     contract->setAttr(
         isolateLhsAttr,
         builder.getBoolAttr(repeatedContractionOperand(

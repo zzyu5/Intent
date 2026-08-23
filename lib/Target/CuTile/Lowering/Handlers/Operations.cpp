@@ -1958,6 +1958,28 @@ LogicalResult ProgramMaterializer::replayContractProducers(
   return success();
 }
 
+LogicalResult ProgramMaterializer::replayBlock(Block &block) {
+  if (!operationRegistry())
+    return block.getParentOp()->emitOpError(
+        "has no cuTile operation registry for provider-form replay");
+  for (Operation &operation : block) {
+    const target::OperationHandler *handler = operationRegistry()->lookup(
+        target::semanticOperationName(operation));
+    if (!handler)
+      return operation.emitOpError(
+          "has no cuTile handler during provider-form replay");
+    if (handler->enter && failed(handler->enter(operation)))
+      return failure();
+    for (Region &region : operation.getRegions())
+      for (Block &nested : region)
+        if (failed(replayBlock(nested)))
+          return failure();
+    if (handler->leave && failed(handler->leave(operation)))
+      return failure();
+  }
+  return success();
+}
+
 LogicalResult ProgramMaterializer::emitBroadcast(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "broadcast emission");
   plan::PointwiseOp binding =
@@ -2152,6 +2174,14 @@ LogicalResult ProgramMaterializer::emitConditional(Operation &operation, bool ma
 }
 
 LogicalResult ProgramMaterializer::emitMask(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+  if (succeeded(node) && activeNeutralMasks.contains(*node)) {
+    FailureOr<StringRef> input = lookupValue(operation, 0);
+    if (failed(input))
+      return failure();
+    bindResult(operation, 0, *input);
+    return success();
+  }
   return emitConditional(operation, true);
 }
 
@@ -2703,10 +2733,46 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
   }
   std::string streamTile = "stream_tile_" + std::to_string(*node);
   std::string projectedRegion = streamTile;
-  line("for " + streamTile + " in range(" + addressIndex("0") + ", " +
-       addressIndex("ct.cdiv(" + streamExtent + ", " +
-                    binding.getTile().str() + ")") +
-       ", " + addressIndex("1") + "):");
+  auto streamForm = binding.physical
+                        ? binding.physical->getAttrOfType<StringAttr>(streamFormAttr)
+                        : StringAttr();
+  bool prefixBoundary = streamForm && streamForm.getValue() == "prefix_boundary";
+  if (prefixBoundary) {
+    auto boundaryAxis =
+        binding.physical->getAttrOfType<IntegerAttr>(streamBoundaryAxisAttr);
+    auto neutralMasks =
+        binding.physical->getAttrOfType<DenseI64ArrayAttr>(streamNeutralMasksAttr);
+    plan::AxisOp boundary =
+        boundaryAxis ? planIndex.axes.lookup(boundaryAxis.getInt()) : plan::AxisOp();
+    const target::lowering::RangeBinding *ownership =
+        boundary ? boundary.getRange("ownership", 0) : nullptr;
+    std::string block =
+        boundaryAxis ? programBlocks.lookup(boundaryAxis.getInt()) : std::string();
+    if (!boundaryAxis || !neutralMasks || neutralMasks.empty() || !boundary ||
+        !ownership || block.empty() || raggedStream || partitionedStream)
+      return binding.emitOpError(
+          "has no complete cuTile prefix-boundary stream form");
+    std::string prefixBlocks =
+        "stream_prefix_blocks_" + std::to_string(*node);
+    std::string boundaryStart =
+        addressIndex(block) + " * " + ownership->getTile().str();
+    line(prefixBlocks + " = min(ct.cdiv(" + streamExtent + ", " +
+         binding.getTile().str() + "), max(0, (" + boundaryStart +
+         ") // " + binding.getTile().str() + "))");
+    line("for " + streamTile + " in range(" + addressIndex("0") + ", " +
+         addressIndex(prefixBlocks) + ", " + addressIndex("1") + "):");
+    PrefixBoundaryStream replay{streamTile, streamExtent, prefixBlocks, {}};
+    for (int64_t mask : neutralMasks.asArrayRef()) {
+      replay.neutralMasks.push_back(mask);
+      activeNeutralMasks.insert(mask);
+    }
+    prefixBoundaryStreams[&operation] = std::move(replay);
+  } else {
+    line("for " + streamTile + " in range(" + addressIndex("0") + ", " +
+         addressIndex("ct.cdiv(" + streamExtent + ", " +
+                      binding.getTile().str() + ")") +
+         ", " + addressIndex("1") + "):");
+  }
   ++indentation;
   if (raggedStream) {
     auto runtimes = raggedRuntimesByAxis.find(binding.getAxisNode());
@@ -2777,6 +2843,30 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
     line(carriers->second[index] + " = " + yielded->str());
   }
   --indentation;
+  auto prefix = prefixBoundaryStreams.find(&operation);
+  if (prefix != prefixBoundaryStreams.end()) {
+    for (int64_t mask : prefix->second.neutralMasks)
+      activeNeutralMasks.erase(mask);
+    line("for " + prefix->second.block + " in range(" +
+         addressIndex(prefix->second.prefixBlocks) + ", " +
+         addressIndex("ct.cdiv(" + prefix->second.extent + ", " +
+                      binding.getTile().str() + ")") +
+         ", " + addressIndex("1") + "):");
+    ++indentation;
+    Block &body = operation.getRegion(0).front();
+    valueNames[body.getArgument(0)] = prefix->second.block;
+    axisIndices[binding.getAxisNode()] = prefix->second.block;
+    if (failed(replayBlock(body)))
+      return failure();
+    for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+      FailureOr<StringRef> replayed = lookupValue(terminator, index);
+      if (failed(replayed))
+        return failure();
+      line(carriers->second[index] + " = " + replayed->str());
+    }
+    --indentation;
+    prefixBoundaryStreams.erase(prefix);
+  }
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
   if (auto restores = streamAxisRestores.find(&operation);

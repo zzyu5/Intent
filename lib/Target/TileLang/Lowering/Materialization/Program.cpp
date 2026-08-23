@@ -1202,9 +1202,9 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     }
     for (const std::string &extent : dynamicContractionRowExtents) {
       output << "    if 0 < " << extent << " < 16:\n";
-      output << "        raise NotImplementedError('TileLang cannot pad a "
-                "logical contraction row extent smaller than 16 to a native "
-                "MMA fragment')\n";
+      output << "        raise NotImplementedError('the current TileLang "
+                "provider program has no subwarp SIMT GEMV form for a logical "
+                "contraction row smaller than 16')\n";
     }
     llvm::SmallVector<StringRef> exactExtents;
     exactExtents.reserve(exactBulkExtents.size());
@@ -2370,36 +2370,13 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
       if (!includeBase)
         return std::string();
       auto tensor = cast<RankedTensorType>(indexed.getType());
-      if (!tensorIndices.requiresBroadcastProjection()) {
-        FailureOr<StringRef> exact =
-            lookupValue(operation, *term.operands.front());
-        if (tensor.getRank() != 1 || failed(exact) ||
-            tileAxis >= tileExtents.size() || tileExtents[tileAxis] != "1")
-          return operation.emitOpError(
-              "TileLang bulk bounds require one singleton indirect index tile");
-        ++tileAxis;
-        std::string index = exact->str() + "[0]";
-        predicates.push_back("0 <= " + index);
-        predicates.push_back(index + " < " + (*view)->shape[axisNumber]);
-        continue;
-      }
-      if (!tensorGroupAxis) {
-        if (tileAxis + tensorIndices.rank > tileExtents.size())
-          return operation.emitOpError(
-              "TileLang structured bulk bounds exceed the transfer rank");
-        tensorGroupAxis = tileAxis;
-        tileAxis += tensorIndices.rank;
-      }
-      if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
-        return operation.emitOpError(
-            "TileLang structured bulk bounds exceed the transfer rank");
       auto result = dyn_cast<OpResult>(indexed);
       FailureOr<SmallVector<std::string>> extents =
           result ? tensorExtents(*result.getOwner(), result.getResultNumber())
                  : FailureOr<SmallVector<std::string>>(failure());
       FailureOr<std::string> base =
           structuredIndexExpression(indexed, operation);
-      if (failed(extents) || failed(base) ||
+      if (failed(extents) ||
           extents->size() != static_cast<size_t>(tensor.getRank()))
         return operation.emitOpError(
             "TileLang structured bulk bounds have no canonical index span");
@@ -2412,11 +2389,45 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
               "TileLang structured bulk index varies along multiple axes");
         varyingAxis = axis;
       }
+      if (!tensorIndices.requiresBroadcastProjection()) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        StringRef physicalSpan = varyingAxis
+                                     ? StringRef((*extents)[*varyingAxis])
+                                     : StringRef("1");
+        if (tensor.getRank() != 1 || failed(exact) ||
+            tileAxis >= tileExtents.size() ||
+            tileExtents[tileAxis] != physicalSpan ||
+            (failed(base) && varyingAxis))
+          return operation.emitOpError(
+              "TileLang rank-one bulk index does not match its contiguous "
+              "physical span");
+        ++tileAxis;
+        std::string index = succeeded(base) ? *base : exact->str() + "[0]";
+        predicates.push_back("0 <= " + index);
+        predicates.push_back(varyingAxis
+                                 ? index + " + " + (*extents)[*varyingAxis] +
+                                       " <= " + (*view)->shape[axisNumber]
+                                 : index + " < " + (*view)->shape[axisNumber]);
+        continue;
+      }
+      if (!tensorGroupAxis) {
+        if (tileAxis + tensorIndices.rank > tileExtents.size())
+          return operation.emitOpError(
+              "TileLang structured bulk bounds exceed the transfer rank");
+        tensorGroupAxis = tileAxis;
+        tileAxis += tensorIndices.rank;
+      }
+      if (tensor.getRank() > static_cast<int64_t>(tensorIndices.rank))
+        return operation.emitOpError(
+            "TileLang structured bulk bounds exceed the transfer rank");
+      if (failed(extents) || failed(base) ||
+          extents->size() != static_cast<size_t>(tensor.getRank()))
+        return operation.emitOpError(
+            "TileLang structured bulk bounds have no canonical index span");
       predicates.push_back("0 <= " + *base);
       if (varyingAxis) {
-        unsigned valueAxis = *tensorGroupAxis + tensorIndices.rank -
-                             tensor.getRank() + *varyingAxis;
-        predicates.push_back(*base + " + " + tileExtents[valueAxis] +
+        predicates.push_back(*base + " + " + (*extents)[*varyingAxis] +
                              " <= " + (*view)->shape[axisNumber]);
       } else {
         predicates.push_back(*base + " < " + (*view)->shape[axisNumber]);

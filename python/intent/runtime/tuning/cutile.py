@@ -26,7 +26,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "pointwise_lane": (256, 512, 1024, 2048, 4096, 8192, 16384),
         "feature": (64, 128),
         "reduction": (16, 32, 64),
-        "program_m": (16, 32, 64, 128),
+        "program_m": (16, 32, 64, 128, 256),
         "program_n": (16, 32, 64, 128),
         "group_m": (4, 8),
         "gather_spelling": (0, 1),
@@ -134,6 +134,20 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
                 (128, 128, 2, 2),
                 (64, 64, 1, 4),
                 (64, 32, 1, 2),
+            )
+        ),
+        tuple(
+            ({"program_m": program_m, stream_role: stream}, num_ctas, occupancy)
+            for stream_role in ("stream", "stream_contract")
+            for program_m, stream, num_ctas, occupancy in (
+                (32, 32, 1, 4),
+                (64, 32, 1, 2),
+                (64, 64, 1, 4),
+                (64, 128, 1, 2),
+                (128, 64, 1, 2),
+                (128, 128, 1, 1),
+                (256, 64, 1, 1),
+                (256, 128, 1, 1),
             )
         ),
         tuple(

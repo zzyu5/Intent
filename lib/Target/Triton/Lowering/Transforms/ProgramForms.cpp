@@ -384,104 +384,6 @@ bool supportsStreamPipelineCandidate(
   return found;
 }
 
-void collectRegionSources(
-    Value value, const target::KernelModel &kernel,
-    const llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> &regions,
-    llvm::DenseSet<int64_t> &result, llvm::DenseSet<Value> &visited) {
-  if (!value || !visited.insert(value).second)
-    return;
-  auto valueID = kernel.valueIDs.find(value);
-  if (valueID != kernel.valueIDs.end() && regions.count(valueID->second)) {
-    result.insert(valueID->second);
-    return;
-  }
-  if (Operation *definition = value.getDefiningOp())
-    for (Value operand : definition->getOperands())
-      collectRegionSources(operand, kernel, regions, result, visited);
-}
-
-struct PrefixBoundaryForm {
-  int64_t boundaryAxis = -1;
-  llvm::SmallVector<int64_t> neutralMasks;
-};
-
-std::optional<PrefixBoundaryForm> classifyPrefixBoundaryStream(
-    gpu::PhysicalProgramAnalysis &analysis,
-    intent::plan::StreamBindingOp stream) {
-  target::KernelModel &kernel = analysis.getKernel();
-  Operation *operation = kernel.nodes.lookup(stream.getStreamNode());
-  if (!operation || target::semanticOperationName(*operation) !=
-                        "intent.state_stream")
-    return std::nullopt;
-  auto stopIndex =
-      operation->getAttrOfType<IntegerAttr>("intent.stop_operand_index");
-  Operation *stop = stopIndex && stopIndex.getInt() >= 0 &&
-                            static_cast<unsigned>(stopIndex.getInt()) <
-                                operation->getNumOperands()
-                        ? operation->getOperand(stopIndex.getInt()).getDefiningOp()
-                        : nullptr;
-  if (!stop || target::semanticOperationName(*stop) != "intent.region_end" ||
-      stop->getNumOperands() != 1)
-    return std::nullopt;
-
-  llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> regions;
-  for (intent::plan::RegionBindingOp binding :
-       analysis.getProgram().getBody().getOps<intent::plan::RegionBindingOp>())
-    regions[binding.getValue()] = binding;
-  auto stopValue = kernel.valueIDs.find(stop->getOperand(0));
-  auto stopBinding = stopValue != kernel.valueIDs.end()
-                         ? regions.find(stopValue->second)
-                         : regions.end();
-  if (stopBinding == regions.end() ||
-      stopBinding->second.getPurpose() != "ownership")
-    return std::nullopt;
-  int64_t boundaryAxis = stopBinding->second.getAxisNode();
-
-  PrefixBoundaryForm form{boundaryAxis, {}};
-  operation->walk([&](Operation *candidate) {
-    if (target::semanticOperationName(*candidate) != "intent.compare" ||
-        candidate->getNumOperands() != 2 || candidate->getNumResults() != 1)
-      return;
-    auto predicate = candidate->getAttrOfType<StringAttr>("intent.predicate");
-    if (!predicate || predicate.getValue() != "ge")
-      return;
-    llvm::DenseSet<int64_t> lhsSources;
-    llvm::DenseSet<int64_t> rhsSources;
-    llvm::DenseSet<Value> visited;
-    collectRegionSources(candidate->getOperand(0), kernel, regions, lhsSources,
-                         visited);
-    visited.clear();
-    collectRegionSources(candidate->getOperand(1), kernel, regions, rhsSources,
-                         visited);
-    if (lhsSources.size() != 1 || rhsSources.size() != 1)
-      return;
-    intent::plan::RegionBindingOp lhs = regions.lookup(*lhsSources.begin());
-    intent::plan::RegionBindingOp rhs = regions.lookup(*rhsSources.begin());
-    if (!lhs || !rhs || lhs.getAxisNode() !=
-                            static_cast<uint64_t>(boundaryAxis) ||
-        lhs.getPurpose() != "ownership" ||
-        rhs.getAxisNode() != stream.getAxisNode() ||
-        rhs.getPurpose() != "traversal")
-      return;
-    for (Operation *user : candidate->getResult(0).getUsers()) {
-      if (target::semanticOperationName(*user) != "intent.mask" ||
-          user->getNumOperands() < 2 || user->getOperand(1) != candidate->getResult(0))
-        continue;
-      FailureOr<int64_t> node =
-          target::getNodeID(*user, "Triton prefix-boundary mask");
-      if (succeeded(node))
-        form.neutralMasks.push_back(*node);
-    }
-  });
-  if (form.neutralMasks.empty())
-    return std::nullopt;
-  llvm::sort(form.neutralMasks);
-  form.neutralMasks.erase(
-      std::unique(form.neutralMasks.begin(), form.neutralMasks.end()),
-      form.neutralMasks.end());
-  return form;
-}
-
 bool isRuntimeABIDimension(const target::KernelModel &kernel,
                            StringRef dimension) {
   for (const target::ABIArgument &argument : kernel.abi.arguments) {
@@ -764,8 +666,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(tile))
       return stream.emitOpError("does not bind one Triton stream tile");
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
-    std::optional<PrefixBoundaryForm> prefix =
-        classifyPrefixBoundaryStream(**analysis, stream);
+    std::optional<target::lowering::PrefixBoundaryForm> prefix =
+        target::lowering::classifyPrefixBoundaryStream(**analysis, stream);
     bool pipelineCandidates =
         !prefix && supportsStreamPipelineCandidate(**analysis, stream);
     stream->setAttr(streamFormAttr,

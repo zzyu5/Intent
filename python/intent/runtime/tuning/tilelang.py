@@ -27,6 +27,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "query": (1, 2, 64, 128),
         "ragged_member": (64, 128),
         "lane_pack": (64, 128, 256),
+        "pointwise_lane": (64, 128, 256, 512),
         "feature": (64, 128),
         "reduction": (32, 64),
         "program_m": (64, 128),
