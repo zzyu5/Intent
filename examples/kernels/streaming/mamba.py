@@ -414,18 +414,34 @@ def mamba3_siso_forward(
                 source_grid = source_positions[:, None]
                 even_grid = even[None, :]
                 odd_grid = odd[None, :]
-                query_first = I.cast(
-                    query[batch, source_grid, query_head, even_grid], I.f32
-                ) + I.cast(query_bias[head, even], I.f32)[None, :]
-                query_second = I.cast(
-                    query[batch, source_grid, query_head, odd_grid], I.f32
-                ) + I.cast(query_bias[head, odd], I.f32)[None, :]
-                key_first = I.cast(
-                    key[batch, source_grid, query_head, even_grid], I.f32
-                ) + I.cast(key_bias[head, even], I.f32)[None, :]
-                key_second = I.cast(
-                    key[batch, source_grid, query_head, odd_grid], I.f32
-                ) + I.cast(key_bias[head, odd], I.f32)[None, :]
+                query_block = I.cast(
+                    query[
+                        batch,
+                        source_grid,
+                        query_head,
+                        qk_dimension_indices[None, :],
+                    ],
+                    I.f32,
+                ) + I.cast(
+                    query_bias[head, qk_dimension_indices], I.f32
+                )[None, :]
+                key_block = I.cast(
+                    key[
+                        batch,
+                        source_grid,
+                        query_head,
+                        qk_dimension_indices[None, :],
+                    ],
+                    I.f32,
+                ) + I.cast(
+                    key_bias[head, qk_dimension_indices], I.f32
+                )[None, :]
+                query_pairs = I.reshape(query_block, (positions, pairs, 2))
+                key_pairs = I.reshape(key_block, (positions, pairs, 2))
+                query_first = query_pairs[:, :, 0]
+                query_second = query_pairs[:, :, 1]
+                key_first = key_pairs[:, :, 0]
+                key_second = key_pairs[:, :, 1]
                 current_dt = dt[batch, head, source_positions]
                 shifted_positions = source_positions + 1
                 shifted_valid = shifted_positions < S
@@ -460,11 +476,18 @@ def mamba3_siso_forward(
                 rotated_key_second = I.cast(
                     key_first * sine + key_second * cosine, I.bf16
                 )
-                qk_dot = I.reduce.sum(
-                    query_first * key_first + query_second * key_second,
-                    axis=1,
-                    identity=0.0,
-                    acc_dtype=I.f32,
+                qk_dot = I.reshape(
+                    I.contract(
+                        I.cast(
+                            query_first * key_first
+                            + query_second * key_second,
+                            I.bf16,
+                        ),
+                        I.full((pairs, 1), 1.0, dtype=I.bf16),
+                        reduce=((1, 0),),
+                        acc_dtype=I.f32,
+                    ),
+                    (positions,),
                 ) * gamma
                 I.scatter_unique(
                     query_store,
@@ -498,6 +521,7 @@ def mamba3_siso_forward(
                 (value_dimensions, qk_dimensions),
                 dtype=I.f32,
             )
+            residual = residual_scale[head]
             for chunk in I.domain(0, chunks):
                 source_positions = chunk * MAMBA3_CHUNK_SIZE + local
                 source_grid = source_positions[:, None]
@@ -519,8 +543,9 @@ def mamba3_siso_forward(
                     head,
                     value_dimension_indices[None, :],
                 ]
+                decay_input = adt[batch, head, source_positions] * I.LOG2E
                 decay = I.scan(
-                    adt[batch, head, source_positions] * I.LOG2E,
+                    decay_input,
                     axis=0,
                     identity=0.0,
                     combine=I.add,
@@ -528,7 +553,7 @@ def mamba3_siso_forward(
                     acc_dtype=I.f32,
                 )
                 decay_sum = I.reduce.sum(
-                    adt[batch, head, source_positions] * I.LOG2E,
+                    decay_input,
                     axis=0,
                     identity=0.0,
                     acc_dtype=I.f32,
@@ -560,8 +585,7 @@ def mamba3_siso_forward(
                     acc_dtype=I.f32,
                 )
                 skip = (
-                    residual_scale[head]
-                    + qk_store[batch, head, source_positions]
+                    residual + qk_store[batch, head, source_positions]
                 )[:, None] * I.cast(value_block, I.f32)
                 result = carried + current + skip
                 gate_value = I.cast(

@@ -80,7 +80,16 @@ def flaggems_embedding_lookup(context: Context) -> PreparedComparison:
 
 def flaggems_roll(context: Context) -> PreparedComparison:
     x = torch.randn((8192, 4096), device="cuda", dtype=torch.float16)
-    _, generated = compile_single(context, roll_rows_forward, (x,))
+    _, generated_flat = compile_single(
+        context,
+        roll_rows_forward,
+        (x.view(-1),),
+        constexprs={"ROW_WIDTH": x.shape[1]},
+    )
+    generated = PreparedLaunch(
+        generated_flat.launch,
+        lambda: generated_flat.outputs().view_as(x),
+    )
     runtime = _runtime(
         context,
         "source/triton/flag-gems/indexing/roll/roll_runtime.py",

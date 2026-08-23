@@ -539,6 +539,8 @@ assignAxes(const target::KernelFacts &facts) {
       choice.programOrder = programOrder++;
       choice.tiled = true;
       appendRole(choice.roles, "parallel");
+      if (axes->second.size() == 1 && !nearestParallel(operation))
+        appendRole(choice.roles, "pointwise_1d");
     }
   });
 
@@ -622,6 +624,7 @@ assignAxes(const target::KernelFacts &facts) {
   unsigned scanTile = 0;
   unsigned reductionTile = 0;
   unsigned laneTile = 0;
+  unsigned pointwiseTile = 0;
   auto indexedTile = [](StringRef base, unsigned &ordinal) {
     unsigned current = ordinal++;
     return current == 0 ? base.str()
@@ -684,6 +687,13 @@ assignAxes(const target::KernelFacts &facts) {
         tile = "program_m";
       } else if (hasRole(choice.roles, "contraction_n")) {
         tile = "program_n";
+      } else if (hasRole(choice.roles, "pointwise_1d") &&
+                 hasRole(choice.roles, "parallel") &&
+                 llvm::all_of(choice.roles, [](StringRef role) {
+                   return role == "parallel" || role == "lane" ||
+                          role == "pointwise_1d";
+                 })) {
+        tile = indexedTile("pointwise_lane", pointwiseTile);
       } else if (ordinaryTile == 0) {
         tile = "program_m";
         ++ordinaryTile;

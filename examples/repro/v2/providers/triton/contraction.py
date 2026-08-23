@@ -6,6 +6,7 @@ import triton
 from kernels.contraction.block_scaled import scaled_fp8_splitk_matmul
 from kernels.contraction.gemm import Activation
 from kernels.contraction.gemm import gemm
+from kernels.contraction.qkv import fused_qkv_projection
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 
 from ...loading import load_module
@@ -90,23 +91,15 @@ def qkv_projection(context: Context) -> PreparedComparison:
         torch.randn((hidden, projection), device="cuda", dtype=torch.float16)
         for _ in range(3)
     )
-    generated_stages = tuple(
-        compile_single(
-            context,
-            gemm,
-            (x, weight),
-            constexprs={"ACTIVATION": Activation.NONE},
-        )[1]
-        for weight in weights
+    packed_weights = torch.stack(weights)
+    _, generated_base = compile_single(
+        context,
+        fused_qkv_projection,
+        (x, packed_weights),
     )
-
-    def generated_launch():
-        for stage in generated_stages:
-            stage.launch()
-
     generated = PreparedLaunch(
-        launch=generated_launch,
-        outputs=lambda: tuple(stage.outputs() for stage in generated_stages),
+        launch=generated_base.launch,
+        outputs=lambda: tuple(generated_base.outputs()[index] for index in range(3)),
     )
     runtime = _runtime(
         context,

@@ -61,31 +61,39 @@ def padded_rope(context: Context) -> PreparedComparison:
     sequence_lengths = torch.full(
         (batch,), padded_length, device="cuda", dtype=torch.int32
     )
-    generated_key_cache = torch.empty(
-        (batch, padded_length, kv_heads, dimension),
+    packed_input = torch.cat((query, key, value), dim=1)
+    query_rows = batch * query_heads
+    cache_rows = batch * padded_length * kv_heads
+    generated_storage = torch.empty(
+        (query_rows + 2 * cache_rows, dimension),
         device="cuda",
         dtype=torch.float16,
     )
-    generated_value_cache = torch.empty_like(generated_key_cache)
     _, generated_base = compile_single(
         context,
         padded_rope_cache_update,
         (
-            query,
-            key,
-            value,
+            packed_input,
             sequence_lengths,
-            generated_key_cache,
-            generated_value_cache,
+            generated_storage,
             10000.0,
             1.0,
         ),
     )
     position = cache_length
+    generated_query = generated_storage[:query_rows].view(
+        batch, query_heads, dimension
+    )
+    generated_key_cache = generated_storage[
+        query_rows : query_rows + cache_rows
+    ].view(batch, padded_length, kv_heads, dimension)
+    generated_value_cache = generated_storage[query_rows + cache_rows :].view(
+        batch, padded_length, kv_heads, dimension
+    )
     generated = PreparedLaunch(
         launch=generated_base.launch,
         outputs=lambda: (
-            generated_base.outputs(),
+            generated_query,
             generated_key_cache[:, position],
             generated_value_cache[:, position],
         ),

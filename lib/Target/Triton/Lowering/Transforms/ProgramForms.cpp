@@ -94,6 +94,23 @@ bool isDescriptorShapeProjection(Operation &operation) {
          result.getRank() == input.getRank() + static_cast<int64_t>(newAxes);
 }
 
+bool isStaticSplitProjection(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  auto source = operation.getNumOperands() > 0
+                    ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                    : RankedTensorType();
+  if (!source || source.getRank() == 0 || failed(relation) ||
+      !target::isStaticFragmentProjection(operation, *relation) ||
+      source.isDynamicDim(source.getRank() - 1) ||
+      source.getShape().back() != 2)
+    return false;
+  const target::IndexTerm &term = relation->back();
+  return term.kind == "static_index" && term.staticValues.size() == 1 &&
+         term.staticValues.front() &&
+         (*term.staticValues.front() == 0 || *term.staticValues.front() == 1);
+}
+
 std::optional<DescriptorAffineExpression> descriptorAffineExpression(
     Value value, const target::KernelFacts &facts, Operation &consumer,
     llvm::DenseSet<Value> &active) {
@@ -622,20 +639,39 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   for (intent::plan::ReductionOp reduction :
        program.getBody().getOps<intent::plan::ReductionOp>()) {
     if (reduction->hasAttr(reductionLoweringAttr) ||
-        reduction->hasAttr(reductionAxisAttr))
+        reduction->hasAttr(reductionAxisAttr) ||
+        reduction->hasAttr(reductionAllAxesAttr))
       return reduction.emitOpError("already has a Triton reduction spelling");
     Operation *operation = kernel.nodes.lookup(reduction.getNode());
     FailureOr<std::string> role =
         operation ? target::lowering::reductionRole(*operation)
                   : FailureOr<std::string>(failure());
-    FailureOr<int64_t> axis =
-        operation ? target::lowering::reductionAxis(*operation)
-                  : FailureOr<int64_t>(failure());
-    if (failed(role) || failed(axis))
+    FailureOr<SmallVector<int64_t>> axes =
+        operation ? target::lowering::reductionAxes(*operation)
+                  : FailureOr<SmallVector<int64_t>>(failure());
+    if (failed(role) || failed(axes))
       return reduction.emitOpError("does not bind canonical reduction semantics");
     reduction->setAttr(reductionLoweringAttr,
                        builder.getStringAttr(syntax::reduction(*role)));
-    reduction->setAttr(reductionAxisAttr, builder.getI64IntegerAttr(*axis));
+    if (axes->size() == 1) {
+      reduction->setAttr(reductionAxisAttr,
+                         builder.getI64IntegerAttr(axes->front()));
+      continue;
+    }
+    auto input = operation && operation->getNumOperands() > 0
+                     ? dyn_cast<RankedTensorType>(
+                           operation->getOperand(0).getType())
+                     : RankedTensorType();
+    SmallVector<int64_t> sorted(*axes);
+    llvm::sort(sorted);
+    bool coversInput = input &&
+                       sorted.size() == static_cast<size_t>(input.getRank());
+    for (auto [position, axis] : llvm::enumerate(sorted))
+      coversInput &= axis == static_cast<int64_t>(position);
+    if (!coversInput)
+      return reduction.emitOpError(
+          "Triton supports multi-axis reduction only across all input axes");
+    reduction->setAttr(reductionAllAxesAttr, builder.getUnitAttr());
   }
   for (intent::plan::ScanOp scan :
        program.getBody().getOps<intent::plan::ScanOp>()) {
@@ -665,11 +701,17 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       if (*gather == "fragment_projection")
         return pointwise.emitOpError(
             "Triton fragment projection form is not materialized");
+      if (*gather == "static_projection" &&
+          !isStaticSplitProjection(*operation))
+        return pointwise.emitOpError(
+            "Triton static projection requires the final dimension to be a two-component split");
       gatherForm = std::move(*gather);
     }
     FailureOr<std::string> role =
-        operation ? target::lowering::pointwiseRole(*operation)
-                  : FailureOr<std::string>(failure());
+        gatherForm == "static_projection"
+            ? FailureOr<std::string>(std::string("static_projection"))
+            : operation ? target::lowering::pointwiseRole(*operation)
+                        : FailureOr<std::string>(failure());
     FailureOr<StringRef> lowering =
         succeeded(role) ? syntax::pointwise(operation, *role)
                         : FailureOr<StringRef>(failure());
@@ -840,7 +882,9 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
        program.getBody().getOps<intent::plan::ReductionOp>()) {
     auto lowering = reduction->getAttrOfType<StringAttr>(reductionLoweringAttr);
     auto axis = reduction->getAttrOfType<IntegerAttr>(reductionAxisAttr);
-    if (!lowering || lowering.getValue().empty() || !axis || axis.getInt() < 0 ||
+    bool allAxes = reduction->hasAttr(reductionAllAxesAttr);
+    bool validAxis = (axis && axis.getInt() >= 0) != allAxes;
+    if (!lowering || lowering.getValue().empty() || !validAxis ||
         !kernel.nodes.lookup(reduction.getNode()))
       return reduction.emitOpError("has no complete Triton reduction spelling");
   }

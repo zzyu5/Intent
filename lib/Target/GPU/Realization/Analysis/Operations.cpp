@@ -33,8 +33,20 @@ bool isLiteralBool(Value value, bool expected) {
 LogicalResult validateReduction(Operation &operation) {
   auto combine = operation.getAttrOfType<StringAttr>("intent.combine");
   auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
-  if (!axes || axes.size() != 1 || !isa<IntegerAttr>(axes[0]))
-    return operation.emitOpError("has no canonical single-axis reduction");
+  auto input = operation.getNumOperands() > 0
+                   ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                   : RankedTensorType();
+  SmallVector<bool> covered(input ? input.getRank() : 0, false);
+  if (!input || !axes || axes.empty())
+    return operation.emitOpError("has no canonical reduction axes");
+  for (Attribute attribute : axes) {
+    auto axis = dyn_cast<IntegerAttr>(attribute);
+    if (!axis || axis.getInt() < 0 || axis.getInt() >= input.getRank() ||
+        covered[axis.getInt()])
+      return operation.emitOpError(
+          "has invalid or duplicate canonical reduction axes");
+    covered[axis.getInt()] = true;
+  }
   if (target::lowering::hasGenericCombiner(operation))
     return success();
   if (!combine)
@@ -43,10 +55,10 @@ LogicalResult validateReduction(Operation &operation) {
     return success();
   if (combine.getValue() == "logical_or" ||
       combine.getValue() == "logical_and") {
-    auto input = operation.getNumOperands() == 2
-                     ? dyn_cast<RankedTensorType>(
-                           operation.getOperand(0).getType())
-                     : RankedTensorType();
+    auto logicalInput = operation.getNumOperands() == 2
+                            ? dyn_cast<RankedTensorType>(
+                                  operation.getOperand(0).getType())
+                            : RankedTensorType();
     Type result = operation.getNumResults() == 1
                       ? operation.getResult(0).getType()
                       : Type();
@@ -54,7 +66,7 @@ LogicalResult validateReduction(Operation &operation) {
     if (auto tensor = dyn_cast<RankedTensorType>(result))
       resultElement = tensor.getElementType();
     bool identity = combine.getValue() == "logical_and";
-    if (input && input.getElementType().isInteger(1) && resultElement &&
+    if (logicalInput && logicalInput.getElementType().isInteger(1) && resultElement &&
         resultElement.isInteger(1) &&
         isLiteralBool(operation.getOperand(1), identity))
       return success();
@@ -386,6 +398,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 });
             bool fragmentProjection =
                 target::isFragmentProjection(operation, *relation);
+            bool staticFragmentProjection =
+                target::isStaticFragmentProjection(operation, *relation);
             auto sourceType = dyn_cast<RankedTensorType>(
                 operation.getNumOperands() > 0
                     ? operation.getOperand(0).getType()
@@ -399,6 +413,7 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 relation->front().staticValues.front() &&
                 *relation->front().staticValues.front() == 0;
             if (!expand && !indirect && !fragmentProjection &&
+                !staticFragmentProjection &&
                 !extractFirstScalar)
               return operation.emitOpError(
                   "has no mechanical GPU gather realization");

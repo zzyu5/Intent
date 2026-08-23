@@ -12,22 +12,19 @@ HALF_DIMENSION = HEAD_DIMENSION // 2
 
 @intent.kernel
 def padded_rope_cache_update(
-    query: I.In[I.f16, ("B", QUERY_HEADS, HEAD_DIMENSION)],
-    key: I.In[I.f16, ("B", KV_HEADS, HEAD_DIMENSION)],
-    value: I.In[I.f16, ("B", KV_HEADS, HEAD_DIMENSION)],
+    packed_input: I.In[
+        I.f16, ("B", QUERY_HEADS + 2 * KV_HEADS, HEAD_DIMENSION)
+    ],
     sequence_lengths: I.In[I.i32, ("B",)],
-    query_output: I.Out[I.f16, ("B", QUERY_HEADS, HEAD_DIMENSION)],
-    key_cache: I.InOut[
-        I.f16, ("B", CACHE_LENGTH + 1, KV_HEADS, HEAD_DIMENSION)
-    ],
-    value_cache: I.InOut[
-        I.f16, ("B", CACHE_LENGTH + 1, KV_HEADS, HEAD_DIMENSION)
-    ],
+    output_storage: I.InOut[I.f16, ("O", HEAD_DIMENSION)],
     theta: I.f32,
     linear_scale: I.f32,
 ):
-    B = query.shape[0]
+    B = packed_input.shape[0]
     halves = I.domain(0, HALF_DIMENSION)
+    half_indices = I.indices(halves)
+    query_rows = B * QUERY_HEADS
+    cache_rows = B * (CACHE_LENGTH + 1) * KV_HEADS
     for batch, head in I.parallel(
         (
             I.domain(0, B),
@@ -40,40 +37,45 @@ def padded_rope_cache_update(
         angle = I.cast(position, I.f32) * frequencies / linear_scale
         cos = I.cos(angle)
         sin = I.sin(angle)
-        if head < QUERY_HEADS:
-            first = I.cast(query[batch, head, halves], I.f32)
-            second = I.cast(
-                query[batch, head, I.indices(halves) + HALF_DIMENSION],
-                I.f32,
+        valid_head = head < QUERY_HEADS + 2 * KV_HEADS
+        first = I.cast(
+            I.mask(
+                packed_input[batch, head, halves],
+                valid=valid_head,
+                fill=0.0,
+            ),
+            I.f32,
+        )
+        second = I.cast(
+            I.mask(
+                packed_input[batch, head, half_indices + HALF_DIMENSION],
+                valid=valid_head,
+                fill=0.0,
+            ),
+            I.f32,
+        )
+        rotated_first = first * cos - second * sin
+        rotated_second = second * cos + first * sin
+        is_query = head < QUERY_HEADS
+        is_value = head >= QUERY_HEADS + KV_HEADS
+        cache_row = (batch * (CACHE_LENGTH + 1) + position) * KV_HEADS
+        key_cache_row = cache_row + head - QUERY_HEADS
+        value_cache_row = cache_row + head - QUERY_HEADS - KV_HEADS
+        output_row = (
+            batch * QUERY_HEADS + head
+            if is_query
+            else (
+                query_rows + cache_rows + value_cache_row
+                if is_value
+                else query_rows + key_cache_row
             )
-            query_output[batch, head, halves] = I.cast(
-                first * cos - second * sin, I.f16
-            )
-            query_output[
-                batch, head, I.indices(halves) + HALF_DIMENSION
-            ] = I.cast(second * cos + first * sin, I.f16)
-        elif head < QUERY_HEADS + KV_HEADS:
-            key_head = head - QUERY_HEADS
-            first = I.cast(key[batch, key_head, halves], I.f32)
-            second = I.cast(
-                key[
-                    batch,
-                    key_head,
-                    I.indices(halves) + HALF_DIMENSION,
-                ],
-                I.f32,
-            )
-            key_cache[batch, position, key_head, halves] = I.cast(
-                first * cos - second * sin, I.f16
-            )
-            key_cache[
-                batch,
-                position,
-                key_head,
-                I.indices(halves) + HALF_DIMENSION,
-            ] = I.cast(second * cos + first * sin, I.f16)
-        else:
-            value_head = head - QUERY_HEADS - KV_HEADS
-            value_cache[batch, position, value_head, :] = value[
-                batch, value_head, :
-            ]
+        )
+        I.assume_in_bounds(output_row, output_storage, axis=0)
+        output_storage[output_row, halves] = I.cast(
+            first if is_value else rotated_first,
+            I.f16,
+        )
+        output_storage[output_row, half_indices + HALF_DIMENSION] = I.cast(
+            second if is_value else rotated_second,
+            I.f16,
+        )

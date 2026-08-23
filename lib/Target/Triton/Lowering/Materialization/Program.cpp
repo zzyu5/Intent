@@ -247,13 +247,15 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   for (intent::plan::ReductionOp value : reductions) {
     auto lowering = value->getAttrOfType<StringAttr>(reductionLoweringAttr);
     auto axis = value->getAttrOfType<IntegerAttr>(reductionAxisAttr);
-    if (!lowering || !axis)
+    bool allAxes = value->hasAttr(reductionAllAxesAttr);
+    if (!lowering || (static_cast<bool>(axis) == allAxes))
       return value.emitOpError("has no realized Triton reduction spelling");
     plan::ReductionOp binding;
     binding.operation = value;
     binding.lowering = lowering.getValue().str();
     binding.resultSpace = value.getResultSpace().str();
-    binding.axis = axis.getInt();
+    binding.axis = axis ? axis.getInt() : -1;
+    binding.allAxes = allAxes;
     index.reductions[value.getNode()] = binding;
   }
   for (intent::plan::ScanOp value : scans) {

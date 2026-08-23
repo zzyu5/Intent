@@ -137,7 +137,8 @@ LogicalResult AxisOp::verify() {
     StringRef role = cast<StringAttr>(attribute).getValue();
     if (role != "parallel" && role != "ordered" && role != "reduction" &&
         role != "ragged_member" && role != "lane" &&
-        role != "packed_lane" && role != "contraction_m" &&
+        role != "packed_lane" && role != "pointwise_1d" &&
+        role != "contraction_m" &&
         role != "contraction_n")
       return emitOpError() << "contains unsupported axis role " << role;
   }

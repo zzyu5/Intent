@@ -525,6 +525,173 @@ def paged_mla_decode(
 
 
 @intent.kernel
+def paged_mla_decode_partials(
+    q_latent: I.In[I.f16, ("B", "HQ", "C")],
+    q_rope: I.In[I.f16, ("B", "HQ", "DR")],
+    latent_cache: I.In[I.f16, ("PT", "HK", "C")],
+    rope_cache: I.In[I.f16, ("PT", "HK", "DR")],
+    page_offsets: I.In[I.i32, ("B_PLUS_1",)],
+    page_indices: I.In[I.i32, ("S",)],
+    sequence_lengths: I.In[I.i32, ("B",)],
+    split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
+    partial_lse: I.Out[I.f32, ("B", "HQ", "SPLITS")],
+    partial_output: I.Out[I.f32, ("B", "HQ", "SPLITS", "C")],
+    scale: I.f32,
+    PAGE_SIZE: I.Constexpr[int],
+    HEAD_GROUP: I.Constexpr[int],
+    HEAD_TILE: I.Constexpr[int],
+    SPLITS: I.Constexpr[int],
+    BATCH_SIZE: I.Constexpr[int],
+):
+    B, HQ, C = q_latent.shape
+    DR = q_rope.shape[-1]
+    cache_tokens, HK, _ = latent_cache.shape
+    split_tokens = I.ragged(
+        outer=I.domain(0, BATCH_SIZE * SPLITS),
+        members=I.domain(0, cache_tokens),
+        offsets=split_offsets,
+    )
+    local_query_heads = I.domain(0, HEAD_GROUP)
+    for job in I.parallel(split_tokens.outer):
+        batch = job // SPLITS
+        split = job % SPLITS
+        I.assume_in_bounds(batch, q_latent, axis=0)
+        I.assume_in_bounds(batch, q_rope, axis=0)
+        I.assume_in_bounds(batch, page_offsets, axis=0)
+        I.assume_in_bounds(batch, sequence_lengths, axis=0)
+        page_begin = I.cast(page_offsets[batch], I.index)
+        sequence_length = I.cast(sequence_lengths[batch], I.index)
+        batch_token_begin = I.cast(split_offsets[batch * SPLITS], I.index)
+        for key_head in I.parallel(I.domain(0, HK)):
+            I.assume_in_bounds(key_head, latent_cache, axis=1)
+            I.assume_in_bounds(key_head, rope_cache, axis=1)
+            for query_region in I.parallel(
+                I.partition(local_query_heads, extent=HEAD_TILE)
+            ):
+                query_heads = key_head * HEAD_GROUP + I.indices(query_region)
+                I.assume_in_bounds(query_heads, q_latent, axis=1)
+                I.assume_in_bounds(query_heads, q_rope, axis=1)
+                latent_query = I.gather(
+                    q_latent,
+                    index=(batch, query_heads, slice(None)),
+                )
+                rope_query = I.gather(
+                    q_rope,
+                    index=(batch, query_heads, slice(None)),
+                )
+                selected_tokens = split_tokens[job]
+                stream = I.state_stream(
+                    selected_tokens,
+                    extent=I.auto("K_TILE"),
+                    init=(
+                        I.full((query_region,), -I.inf, dtype=I.f32),
+                        I.zeros((query_region,), dtype=I.f32),
+                        I.zeros((query_region, C), dtype=I.f32),
+                    ),
+                    stop=I.end(selected_tokens),
+                )
+                with stream:
+                    for token_region, (
+                        maximum,
+                        denominator,
+                        accumulator,
+                    ) in stream:
+                        logical_token = I.indices(token_region) - batch_token_begin
+                        token_valid = logical_token < sequence_length
+                        page_slot = page_begin + logical_token // PAGE_SIZE
+                        I.assume_in_bounds(page_slot, page_indices, axis=0)
+                        physical_page = I.cast(page_indices[page_slot], I.index)
+                        page_token = logical_token % PAGE_SIZE
+                        physical_token = physical_page * PAGE_SIZE + page_token
+                        I.assume_in_bounds(physical_token, latent_cache, axis=0)
+                        I.assume_in_bounds(physical_token, rope_cache, axis=0)
+                        latent_block = I.gather(
+                            latent_cache,
+                            index=(
+                                physical_token,
+                                key_head,
+                                slice(None),
+                            ),
+                        )
+                        rope_block = I.gather(
+                            rope_cache,
+                            index=(
+                                physical_token,
+                                key_head,
+                                slice(None),
+                            ),
+                        )
+                        scores = I.mask(
+                            (
+                                I.contract(
+                                    latent_query,
+                                    latent_block,
+                                    reduce=((1, 1),),
+                                    acc_dtype=I.f32,
+                                )
+                                + I.contract(
+                                    rope_query,
+                                    rope_block,
+                                    reduce=((1, 1),),
+                                    acc_dtype=I.f32,
+                                )
+                            )
+                            * scale,
+                            valid=token_valid[None, :],
+                            fill=-I.inf,
+                        )
+                        local_maximum = I.reduce.max(
+                            scores, axis=1, identity=-I.inf
+                        )
+                        next_maximum = I.maximum(maximum, local_maximum)
+                        safe_maximum = I.mask(
+                            next_maximum,
+                            valid=next_maximum != -I.inf,
+                            fill=0.0,
+                        )
+                        old_scale = I.exp(maximum - safe_maximum)
+                        probability = I.exp(scores - safe_maximum[:, None])
+                        next_denominator = (
+                            old_scale * denominator
+                            + I.reduce.sum(
+                                probability,
+                                axis=1,
+                                identity=0.0,
+                            )
+                        )
+                        next_accumulator = (
+                            old_scale[:, None] * accumulator
+                            + I.contract(
+                                I.cast(probability, I.f16),
+                                latent_block,
+                                reduce=((1, 0),),
+                                acc_dtype=I.f32,
+                            )
+                        )
+                        stream.yield_(
+                            next_maximum,
+                            next_denominator,
+                            next_accumulator,
+                        )
+                maximum, denominator, accumulator = stream.result
+                safe_denominator = I.mask(
+                    denominator,
+                    valid=denominator > 0.0,
+                    fill=1.0,
+                )
+                I.scatter_unique(
+                    partial_lse,
+                    index=(batch, query_heads, split),
+                    value=maximum + I.log(safe_denominator),
+                )
+                I.scatter_unique(
+                    partial_output,
+                    index=(batch, query_heads, split, slice(None)),
+                    value=accumulator / safe_denominator[:, None],
+                )
+
+
+@intent.kernel
 def absorbed_mla_decode(
     q_latent: I.In[I.f16, ("B", "H", "C")],
     q_rope: I.In[I.f16, ("B", "H", "DR")],

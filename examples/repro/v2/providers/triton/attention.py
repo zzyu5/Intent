@@ -10,10 +10,11 @@ from kernels.backward.attention import attention_backward_dq
 from kernels.streaming.attention import flash_attention_fwd
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_combine
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
-from kernels.streaming.mla import paged_mla_decode
-from kernels.streaming.paged_attention import paged_gqa_decode_attention
+from kernels.streaming.mla import paged_mla_decode_partials
 from kernels.streaming.paged_attention import paged_gqa_decode_partials
 from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce
+from kernels.streaming.splitk_reduce import splitk_attention_bf16_to_f16_reduce
+from kernels.streaming.splitk_reduce import splitk_attention_f32_to_f16_reduce
 from kernels.routing.mqa_logits import fp8_mqa_logits
 
 from ...loading import load_module
@@ -142,6 +143,7 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
     batch, query_heads, kv_heads, dimension = 16, 32, 8, 128
     sequence, page_size, splits = 8192, 16, 8
     pages_per_sequence = sequence // page_size
+    pages_per_split = pages_per_sequence // splits
     pages = batch * pages_per_sequence
     q = torch.randn(
         (batch, query_heads, dimension), device="cuda", dtype=torch.float16
@@ -160,14 +162,21 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         device="cuda",
         dtype=torch.int32,
     )
+    split_offsets = torch.arange(
+        0,
+        pages + 1,
+        pages_per_split,
+        device="cuda",
+        dtype=torch.int32,
+    )
     page_table = page_indices.view(batch, pages_per_sequence)
     lengths = torch.full(
         (batch,), sequence, device="cuda", dtype=torch.int32
     )
     scale = dimension**-0.5
-    _, generated = compile_single(
+    _, partials = compile_single(
         context,
-        paged_gqa_decode_attention,
+        paged_gqa_decode_partials,
         (
             q,
             key_cache,
@@ -175,10 +184,28 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
             page_offsets,
             page_indices,
             lengths,
+            split_offsets,
             scale,
         ),
-        constexprs={"PAGE_SIZE": page_size, "HEAD_GROUP": query_heads // kv_heads},
+        constexprs={
+            "PAGE_SIZE": page_size,
+            "HEAD_GROUP": query_heads // kv_heads,
+            "SPLITS": splits,
+            "BATCH_SIZE": batch,
+        },
     )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_bf16_to_f16_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(generated_launch, reduction.outputs)
     runtime = load_module(
         context.project_root
         / "source/triton/vllm/attention/paged_decode/paged_gqa_decode_runtime.py",
@@ -319,6 +346,7 @@ def paged_mla(context: Context) -> PreparedComparison:
     key_dimension = latent_dimension + rope_dimension
     page_size, splits = 16, 8
     pages_per_sequence = sequence // page_size
+    tokens_per_split = sequence // splits
     pages = batch * pages_per_sequence
     q_latent = torch.randn(
         (batch, query_heads, latent_dimension),
@@ -352,22 +380,48 @@ def paged_mla(context: Context) -> PreparedComparison:
     lengths = torch.full(
         (batch,), sequence, device="cuda", dtype=torch.int32
     )
+    split_offsets = torch.arange(
+        0,
+        batch * sequence + 1,
+        tokens_per_split,
+        device="cuda",
+        dtype=torch.int32,
+    )
     scale = key_dimension**-0.5
-    _, generated = compile_single(
+    _, partials = compile_single(
         context,
-        paged_mla_decode,
+        paged_mla_decode_partials,
         (
             q_latent,
             q_rope,
-            latent_cache,
-            rope_cache,
+            latent_cache.view(pages * page_size, kv_heads, latent_dimension),
+            rope_cache.view(pages * page_size, kv_heads, rope_dimension),
             page_offsets,
             page_indices,
             lengths,
+            split_offsets,
             scale,
         ),
-        constexprs={"PAGE_SIZE": page_size, "HEAD_GROUP": query_heads // kv_heads},
+        constexprs={
+            "PAGE_SIZE": page_size,
+            "HEAD_GROUP": query_heads // kv_heads,
+            "HEAD_TILE": 16,
+            "SPLITS": splits,
+            "BATCH_SIZE": batch,
+        },
     )
+    partial_lse, partial_output = partials.outputs()
+    _, reduction = compile_single(
+        context,
+        splitk_attention_f32_to_f16_reduce,
+        (partial_output, partial_lse),
+    )
+
+    def generated_launch():
+        partials.launch()
+        reduction.launch()
+
+    generated = PreparedLaunch(generated_launch, reduction.outputs)
     runtime = load_module(
         context.project_root
         / "source/triton/vllm/attention/paged_decode/paged_mla_decode_runtime.py",

@@ -1530,6 +1530,9 @@ LogicalResult ProgramMaterializer::emitReduction(Operation &operation) {
       return failure();
     operands.push_back(operand->str());
   }
+  std::string axis = binding.getAllAxes()
+                         ? std::string("None")
+                         : std::to_string(binding.getAxis());
   if (binding.getLowering() == "tl.max_with_index") {
     FailureOr<StringRef> indexIdentity = lookupValue(operation, 3);
     if (operation.getNumResults() != 2 || operands.size() != 2 ||
@@ -1540,7 +1543,6 @@ LogicalResult ProgramMaterializer::emitReduction(Operation &operation) {
     std::string index = makeResultName(operation, 1);
     std::string valueKeepDims = value + "_keep_dims";
     std::string candidates = index + "_candidates";
-    std::string axis = std::to_string(binding.getAxis());
     StringRef indexDtype = tritonDtype(operation.getResult(1).getType());
     if (indexDtype.empty())
       return operation.emitOpError("has an unsupported arg-reduction index type");
@@ -1591,9 +1593,8 @@ LogicalResult ProgramMaterializer::emitReduction(Operation &operation) {
     std::string input = projectedInputs.size() == 1
                             ? projectedInputs.front()
                             : "(" + llvm::join(projectedInputs, ", ") + ")";
-    line(llvm::join(projectedResults, ", ") + " = tl.reduce(" + input + ", axis=" +
-         std::to_string(binding.getAxis()) + ", combine_fn=" +
-         function + ")");
+    line(llvm::join(projectedResults, ", ") + " = tl.reduce(" + input +
+         ", axis=" + axis + ", combine_fn=" + function + ")");
     for (auto [index, result] : llvm::enumerate(results))
       bindResult(operation, index, result);
     return success();
@@ -1605,10 +1606,10 @@ LogicalResult ProgramMaterializer::emitReduction(Operation &operation) {
     std::string result = makeResultName(operation, component);
     if (binding.getLowering() == "tl.reduce_all")
       line(result + " = ~tl.reduce_or(~(" + operands[component] + "), axis=" +
-         std::to_string(binding.getAxis()) + ")");
+           axis + ")");
     else
       line(result + " = " + binding.getLowering().str() + "(" + operands[component] +
-         ", axis=" + std::to_string(binding.getAxis()) + ")");
+           ", axis=" + axis + ")");
     bindResult(operation, component, result);
   }
   return success();
@@ -2399,6 +2400,39 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     std::string result = makeResultName(operation, 0);
     line(result + " = tl.sum(tl.gather(" + source->str() +
          ", tl.full((1,), 0, tl.int32), axis=0), axis=0)");
+    bindResult(operation, 0, result);
+    return success();
+  }
+  if (form == "static_projection" && succeeded(relation)) {
+    FailureOr<StringRef> source = lookupValue(operation, 0);
+    auto sourceType = operation.getNumOperands() > 0
+                          ? dyn_cast<RankedTensorType>(
+                                operation.getOperand(0).getType())
+                          : RankedTensorType();
+    bool supported = succeeded(source) &&
+                     target::isStaticFragmentProjection(operation, *relation) &&
+                     sourceType && sourceType.getRank() > 0 &&
+                     !sourceType.isDynamicDim(sourceType.getRank() - 1) &&
+                     sourceType.getShape().back() == 2;
+    std::optional<int64_t> component;
+    for (auto [axis, term] : llvm::enumerate(*relation)) {
+      if (term.kind == "full_slice")
+        continue;
+      if (term.kind != "static_index" || term.staticValues.size() != 1 ||
+          !term.staticValues.front() ||
+          !sourceType || axis + 1 != static_cast<unsigned>(sourceType.getRank()) ||
+          (*term.staticValues.front() != 0 && *term.staticValues.front() != 1)) {
+        supported = false;
+        continue;
+      }
+      component = *term.staticValues.front();
+    }
+    if (!supported || !component)
+      return operation.emitOpError(
+          "has no mechanical Triton static fragment projection");
+    std::string result = makeResultName(operation, 0);
+    line(result + " = tl.split(" + source->str() + ")[" +
+         std::to_string(*component) + "]");
     bindResult(operation, 0, result);
     return success();
   }

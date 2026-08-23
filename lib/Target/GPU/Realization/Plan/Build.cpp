@@ -329,12 +329,21 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     FailureOr<int64_t> node =
         target::getNodeID(operation, "reduction binding");
     auto axes = operation.getAttrOfType<ArrayAttr>("intent.axes");
-    auto axis = axes && axes.size() == 1 ? dyn_cast<IntegerAttr>(axes[0])
-                                         : IntegerAttr();
-    if (failed(node) || !axis)
+    auto input = operation.getNumOperands() > 0
+                     ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                     : RankedTensorType();
+    SmallVector<unsigned> reductionAxes;
+    SmallVector<bool> covered(input ? input.getRank() : 0, false);
+    if (failed(node) || !input || !axes || axes.empty())
       return failure();
-    if (axis.getInt() < 0)
-      return operation.emitOpError("has a negative reduction axis");
+    for (Attribute attribute : axes) {
+      auto axis = dyn_cast<IntegerAttr>(attribute);
+      if (!axis || axis.getInt() < 0 || axis.getInt() >= input.getRank() ||
+          covered[axis.getInt()])
+        return operation.emitOpError("has an invalid or duplicate reduction axis");
+      covered[axis.getInt()] = true;
+      reductionAxes.push_back(static_cast<unsigned>(axis.getInt()));
+    }
     auto components =
         operation.getAttrOfType<IntegerAttr>("intent.component_count");
     auto captures =
@@ -357,8 +366,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
           return operation.emitOpError(
               "cannot realize reduction-lane padding without a literal identity");
         if (failed(paddingState.require(
-                operation.getOperand(component),
-                {static_cast<unsigned>(axis.getInt())}, *identityPadding,
+                operation.getOperand(component), reductionAxes, *identityPadding,
                 operation)))
           return failure();
       }
@@ -367,8 +375,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
     StringRef combine = combineAttr ? combineAttr.getValue() : StringRef();
     if (combine == "maximum" &&
         failed(paddingState.require(
-            operation.getOperand(0),
-            {static_cast<unsigned>(axis.getInt())}, "negative_infinity",
+            operation.getOperand(0), reductionAxes, "negative_infinity",
             operation)))
       return failure();
     builder.create<intent::plan::ReductionOp>(

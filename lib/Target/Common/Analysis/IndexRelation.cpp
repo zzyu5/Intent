@@ -153,6 +153,36 @@ bool isFragmentProjection(Operation &operation,
   return projectedAxes == 1;
 }
 
+bool isStaticFragmentProjection(Operation &operation,
+                                ArrayRef<IndexTerm> relation) {
+  auto source = operation.getNumOperands() > 0
+                    ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                    : RankedTensorType();
+  auto result = operation.getNumResults() == 1
+                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                    : RankedTensorType();
+  if (!source || !result || source.getRank() != result.getRank() + 1 ||
+      relation.size() != static_cast<size_t>(source.getRank()))
+    return false;
+  unsigned projectedAxes = 0;
+  SmallVector<int64_t> projectedShape;
+  for (auto [axis, term] : llvm::enumerate(relation)) {
+    if (term.kind == "full_slice") {
+      projectedShape.push_back(source.getDimSize(axis));
+      continue;
+    }
+    if (term.kind != "static_index" || term.staticValues.size() != 1 ||
+        !term.staticValues.front())
+      return false;
+    int64_t index = *term.staticValues.front();
+    if (index < 0 || source.isDynamicDim(axis) ||
+        index >= source.getDimSize(axis))
+      return false;
+    ++projectedAxes;
+  }
+  return projectedAxes == 1 && projectedShape == result.getShape();
+}
+
 Operation *resolveStructuralDomain(Value value) {
   return structuralDomainImpl(value);
 }

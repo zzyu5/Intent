@@ -130,3 +130,83 @@ def splitk_attention_weighted_sum_reduce(
                 numerator / denominator,
                 I.bf16,
             )
+
+
+@intent.kernel
+def splitk_attention_bf16_to_f16_reduce(
+    partial: I.In[I.bf16, ("B", "H", "S", "D")],
+    partial_lse: I.In[I.f32, ("B", "H", "S")],
+    output: I.Out[I.f16, ("B", "H", "D")],
+):
+    B, H, S, D = partial.shape
+    splits = I.domain(0, S)
+    dimensions = I.domain(0, D)
+    for batch in I.parallel(I.domain(0, B)):
+        for head in I.parallel(I.domain(0, H)):
+            lse = partial_lse[batch, head, splits]
+            maximum = I.reduce.max(
+                lse,
+                axis=0,
+                identity=-I.inf,
+                acc_dtype=I.f32,
+            )
+            weights = I.exp2(lse - maximum)
+            denominator = I.reduce.sum(
+                weights,
+                axis=0,
+                identity=0.0,
+                acc_dtype=I.f32,
+            )
+            weighted = I.cast(
+                partial[batch, head, splits, dimensions], I.f32
+            ) * I.reshape(weights, (S, 1))
+            numerator = I.reduce.sum(
+                weighted,
+                axis=0,
+                identity=0.0,
+                acc_dtype=I.f32,
+            )
+            output[batch, head, dimensions] = I.cast(
+                numerator / denominator,
+                I.f16,
+            )
+
+
+@intent.kernel
+def splitk_attention_f32_to_f16_reduce(
+    partial: I.In[I.f32, ("B", "H", "S", "D")],
+    partial_lse: I.In[I.f32, ("B", "H", "S")],
+    output: I.Out[I.f16, ("B", "H", "D")],
+):
+    B, H, S, D = partial.shape
+    splits = I.domain(0, S)
+    dimensions = I.domain(0, D)
+    for batch in I.parallel(I.domain(0, B)):
+        for head in I.parallel(I.domain(0, H)):
+            lse = partial_lse[batch, head, splits]
+            maximum = I.reduce.max(
+                lse,
+                axis=0,
+                identity=-I.inf,
+                acc_dtype=I.f32,
+            )
+            weights = I.exp(lse - maximum)
+            denominator = I.reduce.sum(
+                weights,
+                axis=0,
+                identity=0.0,
+                acc_dtype=I.f32,
+            )
+            weighted = partial[batch, head, splits, dimensions] * I.reshape(
+                weights, (S, 1)
+            )
+            numerator = I.reduce.sum(
+                weighted,
+                axis=0,
+                identity=0.0,
+                acc_dtype=I.f32,
+            )
+            output[batch, head, dimensions] = I.cast(
+                numerator / denominator,
+                I.f16,
+            )

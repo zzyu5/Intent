@@ -173,6 +173,29 @@ reductionAxis(mlir::Operation &operation) {
 }
 
 inline mlir::FailureOr<llvm::SmallVector<int64_t>>
+reductionAxes(mlir::Operation &operation) {
+  auto input = operation.getNumOperands() > 0
+                   ? mlir::dyn_cast<mlir::RankedTensorType>(
+                         operation.getOperand(0).getType())
+                   : mlir::RankedTensorType();
+  auto attributes = operation.getAttrOfType<mlir::ArrayAttr>("intent.axes");
+  if (!input || !attributes || attributes.empty())
+    return operation.emitOpError("has no canonical reduction axes");
+  llvm::SmallVector<bool> covered(input.getRank(), false);
+  llvm::SmallVector<int64_t> axes;
+  for (mlir::Attribute attribute : attributes) {
+    auto axis = mlir::dyn_cast<mlir::IntegerAttr>(attribute);
+    if (!axis || axis.getInt() < 0 || axis.getInt() >= input.getRank() ||
+        covered[axis.getInt()])
+      return operation.emitOpError(
+          "has invalid or duplicate canonical reduction axes");
+    covered[axis.getInt()] = true;
+    axes.push_back(axis.getInt());
+  }
+  return axes;
+}
+
+inline mlir::FailureOr<llvm::SmallVector<int64_t>>
 transposePermutation(mlir::Operation &operation) {
   auto result = operation.getNumResults() == 1
                     ? mlir::dyn_cast<mlir::RankedTensorType>(
@@ -336,6 +359,11 @@ inline bool feedsContraction(mlir::Operation &operation) {
 
 inline mlir::FailureOr<std::string>
 classifyGatherProjection(mlir::Operation &operation) {
+  mlir::FailureOr<llvm::SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (mlir::succeeded(relation) &&
+      target::isStaticFragmentProjection(operation, *relation))
+    return std::string("static_projection");
   mlir::FailureOr<std::string> role = pointwiseRole(operation);
   if (mlir::failed(role))
     return mlir::failure();
@@ -894,11 +922,13 @@ struct ReductionBinding : Binding<intent::plan::ReductionOp> {
   std::string lowering;
   std::string resultSpace;
   int64_t axis = -1;
+  bool allAxes = false;
   bool keepDims = false;
 
   int64_t getNode() const { return operation.getNode(); }
   llvm::StringRef getLowering() const { return lowering; }
   int64_t getAxis() const { return axis; }
+  bool getAllAxes() const { return allAxes; }
   bool getKeepDims() const { return keepDims; }
   llvm::StringRef getResultSpace() const { return resultSpace; }
 };

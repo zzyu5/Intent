@@ -44,6 +44,9 @@ TensorIndexGroup tensorIndexGroup(mlir::Operation &operation,
 bool isFragmentProjection(mlir::Operation &operation,
                           llvm::ArrayRef<IndexTerm> relation);
 
+bool isStaticFragmentProjection(mlir::Operation &operation,
+                                llvm::ArrayRef<IndexTerm> relation);
+
 mlir::FailureOr<ScalarIndexSource>
 traceScalarIndexSource(mlir::Value value, mlir::Operation &consumer);
 

@@ -34,14 +34,14 @@ def shifted_row_copy(
 
 @intent.kernel
 def roll_rows_forward(
-    x: I.In[I.f16, ("M", "N")],
-    output: I.Out[I.f16, ("M", "N")],
+    x: I.In[I.f16, ("T",)],
+    output: I.Out[I.f16, ("T",)],
+    ROW_WIDTH: I.Constexpr[int],
 ):
-    M, N = x.shape
-    rows = I.domain(0, M)
-    columns = I.domain(0, N)
-    source_rows = (I.indices(rows) + 1) % M
-    output[rows, columns] = x[source_rows, columns]
+    T = x.shape[0]
+    elements = I.domain(0, T)
+    source = (I.indices(elements) + ROW_WIDTH) % T
+    output[elements] = x[source]
 
 
 @intent.kernel

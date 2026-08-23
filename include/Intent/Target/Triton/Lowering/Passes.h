@@ -23,6 +23,8 @@ inline constexpr llvm::StringLiteral reductionLoweringAttr =
     "intent_plan.triton.reduction_lowering";
 inline constexpr llvm::StringLiteral reductionAxisAttr =
     "intent_plan.triton.reduction_axis";
+inline constexpr llvm::StringLiteral reductionAllAxesAttr =
+    "intent_plan.triton.reduction_all_axes";
 inline constexpr llvm::StringLiteral scanLoweringAttr =
     "intent_plan.triton.scan_lowering";
 inline constexpr llvm::StringLiteral pointwiseLoweringAttr =

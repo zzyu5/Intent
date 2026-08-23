@@ -1,6 +1,8 @@
 #ifndef INTENT_TARGET_COMMON_ANALYSIS_RECORD_H
 #define INTENT_TARGET_COMMON_ANALYSIS_RECORD_H
 
+#include "Intent/Target/Common/Analysis/Operation.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
@@ -18,8 +20,7 @@ resolveRecordField(mlir::Operation &extract) {
           : nullptr;
   auto fields = record ? record->getAttrOfType<mlir::ArrayAttr>("intent.fields")
                        : mlir::ArrayAttr();
-  if (!key || !record ||
-      record->getName().getStringRef() != "intent.make_record" ||
+  if (!key || !record || semanticOperationName(*record) != "intent.make_record" ||
       record->getNumResults() != 1 || !fields ||
       fields.size() != record->getNumOperands() || extract.getNumResults() != 1)
     return extract.emitOpError("has no canonical record-field source");

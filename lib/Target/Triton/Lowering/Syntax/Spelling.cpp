@@ -177,6 +177,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role) {
     return StringRef("tl.members");
   if (role == "expand_dims")
     return StringRef("expand_dims");
+  if (role == "static_projection")
+    return StringRef("static_projection");
   if (role == "indirect_gather")
     return StringRef("tl.indirect_gather");
   if (role == "extract_first_scalar")
