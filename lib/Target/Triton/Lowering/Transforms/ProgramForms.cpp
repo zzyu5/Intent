@@ -3,6 +3,7 @@
 #include "Syntax/Spelling.h"
 
 #include "Intent/Target/Common/Lowering/ProgramAnalysis.h"
+#include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/STLExtras.h"
@@ -40,6 +41,159 @@ intent::plan::AxisOp firstLane(gpu::PhysicalProgramAnalysis &analysis) {
     return lhs.getNode() < rhs.getNode();
   });
   return lanes.empty() ? intent::plan::AxisOp() : lanes.front();
+}
+
+FailureOr<bool> supportsDescriptorCandidate(
+    gpu::PhysicalProgramAnalysis &analysis, intent::plan::TransferOp transfer,
+    Operation &operation) {
+  StringRef semantic = target::semanticOperationName(operation);
+  if (semantic != "intent.view_load" && semantic != "intent.view_store")
+    return false;
+  auto view = dyn_cast<intent::ViewType>(operation.getOperand(0).getType());
+  auto tensor = view ? dyn_cast<RankedTensorType>(view.getTensor())
+                     : RankedTensorType();
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (!tensor || tensor.getRank() < 2 || failed(relation) ||
+      relation->size() != static_cast<size_t>(tensor.getRank()) ||
+      relation->back().kind != "full_slice" ||
+      (transfer.getFill() != "none" && transfer.getFill() != "zero"))
+    return false;
+
+  llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> regions;
+  for (intent::plan::RegionBindingOp binding :
+       analysis.getProgram().getBody().getOps<intent::plan::RegionBindingOp>())
+    regions[binding.getValue()] = binding;
+  unsigned blockedAxes = 0;
+  for (auto [position, term] : llvm::enumerate(*relation)) {
+    if (position + 1 == relation->size())
+      continue;
+    if (term.kind == "static_index")
+      continue;
+    if (term.kind == "value_index" && term.operands.size() == 1 &&
+        term.operands.front() &&
+        !isa<RankedTensorType>(
+            operation.getOperand(*term.operands.front()).getType()))
+      continue;
+    if (term.kind != "region_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      return false;
+    Value indexed = operation.getOperand(*term.operands.front());
+    FailureOr<int64_t> valueID = target::getValueID(
+        indexed, analysis.getKernel(), operation,
+        "Triton descriptor region projection");
+    auto binding = succeeded(valueID) ? regions.find(*valueID) : regions.end();
+    if (failed(valueID) || binding == regions.end())
+      return false;
+    intent::plan::AxisOp axis = analysis.getAxis(binding->second.getAxisNode());
+    intent::plan::RangeOp range =
+        axis ? analysis.getRange(axis.getNode(), binding->second.getPurpose(),
+                                 binding->second.getLevel())
+             : intent::plan::RangeOp();
+    if (!axis || !range)
+      return false;
+    if (!analysis.isScalarAxis(axis.getNode()))
+      ++blockedAxes;
+  }
+  return blockedAxes == 1;
+}
+
+void collectRegionSources(
+    Value value, const target::KernelModel &kernel,
+    const llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> &regions,
+    llvm::DenseSet<int64_t> &result, llvm::DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return;
+  auto valueID = kernel.valueIDs.find(value);
+  if (valueID != kernel.valueIDs.end() && regions.count(valueID->second)) {
+    result.insert(valueID->second);
+    return;
+  }
+  if (Operation *definition = value.getDefiningOp())
+    for (Value operand : definition->getOperands())
+      collectRegionSources(operand, kernel, regions, result, visited);
+}
+
+struct PrefixBoundaryForm {
+  int64_t boundaryAxis = -1;
+  llvm::SmallVector<int64_t> neutralMasks;
+};
+
+std::optional<PrefixBoundaryForm> classifyPrefixBoundaryStream(
+    gpu::PhysicalProgramAnalysis &analysis,
+    intent::plan::StreamBindingOp stream) {
+  target::KernelModel &kernel = analysis.getKernel();
+  Operation *operation = kernel.nodes.lookup(stream.getStreamNode());
+  if (!operation || target::semanticOperationName(*operation) !=
+                        "intent.state_stream")
+    return std::nullopt;
+  auto stopIndex =
+      operation->getAttrOfType<IntegerAttr>("intent.stop_operand_index");
+  Operation *stop = stopIndex && stopIndex.getInt() >= 0 &&
+                            static_cast<unsigned>(stopIndex.getInt()) <
+                                operation->getNumOperands()
+                        ? operation->getOperand(stopIndex.getInt()).getDefiningOp()
+                        : nullptr;
+  if (!stop || target::semanticOperationName(*stop) != "intent.region_end" ||
+      stop->getNumOperands() != 1)
+    return std::nullopt;
+
+  llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> regions;
+  for (intent::plan::RegionBindingOp binding :
+       analysis.getProgram().getBody().getOps<intent::plan::RegionBindingOp>())
+    regions[binding.getValue()] = binding;
+  auto stopValue = kernel.valueIDs.find(stop->getOperand(0));
+  auto stopBinding = stopValue != kernel.valueIDs.end()
+                         ? regions.find(stopValue->second)
+                         : regions.end();
+  if (stopBinding == regions.end() ||
+      stopBinding->second.getPurpose() != "ownership")
+    return std::nullopt;
+  int64_t boundaryAxis = stopBinding->second.getAxisNode();
+
+  PrefixBoundaryForm form{boundaryAxis, {}};
+  operation->walk([&](Operation *candidate) {
+    if (target::semanticOperationName(*candidate) != "intent.compare" ||
+        candidate->getNumOperands() != 2 || candidate->getNumResults() != 1)
+      return;
+    auto predicate = candidate->getAttrOfType<StringAttr>("intent.predicate");
+    if (!predicate || predicate.getValue() != "ge")
+      return;
+    llvm::DenseSet<int64_t> lhsSources;
+    llvm::DenseSet<int64_t> rhsSources;
+    llvm::DenseSet<Value> visited;
+    collectRegionSources(candidate->getOperand(0), kernel, regions, lhsSources,
+                         visited);
+    visited.clear();
+    collectRegionSources(candidate->getOperand(1), kernel, regions, rhsSources,
+                         visited);
+    if (lhsSources.size() != 1 || rhsSources.size() != 1)
+      return;
+    intent::plan::RegionBindingOp lhs = regions.lookup(*lhsSources.begin());
+    intent::plan::RegionBindingOp rhs = regions.lookup(*rhsSources.begin());
+    if (!lhs || !rhs || lhs.getAxisNode() !=
+                            static_cast<uint64_t>(boundaryAxis) ||
+        lhs.getPurpose() != "ownership" ||
+        rhs.getAxisNode() != stream.getAxisNode() ||
+        rhs.getPurpose() != "traversal")
+      return;
+    for (Operation *user : candidate->getResult(0).getUsers()) {
+      if (target::semanticOperationName(*user) != "intent.mask" ||
+          user->getNumOperands() < 2 || user->getOperand(1) != candidate->getResult(0))
+        continue;
+      FailureOr<int64_t> node =
+          target::getNodeID(*user, "Triton prefix-boundary mask");
+      if (succeeded(node))
+        form.neutralMasks.push_back(*node);
+    }
+  });
+  if (form.neutralMasks.empty())
+    return std::nullopt;
+  llvm::sort(form.neutralMasks);
+  form.neutralMasks.erase(
+      std::unique(form.neutralMasks.begin(), form.neutralMasks.end()),
+      form.neutralMasks.end());
+  return form;
 }
 
 bool isRuntimeABIDimension(const target::KernelModel &kernel,
@@ -259,7 +413,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   }
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
-    if (transfer->hasAttr(transferAccessAttr))
+    if (transfer->hasAttr(transferAccessAttr) ||
+        transfer->hasAttr(transferFormAttr))
       return transfer.emitOpError("already has a Triton transfer spelling");
     Operation *operation = kernel.nodes.lookup(transfer.getNode());
     StringRef name = operation ? target::semanticOperationName(*operation)
@@ -272,10 +427,19 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return transfer.emitOpError("does not bind canonical transfer semantics");
     transfer->setAttr(transferAccessAttr,
                       builder.getStringAttr(load ? "load" : "store"));
+    FailureOr<bool> descriptor =
+        operation && searchSpace
+            ? supportsDescriptorCandidate(**analysis, transfer, *operation)
+            : FailureOr<bool>(false);
+    if (failed(descriptor))
+      return failure();
+    transfer->setAttr(
+        transferFormAttr,
+        builder.getStringAttr(*descriptor ? "pointer_or_descriptor" : "pointer"));
   }
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
-    if (stream->hasAttr(streamTileAttr))
+    if (stream->hasAttr(streamTileAttr) || stream->hasAttr(streamFormAttr))
       return stream.emitOpError("already has a Triton stream-tile spelling");
     intent::plan::RangeOp range = (*analysis)->getRange(
         stream.getAxisNode(), stream.getPurpose(), stream.getLevel());
@@ -285,6 +449,16 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(tile))
       return stream.emitOpError("does not bind one Triton stream tile");
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
+    std::optional<PrefixBoundaryForm> prefix =
+        classifyPrefixBoundaryStream(**analysis, stream);
+    stream->setAttr(streamFormAttr,
+                    builder.getStringAttr(prefix ? "prefix_boundary" : "single"));
+    if (prefix) {
+      stream->setAttr(streamBoundaryAxisAttr,
+                      builder.getI64IntegerAttr(prefix->boundaryAxis));
+      stream->setAttr(streamNeutralMasksAttr,
+                      builder.getDenseI64ArrayAttr(prefix->neutralMasks));
+    }
   }
 
   return success();
@@ -413,15 +587,42 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
     auto access = transfer->getAttrOfType<StringAttr>(transferAccessAttr);
+    auto transferForm = transfer->getAttrOfType<StringAttr>(transferFormAttr);
     if (!access || (access.getValue() != "load" &&
                     access.getValue() != "store") ||
+        !transferForm ||
+        (transferForm.getValue() != "pointer" &&
+         transferForm.getValue() != "pointer_or_descriptor") ||
         !kernel.nodes.lookup(transfer.getNode()))
       return transfer.emitOpError("has no complete Triton transfer spelling");
   }
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
     auto tile = stream->getAttrOfType<StringAttr>(streamTileAttr);
-    if (!tile || tile.getValue().empty())
+    auto form = stream->getAttrOfType<StringAttr>(streamFormAttr);
+    auto boundary = stream->getAttrOfType<IntegerAttr>(streamBoundaryAxisAttr);
+    auto masks = stream->getAttrOfType<DenseI64ArrayAttr>(streamNeutralMasksAttr);
+    bool validBoundary = !boundary || llvm::any_of(
+                                          program.getBody().getOps<
+                                              intent::plan::AxisOp>(),
+                                          [&](intent::plan::AxisOp axis) {
+                                            return axis.getNode() ==
+                                                   static_cast<uint64_t>(
+                                                       boundary.getInt());
+                                          });
+    bool validMasks = !masks || llvm::all_of(
+                                    masks.asArrayRef(), [&](int64_t node) {
+                                      Operation *operation = kernel.nodes.lookup(node);
+                                      return operation &&
+                                             target::semanticOperationName(*operation) ==
+                                                 "intent.mask";
+                                    });
+    if (!tile || tile.getValue().empty() || !form ||
+        (form.getValue() != "single" && form.getValue() != "prefix_boundary") ||
+        (form.getValue() == "prefix_boundary" &&
+         (!boundary || !masks || masks.empty() || !validBoundary ||
+          !validMasks)) ||
+        (form.getValue() == "single" && (boundary || masks)))
       return stream.emitOpError("has no complete Triton stream-tile spelling");
   }
   return success();

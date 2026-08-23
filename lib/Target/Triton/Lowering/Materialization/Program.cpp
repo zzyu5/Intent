@@ -252,13 +252,15 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   index.components = target::lowering::indexPhysicalComponents(index);
   for (intent::plan::TransferOp value : transfers) {
     auto access = value->getAttrOfType<StringAttr>(transferAccessAttr);
-    if (!access)
+    auto form = value->getAttrOfType<StringAttr>(transferFormAttr);
+    if (!access || !form)
       return value.emitOpError("has no realized Triton transfer spelling");
     plan::BoundaryOp binding;
     binding.operation = value;
     binding.access = access.getValue().str();
     binding.resultSpace = value.getResultSpace().str();
     index.boundaries[value.getNode()] = binding;
+    index.transferForms[value.getNode()] = form.getValue().str();
   }
   if (!index.target || !index.program) {
     physicalProgram.emitOpError("lacks device or launch decisions");
@@ -721,10 +723,48 @@ void ProgramMaterializer::emitImports() {
       firstRuntimeExtent = false;
     }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
-    if (usesScaledContraction())
-      output << ", {'USE_NATIVE_SCALED': (0, 1)}";
+    if (usesScaledContraction() || usesDescriptorCandidates()) {
+      output << ", {";
+      bool firstCandidate = true;
+      if (usesScaledContraction()) {
+        output << "'USE_NATIVE_SCALED': (0, 1)";
+        firstCandidate = false;
+      }
+      if (usesDescriptorCandidates()) {
+        output << (firstCandidate ? "" : ", ") << "'USE_TMA': (0, 1)";
+      }
+      output << "}";
+    }
     output << ", parameter_extents=_PARAMETER_EXTENTS)\n";
+    if (usesDescriptorCandidates()) {
+      output << "_DESCRIPTOR_VIEWS = (";
+      llvm::StringSet<> emitted;
+      bool firstView = true;
+      for (const auto &entry : planIndex.transferForms) {
+        if (entry.second != "pointer_or_descriptor")
+          continue;
+        Operation *operation = kernel.nodes.lookup(entry.first);
+        auto position = operation && operation->getNumOperands() > 0
+                            ? viewPositions.find(operation->getOperand(0))
+                            : viewPositions.end();
+        if (position == viewPositions.end())
+          continue;
+        StringRef pointer = views[position->second].pointer;
+        if (!emitted.insert(pointer).second)
+          continue;
+        output << (firstView ? "" : ", ") << "'" << pointer << "'";
+        firstView = false;
+      }
+      if (emitted.size() == 1)
+        output << ",";
+      output << ")\n";
+    }
   }
+  if (usesDescriptorCandidates())
+    output << "\ndef _intent_descriptor_allocator(size, alignment, stream):\n"
+              "    del alignment, stream\n"
+              "    return torch.empty(size, dtype=torch.int8, device=_DEVICE)\n\n"
+              "triton.set_allocator(_intent_descriptor_allocator)\n";
   output << "\n\n";
 }
 
@@ -772,9 +812,17 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
         output << ", ";
       output << "'" << cast<StringAttr>(attribute).getValue() << "'";
     }
+    if (usesDescriptorCandidates()) {
+      if (!searchIndex.autotune.getKey().empty())
+        output << ", ";
+      output << "'TMA_LEGAL'";
+    }
     output << "]";
     output << ",\n    prune_configs_by=runtime_extent_pruning("
-              "_PARAMETER_RUNTIME_EXTENTS)";
+              "_PARAMETER_RUNTIME_EXTENTS";
+    if (usesDescriptorCandidates())
+      output << ", _DESCRIPTOR_VIEWS";
+    output << ")";
     bool firstRestoredView = true;
     for (ABIView &view : views) {
       if (view.view.getAccess() != "inout")
@@ -876,8 +924,13 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
       emitParameter(parameter.getName().getValue().str() + ": tl.constexpr");
   if (usesScaledContraction())
     emitParameter("USE_NATIVE_SCALED: tl.constexpr");
+  if (usesDescriptorCandidates())
+    emitParameter("TMA_LEGAL: tl.constexpr"),
+        emitParameter("USE_TMA: tl.constexpr");
   output << "):\n";
   if (failed(emitProgramBindings()))
+    return failure();
+  if (failed(emitDescriptorDefinitions()))
     return failure();
   return success();
 }
@@ -1210,6 +1263,31 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     output << "        raise ValueError('" << view.argument->name
            << " shape violates the kernel symbols')\n";
   }
+  if (usesDescriptorCandidates()) {
+    output << "    tma_legal = all(view.is_contiguous() and "
+              "view.data_ptr() % 16 == 0 and view.ndim >= 2 and "
+              "view.shape[-1] * view.element_size() % 16 == 0 for view in (";
+    llvm::StringSet<> emitted;
+    bool firstView = true;
+    for (const auto &entry : planIndex.transferForms) {
+      if (entry.second != "pointer_or_descriptor")
+        continue;
+      Operation *operation = kernel.nodes.lookup(entry.first);
+      auto position = operation && operation->getNumOperands() > 0
+                          ? viewPositions.find(operation->getOperand(0))
+                          : viewPositions.end();
+      if (position == viewPositions.end())
+        continue;
+      StringRef argument = views[position->second].argument->name;
+      if (!emitted.insert(argument).second)
+        continue;
+      output << (firstView ? "" : ", ") << argument;
+      firstView = false;
+    }
+    if (emitted.size() == 1)
+      output << ",";
+    output << "))\n";
+  }
   if (failed(emitPrivateWorkspaceAllocations()))
     return failure();
   SmallVector<plan::AxisOp> programAxes =
@@ -1315,6 +1393,8 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   }
   output << "    return " << kernelName << "[grid](";
   emitKernelLaunchArguments(false);
+  if (usesDescriptorCandidates())
+    output << ", TMA_LEGAL=tma_legal";
   output << ")\n\n\n";
   output << "def run(";
   firstParameter = true;
@@ -1564,6 +1644,140 @@ bool ProgramMaterializer::usesScaledContraction() const {
   return llvm::any_of(planIndex.contracts, [](const auto &entry) {
     return entry.second.getLowering() == "tl.dot_scaled";
   });
+}
+
+bool ProgramMaterializer::usesDescriptorCandidates() const {
+  return llvm::any_of(planIndex.transferForms, [](const auto &entry) {
+    return entry.second == "pointer_or_descriptor";
+  });
+}
+
+std::string ProgramMaterializer::descriptorName(Operation &operation) const {
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "Triton descriptor name");
+  return failed(node) ? std::string()
+                      : "descriptor_" + std::to_string(*node);
+}
+
+FailureOr<std::string>
+ProgramMaterializer::descriptorBlockTile(Operation &operation, ABIView &view) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation) || relation->size() != view.shape.size() ||
+      relation->empty() || relation->back().kind != "full_slice")
+    return operation.emitOpError("has no rectangular Triton descriptor relation");
+  std::string tile;
+  for (auto [position, term] : llvm::enumerate(*relation)) {
+    if (position + 1 == relation->size() || term.kind == "static_index")
+      continue;
+    if (term.kind == "value_index" && term.operands.size() == 1 &&
+        term.operands.front() &&
+        !isa<RankedTensorType>(
+            operation.getOperand(*term.operands.front()).getType()))
+      continue;
+    if (term.kind != "region_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      return operation.emitOpError("has a non-rectangular descriptor index");
+    Value indexed = operation.getOperand(*term.operands.front());
+    FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
+        target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
+                                                   operation);
+    if (failed(selected) || !*selected)
+      return operation.emitOpError("has no selected descriptor region range");
+    if (!(*selected)->axis.isScalar()) {
+      if (!tile.empty())
+        return operation.emitOpError("has multiple descriptor block axes");
+      tile = (*selected)->range.getTile().str();
+    }
+  }
+  if (tile.empty())
+    return operation.emitOpError("has no descriptor block axis");
+  return tile;
+}
+
+FailureOr<std::string>
+ProgramMaterializer::descriptorRowOffset(Operation &operation, ABIView &view) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation) || relation->size() != view.shape.size() ||
+      relation->empty() || relation->back().kind != "full_slice")
+    return operation.emitOpError("has no rectangular Triton descriptor relation");
+  std::string row;
+  for (auto [position, term] : llvm::enumerate(*relation)) {
+    if (position + 1 == relation->size())
+      break;
+    std::string index;
+    if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError("has an invalid descriptor static index");
+      index = std::to_string(*term.staticValues.front());
+    } else if (term.kind == "value_index" && term.operands.size() == 1 &&
+               term.operands.front() &&
+               !isa<RankedTensorType>(
+                   operation.getOperand(*term.operands.front()).getType())) {
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (failed(exact))
+        return failure();
+      index = exact->str();
+    } else {
+      if (term.kind != "region_index" || term.operands.size() != 1 ||
+          !term.operands.front())
+        return operation.emitOpError("has a non-rectangular descriptor index");
+      Value indexed = operation.getOperand(*term.operands.front());
+      FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
+          target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
+                                                     operation);
+      if (failed(selected) || !*selected)
+        return failure();
+      if ((*selected)->axis.isScalar()) {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        index = exact->str();
+      } else {
+        auto start = selectedRegionStarts.find(indexed);
+        if (start == selectedRegionStarts.end())
+          return operation.emitOpError(
+              "has no active descriptor block start for its region index");
+        index = start->second;
+      }
+    }
+    row = row.empty() ? index
+                      : "(" + row + ") * " + view.shape[position] + " + (" +
+                            index + ")";
+  }
+  return row;
+}
+
+LogicalResult ProgramMaterializer::emitDescriptorDefinitions() {
+  for (const auto &entry : planIndex.transferForms) {
+    if (entry.second != "pointer_or_descriptor")
+      continue;
+    Operation *operation = kernel.nodes.lookup(entry.first);
+    FailureOr<ABIView *> view =
+        operation && operation->getNumOperands() > 0
+            ? lookupView(operation->getOperand(0), *operation)
+            : FailureOr<ABIView *>(failure());
+    FailureOr<std::string> tile =
+        succeeded(view) ? descriptorBlockTile(*operation, **view)
+                        : FailureOr<std::string>(failure());
+    if (!operation || failed(view) || failed(tile))
+      return failure();
+    std::string rows;
+    for (size_t axis = 0; axis + 1 < (*view)->shape.size(); ++axis)
+      rows = rows.empty() ? (*view)->shape[axis]
+                          : "(" + rows + ") * " + (*view)->shape[axis];
+    line("if USE_TMA:");
+    ++indentation;
+    line(descriptorName(*operation) + " = tl.make_tensor_descriptor(" +
+         (*view)->pointer + ", [" + rows + ", " + (*view)->shape.back() +
+         "], [" + (*view)->shape.back() + ", 1], [" + *tile + ", " +
+         physicalExtent((*view)->shape.back()) + "])");
+    --indentation;
+  }
+  return success();
 }
 
 FailureOr<std::string> ProgramMaterializer::physicalAxisTile(plan::AxisOp axis) {

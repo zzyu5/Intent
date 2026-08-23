@@ -17,6 +17,7 @@ def _power_of_two_ceiling(value: int) -> int:
 
 def runtime_extent_pruning(
     parameter_extents: dict[str, tuple[str, ...]],
+    descriptor_views: tuple[str, ...] = (),
 ) -> dict[str, object]:
     bindings = {
         parameter: tuple(extents)
@@ -25,6 +26,15 @@ def runtime_extent_pruning(
 
     def early_config_prune(configs, named_args, **kwargs):
         arguments = {**named_args, **kwargs}
+        descriptors_legal = all(
+            view in arguments
+            and hasattr(arguments[view], "is_contiguous")
+            and arguments[view].is_contiguous()
+            and arguments[view].data_ptr() % 16 == 0
+            and arguments[view].ndim >= 2
+            and arguments[view].shape[-1] * arguments[view].element_size() % 16 == 0
+            for view in descriptor_views
+        )
         limits = {}
         for parameter, extents in bindings.items():
             if not extents:
@@ -54,6 +64,7 @@ def runtime_extent_pruning(
                 config.kwargs[parameter] <= limit
                 for parameter, limit in limits.items()
             )
+            and (not config.kwargs.get("USE_TMA", 0) or descriptors_legal)
         ]
         if not accepted:
             raise ValueError(
@@ -74,7 +85,7 @@ def _role_candidates(role: str) -> tuple[int, ...]:
         "query": (1, 2, 16, 32, 64, 128),
         "ragged_member": (32, 64, 128),
         "lane_pack": (64, 128, 256, 512),
-        "pointwise_lane": (128, 256, 512, 1024, 2048, 4096, 8192, 16384),
+        "pointwise_lane": (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384),
         "feature": (64, 128, 256),
         "reduction": (32, 64, 128),
         "program_m": (32, 64, 128, 256),
@@ -148,6 +159,8 @@ def autotune_configurations(
             ({"stream_scaled": 8}, 2, 8),
         ),
         (
+            ({"pointwise_lane": 32}, 1, 1),
+            ({"pointwise_lane": 64}, 1, 1),
             ({"pointwise_lane": 128}, 1, 4),
             ({"pointwise_lane": 256}, 1, 4),
             ({"pointwise_lane": 512}, 1, 4),
@@ -220,6 +233,39 @@ def autotune_configurations(
                 (128, 64, 3, 4),
                 (128, 64, 2, 8),
                 (128, 128, 2, 8),
+            )
+        ),
+        tuple(
+            (
+                {"program_m": program, "stream_contract": stream},
+                stages,
+                warps,
+            )
+            for program, stream, stages, warps in (
+                (32, 32, 4, 4),
+                (64, 32, 4, 4),
+                (64, 64, 3, 4),
+                (64, 128, 3, 4),
+                (128, 32, 4, 4),
+                (128, 64, 3, 4),
+                (128, 128, 2, 8),
+            )
+        ),
+        tuple(
+            ({"program_m": m, "program_n": n}, stages, warps)
+            for m, n, stages, warps in (
+                (8, 8, 5, 2),
+                (8, 16, 5, 2),
+                (16, 8, 5, 2),
+                (16, 16, 4, 4),
+                (16, 32, 3, 4),
+                (32, 16, 3, 4),
+                (32, 32, 2, 8),
+                (16, 64, 2, 8),
+                (64, 16, 2, 8),
+                (32, 64, 3, 8),
+                (64, 32, 3, 8),
+                (64, 64, 2, 8),
             )
         ),
         (

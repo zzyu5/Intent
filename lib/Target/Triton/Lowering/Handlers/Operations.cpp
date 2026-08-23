@@ -354,27 +354,29 @@ LogicalResult ProgramMaterializer::emitRegionEnd(Operation &operation) {
   std::string extent = axisDimensions.lookup(axis->getNode());
   if (extent.empty())
     return operation.emitOpError("has no planned logical extent for region end");
-  std::string expression = extent;
+  FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
+      target::lowering::selectedRegionValueRange(
+          planIndex, kernel, operation.getOperand(0), operation);
+  if (failed(selected))
+    return failure();
+  std::string logicalEnd = extent;
   if (target::lowering::isRaggedBoundAxis(planIndex.components,
-                                           axis->getNode())) {
-    expression = "sequence_end_" + std::to_string(axis->getNode());
-  } else if (isa<intent::RegionType>(operation.getOperand(0).getType())) {
-    if (axis->hasRole("parallel") && !axis->isScalar()) {
-      std::string block = programBlocks.lookup(axis->getNode());
-      if (block.empty())
+                                           axis->getNode()))
+    logicalEnd = "sequence_end_" + std::to_string(axis->getNode());
+  std::string expression = logicalEnd;
+  if (*selected) {
+    if ((*selected)->axis.getNode() != axis->getNode())
+      return operation.emitOpError(
+          "selected region-end range does not bind its resolved axis");
+    StringRef purpose = (*selected)->range.getPurpose();
+    if ((purpose == "ownership" || purpose == "traversal") &&
+        !axis->isScalar()) {
+      auto start = selectedRegionStarts.find(operation.getOperand(0));
+      if (start == selectedRegionStarts.end())
         return operation.emitOpError(
-            "has no planned program block for parallel region end");
-      expression = "tl.minimum((" + block + " + 1) * " +
-                   axis->getTile().str() + ", " + extent + ")";
-    } else if (axis->hasRole("ordered")) {
-      const target::lowering::RangeBinding *range =
-          axis->getRange("traversal", 0);
-      std::string start = axisIndices.lookup(axis->getNode());
-      if (!range || start.empty())
-        return operation.emitOpError(
-            "has no planned ordered range for region end");
-      expression = "tl.minimum((" + start + ") + " + range->getTile().str() +
-                   ", " + extent + ")";
+            "has no exact selected-region start for region end");
+      expression = "tl.minimum((" + start->second + ") + " +
+                   (*selected)->range.getTile().str() + ", " + logicalEnd + ")";
     }
   }
   bindResult(operation, 0, expression);
@@ -483,6 +485,8 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     line(rhsBlock + " = (" + pid + " % " + groupSpan + ") // " + size);
     programBlocks[lhs.getNode()] = lhsBlock;
     programBlocks[rhs.getNode()] = rhsBlock;
+    axisStarts[lhs.getNode()] = lhsBlock + " * " + lhs.getTile().str();
+    axisStarts[rhs.getNode()] = rhsBlock + " * " + rhs.getTile().str();
     axisIndices[lhs.getNode()] = lhsBlock + " * " + lhs.getTile().str() +
                                  " + tl.arange(0, " + lhs.getTile().str() + ")";
     axisIndices[rhs.getNode()] = rhsBlock + " * " + rhs.getTile().str() +
@@ -511,6 +515,7 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     programBlocks[axis.getNode()] = block;
     if (axis.isScalar()) {
       axisIndices[axis.getNode()] = block;
+      axisStarts[axis.getNode()] = block;
       continue;
     }
     std::string value = "axis_index_" + std::to_string(axis.getNode());
@@ -521,6 +526,7 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     line(value + " = " + block + " * " + axis.getTile().str() +
          " + tl.arange(0, " + axis.getTile().str() + ")");
     axisIndices[axis.getNode()] = value;
+    axisStarts[axis.getNode()] = block + " * " + axis.getTile().str();
   }
   for (int64_t memberNode : planIndex.components.raggedProgramAxes) {
     plan::AxisOp axis = planIndex.axes.lookup(memberNode);
@@ -564,6 +570,8 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
          axis.getTile().str() + " + tl.arange(0, " + axis.getTile().str() +
          ")");
     axisIndices[memberNode] = value;
+    axisStarts[memberNode] = "sequence_begin_" + suffix + " + " + block +
+                             " * " + axis.getTile().str();
   }
   for (const auto &entry : planIndex.axesByRole) {
     plan::AxisOp axis = entry.getValue();
@@ -579,6 +587,7 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
                                : physicalExtent(extent);
     line(value + " = tl.arange(0, " + physical + ")");
     axisIndices[axis.getNode()] = value;
+    axisStarts[axis.getNode()] = "0";
   }
   for (const auto &entry : planIndex.axes) {
     plan::AxisOp axis = entry.second;
@@ -591,6 +600,7 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     std::string value = "axis_index_" + std::to_string(axis.getNode());
     line(value + " = tl.arange(0, " + range->getTile().str() + ")");
     axisIndices[axis.getNode()] = value;
+    axisStarts[axis.getNode()] = "0";
   }
   for (const auto &entry : planIndex.regionBindings) {
     Value value = kernel.values.lookup(entry.first);
@@ -602,6 +612,11 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
       return binding.emitOpError(
           "has no active Triton projection for its selected region value");
     selectedRegionIndices[value] = std::move(projected);
+    std::string start = axisStarts.lookup(binding.getAxisNode());
+    if (start.empty())
+      return binding.emitOpError(
+          "has no active Triton start for its selected region value");
+    selectedRegionStarts[value] = std::move(start);
   }
   return success();
 }
@@ -628,6 +643,9 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
           "has no emitted Triton part and region projection");
     valueNames[body.getArgument(0)] = part;
     valueNames[body.getArgument(1)] = region;
+    selectedRegionStarts[body.getArgument(0)] = part;
+    selectedRegionStarts[body.getArgument(1)] =
+        axisStarts.lookup(partition.getAxisNode());
     return success();
   }
   SmallVector<plan::AxisOp> axes;
@@ -659,6 +677,7 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
     line(vectorIndex + " = tl.arange(0, BLOCK_SIZE)");
     axisIndices[axis.getNode()] = programIndex;
     valueNames[argument] = programIndex;
+    selectedRegionStarts[argument] = programIndex;
     return success();
   }
 
@@ -671,6 +690,7 @@ LogicalResult ProgramMaterializer::enterParallel(Operation &operation) {
                                   ? "has no persistent Triton program index"
                                   : "has no emitted per-axis program index");
     valueNames[argument] = value;
+    selectedRegionStarts[argument] = axisStarts.lookup(axis.getNode());
   }
   return success();
 }
@@ -1283,6 +1303,11 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
   FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
   if (failed(view))
     return failure();
+  bool descriptorCandidate =
+      planIndex.transferForms.lookup(*node) == "pointer_or_descriptor";
+  FailureOr<std::string> descriptorOffset =
+      descriptorCandidate ? descriptorRowOffset(operation, **view)
+                          : FailureOr<std::string>(std::string());
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, false);
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
@@ -1301,21 +1326,36 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
                                    boundary.getValidityDomainNodes(),
                                    operation.getResult(0), operation)
           : FailureOr<std::string>(std::string("True"));
-  if (failed(pointers) || failed(mask) || failed(validity) ||
+  if (failed(descriptorOffset) || failed(pointers) || failed(mask) || failed(validity) ||
       failed(physicalFill))
     return failure();
   std::string result = makeResultName(operation, 0);
   if (*validity != "True" && *validity != *mask)
     *mask = *mask == "True" ? *validity
                             : "(" + *mask + ") & (" + *validity + ")";
-  if (loadFill == "none") {
-    line(result + " = tl.load(" + *pointers + ")");
+  auto emitPointerLoad = [&]() {
+    if (loadFill == "none") {
+      line(result + " = tl.load(" + *pointers + ")");
+    } else {
+      StringRef fill = loadFill == "negative_infinity"
+                           ? "-float('inf')"
+                           : "0.0";
+      line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
+           ", other=" + fill.str() + ")");
+    }
+  };
+  if (descriptorCandidate) {
+    line("if USE_TMA:");
+    ++indentation;
+    line(result + " = " + descriptorName(operation) + ".load([tl.cast((" +
+         *descriptorOffset + "), tl.int32), 0])");
+    --indentation;
+    line("else:");
+    ++indentation;
+    emitPointerLoad();
+    --indentation;
   } else {
-    StringRef fill = loadFill == "negative_infinity"
-                         ? "-float('inf')"
-                         : "0.0";
-    line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
-         ", other=" + fill.str() + ")");
+    emitPointerLoad();
   }
   FailureOr<std::string> padded =
       padExpression(operation.getResult(0), result, operation);
@@ -1861,6 +1901,28 @@ LogicalResult ProgramMaterializer::replayContractProducers(
   return success();
 }
 
+LogicalResult ProgramMaterializer::replayBlock(Block &block) {
+  if (!operationRegistry())
+    return block.getParentOp()->emitOpError(
+        "has no Triton operation registry for provider-form replay");
+  for (Operation &operation : block) {
+    const target::OperationHandler *handler = operationRegistry()->lookup(
+        target::semanticOperationName(operation));
+    if (!handler)
+      return operation.emitOpError(
+          "has no Triton handler during provider-form replay");
+    if (handler->enter && failed(handler->enter(operation)))
+      return failure();
+    for (Region &region : operation.getRegions())
+      for (Block &nested : region)
+        if (failed(replayBlock(nested)))
+          return failure();
+    if (handler->leave && failed(handler->leave(operation)))
+      return failure();
+  }
+  return success();
+}
+
 LogicalResult ProgramMaterializer::emitBroadcast(Operation &operation) {
   FailureOr<int64_t> node = target::getNodeID(operation, "broadcast emission");
   plan::PointwiseOp binding =
@@ -2060,6 +2122,14 @@ LogicalResult ProgramMaterializer::emitConditional(Operation &operation, bool ma
 }
 
 LogicalResult ProgramMaterializer::emitMask(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "mask emission");
+  if (succeeded(node) && activeNeutralMasks.contains(*node)) {
+    FailureOr<StringRef> input = lookupValue(operation, 0);
+    if (failed(input))
+      return failure();
+    bindResult(operation, 0, *input);
+    return success();
+  }
   return emitConditional(operation, true);
 }
 
@@ -2222,6 +2292,18 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
       operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
   auto fillIndex =
       operation.getAttrOfType<IntegerAttr>("intent.fill_operand_index");
+  bool alwaysValid = false;
+  if (validIndex && validIndex.getInt() >= 0 &&
+      static_cast<unsigned>(validIndex.getInt()) < operation.getNumOperands()) {
+    Operation *definition =
+        operation.getOperand(validIndex.getInt()).getDefiningOp();
+    auto literal =
+        definition && target::semanticOperationName(*definition) ==
+                          "intent.constant"
+            ? definition->getAttrOfType<IntegerAttr>("intent.value")
+            : IntegerAttr();
+    alwaysValid = literal && !literal.getValue().isZero();
+  }
   bool scalarFragmentGather =
       form == "scalar_fragment" &&
       isa<RankedTensorType>(operation.getOperand(0).getType()) &&
@@ -2346,8 +2428,11 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
     expanded += term.kind == "new_axis" ? "None" : ":";
   }
   expanded += "]";
-  line(result + " = tl.where(" + valid->str() + ", " + expanded + ", " +
-       fill->str() + ")");
+  if (alwaysValid || *valid == "True")
+    line(result + " = " + expanded);
+  else
+    line(result + " = tl.where(" + valid->str() + ", " + expanded + ", " +
+         fill->str() + ")");
   bindResult(operation, 0, result);
   return success();
 }
@@ -2533,8 +2618,43 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
   }
   std::string block = "stream_block_" + std::to_string(*node);
   std::string offsets = "stream_axis_index_" + std::to_string(*node);
-  line("for " + block + " in range(0, tl.cdiv(" + streamExtent + ", " +
-       binding.getTile().str() + ")):");
+  auto streamForm = binding.physical
+                        ? binding.physical->getAttrOfType<StringAttr>(streamFormAttr)
+                        : StringAttr();
+  bool prefixBoundary = streamForm && streamForm.getValue() == "prefix_boundary";
+  std::string streamBase = partitionedStream
+                               ? partitionBegin
+                           : raggedStream
+                               ? "sequence_begin_" + raggedSuffix
+                               : "0";
+  if (prefixBoundary) {
+    auto boundaryAxis =
+        binding.physical->getAttrOfType<IntegerAttr>(streamBoundaryAxisAttr);
+    auto neutralMasks =
+        binding.physical->getAttrOfType<DenseI64ArrayAttr>(streamNeutralMasksAttr);
+    std::string boundaryStart =
+        boundaryAxis ? axisStarts.lookup(boundaryAxis.getInt()) : std::string();
+    if (!boundaryAxis || !neutralMasks || neutralMasks.empty() ||
+        boundaryStart.empty())
+      return binding.emitOpError(
+          "has no complete Triton prefix-boundary stream form");
+    std::string prefixBlocks =
+        "stream_prefix_blocks_" + std::to_string(*node);
+    line(prefixBlocks + " = tl.minimum(tl.cdiv(" + streamExtent + ", " +
+         binding.getTile().str() + "), tl.maximum(0, (" + boundaryStart +
+         " - " + streamBase + ") // " + binding.getTile().str() + "))");
+    line("for " + block + " in range(0, " + prefixBlocks + "):");
+    PrefixBoundaryStream replay{block, offsets, streamExtent, prefixBlocks,
+                                streamBase, {}};
+    for (int64_t mask : neutralMasks.asArrayRef()) {
+      replay.neutralMasks.push_back(mask);
+      activeNeutralMasks.insert(mask);
+    }
+    prefixBoundaryStreams[&operation] = std::move(replay);
+  } else {
+    line("for " + block + " in range(0, tl.cdiv(" + streamExtent + ", " +
+         binding.getTile().str() + ")):");
+  }
   ++indentation;
   line(offsets + " = " +
        std::string(partitionedStream
@@ -2544,6 +2664,13 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
        addressIndex(block) + " * " + binding.getTile().str() + " + " +
        addressIndex("tl.arange(0, " + binding.getTile().str() + ")"));
   valueNames[body.getArgument(0)] = offsets;
+  std::string streamStart =
+      std::string(partitionedStream
+                      ? partitionBegin + " + "
+                      : raggedStream ? "sequence_begin_" + raggedSuffix + " + "
+                                     : "") +
+      addressIndex(block) + " * " + binding.getTile().str();
+  selectedRegionStarts[body.getArgument(0)] = streamStart;
   auto bindScopedAxis = [&](int64_t axisNode, std::string value) {
     auto previous = axisIndices.find(axisNode);
     std::optional<std::string> restore;
@@ -2552,8 +2679,17 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     streamAxisRestores[&operation].emplace_back(axisNode, std::move(restore));
     axisIndices[axisNode] = std::move(value);
   };
+  auto bindScopedStart = [&](int64_t axisNode, std::string value) {
+    auto previous = axisStarts.find(axisNode);
+    std::optional<std::string> restore;
+    if (previous != axisStarts.end())
+      restore = previous->second;
+    streamStartRestores[&operation].emplace_back(axisNode, std::move(restore));
+    axisStarts[axisNode] = std::move(value);
+  };
   if (axisIndices.lookup(binding.getAxisNode()).empty())
     bindScopedAxis(binding.getAxisNode(), offsets);
+  bindScopedStart(binding.getAxisNode(), streamStart);
   for (int64_t axisNode : binding.getInnerReductionAxes()) {
     if (axisNode == binding.getAxisNode())
       continue;
@@ -2565,6 +2701,7 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     bindScopedAxis(
         axisNode,
         addressIndex("tl.arange(0, " + range->getTile().str() + ")"));
+    bindScopedStart(axisNode, "0");
   }
   return success();
 }
@@ -2587,6 +2724,36 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
     line(carriers->second[index] + " = " + yielded->str());
   }
   --indentation;
+  auto prefix = prefixBoundaryStreams.find(&operation);
+  if (prefix != prefixBoundaryStreams.end()) {
+    for (int64_t mask : prefix->second.neutralMasks)
+      activeNeutralMasks.erase(mask);
+    line("for " + prefix->second.block + " in range(" +
+         prefix->second.prefixBlocks + ", tl.cdiv(" + prefix->second.extent +
+         ", " + binding.getTile().str() + ")):");
+    ++indentation;
+    line(prefix->second.offsets + " = " + prefix->second.base + " + " +
+         addressIndex(prefix->second.block) + " * " + binding.getTile().str() +
+         " + " +
+         addressIndex("tl.arange(0, " + binding.getTile().str() + ")"));
+    Block &body = operation.getRegion(0).front();
+    valueNames[body.getArgument(0)] = prefix->second.offsets;
+    selectedRegionStarts[body.getArgument(0)] =
+        prefix->second.base + " + " + addressIndex(prefix->second.block) +
+        " * " + binding.getTile().str();
+    axisIndices[binding.getAxisNode()] = prefix->second.offsets;
+    axisStarts[binding.getAxisNode()] = selectedRegionStarts[body.getArgument(0)];
+    if (failed(replayBlock(body)))
+      return failure();
+    for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+      FailureOr<StringRef> replayed = lookupValue(terminator, index);
+      if (failed(replayed))
+        return failure();
+      line(carriers->second[index] + " = " + replayed->str());
+    }
+    --indentation;
+    prefixBoundaryStreams.erase(prefix);
+  }
   for (unsigned index = 0; index < operation.getNumResults(); ++index)
     valueNames[operation.getResult(index)] = carriers->second[index];
   if (auto restores = streamAxisRestores.find(&operation);
@@ -2599,6 +2766,17 @@ LogicalResult ProgramMaterializer::leaveStateStream(Operation &operation) {
         axisIndices.erase(value->first);
     }
     streamAxisRestores.erase(restores);
+  }
+  if (auto restores = streamStartRestores.find(&operation);
+      restores != streamStartRestores.end()) {
+    for (auto value = restores->second.rbegin();
+         value != restores->second.rend(); ++value) {
+      if (value->second)
+        axisStarts[value->first] = *value->second;
+      else
+        axisStarts.erase(value->first);
+    }
+    streamStartRestores.erase(restores);
   }
   if (auto restores = streamEndRestores.find(&operation);
       restores != streamEndRestores.end()) {
@@ -2776,11 +2954,32 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
                         : FailureOr<std::string>(failure());
     FailureOr<std::string> mask = emitMaskExpression(*load, false);
     FailureOr<StringRef> direct = lookupValue(operation, directOperand);
-    if (failed(view) || failed(pointers) || failed(mask) || failed(direct))
+    FailureOr<int64_t> loadNode = target::getNodeID(*load, "deferred load");
+    bool descriptorCandidate =
+        succeeded(loadNode) && succeeded(view) &&
+        planIndex.transferForms.lookup(*loadNode) == "pointer_or_descriptor";
+    FailureOr<std::string> descriptorOffset =
+        descriptorCandidate ? descriptorRowOffset(*load, **view)
+                            : FailureOr<std::string>(std::string());
+    if (failed(view) || failed(pointers) || failed(mask) || failed(direct) ||
+        failed(loadNode) || failed(descriptorOffset))
       return failure();
     std::string loaded = makeResultName(*load, 0);
-    line(loaded + " = tl.load(" + *pointers + ", mask=" + *mask +
-         ", other=0.0)");
+    if (descriptorCandidate) {
+      line("if USE_TMA:");
+      ++indentation;
+      line(loaded + " = " + descriptorName(*load) +
+           ".load([tl.cast((" + *descriptorOffset + "), tl.int32), 0])");
+      --indentation;
+      line("else:");
+      ++indentation;
+      line(loaded + " = tl.load(" + *pointers + ", mask=" + *mask +
+           ", other=0.0)");
+      --indentation;
+    } else {
+      line(loaded + " = tl.load(" + *pointers + ", mask=" + *mask +
+           ", other=0.0)");
+    }
     std::string lhsExpression = loadOperand == 0 ? loaded : direct->str();
     std::string rhsExpression = loadOperand == 1 ? loaded : direct->str();
     if (orientation->lhsTranspose)
@@ -2845,10 +3044,38 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     return failure();
   std::string lhs = makeResultName(*lhsLoad, 0);
   std::string rhs = makeResultName(*rhsLoad, 0);
-  line(lhs + " = tl.load(" + *lhsPointers + ", mask=" + *lhsMask +
-       ", other=0.0)");
-  line(rhs + " = tl.load(" + *rhsPointers + ", mask=" + *rhsMask +
-       ", other=0.0)");
+  auto emitDeferredLoad = [&](Operation &load, ABIView &view,
+                              StringRef result, StringRef pointers,
+                              StringRef mask) -> LogicalResult {
+    FailureOr<int64_t> loadNode = target::getNodeID(load, "deferred load");
+    bool descriptorCandidate =
+        succeeded(loadNode) &&
+        planIndex.transferForms.lookup(*loadNode) == "pointer_or_descriptor";
+    FailureOr<std::string> descriptorOffset =
+        descriptorCandidate ? descriptorRowOffset(load, view)
+                            : FailureOr<std::string>(std::string());
+    if (failed(loadNode) || failed(descriptorOffset))
+      return failure();
+    if (descriptorCandidate) {
+      line("if USE_TMA:");
+      ++indentation;
+      line(result.str() + " = " + descriptorName(load) +
+           ".load([tl.cast((" + *descriptorOffset + "), tl.int32), 0])");
+      --indentation;
+      line("else:");
+      ++indentation;
+      line(result.str() + " = tl.load(" + pointers.str() + ", mask=" +
+           mask.str() + ", other=0.0)");
+      --indentation;
+    } else {
+      line(result.str() + " = tl.load(" + pointers.str() + ", mask=" +
+           mask.str() + ", other=0.0)");
+    }
+    return success();
+  };
+  if (failed(emitDeferredLoad(*lhsLoad, **lhsView, lhs, *lhsPointers, *lhsMask)) ||
+      failed(emitDeferredLoad(*rhsLoad, **rhsView, rhs, *rhsPointers, *rhsMask)))
+    return failure();
   std::string lhsExpression = lhs;
   std::string rhsExpression = rhs;
   if (orientation->lhsTranspose)
@@ -2975,13 +3202,32 @@ LogicalResult ProgramMaterializer::emitStore(Operation &operation) {
                                    boundary.getValidityDomainNodes(),
                                    operation.getOperand(valueIndex.getInt()),
                                    operation);
-  if (failed(pointers) || failed(mask) || failed(validity))
+  bool descriptorCandidate =
+      planIndex.transferForms.lookup(*node) == "pointer_or_descriptor";
+  FailureOr<std::string> descriptorOffset =
+      descriptorCandidate ? descriptorRowOffset(operation, **view)
+                          : FailureOr<std::string>(std::string());
+  if (failed(pointers) || failed(mask) || failed(validity) ||
+      failed(descriptorOffset))
     return failure();
   if (*validity != "True" && *validity != *mask)
     *mask = *mask == "True" ? *validity
                             : "(" + *mask + ") & (" + *validity + ")";
-  line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" + *mask +
-       ")");
+  if (descriptorCandidate) {
+    line("if USE_TMA:");
+    ++indentation;
+    line(descriptorName(operation) + ".store([tl.cast((" +
+         *descriptorOffset + "), tl.int32), 0], " + stored->str() + ")");
+    --indentation;
+    line("else:");
+    ++indentation;
+    line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" +
+         *mask + ")");
+    --indentation;
+  } else {
+    line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" +
+         *mask + ")");
+  }
   return success();
 }
 

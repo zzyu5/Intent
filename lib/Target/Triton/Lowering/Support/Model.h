@@ -59,6 +59,7 @@ struct PhysicalProgramIndex {
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
+  llvm::DenseMap<int64_t, std::string> transferForms;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::lowering::PhysicalComponents components;
@@ -165,6 +166,7 @@ private:
                                           llvm::StringRef offsets);
   mlir::LogicalResult replayContractProducers(
       llvm::ArrayRef<mlir::Operation *> producers);
+  mlir::LogicalResult replayBlock(mlir::Block &block);
   void emitImports() override;
   mlir::LogicalResult emitHelpers() override;
   mlir::LogicalResult emitKernelHeader() override;
@@ -186,6 +188,13 @@ private:
   std::string addressIndex(llvm::StringRef expression) const;
   std::string physicalExtent(llvm::StringRef logicalExtent) const;
   bool usesScaledContraction() const;
+  bool usesDescriptorCandidates() const;
+  mlir::LogicalResult emitDescriptorDefinitions();
+  mlir::FailureOr<std::string>
+  descriptorBlockTile(mlir::Operation &operation, ABIView &view);
+  mlir::FailureOr<std::string>
+  descriptorRowOffset(mlir::Operation &operation, ABIView &view);
+  std::string descriptorName(mlir::Operation &operation) const;
   mlir::FailureOr<std::string> physicalAxisTile(plan::AxisOp axis);
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);
@@ -252,11 +261,17 @@ private:
   llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
   llvm::DenseMap<int64_t, std::string> axisIndices;
+  llvm::DenseMap<int64_t, std::string> axisStarts;
   llvm::DenseMap<mlir::Value, std::string> selectedRegionIndices;
+  llvm::DenseMap<mlir::Value, std::string> selectedRegionStarts;
   llvm::DenseMap<
       mlir::Operation *,
       llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>
       streamAxisRestores;
+  llvm::DenseMap<
+      mlir::Operation *,
+      llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>
+      streamStartRestores;
   llvm::DenseMap<int64_t, std::string> activeTraversalEnds;
   llvm::DenseMap<
       mlir::Operation *,
@@ -267,6 +282,16 @@ private:
   bool requiresPreallocatedOutputs = false;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;
+  struct PrefixBoundaryStream {
+    std::string block;
+    std::string offsets;
+    std::string extent;
+    std::string prefixBlocks;
+    std::string base;
+    llvm::SmallVector<int64_t> neutralMasks;
+  };
+  llvm::DenseMap<mlir::Operation *, PrefixBoundaryStream> prefixBoundaryStreams;
+  llvm::DenseSet<int64_t> activeNeutralMasks;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       loopCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>

@@ -31,8 +31,16 @@ inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.triton.gather_form";
 inline constexpr llvm::StringLiteral transferAccessAttr =
     "intent_plan.triton.transfer_access";
+inline constexpr llvm::StringLiteral transferFormAttr =
+    "intent_plan.triton.transfer_form";
 inline constexpr llvm::StringLiteral streamTileAttr =
     "intent_plan.triton.stream_tile";
+inline constexpr llvm::StringLiteral streamFormAttr =
+    "intent_plan.triton.stream_form";
+inline constexpr llvm::StringLiteral streamBoundaryAxisAttr =
+    "intent_plan.triton.stream_boundary_axis";
+inline constexpr llvm::StringLiteral streamNeutralMasksAttr =
+    "intent_plan.triton.stream_neutral_masks";
 inline constexpr llvm::StringLiteral raggedRouteAttr =
     "intent_plan.triton.ragged_route";
 void addProviderPasses(mlir::PassManager &manager);
