@@ -17,8 +17,14 @@ inline constexpr llvm::StringLiteral boundsAttr =
     "intent_plan.tilelang.bounds";
 inline constexpr llvm::StringLiteral deferredAttr =
     "intent_plan.tilelang.deferred";
+inline constexpr llvm::StringLiteral selectedScalarIndexNodesAttr =
+    "intent_plan.tilelang.selected_scalar_index_nodes";
 inline constexpr llvm::StringLiteral pointwiseFormAttr =
     "intent_plan.tilelang.pointwise_form";
+inline constexpr llvm::StringLiteral pointwiseStorageAttr =
+    "intent_plan.tilelang.pointwise_storage";
+inline constexpr llvm::StringLiteral nativeContractReshapeNodeAttr =
+    "intent_plan.tilelang.native_contract_reshape_node";
 inline constexpr llvm::StringLiteral rowLaunchAttr =
     "intent_plan.tilelang.row_launch";
 inline constexpr llvm::StringLiteral equalProgramTilesAttr =
@@ -35,6 +41,14 @@ inline constexpr llvm::StringLiteral contractOrientationAttr =
     "intent_plan.tilelang.contract_orientation";
 inline constexpr llvm::StringLiteral contractBatchedAttr =
     "intent_plan.tilelang.contract_batched";
+inline constexpr llvm::StringLiteral contractMmaFormAttr =
+    "intent_plan.tilelang.contract_mma_form";
+inline constexpr llvm::StringLiteral packedDecodeLoadNodeAttr =
+    "intent_plan.tilelang.packed_decode_load_node";
+inline constexpr llvm::StringLiteral packedDecodeColumnAxisNodeAttr =
+    "intent_plan.tilelang.packed_decode_column_axis_node";
+inline constexpr llvm::StringLiteral packedDecodeProducerNodesAttr =
+    "intent_plan.tilelang.packed_decode_producer_nodes";
 inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
     "intent_plan.tilelang.scaled_contract_layout";
 inline constexpr llvm::StringLiteral reductionLoweringAttr =
@@ -47,6 +61,8 @@ inline constexpr llvm::StringLiteral pointwiseLoweringAttr =
     "intent_plan.tilelang.pointwise_lowering";
 inline constexpr llvm::StringLiteral gatherFormAttr =
     "intent_plan.tilelang.gather_form";
+inline constexpr llvm::StringLiteral loopCarrierSpacesAttr =
+    "intent_plan.tilelang.loop_carrier_spaces";
 inline constexpr llvm::StringLiteral streamTileAttr =
     "intent_plan.tilelang.stream_tile";
 inline constexpr llvm::StringLiteral raggedRouteAttr =

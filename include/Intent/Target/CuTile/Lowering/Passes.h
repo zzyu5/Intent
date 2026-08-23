@@ -13,6 +13,10 @@ inline constexpr llvm::StringLiteral accessAttr =
     "intent_plan.cutile.access";
 inline constexpr llvm::StringLiteral boundsAttr =
     "intent_plan.cutile.bounds";
+inline constexpr llvm::StringLiteral transferAttr =
+    "intent_plan.cutile.transfer";
+inline constexpr llvm::StringLiteral loadShapeNodeAttr =
+    "intent_plan.cutile.load_shape_node";
 inline constexpr llvm::StringLiteral rowOccupancyAttr =
     "intent_plan.cutile.row_occupancy";
 inline constexpr llvm::StringLiteral contractLoweringAttr =
@@ -21,6 +25,8 @@ inline constexpr llvm::StringLiteral contractOrientationAttr =
     "intent_plan.cutile.contract_orientation";
 inline constexpr llvm::StringLiteral contractBatchedAttr =
     "intent_plan.cutile.contract_batched";
+inline constexpr llvm::StringLiteral contractMmaFormAttr =
+    "intent_plan.cutile.contract_mma_form";
 inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
     "intent_plan.cutile.scaled_contract_layout";
 inline constexpr llvm::StringLiteral reductionLoweringAttr =

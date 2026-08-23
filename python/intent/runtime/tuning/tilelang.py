@@ -248,5 +248,12 @@ def autotune_configurations(
 def row_autotune_configurations() -> list[dict[str, int]]:
     return [
         {"num_stages": num_stages, "threads": threads}
-        for num_stages, threads in ((1, 128), (2, 128), (1, 256), (2, 256))
+        for num_stages, threads in (
+            (0, 32),
+            (1, 32),
+            (1, 128),
+            (2, 128),
+            (1, 256),
+            (2, 256),
+        )
     ]

@@ -14,11 +14,13 @@ from kernels.streaming.mla import paged_mla_decode
 from kernels.streaming.paged_attention import paged_gqa_decode_attention
 from kernels.streaming.paged_attention import paged_gqa_decode_partials
 from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce
+from kernels.routing.mqa_logits import fp8_mqa_logits
 
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
 from ...model import Context
+from ...model import ComparisonUnavailable
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
@@ -82,6 +84,52 @@ def modern_flash_attention_forward(context: Context) -> PreparedComparison:
 
     source_launch()
     source = PreparedLaunch(source_launch, lambda: source_output)
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=2e-2),
+        cuda_graph=True,
+    )
+
+
+def legacy_flash_attention_bias(context: Context) -> PreparedComparison:
+    del context
+    raise ComparisonUnavailable(
+        "source_compatibility_gap",
+        "the vendored legacy FlashAttention Triton kernel is numerically "
+        "incorrect under Triton 3.6 for both biased and unbiased forward "
+        "paths; keep the unmodified source as structure reference, not a "
+        "performance baseline",
+    )
+
+
+def flaggems_fp8_mqa_logits(context: Context) -> PreparedComparison:
+    queries, keys, heads, dimension = 256, 4096, 32, 128
+    q = (
+        torch.randn(
+            (queries, heads, dimension), device="cuda", dtype=torch.float16
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    kv = (
+        torch.randn((keys, dimension), device="cuda", dtype=torch.float16)
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    kv_scale = 0.5 + torch.rand((keys,), device="cuda", dtype=torch.float32)
+    head_weight = (
+        torch.rand((queries, heads), device="cuda", dtype=torch.float32) * 0.1
+    )
+    indices = torch.arange(queries, device="cuda", dtype=torch.int32)
+    key_start = indices % 17
+    key_end = keys - indices % 19
+    arguments = (q, kv, kv_scale, head_weight, key_start, key_end)
+    _, generated = compile_single(context, fp8_mqa_logits, arguments)
+    runtime = load_module(
+        context.project_root
+        / "source/triton/flag-gems/routing/fp8_mqa_logits/fp8_mqa_logits_runtime.py",
+        "intent_v2_triton_flaggems_fp8_mqa_logits",
+    )
+    source = functional_launch(lambda: runtime.upstream(arguments))
     return PreparedComparison(
         generated,
         source,
@@ -548,6 +596,8 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
 CASES = {
     "flash_attention_forward": flash_attention_forward,
     "modern_flash_attention_forward": modern_flash_attention_forward,
+    "legacy_flash_attention_bias": legacy_flash_attention_bias,
+    "flaggems_fp8_mqa_logits": flaggems_fp8_mqa_logits,
     "paged_gqa_decode": paged_gqa_decode,
     "splitk_paged_attention": splitk_paged_attention,
     "paged_mla_decode": paged_mla,

@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
+#include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -39,7 +40,7 @@ logicalBufferElementCount(const LogicalBufferInfo &info,
 
 inline mlir::FailureOr<LogicalBufferInfo>
 getLogicalBufferInfo(mlir::Operation &operation) {
-  if (operation.getName().getStringRef() != "intent.buffer" ||
+  if (semanticOperationName(operation) != "intent.buffer" ||
       operation.getNumOperands() != 1 || operation.getNumResults() != 1 ||
       !mlir::isa<intent::BufferType>(operation.getResult(0).getType()))
     return operation.emitOpError(

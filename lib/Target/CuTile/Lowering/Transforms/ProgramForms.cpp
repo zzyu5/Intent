@@ -63,7 +63,7 @@ bool translatedUnitStride(intent::plan::ProgramOp program,
       ranges.push_back(range);
   if (transfer.getTensorIndexing() != "structured" || ranges.size() != 1 ||
       ranges.front().getDivisorAttr() || !ranges.front().getOffsetAttr() ||
-      ranges.front().getOffsetAttr().getInt() <= 0)
+      ranges.front().getOffsetAttr().getInt() < 0)
     return false;
   StringRef tile = ranges.front().getTile();
   int64_t width = 0;
@@ -72,10 +72,99 @@ bool translatedUnitStride(intent::plan::ProgramOp program,
          ranges.front().getOffsetAttr().getInt() % width == 0;
 }
 
+Operation *matchDirectLoadShape(Operation &operation) {
+  if (::intent::target::semanticOperationName(operation) !=
+          "intent.view_load" ||
+      operation.getNumResults() != 1 ||
+      !isa<RankedTensorType>(operation.getResult(0).getType()))
+    return nullptr;
+  Value value = operation.getResult(0);
+  while (llvm::hasSingleElement(value.getUsers())) {
+    Operation *user = *value.user_begin();
+    StringRef name = ::intent::target::semanticOperationName(*user);
+    if (name == "intent.reshape" && user->getNumOperands() == 1 &&
+        user->getNumResults() == 1 &&
+        isa<RankedTensorType>(user->getResult(0).getType()))
+      return user;
+    if (name != "intent.cast" || user->getNumOperands() != 1 ||
+        user->getNumResults() != 1 ||
+        !isa<RankedTensorType>(user->getResult(0).getType()))
+      return nullptr;
+    value = user->getResult(0);
+  }
+  return nullptr;
+}
+
 bool hasIndexedRagged(const target::KernelFacts &facts) {
   return llvm::any_of(facts.raggedRelations, [](const auto &entry) {
     return static_cast<bool>(entry.second.indices);
   });
+}
+
+bool hasExactStructuredUniqueStore(
+    gpu::PhysicalProgramAnalysis &analysis, intent::plan::TransferOp transfer,
+    Operation &operation) {
+  if (::intent::target::semanticOperationName(operation) !=
+          "intent.scatter_unique" ||
+      transfer.getTensorIndexing() != "structured")
+    return false;
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation))
+    return false;
+  unsigned tensorIndices = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    auto tensor = dyn_cast<RankedTensorType>(
+        operation.getOperand(*term.operands.front()).getType());
+    if (!tensor)
+      continue;
+    if (tensor.getRank() != 1)
+      return false;
+    ++tensorIndices;
+  }
+  if (tensorIndices != 1)
+    return false;
+  for (int64_t node : transfer.getValidityDomainNodes()) {
+    intent::plan::RangeOp range = analysis.getRange(node, "ownership");
+    if (!range || !range.getTile().starts_with("fixed_"))
+      return false;
+    int64_t tile = 0;
+    int64_t extent = 0;
+    if (range.getTile().drop_front(6).getAsInteger(10, tile) ||
+        range.getExtent().getAsInteger(10, extent) || tile != extent)
+      return false;
+  }
+  return true;
+}
+
+std::optional<int64_t>
+physicalLeadingExtent(gpu::PhysicalProgramAnalysis &analysis, Value value) {
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor || tensor.getRank() == 0)
+    return std::nullopt;
+  int64_t staticExtent = tensor.getDimSize(0);
+  if (staticExtent != ShapedType::kDynamic)
+    return staticExtent;
+  auto axes = analysis.getFacts().valueAxes.find(value);
+  if (axes == analysis.getFacts().valueAxes.end() || axes->second.empty() ||
+      !axes->second.front().domain)
+    return std::nullopt;
+  auto node = axes->second.front().domain->getAttrOfType<IntegerAttr>(
+      "intent.node");
+  intent::plan::RangeOp range =
+      node ? analysis.getRange(node.getInt(), "ownership")
+           : intent::plan::RangeOp();
+  if (!range && node)
+    range = analysis.getRange(node.getInt(), "lane");
+  if (!range || !range.getTile().starts_with("fixed_"))
+    return std::nullopt;
+  int64_t extent = 0;
+  if (range.getTile().drop_front(6).getAsInteger(10, extent))
+    return std::nullopt;
+  return extent;
 }
 
 LogicalResult realizePointwiseLaneForm(
@@ -206,6 +295,11 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                   builder.getStringAttr(tuneRows ? "delegated" : "fixed"));
 
   target::KernelModel &kernel = (*analysis)->getKernel();
+  llvm::DenseSet<int64_t> partitionedStreams;
+  for (intent::plan::StreamBindingOp stream :
+       program.getBody().getOps<intent::plan::StreamBindingOp>())
+    if (stream.getPartitionNodeAttr())
+      partitionedStreams.insert(stream.getStreamNode());
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
     if (!ragged || ragged->hasAttr(raggedRouteAttr))
@@ -222,6 +316,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (contract->hasAttr(contractLoweringAttr) ||
         contract->hasAttr(contractOrientationAttr) ||
         contract->hasAttr(contractBatchedAttr) ||
+        contract->hasAttr(contractMmaFormAttr) ||
         contract->hasAttr(scaledContractLayoutAttr))
       return contract.emitOpError("already has a cuTile contraction spelling");
     Operation *operation = kernel.nodes.lookup(contract.getNode());
@@ -244,6 +339,18 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                               *orientation)));
     contract->setAttr(contractBatchedAttr,
                       builder.getBoolAttr(orientation->batched));
+    auto result = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
+    std::optional<int64_t> resultRows =
+        result && result.getRank() == 2
+            ? physicalLeadingExtent(**analysis, operation->getResult(0))
+            : std::nullopt;
+    bool transposeSubwarpRows =
+        contract.getForm() == "direct" && !orientation->batched &&
+        resultRows && *resultRows > 0 && *resultRows < 16;
+    contract->setAttr(
+        contractMmaFormAttr,
+        builder.getStringAttr(transposeSubwarpRows ? "transposed_result"
+                                                  : "native"));
     if (contract.getForm() == "scaled_direct") {
       FailureOr<StringRef> layout =
           target::lowering::scaledContractionLayout(*operation);
@@ -289,6 +396,18 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError("already has a cuTile pointwise spelling");
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    std::string gatherForm;
+    if (operation && target::semanticOperationName(*operation) ==
+                         "intent.gather") {
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
+      if (failed(gather))
+        return failure();
+      if (*gather == "fragment_projection")
+        return pointwise.emitOpError(
+            "cuTile fragment projection form is not materialized");
+      gatherForm = std::move(*gather);
+    }
     FailureOr<std::string> role =
         operation ? target::lowering::pointwiseRole(*operation)
                   : FailureOr<std::string>(failure());
@@ -301,13 +420,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather =
-          target::lowering::classifyGatherProjection(*operation);
-      if (failed(gather))
-        return failure();
-      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
-    }
+    if (!gatherForm.empty())
+      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(gatherForm));
   }
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
@@ -323,15 +437,11 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
   }
 
-  llvm::DenseSet<int64_t> partitionedStreams;
-  for (intent::plan::StreamBindingOp stream :
-       program.getBody().getOps<intent::plan::StreamBindingOp>())
-    if (stream.getPartitionNodeAttr())
-      partitionedStreams.insert(stream.getStreamNode());
-
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
-    if (transfer->hasAttr(accessAttr) || transfer->hasAttr(boundsAttr))
+    if (transfer->hasAttr(accessAttr) || transfer->hasAttr(boundsAttr) ||
+        transfer->hasAttr(transferAttr) ||
+        transfer->hasAttr(loadShapeNodeAttr))
       return transfer.emitOpError(
           "already has a cuTile transfer-form decision");
     Operation *operation =
@@ -343,11 +453,20 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     bool uniqueStore = name == "intent.scatter_unique";
     if (!load && !store)
       return transfer.emitOpError("does not bind a canonical transfer");
+    Operation *loadShape = load ? matchDirectLoadShape(*operation) : nullptr;
+    auto loadShapeType =
+        loadShape && loadShape->getNumResults() == 1
+            ? dyn_cast<RankedTensorType>(loadShape->getResult(0).getType())
+            : RankedTensorType();
+    bool scalarLoadShape = loadShapeType && loadShapeType.getRank() == 0;
     FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(*operation);
     if (failed(derivedScalar))
       return failure();
     bool tensorIndexed = transfer.getTensorIndexing() != "none" &&
                          !translatedUnitStride(program, transfer);
+    bool advancedUniqueStore =
+        uniqueStore && hasExactStructuredUniqueStore(**analysis, transfer,
+                                                     *operation);
     bool vectorized = llvm::any_of(
         transfer.getDomainNodes(), [&](int64_t node) {
           return !(*analysis)->isScalarAxis(node);
@@ -366,20 +485,51 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       partitionStream = node && partitionedStreams.contains(node.getInt());
       break;
     }
-    bool indirect = !uniqueStore &&
-                    (tensorIndexed ||
-                     (((*analysis)->hasWorkerReuse() || raggedBound ||
-                       partitionStream) &&
-                      vectorized));
-    StringRef access = indirect ? (load ? "gather" : "scatter")
-                                : (load ? "load" : "store");
+    bool partitionTile =
+        load && partitionStream && vectorized && !tensorIndexed &&
+        !raggedBound && !(*analysis)->hasWorkerReuse() && !*derivedScalar;
+    bool indirect =
+        uniqueStore
+            ? tensorIndexed && !advancedUniqueStore
+            : (tensorIndexed ||
+               (((*analysis)->hasWorkerReuse() || raggedBound ||
+                 (partitionStream && !partitionTile)) &&
+                vectorized));
+    StringRef access = scalarLoadShape
+                           ? StringRef("gather")
+                       : indirect ? (load ? StringRef("gather")
+                                          : StringRef("scatter"))
+                                  : (load ? StringRef("load")
+                                          : StringRef("store"));
     bool bounds = (*analysis)->hasWorkerReuse() || raggedBound ||
                   partitionStream || *derivedScalar;
     transfer->setAttr(accessAttr, builder.getStringAttr(access));
     transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
+    transfer->setAttr(
+        transferAttr,
+        builder.getStringAttr(advancedUniqueStore
+                                  ? "advanced_index_store"
+                              : partitionTile ? "partition_stream_tile"
+                                              : "direct"));
+    loadShape =
+        load && !partitionTile &&
+                transfer.getMaterialization() == "direct"
+            ? matchDirectLoadShape(*operation)
+            : nullptr;
+    auto loadShapeNode =
+        loadShape
+            ? loadShape->getAttrOfType<IntegerAttr>("intent.node")
+            : IntegerAttr();
+    if (loadShape && !loadShapeNode)
+      return loadShape->emitOpError(
+          "cuTile direct-load shape form requires one canonical reshape node");
+    if (loadShapeNode)
+      transfer->setAttr(loadShapeNodeAttr, loadShapeNode);
   }
-  return appendGatherTuning(
-      searchSpace, needsGuardedGatherTuning(**analysis, searchSpace));
+  if (failed(appendGatherTuning(
+          searchSpace, needsGuardedGatherTuning(**analysis, searchSpace))))
+    return failure();
+  return success();
 }
 
 class RealizeProviderProgramPass final
@@ -454,8 +604,11 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto orientation =
         contract->getAttrOfType<StringAttr>(contractOrientationAttr);
     auto batched = contract->getAttrOfType<BoolAttr>(contractBatchedAttr);
+    auto mmaForm = contract->getAttrOfType<StringAttr>(contractMmaFormAttr);
     auto layout = contract->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
     if (!lowering || lowering.getValue().empty() || !orientation || !batched ||
+        !mmaForm || (mmaForm.getValue() != "native" &&
+                     mmaForm.getValue() != "transposed_result") ||
         (orientation.getValue() != "nn" && orientation.getValue() != "nt" &&
          orientation.getValue() != "tn" && orientation.getValue() != "tt") ||
         (contract.getForm() == "scaled_direct" &&
@@ -501,6 +654,8 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
        program.getBody().getOps<intent::plan::TransferOp>()) {
     auto access = transfer->getAttrOfType<StringAttr>(accessAttr);
     auto bounds = transfer->getAttrOfType<BoolAttr>(boundsAttr);
+    auto form = transfer->getAttrOfType<StringAttr>(transferAttr);
+    auto loadShape = transfer->getAttrOfType<IntegerAttr>(loadShapeNodeAttr);
     Operation *operation = kernel.nodes.lookup(transfer.getNode());
     StringRef name = operation ? ::intent::target::semanticOperationName(*operation) : StringRef();
     bool load = name == "intent.view_load";
@@ -509,7 +664,37 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                   access.getValue() == "gather")) ||
                         (!load && (access.getValue() == "store" ||
                                    access.getValue() == "scatter")));
-    if (!operation || !bounds || !validAccess)
+    bool validForm =
+        form && (form.getValue() == "direct" ||
+                 (form.getValue() == "advanced_index_store" && !load &&
+                  access && access.getValue() == "store") ||
+                 (form.getValue() == "partition_stream_tile" && load &&
+                  access && access.getValue() == "load"));
+    Operation *matchedLoadShape =
+        operation && load ? matchDirectLoadShape(*operation) : nullptr;
+    auto matchedLoadShapeNode =
+        matchedLoadShape
+            ? matchedLoadShape->getAttrOfType<IntegerAttr>("intent.node")
+            : IntegerAttr();
+    auto matchedLoadShapeType =
+        matchedLoadShape && matchedLoadShape->getNumResults() == 1
+            ? dyn_cast<RankedTensorType>(
+                  matchedLoadShape->getResult(0).getType())
+            : RankedTensorType();
+    bool matchedScalarLoadShape =
+        matchedLoadShapeType && matchedLoadShapeType.getRank() == 0;
+    bool validLoadShape =
+        !loadShape ||
+        (load && access &&
+         access.getValue() ==
+             (matchedScalarLoadShape ? StringRef("gather")
+                                     : StringRef("load")) &&
+         form &&
+         form.getValue() == "direct" &&
+         matchedLoadShapeNode &&
+         matchedLoadShapeNode.getInt() == loadShape.getInt());
+    if (!operation || !bounds || !validAccess || !validForm ||
+        !validLoadShape)
       return transfer.emitOpError(
           "has no complete legal cuTile transfer-form decision");
   }

@@ -129,7 +129,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       ranges.push_back(value);
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
-      index.regionBindings[value.getArgument()] = value;
+      index.regionBindings[value.getValue()] = value;
     } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
@@ -497,14 +497,13 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
   }
   for (const auto &entry : planIndex.regionBindings) {
     Value value = kernel.values.lookup(entry.first);
-    auto argument = dyn_cast<BlockArgument>(value);
     plan::RegionBindingOp binding = entry.second;
     plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
     const target::lowering::RangeBinding *range =
         axis ? axis.getRange(binding.getPurpose(), binding.getLevel()) : nullptr;
-    if (!argument || !axis || !range)
+    if (!value || !axis || !range)
       return binding.emitOpError(
-          "does not bind a canonical region argument and selected range");
+          "does not bind a canonical region value and selected range");
     bool roundedRow = !axis.getReuseWorker() &&
                       range->getTileRole().starts_with("row_vector");
     if (roundedRow && !planIndex.blockExtents.count(range->getExtent()))
@@ -643,7 +642,7 @@ void ProgramMaterializer::emitImports() {
               "        raise ValueError('partition count must be positive')\n"
               "    return (logical_extent + count - 1) // count\n";
   if (llvm::any_of(planIndex.pointwise, [](const auto &entry) {
-        return entry.second.getLowering() == "libdevice.pow";
+        return entry.second.getLowering().starts_with("libdevice.");
       }))
     output << "from triton.language.extra import libdevice\n";
   if (!planIndex.components.reusedAxes.empty() || configureRowVector) {
@@ -878,7 +877,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
   if (usesScaledContraction())
     emitParameter("USE_NATIVE_SCALED: tl.constexpr");
   output << "):\n";
-  if (!programRoot && failed(emitProgramBindings()))
+  if (failed(emitProgramBindings()))
     return failure();
   return success();
 }
@@ -1216,7 +1215,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   SmallVector<plan::AxisOp> programAxes =
       target::lowering::orderedProgramAxes(planIndex);
   for (plan::AxisOp axis : programAxes) {
-    if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
+    if (!planIndex.components.raggedProgramAxes.contains(axis.getNode()))
       continue;
     FailureOr<plan::RaggedOp> relation =
         target::lowering::uniqueRaggedRelation(
@@ -1225,7 +1224,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
                        ? raggedRuntimeByRelation.find(relation->getNode())
                        : raggedRuntimeByRelation.end();
     if (failed(relation) || runtime == raggedRuntimeByRelation.end())
-      return axis.emitOpError("has no ordered ragged runtime metadata");
+      return axis.emitOpError("has no ragged program runtime metadata");
     ABIView *offsets = raggedRuntimes[runtime->second].offsets;
     output << "    max_member_length_" << axis.getNode() << " = int(("
            << offsets->argument->name << "[1:] - "
@@ -1235,7 +1234,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
       planIndex, [&](plan::AxisOp axis) {
         std::string role = "program_" + std::to_string(axis.getProgramOrder());
         std::string extent =
-            planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode())
+            planIndex.components.raggedProgramAxes.contains(axis.getNode())
                 ? "max_member_length_" + std::to_string(axis.getNode())
                 : roleDimensions.lookup(role);
         return axis.isScalar()
@@ -1527,14 +1526,7 @@ ProgramMaterializer::packedScalarInsertions(Operation &operation) {
 }
 
 FailureOr<std::string> ProgramMaterializer::dimensionName(Operation &domain) {
-  return target::lowering::logicalDomainExtent(
-      domain, [&](Value value,
-                  Operation &consumer) -> FailureOr<ArrayRef<std::string>> {
-        FailureOr<ABIView *> view = lookupView(value, consumer);
-        if (failed(view))
-          return failure();
-        return ArrayRef<std::string>((*view)->shape);
-      });
+  return target::lowering::plannedDomainExtent(domain, planIndex);
 }
 
 FailureOr<std::string>
@@ -1544,7 +1536,8 @@ ProgramMaterializer::indexExpression(plan::AxisOp axis, bool store,
   std::string base = axisIndices.lookup(axis.getNode());
   if (base.empty()) {
     consumer.emitOpError()
-        << "has no active physical index for logical axis " << axis.getNode();
+        << "has no active physical index for logical axis " << axis.getNode()
+        << " with roles " << axis.getRoles();
     return failure();
   }
   if (axis.isScalar())

@@ -47,53 +47,28 @@ inline bool hasNonReplayableEffect(mlir::Operation *root) {
   return found;
 }
 
-template <typename LookupShape>
+template <typename PlanIndex>
 inline mlir::FailureOr<std::string>
-logicalDomainExtent(mlir::Operation &domain, LookupShape lookupShape) {
-  llvm::StringRef name = ::intent::target::semanticOperationName(domain);
-  if (name == "intent.ragged_outer" || name == "intent.ragged_member") {
-    mlir::Operation *relation =
-        domain.getNumOperands() >= 1
-            ? domain.getOperand(0).getDefiningOp()
-            : nullptr;
-    unsigned sourceOperand = name == "intent.ragged_outer" ? 0 : 1;
-    mlir::Operation *source =
-        relation && (relation->getNumOperands() == 3 ||
-                     relation->getNumOperands() == 4)
-            ? relation->getOperand(sourceOperand).getDefiningOp()
-            : nullptr;
-    if (!source)
+plannedDomainExtent(mlir::Operation &domain, const PlanIndex &index) {
+  mlir::FailureOr<int64_t> node =
+      target::getNodeID(domain, "planned logical-domain extent");
+  auto axis = mlir::succeeded(node) ? index.axes.find(*node) : index.axes.end();
+  if (mlir::failed(node) || axis == index.axes.end() ||
+      axis->second.ranges.empty())
+    return domain.emitOpError("has no planned logical-domain extent");
+  auto logical = llvm::find_if(axis->second.ranges, [](const auto &range) {
+    return range.getPurpose() != "access";
+  });
+  if (logical == axis->second.ranges.end() || logical->getExtent().empty())
+    return domain.emitOpError("has an empty planned logical-domain extent");
+  llvm::StringRef extent = logical->getExtent();
+  for (const auto &range : axis->second.ranges)
+    if (range.getPurpose() != "access" && range.getExtent() != extent)
       return domain.emitOpError(
-          "has no canonical ragged source-domain extent");
-    return logicalDomainExtent(*source, lookupShape);
-  }
-  if (domain.getNumOperands() < 2)
-    return domain.emitOpError("has no canonical extent operand");
-  mlir::Operation *dimension = domain.getOperand(1).getDefiningOp();
-  auto constant =
-      dimension
-          ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.value")
-          : mlir::IntegerAttr();
-  if (dimension &&
-      ::intent::target::semanticOperationName(*dimension) == "intent.constant" &&
-      constant &&
-      constant.getInt() > 0)
-    return std::to_string(constant.getInt());
-  auto axis =
-      dimension
-          ? dimension->getAttrOfType<mlir::IntegerAttr>("intent.axis")
-          : mlir::IntegerAttr();
-  if (!dimension ||
-      ::intent::target::semanticOperationName(*dimension) != "intent.dim" ||
-      !axis ||
-      dimension->getNumOperands() != 1)
-    return domain.emitOpError("has no canonical ABI dimension source");
-  mlir::FailureOr<llvm::ArrayRef<std::string>> shape =
-      lookupShape(dimension->getOperand(0), domain);
-  if (mlir::failed(shape) || axis.getInt() < 0 ||
-      static_cast<size_t>(axis.getInt()) >= shape->size())
-    return domain.emitOpError("references an invalid ABI dimension axis");
-  return (*shape)[axis.getInt()];
+                 "has conflicting logical extents across physical ranges: ")
+             << logical->getPurpose() << "=" << extent
+             << ", " << range.getPurpose() << "=" << range.getExtent();
+  return extent.str();
 }
 
 inline mlir::FailureOr<std::string>
@@ -314,6 +289,8 @@ pointwiseRole(mlir::Operation &operation) {
     bool indirect = llvm::any_of(*relation, [](const target::IndexTerm &term) {
       return term.kind == "value_index";
     });
+    bool fragmentProjection =
+        target::isFragmentProjection(operation, *relation);
     auto sourceType = operation.getNumOperands() > 0
                           ? mlir::dyn_cast<mlir::RankedTensorType>(
                                 operation.getOperand(0).getType())
@@ -330,6 +307,8 @@ pointwiseRole(mlir::Operation &operation) {
       return std::string("expand_dims");
     if (indirect)
       return std::string("indirect_gather");
+    if (fragmentProjection)
+      return std::string("fragment_projection");
     if (extractFirstScalar)
       return std::string("extract_first_scalar");
     return operation.emitOpError("has no supported gather relation");
@@ -360,10 +339,23 @@ classifyGatherProjection(mlir::Operation &operation) {
   mlir::FailureOr<std::string> role = pointwiseRole(operation);
   if (mlir::failed(role))
     return mlir::failure();
-  if (*role == "extract_first_scalar")
+  if (*role == "extract_first_scalar") {
+    if (mlir::Operation *indices = operation.getOperand(0).getDefiningOp();
+        indices &&
+        ::intent::target::semanticOperationName(*indices) == "intent.indices" &&
+        indices->getNumOperands() == 1) {
+      mlir::Operation *domain = indices->getOperand(0).getDefiningOp();
+      if (domain &&
+          ::intent::target::semanticOperationName(*domain) ==
+              "intent.ragged_member")
+        return std::string("ragged_start_scalar");
+    }
     return std::string("extract_first_scalar");
+  }
   if (*role == "expand_dims")
     return std::string("expand_dims");
+  if (*role == "fragment_projection")
+    return std::string("fragment_projection");
   if (*role != "indirect_gather")
     return operation.emitOpError("is not an indirect gather projection");
 
@@ -597,34 +589,45 @@ struct ResultAxisRegionRangeBinding {
 };
 
 template <typename PlanIndex>
-mlir::FailureOr<RegionRangeBinding>
-selectedRegionArgumentRange(const PlanIndex &index,
-                            const target::KernelModel &kernel,
-                            mlir::Value value, mlir::Operation &consumer) {
-  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+mlir::FailureOr<std::optional<RegionRangeBinding>>
+selectedRegionValueRange(const PlanIndex &index,
+                         const target::KernelModel &kernel, mlir::Value value,
+                         mlir::Operation &consumer) {
   mlir::FailureOr<int64_t> valueID =
-      argument ? target::getValueID(value, kernel, consumer,
-                                    "selected region-argument range")
-               : mlir::FailureOr<int64_t>(mlir::failure());
-  auto binding = mlir::succeeded(valueID)
-                     ? index.regionBindings.find(*valueID)
-                     : index.regionBindings.end();
-  intent::plan::RegionBindingOp region =
-      binding != index.regionBindings.end() ? binding->second
-                                            : intent::plan::RegionBindingOp();
-  auto axis = binding != index.regionBindings.end()
-                  ? index.axes.find(region.getAxisNode())
-                  : index.axes.end();
+      target::getValueID(value, kernel, consumer, "selected region-value range");
+  if (mlir::failed(valueID))
+    return mlir::failure();
+  auto binding = index.regionBindings.find(*valueID);
+  if (binding == index.regionBindings.end())
+    return std::optional<RegionRangeBinding>();
+  intent::plan::RegionBindingOp region = binding->second;
+  auto axis = index.axes.find(region.getAxisNode());
   const RangeBinding *range =
       axis != index.axes.end()
           ? axis->second.getRange(region.getPurpose(), region.getLevel())
           : nullptr;
-  if (!argument || mlir::failed(valueID) ||
-      binding == index.regionBindings.end() || axis == index.axes.end() ||
-      !range)
+  if (axis == index.axes.end() || !range)
+    return consumer.emitOpError(
+        "has no selected physical range for its bound region value");
+  return std::optional<RegionRangeBinding>(
+      RegionRangeBinding{axis->second, *range});
+}
+
+template <typename PlanIndex>
+mlir::FailureOr<RegionRangeBinding>
+selectedRegionArgumentRange(const PlanIndex &index,
+                            const target::KernelModel &kernel,
+                            mlir::Value value, mlir::Operation &consumer) {
+  if (!mlir::isa<mlir::BlockArgument>(value))
+    return consumer.emitOpError("does not reference a region argument");
+  mlir::FailureOr<std::optional<RegionRangeBinding>> selected =
+      selectedRegionValueRange(index, kernel, value, consumer);
+  if (mlir::failed(selected))
+    return mlir::failure();
+  if (!*selected)
     return consumer.emitOpError(
         "has no selected physical range for its region argument");
-  return RegionRangeBinding{axis->second, *range};
+  return **selected;
 }
 
 template <typename PlanIndex>
@@ -1346,7 +1349,7 @@ struct PhysicalComponents {
   llvm::DenseMap<int64_t, llvm::SmallVector<StreamBinding>> streamsByAxis;
   llvm::DenseMap<int64_t, llvm::SmallVector<RaggedBinding>> raggedByAxis;
   llvm::DenseSet<int64_t> orderedRaggedAxes;
-  llvm::DenseSet<int64_t> orderedRaggedProgramAxes;
+  llvm::DenseSet<int64_t> raggedProgramAxes;
   llvm::DenseMap<int64_t, llvm::SmallVector<int64_t>> orderedAxesByRelation;
   llvm::DenseMap<int64_t, llvm::SmallVector<int64_t>> programAxesByRelation;
 };
@@ -1594,14 +1597,15 @@ uniqueRaggedRelation(const PlanIndex &index, int64_t axis,
 inline bool isRaggedBoundAxis(const PhysicalComponents &components,
                               int64_t axis) {
   return components.orderedRaggedAxes.contains(axis) ||
-         components.orderedRaggedProgramAxes.contains(axis);
+         components.raggedProgramAxes.contains(axis);
 }
 
 template <typename PlanIndex>
 mlir::FailureOr<int64_t>
 representativeOrderedAxis(const PlanIndex &index, int64_t axis,
                           mlir::Operation &consumer) {
-  if (index.components.orderedRaggedAxes.contains(axis))
+  if (index.components.orderedRaggedAxes.contains(axis) ||
+      index.components.raggedProgramAxes.contains(axis))
     return axis;
   mlir::FailureOr<RaggedBinding> relation =
       uniqueRaggedRelation(index, axis, consumer);
@@ -1689,35 +1693,43 @@ mlir::LogicalResult indexCanonicalStructure(
     intent::plan::RegionBindingOp binding = entry.second;
     mlir::Value value = kernel.values.lookup(entry.first);
     auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    bool canonicalDomainResult =
+        result && result.getResultNumber() == 0 &&
+        result.getOwner()->getNumResults() == 1 &&
+        mlir::isa<intent::DomainType>(result.getType());
     auto axis = index.axes.find(binding.getAxisNode());
     const RangeBinding *range =
         axis == index.axes.end()
             ? nullptr
             : axis->second.getRange(binding.getPurpose(), binding.getLevel());
-    mlir::Operation *owner =
-        argument ? argument.getOwner()->getParentOp() : nullptr;
+    mlir::Operation *owner = argument ? argument.getOwner()->getParentOp()
+                                      : result ? result.getOwner() : nullptr;
     llvm::StringRef expected =
         owner && ::intent::target::semanticOperationName(*owner) ==
                      "intent.parallel"
             ? llvm::StringRef("ownership")
-        : owner && ::intent::target::semanticOperationName(*owner) ==
+        : owner && argument && ::intent::target::semanticOperationName(*owner) ==
                        "intent.state_stream"
             ? llvm::StringRef("traversal")
+        : owner && canonicalDomainResult ? llvm::StringRef("ownership")
             : llvm::StringRef();
     mlir::FailureOr<target::ScalarIndexSource> source =
         argument && owner
             ? target::traceScalarIndexSource(argument, *owner)
             : mlir::FailureOr<target::ScalarIndexSource>(mlir::failure());
     mlir::FailureOr<int64_t> sourceNode =
-        mlir::succeeded(source) && source->domain
+        canonicalDomainResult && owner
+            ? target::getNodeID(*owner, "region-value source-axis verification")
+        : mlir::succeeded(source) && source->domain
             ? target::getNodeID(*source->domain,
                                 "region-argument source-axis verification")
             : mlir::FailureOr<int64_t>(mlir::failure());
-    if (!argument || !owner || expected.empty() ||
+    if ((!argument && !canonicalDomainResult) || !owner || expected.empty() ||
         binding.getPurpose() != expected || !range || mlir::failed(sourceNode) ||
         *sourceNode != static_cast<int64_t>(binding.getAxisNode()))
       return binding.emitOpError(
-          "does not bind the exact region argument source to its selected range");
+          "does not bind the exact region value source to its selected range");
   }
   llvm::SmallVector<int64_t> relationNodes;
   for (const auto &entry : kernel.raggedRelations)
@@ -1887,13 +1899,11 @@ PhysicalComponents indexPhysicalComponents(const PlanIndex &index) {
     }
   }
   for (RaggedBinding relation : index.ragged) {
-    if (!result.orderedAxesByRelation.count(relation.getNode()))
-      continue;
     for (int64_t member : relation.getMemberNodes()) {
       auto axis = index.axes.find(member);
       if (axis == index.axes.end() || !axis->second.hasRole("parallel"))
         continue;
-      result.orderedRaggedProgramAxes.insert(member);
+      result.raggedProgramAxes.insert(member);
       result.programAxesByRelation[relation.getNode()].push_back(member);
     }
   }

@@ -33,6 +33,18 @@ def shifted_row_copy(
 
 
 @intent.kernel
+def roll_rows_forward(
+    x: I.In[I.f16, ("M", "N")],
+    output: I.Out[I.f16, ("M", "N")],
+):
+    M, N = x.shape
+    rows = I.domain(0, M)
+    columns = I.domain(0, N)
+    source_rows = (I.indices(rows) + 1) % M
+    output[rows, columns] = x[source_rows, columns]
+
+
+@intent.kernel
 def grouped_query_head_add(
     query: I.In[I.f16, ("HQ", "N")],
     key: I.In[I.f16, ("HK", "N")],

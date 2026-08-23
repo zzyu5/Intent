@@ -64,6 +64,8 @@ cos = Intrinsic("cos")
 floor = Intrinsic("floor")
 rsqrt = Intrinsic("rsqrt")
 sigmoid = Intrinsic("sigmoid")
+tanh = Intrinsic("tanh")
+abs = Intrinsic("abs")
 maximum = Intrinsic("maximum")
 minimum = Intrinsic("minimum")
 any = Intrinsic("any")
@@ -121,6 +123,8 @@ INTRINSICS = {
         cos,
         rsqrt,
         sigmoid,
+        tanh,
+        abs,
         maximum,
         minimum,
         any,

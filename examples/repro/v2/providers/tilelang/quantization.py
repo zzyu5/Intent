@@ -57,7 +57,9 @@ def per_token_fp8(context: Context) -> PreparedComparison:
 CASES = {
     "per_token_fp8": per_token_fp8,
     "block_fp4_quant": implementation_gap(
-        "the source output is a packed float4_e2m1fn_x2 tensor with explicit "
-        "nibble ordering; that storage contract is not a current Intent dtype"
+        "the source contract converts each bf16 group of 32 with a power-of-two "
+        "absmax scale, rounds to E2M1, and stores even logical elements in the "
+        "low nibble and odd elements in the high nibble; Intent has no typed "
+        "E2M1 conversion and packed-nibble output ABI"
     ),
 }

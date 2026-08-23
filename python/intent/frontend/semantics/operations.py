@@ -123,6 +123,8 @@ class UnaryOperator(Enum):
     FLOOR = "floor"
     RSQRT = "rsqrt"
     SIGMOID = "sigmoid"
+    TANH = "tanh"
+    ABS = "abs"
 
 
 class BinaryOperator(Enum):

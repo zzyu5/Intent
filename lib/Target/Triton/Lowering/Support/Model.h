@@ -252,6 +252,7 @@ private:
   llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
   llvm::DenseMap<int64_t, std::string> axisIndices;
+  llvm::DenseMap<mlir::Value, std::string> selectedRegionIndices;
   llvm::DenseMap<
       mlir::Operation *,
       llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>

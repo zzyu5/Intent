@@ -41,7 +41,6 @@ def recurrent_gated_delta_fwd(
             )
             with stream:
                 for position_region, state in stream:
-                    position = I.indices(position_region)
                     query_vector = I.reshape(
                         I.cast(
                             query[
@@ -81,7 +80,7 @@ def recurrent_gated_delta_fwd(
                     decay = I.exp(
                         I.reshape(
                             I.cast(
-                                gate[batch, position, value_head],
+                                gate[batch, position_region, value_head],
                                 I.f32,
                             ),
                             (),
@@ -97,7 +96,7 @@ def recurrent_gated_delta_fwd(
                         value_vector - remembered
                     ) * I.reshape(
                         I.cast(
-                            beta[batch, position, value_head],
+                            beta[batch, position_region, value_head],
                             I.f32,
                         ),
                         (),

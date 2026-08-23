@@ -63,6 +63,16 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
     roles = frozenset(parameter_map.values())
     for role in roles:
         _role_candidates(role)
+    single_program_profiles = (
+        tuple(
+            ({role: tile}, 1, occupancy)
+            for role in roles
+            for tile in _role_candidates(role)
+            for occupancy in (1, 2, 3, 4)
+        )
+        if len(roles) == 1 and next(iter(roles)).startswith("program_")
+        else ()
+    )
     joint_program_profiles = (
         tuple(
             (
@@ -97,6 +107,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
         (
             ({"stream_contract": 32}, 1, 4),
             ({"stream_contract": 64}, 1, 2),
+            ({"stream_contract": 128}, 1, 1),
         ),
         (
             ({"stream_scaled": 1}, 1, 4),
@@ -141,6 +152,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
             for reduction in (16, 32, 64)
             for occupancy in (1, 2, 4)
         ),
+        single_program_profiles,
         joint_program_profiles,
         (
             ({"ragged_member": 128, "feature": 64, "reduction": 64}, 1, 1),

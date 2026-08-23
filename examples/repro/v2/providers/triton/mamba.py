@@ -172,6 +172,25 @@ def mamba3_siso_forward(context: Context) -> PreparedComparison:
         angles,
         residual,
         gate,
+        torch.empty(
+            (batch, sequence, heads, qk_dimension),
+            device="cuda",
+            dtype=dtype,
+        ),
+        torch.empty(
+            (batch, sequence, heads, qk_dimension),
+            device="cuda",
+            dtype=dtype,
+        ),
+        torch.empty(
+            (batch, heads, sequence), device="cuda", dtype=torch.float32
+        ),
+        torch.empty(
+            (batch, heads, sequence), device="cuda", dtype=torch.float32
+        ),
+        torch.empty(
+            (batch, heads, sequence), device="cuda", dtype=torch.float32
+        ),
     )
     _, generated_base = compile_single(
         context,
@@ -181,7 +200,7 @@ def mamba3_siso_forward(context: Context) -> PreparedComparison:
     )
     generated = PreparedLaunch(
         generated_base.launch,
-        lambda: generated_base.outputs()[0],
+        generated_base.outputs,
     )
     _activate(
         context,

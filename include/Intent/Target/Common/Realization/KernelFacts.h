@@ -96,6 +96,13 @@ struct CountPartitionFact {
   mlir::Value regionArgument;
 };
 
+struct RuntimeDomainFact {
+  mlir::Value start;
+  mlir::Value stop;
+  mlir::Value step;
+  std::string extent;
+};
+
 enum class TensorIndexingKind {
   none,
   structured,
@@ -112,7 +119,7 @@ struct KernelFacts {
   llvm::DenseMap<mlir::Operation *, int64_t> staticDomainExtents;
   llvm::DenseMap<mlir::Operation *, std::pair<int64_t, int64_t>>
       staticDomainBounds;
-  llvm::DenseSet<mlir::Operation *> runtimeSequentialDomains;
+  llvm::DenseMap<mlir::Operation *, RuntimeDomainFact> runtimeBoundedDomains;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> partitionDomains;
   llvm::DenseMap<mlir::Operation *, int64_t> partitionFixedExtents;
   llvm::DenseMap<mlir::Operation *, mlir::Value> partitionCounts;

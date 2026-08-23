@@ -1,5 +1,6 @@
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 
+#include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Target/Common/Analysis/Operation.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -125,6 +126,32 @@ traceScalarIndexSourceImpl(Value value, Operation &consumer,
 }
 
 } // namespace
+
+bool isFragmentProjection(Operation &operation,
+                          ArrayRef<IndexTerm> relation) {
+  auto source = operation.getNumOperands() > 0
+                    ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                    : RankedTensorType();
+  auto result = operation.getNumResults() == 1
+                    ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                    : RankedTensorType();
+  if (!source || !result || source.getRank() != result.getRank() ||
+      relation.size() != static_cast<size_t>(source.getRank()))
+    return false;
+  unsigned projectedAxes = 0;
+  for (const IndexTerm &term : relation) {
+    if (term.kind == "full_slice")
+      continue;
+    if (term.kind != "region_index" || term.operands.size() != 1 ||
+        !term.operands.front() || *term.operands.front() >= operation.getNumOperands())
+      return false;
+    Type index = operation.getOperand(*term.operands.front()).getType();
+    if (!isa<intent::DomainType, intent::RegionType>(index))
+      return false;
+    ++projectedAxes;
+  }
+  return projectedAxes == 1;
+}
 
 Operation *resolveStructuralDomain(Value value) {
   return structuralDomainImpl(value);

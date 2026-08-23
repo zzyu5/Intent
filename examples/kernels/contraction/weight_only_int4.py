@@ -171,8 +171,11 @@ def dequant_bf16_fp4_matmul(
         for k_region, accumulator in accumulation:
             k_indices = I.indices(k_region)
             packed_pair = (k_indices // 4) * 2
+            packed_pair_next = packed_pair + 1
+            I.assume_in_bounds(packed_pair, packed_weight, axis=1)
+            I.assume_in_bounds(packed_pair_next, packed_weight, axis=1)
             first = I.cast(packed_weight[columns, packed_pair], I.u16)
-            second = I.cast(packed_weight[columns, packed_pair + 1], I.u16)
+            second = I.cast(packed_weight[columns, packed_pair_next], I.u16)
             word = (first << I.cast(8, I.u16)) | second
             decode_mask = I.cast(0x81C0, I.u16)
             decoded_zero = word & decode_mask

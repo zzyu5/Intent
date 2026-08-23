@@ -417,6 +417,42 @@ LogicalResult refineContractions(plan::ProgramOp program) {
       binding->setAttr("form", builder.getStringAttr("scaled_direct"));
       continue;
     }
+    auto resultAxis = [&](ArrayRef<target::LogicalAxis> axes,
+                          ArrayRef<unsigned> reduced,
+                          ArrayRef<unsigned> batched,
+                          StringRef side)
+        -> FailureOr<std::optional<int64_t>> {
+      std::optional<int64_t> selected;
+      for (auto [position, axis] : llvm::enumerate(axes)) {
+        if (!axis.domain || llvm::is_contained(reduced, position) ||
+            llvm::is_contained(batched, position))
+          continue;
+        FailureOr<int64_t> domain = target::getNodeID(
+            *axis.domain, "contraction result-axis realization");
+        if (failed(domain))
+          return failure();
+        if ((*analysis)->isScalarAxis(*domain))
+          continue;
+        if (selected && *selected != *domain)
+          return operation.emitOpError()
+                 << "has more than one logical " << side << " result axis";
+        selected = *domain;
+      }
+      return selected;
+    };
+    const target::ContractionFact &fact = entry.second;
+    FailureOr<std::optional<int64_t>> lhs = resultAxis(
+        fact.lhsAxes, fact.lhsReductionAxes, fact.lhsBatchAxes, "lhs");
+    FailureOr<std::optional<int64_t>> rhs = resultAxis(
+        fact.rhsAxes, fact.rhsReductionAxes, fact.rhsBatchAxes, "rhs");
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    if (*lhs)
+      binding->setAttr("lhs_result_axis_node",
+                       builder.getI64IntegerAttr(**lhs));
+    if (*rhs)
+      binding->setAttr("rhs_result_axis_node",
+                       builder.getI64IntegerAttr(**rhs));
     if (binding.getProducerReplay()) {
       binding->setAttr("form", builder.getStringAttr("replay"));
       FailureOr<int64_t> reduction =
@@ -442,8 +478,17 @@ LogicalResult refineContractions(plan::ProgramOp program) {
                      : deferred == 1 ? StringRef("deferred_one")
                                      : StringRef("deferred_two");
     binding->setAttr("form", builder.getStringAttr(form));
-    if (form == "direct")
+    if (form == "direct") {
+      if (hasPhysicalReductionAxis(operation, **analysis)) {
+        FailureOr<int64_t> reduction =
+            physicalReductionAxis(operation, **analysis);
+        if (failed(reduction))
+          return failure();
+        binding->setAttr("reduction_axis_node",
+                         builder.getI64IntegerAttr(*reduction));
+      }
       continue;
+    }
     FailureOr<int64_t> reduction = physicalReductionAxis(operation, **analysis);
     if (failed(reduction))
       return failure();
@@ -451,35 +496,9 @@ LogicalResult refineContractions(plan::ProgramOp program) {
                      builder.getI64IntegerAttr(*reduction));
     if (form != "deferred_two")
       continue;
-    auto resultAxis = [&](Value operand, StringRef side) -> FailureOr<int64_t> {
-      Operation *definition = operand.getDefiningOp();
-      auto transferNode =
-          definition ? definition->getAttrOfType<IntegerAttr>("intent.node")
-                     : IntegerAttr();
-      plan::TransferOp transfer =
-          transferNode ? transfers.lookup(transferNode.getInt())
-                       : plan::TransferOp();
-      std::optional<int64_t> selected;
-      if (transfer)
-        for (int64_t domain : transfer.getDomainNodes()) {
-          if (domain == *reduction || (*analysis)->isScalarAxis(domain))
-            continue;
-          if (selected && *selected != domain)
-            return operation.emitOpError()
-                   << "has more than one physical " << side << " result axis";
-          selected = domain;
-        }
-      if (!selected)
-        return operation.emitOpError()
-               << "has no physical " << side << " result axis";
-      return *selected;
-    };
-    FailureOr<int64_t> lhs = resultAxis(operation.getOperand(0), "lhs");
-    FailureOr<int64_t> rhs = resultAxis(operation.getOperand(1), "rhs");
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    binding->setAttr("lhs_result_axis_node", builder.getI64IntegerAttr(*lhs));
-    binding->setAttr("rhs_result_axis_node", builder.getI64IntegerAttr(*rhs));
+    if (!*lhs || !*rhs)
+      return operation.emitOpError(
+          "has no complete pair of physical contraction result axes");
   }
 
   SmallVector<plan::StreamAxisOp> oldStreamAxes(

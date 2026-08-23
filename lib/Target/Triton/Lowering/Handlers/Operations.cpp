@@ -355,7 +355,10 @@ LogicalResult ProgramMaterializer::emitRegionEnd(Operation &operation) {
   if (extent.empty())
     return operation.emitOpError("has no planned logical extent for region end");
   std::string expression = extent;
-  if (isa<intent::RegionType>(operation.getOperand(0).getType())) {
+  if (target::lowering::isRaggedBoundAxis(planIndex.components,
+                                           axis->getNode())) {
+    expression = "sequence_end_" + std::to_string(axis->getNode());
+  } else if (isa<intent::RegionType>(operation.getOperand(0).getType())) {
     if (axis->hasRole("parallel") && !axis->isScalar()) {
       std::string block = programBlocks.lookup(axis->getNode());
       if (block.empty())
@@ -511,46 +514,56 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
       continue;
     }
     std::string value = "axis_index_" + std::to_string(axis.getNode());
-    if (planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode())) {
-      FailureOr<plan::RaggedOp> relation =
-          target::lowering::uniqueRaggedRelation(planIndex, axis.getNode(),
-                                                  *axis.operation.getOperation());
-      std::string outer = succeeded(relation)
-                              ? axisIndices.lookup(relation->getOuterNode())
-                              : std::string();
-      auto runtime = succeeded(relation)
-                         ? raggedRuntimeByRelation.find(relation->getNode())
-                         : raggedRuntimeByRelation.end();
-      if (failed(relation) || outer.empty() ||
-          runtime == raggedRuntimeByRelation.end())
-        return axis.emitOpError(
-            "ordered ragged axis has no outer-axis or offsets binding");
-      ABIView *offsets = raggedRuntimes[runtime->second].offsets;
-      auto ordered =
-          planIndex.components.orderedAxesByRelation.find(relation->getNode());
-      if (ordered == planIndex.components.orderedAxesByRelation.end() ||
-          ordered->second.empty())
-        return axis.emitOpError("has no ordered axis in its ragged relation");
-      for (int64_t orderedAxis : ordered->second) {
-        std::string suffix = std::to_string(orderedAxis);
-        line("sequence_begin_" + suffix + " = tl.load(" + offsets->pointer +
-             " + " + addressIndex(outer) + " * " +
-             addressIndex(offsets->strides[0]) + ")");
-        line("sequence_end_" + suffix + " = tl.load(" + offsets->pointer +
-             " + " + addressIndex(outer + " + 1") + " * " +
-             addressIndex(offsets->strides[0]) + ")");
-        line("sequence_length_" + suffix + " = sequence_end_" + suffix +
-             " - sequence_begin_" + suffix);
-      }
-      std::string suffix = std::to_string(ordered->second.front());
-      line(value + " = sequence_begin_" + suffix + " + " + block + " * " +
-           axis.getTile().str() + " + tl.arange(0, " + axis.getTile().str() +
-           ")");
-    } else {
-      line(value + " = " + block + " * " + axis.getTile().str() +
-           " + tl.arange(0, " + axis.getTile().str() + ")");
+    if (planIndex.components.raggedProgramAxes.contains(axis.getNode())) {
+      axisIndices[axis.getNode()] = block;
+      continue;
     }
+    line(value + " = " + block + " * " + axis.getTile().str() +
+         " + tl.arange(0, " + axis.getTile().str() + ")");
     axisIndices[axis.getNode()] = value;
+  }
+  for (int64_t memberNode : planIndex.components.raggedProgramAxes) {
+    plan::AxisOp axis = planIndex.axes.lookup(memberNode);
+    std::string block = programBlocks.lookup(memberNode);
+    FailureOr<plan::RaggedOp> relation =
+        axis ? target::lowering::uniqueRaggedRelation(
+                   planIndex, memberNode, *axis.operation.getOperation())
+             : FailureOr<plan::RaggedOp>(failure());
+    std::string outer = succeeded(relation)
+                            ? axisIndices.lookup(relation->getOuterNode())
+                            : std::string();
+    auto runtime = succeeded(relation)
+                       ? raggedRuntimeByRelation.find(relation->getNode())
+                       : raggedRuntimeByRelation.end();
+    if (!axis || axis.isScalar() || block.empty() || failed(relation) ||
+        outer.empty() || runtime == raggedRuntimeByRelation.end())
+      return programRoot->emitOpError(
+          "ragged program axis has no tiled outer-axis or offsets binding");
+    ABIView *offsets = raggedRuntimes[runtime->second].offsets;
+    SmallVector<int64_t> boundAxes{memberNode};
+    auto ordered =
+        planIndex.components.orderedAxesByRelation.find(relation->getNode());
+    if (ordered != planIndex.components.orderedAxesByRelation.end())
+      for (int64_t orderedAxis : ordered->second)
+        if (!llvm::is_contained(boundAxes, orderedAxis))
+          boundAxes.push_back(orderedAxis);
+    for (int64_t boundAxis : boundAxes) {
+      std::string suffix = std::to_string(boundAxis);
+      line("sequence_begin_" + suffix + " = tl.load(" + offsets->pointer +
+           " + " + addressIndex(outer) + " * " +
+           addressIndex(offsets->strides[0]) + ")");
+      line("sequence_end_" + suffix + " = tl.load(" + offsets->pointer +
+           " + " + addressIndex(outer + " + 1") + " * " +
+           addressIndex(offsets->strides[0]) + ")");
+      line("sequence_length_" + suffix + " = sequence_end_" + suffix +
+           " - sequence_begin_" + suffix);
+    }
+    std::string suffix = std::to_string(memberNode);
+    std::string value = "axis_index_" + suffix;
+    line(value + " = sequence_begin_" + suffix + " + " + block + " * " +
+         axis.getTile().str() + " + tl.arange(0, " + axis.getTile().str() +
+         ")");
+    axisIndices[memberNode] = value;
   }
   for (const auto &entry : planIndex.axesByRole) {
     plan::AxisOp axis = entry.getValue();
@@ -578,6 +591,17 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     std::string value = "axis_index_" + std::to_string(axis.getNode());
     line(value + " = tl.arange(0, " + range->getTile().str() + ")");
     axisIndices[axis.getNode()] = value;
+  }
+  for (const auto &entry : planIndex.regionBindings) {
+    Value value = kernel.values.lookup(entry.first);
+    plan::RegionBindingOp binding = entry.second;
+    if (!value || isa<BlockArgument>(value) || binding.getPurpose() != "ownership")
+      continue;
+    std::string projected = axisIndices.lookup(binding.getAxisNode());
+    if (projected.empty())
+      return binding.emitOpError(
+          "has no active Triton projection for its selected region value");
+    selectedRegionIndices[value] = std::move(projected);
   }
   return success();
 }
@@ -1351,15 +1375,31 @@ LogicalResult ProgramMaterializer::emitIndices(Operation &operation) {
     emittedAxis = tensorAxis.getInt();
   } else if (operation.getNumOperands() == 1) {
     Value indexed = operation.getOperand(0);
-    if (isa<BlockArgument>(indexed)) {
-      FailureOr<target::lowering::RegionRangeBinding> region =
-          target::lowering::selectedRegionArgumentRange(planIndex, kernel,
-                                                        indexed, operation);
-      FailureOr<StringRef> projected = lookupValue(operation, 0);
-      if (failed(region) || failed(projected))
+    FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
+        target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
+                                                   operation);
+    if (failed(selected))
+      return failure();
+    if (*selected) {
+      FailureOr<StringRef> argumentProjection =
+          isa<BlockArgument>(indexed) ? lookupValue(operation, 0)
+                                      : FailureOr<StringRef>(failure());
+      std::string projected = isa<BlockArgument>(indexed)
+                                  ? succeeded(argumentProjection)
+                                        ? argumentProjection->str()
+                                        : std::string()
+                                  : selectedRegionIndices.lookup(indexed);
+      if (projected.empty() && isa<intent::DomainType>(indexed.getType()))
+        projected = axisIndices.lookup((*selected)->axis.getNode());
+      if (projected.empty())
+        return operation.emitOpError(
+                   "has no active projection for its selected region value on axis ")
+               << (*selected)->axis.getNode() << " with roles "
+               << (*selected)->axis.getRoles();
+      if (isa<BlockArgument>(indexed) && failed(argumentProjection))
         return failure();
       FailureOr<std::string> padded =
-          padExpression(operation.getResult(0), projected->str(), operation);
+          padExpression(operation.getResult(0), projected, operation);
       if (failed(padded))
         return failure();
       std::string emitted = makeResultName(operation, 0);
@@ -2190,6 +2230,21 @@ LogicalResult ProgramMaterializer::emitGather(Operation &operation) {
       (*relation)[0].kind == "value_index" &&
       (*relation)[0].operands.size() == 1 &&
       (*relation)[0].operands.front();
+  if (form == "ragged_start_scalar") {
+    Operation *indices = operation.getOperand(0).getDefiningOp();
+    FailureOr<plan::AxisOp> axis =
+        indices && indices->getNumOperands() == 1
+            ? resolveAxis(indices->getOperand(0), operation)
+            : FailureOr<plan::AxisOp>(failure());
+    if (failed(axis) ||
+        !target::lowering::isRaggedBoundAxis(planIndex.components,
+                                             axis->getNode()))
+      return operation.emitOpError(
+          "ragged-start Triton gather has no planned ragged axis");
+    bindResult(operation, 0,
+               "sequence_begin_" + std::to_string(axis->getNode()));
+    return success();
+  }
   if (scalarFragmentGather) {
     auto scanSource = scanResults.find(operation.getOperand(0));
     auto materializedSource =
@@ -2310,9 +2365,10 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
           : FailureOr<plan::AxisOp>(failure());
   if (failed(memberAxis))
     return operation.emitOpError("has no physical ragged-member axis");
-  if (!planIndex.components.orderedRaggedAxes.contains(memberAxis->getNode()))
+  if (!target::lowering::isRaggedBoundAxis(planIndex.components,
+                                           memberAxis->getNode()))
     return operation.emitOpError(
-        "has no single-launch ordered ragged traversal realization");
+        "has no single-launch ragged-member realization");
   FailureOr<plan::RaggedOp> relation =
       target::lowering::uniqueRaggedRelation(planIndex, memberAxis->getNode(),
                                               operation);
@@ -2333,7 +2389,7 @@ LogicalResult ProgramMaterializer::emitMembers(Operation &operation) {
   }
   if (failed(relation) || runtime == raggedRuntimeByRelation.end() ||
       position.empty())
-    return operation.emitOpError("has no ordered ragged runtime position");
+    return operation.emitOpError("has no ragged runtime position");
   RaggedRuntime &ragged = raggedRuntimes[runtime->second];
   std::string suffix = std::to_string(memberAxis->getNode());
   std::string valid = position + " < sequence_end_" + suffix;
@@ -2385,7 +2441,8 @@ LogicalResult ProgramMaterializer::enterStateStream(Operation &operation) {
     return binding.emitOpError(
         "cannot mechanically combine ragged and count-partition stream bounds");
   std::string raggedSuffix = std::to_string(binding.getAxisNode());
-  if (raggedStream) {
+  if (raggedStream && !planIndex.components.raggedProgramAxes.contains(
+                          binding.getAxisNode())) {
     FailureOr<plan::RaggedOp> relation =
         target::lowering::uniqueRaggedRelation(
             planIndex, binding.getAxisNode(), operation);
@@ -2911,8 +2968,18 @@ LogicalResult ProgramMaterializer::emitStore(Operation &operation) {
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, true);
   FailureOr<std::string> mask = emitMaskExpression(operation, true);
-  if (failed(pointers) || failed(mask))
+  FailureOr<std::string> validity =
+      boundary.getValidityDomainNodes().empty()
+          ? FailureOr<std::string>(std::string("True"))
+          : emitValidityExpression(boundary.getValidityTensorAxes(),
+                                   boundary.getValidityDomainNodes(),
+                                   operation.getOperand(valueIndex.getInt()),
+                                   operation);
+  if (failed(pointers) || failed(mask) || failed(validity))
     return failure();
+  if (*validity != "True" && *validity != *mask)
+    *mask = *mask == "True" ? *validity
+                            : "(" + *mask + ") & (" + *validity + ")";
   line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" + *mask +
        ")");
   return success();
@@ -2938,8 +3005,18 @@ LogicalResult ProgramMaterializer::emitUniqueStore(Operation &operation) {
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, true);
   FailureOr<std::string> mask = emitMaskExpression(operation, true);
-  if (failed(pointers) || failed(mask))
+  FailureOr<std::string> validity =
+      binding.getValidityDomainNodes().empty()
+          ? FailureOr<std::string>(std::string("True"))
+          : emitValidityExpression(binding.getValidityTensorAxes(),
+                                   binding.getValidityDomainNodes(),
+                                   operation.getOperand(valueIndex.getInt()),
+                                   operation);
+  if (failed(pointers) || failed(mask) || failed(validity))
     return failure();
+  if (*validity != "True" && *validity != *mask)
+    *mask = *mask == "True" ? *validity
+                            : "(" + *mask + ") & (" + *validity + ")";
   line("tl.store(" + *pointers + ", " + stored->str() + ", mask=" + *mask +
        ")");
   return success();

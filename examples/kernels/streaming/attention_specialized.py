@@ -4,6 +4,7 @@ import intent.language as I
 from kernels.activation.pointwise import tanh_value
 from kernels.streaming.attention import online_attention_accumulate
 from kernels.streaming.attention import online_attention_accumulate_bf16
+from kernels.streaming.attention import online_attention_accumulate_transposed_bf16
 
 
 SINK_BATCH = 1
@@ -137,9 +138,11 @@ def attention_sink_decode_partials(
             ):
                 query_heads = key_head * HEAD_GROUP + I.indices(query_region)
                 I.assume_in_bounds(query_heads, q, axis=1)
-                query = I.gather(
-                    q,
-                    index=(batch, query_heads, slice(None)),
+                query = I.transpose(
+                    I.gather(
+                        q,
+                        index=(batch, query_heads, slice(None)),
+                    )
                 )
                 sink_log2 = I.cast(
                     I.gather(sinks, index=(query_heads,)), I.f32
@@ -151,31 +154,31 @@ def attention_sink_decode_partials(
                         init=(
                             I.full((query_region,), -I.inf, dtype=I.f32),
                             I.zeros((query_region,), dtype=I.f32),
-                            I.zeros((query_region, DV), dtype=I.f32),
+                            I.zeros((DV, query_region), dtype=I.f32),
                         ),
                         stop=query_end,
                     )
                     with stream:
                         for key_region, (maximum, denominator, accumulator) in stream:
                             scores = I.contract(
-                                query,
                                 k[batch, key_region, key_head, :],
-                                reduce=((1, 1),),
+                                query,
+                                reduce=((1, 0),),
                                 acc_dtype=I.f32,
                             ) * (scale * I.LOG2E)
                             if WINDOW > 0:
                                 scores = I.mask(
                                     scores,
-                                    valid=I.indices(key_region)[None, :]
+                                    valid=I.indices(key_region)[:, None]
                                     >= query_end - WINDOW,
                                     fill=-I.inf,
                                 )
                             local_maximum = I.reduce.max(
-                                scores, axis=1, identity=-I.inf
+                                scores, axis=0, identity=-I.inf
                             )
                             next_maximum = I.maximum(maximum, local_maximum)
                             next_denominator, next_accumulator = (
-                                online_attention_accumulate_bf16(
+                                online_attention_accumulate_transposed_bf16(
                                     maximum,
                                     next_maximum,
                                     denominator,
@@ -196,7 +199,7 @@ def attention_sink_decode_partials(
                         denominator = denominator * alpha + I.exp2(
                             sink_log2 - maximum_with_sink
                         )
-                        accumulator = accumulator * alpha[:, None]
+                        accumulator = accumulator * alpha[None, :]
                         maximum = maximum_with_sink
                     I.scatter_unique(
                         partial_lse,
@@ -207,7 +210,7 @@ def attention_sink_decode_partials(
                         partial_output,
                         index=(batch, query_heads, part, slice(None)),
                         value=I.cast(
-                            accumulator / denominator[:, None],
+                            I.transpose(accumulator / denominator[None, :]),
                             I.bf16,
                         ),
                     )
@@ -311,9 +314,11 @@ def gemma_gqa_decode_partials(
             ):
                 query_heads = key_head * HEAD_GROUP + I.indices(query_region)
                 I.assume_in_bounds(query_heads, q, axis=1)
-                query = I.gather(
-                    q,
-                    index=(batch, query_heads, 0, slice(None)),
+                query = I.transpose(
+                    I.gather(
+                        q,
+                        index=(batch, query_heads, 0, slice(None)),
+                    )
                 )
                 for part, part_keys in I.parallel(I.partition(key_axis, count=P)):
                     stream = I.state_stream(
@@ -322,32 +327,32 @@ def gemma_gqa_decode_partials(
                         init=(
                             I.full((query_region,), -I.inf, dtype=I.f32),
                             I.zeros((query_region,), dtype=I.f32),
-                            I.zeros((query_region, DV), dtype=I.f32),
+                            I.zeros((DV, query_region), dtype=I.f32),
                         ),
                     )
                     with stream:
                         for key_region, (maximum, denominator, accumulator) in stream:
                             raw_scores = I.contract(
-                                query,
                                 k[batch, key_head, key_region, :],
-                                reduce=((1, 1),),
+                                query,
+                                reduce=((1, 0),),
                                 acc_dtype=I.f32,
                             ) * scale
                             scores = SOFT_CAP * tanh_value(raw_scores / SOFT_CAP)
                             if WINDOW > 0:
                                 scores = I.mask(
                                     scores,
-                                    valid=I.indices(key_region)[None, :]
+                                    valid=I.indices(key_region)[:, None]
                                     >= K - 1 - WINDOW,
                                     fill=-I.inf,
                                 )
                             scores = scores * I.LOG2E
                             local_maximum = I.reduce.max(
-                                scores, axis=1, identity=-I.inf
+                                scores, axis=0, identity=-I.inf
                             )
                             next_maximum = I.maximum(maximum, local_maximum)
                             next_denominator, next_accumulator = (
-                                online_attention_accumulate_bf16(
+                                online_attention_accumulate_transposed_bf16(
                                     maximum,
                                     next_maximum,
                                     denominator,
@@ -362,16 +367,21 @@ def gemma_gqa_decode_partials(
                                 next_accumulator,
                             )
                     maximum, denominator, accumulator = stream.result
+                    safe_denominator = I.mask(
+                        denominator,
+                        valid=denominator > 0.0,
+                        fill=1.0,
+                    )
                     I.scatter_unique(
                         partial_lse,
                         index=(batch, query_heads, part),
-                        value=maximum + I.log(denominator) * I.LOG2E,
+                        value=maximum + I.log(safe_denominator) * I.LOG2E,
                     )
                     I.scatter_unique(
                         partial_output,
                         index=(batch, query_heads, part, slice(None)),
                         value=I.cast(
-                            accumulator / denominator[:, None],
+                            I.transpose(accumulator / safe_denominator[None, :]),
                             I.bf16,
                         ),
                     )

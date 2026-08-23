@@ -11,6 +11,8 @@
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Pass/Pass.h"
 
+#include <functional>
+
 using namespace mlir;
 
 namespace intent::tilelang::lowering {
@@ -32,6 +34,205 @@ getProgram(ModuleOp module) {
                                              : searchSpaces.front());
 }
 
+Operation *definingOperation(Value value) {
+  auto result = dyn_cast<OpResult>(value);
+  return result ? result.getOwner() : nullptr;
+}
+
+bool isSemanticOp(Operation *operation, StringRef name) {
+  return operation && ::intent::target::semanticOperationName(*operation) == name;
+}
+
+std::optional<int64_t> integerConstant(Value value) {
+  Operation *operation = definingOperation(value);
+  if (!operation)
+    return std::nullopt;
+  if (isSemanticOp(operation, "intent.constant")) {
+    auto attribute = operation->getAttrOfType<IntegerAttr>("intent.value");
+    return attribute ? std::optional<int64_t>(attribute.getInt()) : std::nullopt;
+  }
+  StringRef name = ::intent::target::semanticOperationName(*operation);
+  if ((name == "intent.broadcast" || name == "intent.cast" ||
+       name == "intent.reshape") &&
+      operation->getNumOperands() == 1)
+    return integerConstant(operation->getOperand(0));
+  return std::nullopt;
+}
+
+bool matchBinary(Value value, StringRef kind, Value &lhs, Value &rhs) {
+  Operation *operation = definingOperation(value);
+  auto binary = operation
+                    ? operation->getAttrOfType<StringAttr>("intent.operator")
+                    : StringAttr();
+  if (!isSemanticOp(operation, "intent.binary") || !binary ||
+      binary.getValue() != kind || operation->getNumOperands() != 2)
+    return false;
+  lhs = operation->getOperand(0);
+  rhs = operation->getOperand(1);
+  return true;
+}
+
+bool matchBinaryConstant(Value value, StringRef kind, int64_t constant,
+                         Value &other) {
+  Value lhs;
+  Value rhs;
+  if (!matchBinary(value, kind, lhs, rhs))
+    return false;
+  if (integerConstant(rhs) == constant) {
+    other = lhs;
+    return true;
+  }
+  if ((kind == "multiply" || kind == "add" || kind == "bitwise_and") &&
+      integerConstant(lhs) == constant) {
+    other = rhs;
+    return true;
+  }
+  return false;
+}
+
+Value stripShapeProjection(Value value) {
+  while (Operation *operation = definingOperation(value)) {
+    StringRef name = ::intent::target::semanticOperationName(*operation);
+    if ((name == "intent.broadcast" || name == "intent.reshape") &&
+        operation->getNumOperands() == 1) {
+      value = operation->getOperand(0);
+      continue;
+    }
+    if (name == "intent.gather" && operation->getNumOperands() >= 1) {
+      value = operation->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return value;
+}
+
+struct PackedInt2DecodeMatch {
+  Operation *load = nullptr;
+  SmallVector<Operation *> producers;
+};
+
+std::optional<PackedInt2DecodeMatch>
+matchPackedInt2Decode(Operation &contract) {
+  if (contract.getNumOperands() != 2 || contract.getNumResults() != 1)
+    return std::nullopt;
+  auto lhsType = dyn_cast<RankedTensorType>(contract.getOperand(0).getType());
+  auto rhsType = dyn_cast<RankedTensorType>(contract.getOperand(1).getType());
+  auto resultType = dyn_cast<RankedTensorType>(contract.getResult(0).getType());
+  if (!lhsType || !rhsType || !resultType || !lhsType.getElementType().isInteger(8) ||
+      !rhsType.getElementType().isInteger(8) ||
+      !resultType.getElementType().isInteger(32))
+    return std::nullopt;
+
+  Operation *decoded = definingOperation(contract.getOperand(1));
+  if (!isSemanticOp(decoded, "intent.cast") || decoded->getNumOperands() != 1)
+    return std::nullopt;
+  Value shifted;
+  Value mask;
+  if (!matchBinary(decoded->getOperand(0), "bitwise_and", shifted, mask))
+    return std::nullopt;
+  if (integerConstant(mask) != 3) {
+    if (integerConstant(shifted) != 3)
+      return std::nullopt;
+    std::swap(shifted, mask);
+  }
+  Value packed;
+  Value shifts;
+  if (!matchBinary(shifted, "right_shift", packed, shifts))
+    return std::nullopt;
+  Operation *load = definingOperation(packed);
+  if (!isSemanticOp(load, "intent.view_load") || load->getNumOperands() < 2)
+    return std::nullopt;
+  auto packedView = dyn_cast<intent::ViewType>(load->getOperand(0).getType());
+  auto packedTensor =
+      packedView ? dyn_cast<RankedTensorType>(packedView.getTensor())
+                 : RankedTensorType();
+  if (!packedTensor || !packedTensor.getElementType().isUnsignedInteger(8))
+    return std::nullopt;
+
+  Value packedIndex;
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(*load);
+  if (failed(relation))
+    return std::nullopt;
+  for (const target::IndexTerm &term : *relation)
+    if (term.kind == "value_index" && term.operands.size() == 1 &&
+        term.operands.front())
+      packedIndex = load->getOperand(*term.operands.front());
+  if (!packedIndex)
+    return std::nullopt;
+
+  Value packedLhs;
+  Value packedRhs;
+  if (!matchBinary(packedIndex, "add", packedLhs, packedRhs))
+    return std::nullopt;
+  auto matchPackedComponents = [&](Value scaled, Value lane,
+                                   Value &base) -> bool {
+    Value divided;
+    Value scaledBase;
+    Value laneBase;
+    if (!matchBinaryConstant(scaled, "multiply", 4, divided) ||
+        !matchBinaryConstant(divided, "floor_divide", 16, scaledBase) ||
+        !matchBinaryConstant(lane, "remainder", 4, laneBase) ||
+        scaledBase != laneBase)
+      return false;
+    base = scaledBase;
+    return true;
+  };
+  Value base;
+  if (!matchPackedComponents(packedLhs, packedRhs, base) &&
+      !matchPackedComponents(packedRhs, packedLhs, base))
+    return std::nullopt;
+
+  shifts = stripShapeProjection(shifts);
+  Operation *shiftCast = definingOperation(shifts);
+  if (!isSemanticOp(shiftCast, "intent.cast") ||
+      shiftCast->getNumOperands() != 1)
+    return std::nullopt;
+  Value shiftRemainder;
+  if (!matchBinaryConstant(shiftCast->getOperand(0), "multiply", 2,
+                           shiftRemainder))
+    return std::nullopt;
+  Value shiftDivided;
+  Value shiftBase;
+  if (!matchBinaryConstant(shiftRemainder, "remainder", 4, shiftDivided) ||
+      !matchBinaryConstant(shiftDivided, "floor_divide", 4, shiftBase) ||
+      shiftBase != base)
+    return std::nullopt;
+  Operation *indices = definingOperation(base);
+  if (!isSemanticOp(indices, "intent.indices"))
+    return std::nullopt;
+
+  llvm::DenseSet<Operation *> producerSet;
+  std::function<void(Value)> collect = [&](Value value) {
+    Operation *operation = definingOperation(value);
+    if (!operation || !producerSet.insert(operation).second)
+      return;
+    StringRef name = ::intent::target::semanticOperationName(*operation);
+    if (name == "intent.view_load" || name == "intent.indices")
+      return;
+    for (Value operand : operation->getOperands())
+      collect(operand);
+  };
+  collect(contract.getOperand(1));
+  collect(packedIndex);
+  for (Operation *producer : producerSet)
+    for (Value result : producer->getResults())
+      for (Operation *user : result.getUsers())
+        if (user != &contract && !producerSet.contains(user))
+          return std::nullopt;
+
+  PackedInt2DecodeMatch match;
+  match.load = load;
+  match.producers.assign(producerSet.begin(), producerSet.end());
+  llvm::sort(match.producers, [](Operation *lhs, Operation *rhs) {
+    auto lhsNode = lhs->getAttrOfType<IntegerAttr>("intent.node");
+    auto rhsNode = rhs->getAttrOfType<IntegerAttr>("intent.node");
+    return lhsNode && rhsNode && lhsNode.getInt() < rhsNode.getInt();
+  });
+  return match;
+}
+
 intent::plan::AxisOp firstLane(gpu::PhysicalProgramAnalysis &analysis) {
   SmallVector<intent::plan::AxisOp> lanes;
   for (intent::plan::AxisOp axis :
@@ -51,6 +252,207 @@ bool isRaggedBoundAxis(gpu::PhysicalProgramAnalysis &analysis, int64_t node) {
   const target::KernelFacts &facts = analysis.getFacts();
   return facts.raggedMembers.count(domain) ||
          facts.raggedOuterRelations.count(domain);
+}
+
+struct SelectedContiguousIndexMatch {
+  llvm::SmallVector<int64_t> scalarNodes;
+};
+
+struct SelectedIndexExpression {
+  bool valid = false;
+  bool constant = false;
+  llvm::DenseSet<int64_t> scalarNodes;
+  llvm::DenseSet<int64_t> varyingAxes;
+};
+
+bool isPhysicallyScalarTensor(Value value,
+                              gpu::PhysicalProgramAnalysis &analysis) {
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  auto axes = analysis.getFacts().valueAxes.find(value);
+  if (!tensor || axes == analysis.getFacts().valueAxes.end() ||
+      axes->second.size() != static_cast<size_t>(tensor.getRank()))
+    return false;
+  for (const target::LogicalAxis &axis : axes->second) {
+    if (axis.extent == "1")
+      continue;
+    auto node = axis.domain
+                    ? axis.domain->getAttrOfType<IntegerAttr>("intent.node")
+                    : IntegerAttr();
+    if (!node)
+      return false;
+    bool singleElement = analysis.isScalarAxis(node.getInt());
+    for (StringRef purpose : {StringRef("ownership"), StringRef("traversal"),
+                              StringRef("reduction"), StringRef("lane")}) {
+      intent::plan::RangeOp range = analysis.getRange(node.getInt(), purpose);
+      singleElement |= range && range.getTile() == "fixed_1";
+    }
+    if (!singleElement)
+      return false;
+  }
+  return true;
+}
+
+Operation *matchNativeContractOperandLoad(
+    Operation &load, gpu::PhysicalProgramAnalysis &analysis) {
+  if (!isSemanticOp(&load, "intent.view_load") || load.getNumResults() != 1 ||
+      !llvm::hasSingleElement(load.getResult(0).getUsers()))
+    return nullptr;
+  Operation *reshape = *load.getResult(0).getUsers().begin();
+  if (!isSemanticOp(reshape, "intent.reshape") ||
+      reshape->getNumOperands() != 1 || reshape->getNumResults() != 1 ||
+      !llvm::hasSingleElement(reshape->getResult(0).getUsers()))
+    return nullptr;
+  Operation *contract = *reshape->getResult(0).getUsers().begin();
+  StringRef contractName = target::semanticOperationName(*contract);
+  if (contractName != "intent.contract" &&
+      contractName != "intent.scaled_contract" &&
+      contractName != "intent.sparse_contract")
+    return nullptr;
+
+  auto sourceType = dyn_cast<RankedTensorType>(load.getResult(0).getType());
+  auto targetType = dyn_cast<RankedTensorType>(reshape->getResult(0).getType());
+  if (!sourceType || !targetType || targetType.getRank() != 2 ||
+      sourceType.getRank() <= targetType.getRank() ||
+      sourceType.getElementType() != targetType.getElementType())
+    return nullptr;
+
+  const target::KernelFacts &facts = analysis.getFacts();
+  auto sourceAxes = facts.valueAxes.find(load.getResult(0));
+  auto targetAxes = facts.valueAxes.find(reshape->getResult(0));
+  if (sourceAxes == facts.valueAxes.end() || targetAxes == facts.valueAxes.end() ||
+      sourceAxes->second.size() != static_cast<size_t>(sourceType.getRank()) ||
+      targetAxes->second.size() != static_cast<size_t>(targetType.getRank()))
+    return nullptr;
+
+  SmallVector<target::LogicalAxis> nonUnitAxes;
+  for (const target::LogicalAxis &axis : sourceAxes->second) {
+    bool unit = axis.extent == "1";
+    auto node = axis.domain
+                    ? axis.domain->getAttrOfType<IntegerAttr>("intent.node")
+                    : IntegerAttr();
+    if (node) {
+      unit |= analysis.isScalarAxis(node.getInt());
+      for (StringRef purpose : {StringRef("ownership"), StringRef("traversal"),
+                                StringRef("reduction"), StringRef("lane")}) {
+        intent::plan::RangeOp range = analysis.getRange(node.getInt(), purpose);
+        unit |= range && range.getTile() == "fixed_1";
+      }
+    }
+    if (!unit)
+      nonUnitAxes.push_back(axis);
+  }
+  return nonUnitAxes == targetAxes->second ? reshape : nullptr;
+}
+
+std::optional<SelectedContiguousIndexMatch>
+matchSelectedContiguousIndex(Operation &operation,
+                             gpu::PhysicalProgramAnalysis &analysis) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  if (failed(relation))
+    return std::nullopt;
+
+  Value tensorIndex;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      return std::nullopt;
+    if (term.kind != "value_index" || term.operands.size() != 1 ||
+        !term.operands.front())
+      continue;
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (!isa<RankedTensorType>(indexed.getType()))
+      continue;
+    if (tensorIndex)
+      return std::nullopt;
+    tensorIndex = indexed;
+  }
+  if (!tensorIndex)
+    return std::nullopt;
+
+  llvm::DenseSet<Value> active;
+  std::function<SelectedIndexExpression(Value)> inspect =
+      [&](Value value) -> SelectedIndexExpression {
+    if (!active.insert(value).second)
+      return {};
+    auto finish = [&](SelectedIndexExpression result) {
+      active.erase(value);
+      return result;
+    };
+    Operation *definition = definingOperation(value);
+    if (!definition)
+      return finish({});
+    StringRef name = ::intent::target::semanticOperationName(*definition);
+    if (name == "intent.constant")
+      return finish({true, true, {}, {}});
+    if ((name == "intent.broadcast" || name == "intent.reshape" ||
+         name == "intent.cast" || name == "intent.gather") &&
+        definition->getNumOperands() >= 1)
+      return finish(inspect(definition->getOperand(0)));
+    if (name == "intent.indices") {
+      auto axes = analysis.getFacts().valueAxes.find(value);
+      if (axes == analysis.getFacts().valueAxes.end())
+        return finish({});
+      SelectedIndexExpression result{true, false, {}, {}};
+      for (const target::LogicalAxis &axis : axes->second) {
+        if (axis.extent == "1")
+          continue;
+        auto node = axis.domain
+                        ? axis.domain->getAttrOfType<IntegerAttr>("intent.node")
+                        : IntegerAttr();
+        if (!node)
+          return finish({});
+        if (!analysis.isScalarAxis(node.getInt()))
+          result.varyingAxes.insert(node.getInt());
+      }
+      return finish(result.varyingAxes.size() <= 1 ? std::move(result)
+                                                    : SelectedIndexExpression());
+    }
+    if ((name == "intent.view_load" || name == "intent.members") &&
+        isPhysicallyScalarTensor(value, analysis)) {
+      auto node = definition->getAttrOfType<IntegerAttr>("intent.node");
+      if (!node)
+        return finish({});
+      SelectedIndexExpression result{true, false, {}, {}};
+      result.scalarNodes.insert(node.getInt());
+      return finish(std::move(result));
+    }
+    if (name == "intent.unary" && definition->getNumOperands() == 1) {
+      auto kind = definition->getAttrOfType<StringAttr>("intent.operator");
+      if (!kind || kind.getValue() != "negate")
+        return finish({});
+      return finish(inspect(definition->getOperand(0)));
+    }
+    if (name != "intent.binary" || definition->getNumOperands() != 2)
+      return finish({});
+    auto kind = definition->getAttrOfType<StringAttr>("intent.operator");
+    if (!kind || (kind.getValue() != "add" &&
+                  kind.getValue() != "subtract" &&
+                  kind.getValue() != "multiply"))
+      return finish({});
+    SelectedIndexExpression lhs = inspect(definition->getOperand(0));
+    SelectedIndexExpression rhs = inspect(definition->getOperand(1));
+    if (!lhs.valid || !rhs.valid ||
+        (kind.getValue() == "multiply" && !lhs.constant && !rhs.constant))
+      return finish({});
+    SelectedIndexExpression result{true, lhs.constant && rhs.constant, {}, {}};
+    result.scalarNodes.insert(lhs.scalarNodes.begin(), lhs.scalarNodes.end());
+    result.scalarNodes.insert(rhs.scalarNodes.begin(), rhs.scalarNodes.end());
+    result.varyingAxes.insert(lhs.varyingAxes.begin(), lhs.varyingAxes.end());
+    result.varyingAxes.insert(rhs.varyingAxes.begin(), rhs.varyingAxes.end());
+    if (result.scalarNodes.size() != 1 || result.varyingAxes.size() > 1)
+      return finish({});
+    return finish(std::move(result));
+  };
+
+  SelectedIndexExpression expression = inspect(tensorIndex);
+  if (!expression.valid || expression.scalarNodes.size() != 1 ||
+      expression.varyingAxes.size() > 1)
+    return std::nullopt;
+  SelectedContiguousIndexMatch match;
+  match.scalarNodes.assign(expression.scalarNodes.begin(),
+                           expression.scalarNodes.end());
+  llvm::sort(match.scalarNodes);
+  return match;
 }
 
 bool feedsAtomicValue(Operation &operation) {
@@ -86,6 +488,20 @@ bool validityCoveredByPhysicalExtent(intent::plan::ProgramOp program,
   });
 }
 
+bool hasCompactAccessRange(intent::plan::ProgramOp program,
+                           intent::plan::TransferOp transfer) {
+  SmallVector<intent::plan::RangeOp> ranges;
+  for (intent::plan::RangeOp range :
+       program.getBody().getOps<intent::plan::RangeOp>())
+    if (range.getPurpose() == "access" && range.getTransferNodeAttr() &&
+        range.getTransferNodeAttr().getInt() ==
+            static_cast<int64_t>(transfer.getNode()))
+      ranges.push_back(range);
+  return ranges.size() == 1 && ranges.front().getDivisorAttr() &&
+         ranges.front().getDivisorAttr().getInt() > 1 &&
+         ranges.front().getOffsetAttr();
+}
+
 bool isRankReducingReductionChain(
     Operation &operation, const llvm::DenseSet<int64_t> &reductionNodes) {
   if (operation.getNumOperands() == 0 || operation.getNumResults() != 1)
@@ -107,6 +523,44 @@ bool isRankReducingReductionChain(
          result.getRank() + 1 == intermediate.getRank();
 }
 
+bool hasSubwarpRowContraction(gpu::PhysicalProgramAnalysis &analysis,
+                              intent::plan::ContractOp contract,
+                              Operation &operation) {
+  if (std::optional<int64_t> axis = contract.getLhsResultAxisNode()) {
+    intent::plan::AxisOp physicalAxis = analysis.getAxis(*axis);
+    if (physicalAxis) {
+      for (StringRef purpose : {StringRef("ownership"), StringRef("lane")}) {
+        intent::plan::RangeOp range = analysis.getRange(*axis, purpose);
+        if (!range)
+          continue;
+        int64_t extent = 0;
+        if (!range.getExtent().getAsInteger(10, extent) && extent > 0)
+          return extent < 16;
+      }
+    }
+  }
+  if (operation.getNumOperands() != 2 || operation.getNumResults() != 1)
+    return false;
+  auto lhs = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto rhs = dyn_cast<RankedTensorType>(operation.getOperand(1).getType());
+  auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  auto reduction = operation.getAttrOfType<ArrayAttr>("intent.reduce");
+  auto pair = reduction && reduction.size() == 1
+                  ? dyn_cast<ArrayAttr>(reduction[0])
+                  : ArrayAttr();
+  auto lhsReduction = pair && pair.size() == 2
+                          ? dyn_cast<IntegerAttr>(pair[0])
+                          : IntegerAttr();
+  auto rhsReduction = pair && pair.size() == 2
+                          ? dyn_cast<IntegerAttr>(pair[1])
+                          : IntegerAttr();
+  int64_t rows = result ? result.getDimSize(0) : ShapedType::kDynamic;
+  return lhs && rhs && result && lhs.getRank() == 2 && rhs.getRank() == 2 &&
+         result.getRank() == 2 && rows > 0 && rows < 16 && lhsReduction &&
+         rhsReduction && lhsReduction.getInt() == 1 &&
+         (rhsReduction.getInt() == 0 || rhsReduction.getInt() == 1);
+}
+
 LogicalResult realizeProgram(intent::plan::ProgramOp program,
                              intent::plan::SearchSpaceOp searchSpace) {
   FailureOr<std::unique_ptr<gpu::PhysicalProgramAnalysis>> analysis =
@@ -125,10 +579,15 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   intent::plan::RangeOp laneRange =
       lane ? (*analysis)->getRange(lane.getNode(), "lane")
            : intent::plan::RangeOp();
-  bool tuneRows = !searchSpace && !(*analysis)->hasWorkerReuse() && laneRange &&
-                  laneRange.getTile().starts_with("row_vector") &&
-                  !target::lowering::hasNonReplayableEffect(
-                      (*analysis)->getKernel().entry.getOperation());
+  bool matrixProgram =
+      !program.getBody().getOps<intent::plan::ContractOp>().empty() ||
+      !program.getBody().getOps<intent::plan::SparseContractOp>().empty();
+  bool tuneRows =
+      !searchSpace && !(*analysis)->hasWorkerReuse() &&
+      (matrixProgram ||
+       (laneRange && laneRange.getTile().starts_with("row_vector") &&
+        !target::lowering::hasNonReplayableEffect(
+            (*analysis)->getKernel().entry.getOperation())));
   launch->setAttr(rowLaunchAttr,
                   builder.getStringAttr(tuneRows ? "delegated" : "fixed"));
 
@@ -162,6 +621,50 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
 
   target::KernelModel &kernel = (*analysis)->getKernel();
 
+  llvm::DenseMap<int64_t, int64_t> nativeContractOperandReshapes;
+  WalkResult nativeOperands = kernel.entry.walk([&](Operation *operation) {
+    Operation *reshape = matchNativeContractOperandLoad(*operation, **analysis);
+    if (!reshape)
+      return WalkResult::advance();
+    auto loadNode = operation->getAttrOfType<IntegerAttr>("intent.node");
+    auto reshapeNode = reshape->getAttrOfType<IntegerAttr>("intent.node");
+    if (!loadNode || !reshapeNode) {
+      operation->emitOpError(
+          "native TileLang contraction operand lacks canonical nodes");
+      return WalkResult::interrupt();
+    }
+    nativeContractOperandReshapes[loadNode.getInt()] = reshapeNode.getInt();
+    return WalkResult::advance();
+  });
+  if (nativeOperands.wasInterrupted())
+    return failure();
+
+  FailureOr<func::FuncOp> physicalEntry = intent::plan::getPhysicalEntry(program);
+  if (failed(physicalEntry))
+    return failure();
+  WalkResult loopForms = physicalEntry->walk([&](intent::plan::ExecForOp loop) {
+    if (loop->hasAttr(loopCarrierSpacesAttr)) {
+      loop.emitOpError("already has a TileLang loop-carrier form");
+      return WalkResult::interrupt();
+    }
+    SmallVector<Attribute> spaces;
+    spaces.reserve(loop.getNumResults());
+    for (Type type : loop.getResultTypes()) {
+      if (type.isIntOrIndexOrFloat())
+        spaces.push_back(builder.getStringAttr("local"));
+      else if (isa<RankedTensorType>(type))
+        spaces.push_back(builder.getStringAttr("shared"));
+      else {
+        loop.emitOpError("has an unsupported TileLang loop-carrier type");
+        return WalkResult::interrupt();
+      }
+    }
+    loop->setAttr(loopCarrierSpacesAttr, builder.getArrayAttr(spaces));
+    return WalkResult::advance();
+  });
+  if (loopForms.wasInterrupted())
+    return failure();
+
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
     if (!ragged || ragged->hasAttr(raggedRouteAttr))
@@ -180,6 +683,10 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         contract->hasAttr(contractLoweringAttr) ||
         contract->hasAttr(contractOrientationAttr) ||
         contract->hasAttr(contractBatchedAttr) ||
+        contract->hasAttr(contractMmaFormAttr) ||
+        contract->hasAttr(packedDecodeLoadNodeAttr) ||
+        contract->hasAttr(packedDecodeColumnAxisNodeAttr) ||
+        contract->hasAttr(packedDecodeProducerNodesAttr) ||
         contract->hasAttr(scaledContractLayoutAttr))
       return contract.emitOpError(
           "already has TileLang contraction-operand forms");
@@ -203,12 +710,20 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                return ::intent::target::semanticOperationName(*user) == "intent.contract";
              }) > 1;
     };
-    contract->setAttr(isolateLhsAttr, builder.getBoolAttr(
-                                           repeatedContractionOperand(
-                                               operation->getOperand(0))));
-    contract->setAttr(isolateRhsAttr, builder.getBoolAttr(
-                                           repeatedContractionOperand(
-                                               operation->getOperand(1))));
+    bool subwarpRows =
+        hasSubwarpRowContraction(**analysis, contract, *operation);
+    if (subwarpRows)
+      return contract.emitOpError(
+          "the current TileLang provider form cannot pad a logical contraction "
+          "row extent smaller than 16 to a native MMA fragment");
+    contract->setAttr(
+        isolateLhsAttr,
+        builder.getBoolAttr(repeatedContractionOperand(
+            operation->getOperand(0))));
+    contract->setAttr(
+        isolateRhsAttr,
+        builder.getBoolAttr(repeatedContractionOperand(
+            operation->getOperand(1))));
     StringRef lowering = contract.getForm() == "scaled_direct"
                              ? syntax::scaledContraction()
                              : syntax::contraction();
@@ -219,6 +734,65 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                               *orientation)));
     contract->setAttr(contractBatchedAttr,
                       builder.getBoolAttr(orientation->batched));
+    StringRef mmaForm = "native";
+    std::optional<int64_t> reductionAxis = contract.getReductionAxisNode();
+    std::optional<int64_t> lhsResultAxis = contract.getLhsResultAxisNode();
+    auto operandElementType = [](Value value) -> Type {
+      auto tensor = dyn_cast<RankedTensorType>(value.getType());
+      return tensor ? tensor.getElementType() : Type();
+    };
+    Type lhsElement = operandElementType(operation->getOperand(0));
+    Type rhsElement = operandElementType(operation->getOperand(1));
+    bool fp8Operands =
+        lhsElement && rhsElement &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(lhsElement) &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(rhsElement);
+    std::optional<PackedInt2DecodeMatch> packedDecode =
+        contract.getForm() == "deferred_one"
+            ? matchPackedInt2Decode(*operation)
+            : std::nullopt;
+    if (packedDecode) {
+      auto fact = (*analysis)->getFacts().contractions.find(operation);
+      if (fact == (*analysis)->getFacts().contractions.end() ||
+          fact->second.rhsAxes.size() != 2 ||
+          fact->second.rhsReductionAxes.size() != 1 ||
+          fact->second.rhsReductionAxes.front() >= fact->second.rhsAxes.size())
+        return contract.emitOpError(
+            "packed INT2 provider form requires one rank-two rhs reduction");
+      unsigned reductionTensorAxis = fact->second.rhsReductionAxes.front();
+      unsigned columnTensorAxis = reductionTensorAxis == 0 ? 1 : 0;
+      Operation *columnDomain = fact->second.rhsAxes[columnTensorAxis].domain;
+      auto columnNode =
+          columnDomain
+              ? columnDomain->getAttrOfType<IntegerAttr>("intent.node")
+              : IntegerAttr();
+      auto loadNode =
+          packedDecode->load->getAttrOfType<IntegerAttr>("intent.node");
+      SmallVector<int64_t> producerNodes;
+      for (Operation *producer : packedDecode->producers) {
+        auto producerNode =
+            producer->getAttrOfType<IntegerAttr>("intent.node");
+        if (!producerNode)
+          return producer->emitOpError(
+              "packed INT2 provider form requires canonical producer nodes");
+        producerNodes.push_back(producerNode.getInt());
+      }
+      if (!loadNode || !columnNode)
+        return packedDecode->load->emitOpError(
+            "packed INT2 provider form requires load and column-axis nodes");
+      mmaForm = "packed_int2_i8_mma";
+      contract->setAttr(packedDecodeLoadNodeAttr,
+                        builder.getI64IntegerAttr(loadNode.getInt()));
+      contract->setAttr(packedDecodeColumnAxisNodeAttr,
+                        builder.getI64IntegerAttr(columnNode.getInt()));
+      contract->setAttr(packedDecodeProducerNodesAttr,
+                        builder.getDenseI64ArrayAttr(producerNodes));
+    } else if (reductionAxis && isRaggedBoundAxis(**analysis, *reductionAxis))
+      mmaForm = "ragged_masked";
+    else if (fp8Operands && lhsResultAxis &&
+             (*analysis)->axisHasRole(*lhsResultAxis, "lane"))
+      mmaForm = "fp8_lane";
+    contract->setAttr(contractMmaFormAttr, builder.getStringAttr(mmaForm));
     if (contract.getForm() == "scaled_direct") {
       FailureOr<StringRef> layout =
           target::lowering::scaledContractionLayout(*operation);
@@ -272,6 +846,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     if (pointwise->hasAttr(pointwiseFormAttr) ||
+        pointwise->hasAttr(pointwiseStorageAttr) ||
         pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError(
           "already has a TileLang pointwise-form decision");
@@ -279,6 +854,17 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         kernel.nodes.lookup(pointwise.getNode());
     if (!operation)
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
+    std::string gatherForm;
+    if (target::semanticOperationName(*operation) == "intent.gather") {
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
+      if (failed(gather))
+        return failure();
+      if (*gather == "fragment_projection")
+        return pointwise.emitOpError(
+            "TileLang fragment projection form is not materialized");
+      gatherForm = std::move(*gather);
+    }
     StringRef form = target::lowering::feedsContraction(*operation)
                          ? StringRef("contract_operand")
                          : StringRef("elementwise");
@@ -289,15 +875,16 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (failed(lowering))
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
     pointwise->setAttr(pointwiseFormAttr, builder.getStringAttr(form));
+    pointwise->setAttr(
+        pointwiseStorageAttr,
+        builder.getStringAttr(
+            succeeded(role) && *role == "cast" && form == "contract_operand"
+                ? "shared"
+                : "plan"));
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather =
-          target::lowering::classifyGatherProjection(*operation);
-      if (failed(gather))
-        return failure();
-      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
-    }
+    if (!gatherForm.empty())
+      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(gatherForm));
   }
 
   for (intent::plan::StreamBindingOp stream :
@@ -317,7 +904,9 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {
     if (transfer->hasAttr(accessAttr) || transfer->hasAttr(transferAttr) ||
-        transfer->hasAttr(boundsAttr) || transfer->hasAttr(deferredAttr))
+        transfer->hasAttr(boundsAttr) || transfer->hasAttr(deferredAttr) ||
+        transfer->hasAttr(selectedScalarIndexNodesAttr) ||
+        transfer->hasAttr(nativeContractReshapeNodeAttr))
       return transfer.emitOpError(
           "already has a TileLang transfer-form decision");
     Operation *operation =
@@ -331,22 +920,34 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     FailureOr<bool> derivedScalar = target::hasDerivedScalarIndex(*operation);
     if (failed(derivedScalar))
       return failure();
-    bool tensorIndirect = transfer.getTensorIndexing() == "data_dependent";
+    std::optional<SelectedContiguousIndexMatch> selectedContiguous =
+        load && transfer.getTensorIndexing() == "data_dependent"
+            ? matchSelectedContiguousIndex(*operation, **analysis)
+            : std::nullopt;
+    bool tensorIndirect = transfer.getTensorIndexing() == "data_dependent" &&
+                          !selectedContiguous;
     bool raggedBound = llvm::any_of(
         transfer.getDomainNodes(), [&](int64_t node) {
           return isRaggedBoundAxis(**analysis, node);
         });
     bool plannedValidity = !transfer.getValidityDomainNodes().empty() &&
                            (store || transfer.getFill() != "none");
-    bool logicalBounds =
-        (raggedBound || plannedValidity) && !transfer.getConsumerNeutralized();
     bool physicalValidity =
         validityCoveredByPhysicalExtent(program, transfer);
+    bool logicalBounds =
+        raggedBound ||
+        (plannedValidity &&
+         (!transfer.getConsumerNeutralized() || !physicalValidity));
     bool packedScalar = llvm::any_of(
         transfer.getDomainNodes(), [&](int64_t node) {
           return (*analysis)->isPackedScalarAxis(node);
         });
-    bool elementwise = *derivedScalar || tensorIndirect || logicalBounds;
+    bool compactIndexing =
+        load && transfer.getTensorIndexing() == "compact" &&
+        transfer.getCoverageSpace() != "none";
+    bool compact = compactIndexing && hasCompactAccessRange(program, transfer);
+    bool elementwise = *derivedScalar || tensorIndirect || logicalBounds ||
+                       (compactIndexing && !compact);
     bool bounds = (*analysis)->hasWorkerReuse() || raggedBound ||
                   (logicalBounds && !physicalValidity) || *derivedScalar ||
                   tensorIndirect || packedScalar;
@@ -359,8 +960,6 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                   ? cast<RankedTensorType>(operation->getResult(0).getType())
                         .getElementType()
                   : Type();
-    bool compact = load && transfer.getTensorIndexing() == "compact" &&
-                   transfer.getCoverageSpace() != "none";
     bool guardedF16Bulk =
         load && !scalarResult && resultElement.isF16() && *derivedScalar &&
         !tensorIndirect && !logicalBounds && bounds && transfer.getFill() != "none";
@@ -398,13 +997,46 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
         builder.getStringAttr((*analysis)->hasWorkerReuse()
                                   ? (load ? "gather" : "scatter")
                                   : (load ? "load" : "store")));
-    StringRef transferForm = compact
+    auto nativeContract = nativeContractOperandReshapes.find(transfer.getNode());
+    bool nativeContractOperand =
+        nativeContract != nativeContractOperandReshapes.end() && load &&
+        transfer.getResultSpace() == "shared" && !elementwise && !bounds;
+    StringRef transferForm = nativeContractOperand
+                                 ? StringRef("native_contract_operand")
+                             : selectedContiguous
+                                 ? StringRef("selected_contiguous")
+                             : compact
                                  ? StringRef("compact")
                              : guardedF16Bulk
                                  ? StringRef("guarded_f16_bulk")
                              : elementwise ? StringRef("parallel_elements")
                                            : StringRef("bulk_copy");
     transfer->setAttr(transferAttr, builder.getStringAttr(transferForm));
+    if (selectedContiguous)
+      transfer->setAttr(selectedScalarIndexNodesAttr,
+                        builder.getDenseI64ArrayAttr(
+                            selectedContiguous->scalarNodes));
+    if (nativeContractOperand)
+      transfer->setAttr(nativeContractReshapeNodeAttr,
+                        builder.getI64IntegerAttr(nativeContract->second));
+    if (nativeContractOperand) {
+      intent::plan::PointwiseOp reshapeBinding;
+      for (intent::plan::PointwiseOp value :
+           program.getBody().getOps<intent::plan::PointwiseOp>())
+        if (static_cast<int64_t>(value.getNode()) == nativeContract->second) {
+          reshapeBinding = value;
+          break;
+        }
+      if (!reshapeBinding)
+        return transfer.emitOpError(
+            "native TileLang contraction operand has no reshape binding");
+      reshapeBinding->setAttr(pointwiseFormAttr,
+                              builder.getStringAttr("contract_operand"));
+      reshapeBinding->setAttr(pointwiseLoweringAttr,
+                              builder.getStringAttr("alias"));
+      reshapeBinding->setAttr(pointwiseStorageAttr,
+                              builder.getStringAttr("shared"));
+    }
     transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
     transfer->setAttr(
         deferredAttr,
@@ -462,6 +1094,31 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                     intent::plan::ProgramOp program,
                                     intent::plan::SearchSpaceOp searchSpace) {
   (void)searchSpace;
+  FailureOr<func::FuncOp> physicalEntry = intent::plan::getPhysicalEntry(program);
+  if (failed(physicalEntry))
+    return failure();
+  WalkResult loopForms = physicalEntry->walk([&](intent::plan::ExecForOp loop) {
+    auto spaces = loop->getAttrOfType<ArrayAttr>(loopCarrierSpacesAttr);
+    if (!spaces || spaces.size() != loop.getNumResults()) {
+      loop.emitOpError("has no complete TileLang loop-carrier form");
+      return WalkResult::interrupt();
+    }
+    for (auto [type, attribute] : llvm::zip(loop.getResultTypes(), spaces)) {
+      auto space = dyn_cast<StringAttr>(attribute);
+      StringRef expected = type.isIntOrIndexOrFloat()
+                               ? StringRef("local")
+                           : isa<RankedTensorType>(type)
+                               ? StringRef("shared")
+                               : StringRef();
+      if (!space || expected.empty() || space.getValue() != expected) {
+        loop.emitOpError("has an invalid TileLang loop-carrier residency");
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (loopForms.wasInterrupted())
+    return failure();
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
     auto route = ragged ? ragged->getAttrOfType<StringAttr>(raggedRouteAttr)
@@ -489,17 +1146,69 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
       return searchSpace.emitOpError(
           "has no TileLang GEMM warp-policy tuning decision");
   }
+  FailureOr<std::unique_ptr<gpu::PhysicalProgramAnalysis>> analysis =
+      gpu::PhysicalProgramAnalysis::compute(program);
+  if (failed(analysis))
+    return failure();
+  llvm::DenseMap<int64_t, unsigned> nativeContractAliasCounts;
+  for (intent::plan::TransferOp transfer :
+       program.getBody().getOps<intent::plan::TransferOp>()) {
+    auto form = transfer->getAttrOfType<StringAttr>(transferAttr);
+    auto bounds = transfer->getAttrOfType<BoolAttr>(boundsAttr);
+    auto reshape =
+        transfer->getAttrOfType<IntegerAttr>(nativeContractReshapeNodeAttr);
+    bool nativeForm = form && form.getValue() == "native_contract_operand";
+    if (!nativeForm) {
+      if (reshape)
+        return transfer.emitOpError(
+            "has a native contraction reshape without its transfer form");
+      continue;
+    }
+    Operation *operation = kernel.nodes.lookup(transfer.getNode());
+    Operation *matchedReshape =
+        operation ? matchNativeContractOperandLoad(*operation, **analysis)
+                  : nullptr;
+    auto matchedNode = matchedReshape
+                           ? matchedReshape->getAttrOfType<IntegerAttr>(
+                                 "intent.node")
+                           : IntegerAttr();
+    if (!operation ||
+        target::semanticOperationName(*operation) != "intent.view_load" ||
+        transfer.getResultSpace() != "shared" || !bounds || bounds.getValue() ||
+        !reshape || !matchedNode || reshape.getInt() != matchedNode.getInt())
+      return transfer.emitOpError(
+          "has an invalid native TileLang contraction operand form");
+    unsigned &count = nativeContractAliasCounts[reshape.getInt()];
+    if (++count != 1)
+      return transfer.emitOpError(
+          "does not uniquely own its native contraction reshape alias");
+  }
   for (intent::plan::PointwiseOp pointwise :
        program.getBody().getOps<intent::plan::PointwiseOp>()) {
     auto form = pointwise->getAttrOfType<StringAttr>(pointwiseFormAttr);
+    auto storage = pointwise->getAttrOfType<StringAttr>(pointwiseStorageAttr);
     auto lowering = pointwise->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
     auto gather = pointwise->getAttrOfType<StringAttr>(gatherFormAttr);
-    bool requiresGather =
-        operation && target::semanticOperationName(*operation) == "intent.gather";
+    StringRef operationName =
+        operation ? target::semanticOperationName(*operation) : StringRef();
+    bool requiresGather = operationName == "intent.gather";
+    bool nativeAlias = nativeContractAliasCounts.contains(pointwise.getNode());
+    bool aliasLowering = lowering && lowering.getValue() == "alias";
+    bool canonicalBroadcastAlias =
+        aliasLowering && operationName == "intent.broadcast";
     if (!form || (form.getValue() != "elementwise" &&
                   form.getValue() != "contract_operand") ||
+        !storage || (storage.getValue() != "plan" &&
+                     storage.getValue() != "shared") ||
         !lowering || lowering.getValue().empty() || !operation ||
+        (aliasLowering && !nativeAlias && !canonicalBroadcastAlias) ||
+        (nativeAlias &&
+         (nativeContractAliasCounts.lookup(pointwise.getNode()) != 1 ||
+          !aliasLowering ||
+          form.getValue() != "contract_operand" ||
+          storage.getValue() != "shared" ||
+          operationName != "intent.reshape")) ||
         (requiresGather && (!gather || gather.getValue().empty())))
       return pointwise.emitOpError(
           "has no complete TileLang pointwise-form decision");
@@ -512,16 +1221,32 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto orientation =
         contract->getAttrOfType<StringAttr>(contractOrientationAttr);
     auto batched = contract->getAttrOfType<BoolAttr>(contractBatchedAttr);
+    auto mmaForm = contract->getAttrOfType<StringAttr>(contractMmaFormAttr);
     auto layout = contract->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
+    auto packedColumn = contract->getAttrOfType<IntegerAttr>(
+        packedDecodeColumnAxisNodeAttr);
     Operation *operation = kernel.nodes.lookup(contract.getNode());
     if (!lhs || !rhs || !lowering || lowering.getValue().empty() ||
-        !orientation || !batched || batched.getValue() ||
+        !orientation || !batched || batched.getValue() || !mmaForm ||
+        (mmaForm.getValue() != "native" &&
+         mmaForm.getValue() != "ragged_masked" &&
+         mmaForm.getValue() != "fp8_lane" &&
+         mmaForm.getValue() != "packed_int2_i8_mma") ||
         (orientation.getValue() != "nn" && orientation.getValue() != "nt" &&
          orientation.getValue() != "tn" && orientation.getValue() != "tt") ||
         (contract.getForm() == "scaled_direct" &&
          (!layout || (layout.getValue() != "grouped_rank_two" &&
                       layout.getValue() != "flattened_rank_three"))) ||
         (contract.getForm() != "scaled_direct" && layout) || !operation ||
+        ((mmaForm.getValue() == "packed_int2_i8_mma") !=
+         static_cast<bool>(contract->getAttrOfType<IntegerAttr>(
+             packedDecodeLoadNodeAttr))) ||
+        ((mmaForm.getValue() == "packed_int2_i8_mma") !=
+         static_cast<bool>(packedColumn)) ||
+        (packedColumn && !kernel.nodes.lookup(packedColumn.getInt())) ||
+        ((mmaForm.getValue() == "packed_int2_i8_mma") !=
+         static_cast<bool>(contract->getAttrOfType<DenseI64ArrayAttr>(
+             packedDecodeProducerNodesAttr))) ||
         (operation->getNumOperands() != 2 &&
          (contract.getForm() != "scaled_direct" ||
           operation->getNumOperands() != 4)))
@@ -556,6 +1281,10 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto form = transfer->getAttrOfType<StringAttr>(transferAttr);
     auto bounds = transfer->getAttrOfType<BoolAttr>(boundsAttr);
     auto deferred = transfer->getAttrOfType<BoolAttr>(deferredAttr);
+    auto selectedScalars =
+        transfer->getAttrOfType<DenseI64ArrayAttr>(selectedScalarIndexNodesAttr);
+    auto nativeReshape =
+        transfer->getAttrOfType<IntegerAttr>(nativeContractReshapeNodeAttr);
     Operation *operation = kernel.nodes.lookup(transfer.getNode());
     StringRef name = operation ? ::intent::target::semanticOperationName(*operation) : StringRef();
     bool load = name == "intent.view_load";
@@ -568,8 +1297,22 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                          (form.getValue() == "bulk_copy" ||
                           form.getValue() == "parallel_elements" ||
                           form.getValue() == "compact" ||
+                          form.getValue() == "selected_contiguous" ||
+                          form.getValue() == "native_contract_operand" ||
                           form.getValue() == "guarded_f16_bulk");
-    if (!operation || !validAccess || !validTransfer || !bounds || !deferred)
+    bool selectedForm = form && form.getValue() == "selected_contiguous";
+    bool nativeForm = form && form.getValue() == "native_contract_operand";
+    bool validSelectedScalars =
+        selectedScalars && !selectedScalars.empty() &&
+        llvm::all_of(selectedScalars.asArrayRef(), [&](int64_t node) {
+          return kernel.nodes.lookup(node) != nullptr;
+        });
+    if (!operation || !validAccess || !validTransfer || !bounds || !deferred ||
+        (selectedForm != validSelectedScalars) ||
+        (nativeForm != static_cast<bool>(nativeReshape)) ||
+        (nativeReshape &&
+         !isSemanticOp(kernel.nodes.lookup(nativeReshape.getInt()),
+                       "intent.reshape")))
       return transfer.emitOpError(
           "has no complete legal TileLang transfer-form decision");
   }

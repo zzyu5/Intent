@@ -232,6 +232,18 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError("already has a Triton pointwise spelling");
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    std::string gatherForm;
+    if (operation && target::semanticOperationName(*operation) ==
+                         "intent.gather") {
+      FailureOr<std::string> gather =
+          target::lowering::classifyGatherProjection(*operation);
+      if (failed(gather))
+        return failure();
+      if (*gather == "fragment_projection")
+        return pointwise.emitOpError(
+            "Triton fragment projection form is not materialized");
+      gatherForm = std::move(*gather);
+    }
     FailureOr<std::string> role =
         operation ? target::lowering::pointwiseRole(*operation)
                   : FailureOr<std::string>(failure());
@@ -242,13 +254,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return pointwise.emitOpError("does not bind canonical pointwise semantics");
     pointwise->setAttr(pointwiseLoweringAttr,
                        builder.getStringAttr(*lowering));
-    if (target::semanticOperationName(*operation) == "intent.gather") {
-      FailureOr<std::string> gather =
-          target::lowering::classifyGatherProjection(*operation);
-      if (failed(gather))
-        return failure();
-      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(*gather));
-    }
+    if (!gatherForm.empty())
+      pointwise->setAttr(gatherFormAttr, builder.getStringAttr(gatherForm));
   }
   for (intent::plan::TransferOp transfer :
        program.getBody().getOps<intent::plan::TransferOp>()) {

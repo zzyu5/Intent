@@ -53,7 +53,7 @@ Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch r
 - `tilelang/attention/native_sparse_forward/reference.py`：上游文件的直接导入；不进入 V2 计时。
 - `tilelang/attention/native_sparse_decode/reference.py`：decode example 的原始 reference import；不进入 V2 计时。
 - `tilelang/attention/sparse_mla_backward/sparse_mla_fwd.py` 与 `tilelang/attention/support/deepseek_v32_utils.py`：backward 的 forward state 与上游工具依赖。
-- `tilelang/gemm/sparse_2to4/sparse_utils.py`、`tilelang/gemm/dequant_bf16_fp4/dequantize_utils.py`：压缩 metadata / 解包参考依赖。
+- `tilelang/gemm/sparse_2to4/sparse_utils.py`、`tilelang/gemm/dequant_bf16_fp4/dequantize_utils.py` 与 `tilelang/gemm/dequant_bf16_fp4/quantize/*.py`：压缩 metadata、FP4 解包和上游 decode intrinsic 依赖。
 - `tilelang/support/{runtime.py,runtime_cases.py}`：加载 vendored 源码、构造模型级输入并输出一次运行结果。
 - 两个 fused linear-attention 文件只在导入时引用 FLA reference；runtime 为这些未计时 reference symbols 提供明确拒绝的包边界，实际运行的 TileLang kernel 源码保持原样。
 

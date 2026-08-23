@@ -10,9 +10,7 @@ GATED_FEATURES = 14336
 
 @intent.fn
 def tanh_value(value):
-    value_f32 = I.cast(value, I.f32)
-    sigmoid = 1.0 / (1.0 + I.exp(-2.0 * value_f32))
-    return 2.0 * sigmoid - 1.0
+    return I.tanh(I.cast(value, I.f32))
 
 
 @intent.fn
@@ -58,3 +56,20 @@ def relu_forward(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         output[row, columns] = I.maximum(x[row, columns], I.cast(0.0, I.f16))
+
+
+@intent.kernel
+def addcmul_broadcast_bf16(
+    x: I.In[I.bf16, ("B", "C", "L")],
+    scale: I.In[I.bf16, ("B", "C")],
+    bias: I.In[I.bf16, ("B", "C")],
+    output: I.Out[I.bf16, ("B", "C", "L")],
+):
+    B, C, L = x.shape
+    channels = I.domain(0, C)
+    positions = I.domain(0, L)
+    for batch in I.parallel(I.domain(0, B)):
+        output[batch, channels, positions] = (
+            bias[batch, channels, None]
+            + x[batch, channels, positions] * scale[batch, channels, None]
+        )

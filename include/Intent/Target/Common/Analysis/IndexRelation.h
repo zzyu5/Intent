@@ -41,6 +41,9 @@ parseIndexRelation(mlir::Operation &operation);
 TensorIndexGroup tensorIndexGroup(mlir::Operation &operation,
                                   llvm::ArrayRef<IndexTerm> relation);
 
+bool isFragmentProjection(mlir::Operation &operation,
+                          llvm::ArrayRef<IndexTerm> relation);
+
 mlir::FailureOr<ScalarIndexSource>
 traceScalarIndexSource(mlir::Value value, mlir::Operation &consumer);
 

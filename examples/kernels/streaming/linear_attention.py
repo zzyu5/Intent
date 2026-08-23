@@ -28,16 +28,19 @@ def fused_chunk_linear_attention_fwd(
             chunks = I.state_stream(
                 positions,
                 extent=CHUNK_SIZE,
-                init=(I.zeros((D, DV), dtype=I.f32),),
+                init=(I.zeros((key_dimensions, value_dimensions), dtype=I.f32),),
             )
             with chunks:
                 for chunk_region, state in chunks:
                     query = I.cast(
-                        I.cast(q[batch, chunk_region, head, :], I.f32) * scale,
+                        I.cast(
+                            q[batch, chunk_region, head, key_dimensions], I.f32
+                        )
+                        * scale,
                         I.f16,
                     )
-                    key = k[batch, chunk_region, head, :]
-                    value = v[batch, chunk_region, head, :]
+                    key = k[batch, chunk_region, head, key_dimensions]
+                    value = v[batch, chunk_region, head, value_dimensions]
                     scores = I.contract(
                         query,
                         key,
@@ -63,7 +66,9 @@ def fused_chunk_linear_attention_fwd(
                         reduce=((1, 0),),
                         acc_dtype=I.f32,
                     )
-                    output[batch, chunk_region, head, :] = intra + inter
+                    output[
+                        batch, chunk_region, head, value_dimensions
+                    ] = intra + inter
                     update = I.contract(
                         key,
                         value,
@@ -95,13 +100,15 @@ def fused_chunk_linear_attention_bwd(
             forward = I.state_stream(
                 positions,
                 extent=CHUNK_SIZE,
-                init=(I.zeros((DV, D), dtype=I.f32),),
+                init=(I.zeros((value_dimensions, key_dimensions), dtype=I.f32),),
             )
             with forward:
                 for chunk_region, state in forward:
-                    key = k[batch, chunk_region, head, :]
-                    value = v[batch, chunk_region, head, :]
-                    grad = grad_output[batch, chunk_region, head, :]
+                    key = k[batch, chunk_region, head, key_dimensions]
+                    value = v[batch, chunk_region, head, value_dimensions]
+                    grad = grad_output[
+                        batch, chunk_region, head, value_dimensions
+                    ]
                     local_positions = I.indices(chunk_region)
                     score_gradient = I.contract(
                         grad,
@@ -141,7 +148,7 @@ def fused_chunk_linear_attention_bwd(
             reverse = I.state_stream(
                 positions,
                 extent=CHUNK_SIZE,
-                init=(I.zeros((D, DV), dtype=I.f32),),
+                init=(I.zeros((key_dimensions, value_dimensions), dtype=I.f32),),
             )
             with reverse:
                 for traversal_region, grad_state in reverse:
@@ -266,22 +273,27 @@ def chunk_retention_fwd(
     B, S, H, D = q.shape
     DV = v.shape[3]
     positions = I.domain(0, S)
+    key_dimensions = I.domain(0, D)
+    value_dimensions = I.domain(0, DV)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
             log_decay = I.log(1.0 - I.exp(-5.0 - I.cast(head, I.f32)))
             chunks = I.state_stream(
                 positions,
                 extent=CHUNK_SIZE,
-                init=(I.zeros((D, DV), dtype=I.f32),),
+                init=(I.zeros((key_dimensions, value_dimensions), dtype=I.f32),),
             )
             with chunks:
                 for chunk_region, state in chunks:
                     query = I.cast(
-                        I.cast(q[batch, chunk_region, head, :], I.f32) * scale,
+                        I.cast(
+                            q[batch, chunk_region, head, key_dimensions], I.f32
+                        )
+                        * scale,
                         I.f16,
                     )
-                    key = k[batch, chunk_region, head, :]
-                    value = v[batch, chunk_region, head, :]
+                    key = k[batch, chunk_region, head, key_dimensions]
+                    value = v[batch, chunk_region, head, value_dimensions]
                     local = I.indices(chunk_region) - I.indices(chunk_region)[0]
                     score = I.contract(
                         query,
@@ -307,9 +319,9 @@ def chunk_retention_fwd(
                         reduce=((1, 0),),
                         acc_dtype=I.f32,
                     ) * I.exp(I.cast(local + 1, I.f32) * log_decay)[:, None]
-                    output[batch, chunk_region, head, :] = I.cast(
-                        intra + inter, I.f16
-                    )
+                    output[
+                        batch, chunk_region, head, value_dimensions
+                    ] = I.cast(intra + inter, I.f16)
                     weighted_value = value * I.cast(
                         I.exp(
                             I.cast(CHUNK_SIZE - local - 1, I.f32) * log_decay

@@ -53,11 +53,13 @@ struct PhysicalProgramIndex {
   llvm::DenseMap<int64_t, plan::ReductionOp> reductions;
   llvm::DenseMap<int64_t, plan::ScanOp> scans;
   llvm::DenseMap<int64_t, plan::PointwiseOp> pointwise;
+  llvm::DenseMap<int64_t, llvm::SmallVector<std::string>> loopCarrierSpaces;
   llvm::DenseMap<int64_t, plan::ContractOp> contracts;
   llvm::DenseMap<int64_t, plan::SparseContractOp> sparseContracts;
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
+  llvm::DenseMap<int64_t, int64_t> nativeContractOperandReshapes;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::lowering::PhysicalComponents components;
@@ -164,6 +166,9 @@ private:
   mlir::LogicalResult replayContractProducers(
       llvm::ArrayRef<mlir::Operation *> producers);
   mlir::FailureOr<std::string>
+  emitPackedInt2Operand(mlir::Operation &contract,
+                        const plan::ContractOp &binding);
+  mlir::FailureOr<std::string>
   scanWorkspaceIndex(const plan::ScanOp &binding,
                      llvm::StringRef logicalIndex,
                      mlir::Operation &consumer);
@@ -220,6 +225,7 @@ private:
   elementValidityPredicate(llvm::ArrayRef<int64_t> tensorAxes,
                            llvm::ArrayRef<int64_t> domainNodes,
                            llvm::ArrayRef<std::string> elementIndices,
+                           mlir::Value value,
                            mlir::Operation &consumer);
   mlir::FailureOr<std::string>
   paddingFillExpression(mlir::Value value, mlir::Operation &consumer);
@@ -266,6 +272,7 @@ private:
       deferredContractReplays;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
       deferredContractProducerOwners;
+  llvm::DenseSet<mlir::Operation *> packedDecodeProducers;
   mlir::Operation *activeDeferredContract = nullptr;
   llvm::StringSet<> usedNames;
   llvm::StringMap<std::string> dimensionOwners;
@@ -293,6 +300,7 @@ private:
       streamCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       loopCarriers;
+  llvm::DenseSet<mlir::Value> sharedLoopValues;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       whileCarriers;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>> ifResults;
@@ -313,6 +321,7 @@ private:
   mlir::Operation *vectorDomain = nullptr;
   ABIView *fixedOutput = nullptr;
   bool tuneRowLaunch = false;
+  bool needsPackedInt2Decode = false;
   std::string kernelName;
   unsigned indentation = 3;
 };

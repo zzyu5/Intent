@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import torch
+import intent
+
+from repro.common.support import prepare_kernel_call
 
 from kernels.contraction.block_sparse import block_sparse_matmul
 from kernels.contraction.block_scaled import deepgemm_fp8_2xacc
@@ -9,6 +12,7 @@ from kernels.contraction.gemm import gemm
 from kernels.contraction.sparse_2to4 import sparse_2to4_gemm
 from kernels.contraction.weight_only_int4 import fp8_e4m3_matmul
 from kernels.contraction.weight_only_int4 import bitnet_int2_matmul
+from kernels.contraction.weight_only_int4 import dequant_bf16_fp4_matmul
 from kernels.contraction.weight_only_int4 import w4a8_packed_matmul
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
@@ -17,10 +21,10 @@ from ...measurement import compile_single
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
+from ...model import PreparedLaunch
 from ...model import Tolerance
 from .common import runtime_module
 from .common import source_from_runtime
-from .. import implementation_gap
 
 
 def dense_gemm(context: Context) -> PreparedComparison:
@@ -320,10 +324,19 @@ def grouped_gemm_backward(context: Context) -> PreparedComparison:
     group_offsets = torch.cat(
         (offsets, torch.tensor((total,), device="cuda", dtype=torch.int32))
     )
-    _, generated = compile_single(
-        context,
+    grad_weight = torch.empty(
+        (len(rows), hidden, output), device="cuda", dtype=torch.float16
+    )
+    artifact = intent.compile(
         ragged_grouped_gemm_backward_weight,
-        (left, right, group_offsets),
+        target=context.target,
+        compiler=context.compiler,
+    )
+    generated = PreparedLaunch(
+        launch=prepare_kernel_call(
+            artifact, (left, right, group_offsets), grad_weight
+        ),
+        outputs=lambda: grad_weight,
     )
     runtime = runtime_module(
         context,
@@ -400,6 +413,58 @@ def deepgemm_fp8(context: Context) -> PreparedComparison:
     )
 
 
+def dequant_bf16_fp4(context: Context) -> PreparedComparison:
+    m = n = k = 4096
+    activation = (
+        torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.125
+    )
+    packed_weight = torch.randint(
+        0,
+        256,
+        (n, k // 2),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    _, generated = compile_single(
+        context,
+        dequant_bf16_fp4_matmul,
+        (activation, packed_weight),
+    )
+    support = runtime_module(
+        context,
+        "source/tilelang/tilelang/support/runtime.py",
+        "intent_v2_tilelang_runtime_support",
+    )
+    source_module = support.load_source(
+        context.project_root
+        / "source/tilelang/tilelang/gemm/dequant_bf16_fp4/example_dequant_gemm_bf16_fp4_hopper.py",
+        "intent_v2_tilelang_dequant_bf16_fp4",
+    )
+    source_kernel = source_module.matmul(
+        m,
+        n,
+        k,
+        "bfloat16",
+        "bfloat16",
+        "float32",
+        num_bits=4,
+        fast_dequant=True,
+        block_M=256,
+        block_N=128,
+        block_K=128,
+        num_stages=2,
+        threads=256,
+        split=1,
+    )
+    source = functional_launch(lambda: source_kernel(activation, packed_weight))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1.0, rtol=2e-2),
+        cuda_graph=False,
+    )
+
+
 CASES = {
     "dense_gemm": dense_gemm,
     "w4a8_gemm": w4a8_gemm,
@@ -410,9 +475,5 @@ CASES = {
     "grouped_gemm_backward": grouped_gemm_backward,
     "deepgemm_fp8_2xacc": deepgemm_fp8,
     "bitnet_int2_decode": bitnet_int2,
-    "dequant_bf16_fp4": implementation_gap(
-        "the DSL expresses the registered twiddled packed ABI and equal-width "
-        "bit reinterpretation, but the imported source callable depends on an "
-        "external decode-intrinsic module that is not present beside the source"
-    ),
+    "dequant_bf16_fp4": dequant_bf16_fp4,
 }

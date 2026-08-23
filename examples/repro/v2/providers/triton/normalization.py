@@ -3,9 +3,14 @@ from __future__ import annotations
 import torch
 
 from kernels.activation.swiglu import swiglu_forward
+from kernels.backward.group_norm import group_norm_backward_dx
+from kernels.backward.group_norm import group_norm_backward_weight_bias
+from kernels.backward.softmax import softmax_backward as softmax_backward_kernel
+from kernels.normalization.batch_norm import batch_norm_training as batch_norm_training_kernel
 from kernels.normalization.fused_add_rms_norm import fused_add_rms_norm
 from kernels.normalization.layer_norm import layer_norm_f16
 from kernels.normalization.layer_norm import layer_norm_bf16
+from kernels.normalization.logsumexp import row_logsumexp
 from kernels.normalization.rms_norm import rms_norm_bf16
 from kernels.normalization.softmax import stable_softmax_f16
 
@@ -14,6 +19,7 @@ from ...measurement import compile_single
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
+from ...model import PreparedLaunch
 from ...model import Tolerance
 
 
@@ -143,6 +149,149 @@ def xformers_rms_norm(context: Context) -> PreparedComparison:
     )
 
 
+def flaggems_batch_norm_training(context: Context) -> PreparedComparison:
+    batch, channels, spatial = 32, 64, 4096
+    x = torch.randn(
+        (batch, channels, spatial), device="cuda", dtype=torch.float16
+    )
+    weight = torch.randn((channels,), device="cuda", dtype=torch.float32)
+    bias = torch.randn((channels,), device="cuda", dtype=torch.float32)
+    initial_mean = torch.randn((channels,), device="cuda", dtype=torch.float32)
+    initial_variance = (
+        torch.rand((channels,), device="cuda", dtype=torch.float32) + 1.0
+    )
+    generated_mean = initial_mean.clone()
+    generated_variance = initial_variance.clone()
+    _, generated_base = compile_single(
+        context,
+        batch_norm_training_kernel,
+        (x, weight, bias, generated_mean, generated_variance, 1e-5, 0.1),
+    )
+    generated = PreparedLaunch(
+        launch=generated_base.launch,
+        outputs=lambda: (*generated_base.outputs(), generated_mean, generated_variance),
+        prepare=lambda: (
+            generated_mean.copy_(initial_mean),
+            generated_variance.copy_(initial_variance),
+        ),
+    )
+    runtime = _runtime(
+        context,
+        "source/triton/flag-gems/normalization/batch_norm/batch_norm_runtime.py",
+        "intent_v2_triton_flaggems_batch_norm",
+    )
+    source_mean = initial_mean.clone()
+    source_variance = initial_variance.clone()
+    state: dict[str, object] = {}
+
+    def source_launch():
+        state["outputs"] = runtime.upstream(
+            (x, weight, bias, source_mean, source_variance, 1e-5, 0.1)
+        )
+
+    source_launch()
+    source = PreparedLaunch(
+        launch=source_launch,
+        outputs=lambda: (*state["outputs"], source_mean, source_variance),
+        prepare=lambda: (
+            source_mean.copy_(initial_mean),
+            source_variance.copy_(initial_variance),
+        ),
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        (
+            Tolerance(atol=2e-2, rtol=1e-2),
+            Tolerance(atol=1e-4, rtol=1e-4),
+            Tolerance(atol=1e-4, rtol=1e-4),
+            Tolerance(atol=1e-4, rtol=1e-4),
+            Tolerance(atol=1e-4, rtol=1e-4),
+        ),
+        cuda_graph=False,
+    )
+
+
+def flaggems_group_norm_backward(context: Context) -> PreparedComparison:
+    batch, channels, spatial, groups = 32, 256, 1024, 32
+    x = torch.randn(
+        (batch, channels, spatial), device="cuda", dtype=torch.float16
+    )
+    grad_y = torch.randn_like(x)
+    weight = torch.randn((channels,), device="cuda", dtype=torch.float16)
+    mean = torch.randn((batch, groups), device="cuda", dtype=torch.float16)
+    rstd = (
+        torch.rand((batch, groups), device="cuda", dtype=torch.float16) + 0.5
+    )
+    _, generated_dx = compile_single(
+        context,
+        group_norm_backward_dx,
+        (x, grad_y, weight, mean, rstd, 1.0 / ((channels // groups) * spatial)),
+    )
+    _, generated_weight_bias = compile_single(
+        context,
+        group_norm_backward_weight_bias,
+        (x, grad_y, mean, rstd),
+    )
+    generated = PreparedLaunch(
+        launch=lambda: (generated_dx.launch(), generated_weight_bias.launch()),
+        outputs=lambda: (generated_dx.outputs(), *generated_weight_bias.outputs()),
+    )
+    runtime = _runtime(
+        context,
+        "source/triton/flag-gems/normalization/group_norm/groupnorm_runtime.py",
+        "intent_v2_triton_flaggems_group_norm_backward",
+    )
+    source = functional_launch(
+        lambda: runtime.upstream((x, grad_y, weight, mean, rstd))
+    )
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=5e-2, rtol=2e-2),
+        cuda_graph=True,
+    )
+
+
+def flaggems_logsumexp(context: Context) -> PreparedComparison:
+    x = torch.randn((8192, 8192), device="cuda", dtype=torch.float32)
+    _, generated = compile_single(context, row_logsumexp, (x,))
+    runtime = _runtime(
+        context,
+        "source/triton/flag-gems/normalization/logsumexp/logsumexp_runtime.py",
+        "intent_v2_triton_flaggems_logsumexp",
+    )
+    source = functional_launch(lambda: runtime.upstream((x,)))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-4, rtol=1e-5),
+        cuda_graph=True,
+    )
+
+
+def flaggems_softmax_backward(context: Context) -> PreparedComparison:
+    probabilities = torch.randn(
+        (4096, 4097), device="cuda", dtype=torch.float32
+    )
+    gradient = torch.randn_like(probabilities)
+    _, generated = compile_single(
+        context, softmax_backward_kernel, (probabilities, gradient)
+    )
+    runtime = _runtime(
+        context,
+        "source/triton/flag-gems/normalization/softmax/softmax_runtime.py",
+        "intent_v2_triton_flaggems_softmax_backward",
+    )
+    source = functional_launch(lambda: runtime.upstream((probabilities, gradient)))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=1e-4, rtol=1e-5),
+        cuda_graph=True,
+    )
+
+
 CASES = {
     "fused_softmax": fused_softmax,
     "layer_norm": layer_norm,
@@ -151,4 +300,8 @@ CASES = {
     "fused_add_rms_norm": fused_add_rms,
     "rms_norm": rms_norm,
     "xformers_rms_norm": xformers_rms_norm,
+    "flaggems_batch_norm_training": flaggems_batch_norm_training,
+    "flaggems_group_norm_backward": flaggems_group_norm_backward,
+    "flaggems_logsumexp": flaggems_logsumexp,
+    "flaggems_softmax_backward": flaggems_softmax_backward,
 }

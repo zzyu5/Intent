@@ -15,8 +15,10 @@ def ragged_grouped_gemm(
     weight: I.In[I.f16, ("G", "K", "N")],
     y: I.Out[I.f16, ("R", "N")],
 ):
-    R, _ = x.shape
+    R, K = x.shape
     G, _, N = weight.shape
+    reduction = I.domain(0, K)
+    columns = I.domain(0, N)
     groups = I.ragged(
         outer=I.domain(0, G),
         members=I.domain(0, R),
@@ -24,16 +26,16 @@ def ragged_grouped_gemm(
     )
     for group in I.parallel(groups.outer):
         rows = I.members(groups[group])
-        values = I.gather(x, index=(rows, slice(None)))
+        values = I.gather(x, index=(rows, reduction))
         result = I.contract(
             values,
-            weight[group, :, :],
+            weight[group, reduction, columns],
             reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(
             y,
-            index=(rows, slice(None)),
+            index=(rows, columns),
             value=I.cast(result, I.f16),
         )
 
@@ -45,8 +47,10 @@ def ragged_grouped_gemm_bf16(
     weight: I.In[I.bf16, ("G", "K", "N")],
     y: I.Out[I.bf16, ("R", "N")],
 ):
-    R, _ = x.shape
+    R, K = x.shape
     G, _, N = weight.shape
+    reduction = I.domain(0, K)
+    columns = I.domain(0, N)
     groups = I.ragged(
         outer=I.domain(0, G),
         members=I.domain(0, R),
@@ -54,16 +58,16 @@ def ragged_grouped_gemm_bf16(
     )
     for group in I.parallel(groups.outer):
         rows = I.members(groups[group])
-        values = I.gather(x, index=(rows, slice(None)))
+        values = I.gather(x, index=(rows, reduction))
         result = I.contract(
             values,
-            weight[group, :, :],
+            weight[group, reduction, columns],
             reduce=((1, 0),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(
             y,
-            index=(rows, slice(None)),
+            index=(rows, columns),
             value=I.cast(result, I.bf16),
         )
 
@@ -106,7 +110,11 @@ def routed_expert_projection_bf16(
     TOP_K: I.Constexpr[int],
 ):
     E = weight.shape[0]
+    N = weight.shape[1]
+    K = weight.shape[2]
     R = member_routes.shape[0]
+    reduction = I.domain(0, K)
+    columns = I.domain(0, N)
     experts = I.ragged(
         outer=I.domain(0, E),
         members=I.domain(0, R),
@@ -118,15 +126,15 @@ def routed_expert_projection_bf16(
         token = routes // TOP_K
         slot = routes % TOP_K
         I.assume_in_bounds(token, x, axis=0)
-        values = I.gather(x, index=(token, slice(None)))
+        values = I.gather(x, index=(token, reduction))
         result = I.contract(
             values,
-            weight[expert, :, :],
+            weight[expert, columns, reduction],
             reduce=((1, 1),),
             acc_dtype=I.f32,
         )
         I.scatter_unique(
             output,
-            index=(token, slot, slice(None)),
+            index=(token, slot, columns),
             value=I.cast(result, I.bf16),
         )

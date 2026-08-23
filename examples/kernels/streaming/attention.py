@@ -102,6 +102,36 @@ def online_attention_accumulate_bf16(
     return next_denominator, next_accumulator
 
 
+@intent.fn
+def online_attention_accumulate_transposed_bf16(
+    maximum,
+    next_maximum,
+    denominator,
+    accumulator,
+    scores,
+    value_block,
+):
+    safe_maximum = I.mask(
+        next_maximum,
+        valid=next_maximum != -I.inf,
+        fill=0.0,
+    )
+    alpha = I.exp2(maximum - safe_maximum)
+    probability = I.exp2(scores - safe_maximum[None, :])
+    next_denominator = alpha * denominator + I.reduce.sum(
+        probability,
+        axis=0,
+        identity=0.0,
+    )
+    next_accumulator = alpha[None, :] * accumulator + I.contract(
+        I.transpose(value_block),
+        I.cast(probability, I.bf16),
+        reduce=((1, 0),),
+        acc_dtype=I.f32,
+    )
+    return next_denominator, next_accumulator
+
+
 @intent.kernel
 def flash_attention_fwd(
     q: I.In[I.f16, ("B", "H", "Q", "D")],

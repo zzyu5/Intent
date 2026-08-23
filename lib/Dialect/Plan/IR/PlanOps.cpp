@@ -196,14 +196,13 @@ LogicalResult RangeOp::verify() {
 }
 
 LogicalResult RegionBindingOp::verify() {
-  if (failed(requireNonNegative(*this, getArgument(),
-                                "region argument value ID")) ||
+  if (failed(requireNonNegative(*this, getValue(), "region value ID")) ||
       failed(requireNode(*this, getAxisNode())) ||
       failed(requireNonNegative(*this, getLevel(), "range level")))
     return failure();
   if (getPurpose() != "ownership" && getPurpose() != "traversal")
     return emitOpError(
-        "region arguments may only bind ownership or traversal ranges");
+        "region values may only bind ownership or traversal ranges");
   return success();
 }
 
@@ -389,11 +388,13 @@ LogicalResult ContractOp::verify() {
   bool needsReduction = getForm() == "replay" || getForm() == "deferred_one" ||
                         getForm() == "deferred_two";
   bool needsResultAxes = getForm() == "deferred_two";
+  bool forbidsAxes = getForm() == "scaled_direct";
   bool hasReduction = static_cast<bool>(getReductionAxisNodeAttr());
   bool hasLhsResult = static_cast<bool>(getLhsResultAxisNodeAttr());
   bool hasRhsResult = static_cast<bool>(getRhsResultAxisNodeAttr());
-  if (needsReduction != hasReduction || needsResultAxes != hasLhsResult ||
-      needsResultAxes != hasRhsResult)
+  if ((needsReduction && !hasReduction) ||
+      (needsResultAxes && (!hasLhsResult || !hasRhsResult)) ||
+      (forbidsAxes && (hasReduction || hasLhsResult || hasRhsResult)))
     return emitOpError(
         "does not carry the physical axes required by its realization form");
   if ((hasReduction &&
@@ -536,7 +537,7 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   llvm::DenseMap<int64_t, AxisOp> axes;
   llvm::StringSet<> rangeKeys;
   SmallVector<RangeOp> ranges;
-  llvm::DenseSet<int64_t> regionArguments;
+  llvm::DenseSet<int64_t> regionValues;
   SmallVector<RegionBindingOp> regionBindings;
   llvm::DenseSet<int64_t> partitionPartArguments;
   llvm::DenseSet<int64_t> partitionRegionArguments;
@@ -581,9 +582,9 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
         return range.emitOpError("duplicates an axis physical range");
       ranges.push_back(range);
     } else if (auto binding = dyn_cast<RegionBindingOp>(operation)) {
-      if (!regionArguments.insert(binding.getArgument()).second)
+      if (!regionValues.insert(binding.getValue()).second)
         return binding.emitOpError(
-            "duplicates a region-argument physical binding");
+            "duplicates a region-value physical binding");
       regionBindings.push_back(binding);
     } else if (auto binding = dyn_cast<PartitionBindingOp>(operation)) {
       if (!partitionsByNode.try_emplace(binding.getPartitionNode(), binding).second)
@@ -758,14 +759,14 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
       return binding.emitOpError(
           "does not match the selected count-partition ownership extent");
     auto region = llvm::find_if(regionBindings, [&](RegionBindingOp candidate) {
-      return candidate.getArgument() == binding.getRegionArgument();
+      return candidate.getValue() == binding.getRegionArgument();
     });
     if (region == regionBindings.end() ||
         region->getAxisNode() != binding.getAxisNode() ||
         region->getPurpose() != "ownership" || region->getLevel() != 0)
       return binding.emitOpError(
           "does not bind its region argument to the selected ownership range");
-    if (regionArguments.contains(binding.getPartArgument()))
+    if (regionValues.contains(binding.getPartArgument()))
       return binding.emitOpError(
           "part identity cannot also be a physical region argument");
   }

@@ -12,6 +12,17 @@
 using namespace mlir;
 
 namespace intent::tilelang::lowering {
+
+static bool isPlainRaggedMemberAxis(const PhysicalProgramIndex &index,
+                                    int64_t axis) {
+  auto relations = index.components.raggedByAxis.find(axis);
+  if (relations == index.components.raggedByAxis.end())
+    return false;
+  return llvm::any_of(relations->second, [&](const plan::RaggedOp &relation) {
+    return llvm::is_contained(relation.getMemberNodes(), axis);
+  });
+}
+
 FailureOr<PhysicalProgramIndex>
 indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                  const target::KernelModel &kernel) {
@@ -40,7 +51,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       ranges.push_back(value);
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
-      index.regionBindings[value.getArgument()] = value;
+      index.regionBindings[value.getValue()] = value;
     } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
@@ -118,6 +129,36 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   if (failed(target::lowering::indexAxisRanges(index, ranges, syntax::tile)) ||
       failed(target::lowering::indexCanonicalStructure(index, kernel)))
     return failure();
+  FailureOr<func::FuncOp> physicalEntry =
+      intent::plan::getPhysicalEntry(physicalProgram);
+  if (failed(physicalEntry))
+    return failure();
+  WalkResult loopForms = physicalEntry->walk([&](intent::plan::ExecForOp loop) {
+    auto node = loop->getAttrOfType<IntegerAttr>("intent.node");
+    auto spaces = loop->getAttrOfType<ArrayAttr>(loopCarrierSpacesAttr);
+    if (!node || !spaces || spaces.size() != loop.getNumResults()) {
+      loop.emitOpError("has no indexed TileLang loop-carrier form");
+      return WalkResult::interrupt();
+    }
+    SmallVector<std::string> selected;
+    selected.reserve(spaces.size());
+    for (Attribute attribute : spaces) {
+      auto space = dyn_cast<StringAttr>(attribute);
+      if (!space) {
+        loop.emitOpError("has a non-string TileLang loop-carrier form");
+        return WalkResult::interrupt();
+      }
+      selected.push_back(space.getValue().str());
+    }
+    if (!index.loopCarrierSpaces.try_emplace(node.getInt(), std::move(selected))
+             .second) {
+      loop.emitOpError("duplicates one TileLang loop-carrier form");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (loopForms.wasInterrupted())
+    return failure();
   for (plan::RaggedOp &ragged : index.ragged) {
     auto route = ragged.operation
                      ? ragged.operation->getAttrOfType<StringAttr>(raggedRouteAttr)
@@ -168,10 +209,13 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   }
   for (intent::plan::PointwiseOp value : pointwise) {
     auto lowering = value->getAttrOfType<StringAttr>(pointwiseLoweringAttr);
+    auto storage = value->getAttrOfType<StringAttr>(pointwiseStorageAttr);
     plan::PointwiseOp binding;
     binding.operation = value;
-    binding.resultSpace = syntax::bufferSpace(value.getResultSpace()).str();
-    if (!lowering || binding.resultSpace.empty())
+    binding.resultSpace = storage && storage.getValue() == "shared"
+                              ? "shared"
+                              : syntax::bufferSpace(value.getResultSpace()).str();
+    if (!lowering || !storage || binding.resultSpace.empty())
       return value.emitOpError("has no realized TileLang pointwise spelling");
     binding.lowering = lowering.getValue().str();
     index.pointwise[value.getNode()] = binding;
@@ -191,6 +235,8 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     auto transfer = value->getAttrOfType<StringAttr>(transferAttr);
     auto bounds = value->getAttrOfType<BoolAttr>(boundsAttr);
     auto deferred = value->getAttrOfType<BoolAttr>(deferredAttr);
+    auto nativeReshape =
+        value->getAttrOfType<IntegerAttr>(nativeContractReshapeNodeAttr);
     if (!access || !transfer || !bounds || !deferred)
       return value.emitOpError("has no realized TileLang transfer form");
     plan::BoundaryOp binding;
@@ -205,6 +251,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       return failure();
     }
     index.boundaries[value.getNode()] = binding;
+    if (nativeReshape)
+      index.nativeContractOperandReshapes[value.getNode()] =
+          nativeReshape.getInt();
   }
   if (!index.target || !index.program) {
     physicalProgram.emitOpError("lacks device or launch decisions for TileLang");
@@ -270,6 +319,25 @@ LogicalResult ProgramMaterializer::prepare() {
           kernel, planIndex, deferredContractReplays,
           deferredContractProducerOwners)))
     return failure();
+  for (const auto &entry : planIndex.contracts) {
+    auto form = entry.second.operation->getAttrOfType<StringAttr>(
+        contractMmaFormAttr);
+    if (!form || form.getValue() != "packed_int2_i8_mma")
+      continue;
+    auto producers = entry.second.operation->getAttrOfType<DenseI64ArrayAttr>(
+        packedDecodeProducerNodesAttr);
+    if (!producers)
+      return entry.second.emitOpError(
+          "has no packed INT2 producer ownership list");
+    needsPackedInt2Decode = true;
+    for (int64_t node : producers.asArrayRef()) {
+      Operation *producer = kernel.nodes.lookup(node);
+      if (!producer)
+        return entry.second.emitOpError(
+            "references an unknown packed INT2 producer node");
+      packedDecodeProducers.insert(producer);
+    }
+  }
   for (const auto &entry : planIndex.scans)
     if (failed(target::lowering::verifyScanMaterializedValues(kernel,
                                                               entry.second)))
@@ -452,14 +520,13 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
   }
   for (const auto &entry : planIndex.regionBindings) {
     Value value = kernel.values.lookup(entry.first);
-    auto argument = dyn_cast<BlockArgument>(value);
     plan::RegionBindingOp binding = entry.second;
     plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
     const target::lowering::RangeBinding *range =
         axis ? axis.getRange(binding.getPurpose(), binding.getLevel()) : nullptr;
-    if (!argument || !axis || !range)
+    if (!value || !axis || !range)
       return binding.emitOpError(
-          "does not bind a canonical region argument and selected range");
+          "does not bind a canonical region value and selected range");
     bool roundedRow = !axis.getReuseWorker() &&
                       range->getTileRole().starts_with("row_vector");
     if (roundedRow && !planIndex.blockExtents.count(range->getExtent()))
@@ -577,6 +644,8 @@ LogicalResult ProgramMaterializer::prepareRaggedMetadata() {
 }
 
 bool ProgramMaterializer::selectOperation(Operation &operation) {
+  if (packedDecodeProducers.contains(&operation))
+    return false;
   if (target::lowering::isAbsorbedRaggedDescriptorLoad(operation))
     return false;
   auto contractProducer = deferredContractProducerOwners.find(&operation);
@@ -680,6 +749,24 @@ LogicalResult ProgramMaterializer::emitHelpers() {
         "TileLang 0.1.13 CUDA codegen cannot lower the tirx.Reduce produced by "
         "comm_reducer and exposes no generic scan equivalent; generic "
         "combiners are unsupported");
+  if (needsPackedInt2Decode)
+    output << R"INTENT(_INTENT_U2X16_TO_I8_SOURCE = r"""
+template <typename T1, typename T2>
+__device__ void intent_u2x16_to_i8(T1 *packed, T2 *decoded) {
+  unsigned int *out = reinterpret_cast<unsigned int *>(decoded);
+  const unsigned int word = *reinterpret_cast<unsigned int *>(packed);
+  constexpr unsigned int lut = (0xf0 & 0xcc) | 0xaa;
+  constexpr unsigned int mask = 0x03030303;
+#pragma unroll
+  for (int lane = 0; lane < 4; ++lane) {
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(out[lane])
+                 : "r"(word >> (2 * lane)), "n"(mask), "n"(0), "n"(lut));
+  }
+}
+"""
+
+)INTENT";
   return success();
 }
 
@@ -695,7 +782,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     };
     for (const std::string &dimension : dimensionOrder)
       parameter(dimension);
-    for (int64_t axis : planIndex.components.orderedRaggedProgramAxes)
+    for (int64_t axis : planIndex.components.raggedProgramAxes)
       parameter("MAX_SEQUENCE_LENGTH_" + std::to_string(axis));
     if (usesMatrixContraction())
       parameter("gemm_warp_policy=0");
@@ -818,6 +905,44 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
   emitBuilderParameters(output);
   output << "):\n";
   emitBlockExtentConstants(output);
+  llvm::StringSet<> selectedContiguousConstraints;
+  for (const auto &entry : planIndex.boundaries) {
+    const plan::BoundaryOp &boundary = entry.second;
+    if (boundary.getTransfer() != "selected_contiguous")
+      continue;
+    Operation *operation = kernel.nodes.lookup(boundary.getNode());
+    FailureOr<SmallVector<std::string>> physical =
+        operation ? tensorExtents(*operation, 0)
+                  : FailureOr<SmallVector<std::string>>(failure());
+    FailureOr<SmallVector<std::string>> logical =
+        operation ? tensorExtents(*operation, 0, false)
+                  : FailureOr<SmallVector<std::string>>(failure());
+    if (failed(physical) || failed(logical) ||
+        physical->size() != logical->size())
+      return boundary.emitOpError(
+          "has no exact selected-contiguous TileLang result shape");
+    for (auto [physicalExtent, logicalExtent] :
+         llvm::zip(*physical, *logical))
+      if (physicalExtent != logicalExtent)
+        selectedContiguousConstraints.insert(physicalExtent + " != " +
+                                             logicalExtent);
+    for (int64_t node : boundary.getDomainNodes()) {
+      auto axis = planIndex.axes.find(node);
+      if (axis == planIndex.axes.end() || axis->second.isScalar())
+        continue;
+      std::string extent = axisDimensions.lookup(node);
+      std::string tile = axis->second.getTile().str();
+      if (extent.empty() || tile.empty())
+        return boundary.emitOpError(
+            "has no exact selected-contiguous TileLang axis interval");
+      selectedContiguousConstraints.insert(extent + " % " + tile + " != 0");
+    }
+  }
+  for (StringRef constraint : selectedContiguousConstraints.keys()) {
+    output << "    if " << constraint << ":\n";
+    output << "        raise NotImplementedError('TileLang selected-contiguous "
+              "transfer requires exact physical tiles')\n";
+  }
   output << "    @T.prim_func\n    def main(";
   if (failed(emitMainParameters(output)))
     return failure();
@@ -843,7 +968,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
   auto axisExtent = [&](plan::AxisOp axis) {
     std::string role = "program_" + std::to_string(axis.getProgramOrder());
     std::string extent =
-        planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode())
+        planIndex.components.raggedProgramAxes.contains(axis.getNode())
             ? "MAX_SEQUENCE_LENGTH_" + std::to_string(axis.getNode())
             : roleDimensions.lookup(role);
     return axis.isScalar()
@@ -992,6 +1117,8 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
       continue;
     axisIndices[axis.getNode()] = "0";
   }
+  if (needsPackedInt2Decode)
+    output << programIndent << "T.import_source(_INTENT_U2X16_TO_I8_SOURCE)\n";
   return success();
 }
 
@@ -1056,6 +1183,29 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     for (const std::string &dimension : dimensionOrder)
       output << "    " << dimension << " = "
              << dimensionOwners.lookup(dimension) << "\n";
+    SmallVector<std::string> dynamicContractionRowExtents;
+    for (const auto &entry : planIndex.contracts) {
+      std::optional<int64_t> axisNode = entry.second.getLhsResultAxisNode();
+      auto axis = axisNode ? planIndex.axes.find(*axisNode) : planIndex.axes.end();
+      const target::lowering::RangeBinding *range =
+          axis == planIndex.axes.end()
+              ? nullptr
+              : target::lowering::canonicalDomainRange(axis->second);
+      if (!range)
+        continue;
+      int64_t staticExtent = 0;
+      if (!range->getExtent().getAsInteger(10, staticExtent))
+        continue;
+      std::string extent = syntax::dimension(range->getExtent());
+      if (!llvm::is_contained(dynamicContractionRowExtents, extent))
+        dynamicContractionRowExtents.push_back(std::move(extent));
+    }
+    for (const std::string &extent : dynamicContractionRowExtents) {
+      output << "    if 0 < " << extent << " < 16:\n";
+      output << "        raise NotImplementedError('TileLang cannot pad a "
+                "logical contraction row extent smaller than 16 to a native "
+                "MMA fragment')\n";
+    }
     llvm::SmallVector<StringRef> exactExtents;
     exactExtents.reserve(exactBulkExtents.size());
     for (const auto &extent : exactBulkExtents)
@@ -1197,7 +1347,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
       output << dimension;
       first = false;
     }
-    for (int64_t axis : planIndex.components.orderedRaggedProgramAxes) {
+    for (int64_t axis : planIndex.components.raggedProgramAxes) {
       if (!first)
         output << ", ";
       output << "max_sequence_length_" << axis;
@@ -1234,7 +1384,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   });
   if (outputs.empty() && !hasInOut)
     return kernel.entry.emitOpError("TileLang wrapper has no writable views");
-  for (int64_t axis : planIndex.components.orderedRaggedProgramAxes) {
+  for (int64_t axis : planIndex.components.raggedProgramAxes) {
     FailureOr<plan::RaggedOp> relation =
         target::lowering::uniqueRaggedRelation(
             planIndex, axis, *kernel.entry.getOperation());
@@ -1243,7 +1393,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
                        : raggedRuntimeByRelation.end();
     if (failed(relation) || runtime == raggedRuntimeByRelation.end())
       return kernel.entry.emitOpError(
-          "has no ordered ragged runtime metadata");
+          "has no ragged program runtime metadata");
     ABIView *offsets = raggedRuntimes[runtime->second].offsets;
     output << "    max_sequence_length_" << axis << " = int(("
            << offsets->argument->name << "[1:] - "
@@ -1259,7 +1409,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   };
   for (const std::string &dimension : dimensionOrder)
     emitCacheKey(dimension);
-  for (int64_t axis : planIndex.components.orderedRaggedProgramAxes)
+  for (int64_t axis : planIndex.components.raggedProgramAxes)
     emitCacheKey("max_sequence_length_" + std::to_string(axis));
   for (ABIView *input : inputs)
     emitCacheKey(input->argument->name + ".dtype");
@@ -1428,14 +1578,7 @@ FailureOr<plan::AxisOp> ProgramMaterializer::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> ProgramMaterializer::dimensionName(Operation &domain) {
-  return target::lowering::logicalDomainExtent(
-      domain, [&](Value value,
-                  Operation &consumer) -> FailureOr<ArrayRef<std::string>> {
-        FailureOr<ABIView *> view = lookupView(value, consumer);
-        if (failed(view))
-          return failure();
-        return ArrayRef<std::string>((*view)->shape);
-      });
+  return target::lowering::plannedDomainExtent(domain, planIndex);
 }
 
 bool ProgramMaterializer::usesMatrixContraction() const {
@@ -1477,6 +1620,15 @@ ProgramMaterializer::transferPhysicalExtentFill(Operation &operation) {
 
 FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
     Value value, Operation &consumer) {
+  FailureOr<int64_t> consumerNode =
+      target::getNodeID(consumer, "TileLang structured-index projection");
+  plan::BoundaryOp boundary =
+      succeeded(consumerNode) ? planIndex.boundaries.lookup(*consumerNode)
+                              : plan::BoundaryOp();
+  auto selectedScalars =
+      boundary ? boundary.operation->getAttrOfType<DenseI64ArrayAttr>(
+                     selectedScalarIndexNodesAttr)
+               : DenseI64ArrayAttr();
   llvm::DenseSet<Value> active;
   auto project = [&](auto &self, Value current) -> FailureOr<std::string> {
     if (!active.insert(current).second)
@@ -1495,6 +1647,25 @@ FailureOr<std::string> ProgramMaterializer::structuredIndexExpression(
     if (!definition)
       return finish(failure());
     StringRef name = ::intent::target::semanticOperationName(*definition);
+    auto node = definition->getAttrOfType<IntegerAttr>("intent.node");
+    if (node && selectedScalars &&
+        llvm::is_contained(selectedScalars.asArrayRef(), node.getInt())) {
+      auto assumed = assumedIndexNames.find(current);
+      if (assumed != assumedIndexNames.end())
+        return finish(assumed->second);
+      auto emitted = valueNames.find(current);
+      auto tensor = dyn_cast<RankedTensorType>(current.getType());
+      if (emitted == valueNames.end() || !tensor || tensor.getRank() <= 0)
+        return finish(failure());
+      std::string scalar = emitted->second + "[";
+      for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
+        if (axis)
+          scalar += ", ";
+        scalar += "0";
+      }
+      scalar += "]";
+      return finish(std::move(scalar));
+    }
     if (name == "intent.constant") {
       if (auto integer =
               definition->getAttrOfType<IntegerAttr>("intent.value"))
@@ -1600,7 +1771,8 @@ FailureOr<std::string> ProgramMaterializer::accessIndices(Operation &operation) 
       if (failed(exact) || failed(extents) || failed(transferNode) || !boundary ||
           extents->size() != static_cast<size_t>(tensor.getRank()))
         return failure();
-      if (!boundary.hasDataDependentTensorIndex()) {
+      if (!boundary.hasDataDependentTensorIndex() ||
+          boundary.getTransfer() == "selected_contiguous") {
         std::optional<unsigned> varying;
         FailureOr<std::string> projected =
             structuredIndexExpression(indexed, operation);
@@ -2071,11 +2243,16 @@ ProgramMaterializer::elementBoundsPredicate(Operation &operation,
     }
     Operation *domain = kernel.nodes.lookup(axis->getNode());
     FailureOr<std::string> extent = failure();
-    if (target::lowering::isRaggedBoundAxis(planIndex.components,
+    bool plainRaggedMember =
+        isPlainRaggedMemberAxis(planIndex, axis->getNode());
+    if (plainRaggedMember ||
+        target::lowering::isRaggedBoundAxis(planIndex.components,
                                             axis->getNode())) {
       FailureOr<int64_t> orderedAxis =
-          target::lowering::representativeOrderedAxis(planIndex,
-                                                      axis->getNode(), operation);
+          plainRaggedMember
+              ? FailureOr<int64_t>(axis->getNode())
+              : target::lowering::representativeOrderedAxis(
+                    planIndex, axis->getNode(), operation);
       if (failed(orderedAxis))
         return failure();
       extent = "sequence_end_" + std::to_string(*orderedAxis);
@@ -2275,11 +2452,16 @@ FailureOr<std::string> ProgramMaterializer::tileBoundsPredicate(
           "whole-tile TileLang transfer has too few tile extents");
     std::string base = axisIndices.lookup(axis->getNode());
     FailureOr<std::string> extent = failure();
-    if (target::lowering::isRaggedBoundAxis(planIndex.components,
+    bool plainRaggedMember =
+        isPlainRaggedMemberAxis(planIndex, axis->getNode());
+    if (plainRaggedMember ||
+        target::lowering::isRaggedBoundAxis(planIndex.components,
                                             axis->getNode())) {
       FailureOr<int64_t> orderedAxis =
-          target::lowering::representativeOrderedAxis(planIndex,
-                                                      axis->getNode(), operation);
+          plainRaggedMember
+              ? FailureOr<int64_t>(axis->getNode())
+              : target::lowering::representativeOrderedAxis(
+                    planIndex, axis->getNode(), operation);
       if (failed(orderedAxis))
         return failure();
       extent = "sequence_end_" + std::to_string(*orderedAxis);
@@ -2321,7 +2503,8 @@ FailureOr<std::string> ProgramMaterializer::tileFitsViewPredicate(
 
 FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
     ArrayRef<int64_t> tensorAxes, ArrayRef<int64_t> domainNodes,
-    ArrayRef<std::string> elementIndices, Operation &consumer) {
+    ArrayRef<std::string> elementIndices, Value value,
+    Operation &consumer) {
   if (tensorAxes.size() != domainNodes.size())
     return consumer.emitOpError(
         "has no TileLang value-validity binding");
@@ -2339,7 +2522,7 @@ FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
       continue;
     FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
         region = target::lowering::selectedResultAxisRegionRange(
-            planIndex, kernel, consumer.getResult(0), tensorAxis, consumer);
+            planIndex, kernel, value, tensorAxis, consumer);
     if (failed(region))
       return failure();
     if (*region && (*region)->selected.axis.getNode() != domainNode)
@@ -2352,11 +2535,16 @@ FailureOr<std::string> ProgramMaterializer::elementValidityPredicate(
       return consumer.emitOpError(
           "has no active TileLang index for its planned validity axis");
     FailureOr<std::string> extent = failure();
-    if (target::lowering::isRaggedBoundAxis(planIndex.components,
+    bool plainRaggedMember =
+        isPlainRaggedMemberAxis(planIndex, axis.getNode());
+    if (plainRaggedMember ||
+        target::lowering::isRaggedBoundAxis(planIndex.components,
                                             axis.getNode())) {
       FailureOr<int64_t> orderedAxis =
-          target::lowering::representativeOrderedAxis(planIndex, axis.getNode(),
-                                                      consumer);
+          plainRaggedMember
+              ? FailureOr<int64_t>(axis.getNode())
+              : target::lowering::representativeOrderedAxis(
+                    planIndex, axis.getNode(), consumer);
       if (failed(orderedAxis))
         return failure();
       extent = "sequence_end_" + std::to_string(*orderedAxis);
@@ -2422,7 +2610,7 @@ FailureOr<std::string> ProgramMaterializer::padElementExpression(
     return expression.str();
   FailureOr<std::string> predicate = elementValidityPredicate(
       padding.getTensorAxes(), padding.getDomainNodes(), elementIndices,
-      consumer);
+      value, consumer);
   FailureOr<std::string> fill = paddingFillExpression(value, consumer);
   if (failed(predicate) || failed(fill) || fill->empty())
     return failure();

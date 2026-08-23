@@ -276,7 +276,9 @@ LogicalResult validatePointwise(Operation &operation) {
                           StringRef("log"), StringRef("sin"), StringRef("cos"),
                           StringRef("floor"),
                           StringRef("rsqrt"),
-                          StringRef("sigmoid"), StringRef("negate"),
+                          StringRef("sigmoid"), StringRef("tanh"),
+                          StringRef("abs"),
+                          StringRef("negate"),
                           StringRef("not")},
                          logical.getValue()))
     return success();
@@ -382,6 +384,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 *relation, [](const target::IndexTerm &term) {
                   return term.kind == "value_index";
                 });
+            bool fragmentProjection =
+                target::isFragmentProjection(operation, *relation);
             auto sourceType = dyn_cast<RankedTensorType>(
                 operation.getNumOperands() > 0
                     ? operation.getOperand(0).getType()
@@ -394,7 +398,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                 relation->front().staticValues.size() == 1 &&
                 relation->front().staticValues.front() &&
                 *relation->front().staticValues.front() == 0;
-            if (!expand && !indirect && !extractFirstScalar)
+            if (!expand && !indirect && !fragmentProjection &&
+                !extractFirstScalar)
               return operation.emitOpError(
                   "has no mechanical GPU gather realization");
             return success();

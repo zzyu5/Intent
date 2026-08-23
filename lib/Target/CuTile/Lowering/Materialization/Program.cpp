@@ -58,7 +58,7 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
       ranges.push_back(value);
     } else if (auto value =
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
-      index.regionBindings[value.getArgument()] = value;
+      index.regionBindings[value.getValue()] = value;
     } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
@@ -182,11 +182,13 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
   for (intent::plan::TransferOp value : transfers) {
     auto access = value->getAttrOfType<StringAttr>(accessAttr);
     auto bounds = value->getAttrOfType<BoolAttr>(boundsAttr);
-    if (!access || !bounds)
+    auto transfer = value->getAttrOfType<StringAttr>(transferAttr);
+    if (!access || !bounds || !transfer)
       return value.emitOpError("has no realized cuTile transfer form");
     plan::BoundaryOp binding;
     binding.operation = value;
     binding.access = access.getValue().str();
+    binding.transfer = transfer.getValue().str();
     binding.resultSpace = value.getResultSpace().str();
     binding.explicitBounds = bounds.getValue();
     index.boundaries[value.getNode()] = binding;
@@ -449,14 +451,13 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
   }
   for (const auto &entry : planIndex.regionBindings) {
     Value value = kernel.values.lookup(entry.first);
-    auto argument = dyn_cast<BlockArgument>(value);
     plan::RegionBindingOp binding = entry.second;
     plan::AxisOp axis = planIndex.axes.lookup(binding.getAxisNode());
     const target::lowering::RangeBinding *range =
         axis ? axis.getRange(binding.getPurpose(), binding.getLevel()) : nullptr;
-    if (!argument || !axis || !range)
+    if (!value || !axis || !range)
       return binding.emitOpError(
-          "does not bind a canonical region argument and selected range");
+          "does not bind a canonical region value and selected range");
     bool roundedRow = !axis.getReuseWorker() &&
                       range->getTileRole().starts_with("row_vector");
     if (roundedRow && !planIndex.blockExtents.count(range->getExtent()))
@@ -742,7 +743,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
         emitParameter(configParameter.first + ": ConstInt");
   }
   output << "):\n";
-  if (!programRoot && failed(emitProgramBindings()))
+  if (failed(emitProgramBindings()))
     return failure();
   return success();
 }
@@ -1207,7 +1208,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
         target::lowering::orderedProgramAxes(planIndex);
     SmallVector<plan::AxisOp> dynamicRaggedAxes;
     for (plan::AxisOp axis : programAxes) {
-      if (!planIndex.components.orderedRaggedProgramAxes.contains(axis.getNode()))
+      if (!planIndex.components.raggedProgramAxes.contains(axis.getNode()))
         continue;
       FailureOr<plan::RaggedOp> relation =
           target::lowering::uniqueRaggedRelation(
@@ -1216,7 +1217,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
                          ? raggedRuntimeByRelation.find(relation->getNode())
                          : raggedRuntimeByRelation.end();
       if (failed(relation) || runtime == raggedRuntimeByRelation.end())
-        return axis.emitOpError("has no ordered ragged runtime metadata");
+        return axis.emitOpError("has no ragged program runtime metadata");
       ABIView *offsets = raggedRuntimes[runtime->second].offsets;
       output << "    max_member_length_" << axis.getNode() << " = int(("
              << offsets->argument->name << "[1:] - "
@@ -1256,7 +1257,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
               std::string role =
                   "program_" + std::to_string(axis.getProgramOrder());
               std::string extent =
-                  planIndex.components.orderedRaggedProgramAxes.contains(
+                  planIndex.components.raggedProgramAxes.contains(
                       axis.getNode())
                       ? "max_member_length_" + std::to_string(axis.getNode())
                       : roleDimensions.lookup(role);
@@ -1323,7 +1324,7 @@ LogicalResult ProgramMaterializer::emitWrapper() {
               std::string role =
                   "program_" + std::to_string(axis.getProgramOrder());
               std::string extent =
-                  planIndex.components.orderedRaggedProgramAxes.contains(
+                  planIndex.components.raggedProgramAxes.contains(
                       axis.getNode())
                       ? "max_member_length_" + std::to_string(axis.getNode())
                       : roleDimensions.lookup(role);
@@ -1501,14 +1502,7 @@ FailureOr<plan::AxisOp> ProgramMaterializer::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> ProgramMaterializer::dimensionName(Operation &domain) {
-  return target::lowering::logicalDomainExtent(
-      domain, [&](Value value,
-                  Operation &consumer) -> FailureOr<ArrayRef<std::string>> {
-        FailureOr<ABIView *> view = lookupView(value, consumer);
-        if (failed(view))
-          return failure();
-        return ArrayRef<std::string>((*view)->shape);
-      });
+  return target::lowering::plannedDomainExtent(domain, planIndex);
 }
 
 std::string ProgramMaterializer::addressIndex(StringRef expression) const {
@@ -1557,7 +1551,8 @@ ProgramMaterializer::transferPhysicalExtentFill(Operation &operation) {
 }
 
 FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
-                                                 bool elementwiseAccess) {
+                                                 bool elementwiseAccess,
+                                                 bool partitionStreamTile) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   if (failed(relation))
@@ -1839,6 +1834,13 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
         (term.kind == "region_index" &&
          (target::lowering::isSequentialIterator(indexed) ||
           isa<BlockArgument>(indexed)))) {
+      if (partitionStreamTile) {
+        auto base = partitionStreamBaseIndices.find(indexed);
+        if (base != partitionStreamBaseIndices.end()) {
+          indices.push_back(addressIndex(base->second));
+          continue;
+        }
+      }
       FailureOr<StringRef> exact =
           lookupValue(operation, *term.operands.front());
       if (failed(exact))
@@ -1871,6 +1873,87 @@ FailureOr<std::string> ProgramMaterializer::indexTuple(Operation &operation,
     tuple += ",";
   tuple += ")";
   return tuple;
+}
+
+FailureOr<std::string>
+ProgramMaterializer::advancedIndexTuple(Operation &operation) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<ABIView *> view = lookupView(operation.getOperand(0), operation);
+  if (failed(relation) || failed(view))
+    return failure();
+  SmallVector<std::string> indices;
+  unsigned sourceAxis = 0;
+  unsigned tensorIndices = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "new_axis")
+      continue;
+    unsigned axisNumber = sourceAxis++;
+    if (term.kind == "full_slice") {
+      indices.push_back("ct.Slice(0, " +
+                        physicalExtent((*view)->shape[axisNumber]) + ")");
+      continue;
+    }
+    if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError(
+            "advanced cuTile store has an invalid static index");
+      indices.push_back("ct.Slice(" +
+                        std::to_string(*term.staticValues.front()) + ", 1)");
+      continue;
+    }
+    if ((term.kind != "region_index" && term.kind != "value_index") ||
+        term.operands.size() != 1 || !term.operands.front())
+      return operation.emitOpError(
+          "advanced cuTile store has no mechanical index relation");
+    Value indexed = operation.getOperand(*term.operands.front());
+    if (term.kind == "value_index" &&
+        isa<RankedTensorType>(indexed.getType())) {
+      auto tensor = cast<RankedTensorType>(indexed.getType());
+      FailureOr<StringRef> exact =
+          lookupValue(operation, *term.operands.front());
+      if (tensor.getRank() != 1 || failed(exact) || ++tensorIndices != 1)
+        return operation.emitOpError(
+            "advanced cuTile store requires one rank-one tensor index");
+      indices.push_back(exact->str());
+      continue;
+    }
+    std::string exact;
+    if ((term.kind == "value_index" &&
+         isa<IntegerType, IndexType, intent::LogicalIndexType>(
+             indexed.getType())) ||
+        (term.kind == "region_index" &&
+         (target::lowering::isSequentialIterator(indexed) ||
+          isa<BlockArgument>(indexed)))) {
+      FailureOr<StringRef> value =
+          lookupValue(operation, *term.operands.front());
+      if (failed(value))
+        return failure();
+      exact = value->str();
+    } else {
+      FailureOr<plan::AxisOp> axis = resolveAxis(indexed, operation);
+      if (failed(axis) || !axis->isScalar())
+        return operation.emitOpError(
+            "advanced cuTile store requires scalar non-index axes");
+      exact = axisIndices.lookup(axis->getNode());
+      if (exact.empty())
+        return operation.emitOpError(
+            "advanced cuTile store has no active scalar axis");
+    }
+    indices.push_back("ct.Slice(" + addressIndex(exact) + ", 1)");
+  }
+  if (sourceAxis != (*view)->shape.size() || tensorIndices != 1)
+    return operation.emitOpError(
+        "advanced cuTile store does not cover its external view");
+  std::string tuple = "(";
+  for (auto [index, value] : llvm::enumerate(indices)) {
+    if (index)
+      tuple += ", ";
+    tuple += value;
+  }
+  if (indices.size() == 1)
+    tuple += ",";
+  return tuple + ")";
 }
 
 FailureOr<std::string> ProgramMaterializer::tileShape(Operation &operation) {

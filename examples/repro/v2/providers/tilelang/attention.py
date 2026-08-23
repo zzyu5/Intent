@@ -271,6 +271,11 @@ def varlen_block_causal(context: Context) -> PreparedComparison:
         context.project_root
         / "source/tilelang/tilelang/attention/block_causal_varlen/block_causal_attention_varlen.py",
         "intent_v2_tilelang_varlen_block_causal",
+        aliases=((
+            "block_causal_attention",
+            context.project_root
+            / "source/tilelang/tilelang/attention/block_causal/block_causal_attention.py",
+        ),),
     )
     source = functional_launch(
         lambda: source_module.block_causal_attention_varlen(

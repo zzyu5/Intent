@@ -382,15 +382,15 @@ def mamba3_siso_forward(
     residual_scale: I.In[I.f32, (MAMBA3_HEADS,)],
     gate: I.In[I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_VALUE_DIMENSION)],
     output: I.Out[I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_VALUE_DIMENSION)],
-    query_store: I.Out[
+    query_store: I.InOut[
         I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_QK_DIMENSION)
     ],
-    key_store: I.Out[
+    key_store: I.InOut[
         I.bf16, ("B", "S", MAMBA3_HEADS, MAMBA3_QK_DIMENSION)
     ],
-    qk_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
-    scale_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
-    gamma_store: I.Out[I.f32, ("B", MAMBA3_HEADS, "S")],
+    qk_store: I.InOut[I.f32, ("B", MAMBA3_HEADS, "S")],
+    scale_store: I.InOut[I.f32, ("B", MAMBA3_HEADS, "S")],
+    gamma_store: I.InOut[I.f32, ("B", MAMBA3_HEADS, "S")],
     HEAD_GROUP: I.Constexpr[int],
 ):
     B, S, _, _ = query.shape
@@ -399,6 +399,8 @@ def mamba3_siso_forward(
     pairs = I.domain(0, MAMBA3_QK_DIMENSION // 2)
     qk_dimensions = I.domain(0, MAMBA3_QK_DIMENSION)
     value_dimensions = I.domain(0, MAMBA3_VALUE_DIMENSION)
+    qk_dimension_indices = I.indices(qk_dimensions)
+    value_dimension_indices = I.indices(value_dimensions)
     local = I.indices(positions)
     pair = I.indices(pairs)
     even = pair * 2
@@ -409,17 +411,20 @@ def mamba3_siso_forward(
             query_head = head // HEAD_GROUP
             for chunk in I.domain(0, chunks):
                 source_positions = chunk * MAMBA3_CHUNK_SIZE + local
+                source_grid = source_positions[:, None]
+                even_grid = even[None, :]
+                odd_grid = odd[None, :]
                 query_first = I.cast(
-                    query[batch, source_positions, query_head, even], I.f32
+                    query[batch, source_grid, query_head, even_grid], I.f32
                 ) + I.cast(query_bias[head, even], I.f32)[None, :]
                 query_second = I.cast(
-                    query[batch, source_positions, query_head, odd], I.f32
+                    query[batch, source_grid, query_head, odd_grid], I.f32
                 ) + I.cast(query_bias[head, odd], I.f32)[None, :]
                 key_first = I.cast(
-                    key[batch, source_positions, query_head, even], I.f32
+                    key[batch, source_grid, query_head, even_grid], I.f32
                 ) + I.cast(key_bias[head, even], I.f32)[None, :]
                 key_second = I.cast(
-                    key[batch, source_positions, query_head, odd], I.f32
+                    key[batch, source_grid, query_head, odd_grid], I.f32
                 ) + I.cast(key_bias[head, odd], I.f32)[None, :]
                 current_dt = dt[batch, head, source_positions]
                 shifted_positions = source_positions + 1
@@ -440,7 +445,7 @@ def mamba3_siso_forward(
                 gamma = current_dt * current_trap
                 shifted_gamma = shifted_dt * (1.0 - shifted_trap)
                 transition_scale = gamma + shifted_gamma
-                angle = angles[batch, source_positions, head, pairs]
+                angle = angles[batch, source_grid, head, pair[None, :]]
                 cosine = I.cos(angle)
                 sine = I.sin(angle)
                 rotated_query_first = I.cast(
@@ -463,24 +468,24 @@ def mamba3_siso_forward(
                 ) * gamma
                 I.scatter_unique(
                     query_store,
-                    index=(batch, source_positions, head, even),
+                    index=(batch, source_grid, head, even_grid),
                     value=rotated_query_first,
                 )
                 I.scatter_unique(
                     query_store,
-                    index=(batch, source_positions, head, odd),
+                    index=(batch, source_grid, head, odd_grid),
                     value=rotated_query_second,
                 )
                 I.scatter_unique(
                     key_store,
-                    index=(batch, source_positions, head, even),
+                    index=(batch, source_grid, head, even_grid),
                     value=rotated_key_first * I.cast(
                         transition_scale[:, None], I.bf16
                     ),
                 )
                 I.scatter_unique(
                     key_store,
-                    index=(batch, source_positions, head, odd),
+                    index=(batch, source_grid, head, odd_grid),
                     value=rotated_key_second * I.cast(
                         transition_scale[:, None], I.bf16
                     ),
@@ -490,28 +495,29 @@ def mamba3_siso_forward(
                 gamma_store[batch, head, source_positions] = gamma
 
             state = I.zeros(
-                (MAMBA3_VALUE_DIMENSION, MAMBA3_QK_DIMENSION),
+                (value_dimensions, qk_dimensions),
                 dtype=I.f32,
             )
             for chunk in I.domain(0, chunks):
                 source_positions = chunk * MAMBA3_CHUNK_SIZE + local
+                source_grid = source_positions[:, None]
                 query_block = query_store[
                     batch,
-                    source_positions,
+                    source_grid,
                     head,
-                    qk_dimensions,
+                    qk_dimension_indices[None, :],
                 ]
                 key_block = key_store[
                     batch,
-                    source_positions,
+                    source_grid,
                     head,
-                    qk_dimensions,
+                    qk_dimension_indices[None, :],
                 ]
                 value_block = value[
                     batch,
-                    source_positions,
+                    source_grid,
                     head,
-                    value_dimensions,
+                    value_dimension_indices[None, :],
                 ]
                 decay = I.scan(
                     adt[batch, head, source_positions] * I.LOG2E,
@@ -561,18 +567,18 @@ def mamba3_siso_forward(
                 gate_value = I.cast(
                     gate[
                         batch,
-                        source_positions,
+                        source_grid,
                         head,
-                        value_dimensions,
+                        value_dimension_indices[None, :],
                     ],
                     I.f32,
                 )
                 result = result * gate_value * I.sigmoid(gate_value)
                 output[
                     batch,
-                    source_positions,
+                    source_grid,
                     head,
-                    value_dimensions,
+                    value_dimension_indices[None, :],
                 ] = I.cast(result, I.bf16)
                 reverse_decay = decay_sum - decay
                 weighted_value = I.cast(value_block, I.f32) * I.exp2(

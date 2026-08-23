@@ -5,7 +5,7 @@
 - `kernels/`：作者写下的目标无关算法；按算法职责分层，不按 target language 分叉。
 - `repro/common/`：V1 与 V2 共用的数值、计时和 artifact 执行支持。
 - `repro/{triton,cutile,tilelang}/`：冻结的 V1 provider 接线。
-- `repro/v2/`：三家 source inventory（Triton 38、cuTile 37、TileLang 37）、结构化测量与 provider ABI adapter；没有同语义 DSL 的 entry 在比较前明确拒绝，不用相似算法冒充。
+- `repro/v2/`：三家 source inventory（Triton 54、cuTile 37、TileLang 37）、结构化测量与 provider ABI adapter；没有同语义 DSL 的 entry 在比较前明确拒绝，不用相似算法冒充。
 - `run/`：人工可执行入口。
 
 `V1` 指 `report/baseline/` 冻结矩阵实际使用过的算法；`V1+V2` 指 V2 继续复用同一算法构造；`V2` 指为了和新 source 的算法边界对齐而新增的 DSL。相似但算法不同的 entry 不会因为名称相近而合并。

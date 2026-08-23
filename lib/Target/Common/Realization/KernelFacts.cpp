@@ -148,6 +148,9 @@ FailureOr<LogicalAxis> axisFromDomain(Operation &domain,
   auto staticExtent = facts.staticDomainExtents.find(&domain);
   if (staticExtent != facts.staticDomainExtents.end())
     return LogicalAxis{&domain, std::to_string(staticExtent->second)};
+  auto runtime = facts.runtimeBoundedDomains.find(&domain);
+  if (runtime != facts.runtimeBoundedDomains.end())
+    return LogicalAxis{&domain, runtime->second.extent};
   auto source = facts.domainSources.find(&domain);
   auto sourceAxis = facts.domainSourceAxes.find(&domain);
   if (source == facts.domainSources.end() ||
@@ -639,7 +642,7 @@ sequentialDomainRange(Operation *domain, const KernelFacts &facts,
   if (bounds != facts.staticDomainBounds.end())
     return std::pair<int64_t, int64_t>{bounds->second.first,
                                        bounds->second.second - 1};
-  if (!facts.runtimeSequentialDomains.contains(domain) ||
+  if (!facts.runtimeBoundedDomains.count(domain) ||
       domain->getNumOperands() < 2)
     return std::nullopt;
 
@@ -709,7 +712,7 @@ FailureOr<bool> requiresRuntimeBoundary(Operation &operation,
       if (failed(source))
         return failure();
       if (source->domain &&
-          facts.runtimeSequentialDomains.contains(source->domain)) {
+          facts.runtimeBoundedDomains.count(source->domain)) {
         range = sequentialDomainRange(source->domain, facts, operation);
         if (!range || failed(staticDestination) ||
             StringRef(staticDestination->extent)
@@ -1233,8 +1236,7 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
     auto logical = unarySemantic(*definition);
     StructuredTensorIndex operand =
         classifyStructuredIndex(definition->getOperand(0), facts, active);
-    if (!logical || !operand.valid ||
-        (operand.dependsOnTensorAxis && logical.getValue() != "negate"))
+    if (!logical || !operand.valid || operand.dependsOnTensorAxis)
       return finish({});
     return finish(operand);
   }
@@ -1259,6 +1261,8 @@ StructuredTensorIndex classifyStructuredIndex(Value value,
       hasNonnegativeIntegerOperandsImpl(*definition, facts))
     return finish({true, true, true});
   if (logical.getValue() != "add" && logical.getValue() != "subtract")
+    return finish({});
+  if (logical.getValue() == "subtract" && rhs.dependsOnTensorAxis)
     return finish({});
   return finish({true, true, lhs.compact || rhs.compact});
 }
@@ -1341,13 +1345,26 @@ LogicalResult propagatePointwiseAxes(Operation &operation, KernelFacts &facts) {
   if (labels->size() != axes.size())
     return operation.emitOpError(
         "pointwise result shape does not match its tensor rank");
-  for (auto [position, label] : llvm::enumerate(*labels))
+  for (auto [position, label] : llvm::enumerate(*labels)) {
+    auto exact = facts.axisLabels.find(label);
     if (axes[position].extent == "1" && label != "1") {
-      FailureOr<LogicalAxis> fallback = axisFromLabel(label, facts, operation);
-      if (failed(fallback))
+      if (exact == facts.axisLabels.end()) {
+        operation.emitOpError()
+            << "has no exact logical-axis provenance for shape label '" << label
+            << "'";
         return failure();
-      axes[position] = *fallback;
+      }
+      axes[position] = exact->second;
+      continue;
     }
+    if (exact == facts.axisLabels.end() || !exact->second.domain)
+      continue;
+    if (!compatibleLogicalAxis(axes[position], exact->second))
+      return operation.emitOpError()
+             << "pointwise result shape conflicts with its exact logical-axis provenance for label '"
+             << label << "'";
+    axes[position] = mergeLogicalAxis(axes[position], exact->second);
+  }
   return bindResultAxes(operation, 0, std::move(axes), facts);
 }
 
@@ -1606,14 +1623,19 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return type.isIntOrIndex() || isa<intent::LogicalIndexType>(type);
             };
             if (!validLoopBound(operation.getOperand(0).getType()) ||
-                !validLoopBound(operation.getOperand(1).getType()) ||
-                !llvm::all_of(operation.getResult(0).getUsers(), [](Operation *user) {
-                  return ::intent::target::semanticOperationName(*user) == "intent.for";
-                }))
+                !validLoopBound(operation.getOperand(1).getType()))
               return operation.emitOpError(
-                  "runtime-bounded domains require an ordinary scalar sequential loop");
-            facts.runtimeSequentialDomains.insert(&operation);
-            return success();
+                  "runtime-bounded domains require scalar integer bounds");
+            FailureOr<int64_t> domainNode =
+                target::getNodeID(operation, "runtime-bounded domain identity");
+            if (failed(domainNode))
+              return failure();
+            facts.runtimeBoundedDomains[&operation] = RuntimeDomainFact{
+                operation.getOperand(0), operation.getOperand(1),
+                operation.getNumOperands() == 3 ? operation.getOperand(2)
+                                                : Value(),
+                "runtime_domain_" + std::to_string(*domainNode)};
+            return bindDomainAxisLabel(operation, facts);
           })))
     return failure();
 
@@ -1636,7 +1658,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   "domain product requires direct rank-one logical domains");
             for (Operation *domain : *domains)
               if (!facts.domainSourceAxes.count(domain) &&
-                  !facts.staticDomainExtents.count(domain))
+                  !facts.staticDomainExtents.count(domain) &&
+                  !facts.runtimeBoundedDomains.count(domain))
                 return operation.emitOpError(
                     "domain product contains an unrealized logical domain");
             return success();
@@ -1650,7 +1673,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError("has no canonical partition schema");
             Operation *domain = operation.getOperand(0).getDefiningOp();
             if (!domain || (!facts.domainSourceAxes.count(domain) &&
-                            !facts.staticDomainExtents.count(domain)))
+                            !facts.staticDomainExtents.count(domain) &&
+                            !facts.runtimeBoundedDomains.count(domain)))
               return operation.emitOpError(
                   "tiled partitions currently require a source domain");
             auto mode = operation.getAttrOfType<StringAttr>("intent.mode");
@@ -1703,7 +1727,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   "count partition requires a source-visible part identity");
             for (auto [index, domain] : llvm::enumerate(*domains)) {
               if (!facts.domainSourceAxes.count(domain) &&
-                  !facts.staticDomainExtents.count(domain))
+                  !facts.staticDomainExtents.count(domain) &&
+                  !facts.runtimeBoundedDomains.count(domain))
                 return operation.emitOpError(
                     "parallel ownership requires canonical logical domains");
               if (failed(bindRegionArgumentAxis(operation, index + argumentOffset,
@@ -1739,13 +1764,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               return operation.emitOpError(
                   "has no canonical sequential-loop schema");
             for (auto [index, domain] : llvm::enumerate(*domains)) {
-              bool runtime = facts.runtimeSequentialDomains.contains(domain);
+              bool runtime = facts.runtimeBoundedDomains.count(domain);
               if ((!facts.domainSourceAxes.count(domain) &&
                    !facts.staticDomainExtents.count(domain) && !runtime) ||
                   !isa<intent::LogicalIndexType>(
                       operation.getRegion(0).front().getArgument(index).getType()) ||
-                  (!runtime &&
-                   failed(bindRegionArgumentAxis(operation, index, *domain, facts))))
+                  failed(bindRegionArgumentAxis(operation, index, *domain, facts)))
                 return operation.emitOpError(
                     "sequential loop has an unrealized logical axis");
             }
@@ -1773,9 +1797,11 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 if (axes == facts.valueAxes.end())
                   return operation.emitOpError(
                       "tensor loop state has no logical-axis provenance");
+                SmallVector<LogicalAxis> initialAxes = axes->second;
                 facts.valueAxes[operation.getRegion(0).front().getArgument(
-                    domains->size() + index)] = axes->second;
-                facts.valueAxes[operation.getResult(index)] = axes->second;
+                    domains->size() + index)] = initialAxes;
+                facts.valueAxes[operation.getResult(index)] =
+                    std::move(initialAxes);
               }
             }
             for (Operation *domain : *domains) {
@@ -2051,7 +2077,8 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                : RankedTensorType();
             bool supportedOuter =
                 outer && (facts.domainSourceAxes.count(outer) ||
-                          facts.staticDomainExtents.count(outer));
+                          facts.staticDomainExtents.count(outer) ||
+                          facts.runtimeBoundedDomains.count(outer));
             if (!supportedOuter || !members ||
                 !facts.domainSourceAxes.count(members) || !offsets ||
                 offsets.getRank() != 1 ||
@@ -2096,6 +2123,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                   facts.staticDomainExtents.lookup(source);
               facts.staticDomainBounds[&operation] =
                   facts.staticDomainBounds.lookup(source);
+            } else if (facts.runtimeBoundedDomains.count(source)) {
+              facts.runtimeBoundedDomains[&operation] =
+                  facts.runtimeBoundedDomains.lookup(source);
             } else {
               facts.domainSources[&operation] = facts.domainSources.lookup(source);
               facts.domainSourceAxes[&operation] =
@@ -2410,6 +2440,7 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                 axisFromDomain(**domain, facts, operation);
             if (failed(axis))
               return failure();
+            facts.vectorDomains.insert(*domain);
             return bindResultAxes(operation, 0, {*axis}, facts);
           })))
     return failure();
@@ -2575,8 +2606,9 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
         return operation.emitOpError(
             "tensor state has no logical-axis provenance");
       if (axes != facts.valueAxes.end()) {
-        facts.valueAxes[argument] = axes->second;
-        facts.valueAxes[operation.getResult(index)] = axes->second;
+        SmallVector<LogicalAxis> initialAxes = axes->second;
+        facts.valueAxes[argument] = initialAxes;
+        facts.valueAxes[operation.getResult(index)] = std::move(initialAxes);
       }
     }
     facts.orderedDomains.insert(axisDomain);
@@ -2638,15 +2670,39 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                  ? dyn_cast<IntegerAttr>(pair[1])
                                  : IntegerAttr();
               if (!lhsAxis || !rhsAxis || lhsAxis.getInt() < 0 ||
-                  rhsAxis.getInt() < 0 ||
-                  static_cast<size_t>(lhsAxis.getInt()) >= lhs->second.size() ||
-                  static_cast<size_t>(rhsAxis.getInt()) >= rhs->second.size() ||
-                  lhs->second[lhsAxis.getInt()] != rhs->second[rhsAxis.getInt()] ||
-                  !lhsReduced.insert(lhsAxis.getInt()).second ||
-                  !rhsReduced.insert(rhsAxis.getInt()).second)
+                  rhsAxis.getInt() < 0)
                 return operation.emitOpError(
                     "contraction pair has invalid logical-domain provenance");
-              if (Operation *domain = lhs->second[lhsAxis.getInt()].domain)
+              if (static_cast<size_t>(lhsAxis.getInt()) >= lhs->second.size() ||
+                  static_cast<size_t>(rhsAxis.getInt()) >= rhs->second.size())
+                return operation.emitOpError()
+                       << "contraction pair indexes lhs axis " << lhsAxis.getInt()
+                       << " of " << lhs->second.size() << " and rhs axis "
+                       << rhsAxis.getInt() << " of " << rhs->second.size();
+              if (!lhsReduced.insert(lhsAxis.getInt()).second ||
+                  !rhsReduced.insert(rhsAxis.getInt()).second)
+                return operation.emitOpError(
+                    "contraction pair repeats one logical reduction axis");
+              const LogicalAxis &lhsLogical = lhs->second[lhsAxis.getInt()];
+              const LogicalAxis &rhsLogical = rhs->second[rhsAxis.getInt()];
+              if (!compatibleLogicalAxis(lhsLogical, rhsLogical)) {
+                auto domainNode = [](Operation *domain) -> int64_t {
+                  auto node = domain
+                                  ? domain->getAttrOfType<IntegerAttr>(
+                                        "intent.node")
+                                  : IntegerAttr();
+                  return node ? node.getInt() : -1;
+                };
+                return operation.emitOpError()
+                       << "contracts incompatible logical axes lhs(domain="
+                       << domainNode(lhsLogical.domain)
+                       << ", extent=" << lhsLogical.extent
+                       << ") and rhs(domain=" << domainNode(rhsLogical.domain)
+                       << ", extent=" << rhsLogical.extent << ")";
+              }
+              LogicalAxis reductionAxis =
+                  mergeLogicalAxis(lhsLogical, rhsLogical);
+              if (Operation *domain = reductionAxis.domain)
                 facts.contractionDomains.insert(domain);
             }
             llvm::DenseSet<unsigned> lhsBatched;
@@ -2792,7 +2848,8 @@ FailureOr<Operation *> resolveDomain(Value indexedValue,
   }
   Operation *domain = resolveStructuralDomain(indexedValue);
   if (domain && (facts.domainSourceAxes.count(domain) ||
-                 facts.staticDomainExtents.count(domain)))
+                 facts.staticDomainExtents.count(domain) ||
+                 facts.runtimeBoundedDomains.count(domain)))
     return domain;
   consumer.emitOpError(
       "cannot resolve an indexed value to its structural source domain");

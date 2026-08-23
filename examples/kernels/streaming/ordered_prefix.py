@@ -30,3 +30,21 @@ def ordered_product_prefix(
             acc_dtype=I.f32,
         )
         I.scatter_unique(output, index=(batch, row, column), value=prefix)
+
+
+@intent.kernel
+def row_cumsum_f32(
+    x: I.In[I.f32, ("M", "N")],
+    output: I.Out[I.f32, ("M", "N")],
+):
+    M, N = x.shape
+    columns = I.domain(0, N)
+    for row in I.parallel(I.domain(0, M)):
+        output[row, columns] = I.scan(
+            x[row, columns],
+            axis=0,
+            identity=0.0,
+            combine=I.add,
+            inclusive=True,
+            acc_dtype=I.f32,
+        )

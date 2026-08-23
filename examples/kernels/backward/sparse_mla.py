@@ -170,9 +170,9 @@ def sparse_mla_backward_main(
                     grad_key_value,
                     index=(
                         batch,
-                        safe_index,
+                        safe_index[:, None],
                         key_value_group,
-                        DV + I.indices(tail_features),
+                        DV + I.indices(tail_features)[None, :],
                     ),
                     value=I.mask(
                         grad_key_value_tail,

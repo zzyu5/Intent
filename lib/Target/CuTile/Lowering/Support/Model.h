@@ -181,7 +181,10 @@ private:
   mlir::FailureOr<std::string>
   transferPhysicalExtentFill(mlir::Operation &operation);
   mlir::FailureOr<std::string>
-  indexTuple(mlir::Operation &operation, bool elementwiseAccess);
+  indexTuple(mlir::Operation &operation, bool elementwiseAccess,
+             bool partitionStreamTile = false);
+  mlir::FailureOr<std::string>
+  advancedIndexTuple(mlir::Operation &operation);
   mlir::FailureOr<std::string>
   privateWorkspaceIndex(mlir::Operation &operation);
   mlir::FailureOr<std::string>
@@ -240,6 +243,8 @@ private:
   llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
   llvm::DenseMap<int64_t, std::string> axisIndices;
+  llvm::DenseMap<mlir::Value, std::string> partitionStreamBaseIndices;
+  llvm::DenseMap<mlir::Value, std::string> selectedRegionIndices;
   llvm::DenseMap<
       mlir::Operation *,
       llvm::SmallVector<std::pair<int64_t, std::optional<std::string>>>>

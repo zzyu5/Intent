@@ -31,7 +31,8 @@ inline bool isReplayableContractProducer(mlir::Operation &operation) {
          name == "intent.mask" || name == "intent.select" ||
          name == "intent.cast" || name == "intent.bitcast" ||
          name == "intent.full" ||
-         name == "intent.zeros" || name == "intent.gather" ||
+         name == "intent.zeros" || name == "intent.members" ||
+         name == "intent.gather" ||
          name == "intent.reshape" || name == "intent.transpose";
 }
 
@@ -59,7 +60,7 @@ analyzeContractOperandReplay(mlir::Value operand,
       replay.transfers.push_back(definition);
     return true;
   };
-  if (!collect(operand) || replay.transfers.empty())
+  if (!collect(operand))
     return std::nullopt;
 
   llvm::DenseSet<mlir::Operation *> loadDependent;

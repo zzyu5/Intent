@@ -44,6 +44,13 @@ public:
     return proveUses(load.getResult(0), validityDomains, active);
   }
 
+  bool isRedundantPadding(Value value, Operation *domain,
+                          StringRef expected) const {
+    std::optional<std::string> derived =
+        paddingForDomain(value, domain, value);
+    return derived && *derived == expected;
+  }
+
 private:
   const target::KernelFacts &facts;
   ArrayRef<PaddingBinding> paddings;
@@ -75,8 +82,9 @@ private:
     return result;
   }
 
-  std::optional<std::string> materializedPadding(Value value,
-                                                 Operation *domain) const {
+  std::optional<std::string>
+  materializedPadding(Value value, Operation *domain,
+                      Value ignoredMaterialization = {}) const {
     Operation *definition = value.getDefiningOp();
     if (definition &&
         ::intent::target::semanticOperationName(*definition) == "intent.view_load")
@@ -86,7 +94,8 @@ private:
     if (!domainNode || !tensorAxis)
       return std::nullopt;
     for (const PaddingBinding &padding : paddings) {
-      if (padding.value != value)
+      if (padding.value != value ||
+          (ignoredMaterialization && value == ignoredMaterialization))
         continue;
       for (auto [axis, node] : llvm::zip(padding.axes, padding.nodes))
         if (axis == *tensorAxis && node == *domainNode)
@@ -95,10 +104,11 @@ private:
     return std::nullopt;
   }
 
-  std::optional<std::string> paddingForDomain(Value value,
-                                              Operation *domain) const {
+  std::optional<std::string>
+  paddingForDomain(Value value, Operation *domain,
+                   Value ignoredMaterialization = {}) const {
     if (std::optional<std::string> materialized =
-            materializedPadding(value, domain))
+            materializedPadding(value, domain, ignoredMaterialization))
       return materialized;
     Operation *definition = value.getDefiningOp();
     if (!definition)
@@ -137,15 +147,45 @@ private:
       return std::nullopt;
     }
     if (name == "intent.full" && definition->getNumOperands() == 1)
-      return paddingForDomain(definition->getOperand(0), domain);
+      return paddingForDomain(definition->getOperand(0), domain,
+                              ignoredMaterialization);
     if ((name == "intent.cast" || name == "intent.broadcast" ||
          name == "intent.reshape" || name == "intent.transpose") &&
         definition->getNumOperands() >= 1)
-      return paddingForDomain(definition->getOperand(0), domain);
+      return paddingForDomain(definition->getOperand(0), domain,
+                              ignoredMaterialization);
+    if (name == "intent.gather" && definition->getNumOperands() >= 1) {
+      FailureOr<SmallVector<target::IndexTerm>> relation =
+          target::parseIndexRelation(*definition);
+      auto validIndex =
+          definition->getAttrOfType<IntegerAttr>("intent.valid_operand_index");
+      Operation *validDefinition =
+          validIndex && validIndex.getInt() >= 0 &&
+                  static_cast<unsigned>(validIndex.getInt()) <
+                      definition->getNumOperands()
+              ? definition->getOperand(validIndex.getInt()).getDefiningOp()
+              : nullptr;
+      auto validLiteral =
+          validDefinition &&
+                  ::intent::target::semanticOperationName(*validDefinition) ==
+                      "intent.constant"
+              ? validDefinition->getAttrOfType<IntegerAttr>("intent.value")
+              : IntegerAttr();
+      bool pureExpansion =
+          succeeded(relation) &&
+          llvm::all_of(*relation, [](const target::IndexTerm &term) {
+            return term.kind == "full_slice" || term.kind == "new_axis";
+          });
+      if (pureExpansion && validLiteral &&
+          !validLiteral.getValue().isZero())
+        return paddingForDomain(definition->getOperand(0), domain,
+                                ignoredMaterialization);
+    }
     if (name == "intent.unary" &&
         definition->getNumOperands() == 1) {
       std::optional<std::string> operand =
-          paddingForDomain(definition->getOperand(0), domain);
+          paddingForDomain(definition->getOperand(0), domain,
+                           ignoredMaterialization);
       auto logical =
           definition->getAttrOfType<StringAttr>("intent.operator");
       if (operand && *operand == "negative_infinity" && logical &&
@@ -158,9 +198,11 @@ private:
     }
     if (name == "intent.binary" && definition->getNumOperands() == 2) {
       std::optional<std::string> lhs =
-          paddingForDomain(definition->getOperand(0), domain);
+          paddingForDomain(definition->getOperand(0), domain,
+                           ignoredMaterialization);
       std::optional<std::string> rhs =
-          paddingForDomain(definition->getOperand(1), domain);
+          paddingForDomain(definition->getOperand(1), domain,
+                           ignoredMaterialization);
       auto logical =
           definition->getAttrOfType<StringAttr>("intent.operator");
       if (!logical)
@@ -407,6 +449,23 @@ private:
           padding.getFill().str()});
     }
     BoundaryNeutralizationProof proof(analysis.getFacts(), paddings);
+    SmallVector<plan::PaddingOp> redundantPaddings;
+    for (plan::PaddingOp padding :
+         program.getBody().getOps<plan::PaddingOp>()) {
+      Value value = kernel.values.lookup(padding.getValue());
+      bool redundant = value && !padding.getDomainNodes().empty() &&
+                       llvm::all_of(
+                           padding.getDomainNodes(), [&](int64_t node) {
+                             Operation *domain = kernel.nodes.lookup(node);
+                             return domain && proof.isRedundantPadding(
+                                                  value, domain,
+                                                  padding.getFill());
+                           });
+      if (redundant)
+        redundantPaddings.push_back(padding);
+    }
+    for (plan::PaddingOp padding : redundantPaddings)
+      padding.erase();
     OpBuilder builder(program.getContext());
     for (plan::TransferOp transfer :
          program.getBody().getOps<plan::TransferOp>()) {

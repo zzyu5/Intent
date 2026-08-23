@@ -294,7 +294,7 @@ def IntentPlan_RangeOp : IntentPlan_Op<"range"> {
 
 def IntentPlan_RegionBindingOp : IntentPlan_Op<"region_binding"> {
   let arguments = (ins
-    I64Attr:$argument,
+    I64Attr:$value,
     I64Attr:$axis_node,
     StrAttr:$purpose,
     I64Attr:$level

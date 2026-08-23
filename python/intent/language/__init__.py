@@ -11,6 +11,7 @@ from .annotations import ViewKind
 from .annotations import ViewSpec
 from .annotations import constraints
 from .builtins import LOG2E
+from .builtins import abs
 from .builtins import add
 from .builtins import all
 from .builtins import assume_in_bounds
@@ -50,6 +51,7 @@ from .builtins import reduce
 from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import sigmoid
+from .builtins import tanh
 from .builtins import sin
 from .builtins import scan
 from .builtins import scatter_reduce
@@ -91,6 +93,7 @@ __all__ = [
     "In",
     "InOut",
     "LOG2E",
+    "abs",
     "Out",
     "ShapeDim",
     "StrideDim",
@@ -152,6 +155,7 @@ __all__ = [
     "reshape",
     "rsqrt",
     "sigmoid",
+    "tanh",
     "sin",
     "scan",
     "scatter_reduce",

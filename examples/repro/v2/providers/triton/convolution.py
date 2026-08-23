@@ -4,6 +4,7 @@ import torch
 
 from kernels.convolution.direct import causal_depthwise_conv1d_bf16
 from kernels.convolution.direct import causal_depthwise_conv1d_update_bf16
+from kernels.convolution.direct import conv1d_same
 from kernels.convolution.varlen import varlen_causal_conv1d_final_state
 from kernels.convolution.varlen import varlen_aligned_causal_depthwise_conv1d
 
@@ -43,6 +44,25 @@ def causal_conv1d(context: Context) -> PreparedComparison:
         )
     )
     return PreparedComparison(generated, source, Tolerance(atol=5e-2, rtol=5e-2), cuda_graph=True)
+
+
+def flaggems_conv1d(context: Context) -> PreparedComparison:
+    batch, length, width = 64, 16384, 5
+    x = torch.randn((batch, length), device="cuda", dtype=torch.float16)
+    weight = torch.randn((width,), device="cuda", dtype=torch.float16)
+    _, generated = compile_single(context, conv1d_same, (x, weight))
+    runtime = load_module(
+        context.project_root
+        / "source/triton/flag-gems/convolution/conv1d/conv1d_runtime.py",
+        "intent_v2_triton_flaggems_conv1d",
+    )
+    source = functional_launch(lambda: runtime.upstream((x, weight)))
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=1e-2),
+        cuda_graph=True,
+    )
 
 
 def varlen_causal_conv1d(context: Context) -> PreparedComparison:
@@ -180,6 +200,7 @@ def causal_conv1d_update(context: Context) -> PreparedComparison:
 
 
 CASES = {
+    "flaggems_conv1d": flaggems_conv1d,
     "causal_conv1d": causal_conv1d,
     "varlen_causal_conv1d": varlen_causal_conv1d,
     "causal_conv1d_update": causal_conv1d_update,

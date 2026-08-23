@@ -409,7 +409,7 @@ assignAxes(const target::KernelFacts &facts) {
   }
   for (Operation *domain : facts.orderedDomains)
     if (!facts.serialLoopDomains.contains(domain) &&
-        !facts.runtimeSequentialDomains.contains(domain))
+        !facts.runtimeBoundedDomains.count(domain))
       appendRole(ensure(domain).roles, "ordered");
   for (const auto &entry : facts.scans)
     if (entry.second.scalarConsumers)
@@ -450,11 +450,6 @@ assignAxes(const target::KernelFacts &facts) {
     if (!domain)
       return success();
     AxisChoice &choice = ensure(domain);
-    StringRef incompatible =
-        role == "contraction_m" ? "contraction_n" : "contraction_m";
-    if (hasRole(choice.roles, incompatible))
-      return contract.emitOpError(
-          "maps one logical axis to incompatible contraction matrix roles");
     appendRole(choice.roles, role);
     return success();
   };
@@ -524,10 +519,19 @@ assignAxes(const target::KernelFacts &facts) {
       bool reductionRole =
           axis.domain && (facts.contractionDomains.contains(axis.domain) ||
                           facts.reductionDomains.contains(axis.domain));
+      bool scanRole = axis.domain && llvm::any_of(
+                                         facts.scans, [&](const auto &entry) {
+                                           return entry.second.axis == axis.domain;
+                                         });
       bool orderedRole =
           axis.domain && facts.orderedDomains.contains(axis.domain);
-      if (!axis.domain || reductionRole ||
-          (orderedRole && !facts.vectorDomains.contains(axis.domain)))
+      bool independentContractionResult =
+          axis.domain && hasRole(ensure(axis.domain).roles, "contraction_m");
+      bool independentOrderedResult =
+          orderedRole && independentContractionResult;
+      if (!axis.domain || scanRole ||
+          (reductionRole && !independentContractionResult) ||
+          (orderedRole && !independentOrderedResult))
         continue;
       AxisChoice &choice = ensure(axis.domain);
       if (choice.programOrder)
@@ -951,6 +955,23 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
   }
 
   SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
+  for (const AxisChoice &choice : assignments->axes) {
+    if (!hasRole(choice.roles, "parallel"))
+      continue;
+    if (!choice.domain || choice.domain->getNumResults() != 1 ||
+        !isa<intent::DomainType>(choice.domain->getResult(0).getType()))
+      return facts.kernel.entry.emitOpError(
+          "has a parallel axis without one canonical logical region value");
+    FailureOr<int64_t> regionValue =
+        valueID(choice.domain->getResult(0), facts.kernel, *choice.domain,
+                "region-value ownership binding");
+    FailureOr<int64_t> axisNode =
+        node(*choice.domain, "region-value physical axis binding");
+    if (failed(regionValue) || failed(axisNode))
+      return failure();
+    regionBindings.emplace_back(*regionValue, *axisNode,
+                                StringRef("ownership"));
+  }
   for (const auto &entry : facts.regionArgumentAxes) {
     auto argument = dyn_cast<BlockArgument>(entry.first);
     if (!argument || !entry.second.domain) {
@@ -984,10 +1005,10 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
   llvm::sort(regionBindings, [](const auto &lhs, const auto &rhs) {
     return std::get<0>(lhs) < std::get<0>(rhs);
   });
-  for (const auto &[argument, axis, purpose] : regionBindings)
+  for (const auto &[value, axis, purpose] : regionBindings)
     decisions.regionBindings.push_back(
         builder.create<intent::plan::RegionBindingOp>(
-            facts.kernel.entry.getLoc(), i64(builder, argument),
+            facts.kernel.entry.getLoc(), i64(builder, value),
             i64(builder, axis), string(builder, purpose), i64(builder, 0)));
 
   for (const target::CountPartitionFact &partition : facts.countPartitions) {

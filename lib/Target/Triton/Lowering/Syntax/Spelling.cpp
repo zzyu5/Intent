@@ -115,6 +115,10 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role) {
     return StringRef("tl.rsqrt");
   if (role == "unary_sigmoid")
     return StringRef("tl.sigmoid");
+  if (role == "unary_tanh")
+    return StringRef("libdevice.tanh");
+  if (role == "unary_abs")
+    return StringRef("tl.abs");
   if (role == "unary_negate")
     return StringRef("python_negate");
   if (role == "unary_not")
