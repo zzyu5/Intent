@@ -18,6 +18,7 @@ def _power_of_two_ceiling(value: int) -> int:
 def runtime_extent_pruning(
     parameter_extents: dict[str, tuple[str, ...]],
     descriptor_views: tuple[str, ...] = (),
+    require_contiguous_descriptors: bool = False,
 ) -> dict[str, object]:
     bindings = {
         parameter: tuple(extents)
@@ -28,10 +29,18 @@ def runtime_extent_pruning(
         arguments = {**named_args, **kwargs}
         descriptors_legal = all(
             view in arguments
-            and hasattr(arguments[view], "is_contiguous")
-            and arguments[view].is_contiguous()
+            and hasattr(arguments[view], "stride")
             and arguments[view].data_ptr() % 16 == 0
             and arguments[view].ndim >= 2
+            and arguments[view].stride(-1) == 1
+            and (
+                not require_contiguous_descriptors
+                or arguments[view].is_contiguous()
+            )
+            and all(
+                stride * arguments[view].element_size() % 16 == 0
+                for stride in arguments[view].stride()[:-1]
+            )
             and arguments[view].shape[-1] * arguments[view].element_size() % 16 == 0
             for view in descriptor_views
         )
@@ -308,21 +317,24 @@ def autotune_configurations(
             )
         ),
     )
-    score = max(
-        (len(roles.intersection(values)), -len(set(values).difference(roles)))
-        for family in profiles
-        for values, _, _ in family
-    )
-    selected = [
-        profile
-        for family in profiles
-        for profile in family
-        if (
-            len(roles.intersection(profile[0])),
-            -len(set(profile[0]).difference(roles)),
+    if roles:
+        score = max(
+            (len(roles.intersection(values)), -len(set(values).difference(roles)))
+            for family in profiles
+            for values, _, _ in family
         )
-        == score
-    ]
+        selected = [
+            profile
+            for family in profiles
+            for profile in family
+            if (
+                len(roles.intersection(profile[0])),
+                -len(set(profile[0]).difference(roles)),
+            )
+            == score
+        ]
+    else:
+        selected = [({}, 2, 4), ({}, 3, 4), ({}, 3, 8)]
     choices = []
     seen = set()
     for index, (profile, stages, warps) in enumerate(selected):

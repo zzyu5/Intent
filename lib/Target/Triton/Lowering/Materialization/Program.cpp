@@ -99,6 +99,42 @@ std::string projectTensorIndex(StringRef value, unsigned valueRank,
   return expression + "]";
 }
 
+bool isDescriptorShapeProjection(Operation &operation) {
+  if (target::semanticOperationName(operation) != "intent.gather" ||
+      operation.getNumOperands() < 2 || operation.getNumResults() != 1)
+    return false;
+  auto input = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  auto validIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
+  Operation *valid = validIndex && validIndex.getInt() >= 0 &&
+                             static_cast<unsigned>(validIndex.getInt()) <
+                                 operation.getNumOperands()
+                         ? operation.getOperand(validIndex.getInt()).getDefiningOp()
+                         : nullptr;
+  auto validValue = valid && target::semanticOperationName(*valid) ==
+                                 "intent.constant"
+                        ? valid->getAttrOfType<BoolAttr>("intent.value")
+                        : BoolAttr();
+  if (!input || !result || failed(relation) || !validValue ||
+      !validValue.getValue())
+    return false;
+  unsigned fullSlices = 0;
+  unsigned newAxes = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "full_slice")
+      ++fullSlices;
+    else if (term.kind == "new_axis")
+      ++newAxes;
+    else
+      return false;
+  }
+  return fullSlices == static_cast<unsigned>(input.getRank()) &&
+         result.getRank() == input.getRank() + static_cast<int64_t>(newAxes);
+}
+
 } // namespace
 
 FailureOr<PhysicalProgramIndex>
@@ -261,6 +297,12 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     binding.resultSpace = value.getResultSpace().str();
     index.boundaries[value.getNode()] = binding;
     index.transferForms[value.getNode()] = form.getValue().str();
+    if (auto axes =
+            value->getAttrOfType<DenseI64ArrayAttr>(descriptorBlockAxesAttr))
+      index.descriptorBlockAxes[value.getNode()] =
+          SmallVector<int64_t>(axes.asArrayRef());
+    if (auto layout = value->getAttrOfType<StringAttr>(descriptorLayoutAttr))
+      index.descriptorLayouts[value.getNode()] = layout.getValue().str();
   }
   if (!index.target || !index.program) {
     physicalProgram.emitOpError("lacks device or launch decisions");
@@ -654,7 +696,8 @@ void ProgramMaterializer::emitImports() {
            << ")\n";
     output << "_ROW_TUNED_KEYS = set()\n";
   }
-  if (searchSpace) {
+  bool providerAutotune = searchSpace || usesStreamPipelineCandidates();
+  if (providerAutotune) {
     llvm::StringMap<uint64_t> staticRoleExtents;
     llvm::StringMap<SmallVector<std::string>> runtimeRoleExtents;
     auto recordExtent = [&](StringRef role, StringRef extent) {
@@ -682,46 +725,49 @@ void ProgramMaterializer::emitImports() {
 
     output << "from intent.runtime.tuning.triton import autotune_configurations, runtime_extent_pruning\n";
     output << "\n_PARAMETER_MAP = {";
-    for (auto [index, mapping] :
-         llvm::enumerate(searchIndex.autotune.getParameterMap())) {
-      if (index)
-        output << ", ";
-      output << "'" << mapping.getName().getValue() << "': '"
-             << cast<StringAttr>(mapping.getValue()).getValue() << "'";
-    }
-    output << "}\n_PARAMETER_EXTENTS = {";
-    bool firstExtent = true;
-    for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
-      StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
-      auto extent = staticRoleExtents.find(role);
-      if (extent == staticRoleExtents.end())
-        continue;
-      if (!firstExtent)
-        output << ", ";
-      output << "'" << mapping.getName().getValue() << "': "
-             << extent->second;
-      firstExtent = false;
-    }
-    output << "}\n_PARAMETER_RUNTIME_EXTENTS = {";
-    bool firstRuntimeExtent = true;
-    for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
-      StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
-      auto extents = runtimeRoleExtents.find(role);
-      if (extents == runtimeRoleExtents.end())
-        continue;
-      if (!firstRuntimeExtent)
-        output << ", ";
-      output << "'" << mapping.getName().getValue() << "': (";
-      for (auto [index, extent] : llvm::enumerate(extents->second)) {
+    if (searchSpace)
+      for (auto [index, mapping] :
+           llvm::enumerate(searchIndex.autotune.getParameterMap())) {
         if (index)
           output << ", ";
-        output << "'" << extent << "'";
+        output << "'" << mapping.getName().getValue() << "': '"
+               << cast<StringAttr>(mapping.getValue()).getValue() << "'";
       }
-      if (extents->second.size() == 1)
-        output << ",";
-      output << ")";
-      firstRuntimeExtent = false;
-    }
+    output << "}\n_PARAMETER_EXTENTS = {";
+    bool firstExtent = true;
+    if (searchSpace)
+      for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
+        StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
+        auto extent = staticRoleExtents.find(role);
+        if (extent == staticRoleExtents.end())
+          continue;
+        if (!firstExtent)
+          output << ", ";
+        output << "'" << mapping.getName().getValue() << "': "
+               << extent->second;
+        firstExtent = false;
+      }
+    output << "}\n_PARAMETER_RUNTIME_EXTENTS = {";
+    bool firstRuntimeExtent = true;
+    if (searchSpace)
+      for (NamedAttribute mapping : searchIndex.autotune.getParameterMap()) {
+        StringRef role = cast<StringAttr>(mapping.getValue()).getValue();
+        auto extents = runtimeRoleExtents.find(role);
+        if (extents == runtimeRoleExtents.end())
+          continue;
+        if (!firstRuntimeExtent)
+          output << ", ";
+        output << "'" << mapping.getName().getValue() << "': (";
+        for (auto [index, extent] : llvm::enumerate(extents->second)) {
+          if (index)
+            output << ", ";
+          output << "'" << extent << "'";
+        }
+        if (extents->second.size() == 1)
+          output << ",";
+        output << ")";
+        firstRuntimeExtent = false;
+      }
     output << "}\n_CONFIGS = autotune_configurations(_PARAMETER_MAP";
     if (usesScaledContraction() || usesDescriptorCandidates()) {
       output << ", {";
@@ -732,6 +778,7 @@ void ProgramMaterializer::emitImports() {
       }
       if (usesDescriptorCandidates()) {
         output << (firstCandidate ? "" : ", ") << "'USE_TMA': (0, 1)";
+        firstCandidate = false;
       }
       output << "}";
     }
@@ -805,15 +852,17 @@ LogicalResult ProgramMaterializer::emitHelpers() {
 
 LogicalResult ProgramMaterializer::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
-  if (searchSpace) {
+  if (searchSpace || usesStreamPipelineCandidates()) {
     output << "@triton.autotune(\n    configs=_CONFIGS,\n    key=[";
-    for (auto [index, attribute] : llvm::enumerate(searchIndex.autotune.getKey())) {
-      if (index)
-        output << ", ";
-      output << "'" << cast<StringAttr>(attribute).getValue() << "'";
-    }
+    if (searchSpace)
+      for (auto [index, attribute] :
+           llvm::enumerate(searchIndex.autotune.getKey())) {
+        if (index)
+          output << ", ";
+        output << "'" << cast<StringAttr>(attribute).getValue() << "'";
+      }
     if (usesDescriptorCandidates()) {
-      if (!searchIndex.autotune.getKey().empty())
+      if (searchSpace && !searchIndex.autotune.getKey().empty())
         output << ", ";
       output << "'TMA_LEGAL'";
     }
@@ -821,7 +870,8 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     output << ",\n    prune_configs_by=runtime_extent_pruning("
               "_PARAMETER_RUNTIME_EXTENTS";
     if (usesDescriptorCandidates())
-      output << ", _DESCRIPTOR_VIEWS";
+      output << ", _DESCRIPTOR_VIEWS, "
+             << (usesLinearDescriptorCandidates() ? "True" : "False");
     output << ")";
     bool firstRestoredView = true;
     for (ABIView &view : views) {
@@ -1264,9 +1314,14 @@ LogicalResult ProgramMaterializer::emitWrapper() {
            << " shape violates the kernel symbols')\n";
   }
   if (usesDescriptorCandidates()) {
-    output << "    tma_legal = all(view.is_contiguous() and "
-              "view.data_ptr() % 16 == 0 and view.ndim >= 2 and "
-              "view.shape[-1] * view.element_size() % 16 == 0 for view in (";
+    output << "    tma_legal = all(view.data_ptr() % 16 == 0 and "
+              "view.ndim >= 2 and view.stride(-1) == 1 and ";
+    if (usesLinearDescriptorCandidates())
+      output << "view.is_contiguous() and ";
+    output <<
+              "all(stride * view.element_size() % 16 == 0 for stride in "
+              "view.stride()[:-1]) and view.shape[-1] * "
+              "view.element_size() % 16 == 0 for view in (";
     llvm::StringSet<> emitted;
     bool firstView = true;
     for (const auto &entry : planIndex.transferForms) {
@@ -1391,11 +1446,30 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     output << ")\n";
     output << "        _ROW_TUNED_KEYS.add(row_tuning_key)\n";
   }
-  output << "    return " << kernelName << "[grid](";
-  emitKernelLaunchArguments(false);
-  if (usesDescriptorCandidates())
-    output << ", TMA_LEGAL=tma_legal";
-  output << ")\n\n\n";
+  bool directPipelineLaunch = usesStreamPipelineCandidates() && !hasInOut;
+  if (directPipelineLaunch) {
+    output << "    " << kernelName << "[grid](";
+    emitKernelLaunchArguments(false);
+    if (usesDescriptorCandidates())
+      output << ", TMA_LEGAL=tma_legal";
+    output << ")\n";
+    output << "    selected_config = " << kernelName << ".best_config\n";
+    output << "    def selected_launch():\n";
+    output << "        return " << kernelName << ".fn[grid](";
+    emitKernelLaunchArguments(false);
+    if (usesDescriptorCandidates())
+      output << ", TMA_LEGAL=tma_legal";
+    output << ", **selected_config.kwargs, num_warps=selected_config.num_warps, "
+              "num_stages=selected_config.num_stages, "
+              "num_ctas=selected_config.num_ctas, maxnreg=selected_config.maxnreg)\n";
+    output << "    return selected_launch\n\n\n";
+  } else {
+    output << "    return " << kernelName << "[grid](";
+    emitKernelLaunchArguments(false);
+    if (usesDescriptorCandidates())
+      output << ", TMA_LEGAL=tma_legal";
+    output << ")\n\n\n";
+  }
   output << "def run(";
   firstParameter = true;
   for (ABIView *view : inputs) {
@@ -1652,6 +1726,24 @@ bool ProgramMaterializer::usesDescriptorCandidates() const {
   });
 }
 
+bool ProgramMaterializer::usesLinearDescriptorCandidates() const {
+  return llvm::any_of(planIndex.descriptorLayouts, [](const auto &entry) {
+    return entry.second == "linear";
+  });
+}
+
+bool ProgramMaterializer::usesStreamPipelineCandidates() const {
+  for (const auto &entry : planIndex.streams) {
+    plan::StreamOp stream = entry.second;
+    auto form = stream.physical
+                    ? stream.physical->getAttrOfType<StringAttr>(streamFormAttr)
+                    : StringAttr();
+    if (form && form.getValue() == "pipeline_candidates")
+      return true;
+  }
+  return false;
+}
+
 std::string ProgramMaterializer::descriptorName(Operation &operation) const {
   FailureOr<int64_t> node =
       target::getNodeID(operation, "Triton descriptor name");
@@ -1659,49 +1751,74 @@ std::string ProgramMaterializer::descriptorName(Operation &operation) const {
                       : "descriptor_" + std::to_string(*node);
 }
 
-FailureOr<std::string>
-ProgramMaterializer::descriptorBlockTile(Operation &operation, ABIView &view) {
+FailureOr<SmallVector<std::string>>
+ProgramMaterializer::descriptorBlockShape(Operation &operation, ABIView &view) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
-  if (failed(relation) || relation->size() != view.shape.size() ||
-      relation->empty() || relation->back().kind != "full_slice")
-    return operation.emitOpError("has no rectangular Triton descriptor relation");
-  std::string tile;
-  for (auto [position, term] : llvm::enumerate(*relation)) {
-    if (position + 1 == relation->size() || term.kind == "static_index")
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "Triton descriptor block shape");
+  auto axes = succeeded(node) ? planIndex.descriptorBlockAxes.find(*node)
+                              : planIndex.descriptorBlockAxes.end();
+  if (failed(relation) || failed(node) ||
+      axes == planIndex.descriptorBlockAxes.end() ||
+      axes->second.size() != view.shape.size() ||
+      relation->size() != view.shape.size())
+    return operation.emitOpError("has no typed Triton descriptor block shape");
+  SmallVector<std::string> shape;
+  shape.reserve(axes->second.size());
+  for (auto [position, axisNode] : llvm::enumerate(axes->second)) {
+    if (axisNode == -1) {
+      shape.push_back("1");
       continue;
-    if (term.kind == "value_index" && term.operands.size() == 1 &&
-        term.operands.front() &&
-        !isa<RankedTensorType>(
-            operation.getOperand(*term.operands.front()).getType()))
-      continue;
-    if (term.kind != "region_index" || term.operands.size() != 1 ||
-        !term.operands.front())
-      return operation.emitOpError("has a non-rectangular descriptor index");
-    Value indexed = operation.getOperand(*term.operands.front());
-    FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
-        target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
-                                                   operation);
-    if (failed(selected) || !*selected)
-      return operation.emitOpError("has no selected descriptor region range");
-    if (!(*selected)->axis.isScalar()) {
-      if (!tile.empty())
-        return operation.emitOpError("has multiple descriptor block axes");
-      tile = (*selected)->range.getTile().str();
     }
+    if (axisNode == -2) {
+      shape.push_back(physicalExtent(view.shape[position]));
+      continue;
+    }
+    const target::IndexTerm &term = (*relation)[position];
+    if (term.kind == "region_index" && term.operands.size() == 1 &&
+        term.operands.front()) {
+      Value indexed = operation.getOperand(*term.operands.front());
+      FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
+          target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
+                                                     operation);
+      if (failed(selected) || !*selected ||
+          static_cast<int64_t>((*selected)->axis.getNode()) != axisNode)
+        return operation.emitOpError(
+            "has no selected descriptor region block shape");
+      shape.push_back((*selected)->range.getTile().str());
+      continue;
+    }
+    plan::AxisOp axis = planIndex.axes.lookup(axisNode);
+    FailureOr<std::string> tile =
+        axis ? physicalAxisTile(axis) : FailureOr<std::string>(failure());
+    if (failed(tile))
+      return operation.emitOpError("has an unbound descriptor block axis");
+    shape.push_back(*tile);
   }
-  if (tile.empty())
-    return operation.emitOpError("has no descriptor block axis");
-  return tile;
+  auto layout = planIndex.descriptorLayouts.find(*node);
+  if (layout == planIndex.descriptorLayouts.end())
+    return operation.emitOpError("has no selected Triton descriptor layout");
+  if (layout->second == "linear") {
+    auto block = llvm::find_if(axes->second,
+                               [](int64_t axis) { return axis >= 0; });
+    if (block == axes->second.end() || shape.empty())
+      return operation.emitOpError("has no linear descriptor block axis");
+    return SmallVector<std::string>{
+        shape[block - axes->second.begin()], shape.back()};
+  }
+  if (layout->second != "strided")
+    return operation.emitOpError("has an unknown Triton descriptor layout");
+  return shape;
 }
 
-FailureOr<std::string>
-ProgramMaterializer::descriptorRowOffset(Operation &operation, ABIView &view) {
+FailureOr<std::string> ProgramMaterializer::descriptorLinearRowOffset(
+    Operation &operation, ABIView &view) {
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
   if (failed(relation) || relation->size() != view.shape.size() ||
       relation->empty() || relation->back().kind != "full_slice")
-    return operation.emitOpError("has no rectangular Triton descriptor relation");
+    return operation.emitOpError("has no linear Triton descriptor relation");
   std::string row;
   for (auto [position, term] : llvm::enumerate(*relation)) {
     if (position + 1 == relation->size())
@@ -1723,7 +1840,7 @@ ProgramMaterializer::descriptorRowOffset(Operation &operation, ABIView &view) {
     } else {
       if (term.kind != "region_index" || term.operands.size() != 1 ||
           !term.operands.front())
-        return operation.emitOpError("has a non-rectangular descriptor index");
+        return operation.emitOpError("has a non-linear descriptor index");
       Value indexed = operation.getOperand(*term.operands.front());
       FailureOr<std::optional<target::lowering::RegionRangeBinding>> selected =
           target::lowering::selectedRegionValueRange(planIndex, kernel, indexed,
@@ -1751,6 +1868,123 @@ ProgramMaterializer::descriptorRowOffset(Operation &operation, ABIView &view) {
   return row;
 }
 
+FailureOr<std::string> ProgramMaterializer::descriptorTensorOrigin(
+    Value value, int64_t axisNode, Operation &consumer) {
+  if (!isa<RankedTensorType>(value.getType())) {
+    auto named = valueNames.find(value);
+    if (named == valueNames.end())
+      return consumer.emitOpError(
+          "has no emitted scalar descriptor-origin operand");
+    return named->second;
+  }
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return consumer.emitOpError("has an opaque tensor descriptor origin");
+  StringRef name = target::semanticOperationName(*definition);
+  if (name == "intent.indices") {
+    std::string start = axisStarts.lookup(axisNode);
+    if (start.empty())
+      return consumer.emitOpError("has no active descriptor-axis origin");
+    return start;
+  }
+  if (name == "intent.broadcast" || name == "intent.reshape" ||
+      name == "intent.transpose" || name == "intent.cast" ||
+      (name == "intent.gather" && isDescriptorShapeProjection(*definition))) {
+    if (definition->getNumOperands() == 0)
+      return consumer.emitOpError("has an empty descriptor-origin projection");
+    return descriptorTensorOrigin(definition->getOperand(0), axisNode, consumer);
+  }
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return consumer.emitOpError(
+        "has no mechanical affine descriptor-origin projection");
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  FailureOr<std::string> lhs =
+      descriptorTensorOrigin(definition->getOperand(0), axisNode, consumer);
+  FailureOr<std::string> rhs =
+      descriptorTensorOrigin(definition->getOperand(1), axisNode, consumer);
+  if (!logical || failed(lhs) || failed(rhs))
+    return failure();
+  StringRef spelling = logical.getValue() == "add"
+                           ? "+"
+                           : logical.getValue() == "subtract"
+                                 ? "-"
+                                 : logical.getValue() == "multiply" ? "*" : "";
+  if (spelling.empty())
+    return consumer.emitOpError(
+        "has a non-affine descriptor-origin operation");
+  return "(" + *lhs + ") " + spelling.str() + " (" + *rhs + ")";
+}
+
+FailureOr<std::string>
+ProgramMaterializer::descriptorOffsets(Operation &operation, ABIView &view) {
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  FailureOr<int64_t> node =
+      target::getNodeID(operation, "Triton descriptor offsets");
+  auto axes = succeeded(node) ? planIndex.descriptorBlockAxes.find(*node)
+                              : planIndex.descriptorBlockAxes.end();
+  if (failed(relation) || failed(node) || relation->size() != view.shape.size() ||
+      axes == planIndex.descriptorBlockAxes.end() ||
+      axes->second.size() != relation->size())
+    return operation.emitOpError("has no rectangular Triton descriptor relation");
+  auto layout = planIndex.descriptorLayouts.find(*node);
+  if (layout == planIndex.descriptorLayouts.end())
+    return operation.emitOpError("has no selected Triton descriptor layout");
+  if (layout->second == "linear") {
+    FailureOr<std::string> row = descriptorLinearRowOffset(operation, view);
+    if (failed(row))
+      return failure();
+    return "tl.cast((" + *row + "), tl.int32), 0";
+  }
+  if (layout->second != "strided")
+    return operation.emitOpError("has an unknown Triton descriptor layout");
+  std::string offsets;
+  for (auto [position, term] : llvm::enumerate(*relation)) {
+    std::string index;
+    if (term.kind == "full_slice") {
+      index = "0";
+    } else if (term.kind == "static_index") {
+      if (term.staticValues.size() != 1 || !term.staticValues.front())
+        return operation.emitOpError("has an invalid descriptor static index");
+      index = std::to_string(*term.staticValues.front());
+    } else if ((term.kind == "value_index" ||
+                term.kind == "region_index") &&
+               term.operands.size() == 1 && term.operands.front()) {
+      Value indexed = operation.getOperand(*term.operands.front());
+      if (isa<RankedTensorType>(indexed.getType())) {
+        if (axes->second[position] < 0)
+          return operation.emitOpError(
+              "has a tensor descriptor index without a block axis");
+        FailureOr<std::string> origin = descriptorTensorOrigin(
+            indexed, axes->second[position], operation);
+        if (failed(origin))
+          return failure();
+        index = *origin;
+      } else if (axes->second[position] >= 0 &&
+                 term.kind == "region_index") {
+        index = axisStarts.lookup(axes->second[position]);
+        if (index.empty())
+          return operation.emitOpError(
+              "has no active descriptor block start for its region index");
+      } else {
+        FailureOr<StringRef> exact =
+            lookupValue(operation, *term.operands.front());
+        if (failed(exact))
+          return failure();
+        index = exact->str();
+      }
+    } else {
+      return operation.emitOpError("has a non-rectangular descriptor index");
+    }
+    if (index.empty())
+      return operation.emitOpError("has an empty descriptor offset");
+    if (!offsets.empty())
+      offsets += ", ";
+    offsets += "tl.cast((" + index + "), tl.int32)";
+  }
+  return offsets;
+}
+
 LogicalResult ProgramMaterializer::emitDescriptorDefinitions() {
   for (const auto &entry : planIndex.transferForms) {
     if (entry.second != "pointer_or_descriptor")
@@ -1760,21 +1994,40 @@ LogicalResult ProgramMaterializer::emitDescriptorDefinitions() {
         operation && operation->getNumOperands() > 0
             ? lookupView(operation->getOperand(0), *operation)
             : FailureOr<ABIView *>(failure());
-    FailureOr<std::string> tile =
-        succeeded(view) ? descriptorBlockTile(*operation, **view)
-                        : FailureOr<std::string>(failure());
-    if (!operation || failed(view) || failed(tile))
+    FailureOr<SmallVector<std::string>> blockShape =
+        succeeded(view) ? descriptorBlockShape(*operation, **view)
+                        : FailureOr<SmallVector<std::string>>(failure());
+    auto layout = planIndex.descriptorLayouts.find(entry.first);
+    if (!operation || failed(view) || failed(blockShape) ||
+        layout == planIndex.descriptorLayouts.end())
       return failure();
-    std::string rows;
-    for (size_t axis = 0; axis + 1 < (*view)->shape.size(); ++axis)
-      rows = rows.empty() ? (*view)->shape[axis]
-                          : "(" + rows + ") * " + (*view)->shape[axis];
+    auto emitList = [&](ArrayRef<std::string> values) {
+      std::string result;
+      for (auto [index, value] : llvm::enumerate(values)) {
+        if (index)
+          result += ", ";
+        result += value;
+      }
+      return result;
+    };
     line("if USE_TMA:");
     ++indentation;
-    line(descriptorName(*operation) + " = tl.make_tensor_descriptor(" +
-         (*view)->pointer + ", [" + rows + ", " + (*view)->shape.back() +
-         "], [" + (*view)->shape.back() + ", 1], [" + *tile + ", " +
-         physicalExtent((*view)->shape.back()) + "])");
+    if (layout->second == "linear") {
+      std::string rows;
+      for (size_t axis = 0; axis + 1 < (*view)->shape.size(); ++axis)
+        rows = rows.empty() ? (*view)->shape[axis]
+                            : "(" + rows + ") * " + (*view)->shape[axis];
+      line(descriptorName(*operation) + " = tl.make_tensor_descriptor(" +
+           (*view)->pointer + ", [" + rows + ", " + (*view)->shape.back() +
+           "], [" + (*view)->shape.back() + ", 1], [" +
+           (*blockShape).front() + ", " + (*blockShape).back() + "])");
+    } else if (layout->second == "strided") {
+      line(descriptorName(*operation) + " = tl.make_tensor_descriptor(" +
+           (*view)->pointer + ", [" + emitList((*view)->shape) + "], [" +
+           emitList((*view)->strides) + "], [" + emitList(*blockShape) + "])");
+    } else {
+      return operation->emitOpError("has an unknown Triton descriptor layout");
+    }
     --indentation;
   }
   return success();

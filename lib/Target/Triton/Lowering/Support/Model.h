@@ -60,6 +60,8 @@ struct PhysicalProgramIndex {
   llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
   llvm::DenseMap<int64_t, std::string> transferForms;
+  llvm::DenseMap<int64_t, llvm::SmallVector<int64_t>> descriptorBlockAxes;
+  llvm::DenseMap<int64_t, std::string> descriptorLayouts;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::lowering::PhysicalComponents components;
@@ -189,11 +191,18 @@ private:
   std::string physicalExtent(llvm::StringRef logicalExtent) const;
   bool usesScaledContraction() const;
   bool usesDescriptorCandidates() const;
+  bool usesLinearDescriptorCandidates() const;
+  bool usesStreamPipelineCandidates() const;
   mlir::LogicalResult emitDescriptorDefinitions();
+  mlir::FailureOr<llvm::SmallVector<std::string>>
+  descriptorBlockShape(mlir::Operation &operation, ABIView &view);
   mlir::FailureOr<std::string>
-  descriptorBlockTile(mlir::Operation &operation, ABIView &view);
+  descriptorLinearRowOffset(mlir::Operation &operation, ABIView &view);
   mlir::FailureOr<std::string>
-  descriptorRowOffset(mlir::Operation &operation, ABIView &view);
+  descriptorOffsets(mlir::Operation &operation, ABIView &view);
+  mlir::FailureOr<std::string>
+  descriptorTensorOrigin(mlir::Value value, int64_t axisNode,
+                         mlir::Operation &consumer);
   std::string descriptorName(mlir::Operation &operation) const;
   mlir::FailureOr<std::string> physicalAxisTile(plan::AxisOp axis);
   mlir::FailureOr<std::string>

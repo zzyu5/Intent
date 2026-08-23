@@ -8,6 +8,7 @@
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
@@ -43,59 +44,327 @@ intent::plan::AxisOp firstLane(gpu::PhysicalProgramAnalysis &analysis) {
   return lanes.empty() ? intent::plan::AxisOp() : lanes.front();
 }
 
-FailureOr<bool> supportsDescriptorCandidate(
+struct DescriptorCandidate {
+  SmallVector<int64_t> blockAxes;
+  std::string layout;
+};
+
+struct DescriptorAffineExpression {
+  llvm::DenseMap<Operation *, int64_t> coefficients;
+  int64_t constant = 0;
+};
+
+std::optional<int64_t> descriptorIntegerConstant(Value value) {
+  Operation *definition = value.getDefiningOp();
+  if (!definition || target::semanticOperationName(*definition) !=
+                         "intent.constant")
+    return std::nullopt;
+  if (auto boolean = definition->getAttrOfType<BoolAttr>("intent.value"))
+    return boolean.getValue() ? 1 : 0;
+  auto integer = definition->getAttrOfType<IntegerAttr>("intent.value");
+  return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+}
+
+bool isDescriptorShapeProjection(Operation &operation) {
+  if (target::semanticOperationName(operation) != "intent.gather" ||
+      operation.getNumOperands() < 2 || operation.getNumResults() != 1)
+    return false;
+  auto input = dyn_cast<RankedTensorType>(operation.getOperand(0).getType());
+  auto result = dyn_cast<RankedTensorType>(operation.getResult(0).getType());
+  FailureOr<SmallVector<target::IndexTerm>> relation =
+      target::parseIndexRelation(operation);
+  auto validIndex =
+      operation.getAttrOfType<IntegerAttr>("intent.valid_operand_index");
+  if (!input || !result || failed(relation) || !validIndex ||
+      validIndex.getInt() < 0 ||
+      static_cast<unsigned>(validIndex.getInt()) >= operation.getNumOperands() ||
+      descriptorIntegerConstant(operation.getOperand(validIndex.getInt())) != 1)
+    return false;
+  unsigned fullSlices = 0;
+  unsigned newAxes = 0;
+  for (const target::IndexTerm &term : *relation) {
+    if (term.kind == "full_slice")
+      ++fullSlices;
+    else if (term.kind == "new_axis")
+      ++newAxes;
+    else
+      return false;
+  }
+  return fullSlices == static_cast<unsigned>(input.getRank()) &&
+         result.getRank() == input.getRank() + static_cast<int64_t>(newAxes);
+}
+
+std::optional<DescriptorAffineExpression> descriptorAffineExpression(
+    Value value, const target::KernelFacts &facts, Operation &consumer,
+    llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return std::nullopt;
+  auto finish = [&](std::optional<DescriptorAffineExpression> expression) {
+    active.erase(value);
+    return expression;
+  };
+  if (std::optional<int64_t> literal = descriptorIntegerConstant(value)) {
+    DescriptorAffineExpression expression;
+    expression.constant = *literal;
+    return finish(std::move(expression));
+  }
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition) {
+    FailureOr<target::ScalarIndexSource> source =
+        target::traceScalarIndexSource(value, consumer);
+    if (failed(source) || !source->domain || source->opaque ||
+        source->transformed)
+      return finish(std::nullopt);
+    DescriptorAffineExpression expression;
+    expression.coefficients[source->domain] = 1;
+    return finish(std::move(expression));
+  }
+  StringRef name = target::semanticOperationName(*definition);
+  if (name == "intent.indices") {
+    auto axes = facts.valueAxes.find(value);
+    if (axes == facts.valueAxes.end())
+      return finish(std::nullopt);
+    DescriptorAffineExpression expression;
+    for (const target::LogicalAxis &axis : axes->second)
+      if (axis.domain && axis.extent != "1")
+        ++expression.coefficients[axis.domain];
+    return finish(expression.coefficients.empty()
+                      ? std::nullopt
+                      : std::optional<DescriptorAffineExpression>(
+                            std::move(expression)));
+  }
+  if (name == "intent.broadcast" || name == "intent.reshape" ||
+      name == "intent.transpose" || name == "intent.cast" ||
+      (name == "intent.gather" && isDescriptorShapeProjection(*definition))) {
+    if (definition->getNumOperands() == 0)
+      return finish(std::nullopt);
+    return finish(descriptorAffineExpression(definition->getOperand(0), facts,
+                                             consumer, active));
+  }
+  if (name != "intent.binary" || definition->getNumOperands() != 2)
+    return finish(std::nullopt);
+  auto logical = definition->getAttrOfType<StringAttr>("intent.operator");
+  std::optional<DescriptorAffineExpression> lhs = descriptorAffineExpression(
+      definition->getOperand(0), facts, consumer, active);
+  std::optional<DescriptorAffineExpression> rhs = descriptorAffineExpression(
+      definition->getOperand(1), facts, consumer, active);
+  if (!logical || !lhs || !rhs)
+    return finish(std::nullopt);
+  auto scale = [](DescriptorAffineExpression &expression, int64_t factor) {
+    expression.constant *= factor;
+    for (auto &coefficient : expression.coefficients)
+      coefficient.second *= factor;
+  };
+  if (logical.getValue() == "multiply") {
+    if (lhs->coefficients.empty()) {
+      scale(*rhs, lhs->constant);
+      return finish(std::move(rhs));
+    }
+    if (rhs->coefficients.empty()) {
+      scale(*lhs, rhs->constant);
+      return finish(std::move(lhs));
+    }
+    return finish(std::nullopt);
+  }
+  int64_t sign = logical.getValue() == "add"
+                     ? 1
+                     : logical.getValue() == "subtract" ? -1 : 0;
+  if (!sign)
+    return finish(std::nullopt);
+  lhs->constant += sign * rhs->constant;
+  for (const auto &coefficient : rhs->coefficients)
+    lhs->coefficients[coefficient.first] += sign * coefficient.second;
+  return finish(std::move(lhs));
+}
+
+std::optional<DescriptorCandidate> descriptorCandidate(
     gpu::PhysicalProgramAnalysis &analysis, intent::plan::TransferOp transfer,
     Operation &operation) {
   StringRef semantic = target::semanticOperationName(operation);
   if (semantic != "intent.view_load" && semantic != "intent.view_store")
-    return false;
+    return std::nullopt;
   auto view = dyn_cast<intent::ViewType>(operation.getOperand(0).getType());
   auto tensor = view ? dyn_cast<RankedTensorType>(view.getTensor())
                      : RankedTensorType();
   FailureOr<SmallVector<target::IndexTerm>> relation =
       target::parseIndexRelation(operation);
+  bool supportedFill = transfer.getFill() == "none" ||
+                       transfer.getFill() == "zero" ||
+                       transfer.getFill() == "negative_infinity" ||
+                       transfer.getFill() == "positive_infinity";
   if (!tensor || tensor.getRank() < 2 || failed(relation) ||
       relation->size() != static_cast<size_t>(tensor.getRank()) ||
-      relation->back().kind != "full_slice" ||
-      (transfer.getFill() != "none" && transfer.getFill() != "zero"))
-    return false;
+      !supportedFill ||
+      (semantic == "intent.view_store" && transfer.getFill() != "none") ||
+      (transfer.getFill() != "none" && transfer.getFill() != "zero" &&
+       transfer.getMaterialization() != "direct"))
+    return std::nullopt;
 
   llvm::DenseMap<int64_t, intent::plan::RegionBindingOp> regions;
   for (intent::plan::RegionBindingOp binding :
        analysis.getProgram().getBody().getOps<intent::plan::RegionBindingOp>())
     regions[binding.getValue()] = binding;
+  DescriptorCandidate candidate;
+  llvm::DenseSet<int64_t> usedBlockAxes;
   unsigned blockedAxes = 0;
   for (auto [position, term] : llvm::enumerate(*relation)) {
-    if (position + 1 == relation->size())
+    if (term.kind == "full_slice") {
+      candidate.blockAxes.push_back(-2);
+      ++blockedAxes;
       continue;
-    if (term.kind == "static_index")
+    }
+    if (term.kind == "static_index") {
+      candidate.blockAxes.push_back(-1);
       continue;
+    }
     if (term.kind == "value_index" && term.operands.size() == 1 &&
         term.operands.front() &&
         !isa<RankedTensorType>(
-            operation.getOperand(*term.operands.front()).getType()))
+            operation.getOperand(*term.operands.front()).getType())) {
+      candidate.blockAxes.push_back(-1);
       continue;
+    }
+    if (term.kind == "value_index" && term.operands.size() == 1 &&
+        term.operands.front()) {
+      Value indexed = operation.getOperand(*term.operands.front());
+      auto axes = analysis.getFacts().valueAxes.find(indexed);
+      if (axes == analysis.getFacts().valueAxes.end())
+        return std::nullopt;
+      Operation *blockDomain = nullptr;
+      for (const target::LogicalAxis &axis : axes->second) {
+        if (!axis.domain || axis.extent == "1")
+          continue;
+        if (blockDomain && blockDomain != axis.domain)
+          return std::nullopt;
+        blockDomain = axis.domain;
+      }
+      if (!blockDomain)
+        return std::nullopt;
+      llvm::DenseSet<Value> active;
+      std::optional<DescriptorAffineExpression> expression =
+          descriptorAffineExpression(indexed, analysis.getFacts(), operation,
+                                     active);
+      if (!expression)
+        return std::nullopt;
+      auto coefficient = expression->coefficients.find(blockDomain);
+      if (coefficient == expression->coefficients.end() ||
+          coefficient->second != 1)
+        return std::nullopt;
+      for (const auto &[domain, value] : expression->coefficients) {
+        if (domain == blockDomain || value == 0)
+          continue;
+        FailureOr<int64_t> node =
+            target::getNodeID(*domain, "Triton descriptor affine source");
+        intent::plan::AxisOp axis =
+            succeeded(node) ? analysis.getAxis(*node) : intent::plan::AxisOp();
+        if (axis && !analysis.isScalarAxis(axis.getNode()))
+          return std::nullopt;
+      }
+      FailureOr<int64_t> node =
+          target::getNodeID(*blockDomain, "Triton descriptor block axis");
+      intent::plan::AxisOp axis =
+          succeeded(node) ? analysis.getAxis(*node) : intent::plan::AxisOp();
+      if (failed(node) || !axis || analysis.isScalarAxis(axis.getNode()) ||
+          (!analysis.getRange(axis.getNode(), "ownership") &&
+           !analysis.getRange(axis.getNode(), "traversal") &&
+           !analysis.getRange(axis.getNode(), "reduction") &&
+           !analysis.getRange(axis.getNode(), "lane")))
+        return std::nullopt;
+      if (!usedBlockAxes.insert(*node).second)
+        return std::nullopt;
+      candidate.blockAxes.push_back(*node);
+      ++blockedAxes;
+      continue;
+    }
     if (term.kind != "region_index" || term.operands.size() != 1 ||
         !term.operands.front())
-      return false;
+      return std::nullopt;
     Value indexed = operation.getOperand(*term.operands.front());
     FailureOr<int64_t> valueID = target::getValueID(
         indexed, analysis.getKernel(), operation,
         "Triton descriptor region projection");
     auto binding = succeeded(valueID) ? regions.find(*valueID) : regions.end();
     if (failed(valueID) || binding == regions.end())
-      return false;
+      return std::nullopt;
     intent::plan::AxisOp axis = analysis.getAxis(binding->second.getAxisNode());
     intent::plan::RangeOp range =
         axis ? analysis.getRange(axis.getNode(), binding->second.getPurpose(),
                                  binding->second.getLevel())
              : intent::plan::RangeOp();
     if (!axis || !range)
-      return false;
-    if (!analysis.isScalarAxis(axis.getNode()))
+      return std::nullopt;
+    if (analysis.isScalarAxis(axis.getNode())) {
+      candidate.blockAxes.push_back(-1);
+    } else {
+      if (!usedBlockAxes.insert(axis.getNode()).second)
+        return std::nullopt;
+      candidate.blockAxes.push_back(axis.getNode());
       ++blockedAxes;
+    }
   }
-  return blockedAxes == 1;
+  if (candidate.blockAxes.size() != relation->size() || blockedAxes < 2 ||
+      candidate.blockAxes.back() == -1)
+    return std::nullopt;
+  auto block = llvm::find_if(candidate.blockAxes,
+                             [](int64_t axis) { return axis >= 0; });
+  bool linear = candidate.blockAxes.back() == -2 &&
+                block != candidate.blockAxes.end() &&
+                llvm::count_if(candidate.blockAxes,
+                               [](int64_t axis) { return axis >= 0; }) == 1 &&
+                llvm::all_of(ArrayRef<int64_t>(candidate.blockAxes).drop_back(),
+                             [](int64_t axis) { return axis == -1 || axis >= 0; }) &&
+                (*relation)[block - candidate.blockAxes.begin()].kind ==
+                    "region_index";
+  candidate.layout = linear ? "linear" : "strided";
+  return std::optional<DescriptorCandidate>(std::move(candidate));
+}
+
+bool hasWriteEffect(Operation &operation) {
+  bool write = false;
+  operation.walk([&](Operation *nested) {
+    auto effects = nested->getAttrOfType<ArrayAttr>("intent.effects");
+    if (!effects)
+      return;
+    for (Attribute attribute : effects) {
+      auto effect = dyn_cast<DictionaryAttr>(attribute);
+      auto kind = effect ? effect.getAs<StringAttr>("kind") : StringAttr();
+      write |= kind && kind.getValue() != "read";
+    }
+  });
+  return write;
+}
+
+bool supportsStreamPipelineCandidate(
+    gpu::PhysicalProgramAnalysis &analysis,
+    intent::plan::StreamBindingOp stream) {
+  Operation *operation = analysis.getKernel().nodes.lookup(stream.getStreamNode());
+  if (!operation || hasWriteEffect(*operation))
+    return false;
+  bool found = false;
+  for (intent::plan::StreamAxisOp streamAxis :
+       analysis.getProgram().getBody().getOps<intent::plan::StreamAxisOp>()) {
+    if (streamAxis.getStreamNode() != stream.getStreamNode())
+      continue;
+    intent::plan::AxisOp axis = analysis.getAxis(streamAxis.getAxisNode());
+    intent::plan::RangeOp range =
+        axis ? analysis.getRange(axis.getNode(), "reduction")
+             : intent::plan::RangeOp();
+    int64_t logicalExtent = 0;
+    if (!axis || !range || !analysis.axisHasRole(axis.getNode(), "contraction_n") ||
+        analysis.axisHasRole(axis.getNode(), "contraction_k") ||
+        range.getExtent().getAsInteger(10, logicalExtent) ||
+        logicalExtent < 128 ||
+        !llvm::isPowerOf2_64(static_cast<uint64_t>(logicalExtent)))
+      continue;
+    StringRef tile = range.getTile();
+    int64_t tileExtent = 0;
+    if (!tile.consume_front("fixed_") || tile.getAsInteger(10, tileExtent) ||
+        tileExtent != logicalExtent || found)
+      return false;
+    found = true;
+  }
+  return found;
 }
 
 void collectRegionSources(
@@ -427,15 +696,19 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
       return transfer.emitOpError("does not bind canonical transfer semantics");
     transfer->setAttr(transferAccessAttr,
                       builder.getStringAttr(load ? "load" : "store"));
-    FailureOr<bool> descriptor =
+    std::optional<DescriptorCandidate> descriptor =
         operation && searchSpace
-            ? supportsDescriptorCandidate(**analysis, transfer, *operation)
-            : FailureOr<bool>(false);
-    if (failed(descriptor))
-      return failure();
+            ? descriptorCandidate(**analysis, transfer, *operation)
+            : std::nullopt;
     transfer->setAttr(
         transferFormAttr,
-        builder.getStringAttr(*descriptor ? "pointer_or_descriptor" : "pointer"));
+        builder.getStringAttr(descriptor ? "pointer_or_descriptor" : "pointer"));
+    if (descriptor) {
+      transfer->setAttr(descriptorBlockAxesAttr,
+                        builder.getDenseI64ArrayAttr(descriptor->blockAxes));
+      transfer->setAttr(descriptorLayoutAttr,
+                        builder.getStringAttr(descriptor->layout));
+    }
   }
   for (intent::plan::StreamBindingOp stream :
        program.getBody().getOps<intent::plan::StreamBindingOp>()) {
@@ -451,8 +724,13 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     stream->setAttr(streamTileAttr, builder.getStringAttr(*tile));
     std::optional<PrefixBoundaryForm> prefix =
         classifyPrefixBoundaryStream(**analysis, stream);
+    bool pipelineCandidates =
+        !prefix && supportsStreamPipelineCandidate(**analysis, stream);
     stream->setAttr(streamFormAttr,
-                    builder.getStringAttr(prefix ? "prefix_boundary" : "single"));
+                    builder.getStringAttr(prefix ? "prefix_boundary"
+                                                 : pipelineCandidates
+                                                       ? "pipeline_candidates"
+                                                       : "single"));
     if (prefix) {
       stream->setAttr(streamBoundaryAxisAttr,
                       builder.getI64IntegerAttr(prefix->boundaryAxis));
@@ -588,12 +866,51 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
        program.getBody().getOps<intent::plan::TransferOp>()) {
     auto access = transfer->getAttrOfType<StringAttr>(transferAccessAttr);
     auto transferForm = transfer->getAttrOfType<StringAttr>(transferFormAttr);
+    auto descriptorAxes =
+        transfer->getAttrOfType<DenseI64ArrayAttr>(descriptorBlockAxesAttr);
+    auto descriptorLayout =
+        transfer->getAttrOfType<StringAttr>(descriptorLayoutAttr);
+    Operation *operation = kernel.nodes.lookup(transfer.getNode());
+    auto view = operation && operation->getNumOperands() > 0
+                    ? dyn_cast<intent::ViewType>(operation->getOperand(0).getType())
+                    : intent::ViewType();
+    auto tensor = view ? dyn_cast<RankedTensorType>(view.getTensor())
+                       : RankedTensorType();
+    bool linearLayout =
+        descriptorAxes && descriptorLayout &&
+        descriptorLayout.getValue() == "linear" && !descriptorAxes.empty() &&
+        descriptorAxes.asArrayRef().back() == -2 &&
+        llvm::count_if(descriptorAxes.asArrayRef(),
+                       [](int64_t axis) { return axis >= 0; }) == 1 &&
+        llvm::all_of(descriptorAxes.asArrayRef().drop_back(),
+                     [](int64_t axis) { return axis == -1 || axis >= 0; });
+    bool validDescriptor =
+        (!descriptorAxes && !descriptorLayout) ||
+        (transferForm && transferForm.getValue() == "pointer_or_descriptor" &&
+         descriptorAxes && descriptorLayout &&
+         (linearLayout || descriptorLayout.getValue() == "strided") &&
+         tensor && static_cast<int64_t>(descriptorAxes.size()) == tensor.getRank() &&
+         llvm::count_if(descriptorAxes.asArrayRef(),
+                        [](int64_t axis) { return axis >= 0 || axis == -2; }) >= 2 &&
+         llvm::all_of(descriptorAxes.asArrayRef(), [&](int64_t axis) {
+           return axis == -1 || axis == -2 || llvm::any_of(
+                                                  program.getBody().getOps<
+                                                      intent::plan::AxisOp>(),
+                                                  [&](intent::plan::AxisOp value) {
+                                                    return value.getNode() ==
+                                                           static_cast<uint64_t>(axis);
+                                                  });
+         }));
     if (!access || (access.getValue() != "load" &&
                     access.getValue() != "store") ||
         !transferForm ||
         (transferForm.getValue() != "pointer" &&
          transferForm.getValue() != "pointer_or_descriptor") ||
-        !kernel.nodes.lookup(transfer.getNode()))
+        !operation || !validDescriptor ||
+        (transferForm.getValue() == "pointer_or_descriptor" &&
+         (!descriptorAxes || !descriptorLayout)) ||
+        (transferForm.getValue() == "pointer" &&
+         (descriptorAxes || descriptorLayout)))
       return transfer.emitOpError("has no complete Triton transfer spelling");
   }
   for (intent::plan::StreamBindingOp stream :
@@ -618,11 +935,12 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
                                                  "intent.mask";
                                     });
     if (!tile || tile.getValue().empty() || !form ||
-        (form.getValue() != "single" && form.getValue() != "prefix_boundary") ||
+        (form.getValue() != "single" && form.getValue() != "prefix_boundary" &&
+         form.getValue() != "pipeline_candidates") ||
         (form.getValue() == "prefix_boundary" &&
          (!boundary || !masks || masks.empty() || !validBoundary ||
           !validMasks)) ||
-        (form.getValue() == "single" && (boundary || masks)))
+        (form.getValue() != "prefix_boundary" && (boundary || masks)))
       return stream.emitOpError("has no complete Triton stream-tile spelling");
   }
   return success();

@@ -1305,9 +1305,15 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     return failure();
   bool descriptorCandidate =
       planIndex.transferForms.lookup(*node) == "pointer_or_descriptor";
+  bool linearDescriptor =
+      descriptorCandidate && planIndex.descriptorLayouts.lookup(*node) == "linear";
   FailureOr<std::string> descriptorOffset =
-      descriptorCandidate ? descriptorRowOffset(operation, **view)
+      descriptorCandidate ? descriptorOffsets(operation, **view)
                           : FailureOr<std::string>(std::string());
+  FailureOr<std::string> descriptorShape =
+      descriptorCandidate && !linearDescriptor
+          ? emitTensorShape(operation, 0)
+          : FailureOr<std::string>(std::string());
   FailureOr<std::string> pointers =
       emitPointerExpression(operation, **view, false);
   FailureOr<std::string> mask = emitMaskExpression(operation, false);
@@ -1317,19 +1323,25 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
   if (loadFill == "none" &&
       target::lowering::hasPackedScalarDomain(planIndex, boundary))
     loadFill = "zero";
-  bool materializeValidity = !boundary.getConsumerNeutralized() &&
-                             loadFill != "none" &&
-                             !boundary.getValidityDomainNodes().empty();
+  bool materializeValidity =
+      (!boundary.getConsumerNeutralized() ||
+       (descriptorCandidate && !linearDescriptor)) &&
+      loadFill != "none" && !boundary.getValidityDomainNodes().empty();
   FailureOr<std::string> validity =
       materializeValidity
           ? emitValidityExpression(boundary.getValidityTensorAxes(),
                                    boundary.getValidityDomainNodes(),
                                    operation.getResult(0), operation)
           : FailureOr<std::string>(std::string("True"));
-  if (failed(descriptorOffset) || failed(pointers) || failed(mask) || failed(validity) ||
-      failed(physicalFill))
+  if (failed(descriptorOffset) || failed(descriptorShape) || failed(pointers) ||
+      failed(mask) || failed(validity) || failed(physicalFill))
     return failure();
   std::string result = makeResultName(operation, 0);
+  StringRef loadFillExpression = loadFill == "negative_infinity"
+                                     ? "-float('inf')"
+                                     : loadFill == "positive_infinity"
+                                           ? "float('inf')"
+                                           : "0.0";
   if (*validity != "True" && *validity != *mask)
     *mask = *mask == "True" ? *validity
                             : "(" + *mask + ") & (" + *validity + ")";
@@ -1337,18 +1349,22 @@ LogicalResult ProgramMaterializer::emitLoad(Operation &operation) {
     if (loadFill == "none") {
       line(result + " = tl.load(" + *pointers + ")");
     } else {
-      StringRef fill = loadFill == "negative_infinity"
-                           ? "-float('inf')"
-                           : "0.0";
       line(result + " = tl.load(" + *pointers + ", mask=" + *mask +
-           ", other=" + fill.str() + ")");
+           ", other=" + loadFillExpression.str() + ")");
     }
   };
   if (descriptorCandidate) {
     line("if USE_TMA:");
     ++indentation;
-    line(result + " = " + descriptorName(operation) + ".load([tl.cast((" +
-         *descriptorOffset + "), tl.int32), 0])");
+    if (linearDescriptor)
+      line(result + " = " + descriptorName(operation) + ".load([" +
+           *descriptorOffset + "])");
+    else
+      line(result + " = tl.reshape(" + descriptorName(operation) + ".load([" +
+           *descriptorOffset + "]), " + *descriptorShape + ")");
+    if (!linearDescriptor && *validity != "True")
+      line(result + " = tl.where(" + *validity + ", " + result + ", " +
+           loadFillExpression.str() + ")");
     --indentation;
     line("else:");
     ++indentation;
@@ -2958,18 +2974,29 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bool descriptorCandidate =
         succeeded(loadNode) && succeeded(view) &&
         planIndex.transferForms.lookup(*loadNode) == "pointer_or_descriptor";
+    bool linearDescriptor =
+        descriptorCandidate &&
+        planIndex.descriptorLayouts.lookup(*loadNode) == "linear";
     FailureOr<std::string> descriptorOffset =
-        descriptorCandidate ? descriptorRowOffset(*load, **view)
+        descriptorCandidate ? descriptorOffsets(*load, **view)
                             : FailureOr<std::string>(std::string());
+    FailureOr<std::string> descriptorShape =
+        descriptorCandidate && !linearDescriptor
+            ? emitTensorShape(*load, 0)
+            : FailureOr<std::string>(std::string());
     if (failed(view) || failed(pointers) || failed(mask) || failed(direct) ||
-        failed(loadNode) || failed(descriptorOffset))
+        failed(loadNode) || failed(descriptorOffset) || failed(descriptorShape))
       return failure();
     std::string loaded = makeResultName(*load, 0);
     if (descriptorCandidate) {
       line("if USE_TMA:");
       ++indentation;
-      line(loaded + " = " + descriptorName(*load) +
-           ".load([tl.cast((" + *descriptorOffset + "), tl.int32), 0])");
+      if (linearDescriptor)
+        line(loaded + " = " + descriptorName(*load) + ".load([" +
+             *descriptorOffset + "])");
+      else
+        line(loaded + " = tl.reshape(" + descriptorName(*load) + ".load([" +
+             *descriptorOffset + "]), " + *descriptorShape + ")");
       --indentation;
       line("else:");
       ++indentation;
@@ -3051,16 +3078,27 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     bool descriptorCandidate =
         succeeded(loadNode) &&
         planIndex.transferForms.lookup(*loadNode) == "pointer_or_descriptor";
+    bool linearDescriptor =
+        descriptorCandidate &&
+        planIndex.descriptorLayouts.lookup(*loadNode) == "linear";
     FailureOr<std::string> descriptorOffset =
-        descriptorCandidate ? descriptorRowOffset(load, view)
+        descriptorCandidate ? descriptorOffsets(load, view)
                             : FailureOr<std::string>(std::string());
-    if (failed(loadNode) || failed(descriptorOffset))
+    FailureOr<std::string> descriptorShape =
+        descriptorCandidate && !linearDescriptor
+            ? emitTensorShape(load, 0)
+            : FailureOr<std::string>(std::string());
+    if (failed(loadNode) || failed(descriptorOffset) || failed(descriptorShape))
       return failure();
     if (descriptorCandidate) {
       line("if USE_TMA:");
       ++indentation;
-      line(result.str() + " = " + descriptorName(load) +
-           ".load([tl.cast((" + *descriptorOffset + "), tl.int32), 0])");
+      if (linearDescriptor)
+        line(result.str() + " = " + descriptorName(load) + ".load([" +
+             *descriptorOffset + "])");
+      else
+        line(result.str() + " = tl.reshape(" + descriptorName(load) +
+             ".load([" + *descriptorOffset + "]), " + *descriptorShape + ")");
       --indentation;
       line("else:");
       ++indentation;
@@ -3204,11 +3242,17 @@ LogicalResult ProgramMaterializer::emitStore(Operation &operation) {
                                    operation);
   bool descriptorCandidate =
       planIndex.transferForms.lookup(*node) == "pointer_or_descriptor";
+  bool linearDescriptor =
+      descriptorCandidate && planIndex.descriptorLayouts.lookup(*node) == "linear";
   FailureOr<std::string> descriptorOffset =
-      descriptorCandidate ? descriptorRowOffset(operation, **view)
+      descriptorCandidate ? descriptorOffsets(operation, **view)
                           : FailureOr<std::string>(std::string());
+  FailureOr<SmallVector<std::string>> descriptorBlock =
+      descriptorCandidate && !linearDescriptor
+          ? descriptorBlockShape(operation, **view)
+          : FailureOr<SmallVector<std::string>>(SmallVector<std::string>());
   if (failed(pointers) || failed(mask) || failed(validity) ||
-      failed(descriptorOffset))
+      failed(descriptorOffset) || failed(descriptorBlock))
     return failure();
   if (*validity != "True" && *validity != *mask)
     *mask = *mask == "True" ? *validity
@@ -3216,8 +3260,22 @@ LogicalResult ProgramMaterializer::emitStore(Operation &operation) {
   if (descriptorCandidate) {
     line("if USE_TMA:");
     ++indentation;
-    line(descriptorName(operation) + ".store([tl.cast((" +
-         *descriptorOffset + "), tl.int32), 0], " + stored->str() + ")");
+    if (linearDescriptor) {
+      line(descriptorName(operation) + ".store([" + *descriptorOffset + "], " +
+           stored->str() + ")");
+    } else {
+      std::string blockShape = "(";
+      for (auto [position, extent] : llvm::enumerate(*descriptorBlock)) {
+        if (position)
+          blockShape += ", ";
+        blockShape += extent;
+      }
+      if (descriptorBlock->size() == 1)
+        blockShape += ",";
+      blockShape += ")";
+      line(descriptorName(operation) + ".store([" + *descriptorOffset +
+           "], tl.reshape(" + stored->str() + ", " + blockShape + "))");
+    }
     --indentation;
     line("else:");
     ++indentation;

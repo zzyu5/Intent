@@ -33,6 +33,10 @@ inline constexpr llvm::StringLiteral transferAccessAttr =
     "intent_plan.triton.transfer_access";
 inline constexpr llvm::StringLiteral transferFormAttr =
     "intent_plan.triton.transfer_form";
+inline constexpr llvm::StringLiteral descriptorBlockAxesAttr =
+    "intent_plan.triton.descriptor_block_axes";
+inline constexpr llvm::StringLiteral descriptorLayoutAttr =
+    "intent_plan.triton.descriptor_layout";
 inline constexpr llvm::StringLiteral streamTileAttr =
     "intent_plan.triton.stream_tile";
 inline constexpr llvm::StringLiteral streamFormAttr =
