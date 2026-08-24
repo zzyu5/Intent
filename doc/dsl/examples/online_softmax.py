@@ -2,6 +2,16 @@ import intent
 import intent.language as I
 
 
+@intent.fn
+def merge_softmax_summary(lhs, rhs):
+    maximum = I.maximum(lhs.maximum, rhs.maximum)
+    denominator = (
+        I.exp(lhs.maximum - maximum) * lhs.denominator
+        + I.exp(rhs.maximum - maximum) * rhs.denominator
+    )
+    return I.record(maximum=maximum, denominator=denominator)
+
+
 @intent.kernel
 def online_softmax(
     x: I.In[I.f32, ("M", "N")],
@@ -11,27 +21,17 @@ def online_softmax(
     columns = I.domain(0, N)
 
     for row in I.parallel(I.domain(0, M)):
-        stream = I.state_stream(
-            columns,
-            init=(I.cast(-I.inf, I.f32), I.cast(0.0, I.f32)),
-            stop=I.end(columns),
+        values = x[row, columns]
+        element_summaries = I.record(
+            maximum=values,
+            denominator=I.full((N,), fill=1.0, dtype=I.f32),
         )
-        with stream:
-            for region, (maximum, denominator) in stream:
-                values = x[row, region]
-                local_maximum = I.reduce.max(
-                    values, axis=0, identity=-I.inf
-                )
-                next_maximum = I.maximum(maximum, local_maximum)
-                next_denominator = (
-                    I.exp(maximum - next_maximum) * denominator
-                    + I.reduce.sum(
-                        I.exp(values - next_maximum),
-                        axis=0,
-                        identity=0.0,
-                    )
-                )
-                stream.yield_(next_maximum, next_denominator)
-
-        maximum, denominator = stream.result
-        output[row, columns] = I.exp(x[row, columns] - maximum) / denominator
+        summary = I.reduce(
+            element_summaries,
+            axis=0,
+            identity=I.record(maximum=-I.inf, denominator=0.0),
+            combine=merge_softmax_summary,
+        )
+        output[row, columns] = (
+            I.exp(values - summary.maximum) / summary.denominator
+        )

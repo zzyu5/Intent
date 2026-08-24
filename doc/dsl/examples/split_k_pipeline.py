@@ -13,12 +13,13 @@ def split_k_partial(
     parts = I.domain(0, P)
     rows = I.domain(0, M)
     columns = I.domain(0, N)
-    width = I.ceil_div(K, P)
+    reduction_axis = I.domain(0, K)
+    width = (K + P - 1) // P
 
     for part in I.parallel(parts):
         begin = I.minimum(part * width, K)
         end = I.minimum((part + 1) * width, K)
-        reduction = I.domain(begin, end)
+        reduction = reduction_axis[begin:end]
         partial[part, rows, columns] = I.contract(
             a[rows, reduction],
             b[reduction, columns],

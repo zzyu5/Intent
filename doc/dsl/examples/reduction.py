@@ -18,7 +18,7 @@ def row_max(
 
     output[rows] = I.reduce(
         x[rows, columns],
-        axes=(1,),
+        axis=1,
         identity=-I.inf,
         combine=maximum_pair,
     )

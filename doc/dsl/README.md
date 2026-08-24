@@ -2,56 +2,72 @@
 
 ## 1. 语言表面
 
-Intent DSL 使用受限 Python AST 表达一个 kernel 的硬件无关算法。Python 负责可读语法；语言语义由 Intent Core 定义，不等同于任意 Python 执行。
+Intent DSL 使用受限 Python AST 表达一个硬件无关 kernel algorithm。Python 提供可编程语法；正式语义由 canonical Kernel IR 定义，不等同于任意 Python 执行。
 
-这组文档定义理想作者表面，不以当前 frontend 是否已经接受某个拼写为依据，也不包含 compiler、backend 或性能状态。
+target 在编译调用中选择，不是 DSL value、类型、`Constexpr` 或控制条件。本文档定义最终作者表面，不以当前 frontend、KIR 或 provider 是否已经实现为依据，也不记录实现进度与性能状态。
 
-## 2. 三层构造
+## 2. 构造的归属
 
-### Core
+### Canonical algorithm semantics
 
-不能在不丢失算法语义的情况下删除：
+这些内容必须在 canonical Kernel IR 中拥有唯一、可验证的表示：
 
-- kernel ABI、runtime/constexpr 参数；
-- domain、region、logical index 与 index relation；
-- structured control、parallel independence 与 state carry；
-- typed tensor/value operations；
-- generic reduce、scan、contract；
-- ragged/sparse/packed data semantics；
-- external effects、logical buffers、scatter、atomic 和 RNG。
+- kernel interface、runtime/constexpr 参数与 helper calls；
+- domain、source-derived subregion、logical index 与 indexed relation；
+- structured control、unordered parallel iteration 与 loop carry；
+- typed tensor/value operations，包括 broadcast、reshape、transpose 与 join；
+- generic reduce、scan、contract、scaled contract、sparse contract 与 histogram；
+- external/logical-buffer read/write、unique/reduction scatter 与 atomic operations；
+- stateless counter-based RNG。
 
-### Sugar
+### Surface shorthand
 
-可以在 frontend 中无损归一化为 Core：
+这些写法可以保留可编程性，但 frontend 必须机械归一到上面的唯一 canonical path：
 
-- `reduce.sum`、`reduce.max`、`any`、`all`；
-- `arg_reduce.max`；
-- Python `range`、条件表达式、`break`、`continue`；
-- `zeros`、常用 activation 和其它纯 helper；
-- `partition(count=P)`，当它只是 part domain 与连续 subdomain 公式的简写时。
+- `reduce.sum/max`、`any/all` 与 `arg_reduce.max`；
+- Python `range`、slice、条件表达式、`break`、`continue`；
+- `zeros`、常用 pointwise helper 与 value-level `mask`；
+- `indices`、endpoint、`ragged(...)`、`members(...)` 等 relation helpers；
+- ordinary indexing/assignment 与明确的 gather/scatter convenience methods；
+- `sparse_contract_2to4` 等具体 format convenience spelling。
+
+### Author libraries
+
+softmax、logsumexp、Welford、attention、normalization、MoE、量化 GEMM 等完整算法由作者使用基础 constructs、`@intent.fn` 与显式多个 kernels组合。它们不是 language intrinsic，也不由 compiler 用 whole-operator matcher替换成模板。
 
 ### 不属于 DSL
 
-- `auto("TILE")` 和 physical extent；
-- program id、grid、warp、thread、lane；
-- register/shared/TMEM/local storage；
-- pointer arithmetic、physical mask、padding；
-- target primitive、layout、copy、pipeline、barrier；
-- provider capability 分支和 autotune config。
+- `auto("TILE")`、`state_stream` 与所有 `partition` forms；
+- public `ordered` 或独立 RaggedOp/MembersOp；
+- program id、grid、block、warp、thread、lane、hart；
+- physical tile、vector length、register/shared/TMEM/local storage；
+- pointer spelling、physical mask/padding、copy instruction、layout、pipeline 与 barrier；
+- physical atomic scope；
+- provider/target/device/ISA capability branch；
+- autotune configuration 与 winner。
 
-## 3. 设计纪律
+这些排除项的算法能力并未被删除：
 
-一个新构造只有同时满足下面条件才应进入 Core：
+- reduce、scan 与 ordered loop承接原 `state_stream` 的三种合法含义；
+- part domain、boundary arithmetic、source slicing与partial tensor承接可观察 partitioning；
+- offsets、subregion与indexed relation承接 ragged关系；
+- indexed read→SSA value→write承接逻辑 copy；
+- physical program根据 target补回 blocking、storage、copy、atomic scope与execution mapping。
 
-1. 真实算法无法由现有 Core 自然表达；
-2. 去掉它会改变 logical values、control/state、effects、ABI 或数值合同；
-3. 它在不同硬件族上仍然有同一算法含义；
-4. 它不是下层语言已经能够从普通目标程序完成的 physical lowering。
+## 3. Operation 进入 canonical language 的判据
 
-如果一个需求只是让作者手写 tile、storage、copy 或 provider hint，答案应是改进编译器，而不是扩 DSL。
+判断一项构造时：
+
+1. 抽掉 target spelling、physical participant、tile、storage与instruction，写出它的 logical values/control/effects语义；
+2. 尝试用已有 canonical constructs展开；
+3. 若展开完全机械且不改变结果、顺序、shape、effects、alias、数值与接口语义，专用 canonical op不成立；
+4. 若展开必须选择 reduction order、中间物化、snapshot、collision behavior、format decode或其它 realization，该 structured semantics必须first-class保留；
+5. GPU、CPU、RVV只用于检验同一语义是否成立；某个 target有无同名 primitive不决定公共 op是否存在。
+
+“理论上能用标量循环模拟”不是机械展开。若模拟会丢失 associativity、prefix、paired-axis relation、metadata interpretation、collision或atomicity，compiler之后只能从任意代码猜回结构，说明该语义应当保留。
 
 ## 4. 文档
 
-- [`core.md`](core.md)：Core 构造和语义；
-- [`types-numerics-and-effects.md`](types-numerics-and-effects.md)：类型、数值、views、资源与 effects；
-- [`examples/`](examples/)：理想化的完整 DSL 示例。
+- [`core.md`](core.md)：作者构造、canonical operations与surface shorthand；
+- [`types-numerics-and-effects.md`](types-numerics-and-effects.md)：类型、数值、views、buffers、memory effects与RNG；
+- [`examples/`](examples/)：理想化完整 DSL 示例。
