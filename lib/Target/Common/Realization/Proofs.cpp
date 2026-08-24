@@ -25,6 +25,22 @@ enum class PaddedValue {
   booleanTrue,
 };
 
+std::optional<StringRef> paddingName(PaddedValue value) {
+  switch (value) {
+  case PaddedValue::zero:
+    return StringRef("zero");
+  case PaddedValue::negativeInfinity:
+    return StringRef("negative_infinity");
+  case PaddedValue::booleanFalse:
+    return StringRef("false");
+  case PaddedValue::booleanTrue:
+    return StringRef("true");
+  case PaddedValue::arbitrary:
+    return std::nullopt;
+  }
+  llvm_unreachable("unhandled padded value");
+}
+
 bool isShapeOnlyGather(Operation &operation) {
   auto relation = operation.getAttrOfType<ArrayAttr>("intent.index");
   if (!relation)
@@ -146,6 +162,23 @@ bool provePaddedUses(Value value, PaddedValue padded,
     if (name == "intent.cast" || name == "intent.broadcast" ||
         name == "intent.reshape" || name == "intent.transpose") {
       result = padded;
+    } else if (name == "intent.join" && user->getNumOperands() == 2) {
+      if (padded == PaddedValue::arbitrary) {
+        result = padded;
+      } else {
+        std::optional<StringRef> expected = paddingName(padded);
+        llvm::DenseMap<Value, std::string> assumedPadding;
+        if (expected)
+          assumedPadding[value] = expected->str();
+        std::optional<std::string> lhs =
+            inferPadding(user->getOperand(0), facts, assumedPadding);
+        std::optional<std::string> rhs =
+            inferPadding(user->getOperand(1), facts, assumedPadding);
+        if (!expected || !lhs || !rhs || *lhs != *expected ||
+            *rhs != *expected)
+          return false;
+        result = padded;
+      }
     } else if (name == "intent.gather" && user->getNumOperands() >= 1 &&
                user->getOperand(0) == value && isShapeOnlyGather(*user)) {
       result = padded;
@@ -284,6 +317,13 @@ std::optional<std::string> inferPadding(
        name == "intent.reshape" || name == "intent.transpose") &&
       definition->getNumOperands() >= 1)
     return inferPadding(definition->getOperand(0), facts, assumedPadding);
+  if (name == "intent.join" && definition->getNumOperands() == 2) {
+    std::optional<std::string> lhs =
+        inferPadding(definition->getOperand(0), facts, assumedPadding);
+    std::optional<std::string> rhs =
+        inferPadding(definition->getOperand(1), facts, assumedPadding);
+    return lhs && rhs && *lhs == *rhs ? lhs : std::nullopt;
+  }
   if (name == "intent.gather" && definition->getNumOperands() >= 1) {
     if (!isa<intent::ViewType>(definition->getOperand(0).getType()) &&
         isShapeOnlyGather(*definition))
@@ -456,6 +496,13 @@ public:
         definition->getNumOperands() >= 1)
       return infer(definition->getOperand(0), domain,
                    ignoredMaterialization);
+    if (name == "intent.join" && definition->getNumOperands() == 2) {
+      std::optional<std::string> lhs =
+          infer(definition->getOperand(0), domain, ignoredMaterialization);
+      std::optional<std::string> rhs =
+          infer(definition->getOperand(1), domain, ignoredMaterialization);
+      return lhs && rhs && *lhs == *rhs ? lhs : std::nullopt;
+    }
     if (name == "intent.gather" && definition->getNumOperands() >= 1) {
       FailureOr<SmallVector<IndexTerm>> relation =
           parseIndexRelation(*definition);

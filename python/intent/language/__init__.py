@@ -35,6 +35,7 @@ from .builtins import floor
 from .builtins import full
 from .builtins import gather
 from .builtins import indices
+from .builtins import join
 from .builtins import inf
 from .builtins import log
 from .builtins import mask
@@ -139,6 +140,7 @@ __all__ = [
     "i64",
     "index",
     "indices",
+    "join",
     "inf",
     "log",
     "mask",

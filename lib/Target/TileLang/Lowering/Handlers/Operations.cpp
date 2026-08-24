@@ -822,8 +822,11 @@ LogicalResult ProgramMaterializer::enterIf(Operation &operation) {
             contract.getAccumulatorConditionalResult();
         std::optional<int64_t> previousValue =
             contract.getAccumulatorValue();
+        std::optional<int64_t> inputValue =
+            contract.getAccumulatorInputValue();
         if (contract.getAccumulatorFlow() != "loop_carried" || !conditional ||
-            !conditionalResult || !previousValue || *conditional != *node ||
+            !conditionalResult || !previousValue || !inputValue ||
+            *inputValue != *previousValue || *conditional != *node ||
             *conditionalResult != static_cast<int64_t>(index))
           continue;
         Value previous = kernel.values.lookup(*previousValue);
@@ -3864,12 +3867,15 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
   std::optional<int64_t> accumulatorUpdate =
       binding.getAccumulatorUpdateNode();
   std::optional<int64_t> accumulatorValue = binding.getAccumulatorValue();
+  std::optional<int64_t> accumulatorInput =
+      binding.getAccumulatorInputValue();
   std::optional<int64_t> accumulatorConditional =
       binding.getAccumulatorConditionalNode();
   bool producerReplay = form == "replay";
   bool oneSidedDeferredOperand = form == "deferred_one";
   bool reuseCarriedAccumulator =
-      carriedFlow &&
+      carriedFlow && accumulatorValue && accumulatorInput &&
+      *accumulatorInput == *accumulatorValue &&
       (accumulatorConditional || producerReplay ||
        (accumulatorOwner && planIndex.streams.count(*accumulatorOwner) &&
         oneSidedDeferredOperand));

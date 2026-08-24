@@ -219,6 +219,7 @@ def mamba3_siso_step(
     B = query.shape[0]
     value_dimensions = I.domain(0, MAMBA3_VALUE_DIMENSION)
     angle_dimensions = I.domain(0, MAMBA3_ANGLE_DIMENSION)
+    qk_dimensions = I.domain(0, MAMBA3_QK_DIMENSION)
     for batch, head in I.parallel(
         (I.domain(0, B), I.domain(0, MAMBA3_HEADS))
     ):
@@ -283,15 +284,12 @@ def mamba3_siso_step(
                 rotated_key_second = I.cast(
                     key_first * sine + key_second * cosine, I.bf16
                 )
-                I.scatter_unique(
-                    output_key_state,
-                    index=(batch, head, pair_indices),
-                    value=I.cast(rotated_key_first, I.f32),
+                rotated_key = I.reshape(
+                    I.join(rotated_key_first, rotated_key_second),
+                    (qk_dimensions,),
                 )
-                I.scatter_unique(
-                    output_key_state,
-                    index=(batch, head, pair_indices + 1),
-                    value=I.cast(rotated_key_second, I.f32),
+                output_key_state[batch, head, qk_dimensions] = I.cast(
+                    rotated_key, I.f32
                 )
 
                 alpha = I.exp2(adt[batch, head] * I.LOG2E)
@@ -330,16 +328,11 @@ def mamba3_siso_step(
                     + (gamma * current_value)[:, None]
                     * I.cast(rotated_key_second, I.f32)[None, :]
                 )
-                I.scatter_unique(
-                    output_ssm_state,
-                    index=(batch, head, value_region, pair_indices),
-                    value=state_first,
+                state = I.reshape(
+                    I.join(state_first, state_second),
+                    (value_region, qk_dimensions),
                 )
-                I.scatter_unique(
-                    output_ssm_state,
-                    index=(batch, head, value_region, pair_indices + 1),
-                    value=state_second,
-                )
+                output_ssm_state[batch, head, value_region, qk_dimensions] = state
                 projected_first = I.contract(
                     I.cast(state_first, I.bf16),
                     I.reshape(rotated_query_first, (angle_region, 1)),
@@ -412,8 +405,6 @@ def mamba3_siso_forward(
             for chunk in I.domain(0, chunks):
                 source_positions = chunk * MAMBA3_CHUNK_SIZE + local
                 source_grid = source_positions[:, None]
-                even_grid = even[None, :]
-                odd_grid = odd[None, :]
                 query_block = I.cast(
                     query[
                         batch,
@@ -476,6 +467,14 @@ def mamba3_siso_forward(
                 rotated_key_second = I.cast(
                     key_first * sine + key_second * cosine, I.bf16
                 )
+                rotated_query = I.reshape(
+                    I.join(rotated_query_first, rotated_query_second),
+                    (positions, qk_dimensions),
+                )
+                rotated_key = I.reshape(
+                    I.join(rotated_key_first, rotated_key_second),
+                    (positions, qk_dimensions),
+                ) * I.cast(transition_scale[:, None], I.bf16)
                 qk_dot = I.reshape(
                     I.contract(
                         I.cast(
@@ -489,29 +488,11 @@ def mamba3_siso_forward(
                     ),
                     (positions,),
                 ) * gamma
-                I.scatter_unique(
-                    query_store,
-                    index=(batch, source_grid, head, even_grid),
-                    value=rotated_query_first,
+                query_store[batch, source_grid, head, qk_dimension_indices[None, :]] = (
+                    rotated_query
                 )
-                I.scatter_unique(
-                    query_store,
-                    index=(batch, source_grid, head, odd_grid),
-                    value=rotated_query_second,
-                )
-                I.scatter_unique(
-                    key_store,
-                    index=(batch, source_grid, head, even_grid),
-                    value=rotated_key_first * I.cast(
-                        transition_scale[:, None], I.bf16
-                    ),
-                )
-                I.scatter_unique(
-                    key_store,
-                    index=(batch, source_grid, head, odd_grid),
-                    value=rotated_key_second * I.cast(
-                        transition_scale[:, None], I.bf16
-                    ),
+                key_store[batch, source_grid, head, qk_dimension_indices[None, :]] = (
+                    rotated_key
                 )
                 qk_store[batch, head, source_positions] = qk_dot
                 scale_store[batch, head, source_positions] = transition_scale

@@ -220,6 +220,11 @@ LogicalResult registerEmissionHandlers(target::OperationHandlerRegistry &registr
                             return success();
                           return emitter.emitReshape(op);
                         })) ||
+      failed(addHandler(registry, "intent.join", [&](Operation &op) {
+        if (!emitter.selectOperation(op))
+          return success();
+        return emitter.emitJoin(op);
+      })) ||
       failed(addHandler(registry, "intent.transpose",
                         [&](Operation &op) {
                           if (!emitter.selectOperation(op))
@@ -1984,6 +1989,21 @@ LogicalResult ProgramMaterializer::emitBinary(Operation &operation) {
   FailureOr<StringRef> rhs = lookupValue(operation, 1);
   if (failed(node) || !binding || failed(lhs) || failed(rhs))
     return failure();
+  if (binding.getLowering() == "contract_accumulator_alias") {
+    bool lhsContract = operation.getOperand(0).getDefiningOp() &&
+                       target::semanticOperationName(
+                           *operation.getOperand(0).getDefiningOp()) ==
+                           "intent.contract";
+    bool rhsContract = operation.getOperand(1).getDefiningOp() &&
+                       target::semanticOperationName(
+                           *operation.getOperand(1).getDefiningOp()) ==
+                           "intent.contract";
+    if (lhsContract == rhsContract)
+      return operation.emitOpError(
+          "does not have one selected Triton fused contraction result");
+    bindResult(operation, 0, lhsContract ? lhs->str() : rhs->str());
+    return success();
+  }
   std::string result = makeResultName(operation, 0);
   std::string expression;
   if (binding.getLowering() == "tl.maximum" ||
@@ -2225,6 +2245,22 @@ LogicalResult ProgramMaterializer::emitReshape(Operation &operation) {
     return operation.emitOpError("lacks a mechanical Triton reshape binding");
   std::string result = makeResultName(operation, 0);
   line(result + " = tl.reshape(" + operand->str() + ", " + *shape + ")");
+  bindResult(operation, 0, result);
+  return success();
+}
+
+LogicalResult ProgramMaterializer::emitJoin(Operation &operation) {
+  FailureOr<int64_t> node = target::getNodeID(operation, "join emission");
+  plan::PointwiseOp binding =
+      succeeded(node) ? planIndex.pointwise.lookup(*node) : plan::PointwiseOp();
+  FailureOr<StringRef> lhs = lookupValue(operation, 0);
+  FailureOr<StringRef> rhs = lookupValue(operation, 1);
+  if (failed(node) || !binding || binding.getLowering() != "tl.join" ||
+      failed(lhs) || failed(rhs) || operation.getNumResults() != 1 ||
+      !isa<RankedTensorType>(operation.getResult(0).getType()))
+    return operation.emitOpError("lacks a mechanical Triton join binding");
+  std::string result = makeResultName(operation, 0);
+  line(result + " = tl.join(" + lhs->str() + ", " + rhs->str() + ")");
   bindResult(operation, 0, result);
   return success();
 }
@@ -2860,6 +2896,18 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
       resultTensor ? tritonDtype(resultTensor.getElementType()).str() : "";
   if (accumulatorDtype.empty())
     return operation.emitOpError("has no supported Triton accumulator dtype");
+  auto accumulatorForm =
+      binding.operation->getAttrOfType<StringAttr>(contractAccumulatorAttr);
+  std::optional<std::string> accumulatorInput;
+  if (accumulatorForm && accumulatorForm.getValue() == "input") {
+    std::optional<int64_t> inputID = binding.getAccumulatorInputValue();
+    Value input = inputID ? kernel.values.lookup(*inputID) : Value();
+    auto emitted = input ? valueNames.find(input) : valueNames.end();
+    if (!inputID || !input || emitted == valueNames.end())
+      return operation.emitOpError(
+          "cannot resolve the selected Triton fused accumulator input");
+    accumulatorInput = emitted->second;
+  }
   auto replay = deferredContractReplays.find(&operation);
   if (form == "replay") {
     if (replay == deferredContractReplays.end())
@@ -2966,8 +3014,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
                           ? "tl.trans(" + rhsExpression + ", 0, 2, 1)"
                           : "tl.trans(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
+    std::string accumulator = accumulatorInput
+                                  ? ", " + *accumulatorInput
+                                  : ", out_dtype=" + accumulatorDtype;
     line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression +
-         ", out_dtype=" + accumulatorDtype + ")");
+         accumulator + ")");
     bindResult(operation, 0, result);
     return success();
   }
@@ -3048,8 +3099,11 @@ LogicalResult ProgramMaterializer::emitContract(Operation &operation) {
     if (orientation->rhsTranspose)
       rhsExpression = "tl.trans(" + rhsExpression + ")";
     std::string result = makeResultName(operation, 0);
+    std::string accumulator = accumulatorInput
+                                  ? ", " + *accumulatorInput
+                                  : ", out_dtype=" + accumulatorDtype;
     line(result + " = tl.dot(" + lhsExpression + ", " + rhsExpression +
-         ", out_dtype=" + accumulatorDtype + ")");
+         accumulator + ")");
     bindResult(operation, 0, result);
     return success();
   }

@@ -17,6 +17,8 @@ inline constexpr llvm::StringLiteral contractOrientationAttr =
     "intent_plan.triton.contract_orientation";
 inline constexpr llvm::StringLiteral contractBatchedAttr =
     "intent_plan.triton.contract_batched";
+inline constexpr llvm::StringLiteral contractAccumulatorAttr =
+    "intent_plan.triton.contract_accumulator";
 inline constexpr llvm::StringLiteral scaledContractLayoutAttr =
     "intent_plan.triton.scaled_contract_layout";
 inline constexpr llvm::StringLiteral reductionLoweringAttr =

@@ -97,6 +97,8 @@ FailureOr<StringRef> pointwise(Operation *operation, StringRef role) {
     return StringRef("tl.bitcast");
   if (role == "reshape")
     return StringRef("tl.reshape");
+  if (role == "join")
+    return StringRef("tl.join");
   if (role == "transpose")
     return StringRef("tl.permute");
   if (role == "unary_exp")

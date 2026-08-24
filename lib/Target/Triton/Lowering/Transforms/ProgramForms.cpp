@@ -9,6 +9,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;
@@ -491,6 +492,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                   builder.getStringAttr(configured ? "configured" : "generic"));
 
   target::KernelModel &kernel = (*analysis)->getKernel();
+  DominanceInfo dominance(kernel.entry);
+  llvm::DenseSet<int64_t> fusedAccumulatorUpdates;
   for (const auto &entry : kernel.raggedRelations) {
     Operation *ragged = entry.second.operation;
     if (!ragged || ragged->hasAttr(raggedRouteAttr))
@@ -507,6 +510,7 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (contract->hasAttr(contractLoweringAttr) ||
         contract->hasAttr(contractOrientationAttr) ||
         contract->hasAttr(contractBatchedAttr) ||
+        contract->hasAttr(contractAccumulatorAttr) ||
         contract->hasAttr(scaledContractLayoutAttr))
       return contract.emitOpError("already has a Triton contraction spelling");
     Operation *operation = kernel.nodes.lookup(contract.getNode());
@@ -529,6 +533,29 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                               *orientation)));
     contract->setAttr(contractBatchedAttr,
                       builder.getBoolAttr(orientation->batched));
+    Value accumulatorInput = contract.getAccumulatorInputValueAttr()
+                                 ? kernel.values.lookup(
+                                       contract.getAccumulatorInputValueAttr()
+                                           .getInt())
+                                 : Value();
+    Operation *accumulatorDefinition =
+        accumulatorInput ? accumulatorInput.getDefiningOp() : nullptr;
+    bool inputAvailable =
+        accumulatorInput &&
+        (!accumulatorDefinition ||
+         dominance.properlyDominates(accumulatorDefinition, operation));
+    bool fusedAccumulator =
+        contract.getAccumulatorFlow() == "loop_carried" &&
+        (contract.getForm() == "direct" ||
+         contract.getForm() == "deferred_one") &&
+        inputAvailable &&
+        static_cast<bool>(contract.getAccumulatorUpdateNodeAttr());
+    contract->setAttr(
+        contractAccumulatorAttr,
+        builder.getStringAttr(fusedAccumulator ? "input" : "none"));
+    if (fusedAccumulator)
+      fusedAccumulatorUpdates.insert(
+          contract.getAccumulatorUpdateNodeAttr().getInt());
     if (contract.getForm() == "scaled_direct") {
       FailureOr<StringRef> layout =
           target::lowering::scaledContractionLayout(*operation);
@@ -593,6 +620,19 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
     if (pointwise->hasAttr(pointwiseLoweringAttr))
       return pointwise.emitOpError("already has a Triton pointwise spelling");
     Operation *operation = kernel.nodes.lookup(pointwise.getNode());
+    if (fusedAccumulatorUpdates.contains(pointwise.getNode())) {
+      auto logical = operation
+                         ? operation->getAttrOfType<StringAttr>("intent.operator")
+                         : StringAttr();
+      if (!operation || target::semanticOperationName(*operation) !=
+                            "intent.binary" ||
+          !logical || logical.getValue() != "add")
+        return pointwise.emitOpError(
+            "does not bind the selected Triton fused-accumulator update");
+      pointwise->setAttr(pointwiseLoweringAttr,
+                         builder.getStringAttr("contract_accumulator_alias"));
+      continue;
+    }
     std::string gatherForm;
     if (operation && target::semanticOperationName(*operation) ==
                          "intent.gather") {
@@ -769,8 +809,17 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto orientation =
         contract->getAttrOfType<StringAttr>(contractOrientationAttr);
     auto batched = contract->getAttrOfType<BoolAttr>(contractBatchedAttr);
+    auto accumulator =
+        contract->getAttrOfType<StringAttr>(contractAccumulatorAttr);
     auto layout = contract->getAttrOfType<StringAttr>(scaledContractLayoutAttr);
     if (!lowering || lowering.getValue().empty() || !orientation || !batched ||
+        !accumulator ||
+        (accumulator.getValue() != "none" &&
+         accumulator.getValue() != "input") ||
+        (accumulator.getValue() == "input" &&
+         (contract.getAccumulatorFlow() != "loop_carried" ||
+          !contract.getAccumulatorInputValueAttr() ||
+          !contract.getAccumulatorUpdateNodeAttr())) ||
         (orientation.getValue() != "nn" && orientation.getValue() != "nt" &&
          orientation.getValue() != "tn" && orientation.getValue() != "tt") ||
         (contract.getForm() == "scaled_direct" &&

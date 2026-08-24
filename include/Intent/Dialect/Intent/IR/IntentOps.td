@@ -94,6 +94,7 @@ def Intent_ConditionOp : Intent_TerminatorOp<"condition">;
 def Intent_ViewLoadOp : Intent_VariadicOneResultOp<"view_load", [MemoryEffects<[MemRead]>]>;
 def Intent_ViewStoreOp : Intent_VariadicNoResultOp<"view_store", [MemoryEffects<[MemWrite]>]>;
 def Intent_ReshapeOp : Intent_UnaryOneResultOp<"reshape">;
+def Intent_JoinOp : Intent_BinaryOneResultOp<"join">;
 def Intent_TransposeOp : Intent_UnaryOneResultOp<"transpose">;
 def Intent_BroadcastOp : Intent_UnaryOneResultOp<"broadcast">;
 def Intent_FullOp : Intent_UnaryOneResultOp<"full">;

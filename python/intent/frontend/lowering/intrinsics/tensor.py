@@ -32,6 +32,7 @@ def lower_tensor_intrinsic(
 ) -> object:
     handlers = {
         "reshape": _reshape,
+        "join": _join,
         "transpose": _transpose,
         "full": _full,
         "zeros": _zeros,
@@ -72,6 +73,30 @@ def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         lowerer.location(node),
         operands=(source,),
         result_types=(TensorType(source.type.dtype, shape),),
+    )
+    return operation.results[0]
+
+
+def _join(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(lowerer, node, ("lhs", "rhs"), required=("lhs", "rhs"))
+    lhs_expression = lowerer.lower_expression(bound["lhs"])
+    rhs_expression = lowerer.lower_expression(bound["rhs"])
+    lhs, rhs = lowerer.coerce_pair(lhs_expression, rhs_expression, node)
+    lhs_dtype, lhs_shape = lowerer.dtype_and_shape(lhs.type, node)
+    rhs_dtype, rhs_shape = lowerer.dtype_and_shape(rhs.type, node)
+    if lhs_dtype != rhs_dtype:
+        lowerer.error(node, "I.join inputs must have the same dtype")
+    try:
+        shape = broadcast_shape(lhs_shape, rhs_shape)
+    except ValueError as error:
+        lowerer.error(node, str(error))
+    lhs = lowerer.broadcast_value(lhs, shape, node)
+    rhs = lowerer.broadcast_value(rhs, shape, node)
+    operation = lowerer.emit(
+        OperationKind.JOIN,
+        lowerer.location(node),
+        operands=(lhs, rhs),
+        result_types=(TensorType(lhs_dtype, shape + (2,)),),
     )
     return operation.results[0]
 

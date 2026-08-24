@@ -356,6 +356,8 @@ pointwiseRole(mlir::Operation &operation) {
     return std::string("bitcast");
   if (name == "intent.reshape")
     return std::string("reshape");
+  if (name == "intent.join")
+    return std::string("join");
   if (name == "intent.transpose")
     return std::string("transpose");
   if (name == "intent.mask")
@@ -1359,6 +1361,10 @@ struct ContractBinding : Binding<intent::plan::ContractOp> {
   }
   std::optional<int64_t> getAccumulatorValue() const {
     auto value = operation.getAccumulatorValueAttr();
+    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+  }
+  std::optional<int64_t> getAccumulatorInputValue() const {
+    auto value = operation.getAccumulatorInputValueAttr();
     return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
   }
   std::optional<int64_t> getAccumulatorConditionalNode() const {

@@ -5,6 +5,7 @@
 #include "Intent/Target/Common/Analysis/Operation.h"
 #include "Intent/Target/Common/Analysis/IndexRelation.h"
 #include "Intent/Target/GPU/Transforms/Analysis/PhysicalProgram.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Pass/Pass.h"
 
@@ -22,7 +23,21 @@ struct AccumulatorFlow {
   Operation *conditional = nullptr;
   unsigned conditionalResult = 0;
   Value previous;
+  Value input;
 };
+
+bool dependsOn(Value value, Value source) {
+  llvm::DenseSet<Value> visited;
+  std::function<bool(Value)> visit = [&](Value current) {
+    if (current == source)
+      return true;
+    if (!visited.insert(current).second)
+      return false;
+    Operation *definition = current.getDefiningOp();
+    return definition && llvm::any_of(definition->getOperands(), visit);
+  };
+  return visit(value);
+}
 
 std::optional<AccumulatorFlow> findAccumulatorFlow(Operation &operation) {
   if (target::semanticOperationName(operation) != "intent.contract" ||
@@ -86,12 +101,16 @@ std::optional<AccumulatorFlow> findAccumulatorFlow(Operation &operation) {
   unsigned domainCount = body.getNumArguments() - owner->getNumResults();
   Value previous = body.getArgument(domainCount + *carried);
   bool consumesContract = false;
-  bool consumesPrevious = false;
+  Value input;
   for (Value operand : update->getOperands()) {
-    consumesContract |= operand == operation.getResult(0);
-    consumesPrevious |= operand == previous;
+    if (operand == operation.getResult(0)) {
+      consumesContract = true;
+      continue;
+    }
+    if (dependsOn(operand, previous))
+      input = operand;
   }
-  if (!consumesContract || !consumesPrevious)
+  if (!consumesContract || !input)
     return std::nullopt;
 
   if (conditional) {
@@ -108,7 +127,8 @@ std::optional<AccumulatorFlow> findAccumulatorFlow(Operation &operation) {
         otherYield.getOperand(conditionalResult) != previous)
       return std::nullopt;
   }
-  return AccumulatorFlow{owner, update, conditional, conditionalResult, previous};
+  return AccumulatorFlow{owner, update, conditional, conditionalResult, previous,
+                         input};
 }
 
 bool isDirectViewLoad(Value value) {
@@ -298,6 +318,7 @@ LogicalResult refineContractions(plan::ProgramOp program) {
     binding->setAttr("producer_replay", builder.getBoolAttr(replayed));
     for (StringRef attribute : {"accumulator_owner_node",
                                 "accumulator_update_node", "accumulator_value",
+                                "accumulator_input_value",
                                 "accumulator_conditional_node",
                                 "accumulator_conditional_result"})
       binding->removeAttr(attribute);
@@ -311,11 +332,15 @@ LogicalResult refineContractions(plan::ProgramOp program) {
           target::getNodeID(*flow->update, "contraction accumulator update");
       FailureOr<int64_t> value = target::getValueID(
           flow->previous, kernel, operation, "contraction accumulator value");
-      if (failed(owner) || failed(update) || failed(value))
+      FailureOr<int64_t> input = target::getValueID(
+          flow->input, kernel, operation, "contraction accumulator input value");
+      if (failed(owner) || failed(update) || failed(value) || failed(input))
         return failure();
       binding->setAttr("accumulator_owner_node", builder.getI64IntegerAttr(*owner));
       binding->setAttr("accumulator_update_node", builder.getI64IntegerAttr(*update));
       binding->setAttr("accumulator_value", builder.getI64IntegerAttr(*value));
+      binding->setAttr("accumulator_input_value",
+                       builder.getI64IntegerAttr(*input));
       if (flow->conditional) {
         FailureOr<int64_t> conditional = target::getNodeID(
             *flow->conditional, "contraction accumulator conditional");

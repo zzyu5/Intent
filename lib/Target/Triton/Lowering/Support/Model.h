@@ -139,6 +139,7 @@ public:
   mlir::LogicalResult emitCast(mlir::Operation &operation);
   mlir::LogicalResult emitBitcast(mlir::Operation &operation);
   mlir::LogicalResult emitReshape(mlir::Operation &operation);
+  mlir::LogicalResult emitJoin(mlir::Operation &operation);
   mlir::LogicalResult emitTranspose(mlir::Operation &operation);
   mlir::LogicalResult emitFull(mlir::Operation &operation);
   mlir::LogicalResult emitZeros(mlir::Operation &operation);

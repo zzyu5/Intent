@@ -26,6 +26,7 @@ class OperationKind(Enum):
     VIEW_LOAD = "view_load"
     VIEW_STORE = "view_store"
     RESHAPE = "reshape"
+    JOIN = "join"
     TRANSPOSE = "transpose"
     BROADCAST = "broadcast"
     FULL = "full"

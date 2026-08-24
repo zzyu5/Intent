@@ -479,7 +479,8 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                          "intent.select", "intent.cast", "intent.bitcast",
                          "intent.full",
                          "intent.zeros", "intent.members", "intent.gather",
-                         "intent.reshape", "intent.transpose", "intent.random"})
+                         "intent.reshape", "intent.join", "intent.transpose",
+                         "intent.random"})
     if (failed(addHandler(
             registry, name, [&](Operation &operation) -> LogicalResult {
               FailureOr<int64_t> node =
@@ -552,7 +553,7 @@ LogicalResult registerPlanHandlers(target::OperationHandlerRegistry &registry,
                 string(builder, "private_fragment"),
                 string(builder, "private_fragment"),
                 string(builder, "none"), IntegerAttr(), IntegerAttr(),
-                IntegerAttr(), IntegerAttr(), IntegerAttr(),
+                IntegerAttr(), IntegerAttr(), IntegerAttr(), IntegerAttr(),
                 builder.getBoolAttr(false));
             return success();
           };

@@ -431,13 +431,16 @@ LogicalResult ContractOp::verify() {
   bool hasOwner = static_cast<bool>(getAccumulatorOwnerNodeAttr());
   bool hasUpdate = static_cast<bool>(getAccumulatorUpdateNodeAttr());
   bool hasValue = static_cast<bool>(getAccumulatorValueAttr());
+  bool hasInputValue = static_cast<bool>(getAccumulatorInputValueAttr());
   bool hasConditional =
       static_cast<bool>(getAccumulatorConditionalNodeAttr());
   bool hasConditionalResult =
       static_cast<bool>(getAccumulatorConditionalResultAttr());
-  if (carried != hasOwner || carried != hasUpdate || carried != hasValue)
+  if (carried != hasOwner || carried != hasUpdate || carried != hasValue ||
+      carried != hasInputValue)
     return emitOpError(
-        "loop-carried accumulator flow requires owner, update, and value bindings");
+        "loop-carried accumulator flow requires owner, update, previous-value, "
+        "and input-value bindings");
   if (hasConditional != hasConditionalResult)
     return emitOpError(
         "conditional accumulator flow requires node and result bindings");
@@ -451,6 +454,9 @@ LogicalResult ContractOp::verify() {
       (hasValue &&
        failed(requireNonNegative(*this, getAccumulatorValueAttr().getInt(),
                                  "accumulator Kernel IR value ID"))) ||
+      (hasInputValue &&
+       failed(requireNonNegative(*this, getAccumulatorInputValueAttr().getInt(),
+                                 "accumulator input Kernel IR value ID"))) ||
       (hasConditional &&
        failed(requireNode(*this, getAccumulatorConditionalNodeAttr().getInt()))) ||
       (hasConditionalResult &&

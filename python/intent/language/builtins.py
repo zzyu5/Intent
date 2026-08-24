@@ -48,6 +48,7 @@ end = Intrinsic("end")
 assume_in_bounds = Intrinsic("assume_in_bounds")
 
 reshape = Intrinsic("reshape")
+join = Intrinsic("join")
 transpose = Intrinsic("transpose")
 full = Intrinsic("full")
 zeros = Intrinsic("zeros")
@@ -109,6 +110,7 @@ INTRINSICS = {
         end,
         assume_in_bounds,
         reshape,
+        join,
         transpose,
         full,
         zeros,

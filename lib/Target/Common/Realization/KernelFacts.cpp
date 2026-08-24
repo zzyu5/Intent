@@ -1488,6 +1488,20 @@ LogicalResult propagateReshapeAxes(Operation &operation, KernelFacts &facts) {
   return bindResultAxes(operation, 0, std::move(result), facts);
 }
 
+LogicalResult propagateJoinAxes(Operation &operation, KernelFacts &facts) {
+  if (operation.getNumOperands() != 2 || operation.getNumResults() != 1)
+    return operation.emitOpError("has no canonical join provenance schema");
+  auto lhs = facts.valueAxes.find(operation.getOperand(0));
+  auto rhs = facts.valueAxes.find(operation.getOperand(1));
+  if (lhs == facts.valueAxes.end() || rhs == facts.valueAxes.end())
+    return operation.emitOpError("join operands have no logical-axis provenance");
+  SmallVector<LogicalAxis> merged;
+  if (!mergeLogicalAxes(lhs->second, rhs->second, merged))
+    return operation.emitOpError("join operands have incompatible logical axes");
+  merged.push_back(LogicalAxis{nullptr, "2"});
+  return bindResultAxes(operation, 0, std::move(merged), facts);
+}
+
 LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
                                    KernelFacts &facts) {
   auto noOp = [](Operation &) { return success(); };
@@ -2358,6 +2372,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
   if (failed(addHandler(
           registry, "intent.reshape", [&](Operation &operation) -> LogicalResult {
             return propagateReshapeAxes(operation, facts);
+          })))
+    return failure();
+
+  if (failed(addHandler(
+          registry, "intent.join", [&](Operation &operation) -> LogicalResult {
+            return propagateJoinAxes(operation, facts);
           })))
     return failure();
 

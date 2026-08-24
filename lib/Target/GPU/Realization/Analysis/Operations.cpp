@@ -192,6 +192,25 @@ LogicalResult validatePointwise(Operation &operation) {
       return operation.emitOpError("has no canonical tensor reshape schema");
     return success();
   }
+  if (name == "intent.join") {
+    auto lhs = operation.getNumOperands() == 2
+                   ? dyn_cast<RankedTensorType>(operation.getOperand(0).getType())
+                   : RankedTensorType();
+    auto rhs = operation.getNumOperands() == 2
+                   ? dyn_cast<RankedTensorType>(operation.getOperand(1).getType())
+                   : RankedTensorType();
+    auto result = operation.getNumResults() == 1
+                      ? dyn_cast<RankedTensorType>(operation.getResult(0).getType())
+                      : RankedTensorType();
+    if (!lhs || !rhs || !result || lhs != rhs ||
+        result.getElementType() != lhs.getElementType() ||
+        result.getRank() != lhs.getRank() + 1 ||
+        result.getDimSize(result.getRank() - 1) != 2 ||
+        !llvm::equal(result.getShape().drop_back(), lhs.getShape()))
+      return operation.emitOpError(
+          "join requires equal tensor operands and appends one extent-two axis");
+    return success();
+  }
   if (name == "intent.transpose") {
     auto source = operation.getNumOperands() == 1
                       ? dyn_cast<RankedTensorType>(
@@ -367,7 +386,8 @@ LogicalResult registerHandlers(target::OperationHandlerRegistry &registry) {
                          "intent.binary", "intent.compare",
                          "intent.mask", "intent.select", "intent.cast",
                          "intent.bitcast",
-                         "intent.reshape", "intent.transpose", "intent.random"})
+                         "intent.reshape", "intent.join", "intent.transpose",
+                         "intent.random"})
     if (failed(addHandler(
             registry, name, validatePointwise)))
       return failure();

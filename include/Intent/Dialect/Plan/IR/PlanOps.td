@@ -116,6 +116,8 @@ def IntentPlan_ExecViewStoreOp
                                                [MemoryEffects<[MemWrite]>]>;
 def IntentPlan_ExecReshapeOp
     : IntentPlan_ExecUnaryOneResultOp<"exec_reshape">;
+def IntentPlan_ExecJoinOp
+    : IntentPlan_ExecBinaryOneResultOp<"exec_join">;
 def IntentPlan_ExecTransposeOp
     : IntentPlan_ExecUnaryOneResultOp<"exec_transpose">;
 def IntentPlan_ExecBroadcastOp
@@ -435,6 +437,7 @@ def IntentPlan_ContractOp : IntentPlan_Op<"contract"> {
     OptionalAttr<I64Attr>:$accumulator_owner_node,
     OptionalAttr<I64Attr>:$accumulator_update_node,
     OptionalAttr<I64Attr>:$accumulator_value,
+    OptionalAttr<I64Attr>:$accumulator_input_value,
     OptionalAttr<I64Attr>:$accumulator_conditional_node,
     OptionalAttr<I64Attr>:$accumulator_conditional_result,
     BoolAttr:$producer_replay
