@@ -41,7 +41,7 @@ Operation *nearestParallelOwner(Operation &operation) {
 }
 
 LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
-                              StringRef fill) {
+                              std::optional<StringRef> fill) {
   FailureOr<SmallVector<IndexTerm>> relation = parseIndexRelation(operation);
   if (failed(relation))
     return failure();
@@ -102,7 +102,8 @@ LogicalResult analyzeBoundary(Operation &operation, KernelFacts &facts,
       !hasInBoundsIndex)
     return operation.emitOpError("has no domain-bound index for realization");
   facts.boundaryDomains[&operation] = std::move(domains);
-  facts.boundaryFills[&operation] = fill.str();
+  if (fill)
+    facts.boundaryFills[&operation] = fill->str();
   return success();
 }
 
@@ -2232,26 +2233,12 @@ LogicalResult registerFactHandlers(OperationHandlerRegistry &registry,
               facts.wholeViewLoads.insert(&operation);
               return recordLoadAxes(operation, facts);
             }
-            bool feedsContract = llvm::any_of(
-                operation.getResult(0).getUsers(), [](Operation *user) {
-                  return ::intent::target::semanticOperationName(*user) == "intent.contract";
-                });
             FailureOr<bool> masked = requiresRuntimeBoundary(operation, facts);
             if (failed(masked))
               return failure();
-            std::optional<std::string> fill =
-                !*masked ? std::optional<std::string>("none")
-                : feedsContract ? std::optional<std::string>("zero")
-                                : inferMaskedLaneFill(operation.getResult(0));
-            if (!fill) {
-              InFlightDiagnostic diagnostic = operation.emitOpError(
-                  "cannot prove a semantics-preserving masked-load fill");
-              if (auto names = operation.getAttrOfType<ArrayAttr>(
-                      "intent.result_names"))
-                diagnostic << " for " << names;
-              return failure();
-            }
-            if (failed(analyzeBoundary(operation, facts, *fill)) ||
+            std::optional<StringRef> fill =
+                !*masked ? std::optional<StringRef>("none") : std::nullopt;
+            if (failed(analyzeBoundary(operation, facts, fill)) ||
                 failed(recordLoadAxes(operation, facts)))
               return failure();
             if (failed(classifyTensorIndices(operation, facts)))
@@ -2889,6 +2876,39 @@ LogicalResult analyzeKernelFacts(KernelFacts &facts) {
   if (failed(traverseKernel(facts.kernel.entry, registry,
                             "canonical realization analysis")))
     return failure();
+
+  SmallVector<Operation *> unresolvedBoundaryLoads;
+  facts.kernel.entry.walk([&](Operation *operation) {
+    if (::intent::target::semanticOperationName(*operation) ==
+            "intent.view_load" &&
+        facts.boundaryDomains.contains(operation) &&
+        !facts.boundaryFills.contains(operation))
+      unresolvedBoundaryLoads.push_back(operation);
+  });
+  while (!unresolvedBoundaryLoads.empty()) {
+    bool progress = false;
+    for (auto current = unresolvedBoundaryLoads.begin();
+         current != unresolvedBoundaryLoads.end();) {
+      Operation *load = *current;
+      std::optional<std::string> fill =
+          inferMaskedLaneFill(load->getResult(0), facts);
+      if (!fill) {
+        ++current;
+        continue;
+      }
+      facts.boundaryFills[load] = std::move(*fill);
+      current = unresolvedBoundaryLoads.erase(current);
+      progress = true;
+    }
+    if (progress)
+      continue;
+    Operation *load = unresolvedBoundaryLoads.front();
+    InFlightDiagnostic diagnostic = load->emitOpError(
+        "cannot prove a semantics-preserving masked-load fill");
+    if (auto names = load->getAttrOfType<ArrayAttr>("intent.result_names"))
+      diagnostic << " for " << names;
+    return failure();
+  }
 
   llvm::DenseSet<Operation *> programDomains;
   for (Operation *parallel : facts.parallels)

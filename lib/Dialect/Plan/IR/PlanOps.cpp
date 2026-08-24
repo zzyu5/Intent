@@ -207,6 +207,20 @@ LogicalResult RegionBindingOp::verify() {
   return success();
 }
 
+LogicalResult DomainExtentBindingOp::verify() {
+  if (failed(requireNode(*this, getAxisNode())) ||
+      failed(requireNonNegative(*this, getStartValue(),
+                                "domain start value ID")) ||
+      failed(requireNonNegative(*this, getStopValue(),
+                                "domain stop value ID")))
+    return failure();
+  if (getStepValueAttr() &&
+      failed(requireNonNegative(*this, getStepValueAttr().getInt(),
+                                "domain step value ID")))
+    return failure();
+  return success();
+}
+
 LogicalResult PartitionBindingOp::verify() {
   if (failed(requireNode(*this, getPartitionNode())) ||
       failed(requireNode(*this, getAxisNode())) ||
@@ -540,6 +554,7 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
   SmallVector<RangeOp> ranges;
   llvm::DenseSet<int64_t> regionValues;
   SmallVector<RegionBindingOp> regionBindings;
+  llvm::DenseMap<int64_t, DomainExtentBindingOp> domainExtentBindings;
   llvm::DenseSet<int64_t> partitionPartArguments;
   llvm::DenseSet<int64_t> partitionRegionArguments;
   llvm::DenseMap<int64_t, PartitionBindingOp> partitionsByNode;
@@ -587,6 +602,12 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
         return binding.emitOpError(
             "duplicates a region-value physical binding");
       regionBindings.push_back(binding);
+    } else if (auto binding = dyn_cast<DomainExtentBindingOp>(operation)) {
+      if (!domainExtentBindings
+               .try_emplace(binding.getAxisNode(), binding)
+               .second)
+        return binding.emitOpError(
+            "duplicates a runtime-domain extent binding");
     } else if (auto binding = dyn_cast<PartitionBindingOp>(operation)) {
       if (!partitionsByNode.try_emplace(binding.getPartitionNode(), binding).second)
         return binding.emitOpError("duplicates a count-partition physical binding");
@@ -746,6 +767,10 @@ LogicalResult intent::plan::verifyGpuProgram(ProgramOp program) {
       return binding.emitOpError(
           "references an unbound selected physical range");
   }
+  for (auto entry : domainExtentBindings)
+    if (!axes.count(entry.first))
+      return entry.second.emitOpError(
+          "references an unbound runtime-domain axis");
   for (PartitionBindingOp binding : partitionBindings) {
     auto axis = axes.find(binding.getAxisNode());
     if (axis == axes.end() || !axisHasRole(axis->second, "parallel"))

@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <string>
+#include <functional>
 #include <optional>
 #include <utility>
 
@@ -169,11 +170,24 @@ bool hasNonnegativeIntegerOperands(mlir::Operation &operation,
 TensorIndexingKind tensorIndexingKind(mlir::Operation &operation,
                                       const KernelFacts &facts);
 
-std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded);
+std::optional<std::string> inferMaskedLaneFill(mlir::Value loaded,
+                                               const KernelFacts &facts);
 
 std::optional<std::string> inferValuePadding(
     mlir::Value value, const KernelFacts &facts,
     const llvm::DenseMap<mlir::Value, std::string> &assumedPadding);
+
+using MaterializedPaddingQuery = std::function<std::optional<std::string>(
+    mlir::Value, mlir::Operation *, mlir::Value)>;
+
+std::optional<std::string> inferDomainPadding(
+    mlir::Value value, mlir::Operation *domain, const KernelFacts &facts,
+    const MaterializedPaddingQuery &materializedPadding = {},
+    mlir::Value ignoredMaterialization = {});
+
+bool proveBoundaryNeutralization(
+    mlir::Operation &load, llvm::StringRef fill, const KernelFacts &facts,
+    const MaterializedPaddingQuery &materializedPadding = {});
 
 } // namespace intent::target
 

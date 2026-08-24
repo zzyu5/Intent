@@ -60,6 +60,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getValue()] = value;
     } else if (auto value =
+                   dyn_cast<intent::plan::DomainExtentBindingOp>(operation)) {
+      index.domainExtentBindings[value.getAxisNode()] = value;
+    } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
@@ -192,14 +195,10 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
     binding.resultSpace = value.getResultSpace().str();
     binding.explicitBounds = bounds.getValue();
     index.boundaries[value.getNode()] = binding;
-  }
-  for (const auto &entry : index.axes) {
-    const plan::AxisOp &axis = entry.second;
-    if (axis.hasRole("contraction_m") &&
-        axis.getTileRole().starts_with("row_vector") &&
-        !axis.getReuseWorker())
-      return axis.emitOpError(
-          "cuTile does not support a runtime-sized lane as the matrix-M axis");
+    if (auto exact =
+            value->getAttrOfType<DenseI64ArrayAttr>(exactStoreAxesAttr))
+      index.exactStoreAxes[value.getNode()] =
+          SmallVector<int64_t>(exact.asArrayRef());
   }
   if (!index.target || !index.program) {
     physicalProgram.emitOpError("lacks device or launch decisions for cuTile");
@@ -246,11 +245,23 @@ LogicalResult ProgramMaterializer::materialize() {
 }
 
 LogicalResult ProgramMaterializer::prepare() {
+  auto consumedParameterRole = [&](StringRef role) {
+    if (!role.starts_with("reduction"))
+      return true;
+    return llvm::any_of(planIndex.axes, [&](const auto &entry) {
+      const target::lowering::RangeBinding *selected = entry.second.roleRange();
+      return selected && selected->getTileRole() == role;
+    });
+  };
   if (searchIndex.autotune)
-    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap())
+    for (NamedAttribute parameter : searchIndex.autotune.getParameterMap()) {
+      StringRef role = cast<StringAttr>(parameter.getValue()).getValue();
+      if (!consumedParameterRole(role))
+        continue;
       tuningParameters.emplace_back(
           parameter.getName().getValue().str(),
-          cast<StringAttr>(parameter.getValue()).getValue().str());
+          role.str());
+    }
   if (failed(indexABI()))
     return failure();
   if (!planIndex.ragged.empty() && failed(prepareRaggedMetadata()))
@@ -422,6 +433,9 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  if (failed(target::lowering::indexRuntimeDomainExtents(
+          planIndex, kernel, dimensionOwners, dimensionOrder)))
+    return failure();
   if (failed(target::lowering::indexPartitionExtents(
           planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
           syntax::tile)))
@@ -490,6 +504,33 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
       (!searchSpace || !searchIndex.autotune))
     return physicalProgram.emitOpError(
         "tiled physical components require a delegated cuTile tuner");
+  for (const auto &entry : planIndex.exactStoreAxes) {
+    for (int64_t node : entry.second) {
+      plan::AxisOp axis = planIndex.axes.lookup(node);
+      std::string extent = axisDimensions.lookup(node);
+      if (!axis || extent.empty())
+        return physicalProgram.emitOpError(
+            "cannot bind a cuTile exact-store axis extent");
+      StringRef tile = axis.getTile();
+      auto parameter = llvm::find_if(
+          tuningParameters,
+          [&](const auto &candidate) { return candidate.first == tile; });
+      if (parameter != tuningParameters.end()) {
+        std::pair<std::string, std::string> constraint{extent,
+                                                       parameter->first};
+        if (!llvm::is_contained(exactDivisibilityConstraints, constraint))
+          exactDivisibilityConstraints.push_back(std::move(constraint));
+        continue;
+      }
+      uint64_t logical = 0;
+      uint64_t physical = 0;
+      if (!StringRef(extent).getAsInteger(10, logical) &&
+          !tile.getAsInteger(10, physical) && physical > 0 &&
+          logical % physical != 0)
+        return axis.emitOpError(
+            "selects a non-divisible fixed tile for an unbounded cuTile store");
+    }
+  }
   kernelConstants.append(dimensionOrder.begin(), dimensionOrder.end());
   SmallVector<StringRef> logicalBlockExtents;
   logicalBlockExtents.reserve(planIndex.blockExtents.size());
@@ -1121,16 +1162,26 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     if (planIndex.program.getPersistent() || unsupportedTiledAxis)
       return physicalProgram.emitOpError(
           "untuned cuTile launch requires scalar or source-fixed non-persistent program axes");
+    DenseMap<int64_t, std::string> projectedAxisTiles;
+    for (plan::AxisOp axis : axes) {
+      if (axis.isScalar())
+        continue;
+      FailureOr<std::string> tile = physicalAxisTile(axis);
+      if (failed(tile))
+        return failure();
+      projectedAxisTiles.insert({axis.getNode(), *tile});
+    }
     std::array<std::string, 3> grid =
         target::lowering::projectProgramGrid(
             planIndex, [&](plan::AxisOp axis) {
               std::string role =
                   "program_" + std::to_string(axis.getProgramOrder());
               std::string extent = roleDimensions.lookup(role);
+              std::string tile = projectedAxisTiles.lookup(axis.getNode());
               return axis.isScalar()
                          ? extent
-                         : "(" + extent + " + " + axis.getTile().str() +
-                               " - 1) // " + axis.getTile().str();
+                         : "(" + extent + " + " + tile + " - 1) // " +
+                               tile;
             });
     output << "    grid = (" << grid[0] << ", " << grid[1] << ", "
            << grid[2] << ")\n";
@@ -1206,6 +1257,21 @@ LogicalResult ProgramMaterializer::emitWrapper() {
   } else {
     SmallVector<plan::AxisOp> programAxes =
         target::lowering::orderedProgramAxes(planIndex);
+    DenseMap<int64_t, std::string> projectedAxisTiles;
+    for (plan::AxisOp axis : programAxes) {
+      if (axis.isScalar())
+        continue;
+      std::string tile = axis.getTile().str();
+      bool tuned = llvm::any_of(
+          tuningParameters,
+          [&](const auto &parameter) { return parameter.first == tile; });
+      if (tuned)
+        continue;
+      FailureOr<std::string> physicalTile = physicalAxisTile(axis);
+      if (failed(physicalTile))
+        return failure();
+      projectedAxisTiles.insert({axis.getNode(), *physicalTile});
+    }
     SmallVector<plan::AxisOp> dynamicRaggedAxes;
     for (plan::AxisOp axis : programAxes) {
       if (!planIndex.components.raggedProgramAxes.contains(axis.getNode()))
@@ -1241,15 +1307,32 @@ LogicalResult ProgramMaterializer::emitWrapper() {
     emitCacheKey("str(_DEVICE)");
     output << ")\n";
     output << "    if cache_key not in _TUNE_CACHE:\n";
+    if (!exactDivisibilityConstraints.empty()) {
+      output << "        legal_configs = tuple(cfg for cfg in _CONFIGS if ";
+      for (auto [index, constraint] :
+           llvm::enumerate(exactDivisibilityConstraints)) {
+        if (index)
+          output << " and ";
+        output << "(" << constraint.first << " % cfg." << constraint.second
+               << " == 0)";
+      }
+      output << ")\n";
+      output << "        if not legal_configs:\n"
+                "            raise ValueError('no cuTile autotune configuration satisfies exact-store divisibility')\n";
+    }
     output << "        with ct.compiler_timeout(_TUNE_TIMEOUT):\n";
     output << "            result = exhaustive_search(\n";
-    output << "                _CONFIGS,\n                stream,\n";
+    output << "                "
+           << (exactDivisibilityConstraints.empty() ? "_CONFIGS"
+                                                     : "legal_configs")
+           << ",\n                stream,\n";
     auto projectedTile = [&](plan::AxisOp axis, StringRef configuration) {
       std::string tile = axis.getTile().str();
       bool tuned = llvm::any_of(
           tuningParameters,
           [&](const auto &parameter) { return parameter.first == tile; });
-      return tuned ? configuration.str() + "." + tile : tile;
+      return tuned ? configuration.str() + "." + tile
+                   : projectedAxisTiles.lookup(axis.getNode());
     };
     std::array<std::string, 3> candidateGrid =
         target::lowering::projectProgramGrid(
@@ -1522,8 +1605,17 @@ FailureOr<std::string> ProgramMaterializer::physicalAxisTile(plan::AxisOp axis) 
     return scanTile->second;
   const target::lowering::RangeBinding *range =
       target::lowering::canonicalDomainRange(axis);
-  if (!range)
-    return axis.emitOpError("has no canonical cuTile domain range");
+  if (!range) {
+    InFlightDiagnostic diagnostic =
+        axis.emitOpError()
+        << "has no canonical cuTile domain range for node " << axis.getNode()
+        << " with roles " << axis.getRoles() << " and indexed ranges [";
+    for (const target::lowering::RangeBinding &candidate : axis.ranges)
+      diagnostic << "(" << candidate.getPurpose() << ", "
+                 << candidate.getLevel() << ", " << candidate.getTileRole()
+                 << ")";
+    return diagnostic << "]";
+  }
   if (axis.getReuseWorker() ||
       !range->getTileRole().starts_with("row_vector"))
     return range->getTile().str();
@@ -2247,13 +2339,13 @@ ProgramMaterializer::emitTensorShape(Operation &operation, unsigned resultIndex,
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
-    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
-        selected = target::lowering::selectedResultAxisRegionRange(
+    FailureOr<std::optional<target::lowering::RegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisPhysicalRange(
             planIndex, kernel, resultValue, tensorAxis, operation);
     if (failed(selected))
       return failure();
     if (*selected) {
-      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RegionRangeBinding &binding = **selected;
       const target::lowering::RangeBinding &range = binding.range;
       bool rounded = !binding.axis.getReuseWorker() &&
                      range.getTileRole().starts_with("row_vector");

@@ -46,6 +46,8 @@ struct PhysicalProgramIndex {
   llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::DenseMap<int64_t, plan::RegionBindingOp> regionBindings;
+  llvm::DenseMap<int64_t, intent::plan::DomainExtentBindingOp>
+      domainExtentBindings;
   llvm::SmallVector<plan::PartitionBindingOp> partitionBindings;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
@@ -58,6 +60,7 @@ struct PhysicalProgramIndex {
   llvm::DenseMap<int64_t, plan::StreamOp> streams;
   llvm::DenseMap<int64_t, plan::StreamBindingOp> streamBindings;
   llvm::DenseMap<int64_t, plan::BoundaryOp> boundaries;
+  llvm::DenseMap<int64_t, llvm::SmallVector<int64_t>> exactStoreAxes;
   llvm::SmallVector<plan::RaggedOp, 0> ragged;
   llvm::SmallVector<plan::StreamAxisOp> streamAxes;
   target::lowering::PhysicalComponents components;
@@ -261,6 +264,8 @@ private:
   bool requiresPreallocatedOutputs = false;
   llvm::SmallVector<std::string> kernelConstants;
   llvm::SmallVector<std::pair<std::string, std::string>> tuningParameters;
+  llvm::SmallVector<std::pair<std::string, std::string>>
+      exactDivisibilityConstraints;
   llvm::SmallVector<std::pair<std::string, std::string>> blockExtentConstants;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<std::string>>
       streamCarriers;

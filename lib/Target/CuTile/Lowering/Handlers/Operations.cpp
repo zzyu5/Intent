@@ -381,6 +381,19 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     return success();
   programBindingsEmitted = true;
 
+  DenseMap<int64_t, std::string> programAxisTiles;
+  for (plan::AxisOp axis : target::lowering::orderedProgramAxes(planIndex)) {
+    if (axis.isScalar())
+      continue;
+    FailureOr<std::string> tile = physicalAxisTile(axis);
+    if (failed(tile))
+      return failure();
+    programAxisTiles.insert({axis.getNode(), *tile});
+  }
+  auto programAxisTile = [&](plan::AxisOp axis) {
+    return programAxisTiles.lookup(axis.getNode());
+  };
+
   auto roleExtent = [&](StringRef role) {
     std::string dimension = roleDimensions.lookup(role);
     std::string owner = dimensionOwners.lookup(dimension);
@@ -392,7 +405,7 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     std::string extent = roleExtent(role);
     return axis.isScalar()
                ? extent
-               : "ct.cdiv(" + extent + ", " + axis.getTile().str() + ")";
+               : "ct.cdiv(" + extent + ", " + programAxisTile(axis) + ")";
   };
   bool persistent = planIndex.program.getPersistent();
   std::string linear = "persistent_program";
@@ -412,9 +425,15 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
       return lhs.getProgramOrder() < rhs.getProgramOrder();
     });
     if (axes.size() != 2 ||
-        axes.front().getWorkerAxis() != axes.back().getWorkerAxis())
-      return axes.front().emitOpError(
-          "cuTile supports two-axis program grouping on one worker axis");
+        axes.front().getWorkerAxis() != axes.back().getWorkerAxis()) {
+      InFlightDiagnostic diagnostic = axes.front().emitOpError(
+          "cuTile supports two-axis program grouping on one worker axis; got");
+      for (plan::AxisOp axis : axes)
+        diagnostic << " (node=" << axis.getNode()
+                   << ", worker=" << axis.getWorkerAxis()
+                   << ", roles=" << axis.getRoles() << ")";
+      return failure();
+    }
     StringRef group = axes.front().getGroupSpelling();
     if (group.empty())
       return axes.front().emitOpError("has no cuTile group spelling");
@@ -448,10 +467,10 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     }
     line(lhsCount + " = " +
          addressIndex("ct.cdiv(" +
-                      roleExtent(lhsRole) + ", " + lhs.getTile().str() + ")"));
+                      roleExtent(lhsRole) + ", " + programAxisTile(lhs) + ")"));
     line(rhsCount + " = " +
          addressIndex("ct.cdiv(" +
-                      roleExtent(rhsRole) + ", " + rhs.getTile().str() + ")"));
+                      roleExtent(rhsRole) + ", " + programAxisTile(rhs) + ")"));
     line(span + " = " + group.str() + " * " + rhsCount);
     line(id + " = " + pid + " // " + span);
     line(first + " = " + id + " * " + group.str());
@@ -518,10 +537,10 @@ LogicalResult ProgramMaterializer::emitProgramBindings() {
     }
     std::string suffix = std::to_string(memberNode);
     std::string values = "axis_index_" + suffix;
+    std::string tile = programAxisTile(axis);
     line(values + " = sequence_begin_" + suffix + " + " + block + " * " +
-         axis.getTile().str() + " + " +
-         addressIndex("ct.arange(" + axis.getTile().str() +
-                      ", dtype=ct.int32)"));
+         tile + " + " +
+         addressIndex("ct.arange(" + tile + ", dtype=ct.int32)"));
     line(values + " = ct.where(" + values + " < sequence_end_" + suffix +
          ", " + values + ", " + ragged.membersView->argument->name +
          ".shape[0])");
@@ -754,8 +773,24 @@ LogicalResult ProgramMaterializer::enterFor(Operation &operation) {
            ")):");
       ++indentation;
     } else {
-      line("for " + iterator + " in range(" + *start + ", " + *stop +
-           ", " + *step + "):");
+      auto literalBound = [](Value value) {
+        Operation *definition = value.getDefiningOp();
+        return definition &&
+               ::intent::target::semanticOperationName(*definition) ==
+                   "intent.constant" &&
+               definition->getAttrOfType<IntegerAttr>("intent.value");
+      };
+      bool dynamicBounds =
+          ::intent::target::semanticOperationName(*domain) != "intent.domain" ||
+          llvm::any_of(domain->getOperands(),
+                       [&](Value value) { return !literalBound(value); });
+      auto loopBound = [&](StringRef expression) {
+        return dynamicBounds
+                   ? "ct.astype((" + expression.str() + "), ct.int32)"
+                   : expression.str();
+      };
+      line("for " + iterator + " in range(" + loopBound(*start) + ", " +
+           loopBound(*stop) + ", " + loopBound(*step) + "):");
       ++indentation;
     }
     std::string logicalIterator = iterator;

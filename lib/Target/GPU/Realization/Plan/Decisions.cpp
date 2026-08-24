@@ -76,6 +76,9 @@ FailureOr<std::string> sourceDimensionSymbol(Operation &domain,
   if (staticBounds != facts.staticDomainBounds.end())
     return std::to_string(staticBounds->second.second -
                           staticBounds->second.first);
+  auto runtimeBounded = facts.runtimeBoundedDomains.find(&domain);
+  if (runtimeBounded != facts.runtimeBoundedDomains.end())
+    return runtimeBounded->second.extent;
   Value source = facts.domainSources.lookup(&domain);
   int64_t axis = facts.domainSourceAxes.lookup(&domain);
   auto argument = llvm::find_if(facts.kernel.abi.arguments,
@@ -146,6 +149,7 @@ struct AxisChoice {
   SmallVector<std::string> roles;
   bool tiled = false;
   std::optional<int64_t> fixedOwnershipExtent;
+  bool singleOwnershipTile = false;
   Operation *countPartition = nullptr;
   bool packedLane = false;
   SmallVector<RangeChoice> ranges;
@@ -544,6 +548,25 @@ assignAxes(const target::KernelFacts &facts) {
     }
   });
 
+  // Compiler-introduced program axes share one Cartesian launch grid.  A
+  // non-atomic external write that does not consume one of those axes would be
+  // replayed by every program along that axis.  Until the physical program
+  // carries per-effect ownership guards, the only legal realization is one
+  // ownership tile spanning that entire automatically introduced axis.
+  for (AxisChoice &choice : choices) {
+    if (!choice.programOrder || !choice.tiled || !choice.parallels.empty())
+      continue;
+    bool omittedByUniqueWrite = false;
+    facts.kernel.entry.walk([&](Operation *operation) {
+      StringRef name = ::intent::target::semanticOperationName(*operation);
+      if (name != "intent.view_store" && name != "intent.scatter_unique")
+        return;
+      ArrayRef<Operation *> domains = facts.boundaryDomains.lookup(operation);
+      omittedByUniqueWrite |= !llvm::is_contained(domains, choice.domain);
+    });
+    choice.singleOwnershipTile = omittedByUniqueWrite;
+  }
+
   // Once a contraction result axis owns program space, its ownership range is
   // also the local matrix-fragment extent.  Keeping the earlier derived lane
   // role would describe a second, runtime-sized fragment range for the same
@@ -679,6 +702,8 @@ assignAxes(const target::KernelFacts &facts) {
         tile = "partition_extent_" + std::to_string(*partitionNode);
       } else if (choice.fixedOwnershipExtent) {
         tile = "fixed_" + std::to_string(*choice.fixedOwnershipExtent);
+      } else if (choice.singleOwnershipTile) {
+        tile = nextLaneTile();
       } else if (ownsOrderedStream(choice, facts)) {
         tile = indexedTile("query", queryTile);
       } else if (hasRole(choice.roles, "ragged_member")) {
@@ -766,6 +791,9 @@ assignAxes(const target::KernelFacts &facts) {
   for (const auto &entry : facts.contractions) {
     SmallVector<unsigned> axes =
         contractionProgramAxes(entry.second, positions, choices);
+    llvm::erase_if(axes, [&](unsigned position) {
+      return choices[position].singleOwnershipTile;
+    });
     for (unsigned index = 1; index < axes.size(); ++index)
       unite(axes.front(), axes[index]);
   }
@@ -917,8 +945,10 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
       collectImplicitExtent(axis);
   }
   for (const AxisChoice &choice : assignments->axes) {
-    const AxisChoice::RangeChoice *lane = findRange(choice, "lane");
-    if (choice.reuse || !lane || !StringRef(lane->tile).starts_with("row_vector"))
+    auto rounded = llvm::find_if(choice.ranges, [](const auto &range) {
+      return StringRef(range.tile).starts_with("row_vector");
+    });
+    if (choice.reuse || rounded == choice.ranges.end())
       continue;
     FailureOr<std::string> extent = sourceDimensionSymbol(*choice.domain, facts);
     if (failed(extent))
@@ -962,6 +992,30 @@ emitPhysicalDecisions(OpBuilder &builder, const KernelFacts &facts,
           string(builder, range.purpose), i64(builder, range.level),
           string(builder, range.tile), string(builder, *logicalExtent),
           IntegerAttr(), IntegerAttr(), IntegerAttr(), IntegerAttr()));
+    auto runtime = facts.runtimeBoundedDomains.find(choice.domain);
+    if (runtime != facts.runtimeBoundedDomains.end()) {
+      FailureOr<int64_t> start = valueID(runtime->second.start, facts.kernel,
+                                         *choice.domain,
+                                         "runtime-domain start binding");
+      FailureOr<int64_t> stop = valueID(runtime->second.stop, facts.kernel,
+                                        *choice.domain,
+                                        "runtime-domain stop binding");
+      IntegerAttr step;
+      if (runtime->second.step) {
+        FailureOr<int64_t> resolved = valueID(
+            runtime->second.step, facts.kernel, *choice.domain,
+            "runtime-domain step binding");
+        if (failed(resolved))
+          return failure();
+        step = i64(builder, *resolved);
+      }
+      if (failed(start) || failed(stop))
+        return failure();
+      decisions.domainExtentBindings.push_back(
+          builder.create<intent::plan::DomainExtentBindingOp>(
+              choice.domain->getLoc(), i64(builder, *domainNode),
+              i64(builder, *start), i64(builder, *stop), step));
+    }
   }
 
   SmallVector<std::tuple<int64_t, int64_t, StringRef>> regionBindings;
@@ -1215,6 +1269,7 @@ mlir::LogicalResult intent::gpu::formAutomaticBlocking(
     } else if (mlir::isa<intent::plan::LaunchOp, intent::plan::BlockExtentOp,
                   intent::plan::AxisOp, intent::plan::RangeOp,
                   intent::plan::RegionBindingOp,
+                  intent::plan::DomainExtentBindingOp,
                   intent::plan::PartitionBindingOp,
                   intent::plan::StreamBindingOp>(operation))
       previous.push_back(&operation);

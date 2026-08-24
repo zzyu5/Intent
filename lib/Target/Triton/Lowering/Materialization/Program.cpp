@@ -167,6 +167,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getValue()] = value;
     } else if (auto value =
+                   dyn_cast<intent::plan::DomainExtentBindingOp>(operation)) {
+      index.domainExtentBindings[value.getAxisNode()] = value;
+    } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
@@ -519,6 +522,9 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     roleDimensions[entry.getValue().getRole()] = *dimension;
     axisDimensions[entry.getValue().getNode()] = *dimension;
   }
+  if (failed(target::lowering::indexRuntimeDomainExtents(
+          planIndex, kernel, dimensionOwners, dimensionOrder)))
+    return failure();
   if (failed(target::lowering::indexPartitionExtents(
           planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
           syntax::tile)))
@@ -584,6 +590,24 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
       (!searchSpace || !searchIndex.autotune))
     return physicalProgram.emitOpError(
         "tiled physical components require a delegated Triton tuner");
+  for (const auto &entry : planIndex.transferForms) {
+    if (entry.second != "pointer_or_descriptor")
+      continue;
+    Operation *operation = kernel.nodes.lookup(entry.first);
+    auto position = operation && operation->getNumOperands() > 0
+                        ? viewPositions.find(operation->getOperand(0))
+                        : viewPositions.end();
+    FailureOr<SmallVector<std::string>> blockShape =
+        position != viewPositions.end()
+            ? descriptorBlockShape(*operation, views[position->second])
+            : FailureOr<SmallVector<std::string>>(failure());
+    if (!operation || position == viewPositions.end() || failed(blockShape) ||
+        blockShape->empty())
+      return physicalProgram.emitOpError(
+          "cannot resolve a descriptor block legality constraint");
+    descriptorBlocks.emplace_back(views[position->second].pointer,
+                                  blockShape->back());
+  }
   return success();
 }
 
@@ -807,6 +831,31 @@ void ProgramMaterializer::emitImports() {
       if (emitted.size() == 1)
         output << ",";
       output << ")\n";
+      output << "_DESCRIPTOR_BLOCKS = (";
+      bool firstBlock = true;
+      for (const auto &[pointer, lastSpelling] : descriptorBlocks) {
+        StringRef last = lastSpelling;
+        StringRef parameter;
+        if (searchSpace)
+          for (NamedAttribute mapping : searchIndex.autotune.getParameterMap())
+            if (mapping.getName().getValue() == last) {
+              parameter = mapping.getName().getValue();
+              break;
+            }
+        uint64_t fixed = 0;
+        bool hasFixed = !last.getAsInteger(10, fixed) && fixed > 0;
+        output << (firstBlock ? "" : ", ") << "('" << pointer << "', ";
+        if (!parameter.empty())
+          output << "'" << parameter << "', None)";
+        else if (hasFixed)
+          output << "None, " << fixed << ")";
+        else
+          output << "None, None)";
+        firstBlock = false;
+      }
+      if (!firstBlock)
+        output << ",";
+      output << ")\n";
     }
   }
   if (usesDescriptorCandidates())
@@ -872,7 +921,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     output << ",\n    prune_configs_by=runtime_extent_pruning("
               "_PARAMETER_RUNTIME_EXTENTS";
     if (usesDescriptorCandidates())
-      output << ", _DESCRIPTOR_VIEWS, "
+      output << ", _DESCRIPTOR_VIEWS, _DESCRIPTOR_BLOCKS, "
              << (usesLinearDescriptorCandidates() ? "True" : "False");
     output << ")";
     bool firstRestoredView = true;
@@ -2551,13 +2600,13 @@ ProgramMaterializer::emitTensorShape(Operation &operation, unsigned resultIndex)
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
-    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
-        selected = target::lowering::selectedResultAxisRegionRange(
+    FailureOr<std::optional<target::lowering::RegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisPhysicalRange(
             planIndex, kernel, resultValue, tensorAxis, operation);
     if (failed(selected))
       return failure();
     if (*selected) {
-      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RegionRangeBinding &binding = **selected;
       const target::lowering::RangeBinding &range = binding.range;
       bool rounded = !binding.axis.getReuseWorker() &&
                      range.getTileRole().starts_with("row_vector");

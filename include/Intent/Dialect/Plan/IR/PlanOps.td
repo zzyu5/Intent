@@ -303,6 +303,18 @@ def IntentPlan_RegionBindingOp : IntentPlan_Op<"region_binding"> {
   let hasVerifier = 1;
 }
 
+def IntentPlan_DomainExtentBindingOp
+    : IntentPlan_Op<"domain_extent_binding"> {
+  let arguments = (ins
+    I64Attr:$axis_node,
+    I64Attr:$start_value,
+    I64Attr:$stop_value,
+    OptionalAttr<I64Attr>:$step_value
+  );
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def IntentPlan_PartitionBindingOp : IntentPlan_Op<"partition_binding"> {
   let arguments = (ins
     I64Attr:$partition_node,

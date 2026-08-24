@@ -17,6 +17,8 @@ inline constexpr llvm::StringLiteral transferAttr =
     "intent_plan.cutile.transfer";
 inline constexpr llvm::StringLiteral loadShapeNodeAttr =
     "intent_plan.cutile.load_shape_node";
+inline constexpr llvm::StringLiteral exactStoreAxesAttr =
+    "intent_plan.cutile.exact_store_axes";
 inline constexpr llvm::StringLiteral rowOccupancyAttr =
     "intent_plan.cutile.row_occupancy";
 inline constexpr llvm::StringLiteral contractLoweringAttr =

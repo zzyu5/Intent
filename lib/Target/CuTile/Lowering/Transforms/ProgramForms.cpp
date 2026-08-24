@@ -455,7 +455,8 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
        program.getBody().getOps<intent::plan::TransferOp>()) {
     if (transfer->hasAttr(accessAttr) || transfer->hasAttr(boundsAttr) ||
         transfer->hasAttr(transferAttr) ||
-        transfer->hasAttr(loadShapeNodeAttr))
+        transfer->hasAttr(loadShapeNodeAttr) ||
+        transfer->hasAttr(exactStoreAxesAttr))
       return transfer.emitOpError(
           "already has a cuTile transfer-form decision");
     Operation *operation =
@@ -519,6 +520,16 @@ LogicalResult realizeProgram(intent::plan::ProgramOp program,
                   partitionStream || *derivedScalar;
     transfer->setAttr(accessAttr, builder.getStringAttr(access));
     transfer->setAttr(boundsAttr, builder.getBoolAttr(bounds));
+    if (store && access == "store" && !bounds) {
+      SmallVector<int64_t> exactAxes;
+      for (int64_t node : transfer.getDomainNodes())
+        if (!(*analysis)->isScalarAxis(node) &&
+            !llvm::is_contained(exactAxes, node))
+          exactAxes.push_back(node);
+      if (!exactAxes.empty())
+        transfer->setAttr(exactStoreAxesAttr,
+                          builder.getDenseI64ArrayAttr(exactAxes));
+    }
     transfer->setAttr(
         transferAttr,
         builder.getStringAttr(advancedUniqueStore
@@ -694,6 +705,8 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
     auto bounds = transfer->getAttrOfType<BoolAttr>(boundsAttr);
     auto form = transfer->getAttrOfType<StringAttr>(transferAttr);
     auto loadShape = transfer->getAttrOfType<IntegerAttr>(loadShapeNodeAttr);
+    auto exactAxes =
+        transfer->getAttrOfType<DenseI64ArrayAttr>(exactStoreAxesAttr);
     Operation *operation = kernel.nodes.lookup(transfer.getNode());
     StringRef name = operation ? ::intent::target::semanticOperationName(*operation) : StringRef();
     bool load = name == "intent.view_load";
@@ -731,8 +744,14 @@ LogicalResult verifyProviderProgram(const target::KernelModel &kernel,
          form.getValue() == "direct" &&
          matchedLoadShapeNode &&
          matchedLoadShapeNode.getInt() == loadShape.getInt());
+    bool validExactAxes =
+        !exactAxes ||
+        (access && access.getValue() == "store" && bounds && !bounds.getValue() &&
+         llvm::all_of(exactAxes.asArrayRef(), [&](int64_t node) {
+           return llvm::is_contained(transfer.getDomainNodes(), node);
+         }));
     if (!operation || !bounds || !validAccess || !validForm ||
-        !validLoadShape)
+        !validLoadShape || !validExactAxes)
       return transfer.emitOpError(
           "has no complete legal cuTile transfer-form decision");
   }

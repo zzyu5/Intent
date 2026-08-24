@@ -53,6 +53,9 @@ indexPhysicalProgram(intent::plan::ProgramOp physicalProgram,
                    dyn_cast<intent::plan::RegionBindingOp>(operation)) {
       index.regionBindings[value.getValue()] = value;
     } else if (auto value =
+                   dyn_cast<intent::plan::DomainExtentBindingOp>(operation)) {
+      index.domainExtentBindings[value.getAxisNode()] = value;
+    } else if (auto value =
                    dyn_cast<intent::plan::PartitionBindingOp>(operation)) {
       index.partitionBindings.push_back(value);
     } else if (auto value = dyn_cast<intent::plan::LaunchOp>(operation)) {
@@ -479,9 +482,13 @@ LogicalResult ProgramMaterializer::resolvePhysicalBindings() {
     FailureOr<std::string> dimension = dimensionName(*domain);
     if (failed(dimension))
       return entry.getValue().emitOpError("cannot resolve its source dimension");
-    roleDimensions[entry.getValue().getRole()] = *dimension;
-    axisDimensions[entry.getValue().getNode()] = *dimension;
+    std::string targetDimension = syntax::dimension(*dimension);
+    roleDimensions[entry.getValue().getRole()] = targetDimension;
+    axisDimensions[entry.getValue().getNode()] = std::move(targetDimension);
   }
+  if (failed(target::lowering::indexRuntimeDomainExtents(
+          planIndex, kernel, dimensionOwners, dimensionOrder)))
+    return failure();
   if (failed(target::lowering::indexPartitionExtents(
           planIndex, kernel, axisDimensions, dimensionOwners, dimensionOrder,
           syntax::tile)))
@@ -772,6 +779,15 @@ __device__ void intent_u2x16_to_i8(T1 *packed, T2 *decoded) {
 
 LogicalResult ProgramMaterializer::emitKernelHeader() {
   kernelName = (kernel.entry.getName() + "_kernel").str();
+  DenseMap<int64_t, std::string> resolvedAxisTiles;
+  for (const auto &entry : planIndex.axes) {
+    const target::lowering::RangeBinding *range =
+        target::lowering::canonicalDomainRange(entry.second);
+    if (!range)
+      return entry.second.emitOpError(
+          "has no canonical TileLang physical range");
+    resolvedAxisTiles.insert({entry.first, range->getTile().str()});
+  }
   auto emitBuilderParameters = [&](raw_ostream &stream) {
     bool first = true;
     auto parameter = [&](StringRef value) {
@@ -931,7 +947,7 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
       if (axis == planIndex.axes.end() || axis->second.isScalar())
         continue;
       std::string extent = axisDimensions.lookup(node);
-      std::string tile = axis->second.getTile().str();
+      std::string tile = resolvedAxisTiles.lookup(node);
       if (extent.empty() || tile.empty())
         return boundary.emitOpError(
             "has no exact selected-contiguous TileLang axis interval");
@@ -973,7 +989,8 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
             : roleDimensions.lookup(role);
     return axis.isScalar()
                ? extent
-               : "T.ceildiv(" + extent + ", " + axis.getTile().str() + ")";
+               : "T.ceildiv(" + extent + ", " +
+                     resolvedAxisTiles.lookup(axis.getNode()) + ")";
   };
   std::array<std::string, 3> grid =
       target::lowering::projectProgramGrid(planIndex, axisExtent);
@@ -1072,11 +1089,13 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
     }
     output << programIndent << lhsCount << " = "
            << addressIndex("T.ceildiv(" + roleDimensions.lookup(lhsRole) +
-                           ", " + lhs.getTile().str() + ")")
+                           ", " + resolvedAxisTiles.lookup(lhs.getNode()) +
+                           ")")
            << "\n";
     output << programIndent << rhsCount << " = "
            << addressIndex("T.ceildiv(" + roleDimensions.lookup(rhsRole) +
-                           ", " + rhs.getTile().str() + ")")
+                           ", " + resolvedAxisTiles.lookup(rhs.getNode()) +
+                           ")")
            << "\n";
     output << programIndent << span << " = " << group << " * " << rhsCount
            << "\n";
@@ -1090,8 +1109,10 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
            << ") // " << size << "\n";
     programBlocks[lhs.getNode()] = lhsBlock;
     programBlocks[rhs.getNode()] = rhsBlock;
-    axisIndices[lhs.getNode()] = lhsBlock + " * " + lhs.getTile().str();
-    axisIndices[rhs.getNode()] = rhsBlock + " * " + rhs.getTile().str();
+    axisIndices[lhs.getNode()] =
+        lhsBlock + " * " + resolvedAxisTiles.lookup(lhs.getNode());
+    axisIndices[rhs.getNode()] =
+        rhsBlock + " * " + resolvedAxisTiles.lookup(rhs.getNode());
   }
   SmallVector<target::lowering::ProgramIndexProjection> projections =
       persistent
@@ -1108,7 +1129,9 @@ LogicalResult ProgramMaterializer::emitKernelHeader() {
            << addressIndex(projection.expression) << "\n";
     programBlocks[axis.getNode()] = block;
     axisIndices[axis.getNode()] =
-        axis.isScalar() ? block : block + " * " + axis.getTile().str();
+        axis.isScalar()
+            ? block
+            : block + " * " + resolvedAxisTiles.lookup(axis.getNode());
   }
   for (const auto &entry : planIndex.axes) {
     plan::AxisOp axis = entry.second;
@@ -1578,7 +1601,11 @@ FailureOr<plan::AxisOp> ProgramMaterializer::resolveAxis(Value indexedValue,
 }
 
 FailureOr<std::string> ProgramMaterializer::dimensionName(Operation &domain) {
-  return target::lowering::plannedDomainExtent(domain, planIndex);
+  FailureOr<std::string> dimension =
+      target::lowering::plannedDomainExtent(domain, planIndex);
+  if (failed(dimension))
+    return failure();
+  return syntax::dimension(*dimension);
 }
 
 bool ProgramMaterializer::usesMatrixContraction() const {
@@ -2645,13 +2672,13 @@ ProgramMaterializer::tensorExtents(Operation &operation, unsigned resultIndex,
     if (!label)
       return operation.emitOpError(
           "tensor shape contains a non-symbolic extent");
-    FailureOr<std::optional<target::lowering::ResultAxisRegionRangeBinding>>
-        selected = target::lowering::selectedResultAxisRegionRange(
+    FailureOr<std::optional<target::lowering::RegionRangeBinding>>
+        selected = target::lowering::selectedResultAxisPhysicalRange(
             planIndex, kernel, resultValue, tensorAxis, operation);
     if (failed(selected))
       return failure();
     if (*selected) {
-      const target::lowering::RegionRangeBinding &binding = (*selected)->selected;
+      const target::lowering::RegionRangeBinding &binding = **selected;
       const target::lowering::RangeBinding &range = binding.range;
       bool rounded = physical && !binding.axis.getReuseWorker() &&
                      range.getTileRole().starts_with("row_vector");

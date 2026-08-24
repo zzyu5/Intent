@@ -18,6 +18,7 @@ def _power_of_two_ceiling(value: int) -> int:
 def runtime_extent_pruning(
     parameter_extents: dict[str, tuple[str, ...]],
     descriptor_views: tuple[str, ...] = (),
+    descriptor_blocks: tuple[tuple[str, str | None, int | None], ...] = (),
     require_contiguous_descriptors: bool = False,
 ) -> dict[str, object]:
     bindings = {
@@ -44,6 +45,21 @@ def runtime_extent_pruning(
             and arguments[view].shape[-1] * arguments[view].element_size() % 16 == 0
             for view in descriptor_views
         )
+        def descriptor_block_legal(config) -> bool:
+            for view, parameter, fixed_extent in descriptor_blocks:
+                if view not in arguments or not hasattr(arguments[view], "element_size"):
+                    return False
+                extent = (
+                    config.kwargs.get(parameter)
+                    if parameter is not None
+                    else fixed_extent
+                )
+                if extent is None:
+                    continue
+                block_bytes = int(extent) * arguments[view].element_size()
+                if block_bytes < 16 or block_bytes % 16 != 0:
+                    return False
+            return True
         limits = {}
         for parameter, extents in bindings.items():
             if not extents:
@@ -73,7 +89,10 @@ def runtime_extent_pruning(
                 config.kwargs[parameter] <= limit
                 for parameter, limit in limits.items()
             )
-            and (not config.kwargs.get("USE_TMA", 0) or descriptors_legal)
+            and (
+                not config.kwargs.get("USE_TMA", 0)
+                or (descriptors_legal and descriptor_block_legal(config))
+            )
         ]
         if not accepted:
             raise ValueError(

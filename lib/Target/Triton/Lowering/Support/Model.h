@@ -47,6 +47,8 @@ struct PhysicalProgramIndex {
   llvm::StringMap<plan::BlockExtentOp> blockExtents;
   llvm::DenseMap<int64_t, plan::AxisOp> axes;
   llvm::DenseMap<int64_t, plan::RegionBindingOp> regionBindings;
+  llvm::DenseMap<int64_t, intent::plan::DomainExtentBindingOp>
+      domainExtentBindings;
   llvm::SmallVector<plan::PartitionBindingOp> partitionBindings;
   llvm::StringMap<plan::AxisOp> axesByRole;
   llvm::DenseMap<int64_t, plan::PaddingOp> paddings;
@@ -269,6 +271,7 @@ private:
   llvm::StringMap<std::string> roleDimensions;
   llvm::DenseMap<int64_t, std::string> axisDimensions;
   llvm::StringMap<std::string> regionTiles;
+  llvm::SmallVector<std::pair<std::string, std::string>> descriptorBlocks;
   llvm::DenseMap<int64_t, std::string> axisIndices;
   llvm::DenseMap<int64_t, std::string> axisStarts;
   llvm::DenseMap<mlir::Value, std::string> selectedRegionIndices;

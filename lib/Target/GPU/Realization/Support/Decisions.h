@@ -12,6 +12,7 @@ struct PhysicalDecisions {
   llvm::SmallVector<intent::plan::AxisOp> axes;
   llvm::SmallVector<intent::plan::RangeOp> ranges;
   llvm::SmallVector<intent::plan::RegionBindingOp> regionBindings;
+  llvm::SmallVector<intent::plan::DomainExtentBindingOp> domainExtentBindings;
   llvm::SmallVector<intent::plan::PartitionBindingOp> partitionBindings;
   llvm::SmallVector<intent::plan::StreamBindingOp> streamBindings;
 };

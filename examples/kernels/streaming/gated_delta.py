@@ -298,7 +298,7 @@ def chunk_gated_delta_recurrence(
     causal = local[:, None] >= local[None, :]
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
-            state = I.zeros((K, V), dtype=I.f32)
+            state = I.zeros((key_dimensions, value_dimensions), dtype=I.f32)
             for chunk in I.domain(0, C):
                 source_positions = chunk * CHUNK_SIZE + local
                 query = I.cast(
@@ -375,6 +375,7 @@ def chunk_gated_delta_recurrence(
                     value_dimensions,
                 ] = I.cast(inter + intra, I.bf16)
                 chunk_end = I.minimum((chunk + 1) * CHUNK_SIZE, T) - 1
+                I.assume_in_bounds(chunk_end, cumulative_gate, axis=2)
                 last_gate = cumulative_gate[batch, head, chunk_end]
                 weighted_key = key * I.exp(last_gate - gate_prefix)[:, None]
                 update = I.contract(

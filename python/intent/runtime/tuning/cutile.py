@@ -227,12 +227,7 @@ def autotune_configurations(parameter_map: dict[str, str]) -> tuple[SimpleNamesp
 
 
 def autotune_timeout(parameter_map: dict[str, str]) -> int:
-    roles = frozenset(parameter_map.values())
-    return (
-        10
-        if "query" in roles and {"stream", "stream_contract"}.intersection(roles)
-        else 5
-    )
+    return 10
 
 
 def tune_row_occupancy(
