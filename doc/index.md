@@ -1,51 +1,10 @@
-# Intent Kernel DSL 设计文档
+# IntentDSL 规格
 
-这组文档描述 Intent Kernel DSL 的语言语义、编译器模块边界与稳定使用方法，不记录实现进度、历史版本、测试清单、失败状态或迁移过程。运行与实现状态只进入 `report/`；设计文档只在明确修改规格时更新，环境文档只维护可复现的依赖与构建合同。
+本目录只保存稳定设计，不保存实现进度、测试结果、性能数字或历史决策过程。
 
-Intent 是一门 **Python-hosted、跨后端、region-parametric 的结构化算子 kernel DSL**：用户写一个 runtime-visible kernel 内的完整算法，编译器补全不可由 source 观察的单次 kernel launch realization。需要多个 launches 的算法由作者用多个 kernels 和普通 Python wrapper 明确编排。
+当前规格分为两层：
 
-## 设计变更门槛
+- [`programming-model/`](programming-model/)：定义作者、kernel、host 与编译器之间的语义边界；
+- [`dsl/`](dsl/)：定义作者可使用的语言表面、Core 构造及其理想化示例。
 
-语言构造和表示层不能作为普通实现补丁扩张：目录、字段或 target API 可以演进，但不能制造第二份算法真理、改变 source algorithm，或把某个 target 的抽象抬进共享层。
-
-新增语言构造必须同时满足两条：
-
-1. 一个真实算法无法用现有 Core 表达，且问题不是缺少语法糖、library helper 或作者显式的多-kernel wrapper；
-2. 所需能力不能机械委托给下层 target compiler 已有的原语或接口。
-
-新增物理决定也必须同时满足：其正确取值依赖 Kernel IR 保留的算法结构；该值只有在具体机器上才有意义，作者没有写也不应写。否则需求应当被拒绝、作为 library policy 表达、成为 target capability subset，或交给下层 compiler/tuner，而不是扩展语言或 Plan。
-
-## 阅读顺序
-
-1. [语言定位与边界](dsl/model.md)
-2. [Python eDSL](dsl/python-edsl.md)
-3. [Domain、Region 与控制](dsl/domains-and-control.md)
-4. [Tensor-flow 与 Core primitives](dsl/tensor-flow.md)
-5. [Core 与算法库](dsl/core-and-algorithms.md)
-6. [数值与确定性](dsl/numerics.md)
-7. [编译器模块架构](compiler/architecture.md)
-8. [Kernel IR](compiler/kernel-ir.md)
-9. [Physical Program 与 Plan decisions](compiler/physical-plan.md)
-10. [后端 lowering](compiler/backend-lowering.md)
-11. [编译产物与运行边界](compiler/compiled-artifact.md)
-12. [环境、依赖与构建](setup/environment.md)
-
-典型 kernel 的 DSL 写法单独放在 `kernels/`：
-
-- [GEMM](kernels/gemm.md)
-- [Stable softmax](kernels/softmax.md)
-- [FlashAttention forward](kernels/attention.md)
-- [Host-visible two-pass reduction](kernels/reduction.md)
-- [Ragged MoE expert kernel](kernels/moe.md)
-
-## 文档分工
-
-```text
-doc/
-├── dsl/       source language 的构造与语义
-├── compiler/  编译器模块、IR、Plan、lowering 与产物
-├── kernels/   按 kernel 类型组织的 canonical DSL 模板
-└── setup/     可复现环境、依赖与构建入口
-```
-
-每个概念只有一个权威落点。其他文档只引用该定义，不复制出第二套规则。
+编译器 IR、pass、target lowering 和运行时合同将在编程模型与 DSL 通过审查后另行定义。现有实现和历史报告都不能反向修改这里的语言语义。
