@@ -101,7 +101,7 @@ NaN与tie behavior来自明确combine。`reduce.max`使用propagating maximum；
 
 scaled-contract schema定义logical element format、carrier packing、scale encoding、group relation、rounding、special values与accumulator dtype。普通target不能以native primitive限制反向缩窄该语义。
 
-当前canonical microscaling formats定义如下：
+本规范的canonical microscaling formats定义如下：
 
 - `e2m1` logical element占4 bits，sign为bit 3；正值编码`0..7`依次表示`0, 0.5, 1, 1.5, 2, 3, 4, 6`，sign bit取反数值符号；无NaN或infinity。两个elements按logical reduction coordinate递增顺序打包到一个`u8`，较小coordinate使用低nibble；
 - `e4m3`采用上文`f8e4m3fn`的8-bit encoding；

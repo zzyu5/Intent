@@ -4,6 +4,20 @@
 推进骨架。判据:本轮改动是否让某个语言构造/IR 节点
 更接近"能 lowering 出后端代码"?不是,就不要做。
 
+## 规格权威
+`doc/` 是最终设计规格,实现必须向它收敛。动 DSL、canonical KIR、compiler IR/pass、
+provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对应章节。
+
+- `doc/programming-model/` 定义作者、kernel、host 与 compiler 的语义边界。
+- `doc/dsl/` 定义 public surface 与唯一 canonical semantics。
+- `doc/compiler/` 定义 KIR 之后的 executable physical programs、passes、target
+  extensions 与外部 provider compiler 边界。
+- `report/` 只记录讨论、现状和验证事实,不是规格权威。
+
+当前实现、旧 IR、examples、历史报告或任一 target API 都不能反向定义规格。代码与 `doc/`
+不一致时,按规格迁移代码并删除旧 executable path;不得为了保住现状而把 `doc/` 改成当前行为。
+只有用户明确要求修改设计时才改 `doc/`;普通实现推进不把进度、失败、性能数字或临时字段同步进去。
+
 ## 目录结构纪律
 目录结构就是架构,内部层级和顶层目录同样重要。动手前先从整体结构判断
 文件归属,不能只找一个能放的位置。

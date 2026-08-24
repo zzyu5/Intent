@@ -199,7 +199,7 @@ acc = I.sparse_contract(
 
 `format` 是语言定义的closed typed schema，不是provider字符串或opaque descriptor。每个schema定义group size、nonzero count、compressed ordering、metadata到logical reduction positions的映射、合法metadata与logical dtype rules。
 
-当前真实schemas包括`one_of_two`与`two_of_four`；它们的logical position metadata与compressed ordering见[`types-numerics-and-effects.md`](types-numerics-and-effects.md)。增加新格式需要定义新的concrete schema。external packed metadata由作者显式解释，instruction-native metadata layout、physical repacking、memory placement与sparse MMA属于target lowering。`sparse_contract_2to4`可作为surface shorthand，但不形成第二条canonical path。
+本规范定义的schemas包括`one_of_two`与`two_of_four`；它们的logical position metadata与compressed ordering见[`types-numerics-and-effects.md`](types-numerics-and-effects.md)。增加新格式需要定义新的concrete schema。external packed metadata由作者显式解释，instruction-native metadata layout、physical repacking、memory placement与sparse MMA属于target lowering。`sparse_contract_2to4`可作为surface shorthand，但不形成第二条canonical path。
 
 sparse contract同样继承ordinary contract的非空reduction、batch/free-axis、result order与accumulator规则；format只替换一个operand沿声明compression axis的logical value relation。
 

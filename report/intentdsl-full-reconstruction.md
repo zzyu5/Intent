@@ -20,7 +20,7 @@ IntentDSL 已经经历了多轮 DSL、compiler、三后端、examples 和 baseli
 
 Intent 要占据 Triton kernel 的生态位置：用户仍在普通 Python 项目里写 kernel，多个 kernels 仍由 Python wrapper 编排；但 Intent 作者写跨后端 logical kernel algorithm，而不是 GPU block/SPMD skeleton。只有先固定这一点，后续 compiler 才知道哪些结构必须保持、哪些 realization 可以自由选择。
 
-下面按这一阶段真实发生的三十轮讨论记录你的输入、我的输出和当前校正。
+下面按真实发生的讨论轮次记录你的输入、我的输出和当前校正。
 
 ## 第一轮：清理旧规格，从 DSL 开始完整重构
 
@@ -1211,7 +1211,255 @@ programming model 与 DSL 审定后，本报告继续记录：
 - shared、Triton、cuTile、TileLang 以及未来 CPU/RVV 的责任边界；
 - examples/source/runtime/baseline 的重新接入和最终验证。
 
-这些阶段尚未在当前三十轮中展开，不能用第一阶段的 DSL 结论提前替它们作答。
+这些阶段在前三十轮中尚未展开，不能用第一阶段的 DSL 结论提前替它们作答；第三十一轮开始进入 compiler 阶段。
+
+## 第三十一轮：从已冻结的 KIR 进入 compiler，重读 V2 自查与 Triton 两层 IR
+
+### 你的输入
+
+> “编程模型和 DSL 基本确定了。下一步是 compiler 本身。先看 `gpu-compiler-space-pass-and-baseline-contract.md` 暴露的问题；继续参考 Triton 的两层，一个 TTIR、一个 TTGIR。先搞清楚我们现在的 compiler 到底应该怎样设计，对话继续记录在这份持续报告中。”
+
+你同时强调：前一阶段已经裁决的是作者语言，不应在进入 compiler 后又把旧 `state_stream`、`partition`、独立 ragged op 或旧 Plan 结构当成新设计前提。Compiler V2 和自查报告都只是证据；当前代码、Triton 实现与新的 KIR 语义要重新对齐。
+
+### 我的输出
+
+我完整复核了自查报告、当前 `intent_plan` 主链和真实 Triton TTIR→TTGIR pipeline。自查的核心诊断仍成立，但其中列举的旧 KIR operation inventory 已被前三十轮 DSL 裁决淘汰，不能机械照搬。
+
+当前 `intent_plan.exec_*` 并不是一份已物理化的 executable program。conversion 只是把 `intent.foo` 改名为 `intent_plan.exec_foo`，原样复制 operands、types、attributes 与 regions；`ProgramOp` 旁边的 Axis/Range/Launch/Transfer/Contract/Buffer 等 records 保存部分决定，但 program-id、physical loops、fragment values、access operands、mask、accumulator def-use 和 storage lifetime 并未进入 executable function。shared passes 多数更新 records，Triton `ProgramForms` 又回到 KIR/KernelModel 重推 orientation、reduction axes、ragged route、gather 与 stream facts，最终 materializer 才现场生成 pointer、mask、shape、loop、workspace、grid 与 wrapper。当前真正缺的是程序载体，不是再加一层 records。
+
+真实 Triton 两层提供的关键方法不是名称，而是 IR 不变量：
+
+- TTIR 已是一份完整 GPU block program：program id、静态 block tensor、pointer/mask access、SCF loop/control、dot/reduce/scan 都在当前 SSA program中；TTIR passes直接替换、移动或删除 op。
+- TTIR→TTGIR conversion把 distributed encoding materialize到 tensor types，并在需要时插入 `convert_layout`；coalesce、matmul acceleration、pipeline、warp specialization、TMA/TMEM 等继续通过 op/type/region rewrite形成当前程序，而不是写旁表后交给 printer 猜。
+- Intent 输出 Triton DSL source后，外部 Triton仍会建立 TTIR、TTGIR并完成这些 lower transformations。因此 Intent不能复制一套 TTGIR/NVIDIA compiler；它缺的是 Triton作者本来手写、而 Triton compiler不会从逻辑算法替作者补出的 block program。
+
+由此得到当前 compiler 的候选分层：
+
+```text
+canonical Intent KIR
+    │  immutable algorithm authority
+    ▼
+executable GPU block program IR
+    │  explicit program mapping, loops, fragment SSA,
+    │  accesses/validity, buffers/lifetimes and physical structured ops
+    ▼
+provider-legal program IR
+    │  Triton/cuTile/TileLang surface legalization and capability forms
+    ▼
+deterministic provider source serialization
+    ▼
+external provider compiler
+    └─ Triton: source → TTIR → TTGIR/NVIDIA IR → LLVM/PTX
+```
+
+这里不存在把 Intent KIR 简单类比成 TTIR、再把当前 Plan 类比成 TTGIR的关系。Intent KIR 比 TTIR更高；新建的 shared GPU program应拥有一份 Triton-source/TTIR级别所需的完整 block-program内容，但不拥有 TTGIR 的 lane/warp/layout/MMA/TMA/pipeline machine representation。Triton provider IR也不是一份自造 TTIR，它只是能独立验证并一一序列化为 Triton DSL的程序。
+
+CPU/RVV不消费这份 GPU IR。它们与 GPU 从同一 canonical KIR分叉，各自建立适合自己的 executable physical program；可复用的是 KIR semantics、shape/index/effect/dependence/reuse analyses与 transformation reasoning，不是把 GPU program-id、fragment或block IR改名后继续使用。同一作者算法在 CPU 上未必是全局最优算法，但可以被正确复用并采用不同物理实现；若需要另一算法，仍由作者提供另一 kernel/module。
+
+下一阶段的硬不变量应当是：
+
+1. KIR 是唯一算法权威；physical IR 可以等价改写，但每个 physical op保留可追溯 provenance与明确的语义保持条件。
+2. 第一份 GPU program可以保守、可以慢，但必须完整可执行；不能有“Range record已选、pointer/mask以后由 emitter重建”之类的洞。
+3. 会改变执行的决定必须成为当前 IR 的 op/type/region/operand/result/def-use。side records只可保存analysis cache、provenance或search schema，不能与 executable function共同解释程序。
+4. shared passes直接改写当前 GPU program：ownership/blocking改变program mapping、loop和fragment types；replay/materialization改变def-use；access lowering产生显式access与validity；structured realization产生真实accumulator与physical reduction/contract skeleton。
+5. provider conversion只消费当前 GPU program。它可以选择pointer或descriptor等真实provider surface form，但不能回到KIR、shape或role重新建立shared ownership、range、axis与validity。
+6. provider-legal IR必须能独立验证，terminal translator只序列化；字符串生成阶段不得创造loop、workspace、mask、grid或tuner axis。
+7. Triton已有的distributed layout、coalescing、MMA/shared/TMEM encoding、software pipeline、warp specialization、TMA lowering与winner selection继续委托Triton。
+
+这也说明当前 Plan records的去向不能一刀切：Launch/Axis/Range中影响执行的部分要进入program mapping、loop与types；Transfer/Padding进入显式access/validity graph；Contract/Reduction/Scan进入physical SSA和structured ops；Buffer进入allocation/lifetime/use-def；只有纯derived analysis、provenance与candidate schema适合继续作为非executable记录。
+
+当前仍需继续裁决、不能在本轮拍定的是三件事：
+
+1. KIR→GPU block program的“完整保守初始程序”采用什么普遍合法的program mapping；不能为了容易实现就假定每个kernel都是一个输出点一个program，也不能用全kernel单program掩盖dynamic buffer与effect合法性。
+2. shared GPU block program需要哪些最小types/ops，才能同时机械投影到Triton与cuTile，并允许TileLang在provider层增加显式storage/copy/sync legalization；不能先按当前三个materializer函数反推op列表。
+3. provider-legal program是独立dialect，还是同一GPU dialect的严格legal subset；判据不是文件数量，而是它能否在不访问KIR和KernelModel的情况下独立verify并确定性serialization。
+
+### 当前校正
+
+- `gpu-compiler-space-pass-and-baseline-contract.md` 对“exec clone + side records + hidden materializer compiler”的诊断继续成立；其中以旧 `state_stream/partition/ragged` KIR为前提的清单不再是目标设计。
+- 参考 Triton 的正确方式是采用“决定进入当前IR并由passes重写”的纪律，以及严格区分block-program语义与distributed/machine lowering；不是在Intent内部复制TTIR/TTGIR两套dialect。
+- 当前最先需要定义的是executable GPU block program的完整不变量与保守initial conversion。未定义这一步之前，不应继续搬pass、拆materializer或增加provider attrs。
+- 本轮只形成compiler阶段的起始判断并更新持续报告，不修改compiler实现或正式compiler spec。
+
+## 第三十二轮：撤回“每个 provider 必须有独立 IR”的过度设计
+
+### 你的输入
+
+> “为什么 Triton 一定要抽象出自己的 IR？此前已经确定：shared program 已经拥有的 execution/value/access/validity/structured facts，Triton 与 cuTile 默认复用同一来源；不能预先把三家扩张成三套完整 leaf compiler。你凭什么又改变？”
+
+### 我的输出
+
+你的质疑成立。第三十一轮把两个不同要求错误地合并了：
+
+1. source emitter 之前必须已有一份自足、可执行、可验证的程序，不能由字符串 materializer临时创造grid、loop、pointer、mask、workspace与value flow；
+2. 每个provider都必须拥有一份独立provider IR。
+
+第一项由当前失败结构直接逼出；第二项没有被证据逼出。我因为当前Triton materializer很厚，就把“消除隐藏编译器”过度推导成“建立Triton provider dialect”。但隐藏决定也可以通过完善shared GPU executable IR而消失；若Triton/cuTile只是对同一program model使用不同API spelling，随后完全可以是薄的deterministic lowering/serialization，不需要再复制一份program authority。
+
+正确的最小架构恢复为：
+
+```text
+canonical Intent KIR
+    ▼
+shared executable GPU program IR
+    ├─ thin Triton legalization/serialization → Triton DSL source
+    ├─ thin cuTile legalization/serialization → cuTile source
+    └─ 仅在真实差异逼出时增加 TileLang-local legalization
+```
+
+这里的“thin legalization”不预设独立dialect。它可以是对shared GPU IR运行的capability verifier、少量form selection与直接serializer。只有某个provider的source surface确实要求shared GPU program没有、也不应公共化的结构，而且该结构需要多步变换、独立legality和后续消费时，才由证据建立provider-local IR/ops。不能为了形式完整或对称预建三套。
+
+因此，第三十一轮所写“provider-legal program IR”不再是架构必选层。真正必须独立成立的是shared GPU executable IR；provider边界只要求在serialization前所有决定已经闭合，并不要求决定存在于一份provider专属dialect中。
+
+Triton TTIR/TTGIR的参考价值也重新限定：
+
+- 借鉴的是决定进入当前IR的op/type/region/def-use、pass直接改写当前程序、legality驱动conversion这些编译器方法；
+- 不复制TTIR/TTGIR层数，不在Intent中重建Triton provider IR，更不复制NVIDIA lower compiler；
+- shared GPU IR应表达Triton与cuTile共同需要的block program事实；TileLang额外需要的显式storage/copy/sync必须先读真实surface与lowering，确认无法由共同表示直接序列化后再决定是否增加local legalization。
+
+### 当前校正
+
+- 撤回“每个provider都需要一份独立provider-legal IR”的推导。
+- 保留“shared GPU executable IR必须自足、terminal source emission不得重新作决定”的硬要求。
+- Triton/cuTile默认从同一shared GPU program薄映射；provider-local IR或额外pass只能由已确认的目标语义/legality差异逼出，不能预建。
+- compiler阶段当前真正需要继续定义的是shared GPU executable IR，而不是Triton dialect的形状。
+
+## 第三十三轮：共同 GPU IR、vendor 扩展与架构版本不是同一层
+
+### 你的输入
+
+> “还是说其实有这样的 IR 更好？Triton 面对 NVIDIA/AMD 是不是一个 TTGIR；下面是什么？SM90 之类不同版本又如何表达？”
+
+你要求把“独立provider IR”从二元争论改成真实编译器问题：共同IR、vendor扩展与具体架构版本分别如何存在，Intent应当类比哪一层。
+
+### 我的输出
+
+真实 Triton 不是“每个vendor一份完整TTGIR”，也不是“所有差异只能由printer处理”。它采用共同核心加局部扩展：
+
+```text
+Triton source
+    ▼
+TTIR (`tt`)
+    ▼
+共同 TritonGPU IR (`ttg`)
+    ├─ NVIDIA extension ops (`ttng`, 以及更低层 `nvg`/`nvws`)
+    └─ AMD extension ops (`amdg`)
+    ▼
+target-specific LLVM conversion
+    ├─ NVVM / PTX
+    └─ ROCDL / AMDGPU
+```
+
+NVIDIA与AMD都调用同一个TTIR→TritonGPU conversion，先得到共同`ttg` program。后续pipeline在同一个current module中运行共同TTGIR passes，并按需引入/消费`ttng`或`amdg` operations；源码没有一个必须把完整program复制成“独立NVIDIA IR”或“独立AMD IR”的统一阶段。Vendor dialect只承载共同TTGIR无法正确表示、且后续passes/lowering确实需要操作的target-local constructs。
+
+SM80、SM90、SM100、SM120也没有各自独立dialect。它们共享`ttg + ttng`：module保存`ttg.target = "cuda:<capability>"`，`TargetFeatures`从该属性得到compute capability；同一pipeline按capability启用Hopper warp specialization、Blackwell TMEM/CLC、TMA lowering或其它passes，具体ops/patterns再用feature predicates验证与lower。SM120即使与SM100同属Blackwell分支，也可以由feature predicates排除不支持的cluster、`ld.red`或reuse能力。AMD同样以`gfx arch → ISA family → feature predicates/pipeline branches`表达CDNA/RDNA差异，而不是每个gfx建立一份IR。
+
+这把前两轮的二元说法进一步收紧：
+
+- **必须有**一份共同、完整、唯一的shared executable GPU IR；
+- **可以有**target/provider-local extension ops或小dialect，但它们扩展当前共同program，不复制完整program authority；
+- **不默认有**Triton、cuTile、TileLang三套完整leaf IR；
+- **不为每个SM/gfx版本建IR**，版本差异进入physical module的target capability、legality、pass pipeline与pattern selection。
+
+Intent中还必须区分两条正交维度：
+
+1. Triton/cuTile/TileLang是生成source所面向的provider surface；
+2. NVIDIA/AMD以及SM90/SM100/gfx942等是provider下层的hardware target。
+
+Triton一个provider本身可以继续面向NVIDIA或AMD，因此不能把“一个provider”机械类比成“Triton的一个vendor dialect”。Intent的shared GPU IR应先保存三家共同消费的program mapping、fragment SSA、access/validity、structured physical ops与dependency；provider surface若只差API spelling，直接legalize/serialize。只有例如TileLang显式storage/copy/sync，或Triton descriptor form这类结构满足下面条件时，才值得成为local extension op：
+
+- 共同IR无法无损表达且不应公共化；
+- 不只是一个终端函数名或字符串差异；
+- 有多个后续passes/consumers需要检查或改写；
+- 需要独立legality/verifier；
+- 其选择在serialization之前必须显式存在于current program。
+
+若只需把shared access机械写成`tl.load`或`ct.load`，没有local IR的必要；若选择descriptor后会产生descriptor value、改变access operands、约束block shape并被后续pass消费，则可以在同一program中引入一个Triton-local extension op，而不是复制整份Triton program。
+
+不同GPU版本同理。Target capability只进入KIR之后的physical compiler；shared/provider passes可以据此产生不同program，但作者KIR不出现SM/gfx分支。对Triton路径，TTGIR以下的layout、MMA、TMA、TMEM、pipeline与ISA feature gating仍由外部Triton拥有；Intent只有在Triton DSL source必须显式表达某种surface、下层不能从普通source与config得到时，才需要provider-local表示。
+
+### 当前校正
+
+- 第三十二轮“默认不建独立provider IR”继续成立，但不能被解释成“target-local op/dialect永远不合法”。
+- 正确目标是一个shared executable GPU program，加由真实差异逼出的局部extensions；不是三份完整leaf programs，也不是所有差异都拖到字符串printer。
+- SM/gfx版本通过physical target attributes、feature queries、legality与pass/pattern selection表达，不建立architecture-specific完整IR。
+- 下一步设计shared GPU IR时，应预留可扩展operation legality，但不预建Triton/cuTile/TileLang对称dialect。
+
+## 第三十四轮：compiler 总体分层已定，但 shared GPU IR 本体尚未冻结
+
+### 你的输入
+
+> “可以，按照这个和自查，直接给出 `doc/compiler/` 的设计；还是你认为还有需要讨论、不清晰的地方？”
+
+### 我的输出
+
+当前已经足以冻结compiler的总体边界：canonical KIR是算法权威；KIR之后按target family建立独立physical program；GPU拥有一份共同、完整的executable IR；Triton/cuTile默认薄映射，TileLang等只有在真实差异逼出时增加local extensions；SM/gfx版本由physical target features与passes表达；terminal serialization不作决定；外部provider compiler继续拥有layout、machine pipeline与instruction lowering。
+
+但这还不足以直接写正式`doc/compiler/`。如果现在只把这些原则换成目录和类名，仍然没有回答当前V2失败的根因：到底什么operation/type/region使program本身可执行。仍有五项IR本体问题必须先裁决。
+
+#### 1. Shared GPU IR的执行模型
+
+必须精确定义program instance、grid/virtual coordinate、program内ordered loops、unordered logical work的physical ownership、fragment/static shape与scalar value。尤其要说明多个logical outputs、不同worksets、ordered recurrence和effects怎样共存于一个kernel，而不能再次用Axis/Range records共同解释。
+
+#### 2. 第一份完整、普遍合法的KIR→GPU program
+
+conversion不能留下hole，但目前没有证明“每个logical point一个program”或“全kernel一个program”能覆盖全部kernel。必须确定一个对multi-output、reduce/scan/contract、dynamic subregion、logical buffer和effects都定义完整的保守baseline；后续blocking/ownership passes才有明确的可改写起点。
+
+#### 3. KIR语义与physical executable authority的连接
+
+需要决定physical op怎样引用而不复制第二份算法真理：哪些内容通过稳定origin/symbol reference读取，哪些combine/control region必须lower成physical region，哪些derived facts只在analysis中重算。目标是KIR仍是语义权威，同时physical program无需结合KIR side metadata才能执行和verify。
+
+#### 4. Physical parameters与search surface怎样进入IR
+
+block/fragment extent可以是target compile-time参数，但参数必须直接约束当前types/loops/access，而不是继续只在SearchSpaceOp或字符串里出现。需要定义parameterized physical program、candidate instantiation、legality pruning与provider autotuner之间的边界；winner仍由下层实测，但每个candidate必须对应一份完整合法program。
+
+#### 5. 共同op与local extension的真实inventory
+
+共同GPU IR至少要覆盖program mapping、loops、fragment SSA、access/validity、buffers/lifetimes和physical structured operations。但pointer/descriptor、explicit allocation/copy/sync等究竟是共同form还是Triton/cuTile/TileLang local extension，必须逐项读取三家source surface与lowering后裁决，不能按当前materializer函数或追求三家对称预建。
+
+这五项不是实现细节：它们分别决定dialect边界、executable authority、pass可变换空间与provider复用程度。任何一项含糊，都可能再次产生“KIR clone + side records + hidden materializer compiler”。
+
+### 当前校正
+
+- 暂不创建正式`doc/compiler/`，避免把尚未定义的shared GPU IR写成稳定规格。
+- 下一轮应先闭合shared GPU IR的执行模型与第一份完整initial conversion；这是其它pass、provider extension和目录结构的地基。
+- 总体分层不再重开：后续讨论只解决上述IR本体，不再重新争论是否需要共同GPU IR或是否复制TTIR/TTGIR。
+
+## 第三十五轮：闭合 shared GPU IR，本轮正式写入 compiler 规格
+
+### 你的输入
+
+> “这些问题不是已经有一些答案了吗？可以直接给我吗？现在设计与目标差别到底大不大？我不熟悉编译器细节，你参考 Triton 等真实实现，把旧的错误结构彻底清除后给出这个抽象。”
+
+你要求停止把已经有证据的问题继续挂成开放讨论，也不要只给分层口号；要把 initial program、executable authority、parameter/tuner 和三家 target 边界写成可实现、可验证的正式 compiler 规格。
+
+### 我的输出
+
+我以已经冻结的 KIR 语义为输入，复核真实 Triton TTIR/TTGIR、cuTile 与 TileLang source surface，并用现有 ragged、scan、dynamic-programming、atomic、multi-output 和 mutable-buffer kernels 反证过于简单的 initial mapping。由此在 `doc/compiler/` 建立了正式设计：
+
+1. KIR 保持 immutable algorithm authority。Conversion 产生一份不依赖 KIR clone 或 side records 才能执行的 shared GPU program；origin IDs只用于验证、诊断和追踪。
+2. Initial conversion先由parallel/unique effects/free axes、def-use、alias和dependence形成logical worksets，再把必须共同拥有的computations/effects组成execution groups。Launch前可知的group domains组成带runtime segment length与prefix offset的disjoint program space；grid使用只能读取host-visible ABI metadata的typed `LaunchExpr`。Device data决定大小的ragged members不参与grid cardinality，而留在outer program内遍历，避免为了数成员偷偷引入第二个kernel。
+3. Execution group只是同一kernel内的dispatch region，不是hidden kernel。一个`@intent.kernel` specialization仍对应一个artifact和一次launch；多kernel算法由作者定义多个kernels并由host wrapper编排。
+4. Shared GPU IR显式保存program mapping、structured control与loop carries、scalar/fragment SSA、每次access的coordinates/validity/effect、structured reduce/scan/contract的完整schema、buffer allocation scope/initialization或first-write obligation/lifetime/ownership，以及atomic order与logical sharing domain。Fragment不携带lane/warp/register/shared/TMEM layout。
+5. Logical buffer根据语义落为program-private、iteration-private、invocation workspace或external view。跨program非atomic dependence在保守程序里必须收回同一program；不能假设kernel-global barrier。Invocation workspace可以作为hidden ABI argument分配，但不能引入hidden launch。
+6. Physical parameters是直接约束types、loops、accesses与launch的typed symbols。Intent给出合法domain并删除可证明非法的candidate；Triton/cuTile/TileLang各自的tuner编译、实测并选择winner，winner不是IR事实。
+7. Triton与cuTile默认薄映射同一shared program；TileLang只为其真实要求的storage/copy/sync形式增加local legalization。Provider-local extension必须由无法无损公共化、需要独立legality和后续consumer的真实结构逼出；API spelling不建立第二份IR。Triton descriptor若成为local form，其shape/stride/block/alignment、runtime allocator requirement与lifetime也必须在serialization前进入current program。SM/gfx版本由target capability与feature predicates处理，不建立架构专属完整dialect。
+8. External Triton继续拥有TTIR之后的distributed layout、coalescing、MMA/shared/TMEM、TMA lowering、software pipeline、warp specialization和LLVM/PTX。Intent不复制这部分compiler。
+
+正式规格分为：
+
+- `doc/compiler/kir-to-gpu.md`：workset、execution group、initial mapping、buffer/effect scope与construction verification；
+- `doc/compiler/gpu-program-ir.md`：共同executable GPU IR的types、ops与不变量；
+- `doc/compiler/passes-and-analyses.md`：canonical/construction/physical analyses、passes、semantic-preserving rewrites与verifiers；
+- `doc/compiler/physical-parameters.md`：typed parameters、candidate legality、provider tuner与baseline合同；
+- `doc/compiler/target-lowering.md`：Triton/cuTile/TileLang、hardware features、local extensions与terminal serialization边界。
+
+### 当前校正
+
+- 与目标规格相比，当前V2实现不是“小修几处字段”即可完成：`exec_*`同构clone、side decision records、provider回读KIR和厚materializer都不再属于最终架构。需要按新IR纵向迁移并删除旧authority，而不是给旧Plan继续补record。
+- 目标并不是复制TTIR/TTGIR，也不是三套provider leaf compilers；真正新增的是Intent作者没有写、而provider compiler也不会从logical KIR替作者发明的完整GPU block program。
+- Compiler总体分层和shared GPU IR表示层已经闭合。具体dialect类名、pass切分与provider extension数量留给实现从真实rewrite依赖决定，但它们不能改变这里规定的authority、可执行字段与target边界。
+- 本轮只建立稳定compiler设计，没有修改现有compiler实现，也没有用实现现状反向缩窄规格。
 
 ## 维护方式
 
