@@ -1,12 +1,12 @@
 # Triton source inventory
 
-本目录只保存两类内容：冻结的 baseline-v1 实际使用过的上游源码，以及 baseline-new 已登记、可由相邻 runtime 独立调用的高性能入口。表中的计数单位是一次可独立调用与计时的算法入口，不是文件数，也不是 `@triton.jit` 内部 helper 数。
+本目录只保存两类内容：冻结的 Baseline V1 实际使用过的上游源码，以及 Baseline V2 已登记、可由相邻 runtime 独立调用的高性能入口。表中的计数单位是一次可独立调用与计时的算法入口，不是文件数，也不是 `@triton.jit` 内部 helper 数。
 
 运行前进入项目的 Triton Python 环境；命令均从仓库根目录执行。当前 registry 共 54 个入口：38 个原 baseline-v2 入口，加上 16 个继续保留历史来源边界的 baseline-v1 入口。
 
 Upstream roots：`triton-lang/triton`、`Dao-AILab/flash-attention`、`linkedin/Liger-Kernel`、`facebookresearch/xformers`、`meta-pytorch/tritonbench`、`meta-pytorch/applied-ai`、`state-spaces/mamba`、`fla-org/flash-linear-attention`、`vllm-project/vllm`；V1-only 的 FlagGems 来源为 `FlagOpen/FlagGems`。
 
-## baseline-new 主清单（38）
+## Baseline V2 主清单（38）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
@@ -53,7 +53,7 @@ V2 的 Meta entries 来自公开的 `meta-pytorch/applied-ai`；MoE runtime 只�
 
 ## baseline-v1 复用来源（16）
 
-以下源码既保留旧 CSV 的真实来源，也已经作为独立 entry 进入 baseline-new registry。单列是为了保留来源边界，不表示它们被排除在 54 个入口之外。
+以下源码既保留旧 CSV 的真实来源，也已经作为独立 entry 进入 Baseline V2 registry。单列是为了保留来源边界，不表示它们被排除在 54 个入口之外。
 
 | V1 entry | source | runtime |
 |---|---|---|

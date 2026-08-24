@@ -5,10 +5,10 @@
 - `kernels/`：作者写下的目标无关算法；按算法职责分层，不按 target language 分叉。
 - `repro/common/`：V1 与 V2 共用的数值、计时和 artifact 执行支持。
 - `repro/{triton,cutile,tilelang}/`：冻结的 V1 provider 接线。
-- `repro/v2/`：三家 source inventory（Triton 54、cuTile 37、TileLang 37）、结构化测量与 provider ABI adapter；没有同语义 DSL 的 entry 在比较前明确拒绝，不用相似算法冒充。
+- `repro/v2/`：三家 Baseline V2 source inventory（Triton 54、cuTile 37、TileLang 37）、结构化测量与 provider ABI adapter；没有同语义 DSL 的 entry 在比较前明确拒绝，不用相似算法冒充。
 - `run/`：人工可执行入口。
 
-`V1` 指 `report/baseline/` 冻结矩阵实际使用过的算法；`V1+V2` 指 V2 继续复用同一算法构造；`V2` 指为了和新 source 的算法边界对齐而新增的 DSL。相似但算法不同的 entry 不会因为名称相近而合并。
+`V1` 与 `V2` 只表示 baseline corpus membership，不是 DSL、KIR 或 compiler 版本。`V1+V2` 表示两个 baseline 集合复用同一算法构造；`V2` 表示为了和新 source 的算法边界对齐而加入 Baseline V2 的 entry。相似但算法不同的 entry 不会因为名称相近而合并。
 
 ## V1 算法清单
 
@@ -197,8 +197,8 @@ V1 中的 `variant_*` 只证明同一算法的等价 DSL 分解可以编译，�
 单条或整组 V2；第二个参数是该设备对应的 CSV：
 
 ```bash
-./examples/run/baseline-v2.sh triton report/baseline-new/triton-5090.csv fused_softmax
-./examples/run/baseline-v2.sh triton report/baseline-new/triton-5090.csv
+./examples/run/baseline-v2.sh triton report/baselinev2/triton-5090.csv fused_softmax
+./examples/run/baseline-v2.sh triton report/baselinev2/triton-5090.csv
 ```
 
 V2 runner 只从 `repro/v2/registry.py` 取 entry 顺序；provider adapter 只处理 source ABI、输入 view、multi-kernel launch 与数值/计时接线，不改变 DSL 算法。输入、输出和 workspace 在计时前构造，source 首次 JIT/编译也在计时外；CSV 的两列时间都只覆盖已经准备好的单 kernel launch 或完整 multi-kernel pipeline launch。registry 中的 source 路径是可审计 inventory，真正的 callable 接线位于相邻 provider adapter。

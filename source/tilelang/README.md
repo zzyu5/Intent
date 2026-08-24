@@ -4,7 +4,7 @@
 
 Upstream root：`tile-ai/tilelang`。本轮没有用第三方复写或 PyTorch reference 充当 TileLang source。
 
-## baseline-v2 entries（37）
+## Baseline V2 entries（37）
 
 | 集合 | entry | source / public boundary | 模型级输入 | runtime |
 |---|---|---|---|---|
