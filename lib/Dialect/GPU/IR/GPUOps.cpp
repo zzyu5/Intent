@@ -1,0 +1,748 @@
+#include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/DenseSet.h"
+
+using namespace mlir;
+
+namespace intent::gpu {
+namespace {
+
+Type elementType(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getElementType();
+  return type;
+}
+
+bool sameShape(Type lhs, Type rhs) {
+  auto left = dyn_cast<FragmentType>(lhs);
+  auto right = dyn_cast<FragmentType>(rhs);
+  if (static_cast<bool>(left) != static_cast<bool>(right))
+    return false;
+  return !left || (left.getShape() == right.getShape() &&
+                   left.getAxisMaps() == right.getAxisMaps() &&
+                   left.getValidity() == right.getValidity() &&
+                   left.getOwner() == right.getOwner());
+}
+
+LogicalResult verifyDataSchemas(Operation *operation, TypeRange operands,
+                                Type result, bool resultIsPredicate = false) {
+  for (Type operand : operands)
+    if (!sameShape(operand, result))
+      return operation->emitOpError("physical data shapes/ownership disagree");
+  if (resultIsPredicate) {
+    if (!elementType(result).isInteger(1))
+      return operation->emitOpError("physical predicate result must be i1");
+  } else {
+    for (Type operand : operands)
+      if (elementType(operand) != elementType(result))
+        return operation->emitOpError("physical data element types disagree");
+  }
+  return success();
+}
+
+unsigned rankOf(Type type) {
+  if (auto view = dyn_cast<ViewType>(type))
+    return view.getRank();
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getShape().size();
+  if (auto buffer = dyn_cast<BufferType>(type))
+    return buffer.getShape().size();
+  return 0;
+}
+
+Type resourceElementType(Type type) {
+  if (auto view = dyn_cast<ViewType>(type))
+    return view.getElementType();
+  if (auto buffer = dyn_cast<BufferType>(type))
+    return buffer.getElementType();
+  return {};
+}
+
+LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
+                                 FragmentType rhs, FragmentType result,
+                                 ArrayRef<int64_t> lhsReduction,
+                                 ArrayRef<int64_t> rhsReduction,
+                                 ArrayRef<int64_t> lhsBatch,
+                                 ArrayRef<int64_t> rhsBatch,
+                                 std::optional<int64_t> lhsExtentException =
+                                     std::nullopt) {
+  if (lhsReduction.empty() || lhsReduction.size() != rhsReduction.size() ||
+      lhsBatch.size() != rhsBatch.size())
+    return owner->emitOpError("physical contract axis-pair counts disagree");
+  llvm::DenseSet<int64_t> lhsAxes;
+  llvm::DenseSet<int64_t> rhsAxes;
+  auto verifyPairs = [&](ArrayRef<int64_t> leftAxes,
+                         ArrayRef<int64_t> rightAxes,
+                         StringRef role) -> LogicalResult {
+    for (auto [left, right] : llvm::zip(leftAxes, rightAxes)) {
+      if (left < 0 || right < 0 ||
+          static_cast<size_t>(left) >= lhs.getShape().size() ||
+          static_cast<size_t>(right) >= rhs.getShape().size() ||
+          !lhsAxes.insert(left).second || !rhsAxes.insert(right).second ||
+          (lhs.getShape()[left] != rhs.getShape()[right] &&
+           (!lhsExtentException || left != *lhsExtentException)))
+        return owner->emitOpError()
+               << "physical contract " << role << " axes are invalid";
+    }
+    return success();
+  };
+  if (failed(verifyPairs(lhsReduction, rhsReduction, "reduction")) ||
+      failed(verifyPairs(lhsBatch, rhsBatch, "batch")))
+    return failure();
+  size_t expectedRank = lhsBatch.size() +
+                        (lhs.getShape().size() - lhsAxes.size()) +
+                        (rhs.getShape().size() - rhsAxes.size());
+  return result.getShape().size() == expectedRank
+             ? success()
+             : owner->emitOpError(
+                   "physical contract result rank disagrees with batch/free axes");
+}
+
+} // namespace
+
+LogicalResult ParameterOp::verify() {
+  return getParameter().getCandidates().empty()
+             ? emitOpError("parameter has no legal candidate")
+             : success();
+}
+
+LogicalResult PhysicalExprOp::verify() { return success(); }
+
+LogicalResult ProgramIdOp::verify() {
+  return success();
+}
+
+LogicalResult DelinearizeOp::verify() {
+  if (getExtents().empty() || getExtents().size() != getCoordinates().size() ||
+      getLaunchExtents().size() != getExtents().size())
+    return emitOpError(
+        "delinearization requires one runtime and launch extent per coordinate");
+  for (Attribute extent : getLaunchExtents())
+    if (!isa<PhysicalExprAttr>(extent))
+      return emitOpError("delinearization launch extents must be typed expressions");
+  return success();
+}
+
+LogicalResult DimOp::verify() {
+  return static_cast<uint64_t>(getAxis()) < getView().getType().getRank()
+             ? success()
+             : emitOpError("view dimension axis is out of range");
+}
+
+LogicalResult RangeOp::verify() {
+  return getResult().getType().getSourceId() != 0
+             ? success()
+             : emitOpError("physical range requires logical source provenance");
+}
+
+LogicalResult RangeBoundOp::verify() {
+  return getBound() <= 2 ? success()
+                         : emitOpError("range bound selector is invalid");
+}
+
+LogicalResult MakeRangeOp::verify() {
+  auto result = getResult().getType();
+  if (result.getShape().size() != 1 || result.getElementType() != getStart().getType())
+    return emitOpError("physical range must produce a rank-one index fragment");
+  auto mapping = dyn_cast<AxisMapAttr>(result.getAxisMaps()[0]);
+  if (!mapping || mapping.getSourceId() != static_cast<uint64_t>(getSourceId()) ||
+      mapping.getSourceAxis() != static_cast<uint32_t>(getSourceAxis()))
+    return emitOpError("physical range result lost logical provenance");
+  return success();
+}
+
+LogicalResult SplatOp::verify() {
+  return getResult().getType().getElementType() == getValue().getType()
+             ? success()
+             : emitOpError("splat element/result type disagree");
+}
+
+LogicalResult BroadcastOp::verify() {
+  if (auto input = dyn_cast<FragmentType>(getValue().getType())) {
+    auto result = getResult().getType();
+    if (input.getElementType() != result.getElementType() ||
+        input.getOwner() != result.getOwner() ||
+        input.getShape().size() > result.getShape().size())
+      return emitOpError("broadcast physical schema is invalid");
+  } else if (getValue().getType() != getResult().getType().getElementType()) {
+    return emitOpError("scalar broadcast element type disagrees");
+  }
+  return success();
+}
+
+LogicalResult UnaryOp::verify() {
+  if (getOperatorKind() > 12 || !sameShape(getInput().getType(), getResult().getType()) ||
+      elementType(getInput().getType()) != elementType(getResult().getType()))
+    return emitOpError("unary physical schema is invalid");
+  return success();
+}
+
+LogicalResult BinaryOp::verify() {
+  if (getOperatorKind() > 17)
+    return emitOpError("binary operator is outside the canonical enum");
+  return verifyDataSchemas(getOperation(), {getLhs().getType(), getRhs().getType()},
+                           getResult().getType());
+}
+
+LogicalResult CompareOp::verify() {
+  if (getPredicate() > 5 ||
+      !sameShape(getLhs().getType(), getRhs().getType()) ||
+      !sameShape(getLhs().getType(), getResult().getType()) ||
+      elementType(getLhs().getType()) != elementType(getRhs().getType()) ||
+      !elementType(getResult().getType()).isInteger(1))
+    return emitOpError("comparison physical schema is invalid");
+  return success();
+}
+
+LogicalResult SelectOp::verify() {
+  if (!sameShape(getCondition().getType(), getTrueValue().getType()) ||
+      !sameShape(getTrueValue().getType(), getFalseValue().getType()) ||
+      !sameShape(getTrueValue().getType(), getResult().getType()) ||
+      !elementType(getCondition().getType()).isInteger(1) ||
+      elementType(getTrueValue().getType()) != elementType(getFalseValue().getType()) ||
+      elementType(getTrueValue().getType()) != elementType(getResult().getType()))
+    return emitOpError("select physical schema is invalid");
+  return success();
+}
+
+LogicalResult CastOp::verify() {
+  return sameShape(getValue().getType(), getResult().getType())
+             ? success()
+             : emitOpError("cast must preserve physical shape and ownership");
+}
+
+LogicalResult BitcastOp::verify() {
+  if (!sameShape(getValue().getType(), getResult().getType()))
+    return emitOpError("bitcast must preserve physical shape and ownership");
+  auto width = [](Type type) -> std::optional<unsigned> {
+    if (auto integer = dyn_cast<IntegerType>(type))
+      return integer.getWidth();
+    if (auto floating = dyn_cast<FloatType>(type))
+      return floating.getWidth();
+    return std::nullopt;
+  };
+  auto source = width(elementType(getValue().getType()));
+  auto target = width(elementType(getResult().getType()));
+  return source && target && *source == *target
+             ? success()
+             : emitOpError("bitcast element widths disagree");
+}
+
+LogicalResult ReshapeOp::verify() {
+  auto source = dyn_cast<FragmentType>(getValue().getType());
+  auto result = dyn_cast<FragmentType>(getResult().getType());
+  if (!source || !result || source.getElementType() != result.getElementType() ||
+      source.getOwner() != result.getOwner() || !getReassociation())
+    return emitOpError("reshape physical schema is invalid");
+  return success();
+}
+
+LogicalResult TransposeOp::verify() {
+  auto source = getValue().getType();
+  auto result = getResult().getType();
+  if (source.getShape().size() != result.getShape().size() ||
+      getPermutation().size() != source.getShape().size() ||
+      source.getElementType() != result.getElementType() ||
+      source.getOwner() != result.getOwner())
+    return emitOpError("transpose physical rank/type/owner is invalid");
+  llvm::DenseSet<int64_t> axes;
+  for (auto [target, input] : llvm::enumerate(getPermutation()))
+    if (input < 0 || static_cast<size_t>(input) >= source.getShape().size() ||
+        !axes.insert(input).second || source.getShape()[input] != result.getShape()[target])
+      return emitOpError("transpose permutation does not map physical extents");
+  return success();
+}
+
+LogicalResult JoinOp::verify() {
+  auto lhs = getLhs().getType();
+  auto rhs = getRhs().getType();
+  auto result = getResult().getType();
+  if (lhs != rhs || getAxis() != lhs.getShape().size() ||
+      result.getShape().size() != lhs.getShape().size() + 1 ||
+      result.getElementType() != lhs.getElementType() ||
+      result.getOwner() != lhs.getOwner())
+    return emitOpError("join physical schema is invalid");
+  for (unsigned axis = 0; axis < lhs.getShape().size(); ++axis)
+    if (result.getShape()[axis] != lhs.getShape()[axis])
+      return emitOpError("join changed a pre-existing physical extent");
+  auto trailing = dyn_cast<PhysicalExprAttr>(
+      result.getShape()[result.getShape().size() - 1]);
+  if (!trailing ||
+      trailing.getKind() != static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      trailing.getValue() != 2)
+    return emitOpError("join trailing physical extent must be exactly two");
+  return success();
+}
+
+LogicalResult MakeRecordOp::verify() {
+  auto result = getResult().getType();
+  if (result.getFieldTypes().size() != getFields().size())
+    return emitOpError("record fields do not match its physical type");
+  for (auto [field, type] : llvm::zip(getFields(), result.getFieldTypes()))
+    if (field.getType() != cast<TypeAttr>(type).getValue())
+      return emitOpError("record field has the wrong physical type");
+  return success();
+}
+
+LogicalResult ExtractOp::verify() {
+  auto record = getRecord().getType();
+  if (getField() >= record.getFieldTypes().size() ||
+      getResult().getType() !=
+          cast<TypeAttr>(record.getFieldTypes()[getField()]).getValue())
+    return emitOpError("record projection is outside its physical schema");
+  return success();
+}
+
+LogicalResult LoadOp::verify() {
+  unsigned coordinateCount = getCoordinates().size();
+  if (coordinateCount != rankOf(getResource().getType()) ||
+      getSourceAxes().size() != coordinateCount)
+    return emitOpError("load coordinate partition/rank is inconsistent");
+  bool hasValid = static_cast<bool>(getValid());
+  bool hasFill = static_cast<bool>(getFill());
+  if (hasValid != hasFill)
+    return emitOpError("load requires validity and fill together");
+  if (hasValid && (!elementType(getValid().getType()).isInteger(1) ||
+                   !sameShape(getValid().getType(), getResult().getType()) ||
+                   !sameShape(getFill().getType(), getResult().getType())))
+    return emitOpError("load validity/fill physical schema is invalid");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : getSourceAxes())
+    if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||
+        !axes.insert(axis).second)
+      return emitOpError("load source-axis mapping is not a bijection");
+  Type resourceElement = dyn_cast<ViewType>(getResource().getType())
+                             ? cast<ViewType>(getResource().getType()).getElementType()
+                             : cast<BufferType>(getResource().getType()).getElementType();
+  return resourceElement == elementType(getResult().getType())
+             ? success()
+             : emitOpError("load resource/result element types disagree");
+}
+
+LogicalResult GatherOp::verify() {
+  auto source = dyn_cast<FragmentType>(getSource().getType());
+  if (!source || getCoordinates().size() != source.getShape().size() ||
+      getSourceAxes().size() != getCoordinates().size())
+    return emitOpError("gather source/coordinate relation is inconsistent");
+  bool hasValid = static_cast<bool>(getValid());
+  bool hasFill = static_cast<bool>(getFill());
+  if (hasValid != hasFill)
+    return emitOpError("gather requires validity and fill together");
+  if (hasValid && (!elementType(getValid().getType()).isInteger(1) ||
+                   !sameShape(getValid().getType(), getResult().getType()) ||
+                   !sameShape(getFill().getType(), getResult().getType())))
+    return emitOpError("gather validity/fill physical schema is invalid");
+  return source.getElementType() == elementType(getResult().getType())
+             ? success()
+             : emitOpError("gather source/result element types disagree");
+}
+
+LogicalResult AssumeInBoundsOp::verify() {
+  return getAxis() < rankOf(getResource().getType())
+             ? success()
+             : emitOpError("assumed source axis is outside the resource rank");
+}
+
+void LoadOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Read::get());
+}
+
+LogicalResult StoreOp::verify() {
+  unsigned coordinateCount = getCoordinates().size();
+  if (coordinateCount != rankOf(getResource().getType()) ||
+      getSourceAxes().size() != coordinateCount ||
+      getCollision() > 2)
+    return emitOpError("store coordinate/effect schema is inconsistent");
+  if (getValid() && (!elementType(getValid().getType()).isInteger(1) ||
+                     !sameShape(getValid().getType(), getValue().getType())))
+    return emitOpError("store validity must match its value fragment");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : getSourceAxes())
+    if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||
+        !axes.insert(axis).second)
+      return emitOpError("store source-axis mapping is not a bijection");
+  Type resourceElement = dyn_cast<ViewType>(getResource().getType())
+                             ? cast<ViewType>(getResource().getType()).getElementType()
+                             : cast<BufferType>(getResource().getType()).getElementType();
+  return resourceElement == elementType(getValue().getType())
+             ? success()
+             : emitOpError("store resource/value element types disagree");
+}
+
+void StoreOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+LogicalResult ContractOp::verify() {
+  auto lhs = getLhs().getType();
+  auto rhs = getRhs().getType();
+  auto accumulator = getAccumulator().getType();
+  auto result = getResult().getType();
+  if (accumulator != result || lhs.getOwner() != rhs.getOwner() ||
+      lhs.getOwner() != result.getOwner())
+    return emitOpError("physical contract relation/ownership is inconsistent");
+  return verifyContractAxes(getOperation(), lhs, rhs, result,
+                            getLhsReductionAxes(), getRhsReductionAxes(),
+                            getLhsBatchAxes(), getRhsBatchAxes());
+}
+
+namespace {
+
+LogicalResult verifyHelperRegion(Operation *owner, Region &region,
+                                 TypeRange argumentTypes,
+                                 TypeRange resultTypes) {
+  if (!llvm::hasSingleElement(region))
+    return owner->emitOpError("physical helper requires one block");
+  Block &block = region.front();
+  if (!llvm::equal(block.getArgumentTypes(), argumentTypes) || block.empty())
+    return owner->emitOpError("physical helper arguments disagree with its schema");
+  auto yield = dyn_cast<YieldOp>(block.back());
+  if (!yield || !llvm::equal(yield.getOperandTypes(), resultTypes))
+    return owner->emitOpError("physical helper yield disagrees with its schema");
+  WalkResult effects = region.walk([&](Operation *nested) {
+    if (isa<YieldOp>(nested))
+      return WalkResult::advance();
+    if (!isMemoryEffectFree(nested)) {
+      nested->emitOpError("is effectful inside a physical pure helper");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return effects.wasInterrupted() ? failure() : success();
+}
+
+LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
+                                 Type sliceType, uint64_t axis,
+                                 ParameterAttr segment) {
+  auto source = dyn_cast<FragmentType>(sourceType);
+  auto slice = dyn_cast<FragmentType>(sliceType);
+  if (!source || !slice || source.getElementType() != slice.getElementType() ||
+      source.getOwner() != slice.getOwner() ||
+      source.getShape().size() != slice.getShape().size() ||
+      axis >= source.getShape().size() ||
+      source.getAxisMaps() != slice.getAxisMaps())
+    return owner->emitOpError(
+        "physical region source slice lost rank/type/coordinate mapping");
+  for (unsigned dimension = 0; dimension < source.getShape().size(); ++dimension) {
+    if (dimension == axis) {
+      auto extent = dyn_cast<PhysicalExprAttr>(slice.getShape()[dimension]);
+      if (!extent ||
+          extent.getKind() !=
+              static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
+          extent.getSymbol() != segment.getName())
+        return owner->emitOpError(
+            "physical region slice axis is not bound to its segment parameter");
+    } else if (source.getShape()[dimension] != slice.getShape()[dimension]) {
+      return owner->emitOpError(
+          "physical region slice changed a non-segment extent");
+    }
+  }
+  return success();
+}
+
+LogicalResult verifyReduceLike(Operation *owner, ValueRange inputs,
+                               ResultRange results, Region &combine,
+                               uint64_t sourceCount, uint64_t identityCount,
+                               uint64_t captureCount) {
+  if (sourceCount == 0 || sourceCount != identityCount ||
+      inputs.size() != sourceCount + identityCount + captureCount ||
+      results.size() != identityCount)
+    return owner->emitOpError("physical reduce/scan component partition is invalid");
+  SmallVector<Type> accumulators;
+  for (unsigned index = 0; index < identityCount; ++index) {
+    Type identity = inputs[sourceCount + index].getType();
+    if (identity != results[index].getType())
+      return owner->emitOpError("physical identity/result type disagrees");
+    accumulators.push_back(identity);
+  }
+  SmallVector<Type> arguments(accumulators);
+  arguments.append(accumulators);
+  for (Value capture : inputs.drop_front(sourceCount + identityCount))
+    arguments.push_back(capture.getType());
+  return verifyHelperRegion(owner, combine, arguments, accumulators);
+}
+
+} // namespace
+
+LogicalResult ReduceOp::verify() {
+  if (getAxes().empty())
+    return emitOpError("physical reduce requires at least one axis");
+  return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
+                          getSourceCount(), getIdentityCount(), getCaptureCount());
+}
+
+LogicalResult ScanOp::verify() {
+  return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
+                          getSourceCount(), getIdentityCount(), getCaptureCount());
+}
+
+LogicalResult RegionFoldOp::verify() {
+  uint64_t sourceCount = getSourceCount();
+  uint64_t identityCount = getIdentityCount();
+  uint64_t captureCount = getCaptureCount();
+  if (sourceCount == 0 || identityCount == 0 ||
+      getInputs().size() != sourceCount + identityCount + captureCount ||
+      getResults().size() != identityCount || !getSegment())
+    return emitOpError("physical region-fold component partition is invalid");
+  SmallVector<Type> summaries;
+  for (unsigned index = 0; index < identityCount; ++index) {
+    Type identity = getInputs()[sourceCount + index].getType();
+    if (identity != getResults()[index].getType())
+      return emitOpError("region-fold identity/result type disagrees");
+    summaries.push_back(identity);
+  }
+  if (!llvm::hasSingleElement(getSummarize()) ||
+      getSummarize().front().getNumArguments() != sourceCount + captureCount)
+    return emitOpError("region-fold summarizer argument partition is invalid");
+  SmallVector<Type> summarizeArguments;
+  for (unsigned index = 0; index < sourceCount; ++index) {
+    Type slice = getSummarize().front().getArgument(index).getType();
+    if (failed(verifySegmentSlice(getOperation(), getInputs()[index].getType(),
+                                  slice, getAxis(), getSegment())))
+      return failure();
+    summarizeArguments.push_back(slice);
+  }
+  for (Value capture : getInputs().drop_front(sourceCount + identityCount))
+    summarizeArguments.push_back(capture.getType());
+  if (failed(verifyHelperRegion(getOperation(), getSummarize(), summarizeArguments,
+                                summaries)))
+    return failure();
+  SmallVector<Type> combineArguments(summaries);
+  combineArguments.append(summaries);
+  return verifyHelperRegion(getOperation(), getCombine(), combineArguments,
+                            summaries);
+}
+
+LogicalResult RegionScanOp::verify() {
+  uint64_t sourceCount = getSourceCount();
+  uint64_t identityCount = getIdentityCount();
+  uint64_t stateCount = getStateCount();
+  uint64_t captureCount = getCaptureCount();
+  uint64_t outputCount = getOutputCount();
+  if (sourceCount == 0 || identityCount == 0 || stateCount == 0 ||
+      outputCount == 0 ||
+      getInputs().size() != sourceCount + identityCount + stateCount + captureCount ||
+      getResults().size() != outputCount + stateCount || !getSegment())
+    return emitOpError("physical region-scan component partition is invalid");
+  if (!llvm::hasSingleElement(getSummarize()) ||
+      getSummarize().front().getNumArguments() != sourceCount + captureCount)
+    return emitOpError("region-scan summarizer argument partition is invalid");
+  SmallVector<Type> slices;
+  for (unsigned index = 0; index < sourceCount; ++index) {
+    Type slice = getSummarize().front().getArgument(index).getType();
+    if (failed(verifySegmentSlice(getOperation(), getInputs()[index].getType(),
+                                  slice, getAxis(), getSegment())))
+      return failure();
+    slices.push_back(slice);
+  }
+  SmallVector<Type> transitions;
+  for (unsigned index = 0; index < identityCount; ++index)
+    transitions.push_back(getInputs()[sourceCount + index].getType());
+  SmallVector<Type> states;
+  unsigned stateOffset = sourceCount + identityCount;
+  for (unsigned index = 0; index < stateCount; ++index) {
+    Type state = getInputs()[stateOffset + index].getType();
+    if (state != getResults()[outputCount + index].getType())
+      return emitOpError("region-scan final-state type disagrees");
+    states.push_back(state);
+  }
+  SmallVector<Type> captures;
+  unsigned captureOffset = stateOffset + stateCount;
+  for (Value capture : getInputs().drop_front(captureOffset))
+    captures.push_back(capture.getType());
+  SmallVector<Type> summarizeArguments(slices);
+  summarizeArguments.append(captures);
+  if (failed(verifyHelperRegion(getOperation(), getSummarize(),
+                                summarizeArguments, transitions)))
+    return failure();
+  SmallVector<Type> combineArguments(transitions);
+  combineArguments.append(transitions);
+  if (failed(verifyHelperRegion(getOperation(), getCombine(), combineArguments,
+                                transitions)))
+    return failure();
+  SmallVector<Type> applyArguments(transitions);
+  applyArguments.append(states);
+  if (failed(verifyHelperRegion(getOperation(), getApply(), applyArguments,
+                                states)))
+    return failure();
+  SmallVector<Type> emitArguments(slices);
+  emitArguments.append(states);
+  emitArguments.append(captures);
+  if (!llvm::hasSingleElement(getEmit()) || getEmit().front().empty())
+    return emitOpError("region-scan emitter is empty");
+  auto yield = dyn_cast<YieldOp>(getEmit().front().back());
+  if (!yield || yield.getValues().size() != outputCount)
+    return emitOpError("region-scan emitter output count disagrees");
+  SmallVector<Type> emitted(yield.getOperandTypes());
+  if (failed(verifyHelperRegion(getOperation(), getEmit(), emitArguments,
+                                emitted)))
+    return failure();
+  for (auto [slice, result] : llvm::zip(emitted, getResults().take_front(outputCount))) {
+    auto sliceFragment = dyn_cast<FragmentType>(slice);
+    auto resultFragment = dyn_cast<FragmentType>(result.getType());
+    if (!sliceFragment || !resultFragment ||
+        sliceFragment.getElementType() != resultFragment.getElementType() ||
+        sliceFragment.getShape().size() != resultFragment.getShape().size() ||
+        sliceFragment.getAxisMaps() != resultFragment.getAxisMaps())
+      return emitOpError("region-scan output assembly relation is invalid");
+  }
+  return success();
+}
+
+LogicalResult ScaledContractOp::verify() {
+  auto lhs = getLhs().getType();
+  auto rhs = getRhs().getType();
+  auto result = getResult().getType();
+  if (getLhsGroupSize() == 0 || getRhsGroupSize() == 0 ||
+      getLhsFormat() > 2 || getRhsFormat() > 2 ||
+      getAccumulator().getType() != result || lhs.getOwner() != rhs.getOwner() ||
+      lhs.getOwner() != result.getOwner())
+    return emitOpError("scaled-contract physical schema is invalid");
+  return verifyContractAxes(getOperation(), lhs, rhs, result,
+                            getLhsReductionAxes(), getRhsReductionAxes(),
+                            getLhsBatchAxes(), getRhsBatchAxes());
+}
+
+LogicalResult SparseContractOp::verify() {
+  auto lhs = getCompressed().getType();
+  auto rhs = getRhs().getType();
+  auto result = getResult().getType();
+  if (getFormat() > 1 ||
+      getCompressionAxis() >= getCompressed().getType().getShape().size() ||
+      getAccumulator().getType() != result || lhs.getOwner() != rhs.getOwner() ||
+      lhs.getOwner() != result.getOwner())
+    return emitOpError("sparse-contract physical schema is invalid");
+  return verifyContractAxes(getOperation(), lhs, rhs, result,
+                            getLhsReductionAxes(), getRhsReductionAxes(),
+                            getLhsBatchAxes(), getRhsBatchAxes(),
+                            static_cast<int64_t>(getCompressionAxis()));
+}
+
+LogicalResult HistogramOp::verify() {
+  if (!getValues().getType().getElementType().isIntOrIndex() ||
+      !getValid().getType().getElementType().isInteger(1) ||
+      getValues().getType().getShape() != getValid().getType().getShape() ||
+      getResult().getType().getShape().size() != 1)
+    return emitOpError("histogram physical schema is invalid");
+  return success();
+}
+
+LogicalResult ScatterReduceOp::verify() {
+  if (getCoordinates().size() != rankOf(getResource().getType()) ||
+      getSourceAxes().size() != getCoordinates().size() || getSharing() > 2)
+    return emitOpError("scatter-reduce address rank is invalid");
+  if (resourceElementType(getResource().getType()) !=
+          elementType(getValue().getType()) ||
+      (getValid() &&
+       (!elementType(getValid().getType()).isInteger(1) ||
+        !sameShape(getValid().getType(), getValue().getType()))))
+    return emitOpError("scatter-reduce value/validity schema is invalid");
+  SmallVector<Type> arguments{getValue().getType(), getValue().getType()};
+  SmallVector<Type> results{getValue().getType()};
+  return verifyHelperRegion(getOperation(), getCombine(), arguments, results);
+}
+
+void ScatterReduceOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+namespace {
+
+LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
+                                  ValueRange coordinates, Value valid,
+                                  ArrayRef<int64_t> sourceAxes,
+                                  uint64_t ordering, uint64_t sharing) {
+  if (coordinates.size() != rankOf(resource) ||
+      sourceAxes.size() != coordinates.size() || ordering > 3 || sharing > 2)
+    return owner->emitOpError("atomic physical address/order schema is invalid");
+  if (valid && !elementType(valid.getType()).isInteger(1))
+    return owner->emitOpError("atomic validity must be a predicate");
+  return success();
+}
+
+} // namespace
+
+LogicalResult AtomicLoadOp::verify() {
+  if (resourceElementType(getResource().getType()) !=
+          elementType(getResult().getType()) ||
+      (getValid() && !sameShape(getValid().getType(), getResult().getType())))
+    return emitOpError("atomic-load resource/result element types disagree");
+  return verifyAtomicAddress(getOperation(), getResource().getType(),
+                             getCoordinates(), getValid(), getSourceAxes(),
+                             getOrdering(), getSharing());
+}
+
+LogicalResult AtomicStoreOp::verify() {
+  if (resourceElementType(getResource().getType()) !=
+          elementType(getValue().getType()) ||
+      (getValid() && !sameShape(getValid().getType(), getValue().getType())))
+    return emitOpError("atomic-store resource/value element types disagree");
+  return verifyAtomicAddress(getOperation(), getResource().getType(),
+                             getCoordinates(), getValid(), getSourceAxes(),
+                             getOrdering(), getSharing());
+}
+
+LogicalResult AtomicRMWOp::verify() {
+  if (getKind() > 6 || getResult().getType() != getValue().getType() ||
+      resourceElementType(getResource().getType()) !=
+          elementType(getValue().getType()) ||
+      (getValid() && !sameShape(getValid().getType(), getValue().getType())))
+    return emitOpError("atomic RMW physical value/kind schema is invalid");
+  return verifyAtomicAddress(getOperation(), getResource().getType(),
+                             getCoordinates(), getValid(), getSourceAxes(),
+                             getOrdering(), getSharing());
+}
+
+LogicalResult AtomicCompareExchangeOp::verify() {
+  auto result = getResult().getType();
+  if (getExpected().getType() != getDesired().getType() ||
+      resourceElementType(getResource().getType()) !=
+          elementType(getExpected().getType()) ||
+      (getValid() && !sameShape(getValid().getType(), getExpected().getType())) ||
+      result.getFieldTypes().size() != 2 ||
+      cast<TypeAttr>(result.getFieldTypes()[0]).getValue() !=
+          getExpected().getType() ||
+      !elementType(cast<TypeAttr>(result.getFieldTypes()[1]).getValue())
+           .isInteger(1))
+    return emitOpError("compare-exchange physical result schema is invalid");
+  return verifyAtomicAddress(getOperation(), getResource().getType(),
+                             getCoordinates(), getValid(), getSourceAxes(),
+                             getOrdering(), getSharing());
+}
+
+LogicalResult RandomBitsOp::verify() {
+  return elementType(getResult().getType()).isUnsignedInteger(32) &&
+                 sameShape(getCounter().getType(), getResult().getType())
+             ? success()
+             : emitOpError("Philox result must be a shape-identical u32 value");
+}
+
+LogicalResult BufferOp::verify() {
+  auto type = getResult().getType();
+  if (type.getWorkspace())
+    return emitOpError(
+        "invocation workspace must be an explicit hidden ABI resource");
+  if ((type.getInitialization() == 0) !=
+      static_cast<bool>(getInitialValue()))
+    return emitOpError(
+        "buffer initializer disagrees with its initialization obligation");
+  if (getInitialValue() &&
+      elementType(getInitialValue().getType()) != getResult().getType().getElementType())
+    return emitOpError("buffer initializer element type disagrees");
+  return success();
+}
+
+void BufferOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Allocate::get());
+  if (getInitialValue())
+    effects.emplace_back(MemoryEffects::Write::get());
+}
+
+} // namespace intent::gpu
+
+#define GET_OP_CLASSES
+#include "Intent/Dialect/GPU/IR/GPUOps.cpp.inc"

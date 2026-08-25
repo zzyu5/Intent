@@ -9,6 +9,10 @@ target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
   MLIRIntentDialect
   MLIRIntentKIRToGPU
+  MLIRIntentGPUDialect
+  MLIRIntentGPUTransforms
+  MLIRIntentTritonTransforms
+  MLIRIntentTritonSerialization
   MLIRIntentTransforms
   MLIRParser
   MLIRIR

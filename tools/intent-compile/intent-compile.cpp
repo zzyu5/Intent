@@ -1,11 +1,19 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
+#include "Intent/Dialect/GPU/IR/GPUDialect.h"
+#include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
+#include "Intent/Target/Triton/Serialization/Serializer.h"
+#include "Intent/Target/Triton/Transforms/Passes.h"
 #include "Intent/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
@@ -17,6 +25,11 @@ enum class ExitCode : int {
   Invocation = 1,
   KernelIR = 2,
   PhysicalProgram = 3,
+  PhysicalProgramVerification = 4,
+  ProviderProgram = 5,
+  ProviderProgramVerification = 6,
+  TerminalTranslation = 7,
+  CompilerOutput = 8,
 };
 
 int exitCode(ExitCode code) { return static_cast<int>(code); }
@@ -53,28 +66,58 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
 
-  (void)target;
   (void)device;
-  (void)computeUnits;
-  (void)sharedMemoryPerUnit;
-  (void)registersPerUnit;
-  (void)matrixUnits;
-  (void)dynamicVectorWidth;
-  (void)irOutputFilename;
-  (void)sourceOutputFilename;
-
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect>();
+  registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect>();
   mlir::MLIRContext context(registry);
-  context.loadDialect<intent::IntentDialect>();
+  context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
+                      mlir::arith::ArithDialect, mlir::func::FuncDialect,
+                      mlir::scf::SCFDialect>();
 
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
   if (!module || mlir::failed(intent::verifyKernelModule(*module)))
     return exitCode(ExitCode::KernelIR);
-  if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module))) {
-    llvm::errs() << "Intent KIR-to-GPU boundary is not implemented\n";
+  intent::GPUCapabilities capabilities{
+      computeUnits, sharedMemoryPerUnit, registersPerUnit, matrixUnits,
+      dynamicVectorWidth};
+  if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module, capabilities))) {
+    llvm::errs() << "Intent KIR-to-GPU construction failed\n";
     return exitCode(ExitCode::PhysicalProgram);
   }
+  if (mlir::failed(intent::gpu::runSharedGPUPasses(*module)))
+    return exitCode(ExitCode::PhysicalProgramVerification);
+  if (target != TargetKind::Triton) {
+    llvm::errs() << "selected provider is not implemented in this reconstruction round\n";
+    return exitCode(ExitCode::ProviderProgram);
+  }
+  if (mlir::failed(intent::triton::legalizeGPUProgram(*module)))
+    return exitCode(ExitCode::ProviderProgramVerification);
+  std::string source;
+  if (mlir::failed(intent::triton::serializeProgram(*module, source)))
+    return exitCode(ExitCode::TerminalTranslation);
+  if (irOutputFilename.empty() || sourceOutputFilename.empty()) {
+    llvm::errs() << "both --ir-output and --source-output are required\n";
+    return exitCode(ExitCode::CompilerOutput);
+  }
+  std::error_code error;
+  llvm::raw_fd_ostream irOutput(irOutputFilename, error,
+                               llvm::sys::fs::OF_Text);
+  if (error) {
+    llvm::errs() << "cannot open physical IR output: " << error.message() << "\n";
+    return exitCode(ExitCode::CompilerOutput);
+  }
+  module->print(irOutput);
+  irOutput << "\n";
+  irOutput.close();
+  llvm::raw_fd_ostream sourceOutput(sourceOutputFilename, error,
+                                   llvm::sys::fs::OF_Text);
+  if (error) {
+    llvm::errs() << "cannot open provider source output: " << error.message()
+                 << "\n";
+    return exitCode(ExitCode::CompilerOutput);
+  }
+  sourceOutput << source;
+  sourceOutput.close();
   return exitCode(ExitCode::Success);
 }

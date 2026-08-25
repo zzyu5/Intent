@@ -5,10 +5,18 @@
 
 namespace intent {
 
-/// The typed boundary to the shared executable GPU Program. Round two stops
-/// here deliberately: no legacy Plan or provider path may consume canonical
-/// KIR while the new physical program is absent.
-mlir::LogicalResult lowerCanonicalKIRToGPU(mlir::ModuleOp module);
+struct GPUCapabilities {
+  int64_t computeUnits;
+  int64_t sharedMemoryPerUnit;
+  int64_t registersPerUnit;
+  bool matrixUnits;
+  bool dynamicVectorWidth;
+};
+
+/// Consumes canonical KIR and replaces it with one complete conservative
+/// provider-neutral executable GPU program.  The result never references KIR.
+mlir::LogicalResult lowerCanonicalKIRToGPU(mlir::ModuleOp module,
+                                           const GPUCapabilities &capabilities);
 
 } // namespace intent
 
