@@ -145,12 +145,14 @@ Physical pass若选择重算pure producer，必须真实改变def-use；若选�
 Physical structured operations消费当前scalar/fragment SSA：
 
 - reduce与scan：physical axes、逐component identity、typed pure combine region、direction、inclusive/exclusive、dynamic extent、result relation与accumulator flow；
+- region fold：physical segment loop、source-slice operands、typed summarizer region、summary identity/combine、captures与result flow；
+- region scan：physical segment loop、summarizer与transition combine、incoming-state application、slice emitter、source-aligned output assembly与final-state flow；
 - contract：physical lhs/rhs/accumulator fragments、paired reduction与batch axis maps、free/result-axis order、zero-reduction result rule、result relation与accumulator dtype；
 - scaled/sparse contract：保留KIR的logical format/schema，同时具有physical operand/access mapping；
 - histogram：physical input fragment、validity与count result；
 -其它被canonical KIR正式定义的local structured operation。
 
-Arg-reduce等复合result还保存tie、NaN与index semantics；ordinary ordered loop则显式保存runtime condition/bounds、loop-carried values、effects与terminators。上述ops不携带provider primitive名称、MMA version、input precision hint、K-pack、warp policy或pipeline stage。Provider可以直接映射到native primitive、合法展开或明确拒绝，但不得改变KIR semantic schema。
+Arg-reduce等复合result还保存tie、NaN与index semantics；ordinary ordered loop则显式保存runtime condition/bounds、loop-carried values、effects与terminators。Region summarizer内原本显式存在的contract/reduce继续是独立physical structured ops；compiler不需要从summary combine猜回它们。上述ops不携带provider primitive名称、MMA version、input precision hint、K-pack、warp policy或pipeline stage。Provider可以直接映射到native primitive、合法展开或明确拒绝，但不得改变KIR semantic schema。
 
 ## 9. Dependency、storage 与 synchronization
 

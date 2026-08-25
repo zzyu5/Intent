@@ -88,7 +88,7 @@ for index in I.domain(0, N):
 
 不提供public `ordered`。`break/continue`使用普通结构化语义；tensor predicate使用`select`，不作为structured `if`条件。
 
-不提供`state_stream`：可重结合summary写成reduce，需要prefix写成scan，严格顺序或动态停止写成ordinary loop。
+不提供允许arbitrary body随compiler-selected extent重新分段的`state_stream`。逐element的可重结合summary写成reduce/scan；需要在任意连续source slice内显式执行contract等tensor operations时使用region fold/scan；严格顺序或动态停止写成ordinary loop。
 
 ## 7. Generic reduce
 
@@ -132,7 +132,83 @@ prefix = I.scan(
 
 scan使用与reduce相同的typed pure combine，定义每个logical prefix。`inclusive/exclusive`与forward/reverse是operation semantics。严格顺序、不可重结合的recurrence使用ordinary loop。
 
-## 9. Contract
+## 9. Region fold 与 region scan
+
+### 9.1 Region fold
+
+```python
+summary = I.region_fold(
+    source=(keys, values, key_coordinates),
+    axis=0,
+    summarize=summarize_chunk,
+    combine=merge_summaries,
+    identity=empty_summary,
+    operands=(queries, query_coordinates, scale),
+)
+```
+
+`region_fold`表达一个有序source axis上的list homomorphism。对非空source，compiler可以把该axis分成任意数量的连续非空、保持顺序且完整覆盖source的slices；slice extent不是DSL value或KIR parameter。所有source components在`axis`位置具有同一logical extent，并按同一boundaries切片后传给`summarize`。`operands`是不随slice切分的显式captures；runtime values成为KIR operands，constexpr values保持specialization facts。
+
+`summarize`：
+
+- 接收各source components的当前slice，随后接收`operands`；
+- 返回固定typed summary schema；
+- 可以调用pure pointwise、reduce、scan、contract、scaled/sparse contract与其它pure helpers；
+- 不得写external view或logical buffer，不得scatter、atomic、RNG或依赖调用次数；
+- 不得读取segment ordinal、segment count、chosen extent或chunk-relative coordinates。
+
+需要logical coordinates时，把`I.indices(source_axis)`作为一个source component传入。该component被切片后仍保存absolute source coordinates。
+
+`combine`接受两个summary并返回同一schema。`identity`也具有该schema。作者选择`region_fold`即要求：
+
+```text
+summarize(A ++ B) == combine(summarize(A), summarize(B))
+combine(identity, x) == combine(x, identity) == x
+```
+
+其中`A`、`B`是相邻source slices。Combine保持logical order但允许任意parenthesization。Empty source返回identity；physical tail或padding也可以安全使用identity，因此不能把在combine中产生NaN的sentinel冒充identity。需要区分“没有成员”时，summary显式携带bool validity或等价typed状态。
+
+Ordinary reduce是element-summary的受限形式。二者共享homomorphic summary interface与physical reduction framework；若region summarizer只是用同一个combine折叠slice elements，frontend canonicalize为ordinary reduce。
+
+### 9.2 Region scan
+
+```python
+outputs, final_state = I.region_scan(
+    source=source,
+    axis=0,
+    summarize=summarize_transition,
+    combine=compose_transitions,
+    identity=identity_transition,
+    initial_state=initial_state,
+    apply=apply_transition,
+    emit=emit_slice,
+    operands=captures,
+)
+```
+
+`region_scan`在同一homomorphism上增加incoming-state与slice output。`summarize`/`combine`/`apply`/`emit`都是typed pure helpers：
+
+- `summarize(slice, captures) -> Transition`；
+- `combine(lhs, rhs) -> Transition`按source顺序组合transitions；
+- `apply(prefix_transition, initial_state) -> incoming_state`；
+- `emit(slice, incoming_state, captures) -> output_slice`。
+
+`apply(combine(a,b), state)`等于先应用`a`再应用`b`。对相邻slices `A`、`B`，还必须满足：
+
+```text
+emit(A ++ B, state)
+  == concat(
+       emit(A, state),
+       emit(B, apply(summarize(A), state)))
+```
+
+`emit`的result axis必须与输入slice保存同一source member relation；operation返回按source order拼回的完整logical output以及final state `apply(summarize(full_source), initial_state)`。Compiler-selected slice boundaries、内部prefix states与segment count不可观察。需要host-visible chunk states或固定chunk ABI时，作者使用显式logical chunk domain、subregions与ordinary scan。
+
+Ordinary scan是element-summary/element-output的受限形式；退化的region写法canonicalize回ordinary scan。`region_scan`不是任意effectful state loop，不能代替严格ordered recurrence。
+
+完整FlashAttention写法见[`examples/flash_attention.py`](examples/flash_attention.py)。其中QK与PV都是作者显式写下的contract；region fold只抽象K source的合法连续segmentation，不依赖compiler从tuple reduction识别attention模式。
+
+## 10. Contract
 
 ```python
 acc = I.contract(
@@ -159,7 +235,7 @@ public surface不提供假的`multiply=`/`combine=`参数。其它semiring写成
 
 axis permutation、将多个free/reduction axes双射flatten为M/K/N、MMA选择与staging都是compiler工作，不是作者surface。
 
-## 10. Scaled contract
+## 11. Scaled contract
 
 ```python
 acc = I.scaled_contract(
@@ -183,7 +259,7 @@ scaled contract是first-class local tensor operation。formats、packed logical 
 
 普通packed INT4/INT2不是scaled contract。作者使用carrier tensor、bit/index arithmetic、sign extension、zero-point与scale表达其logical values，再调用ordinary contract。
 
-## 11. Sparse contract
+## 12. Sparse contract
 
 ```python
 acc = I.sparse_contract(
@@ -203,7 +279,7 @@ acc = I.sparse_contract(
 
 sparse contract同样继承ordinary contract的非空reduction、batch/free-axis、result order与accumulator规则；format只替换一个operand沿声明compression axis的logical value relation。
 
-## 12. Histogram
+## 13. Histogram
 
 ```python
 counts = I.histogram(
@@ -220,7 +296,7 @@ histogram是pure value-producing structured operation。每个active value必须
 
 它不等价于作者预写external buffer初始化与atomic updates；后者已选择一种effectful lowering。
 
-## 13. Ragged relation 的普通组成
+## 14. Ragged relation 的普通组成
 
 ```python
 member_source = I.domain(0, R)
@@ -230,7 +306,7 @@ logical_members = mapping[members] if HAS_MAPPING else I.indices(members)
 
 offsets-derived subregion、可选indexed mapping及其SSA provenance就是完整ragged语义。`I.ragged(...)`/`I.members(...)`可以是机械surface helper，但不形成专用canonical RaggedOp/MemberOp。
 
-## 14. Indexed access、buffers 与 copy
+## 15. Indexed access、buffers 与 copy
 
 普通indexing与显式gather共享typed index relation和active validity。relation保存source identity、source rank、result logical axes，以及每个source axis的coordinate expression；coordinate可以来自constant、domain/subregion coordinate或data-derived integer value。relation composition必须保存这些SSA dependencies与provenance，不能只留下result shape。invalid read不访问source并返回同dtype、可broadcast到result shape的显式fill；invalid write不产生effect。
 
@@ -248,7 +324,7 @@ logical buffer是kernel-local mutable state；作者定义shape、dtype、initia
 
 不提供canonical `copy`。一次indexed read产生immutable SSA value，再由indexed write消费，已经完整定义snapshot与effects。provider可从该def-use/access relation形成bulk、vector、async或DMA copy。
 
-## 15. Atomic operations
+## 16. Atomic operations
 
 public surface提供具体operations：
 
@@ -271,7 +347,7 @@ load只允许`relaxed/acquire`，store只允许`relaxed/release`，RMW/CAS允许
 
 atomic不带作者可见`scope=`。logical allocation identity、alias/index relation与本次kernel invocation确定参与同一atomic object的executions；provider选择physical scope。
 
-## 16. RNG
+## 17. RNG
 
 ```python
 bits = I.random.bits(seed, logical_counter)
@@ -282,7 +358,7 @@ canonical bits operation固定Philox4x32-10。scalar logical counter按`block_co
 
 `uniform`是从canonical bits到浮点值的固定转换。normal等复合distribution由作者helper构造。
 
-## 17. Logical parts 不使用 `partition`
+## 18. Logical parts 不使用 `partition`
 
 ```python
 parts = I.domain(0, P)
@@ -298,14 +374,14 @@ for part in I.parallel(parts):
 
 part identity、boundary formula、empty/tail与partial tensor interface由普通constructs明确表达。`partition(auto/count/extent)`均不是public或canonical operation。
 
-## 18. Surface 归属总表
+## 19. Surface 归属总表
 
 | family | canonical semantics | surface shorthand / accessor | 不属于语言 |
 |---|---|---|---|
 | definitions/interface | kernel、helper、`In/Out/InOut`、runtime/constexpr | Python decorators与type spelling | target selection、hidden launch、provider dispatch |
 | domain/control | domain、source subregion、`if/for/while`、unordered parallel、loop carry | slices、`indices`、`break/continue` | `auto`、partition、state_stream、ordered、program/lane id |
 | tensor values | arithmetic、compare/select、broadcast、reshape、transpose、join、record、full、cast/bitcast | zeros、activation helpers、value mask | physical tile/layout/padding |
-| structured ops | generic reduce、scan、contract、scaled contract、sparse contract、histogram | built-in reduces、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
+| structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、histogram | built-in reduces、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
 | relations | source subregion、index relation、sparse format schema | ragged/members/index helpers | target metadata layout、MMA hint |
 | memory/effects | external/buffer read-write、unique/reduction scatter、atomic ops、Philox bits | ordinary indexing/assignment、atomic convenience names | physical scope、storage、copy instruction、barrier/pipeline |
 

@@ -25,7 +25,7 @@ Pass的成立依据是它改变了当前program，并保持可验证不变量；
 - index relations与alias；
 - operation effects与collision semantics；
 - control dependence、loop carry与ordered state；
-- reduce/scan/contract schemas；
+- reduce/scan/region-fold/region-scan/contract schemas；
 - logical-buffer lifetime；
 - def-use、producer-consumer与logical reuse。
 
@@ -97,7 +97,7 @@ Blocking pass不得修改KIR logical subregions或作者可观察的page/window/
 - replay/rematerialization改变physical def-use；
 - bufferization产生真实allocation/lifetime/read/write；
 - access realization产生coordinate/validity/fill/effect operands；
-- contract/reduce/scan realization产生真实fragments、loops、carry与accumulator graph；
+- contract/reduce/scan/region-fold/region-scan realization产生真实fragments、loops、carry与accumulator graph；region summarizer中的contract保持显式，不能依赖attention-shaped algebraic recognition恢复；
 - boundary neutralization删除或简化实际validity/fill，不只删除padding record。
 
 ### 3.5 Target-capability legalization

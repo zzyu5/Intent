@@ -45,6 +45,7 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 - explicit access/validity/fill → pointer expressions、mask/other与`tl.load/store`；
 - gather/scatter/atomic →对应Triton operations；
 - physical reduce/scan/contract → `tl.reduce/associative_scan/dot/dot_scaled`或合法展开；
+- physical region fold/scan → 已选segment loop、summarizer body、summary combine、scan apply/emit与其中显式structured operations；
 - structured control → Python/Triton structured control。
 
 Triton-local form可以包括真正影响source program的descriptor value/access、某些provider compile-time branches与Config binding。若pointer/descriptor只是终端spelling差异，可直接serialize；若descriptor选择改变operands、static block constraints并被多个passes消费，则用local extension op表达。
@@ -68,7 +69,7 @@ Thin mapping包括：
 - program coordinates → `ct.bid`及所需grid values；
 - fragment shape与coordinate relation → cuTile tile-space indices；
 - common accesses → `ct.load/store/gather/scatter`；
-- structured operations → cuTile支持的`ct.sum`/`ct.max`/`ct.cumsum`等reduction/prefix forms，以及`ct.mma/mma_scaled`。
+- structured operations → cuTile支持的`ct.sum`/`ct.max`/`ct.cumsum`等reduction/prefix forms，以及`ct.mma/mma_scaled`；region fold/scan按共同program中已经形成的segment loop、summary与state/output flow投影。
 
 cuTile-local legality/forms包括最多三维block identity、tile-space index multiplication、check-bounds/padding、advanced indexing、MMA-scaled layout与provider tuning constraints。它们只有在不只是机械index conversion时才形成local extension。
 
@@ -84,7 +85,7 @@ TileLang同样消费共同的grid、loops、fragments、accesses与structured co
 - `T.Pipelined` schedule metadata；
 - synchronization与barrier forms。
 
-TileLang provider pass根据共同IR的lifetime、sharing、access、dependency与structured-op facts形成必要的storage/copy/sync extensions。WGMMA、TCGEN05、mbarrier parity、named barrier、TMA instruction preference等只留在TileLang CUDA-target lowering或local extensions。
+TileLang provider pass根据共同IR的lifetime、sharing、access、dependency与structured-op facts形成必要的storage/copy/sync extensions。Region fold/scan的segment loop、summary/state flow与chunk-local contract已经来自共同IR；TileLang只补其storage、copy、pipeline与sync形式。WGMMA、TCGEN05、mbarrier parity、named barrier、TMA instruction preference等只留在TileLang CUDA-target lowering或local extensions。
 
 若共同program可以直接使用普通TileLang loops/access/compute表达，则不创建extension；不能为了让三家形式对称而强制Triton/cuTile也拥有allocation/copy dialect。
 

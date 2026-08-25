@@ -16,7 +16,7 @@ target 在编译调用中选择，不是 DSL value、类型、`Constexpr` 或控
 - domain、source-derived subregion、logical index 与 indexed relation；
 - structured control、unordered parallel iteration 与 loop carry；
 - typed tensor/value operations，包括 broadcast、reshape、transpose 与 join；
-- generic reduce、scan、contract、scaled contract、sparse contract 与 histogram；
+- generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract 与 histogram；
 - external/logical-buffer read/write、unique/reduction scatter 与 atomic operations；
 - stateless counter-based RNG。
 
@@ -48,7 +48,7 @@ softmax、logsumexp、Welford、attention、normalization、MoE、量化 GEMM �
 
 这些排除项的算法能力并未被删除：
 
-- reduce、scan 与 ordered loop承接原 `state_stream` 的三种合法含义；
+- reduce、scan、region fold/scan与ordered loop承接原`state_stream`中分别属于element aggregation、region homomorphism和strict recurrence的语义；
 - part domain、boundary arithmetic、source slicing与partial tensor承接可观察 partitioning；
 - offsets、subregion与indexed relation承接 ragged关系；
 - indexed read→SSA value→write承接逻辑 copy；

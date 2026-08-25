@@ -25,7 +25,7 @@ Intent source + specialization + external target selection
 - logical domains、由作者边界得到的 source-derived subregions 和 indexed relations；
 - 硬件无关的 `if`、ordered `for/while`、unordered `parallel`、状态转移与停止条件；
 - 张量索引、广播、形状变换和数值表达式；
-- reduce、scan、contract、scaled contract、sparse contract 与 histogram 的完整操作语义；
+- reduce、scan、region fold/scan、contract、scaled contract、sparse contract 与 histogram 的完整操作语义；
 - indexed read/write、collision reduction、atomic、logical buffer 与 deterministic RNG；
 - 一个算法使用一个 kernel 还是由 Python wrapper 编排多个 kernels。
 
@@ -53,6 +53,8 @@ subregion 会改变 body 读取的逻辑成员，因此属于算法。compiler �
 
 作者可以表达“对变长序列的有效前缀做归约”或“第 `p` 份读取 `[begin_p,end_p)`”；不表达“每个 CTA 处理 128 个 token”“CPU 每次处理 16 个元素”或“RVV 使用当前 VL”。
 
+Region fold/scan中的source slice不是作者创建的ordinary subregion，也不能逃逸成value、shape或ABI。它是structured operation内部受homomorphism约束的parametric slice：operation对所有合法连续segmentation定义同一结果，compiler只为当前physical program绑定extent。作者只能消费被同步切片的tensor components和absolute source coordinates，不能观察segment identity、数量或chosen extent。该受限语义不赋予ordinary loop任意重新分段的权限。
+
 ## 6. 程序式与张量式语义并存
 
 Intent 不是纯表达式图。一个 kernel body 可以同时包含：
@@ -61,7 +63,7 @@ Intent 不是纯表达式图。一个 kernel body 可以同时包含：
 - 具有 SSA merge 的条件控制；
 - ordered loop 与 loop-carried state；
 - unordered parallel iteration；
-- first-class reduce、scan 与 contraction；
+- first-class reduce、scan、homomorphic region operations 与 contraction；
 - indexed access、external view 与 logical mutable buffer effects。
 
 张量式构造不会消除程序顺序；程序式控制也不会迫使作者写机器执行单位。编译器必须同时保持 logical tensor flow 与 control/effect semantics。

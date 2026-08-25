@@ -26,7 +26,7 @@ GPU pipeline 必须产生一份共同、完整、唯一的 executable GPU progra
 - program 内 structured control、physical loops 与 loop carries；
 - scalar/fragment SSA、accumulator、materialization 与 buffer lifetimes；
 - access coordinates、validity、fill、collision 与 atomic effects；
-- physical reduce、scan、contract、scaled/sparse contract 与其它 local structured operations；
+- physical reduce、scan、region fold/scan、contract、scaled/sparse contract 与其它 local structured operations；
 - compile-time physical parameters对types、loops、accesses与launch的直接约束。
 
 任何影响执行的决定都必须成为当前 IR 的 type、operation、region、operand、result、attribute或def-use。Analysis cache、provenance和search declaration可以独立存在，但不能与executable function共同解释程序。

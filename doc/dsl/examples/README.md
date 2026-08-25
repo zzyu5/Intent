@@ -6,6 +6,7 @@
 - [`reduction.py`](reduction.py)：generic reduce 与 typed combine；
 - [`gemm.py`](gemm.py)：完整域 contraction 与算法 constexpr 分支；
 - [`online_softmax.py`](online_softmax.py)：用 typed record reduction 表达 online-softmax summary algebra，不使用 `state_stream`；
+- [`flash_attention.py`](flash_attention.py)：用region fold显式表达chunk-local QK/max/sum/PV与summary merge，同时不暴露任何Q/K physical extent；
 - [`ragged_grouped_gemm.py`](ragged_grouped_gemm.py)：用可机械展开的 ragged helper 表达 offsets/subregion/index relation，再进行 gather、contract 与 unique scatter；
 - [`split_k_pipeline.py`](split_k_pipeline.py)：不用 `partition`，显式写 part domain、boundary arithmetic、source subregion、partial tensor 与两个 kernels 的 host orchestration。
 

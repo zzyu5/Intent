@@ -7,7 +7,7 @@ Physical parameter是在target compile time绑定、直接参与当前GPU progra
 每个parameter declaration至少定义：
 
 - stable symbol；
-- semantic role，例如logical ownership extent、reduction chunk、scan chunk、group size或provider option；
+- semantic role，例如logical ownership extent、reduction chunk、scan/region segment、group size或provider option；
 - integer/bool/enum kind；
 - finite candidate domain或可验证constraints；
 - 它直接影响的types、operations与launch fields；

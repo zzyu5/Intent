@@ -7,7 +7,7 @@ KIR 在进入 physical construction 后冻结。它唯一规定：
 - kernel ABI、logical shapes、views、alias与effects；
 - domains、source-derived subregions、indexed relations与logical identities；
 - ordered control、unordered parallel、loop carry与停止条件；
-- reduce/scan/contract family、histogram、atomic、RNG及其数值语义；
+- reduce/scan/region-fold/region-scan/contract family、histogram、atomic、RNG及其数值语义；
 - 一个算法使用几个kernels以及每个kernel的边界。
 
 GPU conversion可以分析这些事实并产生等价physical program，不能改变logical members、operation semantics、effect order或kernel数量。
@@ -60,7 +60,7 @@ Execution group只是同一个physical kernel body中的内部dispatch region，
 7. scalar computation保持scalar，tensor computation先采用最小合法fragment或scalar loop；
 8. 每次load/store/gather/scatter/atomic都立即产生显式access relation与validity；
 9. logical buffers立即产生allocation scope、initialization mode或first-write obligation、read/write、ownership与lifetime，不把这些事实留给emitter；
-10. reduce/scan/contract立即成为可执行physical structured ops；未分块的版本可以慢，但不能只保留一个等待materializer解释的record。
+10. reduce/scan/region-fold/region-scan/contract立即成为可执行physical structured ops；未分块的版本可以慢，但不能只保留一个等待materializer解释的record。
 
 若kernel只有一个无法拆分的ordered group，该group的segment长度为1，整个算法在一个program instance中按序执行。这是完整性结果，不是所有kernel的默认GPU策略。后续passes可以扩大一个physical program instance的logical ownership extent、重新group/swizzle program space或形成persistent traversal，但每一步都必须保持workset覆盖与effects。只有当新mapping能由launch-visible values或已有index relation直接计算时，pass才能把data-dependent member traversal提升为program space；不得为获得mapping引入隐藏launch。
 
@@ -92,12 +92,14 @@ Atomic op保存KIR memory order、logical allocation/address relation、返回�
 - pointwise/unique write：result/free axes进入workset，初始每instance处理最小合法value slice；
 - reduce：非reduction axes进入workset，reduction axes留在instance内部；
 - scan：非scan axes进入workset，scan axis由physical scan或ordered carry处理；
+- region fold：summary free axes进入workset；source axis留在instance内部，physical pass选择连续非空segments并在每段执行显式summarizer，再按summary combine合并；
+- region scan：output/free axes进入workset；source axis留在instance内部，physical program显式保存segment summarizer、transition combine、incoming-state application、slice emitter与final-state flow；
 - contract：batch与free axes进入workset，paired reduction axes留在instance内部；
 - ordered recurrence：可证明independent的outer axes进入workset，state-carry axes留在instance内部；
 - dynamic subregion：begin/end/source provenance成为runtime SSA和access validity，不改变program instance identity；
 - scatter/atomic：source iteration可以成为workset，collision与ordering由operation semantics保存。
 
-Ordinary `for/while`在physical IR中保存runtime condition/bounds、region arguments、loop-carried SSA、memory effects、`break/continue` edges与yields；compiler不需要证明终止，只需保持KIR控制语义。Reduce/scan保存physical axes、逐component identity、typed combine region与accumulator schema；scan另外保存inclusive/exclusive、direction与result relation。Arg-reduce的tie/NaN规则、dynamic extent与所有stop conditions同样是显式operands/attributes/regions，不能由provider从op名称猜出。
+Ordinary `for/while`在physical IR中保存runtime condition/bounds、region arguments、loop-carried SSA、memory effects、`break/continue` edges与yields；compiler不需要证明终止，只需保持KIR控制语义。Reduce/scan保存physical axes、逐component identity、typed combine region与accumulator schema；scan另外保存inclusive/exclusive、direction与result relation。Region fold/scan还保存source slicing relation、summarizer region及显式captures；region scan保存transition combine、apply、emit、output assembly与final-state flow。Arg-reduce的tie/NaN规则、dynamic extent与所有stop conditions同样是显式operands/attributes/regions，不能由provider从op名称猜出。
 
 ## 8. Origin 与 semantic preservation
 
@@ -122,6 +124,7 @@ Initial conversion完成后必须验证：
 - every access的coordinates、validity与fill/effect完整；
 - every buffer read有dominant initialization或write；
 - every structured op具有完整operands、results、regions与accumulator；
+- every region fold/scan的segment source relation、summarizer、identity、combine以及scan apply/emit/result assembly完整，且没有segment identity/extent泄漏为KIR observable value；
 - all physical values具有合法scalar/fragment types；
 - every runtime program-space extent只依赖launch-visible values，data-derived member domains仍有完整的program-internal traversal；
 - every buffer的allocation scope、instance identity、initialization mode/coverage、ownership与visibility完整；

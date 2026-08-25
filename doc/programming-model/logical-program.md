@@ -77,17 +77,57 @@ compiler 可以 serial、flatten、thread 或 vectorize该语义。纯整域 ten
 
 普通有序程序不需要 `ordered` 标记。compiler只有在 dependence/effect analysis证明结果相同后才能改变它的执行组织。
 
-## 5. Recurrence、reduce 与 scan
+## 5. Recurrence、homomorphic region operations 与 ordered control
 
-Intent 不提供 `state_stream`。原构造的算法含义严格落入三类：
+Intent 不提供允许 arbitrary body 随 compiler-selected extent 重新分段的 `state_stream`。这类构造没有说明改变分段后为什么仍是同一个程序：body 可以观察调用次数、tail、局部 shape 与 effects，因而一般不具备唯一语义。
 
-1. 更新允许按作者写下的 combine合法重结合，只需要最终 summary：`reduce`；
-2. 更新允许重结合，需要每个 logical position 的 prefix：`scan`；
-3. 更新依赖严格顺序、动态停止、非结合 state或 ordered effects：普通 `for/while` 与 loop carry。
+语言区分五种结构：
 
-若 page、window、group 或 chunk boundary 本身影响读取集合或结果，作者显式计算边界并构造 source-derived subregion。若 boundary 不可观察，它属于 compiler physical blocking。
+1. 每个 logical element 已经是 summary，只需要最终可重结合结果：`reduce`；
+2. 每个 logical element 已经是 summary，需要每个 logical prefix：`scan`；
+3. 作者定义“任意连续 source slice 怎样产生 summary”，只需要最终 summary：`region_fold`；
+4. 作者同时定义 slice summary、summary composition、incoming state application 与 slice output，需要每个 logical position 的结果：`region_scan`；
+5. 更新依赖严格顺序、动态停止、非结合 state或 ordered effects：普通 `for/while` 与 loop carry。
 
-不存在“由 compiler 任意选择 segmentation，但没有 reduce/scan algebra，结果仍唯一”的第四种语义。因此 `state_stream`、segment `extent=auto` 与作者命名的 `K_TILE/N_TILE` 都不进入最终语言。
+`region_fold`作用于一个有序 source axis。对任意保持顺序、完整覆盖该axis的连续分段`R0 ... Rn`，作者提供：
+
+```text
+summarize(Ri) -> Summary
+combine(Summary, Summary) -> Summary
+identity : Summary
+```
+
+并要求：
+
+```text
+summarize(A ++ B) == combine(summarize(A), summarize(B))
+combine(identity, x) == combine(x, identity) == x
+```
+
+其中`A`、`B`是相邻且保持source顺序的连续slices。`combine`允许保持logical order的任意parenthesization，不允许permutation。作者选择该operation，即声明这些等式属于算法定义；compiler不证明数学结合律，但验证types、schema、purity、effects与source-axis关系。
+
+`summarize`接收沿同一source axis切出的tensor components以及显式captures。它可以包含pure tensor operations，包括reduce、scan与contract；不得包含external/logical-buffer write、scatter、atomic、RNG或其它可观察effect。它不能读取segment ordinal、segment count、chosen extent或chunk-relative coordinate。需要坐标时，作者把`I.indices(source_axis)`作为source component传入；切片后仍是absolute source coordinates。
+
+`region_scan`使用相同的summary algebra，但还显式提供：
+
+```text
+apply(prefix_summary, initial_state) -> incoming_state
+emit(source_slice, incoming_state, captures) -> output_slice
+```
+
+`apply(combine(a,b), state)`必须等于按source顺序先应用`a`再应用`b`。对相邻slices `A`、`B`，还必须有：
+
+```text
+emit(A ++ B, state)
+  == concat(emit(A, state),
+            emit(B, apply(summarize(A), state)))
+```
+
+`summarize`/`combine`/`apply`/`emit`都是typed pure helpers。`emit`产生与该source slice同一logical成员关系的output；operation把各slice outputs重新组成原source axis上的结果，并返回`apply(summarize(full_source), initial_state)`作为final state。Compiler选择的segment数量、边界和内部prefix states不可由作者观察，也不能成为result shape或ABI。若算法本身输出per-chunk states或chunk数量出现在ABI中，chunk是logical data，作者应使用显式chunk domain、source subregions与ordinary scan，而不是`region_scan`。
+
+`reduce/scan`是element-summary的受限形式；`region_fold/region_scan`只在作者确实写下region-level summarizer或emitter时使用。四者属于同一个homomorphic structured-operation family，共享summary schema、combine legality与physical realization规则；frontend将退化成纯element fold/scan的region写法canonicalize回ordinary reduce/scan，避免两条等价canonical路径。
+
+若 page、window、group 或 chunk boundary本身影响读取集合、输出shape或ABI，作者显式计算边界并构造source-derived subregion。若boundary只服务physical blocking，作者不写其extent；只有上述homomorphism使compiler-selected segmentation具有唯一语义。
 
 ## 6. Structured tensor operations
 

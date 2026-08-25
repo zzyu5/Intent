@@ -97,6 +97,19 @@ identity逐component显式给出：
 
 NaN与tie behavior来自明确combine。`reduce.max`使用propagating maximum；`arg_reduce.max`在values相等时选择lowest logical index，并传播NaN。其它策略必须通过不同typed combine明确写出。
 
+Region fold/scan沿compiler-selected连续source slices允许同样的logical-order-preserving reassociation。它们另外要求region summarizer与summary combine满足：
+
+```text
+summarize(A ++ B) == combine(summarize(A), summarize(B))
+combine(identity, x) == combine(x, identity) == x
+```
+
+Compiler不证明这些代数定律；作者选择operation即声明它们成立。Verifier必须检查source-axis一致、summary/identity/combine schema、captures、purity、output relation及禁止的effects。
+
+`identity`必须在本节定义的float/NaN语义下真正中立。把`maximum=-inf`、其它components为零的record无条件送进包含`exp(maximum - merged_maximum)`的combine，会在`-inf - -inf`处产生NaN，因此不是合法identity。此类summary必须携带显式validity，并在执行指数运算前把invalid分支规范化为有限差值；或者使用另一种能够证明双侧中立的typed表示。Empty source的region fold返回identity；empty region scan返回empty output与initial state。
+
+Region summarizer不能观察compiler-selected segment identity或extent。它若需要位置，必须消费由source axis产生的absolute logical coordinates；这些coordinates切片后不重新编号。Region scan除summary homomorphism外，还要求整段emit等于按相邻slices分段emit，后一段消费前一段summary作用后的incoming state。Floating-point region fold/scan接受由合法segmentation与parenthesization造成的舍入差异，但不允许改变source order、NaN policy、accumulator dtype或approximation contract。
+
 ## 7. Scaled、sparse 与 histogram numerics
 
 scaled-contract schema定义logical element format、carrier packing、scale encoding、group relation、rounding、special values与accumulator dtype。普通target不能以native primitive限制反向缩窄该语义。
