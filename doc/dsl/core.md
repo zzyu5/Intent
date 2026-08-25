@@ -16,6 +16,8 @@ def helper(...):
 
 helper可以返回 scalar、tensor、tuple或record，并可包含调用点本来允许的effects。runtime captures必须成为显式参数，只有不可变 `Constexpr` 可以被词法捕获；递归、target query与kernel launch非法。
 
+Helper边界不会把logical coordinate降级为无来源的integer tensor。传入或返回的tensor/tuple/record components若源自`I.indices`、subregion或indexed relation，canonical KIR必须保留它们的source identity、axis mapping与typed coordinate expression。Helper是否inline不得改变这些facts。
+
 ## 2. Parameters
 
 ```python
@@ -32,6 +34,8 @@ CAUSAL: I.Constexpr[bool]
 - dtype annotation的scalar是runtime scalar；
 - `Constexpr` 只选择硬件无关算法分支。
 
+`I.Enum`是用户定义的有限、非空、封闭、具名constexpr类型。成员名与编译期枚举值在该类型内唯一；值只能作为`Constexpr[EnumType]`参数、constexpr默认值、分支条件或helper constexpr capture。它不是runtime scalar或tensor dtype，不进入external view/logical-buffer ABI，不同enum类型之间不隐式比较或转换，也不继承Python `IntEnum`的整数算术语义。
+
 ## 3. Domains 与 source-derived subregions
 
 ```python
@@ -45,13 +49,22 @@ window = columns[begin:end]
 
 `domain(begin,end,step=1)` 使用半开整数序列。`axis[begin:end]` 产生source-derived连续subregion，保留source axis、bounds、empty/tail与provenance，不隐式clamp。
 
-遍历subregion得到source logical coordinate；`I.indices(subregion)`也返回source coordinates。非连续、重复或重排成员使用indexed relation。
+遍历subregion得到source logical coordinate；`I.indices(subregion)`也返回source coordinates。`I.indices`产生的是logical `index` tensor，其数值是source coordinate，同时canonical relation保存source identity、source axis与member mapping；不能在helper、slice或shape transform后只留下普通`i32/i64`数值。非连续、重复或重排成员使用indexed relation。
 
 ## 4. Tensor values 与 shape transforms
 
 pointwise surface允许scalar与size-one broadcast；frontend必须将其归一成显式broadcast relation。dynamic extents保留identity/equality conditions，不以“都是dynamic”判为兼容。
 
 `reshape` 保持logical row-major element order与元素总数；`transpose/permute` 显式给出axis permutation。
+
+Ranked tensor与external view暴露`.shape`，返回保留dynamic-extent identity的logical extent tuple。Scalar、tuple、record与domain/subregion本身没有统一`.shape`。`.shape`可用于shape arithmetic、domain、shape transform和tensor construction，不表示physical fragment或block shape。
+
+```python
+mask = I.full(scores.shape, fill=True, dtype=I.bool)
+zeros = I.full((M, N), fill=0.0, dtype=I.f32)
+```
+
+`I.full(shape, fill, dtype=...)`产生无effect、无alias的ranked tensor SSA value。`shape`的每一维是非负logical extent，可为静态值或保留identity的runtime shape value；`fill`是按显式`dtype`实例化并广播到所有logical elements的scalar。它不分配logical buffer、不初始化external view，也不携带storage/layout/padding。`I.zeros(shape,dtype)`是`I.full(shape, fill=0, dtype=dtype)`的surface shorthand。
 
 `join` 只表示两个同dtype、同shape values沿新的trailing logical axis堆叠：
 
@@ -64,6 +77,16 @@ pair = I.join(lhs, rhs)
 ```
 
 它不是record、concatenate或一般interleave。
+
+Python tuple literal与tuple-valued helper result构造固定长度、按位置编号的typed product value。`I.record(field=value, ...)`构造非空、字段名唯一、字段顺序固定的typed named product value。两者都是immutable SSA aggregates：
+
+- component可以是scalar、ranked tensor、tuple或nested record，不要求相同dtype、rank或shape；
+- tuple使用静态位置选择或解构，record使用静态`.field`选择；
+- type identity分别包含tuple component顺序，或record字段名、字段顺序与逐字段类型；
+- 它们可作helper values、loop carry、logical-buffer element schema与structured-operation accumulator/identity；
+- 它们不直接成为kernel public runtime parameter、external-view element或host-visible return。跨kernel状态要拆成显式views/scalars。
+
+Tuple/record不拥有统一`.shape`或`.dtype`；要取tensor shape，先选中具体component。它们也不是`join`：`join`产生具有单一element dtype和新logical axis的ranked tensor。
 
 ## 5. Unordered parallel iteration
 
@@ -193,7 +216,14 @@ outputs, final_state = I.region_scan(
 - `apply(prefix_transition, initial_state) -> incoming_state`；
 - `emit(slice, incoming_state, captures) -> output_slice`。
 
-`apply(combine(a,b), state)`等于先应用`a`再应用`b`。对相邻slices `A`、`B`，还必须满足：
+Transition identity与composition必须对state构成合法action：
+
+```text
+apply(identity, state) == state
+apply(combine(a, b), state) == apply(b, apply(a, state))
+```
+
+对相邻slices `A`、`B`，还必须满足：
 
 ```text
 emit(A ++ B, state)
@@ -207,6 +237,8 @@ emit(A ++ B, state)
 Ordinary scan是element-summary/element-output的受限形式；退化的region写法canonicalize回ordinary scan。`region_scan`不是任意effectful state loop，不能代替严格ordered recurrence。
 
 完整FlashAttention写法见[`examples/flash_attention.py`](examples/flash_attention.py)。其中QK与PV都是作者显式写下的contract；region fold只抽象K source的合法连续segmentation，不依赖compiler从tuple reduction识别attention模式。
+
+完整region-scan写法见[`examples/causal_linear_attention.py`](examples/causal_linear_attention.py)；显式算法chunk的反例见[`examples/mamba_state_passing.py`](examples/mamba_state_passing.py)。前者的segment boundaries不可观察且满足summary/emit等价律；后者的chunk axis与per-chunk state进入ABI，因而使用ordinary ordered carry。
 
 ## 10. Contract
 
@@ -223,9 +255,9 @@ acc = I.contract(
 contract定义二元paired-axis multiply-add contraction：
 
 - `reduce` 是非空、唯一、extent-compatible的lhs/rhs axis pairs；
-- `batch` 是唯一、extent-compatible且不与reduction重叠的axis pairs；
-- 其余lhs/rhs axes分别成为result free axes；
-- result axis order是lhs未归约axes，随后是rhs未归约且非rhs-batch axes；
+- `batch` 是唯一、extent-compatible且不与reduction重叠的axis pairs；每个pair在result中只出现一次，由lhs axis代表；
+- lhs中不在`reduce`里的axes按lhs顺序成为result axes，其中包括batch-pair的lhs representatives；
+- rhs中不在`reduce`且不是batch-pair rhs member的axes随后按rhs顺序成为result axes；
 - multiply固定为数值乘法，combine固定为加法；
 - accumulator dtype显式给出。
 
@@ -380,7 +412,7 @@ part identity、boundary formula、empty/tail与partial tensor interface由普�
 |---|---|---|---|
 | definitions/interface | kernel、helper、`In/Out/InOut`、runtime/constexpr | Python decorators与type spelling | target selection、hidden launch、provider dispatch |
 | domain/control | domain、source subregion、`if/for/while`、unordered parallel、loop carry | slices、`indices`、`break/continue` | `auto`、partition、state_stream、ordered、program/lane id |
-| tensor values | arithmetic、compare/select、broadcast、reshape、transpose、join、record、full、cast/bitcast | zeros、activation helpers、value mask | physical tile/layout/padding |
+| tensor values | arithmetic、compare/select、broadcast、reshape、transpose、join、tuple、record、full、cast/bitcast | zeros、activation helpers、value mask | physical tile/layout/padding |
 | structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、histogram | built-in reduces、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
 | relations | source subregion、index relation、sparse format schema | ragged/members/index helpers | target metadata layout、MMA hint |
 | memory/effects | external/buffer read-write、unique/reduction scatter、atomic ops、Philox bits | ordinary indexing/assignment、atomic convenience names | physical scope、storage、copy instruction、barrier/pipeline |

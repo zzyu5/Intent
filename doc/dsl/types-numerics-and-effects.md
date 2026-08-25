@@ -1,6 +1,6 @@
 # Types、Numerics 与 Effects
 
-## 1. Canonical scalar 与 tensor types
+## 1. Canonical value types
 
 普通logical values使用：
 
@@ -16,6 +16,8 @@
 
 physical lane shape、padding、layout、address width和target encoding不进入canonical value type。
 
+Tuple和record是immutable structural product types，不是ranked tensor或memory layout。Tuple type由固定component序列定义；record type由有序、唯一的field names及逐字段value types定义。它们可包含不同shape/dtype的tensor components，也可嵌套；不提供统一`.shape`或`.dtype`。它们可作为SSA、helper result、loop carry、logical-buffer element schema和structured accumulator，但不直接进入public kernel ABI或external-view element type。
+
 `i4/u4/fp4`不作为普通可寻址tensor element type。普通packed data使用`u8/u16/u32` carrier，加显式index、shift、mask、sign extension与scale arithmetic。FP4等microscaling formats由scaled-contract schema定义。
 
 ## 2. Logical index 与 shape values
@@ -25,6 +27,10 @@ logical `index`使用signed 64-bit arithmetic。physical address width由compile
 dynamic extent是有identity的runtime shape value。不同dynamic extents只有在来自同一value、operation产生明确equality relation，或调用前置条件声明相等时才兼容。
 
 tensor rank与logical extents来自domains/subregions和shape transforms。broadcast、reshape与join的规则见[`logical-program.md`](../programming-model/logical-program.md)。
+
+Ranked tensor与external view的`.shape`是logical extent tuple；dynamic members保留shape identity。`I.full(shape, fill, dtype)`要求每个extent非负，把scalar `fill`按本文的literal/cast规则实例化为`dtype`并广播到所有elements；zero extent产生empty tensor。`value.shape`可直接作为`I.full`的shape，但不转化成physical fragment shape。
+
+`I.Enum`是constexpr-only closed named type。成员及其唯一值只参与specialization identity、同类型比较与硬件无关constexpr control；不同enum不隐式比较，enumeration不进入runtime scalar/tensor/buffer/view ABI，不允许算术、cast或bitcast。Python surface可使用`IntEnum`-like declaration convenience，但其underlying Python integer representation不是canonical ABI事实。
 
 ## 3. Literals 与 promotion
 
@@ -108,7 +114,7 @@ Compiler不证明这些代数定律；作者选择operation即声明它们成立
 
 `identity`必须在本节定义的float/NaN语义下真正中立。把`maximum=-inf`、其它components为零的record无条件送进包含`exp(maximum - merged_maximum)`的combine，会在`-inf - -inf`处产生NaN，因此不是合法identity。此类summary必须携带显式validity，并在执行指数运算前把invalid分支规范化为有限差值；或者使用另一种能够证明双侧中立的typed表示。Empty source的region fold返回identity；empty region scan返回empty output与initial state。
 
-Region summarizer不能观察compiler-selected segment identity或extent。它若需要位置，必须消费由source axis产生的absolute logical coordinates；这些coordinates切片后不重新编号。Region scan除summary homomorphism外，还要求整段emit等于按相邻slices分段emit，后一段消费前一段summary作用后的incoming state。Floating-point region fold/scan接受由合法segmentation与parenthesization造成的舍入差异，但不允许改变source order、NaN policy、accumulator dtype或approximation contract。
+Region summarizer不能观察compiler-selected segment identity或extent。它若需要位置，必须消费由source axis产生的absolute logical coordinates；这些coordinates切片后不重新编号。Region scan除summary homomorphism外，还要求`apply(identity,state) == state`，以及整段emit等于按相邻slices分段emit，后一段消费前一段summary作用后的incoming state。Floating-point region fold/scan接受由合法segmentation与parenthesization造成的舍入差异，但不允许改变source order、NaN policy、accumulator dtype或approximation contract。
 
 ## 7. Scaled、sparse 与 histogram numerics
 

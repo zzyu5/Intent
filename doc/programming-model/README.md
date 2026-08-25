@@ -51,6 +51,8 @@ domain 是一组有序 logical coordinates。source-derived subregion 是由作�
 
 subregion 会改变 body 读取的逻辑成员，因此属于算法。compiler 为执行选择的 physical tile 不改变作者 tensor shape，也不会伪装成 logical subregion进入 Kernel IR。
 
+`I.indices`、subregion与indexed relation产生的coordinate values即使经过helper call、slice、broadcast、reshape或transpose，仍保留source identity与typed coordinate provenance。这些facts让compiler能从作者已写下的logical predicate证明physical all-valid/all-invalid ranges，但不赋予compiler改变logical members的权力。
+
 作者可以表达“对变长序列的有效前缀做归约”或“第 `p` 份读取 `[begin_p,end_p)`”；不表达“每个 CTA 处理 128 个 token”“CPU 每次处理 16 个元素”或“RVV 使用当前 VL”。
 
 Region fold/scan中的source slice不是作者创建的ordinary subregion，也不能逃逸成value、shape或ABI。它是structured operation内部受homomorphism约束的parametric slice：operation对所有合法连续segmentation定义同一结果，compiler只为当前physical program绑定extent。作者只能消费被同步切片的tensor components和absolute source coordinates，不能观察segment identity、数量或chosen extent。该受限语义不赋予ordinary loop任意重新分段的权限。

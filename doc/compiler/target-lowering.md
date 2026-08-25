@@ -43,6 +43,7 @@ Passes查询features而不是匹配设备名称。SM90、SM100、SM120或gfx fam
 - program coordinates → `tl.program_id`与grid；
 - physical ranges/fragments → `tl.arange`、scalar/blocked tensor values；
 - explicit access/validity/fill → pointer expressions、mask/other与`tl.load/store`；
+- predicate-proven physical effective ranges → 已选loop bounds、all-valid unmasked body与mixed-range guard；
 - gather/scatter/atomic →对应Triton operations；
 - physical reduce/scan/contract → `tl.reduce/associative_scan/dot/dot_scaled`或合法展开；
 - physical region fold/scan → 已选segment loop、summarizer body、summary combine、scan apply/emit与其中显式structured operations；
@@ -111,7 +112,7 @@ Provider legalization完成后检查：
 - local extension operands/results/regions完整；
 - unsupported dtype/primitive/access/sync组合已在serialization前拒绝；
 - physical parameters完整绑定到provider constexpr/config；
-- no provider pass重新读取KIR去推导shared ownership、axis、range、access或validity。
+- no provider pass重新读取KIR去推导shared ownership、axis、range、coordinate provenance、access或validity。
 
 ## 9. Terminal serialization
 

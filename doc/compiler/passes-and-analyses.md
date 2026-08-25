@@ -22,7 +22,7 @@ Pass的成立依据是它改变了当前program，并保持可验证不变量；
 只在immutable KIR上计算：
 
 - shape/domain/subregion identity；
-- index relations与alias；
+- coordinate provenance、axis maps、active index sets、index relations与alias；
 - operation effects与collision semantics；
 - control dependence、loop carry与ordered state；
 - reduce/scan/region-fold/region-scan/contract schemas；
@@ -48,7 +48,7 @@ Construction完成后，这些结果已经进入GPU IR；后续passes不再把co
 
 - program coverage与mapping；
 - physical dominance、def-use与loop dependence；
-- fragment axes、access footprints与validity；
+- fragment axes、compositional coordinate maps、predicate ranges、access footprints与validity；
 - reuse、rematerialization、buffer lifetime与sharing；
 - structured-op operand/accumulator flow；
 - target-independent resource estimates；
@@ -100,7 +100,22 @@ Blocking pass不得修改KIR logical subregions或作者可观察的page/window/
 - contract/reduce/scan/region-fold/region-scan realization产生真实fragments、loops、carry与accumulator graph；region summarizer中的contract保持显式，不能依赖attention-shaped algebraic recognition恢复；
 - boundary neutralization删除或简化实际validity/fill，不只删除padding record。
 
-### 3.5 Target-capability legalization
+### 3.5 Predicate range narrowing 与 summary emptiness
+
+Canonical coordinate-provenance analysis从`I.indices`、domain/subregion/index relation出发，组合helper calls、slice、broadcast、reshape/transpose、integer arithmetic与comparison。Blocking形成current physical fragment后，predicate-range analysis才把logical predicate投影到该fragment的source ranges：
+
+- 输入必须是typed coordinate expressions、current physical ownership/ranges与structured-op identity/effect facts；
+- 只有单调性、bounds与set inclusion被精确证明时，才可得到all-true、mixed与all-false连续区间；否则保留原遍历与predicate；
+- all-true区间可去掉冗余validity，mixed区间必须保留原predicate，all-false区间只在summarizer/reduction对每个free lane产生identity且没有effect时才可跳过；
+- rewrite必须真实改写physical loop bounds、access coordinates、active sets与validity SSA，但不改变KIR logical source relation。
+
+All-false到identity的证明由局部typed value propagation完成：将predicate代入`select/mask`，再使用builtin reduce identity、zero contraction、pointwise constant folding和tuple/record逐component equality。它不识别summarizer名称或attention形状；任一component无法证明等于identity时，整个区间不得删除。
+
+例如current query fragment是`q in [q_begin,q_end)`，predicate是`q >= k`时，`k in [0,q_begin)`是all-true，`[q_begin,q_end)`是mixed，`[q_end,K)`是all-false。这是coordinate/index-set rule，不是attention或causal kernel matcher。
+
+Range narrowing之后，summary-emptiness analysis可证明某个physical traversal对每个free lane已先产生non-empty summary，或所选concrete combine graph不会让两个empty summaries相互combine。在保持NaN、identity、source order与empty-input语义的前提下，pass可从physical carry中删除optional/valid component及其selects。Canonical KIR中的total identity不因此被改写；证明失效或某路径可使empty summaries两两相合时保留validity。
+
+### 3.6 Target-capability legalization
 
 共同GPU verifier先检查provider-neutral legality。随后selected provider/hardware capability运行local checks与被真实差异逼出的extensions：
 
@@ -111,7 +126,7 @@ Blocking pass不得修改KIR logical subregions或作者可观察的page/window/
 
 不能表达的组合在最早拥有足够信息的层明确拒绝，不生成慢一个数量级的伪支持或等待JIT超时。
 
-### 3.6 Deterministic serialization
+### 3.7 Deterministic serialization
 
 Serializer只遍历已legalized current program并发出provider source。它不得调用canonical KernelModel、按result shape反推fragment、解析role字符串、创造workspace/loop/mask/grid或追加search parameters。
 
@@ -124,6 +139,7 @@ Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允�
 - 对reduce/scan/contract采用operation允许的reassociation；
 - flatten/permutation paired contract axes；
 - 创建blocking loops与fragment accumulators；
+- 从coordinate predicate证明all-true/all-false/mixed ranges，删除identity-only physical traversal或冗余summary validity；
 - 把exact read→write关系映射成bulk transfer；
 - 将program instances group、swizzle或grid-stride遍历。
 
@@ -153,6 +169,7 @@ Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允�
 - scalar/fragment shape与parameter expressions；
 - structured control、dominance、loop carries与terminators；
 - accesses、validity、fill、effects与alias/conflict；
+- coordinate provenance、axis-map composition、active index-set subset与predicate/range proof；
 - buffers、initialization/first-write obligation、lifetime与visibility；
 - structured-op operands/results/accumulators；
 - physical parameters均已声明并有合法domains；
@@ -170,12 +187,14 @@ Serialization前必须证明所有ops具有唯一provider spelling或已明确un
 
 下面内容可以独立于executable SSA存在：
 
-- immutable origin/provenance；
+- immutable diagnostic origin/provenance；
 - analysis cache；
 - diagnostics；
 - target capabilities；
 - physical parameter declarations与candidate domains；
 - benchmark/tuning artifacts。
+
+Provenance/range analysis cache可以是side information；但影响执行的coordinate map、active member set、validity、narrowed loop range与identity elimination必须同时改写进current executable IR。
 
 下面内容不得只存在于side records：
 

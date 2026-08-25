@@ -65,8 +65,8 @@ Fragment保存：
 
 - element dtype；
 - physical shape expressions；
-- 各fragment axes到logical coordinates的mapping；
-- active validity的shape relation；
+- 各fragment axes到logical coordinates的compositional mapping及其source-axis provenance；
+- active member/index set与validity的shape relation；
 - owning program instance/workset。
 
 Fragment不保存register/lane/warp/CTA distribution、shared/TMEM layout、MMA encoding或provider memory space。这些由外部provider compiler或被真实差异逼出的local extensions决定。
@@ -112,7 +112,7 @@ Physical loops可以使用runtime bounds或compile-time physical parameters。�
 - result axes；
 - 每个source axis的typed coordinate expression；
 - coordinate对program ids、loops、fragments、runtime indices与source subregions的SSA dependencies；
-- active validity；
+- 从logical predicate及source bounds组合出的active member/index set与validity；
 - load fill或write collision/effect semantics。
 
 共同access operations是：
@@ -133,12 +133,12 @@ Atomic operation另外显式保存memory order、logical sharing domain、RMW ki
 共同IR包含对scalar和fragment都定义明确的：
 
 - arithmetic、comparison、select、cast与bitcast；
-- broadcast、reshape、transpose、join与record operations；
+- broadcast、reshape、transpose、join、tuple与record operations；
 - explicit scalar↔fragment broadcast/extract；
 - immutable value reuse与rematerialization；
 - typed pure helper/combiner regions。
 
-Physical pass若选择重算pure producer，必须真实改变def-use；若选择materialize，必须产生buffer/value及对应uses。不能只写`replay=true`或value ID列表。
+Broadcast、reshape、transpose、slice、tuple/record extraction与pure helper call同时组合value def-use与coordinate provenance。Physical pass若选择重算pure producer，必须真实改变def-use并保持等价coordinate map；若选择materialize，必须产生buffer/value及对应uses。不能只写`replay=true`、provenance ID或value ID列表。
 
 ## 8. Structured compute
 
@@ -153,6 +153,8 @@ Physical structured operations消费当前scalar/fragment SSA：
 -其它被canonical KIR正式定义的local structured operation。
 
 Arg-reduce等复合result还保存tie、NaN与index semantics；ordinary ordered loop则显式保存runtime condition/bounds、loop-carried values、effects与terminators。Region summarizer内原本显式存在的contract/reduce继续是独立physical structured ops；compiler不需要从summary combine猜回它们。上述ops不携带provider primitive名称、MMA version、input precision hint、K-pack、warp policy或pipeline stage。Provider可以直接映射到native primitive、合法展开或明确拒绝，但不得改变KIR semantic schema。
+
+Structured op可以另外保存一个由typed predicate analysis得到的physical effective source range。该range只能收窄physical traversal，不修改KIR logical source；被排除的members必须已被证明对每个free lane产生identity/no effect。All-true区间可删除predicate，mixed区间保留原validity，all-false区间可从physical loop/access graph中删除。Effective range与改写后的loop/access SSA属于current program；proof是由current coordinate/predicate relations重算的analysis result，可缓存但不参与执行解释。
 
 ## 9. Dependency、storage 与 synchronization
 
@@ -170,13 +172,14 @@ Provider-local pass可以把共同dependency/lifetime展开成explicit allocatio
 2. program space与logical effect/result coverage完整；
 3. every SSA value具有合法scalar/fragment/resource type；
 4. fragment extents是常量或已声明physical parameter expressions；
-5. every access具有resource、coordinates、validity及fill/effect；
+5. every access具有resource、compositional coordinates/provenance、active member set、validity及fill/effect；
 6. every control region具有完整arguments、yields与dominance；
 7. every buffer具有initialization或first-write obligation、lifetime与ownership；
 8. every structured op具有完整physical operands/results与semantic schema；
 9. non-atomic conflicting effects非法；
 10. runtime grid extents不依赖launch后才能读取的device data；
-11. execution不依赖KIR clone、axis/role字符串或side decision records。
+11. every physical range narrowing具有原logical relation的subset/identity proof，并已真实改写loop、access与validity；
+12. execution不依赖KIR clone、axis/role字符串或side decision records。
 
 ## 11. 明确排除
 

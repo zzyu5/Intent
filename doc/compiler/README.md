@@ -25,11 +25,11 @@ GPU pipeline 必须产生一份共同、完整、唯一的 executable GPU progra
 - program-instance space 与 logical workset mapping；
 - program 内 structured control、physical loops 与 loop carries；
 - scalar/fragment SSA、accumulator、materialization 与 buffer lifetimes；
-- access coordinates、validity、fill、collision 与 atomic effects；
+- compositional coordinate provenance、predicate/index sets、access coordinates、validity、fill、collision 与 atomic effects；
 - physical reduce、scan、region fold/scan、contract、scaled/sparse contract 与其它 local structured operations；
 - compile-time physical parameters对types、loops、accesses与launch的直接约束。
 
-任何影响执行的决定都必须成为当前 IR 的 type、operation、region、operand、result、attribute或def-use。Analysis cache、provenance和search declaration可以独立存在，但不能与executable function共同解释程序。
+任何影响执行的决定都必须成为当前 IR 的 type、operation、region、operand、result、attribute或def-use。Analysis cache、diagnostic origin和search declaration可以独立存在，但不能与executable function共同解释程序。Coordinate provenance由canonical KIR relation派生后，必须物化为current physical coordinate/access mappings，不能只存在origin side table。
 
 ## 3. 与 Triton 两层 IR 的关系
 

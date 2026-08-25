@@ -13,12 +13,14 @@ target 在编译调用中选择，不是 DSL value、类型、`Constexpr` 或控
 这些内容必须在 canonical Kernel IR 中拥有唯一、可验证的表示：
 
 - kernel interface、runtime/constexpr 参数与 helper calls；
-- domain、source-derived subregion、logical index 与 indexed relation；
+- domain、source-derived subregion、logical index、compositional coordinate provenance 与 indexed relation；
 - structured control、unordered parallel iteration 与 loop carry；
-- typed tensor/value operations，包括 broadcast、reshape、transpose 与 join；
+- typed tensor/value operations，包括 tuple/record、full、broadcast、reshape、transpose 与 join；
 - generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract 与 histogram；
 - external/logical-buffer read/write、unique/reduction scatter 与 atomic operations；
 - stateless counter-based RNG。
+
+`I.Enum`是constexpr-only surface type，在specialization时归一为closed canonical enum，不进入runtime ABI。
 
 ### Surface shorthand
 

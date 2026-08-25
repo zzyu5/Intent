@@ -27,6 +27,19 @@ window = axis[begin:end]
 
 非连续、重复或重排的成员使用 indexed relation，不冒充 subregion。只有作者边界、输入 relation 或算法 metadata 能在 Kernel IR 中产生 subregion；compiler blocking 只存在于 target physical program。
 
+### 1.1 Coordinate provenance
+
+`I.indices(axis_or_subregion)`产生logical `index` tensor。每个result element的canonical relation同时保存：
+
+- source domain identity、source axis/rank与logical coordinate dtype；
+- 从result logical axes到source coordinate的typed expression；
+- 该expression对domain、subregion、indexed values与predicate的SSA dependencies；
+- active member set与已知bounds。
+
+Provenance是canonical value/relation的一部分，不是字符串axis name或只供调试的origin。`@intent.fn`调用必须逐component传递它；helper inline与非inlined call representation得到同一结果。Slice组合source bounds但不重新编号coordinate。Tuple/record construction只分组components，不丢失各component provenance。
+
+Broadcast保存显式axis map；transpose/permute组合axis permutation；reshape通过logical row-major linear coordinate组合old/new axis maps。对coordinate values的integer arithmetic、comparison与select保留可表示的typed expression及其dependencies。某个operation无法使用canonical expression精确表示时，numerical value仍正确，但coordinate/range analysis必须返回unknown，不得从shape、名称或附近结构猜测。
+
 ## 2. Shape 与 tensor values
 
 tensor value 的每个 dynamic extent 是有 identity 的 runtime shape value。两个未知 extent 不会因为“都是 dynamic”而自动相等；相等只能来自同一 value、operation 明确产生的 shape relation，或调用方必须满足的前置条件。
@@ -38,7 +51,7 @@ pointwise surface 允许 scalar 与 size-one broadcasting，frontend 将其归�
 - `0` 与 `1` broadcast 为 `0`，`0` 与其它正 extent 不兼容；
 - runtime equality/size-one condition 必须保留，不能按静态 shape 猜测。
 
-`reshape` 保持 logical row-major element order与元素总数；最多一个 inferred extent，并且只有结果唯一时合法。它不改变 dtype、bit representation 或 physical storage。`transpose/permute` 明确给出 logical axis permutation。
+`reshape` 保持 logical row-major element order与元素总数；最多一个 inferred extent，并且只有结果唯一时合法。它不改变 dtype、bit representation 或 physical storage。`transpose/permute` 明确给出 logical axis permutation。这些operations的result relation必须组合上节的coordinate maps，不能只保存result shape。
 
 `join(lhs,rhs)` 是唯一的 two-input value construction：两个输入 dtype 与 logical shape相同，结果增加一个 trailing logical axis：
 
@@ -115,7 +128,14 @@ apply(prefix_summary, initial_state) -> incoming_state
 emit(source_slice, incoming_state, captures) -> output_slice
 ```
 
-`apply(combine(a,b), state)`必须等于按source顺序先应用`a`再应用`b`。对相邻slices `A`、`B`，还必须有：
+Transition identity与composition必须对state构成合法action：
+
+```text
+apply(identity, state) == state
+apply(combine(a, b), state) == apply(b, apply(a, state))
+```
+
+对相邻slices `A`、`B`，还必须有：
 
 ```text
 emit(A ++ B, state)

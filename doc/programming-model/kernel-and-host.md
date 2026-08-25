@@ -37,6 +37,8 @@ Intent 逐个编译 kernel；Python wrapper 是 multi-kernel orchestration 的�
 
 helper 是否 inline、是否成为 target-local device function，是实现问题，不改变调用语义。
 
+Helper call同样不改变typed index relation。来自`I.indices`、subregion或indexed relation的coordinate values通过helper parameters/results后仍具有同一source identity、axis mapping与SSA provenance；是否inline不能让它们退化为无来源的integer tensor。
+
 ## 4. Runtime 与 `Constexpr`
 
 runtime 参数在每次 invocation 时取值，可以参与数据计算和 runtime control flow。

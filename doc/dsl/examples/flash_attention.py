@@ -174,3 +174,9 @@ def flash_attention_forward(
 # pipeline appears in the source. Physical lowering may choose both query
 # fragments and key segments. The second contract in summarize_attention_chunk
 # is the canonical source of the provider's dot(probabilities, values).
+# Because key_coordinates retains its source-coordinate provenance through the
+# region-fold helper, a physical predicate-range pass may later project
+# query_coordinate >= key_coordinate onto the chosen query fragment: remove the
+# all-invalid key suffix, drop the mask on the all-valid prefix, and preserve it
+# only on the mixed diagonal range. This changes physical traversal, not the
+# logical key source or causal predicate written above.

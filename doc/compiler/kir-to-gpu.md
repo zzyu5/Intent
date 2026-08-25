@@ -5,7 +5,7 @@
 KIR 在进入 physical construction 后冻结。它唯一规定：
 
 - kernel ABI、logical shapes、views、alias与effects；
-- domains、source-derived subregions、indexed relations与logical identities；
+- domains、source-derived subregions、indexed relations、logical identities、coordinate expressions与predicate/member sets；
 - ordered control、unordered parallel、loop carry与停止条件；
 - reduce/scan/region-fold/region-scan/contract family、histogram、atomic、RNG及其数值语义；
 - 一个算法使用几个kernels以及每个kernel的边界。
@@ -58,7 +58,7 @@ Execution group只是同一个physical kernel body中的内部dispatch region，
 5. 需要先读取device tensor才能知道成员数的data-dependent/ragged domain不得决定launch cardinality。Initial conversion只把其launch-visible outer domain映射成program instances，data-derived subregion/members留在instance内部按序或按已有structured operation遍历；若outer extent本身也不可在launch前得到，该group先使用长度1的segment并在唯一instance内遍历整个domain。没有作者写下的额外kernel，也不允许compiler先生成prefix/count launch；
 6. group body中所有dependent axes、runtime subregions和strict control保留为ordered structured loops；
 7. scalar computation保持scalar，tensor computation先采用最小合法fragment或scalar loop；
-8. 每次load/store/gather/scatter/atomic都立即产生显式access relation与validity；
+8. 每次load/store/gather/scatter/atomic都立即产生显式access relation、typed coordinate SSA、source provenance dependencies、active member set与validity；
 9. logical buffers立即产生allocation scope、initialization mode或first-write obligation、read/write、ownership与lifetime，不把这些事实留给emitter；
 10. reduce/scan/region-fold/region-scan/contract立即成为可执行physical structured ops；未分块的版本可以慢，但不能只保留一个等待materializer解释的record。
 
@@ -97,6 +97,7 @@ Atomic op保存KIR memory order、logical allocation/address relation、返回�
 - contract：batch与free axes进入workset，paired reduction axes留在instance内部；
 - ordered recurrence：可证明independent的outer axes进入workset，state-carry axes留在instance内部；
 - dynamic subregion：begin/end/source provenance成为runtime SSA和access validity，不改变program instance identity；
+- helper-produced coordinate、slice、broadcast、reshape、transpose与predicate必须组合进同一physical coordinate/relation graph；某个pass若重算它们，必须真实改写SSA def-use，不能只留provenance ID或range record；
 - scatter/atomic：source iteration可以成为workset，collision与ordering由operation semantics保存。
 
 Ordinary `for/while`在physical IR中保存runtime condition/bounds、region arguments、loop-carried SSA、memory effects、`break/continue` edges与yields；compiler不需要证明终止，只需保持KIR控制语义。Reduce/scan保存physical axes、逐component identity、typed combine region与accumulator schema；scan另外保存inclusive/exclusive、direction与result relation。Region fold/scan还保存source slicing relation、summarizer region及显式captures；region scan保存transition combine、apply、emit、output assembly与final-state flow。Arg-reduce的tie/NaN规则、dynamic extent与所有stop conditions同样是显式operands/attributes/regions，不能由provider从op名称猜出。
@@ -109,7 +110,7 @@ Construction为kernel、operation、value、region和block argument建立stable 
 - diagnostics和generated-source attribution；
 - 将immutable KIR facts投影到physical analysis的索引。
 
-Physical program不得依赖origin去补执行结构。Combine regions、ordered control和其它执行所需semantic payload在conversion时lower成physical regions/operations；provider无需读取KIR才能执行或serialize。
+Physical program不得依赖origin去补执行结构或coordinate provenance。Coordinate expressions、axis maps、active member sets与validity在conversion时已成为current program的SSA/operation payload；origin只能检查这些mapping是否保持KIR语义。Combine regions、ordered control和其它执行所需semantic payload同样在conversion时lower成physical regions/operations；provider无需读取KIR才能执行或serialize。
 
 Origin mapping至少区分KernelID、OpID、ValueID、RegionID和region argument position。字符串op name只能用于诊断，不能作为identity。
 
@@ -129,5 +130,7 @@ Initial conversion完成后必须验证：
 - every runtime program-space extent只依赖launch-visible values，data-derived member domains仍有完整的program-internal traversal；
 - every buffer的allocation scope、instance identity、initialization mode/coverage、ownership与visibility完整；
 - every dynamic/indexed access由explicit guard、已验证relation或KIR calling precondition证明在目标resource范围内；
+- every physical coordinate expression具有source identity/rank与完整SSA provenance，slice/broadcast/reshape/transpose/helper-call composition与KIR relation等价；
+- every active-member/range narrowing都是原relation的显式subset，并具有typed predicate/range proof；不能从shape、op name或origin side record重建；
 - every atomic op保存order、logical sharing domain与result semantics，并能从physical mapping得到合法provider scope；
 - physical program不需要KIR或side records才能解释执行。
