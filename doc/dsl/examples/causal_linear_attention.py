@@ -21,10 +21,11 @@ def summarize_linear_slice(
     key_slice,
     value_slice,
     token_coordinates,
+    query_slice,
 ):
-    # token_coordinates is an absolute-coordinate source component.  The
-    # summary does not need to inspect it, but helper passage must not erase
-    # its provenance before emit receives the corresponding slice.
+    # region_scan slices every source component at the same boundaries before
+    # calling both helpers.  This summary does not use the coordinate or query
+    # slices; emit consumes their corresponding slices directly.
     matrix = I.contract(
         key_slice,
         value_slice,
@@ -52,12 +53,12 @@ def emit_linear_slice(
     key_slice,
     value_slice,
     token_coordinates,
+    query_slice,
     incoming_state,
-    queries,
 ):
     # These coordinates still refer to the complete source token domain; they
-    # are not ordinals local to the compiler-selected slice.
-    query_slice = queries[token_coordinates, :]
+    # are not ordinals local to the compiler-selected slice.  query_slice was
+    # cut at the same source boundaries and needs no gather reconstruction.
 
     inter_numerator = I.contract(
         query_slice,
@@ -142,7 +143,7 @@ def causal_linear_attention(
             )
 
             outputs, final_state = I.region_scan(
-                source=(keys, values, token_coordinates),
+                source=(keys, values, token_coordinates, queries),
                 axis=0,
                 summarize=summarize_linear_slice,
                 combine=combine_linear_transitions,
@@ -150,7 +151,6 @@ def causal_linear_attention(
                 initial_state=initial_state,
                 apply=apply_linear_transition,
                 emit=emit_linear_slice,
-                operands=(queries,),
             )
 
             output[batch, head, token_axis, :] = I.cast(
