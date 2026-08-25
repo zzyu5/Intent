@@ -1,4 +1,4 @@
-# 第二轮：重构第一层编译器 IR——Canonical KIR
+# 第二轮：Canonical KIR 重构
 
 这一轮重构编译器的第一层：把第一轮已经冻结并迁移完成的作者 DSL 降到 canonical Kernel IR。依据是 `doc/` 中已经确定的编程模型、DSL 和编译器分层设计。先完整阅读这些最终规格和第一轮报告，再检查当前实现：
 
@@ -11,7 +11,7 @@ AGENTS.md
 
 `doc/` 描述目标架构，不以当前代码为标准。当前实现与规格冲突时，应修改实现；但如果真实代码证据表明规格内部存在矛盾，必须停下来指出矛盾，不能靠兼容分支、默认值或弱化 verifier 把它绕过去。
 
-第一轮已经负责public surface、规范示例与`examples/kernels/`源码迁移。本轮不能重新选择算法或修改DSL语义；若发现第一轮源码仍违反最终规格，先按规格修正该遗漏并说明，不能在frontend里为它创造第二种解释。
+第一轮已经负责public surface、规范示例与`examples/kernels/`源码迁移。本轮不能重新选择算法或修改DSL语义。修正第一轮迁移遗漏是本轮的正式工作项：frontend第一次能够检查全部216个kernel，因此本轮必须把解析、desugaring、type/schema或verifier暴露的源码遗漏按最终规格修正，并记录其原因；不能在frontend里为错误源码创造第二种解释。
 
 ## 一、本轮边界
 
@@ -185,7 +185,7 @@ RNG 按最终规格固定为 Philox4x32-10 的逻辑随机位流。KIR 保存 co
 
 ## 六、用第一轮已迁移的 examples 横向闭合 KIR
 
-完整扫描第一轮已经迁移的 `examples/kernels/`，确保每个最终surface都只生成新的canonical KIR。本轮不重新设计example算法，也不把源码改回旧构造来迁就frontend。
+完整扫描第一轮已经迁移的`examples/kernels/`全部93个文件、216个`@intent.kernel`，确保每个最终surface都只生成新的canonical KIR。本轮不重新设计example算法，也不把源码改回旧构造来迁就frontend。
 
 这不是挑几个例子改通。若源码仍残留旧surface，应把它视为第一轮遗漏并按最终规格消除；frontend与KIR中则必须清掉全部旧producer，包括：
 
@@ -308,9 +308,9 @@ DSL producer
 - 检查所有 example 已使用最终 DSL，并且没有为了旧 compiler 写的绕行结构；
 - 检查 `doc/` 描述的最终 KIR 与实现一致；只修设计事实，不写进展、失败表或当前测试状态。
 
-验证只保留一条可手动执行的端到端 repro：选择一个同时包含动态 subregion、structured reduction 和 tail validity 的真实 kernel，将 DSL emit 成 Triton 源码并实际运行一次数值对照。
+本轮验证严格落在本轮边界：使用现有frontend/compiler入口检查`examples/kernels/`全部93个文件、216个`@intent.kernel`，每一个都必须完成解析与desugaring、生成canonical KIR并通过canonical verifier。失败必须定位到具体源码、frontend、KIR schema或verifier规则，并在本轮修正第一轮迁移遗漏或KIR实现；不能统一记成compile failure。
 
-这条 repro 只是确认唯一执行链可运行，不代表横向覆盖；横向完整性由前述 schema、consumer 和 examples 审计负责。不要新增任何测试文件或 fixture。
+本轮不要求生成Triton源码、provider JIT、GPU运行或数值对照，也不建立test目录、pytest、fixture或额外脚手架。KIR→GPU边界对尚未实现的新operation精确报`NotImplementedError`仍是合法状态；第一条真实GPU端到端链由第三轮建立。
 
 ## 九、交付
 
@@ -326,10 +326,11 @@ report/canonical-kir-reconstruction.md
 
 - 最终 canonical KIR 的组成和边界；
 - 删除了哪些旧语义与双份路径；
+- 第一轮迁移遗漏中，本轮frontend判卷发现并修正了哪些；
+- 93个文件、216个kernel的frontend解析、canonical KIR生成与verifier结果；
 - 第一轮examples在新KIR中覆盖了哪些结构；
 - 两次强制自查各发现并修掉了什么；
 - 哪些 downstream consumer 已切到新 KIR；
-- 唯一 repro 命令及数值结果；
 - 是否存在因规格矛盾而无法闭合的地方。
 
 2. 把本轮改动整理成一个语义连贯的提交。

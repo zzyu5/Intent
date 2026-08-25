@@ -1,6 +1,6 @@
-# 第四轮：两机全量回归与 Triton 1.05× 性能闭合
+# 第五轮：两机全量回归与 Triton 1.05× 性能闭合
 
-本轮验证前三轮完成的：
+本轮验证前四轮完成的：
 
 ```text
 最终 DSL
@@ -15,7 +15,7 @@
 
 ## 一、先建立公平比较资格
 
-全量entry以`examples/repro/v2/registry.py`为唯一运行清单，不得只跑前三轮碰过或当前已经通过的examples。当前清单是Triton 54条source-backed entries，cuTile与TileLang各37条；若本轮开始时registry已按正式source inventory发生有依据的变化，使用当时完整清单并在报告中说明，不能静默缩小分母。
+全量entry以`examples/repro/v2/registry.py`为唯一运行清单，不得只跑前四轮碰过或当前已经通过的examples。当前清单是Triton 54条source-backed entries，cuTile与TileLang各37条；若本轮开始时registry已按正式source inventory发生有依据的变化，使用当时完整清单并在报告中说明，不能静默缩小分母。
 
 运行性能前，逐个 Triton registry entry 核对：
 

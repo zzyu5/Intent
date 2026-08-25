@@ -1,4 +1,4 @@
-# 第三轮：重构 Shared GPU IR 与 Provider Leaf
+# 第三轮：重构 Shared GPU IR 与 Triton 纵向闭合
 
 这一轮重构编译器的第二层物理IR；它是整个重构流程的第三轮：
 
@@ -54,6 +54,15 @@ AGENTS.md
 - loops、pointer、mask、validity、workspace、persistent traversal、buffer form、copy/sync 等仍有一部分在生成源码时才被创建。
 
 不能在这些旧结构上继续补字段。要把它们收敛成唯一的 executable GPU program。
+
+本轮执行顺序必须是先竖后横。先选一个能够经过Triton真实运行和数值对照的kernel，只建立它所迫使出来的最小完整shared GPU IR、KIR→GPU construction、shared pass、Triton lowering和terminal source，使下列链第一次真实成立：
+
+```text
+DSL → canonical KIR → shared GPU IR → shared passes
+    → Triton lowering → Triton source/JIT → GPU numerical run
+```
+
+这条纵向链只证明新链路能够执行，绝不替代横向工作。链路跑通后，必须继续按下面各节把GPU IR types/ops/invariants、construction、passes与Triton consumers横向铺到全部KIR families和语料结构；不能把“一个kernel通过”写成本轮完成。
 
 ## 二、建立真正的 Shared Executable GPU IR
 
@@ -282,9 +291,9 @@ Pass负责排除能证明非法的候选，例如：
 
 未知的寄存器分配、机器layout和pipeline成本继续交给外部compiler/tuner。Autotune winner只存在于runtime/tuning artifact，不写回GPU IR。
 
-## 六、收敛三家 Provider Leaf
+## 六、收敛 Triton Provider Leaf
 
-不要制造三套完整leaf compiler。共同GPU IR始终是唯一完整executable authority。
+共同GPU IR始终是唯一完整executable authority。本轮只闭合Triton，不能为了想象cuTile/TileLang以后需要什么而向shared IR预加字段；真实差异由第四轮拿另外两家验证。
 
 ### Triton
 
@@ -312,49 +321,9 @@ Descriptor extension若存在，必须显式保存：
 
 不能在materializer中根据KIR relation临时创建。
 
-### cuTile
+cuTile和TileLang的provider-local legality、storage/copy/sync/pipeline与native operand forms全部留到第四轮。第三轮只允许阅读它们确认shared abstraction没有显然写死Triton，不实现、不保留兼容路径，也不据此声称另外两家已经覆盖。
 
-cuTile leaf主要完成：
-
-- program coordinates到`ct.bid`；
-- fragments与coordinates到tile indices；
-- common access到`ct.load/store/gather/scatter`；
-- structured ops到native reduce/scan/MMA；
-- 已形成的region fold/scan loops与summary/state/output flow到cuTile control和native structured ops；
-- grid rank、tile shape、bounds和MMA-scaled legality。
-
-不得再从KIR shape、state-stream parent、ragged relation或role名称重新决定access、tile和validity。
-
-若某种scalarized buffer/gather路径只是慢速替代而非等价native能力，应在provider legalization明确拒绝，不能保留为fallback。
-
-### TileLang
-
-TileLang确实需要更多provider-local结构：
-
-- storage allocation；
-- `T.copy`/async copy；
-- BufferRegion；
-- synchronization/barrier；
-- pipeline；
-- native GEMM/reduction所要求的operand form。
-
-这些结构必须先由TileLang-local passes根据共同GPU IR的lifetime、sharing、access、dependency和structured-op facts生成显式extension operations，再由serializer打印。
-
-TileLang surface中的`T.gemm`、`T.reduce_max`等高层拼写用于兑现共同GPU IR中已经存在的contract/reduce；它们不构成在leaf重新选择算法结构的理由。Region fold/scan的segment slicing、summary algebra、incoming state和output assembly必须已在共同GPU IR形成；TileLang-local passes只能补其native storage/copy/sync/pipeline与operand form。
-
-不能继续在handlers里临时创建：
-
-- `T.alloc_local/shared`；
-- `T.copy`；
-- `T.sync_threads`；
-- `T.Pipelined`；
-- packed INT2 helper；
-- contract operand replay；
-- storage/copy/sync topology。
-
-三家不要求形式对称。Triton/cuTile可以很薄，TileLang可以有更多local passes；但都不能复制shared program或回到KIR重建结构。
-
-## 七、Terminal serialization
+## 七、Triton Terminal serialization
 
 Serialization前必须经过provider verifier，证明：
 
@@ -387,7 +356,7 @@ Serializer不得：
 
 ## 八、examples 与接纳范围
 
-完整扫描 `examples/kernels/` 和 registry。
+完整扫描`examples/kernels/`和Triton registry，把第一条纵向链扩展为Triton对全部KIR families的横向接纳。
 
 所有examples必须：
 
@@ -437,11 +406,11 @@ Serializer不得：
 5. 是否仍存在`intent_plan.exec_*`、physical KIR clone或side-record executable authority；
 6. provider passes是否仍调用canonical `KernelModel`、扫描KIR graph、读取`intent.result_shapes`或role名称重建结构；
 7. materializer是否仍创建loop、pointer、mask、validity、buffer、workspace、persistent traversal、copy、sync或pipeline；
-8. region fold/scan是否在GPU IR中具有完整segment、summary/state/output flow，而非等待provider解释；
+8. region fold/scan是否在GPU IR中具有完整segment、summary/state/output flow，而非等待Triton解释；
 9. coordinate provenance是否机械传播，causal等range narrowing是否只依赖typed predicate和current physical ranges；
 10. all-false删除是否逐component证明identity且无effect；
-11. Triton/cuTile的普通路径是否确实是thin lowering；
-12. TileLang local extensions是否显式存在并有verifier；
+11. Triton普通路径是否确实是thin lowering；
+12. 是否为了尚未实现的cuTile/TileLang预置未经真实差异逼出的shared字段；
 13. physical parameters是否真实进入types/loops/access/launch；
 14. tuner是否只选择已声明参数/form；
 15. 是否存在kernel名、shape特征、provider字符串或设备型号分支；
@@ -457,12 +426,12 @@ Serializer不得：
 - 删除KIR clone conversion；
 - 删除generic `exec_*`；
 - 删除只描述外部clone的Axis/Range/Transfer/Contract等旧side-record路径；
-- 删除provider重新`analyzeKernel`、`kernel.nodes.lookup`、KIR graph walk的决策路径；
-- 删除materializer中的physical binding、ragged metadata、pointer/mask/validity/shape重建；
-- 删除terminal no-op handlers和canonical-op直接dispatch；
-- 删除scalarized/serial/slow fallback；
-- 删除旧provider form字符串、未使用helper和重复verifier；
-- 删除旧role-based mapping与固定winner路径；
+- 删除shared与Triton路径重新`analyzeKernel`、`kernel.nodes.lookup`、KIR graph walk的决策路径；
+- 删除Triton materializer中的physical binding、ragged metadata、pointer/mask/validity/shape重建；
+- 删除Triton terminal no-op handlers和canonical-op直接dispatch；
+- 删除Triton scalarized/serial/slow fallback；
+- 删除旧Triton provider form字符串、未使用helper和重复verifier；
+- 删除shared/Triton旧role-based mapping与固定winner路径；
 - 检查没有注释保留、compatibility flag或第二条执行链；
 - 检查目录结构真正表达shared IR、shared passes、provider extensions、serializer边界；
 - 检查工作区没有缓存、临时IR或生成源码。
@@ -473,7 +442,7 @@ Serializer不得：
 
 只使用一条现有、可手动执行的端到端repro，不建立测试目录、pytest、fixture或额外脚手架。
 
-优先使用：
+这条命令在最初纵向链形成时运行一次；横向铺开和收尾完成后必须再次运行，确认重构没有破坏已经成立的唯一链。优先使用：
 
 ```bash
 ./examples/run/baseline-v2.sh triton /tmp/intentdsl-gpu-ir.csv grouped_gemm
@@ -492,7 +461,7 @@ DSL
 → GPU numerical comparison
 ```
 
-这条命令只证明一条纵向链真实可运行，不作为横向覆盖的替代。cuTile、TileLang和其它结构由前述IR/schema/consumer审计负责。
+这条命令只证明一条纵向链真实可运行，不作为横向覆盖的替代。其它结构由前述IR/schema/consumer审计负责；cuTile与TileLang由第四轮分别建立真实provider证据。
 
 不更新仓库中的baseline CSV。
 
@@ -501,7 +470,7 @@ DSL
 完成后只产出一份报告：
 
 ```text
-report/gpu-program-ir-and-provider-lowering-reconstruction.md
+report/gpu-program-ir-triton-reconstruction.md
 ```
 
 报告写清楚：
@@ -509,12 +478,13 @@ report/gpu-program-ir-and-provider-lowering-reconstruction.md
 - 最终shared GPU IR的组成和不变量；
 - KIR→GPU construction如何建立完整initial program；
 - 哪些passes产生了真实IR变化；
-- 三家provider leaf最终各持有什么；
+- Triton leaf最终持有什么；
 - 删除了哪些KIR回读、side-record authority和fallback；
 - examples接纳与结构覆盖；
 - 节点二、节点三发现并修掉的问题；
 - 唯一repro命令及数值结果；
-- 剩余明确unsupported的真实性质。
+- Triton横向接纳中剩余明确unsupported的真实性质；
+- 第四轮仍需由cuTile/TileLang真实差异检验的边界。
 
 节点二、节点三不单独建报告。
 

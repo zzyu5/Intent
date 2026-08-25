@@ -1,4 +1,4 @@
-# 第一轮：重构 Public DSL 与算法源码
+# 第一轮：Public DSL 与算法源码重构
 
 这一轮以 `doc/programming-model/` 和 `doc/dsl/` 为最终规格，只重构作者可见的 public DSL、`doc/dsl/examples/` 中的规范示例，并迁移 `examples/kernels/` 中的全部 kernel。Frontend 与 canonical Kernel IR 从第二轮开始，本轮不进入编译器实现。
 
@@ -106,7 +106,7 @@ optional indexed mapping
 
 `region_fold/region_scan`只适用于作者写下的homomorphism语义。不能因为旧代码使用了compiler-selected extent，就假定它满足分段不变性。
 
-如果某处无法从源码、对应source实现和算法语义唯一判断属于哪一类，停止并报告该位置，不自行选择算法。
+如果某处无法从源码、对应source实现和算法语义唯一判断属于哪一类，不自行选择算法，也不在第一处歧义就终止整轮。记录该kernel、源码位置、候选分类及各自依据，暂时跳过该处并继续扫描和迁移其余语料。完成全部93个文件、216个`@intent.kernel`的检查后，一次性提交完整待裁决清单；只有发现最终规格本身互相矛盾时才立即停止。未裁决位置不能被静默计作已迁移，得到用户决定后必须在本轮补完，不能有意留下新旧surface子集。
 
 ## 四、闭合structured operations
 
@@ -227,7 +227,7 @@ I.random.uniform(seed, logical_counter, dtype=...)
 
 ## 六、迁移全部examples
 
-迁移`examples/kernels/**/*.py`全部93个文件，不只迁移baseline registry引用的kernel。
+迁移`examples/kernels/**/*.py`全部93个文件、216个`@intent.kernel`，不只迁移baseline registry引用的kernel。
 
 重点族：
 
@@ -299,6 +299,8 @@ Entry.examples inventory
 9. 是否为了旧compiler改写了算法、kernel数量、effects或ABI；
 10. 是否用旧surface别名、临时wrapper或默认值掩盖第二轮尚未实现的缺口。
 
+同时汇总所有尚待用户裁决的位置，确认已经检查完整个语料，而不是在第一个问号处停止。
+
 节点二不产出文档，不建立测试脚手架。发现问题直接修；遇到语义分叉则停止向用户提问。
 
 ## 节点三：完成后的收尾自查
@@ -314,7 +316,7 @@ Entry.examples inventory
 -检查diff中是否混入无关重构、README批量改写或实验数据；
 -确认没有误改frontend、KIR、GPU IR或provider实现。
 
-本轮不建立parser/checker/test脚手架，也不把旧compiler能否执行新源码当作DSL正确性的判据。唯一端到端repro从第二轮canonical KIR闭合后开始。
+本轮不建立parser/checker/test脚手架，也不把旧compiler能否执行新源码当作DSL正确性的判据。第二轮只验证全部源码能够形成并通过canonical KIR；第一条真实GPU端到端repro从第三轮shared GPU IR与Triton链形成后开始。
 
 ## 最终交付
 
@@ -331,7 +333,10 @@ report/dsl-reconstruction.md
 
 -最终public DSL发生了什么变化；
 -删除了哪些旧作者构造和surface别名；
--93个kernel如何迁移，各类旧构造分别落到哪里；
+- 93个文件、216个kernel如何迁移，各类旧构造分别落到哪里；
+- 按kernel区分机械迁移与手写语义/位级重写：surface换名、part边界算术等列为机械迁移；packed INT4/INT2 carrier解码与sign extension、histogram first-class改写、atomic family迁移、scaled/sparse format schema迁移列为需要后续数值重点核对的重写；
+- summary validity/presence记账出现于多少个kernel、具体位置、形态是否本质相同，以及是否集中在causal/ragged结构；
+- 全量扫描后一次性收集的待裁决位置、每处候选分类与依据，以及裁决后的最终落点；
 -节点二、节点三发现并修掉了哪些真正问题；
 -哪些frontend/KIR缺口必须由第二轮闭合；
 -是否存在因规格矛盾而无法完成的源码迁移。
