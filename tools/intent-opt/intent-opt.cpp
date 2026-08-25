@@ -1,5 +1,4 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
-#include "Intent/Dialect/Plan/IR/PlanDialect.h"
 #include "Intent/Transforms/Passes.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/InitAllDialects.h"
@@ -11,7 +10,7 @@ int main(int argc, char **argv) {
   intent::registerIntentPasses();
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::plan::IntentPlanDialect>();
+  registry.insert<intent::IntentDialect>();
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "Intent kernel optimizer\n", registry));
 }

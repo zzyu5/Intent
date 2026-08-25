@@ -7,14 +7,9 @@ add_llvm_executable(intent-compile
 llvm_update_compile_flags(intent-compile)
 target_link_libraries(intent-compile PRIVATE
   ${dialect_libs}
-  MLIRIntentCuTileLowering
-  MLIRIntentGPURealization
-  MLIRIntentGPUTransforms
   MLIRIntentDialect
-  MLIRIntentPlanDialect
-  MLIRIntentTileLangLowering
+  MLIRIntentKIRToGPU
   MLIRIntentTransforms
-  MLIRIntentTritonLowering
   MLIRParser
   MLIRIR
   MLIRSupport

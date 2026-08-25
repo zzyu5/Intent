@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from enum import IntEnum
 from typing import Iterable
 
 from intent.language.annotations import ConstexprSpec
@@ -162,29 +163,30 @@ class TensorType(ValueType):
 
 @dataclass(frozen=True, slots=True)
 class LogicalIndexType(ValueType):
-    relation: str
+    source_id: int
+    axis: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.relation, str) or not self.relation:
-            raise ValueError("logical index relation must not be empty")
+        for name, value in (("source_id", self.source_id), ("axis", self.axis)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"logical index {name} must be a non-negative integer")
 
     def format(self) -> str:
-        return f"index<{self.relation}>"
+        return f"logical_index<{self.source_id},{self.axis}>"
 
 
-class DomainFlavor(Enum):
-    DENSE = "dense"
-    STRIDED = "strided"
-    PRODUCT = "product"
-    RUNTIME = "runtime"
-    RAGGED_OUTER = "ragged_outer"
-    RAGGED_MEMBER = "ragged_member"
+class DomainFlavor(IntEnum):
+    DENSE = 0
+    STRIDED = 1
+    PRODUCT = 2
+    RUNTIME = 3
 
 
 @dataclass(frozen=True, slots=True)
 class DomainType(ValueType):
     flavor: DomainFlavor = DomainFlavor.DENSE
     rank: int = 1
+    origin_id: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.flavor, DomainFlavor):
@@ -193,80 +195,79 @@ class DomainType(ValueType):
             raise TypeError("domain rank must be an integer")
         if self.rank <= 0:
             raise ValueError("domain rank must be positive")
+        if self.origin_id is not None and (
+            isinstance(self.origin_id, bool)
+            or not isinstance(self.origin_id, int)
+            or self.origin_id < 0
+        ):
+            raise ValueError("domain origin ID must be a non-negative integer")
 
     def format(self) -> str:
-        return f"domain<{self.flavor.value},{self.rank}>"
+        origin = "?" if self.origin_id is None else str(self.origin_id)
+        return f"domain<{int(self.flavor)},{self.rank},{origin}>"
 
 
 @dataclass(frozen=True, slots=True)
 class RegionType(ValueType):
     rank: int = 1
-    relation: str = "domain"
+    source_id: int = 0
+    origin_id: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.rank, bool) or not isinstance(self.rank, int):
             raise TypeError("region rank must be an integer")
         if self.rank <= 0:
             raise ValueError("region rank must be positive")
-        if not isinstance(self.relation, str) or not self.relation:
-            raise ValueError("region relation must not be empty")
-
-    def format(self) -> str:
-        return f"region<{self.relation},{self.rank}>"
-
-
-class PartitionMode(Enum):
-    EXTENT = "extent"
-    COUNT = "count"
-
-
-@dataclass(frozen=True, slots=True)
-class PartitionType(ValueType):
-    mode: PartitionMode
-    region_type: RegionType
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.mode, PartitionMode):
-            raise TypeError("partition mode must be a PartitionMode")
-        if not isinstance(self.region_type, RegionType):
-            raise TypeError("partition requires a RegionType")
-
-    def format(self) -> str:
-        return f"partition<{self.mode.value},{self.region_type.format()}>"
-
-
-@dataclass(frozen=True, slots=True)
-class RaggedType(ValueType):
-    outer: DomainType
-    member: DomainType
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.outer, DomainType) or not isinstance(
-            self.member, DomainType
+        if isinstance(self.source_id, bool) or not isinstance(self.source_id, int) or self.source_id < 0:
+            raise ValueError("region source ID must be a non-negative integer")
+        if self.origin_id is not None and (
+            isinstance(self.origin_id, bool)
+            or not isinstance(self.origin_id, int)
+            or self.origin_id < 0
         ):
-            raise TypeError("ragged descriptor requires outer/member DomainType values")
-        if self.outer.flavor is not DomainFlavor.RAGGED_OUTER:
-            raise ValueError("ragged outer domain must use ragged_outer flavor")
-        if self.member.flavor is not DomainFlavor.RAGGED_MEMBER:
-            raise ValueError("ragged member domain must use ragged_member flavor")
+            raise ValueError("region origin ID must be a non-negative integer")
 
     def format(self) -> str:
-        return f"ragged<{self.outer.format()},{self.member.format()}>"
+        origin = "?" if self.origin_id is None else str(self.origin_id)
+        return f"region<{self.source_id},{self.rank},{origin}>"
 
 
 @dataclass(frozen=True, slots=True)
 class BufferType(ValueType):
     dtype: DType
     shape: Shape
+    origin_id: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.dtype, DType):
             raise TypeError("buffer type requires an Intent dtype")
         object.__setattr__(self, "shape", normalize_shape(self.shape))
+        if self.origin_id is not None and (
+            isinstance(self.origin_id, bool)
+            or not isinstance(self.origin_id, int)
+            or self.origin_id < 0
+        ):
+            raise ValueError("buffer origin ID must be a non-negative integer")
 
     def format(self) -> str:
         dims = "x".join(dim.format() for dim in self.shape)
-        return f"buffer<{dims + 'x' if dims else ''}{self.dtype.name}>"
+        origin = "?" if self.origin_id is None else str(self.origin_id)
+        return f"buffer<{dims + 'x' if dims else ''}{self.dtype.name},{origin}>"
+
+
+@dataclass(frozen=True, slots=True)
+class TupleType(ValueType):
+    components: tuple[ValueType, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "components", tuple(self.components))
+        if any(not _is_product_component(component) for component in self.components):
+            raise TypeError(
+                "tuple components must be scalar/tensor/tuple/record SSA values"
+            )
+
+    def format(self) -> str:
+        return "tuple<" + ",".join(str(component) for component in self.components) + ">"
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +282,7 @@ class RecordType(ValueType):
             not isinstance(field, tuple)
             or len(field) != 2
             or not isinstance(field[0], str)
-            or not isinstance(field[1], ValueType)
+            or not _is_product_component(field[1])
             for field in self.fields
         ):
             raise TypeError("record fields must be (name, ValueType) pairs")
@@ -296,6 +297,13 @@ class RecordType(ValueType):
         return f"record<{body}>"
 
 
+def _is_product_component(value_type: object) -> bool:
+    return isinstance(
+        value_type,
+        (ScalarType, TensorType, LogicalIndexType, TupleType, RecordType),
+    )
+
+
 def type_from_annotation(annotation: object) -> ValueType:
     if isinstance(annotation, ViewSpec):
         return TensorType(annotation.dtype, normalize_shape(annotation.shape))
@@ -308,7 +316,7 @@ def type_from_annotation(annotation: object) -> ValueType:
 
 
 def type_from_python_type(value_type: object) -> ValueType:
-    from enum import IntEnum
+    from intent.language.annotations import Enum as IntentEnum
 
     from intent.language import bool as intent_bool
     from intent.language import f64
@@ -320,7 +328,7 @@ def type_from_python_type(value_type: object) -> ValueType:
         return ScalarType(i64)
     if value_type is float:
         return ScalarType(f64)
-    if isinstance(value_type, type) and issubclass(value_type, IntEnum):
+    if isinstance(value_type, type) and issubclass(value_type, IntentEnum):
         return EnumType(
             value_type.__name__,
             tuple((member.name, int(member.value)) for member in value_type),
@@ -360,11 +368,7 @@ def is_numeric(value_type: ValueType) -> bool:
 
 
 def dims_compatible(lhs: DimExpr, rhs: DimExpr) -> bool:
-    if lhs == rhs:
-        return True
-    if isinstance(lhs, DynamicDim) or isinstance(rhs, DynamicDim):
-        return True
-    return False
+    return lhs == rhs
 
 
 def types_compatible(lhs: ValueType, rhs: ValueType) -> bool:
@@ -386,6 +390,10 @@ def types_compatible(lhs: ValueType, rhs: ValueType) -> bool:
                 types_compatible(a, b)
                 for (_, a), (_, b) in zip(lhs.fields, rhs.fields)
             )
+        )
+    if isinstance(lhs, TupleType) and isinstance(rhs, TupleType):
+        return len(lhs.components) == len(rhs.components) and all(
+            types_compatible(a, b) for a, b in zip(lhs.components, rhs.components)
         )
     return False
 

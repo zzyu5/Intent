@@ -35,7 +35,7 @@ def block_sparse_matmul(
             row_region = rows[row_begin:row_end]
             column_region = columns[column_begin:column_end]
             accumulator = I.zeros(
-                (row_end - row_begin, column_end - column_begin),
+                (row_region, column_region),
                 dtype=I.f32,
             )
             for reduction_block in reduction_blocks:

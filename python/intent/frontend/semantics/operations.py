@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from enum import IntEnum
 
 
 class OperationKind(Enum):
@@ -10,13 +11,12 @@ class OperationKind(Enum):
 
     DOMAIN = "domain"
     DOMAIN_PRODUCT = "domain_product"
-    PARTITION = "partition"
+    SUBREGION = "subregion"
     INDICES = "indices"
     REGION_END = "region_end"
     ASSUME_IN_BOUNDS = "assume_in_bounds"
 
     PARALLEL = "parallel"
-    STATE_STREAM = "state_stream"
     IF = "if"
     FOR = "for"
     WHILE = "while"
@@ -30,7 +30,7 @@ class OperationKind(Enum):
     TRANSPOSE = "transpose"
     BROADCAST = "broadcast"
     FULL = "full"
-    ZEROS = "zeros"
+    MAKE_TUPLE = "make_tuple"
     MAKE_RECORD = "make_record"
     EXTRACT = "extract"
 
@@ -44,14 +44,12 @@ class OperationKind(Enum):
 
     REDUCE = "reduce"
     SCAN = "scan"
+    REGION_FOLD = "region_fold"
+    REGION_SCAN = "region_scan"
     CONTRACT = "contract"
     SCALED_CONTRACT = "scaled_contract"
     SPARSE_CONTRACT = "sparse_contract"
-
-    RAGGED = "ragged"
-    RAGGED_OUTER = "ragged_outer"
-    RAGGED_MEMBER = "ragged_member"
-    MEMBERS = "members"
+    HISTOGRAM = "histogram"
 
     GATHER = "gather"
     SCATTER_UNIQUE = "scatter_unique"
@@ -60,9 +58,11 @@ class OperationKind(Enum):
     BUFFER = "buffer"
     BUFFER_LOAD = "buffer_load"
     BUFFER_STORE = "buffer_store"
-    ATOMIC_ADD = "atomic_add"
-    ATOMIC_CAS = "atomic_cas"
-    RANDOM = "random"
+    ATOMIC_LOAD = "atomic_load"
+    ATOMIC_STORE = "atomic_store"
+    ATOMIC_RMW = "atomic_rmw"
+    ATOMIC_COMPARE_EXCHANGE = "atomic_compare_exchange"
+    RANDOM_BITS = "random_bits"
 
     RETURN = "return"
 
@@ -75,20 +75,26 @@ TERMINATORS = {
 
 REGION_OPS = {
     OperationKind.PARALLEL,
-    OperationKind.STATE_STREAM,
     OperationKind.IF,
     OperationKind.FOR,
     OperationKind.WHILE,
+    OperationKind.REDUCE,
+    OperationKind.SCAN,
+    OperationKind.REGION_FOLD,
+    OperationKind.REGION_SCAN,
+    OperationKind.SCATTER_REDUCE,
 }
 
 STRUCTURED_OPS = {
     OperationKind.REDUCE,
     OperationKind.SCAN,
+    OperationKind.REGION_FOLD,
+    OperationKind.REGION_SCAN,
     OperationKind.CONTRACT,
     OperationKind.SCALED_CONTRACT,
     OperationKind.SPARSE_CONTRACT,
     OperationKind.PARALLEL,
-    OperationKind.STATE_STREAM,
+    OperationKind.HISTOGRAM,
 }
 
 EFFECTFUL_OPS = {
@@ -98,87 +104,128 @@ EFFECTFUL_OPS = {
     OperationKind.SCATTER_REDUCE,
     OperationKind.BUFFER_LOAD,
     OperationKind.BUFFER_STORE,
-    OperationKind.ATOMIC_ADD,
-    OperationKind.ATOMIC_CAS,
-    OperationKind.RANDOM,
+    OperationKind.ATOMIC_LOAD,
+    OperationKind.ATOMIC_STORE,
+    OperationKind.ATOMIC_RMW,
+    OperationKind.ATOMIC_COMPARE_EXCHANGE,
 }
 
 
+class UnaryOperator(IntEnum):
+    NEGATE = 0
+    NOT = 1
+    EXP = 2
+    EXP2 = 3
+    LOG = 4
+    SIN = 5
+    COS = 6
+    FLOOR = 7
+    ERF = 8
+    RSQRT = 9
+    SIGMOID = 10
+    TANH = 11
+    ABS = 12
+
+
+class BinaryOperator(IntEnum):
+    ADD = 0
+    SUBTRACT = 1
+    MULTIPLY = 2
+    TRUE_DIVIDE = 3
+    FLOOR_DIVIDE = 4
+    REMAINDER = 5
+    POWER = 6
+    MAXIMUM = 7
+    MINIMUM = 8
+    MAXIMUM_NUM = 9
+    MINIMUM_NUM = 10
+    LOGICAL_AND = 11
+    LOGICAL_OR = 12
+    BITWISE_AND = 13
+    BITWISE_OR = 14
+    BITWISE_XOR = 15
+    LEFT_SHIFT = 16
+    RIGHT_SHIFT = 17
+
+
+class ComparePredicate(IntEnum):
+    EQ = 0
+    NE = 1
+    LT = 2
+    LE = 3
+    GT = 4
+    GE = 5
+
+
+class AtomicOrdering(IntEnum):
+    RELAXED = 0
+    ACQUIRE = 1
+    RELEASE = 2
+    ACQ_REL = 3
+
+
+class AtomicRMWKind(IntEnum):
+    EXCHANGE = 0
+    ADD = 1
+    MAX = 2
+    MIN = 3
+    AND = 4
+    OR = 5
+    XOR = 6
+
+
+class IndexTermKind(IntEnum):
+    FULL_SLICE = 0
+    NEW_AXIS = 1
+    STATIC_INDEX = 2
+    VALUE_INDEX = 3
+    REGION_INDEX = 4
+    SLICE = 5
+
+
+class ShapeExprKind(IntEnum):
+    STATIC = 0
+    SSA_EXTENT = 1
+    INFERRED = 2
+
+
 @dataclass(frozen=True, slots=True)
-class AutoExtent:
-    name: str
+class ShapeExpr:
+    kind: ShapeExprKind
+    dimension: int
+    payload: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name or not self.name.isidentifier():
-            raise ValueError(f"invalid auto extent name: {self.name!r}")
+        if not isinstance(self.kind, ShapeExprKind):
+            raise TypeError("shape expression kind must be a ShapeExprKind")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (self.dimension, self.payload)
+        ):
+            raise TypeError("shape expression fields must be integers")
+        if self.kind is ShapeExprKind.STATIC:
+            if self.dimension != 0 or self.payload < 0:
+                raise ValueError(
+                    "static shape expression requires identity zero and non-negative extent"
+                )
+        elif self.dimension <= 0:
+            raise ValueError("dynamic shape expression requires a positive identity")
+        elif self.kind is ShapeExprKind.SSA_EXTENT and self.payload < 0:
+            raise ValueError(
+                "SSA shape expression requires a non-negative operand position"
+            )
+        elif self.kind is ShapeExprKind.INFERRED and self.payload != -1:
+            raise ValueError("inferred shape expression uses payload -1")
 
 
-class UnaryOperator(Enum):
-    NEGATE = "negate"
-    NOT = "not"
-    EXP = "exp"
-    EXP2 = "exp2"
-    LOG = "log"
-    SIN = "sin"
-    COS = "cos"
-    FLOOR = "floor"
-    RSQRT = "rsqrt"
-    SIGMOID = "sigmoid"
-    TANH = "tanh"
-    ABS = "abs"
+@dataclass(frozen=True, slots=True)
+class ShapeRelation:
+    axes: tuple[ShapeExpr, ...]
 
-
-class BinaryOperator(Enum):
-    ADD = "add"
-    SUBTRACT = "subtract"
-    MULTIPLY = "multiply"
-    TRUE_DIVIDE = "true_divide"
-    FLOOR_DIVIDE = "floor_divide"
-    REMAINDER = "remainder"
-    POWER = "power"
-    MAXIMUM = "maximum"
-    MINIMUM = "minimum"
-    LOGICAL_AND = "logical_and"
-    LOGICAL_OR = "logical_or"
-    BITWISE_AND = "bitwise_and"
-    BITWISE_OR = "bitwise_or"
-    BITWISE_XOR = "bitwise_xor"
-    LEFT_SHIFT = "left_shift"
-    RIGHT_SHIFT = "right_shift"
-
-
-class ComparePredicate(Enum):
-    EQ = "eq"
-    NE = "ne"
-    LT = "lt"
-    LE = "le"
-    GT = "gt"
-    GE = "ge"
-
-
-class AtomicOrdering(Enum):
-    RELAXED = "relaxed"
-    ACQUIRE = "acquire"
-    RELEASE = "release"
-    ACQ_REL = "acq_rel"
-    SEQ_CST = "seq_cst"
-
-
-class MemoryScope(Enum):
-    WORK_ITEM = "work_item"
-    SUBGROUP = "subgroup"
-    WORKGROUP = "workgroup"
-    DEVICE = "device"
-    SYSTEM = "system"
-
-
-class IndexTermKind(Enum):
-    FULL_SLICE = "full_slice"
-    NEW_AXIS = "new_axis"
-    STATIC_INDEX = "static_index"
-    VALUE_INDEX = "value_index"
-    REGION_INDEX = "region_index"
-    SLICE = "slice"
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "axes", tuple(self.axes))
+        if any(not isinstance(axis, ShapeExpr) for axis in self.axes):
+            raise TypeError("shape relation axes must be ShapeExpr values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,11 +278,32 @@ class IndexTerm:
 
 @dataclass(frozen=True, slots=True)
 class IndexRelation:
+    source_rank: int
+    result_rank: int
+    result_dimensions: tuple[int, ...]
     terms: tuple[IndexTerm, ...]
 
     def __post_init__(self) -> None:
+        for name, rank in (("source", self.source_rank), ("result", self.result_rank)):
+            if isinstance(rank, bool) or not isinstance(rank, int):
+                raise TypeError(f"index relation {name} rank must be an integer")
+            if rank < 0:
+                raise ValueError(f"index relation {name} rank must be non-negative")
+        object.__setattr__(self, "result_dimensions", tuple(self.result_dimensions))
+        if len(self.result_dimensions) != self.result_rank or any(
+            isinstance(identity, bool)
+            or not isinstance(identity, int)
+            or identity < 0
+            for identity in self.result_dimensions
+        ):
+            raise ValueError(
+                "index relation requires one non-negative dimension identity per result axis"
+            )
         object.__setattr__(self, "terms", tuple(self.terms))
         if not self.terms:
             raise ValueError("index relation requires at least one term")
         if any(not isinstance(term, IndexTerm) for term in self.terms):
             raise TypeError("index relation terms must be IndexTerm values")
+        consuming = sum(term.kind is not IndexTermKind.NEW_AXIS for term in self.terms)
+        if consuming != self.source_rank:
+            raise ValueError("index relation must consume every source axis exactly once")

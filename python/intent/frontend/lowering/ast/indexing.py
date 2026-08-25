@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from intent.frontend.semantics import BufferType
+from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import Effect
@@ -14,20 +15,22 @@ from intent.frontend.semantics import IndexTerm
 from intent.frontend.semantics import IndexTermKind
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import RaggedType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import TupleType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
 from intent.frontend.semantics import dims_compatible
 from intent.frontend.semantics.types import is_integer
 from intent.language import bool as intent_bool
+from intent.language import index as intent_index
 from intent.language import DTypeCategory
 
 from .model import ShapeValue
+from .model import RaggedSpec
 from .model import StaticTuple
 
 if TYPE_CHECKING:
@@ -73,20 +76,28 @@ def lower_subscript(
         return _subscript_shape(lowerer, source_expression, node)
     if isinstance(source_expression, StaticTuple):
         return _subscript_static_tuple(lowerer, source_expression, node)
+    if isinstance(source_expression, RaggedSpec):
+        return _subscript_ragged(lowerer, source_expression, node)
     if not isinstance(source_expression, MlirValue):
         lowerer.error(node, "subscript base must be tensor, buffer, ragged descriptor, or tuple")
     source = source_expression
-    if isinstance(source.type, RaggedType):
-        selector = lowerer.materialize(lowerer.lower_expression(node.slice), node.slice)
-        if not is_integer(selector.type):
-            lowerer.error(node.slice, "ragged member selector must be integer/index")
-        operation = lowerer.emit(
-            OperationKind.RAGGED_MEMBER,
+    if isinstance(source.type, TupleType):
+        index = _static_integer(node.slice)
+        if index is None:
+            lowerer.error(node, "tuple index must be a compile-time integer")
+        if index < 0:
+            index += len(source.type.components)
+        if not 0 <= index < len(source.type.components):
+            lowerer.error(node, "tuple index is outside value length")
+        return lowerer.emit(
+            OperationKind.EXTRACT,
             lowerer.location(node),
-            operands=(source, selector),
-            result_types=(source.type.member,),
-        )
-        return operation.results[0]
+            operands=(source,),
+            result_types=(source.type.components[index],),
+            attributes={"field": index},
+        ).results[0]
+    if isinstance(source.type, (DomainType, RegionType)):
+        return _subscript_region(lowerer, source, node)
     if not isinstance(source.type, (TensorType, BufferType)):
         lowerer.error(node, "only tensor/view/buffer values support positional indexing")
     lowered = lower_index(lowerer, source, node.slice, first_operand_position=1)
@@ -114,6 +125,8 @@ def lower_subscript(
         return operation.results[0]
     valid = lowerer.emit_literal(True, node, ScalarType(intent_bool))
     fill = lowerer.emit_literal(False if source.type.dtype == intent_bool else 0, node, ScalarType(source.type.dtype))
+    valid = lowerer.broadcast_value(valid, tuple(lowered.result_shape), node)
+    fill = lowerer.broadcast_value(fill, tuple(lowered.result_shape), node)
     operands = (source, *lowered.operands, valid, fill)
     operation = lowerer.emit(
         OperationKind.GATHER,
@@ -253,7 +266,124 @@ def lower_index(
         else:
             lowerer.error(raw_term, "index expression must be integer, index tensor, or region")
         source_axis += 1
-    return LoweredIndex(IndexRelation(tuple(terms)), tuple(operands), tuple(result_shape))
+    return LoweredIndex(
+        IndexRelation(
+            len(source_type.shape),
+            len(result_shape),
+            tuple(
+                lowerer.compiler.builder.dimension_id(dimension)
+                for dimension in result_shape
+            ),
+            tuple(terms),
+        ),
+        tuple(operands),
+        tuple(result_shape),
+    )
+
+
+def _subscript_region(
+    lowerer: FunctionLowerer,
+    source: MlirValue,
+    node: ast.Subscript,
+) -> MlirValue:
+    if source.type.rank != 1 or not isinstance(node.slice, ast.Slice):
+        lowerer.error(node, "logical subregion requires a rank-one source slice")
+    if node.slice.step is not None:
+        step = _static_integer(node.slice.step)
+        if step != 1:
+            lowerer.error(node.slice.step, "logical subregion requires unit step")
+    operands = [source]
+    has_start = node.slice.lower is not None
+    has_stop = node.slice.upper is not None
+    for bound in (node.slice.lower, node.slice.upper):
+        if bound is None:
+            continue
+        value = lowerer.materialize(lowerer.lower_expression(bound), bound)
+        if not is_integer(value.type):
+            lowerer.error(bound, "subregion boundary must be logical index/integer")
+        operands.append(value)
+    source_id = (
+        source.type.origin_id
+        if isinstance(source.type, DomainType)
+        else source.type.source_id
+    )
+    if not has_start and not has_stop:
+        extent_shape = lowerer.dynamic_shape_for_region(source)
+    else:
+        extent_shape = (lowerer.fresh_dynamic_dimension("subregion_extent"),)
+    operation = lowerer.emit(
+        OperationKind.SUBREGION,
+        lowerer.location(node),
+        operands=tuple(operands),
+        result_types=(RegionType(1, source_id),),
+        attributes={
+            "has_start": has_start,
+            "has_stop": has_stop,
+            "extent_dimensions": tuple(
+                lowerer.compiler.builder.dimension_id(dimension)
+                for dimension in extent_shape
+            ),
+        },
+    )
+    result = operation.results[0]
+    lowerer.iteration_shapes[result] = extent_shape
+    return result
+
+
+def _subscript_ragged(
+    lowerer: FunctionLowerer,
+    ragged: RaggedSpec,
+    node: ast.Subscript,
+) -> MlirValue:
+    selector = lowerer.materialize(lowerer.lower_expression(node.slice), node.slice)
+    if not is_integer(selector.type):
+        lowerer.error(node.slice, "ragged member selector must be integer/index")
+
+    def offset_at(index: MlirValue) -> MlirValue:
+        relation = IndexRelation(
+            1,
+            0,
+            (),
+            (IndexTerm(IndexTermKind.VALUE_INDEX, (1,)),),
+        )
+        return lowerer.emit(
+            OperationKind.GATHER,
+            lowerer.location(node),
+            operands=(ragged.offsets, index),
+            result_types=(ScalarType(ragged.offsets.type.dtype),),
+            attributes={"index": relation},
+        ).results[0]
+
+    one = lowerer.emit_literal(1, node, ScalarType(intent_index))
+    next_selector = lowerer.emit(
+        OperationKind.BINARY,
+        lowerer.location(node),
+        operands=(selector, one),
+        result_types=(selector.type,),
+        attributes={"operator_kind": BinaryOperator.ADD},
+    ).results[0]
+    begin = offset_at(selector)
+    end = offset_at(next_selector)
+    source_id = ragged.members.type.origin_id
+    extent_shape = (lowerer.fresh_dynamic_dimension("ragged_subregion_extent"),)
+    region = lowerer.emit(
+        OperationKind.SUBREGION,
+        lowerer.location(node),
+        operands=(ragged.members, begin, end),
+        result_types=(RegionType(1, source_id),),
+        attributes={
+            "has_start": True,
+            "has_stop": True,
+            "extent_dimensions": tuple(
+                lowerer.compiler.builder.dimension_id(dimension)
+                for dimension in extent_shape
+            ),
+        },
+    ).results[0]
+    lowerer.iteration_shapes[region] = extent_shape
+    if ragged.mapping is not None:
+        lowerer.ragged_mappings[region] = ragged.mapping
+    return region
 
 
 def _expand_ellipsis(

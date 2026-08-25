@@ -56,5 +56,6 @@ def cross_entropy_mean(
     rows = I.domain(0, loss.shape[0])
     for singleton in I.parallel(I.domain(0, 1)):
         mean_loss[singleton] = (
-            I.reduce.sum(loss[rows], axis=0, identity=0.0) / loss.shape[0]
+            I.reduce.sum(loss[rows], axis=0, identity=0.0)
+            / I.cast(loss.shape[0], I.f32)
         )

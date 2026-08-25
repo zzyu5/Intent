@@ -3,15 +3,17 @@ from .effects import EffectKind
 from .effects import PURE
 from .effects import ResourceKind
 from .operations import AtomicOrdering
-from .operations import AutoExtent
+from .operations import AtomicRMWKind
 from .operations import BinaryOperator
 from .operations import ComparePredicate
 from .operations import EFFECTFUL_OPS
 from .operations import IndexRelation
 from .operations import IndexTerm
 from .operations import IndexTermKind
-from .operations import MemoryScope
 from .operations import OperationKind
+from .operations import ShapeExpr
+from .operations import ShapeExprKind
+from .operations import ShapeRelation
 from .operations import REGION_OPS
 from .operations import STRUCTURED_OPS
 from .operations import TERMINATORS
@@ -24,9 +26,6 @@ from .types import DomainType
 from .types import DynamicDim
 from .types import EnumType
 from .types import LogicalIndexType
-from .types import PartitionMode
-from .types import PartitionType
-from .types import RaggedType
 from .types import RecordType
 from .types import RegionType
 from .types import ScalarType
@@ -34,6 +33,7 @@ from .types import Shape
 from .types import StaticDim
 from .types import SymbolDim
 from .types import TensorType
+from .types import TupleType
 from .types import ValueType
 from .types import broadcast_shape
 from .types import dims_compatible

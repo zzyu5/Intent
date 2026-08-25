@@ -11,12 +11,11 @@ from intent.frontend.semantics import Effect
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import PartitionMode
-from intent.frontend.semantics import PartitionType
 from intent.frontend.semantics import RegionType
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import TupleType
 from intent.frontend.mlir import MlirValue
 from intent.language import bool as intent_bool
 from intent.language import DType
@@ -33,7 +32,6 @@ from .model import Literal
 from .model import LoopContext
 from .model import ShapeValue
 from .model import StaticTuple
-from .model import StreamSpec
 
 
 def lower_statement(lowerer: object, node: ast.stmt) -> None:
@@ -67,8 +65,7 @@ def lower_statement(lowerer: object, node: ast.stmt) -> None:
         _lower_while(lowerer, node)
         return
     if isinstance(node, ast.With):
-        _lower_with(lowerer, node)
-        return
+        lowerer.error(node, "with is not a canonical Intent control-flow construct")
     if isinstance(node, ast.Break):
         _reject_unlowered_loop_exit(lowerer, node)
         return
@@ -148,6 +145,17 @@ def _destructure(lowerer: object, expression: Expression, node: ast.AST) -> tupl
         return expression.elements
     if isinstance(expression, ShapeValue):
         return tuple(expression.dimensions)
+    if isinstance(expression, MlirValue) and isinstance(expression.type, TupleType):
+        return tuple(
+            lowerer.emit(
+                OperationKind.EXTRACT,
+                lowerer.location(node),
+                operands=(expression,),
+                result_types=(component_type,),
+                attributes={"field": index},
+            ).results[0]
+            for index, component_type in enumerate(expression.type.components)
+        )
     lowerer.error(node, "value is not destructurable")
 
 
@@ -201,13 +209,7 @@ def _lower_return(lowerer: object, node: ast.Return) -> None:
             values: tuple[MlirValue, ...] = ()
         else:
             expression = lowerer.lower_expression(node.value)
-            if isinstance(expression, StaticTuple):
-                values = tuple(
-                    lowerer.materialize(element, node.value)
-                    for element in expression.elements
-                )
-            else:
-                values = (lowerer.materialize(expression, node.value),)
+            values = (lowerer.materialize(expression, node.value),)
         frame.returned = values
         return
     if lowerer.current_block.owner is not lowerer.function.body:
@@ -258,15 +260,6 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
         )
         if not terminated
     ]
-    if lowerer.loop_stack and lowerer.loop_stack[-1].stream is not None:
-        pending_states = [stack[-1].pending_stream_state for stack in normal_loop_stacks]
-        if any(state != pending_states[0] for state in pending_states[1:]):
-            lowerer.error(
-                node,
-                "runtime if cannot merge different pending stream.yield_ states; assign state and yield after if",
-            )
-        lowerer.loop_stack[-1].pending_stream_state = pending_states[0]
-
     merge_names: list[str] = []
     merged_static: dict[str, Expression] = {}
     merge_types: dict[str, object] = {}
@@ -362,7 +355,7 @@ def _lower_branch(
     loop_stack: list[LoopContext],
     node: ast.AST,
 ) -> tuple[object, dict[str, Expression], bool, list[LoopContext]]:
-    region = lowerer.compiler.builder.region(lowerer.location(node))
+    region = lowerer.make_region(lowerer.location(node))
     saved_block = lowerer.current_block
     saved_environment = lowerer.environment
     saved_loop_stack = lowerer.loop_stack
@@ -383,18 +376,16 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     if node.orelse:
         lowerer.error(node, "for-else is not part of Intent control flow")
     iteration = _lower_iteration_expression(lowerer, node.iter)
-    if isinstance(iteration, StreamSpec):
-        lowerer.error(node, "state_stream iteration must be enclosed by 'with stream'")
     if isinstance(iteration, IterationSpec):
         opcode = iteration.opcode
         source = iteration.source
     elif isinstance(iteration, MlirValue) and isinstance(
-        iteration.type, (DomainType, RegionType, PartitionType)
+        iteration.type, (DomainType, RegionType)
     ):
         opcode = OperationKind.FOR
         source = iteration
     else:
-        lowerer.error(node, "for iterator must be a domain, partition, or I.parallel")
+        lowerer.error(node, "for iterator must be a domain, subregion, or I.parallel")
     has_break, has_continue = (
         _loop_exit_kinds(node.body)
         if opcode is OperationKind.FOR
@@ -437,7 +428,7 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
         lowerer.materialize(snapshot[name], node) for name in carried_names
     )
     iteration_types = _iteration_argument_types(lowerer, source)
-    region = lowerer.compiler.builder.region(
+    region = lowerer.make_region(
         lowerer.location(node),
         (*iteration_types, *(value.type for value in initial_values)),
     )
@@ -524,8 +515,8 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
     carried_names = tuple(sorted(_assigned_names(body) & set(snapshot)))
     initial_values = tuple(lowerer.materialize(snapshot[name], node) for name in carried_names)
     state_types = tuple(value.type for value in initial_values)
-    before = lowerer.compiler.builder.region(lowerer.location(node), state_types)
-    after = lowerer.compiler.builder.region(lowerer.location(node), state_types)
+    before = lowerer.make_region(lowerer.location(node), state_types)
+    after = lowerer.make_region(lowerer.location(node), state_types)
     saved_block = lowerer.current_block
 
     lowerer.current_block = before.blocks[0]
@@ -567,83 +558,6 @@ def _lower_while(lowerer: object, node: ast.While) -> None:
         lowerer.environment.pop(live_name)
 
 
-def _lower_with(lowerer: object, node: ast.With) -> None:
-    if len(node.items) != 1 or node.items[0].optional_vars is not None:
-        lowerer.error(node, "state_stream with block accepts one stream and no 'as' target")
-    stream_expression = lowerer.lower_expression(node.items[0].context_expr)
-    if not isinstance(stream_expression, StreamSpec):
-        lowerer.error(node, "with is reserved for I.state_stream handles")
-    if len(node.body) != 1 or not isinstance(node.body[0], ast.For):
-        lowerer.error(node, "with stream body must contain exactly one 'for ... in stream'")
-    loop = node.body[0]
-    iterator = lowerer.lower_expression(loop.iter)
-    if iterator is not stream_expression:
-        lowerer.error(loop.iter, "stream loop must iterate the same stream handle")
-    if loop.orelse:
-        lowerer.error(loop, "state_stream loop does not support else")
-    stream = stream_expression
-    if isinstance(stream.axis.type, RegionType):
-        segment_type = stream.axis.type
-    elif stream.axis.type.flavor is DomainFlavor.RAGGED_MEMBER:
-        segment_type = RegionType(stream.axis.type.rank, "ragged_member")
-    elif stream.axis.type.flavor is DomainFlavor.RAGGED_OUTER:
-        segment_type = RegionType(stream.axis.type.rank, "ragged_outer")
-    else:
-        segment_type = RegionType(stream.axis.type.rank, "state_stream")
-    region = lowerer.compiler.builder.region(
-        lowerer.location(loop),
-        (segment_type, *(value.type for value in stream.initial_state)),
-    )
-    snapshot = dict(lowerer.environment)
-    saved_block = lowerer.current_block
-    lowerer.current_block = region.blocks[0]
-    lowerer.environment = dict(snapshot)
-    arguments = tuple(region.blocks[0].arguments)
-    if isinstance(loop.target, (ast.Tuple, ast.List)) and len(loop.target.elts) == 2:
-        _assign_target(lowerer, loop.target.elts[0], arguments[0])
-        state_expression: Expression = (
-            arguments[1]
-            if len(arguments) == 2
-            else StaticTuple(tuple(arguments[1:]))
-        )
-        _assign_target(lowerer, loop.target.elts[1], state_expression)
-    else:
-        _assign_iteration_target(lowerer, loop.target, arguments)
-    context = LoopContext(OperationKind.STATE_STREAM, (), stream=stream)
-    lowerer.loop_stack.append(context)
-    lowerer.lower_statements(loop.body)
-    if not lowerer.is_terminated(region.blocks[0]):
-        if context.pending_stream_state is None:
-            lowerer.error(loop, "every state_stream path must call stream.yield_(...)")
-        lowerer.emit(
-            OperationKind.YIELD,
-            lowerer.location(loop),
-            operands=context.pending_stream_state,
-        )
-    lowerer.loop_stack.pop()
-    lowerer.current_block = saved_block
-    lowerer.environment = snapshot
-    operands = [stream.axis, *stream.initial_state]
-    attributes: dict[str, object] = {"state_count": len(stream.initial_state)}
-    if isinstance(stream.extent, MlirValue):
-        attributes["extent_operand_index"] = len(operands)
-        operands.append(stream.extent)
-    else:
-        attributes["extent"] = stream.extent
-    if stream.stop is not None:
-        attributes["stop_operand_index"] = len(operands)
-        operands.append(stream.stop)
-    operation = lowerer.emit(
-        OperationKind.STATE_STREAM,
-        lowerer.location(node),
-        operands=tuple(operands),
-        result_types=tuple(value.type for value in stream.initial_state),
-        attributes=attributes,
-        regions=(region,),
-    )
-    stream.results = operation.results
-
-
 def _lower_assert(lowerer: object, node: ast.Assert) -> None:
     condition = lowerer.lower_expression(node.test)
     known, value = compile_time_value(condition)
@@ -654,18 +568,13 @@ def _lower_assert(lowerer: object, node: ast.Assert) -> None:
 
 
 def _iteration_argument_types(lowerer: object, source: MlirValue) -> tuple[object, ...]:
-    if isinstance(source.type, PartitionType):
-        if source.type.mode is PartitionMode.COUNT:
-            return (LogicalIndexType("partition_part"), source.type.region_type)
-        return (source.type.region_type,)
     if isinstance(source.type, DomainType):
         return tuple(
-            LogicalIndexType(f"domain_axis_{axis}") for axis in range(source.type.rank)
+            lowerer.logical_index_type(source, axis) for axis in range(source.type.rank)
         )
     if isinstance(source.type, RegionType):
         return tuple(
-            LogicalIndexType(f"{source.type.relation}_axis_{axis}")
-            for axis in range(source.type.rank)
+            lowerer.logical_index_type(source, axis) for axis in range(source.type.rank)
         )
     lowerer.error(source.location, "invalid iteration source")
 
@@ -842,8 +751,6 @@ def _copy_loop_stack(stack: list[LoopContext]) -> list[LoopContext]:
         LoopContext(
             context.opcode,
             context.carried_names,
-            context.stream,
-            context.pending_stream_state,
         )
         for context in stack
     ]

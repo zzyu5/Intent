@@ -561,8 +561,8 @@ def varlen_gqa_decode_with_sink_logits(
     members = I.domain(0, k.shape[0])
     blocks = I.domain(0, MAX_BLOCKS)
     for sequence in I.parallel(I.domain(0, B)):
-        sequence_begin = cu_seqlens[sequence]
-        sequence_end = cu_seqlens[sequence + 1]
+        sequence_begin = I.cast(cu_seqlens[sequence], I.index)
+        sequence_end = I.cast(cu_seqlens[sequence + 1], I.index)
         sequence_length = sequence_end - sequence_begin
         block_count = (
             sequence_length + VARLEN_GQA_DECODE_BLOCK_SIZE - 1
@@ -733,7 +733,7 @@ def flash_varlen_attention_fwd(
             axis=0,
             summarize=summarize_attention_chunk_f16,
             combine=merge_attention_summaries,
-            identity=empty_attention_summary(position_count, DV),
+            identity=empty_attention_summary(positions, DV),
             operands=(
                 q[positions, :],
                 I.indices(positions),
@@ -780,7 +780,7 @@ def flash_varlen_gqa_prefill(
                 axis=0,
                 summarize=summarize_attention_chunk_f16,
                 combine=merge_attention_summaries,
-                identity=empty_attention_summary(position_count, DV),
+                identity=empty_attention_summary(positions, DV),
                 operands=(
                     q[positions, query_head, :],
                     I.indices(positions),

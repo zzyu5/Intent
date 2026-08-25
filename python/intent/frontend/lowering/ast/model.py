@@ -4,7 +4,6 @@ import ast
 from dataclasses import dataclass
 from typing import TypeAlias
 
-from intent.frontend.semantics import AutoExtent
 from intent.frontend.semantics import DimExpr
 from intent.frontend.semantics import OperationKind
 from intent.frontend.mlir import MlirValue
@@ -39,14 +38,19 @@ class IterationSpec:
     source: MlirValue
 
 
-@dataclass(slots=True)
-class StreamSpec:
-    axis: MlirValue
-    initial_state: tuple[MlirValue, ...]
-    extent: AutoExtent | MlirValue
-    stop: MlirValue | None
-    ast_node: ast.AST
-    results: tuple[MlirValue, ...] | None = None
+@dataclass(frozen=True, slots=True)
+class RaggedSpec:
+    outer: MlirValue
+    members: MlirValue
+    offsets: MlirValue
+    mapping: MlirValue | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SparseFormatSpec:
+    kind: int
+    compression_axis: int
+    logical_extent: MlirValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +65,9 @@ Expression: TypeAlias = (
     | ShapeDimension
     | ShapeValue
     | IterationSpec
-    | StreamSpec
+    | RaggedSpec
+    | SparseFormatSpec
     | StaticTuple
-    | AutoExtent
     | object
 )
 
@@ -72,8 +76,6 @@ Expression: TypeAlias = (
 class LoopContext:
     opcode: OperationKind
     carried_names: tuple[str, ...]
-    stream: StreamSpec | None = None
-    pending_stream_state: tuple[MlirValue, ...] | None = None
 
 
 __all__ = [
@@ -82,8 +84,9 @@ __all__ = [
     "IterationSpec",
     "Literal",
     "LoopContext",
+    "RaggedSpec",
     "ShapeDimension",
     "ShapeValue",
     "StaticTuple",
-    "StreamSpec",
+    "SparseFormatSpec",
 ]

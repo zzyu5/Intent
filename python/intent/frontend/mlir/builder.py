@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 
 from ..diagnostics.locations import Location
 from ..semantics.effects import Effect
@@ -9,7 +10,8 @@ from ..semantics.operations import REGION_OPS
 from ..semantics.operations import TERMINATORS
 from ..semantics.types import ValueType
 from .attributes import emit_dictionary
-from .attributes import emit_effect
+from .attributes import ParameterAttribute
+from .attributes import FunctionKindAttribute
 from .state import BlockState
 from .state import EmittedOperation
 from .state import FunctionKind
@@ -19,9 +21,7 @@ from .state import ParameterKind
 from .state import ParameterSpec
 from .state import ParameterState
 from .state import RegionState
-from .types import emit_shape_metadata
 from .types import emit_type
-from .types import emit_type_metadata
 from .types import emit_view_type
 from .types import quote
 
@@ -34,6 +34,8 @@ class MlirBuilder:
         self._values: list[MlirValue] = []
         self._next_value_id = 0
         self._next_operation_id = 0
+        self._dimension_ids: dict[object, int] = {}
+        self._next_dimension_id = 1
 
     def _value(
         self,
@@ -43,8 +45,17 @@ class MlirBuilder:
         name_hint: str | None = None,
         view_access: str | None = None,
     ) -> MlirValue:
+        from ..semantics.types import BufferType
+        from ..semantics.types import DomainType
+        from ..semantics.types import RegionType
+
+        value_id = self._next_value_id
+        if isinstance(value_type, (DomainType, RegionType, BufferType)) and (
+            value_type.origin_id is None
+        ):
+            value_type = replace(value_type, origin_id=value_id)
         value = MlirValue(
-            id=self._next_value_id,
+            id=value_id,
             type=value_type,
             location=location,
             name_hint=name_hint,
@@ -97,6 +108,7 @@ class MlirBuilder:
         for spec, value in zip(parameter_specs, values):
             if spec.kind is ParameterKind.VIEW:
                 value.view_access = spec.view_kind.name.lower()
+                value.view_constraints = spec.constraints
         function = FunctionState(
             name=name,
             kind=kind,
@@ -143,7 +155,12 @@ class MlirBuilder:
             raise TypeError("operation effects must be Effect values")
         if any(effect.target is not None and effect.target not in operands for effect in effects):
             raise ValueError("effect target must be one of the operation operands")
-        expected_regions = 2 if operation_kind in (OperationKind.IF, OperationKind.WHILE) else 1
+        expected_regions = {
+            OperationKind.IF: 2,
+            OperationKind.WHILE: 2,
+            OperationKind.REGION_FOLD: 2,
+            OperationKind.REGION_SCAN: 4,
+        }.get(operation_kind, 1)
         if operation_kind in REGION_OPS and len(regions) != expected_regions:
             raise ValueError(
                 f"intent.{operation_kind.value} requires {expected_regions} region(s)"
@@ -168,22 +185,13 @@ class MlirBuilder:
             self._value(value_type, location, name_hint=name)
             for value_type, name in zip(result_types, names)
         )
-        operation_attributes = {
-            f"intent.{key}": value for key, value in dict(attributes or {}).items()
-        }
+        result_types = tuple(value.type for value in results)
+        operation_attributes = dict(attributes or {})
         operation_attributes["intent.node"] = operation_id
         operation_attributes["intent.result_nodes"] = [value.id for value in results]
         operation_attributes["intent.result_names"] = [
             self._name_marker(value) for value in results
         ]
-        operation_attributes["intent.result_types"] = [
-            emit_type_metadata(value_type) for value_type in result_types
-        ]
-        shapes = [emit_shape_metadata(value_type) for value_type in result_types]
-        if any(shape is not None for shape in shapes):
-            operation_attributes["intent.result_shapes"] = [
-                shape if shape is not None else [] for shape in shapes
-            ]
         if regions:
             operation_attributes["intent.region_argument_nodes"] = [
                 [[value.id for value in nested.arguments] for nested in region.blocks]
@@ -196,11 +204,6 @@ class MlirBuilder:
                 ]
                 for region in regions
             ]
-        if effects:
-            operation_attributes["intent.effects"] = [
-                emit_effect(effect, operands) for effect in effects
-            ]
-
         text = self._operation_text(
             operation_kind,
             location,
@@ -241,12 +244,17 @@ class MlirBuilder:
             for parameter in function.parameters
         )
         attributes = {
-            "intent.kind": function.kind.value,
+            "intent.kind": FunctionKindAttribute(
+                0 if function.kind is FunctionKind.KERNEL else 1
+            ),
             "intent.parameters": [
-                self._parameter_metadata(parameter.spec) for parameter in function.parameters
+                ParameterAttribute(
+                    parameter.spec.name,
+                    list(ParameterKind).index(parameter.spec.kind),
+                )
+                for parameter in function.parameters
             ],
             "intent.parameter_nodes": [parameter.value.id for parameter in function.parameters],
-            "intent.results": [self._type_metadata(value) for value in function.result_types],
             "intent.source": function.location.format(),
         }
         attributes.update({f"intent.{key}": value for key, value in function.attributes.items()})
@@ -308,38 +316,15 @@ class MlirBuilder:
         lines.append(f"{prefix}}}")
         return lines
 
-    def _parameter_metadata(self, spec: ParameterSpec) -> dict[str, object]:
-        metadata: dict[str, object] = {
-            "name": spec.name,
-            "kind": spec.kind.value,
-            "type": emit_type_metadata(spec.type),
-        }
-        shape = emit_shape_metadata(spec.type)
-        if shape is not None:
-            metadata["shape"] = shape
-        if spec.kind is ParameterKind.VIEW:
-            metadata["view_kind"] = spec.view_kind.name.lower()
-            constraints = spec.constraints
-            metadata["constraints"] = {
-                "strides": list(constraints.strides) if constraints.strides is not None else None,
-                "layout": constraints.layout,
-                "alignment": constraints.alignment,
-                "alias": constraints.alias,
-                "noalias": constraints.noalias,
-            }
-        return metadata
-
-    def _type_metadata(self, value_type: ValueType) -> dict[str, object]:
-        metadata: dict[str, object] = {"type": emit_type_metadata(value_type)}
-        shape = emit_shape_metadata(value_type)
-        if shape is not None:
-            metadata["shape"] = shape
-        return metadata
-
     def _value_type(self, value: MlirValue) -> str:
         if value.view_access is not None:
-            return emit_view_type(value.type, value.view_access)
-        return emit_type(value.type)
+            return emit_view_type(
+                value.type,
+                value.view_access,
+                value.view_constraints,
+                self._dimension_id,
+            )
+        return emit_type(value.type, self._dimension_id)
 
     def _value_name(self, value: MlirValue) -> str:
         return f"%v{value.id}"
@@ -351,15 +336,35 @@ class MlirBuilder:
         if not result_types:
             return "()"
         if len(result_types) == 1:
-            return emit_type(result_types[0])
-        return "(" + ", ".join(emit_type(value) for value in result_types) + ")"
+            return emit_type(result_types[0], self._dimension_id)
+        return "(" + ", ".join(
+            emit_type(value, self._dimension_id) for value in result_types
+        ) + ")"
 
     def _function_result_types(self, result_types: tuple[ValueType, ...]) -> str:
         if not result_types:
             return ""
         if len(result_types) == 1:
-            return " -> " + emit_type(result_types[0])
-        return " -> (" + ", ".join(emit_type(value) for value in result_types) + ")"
+            return " -> " + emit_type(result_types[0], self._dimension_id)
+        return " -> (" + ", ".join(
+            emit_type(value, self._dimension_id) for value in result_types
+        ) + ")"
+
+    def _dimension_id(self, dimension: object) -> int:
+        from ..semantics.types import StaticDim
+
+        if isinstance(dimension, StaticDim):
+            return 0
+        existing = self._dimension_ids.get(dimension)
+        if existing is not None:
+            return existing
+        identity = self._next_dimension_id
+        self._next_dimension_id += 1
+        self._dimension_ids[dimension] = identity
+        return identity
+
+    def dimension_id(self, dimension: object) -> int:
+        return self._dimension_id(dimension)
 
     def _location(self, location: Location) -> str:
         span = location.primary

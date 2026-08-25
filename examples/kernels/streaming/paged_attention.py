@@ -110,7 +110,9 @@ def paged_gqa_decode_partials(
         page_begin = I.cast(page_offsets[batch], I.index)
         sequence_length = I.cast(sequence_lengths[batch], I.index)
         selected_pages = split_pages[job]
-        page_count = split_offsets[job + 1] - split_offsets[job]
+        page_count = I.cast(
+            split_offsets[job + 1] - split_offsets[job], I.index
+        )
         token_count = page_count * PS
         page_positions = I.indices(selected_pages)
         physical_pages = I.cast(I.members(selected_pages), I.index)

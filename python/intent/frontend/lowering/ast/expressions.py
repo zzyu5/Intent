@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import ast
 import operator
+from enum import Enum
 from enum import IntEnum
 
 from intent.api import HelperDefinition
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import ComparePredicate
 from intent.frontend.semantics import OperationKind
-from intent.frontend.semantics import RaggedType
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import UnaryOperator
@@ -26,7 +26,7 @@ from .model import Expression
 from .model import Literal
 from .model import ShapeValue
 from .model import StaticTuple
-from .model import StreamSpec
+from .model import RaggedSpec
 
 
 _BINARY_OPERATORS = {
@@ -104,7 +104,7 @@ def compile_time_value(expression: Expression) -> tuple[bool, object]:
         return True, expression.value
     if isinstance(expression, ConstexprBinding):
         return True, expression.python_value
-    if isinstance(expression, (DType, IntEnum, str, type(None))):
+    if isinstance(expression, (DType, Enum, str, type(None))):
         return True, expression
     return False, None
 
@@ -115,34 +115,24 @@ def _lower_attribute(lowerer: object, node: ast.Attribute) -> Expression:
         if node.attr == "shape":
             return lowerer.shape_value(base, node)
         if isinstance(base.type, RecordType):
-            field_type = dict(base.type.fields).get(node.attr)
-            if field_type is None:
+            field_names = tuple(name for name, _ in base.type.fields)
+            if node.attr not in field_names:
                 lowerer.error(node, f"record has no field {node.attr!r}")
+            field = field_names.index(node.attr)
+            field_type = base.type.fields[field][1]
             operation = lowerer.emit(
                 OperationKind.EXTRACT,
                 lowerer.location(node),
                 operands=(base,),
                 result_types=(field_type,),
-                attributes={"key": node.attr},
-            )
-            return operation.results[0]
-        if isinstance(base.type, RaggedType) and node.attr == "outer":
-            operation = lowerer.emit(
-                OperationKind.RAGGED_OUTER,
-                lowerer.location(node),
-                operands=(base,),
-                result_types=(base.type.outer,),
+                attributes={"field": field},
             )
             return operation.results[0]
         lowerer.error(node, f"SSA value has no source attribute {node.attr!r}")
-    if isinstance(base, StreamSpec):
-        if node.attr != "result":
-            lowerer.error(node, f"state stream has no attribute {node.attr!r}")
-        if base.results is None:
-            lowerer.error(node, "stream.result is only available after its with block")
-        if len(base.results) == 1:
-            return base.results[0]
-        return StaticTuple(tuple(base.results))
+    if isinstance(base, RaggedSpec):
+        if node.attr == "outer":
+            return base.outer
+        lowerer.error(node, f"ragged helper has no source attribute {node.attr!r}")
     if isinstance(base, ShapeValue):
         lowerer.error(node, "shape tuple has no named attributes")
     try:
@@ -182,7 +172,7 @@ def _lower_unary(lowerer: object, node: ast.UnaryOp) -> Expression:
         lowerer.location(node),
         operands=(operand_value,),
         result_types=(result_type,),
-        attributes={"operator": operator_value},
+        attributes={"operator_kind": operator_value},
     )
     return operation.results[0]
 
@@ -218,6 +208,7 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
     result_type = lowerer.broadcast_result_type(lhs_value.type, rhs_value.type, node)
     result_dtype, result_shape = lowerer.dtype_and_shape(result_type, node)
     if ir_operator in _BITWISE_OPERATORS and result_dtype.category not in (
+        DTypeCategory.BOOL,
         DTypeCategory.SIGNED_INTEGER,
         DTypeCategory.UNSIGNED_INTEGER,
         DTypeCategory.INDEX,
@@ -230,7 +221,7 @@ def _lower_binary(lowerer: object, node: ast.BinOp) -> Expression:
         lowerer.location(node),
         operands=(lhs_value, rhs_value),
         result_types=(result_type,),
-        attributes={"operator": ir_operator},
+        attributes={"operator_kind": ir_operator},
     )
     return operation.results[0]
 
@@ -255,7 +246,7 @@ def _lower_bool(lowerer: object, node: ast.BoolOp) -> Expression:
             lowerer.location(node),
             operands=(lhs, rhs),
             result_types=(result_type,),
-            attributes={"operator": operator_value},
+            attributes={"operator_kind": operator_value},
         )
         result = operation.results[0]
     return result
@@ -310,7 +301,7 @@ def _lower_compare(lowerer: object, node: ast.Compare) -> Expression:
             lowerer.location(node),
             operands=(lhs, rhs),
             result_types=(result_type,),
-            attributes={"operator": BinaryOperator.LOGICAL_AND},
+            attributes={"operator_kind": BinaryOperator.LOGICAL_AND},
         )
         result = operation.results[0]
     return result
@@ -351,10 +342,6 @@ def _lower_if_expression(lowerer: object, node: ast.IfExp) -> Expression:
 
 
 def _lower_call(lowerer: object, node: ast.Call) -> Expression:
-    if isinstance(node.func, ast.Attribute):
-        base = lowerer.lower_expression(node.func.value)
-        if isinstance(base, StreamSpec) and node.func.attr == "yield_":
-            return _lower_stream_yield(lowerer, base, node)
     callee = lowerer.lower_expression(node.func)
     if isinstance(callee, (Intrinsic, IntrinsicNamespace)):
         from ..intrinsics import lower_intrinsic
@@ -363,14 +350,24 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
     if isinstance(callee, HelperDefinition):
         if node.keywords:
             lowerer.error(node, "direct @intent.fn calls use positional SSA arguments")
-        arguments = tuple(
-            lowerer.read_value(lowerer.lower_expression(argument), argument)
-            for argument in node.args
-        )
+        arguments: list[Expression] = []
+        for argument in node.args:
+            expression = lowerer.lower_expression(argument)
+            if isinstance(expression, ConstexprBinding):
+                arguments.append(expression)
+            elif isinstance(expression, Literal):
+                arguments.append(
+                    ConstexprBinding(
+                        expression.value,
+                        lowerer.materialize(expression, argument),
+                    )
+                )
+            else:
+                arguments.append(lowerer.read_value(expression, argument))
         results = lowerer.compiler.lower_helper_inline(
             lowerer,
             callee,
-            arguments,
+            tuple(arguments),
             lowerer.location(node),
         )
         if len(results) == 1:
@@ -379,29 +376,3 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
     if callee is slice:
         lowerer.error(node, "slice(...) is only valid inside an explicit index relation")
     lowerer.error(node, "only Intent intrinsics and @intent.fn values are callable in DSL code")
-
-
-def _lower_stream_yield(lowerer: object, stream: StreamSpec, node: ast.Call) -> Expression:
-    if node.keywords:
-        lowerer.error(node, "stream.yield_ accepts positional carried values")
-    if not lowerer.loop_stack or lowerer.loop_stack[-1].stream is not stream:
-        lowerer.error(node, "stream.yield_ is only legal in its stream body")
-    values: list[MlirValue] = []
-    if len(node.args) == 1:
-        expression = lowerer.lower_expression(node.args[0])
-        if isinstance(expression, StaticTuple):
-            values.extend(lowerer.materialize(value, node.args[0]) for value in expression.elements)
-        else:
-            values.append(lowerer.materialize(expression, node.args[0]))
-    else:
-        values.extend(
-            lowerer.materialize(lowerer.lower_expression(argument), argument)
-            for argument in node.args
-        )
-    if len(values) != len(stream.initial_state):
-        lowerer.error(node, "stream.yield_ state count does not match init schema")
-    for value, initial in zip(values, stream.initial_state):
-        if not lowerer.types_compatible_for_literal(value.type, initial.type):
-            lowerer.error(node, "stream.yield_ state type does not match init schema")
-    lowerer.loop_stack[-1].pending_stream_state = tuple(values)
-    return StaticTuple(())

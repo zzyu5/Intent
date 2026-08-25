@@ -191,7 +191,7 @@ def emit_linear_backward_kv_slice(
 def compose_retention_transition(lhs, rhs):
     return I.record(
         scale=rhs.scale * lhs.scale,
-        matrix=rhs.scale[..., None, None] * lhs.matrix + rhs.matrix,
+        matrix=rhs.scale * lhs.matrix + rhs.matrix,
     )
 
 

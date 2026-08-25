@@ -35,9 +35,8 @@ def varlen_aligned_causal_depthwise_conv1d(
         token_end = I.minimum(token_start + CHUNK_SIZE, sequence_end)
         tokens = packed_tokens[token_start:token_end]
         token_indices = I.indices(tokens)
-        token_count = token_end - token_start
         channel_indices = I.indices(channels)
-        accumulation = I.zeros((token_count, D), dtype=I.f32)
+        accumulation = I.zeros((tokens, D), dtype=I.f32)
         for tap in range(WIDTH):
             source_index = (
                 token_indices

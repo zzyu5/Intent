@@ -8,6 +8,7 @@ from intent.api import Definition
 from intent.api import DefinitionKind
 from intent.frontend.mlir import BlockState
 from intent.frontend.semantics import ConstexprType
+from intent.frontend.semantics import BufferType
 from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import Effect
 from intent.frontend.mlir import FunctionState
@@ -18,10 +19,15 @@ from intent.frontend.semantics import IndexRelation
 from intent.frontend.semantics import IndexTerm
 from intent.frontend.semantics import IndexTermKind
 from intent.frontend.semantics import OperationKind
+from intent.frontend.semantics import ShapeExpr
+from intent.frontend.semantics import ShapeExprKind
+from intent.frontend.semantics import ShapeRelation
 from intent.frontend.mlir import EmittedOperation
 from intent.frontend.mlir import RegionState
 from intent.frontend.semantics import ScalarType
+from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
+from intent.frontend.semantics import TupleType
 from intent.frontend.mlir import MlirValue
 from intent.frontend.semantics import broadcast_shape
 from intent.frontend.semantics import dims_compatible
@@ -34,6 +40,7 @@ from intent.language import i64
 from intent.language import index as intent_index
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import ResourceKind
+from intent.frontend.semantics import RegionType
 
 from ...diagnostics.errors import FrontendError
 from .model import ConstexprBinding
@@ -42,6 +49,7 @@ from .model import Literal
 from .model import LoopContext
 from .model import ShapeDimension
 from .model import ShapeValue
+from .model import StaticTuple
 from ...source.unit import SourceUnit
 
 if TYPE_CHECKING:
@@ -73,6 +81,14 @@ class FunctionLowerer:
         self.loop_stack: list[LoopContext] = []
         self.view_kinds: dict[MlirValue, ViewKind] = {}
         self.inline_helpers: list[InlineHelperFrame] = []
+        self.ragged_mappings: dict[MlirValue, MlirValue] = {}
+        self.iteration_shapes: dict[MlirValue, tuple[object, ...]] = {}
+        self.dimension_values: dict[MlirValue, object] = {}
+        self.dimension_origins: dict[object, list[ShapeDimension]] = {}
+        self.value_blocks: dict[MlirValue, BlockState] = {}
+        self.operation_blocks: dict[int, BlockState] = {}
+        self.region_parent_blocks: dict[RegionState, BlockState] = {}
+        self._dynamic_dimension_counter = 0
         self._initialize_parameters(constexpr_values)
 
     def _initialize_parameters(self, constexpr_values: dict[str, object]) -> None:
@@ -85,6 +101,7 @@ class FunctionLowerer:
                 self.environment[name] = value
             if parameter.spec.view_kind is not None:
                 self.view_kinds[value] = parameter.spec.view_kind
+            self.register_value_shape(value)
 
     def lower(self) -> None:
         self.lower_statements(self.source.function.body)
@@ -97,7 +114,7 @@ class FunctionLowerer:
         definition: Definition[object, object],
         source: SourceUnit,
         parameters: tuple[object, ...],
-        arguments: tuple[MlirValue, ...],
+        arguments: tuple[object, ...],
     ) -> tuple[MlirValue, ...]:
         if len(parameters) != len(arguments):
             self.error(source.function, "helper argument count does not match call")
@@ -154,7 +171,7 @@ class FunctionLowerer:
         effects: tuple[Effect, ...] = (),
         result_names: tuple[str | None, ...] = (),
     ) -> EmittedOperation:
-        return self.compiler.builder.emit(
+        operation = self.compiler.builder.emit(
             self.current_block,
             opcode,
             location,
@@ -165,6 +182,25 @@ class FunctionLowerer:
             effects=effects,
             result_names=result_names,
         )
+        self.operation_blocks[operation.id] = self.current_block
+        for result in operation.results:
+            self.value_blocks[result] = self.current_block
+            self.register_value_shape(result)
+        return operation
+
+    def make_region(
+        self,
+        location: Location,
+        argument_types: tuple[ValueType, ...] = (),
+        argument_names: tuple[str | None, ...] = (),
+    ) -> RegionState:
+        region = self.compiler.builder.region(
+            location, argument_types, argument_names
+        )
+        self.region_parent_blocks[region] = self.current_block
+        for argument in region.blocks[0].arguments:
+            self.register_value_shape(argument, region.blocks[0])
+        return region
 
     def materialize(
         self,
@@ -179,11 +215,44 @@ class FunctionLowerer:
                 self.error(node, f"value type {expression.type} does not match {expected_type}")
             return expression
         if isinstance(expression, ConstexprBinding):
-            return expression.ir_value
+            constexpr_type = expression.ir_value.type
+            return self.emit_literal(
+                expression.python_value,
+                node,
+                expected_type
+                or (
+                    constexpr_type.value_type
+                    if isinstance(constexpr_type, ConstexprType)
+                    else constexpr_type
+                ),
+            )
         if isinstance(expression, ShapeDimension):
             return self.materialize_dimension(expression, node)
         if isinstance(expression, Literal):
             return self.emit_literal(expression.value, node, expected_type)
+        if isinstance(expression, StaticTuple):
+            expected_components: tuple[ValueType, ...] | None = None
+            if expected_type is not None:
+                if not isinstance(expected_type, TupleType):
+                    self.error(node, f"tuple value does not match {expected_type}")
+                if len(expression.elements) != len(expected_type.components):
+                    self.error(node, "tuple value/expected type arity mismatch")
+                expected_components = expected_type.components
+            components = tuple(
+                self.materialize(
+                    element,
+                    node,
+                    expected_components[index] if expected_components is not None else None,
+                )
+                for index, element in enumerate(expression.elements)
+            )
+            result_type = TupleType(tuple(component.type for component in components))
+            return self.emit(
+                OperationKind.MAKE_TUPLE,
+                self.location(node),
+                operands=components,
+                result_types=(result_type,),
+            ).results[0]
         self.error(node, "expression is compile-time metadata, not an SSA value")
 
     def emit_literal(
@@ -216,6 +285,10 @@ class FunctionLowerer:
             isinstance(value, bool) or not isinstance(value, (int, float))
         ):
             self.error(node, "floating literal context requires int/float")
+        if category in (DTypeCategory.FLOAT, DTypeCategory.BFLOAT) and isinstance(
+            value, int
+        ):
+            value = float(value)
         operation = self.emit(
             OperationKind.CONSTANT,
             self.location(node),
@@ -225,14 +298,40 @@ class FunctionLowerer:
         return operation.results[0]
 
     def materialize_dimension(self, dimension: ShapeDimension, node: ast.AST) -> MlirValue:
+        if isinstance(dimension.dimension, StaticDim):
+            return self.emit_literal(
+                dimension.dimension.value, node, ScalarType(intent_index)
+            )
         operation = self.emit(
             OperationKind.DIM,
             self.location(node),
             operands=(dimension.source,),
             result_types=(ScalarType(intent_index),),
-            attributes={"axis": dimension.axis},
+            attributes={
+                "axis": dimension.axis,
+                "dimension": self.compiler.builder.dimension_id(dimension.dimension),
+            },
         )
-        return operation.results[0]
+        result = operation.results[0]
+        self.dimension_values[result] = dimension.dimension
+        self._remember_dimension_origin(dimension)
+        return result
+
+    def materialize_shape_extent(self, dimension: object, node: ast.AST) -> MlirValue:
+        candidates = self.dimension_origins.get(dimension, [])
+        origin = next(
+            (
+                candidate
+                for candidate in candidates
+                if self._block_dominates(
+                    self.value_blocks.get(candidate.source), self.current_block
+                )
+            ),
+            None,
+        )
+        if origin is None:
+            self.error(node, f"dynamic shape extent {dimension} has no SSA source")
+        return self.materialize_dimension(origin, node)
 
     def read_value(self, expression: Expression, node: ast.AST) -> MlirValue:
         value = self.materialize(expression, node)
@@ -242,6 +341,12 @@ class FunctionLowerer:
         if not isinstance(value.type, TensorType):
             self.error(node, "view parameter must have tensor type")
         relation = IndexRelation(
+            len(value.type.shape),
+            len(value.type.shape),
+            tuple(
+                self.compiler.builder.dimension_id(dimension)
+                for dimension in value.type.shape
+            ),
             tuple(IndexTerm(IndexTermKind.FULL_SLICE) for _ in value.type.shape)
         )
         operation = self.emit(
@@ -317,11 +422,28 @@ class FunctionLowerer:
             for source, destination in zip(broadcasted, target_shape)
         ):
             self.error(node, "value cannot broadcast to the required result shape")
+        shape_operands: list[MlirValue] = []
+        shape_relation: list[ShapeExpr] = []
+        for dimension in target_shape:
+            if isinstance(dimension, StaticDim):
+                shape_relation.append(
+                    ShapeExpr(ShapeExprKind.STATIC, 0, dimension.value)
+                )
+            else:
+                shape_relation.append(
+                    ShapeExpr(
+                        ShapeExprKind.SSA_EXTENT,
+                        self.compiler.builder.dimension_id(dimension),
+                        1 + len(shape_operands),
+                    )
+                )
+                shape_operands.append(self.materialize_shape_extent(dimension, node))
         operation = self.emit(
             OperationKind.BROADCAST,
             self.location(node),
-            operands=(value,),
+            operands=(value, *shape_operands),
             result_types=(TensorType(dtype, target_shape),),
+            attributes={"shape": ShapeRelation(tuple(shape_relation))},
         )
         return operation.results[0]
 
@@ -379,8 +501,70 @@ class FunctionLowerer:
         raise FrontendError(message, self.location(node))
 
     def dynamic_shape_for_region(self, value: MlirValue) -> tuple[DynamicDim, ...]:
-        rank = getattr(value.type, "rank", 1)
-        return tuple(DynamicDim(f"region_{value.id}_{axis}") for axis in range(rank))
+        known = self.iteration_shapes.get(value)
+        if known is not None:
+            dimensions = tuple(known)
+        else:
+            rank = getattr(value.type, "rank", 1)
+            dimensions = tuple(
+                DynamicDim(f"region_{value.id}_{axis}") for axis in range(rank)
+            )
+        for axis, dimension in enumerate(dimensions):
+            self._remember_dimension_origin(ShapeDimension(dimension, value, axis))
+        return dimensions
 
-    def logical_index_type(self, relation: str) -> LogicalIndexType:
-        return LogicalIndexType(relation)
+    def fresh_dynamic_dimension(self, role: str) -> DynamicDim:
+        identity = self._dynamic_dimension_counter
+        self._dynamic_dimension_counter += 1
+        return DynamicDim(f"{role}_{identity}")
+
+    def logical_index_type(self, source: MlirValue, axis: int) -> LogicalIndexType:
+        source_id = (
+            source.type.source_id
+            if isinstance(source.type, RegionType)
+            else getattr(source.type, "origin_id", None)
+        )
+        if source_id is None:
+            raise TypeError("logical index source requires stable domain provenance")
+        return LogicalIndexType(source_id, axis)
+
+    def register_value_shape(
+        self, value: MlirValue, block: BlockState | None = None
+    ) -> None:
+        self.value_blocks.setdefault(value, block or self.current_block)
+        value_type = value.type
+        if isinstance(value_type, TensorType):
+            shape = value_type.shape
+        elif isinstance(value_type, BufferType):
+            shape = value_type.shape
+        else:
+            return
+        for axis, dimension in enumerate(shape):
+            if not isinstance(dimension, StaticDim):
+                self._remember_dimension_origin(
+                    ShapeDimension(dimension, value, axis)
+                )
+
+    def _remember_dimension_origin(self, origin: ShapeDimension) -> None:
+        candidates = self.dimension_origins.setdefault(origin.dimension, [])
+        if all(candidate.source is not origin.source or candidate.axis != origin.axis
+               for candidate in candidates):
+            candidates.append(origin)
+
+    def _block_dominates(
+        self, candidate: BlockState | None, current: BlockState
+    ) -> bool:
+        block: BlockState | None = current
+        while block is not None:
+            if block is candidate:
+                return True
+            region = block.owner
+            owner = region.owner_operation if region is not None else None
+            block = (
+                self.operation_blocks.get(owner)
+                if owner is not None
+                else self.region_parent_blocks.get(region)
+                if region is not None
+                else None
+            )
+        return False

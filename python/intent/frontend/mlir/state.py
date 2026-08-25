@@ -59,6 +59,7 @@ class MlirValue:
     location: Location
     name_hint: str | None = None
     view_access: str | None = None
+    view_constraints: ViewConstraints | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.id, bool) or not isinstance(self.id, int) or self.id < 0:
@@ -67,6 +68,10 @@ class MlirValue:
             raise TypeError("MLIR value requires a frontend ValueType")
         if not isinstance(self.location, Location):
             raise TypeError("MLIR value location must be a Location")
+        if self.view_constraints is not None and not isinstance(
+            self.view_constraints, ViewConstraints
+        ):
+            raise TypeError("view constraints must be a ViewConstraints value")
 
     def __hash__(self) -> int:
         return self.id

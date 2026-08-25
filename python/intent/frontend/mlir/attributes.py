@@ -4,14 +4,14 @@ import struct
 import re
 from dataclasses import dataclass
 from enum import Enum
+from enum import IntEnum
 
 from intent.language import DType
 
-from ..semantics.effects import Effect
-from ..semantics.operations import AutoExtent
 from ..semantics.operations import IndexRelation
 from ..semantics.operations import IndexTerm
-from .state import MlirValue
+from ..semantics.operations import ShapeExpr
+from ..semantics.operations import ShapeRelation
 from .types import quote
 
 
@@ -24,11 +24,30 @@ class SymbolRef:
             raise ValueError("MLIR symbol reference requires an identifier")
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterAttribute:
+    name: str
+    kind: int
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionKindAttribute:
+    kind: int
+
+
+@dataclass(frozen=True, slots=True)
+class SparseFormatAttribute:
+    kind: int
+    compression_axis: int
+
+
 def emit_attribute(value: object) -> str:
     if isinstance(value, SymbolRef):
         return f"@{value.name}"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, IntEnum):
+        return f"{int(value)} : i64"
     if isinstance(value, int):
         return f"{value} : i64"
     if isinstance(value, float):
@@ -39,13 +58,29 @@ def emit_attribute(value: object) -> str:
     if value is None:
         return "unit"
     if isinstance(value, DType):
-        return quote(value.name)
+        from .types import emit_dtype
+
+        return f"{emit_dtype(value)}"
     if isinstance(value, Enum):
         return quote(str(value.value))
-    if isinstance(value, AutoExtent):
-        return "{name = " + quote(value.name) + "}"
     if isinstance(value, IndexRelation):
-        return "[" + ", ".join(_emit_index_term(term) for term in value.terms) + "]"
+        terms = ", ".join(_emit_index_term(term) for term in value.terms)
+        return (
+            f"#intent.index_relation<{value.source_rank}, {value.result_rank}, "
+            f"{_emit_dense_i64(value.result_dimensions)}, [{terms}]>"
+        )
+    if isinstance(value, ShapeExpr):
+        return f"#intent.shape_expr<{int(value.kind)}, {value.dimension}, {value.payload}>"
+    if isinstance(value, ShapeRelation):
+        return "#intent.shape_relation<[" + ", ".join(
+            emit_attribute(axis) for axis in value.axes
+        ) + "]>"
+    if isinstance(value, ParameterAttribute):
+        return f"#intent.parameter<{quote(value.name)}, {value.kind}>"
+    if isinstance(value, FunctionKindAttribute):
+        return f"#intent.function_kind<{value.kind}>"
+    if isinstance(value, SparseFormatAttribute):
+        return f"#intent.sparse_format<{value.kind}, {value.compression_axis}>"
     if isinstance(value, (tuple, list)):
         return "[" + ", ".join(emit_attribute(element) for element in value) + "]"
     if isinstance(value, dict):
@@ -66,22 +101,17 @@ def _emit_key(key: str) -> str:
     return quote(key)
 
 
-def emit_effect(effect: Effect, operands: tuple[MlirValue, ...]) -> dict[str, object]:
-    target = -1
-    if effect.target is not None:
-        target = operands.index(effect.target)
-    return {
-        "kind": effect.kind.value,
-        "resource": effect.resource.value,
-        "target": target,
-    }
-
-
 def _emit_index_term(term: IndexTerm) -> str:
-    return emit_dictionary(
-        {
-            "kind": term.kind.value,
-            "operands": term.operand_positions,
-            "static": term.static_values,
-        }
+    absent = -(1 << 63)
+    operands = tuple(
+        -1 if position is None else position for position in term.operand_positions
     )
+    static = tuple(absent if value is None else value for value in term.static_values)
+    return (
+        f"#intent.index_term<{int(term.kind)}, {_emit_dense_i64(operands)}, "
+        f"{_emit_dense_i64(static)}>"
+    )
+
+
+def _emit_dense_i64(values: tuple[int, ...]) -> str:
+    return "[" + ", ".join(str(value) for value in values) + "]"

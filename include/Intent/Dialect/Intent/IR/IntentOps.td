@@ -2,161 +2,313 @@
 #define INTENT_DIALECT_INTENT_IR_INTENTOPS_TD
 
 include "Intent/Dialect/Intent/IR/IntentDialect.td"
+include "Intent/Dialect/Intent/IR/IntentAttrs.td"
+include "Intent/Dialect/Intent/IR/IntentTypes.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class Intent_Op<string mnemonic, list<Trait> traits = []>
-    : Op<Intent_Dialect, mnemonic, traits>;
+    : Op<Intent_Dialect, mnemonic, traits> {
+  let hasVerifier = 1;
+}
 
-class Intent_NullaryOneResultOp<string mnemonic, list<Trait> traits = [Pure]>
+class Intent_UnaryDataOp<string mnemonic, list<Trait> traits = [Pure]>
     : Intent_Op<mnemonic, traits> {
-  let arguments = (ins);
-  let results = (outs AnyType:$result);
+  let arguments = (ins Intent_DataValue:$input);
+  let results = (outs Intent_DataValue:$result);
 }
 
-class Intent_UnaryOneResultOp<string mnemonic, list<Trait> traits = [Pure]>
+class Intent_BinaryDataOp<string mnemonic, list<Trait> traits = [Pure]>
     : Intent_Op<mnemonic, traits> {
-  let arguments = (ins AnyType:$input);
-  let results = (outs AnyType:$result);
+  let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs);
+  let results = (outs Intent_DataValue:$result);
 }
 
-class Intent_BinaryOneResultOp<string mnemonic, list<Trait> traits = [Pure]>
-    : Intent_Op<mnemonic, traits> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
-  let results = (outs AnyType:$result);
+def Intent_ConstantOp : Intent_Op<"constant", [Pure]> {
+  let arguments = (ins AnyAttr:$value);
+  let results = (outs Intent_ScalarValue:$result);
 }
 
-class Intent_VariadicOneResultOp<string mnemonic, list<Trait> traits = [Pure]>
-    : Intent_Op<mnemonic, traits> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs AnyType:$result);
+def Intent_DimOp : Intent_Op<"dim", [Pure]> {
+  let arguments = (ins Intent_Value:$source, I64Attr:$axis,
+                       I64Attr:$dimension);
+  let results = (outs Index:$result);
 }
 
-class Intent_VariadicNoResultOp<string mnemonic, list<Trait> traits = []>
-    : Intent_Op<mnemonic, traits> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs);
+def Intent_DomainOp : Intent_Op<"domain", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$bounds,
+                       ArrayAttr:$extent_dimensions);
+  let results = (outs Intent_DomainValue:$result);
 }
-
-class Intent_TerminatorOp<string mnemonic>
-    : Intent_Op<mnemonic, [Terminator]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs);
+def Intent_DomainProductOp : Intent_Op<"domain_product", [Pure]> {
+  let arguments = (ins Variadic<Intent_DomainValue>:$domains,
+                       ArrayAttr:$extent_dimensions);
+  let results = (outs Intent_DomainValue:$result);
 }
-
-def Intent_ConstantOp : Intent_NullaryOneResultOp<"constant">;
-def Intent_DimOp : Intent_UnaryOneResultOp<"dim">;
-
-def Intent_DomainOp : Intent_VariadicOneResultOp<"domain">;
-def Intent_DomainProductOp : Intent_VariadicOneResultOp<"domain_product">;
-def Intent_PartitionOp : Intent_VariadicOneResultOp<"partition">;
-def Intent_IndicesOp : Intent_UnaryOneResultOp<"indices">;
-def Intent_RegionEndOp : Intent_UnaryOneResultOp<"region_end">;
-def Intent_AssumeInBoundsOp : Intent_Op<"assume_in_bounds"> {
-  let arguments = (ins AnyType:$index, AnyType:$view);
+def Intent_SubregionOp : Intent_Op<"subregion", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs,
+                       BoolAttr:$has_start, BoolAttr:$has_stop,
+                       ArrayAttr:$extent_dimensions);
+  let results = (outs Intent_RegionValue:$result);
+}
+def Intent_IndicesOp : Intent_Op<"indices", [Pure]> {
+  let arguments = (ins Intent_Value:$source, OptionalAttr<I64Attr>:$tensor_axis);
+  let results = (outs AnyRankedTensor:$result);
+}
+def Intent_RegionEndOp : Intent_Op<"region_end", [Pure]> {
+  let arguments = (ins Intent_IterationValue:$source);
+  let results = (outs Index:$result);
+}
+def Intent_AssumeInBoundsOp : Intent_Op<"assume_in_bounds", [Pure]> {
+  let arguments = (ins Intent_Value:$index, Intent_AddressableValue:$view,
+                       I64Attr:$axis);
   let results = (outs);
 }
 
 def Intent_ParallelOp : Intent_Op<"parallel", [RecursiveMemoryEffects]> {
-  let arguments = (ins AnyType:$source);
+  let arguments = (ins Intent_IterationValue:$source);
   let results = (outs);
-  let regions = (region AnyRegion:$body);
+  let regions = (region SizedRegion<1>:$body);
 }
-
-def Intent_StateStreamOp : Intent_Op<"state_stream", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region AnyRegion:$body);
-}
-
 def Intent_IfOp : Intent_Op<"if", [RecursiveMemoryEffects]> {
-  let arguments = (ins AnyType:$condition);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region VariadicRegion<AnyRegion>:$branches);
+  let arguments = (ins I1:$condition);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$then_region,
+                         SizedRegion<1>:$else_region);
 }
-
 def Intent_ForOp : Intent_Op<"for", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region AnyRegion:$body);
+  let arguments = (ins Variadic<Intent_Value>:$inputs);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$body);
 }
-
 def Intent_WhileOp : Intent_Op<"while", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region AnyRegion:$before, AnyRegion:$after);
+  let arguments = (ins Variadic<Intent_Value>:$inputs);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$before, SizedRegion<1>:$after);
+}
+def Intent_YieldOp : Intent_Op<"yield", [Terminator]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs);
+  let results = (outs);
+}
+def Intent_ConditionOp : Intent_Op<"condition", [Terminator]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs);
+  let results = (outs);
 }
 
-def Intent_YieldOp : Intent_TerminatorOp<"yield">;
-def Intent_ConditionOp : Intent_TerminatorOp<"condition">;
+def Intent_ViewLoadOp : Intent_Op<"view_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       OptionalAttr<I64Attr>:$valid_operand_index,
+                       OptionalAttr<I64Attr>:$fill_operand_index);
+  let results = (outs Intent_DataValue:$result);
+}
+def Intent_ViewStoreOp : Intent_Op<"view_store", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand_index);
+  let results = (outs);
+}
+def Intent_ReshapeOp : Intent_Op<"reshape", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_ShapeRelation:$shape);
+  let results = (outs AnyRankedTensor:$result);
+}
+def Intent_JoinOp : Intent_BinaryDataOp<"join">;
+def Intent_TransposeOp : Intent_UnaryDataOp<"transpose"> {
+  let arguments = (ins Intent_DataValue:$input, ArrayAttr:$permutation);
+}
+def Intent_BroadcastOp : Intent_Op<"broadcast", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_ShapeRelation:$shape);
+  let results = (outs AnyRankedTensor:$result);
+}
+def Intent_FullOp : Intent_Op<"full", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_ShapeRelation:$shape);
+  let results = (outs AnyRankedTensor:$result);
+}
+def Intent_MakeTupleOp : Intent_Op<"make_tuple", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$components);
+  let results = (outs Intent_TupleValue:$result);
+}
+def Intent_MakeRecordOp : Intent_Op<"make_record", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$fields);
+  let results = (outs Intent_RecordValue:$result);
+}
+def Intent_ExtractOp : Intent_Op<"extract", [Pure]> {
+  let arguments = (ins AnyTypeOf<[Intent_TupleValue, Intent_RecordValue]>:$product,
+                       I64Attr:$field);
+  let results = (outs Intent_Value:$result);
+}
 
-def Intent_ViewLoadOp : Intent_VariadicOneResultOp<"view_load", [MemoryEffects<[MemRead]>]>;
-def Intent_ViewStoreOp : Intent_VariadicNoResultOp<"view_store", [MemoryEffects<[MemWrite]>]>;
-def Intent_ReshapeOp : Intent_UnaryOneResultOp<"reshape">;
-def Intent_JoinOp : Intent_BinaryOneResultOp<"join">;
-def Intent_TransposeOp : Intent_UnaryOneResultOp<"transpose">;
-def Intent_BroadcastOp : Intent_UnaryOneResultOp<"broadcast">;
-def Intent_FullOp : Intent_UnaryOneResultOp<"full">;
-def Intent_ZerosOp : Intent_NullaryOneResultOp<"zeros">;
-def Intent_MakeRecordOp : Intent_VariadicOneResultOp<"make_record">;
-def Intent_ExtractOp : Intent_UnaryOneResultOp<"extract">;
-
-def Intent_UnaryOp : Intent_UnaryOneResultOp<"unary">;
-def Intent_BinaryOp : Intent_BinaryOneResultOp<"binary">;
-def Intent_CompareOp : Intent_BinaryOneResultOp<"compare">;
+def Intent_UnaryOp : Intent_UnaryDataOp<"unary"> {
+  let arguments = (ins Intent_DataValue:$input, I64Attr:$operator_kind);
+}
+def Intent_BinaryOp : Intent_BinaryDataOp<"binary"> {
+  let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,
+                       I64Attr:$operator_kind);
+}
+def Intent_CompareOp : Intent_Op<"compare", [Pure]> {
+  let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,
+                       I64Attr:$predicate);
+  let results = (outs Intent_DataValue:$result);
+}
 def Intent_SelectOp : Intent_Op<"select", [Pure]> {
-  let arguments = (ins AnyType:$condition, AnyType:$true_value, AnyType:$false_value);
-  let results = (outs AnyType:$result);
+  let arguments = (ins Intent_DataValue:$condition,
+                       Intent_DataValue:$true_value,
+                       Intent_DataValue:$false_value);
+  let results = (outs Intent_DataValue:$result);
 }
-def Intent_CastOp : Intent_UnaryOneResultOp<"cast">;
-def Intent_BitcastOp : Intent_UnaryOneResultOp<"bitcast">;
+def Intent_CastOp : Intent_UnaryDataOp<"cast"> {
+  let arguments = (ins Intent_DataValue:$input,
+                       OptionalAttr<I64Attr>:$rounding);
+}
+def Intent_BitcastOp : Intent_UnaryDataOp<"bitcast">;
 def Intent_MaskOp : Intent_Op<"mask", [Pure]> {
-  let arguments = (ins AnyType:$value, AnyType:$predicate, AnyType:$fill);
-  let results = (outs AnyType:$result);
+  let arguments = (ins Intent_DataValue:$value,
+                       Intent_DataValue:$predicate,
+                       Intent_DataValue:$fill);
+  let results = (outs Intent_DataValue:$result);
 }
 
 def Intent_ReduceOp : Intent_Op<"reduce", [Pure]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
+  let arguments = (ins Variadic<Intent_Value>:$inputs,
+                       ArrayAttr:$axes,
+                       I64Attr:$source_count,
+                       I64Attr:$identity_count,
+                       I64Attr:$capture_count);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$combine);
 }
 def Intent_ScanOp : Intent_Op<"scan", [Pure]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
-  let results = (outs Variadic<AnyType>:$results);
+  let arguments = (ins Variadic<Intent_Value>:$inputs,
+                       I64Attr:$axis,
+                       BoolAttr:$inclusive,
+                       BoolAttr:$reverse,
+                       I64Attr:$source_count,
+                       I64Attr:$identity_count,
+                       I64Attr:$capture_count);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$combine);
 }
-def Intent_ContractOp : Intent_BinaryOneResultOp<"contract">;
+def Intent_RegionFoldOp : Intent_Op<"region_fold", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs,
+                       I64Attr:$axis,
+                       I64Attr:$source_count,
+                       I64Attr:$identity_count,
+                       I64Attr:$capture_count);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$summarize,
+                         SizedRegion<1>:$combine);
+}
+def Intent_RegionScanOp : Intent_Op<"region_scan", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs,
+                       I64Attr:$axis,
+                       I64Attr:$source_count,
+                       I64Attr:$identity_count,
+                       I64Attr:$state_count,
+                       I64Attr:$capture_count,
+                       I64Attr:$output_count);
+  let results = (outs Variadic<Intent_Value>:$results);
+  let regions = (region SizedRegion<1>:$summarize,
+                         SizedRegion<1>:$combine,
+                         SizedRegion<1>:$apply,
+                         SizedRegion<1>:$emit);
+}
+
+def Intent_ContractOp : Intent_Op<"contract", [Pure]> {
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs,
+                       ArrayAttr:$reduce, ArrayAttr:$batch);
+  let results = (outs AnyRankedTensor:$result);
+}
 def Intent_ScaledContractOp : Intent_Op<"scaled_contract", [Pure]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$lhs_scale,
-                       AnyType:$rhs_scale);
-  let results = (outs AnyType:$result);
+  let arguments = (ins AnyRankedTensor:$lhs,
+                       AnyRankedTensor:$lhs_scale,
+                       AnyRankedTensor:$rhs,
+                       AnyRankedTensor:$rhs_scale,
+                       ArrayAttr:$reduce,
+                       ArrayAttr:$batch,
+                       I64Attr:$lhs_format,
+                       I64Attr:$rhs_format,
+                       I64Attr:$lhs_group_size,
+                       I64Attr:$rhs_group_size);
+  let results = (outs AnyRankedTensor:$result);
 }
-def Intent_SparseContractOp : Intent_VariadicOneResultOp<"sparse_contract">;
-
-def Intent_RaggedOp : Intent_Op<"ragged", [Pure]> {
-  let arguments = (ins AnyType:$outer, AnyType:$members, AnyType:$offsets,
-                       Optional<AnyType>:$indices);
-  let results = (outs AnyType:$result);
+def Intent_SparseContractOp : Intent_Op<"sparse_contract", [Pure]> {
+  let arguments = (ins AnyRankedTensor:$compressed,
+                       Intent_Value:$metadata,
+                       AnyRankedTensor:$rhs,
+                       Index:$logical_extent,
+                       Intent_SparseFormat:$format,
+                       ArrayAttr:$reduce,
+                       ArrayAttr:$batch);
+  let results = (outs AnyRankedTensor:$result);
 }
-def Intent_RaggedOuterOp : Intent_UnaryOneResultOp<"ragged_outer">;
-def Intent_RaggedMemberOp : Intent_BinaryOneResultOp<"ragged_member">;
-def Intent_MembersOp : Intent_UnaryOneResultOp<"members">;
+def Intent_HistogramOp : Intent_Op<"histogram", [Pure]> {
+  let arguments = (ins AnyRankedTensor:$values,
+                       Index:$bins,
+                       AnyRankedTensor:$valid,
+                       I64Attr:$result_dimension);
+  let results = (outs AnyRankedTensor:$result);
+}
 
-def Intent_GatherOp : Intent_VariadicOneResultOp<"gather", [MemoryEffects<[MemRead]>]>;
-def Intent_ScatterUniqueOp : Intent_VariadicNoResultOp<"scatter_unique", [MemoryEffects<[MemWrite]>]>;
-def Intent_ScatterReduceOp : Intent_VariadicNoResultOp<"scatter_reduce", [MemoryEffects<[MemWrite]>]>;
+def Intent_GatherOp : Intent_Op<"gather", [Pure]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       OptionalAttr<I64Attr>:$valid_operand_index,
+                       OptionalAttr<I64Attr>:$fill_operand_index);
+  let results = (outs Intent_DataValue:$result);
+}
+def Intent_ScatterUniqueOp : Intent_Op<"scatter_unique", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand_index);
+  let results = (outs);
+}
+def Intent_ScatterReduceOp : Intent_Op<"scatter_reduce", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand_index);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$combine);
+}
 
-def Intent_BufferOp : Intent_VariadicOneResultOp<"buffer">;
-def Intent_BufferLoadOp : Intent_VariadicOneResultOp<"buffer_load", [MemoryEffects<[MemRead]>]>;
-def Intent_BufferStoreOp : Intent_VariadicNoResultOp<"buffer_store", [MemoryEffects<[MemWrite]>]>;
-def Intent_AtomicAddOp : Intent_VariadicOneResultOp<"atomic_add", [MemoryEffects<[MemRead, MemWrite]>]>;
-def Intent_AtomicCasOp : Intent_VariadicOneResultOp<"atomic_cas", [MemoryEffects<[MemRead, MemWrite]>]>;
-def Intent_RandomOp : Intent_Op<"random", [Pure]> {
-  let arguments = (ins AnyType:$seed, AnyType:$logical_index);
-  let results = (outs AnyType:$result);
+def Intent_BufferOp : Intent_Op<"buffer"> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_ShapeRelation:$shape,
+                       OptionalAttr<I64Attr>:$initial_operand);
+  let results = (outs Intent_BufferValue:$result);
+}
+def Intent_BufferLoadOp : Intent_Op<"buffer_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index);
+  let results = (outs Intent_DataValue:$result);
+}
+def Intent_BufferStoreOp : Intent_Op<"buffer_store", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand_index);
+  let results = (outs);
+}
+def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$ordering);
+  let results = (outs Intent_DataValue:$result);
+}
+def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand, I64Attr:$ordering);
+  let results = (outs);
+}
+def Intent_AtomicRMWOp : Intent_Op<"atomic_rmw", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$value_operand, I64Attr:$ordering, I64Attr:$kind);
+  let results = (outs Intent_DataValue:$result);
+}
+def Intent_AtomicCompareExchangeOp : Intent_Op<"atomic_compare_exchange",
+    [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
+                       I64Attr:$expected_operand, I64Attr:$desired_operand,
+                       I64Attr:$ordering);
+  let results = (outs Intent_RecordValue:$result);
+}
+def Intent_RandomBitsOp : Intent_Op<"random_bits", [Pure]> {
+  let arguments = (ins UI64:$seed, Intent_Value:$logical_counter);
+  let results = (outs Intent_DataValue:$result);
 }
 
 def Intent_ReturnOp : Intent_Op<"return", [Terminator, ReturnLike]> {
-  let arguments = (ins Variadic<AnyType>:$inputs);
+  let arguments = (ins Variadic<Intent_Value>:$inputs);
   let results = (outs);
 }
 

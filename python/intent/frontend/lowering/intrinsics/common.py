@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from intent.frontend.semantics import DimExpr
 from intent.frontend.semantics import DynamicDim
 from intent.frontend.semantics import DomainType
 from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import ShapeExpr
+from intent.frontend.semantics import ShapeExprKind
+from intent.frontend.semantics import ShapeRelation
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import SymbolDim
+from intent.frontend.semantics import is_integer
 from intent.frontend.mlir import MlirValue
 from intent.language import DType
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import Literal
 from ..ast.model import ShapeDimension
+from ..ast.model import ShapeValue
 from ..ast.model import StaticTuple
 
 if TYPE_CHECKING:
     from ..ast.context import FunctionLowerer
+
+
+@dataclass(frozen=True, slots=True)
+class LoweredShape:
+    dimensions: tuple[DimExpr, ...]
+    operands: tuple[MlirValue, ...]
+    relation: ShapeRelation
 
 
 def bind_call(
@@ -102,33 +115,100 @@ def normalize_axes(
     return tuple(normalized)
 
 
-def lower_shape(lowerer: FunctionLowerer, node: ast.AST) -> tuple[DimExpr, ...]:
+def lower_shape(
+    lowerer: FunctionLowerer,
+    node: ast.AST,
+    *,
+    first_operand_position: int,
+) -> LoweredShape:
     expression = lowerer.lower_expression(node)
-    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
+    elements = (
+        tuple(expression.dimensions)
+        if isinstance(expression, ShapeValue)
+        else expression.elements
+        if isinstance(expression, StaticTuple)
+        else (expression,)
+    )
     dimensions: list[DimExpr] = []
+    operands: list[MlirValue] = []
+    relation: list[ShapeExpr] = []
+
+    def append_extent(dimension: DimExpr, value: MlirValue | None = None) -> None:
+        dimensions.append(dimension)
+        if isinstance(dimension, StaticDim):
+            relation.append(ShapeExpr(ShapeExprKind.STATIC, 0, dimension.value))
+            return
+        if value is None:
+            raise TypeError("dynamic shape extent requires its canonical SSA value")
+        relation.append(
+            ShapeExpr(
+                ShapeExprKind.SSA_EXTENT,
+                lowerer.compiler.builder.dimension_id(dimension),
+                first_operand_position + len(operands),
+            )
+        )
+        operands.append(value)
+
     for element in elements:
         if isinstance(element, ShapeDimension):
-            dimensions.append(element.dimension)
+            append_extent(
+                element.dimension,
+                None
+                if isinstance(element.dimension, StaticDim)
+                else lowerer.materialize_dimension(element, node),
+            )
         elif isinstance(element, MlirValue) and isinstance(
             element.type, (DomainType, RegionType)
         ):
-            dimensions.extend(lowerer.dynamic_shape_for_region(element))
+            for axis, dimension in enumerate(lowerer.dynamic_shape_for_region(element)):
+                append_extent(
+                    dimension,
+                    None
+                    if isinstance(dimension, StaticDim)
+                    else lowerer.materialize_dimension(
+                        ShapeDimension(dimension, element, axis), node
+                    ),
+                )
+        elif isinstance(element, MlirValue) and is_integer(element.type):
+            dimension = lowerer.dimension_values.get(
+                element, DynamicDim(f"value_{element.id}")
+            )
+            lowerer.dimension_values[element] = dimension
+            append_extent(
+                dimension,
+                None if isinstance(dimension, StaticDim) else element,
+            )
         else:
             known, value = compile_time_value(element)
             if known and isinstance(value, int) and not isinstance(value, bool):
                 if value < 0:
                     lowerer.error(node, "shape dimensions must be non-negative")
                 dimensions.append(StaticDim(value))
+                relation.append(ShapeExpr(ShapeExprKind.STATIC, 0, value))
             elif isinstance(element, str):
-                dimensions.append(SymbolDim(element))
+                dimension = SymbolDim(element)
+                append_extent(
+                    dimension,
+                    lowerer.materialize_shape_extent(dimension, node),
+                )
             elif element is Ellipsis:
-                dimensions.append(DynamicDim("reshape_inferred"))
+                inferred = lowerer.fresh_dynamic_dimension("reshape_inferred")
+                dimensions.append(inferred)
+                relation.append(
+                    ShapeExpr(
+                        ShapeExprKind.INFERRED,
+                        lowerer.compiler.builder.dimension_id(inferred),
+                        -1,
+                    )
+                )
             else:
                 lowerer.error(
                     node,
-                    "shape elements must be static, symbolic, shape-derived, or region",
+                    "shape elements must be static, symbolic, integer SSA, shape-derived, or region",
                 )
-    return tuple(dimensions)
+    return LoweredShape(
+        tuple(dimensions), tuple(operands), ShapeRelation(tuple(relation))
+    )
 
 
 def optional_node(bound: dict[str, ast.AST], name: str) -> ast.AST | None:

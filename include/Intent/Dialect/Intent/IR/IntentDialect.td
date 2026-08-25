@@ -12,6 +12,7 @@ def Intent_Dialect : Dialect {
     computation, state and effects while excluding physical workers, layouts,
     storage placement, pipelines and launch configuration.
   }];
+  let useDefaultAttributePrinterParser = 1;
   let useDefaultTypePrinterParser = 1;
 }
 

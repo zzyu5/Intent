@@ -2,7 +2,10 @@
 #define INTENT_DIALECT_INTENT_IR_INTENTOPS_H
 
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
+#include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"

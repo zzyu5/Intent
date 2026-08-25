@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
+from intent.frontend.semantics import LogicalIndexType
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import TensorType
 from intent.frontend.semantics import UnaryOperator
@@ -37,6 +38,7 @@ def lower_tensor_intrinsic(
         "full": _full,
         "zeros": _zeros,
         "record": _record,
+        "select": _select,
         "cast": _cast,
         "bitcast": _bitcast,
         "mask": _mask,
@@ -46,15 +48,16 @@ def lower_tensor_intrinsic(
         "sin": lambda context, call: _unary(context, call, UnaryOperator.SIN),
         "cos": lambda context, call: _unary(context, call, UnaryOperator.COS),
         "floor": lambda context, call: _unary(context, call, UnaryOperator.FLOOR),
+        "erf": lambda context, call: _unary(context, call, UnaryOperator.ERF),
         "rsqrt": lambda context, call: _unary(context, call, UnaryOperator.RSQRT),
         "sigmoid": lambda context, call: _unary(context, call, UnaryOperator.SIGMOID),
         "tanh": lambda context, call: _unary(context, call, UnaryOperator.TANH),
         "abs": lambda context, call: _unary(context, call, UnaryOperator.ABS),
         "maximum": lambda context, call: _binary(context, call, BinaryOperator.MAXIMUM),
         "minimum": lambda context, call: _binary(context, call, BinaryOperator.MINIMUM),
+        "maximum_num": lambda context, call: _binary(context, call, BinaryOperator.MAXIMUM_NUM),
+        "minimum_num": lambda context, call: _binary(context, call, BinaryOperator.MINIMUM_NUM),
         "add": lambda context, call: _binary(context, call, BinaryOperator.ADD),
-        "any": lambda context, call: _logical_reduce(context, call, any_value=True),
-        "all": lambda context, call: _logical_reduce(context, call, any_value=False),
     }
     handler = handlers.get(name)
     if handler is None:
@@ -67,12 +70,13 @@ def _reshape(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
     if not isinstance(source.type, TensorType):
         lowerer.error(node, "I.reshape input must be a tensor")
-    shape = lower_shape(lowerer, bound["shape"])
+    shape = lower_shape(lowerer, bound["shape"], first_operand_position=1)
     operation = lowerer.emit(
         OperationKind.RESHAPE,
         lowerer.location(node),
-        operands=(source,),
-        result_types=(TensorType(source.type.dtype, shape),),
+        operands=(source, *shape.operands),
+        result_types=(TensorType(source.type.dtype, shape.dimensions),),
+        attributes={"shape": shape.relation},
     )
     return operation.results[0]
 
@@ -131,17 +135,24 @@ def _full(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         required=("shape", "fill", "dtype"),
     )
     dtype = require_dtype(lowerer, bound["dtype"])
-    shape = lower_shape(lowerer, bound["shape"])
-    fill = lowerer.materialize(
-        lowerer.lower_expression(bound["fill"]),
-        bound["fill"],
-        ScalarType(dtype),
-    )
+    shape = lower_shape(lowerer, bound["shape"], first_operand_position=1)
+    fill_expression = lowerer.lower_expression(bound["fill"])
+    if isinstance(fill_expression, MlirValue) and isinstance(
+        fill_expression.type, LogicalIndexType
+    ) and dtype.category is DTypeCategory.INDEX:
+        fill = fill_expression
+    else:
+        fill = lowerer.materialize(
+            fill_expression,
+            bound["fill"],
+            ScalarType(dtype),
+        )
     operation = lowerer.emit(
         OperationKind.FULL,
         lowerer.location(node),
-        operands=(fill,),
-        result_types=(TensorType(dtype, shape),),
+        operands=(fill, *shape.operands),
+        result_types=(TensorType(dtype, shape.dimensions),),
+        attributes={"shape": shape.relation},
     )
     return operation.results[0]
 
@@ -149,11 +160,14 @@ def _full(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 def _zeros(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(lowerer, node, ("shape", "dtype"), required=("shape", "dtype"))
     dtype = require_dtype(lowerer, bound["dtype"])
-    shape = lower_shape(lowerer, bound["shape"])
+    shape = lower_shape(lowerer, bound["shape"], first_operand_position=1)
+    fill = lowerer.emit_literal(0, node, ScalarType(dtype))
     operation = lowerer.emit(
-        OperationKind.ZEROS,
+        OperationKind.FULL,
         lowerer.location(node),
-        result_types=(TensorType(dtype, shape),),
+        operands=(fill, *shape.operands),
+        result_types=(TensorType(dtype, shape.dimensions),),
+        attributes={"shape": shape.relation},
     )
     return operation.results[0]
 
@@ -174,7 +188,6 @@ def _record(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         lowerer.location(node),
         operands=tuple(values),
         result_types=(result_type,),
-        attributes={"fields": tuple(names)},
     )
     return operation.results[0]
 
@@ -189,7 +202,7 @@ def _cast(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         dtype.category
         in (DTypeCategory.SIGNED_INTEGER, DTypeCategory.UNSIGNED_INTEGER)
     ):
-        attributes["rounding"] = "toward_zero"
+        attributes["rounding"] = 0
     operation = lowerer.emit(
         OperationKind.CAST,
         lowerer.location(node),
@@ -261,6 +274,41 @@ def _mask(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     return operation.results[0]
 
 
+def _select(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("condition", "true_value", "false_value"),
+        required=("condition", "true_value", "false_value"),
+    )
+    condition = lowerer.materialize(
+        lowerer.lower_expression(bound["condition"]), bound["condition"]
+    )
+    lhs, rhs = lowerer.coerce_pair(
+        lowerer.lower_expression(bound["true_value"]),
+        lowerer.lower_expression(bound["false_value"]),
+        node,
+    )
+    result_type = lowerer.broadcast_result_type(lhs.type, rhs.type, node)
+    dtype, value_shape = lowerer.dtype_and_shape(result_type, node)
+    condition_dtype, condition_shape = lowerer.dtype_and_shape(condition.type, node)
+    if condition_dtype != intent_bool:
+        lowerer.error(bound["condition"], "I.select condition must have bool dtype")
+    try:
+        result_shape = broadcast_shape(condition_shape, value_shape)
+    except ValueError as error:
+        lowerer.error(node, str(error))
+    condition = lowerer.broadcast_value(condition, result_shape, node)
+    lhs = lowerer.broadcast_value(lhs, result_shape, node)
+    rhs = lowerer.broadcast_value(rhs, result_shape, node)
+    return lowerer.emit(
+        OperationKind.SELECT,
+        lowerer.location(node),
+        operands=(condition, lhs, rhs),
+        result_types=(lowerer.value_result_type(dtype, result_shape),),
+    ).results[0]
+
+
 def _unary(
     lowerer: FunctionLowerer,
     node: ast.Call,
@@ -273,7 +321,7 @@ def _unary(
         lowerer.location(node),
         operands=(source,),
         result_types=(source.type,),
-        attributes={"operator": operator},
+        attributes={"operator_kind": operator},
     )
     return operation.results[0]
 
@@ -296,40 +344,6 @@ def _binary(
         lowerer.location(node),
         operands=(lhs, rhs),
         result_types=(result_type,),
-        attributes={"operator": operator},
-    )
-    return operation.results[0]
-
-
-def _logical_reduce(
-    lowerer: FunctionLowerer,
-    node: ast.Call,
-    *,
-    any_value: bool,
-) -> MlirValue:
-    bound = bind_call(lowerer, node, ("value", "axis"), required=("value",))
-    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
-    if not isinstance(source.type, TensorType) or source.type.dtype != intent_bool:
-        lowerer.error(node, "I.any/I.all input must be a bool tensor")
-    axes = require_axes(lowerer, bound["axis"]) if "axis" in bound else tuple(range(source.type.rank))
-    axes = normalize_axes(lowerer, axes, source.type.rank, node)
-    identity = lowerer.emit_literal(not any_value, node, ScalarType(intent_bool))
-    normalized = set(axes)
-    result_shape = tuple(
-        dimension for axis, dimension in enumerate(source.type.shape) if axis not in normalized
-    )
-    result_type = lowerer.value_result_type(intent_bool, result_shape)
-    operation = lowerer.emit(
-        OperationKind.REDUCE,
-        lowerer.location(node),
-        operands=(source, identity),
-        result_types=(result_type,),
-        attributes={
-            "axes": axes,
-            "acc_dtype": intent_bool,
-            "combine": "logical_or" if any_value else "logical_and",
-            "component_count": 1,
-            "capture_count": 0,
-        },
+        attributes={"operator_kind": operator},
     )
     return operation.results[0]

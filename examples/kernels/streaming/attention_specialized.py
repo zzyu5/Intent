@@ -623,7 +623,10 @@ def varlen_block_causal_attention_fwd(
     for sequence in I.parallel(sequences.outer):
         members = sequences[sequence]
         sequence_start = I.cast(sequence_offsets[sequence], I.index)
-        sequence_length = sequence_offsets[sequence + 1] - sequence_offsets[sequence]
+        sequence_length = I.cast(
+            sequence_offsets[sequence + 1] - sequence_offsets[sequence],
+            I.index,
+        )
         half = sequence_length // 2
         for head in I.parallel(I.domain(0, H)):
             summary = I.region_fold(
@@ -635,7 +638,7 @@ def varlen_block_causal_attention_fwd(
                 axis=0,
                 summarize=summarize_block_causal_chunk,
                 combine=merge_attention_summaries,
-                identity=empty_attention_summary(sequence_length, DV),
+                identity=empty_attention_summary(members, DV),
                 operands=(
                     q[members, head, :],
                     I.indices(members),

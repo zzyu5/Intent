@@ -1,24 +1,34 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from intent.api import HelperDefinition
-from intent.frontend.semantics import ValueType
+from intent.frontend.mlir import MlirValue
+from intent.frontend.mlir.attributes import SparseFormatAttribute
 from intent.frontend.semantics import BinaryOperator
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
-from intent.frontend.mlir import MlirValue
+from intent.frontend.semantics import TupleType
+from intent.frontend.semantics import ValueType
 from intent.frontend.semantics.types import dims_compatible
+from intent.language import DTypeCategory
+from intent.language import bool as intent_bool
+from intent.language import i32
+from intent.language import index as intent_index
+from intent.language import u32
 from intent.language.builtins import Intrinsic
-from intent.language.dtypes import i16
-from intent.language.dtypes import i32
+from intent.language.builtins import ScaledFormat
 
 from ..ast.expressions import compile_time_value
+from ..ast.model import ConstexprBinding
+from ..ast.model import Expression
 from ..ast.model import Literal
+from ..ast.model import SparseFormatSpec
 from ..ast.model import StaticTuple
 from .common import bind_call
 from .common import require_axes
@@ -36,18 +46,34 @@ def lower_structured_intrinsic(
     name: str,
     node: ast.Call,
 ) -> object:
-    if name in ("reduce", "reduce.max", "reduce.sum"):
+    if name in (
+        "reduce",
+        "reduce.max",
+        "reduce.sum",
+        "reduce.any",
+        "reduce.all",
+    ):
         return _reduce(lowerer, name, node)
     if name == "arg_reduce.max":
         return _arg_reduce_max(lowerer, node)
     if name == "scan":
         return _scan(lowerer, node)
+    if name == "region_fold":
+        return _region_fold(lowerer, node)
+    if name == "region_scan":
+        return _region_scan(lowerer, node)
     if name == "contract":
         return _contract(lowerer, node)
     if name == "scaled_contract":
         return _scaled_contract(lowerer, node)
+    if name in ("sparse.one_of_two", "sparse.two_of_four"):
+        return _sparse_format(lowerer, name, node)
+    if name == "sparse_contract":
+        return _sparse_contract(lowerer, node)
     if name == "sparse_contract_2to4":
         return _sparse_contract_2to4(lowerer, node)
+    if name == "histogram":
+        return _histogram(lowerer, node)
     return NotImplemented
 
 
@@ -62,89 +88,117 @@ def _reduce(lowerer: FunctionLowerer, name: str, node: ast.Call) -> MlirValue:
         lowerer.lower_expression(bound["value"]), bound["value"]
     )
     axes = require_axes(lowerer, bound["axis"])
-    if isinstance(source.type, TensorType):
-        axes = normalize_axes(lowerer, axes, source.type.rank, node)
-        acc_dtype = (
-            require_dtype(lowerer, bound["acc_dtype"])
-            if "acc_dtype" in bound
-            else source.type.dtype
-        )
-        identity_expression = lowerer.lower_expression(bound["identity"])
-        identity = lowerer.materialize(
-            identity_expression,
-            bound["identity"],
-            ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
-        )
-        if identity.type != ScalarType(acc_dtype):
-            lowerer.error(node, "reduce identity must have accumulator dtype")
-        if source.type.dtype != acc_dtype:
-            source = lowerer.emit(
+    source_components, component_names = _source_components(lowerer, source, node)
+    if not source_components or any(
+        not isinstance(value.type, TensorType) for value in source_components
+    ):
+        lowerer.error(node, "I.reduce source components must be tensors")
+    rank = source_components[0].type.rank
+    axes = normalize_axes(lowerer, axes, rank, node)
+    if any(value.type.rank != rank for value in source_components):
+        lowerer.error(node, "I.reduce source components must have equal rank")
+
+    acc_dtype = None
+    if "acc_dtype" in bound:
+        if len(source_components) != 1:
+            lowerer.error(node, "record reduce uses explicit field dtypes")
+        acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
+    elif name == "reduce.sum":
+        acc_dtype = _sum_accumulator_dtype(source_components[0].type.dtype)
+    if acc_dtype is not None and source_components[0].type.dtype != acc_dtype:
+        source_components = (
+            lowerer.emit(
                 OperationKind.CAST,
                 lowerer.location(node),
-                operands=(source,),
-                result_types=(TensorType(acc_dtype, source.type.shape),),
-            ).results[0]
-        normalized = {axis % source.type.rank for axis in axes}
-        result_shape = tuple(
-            dimension
-            for axis, dimension in enumerate(source.type.shape)
-            if axis not in normalized
+                operands=(source_components[0],),
+                result_types=(
+                    TensorType(acc_dtype, source_components[0].type.shape),
+                ),
+            ).results[0],
         )
-        result_type: ValueType = lowerer.value_result_type(acc_dtype, result_shape)
-        attributes: dict[str, object] = {"axes": axes, "acc_dtype": acc_dtype}
-    elif isinstance(source.type, RecordType):
-        if "acc_dtype" in bound:
-            lowerer.error(node, "record reduce uses explicit identity field dtypes")
-        identity = lowerer.materialize(
-            lowerer.lower_expression(bound["identity"]), bound["identity"]
-        )
-        if not isinstance(identity.type, RecordType):
-            lowerer.error(node, "record reduce identity must be I.record(...)")
-        result_type = _record_result_type(lowerer, source.type, identity.type, axes, scan=False, node=node)
-        attributes = {"axes": axes}
-    else:
-        lowerer.error(node, "I.reduce input must be tensor or tensor record")
 
-    source_components, identity_components, component_names, result_components = (
-        _flatten_accumulator(lowerer, source, identity, result_type, node)
+    reduced = set(axes)
+    result_components = tuple(
+        lowerer.value_result_type(
+            source_component.type.dtype,
+            tuple(
+                dimension
+                for axis, dimension in enumerate(source_component.type.shape)
+                if axis not in reduced
+            ),
+        )
+        for source_component in source_components
     )
-    captures = _combine_operands(lowerer, bound.get("combine_operands"), node)
+    identity = _lower_component_identity(
+        lowerer,
+        bound["identity"],
+        source_components,
+        component_names,
+        node,
+    )
+    identity_components, identity_names = _identity_components(lowerer, identity, node)
+    if component_names != identity_names or len(source_components) != len(identity_components):
+        lowerer.error(node, "reduce source and identity schemas must match")
+    for source_component, expected, identity_component in zip(
+        source_components, result_components, identity_components
+    ):
+        scalar_identity = ScalarType(source_component.type.dtype)
+        if identity_component.type not in (scalar_identity, expected):
+            lowerer.error(
+                node,
+                "reduce identity must be an element scalar or the complete accumulator result",
+            )
+
+    captures, capture_bindings = _combine_captures(
+        lowerer, bound.get("combine_operands"), node
+    )
+    accumulator_types = tuple(value.type for value in identity_components)
     if name == "reduce.max":
-        if captures:
-            lowerer.error(node, "built-in reduction does not accept combine_operands=")
-        combine: object = "maximum"
+        combine_region = _builtin_combine_region(
+            lowerer, accumulator_types, BinaryOperator.MAXIMUM, node
+        )
     elif name == "reduce.sum":
-        if captures:
-            lowerer.error(node, "built-in reduction does not accept combine_operands=")
-        combine = "add"
+        combine_region = _builtin_combine_region(
+            lowerer, accumulator_types, BinaryOperator.ADD, node
+        )
+    elif name == "reduce.any":
+        combine_region = _builtin_combine_region(
+            lowerer, accumulator_types, BinaryOperator.LOGICAL_OR, node
+        )
+    elif name == "reduce.all":
+        combine_region = _builtin_combine_region(
+            lowerer, accumulator_types, BinaryOperator.LOGICAL_AND, node
+        )
     else:
         if "combine" not in bound:
             lowerer.error(node, "generic I.reduce requires combine=")
-        combine = _combiner(
+        combine_region, combine_results = _combine_region(
             lowerer,
             bound["combine"],
-            identity.type,
-            component_names,
-            tuple(value.type for value in identity_components),
+            accumulator_types,
             captures,
+            capture_bindings,
+            component_names,
             node,
         )
-    attributes.update(
-        {
-            "combine": combine,
-            "component_count": len(source_components),
-            "capture_count": len(captures),
-        }
-    )
+        if combine_results != accumulator_types:
+            lowerer.error(node, "reduce combine result schema must match identity")
+
     operation = lowerer.emit(
         OperationKind.REDUCE,
         lowerer.location(node),
         operands=source_components + identity_components + captures,
         result_types=result_components,
-        attributes=attributes,
+        attributes={
+            "axes": axes,
+            "source_count": len(source_components),
+            "identity_count": len(identity_components),
+            "capture_count": len(captures),
+        },
+        regions=(combine_region,),
     )
-    return _rebuild_accumulator(
-        lowerer, operation.results, result_type, component_names, node
+    return _rebuild_components(
+        lowerer, operation.results, component_names, node
     )
 
 
@@ -155,7 +209,9 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         ("value", "axis", "identity", "acc_dtype"),
         required=("value", "axis", "identity"),
     )
-    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
+    source = lowerer.read_value(
+        lowerer.lower_expression(bound["value"]), bound["value"]
+    )
     if not isinstance(source.type, TensorType):
         lowerer.error(node, "I.arg_reduce.max input must be a tensor")
     axes = normalize_axes(
@@ -171,14 +227,6 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         if "acc_dtype" in bound
         else source.type.dtype
     )
-    identity_expression = lowerer.lower_expression(bound["identity"])
-    identity = lowerer.materialize(
-        identity_expression,
-        bound["identity"],
-        ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
-    )
-    if identity.type != ScalarType(acc_dtype):
-        lowerer.error(node, "arg-reduce identity must have accumulator dtype")
     if source.type.dtype != acc_dtype:
         source = lowerer.emit(
             OperationKind.CAST,
@@ -186,36 +234,46 @@ def _arg_reduce_max(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
             operands=(source,),
             result_types=(TensorType(acc_dtype, source.type.shape),),
         ).results[0]
+    identity = lowerer.materialize(
+        lowerer.lower_expression(bound["identity"]),
+        bound["identity"],
+        ScalarType(acc_dtype),
+    )
+    indices = lowerer.emit(
+        OperationKind.INDICES,
+        lowerer.location(node),
+        operands=(source,),
+        result_types=(TensorType(intent_index, source.type.shape),),
+        attributes={"tensor_axis": axes[0]},
+    ).results[0]
+    indices = lowerer.emit(
+        OperationKind.CAST,
+        lowerer.location(node),
+        operands=(indices,),
+        result_types=(TensorType(i32, source.type.shape),),
+    ).results[0]
+    index_identity = lowerer.emit_literal(2147483647, node, ScalarType(i32))
+    combine = _argmax_combine_region(lowerer, ScalarType(acc_dtype), node)
     result_shape = tuple(
         dimension
         for axis, dimension in enumerate(source.type.shape)
         if axis != axes[0]
     )
-    value_type = lowerer.value_result_type(acc_dtype, result_shape)
-    index_type = lowerer.value_result_type(i32, result_shape)
-    indices = lowerer.emit(
-        OperationKind.INDICES,
-        lowerer.location(node),
-        operands=(source,),
-        result_types=(TensorType(i32, source.type.shape),),
-        attributes={"axis": axes[0], "mode": "tensor_axis"},
-    ).results[0]
-    index_identity = lowerer.emit_literal(2147483647, node, ScalarType(i32))
-    combine = lowerer.compiler.lower_argmax_combiner(
-        ScalarType(acc_dtype), ScalarType(i32), lowerer.location(node)
-    )
     operation = lowerer.emit(
         OperationKind.REDUCE,
         lowerer.location(node),
         operands=(source, indices, identity, index_identity),
-        result_types=(value_type, index_type),
+        result_types=(
+            lowerer.value_result_type(acc_dtype, result_shape),
+            lowerer.value_result_type(i32, result_shape),
+        ),
         attributes={
             "axes": axes,
-            "combine": combine,
-            "combine_builtin": "argmax_lowest",
-            "component_count": 2,
+            "source_count": 2,
+            "identity_count": 2,
             "capture_count": 0,
         },
+        regions=(combine,),
     )
     return StaticTuple(operation.results)
 
@@ -231,180 +289,271 @@ def _scan(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             "combine",
             "combine_operands",
             "inclusive",
+            "reverse",
             "acc_dtype",
         ),
         required=("value", "axis", "identity", "combine", "inclusive"),
     )
-    source = lowerer.read_value(lowerer.lower_expression(bound["value"]), bound["value"])
-    axes = require_axes(lowerer, bound["axis"])
-    if len(axes) != 1:
-        lowerer.error(node, "I.scan requires exactly one axis")
-    inclusive = require_static_bool(lowerer, bound["inclusive"])
-    if isinstance(source.type, TensorType):
-        axes = normalize_axes(lowerer, axes, source.type.rank, node)
-        if len(axes) != 1:
-            lowerer.error(node, "I.scan requires exactly one axis")
-        acc_dtype = (
-            require_dtype(lowerer, bound["acc_dtype"])
-            if "acc_dtype" in bound
-            else source.type.dtype
-        )
-        identity_expression = lowerer.lower_expression(bound["identity"])
-        identity = lowerer.materialize(
-            identity_expression,
-            bound["identity"],
-            ScalarType(acc_dtype) if isinstance(identity_expression, Literal) else None,
-        )
-        if identity.type != ScalarType(acc_dtype):
-            lowerer.error(node, "scan identity must have accumulator dtype")
-        if source.type.dtype != acc_dtype:
-            source = lowerer.emit(
-                OperationKind.CAST,
-                lowerer.location(node),
-                operands=(source,),
-                result_types=(TensorType(acc_dtype, source.type.shape),),
-            ).results[0]
-        result_type: ValueType = TensorType(acc_dtype, source.type.shape)
-        attributes: dict[str, object] = {
-            "axis": axes[0],
-            "inclusive": inclusive,
-            "acc_dtype": acc_dtype,
-        }
-    elif isinstance(source.type, RecordType):
-        if "acc_dtype" in bound:
-            lowerer.error(node, "record scan uses explicit identity field dtypes")
-        identity = lowerer.materialize(
-            lowerer.lower_expression(bound["identity"]), bound["identity"]
-        )
-        if not isinstance(identity.type, RecordType):
-            lowerer.error(node, "record scan identity must be I.record(...)")
-        result_type = _record_result_type(
-            lowerer, source.type, identity.type, axes, scan=True, node=node
-        )
-        attributes = {"axis": axes[0], "inclusive": inclusive}
-    else:
-        lowerer.error(node, "I.scan input must be tensor or tensor record")
-    source_components, identity_components, component_names, result_components = (
-        _flatten_accumulator(lowerer, source, identity, result_type, node)
+    source = lowerer.read_value(
+        lowerer.lower_expression(bound["value"]), bound["value"]
     )
-    captures = _combine_operands(lowerer, bound.get("combine_operands"), node)
-    attributes["combine"] = _combiner(
+    source_components, component_names = _source_components(lowerer, source, node)
+    if not source_components or any(
+        not isinstance(value.type, TensorType) for value in source_components
+    ):
+        lowerer.error(node, "I.scan source components must be tensors")
+    axes = normalize_axes(
         lowerer,
-        bound["combine"],
-        identity.type,
-        component_names,
-        tuple(value.type for value in identity_components),
-        captures,
+        require_axes(lowerer, bound["axis"]),
+        source_components[0].type.rank,
         node,
     )
-    attributes["component_count"] = len(source_components)
-    attributes["capture_count"] = len(captures)
+    if len(axes) != 1:
+        lowerer.error(node, "I.scan requires exactly one axis")
+    if "acc_dtype" in bound:
+        if len(source_components) != 1:
+            lowerer.error(node, "record scan uses explicit field dtypes")
+        acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
+        if source_components[0].type.dtype != acc_dtype:
+            source_components = (
+                lowerer.emit(
+                    OperationKind.CAST,
+                    lowerer.location(node),
+                    operands=(source_components[0],),
+                    result_types=(
+                        TensorType(acc_dtype, source_components[0].type.shape),
+                    ),
+                ).results[0],
+            )
+    identity = _lower_component_identity(
+        lowerer,
+        bound["identity"],
+        source_components,
+        component_names,
+        node,
+    )
+    identity_components, identity_names = _identity_components(lowerer, identity, node)
+    if component_names != identity_names or len(source_components) != len(identity_components):
+        lowerer.error(node, "scan source and identity schemas must match")
+    for source_component, identity_component in zip(source_components, identity_components):
+        scalar_identity = ScalarType(source_component.type.dtype)
+        slice_identity = lowerer.value_result_type(
+            source_component.type.dtype,
+            tuple(
+                dimension
+                for source_axis, dimension in enumerate(source_component.type.shape)
+                if source_axis != axes[0]
+            ),
+        )
+        if identity_component.type not in (scalar_identity, slice_identity):
+            lowerer.error(
+                node,
+                "scan identity must be an element scalar or one source-axis slice",
+            )
+    captures, capture_bindings = _combine_captures(
+        lowerer, bound.get("combine_operands"), node
+    )
+    accumulator_types = tuple(value.type for value in identity_components)
+    combine_region, combine_results = _combine_region(
+        lowerer,
+        bound["combine"],
+        accumulator_types,
+        captures,
+        capture_bindings,
+        component_names,
+        node,
+    )
+    if combine_results != accumulator_types:
+        lowerer.error(node, "scan combine result schema must match identity")
     operation = lowerer.emit(
         OperationKind.SCAN,
         lowerer.location(node),
         operands=source_components + identity_components + captures,
-        result_types=result_components,
-        attributes=attributes,
+        result_types=tuple(value.type for value in source_components),
+        attributes={
+            "axis": axes[0],
+            "inclusive": require_static_bool(lowerer, bound["inclusive"]),
+            "reverse": (
+                require_static_bool(lowerer, bound["reverse"])
+                if "reverse" in bound
+                else False
+            ),
+            "source_count": len(source_components),
+            "identity_count": len(identity_components),
+            "capture_count": len(captures),
+        },
+        regions=(combine_region,),
     )
-    return _rebuild_accumulator(
-        lowerer, operation.results, result_type, component_names, node
+    return _rebuild_components(lowerer, operation.results, component_names, node)
+
+
+def _region_fold(lowerer: FunctionLowerer, node: ast.Call) -> object:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("source", "axis", "summarize", "combine", "identity", "operands"),
+        required=("source", "axis", "summarize", "combine", "identity"),
     )
+    sources = _tensor_sources(lowerer, bound["source"], node)
+    axis = _shared_source_axis(lowerer, sources, bound["axis"], node)
+    captures, capture_bindings = _region_captures(
+        lowerer, bound.get("operands"), node
+    )
+    slice_types = _slice_types(lowerer, sources, axis, "region_fold")
+    summarize, summary_types = _helper_region(
+        lowerer,
+        bound["summarize"],
+        slice_types + tuple(value.type for value in captures),
+        (None,) * len(slice_types) + capture_bindings,
+        node,
+    )
+    identity = _values(lowerer, bound["identity"], node)
+    identity_types = tuple(value.type for value in identity)
+    if summary_types != identity_types:
+        lowerer.error(
+            node,
+            f"region_fold summarize result {summary_types} must match identity schema {identity_types}",
+        )
+    combine, combine_types = _helper_region(
+        lowerer,
+        bound["combine"],
+        summary_types + summary_types,
+        (None,) * (2 * len(summary_types)),
+        node,
+    )
+    if combine_types != summary_types:
+        lowerer.error(node, "region_fold combine result must match summary schema")
+    operation = lowerer.emit(
+        OperationKind.REGION_FOLD,
+        lowerer.location(node),
+        operands=sources + identity + captures,
+        result_types=summary_types,
+        attributes={
+            "axis": axis,
+            "source_count": len(sources),
+            "identity_count": len(identity),
+            "capture_count": len(captures),
+        },
+        regions=(summarize, combine),
+    )
+    return operation.results[0] if len(operation.results) == 1 else StaticTuple(operation.results)
+
+
+def _region_scan(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
+    bound = bind_call(
+        lowerer,
+        node,
+        (
+            "source",
+            "axis",
+            "summarize",
+            "combine",
+            "identity",
+            "initial_state",
+            "apply",
+            "emit",
+            "operands",
+        ),
+        required=(
+            "source",
+            "axis",
+            "summarize",
+            "combine",
+            "identity",
+            "initial_state",
+            "apply",
+            "emit",
+        ),
+    )
+    sources = _tensor_sources(lowerer, bound["source"], node)
+    axis = _shared_source_axis(lowerer, sources, bound["axis"], node)
+    captures, capture_bindings = _region_captures(
+        lowerer, bound.get("operands"), node
+    )
+    slice_types = _slice_types(lowerer, sources, axis, "region_scan")
+    summarize, transition_types = _helper_region(
+        lowerer,
+        bound["summarize"],
+        slice_types + tuple(value.type for value in captures),
+        (None,) * len(slice_types) + capture_bindings,
+        node,
+    )
+    identity = _values(lowerer, bound["identity"], node)
+    if tuple(value.type for value in identity) != transition_types:
+        lowerer.error(node, "region_scan summarize result must match identity schema")
+    combine, combine_types = _helper_region(
+        lowerer,
+        bound["combine"],
+        transition_types + transition_types,
+        (None,) * (2 * len(transition_types)),
+        node,
+    )
+    if combine_types != transition_types:
+        lowerer.error(node, "region_scan combine result must match transition schema")
+    initial = _values(lowerer, bound["initial_state"], node)
+    initial_types = tuple(value.type for value in initial)
+    apply, state_types = _helper_region(
+        lowerer,
+        bound["apply"],
+        transition_types + initial_types,
+        (None,) * (len(transition_types) + len(initial_types)),
+        node,
+    )
+    if state_types != initial_types:
+        lowerer.error(node, "region_scan apply result must match initial-state schema")
+    emit, slice_output_types = _helper_region(
+        lowerer,
+        bound["emit"],
+        slice_types + state_types + tuple(value.type for value in captures),
+        (None,) * (len(slice_types) + len(state_types)) + capture_bindings,
+        node,
+    )
+    source_extent = sources[0].type.shape[axis]
+    output_types = tuple(
+        _replace_slice_extent(value_type, slice_types[0].shape[axis], source_extent)
+        for value_type in slice_output_types
+    )
+    operation = lowerer.emit(
+        OperationKind.REGION_SCAN,
+        lowerer.location(node),
+        operands=sources + identity + initial + captures,
+        result_types=output_types + state_types,
+        attributes={
+            "axis": axis,
+            "source_count": len(sources),
+            "identity_count": len(identity),
+            "state_count": len(initial),
+            "capture_count": len(captures),
+            "output_count": len(output_types),
+        },
+        regions=(summarize, combine, apply, emit),
+    )
+    outputs = operation.results[: len(output_types)]
+    states = operation.results[len(output_types) :]
+    output: object = outputs[0] if len(outputs) == 1 else StaticTuple(outputs)
+    state: object = states[0] if len(states) == 1 else StaticTuple(states)
+    return StaticTuple((output, state))
 
 
 def _contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
     bound = bind_call(
         lowerer,
         node,
-        ("lhs", "rhs", "reduce", "acc_dtype", "batch", "multiply", "combine"),
+        ("lhs", "rhs", "reduce", "acc_dtype", "batch"),
         required=("lhs", "rhs", "reduce", "acc_dtype"),
     )
     lhs = lowerer.read_value(lowerer.lower_expression(bound["lhs"]), bound["lhs"])
     rhs = lowerer.read_value(lowerer.lower_expression(bound["rhs"]), bound["rhs"])
     if not isinstance(lhs.type, TensorType) or not isinstance(rhs.type, TensorType):
         lowerer.error(node, "I.contract operands must be tensors")
-    pairs = _reduction_pairs(lowerer, bound["reduce"])
-    lhs_seen: set[int] = set()
-    rhs_seen: set[int] = set()
-    normalized_pairs: list[tuple[int, int]] = []
-    for lhs_axis, rhs_axis in pairs:
-        if not -lhs.type.rank <= lhs_axis < lhs.type.rank:
-            lowerer.error(node, "contract lhs reduction axis is outside rank")
-        if not -rhs.type.rank <= rhs_axis < rhs.type.rank:
-            lowerer.error(node, "contract rhs reduction axis is outside rank")
-        lhs_axis %= lhs.type.rank
-        rhs_axis %= rhs.type.rank
-        if lhs_axis in lhs_seen or rhs_axis in rhs_seen:
-            lowerer.error(node, "contract reduction axes must be unique")
-        if not dims_compatible(lhs.type.shape[lhs_axis], rhs.type.shape[rhs_axis]):
-            lowerer.error(node, "contract paired dimensions are incompatible")
-        lhs_seen.add(lhs_axis)
-        rhs_seen.add(rhs_axis)
-        normalized_pairs.append((lhs_axis, rhs_axis))
-    pairs = tuple(normalized_pairs)
-    batch_pairs = _axis_pairs(lowerer, bound["batch"], "batch") if "batch" in bound else ()
-    lhs_batch_seen: set[int] = set()
-    rhs_batch_seen: set[int] = set()
-    normalized_batch_pairs: list[tuple[int, int]] = []
-    for lhs_axis, rhs_axis in batch_pairs:
-        if not -lhs.type.rank <= lhs_axis < lhs.type.rank:
-            lowerer.error(node, "contract lhs batch axis is outside rank")
-        if not -rhs.type.rank <= rhs_axis < rhs.type.rank:
-            lowerer.error(node, "contract rhs batch axis is outside rank")
-        lhs_axis %= lhs.type.rank
-        rhs_axis %= rhs.type.rank
-        if lhs_axis in lhs_seen or rhs_axis in rhs_seen:
-            lowerer.error(node, "contract batch axes cannot also be reduction axes")
-        if lhs_axis in lhs_batch_seen or rhs_axis in rhs_batch_seen:
-            lowerer.error(node, "contract batch axes must be unique")
-        if not dims_compatible(lhs.type.shape[lhs_axis], rhs.type.shape[rhs_axis]):
-            lowerer.error(node, "contract paired batch dimensions are incompatible")
-        lhs_batch_seen.add(lhs_axis)
-        rhs_batch_seen.add(rhs_axis)
-        normalized_batch_pairs.append((lhs_axis, rhs_axis))
-    batch_pairs = tuple(normalized_batch_pairs)
-    lhs_axes = {pair[0] for pair in pairs}
-    rhs_axes = {pair[1] for pair in pairs}
-    rhs_batch_axes = {pair[1] for pair in batch_pairs}
-    result_shape = tuple(
-        dimension for axis, dimension in enumerate(lhs.type.shape) if axis not in lhs_axes
-    ) + tuple(
-        dimension
-        for axis, dimension in enumerate(rhs.type.shape)
-        if axis not in rhs_axes and axis not in rhs_batch_axes
-    )
-    acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
-    multiply = "multiply"
-    combine = "add"
-    if "multiply" in bound:
-        multiply = _callable_symbol(
-            lowerer,
-            bound["multiply"],
-        )
-    if "combine" in bound:
-        combine = _callable_symbol(
-            lowerer,
-            bound["combine"],
-        )
-    if multiply != "multiply" or combine != "add":
-        lowerer.error(
-            node,
-            "I.contract currently supports only multiply/add; spell a different "
-            "semiring explicitly with pointwise operations and I.reduce",
-        )
-    operation = lowerer.emit(
+    reduce, batch, result_shape = _contract_relations(lowerer, lhs, rhs, bound, node)
+    return lowerer.emit(
         OperationKind.CONTRACT,
         lowerer.location(node),
         operands=(lhs, rhs),
-        result_types=(TensorType(acc_dtype, result_shape),),
-        attributes={
-            "reduce": pairs,
-            "batch": batch_pairs,
-            "acc_dtype": acc_dtype,
-            "multiply": multiply,
-            "combine": combine,
-        },
-    )
-    return operation.results[0]
+        result_types=(TensorType(require_dtype(lowerer, bound["acc_dtype"]), result_shape),),
+        attributes={"reduce": reduce, "batch": batch},
+    ).results[0]
 
 
 def _scaled_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
@@ -416,300 +565,679 @@ def _scaled_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
             "lhs_scale",
             "rhs",
             "rhs_scale",
-            "acc_dtype",
+            "lhs_format",
+            "rhs_format",
             "lhs_group_size",
             "rhs_group_size",
+            "reduce",
+            "batch",
+            "acc_dtype",
         ),
         required=(
             "lhs",
             "lhs_scale",
             "rhs",
             "rhs_scale",
-            "acc_dtype",
+            "lhs_format",
+            "rhs_format",
             "lhs_group_size",
             "rhs_group_size",
+            "reduce",
+            "acc_dtype",
         ),
     )
-    operands = tuple(
-        lowerer.read_value(lowerer.lower_expression(bound[name]), bound[name])
-        for name in ("lhs", "rhs", "lhs_scale", "rhs_scale")
+    lhs = lowerer.read_value(lowerer.lower_expression(bound["lhs"]), bound["lhs"])
+    lhs_scale = lowerer.read_value(
+        lowerer.lower_expression(bound["lhs_scale"]), bound["lhs_scale"]
     )
-    lhs, rhs, lhs_scale, rhs_scale = operands
-    if not all(isinstance(value.type, TensorType) for value in operands):
-        lowerer.error(node, "I.scaled_contract operands must be tensors")
-    flat = lhs.type.rank == 2 and rhs.type.rank == 2
-    grouped = lhs.type.rank == 3 and rhs.type.rank == 3
-    if (lhs_scale.type.rank != 2 or rhs_scale.type.rank != 2 or not (flat or grouped)):
-        lowerer.error(
-            node,
-            "I.scaled_contract requires rank-two scales and rank-two or grouped rank-three data",
-        )
-    if lhs.type.dtype != rhs.type.dtype or lhs.type.dtype.name not in (
-        "f8e4m3fn",
-        "f8e5m2",
+    rhs = lowerer.read_value(lowerer.lower_expression(bound["rhs"]), bound["rhs"])
+    rhs_scale = lowerer.read_value(
+        lowerer.lower_expression(bound["rhs_scale"]), bound["rhs_scale"]
+    )
+    if any(
+        not isinstance(value.type, TensorType)
+        for value in (lhs, lhs_scale, rhs, rhs_scale)
     ):
-        lowerer.error(
-            node,
-            "I.scaled_contract currently requires matching FP8 data operands",
-        )
-    if lhs_scale.type.dtype.name != "f8e8m0fnu" or rhs_scale.type.dtype.name != "f8e8m0fnu":
-        lowerer.error(node, "I.scaled_contract currently requires E8M0 scales")
+        lowerer.error(node, "I.scaled_contract operands and scales must be tensors")
+    reduce, batch, result_shape = _contract_relations(lowerer, lhs, rhs, bound, node)
+    lhs_format = _scaled_format(lowerer, bound["lhs_format"])
+    rhs_format = _scaled_format(lowerer, bound["rhs_format"])
     lhs_group = require_static_int(lowerer, bound["lhs_group_size"])
     rhs_group = require_static_int(lowerer, bound["rhs_group_size"])
     if lhs_group <= 0 or rhs_group <= 0:
-        lowerer.error(node, "scaled contraction group sizes must be positive")
-    if flat:
-        if not dims_compatible(lhs.type.shape[1], rhs.type.shape[0]):
-            lowerer.error(
-                node, "scaled contraction reduction dimensions are incompatible"
-            )
-        if not dims_compatible(lhs.type.shape[0], lhs_scale.type.shape[0]):
-            lowerer.error(node, "lhs scale rows must match lhs rows")
-        if not dims_compatible(rhs.type.shape[1], rhs_scale.type.shape[1]):
-            lowerer.error(node, "rhs scale columns must match rhs columns")
-        for data_dim, scale_dim, group, side in (
-            (lhs.type.shape[1], lhs_scale.type.shape[1], lhs_group, "lhs"),
-            (rhs.type.shape[0], rhs_scale.type.shape[0], rhs_group, "rhs"),
-        ):
-            if isinstance(data_dim, StaticDim) and isinstance(scale_dim, StaticDim):
-                if (
-                    data_dim.value % group != 0
-                    or data_dim.value // group != scale_dim.value
-                ):
-                    lowerer.error(
-                        node,
-                        f"{side} scale extent does not match its K-group size",
-                    )
-        reduce = ((1, 0),)
-        result_shape = (lhs.type.shape[0], rhs.type.shape[1])
-    else:
-        if not dims_compatible(lhs.type.shape[1], rhs.type.shape[0]) or not dims_compatible(
-            lhs.type.shape[2], rhs.type.shape[1]
-        ):
-            lowerer.error(
-                node, "grouped scaled-contraction K dimensions are incompatible"
-            )
-        if not dims_compatible(lhs.type.shape[0], lhs_scale.type.shape[0]) or not dims_compatible(
-            lhs.type.shape[1], lhs_scale.type.shape[1]
-        ):
-            lowerer.error(node, "lhs grouped scales do not match lhs data")
-        if not dims_compatible(rhs.type.shape[0], rhs_scale.type.shape[0]) or not dims_compatible(
-            rhs.type.shape[2], rhs_scale.type.shape[1]
-        ):
-            lowerer.error(node, "rhs grouped scales do not match rhs data")
-        for inner, group, side in (
-            (lhs.type.shape[2], lhs_group, "lhs"),
-            (rhs.type.shape[1], rhs_group, "rhs"),
-        ):
-            if isinstance(inner, StaticDim) and inner.value != group:
-                lowerer.error(
-                    node,
-                    f"{side} inner K extent must equal its scale group size",
-                )
-        reduce = ((1, 0), (2, 1))
-        result_shape = (lhs.type.shape[0], rhs.type.shape[2])
-    acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
-    operation = lowerer.emit(
+        lowerer.error(node, "scaled-contract group sizes must be positive")
+    return lowerer.emit(
         OperationKind.SCALED_CONTRACT,
         lowerer.location(node),
-        operands=operands,
-        result_types=(
-            TensorType(acc_dtype, result_shape),
-        ),
+        operands=(lhs, lhs_scale, rhs, rhs_scale),
+        result_types=(TensorType(require_dtype(lowerer, bound["acc_dtype"]), result_shape),),
         attributes={
             "reduce": reduce,
-            "batch": (),
-            "acc_dtype": acc_dtype,
-            "multiply": "multiply",
-            "combine": "add",
+            "batch": batch,
+            "lhs_format": lhs_format,
+            "rhs_format": rhs_format,
             "lhs_group_size": lhs_group,
             "rhs_group_size": rhs_group,
-            "lhs_format": lhs.type.dtype.name,
-            "rhs_format": rhs.type.dtype.name,
         },
-    )
-    return operation.results[0]
-
-
-def _sparse_contract_2to4(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
-    bound = bind_call(
-        lowerer,
-        node,
-        ("compressed_lhs", "metadata", "rhs", "acc_dtype"),
-        required=("compressed_lhs", "metadata", "rhs", "acc_dtype"),
-    )
-    compressed = lowerer.read_value(
-        lowerer.lower_expression(bound["compressed_lhs"]),
-        bound["compressed_lhs"],
-    )
-    metadata = lowerer.read_value(
-        lowerer.lower_expression(bound["metadata"]),
-        bound["metadata"],
-    )
-    rhs = lowerer.read_value(
-        lowerer.lower_expression(bound["rhs"]),
-        bound["rhs"],
-    )
-    if not all(
-        isinstance(value.type, TensorType)
-        for value in (compressed, metadata, rhs)
-    ):
-        lowerer.error(node, "I.sparse_contract_2to4 operands must be tensors")
-    if compressed.type.rank != 2 or metadata.type.rank != 2 or rhs.type.rank != 2:
-        lowerer.error(node, "I.sparse_contract_2to4 requires rank-two operands")
-    if compressed.type.dtype != rhs.type.dtype:
-        lowerer.error(node, "2:4 sparse contraction data operands must share a dtype")
-    if metadata.type.dtype != i16:
-        lowerer.error(node, "2:4 sparse contraction metadata must be i16")
-    result_shape = (compressed.type.shape[0], rhs.type.shape[1])
-    acc_dtype = require_dtype(lowerer, bound["acc_dtype"])
-    operation = lowerer.emit(
-        OperationKind.SPARSE_CONTRACT,
-        lowerer.location(node),
-        operands=(compressed, metadata, rhs),
-        result_types=(TensorType(acc_dtype, result_shape),),
-        attributes={
-            "format": "two_of_four",
-            "compressed_axis": 1,
-            "metadata_axis": 1,
-            "rhs_reduction_axis": 0,
-            "acc_dtype": acc_dtype,
-        },
-    )
-    return operation.results[0]
-
-
-def _callable_symbol(
-    lowerer: FunctionLowerer,
-    node: ast.AST,
-) -> object:
-    expression = lowerer.lower_expression(node)
-    if isinstance(expression, Intrinsic):
-        return expression.name
-    lowerer.error(node, "combine/multiply must be an Intent intrinsic")
-
-
-def _combiner(
-    lowerer: FunctionLowerer,
-    node: ast.AST,
-    accumulator_type: ValueType,
-    component_names: tuple[str, ...],
-    component_types: tuple[ValueType, ...],
-    captures: tuple[MlirValue, ...],
-    call_node: ast.AST,
-) -> object:
-    expression = lowerer.lower_expression(node)
-    if isinstance(expression, Intrinsic):
-        if captures:
-            lowerer.error(node, "built-in combiner does not accept combine_operands=")
-        return expression.name
-    if isinstance(expression, HelperDefinition):
-        return lowerer.compiler.lower_combiner(
-            lowerer,
-            expression,
-            accumulator_type,
-            component_names,
-            component_types,
-            captures,
-            lowerer.location(call_node),
-        )
-    lowerer.error(node, "combine= must be an Intent intrinsic or @intent.fn")
-
-
-def _combine_operands(
-    lowerer: FunctionLowerer,
-    node: ast.AST | None,
-    call_node: ast.AST,
-) -> tuple[MlirValue, ...]:
-    if node is None:
-        return ()
-    expression = lowerer.lower_expression(node)
-    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
-    values = tuple(lowerer.materialize(element, node) for element in elements)
-    if any(isinstance(value.type, (TensorType, RecordType)) for value in values):
-        lowerer.error(
-            call_node,
-            "combine_operands must be explicit scalar SSA values",
-        )
-    return values
-
-
-def _extract_record_components(
-    lowerer: FunctionLowerer,
-    value: MlirValue,
-    node: ast.AST,
-) -> tuple[MlirValue, ...]:
-    if not isinstance(value.type, RecordType):
-        return (value,)
-    return tuple(
-        lowerer.emit(
-            OperationKind.EXTRACT,
-            lowerer.location(node),
-            operands=(value,),
-            result_types=(field_type,),
-            attributes={"key": field},
-        ).results[0]
-        for field, field_type in value.type.fields
-    )
-
-
-def _flatten_accumulator(
-    lowerer: FunctionLowerer,
-    source: MlirValue,
-    identity: MlirValue,
-    result_type: ValueType,
-    node: ast.AST,
-) -> tuple[
-    tuple[MlirValue, ...],
-    tuple[MlirValue, ...],
-    tuple[str, ...],
-    tuple[ValueType, ...],
-]:
-    source_components = _extract_record_components(lowerer, source, node)
-    identity_components = _extract_record_components(lowerer, identity, node)
-    if len(source_components) != len(identity_components):
-        lowerer.error(node, "source and identity accumulator schemas must match")
-    if isinstance(result_type, RecordType):
-        component_names = tuple(name for name, _ in result_type.fields)
-        result_components = tuple(field_type for _, field_type in result_type.fields)
-    else:
-        component_names = ("value",)
-        result_components = (result_type,)
-    if len(result_components) != len(source_components):
-        lowerer.error(node, "result accumulator schema must match source and identity")
-    return (
-        source_components,
-        identity_components,
-        component_names,
-        result_components,
-    )
-
-
-def _rebuild_accumulator(
-    lowerer: FunctionLowerer,
-    results: tuple[MlirValue, ...],
-    result_type: ValueType,
-    component_names: tuple[str, ...],
-    node: ast.AST,
-) -> MlirValue:
-    if not isinstance(result_type, RecordType):
-        if len(results) != 1:
-            lowerer.error(node, "scalar accumulator requires one result")
-        return results[0]
-    return lowerer.emit(
-        OperationKind.MAKE_RECORD,
-        lowerer.location(node),
-        operands=results,
-        result_types=(result_type,),
-        attributes={"fields": component_names},
     ).results[0]
 
 
-def _reduction_pairs(lowerer: FunctionLowerer, node: ast.AST) -> tuple[tuple[int, int], ...]:
-    pairs = _axis_pairs(lowerer, node, "reduction")
-    if not pairs:
-        lowerer.error(node, "contract requires at least one reduction pair")
-    return pairs
+def _sparse_format(
+    lowerer: FunctionLowerer,
+    name: str,
+    node: ast.Call,
+) -> SparseFormatSpec:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("compression_axis", "logical_extent"),
+        required=("compression_axis", "logical_extent"),
+    )
+    axis = require_static_int(lowerer, bound["compression_axis"])
+    extent = lowerer.materialize(
+        lowerer.lower_expression(bound["logical_extent"]),
+        bound["logical_extent"],
+        ScalarType(intent_index),
+    )
+    kind = {"sparse.one_of_two": 0, "sparse.two_of_four": 1}[name]
+    return SparseFormatSpec(kind, axis, extent)
+
+
+def _sparse_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("compressed", "metadata", "dense_rhs", "format", "reduce", "batch", "acc_dtype"),
+        required=("compressed", "metadata", "dense_rhs", "format", "reduce", "acc_dtype"),
+    )
+    compressed = lowerer.read_value(
+        lowerer.lower_expression(bound["compressed"]), bound["compressed"]
+    )
+    metadata = lowerer.read_value(
+        lowerer.lower_expression(bound["metadata"]), bound["metadata"]
+    )
+    rhs = lowerer.read_value(
+        lowerer.lower_expression(bound["dense_rhs"]), bound["dense_rhs"]
+    )
+    format_value = lowerer.lower_expression(bound["format"])
+    if not isinstance(format_value, SparseFormatSpec):
+        lowerer.error(bound["format"], "sparse contract format must be a typed I.sparse schema")
+    if not isinstance(compressed.type, TensorType) or not isinstance(rhs.type, TensorType):
+        lowerer.error(node, "sparse contract data operands must be tensors")
+    reduce, batch, result_shape = _contract_relations(
+        lowerer, compressed, rhs, bound, node, logical_lhs_axis=format_value.compression_axis
+    )
+    return lowerer.emit(
+        OperationKind.SPARSE_CONTRACT,
+        lowerer.location(node),
+        operands=(compressed, metadata, rhs, format_value.logical_extent),
+        result_types=(TensorType(require_dtype(lowerer, bound["acc_dtype"]), result_shape),),
+        attributes={
+            "format": SparseFormatAttribute(
+                format_value.kind, format_value.compression_axis
+            ),
+            "reduce": reduce,
+            "batch": batch,
+        },
+    ).results[0]
+
+
+def _sparse_contract_2to4(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    lowerer.error(
+        node,
+        "I.sparse_contract_2to4 requires the typed sparse metadata schema; use I.sparse_contract",
+    )
+
+
+def _histogram(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
+    bound = bind_call(
+        lowerer,
+        node,
+        ("values", "bins", "valid", "count_dtype"),
+        required=("values", "bins", "valid", "count_dtype"),
+    )
+    values = lowerer.read_value(
+        lowerer.lower_expression(bound["values"]), bound["values"]
+    )
+    if not isinstance(values.type, TensorType) or values.type.dtype.category not in (
+        DTypeCategory.SIGNED_INTEGER,
+        DTypeCategory.UNSIGNED_INTEGER,
+        DTypeCategory.INDEX,
+    ):
+        lowerer.error(node, "I.histogram values must be an integer tensor")
+    bins = lowerer.materialize(
+        lowerer.lower_expression(bound["bins"]),
+        bound["bins"],
+        ScalarType(intent_index),
+    )
+    valid = lowerer.materialize(
+        lowerer.lower_expression(bound["valid"]), bound["valid"]
+    )
+    valid_dtype, _ = lowerer.dtype_and_shape(valid.type, node)
+    if valid_dtype != intent_bool:
+        lowerer.error(node, "I.histogram valid must be bool")
+    valid = lowerer.broadcast_value(valid, values.type.shape, node)
+    count_dtype = require_dtype(lowerer, bound["count_dtype"])
+    if count_dtype.category not in (
+        DTypeCategory.SIGNED_INTEGER,
+        DTypeCategory.UNSIGNED_INTEGER,
+    ):
+        lowerer.error(node, "I.histogram count dtype must be fixed-width integer")
+    result_extent = lowerer.fresh_dynamic_dimension("histogram_bins")
+    known, static_bins = compile_time_value(lowerer.lower_expression(bound["bins"]))
+    if known:
+        if isinstance(static_bins, bool) or not isinstance(static_bins, int) or static_bins <= 0:
+            lowerer.error(bound["bins"], "histogram bins must be positive")
+        result_extent = StaticDim(static_bins)
+    return lowerer.emit(
+        OperationKind.HISTOGRAM,
+        lowerer.location(node),
+        operands=(values, bins, valid),
+        result_types=(TensorType(count_dtype, (result_extent,)),),
+        attributes={
+            "result_dimension": lowerer.compiler.builder.dimension_id(result_extent)
+        },
+    ).results[0]
+
+
+def _helper_region(
+    lowerer: FunctionLowerer,
+    helper_node: ast.AST,
+    argument_types: tuple[ValueType, ...],
+    static_bindings: tuple[ConstexprBinding | None, ...],
+    call_node: ast.AST,
+) -> tuple[object, tuple[ValueType, ...]]:
+    helper = lowerer.lower_expression(helper_node)
+    if not isinstance(helper, HelperDefinition):
+        lowerer.error(helper_node, "structured callable must be an @intent.fn")
+    if len(static_bindings) != len(argument_types):
+        raise ValueError("helper static-binding schema mismatch")
+    region = lowerer.make_region(lowerer.location(call_node), argument_types)
+    arguments: list[Expression] = []
+    for value, binding in zip(region.blocks[0].arguments, static_bindings):
+        arguments.append(
+            ConstexprBinding(binding.python_value, value)
+            if binding is not None
+            else value
+        )
+    saved_block = lowerer.current_block
+    lowerer.current_block = region.blocks[0]
+    results = lowerer.compiler.lower_helper_inline(
+        lowerer,
+        helper,
+        tuple(arguments),
+        lowerer.location(call_node),
+    )
+    if region.effects:
+        lowerer.error(call_node, "structured callable regions must be pure")
+    lowerer.emit(OperationKind.YIELD, lowerer.location(call_node), operands=results)
+    lowerer.current_block = saved_block
+    return region, tuple(value.type for value in results)
+
+
+def _combine_region(
+    lowerer: FunctionLowerer,
+    helper_node: ast.AST,
+    accumulator_types: tuple[ValueType, ...],
+    captures: tuple[MlirValue, ...],
+    capture_bindings: tuple[ConstexprBinding | None, ...],
+    component_names: tuple[str, ...],
+    node: ast.AST,
+) -> tuple[object, tuple[ValueType, ...]]:
+    expression = lowerer.lower_expression(helper_node)
+    if isinstance(expression, Intrinsic):
+        if captures:
+            lowerer.error(node, "built-in combine does not accept captures")
+        operator = {
+            "add": BinaryOperator.ADD,
+            "maximum": BinaryOperator.MAXIMUM,
+            "minimum": BinaryOperator.MINIMUM,
+        }.get(expression.name)
+        if operator is None:
+            lowerer.error(helper_node, "unsupported built-in combine")
+        return (
+            _builtin_combine_region(lowerer, accumulator_types, operator, node),
+            accumulator_types,
+        )
+    if not isinstance(expression, HelperDefinition):
+        lowerer.error(helper_node, "combine must be an Intent intrinsic or @intent.fn")
+    region = lowerer.make_region(
+        lowerer.location(node),
+        accumulator_types + accumulator_types + tuple(value.type for value in captures),
+    )
+    saved_block = lowerer.current_block
+    lowerer.current_block = region.blocks[0]
+    block_arguments = region.blocks[0].arguments
+    arguments: list[Expression]
+    product_kind = _component_product_kind(component_names)
+    if product_kind == "scalar":
+        arguments = list(block_arguments)
+    else:
+        count = len(accumulator_types)
+        lhs = _make_product_value(
+            lowerer, block_arguments[:count], component_names, product_kind, node
+        )
+        rhs = _make_product_value(
+            lowerer,
+            block_arguments[count : 2 * count],
+            component_names,
+            product_kind,
+            node,
+        )
+        arguments = [lhs, rhs, *block_arguments[2 * count :]]
+    capture_offset = 2 * len(accumulator_types)
+    for index, binding in enumerate(capture_bindings):
+        if binding is not None:
+            argument_index = (
+                capture_offset + index
+                if product_kind == "scalar"
+                else 2 + index
+            )
+            arguments[argument_index] = ConstexprBinding(
+                binding.python_value,
+                region.blocks[0].arguments[capture_offset + index],
+            )
+    helper_results = lowerer.compiler.lower_helper_inline(
+        lowerer,
+        expression,
+        tuple(arguments),
+        lowerer.location(node),
+    )
+    if product_kind == "scalar":
+        results = helper_results
+    else:
+        if len(helper_results) != 1:
+            lowerer.error(node, "product combine must return one typed product")
+        results, result_names = _source_components(lowerer, helper_results[0], node)
+        if result_names != component_names:
+            lowerer.error(node, "product combine result schema does not match accumulator")
+    if region.effects:
+        lowerer.error(node, "combine region must be pure")
+    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=results)
+    lowerer.current_block = saved_block
+    return region, tuple(value.type for value in results)
+
+
+def _lower_component_identity(
+    lowerer: FunctionLowerer,
+    identity_node: ast.AST,
+    source_components: tuple[MlirValue, ...],
+    component_names: tuple[str, ...],
+    call_node: ast.AST,
+) -> MlirValue:
+    if component_names != ("value",) and isinstance(identity_node, ast.Call):
+        callee = lowerer.lower_expression(identity_node.func)
+        if isinstance(callee, Intrinsic) and callee.name == "record":
+            if identity_node.args or any(
+                keyword.arg is None for keyword in identity_node.keywords
+            ):
+                lowerer.error(identity_node, "record identity requires named fields")
+            names = tuple(keyword.arg for keyword in identity_node.keywords)
+            if names != component_names:
+                lowerer.error(
+                    identity_node,
+                    "record identity fields must match source record order",
+                )
+            values: list[MlirValue] = []
+            for keyword, source_component in zip(
+                identity_node.keywords, source_components
+            ):
+                expression = lowerer.lower_expression(keyword.value)
+                expected = (
+                    ScalarType(source_component.type.dtype)
+                    if isinstance(expression, Literal)
+                    and isinstance(source_component.type, TensorType)
+                    else None
+                )
+                values.append(
+                    lowerer.materialize(expression, keyword.value, expected)
+                )
+            return _make_record_value(lowerer, tuple(values), component_names, call_node)
+    expression = lowerer.lower_expression(identity_node)
+    expected = (
+        ScalarType(source_components[0].type.dtype)
+        if len(source_components) == 1
+        and isinstance(source_components[0].type, TensorType)
+        and isinstance(expression, Literal)
+        else None
+    )
+    return lowerer.materialize(expression, identity_node, expected)
+
+
+def _make_record_value(
+    lowerer: FunctionLowerer,
+    values: tuple[MlirValue, ...] | list[MlirValue],
+    names: tuple[str, ...],
+    node: ast.AST,
+) -> MlirValue:
+    value_tuple = tuple(values)
+    result_type = RecordType(
+        tuple((name, value.type) for name, value in zip(names, value_tuple))
+    )
+    return lowerer.emit(
+        OperationKind.MAKE_RECORD,
+        lowerer.location(node),
+        operands=value_tuple,
+        result_types=(result_type,),
+    ).results[0]
+
+
+def _make_tuple_value(
+    lowerer: FunctionLowerer,
+    values: tuple[MlirValue, ...] | list[MlirValue],
+    node: ast.AST,
+) -> MlirValue:
+    value_tuple = tuple(values)
+    return lowerer.emit(
+        OperationKind.MAKE_TUPLE,
+        lowerer.location(node),
+        operands=value_tuple,
+        result_types=(TupleType(tuple(value.type for value in value_tuple)),),
+    ).results[0]
+
+
+def _make_product_value(
+    lowerer: FunctionLowerer,
+    values: tuple[MlirValue, ...] | list[MlirValue],
+    names: tuple[str, ...],
+    product_kind: str,
+    node: ast.AST,
+) -> MlirValue:
+    if product_kind == "tuple":
+        return _make_tuple_value(lowerer, values, node)
+    if product_kind == "record":
+        return _make_record_value(lowerer, values, names, node)
+    raise ValueError("scalar components do not form a product value")
+
+
+def _builtin_combine_region(
+    lowerer: FunctionLowerer,
+    accumulator_types: tuple[ValueType, ...],
+    operator: BinaryOperator,
+    node: ast.AST,
+):
+    region = lowerer.make_region(
+        lowerer.location(node), accumulator_types + accumulator_types
+    )
+    saved_block = lowerer.current_block
+    lowerer.current_block = region.blocks[0]
+    count = len(accumulator_types)
+    results = tuple(
+        lowerer.emit(
+            OperationKind.BINARY,
+            lowerer.location(node),
+            operands=(region.blocks[0].arguments[index], region.blocks[0].arguments[count + index]),
+            result_types=(accumulator_types[index],),
+            attributes={"operator_kind": operator},
+        ).results[0]
+        for index in range(count)
+    )
+    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=results)
+    lowerer.current_block = saved_block
+    return region
+
+
+def _argmax_combine_region(
+    lowerer: FunctionLowerer,
+    value_type: ValueType,
+    node: ast.AST,
+):
+    types = (value_type, ScalarType(i32))
+    region = lowerer.make_region(lowerer.location(node), types + types)
+    saved = lowerer.current_block
+    lowerer.current_block = region.blocks[0]
+    lhs_value, lhs_index, rhs_value, rhs_index = region.blocks[0].arguments
+    greater = lowerer.emit(
+        OperationKind.COMPARE,
+        lowerer.location(node),
+        operands=(lhs_value, rhs_value),
+        result_types=(ScalarType(intent_bool),),
+        attributes={"predicate": 4},
+    ).results[0]
+    equal = lowerer.emit(
+        OperationKind.COMPARE,
+        lowerer.location(node),
+        operands=(lhs_value, rhs_value),
+        result_types=(ScalarType(intent_bool),),
+        attributes={"predicate": 0},
+    ).results[0]
+    lower = lowerer.emit(
+        OperationKind.COMPARE,
+        lowerer.location(node),
+        operands=(lhs_index, rhs_index),
+        result_types=(ScalarType(intent_bool),),
+        attributes={"predicate": 3},
+    ).results[0]
+    tied = lowerer.emit(
+        OperationKind.BINARY,
+        lowerer.location(node),
+        operands=(equal, lower),
+        result_types=(ScalarType(intent_bool),),
+        attributes={"operator_kind": BinaryOperator.LOGICAL_AND},
+    ).results[0]
+    choose = lowerer.emit(
+        OperationKind.BINARY,
+        lowerer.location(node),
+        operands=(greater, tied),
+        result_types=(ScalarType(intent_bool),),
+        attributes={"operator_kind": BinaryOperator.LOGICAL_OR},
+    ).results[0]
+    selected = tuple(
+        lowerer.emit(
+            OperationKind.SELECT,
+            lowerer.location(node),
+            operands=(choose, lhs, rhs),
+            result_types=(result_type,),
+        ).results[0]
+        for lhs, rhs, result_type in zip(
+            (lhs_value, lhs_index), (rhs_value, rhs_index), types
+        )
+    )
+    lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=selected)
+    lowerer.current_block = saved
+    return region
+
+
+def _source_components(
+    lowerer: FunctionLowerer,
+    source: MlirValue,
+    node: ast.AST,
+) -> tuple[tuple[MlirValue, ...], tuple[str, ...]]:
+    if isinstance(source.type, TupleType):
+        values = tuple(
+            lowerer.emit(
+                OperationKind.EXTRACT,
+                lowerer.location(node),
+                operands=(source,),
+                result_types=(component_type,),
+                attributes={"field": index},
+            ).results[0]
+            for index, component_type in enumerate(source.type.components)
+        )
+        return values, tuple(f"#{index}" for index in range(len(values)))
+    if not isinstance(source.type, RecordType):
+        return (source,), ("value",)
+    values = tuple(
+        lowerer.emit(
+            OperationKind.EXTRACT,
+            lowerer.location(node),
+            operands=(source,),
+            result_types=(field_type,),
+            attributes={"field": index},
+        ).results[0]
+        for index, (_, field_type) in enumerate(source.type.fields)
+    )
+    return values, tuple(name for name, _ in source.type.fields)
+
+
+def _identity_components(
+    lowerer: FunctionLowerer,
+    identity: MlirValue,
+    node: ast.AST,
+) -> tuple[tuple[MlirValue, ...], tuple[str, ...]]:
+    return _source_components(lowerer, identity, node)
+
+
+def _rebuild_components(
+    lowerer: FunctionLowerer,
+    values: tuple[MlirValue, ...],
+    names: tuple[str, ...],
+    node: ast.AST,
+) -> MlirValue:
+    if names == ("value",):
+        return values[0]
+    if _component_product_kind(names) == "tuple":
+        return _make_tuple_value(lowerer, values, node)
+    result_type = RecordType(tuple(zip(names, (value.type for value in values))))
+    return lowerer.emit(
+        OperationKind.MAKE_RECORD,
+        lowerer.location(node),
+        operands=values,
+        result_types=(result_type,),
+    ).results[0]
+
+
+def _component_product_kind(names: tuple[str, ...]) -> str:
+    if names == ("value",):
+        return "scalar"
+    if names == tuple(f"#{index}" for index in range(len(names))):
+        return "tuple"
+    return "record"
+
+
+def _values(
+    lowerer: FunctionLowerer,
+    node: ast.AST,
+    call_node: ast.AST,
+) -> tuple[MlirValue, ...]:
+    expression = lowerer.lower_expression(node)
+    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
+    return tuple(lowerer.materialize(element, call_node) for element in elements)
+
+
+def _tensor_sources(
+    lowerer: FunctionLowerer,
+    node: ast.AST,
+    call_node: ast.AST,
+) -> tuple[MlirValue, ...]:
+    expression = lowerer.lower_expression(node)
+    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
+    values = tuple(lowerer.read_value(element, call_node) for element in elements)
+    if not values or any(not isinstance(value.type, TensorType) for value in values):
+        lowerer.error(call_node, "region source must contain one or more tensors")
+    return values
+
+
+def _shared_source_axis(
+    lowerer: FunctionLowerer,
+    sources: tuple[MlirValue, ...],
+    axis_node: ast.AST,
+    call_node: ast.AST,
+) -> int:
+    axis = require_static_int(lowerer, axis_node)
+    rank = sources[0].type.rank
+    if not -rank <= axis < rank:
+        lowerer.error(axis_node, "region source axis is outside rank")
+    axis %= rank
+    extent = sources[0].type.shape[axis]
+    for source in sources[1:]:
+        if source.type.rank <= axis or not dims_compatible(source.type.shape[axis], extent):
+            lowerer.error(call_node, "region source components must share the source extent")
+    return axis
+
+
+def _slice_types(
+    lowerer: FunctionLowerer,
+    sources: tuple[MlirValue, ...],
+    axis: int,
+    role: str,
+) -> tuple[TensorType, ...]:
+    extent = lowerer.fresh_dynamic_dimension(f"{role}_slice")
+    return tuple(
+        TensorType(
+            source.type.dtype,
+            tuple(
+                extent if position == axis else dimension
+                for position, dimension in enumerate(source.type.shape)
+            ),
+        )
+        for source in sources
+    )
+
+
+def _replace_slice_extent(
+    value_type: ValueType,
+    slice_extent: object,
+    full_extent: object,
+) -> ValueType:
+    if isinstance(value_type, TensorType):
+        matches = [axis for axis, dim in enumerate(value_type.shape) if dim == slice_extent]
+        if len(matches) != 1:
+            raise ValueError(
+                "region_scan emit result must contain its source slice extent exactly once"
+            )
+        shape = list(value_type.shape)
+        shape[matches[0]] = full_extent
+        return TensorType(value_type.dtype, tuple(shape))
+    if isinstance(value_type, RecordType):
+        return RecordType(
+            tuple(
+                (name, _replace_slice_extent(field_type, slice_extent, full_extent))
+                for name, field_type in value_type.fields
+            )
+        )
+    if isinstance(value_type, TupleType):
+        return TupleType(
+            tuple(
+                _replace_slice_extent(component, slice_extent, full_extent)
+                for component in value_type.components
+            )
+        )
+    raise ValueError("region_scan emit result must be a tensor or tensor record")
+
+
+def _combine_captures(
+    lowerer: FunctionLowerer,
+    node: ast.AST | None,
+    call_node: ast.AST,
+) -> tuple[tuple[MlirValue, ...], tuple[ConstexprBinding | None, ...]]:
+    return _region_captures(lowerer, node, call_node)
+
+
+def _region_captures(
+    lowerer: FunctionLowerer,
+    node: ast.AST | None,
+    call_node: ast.AST,
+) -> tuple[tuple[MlirValue, ...], tuple[ConstexprBinding | None, ...]]:
+    if node is None:
+        return (), ()
+    expression = lowerer.lower_expression(node)
+    elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
+    values: list[MlirValue] = []
+    bindings: list[ConstexprBinding | None] = []
+    for element in elements:
+        value = lowerer.materialize(element, call_node)
+        if isinstance(element, ConstexprBinding):
+            binding = element
+        elif isinstance(element, Literal):
+            binding = ConstexprBinding(element.value, value)
+        else:
+            binding = None
+        values.append(value)
+        bindings.append(binding)
+    return tuple(values), tuple(bindings)
+
+
+def _sum_accumulator_dtype(dtype):
+    from intent.language import f32
+
+    if dtype.name in ("i8", "i16"):
+        return i32
+    if dtype.name in ("u8", "u16"):
+        return u32
+    if dtype.name in ("f8e4m3fn", "f8e5m2", "f16", "bf16"):
+        return f32
+    return dtype
 
 
 def _axis_pairs(
@@ -728,45 +1256,72 @@ def _axis_pairs(
         for axis in element.elements:
             known, value = compile_time_value(axis)
             if not known or isinstance(value, bool) or not isinstance(value, int):
-                lowerer.error(
-                    node,
-                    f"contract {purpose} axes must be compile-time integers",
-                )
+                lowerer.error(node, f"contract {purpose} axes must be compile-time integers")
             pair.append(value)
         pairs.append((pair[0], pair[1]))
     return tuple(pairs)
 
 
-def _record_result_type(
+def _contract_relations(
     lowerer: FunctionLowerer,
-    source: RecordType,
-    identity: RecordType,
-    axes: tuple[int, ...],
-    *,
-    scan: bool,
+    lhs: MlirValue,
+    rhs: MlirValue,
+    bound: dict[str, ast.AST],
     node: ast.AST,
-) -> RecordType:
-    if tuple(name for name, _ in source.fields) != tuple(name for name, _ in identity.fields):
-        lowerer.error(node, "record source/identity field names must match")
-    tensor_fields = [field_type for _, field_type in source.fields]
-    if not tensor_fields or any(not isinstance(field_type, TensorType) for field_type in tensor_fields):
-        lowerer.error(node, "record reduction source fields must all be tensors")
-    shape = tensor_fields[0].shape
-    if any(field_type.shape != shape for field_type in tensor_fields):
-        lowerer.error(node, "record reduction source fields must share shape")
-    axes = normalize_axes(lowerer, axes, len(shape), node)
-    normalized = set(axes)
-    result_shape = shape if scan else tuple(
-        dimension for axis, dimension in enumerate(shape) if axis not in normalized
+    *,
+    logical_lhs_axis: int | None = None,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...], tuple[object, ...]]:
+    reduce = _axis_pairs(lowerer, bound["reduce"], "reduction")
+    if not reduce:
+        lowerer.error(node, "contract requires at least one reduction pair")
+    batch = _axis_pairs(lowerer, bound["batch"], "batch") if "batch" in bound else ()
+    lhs_reduce: set[int] = set()
+    rhs_reduce: set[int] = set()
+    lhs_batch: set[int] = set()
+    rhs_batch: set[int] = set()
+    normalized_reduce: list[tuple[int, int]] = []
+    normalized_batch: list[tuple[int, int]] = []
+    for left, right in reduce:
+        left %= lhs.type.rank
+        right %= rhs.type.rank
+        if left in lhs_reduce or right in rhs_reduce:
+            lowerer.error(node, "contract reduction axes must be unique")
+        lhs_reduce.add(left)
+        rhs_reduce.add(right)
+        normalized_reduce.append((left, right))
+    for left, right in batch:
+        left %= lhs.type.rank
+        right %= rhs.type.rank
+        if left in lhs_reduce or right in rhs_reduce or left in lhs_batch or right in rhs_batch:
+            lowerer.error(node, "contract batch axes must be unique and disjoint")
+        if not dims_compatible(lhs.type.shape[left], rhs.type.shape[right]):
+            lowerer.error(node, "contract paired batch extents are incompatible")
+        lhs_batch.add(left)
+        rhs_batch.add(right)
+        normalized_batch.append((left, right))
+    for left, right in normalized_reduce:
+        if logical_lhs_axis is None and not dims_compatible(
+            lhs.type.shape[left], rhs.type.shape[right]
+        ):
+            lowerer.error(node, "contract paired reduction extents are incompatible")
+    result_shape = tuple(
+        dimension
+        for axis, dimension in enumerate(lhs.type.shape)
+        if axis not in lhs_reduce
+    ) + tuple(
+        dimension
+        for axis, dimension in enumerate(rhs.type.shape)
+        if axis not in rhs_reduce and axis not in rhs_batch
     )
-    fields: list[tuple[str, ValueType]] = []
-    for (name, source_type), (_, identity_type) in zip(source.fields, identity.fields):
-        if not isinstance(source_type, TensorType) or not isinstance(identity_type, ScalarType):
-            lowerer.error(node, "record identity fields must be scalars")
-        if source_type.dtype != identity_type.dtype:
-            lowerer.error(node, "record accumulation dtype changes require explicit field casts")
-        result_type: ValueType = identity_type
-        if result_shape:
-            result_type = TensorType(identity_type.dtype, result_shape)
-        fields.append((name, result_type))
-    return RecordType(tuple(fields))
+    return tuple(normalized_reduce), tuple(normalized_batch), result_shape
+
+
+def _scaled_format(lowerer: FunctionLowerer, node: ast.AST) -> int:
+    value = lowerer.lower_expression(node)
+    if not isinstance(value, ScaledFormat):
+        lowerer.error(node, "scaled-contract format must be I.e2m1/I.e4m3/I.e8m0")
+    mapping = {"e2m1": 0, "e4m3": 1, "e8m0": 2}
+    try:
+        return mapping[value.name]
+    except KeyError:
+        lowerer.error(node, "unknown scaled-contract format")

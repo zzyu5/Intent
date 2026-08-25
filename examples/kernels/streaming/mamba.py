@@ -432,11 +432,11 @@ def mamba3_siso_forward(
                 )[None, :]
                 query_pairs = I.reshape(
                     query_block,
-                    (chunk_length, MAMBA3_QK_DIMENSION // 2, 2),
+                    (chunk_positions, MAMBA3_QK_DIMENSION // 2, 2),
                 )
                 key_pairs = I.reshape(
                     key_block,
-                    (chunk_length, MAMBA3_QK_DIMENSION // 2, 2),
+                    (chunk_positions, MAMBA3_QK_DIMENSION // 2, 2),
                 )
                 query_first = query_pairs[:, :, 0]
                 query_second = query_pairs[:, :, 1]
@@ -483,11 +483,11 @@ def mamba3_siso_forward(
                 )
                 rotated_query = I.reshape(
                     I.join(rotated_query_first, rotated_query_second),
-                    (chunk_length, MAMBA3_QK_DIMENSION),
+                    (chunk_positions, MAMBA3_QK_DIMENSION),
                 )
                 rotated_key = I.reshape(
                     I.join(rotated_key_first, rotated_key_second),
-                    (chunk_length, MAMBA3_QK_DIMENSION),
+                    (chunk_positions, MAMBA3_QK_DIMENSION),
                 ) * I.cast(transition_scale[:, None], I.bf16)
                 qk_dot = I.reshape(
                     I.contract(
@@ -504,7 +504,7 @@ def mamba3_siso_forward(
                         reduce=((1, 0),),
                         acc_dtype=I.f32,
                     ),
-                    (chunk_length,),
+                    (chunk_positions,),
                 ) * gamma
                 query_store[batch, source_grid, head, qk_dimension_indices[None, :]] = (
                     rotated_query
