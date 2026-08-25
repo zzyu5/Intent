@@ -41,14 +41,22 @@ def conv1d_same(
             + tap_indices[None, :]
             - CONV1D_FILTER // 2
         )
-        patch = I.cast(x[batch, input_indices], I.f32)
+        valid = (input_indices >= 0) & (input_indices < L)
+        safe_input_indices = I.select(valid, input_indices, 0)
+        patch = I.cast(
+            I.mask(
+                x[batch, safe_input_indices],
+                valid=valid,
+                fill=I.cast(0.0, I.f16),
+            ),
+            I.f32,
+        )
         filter_values = I.cast(weight[taps], I.f32)
         products = patch * filter_values
         reduced = I.reduce.sum(
             products,
             axis=1,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         output[batch, length] = I.cast(reduced, I.f16)
 
@@ -70,8 +78,9 @@ def causal_depthwise_conv1d(
             output_index = I.indices(positions)[:, None]
             tap_index = I.indices(taps)[None, :]
             input_index = output_index - (W - 1) + tap_index
-            valid = input_index >= 0
-            patch = x[batch, channel, input_index]
+            valid = (input_index >= 0) & (input_index < L)
+            safe_input_index = I.select(valid, input_index, 0)
+            patch = x[batch, channel, safe_input_index]
             patch = I.mask(
                 patch,
                 valid=valid,
@@ -85,7 +94,6 @@ def causal_depthwise_conv1d(
                 products,
                 axis=1,
                 identity=0.0,
-                acc_dtype=I.f32,
             ) + I.cast(bias[channel], I.f32)
             if SILU:
                 reduced = reduced * I.sigmoid(reduced)
@@ -109,9 +117,11 @@ def causal_depthwise_conv1d_bf16(
         output_index = I.indices(positions)[:, None]
         tap_index = I.indices(taps)[None, :]
         input_index = output_index - (W - 1) + tap_index
+        valid = (input_index >= 0) & (input_index < L)
+        safe_input_index = I.select(valid, input_index, 0)
         patch = I.mask(
-            x[batch, channels, input_index],
-            valid=(input_index >= 0)[None, :, :],
+            x[batch, channels, safe_input_index],
+            valid=valid[None, :, :],
             fill=I.cast(0.0, I.bf16),
         )
         reduced = I.reduce.sum(
@@ -119,7 +129,6 @@ def causal_depthwise_conv1d_bf16(
             * I.cast(weight[channels, taps], I.f32)[:, None, :],
             axis=2,
             identity=0.0,
-            acc_dtype=I.f32,
         ) + I.cast(bias[channels], I.f32)[:, None]
         if SILU:
             reduced = reduced * I.sigmoid(reduced)
@@ -202,11 +211,11 @@ def conv2d_same(
     for batch in I.parallel(I.domain(0, B)):
         output_row_indices = I.reshape(
             I.indices(height),
-            (height, 1, 1, 1),
+            (H, 1, 1, 1),
         )
         output_column_indices = I.reshape(
             I.indices(width),
-            (1, width, 1, 1),
+            (1, W, 1, 1),
         )
         kernel_row_indices = I.indices(kernel_rows)[:, None]
         kernel_column_indices = I.indices(kernel_columns)
@@ -220,7 +229,18 @@ def conv2d_same(
             + kernel_column_indices
             - CONV2D_FILTER_WIDTH // 2
         )
-        patch = I.cast(x[batch, input_rows, input_columns], I.f32)
+        row_valid = (input_rows >= 0) & (input_rows < H)
+        column_valid = (input_columns >= 0) & (input_columns < W)
+        safe_input_rows = I.select(row_valid, input_rows, 0)
+        safe_input_columns = I.select(column_valid, input_columns, 0)
+        patch = I.cast(
+            I.mask(
+                x[batch, safe_input_rows, safe_input_columns],
+                valid=row_valid & column_valid,
+                fill=I.cast(0.0, I.f16),
+            ),
+            I.f32,
+        )
         filter_values = I.cast(
             weight[kernel_rows, kernel_columns],
             I.f32,
@@ -230,13 +250,11 @@ def conv2d_same(
             products,
             axis=3,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         reduced = I.reduce.sum(
             reduced_columns,
             axis=2,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         output[batch, height, width] = I.cast(
             reduced,
@@ -258,20 +276,32 @@ def conv2d_nhwc(
     for batch in I.parallel(I.domain(0, B)):
         for output_row in I.parallel(I.domain(0, H)):
             accumulator = I.zeros(
-                (width, output_channels), dtype=I.f32
+                (W, CO), dtype=I.f32
             )
             for kernel_row in range(3):
                 input_row = output_row + kernel_row - 1
+                row_valid = (input_row >= 0) & (input_row < H)
+                safe_input_row = I.select(row_valid, input_row, 0)
                 for kernel_column in range(3):
                     input_column = (
                         I.indices(width) + kernel_column - 1
                     )
-                    patch = x[
-                        batch,
-                        input_row,
+                    column_valid = (input_column >= 0) & (input_column < W)
+                    safe_input_column = I.select(
+                        column_valid,
                         input_column,
-                        input_channels,
-                    ]
+                        0,
+                    )
+                    patch = I.mask(
+                        x[
+                            batch,
+                            safe_input_row,
+                            safe_input_column,
+                            input_channels,
+                        ],
+                        valid=(row_valid & column_valid)[:, None],
+                        fill=I.cast(0.0, I.f16),
+                    )
                     filter_values = weight[
                         kernel_row,
                         kernel_column,

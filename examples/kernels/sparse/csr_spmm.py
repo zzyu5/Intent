@@ -21,7 +21,7 @@ def csr_spmm(
     for row in I.parallel(I.domain(0, ROWS)):
         start = row_offsets[row]
         stop = row_offsets[row + 1]
-        accumulation = I.zeros((features,), dtype=I.f32)
+        accumulation = I.zeros((FEATURES,), dtype=I.f32)
         for nonzero in range(start, stop):
             I.assume_in_bounds(nonzero, column_indices, axis=0)
             I.assume_in_bounds(nonzero, values, axis=0)

@@ -25,10 +25,11 @@ def adafactor_update_rows(
         )
         updated = decay * row_state[row] + (1.0 - decay) * square_mean
         row_state[row] = updated
-        I.atomic_add(
+        I.atomic.add(
             row_mean,
             index=(0,),
             value=updated * inverse_rows,
+            order="relaxed",
         )
 
 

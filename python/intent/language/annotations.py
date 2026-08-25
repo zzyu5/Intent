@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins as python_builtins
 from dataclasses import dataclass
+from enum import Enum as PythonEnum
 from enum import IntEnum
 from typing import Any
 
@@ -37,8 +38,6 @@ def _normalize_shape(shape: object) -> tuple[ShapeDim, ...]:
 @dataclass(frozen=True, slots=True)
 class ViewConstraints:
     strides: tuple[StrideDim, ...] | None = None
-    layout: str | None = None
-    alignment: int | None = None
     alias: str | None = None
     noalias: bool = False
 
@@ -56,15 +55,6 @@ class ViewConstraints:
                     continue
                 raise TypeError(f"unsupported stride constraint: {stride!r}")
             object.__setattr__(self, "strides", normalized_strides)
-        if self.layout is not None and not self.layout:
-            raise ValueError("layout name must not be empty")
-        if self.alignment is not None:
-            if isinstance(self.alignment, python_builtins.bool) or not isinstance(
-                self.alignment, int
-            ):
-                raise TypeError("alignment must be an integer")
-            if self.alignment <= 0 or self.alignment & (self.alignment - 1):
-                raise ValueError("alignment must be a positive power of two")
         if self.alias is not None and not self.alias:
             raise ValueError("alias group must not be empty")
         if self.alias is not None and self.noalias:
@@ -74,15 +64,11 @@ class ViewConstraints:
 def constraints(
     *,
     strides: tuple[StrideDim, ...] | None = None,
-    layout: str | None = None,
-    alignment: int | None = None,
     alias: str | None = None,
     noalias: bool = False,
 ) -> ViewConstraints:
     return ViewConstraints(
         strides=strides,
-        layout=layout,
-        alignment=alignment,
         alias=alias,
         noalias=noalias,
     )
@@ -165,5 +151,5 @@ class Constexpr:
         return ConstexprSpec(value_type=value_type)
 
 
-class Enum(IntEnum):
+class Enum(PythonEnum):
     """Base class for user specialization enums."""

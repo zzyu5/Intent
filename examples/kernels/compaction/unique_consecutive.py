@@ -36,15 +36,15 @@ def unique_consecutive_rows(
             identity=0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.i32,
         )
         for column in columns:
             group = groups[column] - 1
             inverse[row, column] = group
-            I.atomic_add(
+            I.atomic.add(
                 run_lengths,
                 index=(row, group),
                 value=I.cast(1, I.i32),
+                order="relaxed",
             )
             if run_starts[column]:
                 unique_values[row, group] = values[row, column]

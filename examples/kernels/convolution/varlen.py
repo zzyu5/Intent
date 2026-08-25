@@ -18,8 +18,9 @@ def varlen_aligned_causal_depthwise_conv1d(
     bias: I.In[I.f32, ("D",)],
     output: I.Out[I.bf16, ("U", "D")],
 ):
-    _, D = x.shape
+    U, D = x.shape
     C = chunk_indices.shape[0]
+    packed_tokens = I.domain(0, U)
     channels = I.domain(0, D)
     for chunk in I.parallel(I.domain(0, C)):
         I.assume_in_bounds(chunk, chunk_indices, axis=0)
@@ -29,11 +30,14 @@ def varlen_aligned_causal_depthwise_conv1d(
         I.assume_in_bounds(sequence, sequence_offsets, axis=0)
         I.assume_in_bounds(next_sequence, sequence_offsets, axis=0)
         sequence_start = I.cast(sequence_offsets[sequence], I.index)
+        sequence_end = I.cast(sequence_offsets[next_sequence], I.index)
         token_start = sequence_start + local_chunk * CHUNK_SIZE
-        tokens = I.domain(0, CHUNK_SIZE)
-        token_indices = token_start + I.indices(tokens)
+        token_end = I.minimum(token_start + CHUNK_SIZE, sequence_end)
+        tokens = packed_tokens[token_start:token_end]
+        token_indices = I.indices(tokens)
+        token_count = token_end - token_start
         channel_indices = I.indices(channels)
-        accumulation = I.zeros((tokens, channels), dtype=I.f32)
+        accumulation = I.zeros((token_count, D), dtype=I.f32)
         for tap in range(WIDTH):
             source_index = (
                 token_indices

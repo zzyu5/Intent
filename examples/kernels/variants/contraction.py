@@ -43,11 +43,11 @@ def conv2d_reduce_order(
     for batch in I.parallel(I.domain(0, B)):
         output_row_indices = I.reshape(
             I.indices(height),
-            (height, 1, 1, 1),
+            (H, 1, 1, 1),
         )
         output_column_indices = I.reshape(
             I.indices(width),
-            (1, width, 1, 1),
+            (1, W, 1, 1),
         )
         kernel_row_indices = I.indices(kernel_rows)[:, None]
         kernel_column_indices = I.indices(kernel_columns)
@@ -61,21 +61,27 @@ def conv2d_reduce_order(
             + kernel_column_indices
             - CONV2D_FILTER_WIDTH // 2
         )
-        products = I.cast(
-            x[batch, input_rows, input_columns],
-            I.f32,
-        ) * I.cast(weight[kernel_rows, kernel_columns], I.f32)
+        row_valid = (input_rows >= 0) & (input_rows < H)
+        column_valid = (input_columns >= 0) & (input_columns < W)
+        safe_input_rows = I.select(row_valid, input_rows, 0)
+        safe_input_columns = I.select(column_valid, input_columns, 0)
+        patch = I.mask(
+            x[batch, safe_input_rows, safe_input_columns],
+            valid=row_valid & column_valid,
+            fill=I.cast(0.0, I.f16),
+        )
+        products = I.cast(patch, I.f32) * I.cast(
+            weight[kernel_rows, kernel_columns], I.f32
+        )
         reduced_rows = I.reduce.sum(
             products,
             axis=2,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         reduced = I.reduce.sum(
             reduced_rows,
             axis=2,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         output[batch, height, width] = I.cast(
             reduced,

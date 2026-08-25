@@ -15,7 +15,7 @@ def dropout_residual_rms_norm_forward(
     weight: I.In[I.bf16, ("N",)],
     normalized: I.Out[I.bf16, ("M", "N")],
     residual_out: I.Out[I.bf16, ("M", "N")],
-    seed: I.i32,
+    seed: I.u64,
     keep_probability: I.f32,
     inverse_keep_probability: I.f32,
     inverse_features: I.f32,
@@ -26,7 +26,7 @@ def dropout_residual_rms_norm_forward(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         counter = I.indices(columns) + row * N
-        keep = I.random(seed, counter) < keep_probability
+        keep = I.random.uniform(seed, counter, dtype=I.f32) < keep_probability
         dropped = (
             I.cast(x[row, columns], I.f32)
             * I.cast(keep, I.f32)
@@ -59,7 +59,7 @@ def dropout_residual_rms_norm_backward_data(
     dresidual_out: I.In[I.bf16, ("M", "N")],
     dx: I.Out[I.bf16, ("M", "N")],
     dresidual: I.Out[I.bf16, ("M", "N")],
-    seed: I.i32,
+    seed: I.u64,
     keep_probability: I.f32,
     inverse_keep_probability: I.f32,
     inverse_features: I.f32,
@@ -70,7 +70,7 @@ def dropout_residual_rms_norm_backward_data(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         counter = I.indices(columns) + row * N
-        keep = I.random(seed, counter) < keep_probability
+        keep = I.random.uniform(seed, counter, dtype=I.f32) < keep_probability
         keep_f32 = I.cast(keep, I.f32)
         summed = I.cast(
             I.cast(x[row, columns], I.f32)

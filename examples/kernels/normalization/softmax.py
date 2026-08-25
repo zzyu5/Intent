@@ -1,12 +1,13 @@
 import intent
 import intent.language as I
 
+from kernels.streaming.online_softmax import online_softmax_summary
+
 
 ROWS = 8192
 COLUMNS = 8192
 ROW_MAJOR_NOALIAS = I.constraints(
     strides=(None, 1),
-    layout="row_major",
     noalias=True,
 )
 
@@ -49,36 +50,12 @@ def chunked_softmax_bf16(
     M, N = x.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        statistics = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(I.cast(-I.inf, I.f32), I.cast(0.0, I.f32)),
+        values = I.cast(x[row, columns], I.f32)
+        summary = online_softmax_summary(values)
+        safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        normalized = I.select(
+            summary.valid,
+            I.exp(values - summary.maximum) / safe_denominator,
+            0.0,
         )
-        with statistics:
-            for column_region, (maximum, denominator) in statistics:
-                values = I.cast(x[row, column_region], I.f32)
-                local_maximum = I.reduce.max(values, axis=0, identity=-I.inf)
-                next_maximum = I.maximum(maximum, local_maximum)
-                statistics.yield_(
-                    next_maximum,
-                    I.exp(maximum - next_maximum) * denominator
-                    + I.reduce.sum(
-                        I.exp(values - next_maximum),
-                        axis=0,
-                        identity=0.0,
-                    ),
-                )
-        maximum, denominator = statistics.result
-        writer = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(maximum, denominator),
-        )
-        with writer:
-            for column_region, (final_maximum, final_denominator) in writer:
-                y[row, column_region] = I.cast(
-                    I.exp(I.cast(x[row, column_region], I.f32) - final_maximum)
-                    / final_denominator,
-                    I.bf16,
-                )
-                writer.yield_(final_maximum, final_denominator)
+        y[row, columns] = I.cast(normalized, I.bf16)

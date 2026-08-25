@@ -23,34 +23,32 @@ def block_sparse_matmul(
     rows = I.domain(0, M)
     columns = I.domain(0, N)
     reduction = I.domain(0, K)
-    for row_region in I.parallel(I.partition(rows, extent=BLOCK_M)):
-        for column_region in I.parallel(I.partition(columns, extent=BLOCK_N)):
-            accumulation = I.state_stream(
-                reduction,
-                extent=BLOCK_K,
-                init=(I.zeros((row_region, column_region), dtype=I.f32),),
+    row_blocks = I.domain(0, MB)
+    column_blocks = I.domain(0, NB)
+    reduction_blocks = I.domain(0, KB)
+    for row_block in I.parallel(row_blocks):
+        for column_block in I.parallel(column_blocks):
+            row_begin = row_block * BLOCK_M
+            row_end = I.minimum(row_begin + BLOCK_M, M)
+            column_begin = column_block * BLOCK_N
+            column_end = I.minimum(column_begin + BLOCK_N, N)
+            row_region = rows[row_begin:row_end]
+            column_region = columns[column_begin:column_end]
+            accumulator = I.zeros(
+                (row_end - row_begin, column_end - column_begin),
+                dtype=I.f32,
             )
-            with accumulation:
-                for reduction_region, accumulator in accumulation:
-                    row_block = I.indices(row_region)[0] // BLOCK_M
-                    column_block = I.indices(column_region)[0] // BLOCK_N
-                    reduction_block = I.indices(reduction_region)[0] // BLOCK_K
-                    I.assume_in_bounds(row_block, block_mask, axis=0)
-                    I.assume_in_bounds(column_block, block_mask, axis=1)
-                    I.assume_in_bounds(reduction_block, block_mask, axis=2)
-                    enabled = (
-                        block_mask[row_block, column_block, reduction_block]
-                        != 0
+            for reduction_block in reduction_blocks:
+                reduction_begin = reduction_block * BLOCK_K
+                reduction_end = I.minimum(reduction_begin + BLOCK_K, K)
+                reduction_region = reduction[reduction_begin:reduction_end]
+                enabled = block_mask[row_block, column_block, reduction_block] != 0
+                if enabled:
+                    partial = I.contract(
+                        lhs[row_region, reduction_region],
+                        rhs[reduction_region, column_region],
+                        reduce=((1, 0),),
+                        acc_dtype=I.f32,
                     )
-                    if enabled:
-                        partial = I.contract(
-                            lhs[row_region, reduction_region],
-                            rhs[reduction_region, column_region],
-                            reduce=((1, 0),),
-                            acc_dtype=I.f32,
-                        )
-                        accumulator = accumulator + partial
-                    accumulation.yield_(accumulator)
-            output[row_region, column_region] = I.cast(
-                accumulation.result, I.f16
-            )
+                    accumulator = accumulator + partial
+            output[row_region, column_region] = I.cast(accumulator, I.f16)

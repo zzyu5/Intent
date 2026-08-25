@@ -32,13 +32,21 @@ def max_pool2d_with_indices(
             filter_column = local_index % KERNEL_WIDTH
             input_rows = I.reshape(
                 I.indices(output_rows) * STRIDE - PADDING,
-                (output_rows, 1, 1),
-            ) + I.reshape(filter_row, (1, 1, filter_elements))
+                (OUTPUT_HEIGHT, 1, 1),
+            ) + I.reshape(filter_row, (1, 1, KERNEL_ELEMENTS))
             input_columns = I.reshape(
                 I.indices(output_columns) * STRIDE - PADDING,
-                (1, output_columns, 1),
-            ) + I.reshape(filter_column, (1, 1, filter_elements))
-            patch = x[batch, channel, input_rows, input_columns]
+                (1, OUTPUT_WIDTH, 1),
+            ) + I.reshape(filter_column, (1, 1, KERNEL_ELEMENTS))
+            row_valid = (input_rows >= 0) & (input_rows < HEIGHT)
+            column_valid = (input_columns >= 0) & (input_columns < WIDTH)
+            safe_input_rows = I.select(row_valid, input_rows, 0)
+            safe_input_columns = I.select(column_valid, input_columns, 0)
+            patch = I.mask(
+                x[batch, channel, safe_input_rows, safe_input_columns],
+                valid=row_valid & column_valid,
+                fill=I.cast(-I.inf, I.f16),
+            )
             maximum, winner = I.arg_reduce.max(
                 patch,
                 axis=2,
@@ -56,6 +64,26 @@ def max_pool2d_with_indices(
                 I.indices(output_columns)[None, :] * STRIDE
                 - PADDING
                 + winner_column
+            )
+            winner_valid = (
+                (global_row >= 0)
+                & (global_row < HEIGHT)
+                & (global_column >= 0)
+                & (global_column < WIDTH)
+            )
+            first_valid_row = I.maximum(
+                I.indices(output_rows)[:, None] * STRIDE - PADDING,
+                0,
+            )
+            first_valid_column = I.maximum(
+                I.indices(output_columns)[None, :] * STRIDE - PADDING,
+                0,
+            )
+            global_row = I.select(winner_valid, global_row, first_valid_row)
+            global_column = I.select(
+                winner_valid,
+                global_column,
+                first_valid_column,
             )
             output[batch, channel, output_rows, output_columns] = maximum
             indices[batch, channel, output_rows, output_columns] = I.cast(

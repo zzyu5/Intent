@@ -23,7 +23,6 @@ def sorted_nucleus_cutoff(
             identity=0.0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.f32,
         )
         cumulative[row, candidates] = prefix
         negative_positions = -I.cast(I.indices(candidates), I.f32)
@@ -36,6 +35,5 @@ def sorted_nucleus_cutoff(
             first_reached,
             axis=0,
             identity=-I.inf,
-            acc_dtype=I.f32,
         )
         cutoff[row] = first_index + 1

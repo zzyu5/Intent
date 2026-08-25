@@ -405,7 +405,6 @@ def paged_mla(context: Context) -> PreparedComparison:
         constexprs={
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
-            "HEAD_TILE": 16,
             "SPLITS": splits,
             "BATCH_SIZE": batch,
         },

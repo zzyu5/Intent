@@ -11,9 +11,9 @@ BLOCK_SIZE = 32
 @intent.kernel
 def block_scaled_matmul(
     lhs: I.In[I.f8e4m3fn, ("M", "KB", 32)],
-    lhs_scale: I.In[I.f8e8m0fnu, ("M", "KB")],
+    lhs_scale: I.In[I.u8, ("M", "KB")],
     rhs: I.In[I.f8e4m3fn, ("KB", 32, "N")],
-    rhs_scale: I.In[I.f8e8m0fnu, ("KB", "N")],
+    rhs_scale: I.In[I.u8, ("KB", "N")],
     output: I.Out[I.f32, ("M", "N")],
 ):
     M, KB, KI = lhs.shape
@@ -22,24 +22,18 @@ def block_scaled_matmul(
     columns = I.domain(0, N)
     k_blocks = I.domain(0, KB)
     k_inner = I.domain(0, KI)
-    accumulation = I.state_stream(
-        k_blocks,
-        extent=I.auto("SCALE_GROUP_TILE"),
-        init=(I.zeros((rows, columns), dtype=I.f32),),
+    output[rows, columns] = I.scaled_contract(
+        lhs[rows, k_blocks, k_inner],
+        lhs_scale[rows, k_blocks],
+        rhs[k_blocks, k_inner, columns],
+        rhs_scale[k_blocks, columns],
+        lhs_format=I.e4m3,
+        rhs_format=I.e4m3,
+        lhs_group_size=32,
+        rhs_group_size=32,
+        reduce=((1, 0), (2, 1)),
+        acc_dtype=I.f32,
     )
-    with accumulation:
-        for k_block_region, accumulator in accumulation:
-            partial = I.scaled_contract(
-                lhs[rows, k_block_region, k_inner],
-                lhs_scale[rows, k_block_region],
-                rhs[k_block_region, k_inner, columns],
-                rhs_scale[k_block_region, columns],
-                acc_dtype=I.f32,
-                lhs_group_size=32,
-                rhs_group_size=32,
-            )
-            accumulation.yield_(accumulator + partial)
-    output[rows, columns] = accumulation.result
 
 
 @intent.kernel
@@ -83,47 +77,20 @@ def scaled_fp8_splitk_matmul(
     splits = I.domain(0, SP)
     reduction = I.domain(0, 256)
     for split in I.parallel(splits):
-        accumulation = I.state_stream(
-            iterations,
-            extent=1,
-            init=(I.zeros((rows, columns), dtype=I.f32),),
+        partial = I.contract(
+            lhs[rows, iterations, split, reduction],
+            rhs[iterations, split, reduction, columns],
+            reduce=((1, 0), (2, 1)),
+            acc_dtype=I.f32,
         )
-        with accumulation:
-            for iteration_region, accumulator in accumulation:
-                lhs_block = I.reshape(
-                    lhs[
-                        rows,
-                        iteration_region,
-                        split,
-                        reduction,
-                    ],
-                    (rows, reduction),
-                )
-                rhs_block = I.reshape(
-                    rhs[
-                        iteration_region,
-                        split,
-                        reduction,
-                        columns,
-                    ],
-                    (reduction, columns),
-                )
-                partial = I.contract(
-                    lhs_block,
-                    rhs_block,
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                )
-                accumulation.yield_(
-                    accumulator + partial
-                )
-        I.atomic_add(
+        I.atomic.add(
             output,
             index=(rows, columns),
             value=I.cast(
-                accumulation.result * lhs_scale * rhs_scale,
+                partial * lhs_scale * rhs_scale,
                 I.f16,
             ),
+            order="relaxed",
         )
 
 
@@ -139,45 +106,23 @@ def deepgemm_fp8_2xacc(
     N = rhs.shape[0]
     rows = I.domain(0, M)
     columns = I.domain(0, N)
+    blocks = I.domain(0, KB)
     reduction = I.domain(0, KI)
-    accumulation = I.state_stream(
-        I.domain(0, KB),
-        extent=1,
-        init=(I.zeros((rows, columns), dtype=I.f32),),
+    column_blocks = I.indices(columns) // 128
+    I.assume_in_bounds(column_blocks, rhs_scale, axis=0)
+    result = I.scaled_contract(
+        lhs[rows, blocks, reduction],
+        lhs_scale[rows, blocks],
+        rhs[columns, blocks, reduction],
+        rhs_scale[column_blocks, blocks],
+        lhs_format=I.e4m3,
+        rhs_format=I.e4m3,
+        lhs_group_size=128,
+        rhs_group_size=128,
+        reduce=((1, 1), (2, 2)),
+        acc_dtype=I.f32,
     )
-    with accumulation:
-        for block_region, accumulator in accumulation:
-            lhs_block = I.reshape(
-                lhs[rows, block_region, reduction],
-                (rows, KI),
-            )
-            rhs_block = I.reshape(
-                rhs[columns, block_region, reduction],
-                (columns, KI),
-            )
-            partial = I.contract(
-                lhs_block,
-                rhs_block,
-                reduce=((1, 1),),
-                acc_dtype=I.f32,
-            )
-            column_blocks = I.indices(columns) // 128
-            I.assume_in_bounds(column_blocks, rhs_scale, axis=0)
-            left_scale = I.reshape(
-                lhs_scale[rows, block_region],
-                (rows,),
-            )
-            right_scale = I.reshape(
-                rhs_scale[column_blocks, block_region],
-                (columns,),
-            )
-            accumulation.yield_(
-                accumulator
-                + I.reshape(partial, (rows, columns))
-                * left_scale[:, None]
-                * right_scale[None, :]
-            )
     output[rows, columns] = I.cast(
-        accumulation.result,
+        result,
         I.bf16,
     )

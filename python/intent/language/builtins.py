@@ -38,11 +38,16 @@ class IntrinsicNamespace:
         return f"I.{self.name}"
 
 
-auto = Intrinsic("auto")
+@dataclass(frozen=True, slots=True)
+class ScaledFormat:
+    name: str
+
+    def __repr__(self) -> str:
+        return f"I.{self.name}"
+
+
 domain = Intrinsic("domain")
-partition = Intrinsic("partition")
 parallel = Intrinsic("parallel")
-state_stream = Intrinsic("state_stream")
 indices = Intrinsic("indices")
 end = Intrinsic("end")
 assume_in_bounds = Intrinsic("assume_in_bounds")
@@ -56,6 +61,7 @@ record = Intrinsic("record")
 cast = Intrinsic("cast")
 bitcast = Intrinsic("bitcast")
 mask = Intrinsic("mask")
+select = Intrinsic("select")
 
 exp = Intrinsic("exp")
 exp2 = Intrinsic("exp2")
@@ -63,22 +69,32 @@ log = Intrinsic("log")
 sin = Intrinsic("sin")
 cos = Intrinsic("cos")
 floor = Intrinsic("floor")
+erf = Intrinsic("erf")
 rsqrt = Intrinsic("rsqrt")
 sigmoid = Intrinsic("sigmoid")
 tanh = Intrinsic("tanh")
 abs = Intrinsic("abs")
 maximum = Intrinsic("maximum")
 minimum = Intrinsic("minimum")
-any = Intrinsic("any")
-all = Intrinsic("all")
+maximum_num = Intrinsic("maximum_num")
+minimum_num = Intrinsic("minimum_num")
 add = Intrinsic("add")
 
-reduce = IntrinsicNamespace("reduce", ("max", "sum"))
+reduce = IntrinsicNamespace("reduce", ("max", "sum", "any", "all"))
 arg_reduce = IntrinsicNamespace("arg_reduce", ("max",))
 scan = Intrinsic("scan")
+region_fold = Intrinsic("region_fold")
+region_scan = Intrinsic("region_scan")
 contract = Intrinsic("contract")
 scaled_contract = Intrinsic("scaled_contract")
+sparse_contract = Intrinsic("sparse_contract")
 sparse_contract_2to4 = Intrinsic("sparse_contract_2to4")
+histogram = Intrinsic("histogram")
+
+e2m1 = ScaledFormat("e2m1")
+e4m3 = ScaledFormat("e4m3")
+e8m0 = ScaledFormat("e8m0")
+sparse = IntrinsicNamespace("sparse", ("one_of_two", "two_of_four"))
 
 gather = Intrinsic("gather")
 scatter_unique = Intrinsic("scatter_unique")
@@ -87,12 +103,25 @@ scatter_reduce = Intrinsic("scatter_reduce")
 buffer = Intrinsic("buffer")
 store = Intrinsic("store")
 mutable_load = Intrinsic("mutable_load")
-atomic_add = Intrinsic("atomic_add")
-atomic_cas = Intrinsic("atomic_cas")
+atomic = IntrinsicNamespace(
+    "atomic",
+    (
+        "load",
+        "store",
+        "exchange",
+        "add",
+        "max",
+        "min",
+        "and_",
+        "or_",
+        "xor",
+        "compare_exchange",
+    ),
+)
 
 ragged = Intrinsic("ragged")
 members = Intrinsic("members")
-random = Intrinsic("random")
+random = IntrinsicNamespace("random", ("bits", "uniform"))
 
 inf = math.inf
 LOG2E = math.log2(math.e)
@@ -101,11 +130,8 @@ LOG2E = math.log2(math.e)
 INTRINSICS = {
     intrinsic.name: intrinsic
     for intrinsic in (
-        auto,
         domain,
-        partition,
         parallel,
-        state_stream,
         indices,
         end,
         assume_in_bounds,
@@ -118,39 +144,62 @@ INTRINSICS = {
         cast,
         bitcast,
         mask,
+        select,
         exp,
         exp2,
         log,
         sin,
         cos,
+        floor,
+        erf,
         rsqrt,
         sigmoid,
         tanh,
         abs,
         maximum,
         minimum,
-        any,
-        all,
+        maximum_num,
+        minimum_num,
         add,
         reduce,
         reduce.max,
         reduce.sum,
+        reduce.any,
+        reduce.all,
         arg_reduce,
         arg_reduce.max,
         scan,
+        region_fold,
+        region_scan,
         contract,
         scaled_contract,
+        sparse_contract,
         sparse_contract_2to4,
+        histogram,
+        sparse,
+        sparse.one_of_two,
+        sparse.two_of_four,
         gather,
         scatter_unique,
         scatter_reduce,
         buffer,
         store,
         mutable_load,
-        atomic_add,
-        atomic_cas,
+        atomic,
+        atomic.load,
+        atomic.store,
+        atomic.exchange,
+        atomic.add,
+        atomic.max,
+        atomic.min,
+        atomic.and_,
+        atomic.or_,
+        atomic.xor,
+        atomic.compare_exchange,
         ragged,
         members,
         random,
+        random.bits,
+        random.uniform,
     )
 }

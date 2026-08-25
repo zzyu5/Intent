@@ -13,19 +13,21 @@ from .annotations import constraints
 from .builtins import LOG2E
 from .builtins import abs
 from .builtins import add
-from .builtins import all
 from .builtins import assume_in_bounds
-from .builtins import any
 from .builtins import arg_reduce
-from .builtins import atomic_add
-from .builtins import atomic_cas
-from .builtins import auto
+from .builtins import atomic
 from .builtins import buffer
 from .builtins import bitcast
 from .builtins import cast
 from .builtins import contract
 from .builtins import cos
+from .builtins import e2m1
+from .builtins import e4m3
+from .builtins import e8m0
+from .builtins import erf
 from .builtins import scaled_contract
+from .builtins import sparse
+from .builtins import sparse_contract
 from .builtins import sparse_contract_2to4
 from .builtins import domain
 from .builtins import end
@@ -34,21 +36,25 @@ from .builtins import exp2
 from .builtins import floor
 from .builtins import full
 from .builtins import gather
+from .builtins import histogram
 from .builtins import indices
 from .builtins import join
 from .builtins import inf
 from .builtins import log
 from .builtins import mask
 from .builtins import maximum
+from .builtins import maximum_num
 from .builtins import minimum
+from .builtins import minimum_num
 from .builtins import members
 from .builtins import mutable_load
 from .builtins import parallel
-from .builtins import partition
 from .builtins import ragged
 from .builtins import random
 from .builtins import record
 from .builtins import reduce
+from .builtins import region_fold
+from .builtins import region_scan
 from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import sigmoid
@@ -57,7 +63,7 @@ from .builtins import sin
 from .builtins import scan
 from .builtins import scatter_reduce
 from .builtins import scatter_unique
-from .builtins import state_stream
+from .builtins import select
 from .builtins import store
 from .builtins import transpose
 from .builtins import zeros
@@ -68,17 +74,14 @@ from .dtypes import bool
 from .dtypes import dtype
 from .dtypes import f8e4m3fn
 from .dtypes import f8e5m2
-from .dtypes import f8e8m0fnu
 from .dtypes import f16
 from .dtypes import f32
 from .dtypes import f64
-from .dtypes import i4
 from .dtypes import i8
 from .dtypes import i16
 from .dtypes import i32
 from .dtypes import i64
 from .dtypes import index
-from .dtypes import u4
 from .dtypes import u8
 from .dtypes import u16
 from .dtypes import u32
@@ -102,13 +105,9 @@ __all__ = [
     "ViewKind",
     "ViewSpec",
     "add",
-    "all",
     "assume_in_bounds",
-    "any",
     "arg_reduce",
-    "atomic_add",
-    "atomic_cas",
-    "auto",
+    "atomic",
     "bf16",
     "bool",
     "buffer",
@@ -117,7 +116,13 @@ __all__ = [
     "constraints",
     "contract",
     "cos",
+    "e2m1",
+    "e4m3",
+    "e8m0",
+    "erf",
     "scaled_contract",
+    "sparse",
+    "sparse_contract",
     "sparse_contract_2to4",
     "domain",
     "dtype",
@@ -126,14 +131,13 @@ __all__ = [
     "exp2",
     "f8e4m3fn",
     "f8e5m2",
-    "f8e8m0fnu",
     "f16",
     "f32",
     "f64",
     "floor",
     "full",
     "gather",
-    "i4",
+    "histogram",
     "i8",
     "i16",
     "i32",
@@ -145,15 +149,18 @@ __all__ = [
     "log",
     "mask",
     "maximum",
+    "maximum_num",
     "minimum",
+    "minimum_num",
     "members",
     "mutable_load",
     "parallel",
-    "partition",
     "ragged",
     "random",
     "record",
     "reduce",
+    "region_fold",
+    "region_scan",
     "reshape",
     "rsqrt",
     "sigmoid",
@@ -162,10 +169,9 @@ __all__ = [
     "scan",
     "scatter_reduce",
     "scatter_unique",
-    "state_stream",
+    "select",
     "store",
     "transpose",
-    "u4",
     "u8",
     "u16",
     "u32",

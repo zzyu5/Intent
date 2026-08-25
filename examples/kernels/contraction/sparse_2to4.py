@@ -19,9 +19,24 @@ def sparse_2to4_gemm(
     rows = I.domain(0, M)
     columns = I.domain(0, N)
     reduction = I.domain(0, K)
-    output[rows, columns] = I.sparse_contract_2to4(
-        compressed[rows, :],
-        metadata[rows, :],
+    groups = I.domain(0, K // 4)
+    compressed_axis = I.domain(0, K // 2)
+    group_coordinates = I.indices(groups)
+    metadata_word = metadata[rows, group_coordinates // 4]
+    shift = I.cast((group_coordinates % 4) * 4, I.i16)
+    metadata_nibble = (metadata_word >> shift[None, :]) & 0xF
+    logical_positions = I.record(
+        first=I.cast(metadata_nibble & 0x3, I.index),
+        second=I.cast((metadata_nibble >> 2) & 0x3, I.index),
+    )
+    output[rows, columns] = I.sparse_contract(
+        compressed[rows, compressed_axis],
+        logical_positions,
         rhs[reduction, columns],
+        format=I.sparse.two_of_four(
+            compression_axis=1,
+            logical_extent=K,
+        ),
+        reduce=((1, 0),),
         acc_dtype=I.f32,
     )

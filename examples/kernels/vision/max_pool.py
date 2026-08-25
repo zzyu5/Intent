@@ -27,15 +27,23 @@ def max_pool2d(
         for channel in I.parallel(I.domain(0, CHANNELS)):
             row_indices = I.reshape(
                 I.indices(output_rows) * STRIDE - PADDING,
-                (output_rows, 1, 1, 1),
+                (OUTPUT_HEIGHT, 1, 1, 1),
             )
             column_indices = I.reshape(
                 I.indices(output_columns) * STRIDE - PADDING,
-                (1, output_columns, 1, 1),
+                (1, OUTPUT_WIDTH, 1, 1),
             )
             input_rows = row_indices + I.indices(kernel_rows)[:, None]
             input_columns = column_indices + I.indices(kernel_columns)
-            patch = x[batch, channel, input_rows, input_columns]
+            row_valid = (input_rows >= 0) & (input_rows < HEIGHT)
+            column_valid = (input_columns >= 0) & (input_columns < WIDTH)
+            safe_input_rows = I.select(row_valid, input_rows, 0)
+            safe_input_columns = I.select(column_valid, input_columns, 0)
+            patch = I.mask(
+                x[batch, channel, safe_input_rows, safe_input_columns],
+                valid=row_valid & column_valid,
+                fill=I.cast(-I.inf, I.f16),
+            )
             column_maxima = I.reduce.max(
                 patch,
                 axis=3,

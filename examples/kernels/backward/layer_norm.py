@@ -74,30 +74,15 @@ def layer_norm_backward_reduce(
     G, N = dw_partial.shape
     rows = I.domain(0, G)
     features = I.domain(0, N)
-    accumulation = I.state_stream(
-        rows,
-        extent=I.auto("ROW_TILE"),
-        init=(
-            I.zeros((features,), dtype=I.f32),
-            I.zeros((features,), dtype=I.f32),
-        ),
+    dw_value = I.reduce.sum(
+        I.cast(dw_partial[rows, features], I.f32),
+        axis=0,
+        identity=I.zeros((N,), dtype=I.f32),
     )
-    with accumulation:
-        for row_region, (dw_value, db_value) in accumulation:
-            accumulation.yield_(
-                dw_value
-                + I.reduce.sum(
-                    I.cast(dw_partial[row_region, features], I.f32),
-                    axis=0,
-                    identity=0.0,
-                ),
-                db_value
-                + I.reduce.sum(
-                    I.cast(db_partial[row_region, features], I.f32),
-                    axis=0,
-                    identity=0.0,
-                ),
-            )
-    dw_value, db_value = accumulation.result
+    db_value = I.reduce.sum(
+        I.cast(db_partial[rows, features], I.f32),
+        axis=0,
+        identity=I.zeros((N,), dtype=I.f32),
+    )
     dw[features] = dw_value
     db[features] = db_value

@@ -18,7 +18,8 @@ def batched_row_affine(
     batch_axis = I.domain(0, B)
     row_axis = I.domain(0, M)
     columns = I.domain(0, N)
-    for batch, row in I.parallel((batch_axis, row_axis)):
-        output[batch, row, columns] = (
-            x[batch, row, columns] * scale[batch, row] + bias[batch, row]
-        )
+    for batch in I.parallel(batch_axis):
+        for row in I.parallel(row_axis):
+            output[batch, row, columns] = (
+                x[batch, row, columns] * scale[batch, row] + bias[batch, row]
+            )

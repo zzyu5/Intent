@@ -7,7 +7,6 @@ ROWS = 17
 COLUMNS = 31
 ROW_MAJOR = I.constraints(
     strides=(ROWS * COLUMNS, COLUMNS, 1),
-    layout="row_major",
 )
 
 
@@ -27,7 +26,6 @@ def ordered_product_prefix(
             identity=0.0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.f32,
         )
         I.scatter_unique(output, index=(batch, row, column), value=prefix)
 
@@ -46,5 +44,4 @@ def row_cumsum_f32(
             identity=0.0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.f32,
         )

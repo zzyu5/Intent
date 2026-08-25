@@ -24,7 +24,6 @@ def compact_nonzero_rows(
             identity=0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.i32,
         )
         for column in columns:
             if flags[column] != 0:

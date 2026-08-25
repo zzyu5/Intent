@@ -23,69 +23,51 @@ def causal_conv1d_backward_partials(
     taps = I.domain(0, W)
     for batch in I.parallel(I.domain(0, B)):
         for channel in I.parallel(I.domain(0, D)):
-            accumulation = I.state_stream(
-                positions,
-                extent=I.auto("L_TILE"),
-                init=(
-                    I.zeros((W,), dtype=I.f32),
-                    I.cast(0.0, I.f32),
-                ),
-                stop=I.end(positions),
+            position_index = I.indices(positions)[:, None]
+            tap_index = I.indices(taps)[None, :]
+            input_index = position_index - (W - 1) + tap_index
+            valid_input = (input_index >= 0) & (input_index < L)
+            safe_input_index = I.select(valid_input, input_index, 0)
+            input_patch = x[batch, channel, safe_input_index]
+            input_patch = I.mask(
+                input_patch,
+                valid=valid_input,
+                fill=I.cast(0.0, I.f16),
             )
-            with accumulation:
-                for position_region, (grad_weight_value, grad_bias_value) in accumulation:
-                    position_index = I.indices(position_region)[:, None]
-                    tap_index = I.indices(taps)[None, :]
-                    input_index = position_index - (W - 1) + tap_index
-                    input_patch = x[batch, channel, input_index]
-                    input_patch = I.mask(
-                        input_patch,
-                        valid=input_index >= 0,
-                        fill=I.cast(0.0, I.f16),
-                    )
-                    output_gradient = I.cast(
-                        grad_output[batch, channel, position_region], I.f32
-                    )
-                    grad_weight_delta = I.reduce.sum(
-                        I.cast(input_patch, I.f32) * output_gradient[:, None],
-                        axis=0,
-                        identity=0.0,
-                        acc_dtype=I.f32,
-                    )
-                    grad_bias_delta = I.reduce.sum(
-                        output_gradient,
-                        axis=0,
-                        identity=0.0,
-                        acc_dtype=I.f32,
-                    )
+            output_gradient = I.cast(
+                grad_output[batch, channel, positions],
+                I.f32,
+            )
+            grad_weight_partial[batch, channel, taps] = I.reduce.sum(
+                I.cast(input_patch, I.f32) * output_gradient[:, None],
+                axis=0,
+                identity=I.zeros((W,), dtype=I.f32),
+            )
+            grad_bias_partial[batch, channel] = I.reduce.sum(
+                output_gradient,
+                axis=0,
+                identity=0.0,
+            )
 
-                    contributing_output = position_index + (W - 1) - tap_index
-                    valid_output = contributing_output < L
-                    output_patch = grad_output[
-                        batch, channel, contributing_output
-                    ]
-                    output_patch = I.mask(
-                        output_patch,
-                        valid=valid_output,
-                        fill=I.cast(0.0, I.f16),
-                    )
-                    grad_x_value = I.reduce.sum(
-                        I.cast(output_patch, I.f32)
-                        * I.cast(weight[channel, taps], I.f32)[None, :],
-                        axis=1,
-                        identity=0.0,
-                        acc_dtype=I.f32,
-                    )
-                    grad_x[batch, channel, position_region] = I.cast(
-                        grad_x_value, I.f16
-                    )
-                    accumulation.yield_(
-                        grad_weight_value + grad_weight_delta,
-                        grad_bias_value + grad_bias_delta,
-                    )
-            grad_weight_value, grad_bias_value = accumulation.result
-            grad_weight_partial[batch, channel, taps] = grad_weight_value
-            grad_bias_partial[batch, channel] = grad_bias_value
+            contributing_output = position_index + (W - 1) - tap_index
+            valid_output = (contributing_output >= 0) & (contributing_output < L)
+            safe_output = I.select(valid_output, contributing_output, 0)
+            output_patch = grad_output[batch, channel, safe_output]
+            output_patch = I.mask(
+                output_patch,
+                valid=valid_output,
+                fill=I.cast(0.0, I.f16),
+            )
+            grad_x_value = I.reduce.sum(
+                I.cast(output_patch, I.f32)
+                * I.cast(weight[channel, taps], I.f32)[None, :],
+                axis=1,
+                identity=I.zeros((L,), dtype=I.f32),
+            )
+            grad_x[batch, channel, positions] = I.cast(
+                grad_x_value,
+                I.f16,
+            )
 
 
 @intent.kernel
@@ -103,11 +85,9 @@ def causal_conv1d_backward_reduce(
             grad_bias_partial[batches, channel],
             axis=0,
             identity=0.0,
-            acc_dtype=I.f32,
         )
         grad_weight[channel, taps] = I.reduce.sum(
             grad_weight_partial[batches, channel, taps],
             axis=0,
             identity=0.0,
-            acc_dtype=I.f32,
         )

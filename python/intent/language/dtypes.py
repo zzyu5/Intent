@@ -31,23 +31,21 @@ class DType:
             raise TypeError("dtype bit width must be an integer or None")
         if self.bits is not None and self.bits <= 0:
             raise ValueError("dtype bit width must be positive")
-        if self.category is DTypeCategory.INDEX and self.bits is not None:
-            raise ValueError("index dtype has target-dependent width")
+        if self.category is DTypeCategory.INDEX and self.bits != 64:
+            raise ValueError("logical index dtype must be signed 64-bit")
 
     def __repr__(self) -> str:
         return f"I.{self.name}"
 
 
 bool = DType("bool", DTypeCategory.BOOL, 1)
-index = DType("index", DTypeCategory.INDEX, None)
+index = DType("index", DTypeCategory.INDEX, 64)
 
-i4 = DType("i4", DTypeCategory.SIGNED_INTEGER, 4)
 i8 = DType("i8", DTypeCategory.SIGNED_INTEGER, 8)
 i16 = DType("i16", DTypeCategory.SIGNED_INTEGER, 16)
 i32 = DType("i32", DTypeCategory.SIGNED_INTEGER, 32)
 i64 = DType("i64", DTypeCategory.SIGNED_INTEGER, 64)
 
-u4 = DType("u4", DTypeCategory.UNSIGNED_INTEGER, 4)
 u8 = DType("u8", DTypeCategory.UNSIGNED_INTEGER, 8)
 u16 = DType("u16", DTypeCategory.UNSIGNED_INTEGER, 16)
 u32 = DType("u32", DTypeCategory.UNSIGNED_INTEGER, 32)
@@ -55,7 +53,6 @@ u64 = DType("u64", DTypeCategory.UNSIGNED_INTEGER, 64)
 
 f8e4m3fn = DType("f8e4m3fn", DTypeCategory.FLOAT, 8)
 f8e5m2 = DType("f8e5m2", DTypeCategory.FLOAT, 8)
-f8e8m0fnu = DType("f8e8m0fnu", DTypeCategory.FLOAT, 8)
 f16 = DType("f16", DTypeCategory.FLOAT, 16)
 bf16 = DType("bf16", DTypeCategory.BFLOAT, 16)
 f32 = DType("f32", DTypeCategory.FLOAT, 32)
@@ -67,19 +64,16 @@ DTYPES = {
     for value in (
         bool,
         index,
-        i4,
         i8,
         i16,
         i32,
         i64,
-        u4,
         u8,
         u16,
         u32,
         u64,
         f8e4m3fn,
         f8e5m2,
-        f8e8m0fnu,
         f16,
         bf16,
         f32,

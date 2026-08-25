@@ -3,6 +3,12 @@ import math
 import intent
 import intent.language as I
 
+from kernels.streaming.attention import empty_attention_summary
+from kernels.streaming.attention import merge_attention_summaries
+from kernels.streaming.attention import normalize_attention_summary
+from kernels.streaming.attention import summarize_attention_chunk_f16
+from kernels.streaming.attention import summarize_masked_attention_chunk
+
 
 BATCH = 8
 QUERY_HEADS = 32
@@ -29,152 +35,41 @@ def paged_gqa_decode_attention(
     HEAD_GROUP: I.Constexpr[int],
 ):
     B, HQ, D = q.shape
-    _, PS, _, _ = key_cache.shape
-    DV = value_cache.shape[-1]
-    page_slots = page_indices.shape[0]
-    pages = I.ragged(
-        outer=I.domain(0, B),
-        members=I.domain(0, page_slots),
-        offsets=page_offsets,
-        indices=page_indices,
-    )
-    page_tokens = I.domain(0, PS)
-    for batch in I.parallel(pages.outer):
-        I.assume_in_bounds(batch, page_offsets, axis=0)
-        page_begin = I.cast(page_offsets[batch], I.index)
+    DV = value_cache.shape[3]
+    for batch in I.parallel(I.domain(0, B)):
         sequence_length = I.cast(sequence_lengths[batch], I.index)
+        logical_tokens = I.domain(0, sequence_length)
+        token_coordinates = I.indices(logical_tokens)
+        page_slot = I.cast(page_offsets[batch], I.index) + (
+            token_coordinates // PAGE_SIZE
+        )
+        I.assume_in_bounds(page_slot, page_indices, axis=0)
+        physical_page = I.cast(page_indices[page_slot], I.index)
+        I.assume_in_bounds(physical_page, key_cache, axis=0)
+        I.assume_in_bounds(physical_page, value_cache, axis=0)
+        page_offset = token_coordinates % PAGE_SIZE
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
-            query = q[batch, query_head, :][None, :]
-            page_axis = pages[batch]
-            page_stream = I.state_stream(
-                page_axis,
-                extent=1,
-                init=(
-                    I.full((1,), -I.inf, dtype=I.f32),
-                    I.zeros((1,), dtype=I.f32),
-                    I.zeros((1, DV), dtype=I.f32),
+            query = I.reshape(q[batch, query_head, :], (1, D))
+            summary = I.region_fold(
+                source=(
+                    key_cache[physical_page, page_offset, key_head, :],
+                    value_cache[physical_page, page_offset, key_head, :],
+                    token_coordinates,
                 ),
-                stop=I.end(page_axis),
-            )
-            with page_stream:
-                for page_region, (maximum, denominator, accumulator) in page_stream:
-                    physical_page = I.members(page_region)
-                    I.assume_in_bounds(physical_page, key_cache, axis=0)
-                    I.assume_in_bounds(physical_page, value_cache, axis=0)
-                    page_ordinal = I.indices(page_region) - page_begin
-                    token_stream = I.state_stream(
-                        page_tokens,
-                        extent=I.auto("K_TILE"),
-                        init=(maximum, denominator, accumulator),
-                        stop=I.end(page_tokens),
-                    )
-                    with token_stream:
-                        for token_region, (
-                            token_maximum,
-                            token_denominator,
-                            token_accumulator,
-                        ) in token_stream:
-                            token_index = I.indices(token_region)
-                            I.assume_in_bounds(key_head, key_cache, axis=2)
-                            I.assume_in_bounds(key_head, value_cache, axis=2)
-                            logical_token = I.reshape(
-                                page_ordinal[:, None] * PAGE_SIZE
-                                + token_index[None, :],
-                                (token_region,),
-                            )
-                            token_valid = logical_token < sequence_length
-                            key = I.reshape(
-                                key_cache[
-                                    physical_page,
-                                    token_region,
-                                    key_head,
-                                    :,
-                                ],
-                                (token_region, D),
-                            )
-                            value = I.reshape(
-                                value_cache[
-                                    physical_page,
-                                    token_region,
-                                    key_head,
-                                    :,
-                                ],
-                                (token_region, DV),
-                            )
-                            scores = I.contract(
-                                query,
-                                key,
-                                reduce=((1, 1),),
-                                acc_dtype=I.f32,
-                            )
-                            scores = scores * (scale * I.LOG2E)
-                            scores = I.mask(
-                                scores,
-                                valid=token_valid[None, :],
-                                fill=-I.inf,
-                            )
-                            local_maximum = I.reduce.max(
-                                scores,
-                                axis=1,
-                                identity=-I.inf,
-                            )
-                            next_maximum = I.maximum(
-                                token_maximum,
-                                local_maximum,
-                            )
-                            normalization_maximum = I.mask(
-                                next_maximum,
-                                valid=next_maximum != -I.inf,
-                                fill=0.0,
-                            )
-                            alpha = I.exp2(
-                                token_maximum - normalization_maximum
-                            )
-                            probability = I.exp2(
-                                scores - normalization_maximum[:, None]
-                            )
-                            next_denominator = (
-                                alpha * token_denominator
-                                + I.reduce.sum(
-                                    probability,
-                                    axis=1,
-                                    identity=0.0,
-                                )
-                            )
-                            next_accumulator = (
-                                alpha[:, None] * token_accumulator
-                                + I.contract(
-                                    I.cast(probability, I.f16),
-                                    value,
-                                    reduce=((1, 0),),
-                                    acc_dtype=I.f32,
-                                )
-                            )
-                            token_stream.yield_(
-                                next_maximum,
-                                next_denominator,
-                                next_accumulator,
-                            )
-                    inner_maximum, inner_denominator, inner_accumulator = (
-                        token_stream.result
-                    )
-                    page_stream.yield_(
-                        inner_maximum,
-                        inner_denominator,
-                        inner_accumulator,
-                    )
-            _, denominator, accumulator = page_stream.result
-            safe_denominator = I.mask(
-                denominator,
-                valid=denominator > 0.0,
-                fill=1.0,
+                axis=0,
+                summarize=summarize_attention_chunk_f16,
+                combine=merge_attention_summaries,
+                identity=empty_attention_summary(1, DV),
+                operands=(
+                    query,
+                    I.full((1,), fill=0, dtype=I.index),
+                    scale,
+                    False,
+                ),
             )
             output[batch, query_head, :] = I.reshape(
-                I.cast(
-                    accumulator / safe_denominator[:, None],
-                    I.f16,
-                ),
+                I.cast(normalize_attention_summary(summary), I.f16),
                 (DV,),
             )
 
@@ -197,8 +92,9 @@ def paged_gqa_decode_partials(
     BATCH_SIZE: I.Constexpr[int],
 ):
     B, HQ, D = q.shape
-    _, PS, HK, _ = key_cache.shape
-    DV = value_cache.shape[-1]
+    PS = key_cache.shape[1]
+    HK = key_cache.shape[2]
+    DV = value_cache.shape[3]
     page_slots = page_indices.shape[0]
     split_pages = I.ragged(
         outer=I.domain(0, BATCH_SIZE * SPLITS),
@@ -211,151 +107,70 @@ def paged_gqa_decode_partials(
     for job in I.parallel(split_pages.outer):
         batch = job // SPLITS
         split = job % SPLITS
-        I.assume_in_bounds(batch, q, axis=0)
-        I.assume_in_bounds(batch, page_offsets, axis=0)
-        I.assume_in_bounds(batch, sequence_lengths, axis=0)
-        I.assume_in_bounds(batch, partial_lse, axis=0)
-        I.assume_in_bounds(batch, partial_output, axis=0)
         page_begin = I.cast(page_offsets[batch], I.index)
         sequence_length = I.cast(sequence_lengths[batch], I.index)
+        selected_pages = split_pages[job]
+        page_count = split_offsets[job + 1] - split_offsets[job]
+        token_count = page_count * PS
+        page_positions = I.indices(selected_pages)
+        physical_pages = I.cast(I.members(selected_pages), I.index)
+        I.assume_in_bounds(physical_pages, key_cache, axis=0)
+        I.assume_in_bounds(physical_pages, value_cache, axis=0)
+        token_offsets = I.indices(page_tokens)
+        logical_tokens = (
+            (page_positions - page_begin)[:, None] * PAGE_SIZE
+            + token_offsets[None, :]
+        )
+        active = I.reshape(logical_tokens < sequence_length, (token_count,))
         for key_head in I.parallel(I.domain(0, HK)):
-            for query_region in I.parallel(
-                I.partition(local_query_heads, extent=HEAD_GROUP)
-            ):
-                query_heads = key_head * HEAD_GROUP + I.indices(query_region)
-                I.assume_in_bounds(query_heads, q, axis=1)
-                query = I.gather(
-                    q,
-                    index=(batch, query_heads, slice(None)),
-                )
-                selected_pages = split_pages[job]
-                stream = I.state_stream(
-                    selected_pages,
-                    extent=1,
-                    init=(
-                        I.full((query_region,), -I.inf, dtype=I.f32),
-                        I.zeros((query_region,), dtype=I.f32),
-                        I.zeros((query_region, DV), dtype=I.f32),
-                    ),
-                    stop=I.end(selected_pages),
-                )
-                with stream:
-                    for page_region, (maximum, denominator, accumulator) in stream:
-                        physical_page = I.members(page_region)
-                        I.assume_in_bounds(physical_page, key_cache, axis=0)
-                        I.assume_in_bounds(physical_page, value_cache, axis=0)
-                        page_ordinal = I.indices(page_region) - page_begin
-                        token_stream = I.state_stream(
-                            page_tokens,
-                            extent=I.auto("K_TILE"),
-                            init=(maximum, denominator, accumulator),
-                            stop=I.end(page_tokens),
-                        )
-                        with token_stream:
-                            for token_region, (
-                                token_maximum,
-                                token_denominator,
-                                token_accumulator,
-                            ) in token_stream:
-                                token_index = I.indices(token_region)
-                                logical_token = I.reshape(
-                                    page_ordinal[:, None] * PAGE_SIZE
-                                    + token_index[None, :],
-                                    (token_region,),
-                                )
-                                token_valid = logical_token < sequence_length
-                                key = I.reshape(
-                                    key_cache[
-                                        physical_page,
-                                        token_region,
-                                        key_head,
-                                        :,
-                                    ],
-                                    (token_region, D),
-                                )
-                                value = I.reshape(
-                                    value_cache[
-                                        physical_page,
-                                        token_region,
-                                        key_head,
-                                        :,
-                                    ],
-                                    (token_region, DV),
-                                )
-                                scores = I.contract(
-                                    query,
-                                    key,
-                                    reduce=((1, 1),),
-                                    acc_dtype=I.f32,
-                                )
-                                scores = I.mask(
-                                    scores * (scale * I.LOG2E),
-                                    valid=token_valid[None, :],
-                                    fill=-I.inf,
-                                )
-                                local_maximum = I.reduce.max(
-                                    scores, axis=1, identity=-I.inf
-                                )
-                                next_maximum = I.maximum(
-                                    token_maximum, local_maximum
-                                )
-                                safe_maximum = I.mask(
-                                    next_maximum,
-                                    valid=next_maximum != -I.inf,
-                                    fill=0.0,
-                                )
-                                old_scale = I.exp2(
-                                    token_maximum - safe_maximum
-                                )
-                                probability = I.exp2(
-                                    scores - safe_maximum[:, None]
-                                )
-                                next_denominator = (
-                                    old_scale * token_denominator
-                                    + I.reduce.sum(
-                                        probability,
-                                        axis=1,
-                                        identity=0.0,
-                                    )
-                                )
-                                next_accumulator = (
-                                    old_scale[:, None] * token_accumulator
-                                    + I.contract(
-                                        I.cast(probability, I.f16),
-                                        value,
-                                        reduce=((1, 0),),
-                                        acc_dtype=I.f32,
-                                    )
-                                )
-                                token_stream.yield_(
-                                    next_maximum,
-                                    next_denominator,
-                                    next_accumulator,
-                                )
-                        inner_maximum, inner_denominator, inner_accumulator = (
-                            token_stream.result
-                        )
-                        stream.yield_(
-                            inner_maximum,
-                            inner_denominator,
-                            inner_accumulator,
-                        )
-                maximum, denominator, accumulator = stream.result
-                safe_denominator = I.mask(
-                    denominator,
-                    valid=denominator > 0.0,
-                    fill=1.0,
-                )
-                I.scatter_unique(
-                    partial_lse,
-                    index=(batch, query_heads, split),
-                    value=maximum + I.log(safe_denominator) * I.LOG2E,
-                )
-                I.scatter_unique(
-                    partial_output,
-                    index=(batch, query_heads, split, slice(None)),
-                    value=I.cast(
-                        accumulator / safe_denominator[:, None],
-                        I.bf16,
-                    ),
-                )
+            query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
+            query = I.gather(
+                q,
+                index=(batch, query_heads, slice(None)),
+            )
+            keys = I.reshape(
+                key_cache[
+                    physical_pages[:, None],
+                    token_offsets[None, :],
+                    key_head,
+                    :,
+                ],
+                (token_count, D),
+            )
+            values = I.reshape(
+                value_cache[
+                    physical_pages[:, None],
+                    token_offsets[None, :],
+                    key_head,
+                    :,
+                ],
+                (token_count, DV),
+            )
+            summary = summarize_masked_attention_chunk(
+                keys,
+                values,
+                I.reshape(logical_tokens, (token_count,)),
+                active,
+                query,
+                I.full((HEAD_GROUP,), fill=0, dtype=I.index),
+                scale,
+            )
+            safe_denominator = I.select(
+                summary.valid,
+                summary.denominator,
+                1.0,
+            )
+            I.scatter_unique(
+                partial_lse,
+                index=(batch, query_heads, split),
+                value=I.select(
+                    summary.valid,
+                    summary.maximum + I.log(safe_denominator) * I.LOG2E,
+                    -I.inf,
+                ),
+            )
+            I.scatter_unique(
+                partial_output,
+                index=(batch, query_heads, split, slice(None)),
+                value=I.cast(normalize_attention_summary(summary), I.bf16),
+            )

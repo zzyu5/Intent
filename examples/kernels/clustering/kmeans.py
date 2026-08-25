@@ -28,7 +28,6 @@ def kmeans_assign(
                 difference * difference,
                 axis=0,
                 identity=0.0,
-                acc_dtype=I.f32,
             )
             if distance < best_distance:
                 best_distance = distance

@@ -48,8 +48,9 @@ def embedding_backward_atomic(
     for token in I.parallel(I.domain(0, M)):
         embedding = indices[token]
         I.assume_in_bounds(embedding, grad_weight, axis=0)
-        I.atomic_add(
+        I.atomic.add(
             grad_weight,
             index=(embedding, features),
             value=grad_output[token, features],
+            order="relaxed",
         )

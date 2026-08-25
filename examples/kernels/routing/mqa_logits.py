@@ -41,11 +41,7 @@ def fp8_mqa_logits(
         key_index = I.indices(key_axis)
         begin = I.cast(key_start[query], I.index)
         end = I.cast(key_end[query], I.index)
-        valid = (
-            key_index >= begin
-        ) and (
-            key_index < end
-        )
+        valid = (key_index >= begin) & (key_index < end)
         output[query, key_axis] = I.mask(
             logits,
             valid=valid,

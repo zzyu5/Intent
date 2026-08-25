@@ -12,12 +12,11 @@ def claim_zero_slots(
 ):
     N = state.shape[0]
     for index in I.parallel(I.domain(0, N)):
-        old = I.atomic_cas(
+        result = I.atomic.compare_exchange(
             state,
-            index,
-            compare=0,
-            value=1,
-            ordering="relaxed",
-            scope="device",
+            index=(index,),
+            expected=0,
+            desired=1,
+            order="relaxed",
         )
-        previous[index] = old
+        previous[index] = result.old_value

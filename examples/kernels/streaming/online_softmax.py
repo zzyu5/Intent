@@ -6,6 +6,51 @@ ROWS = 8192
 COLUMNS = 8192
 
 
+@intent.fn
+def merge_softmax_summary(lhs, rhs):
+    valid = lhs.valid | rhs.valid
+    maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
+    maximum = I.select(
+        rhs.valid,
+        I.maximum(maximum, rhs.maximum),
+        maximum,
+    )
+    lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
+    rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
+    lhs_scale = I.select(
+        lhs.valid,
+        I.exp(lhs_maximum - maximum),
+        0.0,
+    )
+    rhs_scale = I.select(
+        rhs.valid,
+        I.exp(rhs_maximum - maximum),
+        0.0,
+    )
+    return I.record(
+        valid=valid,
+        maximum=maximum,
+        denominator=(
+            lhs_scale * lhs.denominator
+            + rhs_scale * rhs.denominator
+        ),
+    )
+
+
+@intent.fn
+def online_softmax_summary(values):
+    return I.reduce(
+        I.record(
+            valid=I.full(values.shape, fill=True, dtype=I.bool),
+            maximum=values,
+            denominator=I.full(values.shape, fill=1.0, dtype=I.f32),
+        ),
+        axis=0,
+        identity=I.record(valid=False, maximum=0.0, denominator=0.0),
+        combine=merge_softmax_summary,
+    )
+
+
 @intent.kernel
 def streamed_online_softmax(
     x: I.In[I.f32, ("M", "N")],
@@ -14,38 +59,14 @@ def streamed_online_softmax(
     M, N = x.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        statistics = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(I.cast(-I.inf, I.f32), I.cast(0.0, I.f32)),
+        values = x[row, columns]
+        summary = online_softmax_summary(values)
+        safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        y[row, columns] = I.select(
+            summary.valid,
+            I.exp(values - summary.maximum) / safe_denominator,
+            0.0,
         )
-        with statistics:
-            for column_region, (maximum, denominator) in statistics:
-                values = x[row, column_region]
-                local_maximum = I.reduce.max(values, axis=0, identity=-I.inf)
-                next_maximum = I.maximum(maximum, local_maximum)
-                scale = I.exp(maximum - next_maximum)
-                local_sum = I.reduce.sum(
-                    I.exp(values - next_maximum), axis=0, identity=0.0
-                )
-                statistics.yield_(
-                    next_maximum,
-                    scale * denominator + local_sum,
-                )
-        maximum, denominator = statistics.result
-
-        output = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(maximum, denominator),
-        )
-        with output:
-            for column_region, (final_maximum, final_denominator) in output:
-                values = x[row, column_region]
-                y[row, column_region] = (
-                    I.exp(values - final_maximum) / final_denominator
-                )
-                output.yield_(final_maximum, final_denominator)
 
 
 @intent.kernel
@@ -56,34 +77,12 @@ def streamed_online_softmax_f16(
     M, N = x.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        statistics = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(I.cast(-I.inf, I.f32), I.cast(0.0, I.f32)),
+        values = I.cast(x[row, columns], I.f32)
+        summary = online_softmax_summary(values)
+        safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        normalized = I.select(
+            summary.valid,
+            I.exp(values - summary.maximum) / safe_denominator,
+            0.0,
         )
-        with statistics:
-            for column_region, (maximum, denominator) in statistics:
-                values = I.cast(x[row, column_region], I.f32)
-                local_maximum = I.reduce.max(values, axis=0, identity=-I.inf)
-                next_maximum = I.maximum(maximum, local_maximum)
-                statistics.yield_(
-                    next_maximum,
-                    I.exp(maximum - next_maximum) * denominator
-                    + I.reduce.sum(
-                        I.exp(values - next_maximum), axis=0, identity=0.0
-                    ),
-                )
-        maximum, denominator = statistics.result
-        writer = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(maximum, denominator),
-        )
-        with writer:
-            for column_region, (final_maximum, final_denominator) in writer:
-                y[row, column_region] = I.cast(
-                    I.exp(I.cast(x[row, column_region], I.f32) - final_maximum)
-                    / final_denominator,
-                    I.f16,
-                )
-                writer.yield_(final_maximum, final_denominator)
+        y[row, columns] = I.cast(normalized, I.f16)

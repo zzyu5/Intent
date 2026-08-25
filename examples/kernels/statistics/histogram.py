@@ -9,14 +9,17 @@ BINS = 256
 @intent.kernel
 def histogram_256(
     samples: I.In[I.f32, ("N",)],
-    histogram: I.InOut[I.f32, (BINS,)],
+    histogram: I.Out[I.f32, (BINS,)],
 ):
     N = samples.shape[0]
     sample_axis = I.domain(0, N)
     bin_index = I.cast(samples[sample_axis], I.i32)
-    I.assume_in_bounds(bin_index, histogram, axis=0)
-    I.atomic_add(
-        histogram,
-        index=(bin_index,),
-        value=I.full((sample_axis,), 1.0, dtype=I.f32),
+    valid = (bin_index >= 0) & (bin_index < BINS)
+    counts = I.histogram(
+        bin_index,
+        bins=BINS,
+        valid=valid,
+        count_dtype=I.u32,
     )
+    bins = I.domain(0, BINS)
+    histogram[bins] = I.cast(counts, I.f32)

@@ -18,14 +18,16 @@ def moe_count_routes_product_domain(
     T, K = topk_ids.shape
     tokens = I.domain(0, T)
     choices = I.domain(0, K)
-    for token, choice in I.parallel((tokens, choices)):
-        expert = topk_ids[token, choice]
-        I.assume_in_bounds(expert, expert_counts, axis=0)
-        I.atomic_add(
-            expert_counts,
-            index=(expert,),
-            value=I.cast(1, I.i32),
-        )
+    for token in I.parallel(tokens):
+        for choice in I.parallel(choices):
+            expert = topk_ids[token, choice]
+            I.assume_in_bounds(expert, expert_counts, axis=0)
+            I.atomic.add(
+                expert_counts,
+                index=(expert,),
+                value=I.cast(1, I.i32),
+                order="relaxed",
+            )
 
 
 @intent.kernel
@@ -251,14 +253,15 @@ def adafactor_apply_scalar_product(
     M, N = parameter.shape
     rows = I.domain(0, M)
     columns = I.domain(0, N)
-    for row, column in I.parallel((rows, columns)):
-        variance = (
-            row_state[row]
-            * column_state[column]
-            / I.maximum(row_mean[0], epsilon)
-        )
-        update = gradient[row, column] * I.rsqrt(variance + epsilon)
-        parameter[row, column] = parameter[row, column] - learning_rate * update
+    for row in I.parallel(rows):
+        for column in I.parallel(columns):
+            variance = (
+                row_state[row]
+                * column_state[column]
+                / I.maximum(row_mean[0], epsilon)
+            )
+            update = gradient[row, column] * I.rsqrt(variance + epsilon)
+            parameter[row, column] = parameter[row, column] - learning_rate * update
 
 
 @intent.kernel
@@ -269,8 +272,9 @@ def matrix_transpose_product_domains(
     M, N = x.shape
     rows = I.domain(0, M)
     columns = I.domain(0, N)
-    for row, column in I.parallel((rows, columns)):
-        output[column, row] = x[row, column]
+    for row in I.parallel(rows):
+        for column in I.parallel(columns):
+            output[column, row] = x[row, column]
 
 
 @intent.kernel

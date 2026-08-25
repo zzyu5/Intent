@@ -1,6 +1,8 @@
 import intent
 import intent.language as I
 
+from kernels.streaming.online_softmax import online_softmax_summary
+
 
 @intent.kernel
 def stable_softmax_online(
@@ -10,37 +12,14 @@ def stable_softmax_online(
     M, N = x.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        statistics = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(I.cast(-I.inf, I.f32), I.cast(0.0, I.f32)),
+        values = x[row, columns]
+        summary = online_softmax_summary(values)
+        safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+        y[row, columns] = I.select(
+            summary.valid,
+            I.exp(values - summary.maximum) / safe_denominator,
+            0.0,
         )
-        with statistics:
-            for region, (maximum, denominator) in statistics:
-                values = x[row, region]
-                local_maximum = I.reduce.max(values, axis=0, identity=-I.inf)
-                next_maximum = I.maximum(maximum, local_maximum)
-                local_sum = I.reduce.sum(
-                    I.exp(values - next_maximum),
-                    axis=0,
-                    identity=0.0,
-                )
-                statistics.yield_(
-                    next_maximum,
-                    I.exp(maximum - next_maximum) * denominator + local_sum,
-                )
-        maximum, denominator = statistics.result
-        output = I.state_stream(
-            columns,
-            extent=I.auto("N_TILE"),
-            init=(maximum, denominator),
-        )
-        with output:
-            for region, (final_maximum, final_denominator) in output:
-                y[row, region] = (
-                    I.exp(x[row, region] - final_maximum) / final_denominator
-                )
-                output.yield_(final_maximum, final_denominator)
 
 
 @intent.kernel

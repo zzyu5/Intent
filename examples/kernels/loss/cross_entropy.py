@@ -7,6 +7,67 @@ VOCABULARY = 16384
 IGNORE_INDEX = -100
 
 
+@intent.fn
+def merge_cross_entropy_summary(lhs, rhs):
+    valid = lhs.valid | rhs.valid
+    maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
+    maximum = I.select(
+        rhs.valid,
+        I.maximum(maximum, rhs.maximum),
+        maximum,
+    )
+    lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
+    rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
+    lhs_scale = I.select(
+        lhs.valid,
+        I.exp(lhs_maximum - maximum),
+        0.0,
+    )
+    rhs_scale = I.select(
+        rhs.valid,
+        I.exp(rhs_maximum - maximum),
+        0.0,
+    )
+    lhs_wins = (lhs.maximum > rhs.maximum) | (
+        (lhs.maximum == rhs.maximum) & (lhs.predicted <= rhs.predicted)
+    )
+    predicted = I.select(lhs.valid, lhs.predicted, rhs.predicted)
+    predicted = I.select(
+        lhs.valid & rhs.valid,
+        I.select(lhs_wins, lhs.predicted, rhs.predicted),
+        predicted,
+    )
+    return I.record(
+        valid=valid,
+        maximum=maximum,
+        denominator=(
+            lhs_scale * lhs.denominator
+            + rhs_scale * rhs.denominator
+        ),
+        predicted=predicted,
+    )
+
+
+@intent.fn
+def cross_entropy_summary(values, coordinates, empty_prediction):
+    return I.reduce(
+        I.record(
+            valid=I.full(values.shape, fill=True, dtype=I.bool),
+            maximum=values,
+            denominator=I.full(values.shape, fill=1.0, dtype=I.f32),
+            predicted=coordinates,
+        ),
+        axis=0,
+        identity=I.record(
+            valid=False,
+            maximum=0.0,
+            denominator=0.0,
+            predicted=empty_prediction,
+        ),
+        combine=merge_cross_entropy_summary,
+    )
+
+
 @intent.kernel
 def fused_cross_entropy(
     logits: I.InOut[I.f32, ("M", "V")],
@@ -22,66 +83,25 @@ def fused_cross_entropy(
         if label == IGNORE_INDEX:
             loss[row] = 0.0
             prediction[row] = -1
-            clear_stream = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(I.cast(0.0, I.f32),),
-            )
-            with clear_stream:
-                for class_region, zero in clear_stream:
-                    logits[row, class_region] = zero
-                    clear_stream.yield_(zero)
+            logits[row, classes] = 0.0
         else:
             I.assume_in_bounds(label, logits, axis=1)
             target = logits[row, label]
-            statistics = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(
-                    I.cast(-I.inf, I.f32),
-                    I.cast(0.0, I.f32),
-                    I.cast(V, I.i32),
-                ),
+            values = logits[row, classes]
+            summary = cross_entropy_summary(
+                values,
+                I.cast(I.indices(classes), I.i32),
+                I.cast(V, I.i32),
             )
-            with statistics:
-                for class_region, (maximum, denominator, predicted) in statistics:
-                    values = logits[row, class_region]
-                    local_maximum, local_predicted = I.arg_reduce.max(
-                        values,
-                        axis=0,
-                        identity=-I.inf,
-                    )
-                    local_wins = (local_maximum > maximum) or (
-                        (local_maximum == maximum) and (local_predicted < predicted)
-                    )
-                    next_maximum = I.maximum(maximum, local_maximum)
-                    local_sum = I.reduce.sum(
-                        I.exp(values - next_maximum),
-                        axis=0,
-                        identity=0.0,
-                    )
-                    statistics.yield_(
-                        next_maximum,
-                        denominator * I.exp(maximum - next_maximum) + local_sum,
-                        local_predicted if local_wins else predicted,
-                    )
-            maximum, denominator, predicted = statistics.result
-            loss[row] = maximum + I.log(denominator) - target
-            prediction[row] = predicted
-
-            gradient_stream = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(maximum, denominator),
+            safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+            loss[row] = summary.maximum + I.log(safe_denominator) - target
+            prediction[row] = summary.predicted
+            probability = I.exp(values - summary.maximum) / safe_denominator
+            gradient = probability - I.cast(
+                I.cast(I.indices(classes), I.i32) == label,
+                I.f32,
             )
-            with gradient_stream:
-                for class_region, (final_maximum, final_denominator) in gradient_stream:
-                    values = logits[row, class_region]
-                    indices = I.cast(I.indices(class_region), I.i32)
-                    probability = I.exp(values - final_maximum) / final_denominator
-                    gradient = probability - I.cast(indices == label, I.f32)
-                    logits[row, class_region] = gradient
-                    gradient_stream.yield_(final_maximum, final_denominator)
+            logits[row, classes] = gradient
 
 
 @intent.kernel
@@ -103,56 +123,21 @@ def fused_cross_entropy_bf16(
         else:
             I.assume_in_bounds(label, logits, axis=1)
             target = I.cast(I.gather(logits, index=(row, label)), I.f32)
-            statistics = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(
-                    I.cast(-I.inf, I.f32),
-                    I.cast(0.0, I.f32),
-                    I.cast(V, I.i64),
-                ),
+            values = I.cast(logits[row, classes], I.f32)
+            summary = cross_entropy_summary(
+                values,
+                I.cast(I.indices(classes), I.i64),
+                I.cast(V, I.i64),
             )
-            with statistics:
-                for class_region, (maximum, denominator, predicted) in statistics:
-                    values = I.cast(logits[row, class_region], I.f32)
-                    local_maximum, local_predicted = I.arg_reduce.max(
-                        values,
-                        axis=0,
-                        identity=-I.inf,
-                    )
-                    local_predicted = I.cast(local_predicted, I.i64)
-                    local_wins = (local_maximum > maximum) or (
-                        (local_maximum == maximum) and (local_predicted < predicted)
-                    )
-                    next_maximum = I.maximum(maximum, local_maximum)
-                    statistics.yield_(
-                        next_maximum,
-                        denominator * I.exp(maximum - next_maximum)
-                        + I.reduce.sum(
-                            I.exp(values - next_maximum),
-                            axis=0,
-                            identity=0.0,
-                        ),
-                        local_predicted if local_wins else predicted,
-                    )
-            maximum, denominator, predicted = statistics.result
-            loss[row] = maximum + I.log(denominator) - target
-            prediction[row] = predicted
-            writer = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(maximum, denominator),
+            safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+            loss[row] = summary.maximum + I.log(safe_denominator) - target
+            prediction[row] = summary.predicted
+            class_index = I.cast(I.indices(classes), I.i64)
+            probability = I.exp(values - summary.maximum) / safe_denominator
+            logits[row, classes] = I.cast(
+                probability - I.cast(class_index == label, I.f32),
+                I.bf16,
             )
-            with writer:
-                for class_region, (final_maximum, final_denominator) in writer:
-                    values = I.cast(logits[row, class_region], I.f32)
-                    class_index = I.cast(I.indices(class_region), I.i64)
-                    probability = I.exp(values - final_maximum) / final_denominator
-                    logits[row, class_region] = I.cast(
-                        probability - I.cast(class_index == label, I.f32),
-                        I.bf16,
-                    )
-                    writer.yield_(final_maximum, final_denominator)
 
 
 @intent.kernel
@@ -174,34 +159,14 @@ def flash_cross_entropy_bf16(
         else:
             I.assume_in_bounds(label, logits, axis=1)
             target = I.cast(I.gather(logits, index=(row, label)), I.f32)
-            statistics = I.state_stream(
-                classes,
-                extent=I.auto("CLASS_TILE"),
-                init=(
-                    I.cast(-I.inf, I.f32),
-                    I.cast(0.0, I.f32),
-                ),
+            values = I.cast(logits[row, classes], I.f32)
+            summary = cross_entropy_summary(
+                values,
+                I.cast(I.indices(classes), I.i64),
+                I.cast(V, I.i64),
             )
-            with statistics:
-                for class_region, (maximum, denominator) in statistics:
-                    values = I.cast(logits[row, class_region], I.f32)
-                    local_maximum = I.reduce.max(
-                        values,
-                        axis=0,
-                        identity=-I.inf,
-                    )
-                    next_maximum = I.maximum(maximum, local_maximum)
-                    statistics.yield_(
-                        next_maximum,
-                        denominator * I.exp(maximum - next_maximum)
-                        + I.reduce.sum(
-                            I.exp(values - next_maximum),
-                            axis=0,
-                            identity=0.0,
-                        ),
-                    )
-            maximum, denominator = statistics.result
-            lse = maximum + I.log(denominator)
+            safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+            lse = summary.maximum + I.log(safe_denominator)
             regularizer = Z_LOSS_SCALE * lse * lse
             z_loss[row] = regularizer
             loss[row] = lse - target + regularizer

@@ -21,10 +21,11 @@ def moe_count_routes(
         for choice in I.parallel(I.domain(0, K)):
             expert = topk_ids[token, choice]
             I.assume_in_bounds(expert, expert_counts, axis=0)
-            I.atomic_add(
+            I.atomic.add(
                 expert_counts,
                 index=(expert,),
                 value=I.cast(1, I.i32),
+                order="relaxed",
             )
 
 
@@ -44,7 +45,6 @@ def moe_prefix_routes(
             identity=0,
             combine=I.add,
             inclusive=True,
-            acc_dtype=I.i32,
         )
         expert_offsets[singleton] = 0
         for expert in experts:
@@ -65,10 +65,11 @@ def moe_scatter_routes(
             expert = topk_ids[token, choice]
             I.assume_in_bounds(expert, expert_offsets, axis=0)
             I.assume_in_bounds(expert, expert_cursors, axis=0)
-            local_position = I.atomic_add(
+            local_position = I.atomic.add(
                 expert_cursors,
                 index=(expert,),
                 value=I.cast(1, I.i32),
+                order="relaxed",
             )
             position = expert_offsets[expert] + local_position
             I.assume_in_bounds(position, sorted_route_ids, axis=0)

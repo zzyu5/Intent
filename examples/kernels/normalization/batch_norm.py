@@ -38,42 +38,26 @@ def batch_norm_training(
     momentum: I.f32,
 ):
     B, C, S = x.shape
+    # Interface precondition: B * S > 1 for the unbiased running variance.
     batches = I.domain(0, B)
     spatials = I.domain(0, S)
     for channel in I.parallel(I.domain(0, C)):
-        stream = I.state_stream(
-            spatials,
-            extent=I.auto("S_TILE"),
-            init=(
-                I.cast(0, I.i32),
-                I.cast(0.0, I.f32),
-                I.cast(0.0, I.f32),
+        values = I.cast(x[batches, channel, spatials], I.f32)
+        summary = I.reduce(
+            I.record(
+                count=I.full(values.shape, fill=1, dtype=I.i32),
+                mean=values,
+                m2=I.zeros(values.shape, dtype=I.f32),
             ),
+            axis=(0, 1),
+            identity=I.record(
+                count=I.cast(0, I.i32),
+                mean=I.cast(0.0, I.f32),
+                m2=I.cast(0.0, I.f32),
+            ),
+            combine=welford_combine,
         )
-        with stream:
-            for spatial_region, (count, mean, m2) in stream:
-                values = I.cast(x[batches, channel, spatial_region], I.f32)
-                chunk = I.reduce(
-                    I.record(
-                        count=I.full(
-                            (batches, spatial_region), 1, dtype=I.i32
-                        ),
-                        mean=values,
-                        m2=I.zeros((batches, spatial_region), dtype=I.f32),
-                    ),
-                    axis=(0, 1),
-                    identity=I.record(
-                        count=I.cast(0, I.i32),
-                        mean=I.cast(0.0, I.f32),
-                        m2=I.cast(0.0, I.f32),
-                    ),
-                    combine=welford_combine,
-                )
-                merged = welford_combine(
-                    I.record(count=count, mean=mean, m2=m2), chunk
-                )
-                stream.yield_(merged.count, merged.mean, merged.m2)
-        count, mean, m2 = stream.result
+        count, mean, m2 = summary.count, summary.mean, summary.m2
         total_count = I.cast(count, I.f32)
         variance = m2 / total_count
         rstd = I.rsqrt(variance + epsilon)
@@ -87,24 +71,9 @@ def batch_norm_training(
             * total_count
             / (total_count - 1.0)
         )
-        output_stream = I.state_stream(
-            spatials,
-            extent=I.auto("S_TILE"),
-            init=(mean, rstd),
+        output[batches, channel, spatials] = I.cast(
+            (values - mean) * rstd * weight[channel] + bias[channel],
+            I.f16,
         )
-        with output_stream:
-            for spatial_region, (
-                carried_mean,
-                carried_rstd,
-            ) in output_stream:
-                values = I.cast(x[batches, channel, spatial_region], I.f32)
-                output[batches, channel, spatial_region] = I.cast(
-                    (values - carried_mean)
-                    * carried_rstd
-                    * weight[channel]
-                    + bias[channel],
-                    I.f16,
-                )
-                output_stream.yield_(carried_mean, carried_rstd)
         saved_mean[channel] = mean
         saved_rstd[channel] = rstd

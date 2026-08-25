@@ -34,94 +34,46 @@ def recurrent_gated_delta_fwd(
     for batch in I.parallel(I.domain(0, B)):
         for value_head in I.parallel(I.domain(0, HV)):
             query_head = value_head // HEAD_GROUP
-            stream = I.state_stream(
-                positions,
-                extent=1,
-                init=(I.zeros((K, value_features), dtype=I.f32),),
-            )
-            with stream:
-                for position_region, state in stream:
-                    query_vector = I.reshape(
-                        I.cast(
-                            query[
-                                batch,
-                                position_region,
-                                query_head,
-                                key_features,
-                            ],
-                            I.f32,
-                        ),
-                        (K,),
-                    ) * scale
-                    key_vector = I.reshape(
-                        I.cast(
-                            key[
-                                batch,
-                                position_region,
-                                query_head,
-                                key_features,
-                            ],
-                            I.f32,
-                        ),
-                        (K,),
-                    )
-                    value_vector = I.reshape(
-                        I.cast(
-                            value[
-                                batch,
-                                position_region,
-                                value_head,
-                                value_features,
-                            ],
-                            I.f32,
-                        ),
-                        (value_features,),
-                    )
-                    decay = I.exp(
-                        I.reshape(
-                            I.cast(
-                                gate[batch, position_region, value_head],
-                                I.f32,
-                            ),
-                            (),
-                        )
-                    )
-                    decayed_state = state * decay
-                    remembered = I.reduce.sum(
-                        decayed_state * key_vector[:, None],
+            state = I.zeros((K, V), dtype=I.f32)
+            for position in positions:
+                query_vector = I.cast(
+                    query[batch, position, query_head, key_features],
+                    I.f32,
+                ) * scale
+                key_vector = I.cast(
+                    key[batch, position, query_head, key_features],
+                    I.f32,
+                )
+                value_vector = I.cast(
+                    value[batch, position, value_head, value_features],
+                    I.f32,
+                )
+                decay = I.exp(I.cast(gate[batch, position, value_head], I.f32))
+                decayed_state = state * decay
+                remembered = I.reduce.sum(
+                    decayed_state * key_vector[:, None],
+                    axis=0,
+                    identity=0.0,
+                )
+                update = (value_vector - remembered) * I.cast(
+                    beta[batch, position, value_head],
+                    I.f32,
+                )
+                state = decayed_state + key_vector[:, None] * update[None, :]
+                output[batch, position, value_head, value_features] = I.cast(
+                    I.reduce.sum(
+                        state * query_vector[:, None],
                         axis=0,
                         identity=0.0,
-                    )
-                    update = (
-                        value_vector - remembered
-                    ) * I.reshape(
-                        I.cast(
-                            beta[batch, position_region, value_head],
-                            I.f32,
-                        ),
-                        (),
-                    )
-                    next_state = decayed_state + key_vector[:, None] * update[None, :]
-                    output[
-                        batch,
-                        position_region,
-                        value_head,
-                        value_features,
-                    ] = I.cast(
-                        I.reduce.sum(
-                            next_state * query_vector[:, None],
-                            axis=0,
-                            identity=0.0,
-                        )[None, :],
-                        I.bf16,
-                    )
-                    stream.yield_(next_state)
+                    ),
+                    I.bf16,
+                )
             final_state[
                 batch,
                 value_head,
                 key_features,
                 value_features,
-            ] = stream.result
+            ] = state
 
 
 @intent.kernel
@@ -141,17 +93,20 @@ def chunk_gated_delta_prepare(
     B, T, H, K = query.shape
     C = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     V = value.shape[3]
-    positions = I.domain(0, CHUNK_SIZE)
+    sequence = I.domain(0, T)
     key_dimensions = I.domain(0, K)
     value_dimensions = I.domain(0, V)
-    local = I.indices(positions)
-    lower = local[:, None] >= local[None, :]
-    strict_lower = local[:, None] > local[None, :]
-    identity = I.cast(local[:, None] == local[None, :], I.f32)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
             for chunk in I.parallel(I.domain(0, C)):
-                source_positions = chunk * CHUNK_SIZE + local
+                chunk_begin = chunk * CHUNK_SIZE
+                chunk_end = I.minimum(chunk_begin + CHUNK_SIZE, T)
+                chunk_positions = sequence[chunk_begin:chunk_end]
+                source_positions = I.indices(chunk_positions)
+                local = source_positions - chunk_begin
+                lower = local[:, None] >= local[None, :]
+                strict_lower = local[:, None] > local[None, :]
+                identity = I.cast(local[:, None] == local[None, :], I.f32)
                 key_values = I.cast(
                     key[batch, source_positions, head, key_dimensions],
                     I.f32,
@@ -164,7 +119,6 @@ def chunk_gated_delta_prepare(
                     identity=0.0,
                     combine=I.add,
                     inclusive=True,
-                    acc_dtype=I.f32,
                 )
                 decay = I.mask(
                     I.exp(gate_prefix[:, None] - gate_prefix[None, :]),
@@ -187,7 +141,6 @@ def chunk_gated_delta_prepare(
                     I.abs(triangular),
                     axis=1,
                     identity=0.0,
-                    acc_dtype=I.f32,
                 )
                 norm = I.reduce.max(row_norm, axis=0, identity=-I.inf)
                 inverse = triangular
@@ -208,7 +161,7 @@ def chunk_gated_delta_prepare(
                             acc_dtype=I.f32,
                         )
                 else:
-                    for row_index in range(1, CHUNK_SIZE):
+                    for row_index in I.domain(1, chunk_end - chunk_begin):
                         is_row = local == row_index
                         row = I.reduce.sum(
                             I.mask(
@@ -218,13 +171,11 @@ def chunk_gated_delta_prepare(
                             ),
                             axis=0,
                             identity=0.0,
-                            acc_dtype=I.f32,
                         )
                         correction = I.reduce.sum(
                             row[:, None] * inverse,
                             axis=0,
                             identity=0.0,
-                            acc_dtype=I.f32,
                         )
                         inverse = inverse + I.mask(
                             correction[None, :],
@@ -291,16 +242,19 @@ def chunk_gated_delta_recurrence(
     B, H, T, K = query_chunks.shape
     C = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     V = corrected_values.shape[3]
-    positions = I.domain(0, CHUNK_SIZE)
+    sequence = I.domain(0, T)
     key_dimensions = I.domain(0, K)
     value_dimensions = I.domain(0, V)
-    local = I.indices(positions)
-    causal = local[:, None] >= local[None, :]
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
-            state = I.zeros((key_dimensions, value_dimensions), dtype=I.f32)
+            state = I.zeros((K, V), dtype=I.f32)
             for chunk in I.domain(0, C):
-                source_positions = chunk * CHUNK_SIZE + local
+                chunk_begin = chunk * CHUNK_SIZE
+                chunk_end = I.minimum(chunk_begin + CHUNK_SIZE, T)
+                chunk_positions = sequence[chunk_begin:chunk_end]
+                source_positions = I.indices(chunk_positions)
+                local = source_positions - chunk_begin
+                causal = local[:, None] >= local[None, :]
                 query = I.cast(
                     query_chunks[
                         batch,
@@ -374,9 +328,9 @@ def chunk_gated_delta_recurrence(
                     head,
                     value_dimensions,
                 ] = I.cast(inter + intra, I.bf16)
-                chunk_end = I.minimum((chunk + 1) * CHUNK_SIZE, T) - 1
-                I.assume_in_bounds(chunk_end, cumulative_gate, axis=2)
-                last_gate = cumulative_gate[batch, head, chunk_end]
+                last_position = chunk_end - 1
+                I.assume_in_bounds(last_position, cumulative_gate, axis=2)
+                last_gate = cumulative_gate[batch, head, last_position]
                 weighted_key = key * I.exp(last_gate - gate_prefix)[:, None]
                 update = I.contract(
                     weighted_key,

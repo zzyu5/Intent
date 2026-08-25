@@ -54,7 +54,6 @@ def recurrent_gated_delta(context: Context) -> PreparedComparison:
             value,
             gate,
             beta,
-            scale=scale,
             initial_state=None,
             output_final_state=True,
         )
