@@ -26,7 +26,9 @@ LogicalResult verifyExpressionSymbols(Operation *owner,
   if ((kind == PhysicalExprKind::Dimension ||
        kind == PhysicalExprKind::ScalarABI) &&
       !launchABI.contains(expression.getSymbol().getValue()))
-    return owner->emitOpError("launch expression references unavailable host metadata");
+    return owner->emitOpError(
+               "launch expression references unavailable host metadata: ")
+           << expression.getSymbol();
   for (Attribute operand : expression.getOperands())
     if (failed(verifyExpressionSymbols(owner, cast<PhysicalExprAttr>(operand),
                                        parameters, launchABI)))
@@ -102,13 +104,23 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       return kernel.emitError("physical ABI argument names must be unique");
     if (kind.getValue() == "view") {
       auto view = dyn_cast<ViewType>(type);
-      if (!view || view.getAbiIndex() >= kernel.getNumArguments())
+      if (!view || view.getAbiIndex() != index)
         return kernel.emitError("view ABI argument has a non-view physical type");
     } else if (kind.getValue() == "dimension" ||
                kind.getValue() == "stride") {
-      if (!type.isIndex() || !attrs.getAs<IntegerAttr>(sourceABIAttr) ||
-          !attrs.getAs<IntegerAttr>(sourceAxisAttr))
+      auto sourceABI = attrs.getAs<IntegerAttr>(sourceABIAttr);
+      auto sourceAxis = attrs.getAs<IntegerAttr>(sourceAxisAttr);
+      if (!type.isIndex() || !sourceABI || !sourceAxis)
         return kernel.emitError("metadata ABI argument lacks its source binding");
+      int64_t source = sourceABI.getInt();
+      int64_t axis = sourceAxis.getInt();
+      if (source < 0 || source >= static_cast<int64_t>(kernel.getNumArguments()))
+        return kernel.emitError("metadata ABI source is outside the physical signature");
+      auto sourceView = dyn_cast<ViewType>(kernel.getArgumentTypes()[source]);
+      if (!sourceView || sourceView.getAbiIndex() != source || axis < 0 ||
+          axis >= static_cast<int64_t>(sourceView.getRank()))
+        return kernel.emitError(
+            "metadata ABI source binding does not name an axis of its physical view");
       launchABI.insert(name.getValue());
     } else if (kind.getValue() == "scalar" ||
                kind.getValue() == "constexpr" ||
@@ -206,7 +218,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   });
   if (result.wasInterrupted())
     return failure();
-  if (!hasProgramId || actualEffectOrigins != expectedEffectOrigins)
+  if (!hasProgramId || programAxes.size() != static_cast<size_t>(gridRank) ||
+      actualEffectOrigins != expectedEffectOrigins)
     return kernel.emitError(
         "physical kernel program mapping/effect coverage is incomplete");
   return success();

@@ -39,9 +39,9 @@ def block_scaled_gemm(context: Context) -> PreparedComparison:
         block_scaled_matmul,
         (
             lhs.view(m, k // block, block),
-            lhs_scale,
+            lhs_scale.view(torch.uint8),
             rhs.view(k // block, block, n),
-            rhs_scale,
+            rhs_scale.view(torch.uint8),
         ),
     )
     source = functional_launch(

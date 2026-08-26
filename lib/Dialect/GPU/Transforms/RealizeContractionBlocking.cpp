@@ -55,6 +55,18 @@ bool requiresPhysicalRealization(ContractOp contract) {
   return false;
 }
 
+bool requiresPhysicalRealization(ScaledContractOp contract) {
+  for (FragmentType type : {
+           contract.getLhs().getType(), contract.getLhsScale().getType(),
+           contract.getRhs().getType(), contract.getRhsScale().getType(),
+           contract.getAccumulator().getType(), contract.getResult().getType()})
+    if (llvm::any_of(type.getShape(), [](Attribute extent) {
+          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
+        }))
+      return true;
+  return false;
+}
+
 Value binary(OpBuilder &builder, Location location, Type result, Value lhs,
              Value rhs, uint64_t kind) {
   return builder.create<BinaryOp>(location, result, lhs, rhs, kind);
@@ -106,6 +118,12 @@ FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
     result = index;
   }
   return result ? FailureOr<unsigned>(*result) : FailureOr<unsigned>(failure());
+}
+
+MakeRangeOp sourceRange(Value value) {
+  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
+    value = broadcast.getValue();
+  return value.getDefiningOp<MakeRangeOp>();
 }
 
 FragmentType fragmentType(MLIRContext *context, Type element,
@@ -175,8 +193,15 @@ FailureOr<Value> retargetFill(OpBuilder &builder, Location location,
         location, result.getElementType(),
         builder.getFloatAttr(result.getElementType(), 0.0));
   else if (auto integer = dyn_cast<IntegerType>(result.getElementType()))
-    zero = builder.create<arith::ConstantOp>(
-        location, integer, builder.getIntegerAttr(integer, 0));
+    if (integer.isSignless()) {
+      zero = builder.create<arith::ConstantOp>(
+          location, integer, builder.getIntegerAttr(integer, 0));
+    } else {
+      auto signless = IntegerType::get(builder.getContext(), integer.getWidth());
+      Value raw = builder.create<arith::ConstantOp>(
+          location, signless, builder.getIntegerAttr(signless, 0));
+      zero = builder.create<CastOp>(location, integer, raw);
+    }
   else
     return failure();
   return Value(builder.create<SplatOp>(location, result, zero));
@@ -285,16 +310,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   if (failed(lhsRowCoordinate) || failed(lhsReductionCoordinate) ||
       failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate))
     return unhandled("load coordinates do not cover all free/reduction axes");
-  auto rowRange = lhsLoad.getCoordinates()[*lhsRowCoordinate]
-                      .getDefiningOp<MakeRangeOp>();
+  auto rowRange = sourceRange(lhsLoad.getCoordinates()[*lhsRowCoordinate]);
   auto lhsReductionRange =
-      lhsLoad.getCoordinates()[*lhsReductionCoordinate]
-          .getDefiningOp<MakeRangeOp>();
+      sourceRange(lhsLoad.getCoordinates()[*lhsReductionCoordinate]);
   auto rhsReductionRange =
-      rhsLoad.getCoordinates()[*rhsReductionCoordinate]
-          .getDefiningOp<MakeRangeOp>();
-  auto columnRange = rhsLoad.getCoordinates()[*rhsColumnCoordinate]
-                         .getDefiningOp<MakeRangeOp>();
+      sourceRange(rhsLoad.getCoordinates()[*rhsReductionCoordinate]);
+  auto columnRange = sourceRange(rhsLoad.getCoordinates()[*rhsColumnCoordinate]);
   if (!rowRange || !lhsReductionRange || !rhsReductionRange || !columnRange ||
       lhsReductionRange.getSourceId() != rhsReductionRange.getSourceId())
     return unhandled("physical coordinates are not explicit compatible ranges");
@@ -720,6 +741,480 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult realizeScaledContract(ScaledContractOp contract,
+                                    func::FuncOp kernel) {
+  if (!contract->getBlock())
+    return success();
+  if (!requiresPhysicalRealization(contract))
+    return success();
+  auto lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
+  auto lhsScaleLoad = contract.getLhsScale().getDefiningOp<LoadOp>();
+  auto rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+  auto rhsScaleLoad = contract.getRhsScale().getDefiningOp<LoadOp>();
+  auto lhsType = contract.getLhs().getType();
+  auto lhsScaleType = contract.getLhsScale().getType();
+  auto rhsType = contract.getRhs().getType();
+  auto rhsScaleType = contract.getRhsScale().getType();
+  auto resultType = contract.getResult().getType();
+  auto reject = [&](const Twine &reason) -> LogicalResult {
+    return contract.emitOpError()
+           << "cannot form a complete block-scaled contraction: " << reason;
+  };
+  if (!lhsLoad || !lhsScaleLoad || !rhsLoad || !rhsScaleLoad ||
+      lhsType.getShape().size() != 3 || lhsScaleType.getShape().size() != 2 ||
+      rhsType.getShape().size() != 3 || rhsScaleType.getShape().size() != 2 ||
+      resultType.getShape().size() != 2 ||
+      contract.getLhsReductionAxes() != ArrayRef<int64_t>{1, 2} ||
+      contract.getRhsReductionAxes() != ArrayRef<int64_t>{0, 1} ||
+      !contract.getLhsBatchAxes().empty() ||
+      !contract.getRhsBatchAxes().empty())
+    return reject("requires direct rank-3 data/rank-2 scale loads, two adjacent reduction axes, and no batch axes");
+  if (contract.getLhsGroupSize() <= 0 ||
+      contract.getLhsGroupSize() != contract.getRhsGroupSize())
+    return reject("requires one equal positive scale-group size");
+  auto innerExtent = cast<PhysicalExprAttr>(lhsType.getShape()[2]);
+  auto rhsInnerExtent = cast<PhysicalExprAttr>(rhsType.getShape()[1]);
+  if (innerExtent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      rhsInnerExtent != innerExtent ||
+      static_cast<uint64_t>(innerExtent.getValue()) !=
+          contract.getLhsGroupSize())
+    return reject("the innermost physical reduction extent must equal the scale group size");
+
+  FailureOr<AxisMapAttr> rowMap = axisMap(lhsType, 0);
+  FailureOr<AxisMapAttr> lhsBlockMap = axisMap(lhsType, 1);
+  FailureOr<AxisMapAttr> lhsInnerMap = axisMap(lhsType, 2);
+  FailureOr<AxisMapAttr> rhsBlockMap = axisMap(rhsType, 0);
+  FailureOr<AxisMapAttr> rhsInnerMap = axisMap(rhsType, 1);
+  FailureOr<AxisMapAttr> columnMap = axisMap(rhsType, 2);
+  FailureOr<AxisMapAttr> lhsScaleRowMap = axisMap(lhsScaleType, 0);
+  FailureOr<AxisMapAttr> lhsScaleBlockMap = axisMap(lhsScaleType, 1);
+  FailureOr<AxisMapAttr> rhsScaleBlockMap = axisMap(rhsScaleType, 0);
+  FailureOr<AxisMapAttr> rhsScaleColumnMap = axisMap(rhsScaleType, 1);
+  if (failed(rowMap) || failed(lhsBlockMap) || failed(lhsInnerMap) ||
+      failed(rhsBlockMap) || failed(rhsInnerMap) || failed(columnMap) ||
+      failed(lhsScaleRowMap) || failed(lhsScaleBlockMap) ||
+      failed(rhsScaleBlockMap) || failed(rhsScaleColumnMap) ||
+      rowMap->getSourceId() != lhsScaleRowMap->getSourceId() ||
+      lhsBlockMap->getSourceId() != rhsBlockMap->getSourceId() ||
+      lhsBlockMap->getSourceId() != lhsScaleBlockMap->getSourceId() ||
+      lhsBlockMap->getSourceId() != rhsScaleBlockMap->getSourceId() ||
+      lhsInnerMap->getSourceId() != rhsInnerMap->getSourceId() ||
+      columnMap->getSourceId() != rhsScaleColumnMap->getSourceId())
+    return reject("data and scale operands do not preserve the paired coordinate provenance");
+
+  auto rangeFor = [&](LoadOp load,
+                      uint64_t sourceId) -> FailureOr<MakeRangeOp> {
+    FailureOr<unsigned> coordinate =
+        coordinateForSource(load.getCoordinates(), sourceId);
+    if (failed(coordinate))
+      return failure();
+    auto range = sourceRange(load.getCoordinates()[*coordinate]);
+    return range ? FailureOr<MakeRangeOp>(range)
+                 : FailureOr<MakeRangeOp>(failure());
+  };
+  FailureOr<MakeRangeOp> rowRange = rangeFor(lhsLoad, rowMap->getSourceId());
+  FailureOr<MakeRangeOp> blockRange =
+      rangeFor(lhsLoad, lhsBlockMap->getSourceId());
+  FailureOr<MakeRangeOp> innerRange =
+      rangeFor(lhsLoad, lhsInnerMap->getSourceId());
+  FailureOr<MakeRangeOp> columnRange =
+      rangeFor(rhsLoad, columnMap->getSourceId());
+  if (failed(rowRange) || failed(blockRange) || failed(innerRange) ||
+      failed(columnRange))
+    return reject("physical data coordinates are not explicit source ranges");
+  auto isUnit = [](Value value) {
+    FailureOr<Value> scalar = scalarSource(value);
+    if (failed(scalar))
+      return false;
+    Value current = *scalar;
+    while (true) {
+      if (auto bound = current.getDefiningOp<RangeBoundOp>()) {
+        if (bound.getBound() != 2)
+          return false;
+        auto range = bound.getRange().getDefiningOp<RangeOp>();
+        if (!range)
+          return false;
+        current = range.getStep();
+        continue;
+      }
+      if (auto cast = current.getDefiningOp<CastOp>()) {
+        current = cast.getValue();
+        continue;
+      }
+      break;
+    }
+    auto constant = current.getDefiningOp<arith::ConstantOp>();
+    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                            : IntegerAttr();
+    return integer && integer.getInt() == 1;
+  };
+  if (!isUnit(rowRange->getStep()) || !isUnit(blockRange->getStep()) ||
+      !isUnit(innerRange->getStep()) || !isUnit(columnRange->getStep()))
+    return reject("blocking currently requires unit-step source ranges");
+  if (lhsLoad.getValid() || lhsScaleLoad.getValid() || rhsLoad.getValid() ||
+      rhsScaleLoad.getValid())
+    return reject("residual data/scale validity must be represented by the selected source ranges");
+
+  SmallVector<StorePath> paths;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
+    return reject("result does not have a complete unique-store path");
+  FailureOr<Value> initialAccumulator = scalarSource(contract.getAccumulator());
+  if (failed(initialAccumulator) ||
+      (*initialAccumulator).getType() != resultType.getElementType())
+    return reject("accumulator is not an explicit scalarizable value");
+
+  DelinearizeOp mapping;
+  for (Operation &operation : *contract->getBlock()) {
+    auto candidate = dyn_cast<DelinearizeOp>(operation);
+    if (candidate && candidate.getLinear().getDefiningOp<ProgramIdOp>() &&
+        candidate->isBeforeInBlock(contract))
+      mapping = candidate;
+  }
+  auto programSpace = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  auto segmentOffset =
+      mapping ? mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr)
+              : PhysicalExprAttr();
+  auto segmentLength =
+      mapping ? mapping->getAttrOfType<PhysicalExprAttr>(segmentLengthAttr)
+              : PhysicalExprAttr();
+  if (!mapping || !programSpace || programSpace.size() != 1 || !segmentOffset ||
+      !segmentLength ||
+      segmentOffset.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      segmentOffset.getValue() != 0 || programSpace[0] != segmentLength)
+    return reject("requires one complete current program segment");
+
+  FailureOr<unsigned> lhsRowCoordinate =
+      coordinateForSource(lhsLoad.getCoordinates(), rowMap->getSourceId());
+  FailureOr<unsigned> lhsBlockCoordinate =
+      coordinateForSource(lhsLoad.getCoordinates(), lhsBlockMap->getSourceId());
+  FailureOr<unsigned> lhsInnerCoordinate =
+      coordinateForSource(lhsLoad.getCoordinates(), lhsInnerMap->getSourceId());
+  FailureOr<unsigned> lhsScaleRowCoordinate = coordinateForSource(
+      lhsScaleLoad.getCoordinates(), rowMap->getSourceId());
+  FailureOr<unsigned> lhsScaleBlockCoordinate = coordinateForSource(
+      lhsScaleLoad.getCoordinates(), lhsBlockMap->getSourceId());
+  FailureOr<unsigned> rhsBlockCoordinate =
+      coordinateForSource(rhsLoad.getCoordinates(), rhsBlockMap->getSourceId());
+  FailureOr<unsigned> rhsInnerCoordinate =
+      coordinateForSource(rhsLoad.getCoordinates(), rhsInnerMap->getSourceId());
+  FailureOr<unsigned> rhsColumnCoordinate =
+      coordinateForSource(rhsLoad.getCoordinates(), columnMap->getSourceId());
+  FailureOr<unsigned> rhsScaleBlockCoordinate = coordinateForSource(
+      rhsScaleLoad.getCoordinates(), rhsBlockMap->getSourceId());
+  FailureOr<unsigned> rhsScaleColumnCoordinate = coordinateForSource(
+      rhsScaleLoad.getCoordinates(), columnMap->getSourceId());
+  if (failed(lhsRowCoordinate) || failed(lhsBlockCoordinate) ||
+      failed(lhsInnerCoordinate) || failed(lhsScaleRowCoordinate) ||
+      failed(lhsScaleBlockCoordinate) || failed(rhsBlockCoordinate) ||
+      failed(rhsInnerCoordinate) || failed(rhsColumnCoordinate) ||
+      failed(rhsScaleBlockCoordinate) || failed(rhsScaleColumnCoordinate))
+    return reject("load coordinates do not cover all data and scale axes");
+
+  unsigned rowResourceAxis = lhsLoad.getSourceAxes()[*lhsRowCoordinate];
+  unsigned columnResourceAxis = rhsLoad.getSourceAxes()[*rhsColumnCoordinate];
+  MLIRContext *context = kernel.getContext();
+  Location location = contract.getLoc();
+  std::string suffix =
+      ("_" + Twine(rowMap->getSourceId()) + "_" +
+       Twine(columnMap->getSourceId()))
+          .str();
+  ParameterOp blockM = getOrCreateParameter(
+      kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM, {64, 128});
+  ParameterOp blockN = getOrCreateParameter(
+      kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN, {64, 128});
+  ParameterOp blockK = getOrCreateParameter(
+      kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction, {2, 4, 8});
+  if (!blockM || !blockN || !blockK)
+    return failure();
+  PhysicalExprAttr unitM = parameterExpression(
+      context, blockM.getParameter().getName().getValue());
+  PhysicalExprAttr unitN = parameterExpression(
+      context, blockN.getParameter().getName().getValue());
+  PhysicalExprAttr unitK = parameterExpression(
+      context, blockK.getParameter().getName().getValue());
+
+  OpBuilder mapBuilder(mapping);
+  Value rowExtent = mapBuilder.create<DimOp>(
+      location, mapBuilder.getIndexType(), lhsLoad.getResource(), rowResourceAxis);
+  Value columnExtent = mapBuilder.create<DimOp>(
+      location, mapBuilder.getIndexType(), rhsLoad.getResource(),
+      columnResourceAxis);
+  auto ceilDiv = [&](Value extent, Value divisor) {
+    Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
+    Value adjusted = binary(mapBuilder, location, mapBuilder.getIndexType(), extent,
+                            binary(mapBuilder, location, mapBuilder.getIndexType(),
+                                   divisor, one, 1),
+                            0);
+    return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
+                  divisor, 4);
+  };
+  Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
+  Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
+  SmallVector<Value> mappingExtents(mapping.getExtents());
+  mappingExtents.push_back(rowTiles);
+  mappingExtents.push_back(columnTiles);
+  SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
+                                       mapping.getLaunchExtents().end());
+  auto rowExpression = cast<PhysicalExprAttr>(
+      cast<ViewType>(lhsLoad.getResource().getType())
+          .getLayout()
+          .getExtents()[rowResourceAxis]);
+  auto columnExpression = cast<PhysicalExprAttr>(
+      cast<ViewType>(rhsLoad.getResource().getType())
+          .getLayout()
+          .getExtents()[columnResourceAxis]);
+  launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
+                                            rowExpression, unitM));
+  launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
+                                            columnExpression, unitN));
+  SmallVector<Type> mappingTypes(mapping.getResultTypes());
+  mappingTypes.push_back(mapBuilder.getIndexType());
+  mappingTypes.push_back(mapBuilder.getIndexType());
+  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
+      location, mappingTypes, mapping.getLinear(), mappingExtents,
+      mapBuilder.getArrayAttr(launchExtents));
+  for (StringRef attribute : {executionGroupAttr, segmentOffsetAttr})
+    if (Attribute value = mapping->getAttr(attribute))
+      expandedMapping->setAttr(attribute, value);
+  segmentLength = cast<PhysicalExprAttr>(launchExtents.front());
+  for (Attribute extent : llvm::drop_begin(launchExtents))
+    segmentLength = binaryExpression(context, PhysicalExprKind::Multiply,
+                                     segmentLength,
+                                     cast<PhysicalExprAttr>(extent));
+  expandedMapping->setAttr(segmentLengthAttr, segmentLength);
+  for (auto [oldCoordinate, newCoordinate] : llvm::zip(
+           mapping.getCoordinates(),
+           expandedMapping.getCoordinates().take_front(mapping.getNumResults())))
+    oldCoordinate.replaceAllUsesWith(newCoordinate);
+  unsigned physicalAxis = mapping.getNumResults();
+  Value rowTile = expandedMapping.getCoordinates()[physicalAxis++];
+  Value columnTile = expandedMapping.getCoordinates()[physicalAxis];
+  mapping.erase();
+  kernel->setAttr(programSpaceAttr,
+                  ArrayAttr::get(context, {segmentLength}));
+
+  OpBuilder builder(contract);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  Value rowStart = binary(
+      builder, location, builder.getIndexType(), rowRange->getStart(),
+      binary(builder, location, builder.getIndexType(), rowTile,
+             blockM.getResult(), 2),
+      0);
+  Value rowStop = binary(builder, location, builder.getIndexType(),
+                         rowRange->getStart(), rowRange->getExtent(), 0);
+  Value columnStart = binary(
+      builder, location, builder.getIndexType(), columnRange->getStart(),
+      binary(builder, location, builder.getIndexType(), columnTile,
+             blockN.getResult(), 2),
+      0);
+  Value columnStop = binary(builder, location, builder.getIndexType(),
+                            columnRange->getStart(), columnRange->getExtent(), 0);
+  Value blockStop = binary(builder, location, builder.getIndexType(),
+                           blockRange->getStart(), blockRange->getExtent(), 0);
+
+  FragmentType rowIndexType = fragmentType(
+      context, builder.getIndexType(), {unitM}, {*rowMap}, lhsType.getOwner());
+  FragmentType columnIndexType = fragmentType(
+      context, builder.getIndexType(), {unitN}, {*columnMap}, rhsType.getOwner());
+  FragmentType blockIndexType = fragmentType(
+      context, builder.getIndexType(), {unitK}, {*lhsBlockMap}, lhsType.getOwner());
+  FragmentType rowPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitM}, {*rowMap}, lhsType.getOwner());
+  FragmentType columnPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitN}, {*columnMap}, rhsType.getOwner());
+  FragmentType blockPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitK}, {*lhsBlockMap}, lhsType.getOwner());
+  PhysicalExprAttr unitInner = innerExtent;
+  FragmentType blockedLhsType = fragmentType(
+      context, lhsType.getElementType(), {unitM, unitK, unitInner},
+      {*rowMap, *lhsBlockMap, *lhsInnerMap}, lhsType.getOwner());
+  FragmentType blockedLhsScaleType = fragmentType(
+      context, lhsScaleType.getElementType(), {unitM, unitK},
+      {*lhsScaleRowMap, *lhsScaleBlockMap}, lhsScaleType.getOwner());
+  FragmentType blockedRhsType = fragmentType(
+      context, rhsType.getElementType(), {unitK, unitInner, unitN},
+      {*rhsBlockMap, *rhsInnerMap, *columnMap}, rhsType.getOwner());
+  FragmentType blockedRhsScaleType = fragmentType(
+      context, rhsScaleType.getElementType(), {unitK, unitN},
+      {*rhsScaleBlockMap, *rhsScaleColumnMap}, rhsScaleType.getOwner());
+  FragmentType blockedResultType = fragmentType(
+      context, resultType.getElementType(), {unitM, unitN},
+      {*rowMap, *columnMap}, resultType.getOwner());
+  FragmentType lhsPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitM, unitK, unitInner},
+      {*rowMap, *lhsBlockMap, *lhsInnerMap}, lhsType.getOwner());
+  FragmentType lhsScalePredicateType = fragmentType(
+      context, builder.getI1Type(), {unitM, unitK},
+      {*lhsScaleRowMap, *lhsScaleBlockMap}, lhsScaleType.getOwner());
+  FragmentType rhsPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitK, unitInner, unitN},
+      {*rhsBlockMap, *rhsInnerMap, *columnMap}, rhsType.getOwner());
+  FragmentType rhsScalePredicateType = fragmentType(
+      context, builder.getI1Type(), {unitK, unitN},
+      {*rhsScaleBlockMap, *rhsScaleColumnMap}, rhsScaleType.getOwner());
+  FragmentType outputPredicateType = fragmentType(
+      context, builder.getI1Type(), {unitM, unitN},
+      {*rowMap, *columnMap}, resultType.getOwner());
+
+  Value rows = builder.create<MakeRangeOp>(
+      location, rowIndexType, rowStart, blockM.getResult(), one,
+      rowMap->getSourceId(), rowMap->getSourceAxis());
+  Value columns = builder.create<MakeRangeOp>(
+      location, columnIndexType, columnStart, blockN.getResult(), one,
+      columnMap->getSourceId(), columnMap->getSourceAxis());
+  Value rowValid = compare(
+      builder, location, rowPredicateType, rows,
+      broadcast(builder, location, rowIndexType, rowStop), 2);
+  Value columnValid = compare(
+      builder, location, columnPredicateType, columns,
+      broadcast(builder, location, columnIndexType, columnStop), 2);
+  Value accumulator = builder.create<SplatOp>(
+      location, blockedResultType, *initialAccumulator);
+  bool loopBodyFailed = false;
+  auto loop = builder.create<scf::ForOp>(
+      location, blockRange->getStart(), blockStop, blockK.getResult(),
+      ValueRange{accumulator},
+      [&](OpBuilder &nested, Location nestedLocation, Value blockStart,
+          ValueRange carries) {
+        Value blocks = nested.create<MakeRangeOp>(
+            nestedLocation, blockIndexType, blockStart, blockK.getResult(), one,
+            lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis());
+        Value blockValid = compare(
+            nested, nestedLocation, blockPredicateType, blocks,
+            broadcast(nested, nestedLocation, blockIndexType, blockStop), 2);
+        Value lhsRows = broadcast(nested, nestedLocation, lhsPredicateType,
+                                  rowValid);
+        Value lhsBlocks = broadcast(nested, nestedLocation, lhsPredicateType,
+                                    blockValid);
+        Value lhsValid = binary(nested, nestedLocation, lhsPredicateType,
+                                lhsRows, lhsBlocks, 11);
+        Value lhsScaleRows = broadcast(
+            nested, nestedLocation, lhsScalePredicateType, rowValid);
+        Value lhsScaleBlocks = broadcast(
+            nested, nestedLocation, lhsScalePredicateType, blockValid);
+        Value lhsScaleValid = binary(
+            nested, nestedLocation, lhsScalePredicateType, lhsScaleRows,
+            lhsScaleBlocks, 11);
+        Value rhsBlocks = broadcast(nested, nestedLocation, rhsPredicateType,
+                                    blockValid);
+        Value rhsColumns = broadcast(nested, nestedLocation, rhsPredicateType,
+                                     columnValid);
+        Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
+                                rhsBlocks, rhsColumns, 11);
+        Value rhsScaleBlocks = broadcast(
+            nested, nestedLocation, rhsScalePredicateType, blockValid);
+        Value rhsScaleColumns = broadcast(
+            nested, nestedLocation, rhsScalePredicateType, columnValid);
+        Value rhsScaleValid = binary(
+            nested, nestedLocation, rhsScalePredicateType, rhsScaleBlocks,
+            rhsScaleColumns, 11);
+
+        SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
+        lhsCoordinates[*lhsRowCoordinate] = rows;
+        lhsCoordinates[*lhsBlockCoordinate] = blocks;
+        SmallVector<Value> lhsScaleCoordinates(lhsScaleLoad.getCoordinates());
+        lhsScaleCoordinates[*lhsScaleRowCoordinate] = rows;
+        lhsScaleCoordinates[*lhsScaleBlockCoordinate] = blocks;
+        SmallVector<Value> rhsCoordinates(rhsLoad.getCoordinates());
+        rhsCoordinates[*rhsBlockCoordinate] = blocks;
+        rhsCoordinates[*rhsColumnCoordinate] = columns;
+        SmallVector<Value> rhsScaleCoordinates(rhsScaleLoad.getCoordinates());
+        rhsScaleCoordinates[*rhsScaleBlockCoordinate] = blocks;
+        rhsScaleCoordinates[*rhsScaleColumnCoordinate] = columns;
+        FailureOr<Value> lhsFill = retargetFill(
+            nested, nestedLocation, lhsLoad.getFill(), blockedLhsType);
+        FailureOr<Value> lhsScaleFill = retargetFill(
+            nested, nestedLocation, lhsScaleLoad.getFill(),
+            blockedLhsScaleType);
+        FailureOr<Value> rhsFill = retargetFill(
+            nested, nestedLocation, rhsLoad.getFill(), blockedRhsType);
+        FailureOr<Value> rhsScaleFill = retargetFill(
+            nested, nestedLocation, rhsScaleLoad.getFill(),
+            blockedRhsScaleType);
+        if (failed(lhsFill) || failed(lhsScaleFill) || failed(rhsFill) ||
+            failed(rhsScaleFill)) {
+          loopBodyFailed = true;
+          return;
+        }
+        Value lhs = nested.create<LoadOp>(
+            nestedLocation, blockedLhsType, lhsLoad.getResource(),
+            lhsCoordinates, lhsValid, *lhsFill, lhsLoad.getSourceAxes());
+        Value lhsScale = nested.create<LoadOp>(
+            nestedLocation, blockedLhsScaleType, lhsScaleLoad.getResource(),
+            lhsScaleCoordinates, lhsScaleValid, *lhsScaleFill,
+            lhsScaleLoad.getSourceAxes());
+        Value rhs = nested.create<LoadOp>(
+            nestedLocation, blockedRhsType, rhsLoad.getResource(),
+            rhsCoordinates, rhsValid, *rhsFill, rhsLoad.getSourceAxes());
+        Value rhsScale = nested.create<LoadOp>(
+            nestedLocation, blockedRhsScaleType, rhsScaleLoad.getResource(),
+            rhsScaleCoordinates, rhsScaleValid, *rhsScaleFill,
+            rhsScaleLoad.getSourceAxes());
+        auto product = nested.create<ScaledContractOp>(
+            nestedLocation, blockedResultType, lhs, lhsScale, rhs, rhsScale,
+            carries.front(), ArrayRef<int64_t>{1, 2},
+            ArrayRef<int64_t>{0, 1}, ArrayRef<int64_t>{},
+            ArrayRef<int64_t>{}, contract.getLhsFormat(),
+            contract.getRhsFormat(), contract.getLhsGroupSize(),
+            contract.getRhsGroupSize());
+        if (Attribute origin = contract->getAttr(originAttr))
+          product->setAttr(originAttr, origin);
+        nested.create<scf::YieldOp>(nestedLocation, product.getResult());
+      });
+  if (loopBodyFailed) {
+    loop.erase();
+    return reject("blocked loop body could not be materialized");
+  }
+
+  Value outputRows = broadcast(builder, location, outputPredicateType, rowValid);
+  Value outputColumns =
+      broadcast(builder, location, outputPredicateType, columnValid);
+  Value outputValid = binary(builder, location, outputPredicateType, outputRows,
+                             outputColumns, 11);
+  for (StorePath &path : paths) {
+    Value output = loop.getResult(0);
+    for (CastOp conversion : path.casts) {
+      auto original = cast<FragmentType>(conversion.getResult().getType());
+      FragmentType converted = fragmentType(
+          context, original.getElementType(), {unitM, unitN},
+          {*rowMap, *columnMap}, original.getOwner());
+      output = builder.create<CastOp>(location, converted, output);
+    }
+    SmallVector<Value> coordinates(path.store.getCoordinates());
+    FailureOr<unsigned> storeRow = coordinateForSource(
+        path.store.getCoordinates(), rowMap->getSourceId());
+    FailureOr<unsigned> storeColumn = coordinateForSource(
+        path.store.getCoordinates(), columnMap->getSourceId());
+    if (failed(storeRow) || failed(storeColumn))
+      return path.store.emitOpError(
+          "blocked scaled-contract output lost source coordinates");
+    coordinates[*storeRow] = rows;
+    coordinates[*storeColumn] = columns;
+    auto replacement = builder.create<StoreOp>(
+        location, path.store.getResource(), coordinates, output, outputValid,
+        path.store.getSourceAxes(), path.store.getCollision());
+    if (Attribute origin = path.store->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+  }
+
+  for (StorePath &path : paths)
+    path.store.erase();
+  for (StorePath &path : paths)
+    for (CastOp conversion : llvm::reverse(path.casts))
+      if (conversion->getBlock() && conversion.getResult().use_empty())
+        conversion.erase();
+  if (contract->getBlock() && contract.getResult().use_empty())
+    contract.erase();
+  for (LoadOp load : {lhsLoad, lhsScaleLoad, rhsLoad, rhsScaleLoad})
+    if (load->getBlock() && load.getResult().use_empty())
+      load.erase();
+  eraseDeadPhysicalValues(kernel);
+  return success();
+}
+
 } // namespace
 
 LogicalResult realizeContractionBlocking(ModuleOp module) {
@@ -728,9 +1223,16 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
   SmallVector<ContractOp> contracts;
+  SmallVector<ScaledContractOp> scaledContracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
-  if (contracts.size() != 1) {
+  kernel.walk(
+      [&](ScaledContractOp contract) { scaledContracts.push_back(contract); });
+  if (contracts.size() + scaledContracts.size() != 1) {
     for (ContractOp contract : contracts)
+      if (requiresPhysicalRealization(contract))
+        return contract.emitOpError(
+            "joint blocking for multiple runtime-shaped contractions is not materialized");
+    for (ScaledContractOp contract : scaledContracts)
       if (requiresPhysicalRealization(contract))
         return contract.emitOpError(
             "joint blocking for multiple runtime-shaped contractions is not materialized");
@@ -738,6 +1240,9 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   }
   for (ContractOp contract : contracts)
     if (failed(realizeContract(contract, kernel)))
+      return failure();
+  for (ScaledContractOp contract : scaledContracts)
+    if (failed(realizeScaledContract(contract, kernel)))
       return failure();
   return success();
 }

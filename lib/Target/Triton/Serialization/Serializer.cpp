@@ -175,7 +175,10 @@ std::string literal(Attribute value) {
   if (auto floating = dyn_cast<FloatAttr>(value)) {
     std::ostringstream stream;
     stream << std::setprecision(17) << floating.getValueAsDouble();
-    return stream.str();
+    std::string result = stream.str();
+    if (result.find_first_of(".eE") == std::string::npos)
+      result += ".0";
+    return result;
   }
   return {};
 }
@@ -228,6 +231,14 @@ private:
         continue;
       }
       if (kind == "scalar" || kind == "constexpr" || kind == "value") {
+        if (kind == "constexpr") {
+          if (!argument.use_empty()) {
+            kernel.emitError(
+                "live constexpr reached Triton runtime ABI after specialization");
+            failed = true;
+          }
+          continue;
+        }
         scalars.push_back({static_cast<unsigned>(index), name, kind,
                            argument.getType()});
         continue;

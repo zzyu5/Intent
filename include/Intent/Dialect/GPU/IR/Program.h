@@ -56,6 +56,7 @@ enum class ParameterRole : uint32_t {
   ProviderWarps = 4,
   ProviderStages = 5,
   ProviderCTAs = 6,
+  ProviderThreads = 7,
 };
 
 } // namespace intent::gpu

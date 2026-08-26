@@ -1,0 +1,854 @@
+#include "Intent/Target/CuTile/Serialization/Serializer.h"
+
+#include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Target/CuTile/IR/CuTileOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <iomanip>
+#include <map>
+#include <numeric>
+#include <sstream>
+
+using namespace mlir;
+
+namespace intent::cutile {
+namespace {
+
+std::string pythonType(Type type, bool torch = false) {
+  if (type.isIndex())
+    return torch ? "torch.int64" : "ct.int32";
+  if (auto integer = dyn_cast<IntegerType>(type)) {
+    if (integer.getWidth() == 1)
+      return torch ? "torch.bool" : "ct.bool_";
+    StringRef prefix = integer.isUnsigned() ? "u" : "";
+    return ((torch ? "torch." : "ct.") + prefix + "int" +
+            Twine(integer.getWidth()))
+        .str();
+  }
+  if (isa<Float16Type>(type))
+    return torch ? "torch.float16" : "ct.float16";
+  if (isa<BFloat16Type>(type))
+    return torch ? "torch.bfloat16" : "ct.bfloat16";
+  if (isa<Float32Type>(type))
+    return torch ? "torch.float32" : "ct.float32";
+  if (isa<Float8E4M3FNType>(type))
+    return torch ? "torch.float8_e4m3fn" : "ct.float8_e4m3fn";
+  if (isa<Float8E5M2Type>(type))
+    return torch ? "torch.float8_e5m2" : "ct.float8_e5m2";
+  return {};
+}
+
+std::string expressionString(gpu::PhysicalExprAttr expression,
+                             bool configContext) {
+  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  if (kind == gpu::PhysicalExprKind::Constant)
+    return std::to_string(expression.getValue());
+  if (kind == gpu::PhysicalExprKind::Parameter)
+    return configContext ? ("cfg." + expression.getSymbol().getValue()).str()
+                         : expression.getSymbol().getValue().str();
+  if (kind == gpu::PhysicalExprKind::Dimension ||
+      kind == gpu::PhysicalExprKind::ScalarABI)
+    return expression.getSymbol().getValue().str();
+  SmallVector<std::string> operands;
+  for (Attribute operand : expression.getOperands())
+    operands.push_back(
+        expressionString(cast<gpu::PhysicalExprAttr>(operand), configContext));
+  if (kind == gpu::PhysicalExprKind::Add)
+    return "(" + operands[0] + " + " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::Subtract)
+    return "(" + operands[0] + " - " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::Multiply)
+    return "(" + operands[0] + " * " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::CeilDiv)
+    return "ct.cdiv(" + operands[0] + ", " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::Minimum)
+    return "min(" + operands[0] + ", " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::Maximum)
+    return "max(" + operands[0] + ", " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::FloorDiv)
+    return "(" + operands[0] + " // " + operands[1] + ")";
+  if (kind == gpu::PhysicalExprKind::Select)
+    return "(" + operands[1] + " if " + operands[0] + " else " +
+           operands[2] + ")";
+  if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
+    return "ct.next_power_of_2(" + operands[0] + ")";
+  return {};
+}
+
+std::string fragmentShape(gpu::FragmentType fragment) {
+  std::string result = "(";
+  for (auto [index, extent] : llvm::enumerate(fragment.getShape())) {
+    if (index)
+      result += ", ";
+    result += expressionString(cast<gpu::PhysicalExprAttr>(extent), false);
+  }
+  if (fragment.getShape().size() == 1)
+    result += ",";
+  return result + ")";
+}
+
+std::string literal(Attribute value) {
+  if (auto integer = dyn_cast<IntegerAttr>(value)) {
+    if (integer.getType().isInteger(1))
+      return integer.getInt() ? "True" : "False";
+    return std::to_string(integer.getInt());
+  }
+  if (auto floating = dyn_cast<FloatAttr>(value)) {
+    std::ostringstream stream;
+    stream << std::setprecision(17) << floating.getValueAsDouble();
+    std::string result = stream.str();
+    if (result.find_first_of(".eE") == std::string::npos)
+      result += ".0";
+    return result;
+  }
+  return {};
+}
+
+struct ParameterDomain {
+  std::string name;
+  SmallVector<int64_t> candidates;
+};
+
+FailureOr<SmallVector<std::map<std::string, int64_t>>>
+parameterConfigs(func::FuncOp kernel) {
+  SmallVector<ParameterDomain> domains;
+  llvm::StringSet<> names;
+  WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
+    auto schema = parameter.getParameter();
+    if (schema.getRole() >=
+        static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps)) {
+      parameter.emitOpError(
+          "cuTile source cannot bind a foreign provider parameter role");
+      return WalkResult::interrupt();
+    }
+    StringRef name = schema.getName().getValue();
+    if (!names.insert(name).second) {
+      parameter.emitOpError("duplicates a cuTile physical parameter");
+      return WalkResult::interrupt();
+    }
+    domains.push_back(
+        {name.str(), SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+  SmallVector<std::map<std::string, int64_t>> configs(1);
+  for (const ParameterDomain &domain : domains) {
+    SmallVector<std::map<std::string, int64_t>> expanded;
+    for (const auto &base : configs)
+      for (int64_t candidate : domain.candidates) {
+        auto next = base;
+        next[domain.name] = candidate;
+        expanded.push_back(std::move(next));
+      }
+    configs = std::move(expanded);
+  }
+  return configs;
+}
+
+class Serializer {
+public:
+  Serializer(func::FuncOp kernel, raw_ostream &output)
+      : kernel(kernel), output(output) {}
+
+  LogicalResult emit() {
+    bindArguments();
+    emitPreamble();
+    emitKernel();
+    emitLaunch();
+    emitRun();
+    return failed ? failure() : success();
+  }
+
+private:
+  struct ViewABI {
+    unsigned argument;
+    std::string name;
+    gpu::ViewType type;
+  };
+  struct MetadataABI {
+    unsigned argument;
+    std::string name;
+    std::string kind;
+    unsigned sourceABI;
+    unsigned sourceAxis;
+    int64_t dimension;
+  };
+  struct ScalarABI {
+    unsigned argument;
+    std::string name;
+    std::string kind;
+    Type type;
+  };
+
+  void bindArguments() {
+    for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
+      DictionaryAttr attrs = kernel.getArgAttrDict(index);
+      std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
+      std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
+      values[argument] = name;
+      if (kind == "view") {
+        views.push_back({static_cast<unsigned>(index), name,
+                         cast<gpu::ViewType>(argument.getType())});
+      } else if (kind == "scalar" || kind == "constexpr" || kind == "value") {
+        if (kind == "constexpr") {
+          if (!argument.use_empty()) {
+            kernel.emitError(
+                "live constexpr reached cuTile runtime ABI after specialization");
+            failed = true;
+          }
+          continue;
+        }
+        scalars.push_back({static_cast<unsigned>(index), name, kind,
+                           argument.getType()});
+      } else {
+        MetadataABI metadata{
+            static_cast<unsigned>(index), name, kind,
+            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceABIAttr).getInt()),
+            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceAxisAttr).getInt()),
+            attrs.getAs<IntegerAttr>(gpu::dimensionAttr)
+                ? attrs.getAs<IntegerAttr>(gpu::dimensionAttr).getInt()
+                : 0};
+        metadataArguments.push_back(metadata);
+        if (kind == "dimension")
+          dimensionBindings[metadata.dimension] = metadata;
+      }
+    }
+  }
+
+  void emitPreamble() {
+    output << "from types import SimpleNamespace\n"
+              "import torch\n"
+              "import cuda.tile as ct\n"
+              "from cuda.tile.tune import exhaustive_search\n\n"
+              "ConstInt = ct.Constant[int]\n\n";
+  }
+
+  void emitKernel() {
+    output << "@ct.kernel\ndef _intent_kernel(";
+    bool first = true;
+    auto argument = [&](StringRef text) {
+      if (!first)
+        output << ", ";
+      first = false;
+      output << text;
+    };
+    for (const ViewABI &view : views)
+      argument(view.name);
+    for (const ScalarABI &scalar : scalars)
+      argument(scalar.name + (scalar.kind == "constexpr" ? ": ConstInt" : ""));
+    for (const MetadataABI &metadata : metadataArguments)
+      argument(metadata.name + ": ConstInt");
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      std::string name = parameter.getParameter().getName().getValue().str();
+      values[parameter.getResult()] = name;
+      argument(name + ": ConstInt");
+    });
+    output << "):\n";
+    indent = 1;
+    emitBlock(kernel.getBody().front(), false, {});
+    output << "\n";
+  }
+
+  void emitLaunch() {
+    FailureOr<SmallVector<std::map<std::string, int64_t>>> configs =
+        parameterConfigs(kernel);
+    if (mlir::failed(configs)) {
+      failed = true;
+      return;
+    }
+    output << "_CONFIGS = (\n";
+    for (const auto &config : *configs) {
+      output << "    SimpleNamespace(";
+      for (auto [index, item] : llvm::enumerate(config)) {
+        if (index)
+          output << ", ";
+        output << item.first << "=" << item.second;
+      }
+      output << "),\n";
+    }
+    output << ")\n_TUNE_CACHE = {}\n\ndef launch(" << joinViewNames(views);
+    for (const ScalarABI &scalar : scalars)
+      output << (views.empty() && &scalar == &scalars.front() ? "" : ", ")
+             << scalar.name;
+    output << "):\n";
+    for (const MetadataABI &metadata : metadataArguments) {
+      const ViewABI &source = viewByABI(metadata.sourceABI);
+      line(metadata.name + " = " + source.name +
+               (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
+               std::to_string(metadata.sourceAxis) +
+               (metadata.kind == "dimension" ? "]" : ")"),
+           1);
+    }
+    std::string key = "key = (";
+    for (const ViewABI &view : views)
+      key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
+             view.name + ".device), ";
+    for (const ScalarABI &scalar : scalars)
+      key += scalar.name + ", ";
+    line(key + ")", 1);
+    line("stream = torch.cuda.current_stream()", 1);
+    line("if key not in _TUNE_CACHE:", 1);
+    auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
+    std::string grid = "lambda cfg: (";
+    for (Attribute extent : space)
+      grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true) + ", ";
+    grid += "1, 1)";
+    line("result = exhaustive_search(_CONFIGS, stream, " + grid +
+             ", _intent_kernel, lambda cfg: (" + joinKernelArguments("cfg") +
+             "), quiet=True)",
+         2);
+    line("_TUNE_CACHE[key] = result.best.config", 2);
+    line("cfg = _TUNE_CACHE[key]", 1);
+    std::string launchGrid = "(";
+    for (Attribute extent : space)
+      launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true) +
+                    ", ";
+    launchGrid += "1, 1)";
+    line("return ct.launch(stream, " + launchGrid + ", _intent_kernel, (" +
+             joinKernelArguments("cfg") + "))",
+         1);
+    output << "\n";
+  }
+
+  void emitRun() {
+    SmallVector<ViewABI> inputs;
+    SmallVector<ViewABI> outputs;
+    for (const ViewABI &view : views) {
+      if (view.type.getAccess() != 1)
+        inputs.push_back(view);
+      if (view.type.getAccess() == 1)
+        outputs.push_back(view);
+    }
+    output << "def run(" << joinViewNames(inputs);
+    for (const ScalarABI &scalar : scalars)
+      output << (inputs.empty() && &scalar == &scalars.front() ? "" : ", ")
+             << scalar.name;
+    output << "):\n";
+    std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
+    for (const ViewABI &view : outputs) {
+      std::string shape = outputShape(view);
+      line(view.name + " = torch.empty(" + shape + ", device=" + device +
+               ", dtype=" + pythonType(view.type.getElementType(), true) + ")",
+           1);
+    }
+    line("launch(" + joinLaunchArguments() + ")", 1);
+    if (outputs.empty())
+      line("return None", 1);
+    else if (outputs.size() == 1)
+      line("return " + outputs.front().name, 1);
+    else
+      line("return (" + joinViewNames(outputs) + ")", 1);
+  }
+
+  void emitBlock(Block &block, bool isLoop,
+                 ArrayRef<std::string> loopResults) {
+    for (Operation &operation : block) {
+      if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
+        if (isLoop)
+          for (auto [name, value] : llvm::zip(loopResults, yield.getOperands()))
+            line(name + " = " + valueString(value));
+        continue;
+      }
+      if (isa<func::ReturnOp>(operation))
+        continue;
+      emitOperation(operation);
+    }
+  }
+
+  void emitOperation(Operation &operation) {
+    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
+      values[constant.getResult()] = literal(constant.getValue());
+    } else if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
+      values[parameter.getResult()] =
+          parameter.getParameter().getName().getValue().str();
+    } else if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
+      assign(physical.getResult(), expressionString(physical.getExpression(), false));
+    } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
+      assign(program.getResult(), "ct.bid(" + std::to_string(program.getAxis()) + ")");
+    } else if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
+      auto extent = cast<gpu::PhysicalExprAttr>(
+          dim.getView().getType().getLayout().getExtents()[dim.getAxis()]);
+      assign(dim.getResult(), expressionString(extent, false));
+    } else if (auto range = dyn_cast<gpu::RangeOp>(operation)) {
+      assign(range.getResult(), "(" + valueString(range.getStart()) + ", " +
+                                    valueString(range.getStop()) + ", " +
+                                    valueString(range.getStep()) + ")");
+    } else if (auto bound = dyn_cast<gpu::RangeBoundOp>(operation)) {
+      assign(bound.getResult(), valueString(bound.getRange()) + "[" +
+                                    std::to_string(bound.getBound()) + "]");
+    } else if (auto mapping = dyn_cast<gpu::DelinearizeOp>(operation)) {
+      std::string remaining = valueString(mapping.getLinear());
+      SmallVector<std::string> coordinates(mapping.getNumResults());
+      for (int64_t axis = mapping.getNumResults() - 1; axis >= 0; --axis) {
+        std::string extent = valueString(mapping.getExtents()[axis]);
+        coordinates[axis] = "(" + remaining + " % " + extent + ")";
+        remaining = "(" + remaining + " // " + extent + ")";
+      }
+      for (auto [coordinate, text] : llvm::zip(mapping.getCoordinates(), coordinates))
+        assign(coordinate, text);
+    } else if (auto binary = dyn_cast<gpu::BinaryOp>(operation)) {
+      assign(binary.getResult(), binaryExpression(binary));
+    } else if (auto unary = dyn_cast<gpu::UnaryOp>(operation)) {
+      assign(unary.getResult(), unaryExpression(unary));
+    } else if (auto compare = dyn_cast<gpu::CompareOp>(operation)) {
+      static constexpr const char *predicates[] = {"==", "!=", "<", "<=", ">", ">="};
+      assign(compare.getResult(), "(" + valueString(compare.getLhs()) + " " +
+                                      predicates[compare.getPredicate()] + " " +
+                                      valueString(compare.getRhs()) + ")");
+    } else if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
+      assign(range.getResult(), "(" + valueString(range.getStart()) +
+                                    " + ct.arange(" + valueString(range.getExtent()) +
+                                    ", dtype=ct.int32) * " +
+                                    valueString(range.getStep()) + ")");
+    } else if (auto splat = dyn_cast<gpu::SplatOp>(operation)) {
+      auto type = splat.getResult().getType();
+      assign(splat.getResult(), "ct.full(" + fragmentShape(type) + ", " +
+                                    valueString(splat.getValue()) + ", dtype=" +
+                                    pythonType(type.getElementType()) + ")");
+    } else if (auto broadcast = dyn_cast<gpu::BroadcastOp>(operation)) {
+      assign(broadcast.getResult(), broadcastValue(broadcast.getValue(),
+                                                   broadcast.getResult().getType()));
+    } else if (auto cast = dyn_cast<gpu::CastOp>(operation)) {
+      assign(cast.getResult(), "ct.astype(" + valueString(cast.getValue()) +
+                                   ", " + pythonType(elementType(cast.getResult().getType())) +
+                                   ")");
+    } else if (auto bitcast = dyn_cast<gpu::BitcastOp>(operation)) {
+      assign(bitcast.getResult(), "ct.bitcast(" + valueString(bitcast.getValue()) +
+                                      ", " +
+                                      pythonType(elementType(bitcast.getResult().getType())) +
+                                      ")");
+    } else if (auto reshape = dyn_cast<gpu::ReshapeOp>(operation)) {
+      assign(reshape.getResult(), "ct.reshape(" + valueString(reshape.getValue()) +
+                                      ", " +
+                                      fragmentShape(mlir::cast<gpu::FragmentType>(
+                                          reshape.getResult().getType())) +
+                                      ")");
+    } else if (auto transpose = dyn_cast<gpu::TransposeOp>(operation)) {
+      std::string permutation = "(";
+      for (auto [index, axis] : llvm::enumerate(transpose.getPermutation())) {
+        if (index)
+          permutation += ", ";
+        permutation += std::to_string(axis);
+      }
+      if (transpose.getPermutation().size() == 1)
+        permutation += ",";
+      permutation += ")";
+      assign(transpose.getResult(), "ct.permute(" +
+                                        valueString(transpose.getValue()) + ", " +
+                                        permutation + ")");
+    } else if (auto join = dyn_cast<gpu::JoinOp>(operation)) {
+      auto input = join.getLhs().getType();
+      std::string expanded = "(";
+      for (Attribute extent : input.getShape())
+        expanded += expressionString(
+                        mlir::cast<gpu::PhysicalExprAttr>(extent), false) +
+                    ", ";
+      expanded += "1)";
+      assign(join.getResult(),
+             "ct.cat((ct.reshape(" + valueString(join.getLhs()) + ", " +
+                 expanded + "), ct.reshape(" + valueString(join.getRhs()) +
+                 ", " + expanded + ")), axis=" +
+                 std::to_string(join.getAxis()) + ")");
+    } else if (auto record = dyn_cast<gpu::MakeRecordOp>(operation)) {
+      values[record.getResult()] = tuple(record.getFields());
+    } else if (auto extract = dyn_cast<gpu::ExtractOp>(operation)) {
+      assign(extract.getResult(), valueString(extract.getRecord()) + "[" +
+                                      std::to_string(extract.getField()) + "]");
+    } else if (auto select = dyn_cast<gpu::SelectOp>(operation)) {
+      assign(select.getResult(), "ct.where(" + valueString(select.getCondition()) +
+                                      ", " + valueString(select.getTrueValue()) +
+                                      ", " + valueString(select.getFalseValue()) + ")");
+    } else if (auto load = dyn_cast<TileLoadOp>(operation)) {
+      std::string call = "ct.load(" + valueString(load.getResource()) +
+                         ", index=" + tuple(load.getTileIndices()) +
+                         ", shape=" + fragmentShape(load.getResult().getType()) +
+                         ", padding_mode=ct.PaddingMode.ZERO)";
+      if (load.getValid())
+        call = "ct.where(" + valueString(load.getValid()) + ", " + call +
+               ", " + valueString(load.getFill()) + ")";
+      assign(load.getResult(), call);
+    } else if (auto load = dyn_cast<ScalarLoadOp>(operation)) {
+      std::string call = "ct.gather(" + valueString(load.getResource()) + ", " +
+                         tuple(load.getIndices());
+      if (load.getValid())
+        call += ", mask=" + valueString(load.getValid()) +
+                ", padding_value=" + valueString(load.getFill());
+      call += ", check_bounds=True)";
+      assign(load.getResult(), call);
+    } else if (auto gather = dyn_cast<GatherLoadOp>(operation)) {
+      std::string call = "ct.gather(" + valueString(gather.getResource()) +
+                         ", " + tuple(gather.getCoordinates());
+      if (gather.getValid())
+        call += ", mask=" + valueString(gather.getValid());
+      if (gather.getFill())
+        call += ", padding_value=" + valueString(gather.getFill());
+      call += ", check_bounds=True)";
+      assign(gather.getResult(), call);
+    } else if (auto mma = dyn_cast<MMAOp>(operation)) {
+      assign(mma.getResult(), "ct.mma(" + valueString(mma.getLhs()) + ", " +
+                                   valueString(mma.getRhs()) + ", " +
+                                   valueString(mma.getAccumulator()) + ")");
+    } else if (auto mma = dyn_cast<ScaledMMAOp>(operation)) {
+      auto lhs = mma.getLhs().getType();
+      auto rhs = mma.getRhs().getType();
+      std::string lhsK =
+          "(" + expressionString(
+                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[1]), false) +
+          " * " + expressionString(
+                        mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[2]),
+                        false) +
+          ")";
+      std::string rhsK =
+          "(" + expressionString(
+                     mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[0]), false) +
+          " * " + expressionString(
+                        mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[1]),
+                        false) +
+          ")";
+      std::string lhsShape =
+          "(" + expressionString(
+                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[0]), false) +
+          ", " + lhsK + ")";
+      std::string rhsShape =
+          "(" + rhsK + ", " +
+          expressionString(
+              mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[2]), false) +
+          ")";
+      assign(mma.getResult(),
+             "ct.mma_scaled(ct.reshape(" + valueString(mma.getLhs()) + ", " +
+                 lhsShape + "), ct.bitcast(" + valueString(mma.getLhsScale()) +
+                 ", ct.float8_e8m0fnu)" +
+                 ", ct.reshape(" + valueString(mma.getRhs()) + ", " + rhsShape +
+                 "), ct.bitcast(" + valueString(mma.getRhsScale()) +
+                 ", ct.float8_e8m0fnu), " +
+                 valueString(mma.getAccumulator()) + ")");
+    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      static constexpr const char *functions[] = {"ct.sum", "ct.max", "ct.min"};
+      assign(reduce.getResult(),
+             std::string(functions[reduce.getKind()]) + "(" +
+                 valueString(reduce.getSource()) + ", axis=" +
+                 std::to_string(reduce.getAxis()) + ")");
+    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
+      assign(scan.getResult(), "ct.cumsum(" + valueString(scan.getSource()) +
+                                   ", axis=" + std::to_string(scan.getAxis()) +
+                                   ", reverse=" +
+                                   (scan.getReverse() ? "True" : "False") + ")");
+    } else if (auto atomic = dyn_cast<AtomicRMWOp>(operation)) {
+      static constexpr const char *operations[] = {
+          "xchg", "add", "max", "min", "and", "or", "xor"};
+      static constexpr const char *orders[] = {
+          "RELAXED", "ACQUIRE", "RELEASE", "ACQ_REL"};
+      static constexpr const char *scopes[] = {"BLOCK", "DEVICE", "SYS"};
+      assign(atomic.getResult(),
+             "ct.atomic_" + std::string(operations[atomic.getKind()]) + "(" +
+                 valueString(atomic.getResource()) + ", " +
+                 tuple(atomic.getCoordinates()) + ", " +
+                 valueString(atomic.getValue()) +
+                 ", check_bounds=True, memory_order=ct.MemoryOrder." +
+                 orders[atomic.getOrdering()] +
+                 ", memory_scope=ct.MemoryScope." +
+                 scopes[atomic.getSharing()] + ")");
+    } else if (auto extract = dyn_cast<ExtractScalarOp>(operation)) {
+      std::string shape = "(";
+      for (unsigned axis = 0;
+           axis < extract.getSource().getType().getShape().size(); ++axis)
+        shape += "1, ";
+      shape += ")";
+      std::string indices = "(";
+      for (auto [index, coordinate] : llvm::enumerate(extract.getCoordinates())) {
+        if (index)
+          indices += ", ";
+        indices += extract.getValid()
+                       ? "ct.where(" + valueString(extract.getValid()) + ", " +
+                             valueString(coordinate) + ", 0)"
+                       : valueString(coordinate);
+      }
+      if (extract.getCoordinates().size() == 1)
+        indices += ",";
+      indices += ")";
+      std::string result = "ct.extract(" + valueString(extract.getSource()) +
+                           ", index=" + indices + ", shape=" + shape +
+                           ").item()";
+      if (extract.getValid())
+        result = "ct.where(" + valueString(extract.getValid()) + ", " + result +
+                 ", " + valueString(extract.getFill()) + ")";
+      assign(extract.getResult(), result);
+    } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
+      line("ct.store(" + valueString(store.getResource()) + ", index=" +
+           tuple(store.getTileIndices()) + ", tile=" +
+           valueString(store.getValue()) + ")");
+    } else if (auto store = dyn_cast<ScalarStoreOp>(operation)) {
+      std::string call = "ct.store(" + valueString(store.getResource()) +
+                         ", index=" + tuple(store.getIndices()) + ", tile=" +
+                         valueString(store.getValue());
+      if (store.getValid())
+        call += ", mask=" + valueString(store.getValid());
+      line(call + ")");
+    } else if (auto scatter = dyn_cast<ScatterStoreOp>(operation)) {
+      std::string call = "ct.scatter(" + valueString(scatter.getResource()) +
+                         ", " + tuple(scatter.getCoordinates()) +
+                         ", " +
+                         valueString(scatter.getValue());
+      if (scatter.getValid())
+        call += ", mask=" + valueString(scatter.getValid());
+      line(call + ", check_bounds=True)");
+    } else if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      SmallVector<std::string> results;
+      for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {
+        std::string name = newName();
+        values[result] = name;
+        line(name + " = " + valueString(initial));
+        results.push_back(name);
+      }
+      std::string induction = "iv" + std::to_string(counter++);
+      values[loop.getInductionVar()] = induction;
+      for (auto [argument, name] : llvm::zip(loop.getRegionIterArgs(), results))
+        values[argument] = name;
+      line("for " + induction + " in range(ct.astype(" +
+           valueString(loop.getLowerBound()) + ", ct.int32), ct.astype(" +
+           valueString(loop.getUpperBound()) + ", ct.int32), ct.astype(" +
+           valueString(loop.getStep()) + ", ct.int32)):");
+      ++indent;
+      emitBlock(*loop.getBody(), true, results);
+      --indent;
+    } else {
+      operation.emitOpError("has no terminal cuTile spelling");
+      failed = true;
+    }
+  }
+
+  Type elementType(Type type) const {
+    if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+      return fragment.getElementType();
+    return type;
+  }
+
+  std::string binaryExpression(gpu::BinaryOp binary) {
+    static constexpr const char *operators[] = {
+        "+", "-", "*", "/", "//", "%", "**", nullptr, nullptr,
+        nullptr, nullptr, "&", "|", "&", "|", "^", "<<", ">>"};
+    uint64_t kind = binary.getOperatorKind();
+    if (kind == 7 || kind == 9)
+      return "ct.maximum(" + valueString(binary.getLhs()) + ", " +
+             valueString(binary.getRhs()) + ")";
+    if (kind == 8 || kind == 10)
+      return "ct.minimum(" + valueString(binary.getLhs()) + ", " +
+             valueString(binary.getRhs()) + ")";
+    return "(" + valueString(binary.getLhs()) + " " + operators[kind] + " " +
+           valueString(binary.getRhs()) + ")";
+  }
+
+  std::string unaryExpression(gpu::UnaryOp unary) {
+    std::string input = valueString(unary.getInput());
+    static constexpr const char *functions[] = {
+        nullptr, nullptr, "ct.exp", "ct.exp2", "ct.log", "ct.sin", "ct.cos",
+        "ct.floor", "ct.erf", "ct.rsqrt", "ct.sigmoid", "ct.tanh", "ct.abs"};
+    if (unary.getOperatorKind() == 0)
+      return "(-" + input + ")";
+    if (unary.getOperatorKind() == 1)
+      return "(~" + input + ")";
+    return std::string(functions[unary.getOperatorKind()]) + "(" + input + ")";
+  }
+
+  std::string broadcastValue(Value value, gpu::FragmentType target) {
+    auto source = dyn_cast<gpu::FragmentType>(value.getType());
+    if (!source || source == target)
+      return valueString(value);
+    SmallVector<int64_t> targetForSource(source.getShape().size(), -1);
+    for (auto [sourceIndex, sourceMapping] :
+         llvm::enumerate(source.getAxisMaps())) {
+      auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
+      for (auto [targetIndex, targetMapping] :
+           llvm::enumerate(target.getAxisMaps())) {
+        auto targetAxis = cast<gpu::AxisMapAttr>(targetMapping);
+        if (sourceAxis.getSourceId() == targetAxis.getSourceId() &&
+            sourceAxis.getSourceAxis() == targetAxis.getSourceAxis()) {
+          targetForSource[sourceIndex] = targetIndex;
+          break;
+        }
+      }
+      if (targetForSource[sourceIndex] < 0) {
+        failed = true;
+        return "<unmapped-cutile-broadcast>";
+      }
+    }
+
+    SmallVector<unsigned> sourceOrder(source.getShape().size());
+    std::iota(sourceOrder.begin(), sourceOrder.end(), 0);
+    llvm::sort(sourceOrder, [&](unsigned lhs, unsigned rhs) {
+      return targetForSource[lhs] < targetForSource[rhs];
+    });
+    std::string input = valueString(value);
+    bool permuted = llvm::any_of(
+        llvm::enumerate(sourceOrder),
+        [](auto item) { return item.index() != item.value(); });
+    if (permuted) {
+      std::string permutation = "(";
+      for (unsigned axis : sourceOrder)
+        permutation += std::to_string(axis) + ", ";
+      permutation += ")";
+      input = "ct.permute(" + input + ", " + permutation + ")";
+    }
+
+    std::string reshape = "(";
+    unsigned orderedSource = 0;
+    for (unsigned targetAxis = 0; targetAxis < target.getShape().size();
+         ++targetAxis) {
+      if (orderedSource < sourceOrder.size() &&
+          targetForSource[sourceOrder[orderedSource]] ==
+              static_cast<int64_t>(targetAxis)) {
+        reshape += expressionString(
+                       cast<gpu::PhysicalExprAttr>(
+                           source.getShape()[sourceOrder[orderedSource]]),
+                       false) +
+                   ", ";
+        ++orderedSource;
+      } else {
+        reshape += "1, ";
+      }
+    }
+    reshape += ")";
+    return "ct.broadcast_to(ct.reshape(" + input + ", " + reshape + "), " +
+           fragmentShape(target) + ")";
+  }
+
+  std::string tuple(ValueRange valuesRange) {
+    std::string result = "(";
+    for (auto [index, value] : llvm::enumerate(valuesRange)) {
+      if (index)
+        result += ", ";
+      result += valueString(value);
+    }
+    if (valuesRange.size() == 1)
+      result += ",";
+    return result + ")";
+  }
+
+  std::string outputShape(const ViewABI &view) {
+    std::string shape = "(";
+    auto ids = view.type.getLayout().getDimensionIds();
+    auto extents = view.type.getLayout().getExtents();
+    for (auto [axis, dimension] : llvm::enumerate(ids.asArrayRef())) {
+      if (axis)
+        shape += ", ";
+      auto extent = cast<gpu::PhysicalExprAttr>(extents[axis]);
+      if (extent.getKind() ==
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
+        shape += std::to_string(extent.getValue());
+      } else {
+        const MetadataABI &metadata = dimensionBindings.lookup(dimension);
+        const ViewABI &source = viewByABI(metadata.sourceABI);
+        shape += source.name + ".shape[" + std::to_string(metadata.sourceAxis) + "]";
+      }
+    }
+    if (ids.size() == 1)
+      shape += ",";
+    return shape + ")";
+  }
+
+  std::string joinKernelArguments(StringRef configName) {
+    std::string result = joinViewNames(views);
+    for (const ScalarABI &scalar : scalars) {
+      if (!result.empty())
+        result += ", ";
+      result += scalar.name;
+    }
+    for (const MetadataABI &metadata : metadataArguments)
+      result += ", " + metadata.name;
+    SmallVector<std::string> parameters;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      parameters.push_back(parameter.getParameter().getName().getValue().str());
+    });
+    for (StringRef parameter : parameters)
+      result += ", " + configName.str() + "." + parameter.str();
+    return result;
+  }
+
+  std::string valueString(Value value) {
+    auto found = values.find(value);
+    if (found == values.end()) {
+      failed = true;
+      return "<missing>";
+    }
+    return found->second;
+  }
+
+  void assign(Value value, const std::string &expression) {
+    std::string name = newName();
+    values[value] = name;
+    line(name + " = " + expression);
+  }
+
+  std::string newName() { return "v" + std::to_string(counter++); }
+
+  void line(const std::string &text, unsigned explicitIndent = ~0U) {
+    unsigned level = explicitIndent == ~0U ? indent : explicitIndent;
+    output.indent(level * 4) << text << "\n";
+  }
+
+  const ViewABI &viewByABI(unsigned abi) const {
+    for (const ViewABI &view : views)
+      if (view.type.getAbiIndex() == abi)
+        return view;
+    llvm_unreachable("verified metadata references a missing view ABI");
+  }
+
+  template <typename Range>
+  std::string joinViewNames(const Range &range) const {
+    std::string result;
+    for (auto [index, view] : llvm::enumerate(range)) {
+      if (index)
+        result += ", ";
+      result += view.name;
+    }
+    return result;
+  }
+
+  std::string joinLaunchArguments() const {
+    std::string result = joinViewNames(views);
+    for (const ScalarABI &scalar : scalars) {
+      if (!result.empty())
+        result += ", ";
+      result += scalar.name;
+    }
+    return result;
+  }
+
+  func::FuncOp kernel;
+  raw_ostream &output;
+  llvm::DenseMap<Value, std::string> values;
+  SmallVector<ViewABI> views;
+  SmallVector<ScalarABI> scalars;
+  SmallVector<MetadataABI> metadataArguments;
+  llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
+  unsigned indent = 0;
+  unsigned counter = 0;
+  bool failed = false;
+};
+
+} // namespace
+
+LogicalResult serializeProgram(ModuleOp module, std::string &source) {
+  FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
+  if (!(*kernel)->hasAttr("intent_cutile.legalized"))
+    return (*kernel).emitError("cuTile program was not provider-legalized");
+  llvm::raw_string_ostream stream(source);
+  Serializer serializer(*kernel, stream);
+  LogicalResult result = serializer.emit();
+  stream.flush();
+  return result;
+}
+
+} // namespace intent::cutile

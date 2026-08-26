@@ -2,6 +2,12 @@
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
+#include "Intent/Target/CuTile/IR/CuTileDialect.h"
+#include "Intent/Target/CuTile/Serialization/Serializer.h"
+#include "Intent/Target/CuTile/Transforms/Passes.h"
+#include "Intent/Target/TileLang/IR/TileLangDialect.h"
+#include "Intent/Target/TileLang/Serialization/Serializer.h"
+#include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
 #include "Intent/Transforms/Passes.h"
@@ -69,9 +75,13 @@ int main(int argc, char **argv) {
   (void)device;
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
-  registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect>();
+  registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,
+                  intent::cutile::IntentCuTileDialect,
+                  intent::tilelang::IntentTileLangDialect>();
   mlir::MLIRContext context(registry);
   context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
+                      intent::cutile::IntentCuTileDialect,
+                      intent::tilelang::IntentTileLangDialect,
                       mlir::arith::ArithDialect, mlir::func::FuncDialect,
                       mlir::scf::SCFDialect>();
 
@@ -87,14 +97,29 @@ int main(int argc, char **argv) {
   }
   if (mlir::failed(intent::gpu::runSharedGPUPasses(*module)))
     return exitCode(ExitCode::PhysicalProgramVerification);
-  if (target != TargetKind::Triton) {
-    llvm::errs() << "selected provider is not implemented in this reconstruction round\n";
-    return exitCode(ExitCode::ProviderProgram);
-  }
-  if (mlir::failed(intent::triton::legalizeGPUProgram(*module)))
-    return exitCode(ExitCode::ProviderProgramVerification);
   std::string source;
-  if (mlir::failed(intent::triton::serializeProgram(*module, source)))
+  mlir::LogicalResult provider = mlir::failure();
+  mlir::LogicalResult serialized = mlir::failure();
+  switch (target) {
+  case TargetKind::Triton:
+    provider = intent::triton::legalizeGPUProgram(*module);
+    if (mlir::succeeded(provider))
+      serialized = intent::triton::serializeProgram(*module, source);
+    break;
+  case TargetKind::CuTile:
+    provider = intent::cutile::legalizeGPUProgram(*module);
+    if (mlir::succeeded(provider))
+      serialized = intent::cutile::serializeProgram(*module, source);
+    break;
+  case TargetKind::TileLang:
+    provider = intent::tilelang::legalizeGPUProgram(*module);
+    if (mlir::succeeded(provider))
+      serialized = intent::tilelang::serializeProgram(*module, source);
+    break;
+  }
+  if (mlir::failed(provider))
+    return exitCode(ExitCode::ProviderProgramVerification);
+  if (mlir::failed(serialized))
     return exitCode(ExitCode::TerminalTranslation);
   if (irOutputFilename.empty() || sourceOutputFilename.empty()) {
     llvm::errs() << "both --ir-output and --source-output are required\n";
