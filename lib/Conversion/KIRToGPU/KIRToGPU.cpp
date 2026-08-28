@@ -141,15 +141,22 @@ bool sameRowMajorElementCount(FragmentType lhs, FragmentType rhs) {
          left.orderedTerms == right.orderedTerms;
 }
 
+struct PhysicalAxisIdentity {
+  uint64_t sourceId;
+  uint32_t sourceAxis;
+  int64_t dimensionId;
+};
+
 FragmentType fragmentType(MLIRContext *context, Type element,
                           ArrayRef<PhysicalExprAttr> shape,
-                          ArrayRef<std::pair<uint64_t, uint32_t>> axes,
+                          ArrayRef<PhysicalAxisIdentity> axes,
                           uint64_t owner = 1) {
   SmallVector<Attribute> extents(shape.begin(), shape.end());
   SmallVector<Attribute> mappings;
   for (auto [fragmentAxis, mapping] : llvm::enumerate(axes))
-    mappings.push_back(AxisMapAttr::get(context, mapping.first, mapping.second,
-                                        fragmentAxis));
+    mappings.push_back(AxisMapAttr::get(
+        context, mapping.sourceId, mapping.sourceAxis, mapping.dimensionId,
+        fragmentAxis));
   return FragmentType::get(context, element, ArrayAttr::get(context, extents),
                            ArrayAttr::get(context, mappings), 1, owner);
 }
@@ -242,47 +249,6 @@ bool dependsOnLoopCarry(Value root) {
   return false;
 }
 
-llvm::SmallDenseSet<uint64_t> explicitRangeSources(Value value) {
-  auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
-  if (!fragment)
-    return {};
-  auto dependsOnRange = [&](Value root, uint64_t sourceId) {
-    SmallVector<Value> worklist{root};
-    llvm::SmallDenseSet<Value> visited;
-    while (!worklist.empty()) {
-      Value current = worklist.pop_back_val();
-      if (!visited.insert(current).second)
-        continue;
-      if (auto range = current.getDefiningOp<gpu::MakeRangeOp>()) {
-        if (range.getSourceId() == sourceId)
-          return true;
-      }
-      if (auto argument = dyn_cast<BlockArgument>(current)) {
-        auto loop = dyn_cast_or_null<scf::ForOp>(
-            argument.getOwner()->getParentOp());
-        if (loop) {
-          for (auto [index, iterArgument] :
-               llvm::enumerate(loop.getRegionIterArgs()))
-            if (argument == iterArgument)
-              worklist.push_back(loop.getInitArgs()[index]);
-        }
-        continue;
-      }
-      if (Operation *definition = current.getDefiningOp())
-        worklist.append(definition->getOperands().begin(),
-                        definition->getOperands().end());
-    }
-    return false;
-  };
-  llvm::SmallDenseSet<uint64_t> matched;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    uint64_t source = cast<gpu::AxisMapAttr>(attribute).getSourceId();
-    if (dependsOnRange(value, source))
-      matched.insert(source);
-  }
-  return matched;
-}
-
 FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
                                             Value identity, Type accumulator) {
   if (identity.getType() == accumulator)
@@ -370,33 +336,23 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
       return success();
     }
   }
-  llvm::SmallDenseSet<uint64_t> leftRangeSources = explicitRangeSources(lhs);
-  llvm::SmallDenseSet<uint64_t> rightRangeSources = explicitRangeSources(rhs);
-  bool sameExplicitRanges =
-      leftRangeSources.size() == rightRangeSources.size() &&
-      llvm::all_of(leftRangeSources, [&](uint64_t sourceId) {
-        return rightRangeSources.contains(sourceId);
-      });
-  bool oneSideHasNoExplicitRange =
-      leftRangeSources.empty() || rightRangeSources.empty();
   if (leftLogical && rightLogical &&
       dimensionIds(leftLogical) == dimensionIds(rightLogical) &&
       left.getShape() == right.getShape() &&
       left.getOwner() == right.getOwner() &&
-      left.getValidity() == right.getValidity() &&
-      (sameExplicitRanges || oneSideHasNoExplicitRange)) {
-    if (rightRangeSources.size() > leftRangeSources.size()) {
-      FailureOr<Value> aligned = retargetBroadcast(builder, location, lhs, right);
+      left.getValidity() == right.getValidity()) {
+    bool sameDimensions = left.getAxisMaps().size() == right.getAxisMaps().size();
+    for (auto [leftMapping, rightMapping] :
+         llvm::zip(left.getAxisMaps(), right.getAxisMaps()))
+      sameDimensions &= cast<gpu::AxisMapAttr>(leftMapping).getDimensionId() ==
+                        cast<gpu::AxisMapAttr>(rightMapping).getDimensionId();
+    if (sameDimensions) {
+      FailureOr<Value> aligned = retargetBroadcast(builder, location, rhs, left);
       if (failed(aligned))
         return failure();
-      lhs = *aligned;
+      rhs = *aligned;
       return success();
     }
-    FailureOr<Value> aligned = retargetBroadcast(builder, location, rhs, left);
-    if (failed(aligned))
-      return failure();
-    rhs = *aligned;
-    return success();
   }
   auto leftBroadcast = lhs.getDefiningOp<gpu::BroadcastOp>();
   auto rightBroadcast = rhs.getDefiningOp<gpu::BroadcastOp>();
@@ -525,7 +481,7 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     auto mapping = cast<gpu::AxisMapAttr>(attribute);
     mappings.push_back(gpu::AxisMapAttr::get(
         lhs.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mappings.size()));
+        mapping.getDimensionId(), mappings.size()));
   }
   for (auto [axis, attribute] : llvm::enumerate(right.getAxisMaps())) {
     auto mapping = cast<gpu::AxisMapAttr>(attribute);
@@ -543,7 +499,7 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     shape.push_back(right.getShape()[axis]);
     mappings.push_back(gpu::AxisMapAttr::get(
         lhs.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mappings.size()));
+        mapping.getDimensionId(), mappings.size()));
   }
   auto leftTarget = gpu::FragmentType::get(
       lhs.getContext(), left.getElementType(), builder.getArrayAttr(shape),
@@ -1112,7 +1068,7 @@ FailureOr<FragmentType> convertTensorType(RankedTensorType tensor,
   MLIRContext *context = tensor.getContext();
   DenseI64ArrayAttr dimensions = dimensionIds(tensor);
   SmallVector<PhysicalExprAttr> shape;
-  SmallVector<std::pair<uint64_t, uint32_t>> mappings;
+  SmallVector<PhysicalAxisIdentity> mappings;
   for (unsigned axis = 0; axis < static_cast<unsigned>(tensor.getRank()); ++axis) {
     if (!dimensions || dimensions.size() != static_cast<unsigned>(tensor.getRank()) ||
         dimensions[axis] <= 0)
@@ -1127,7 +1083,8 @@ FailureOr<FragmentType> convertTensorType(RankedTensorType tensor,
           physicalAxisIdentity(origin, dimensions[axis], axis);
       if (failed(mapping))
         return failure();
-      mappings.push_back(*mapping);
+      mappings.push_back(
+          PhysicalAxisIdentity{mapping->first, mapping->second, dimensions[axis]});
     } else {
       shape.push_back(expression(context, PhysicalExprKind::Constant,
                                  tensor.getDimSize(axis)));
@@ -1135,7 +1092,8 @@ FailureOr<FragmentType> convertTensorType(RankedTensorType tensor,
           physicalAxisIdentity(origin, dimensions[axis], axis);
       if (failed(mapping))
         return failure();
-      mappings.push_back(*mapping);
+      mappings.push_back(
+          PhysicalAxisIdentity{mapping->first, mapping->second, dimensions[axis]});
     }
   }
   if (prototype && prototype->getShape().size() == shape.size()) {
@@ -1144,9 +1102,18 @@ FailureOr<FragmentType> convertTensorType(RankedTensorType tensor,
       sameExtents &= left == right;
     if (sameExtents) {
       SmallVector<Attribute> extents(shape.begin(), shape.end());
+      SmallVector<Attribute> remapped;
+      for (auto [axis, attribute] :
+           llvm::enumerate(prototype->getAxisMaps())) {
+        auto mapping = cast<AxisMapAttr>(attribute);
+        remapped.push_back(AxisMapAttr::get(
+            context, mapping.getSourceId(), mapping.getSourceAxis(),
+            dimensions[axis], axis));
+      }
       return FragmentType::get(context, tensor.getElementType(),
                                ArrayAttr::get(context, extents),
-                               prototype->getAxisMaps(), prototype->getValidity(),
+                               ArrayAttr::get(context, remapped),
+                               prototype->getValidity(),
                                prototype->getOwner());
     }
   }
@@ -1176,7 +1143,8 @@ FailureOr<FragmentType> convertSegmentSliceType(RankedTensorType tensor,
   // logical source used simultaneously as an outer ownership axis and an
   // inner segment axis would collapse to one physical extent authority.
   mappings[axis] = AxisMapAttr::get(
-      tensor.getContext(), static_cast<uint64_t>(dimensions[axis]), axis, axis);
+      tensor.getContext(), static_cast<uint64_t>(dimensions[axis]), axis,
+      dimensions[axis], axis);
   return FragmentType::get(tensor.getContext(), tensor.getElementType(),
                            ArrayAttr::get(tensor.getContext(), shape),
                            ArrayAttr::get(tensor.getContext(), mappings),
@@ -1302,7 +1270,7 @@ FailureOr<Type> convertReductionResultType(Type logical, Operation *origin,
     auto sourceMapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         logical.getContext(), sourceMapping.getSourceId(),
-        sourceMapping.getSourceAxis(), resultAxis));
+        sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(), resultAxis));
     ++resultAxis;
   }
   auto prototype = FragmentType::get(
@@ -1354,7 +1322,7 @@ FailureOr<Type> convertContractResultType(
     auto sourceMapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         tensor.getContext(), sourceMapping.getSourceId(),
-        sourceMapping.getSourceAxis(), resultAxis));
+        sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(), resultAxis));
   };
   for (unsigned axis = 0; axis < leftReduced.size(); ++axis)
     if (!leftReduced[axis])
@@ -1664,6 +1632,7 @@ private:
     };
     auto makeRange = [&](unsigned sourceAxis, Value start, Value stop,
                          Value step, uint64_t sourceId,
+                         int64_t dimensionId,
                          PhysicalExprAttr physicalExtent) -> FailureOr<Value> {
       FailureOr<Value> physicalStart = asIndex(operation->getLoc(), start);
       FailureOr<Value> physicalStop = asIndex(operation->getLoc(), stop);
@@ -1686,7 +1655,8 @@ private:
                                   builder.getIndexType(), adjusted, step,
                                   BinaryOperator::FloorDivide);
       auto type = fragmentType(operation->getContext(), builder.getIndexType(),
-                               {physicalExtent}, {{sourceId, sourceAxis}});
+                               {physicalExtent},
+                               {{sourceId, sourceAxis, dimensionId}});
       return Value(builder.create<gpu::MakeRangeOp>(
           operation->getLoc(), type, start, extent, step, sourceId, sourceAxis));
     };
@@ -1766,7 +1736,7 @@ private:
         }
         Value step = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
         FailureOr<Value> coordinate = makeRange(
-            logicalSourceAxis, start, stop, step, sourceId, extent);
+            logicalSourceAxis, start, stop, step, sourceId, *dimension, extent);
         if (failed(coordinate))
           return failure();
         if (*dimension > 0)
@@ -1808,7 +1778,7 @@ private:
             auto mapping = cast<gpu::AxisMapAttr>(attribute);
             mappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(),
+                mapping.getSourceAxis(), mapping.getDimensionId(),
                 mappings.size()));
           }
           auto target = gpu::FragmentType::get(
@@ -1852,7 +1822,7 @@ private:
         uint64_t sourceId = rangeType.getSourceId();
         uint32_t logicalSourceAxis = rangeType.getSourceAxis();
         FailureOr<Value> coordinate = makeRange(
-            logicalSourceAxis, start, stop, step, sourceId, extent);
+            logicalSourceAxis, start, stop, step, sourceId, *dimension, extent);
         if (failed(coordinate))
           return failure();
         if ((*range).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
@@ -1945,7 +1915,8 @@ private:
           logicalSourceAxis = mapping.getSourceAxis();
         }
         FailureOr<Value> coordinate = makeRange(
-            logicalSourceAxis, bounds[0], bounds[1], bounds[2], sourceId, extent);
+            logicalSourceAxis, bounds[0], bounds[1], bounds[2], sourceId,
+            *dimension, extent);
         if (failed(coordinate))
           return failure();
         if (*dimension > 0)
@@ -1997,7 +1968,7 @@ private:
           liftedShape.push_back(fragment.getShape()[axis]);
           liftedMappings.push_back(gpu::AxisMapAttr::get(
               operation->getContext(), mapping.getSourceId(),
-              mapping.getSourceAxis(), axis));
+              mapping.getSourceAxis(), mapping.getDimensionId(), axis));
         }
       }
     }
@@ -2032,7 +2003,7 @@ private:
         liftedShape.push_back(fragment.getShape()[axis]);
         liftedMappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), liftedMappings.size()));
+            mapping.getSourceAxis(), mapping.getDimensionId(), liftedMappings.size()));
       }
     }
     FailureOr<Type> converted = failure();
@@ -2058,7 +2029,7 @@ private:
             prototypeFragment.getAxisMaps()[tailStart + axis]);
         tailMappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), axis));
+            mapping.getSourceAxis(), mapping.getDimensionId(), axis));
       }
       converted = Type(gpu::FragmentType::get(
           operation->getContext(), logicalTensor.getElementType(),
@@ -2094,7 +2065,7 @@ private:
           shape.push_back(fragment.getShape()[axis]);
           mappings.push_back(gpu::AxisMapAttr::get(
               operation->getContext(), mapping.getSourceId(),
-              mapping.getSourceAxis(), mappings.size()));
+              mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size()));
         }
       }
       *converted = gpu::FragmentType::get(
@@ -2143,7 +2114,7 @@ private:
         shape[resultAxis] = source.getShape()[mapping.getFragmentAxis()];
         mappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), resultAxis++));
+            mapping.getSourceAxis(), mapping.getDimensionId(), resultAxis++));
       }
       return success();
     };
@@ -2205,12 +2176,13 @@ private:
     for (Attribute attribute : relation.getTerms()) {
       auto term = cast<IndexTermAttr>(attribute);
       if (term.getKind() == 1) {
+        FailureOr<int64_t> dimension = resultDimension(resultAxis);
         FailureOr<uint64_t> identity =
             resultAxisIdentity(operation, /*resultIndex=*/0, resultAxis);
-        if (failed(identity))
+        if (failed(dimension) || *dimension <= 0 || failed(identity))
           return failure();
         mappings.push_back(gpu::AxisMapAttr::get(
-            operation->getContext(), *identity, 0, resultAxis));
+            operation->getContext(), *identity, 0, *dimension, resultAxis));
         ++resultAxis;
         continue;
       }
@@ -2254,7 +2226,8 @@ private:
               sourceAxis = 0;
             }
             mappings.push_back(gpu::AxisMapAttr::get(
-                operation->getContext(), sourceId, sourceAxis, resultAxis++));
+                operation->getContext(), sourceId, sourceAxis, *dimension,
+                resultAxis++));
           }
           advancedMapped = true;
         }
@@ -2423,17 +2396,21 @@ private:
       if (failed(start) || failed(stop) || failed(step))
         return domain.emitOpError(
             "physical domain bounds are not integer coordinates");
+      if (domain.getExtentDimensions().size() != 1)
+        return domain.emitOpError(
+            "physical domain requires one logical dimension identity");
+      int64_t identity =
+          cast<IntegerAttr>(domain.getExtentDimensions()[0]).getInt();
+      if (identity <= 0)
+        return domain.emitOpError(
+            "physical domain has no logical dimension identity");
       auto type = gpu::RangeType::get(
-          operation->getContext(), domain.getResult().getType().getOriginId(), 0);
+          operation->getContext(), domain.getResult().getType().getOriginId(), 0,
+          identity);
       auto target =
           builder.create<gpu::RangeOp>(location, type, *start, *stop, *step);
-      if (domain.getExtentDimensions().size() == 1) {
-        int64_t identity =
-            cast<IntegerAttr>(domain.getExtentDimensions()[0]).getInt();
-        if (identity > 0)
-          target->setAttr(gpu::sourceDimensionAttr,
-                          builder.getI64IntegerAttr(identity));
-      }
+      target->setAttr(gpu::sourceDimensionAttr,
+                      builder.getI64IntegerAttr(identity));
       mapResults(operation, target);
       bindExtentDimensions(domain.getExtentDimensions(),
                            rangeExtent(location, *start, *stop, *step));
@@ -2471,8 +2448,10 @@ private:
         stop = *physicalStop;
       }
       auto logical = subregion.getResult().getType();
-      auto type = gpu::RangeType::get(operation->getContext(), logical.getSourceId(),
-                                      0);
+      auto sourceRange = cast<gpu::RangeType>((*source).getType());
+      auto type = gpu::RangeType::get(
+          operation->getContext(), logical.getSourceId(), 0,
+          sourceRange.getDimensionId());
       auto target =
           builder.create<gpu::RangeOp>(location, type, start, stop, step);
       target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
@@ -2518,7 +2497,7 @@ private:
             builder.getArrayAttr({extent}),
             builder.getArrayAttr({gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(), 0)}),
+                mapping.getSourceAxis(), mapping.getDimensionId(), 0)}),
             fragment.getValidity(), fragment.getOwner());
         Value coordinate = builder.create<gpu::MakeRangeOp>(
             location, coordinateType, zero, *physicalExtent, one,
@@ -2553,27 +2532,20 @@ private:
         return indices.emitOpError("indices result has no physical fragment type");
       auto rangeType = cast<gpu::RangeType>((*source).getType());
       auto genericType = cast<gpu::FragmentType>(*result);
-      std::optional<int64_t> sourceDimension =
-          sourceExtentDimension(indices.getSource());
-      if (!sourceDimension)
-        if (auto identity = (*source).getDefiningOp()->getAttrOfType<IntegerAttr>(
-                gpu::sourceDimensionAttr))
-          sourceDimension = identity.getInt();
       auto resultType = gpu::FragmentType::get(
           operation->getContext(), genericType.getElementType(),
           genericType.getShape(),
           builder.getArrayAttr({gpu::AxisMapAttr::get(
               operation->getContext(), rangeType.getSourceId(),
-              rangeType.getSourceAxis(), 0)}),
+              rangeType.getSourceAxis(), rangeType.getDimensionId(), 0)}),
           genericType.getValidity(), genericType.getOwner());
       auto target = builder.create<gpu::MakeRangeOp>(
           location, resultType, start, extent, step, rangeType.getSourceId(),
           rangeType.getSourceAxis());
       if ((*source).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
         target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
-      if (sourceDimension)
-        target->setAttr(gpu::sourceDimensionAttr,
-                        builder.getI64IntegerAttr(*sourceDimension));
+      target->setAttr(gpu::sourceDimensionAttr,
+                      builder.getI64IntegerAttr(rangeType.getDimensionId()));
       mapResults(operation, target);
       return success();
     }
@@ -2610,7 +2582,7 @@ private:
         shape[resultAxis] = fragment.getShape()[dim.getAxis()];
         mappings[resultAxis] = gpu::AxisMapAttr::get(
             operation->getContext(), sourceMapping.getSourceId(),
-            sourceMapping.getSourceAxis(), resultAxis);
+            sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(), resultAxis);
       }
       targetType = gpu::FragmentType::get(
           operation->getContext(), targetType.getElementType(),
@@ -2653,7 +2625,7 @@ private:
         auto appendAxis = [&](Attribute extent, gpu::AxisMapAttr mapping) {
           mappings.push_back(gpu::AxisMapAttr::get(
               operation->getContext(), mapping.getSourceId(),
-              mapping.getSourceAxis(), mappings.size()));
+              mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size()));
           shape.push_back(extent);
         };
         unsigned worksetRank = sourceType.getShape().size() - logicalSourceRank;
@@ -2676,9 +2648,14 @@ private:
                  logicalResult.getDimSize(resultAxis) != 1);
             if (!expandsSingleton)
               extent = sourceType.getShape()[physicalSourceAxis];
-            if (!expandsSingleton)
-              resultMapping = cast<gpu::AxisMapAttr>(
+            if (!expandsSingleton) {
+              auto sourceMapping = cast<gpu::AxisMapAttr>(
                   sourceType.getAxisMaps()[physicalSourceAxis]);
+              resultMapping = gpu::AxisMapAttr::get(
+                  operation->getContext(), sourceMapping.getSourceId(),
+                  sourceMapping.getSourceAxis(), resultMapping.getDimensionId(),
+                  resultAxis);
+            }
           }
           appendAxis(extent, resultMapping);
         }
@@ -2723,12 +2700,15 @@ private:
       auto resultMapping = [&](unsigned logicalResultAxis,
                                unsigned physicalResultAxis)
           -> FailureOr<Attribute> {
+        DenseI64ArrayAttr dimensions = dimensionIds(logicalResult);
         FailureOr<uint64_t> identity =
             resultAxisIdentity(operation, /*resultIndex=*/0, logicalResultAxis);
-        if (failed(identity))
+        if (!dimensions || logicalResultAxis >= dimensions.size() ||
+            dimensions[logicalResultAxis] <= 0 || failed(identity))
           return failure();
         return Attribute(gpu::AxisMapAttr::get(
-            operation->getContext(), *identity, 0, physicalResultAxis));
+            operation->getContext(), *identity, 0,
+            dimensions[logicalResultAxis], physicalResultAxis));
       };
       SmallVector<Attribute> shape;
       SmallVector<Attribute> mappings;
@@ -2737,7 +2717,7 @@ private:
         auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
         mappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), mappings.size()));
+            mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size()));
       }
       unsigned sourceRank = logicalSourceRank;
       unsigned resultRank = logicalResult.getRank();
@@ -2752,7 +2732,7 @@ private:
               source.getAxisMaps()[physicalSourceAxis]);
           mappings.push_back(gpu::AxisMapAttr::get(
               operation->getContext(), mapping.getSourceId(),
-              mapping.getSourceAxis(), worksetRank + prefix));
+              mapping.getSourceAxis(), mapping.getDimensionId(), worksetRank + prefix));
           ++prefix;
         }
         if (prefix == resultRank) {
@@ -2789,7 +2769,7 @@ private:
                 source.getAxisMaps()[physicalSourceAxis]);
             mappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(), worksetRank + resultAxis));
+                mapping.getSourceAxis(), mapping.getDimensionId(), worksetRank + resultAxis));
             ++sourceAxis;
             continue;
           }
@@ -2824,7 +2804,7 @@ private:
                 cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
             candidateMappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(), candidateMappings.size()));
+                mapping.getSourceAxis(), mapping.getDimensionId(), candidateMappings.size()));
           }
           for (auto [axis, extent] : llvm::enumerate(converted->getShape())) {
             candidateShape.push_back(extent);
@@ -2832,7 +2812,7 @@ private:
                 cast<gpu::AxisMapAttr>(converted->getAxisMaps()[axis]);
             candidateMappings.push_back(gpu::AxisMapAttr::get(
                 operation->getContext(), mapping.getSourceId(),
-                mapping.getSourceAxis(), candidateMappings.size()));
+                mapping.getSourceAxis(), mapping.getDimensionId(), candidateMappings.size()));
           }
           auto candidate = FragmentType::get(
               operation->getContext(), source.getElementType(),
@@ -2881,7 +2861,7 @@ private:
             cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
         mappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), mappings.size()));
+            mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size()));
       };
       for (unsigned axis = 0; axis < prefix; ++axis)
         appendAxis(axis);
@@ -2929,7 +2909,9 @@ private:
                << ", logical_result=" << join.getResult().getType();
       FailureOr<uint64_t> trailingIdentity = resultAxisIdentity(
           operation, /*resultIndex=*/0, logical.getRank() - 1);
-      if (failed(trailingIdentity))
+      DenseI64ArrayAttr dimensions = dimensionIds(logical);
+      if (!dimensions || dimensions.size() != logical.getRank() ||
+          dimensions[logical.getRank() - 1] <= 0 || failed(trailingIdentity))
         return join.emitOpError(
             "join trailing axis has no canonical coordinate identity");
       SmallVector<Attribute> shape(left.getShape().begin(),
@@ -2940,6 +2922,7 @@ private:
                                       left.getAxisMaps().end());
       mappings.push_back(gpu::AxisMapAttr::get(
           operation->getContext(), *trailingIdentity, 0,
+          dimensions[logical.getRank() - 1],
           left.getShape().size()));
       auto result = gpu::FragmentType::get(
           operation->getContext(), left.getElementType(),

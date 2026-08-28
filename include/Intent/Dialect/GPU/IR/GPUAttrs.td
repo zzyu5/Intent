@@ -35,9 +35,11 @@ def IntentGPU_AxisMapAttr : AttrDef<IntentGPU_Dialect, "AxisMap"> {
   let parameters = (ins
     "uint64_t":$sourceId,
     "uint32_t":$sourceAxis,
+    "int64_t":$dimensionId,
     "uint32_t":$fragmentAxis
   );
-  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `,` $fragmentAxis `>`";
+  let assemblyFormat =
+      "`<` $sourceId `,` $sourceAxis `,` $dimensionId `,` $fragmentAxis `>`";
   let genVerifyDecl = 1;
 }
 

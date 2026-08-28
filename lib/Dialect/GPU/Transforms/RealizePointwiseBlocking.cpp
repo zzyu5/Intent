@@ -1168,7 +1168,7 @@ LogicalResult rankLiftPointwiseValueGraph(
       shape.push_back(extent);
       mappings.push_back(AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mappings.size()));
+          mapping.getDimensionId(), mappings.size()));
     };
     for (auto [extent, mapping] : liftedAxes) {
       bool present = llvm::any_of(original.getAxisMaps(), [&](Attribute attribute) {
@@ -1195,7 +1195,7 @@ LogicalResult rankLiftPointwiseValueGraph(
       shape.push_back(extent);
       mappings.push_back(AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mappings.size()));
+          mapping.getDimensionId(), mappings.size()));
     }
     return FragmentType::get(
         kernel.getContext(), element, ArrayAttr::get(kernel.getContext(), shape),
@@ -1276,11 +1276,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       Value step = builder.create<arith::ConstantIndexOp>(coordinate.getLoc(), 1);
       PhysicalExprAttr unit = expression(module.getContext(),
                                          PhysicalExprKind::Constant, 1);
+      auto dimension =
+          coordinate->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+      if (!dimension || dimension.getInt() <= 0)
+        return coordinate.emitOpError(
+            "workset coordinate has no logical dimension identity");
       auto type = FragmentType::get(
           module.getContext(), builder.getIndexType(), builder.getArrayAttr({unit}),
           builder.getArrayAttr({AxisMapAttr::get(
               module.getContext(), coordinate.getSourceId(),
-              coordinate.getSourceAxis(), /*fragmentAxis=*/0)}),
+              coordinate.getSourceAxis(), dimension.getInt(),
+              /*fragmentAxis=*/0)}),
           /*validity=*/1, /*owner=*/1);
       auto range = builder.create<MakeRangeOp>(
           coordinate.getLoc(), type, coordinate.getResult(), extent, step,
@@ -1857,13 +1863,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             range.getLoc(), builder.getIndexType(), schema);
         if (sourceDimension)
           (*parameter)->setAttr(dimensionAttr, sourceDimension);
-        retargetSourceExtent(range.getResult(), range.getSourceId(),
-                             fragmentExtent(*parameter));
       }
     }
-    if (succeeded(parameter))
-      retargetSourceExtent(range.getResult(), range.getSourceId(),
-                           fragmentExtent(*parameter));
     FailureOr<uint64_t> dimensionId =
         failed(parameter) ? FailureOr<uint64_t>(failure())
                           : parameterDimension(*parameter);
@@ -1877,6 +1878,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    << parameter->getParameter().getName().getValue();
       return failure();
     }
+    retargetDimensionExtent(range.getResult(), *dimensionId,
+                            fragmentExtent(*parameter));
     auto found = parameters.find(*dimensionId);
     if (found != parameters.end() && found->second != *parameter)
       return range.emitOpError(

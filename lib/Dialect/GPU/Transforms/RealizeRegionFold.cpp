@@ -59,7 +59,7 @@ FragmentType replaceSliceAxis(FragmentType source, unsigned axis,
   shape[axis] = extent;
   mappings[axis] = AxisMapAttr::get(
       source.getContext(), segmentMapping.getSourceId(),
-      segmentMapping.getSourceAxis(), axis);
+      segmentMapping.getSourceAxis(), segmentMapping.getDimensionId(), axis);
   return FragmentType::get(
       source.getContext(), source.getElementType(),
       ArrayAttr::get(source.getContext(), shape),
@@ -543,7 +543,7 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
           mapping.getSourceAxis() != binding->actualSourceAxis) {
         mappings[axis] = AxisMapAttr::get(
             type.getContext(), binding->actualSourceId,
-            binding->actualSourceAxis, axis);
+            binding->actualSourceAxis, mapping.getDimensionId(), axis);
         changed = true;
       }
     }
@@ -646,7 +646,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
               target.getContext(),
               {AxisMapAttr::get(target.getContext(),
                                 targetMapping.getSourceId(),
-                                targetMapping.getSourceAxis(), 0)}),
+                                targetMapping.getSourceAxis(),
+                                targetMapping.getDimensionId(), 0)}),
           target.getValidity(), target.getOwner());
       if (predicate.getType() != projected)
         predicate = builder.create<BroadcastOp>(value.getLoc(), projected,

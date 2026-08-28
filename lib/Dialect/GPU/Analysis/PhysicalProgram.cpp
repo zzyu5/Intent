@@ -144,6 +144,33 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
   return result;
 }
 
+PhysicalDimensionProjection queryFragmentDimension(Type type,
+                                                   int64_t dimensionId) {
+  PhysicalDimensionProjection result;
+  result.dimensionId = dimensionId;
+  if (dimensionId <= 0)
+    return result;
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment)
+    return result;
+  std::optional<unsigned> axis;
+  for (Attribute attribute : fragment.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    if (mapping.getDimensionId() != dimensionId)
+      continue;
+    if (axis && *axis != mapping.getFragmentAxis()) {
+      result.state = PhysicalFactState::Ambiguous;
+      return result;
+    }
+    axis = mapping.getFragmentAxis();
+  }
+  if (!axis)
+    return result;
+  result.state = PhysicalFactState::Exact;
+  result.fragmentAxis = *axis;
+  return result;
+}
+
 PhysicalAxisProjection queryUniqueSourceAxis(Type type, uint64_t sourceId) {
   PhysicalAxisProjection result;
   auto fragment = dyn_cast<FragmentType>(type);

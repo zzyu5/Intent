@@ -47,10 +47,20 @@ struct PhysicalAxisProjection {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
+struct PhysicalDimensionProjection {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  int64_t dimensionId = 0;
+  unsigned fragmentAxis = 0;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
 mlir::FailureOr<unsigned> queryFragmentAxis(mlir::Type type,
                                             uint64_t sourceId);
 PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source);
+PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
+                                                   int64_t dimensionId);
 PhysicalAxisProjection queryUniqueSourceAxis(mlir::Type type,
                                              uint64_t sourceId);
 mlir::FailureOr<unsigned>

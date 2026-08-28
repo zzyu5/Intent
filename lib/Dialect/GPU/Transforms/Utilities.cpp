@@ -11,6 +11,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include <optional>
@@ -28,13 +29,15 @@ Value stripBroadcast(Value value) {
   return value;
 }
 
-FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
-                                 ArrayRef<Attribute> previousExtents,
-                                 PhysicalExprAttr extent) {
+using AxisSelector = llvm::function_ref<bool(AxisMapAttr)>;
+
+FragmentType replaceExtent(FragmentType source, AxisSelector selects,
+                           ArrayRef<Attribute> previousExtents,
+                           PhysicalExprAttr extent) {
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
   bool changed = false;
   for (auto [axis, attribute] : llvm::enumerate(source.getAxisMaps())) {
-    if (cast<AxisMapAttr>(attribute).getSourceId() != sourceId ||
+    if (!selects(cast<AxisMapAttr>(attribute)) ||
         !llvm::is_contained(previousExtents, source.getShape()[axis]))
       continue;
     shape[axis] = extent;
@@ -48,11 +51,11 @@ FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
       source.getValidity(), source.getOwner());
 }
 
-Type replaceSourceExtent(Type source, uint64_t sourceId,
-                         ArrayRef<Attribute> previousExtents,
-                         PhysicalExprAttr extent) {
+Type replaceExtent(Type source, AxisSelector selects,
+                   ArrayRef<Attribute> previousExtents,
+                   PhysicalExprAttr extent) {
   if (auto fragment = dyn_cast<FragmentType>(source))
-    return replaceSourceExtent(fragment, sourceId, previousExtents, extent);
+    return replaceExtent(fragment, selects, previousExtents, extent);
   auto record = dyn_cast<RecordType>(source);
   if (!record)
     return source;
@@ -60,8 +63,7 @@ Type replaceSourceExtent(Type source, uint64_t sourceId,
   bool changed = false;
   for (Attribute attribute : record.getFieldTypes()) {
     Type field = cast<TypeAttr>(attribute).getValue();
-    Type replacement =
-        replaceSourceExtent(field, sourceId, previousExtents, extent);
+    Type replacement = replaceExtent(field, selects, previousExtents, extent);
     fields.push_back(TypeAttr::get(replacement));
     changed |= replacement != field;
   }
@@ -72,11 +74,11 @@ Type replaceSourceExtent(Type source, uint64_t sourceId,
                          record.getOwner());
 }
 
-bool carriesSourceExtent(Type type, uint64_t sourceId,
-                         ArrayRef<Attribute> extents) {
+bool carriesExtent(Type type, AxisSelector selects,
+                   ArrayRef<Attribute> extents) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
     for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps()))
-      if (cast<AxisMapAttr>(attribute).getSourceId() == sourceId &&
+      if (selects(cast<AxisMapAttr>(attribute)) &&
           llvm::is_contained(extents, fragment.getShape()[axis]))
         return true;
     return false;
@@ -85,8 +87,7 @@ bool carriesSourceExtent(Type type, uint64_t sourceId,
   if (!record)
     return false;
   return llvm::any_of(record.getFieldTypes(), [&](Attribute attribute) {
-    return carriesSourceExtent(cast<TypeAttr>(attribute).getValue(), sourceId,
-                               extents);
+    return carriesExtent(cast<TypeAttr>(attribute).getValue(), selects, extents);
   });
 }
 
@@ -119,13 +120,21 @@ FailureOr<unsigned> sourceAxis(FragmentType fragment, uint64_t sourceId) {
                 : FailureOr<unsigned>(failure());
 }
 
-bool preservesIntroducedUnitSourceAxis(Value value, uint64_t sourceId) {
+bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   auto reshape = value.getDefiningOp<ReshapeOp>();
   auto result = dyn_cast<FragmentType>(value.getType());
   if (!reshape || !result)
     return false;
-  FailureOr<unsigned> axis = sourceAxis(result, sourceId);
-  if (failed(axis))
+  std::optional<unsigned> axis;
+  for (Attribute attribute : result.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    if (!selects(mapping))
+      continue;
+    if (axis)
+      return false;
+    axis = mapping.getFragmentAxis();
+  }
+  if (!axis)
     return false;
   auto extent = dyn_cast<PhysicalExprAttr>(result.getShape()[*axis]);
   if (!extent ||
@@ -134,18 +143,16 @@ bool preservesIntroducedUnitSourceAxis(Value value, uint64_t sourceId) {
       extent.getValue() != 1)
     return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-  return !input || failed(sourceAxis(input, sourceId));
+  return !input || !llvm::any_of(input.getAxisMaps(), [&](Attribute attribute) {
+           return selects(cast<AxisMapAttr>(attribute));
+         });
 }
 
 FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
                                   Value predicate, FragmentType target,
-                                  PhysicalSourceAxis source) {
+                                  unsigned axis) {
   auto base = dyn_cast<FragmentType>(predicate.getType());
-  PhysicalAxisProjection projection = queryFragmentAxis(target, source);
-  FailureOr<unsigned> axis =
-      projection.isExact() ? FailureOr<unsigned>(projection.fragmentAxis)
-                           : FailureOr<unsigned>(failure());
-  if (!base || base.getShape().size() != 1 || failed(axis))
+  if (!base || base.getShape().size() != 1 || axis >= target.getShape().size())
     return failure();
   SmallVector<Attribute> shape(
       target.getShape().size(),
@@ -154,7 +161,7 @@ FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
           static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
           StringAttr::get(target.getContext()),
           ArrayAttr::get(target.getContext(), {})));
-  shape[*axis] = base.getShape()[0];
+  shape[axis] = base.getShape()[0];
   auto reshaped = FragmentType::get(
       target.getContext(), builder.getI1Type(),
       ArrayAttr::get(target.getContext(), shape), target.getAxisMaps(),
@@ -290,7 +297,23 @@ FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
                                             Location location, Value predicate,
                                             FragmentType target,
                                             PhysicalSourceAxis source) {
-  return projectPredicate(builder, location, predicate, target, source);
+  PhysicalAxisProjection projection = queryFragmentAxis(target, source);
+  if (!projection.isExact())
+    return failure();
+  return projectPredicate(builder, location, predicate, target,
+                          projection.fragmentAxis);
+}
+
+FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
+                                            Location location, Value predicate,
+                                            FragmentType target,
+                                            int64_t dimensionId) {
+  PhysicalDimensionProjection projection =
+      queryFragmentDimension(target, dimensionId);
+  if (!projection.isExact())
+    return failure();
+  return projectPredicate(builder, location, predicate, target,
+                          projection.fragmentAxis);
 }
 
 FailureOr<Value> materializeValidityConjunction(
@@ -396,18 +419,22 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
       range.getExtent(), BinaryOperator::Add));
 }
 
-void retargetSourceExtent(Value root, uint64_t sourceId,
-                          PhysicalExprAttr extent) {
+static void retargetExtent(Value root, AxisSelector selects,
+                           PhysicalExprAttr extent) {
   auto rootFragment = dyn_cast<FragmentType>(root.getType());
   if (!rootFragment)
     return;
   SmallVector<Attribute> previousExtents;
   for (auto [axis, attribute] : llvm::enumerate(rootFragment.getAxisMaps()))
-    if (cast<AxisMapAttr>(attribute).getSourceId() == sourceId &&
+    if (selects(cast<AxisMapAttr>(attribute)) &&
         !llvm::is_contained(previousExtents, rootFragment.getShape()[axis]))
       previousExtents.push_back(rootFragment.getShape()[axis]);
   if (previousExtents.empty())
     return;
+  SmallVector<Attribute> connectedExtents(previousExtents.begin(),
+                                          previousExtents.end());
+  if (!llvm::is_contained(connectedExtents, Attribute(extent)))
+    connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
   llvm::SmallDenseSet<Value> visited;
   auto isSegmentSourceSlice = [](Value value) {
@@ -439,15 +466,15 @@ void retargetSourceExtent(Value root, uint64_t sourceId,
     // happens to carry the same logical provenance.
     if (value != root && value.getDefiningOp<MakeRangeOp>())
       continue;
-    // A reduction or other structured operation can consume a source axis and
-    // produce a scalar/record that no longer carries that physical axis.  The
-    // extent decision ends there; following the scalar into a later broadcast
-    // would conflate a new traversal with the one being retargeted.
-    if (!carriesSourceExtent(value.getType(), sourceId, previousExtents))
+    // A reduction or other structured operation can consume an axis and
+    // produce a scalar/record that no longer carries it.  The extent decision
+    // ends there; following the scalar into a later broadcast would conflate a
+    // new traversal with the one being retargeted.
+    if (!carriesExtent(value.getType(), selects, connectedExtents))
       continue;
-    if (!preservesIntroducedUnitSourceAxis(value, sourceId))
-      value.setType(replaceSourceExtent(value.getType(), sourceId,
-                                        previousExtents, extent));
+    if (!preservesIntroducedUnitAxis(value, selects))
+      value.setType(
+          replaceExtent(value.getType(), selects, previousExtents, extent));
     // Product fields and structured helper arguments are part of the same
     // physical value flow even though MLIR does not connect them with ordinary
     // result uses.  A blocking decision for one provenance axis must cross
@@ -457,26 +484,74 @@ void retargetSourceExtent(Value root, uint64_t sourceId,
       worklist.append(record.getFields().begin(), record.getFields().end());
     if (auto extract = value.getDefiningOp<ExtractOp>())
       worklist.push_back(extract.getRecord());
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      auto loop = dyn_cast_or_null<scf::ForOp>(
+          argument.getOwner()->getParentOp());
+      if (loop)
+        for (auto [index, iterArgument] :
+             llvm::enumerate(loop.getRegionIterArgs()))
+          if (argument == iterArgument) {
+            worklist.push_back(loop.getInitArgs()[index]);
+            worklist.push_back(loop.getResult(index));
+          }
+    }
+    if (auto loop = value.getDefiningOp<scf::ForOp>())
+      for (auto [index, result] : llvm::enumerate(loop.getResults()))
+        if (value == result) {
+          worklist.push_back(loop.getInitArgs()[index]);
+          worklist.push_back(loop.getRegionIterArgs()[index]);
+          worklist.push_back(loop.getBody()->getTerminator()->getOperand(index));
+        }
     for (Operation *user : value.getUsers()) {
+      if (auto loop = dyn_cast<scf::ForOp>(user))
+        for (auto [index, init] : llvm::enumerate(loop.getInitArgs()))
+          if (value == init) {
+            worklist.push_back(loop.getRegionIterArgs()[index]);
+            worklist.push_back(loop.getResult(index));
+          }
+      if (auto yield = dyn_cast<scf::YieldOp>(user))
+        if (auto loop = dyn_cast_or_null<scf::ForOp>(yield->getParentOp()))
+          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
+            if (value == yielded) {
+              worklist.push_back(loop.getInitArgs()[index]);
+              worklist.push_back(loop.getRegionIterArgs()[index]);
+              worklist.push_back(loop.getResult(index));
+            }
       if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
               ContractOp, ScaledContractOp, SparseContractOp, ReduceOp,
               ScanOp, RegionFoldOp, RegionScanOp, RandomBitsOp,
               ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
               AtomicCompareExchangeOp>(user)) {
         worklist.append(user->getOperands().begin(), user->getOperands().end());
-        for (Region &region : user->getRegions()) {
-          for (Block &block : region) {
-            for (BlockArgument argument : block.getArguments()) {
+        for (Region &region : user->getRegions())
+          for (Block &block : region)
+            for (BlockArgument argument : block.getArguments())
               if (!isSegmentSourceSlice(argument))
                 worklist.push_back(argument);
-            }
-          }
-        }
       }
       for (Value result : user->getResults())
         worklist.push_back(result);
     }
   }
+}
+
+void retargetSourceExtent(Value root, uint64_t sourceId,
+                          PhysicalExprAttr extent) {
+  retargetExtent(
+      root,
+      [=](AxisMapAttr mapping) { return mapping.getSourceId() == sourceId; },
+      extent);
+}
+
+void retargetDimensionExtent(Value root, int64_t dimensionId,
+                             PhysicalExprAttr extent) {
+  if (dimensionId <= 0)
+    return;
+  retargetExtent(root,
+                 [=](AxisMapAttr mapping) {
+                   return mapping.getDimensionId() == dimensionId;
+                 },
+                 extent);
 }
 
 FailureOr<uint64_t> blockedDimension(Attribute attribute) {
@@ -607,9 +682,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                              ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
     Value result;
     for (MakeRangeOp range : sources) {
+      PhysicalAxisProjection projection = queryFragmentAxis(
+          target,
+          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+      if (!projection.isExact())
+        return failure();
       FailureOr<Value> current = projectPredicate(
           builder, location, predicates.lookup(range.getOperation()), target,
-          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+          projection.fragmentAxis);
       if (failed(current))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(

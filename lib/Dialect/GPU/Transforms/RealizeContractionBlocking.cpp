@@ -492,7 +492,7 @@ FragmentType transposeLastTwo(FragmentType source) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        resultAxis));
+        mapping.getDimensionId(), resultAxis));
   }
   return FragmentType::get(
       source.getContext(), source.getElementType(),
@@ -573,7 +573,8 @@ FragmentType fragmentType(MLIRContext *context, Type element,
   SmallVector<Attribute> mappings;
   for (auto [axis, source] : llvm::enumerate(sourceMappings))
     mappings.push_back(AxisMapAttr::get(context, source.getSourceId(),
-                                        source.getSourceAxis(), axis));
+                                        source.getSourceAxis(),
+                                        source.getDimensionId(), axis));
   return FragmentType::get(context, element, ArrayAttr::get(context, extents),
                            ArrayAttr::get(context, mappings), 1, owner);
 }
@@ -777,7 +778,7 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mappings.size()));
+        mapping.getDimensionId(), mappings.size()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),

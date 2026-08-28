@@ -298,6 +298,36 @@ FailureOr<Value> clonePaddedProducer(
     return padded.getResult();
   }
 
+  if (auto broadcast = dyn_cast<BroadcastOp>(producer)) {
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    if (input && input.getShape().size() <= fragment.getShape().size()) {
+      unsigned offset = fragment.getShape().size() - input.getShape().size();
+      if (reductionAxis >= offset) {
+        unsigned inputAxis = reductionAxis - offset;
+        if (input.getShape()[inputAxis] == logicalExtent) {
+          auto inputMapping =
+              cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
+          FailureOr<Value> replayed = clonePaddedProducer(
+              builder, location, broadcast.getValue(),
+              PhysicalSourceAxis{inputMapping.getSourceId(),
+                                 inputMapping.getSourceAxis()},
+              logicalExtent, physicalExtent, physicalExtentValue, mapping,
+              tailPredicates);
+          if (failed(replayed))
+            return failure();
+          auto paddedType =
+              replaceExtent(fragment, reductionAxis, physicalExtent);
+          auto padded =
+              builder.create<BroadcastOp>(location, paddedType, *replayed);
+          if (Attribute origin = broadcast->getAttr(originAttr))
+            padded->setAttr(originAttr, origin);
+          mapping.map(value, padded.getResult());
+          return padded.getResult();
+        }
+      }
+    }
+  }
+
   if (auto load = dyn_cast<LoadOp>(producer)) {
     SmallVector<Value> coordinates;
     for (Value coordinate : load.getCoordinates()) {
@@ -595,7 +625,7 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mappings.size()));
+        mapping.getDimensionId(), mappings.size()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
@@ -1298,7 +1328,7 @@ FragmentType eraseFragmentAxes(FragmentType source,
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mappings.size()));
+        mapping.getDimensionId(), mappings.size()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
@@ -1737,9 +1767,17 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     auto source = cast<FragmentType>(plan.source.getType());
     for (auto [axis, extent] : llvm::enumerate(source.getShape()))
       if (axis != plan.reductionAxis &&
-          !isCompileTimeExtent(cast<PhysicalExprAttr>(extent)))
+          !isCompileTimeExtent(cast<PhysicalExprAttr>(extent))) {
+        auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
         return reduce.emitOpError(
-            "runtime reduction free axes must be physicalized before chunking");
+                   "runtime reduction free axes must be physicalized before chunking")
+               << "; free_axis=" << axis << ", reduction_axis="
+               << plan.reductionAxis << ", extent=" << extent
+               << ", source_id=" << mapping.getSourceId()
+               << ", source_axis=" << mapping.getSourceAxis()
+               << ", dimension=" << mapping.getDimensionId()
+               << ", source=" << source;
+      }
     SmallVector<RootAccess> roots;
     for (LoadOp load : plan.roots) {
       FailureOr<RootAccess> access = analyzeRoot(load, plan.sourceId);

@@ -39,8 +39,12 @@ def IntentGPU_FragmentType : TypeDef<IntentGPU_Dialect, "Fragment"> {
 def IntentGPU_RangeType : TypeDef<IntentGPU_Dialect, "Range"> {
   let mnemonic = "range";
   let summary = "A runtime physical traversal range with logical provenance";
-  let parameters = (ins "uint64_t":$sourceId, "uint32_t":$sourceAxis);
-  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `>`";
+  let parameters = (ins
+    "uint64_t":$sourceId,
+    "uint32_t":$sourceAxis,
+    "int64_t":$dimensionId
+  );
+  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `,` $dimensionId `>`";
   let genVerifyDecl = 1;
 }
 

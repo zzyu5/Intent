@@ -96,11 +96,13 @@ LogicalResult ParameterAttr::verify(
 
 LogicalResult AxisMapAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, uint64_t sourceId,
-    uint32_t sourceAxis, uint32_t fragmentAxis) {
+    uint32_t sourceAxis, int64_t dimensionId, uint32_t fragmentAxis) {
   (void)sourceAxis;
   (void)fragmentAxis;
-  return sourceId != 0 ? success()
-                       : emitError() << "axis mapping requires a nonzero logical source identity";
+  return sourceId != 0 && dimensionId > 0
+             ? success()
+             : emitError()
+                   << "axis mapping requires source and logical-dimension identities";
 }
 
 LogicalResult ViewLayoutAttr::verify(
@@ -178,10 +180,13 @@ LogicalResult FragmentType::verify(
 }
 
 LogicalResult RangeType::verify(function_ref<InFlightDiagnostic()> emitError,
-                                uint64_t sourceId, uint32_t sourceAxis) {
+                                uint64_t sourceId, uint32_t sourceAxis,
+                                int64_t dimensionId) {
   (void)sourceAxis;
-  return sourceId != 0 ? success()
-                       : emitError() << "physical range requires logical provenance";
+  return sourceId != 0 && dimensionId > 0
+             ? success()
+             : emitError()
+                   << "physical range requires source and dimension provenance";
 }
 
 LogicalResult BufferType::verify(

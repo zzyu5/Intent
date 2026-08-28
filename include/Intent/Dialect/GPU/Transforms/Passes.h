@@ -28,6 +28,8 @@ mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
 void retargetSourceExtent(mlir::Value root, uint64_t sourceId,
                           PhysicalExprAttr extent);
+void retargetDimensionExtent(mlir::Value root, int64_t dimensionId,
+                             PhysicalExprAttr extent);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);
@@ -47,6 +49,10 @@ mlir::FailureOr<mlir::Value>
 projectPredicateToFragment(mlir::OpBuilder &builder, mlir::Location location,
                            mlir::Value predicate, FragmentType target,
                            PhysicalSourceAxis source);
+mlir::FailureOr<mlir::Value>
+projectPredicateToFragment(mlir::OpBuilder &builder, mlir::Location location,
+                           mlir::Value predicate, FragmentType target,
+                           int64_t dimensionId);
 mlir::FailureOr<mlir::Value>
 materializeValidityConjunction(mlir::OpBuilder &builder,
                                mlir::Location location, mlir::Value lhs,
