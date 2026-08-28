@@ -125,6 +125,7 @@ class UnaryOperator(IntEnum):
     SIGMOID = 10
     TANH = 11
     ABS = 12
+    SQRT = 13
 
 
 class BinaryOperator(IntEnum):
@@ -204,9 +205,9 @@ class ShapeExpr:
         ):
             raise TypeError("shape expression fields must be integers")
         if self.kind is ShapeExprKind.STATIC:
-            if self.dimension != 0 or self.payload < 0:
+            if self.dimension <= 0 or self.payload < 0:
                 raise ValueError(
-                    "static shape expression requires identity zero and non-negative extent"
+                    "static shape expression requires a positive identity and non-negative extent"
                 )
         elif self.dimension <= 0:
             raise ValueError("dynamic shape expression requires a positive identity")
@@ -293,11 +294,11 @@ class IndexRelation:
         if len(self.result_dimensions) != self.result_rank or any(
             isinstance(identity, bool)
             or not isinstance(identity, int)
-            or identity < 0
+            or identity <= 0
             for identity in self.result_dimensions
         ):
             raise ValueError(
-                "index relation requires one non-negative dimension identity per result axis"
+                "index relation requires one positive dimension identity per result axis"
             )
         object.__setattr__(self, "terms", tuple(self.terms))
         if not self.terms:

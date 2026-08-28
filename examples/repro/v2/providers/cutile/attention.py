@@ -633,6 +633,7 @@ def grouped_flash_decode(context: Context) -> PreparedComparison:
         constexprs={
             "HEAD_GROUP": query_heads // key_heads,
             "P": splits,
+            "SPLIT_SIZE": split_size,
         },
     )
     partial_lse, partial_output = partials.outputs()

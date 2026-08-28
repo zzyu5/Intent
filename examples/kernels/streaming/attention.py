@@ -55,6 +55,16 @@ def empty_attention_summary(query_count, value_width):
 
 
 @intent.fn
+def empty_scalar_attention_summary(value_width):
+    return I.record(
+        valid=False,
+        maximum=I.cast(0.0, I.f32),
+        denominator=I.cast(0.0, I.f32),
+        accumulator=I.zeros((value_width,), dtype=I.f32),
+    )
+
+
+@intent.fn
 def merge_attention_summaries(lhs, rhs):
     valid = lhs.valid | rhs.valid
     maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
@@ -85,6 +95,41 @@ def merge_attention_summaries(lhs, rhs):
         accumulator=(
             lhs_scale[:, None] * lhs.accumulator
             + rhs_scale[:, None] * rhs.accumulator
+        ),
+    )
+
+
+@intent.fn
+def merge_scalar_attention_summaries(lhs, rhs):
+    valid = lhs.valid | rhs.valid
+    maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
+    maximum = I.select(
+        rhs.valid,
+        I.maximum(maximum, rhs.maximum),
+        maximum,
+    )
+    lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
+    rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
+    lhs_scale = I.select(
+        lhs.valid,
+        I.exp2(lhs_maximum - maximum),
+        0.0,
+    )
+    rhs_scale = I.select(
+        rhs.valid,
+        I.exp2(rhs_maximum - maximum),
+        0.0,
+    )
+    return I.record(
+        valid=valid,
+        maximum=maximum,
+        denominator=(
+            lhs_scale * lhs.denominator
+            + rhs_scale * rhs.denominator
+        ),
+        accumulator=(
+            lhs_scale * lhs.accumulator
+            + rhs_scale * rhs.accumulator
         ),
     )
 
@@ -208,6 +253,47 @@ def summarize_masked_attention_chunk(
             value_chunk,
             reduce=((1, 0),),
             acc_dtype=I.f32,
+        ),
+    )
+
+
+@intent.fn
+def summarize_masked_scalar_query_chunk(
+    key_chunk,
+    value_chunk,
+    active,
+    query,
+    scale,
+):
+    scores = I.reduce.sum(
+        query[None, :] * key_chunk,
+        axis=1,
+        identity=0.0,
+    ) * (scale * I.LOG2E)
+    valid = I.full(scores.shape, fill=True, dtype=I.bool) & active
+    scores = I.select(valid, scores, -I.inf)
+    chunk_valid = I.reduce.any(valid, axis=0, identity=False)
+    maximum = I.select(
+        chunk_valid,
+        I.reduce.max(scores, axis=0, identity=-I.inf),
+        0.0,
+    )
+    probability = I.select(
+        valid,
+        I.exp2(scores - maximum),
+        0.0,
+    )
+    return I.record(
+        valid=chunk_valid,
+        maximum=maximum,
+        denominator=I.reduce.sum(probability, axis=0, identity=0.0),
+        accumulator=I.reduce.sum(
+            I.cast(
+                I.cast(probability, I.f16)[:, None] * value_chunk,
+                I.f32,
+            ),
+            axis=0,
+            identity=0.0,
         ),
     )
 
@@ -447,6 +533,7 @@ def grouped_flash_decode_partials(
     scale: I.f32,
     HEAD_GROUP: I.Constexpr[int],
     P: I.Constexpr[int],
+    SPLIT_SIZE: I.Constexpr[int],
 ):
     B, HQ, _, _ = q.shape
     HK = k.shape[1]
@@ -455,14 +542,13 @@ def grouped_flash_decode_partials(
     key_axis = I.domain(0, K)
     parts = I.domain(0, P)
     local_query_heads = I.domain(0, HEAD_GROUP)
-    width = (K + P - 1) // P
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, HK)):
             query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
             query = I.gather(q, index=(batch, query_heads, 0, slice(None)))
             for part in I.parallel(parts):
-                begin = I.minimum(part * width, K)
-                end = I.minimum((part + 1) * width, K)
+                begin = I.minimum(part * SPLIT_SIZE, K)
+                end = I.minimum(begin + SPLIT_SIZE, K)
                 part_keys = key_axis[begin:end]
                 summary = summarize_attention_chunk_bf16(
                     k[batch, key_head, part_keys, :],

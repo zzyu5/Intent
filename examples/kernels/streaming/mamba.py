@@ -281,7 +281,7 @@ def mamba3_siso_step(
             )
             rotated_key = I.reshape(
                 I.join(rotated_key_first, rotated_key_second),
-                (MAMBA3_QK_DIMENSION,),
+                (qk_dimensions,),
             )
             output_key_state[batch, head, qk_dimensions] = I.cast(
                 rotated_key, I.f32
@@ -325,30 +325,20 @@ def mamba3_siso_step(
             )
             state = I.reshape(
                 I.join(state_first, state_second),
-                (MAMBA3_VALUE_DIMENSION, MAMBA3_QK_DIMENSION),
+                (value_region, qk_dimensions),
             )
             output_ssm_state[batch, head, value_region, qk_dimensions] = state
-            projected_first = I.contract(
-                I.cast(state_first, I.bf16),
-                I.reshape(
-                    rotated_query_first,
-                    (MAMBA3_ANGLE_DIMENSION, 1),
-                ),
+            rotated_query = I.reshape(
+                I.join(rotated_query_first, rotated_query_second),
+                (qk_dimensions,),
+            )
+            projected = I.contract(
+                I.cast(state, I.bf16),
+                I.reshape(rotated_query, (qk_dimensions, 1)),
                 reduce=((1, 0),),
                 acc_dtype=I.f32,
             )
-            projected_second = I.contract(
-                I.cast(state_second, I.bf16),
-                I.reshape(
-                    rotated_query_second,
-                    (MAMBA3_ANGLE_DIMENSION, 1),
-                ),
-                reduce=((1, 0),),
-                acc_dtype=I.f32,
-            )
-            projected = I.reshape(
-                projected_first + projected_second, (MAMBA3_VALUE_DIMENSION,)
-            )
+            projected = I.reshape(projected, (value_region,))
             gate_value = I.cast(
                 gate[batch, head, value_region], I.f32
             )
@@ -432,11 +422,11 @@ def mamba3_siso_forward(
                 )[None, :]
                 query_pairs = I.reshape(
                     query_block,
-                    (chunk_positions, MAMBA3_QK_DIMENSION // 2, 2),
+                    (chunk_positions, pairs, 2),
                 )
                 key_pairs = I.reshape(
                     key_block,
-                    (chunk_positions, MAMBA3_QK_DIMENSION // 2, 2),
+                    (chunk_positions, pairs, 2),
                 )
                 query_first = query_pairs[:, :, 0]
                 query_second = query_pairs[:, :, 1]
@@ -483,11 +473,11 @@ def mamba3_siso_forward(
                 )
                 rotated_query = I.reshape(
                     I.join(rotated_query_first, rotated_query_second),
-                    (chunk_positions, MAMBA3_QK_DIMENSION),
+                    (chunk_positions, qk_dimensions),
                 )
                 rotated_key = I.reshape(
                     I.join(rotated_key_first, rotated_key_second),
-                    (chunk_positions, MAMBA3_QK_DIMENSION),
+                    (chunk_positions, qk_dimensions),
                 ) * I.cast(transition_scale[:, None], I.bf16)
                 qk_dot = I.reshape(
                     I.contract(
@@ -497,7 +487,7 @@ def mamba3_siso_forward(
                             I.bf16,
                         ),
                         I.full(
-                            (MAMBA3_QK_DIMENSION // 2, 1),
+                            (pairs, 1),
                             1.0,
                             dtype=I.bf16,
                         ),
@@ -517,7 +507,7 @@ def mamba3_siso_forward(
                 gamma_store[batch, head, source_positions] = gamma
 
             state = I.zeros(
-                (MAMBA3_VALUE_DIMENSION, MAMBA3_QK_DIMENSION),
+                (value_dimensions, qk_dimensions),
                 dtype=I.f32,
             )
             residual = residual_scale[head]

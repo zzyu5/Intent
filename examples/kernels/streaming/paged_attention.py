@@ -84,78 +84,165 @@ def paged_gqa_decode_partials(
     sequence_lengths: I.In[I.i32, ("B",)],
     split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
     partial_lse: I.Out[I.f32, ("B", "HQ", "SPLITS")],
-    partial_output: I.Out[I.bf16, ("B", "HQ", "SPLITS", "DV")],
+    partial_output: I.Out[I.f32, ("B", "HQ", "SPLITS", "DV")],
     scale: I.f32,
     PAGE_SIZE: I.Constexpr[int],
     HEAD_GROUP: I.Constexpr[int],
     SPLITS: I.Constexpr[int],
-    BATCH_SIZE: I.Constexpr[int],
 ):
     B, HQ, D = q.shape
     PS = key_cache.shape[1]
     HK = key_cache.shape[2]
     DV = value_cache.shape[3]
-    page_slots = page_indices.shape[0]
-    split_pages = I.ragged(
-        outer=I.domain(0, BATCH_SIZE * SPLITS),
-        members=I.domain(0, page_slots),
-        offsets=split_offsets,
-        indices=page_indices,
-    )
-    page_tokens = I.domain(0, PS)
+    jobs = I.domain(0, B * SPLITS)
     local_query_heads = I.domain(0, HEAD_GROUP)
-    for job in I.parallel(split_pages.outer):
+    for job in I.parallel(jobs):
         batch = job // SPLITS
         split = job % SPLITS
         page_begin = I.cast(page_offsets[batch], I.index)
         sequence_length = I.cast(sequence_lengths[batch], I.index)
-        selected_pages = split_pages[job]
+        selected_begin = I.cast(split_offsets[job], I.index)
         page_count = I.cast(
             split_offsets[job + 1] - split_offsets[job], I.index
         )
         token_count = page_count * PS
-        page_positions = I.indices(selected_pages)
-        physical_pages = I.cast(I.members(selected_pages), I.index)
-        I.assume_in_bounds(physical_pages, key_cache, axis=0)
-        I.assume_in_bounds(physical_pages, value_cache, axis=0)
-        token_offsets = I.indices(page_tokens)
-        logical_tokens = (
-            (page_positions - page_begin)[:, None] * PAGE_SIZE
-            + token_offsets[None, :]
+        flat_tokens = I.domain(0, token_count)
+        flat_token = I.indices(flat_tokens)
+        page_ordinal = flat_token // PS
+        token_offset = flat_token % PS
+        page_position = selected_begin + page_ordinal
+        I.assume_in_bounds(page_position, page_indices, axis=0)
+        physical_page = I.cast(page_indices[page_position], I.index)
+        I.assume_in_bounds(physical_page, key_cache, axis=0)
+        I.assume_in_bounds(physical_page, value_cache, axis=0)
+        logical_token = (
+            (page_position - page_begin) * PAGE_SIZE + token_offset
         )
-        active = I.reshape(logical_tokens < sequence_length, (token_count,))
+        active = logical_token < sequence_length
+        for key_head in I.parallel(I.domain(0, HK)):
+            query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
+            query = I.gather(q, index=(batch, query_heads, slice(None)))
+            summary = I.region_fold(
+                source=(
+                    key_cache[physical_page, token_offset, key_head, :],
+                    value_cache[physical_page, token_offset, key_head, :],
+                    logical_token,
+                    active,
+                ),
+                axis=0,
+                summarize=summarize_masked_attention_chunk,
+                combine=merge_attention_summaries,
+                identity=empty_attention_summary(local_query_heads, DV),
+                operands=(
+                    query,
+                    I.full((HEAD_GROUP,), fill=0, dtype=I.index),
+                    scale,
+                ),
+            )
+            safe_denominator = I.select(
+                summary.valid,
+                summary.denominator,
+                1.0,
+            )
+            I.scatter_unique(
+                partial_lse,
+                index=(batch, query_heads, split),
+                value=I.select(
+                    summary.valid,
+                    summary.maximum + I.log(safe_denominator) * I.LOG2E,
+                    -I.inf,
+                ),
+            )
+            I.scatter_unique(
+                partial_output,
+                index=(batch, query_heads, split, slice(None)),
+                value=I.select(
+                    summary.valid[:, None],
+                    summary.accumulator / safe_denominator[:, None],
+                    0.0,
+                ),
+            )
+
+
+@intent.kernel
+def splitk_paged_gqa_decode_partials(
+    q: I.In[I.f16, ("B", "HQ", "D")],
+    key_cache: I.In[I.f16, ("P", "PS", "HK", "D")],
+    value_cache: I.In[I.f16, ("P", "PS", "HK", "DV")],
+    page_offsets: I.In[I.i32, ("B_PLUS_1",)],
+    page_indices: I.In[I.i32, ("S",)],
+    sequence_lengths: I.In[I.i32, ("B",)],
+    split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
+    partial_lse: I.Out[I.f32, ("B", "HQ", "SPLITS")],
+    partial_output: I.Out[I.bf16, ("B", "HQ", "SPLITS", "DV")],
+    scale: I.f32,
+    PAGE_SIZE: I.Constexpr[int],
+    HEAD_GROUP: I.Constexpr[int],
+    SPLITS: I.Constexpr[int],
+):
+    B, HQ, D = q.shape
+    PS = key_cache.shape[1]
+    HK = key_cache.shape[2]
+    DV = value_cache.shape[3]
+    jobs = I.domain(0, B * SPLITS)
+    local_query_heads = I.domain(0, HEAD_GROUP)
+    for job in I.parallel(jobs):
+        batch = job // SPLITS
+        split = job % SPLITS
+        page_begin = I.cast(page_offsets[batch], I.index)
+        sequence_length = I.cast(sequence_lengths[batch], I.index)
+        selected_begin = I.cast(split_offsets[job], I.index)
+        page_count = I.cast(
+            split_offsets[job + 1] - split_offsets[job], I.index
+        )
+        token_count = page_count * PS
+        flat_tokens = I.domain(0, token_count)
+        flat_token = I.indices(flat_tokens)
+        page_ordinal = flat_token // PS
+        token_offset = flat_token % PS
+        page_position = selected_begin + page_ordinal
+        I.assume_in_bounds(page_position, page_indices, axis=0)
+        physical_page = I.cast(page_indices[page_position], I.index)
+        I.assume_in_bounds(physical_page, key_cache, axis=0)
+        I.assume_in_bounds(physical_page, value_cache, axis=0)
+        logical_token = (
+            (page_position - page_begin) * PAGE_SIZE + token_offset
+        )
+        active = logical_token < sequence_length
         for key_head in I.parallel(I.domain(0, HK)):
             query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
             query = I.gather(
                 q,
                 index=(batch, query_heads, slice(None)),
             )
-            keys = I.reshape(
-                key_cache[
-                    physical_pages[:, None],
-                    token_offsets[None, :],
-                    key_head,
-                    :,
-                ],
-                (token_count, D),
-            )
-            values = I.reshape(
-                value_cache[
-                    physical_pages[:, None],
-                    token_offsets[None, :],
-                    key_head,
-                    :,
-                ],
-                (token_count, DV),
-            )
-            summary = summarize_masked_attention_chunk(
-                keys,
-                values,
-                I.reshape(logical_tokens, (token_count,)),
-                active,
-                query,
-                I.full((HEAD_GROUP,), fill=0, dtype=I.index),
-                scale,
+            keys = key_cache[
+                physical_page,
+                token_offset,
+                key_head,
+                :,
+            ]
+            values = value_cache[
+                physical_page,
+                token_offset,
+                key_head,
+                :,
+            ]
+            summary = I.region_fold(
+                source=(
+                    keys,
+                    values,
+                    logical_token,
+                    active,
+                ),
+                axis=0,
+                summarize=summarize_masked_attention_chunk,
+                combine=merge_attention_summaries,
+                identity=empty_attention_summary(local_query_heads, DV),
+                operands=(
+                    query,
+                    I.full((HEAD_GROUP,), fill=0, dtype=I.index),
+                    scale,
+                ),
             )
             safe_denominator = I.select(
                 summary.valid,

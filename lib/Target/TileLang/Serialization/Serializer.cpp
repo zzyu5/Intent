@@ -95,6 +95,16 @@ std::string literal(Attribute value) {
     return std::to_string(integer.getInt());
   }
   if (auto floating = dyn_cast<FloatAttr>(value)) {
+    if (floating.getValue().isNaN())
+      return "float(\"nan\")";
+    if (floating.getValue().isInfinity()) {
+      std::string type = tileLangType(floating.getType());
+      if (!type.empty())
+        return (floating.getValue().isNegative() ? "-" : "") +
+               std::string("T.infinity(") + type + ")";
+      return floating.getValue().isNegative() ? "float(\"-inf\")"
+                                               : "float(\"inf\")";
+    }
     std::ostringstream stream;
     stream << std::setprecision(17) << floating.getValueAsDouble();
     std::string result = stream.str();
@@ -107,6 +117,11 @@ std::string literal(Attribute value) {
 
 struct ParameterDomain {
   std::string name;
+  SmallVector<int64_t> candidates;
+};
+
+struct CoverageParameter {
+  std::string dimension;
   SmallVector<int64_t> candidates;
 };
 
@@ -199,6 +214,22 @@ private:
         failed = true;
         return;
       }
+      auto coverage =
+          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
+      if (coverage) {
+        auto binding = dimensionBindings.find(coverage.getInt());
+        if (binding == dimensionBindings.end()) {
+          parameter.emitOpError(
+              "full-coverage parameter references a non-ABI dimension");
+          failed = true;
+          return;
+        }
+        fullCoverageParameters[name.str()] = {
+            binding->second.name,
+            SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
+        values[parameter.getResult()] = name.str();
+        return;
+      }
       domains.push_back(
           {name.str(), SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
       values[parameter.getResult()] = name.str();
@@ -253,6 +284,8 @@ private:
         argument(scalar.name);
     for (const ParameterDomain &domain : domains)
       argument(domain.name);
+    for (const auto &[name, coverage] : fullCoverageParameters)
+      argument(name);
     output << "):\n";
     output << "    @T.prim_func\n    def main(";
     first = true;
@@ -309,6 +342,19 @@ private:
                (metadata.kind == "dimension" ? "]" : ")"),
            1);
     }
+    for (const auto &[parameter, coverage] : fullCoverageParameters) {
+      std::string candidates = "(";
+      for (int64_t candidate : coverage.candidates)
+        candidates += std::to_string(candidate) + ", ";
+      candidates += ")";
+      line(parameter + " = next((extent for extent in " + candidates +
+               " if extent >= " + coverage.dimension + "), None)",
+           1);
+      line("if " + parameter + " is None:", 1);
+      line("raise ValueError(\"no legal full-coverage extent for " + parameter +
+               "\")",
+           2);
+    }
     std::string key = "key = (";
     for (const ViewABI &view : views)
       key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
@@ -324,6 +370,11 @@ private:
       if (index)
         compile += ", ";
       compile += metadata.name + "=" + metadata.name;
+    }
+    for (const auto &[parameter, coverage] : fullCoverageParameters) {
+      if (!metadataArguments.empty() || compile.back() != '(')
+        compile += ", ";
+      compile += parameter + "=" + parameter;
     }
     compile += ")";
     line(compile, 3);
@@ -385,6 +436,8 @@ private:
       } else {
         values[program.getResult()] = "pid0";
       }
+    } else if (auto coordinate = dyn_cast<gpu::WorksetCoordinateOp>(operation)) {
+      values[coordinate.getResult()] = valueString(coordinate.getCoordinate());
     } else if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
       auto extent = cast<gpu::PhysicalExprAttr>(
           dim.getView().getType().getLayout().getExtents()[dim.getAxis()]);
@@ -497,7 +550,8 @@ private:
         --indent;
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       static constexpr const char *functions[] = {
-          "T.reduce_sum", "T.reduce_max", "T.reduce_min"};
+          "T.reduce_sum", "T.reduce_max", "T.reduce_min",
+          "T.reduce_bitand", "T.reduce_bitor", "T.reduce_bitxor"};
       line(std::string(functions[reduce.getKind()]) + "(" +
            valueString(reduce.getSource()) + ", " +
            valueString(reduce.getDestination()) + ", dim=" +
@@ -569,7 +623,8 @@ private:
     std::string input = valueString(unary.getInput());
     static constexpr const char *functions[] = {
         nullptr, nullptr, "T.exp", "T.exp2", "T.log", "T.sin", "T.cos",
-        "T.floor", "T.erf", "T.rsqrt", "T.sigmoid", "T.tanh", "T.abs"};
+        "T.floor", "T.erf", "T.rsqrt", "T.sigmoid", "T.tanh", "T.abs",
+        "T.sqrt"};
     if (unary.getOperatorKind() == 0)
       return "(-" + input + ")";
     if (unary.getOperatorKind() == 1)
@@ -691,6 +746,7 @@ private:
   SmallVector<MetadataABI> metadataArguments;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   SmallVector<ParameterDomain> domains;
+  std::map<std::string, CoverageParameter> fullCoverageParameters;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;

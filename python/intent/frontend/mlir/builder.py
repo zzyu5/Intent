@@ -353,14 +353,13 @@ class MlirBuilder:
     def _dimension_id(self, dimension: object) -> int:
         from ..semantics.types import StaticDim
 
-        if isinstance(dimension, StaticDim):
-            return 0
-        existing = self._dimension_ids.get(dimension)
+        key = (StaticDim, id(dimension)) if isinstance(dimension, StaticDim) else dimension
+        existing = self._dimension_ids.get(key)
         if existing is not None:
             return existing
         identity = self._next_dimension_id
         self._next_dimension_id += 1
-        self._dimension_ids[dimension] = identity
+        self._dimension_ids[key] = identity
         return identity
 
     def dimension_id(self, dimension: object) -> int:

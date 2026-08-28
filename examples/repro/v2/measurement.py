@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Callable
+import statistics
 
 import torch
 
@@ -25,12 +27,46 @@ class NumericalComparisonError(RuntimeError):
     pass
 
 
+TRITON_PARAMETER_OWNERSHIP_M = 0
+TRITON_PARAMETER_OWNERSHIP_N = 1
+TRITON_PARAMETER_REDUCTION = 2
+TRITON_PARAMETER_SCAN_CHUNK = 3
+TRITON_PARAMETER_PROVIDER_WARPS = 4
+TRITON_PARAMETER_PROVIDER_STAGES = 5
+TRITON_PARAMETER_PROVIDER_CTAS = 6
+TRITON_PARAMETER_TRAVERSAL_WORKERS = 8
+TRITON_PARAMETER_TRAVERSAL_GROUP = 9
+MEASUREMENT_REPETITIONS = 200
+
+
+def triton_parameter_value(
+    config, role: int, *, dimension: int | None = None
+) -> int | None:
+    values = triton_parameter_values(config, role, dimension=dimension)
+    return values[0] if len(values) == 1 else None
+
+
+def triton_parameter_values(
+    config, role: int, *, dimension: int | None = None
+) -> tuple[int, ...]:
+    roles = getattr(config, "intent_parameter_roles", {})
+    dimensions = getattr(config, "intent_parameter_dimensions", {})
+    return tuple(
+        config.kwargs[name]
+        for name, parameter_role in roles.items()
+        if parameter_role == role
+        and name in config.kwargs
+        and (dimension is None or dimensions.get(name) == dimension)
+    )
+
+
 def compile_single(
     context: Context,
     definition,
     arguments: tuple[object, ...],
     *,
     constexprs: dict[str, object] | None = None,
+    triton_config_filter: Callable[[object], bool] | None = None,
 ) -> tuple[object, PreparedLaunch]:
     try:
         artifact = intent.compile(
@@ -41,6 +77,32 @@ def compile_single(
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(error.stage, str(error)) from error
+    if triton_config_filter is not None:
+        triton_autotuner = artifact._namespace.get("_intent_kernel")
+        configs = getattr(triton_autotuner, "configs", None)
+        if configs is None:
+            raise PipelineStageError(
+                "candidate_contract",
+                "generated Triton artifact has no observable autotune candidate set",
+            )
+        selected = [config for config in configs if triton_config_filter(config)]
+        if not selected:
+            raise PipelineStageError(
+                "candidate_contract",
+                "generated Triton artifact has no candidate matching the source contract: "
+                + repr(
+                    [
+                        (
+                            tuple(sorted(config.kwargs.items())),
+                            config.num_warps,
+                            config.num_stages,
+                            config.num_ctas,
+                        )
+                        for config in configs[:16]
+                    ]
+                ),
+            )
+        triton_autotuner.configs = selected
     try:
         result = artifact.run(*arguments)
     except Exception as error:
@@ -125,23 +187,23 @@ def compare_outputs(
             f"{len(tolerances)} != {len(generated_values)}"
         )
     errors: list[float] = []
-    for generated_value, source_value, leaf_tolerance in zip(
-        generated_values, source_values, tolerances
+    for leaf_index, (generated_value, source_value, leaf_tolerance) in enumerate(
+        zip(generated_values, source_values, tolerances)
     ):
         if generated_value.shape != source_value.shape:
             raise NumericalComparisonError(
-                "generated/source result shape differs: "
+                f"generated/source result {leaf_index} shape differs: "
                 f"{tuple(generated_value.shape)} != {tuple(source_value.shape)}"
             )
         if generated_value.dtype != source_value.dtype:
             raise NumericalComparisonError(
-                "generated/source result dtype differs: "
+                f"generated/source result {leaf_index} dtype differs: "
                 f"{generated_value.dtype} != {source_value.dtype}"
             )
         if generated_value.dtype == torch.bool or not generated_value.is_floating_point():
             if not torch.equal(generated_value, source_value):
                 raise NumericalComparisonError(
-                    "generated/source integer result differs"
+                    f"generated/source integer result {leaf_index} differs"
                 )
             errors.append(0.0)
             continue
@@ -151,7 +213,7 @@ def compare_outputs(
         source_finite = torch.isfinite(source_compare)
         if not torch.equal(generated_finite, source_finite):
             raise NumericalComparisonError(
-                "generated/source finite-value masks differ"
+                f"generated/source result {leaf_index} finite-value masks differ"
             )
         finite = generated_finite & source_finite
         nonfinite = ~finite
@@ -173,7 +235,7 @@ def compare_outputs(
                 )
             ):
                 raise NumericalComparisonError(
-                    "generated/source non-finite values differ"
+                    f"generated/source result {leaf_index} non-finite values differ"
                 )
         if finite.any():
             difference = (
@@ -186,7 +248,7 @@ def compare_outputs(
             maximum = difference.max().item()
             if torch.any(difference > limit):
                 raise NumericalComparisonError(
-                    "generated/source floating result differs: "
+                    f"generated/source floating result {leaf_index} differs: "
                     f"max_abs={maximum}, atol={leaf_tolerance.atol}, "
                     f"rtol={leaf_tolerance.rtol}"
                 )
@@ -217,23 +279,46 @@ def evaluate(comparison: PreparedComparison) -> tuple[float, float]:
         comparison.tolerance,
     )
     try:
-        generated_p50, _ = benchmark(
+        generated_first, _ = benchmark(
             comparison.generated.launch,
-            warmup=3,
-            repetitions=100,
+            warmup=25,
+            repetitions=MEASUREMENT_REPETITIONS,
             cuda_graph=comparison.cuda_graph,
             prepare=comparison.generated.prepare,
         )
     except Exception as error:
         raise PipelineStageError("generated_benchmark", str(error)) from error
     try:
-        source_p50, _ = benchmark(
+        source_first, _ = benchmark(
             comparison.source.launch,
-            warmup=3,
-            repetitions=100,
+            warmup=25,
+            repetitions=MEASUREMENT_REPETITIONS,
             cuda_graph=comparison.cuda_graph,
             prepare=comparison.source.prepare,
         )
     except Exception as error:
         raise PipelineStageError("source_benchmark", str(error)) from error
-    return generated_p50, source_p50
+    try:
+        source_second, _ = benchmark(
+            comparison.source.launch,
+            warmup=0,
+            repetitions=MEASUREMENT_REPETITIONS,
+            cuda_graph=comparison.cuda_graph,
+            prepare=comparison.source.prepare,
+        )
+    except Exception as error:
+        raise PipelineStageError("source_reverse_benchmark", str(error)) from error
+    try:
+        generated_second, _ = benchmark(
+            comparison.generated.launch,
+            warmup=0,
+            repetitions=MEASUREMENT_REPETITIONS,
+            cuda_graph=comparison.cuda_graph,
+            prepare=comparison.generated.prepare,
+        )
+    except Exception as error:
+        raise PipelineStageError("generated_reverse_benchmark", str(error)) from error
+    return (
+        statistics.median((generated_first, generated_second)),
+        statistics.median((source_first, source_second)),
+    )

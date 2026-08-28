@@ -84,7 +84,7 @@ LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
     uint32_t role, DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::ProviderThreads) ||
+      role > static_cast<uint32_t>(ParameterRole::TraversalGroup) ||
       !candidates || candidates.empty())
     return emitError() << "physical parameter requires a name, role and candidates";
   llvm::DenseSet<int64_t> unique;

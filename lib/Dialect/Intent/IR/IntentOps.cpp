@@ -578,9 +578,8 @@ LogicalResult verifyIndexedData(Operation *operation, Type type,
   DenseI64ArrayAttr actualDimensions = getDimensionIDs(tensor);
   for (unsigned axis = 0; axis < relation.resultRank; ++axis) {
     int64_t expected = relation.resultDimensions[axis];
-    if ((!tensor.isDynamicDim(axis) && expected != 0) ||
-        (tensor.isDynamicDim(axis) &&
-         (!actualDimensions || actualDimensions[axis] != expected)))
+    if (expected <= 0 || !actualDimensions ||
+        actualDimensions[axis] != expected)
       return operation->emitOpError()
              << subject << " lost an index-relation result dimension identity";
   }
@@ -700,7 +699,7 @@ LogicalResult verifyDataOperation(Operation *operation) {
   if (name == "intent.unary") {
     Type input = operation->getOperand(0).getType();
     auto kind = operation->getAttrOfType<IntegerAttr>("operator_kind");
-    if (!kind || kind.getInt() < 0 || kind.getInt() > 12 ||
+    if (!kind || kind.getInt() < 0 || kind.getInt() > 13 ||
         !sameDataSchema(input, result))
       return operation->emitOpError("unary operator/schema is invalid");
     if (kind.getInt() == 1)
@@ -1598,9 +1597,7 @@ LogicalResult verifyCanonicalOperation(Operation *operation) {
         return operation->emitOpError(
             "indices cannot recover its source extent identities");
       for (auto [resultAxis, identity] : llvm::enumerate(*dimensions)) {
-        if ((result.isDynamicDim(resultAxis) &&
-             (!resultIDs || resultIDs[resultAxis] != identity)) ||
-            (!result.isDynamicDim(resultAxis) && identity != 0))
+        if (identity <= 0 || !resultIDs || resultIDs[resultAxis] != identity)
           return operation->emitOpError(
               "indices result extent identity differs from its source");
       }
@@ -1701,7 +1698,10 @@ LogicalResult verifyCanonicalOperation(Operation *operation) {
     if (Operation *definition = bins.getDefiningOp()) {
       if (definition->getName().getStringRef() == "intent.constant") {
         auto value = definition->getAttrOfType<IntegerAttr>("value");
-        if (!value || value.getInt() <= 0 || resultDimension.getInt() != 0 ||
+        auto ids = getDimensionIDs(result);
+        if (!value || value.getInt() <= 0 || !ids ||
+            resultDimension.getInt() <= 0 ||
+            ids[0] != resultDimension.getInt() ||
             result.getDimSize(0) != value.getInt())
           return operation->emitOpError(
               "histogram result extent must equal its static bin count");

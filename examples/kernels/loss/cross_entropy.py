@@ -49,22 +49,65 @@ def merge_cross_entropy_summary(lhs, rhs):
 
 
 @intent.fn
-def cross_entropy_summary(values, coordinates, empty_prediction):
-    return I.reduce(
-        I.record(
-            valid=I.full(values.shape, fill=True, dtype=I.bool),
-            maximum=values,
-            denominator=I.full(values.shape, fill=1.0, dtype=I.f32),
-            predicted=coordinates,
+def minimum_index(lhs, rhs):
+    return I.minimum(lhs, rhs)
+
+
+@intent.fn
+def summarize_cross_entropy_chunk(values, coordinates, empty_prediction):
+    members = coordinates < empty_prediction
+    raw_maximum = I.reduce.max(
+        I.select(members, values, -I.inf),
+        axis=0,
+        identity=-I.inf,
+    )
+    denominator = I.reduce.sum(
+        I.select(
+            members,
+            I.exp(values - raw_maximum),
+            0.0,
         ),
         axis=0,
+        identity=0.0,
+    )
+    chunk_valid = denominator > 0.0
+    chunk_maximum = I.select(chunk_valid, raw_maximum, 0.0)
+    predicted = I.reduce(
+        I.select(
+            members & (values == raw_maximum),
+            coordinates,
+            empty_prediction,
+        ),
+        axis=0,
+        identity=empty_prediction,
+        combine=minimum_index,
+    )
+    return I.record(
+        valid=chunk_valid,
+        maximum=chunk_maximum,
+        denominator=denominator,
+        predicted=I.select(
+            chunk_valid,
+            predicted,
+            empty_prediction * 0,
+        ),
+    )
+
+
+@intent.fn
+def cross_entropy_summary(values, coordinates, empty_prediction):
+    return I.region_fold(
+        source=(values, coordinates),
+        axis=0,
+        summarize=summarize_cross_entropy_chunk,
+        combine=merge_cross_entropy_summary,
         identity=I.record(
             valid=False,
-            maximum=0.0,
-            denominator=0.0,
-            predicted=empty_prediction,
+            maximum=I.cast(0.0, I.f32),
+            denominator=I.cast(0.0, I.f32),
+            predicted=empty_prediction * 0,
         ),
-        combine=merge_cross_entropy_summary,
+        operands=(empty_prediction,),
     )
 
 

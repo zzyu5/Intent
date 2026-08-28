@@ -16,12 +16,10 @@ def swiglu_forward(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         gate_values = I.cast(gate[row, columns], I.f32)
-        up_values = I.cast(up[row, columns], I.f32)
+        up_values = up[row, columns]
         sigmoid = 1.0 / (1.0 + I.exp(-gate_values))
-        output[row, columns] = I.cast(
-            gate_values * sigmoid * up_values,
-            I.bf16,
-        )
+        silu = I.cast(gate_values * sigmoid, I.bf16)
+        output[row, columns] = silu * up_values
 
 
 @intent.kernel

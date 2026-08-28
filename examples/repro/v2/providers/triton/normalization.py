@@ -17,6 +17,9 @@ from kernels.normalization.softmax import stable_softmax_f16
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import TRITON_PARAMETER_REDUCTION
+from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -29,7 +32,22 @@ def _runtime(context: Context, path: str, name: str):
 
 def fused_softmax(context: Context) -> PreparedComparison:
     x = torch.randn((8192, 8192), device="cuda", dtype=torch.float16)
-    _, generated = compile_single(context, stable_softmax_f16, (x,))
+    stages = (
+        4
+        if torch.cuda.get_device_properties(x.device).shared_memory_per_block_optin
+        > 200000
+        else 2
+    )
+    _, generated = compile_single(
+        context,
+        stable_softmax_f16,
+        (x,),
+        triton_config_filter=lambda config: (
+            config.num_warps == 8
+            and config.num_stages == stages
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/triton/normalization/softmax/02-fused-softmax_runtime.py",
@@ -46,7 +64,16 @@ def layer_norm(context: Context) -> PreparedComparison:
     weight = torch.randn((hidden,), device="cuda", dtype=torch.float16)
     bias = torch.randn((hidden,), device="cuda", dtype=torch.float16)
     arguments = (x, weight, bias, 1.0 / hidden, 1e-5)
-    _, generated = compile_single(context, layer_norm_f16, arguments)
+    _, generated = compile_single(
+        context,
+        layer_norm_f16,
+        arguments,
+        triton_config_filter=lambda config: (
+            config.num_warps == 8
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/triton/normalization/layer_norm/05-layer-norm_runtime.py",
@@ -65,7 +92,16 @@ def flash_layer_norm(context: Context) -> PreparedComparison:
     weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
     arguments = (x, weight, bias, 1.0 / hidden, 1e-5)
-    _, generated = compile_single(context, layer_norm_bf16, arguments)
+    _, generated = compile_single(
+        context,
+        layer_norm_bf16,
+        arguments,
+        triton_config_filter=lambda config: (
+            config.num_warps in (1, 2, 4, 8, 16, 32)
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/flash-attention/normalization/layer_norm/layer_norm_runtime.py",
@@ -84,7 +120,23 @@ def swiglu(context: Context) -> PreparedComparison:
     shape = (8192, 14336)
     gate = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     up = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    _, generated = compile_single(context, swiglu_forward, (gate, up))
+    def source_config(config) -> bool:
+        return (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
+            )
+            == 16384
+            and config.num_warps == 16
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        )
+
+    _, generated = compile_single(
+        context,
+        swiglu_forward,
+        (gate, up),
+        triton_config_filter=source_config,
+    )
     runtime = _runtime(
         context,
         "source/triton/liger-kernel/activation/swiglu/swiglu_runtime.py",
@@ -101,7 +153,16 @@ def fused_add_rms(context: Context) -> PreparedComparison:
     residual = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
     arguments = (x, residual, weight, 1.0 / hidden, 1e-6, 0.0)
-    _, generated = compile_single(context, fused_add_rms_norm, arguments)
+    _, generated = compile_single(
+        context,
+        fused_add_rms_norm,
+        arguments,
+        triton_config_filter=lambda config: (
+            config.num_warps == 8
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/liger-kernel/normalization/fused_add_rms_norm/fused_add_rms_norm_runtime.py",
@@ -116,7 +177,16 @@ def rms_norm(context: Context) -> PreparedComparison:
     x = torch.randn((8192, hidden), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
     arguments = (x, weight, 1.0 / hidden, 1e-6)
-    _, generated = compile_single(context, rms_norm_bf16, arguments)
+    _, generated = compile_single(
+        context,
+        rms_norm_bf16,
+        arguments,
+        triton_config_filter=lambda config: (
+            config.num_warps == 8
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/liger-kernel/normalization/rms_norm/rms_norm_runtime.py",
@@ -131,7 +201,16 @@ def xformers_rms_norm(context: Context) -> PreparedComparison:
     x = torch.randn((8192, hidden), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((hidden,), device="cuda", dtype=torch.bfloat16)
     arguments = (x, weight, 1.0 / hidden, 1e-6)
-    _, generated = compile_single(context, rms_norm_bf16, arguments)
+    _, generated = compile_single(
+        context,
+        rms_norm_bf16,
+        arguments,
+        triton_config_filter=lambda config: (
+            config.num_warps == 8
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
+    )
     runtime = _runtime(
         context,
         "source/triton/xformers/normalization/rms_norm/rmsnorm_kernels_runtime.py",
@@ -166,6 +245,15 @@ def flaggems_batch_norm_training(context: Context) -> PreparedComparison:
         context,
         batch_norm_training_kernel,
         (x, weight, bias, generated_mean, generated_variance, 1e-5, 0.1),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
+            )
+            == 512
+            and config.num_warps in (4, 8, 16)
+            and config.num_stages == 2
+            and config.num_ctas == 1
+        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -227,11 +315,23 @@ def flaggems_group_norm_backward(context: Context) -> PreparedComparison:
         context,
         group_norm_backward_dx,
         (x, grad_y, weight, mean, rstd, 1.0 / ((channels // groups) * spatial)),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION) == 128
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
     _, generated_weight_bias = compile_single(
         context,
         group_norm_backward_weight_bias,
         (x, grad_y, mean, rstd),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION) == 1024
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
     generated = PreparedLaunch(
         launch=lambda: (generated_dx.launch(), generated_weight_bias.launch()),
@@ -276,7 +376,14 @@ def flaggems_softmax_backward(context: Context) -> PreparedComparison:
     )
     gradient = torch.randn_like(probabilities)
     _, generated = compile_single(
-        context, softmax_backward_kernel, (probabilities, gradient)
+        context,
+        softmax_backward_kernel,
+        (probabilities, gradient),
+        triton_config_filter=lambda config: (
+            config.num_warps == 4
+            and config.num_stages == 2
+            and config.num_ctas == 1
+        ),
     )
     runtime = _runtime(
         context,

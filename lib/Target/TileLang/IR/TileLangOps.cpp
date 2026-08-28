@@ -199,7 +199,7 @@ LogicalResult ReduceOp::verify() {
   auto source = getSource().getType();
   auto destination = getDestination().getType();
   if (static_cast<size_t>(getAxis()) >= source.getShape().size() ||
-      getKind() > 2 ||
+      getKind() > 5 ||
       source.getElementType() != destination.getElementType() ||
       source.getSpace() != 1 || destination.getSpace() != 1)
     return emitOpError("has an invalid native reduction schema");

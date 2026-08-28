@@ -28,6 +28,7 @@ from ..ast.expressions import compile_time_value
 from ..ast.model import ConstexprBinding
 from ..ast.model import Expression
 from ..ast.model import Literal
+from ..ast.model import ShapeDimension
 from ..ast.model import SparseFormatSpec
 from ..ast.model import StaticTuple
 from .common import bind_call
@@ -407,7 +408,13 @@ def _region_fold(lowerer: FunctionLowerer, node: ast.Call) -> object:
         (None,) * len(slice_types) + capture_bindings,
         node,
     )
-    identity = _values(lowerer, bound["identity"], node)
+    identity_values = _values(lowerer, bound["identity"], node)
+    if len(identity_values) != len(summary_types):
+        lowerer.error(node, "region_fold identity arity must match summary schema")
+    identity = tuple(
+        _align_value_schema(lowerer, value, target, bound["identity"])
+        for value, target in zip(identity_values, summary_types)
+    )
     identity_types = tuple(value.type for value in identity)
     if summary_types != identity_types:
         lowerer.error(
@@ -478,7 +485,13 @@ def _region_scan(lowerer: FunctionLowerer, node: ast.Call) -> StaticTuple:
         (None,) * len(slice_types) + capture_bindings,
         node,
     )
-    identity = _values(lowerer, bound["identity"], node)
+    identity_values = _values(lowerer, bound["identity"], node)
+    if len(identity_values) != len(transition_types):
+        lowerer.error(node, "region_scan identity arity must match transition schema")
+    identity = tuple(
+        _align_value_schema(lowerer, value, target, bound["identity"])
+        for value, target in zip(identity_values, transition_types)
+    )
     if tuple(value.type for value in identity) != transition_types:
         lowerer.error(node, "region_scan summarize result must match identity schema")
     combine, combine_types = _helper_region(
@@ -705,8 +718,9 @@ def _histogram(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         DTypeCategory.INDEX,
     ):
         lowerer.error(node, "I.histogram values must be an integer tensor")
+    bins_expression = lowerer.lower_expression(bound["bins"])
     bins = lowerer.materialize(
-        lowerer.lower_expression(bound["bins"]),
+        bins_expression,
         bound["bins"],
         ScalarType(intent_index),
     )
@@ -723,8 +737,12 @@ def _histogram(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         DTypeCategory.UNSIGNED_INTEGER,
     ):
         lowerer.error(node, "I.histogram count dtype must be fixed-width integer")
-    result_extent = lowerer.fresh_dynamic_dimension("histogram_bins")
-    known, static_bins = compile_time_value(lowerer.lower_expression(bound["bins"]))
+    result_extent = (
+        bins_expression.dimension
+        if isinstance(bins_expression, ShapeDimension)
+        else lowerer.fresh_dynamic_dimension("histogram_bins")
+    )
+    known, static_bins = compile_time_value(bins_expression)
     if known:
         if isinstance(static_bins, bool) or not isinstance(static_bins, int) or static_bins <= 0:
             lowerer.error(bound["bins"], "histogram bins must be positive")
@@ -1113,6 +1131,52 @@ def _values(
     expression = lowerer.lower_expression(node)
     elements = expression.elements if isinstance(expression, StaticTuple) else (expression,)
     return tuple(lowerer.materialize(element, call_node) for element in elements)
+
+
+def _align_value_schema(
+    lowerer: FunctionLowerer,
+    value: MlirValue,
+    target: ValueType,
+    node: ast.AST,
+) -> MlirValue:
+    if isinstance(value.type, TensorType) and isinstance(target, TensorType):
+        if (
+            value.type.dtype != target.dtype
+            or value.type.rank != target.rank
+            or any(
+                not dims_compatible(source, destination)
+                for source, destination in zip(value.type.shape, target.shape)
+            )
+        ):
+            lowerer.error(node, "structured identity tensor does not match its summary schema")
+        return lowerer.broadcast_value(value, target.shape, node)
+    if isinstance(value.type, RecordType) and isinstance(target, RecordType):
+        source_names = tuple(name for name, _ in value.type.fields)
+        target_names = tuple(name for name, _ in target.fields)
+        if source_names != target_names:
+            lowerer.error(node, "structured identity record fields do not match its summary schema")
+        components, _ = _source_components(lowerer, value, node)
+        aligned = tuple(
+            _align_value_schema(lowerer, component, field_type, node)
+            for component, (_, field_type) in zip(components, target.fields)
+        )
+        return _make_record_value(lowerer, aligned, target_names, node)
+    if isinstance(value.type, TupleType) and isinstance(target, TupleType):
+        if len(value.type.components) != len(target.components):
+            lowerer.error(node, "structured identity tuple arity does not match its summary schema")
+        components, _ = _source_components(lowerer, value, node)
+        aligned = tuple(
+            _align_value_schema(lowerer, component, component_type, node)
+            for component, component_type in zip(components, target.components)
+        )
+        return _make_tuple_value(lowerer, aligned, node)
+    if value.type == target:
+        return value
+    lowerer.error(
+        node,
+        f"structured identity value {value.type} does not match summary schema {target}",
+    )
+    raise AssertionError("unreachable after frontend diagnostic")
 
 
 def _tensor_sources(

@@ -57,6 +57,7 @@ from .builtins import region_fold
 from .builtins import region_scan
 from .builtins import reshape
 from .builtins import rsqrt
+from .builtins import sqrt
 from .builtins import sigmoid
 from .builtins import tanh
 from .builtins import sin
@@ -163,6 +164,7 @@ __all__ = [
     "region_scan",
     "reshape",
     "rsqrt",
+    "sqrt",
     "sigmoid",
     "tanh",
     "sin",

@@ -32,11 +32,11 @@ def max_pool2d_with_indices(
             filter_column = local_index % KERNEL_WIDTH
             input_rows = I.reshape(
                 I.indices(output_rows) * STRIDE - PADDING,
-                (OUTPUT_HEIGHT, 1, 1),
+                (output_rows, 1, 1),
             ) + I.reshape(filter_row, (1, 1, KERNEL_ELEMENTS))
             input_columns = I.reshape(
                 I.indices(output_columns) * STRIDE - PADDING,
-                (1, OUTPUT_WIDTH, 1),
+                (1, output_columns, 1),
             ) + I.reshape(filter_column, (1, 1, KERNEL_ELEMENTS))
             row_valid = (input_rows >= 0) & (input_rows < HEIGHT)
             column_valid = (input_columns >= 0) & (input_columns < WIDTH)

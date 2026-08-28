@@ -19,8 +19,8 @@ def upstream(arguments):
         learning_rate,
         beta1,
         beta2,
-        inverse_bias1,
-        inverse_bias2,
+        bias_correction1,
+        bias_correction2,
         epsilon,
         weight_decay,
     ) = arguments
@@ -39,8 +39,8 @@ def upstream(arguments):
         beta2,
         weight_decay,
         epsilon,
-        1.0 / inverse_bias1,
-        1.0 / inverse_bias2,
+        bias_correction1,
+        bias_correction2,
         False,
         False,
     )

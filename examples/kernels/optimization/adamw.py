@@ -14,8 +14,8 @@ def adamw_update(
     learning_rate: I.f32,
     beta1: I.f32,
     beta2: I.f32,
-    inverse_bias1: I.f32,
-    inverse_bias2: I.f32,
+    bias_correction1: I.f32,
+    bias_correction2: I.f32,
     epsilon: I.f32,
     weight_decay: I.f32,
 ):
@@ -27,15 +27,11 @@ def adamw_update(
             beta2 * second_moment[index]
             + (1.0 - beta2) * gradient_value * gradient_value
         )
-        corrected_first = first * inverse_bias1
-        corrected_second = second * inverse_bias2
-        denominator = 1.0 / I.rsqrt(corrected_second) + epsilon
-        updated = (
-            parameter[index] * (1.0 - learning_rate * weight_decay)
-            - learning_rate
-            * corrected_first
-            / denominator
-        )
+        corrected_first = first / bias_correction1
+        corrected_second = second / bias_correction2
+        denominator = I.sqrt(corrected_second) + epsilon
+        update = corrected_first / denominator + weight_decay * parameter[index]
+        updated = parameter[index] - learning_rate * update
         first_moment[index] = first
         second_moment[index] = second
         parameter[index] = updated

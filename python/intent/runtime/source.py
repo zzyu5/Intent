@@ -43,4 +43,5 @@ def materialize_python_source(
         _launcher=launcher,
         _runner=runner,
         _backend_ir_collector=backend_ir_collector,
+        _namespace=namespace,
     )

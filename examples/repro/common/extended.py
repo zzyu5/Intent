@@ -3582,7 +3582,6 @@ def _run_paged_splitk_attention(
             "PAGE_SIZE": PAGED_PAGE_SIZE,
             "HEAD_GROUP": PAGED_HEAD_GROUP,
             "SPLITS": PAGED_SPLITS,
-            "BATCH_SIZE": PAGED_BATCH,
         },
         target=target,
         compiler=compiler,

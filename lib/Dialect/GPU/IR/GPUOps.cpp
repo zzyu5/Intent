@@ -27,11 +27,72 @@ bool sameShape(Type lhs, Type rhs) {
                    left.getOwner() == right.getOwner());
 }
 
+bool sameExecutionShape(Type lhs, Type rhs) {
+  auto left = dyn_cast<FragmentType>(lhs);
+  auto right = dyn_cast<FragmentType>(rhs);
+  if (static_cast<bool>(left) != static_cast<bool>(right))
+    return false;
+  return !left || (left.getShape() == right.getShape() &&
+                   left.getValidity() == right.getValidity() &&
+                   left.getOwner() == right.getOwner());
+}
+
+struct PhysicalProduct {
+  llvm::APInt constant = llvm::APInt(256, 1);
+  SmallVector<PhysicalExprAttr> orderedTerms;
+  bool valid = true;
+};
+
+void collectPhysicalProduct(PhysicalExprAttr value, PhysicalProduct &product) {
+  if (!product.valid)
+    return;
+  auto kind = static_cast<PhysicalExprKind>(value.getKind());
+  if (kind == PhysicalExprKind::Multiply) {
+    if (value.getOperands().size() != 2) {
+      product.valid = false;
+      return;
+    }
+    collectPhysicalProduct(cast<PhysicalExprAttr>(value.getOperands()[0]),
+                           product);
+    collectPhysicalProduct(cast<PhysicalExprAttr>(value.getOperands()[1]),
+                           product);
+    return;
+  }
+  if (kind == PhysicalExprKind::Constant) {
+    if (value.getValue() < 0) {
+      product.valid = false;
+      return;
+    }
+    product.constant *= llvm::APInt(256, value.getValue());
+    return;
+  }
+  product.orderedTerms.push_back(value);
+}
+
+bool sameElementCount(FragmentType lhs, FragmentType rhs) {
+  PhysicalProduct left;
+  PhysicalProduct right;
+  for (Attribute extent : lhs.getShape())
+    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), left);
+  for (Attribute extent : rhs.getShape())
+    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), right);
+  return left.valid && right.valid && left.constant == right.constant &&
+         left.orderedTerms == right.orderedTerms;
+}
+
 LogicalResult verifyDataSchemas(Operation *operation, TypeRange operands,
                                 Type result, bool resultIsPredicate = false) {
-  for (Type operand : operands)
+  for (auto [index, operand] : llvm::enumerate(operands))
     if (!sameShape(operand, result))
-      return operation->emitOpError("physical data shapes/ownership disagree");
+      {
+        InFlightDiagnostic diagnostic = operation->emitOpError(
+            "physical data shapes/ownership disagree: operand=");
+        diagnostic << operand << ", result=" << result;
+        if (Operation *definition =
+                operation->getOperand(index).getDefiningOp())
+          diagnostic << ", producer=" << *definition;
+        return failure();
+      }
   if (resultIsPredicate) {
     if (!elementType(result).isInteger(1))
       return operation->emitOpError("physical predicate result must be i1");
@@ -80,12 +141,22 @@ LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
     for (auto [left, right] : llvm::zip(leftAxes, rightAxes)) {
       if (left < 0 || right < 0 ||
           static_cast<size_t>(left) >= lhs.getShape().size() ||
-          static_cast<size_t>(right) >= rhs.getShape().size() ||
-          !lhsAxes.insert(left).second || !rhsAxes.insert(right).second ||
-          (lhs.getShape()[left] != rhs.getShape()[right] &&
-           (!lhsExtentException || left != *lhsExtentException)))
+          static_cast<size_t>(right) >= rhs.getShape().size())
         return owner->emitOpError()
-               << "physical contract " << role << " axes are invalid";
+               << "physical contract " << role
+               << " axis is out of range: lhs_axis=" << left
+               << ", rhs_axis=" << right;
+      if (!lhsAxes.insert(left).second || !rhsAxes.insert(right).second)
+        return owner->emitOpError()
+               << "physical contract " << role << " axis is repeated";
+      if (lhs.getShape()[left] != rhs.getShape()[right] &&
+          (!lhsExtentException || left != *lhsExtentException))
+        return owner->emitOpError()
+               << "physical contract " << role
+               << " extents disagree: lhs_axis=" << left
+               << ", lhs_extent=" << lhs.getShape()[left]
+               << ", rhs_axis=" << right
+               << ", rhs_extent=" << rhs.getShape()[right];
     }
     return success();
   };
@@ -115,6 +186,28 @@ LogicalResult ProgramIdOp::verify() {
   return success();
 }
 
+LogicalResult WorksetCoordinateOp::verify() {
+  const int64_t sourceId = getSourceIdAttr().getInt();
+  const int64_t sourceAxis = getSourceAxisAttr().getInt();
+  const int64_t sourceRank = getSourceRankAttr().getInt();
+  if (sourceId <= 0)
+    return emitOpError(
+        "workset coordinate requires logical source provenance");
+  if (sourceRank <= 0 || sourceAxis < 0 || sourceAxis >= sourceRank)
+    return emitOpError(
+        "workset coordinate source axis is outside its logical source rank");
+  auto worksetAxis = (*this)->getAttrOfType<IntegerAttr>(worksetAxisAttr);
+  if (!worksetAxis || worksetAxis.getInt() < 0)
+    return emitOpError(
+        "workset coordinate requires a non-negative physical workset axis");
+  if (auto dimension =
+          (*this)->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
+    if (dimension.getInt() < 0)
+      return emitOpError(
+          "workset coordinate source dimension must be non-negative");
+  return success();
+}
+
 LogicalResult DelinearizeOp::verify() {
   if (getExtents().empty() || getExtents().size() != getCoordinates().size() ||
       getLaunchExtents().size() != getExtents().size())
@@ -123,6 +216,15 @@ LogicalResult DelinearizeOp::verify() {
   for (Attribute extent : getLaunchExtents())
     if (!isa<PhysicalExprAttr>(extent))
       return emitOpError("delinearization launch extents must be typed expressions");
+  if (auto roles = (*this)->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
+    if (static_cast<size_t>(roles.size()) != getCoordinates().size())
+      return emitOpError(
+          "delinearization requires one physical role per coordinate");
+    for (int64_t role : roles.asArrayRef())
+      if (role < static_cast<int64_t>(CoordinateRole::Unspecified) ||
+          role > static_cast<int64_t>(CoordinateRole::IndirectTraversal))
+        return emitOpError("delinearization coordinate role is invalid");
+  }
   return success();
 }
 
@@ -168,13 +270,20 @@ LogicalResult BroadcastOp::verify() {
         input.getShape().size() > result.getShape().size())
       return emitOpError("broadcast physical schema is invalid");
   } else if (getValue().getType() != getResult().getType().getElementType()) {
-    return emitOpError("scalar broadcast element type disagrees");
+      return emitOpError("scalar broadcast element type disagrees: value=")
+             << getValue().getType()
+             << ", result_element=" << getResult().getType().getElementType()
+             << ", value_producer="
+             << (getValue().getDefiningOp()
+                     ? getValue().getDefiningOp()->getName().getStringRef()
+                     : StringRef("block argument"))
+             << ", result=" << getResult().getType();
   }
   return success();
 }
 
 LogicalResult UnaryOp::verify() {
-  if (getOperatorKind() > 12 || !sameShape(getInput().getType(), getResult().getType()) ||
+  if (getOperatorKind() > 13 || !sameShape(getInput().getType(), getResult().getType()) ||
       elementType(getInput().getType()) != elementType(getResult().getType()))
     return emitOpError("unary physical schema is invalid");
   return success();
@@ -190,10 +299,20 @@ LogicalResult BinaryOp::verify() {
 LogicalResult CompareOp::verify() {
   if (getPredicate() > 5 ||
       !sameShape(getLhs().getType(), getRhs().getType()) ||
-      !sameShape(getLhs().getType(), getResult().getType()) ||
+      !sameExecutionShape(getLhs().getType(), getResult().getType()) ||
       elementType(getLhs().getType()) != elementType(getRhs().getType()) ||
-      !elementType(getResult().getType()).isInteger(1))
-    return emitOpError("comparison physical schema is invalid");
+      !elementType(getResult().getType()).isInteger(1)) {
+    return emitOpError("comparison physical schema is invalid: lhs=")
+           << getLhs().getType() << ", rhs=" << getRhs().getType()
+           << ", result=" << getResult().getType() << ", lhs_producer="
+           << (getLhs().getDefiningOp()
+                   ? getLhs().getDefiningOp()->getName().getStringRef()
+                   : StringRef("block argument"))
+           << ", rhs_producer="
+           << (getRhs().getDefiningOp()
+                   ? getRhs().getDefiningOp()->getName().getStringRef()
+                   : StringRef("block argument"));
+  }
   return success();
 }
 
@@ -209,9 +328,10 @@ LogicalResult SelectOp::verify() {
 }
 
 LogicalResult CastOp::verify() {
-  return sameShape(getValue().getType(), getResult().getType())
-             ? success()
-             : emitOpError("cast must preserve physical shape and ownership");
+  if (sameShape(getValue().getType(), getResult().getType()))
+    return success();
+  return emitOpError("cast must preserve physical shape and ownership: ")
+         << getValue().getType() << " vs " << getResult().getType();
 }
 
 LogicalResult BitcastOp::verify() {
@@ -235,8 +355,10 @@ LogicalResult ReshapeOp::verify() {
   auto source = dyn_cast<FragmentType>(getValue().getType());
   auto result = dyn_cast<FragmentType>(getResult().getType());
   if (!source || !result || source.getElementType() != result.getElementType() ||
-      source.getOwner() != result.getOwner() || !getReassociation())
-    return emitOpError("reshape physical schema is invalid");
+      source.getOwner() != result.getOwner() || !getReassociation() ||
+      !sameElementCount(source, result))
+    return emitOpError("reshape physical schema is invalid: source=")
+           << getValue().getType() << ", result=" << getResult().getType();
   return success();
 }
 
@@ -308,7 +430,9 @@ LogicalResult LoadOp::verify() {
   if (hasValid && (!elementType(getValid().getType()).isInteger(1) ||
                    !sameShape(getValid().getType(), getResult().getType()) ||
                    !sameShape(getFill().getType(), getResult().getType())))
-    return emitOpError("load validity/fill physical schema is invalid");
+    return emitOpError("load validity/fill physical schema is invalid: result=")
+           << getResult().getType() << ", valid=" << getValid().getType()
+           << ", fill=" << getFill().getType();
   llvm::DenseSet<int64_t> axes;
   for (int64_t axis : getSourceAxes())
     if (axis < 0 || axis >= static_cast<int64_t>(coordinateCount) ||
@@ -324,9 +448,14 @@ LogicalResult LoadOp::verify() {
 
 LogicalResult GatherOp::verify() {
   auto source = dyn_cast<FragmentType>(getSource().getType());
-  if (!source || getCoordinates().size() != source.getShape().size() ||
+  if (!source || getCoordinates().empty() ||
       getSourceAxes().size() != getCoordinates().size())
     return emitOpError("gather source/coordinate relation is inconsistent");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : getSourceAxes())
+    if (axis < 0 || axis >= static_cast<int64_t>(source.getShape().size()) ||
+        !axes.insert(axis).second)
+      return emitOpError("gather source-axis relation is not a unique subset");
   bool hasValid = static_cast<bool>(getValid());
   bool hasFill = static_cast<bool>(getFill());
   if (hasValid != hasFill)
@@ -422,8 +551,7 @@ LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
   if (!source || !slice || source.getElementType() != slice.getElementType() ||
       source.getOwner() != slice.getOwner() ||
       source.getShape().size() != slice.getShape().size() ||
-      axis >= source.getShape().size() ||
-      source.getAxisMaps() != slice.getAxisMaps())
+      axis >= source.getShape().size())
     return owner->emitOpError(
         "physical region source slice lost rank/type/coordinate mapping");
   for (unsigned dimension = 0; dimension < source.getShape().size(); ++dimension) {
@@ -434,10 +562,14 @@ LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
               static_cast<uint32_t>(PhysicalExprKind::Parameter) ||
           extent.getSymbol() != segment.getName())
         return owner->emitOpError(
-            "physical region slice axis is not bound to its segment parameter");
-    } else if (source.getShape()[dimension] != slice.getShape()[dimension]) {
+                   "physical region slice axis is not bound to its segment parameter: slice_extent=")
+               << slice.getShape()[dimension]
+               << ", segment=" << segment.getName();
+    } else if (source.getShape()[dimension] != slice.getShape()[dimension] ||
+               source.getAxisMaps()[dimension] !=
+                   slice.getAxisMaps()[dimension]) {
       return owner->emitOpError(
-          "physical region slice changed a non-segment extent");
+          "physical region slice changed a non-segment extent or coordinate mapping");
     }
   }
   return success();
@@ -491,7 +623,8 @@ LogicalResult RegionFoldOp::verify() {
   for (unsigned index = 0; index < identityCount; ++index) {
     Type identity = getInputs()[sourceCount + index].getType();
     if (identity != getResults()[index].getType())
-      return emitOpError("region-fold identity/result type disagrees");
+      return emitOpError("region-fold identity/result type disagrees: identity=")
+             << identity << ", result=" << getResults()[index].getType();
     summaries.push_back(identity);
   }
   if (!llvm::hasSingleElement(getSummarize()) ||
@@ -691,7 +824,12 @@ LogicalResult AtomicRMWOp::verify() {
       resourceElementType(getResource().getType()) !=
           elementType(getValue().getType()) ||
       (getValid() && !sameShape(getValid().getType(), getValue().getType())))
-    return emitOpError("atomic RMW physical value/kind schema is invalid");
+    return emitOpError("atomic RMW physical value/kind schema is invalid")
+           << "; resource element="
+           << resourceElementType(getResource().getType())
+           << ", value=" << getValue().getType()
+           << ", result=" << getResult().getType()
+           << ", kind=" << getKind();
   return verifyAtomicAddress(getOperation(), getResource().getType(),
                              getCoordinates(), getValid(), getSourceAxes(),
                              getOrdering(), getSharing());

@@ -52,13 +52,13 @@ def emit_type(value_type: ValueType, dimension_id: DimensionID | None = None) ->
             for dimension in value_type.shape
         )
         element = emit_dtype(value_type.dtype)
-        dynamic = any(not isinstance(dimension, StaticDim) for dimension in value_type.shape)
         encoding = ""
-        if dynamic:
-            if dimension_id is None:
+        if dimension_id is None:
+            if any(not isinstance(dimension, StaticDim) for dimension in value_type.shape):
                 raise ValueError(
                     "dynamic tensor type emission requires a dimension identity resolver"
                 )
+        else:
             ids = [dimension_id(dimension) for dimension in value_type.shape]
             encoding = ", #intent.tensor_shape<[" + ", ".join(
                 str(identity) for identity in ids

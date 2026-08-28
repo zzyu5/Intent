@@ -28,6 +28,16 @@ def IntentGPU_ProgramIdOp : IntentGPU_Op<"program_id", [Pure]> {
   let hasVerifier = 1;
 }
 
+def IntentGPU_WorksetCoordinateOp : IntentGPU_Op<"workset_coordinate", [Pure]> {
+  let summary = "Scalar logical coordinate owned by one physical program";
+  let arguments = (ins Index:$coordinate,
+                       I64Attr:$source_id,
+                       I64Attr:$source_axis,
+                       I64Attr:$source_rank);
+  let results = (outs Index:$result);
+  let hasVerifier = 1;
+}
+
 def IntentGPU_DelinearizeOp : IntentGPU_Op<"delinearize", [Pure]> {
   let summary = "Row-major decoding of one physical program coordinate";
   let arguments = (ins Index:$linear,

@@ -13,6 +13,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cmath>
 #include <iomanip>
 #include <map>
 #include <numeric>
@@ -48,20 +49,24 @@ std::string pythonType(Type type, bool torch = false) {
 }
 
 std::string expressionString(gpu::PhysicalExprAttr expression,
-                             bool configContext) {
+                             bool configContext,
+                             const llvm::StringSet<> *fullCoverage = nullptr) {
   auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
   if (kind == gpu::PhysicalExprKind::Constant)
     return std::to_string(expression.getValue());
-  if (kind == gpu::PhysicalExprKind::Parameter)
-    return configContext ? ("cfg." + expression.getSymbol().getValue()).str()
-                         : expression.getSymbol().getValue().str();
+  if (kind == gpu::PhysicalExprKind::Parameter) {
+    StringRef name = expression.getSymbol().getValue();
+    return configContext && (!fullCoverage || !fullCoverage->contains(name))
+               ? ("cfg." + name).str()
+               : name.str();
+  }
   if (kind == gpu::PhysicalExprKind::Dimension ||
       kind == gpu::PhysicalExprKind::ScalarABI)
     return expression.getSymbol().getValue().str();
   SmallVector<std::string> operands;
   for (Attribute operand : expression.getOperands())
-    operands.push_back(
-        expressionString(cast<gpu::PhysicalExprAttr>(operand), configContext));
+    operands.push_back(expressionString(cast<gpu::PhysicalExprAttr>(operand),
+                                        configContext, fullCoverage));
   if (kind == gpu::PhysicalExprKind::Add)
     return "(" + operands[0] + " + " + operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::Subtract)
@@ -103,8 +108,14 @@ std::string literal(Attribute value) {
     return std::to_string(integer.getInt());
   }
   if (auto floating = dyn_cast<FloatAttr>(value)) {
+    double number = floating.getValueAsDouble();
+    if (std::isnan(number))
+      return "float(\"nan\")";
+    if (std::isinf(number))
+      return std::signbit(number) ? "-float(\"inf\")"
+                                  : "float(\"inf\")";
     std::ostringstream stream;
-    stream << std::setprecision(17) << floating.getValueAsDouble();
+    stream << std::setprecision(17) << number;
     std::string result = stream.str();
     if (result.find_first_of(".eE") == std::string::npos)
       result += ".0";
@@ -118,14 +129,22 @@ struct ParameterDomain {
   SmallVector<int64_t> candidates;
 };
 
+struct CoverageParameter {
+  std::string dimension;
+  SmallVector<int64_t> candidates;
+};
+
 FailureOr<SmallVector<std::map<std::string, int64_t>>>
 parameterConfigs(func::FuncOp kernel) {
   SmallVector<ParameterDomain> domains;
   llvm::StringSet<> names;
   WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
-    if (schema.getRole() >=
-        static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps)) {
+    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
+    if (role == gpu::ParameterRole::ProviderWarps ||
+        role == gpu::ParameterRole::ProviderStages ||
+        role == gpu::ParameterRole::ProviderCTAs ||
+        role == gpu::ParameterRole::ProviderThreads) {
       parameter.emitOpError(
           "cuTile source cannot bind a foreign provider parameter role");
       return WalkResult::interrupt();
@@ -135,6 +154,8 @@ parameterConfigs(func::FuncOp kernel) {
       parameter.emitOpError("duplicates a cuTile physical parameter");
       return WalkResult::interrupt();
     }
+    if (parameter->hasAttr(gpu::coverageDimensionAttr))
+      return WalkResult::advance();
     domains.push_back(
         {name.str(), SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
     return WalkResult::advance();
@@ -163,6 +184,7 @@ public:
   LogicalResult emit() {
     bindArguments();
     emitPreamble();
+    emitReductionHelpers();
     emitKernel();
     emitLaunch();
     emitRun();
@@ -223,6 +245,24 @@ private:
           dimensionBindings[metadata.dimension] = metadata;
       }
     }
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto dimension =
+          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
+      if (!dimension)
+        return;
+      auto binding = dimensionBindings.find(dimension.getInt());
+      if (binding == dimensionBindings.end()) {
+        parameter.emitOpError(
+            "full-coverage parameter references a non-ABI dimension");
+        failed = true;
+        return;
+      }
+      auto schema = parameter.getParameter();
+      fullCoverageParameters[schema.getName().getValue().str()] = {
+          binding->second.name,
+          SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
+      fullCoverageParameterNames.insert(schema.getName().getValue());
+    });
   }
 
   void emitPreamble() {
@@ -231,6 +271,66 @@ private:
               "import cuda.tile as ct\n"
               "from cuda.tile.tune import exhaustive_search\n\n"
               "ConstInt = ct.Constant[int]\n\n";
+  }
+
+  Attribute scalarConstant(Value value) {
+    while (true) {
+      if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
+        value = cast.getValue();
+        continue;
+      }
+      if (auto splat = value.getDefiningOp<gpu::SplatOp>()) {
+        value = splat.getValue();
+        continue;
+      }
+      if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>()) {
+        value = broadcast.getValue();
+        continue;
+      }
+      if (auto extract = value.getDefiningOp<gpu::ExtractOp>()) {
+        auto record = extract.getRecord().getDefiningOp<gpu::MakeRecordOp>();
+        if (record && extract.getField() < record.getFields().size()) {
+          value = record.getFields()[extract.getField()];
+          continue;
+        }
+      }
+      break;
+    }
+    auto constant = value.getDefiningOp<arith::ConstantOp>();
+    return constant ? constant.getValue() : Attribute();
+  }
+
+  void emitReductionHelpers() {
+    SmallVector<gpu::ReduceOp> reductions;
+    kernel.walk([&](gpu::ReduceOp reduce) { reductions.push_back(reduce); });
+    for (gpu::ReduceOp reduce : reductions) {
+      std::string helper = "_intent_reduce_" +
+                           std::to_string(reductionHelpers.size());
+      reductionHelpers[reduce.getOperation()] = helper;
+      output << "@ct.function\ndef " << helper << "(";
+      Block &block = reduce.getCombine().front();
+      for (auto [index, argument] : llvm::enumerate(block.getArguments())) {
+        if (index)
+          output << ", ";
+        std::string name = "arg" + std::to_string(index);
+        values[argument] = name;
+        output << name;
+      }
+      output << "):\n";
+      indent = 1;
+      for (Operation &operation : block) {
+        if (auto yield = dyn_cast<gpu::YieldOp>(operation)) {
+          if (yield.getValues().size() == 1)
+            line("return " + valueString(yield.getValues().front()));
+          else
+            line("return " + tuple(yield.getValues()));
+          continue;
+        }
+        emitOperation(operation);
+      }
+      output << "\n";
+      indent = 0;
+    }
   }
 
   void emitKernel() {
@@ -289,6 +389,19 @@ private:
                (metadata.kind == "dimension" ? "]" : ")"),
            1);
     }
+    for (const auto &[parameter, coverage] : fullCoverageParameters) {
+      std::string candidates = "(";
+      for (int64_t candidate : coverage.candidates)
+        candidates += std::to_string(candidate) + ", ";
+      candidates += ")";
+      line(parameter + " = next((extent for extent in " + candidates +
+               " if extent >= " + coverage.dimension + "), None)",
+           1);
+      line("if " + parameter + " is None:", 1);
+      line("raise ValueError(\"no legal full-coverage extent for " + parameter +
+               "\")",
+           2);
+    }
     std::string key = "key = (";
     for (const ViewABI &view : views)
       key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
@@ -301,7 +414,9 @@ private:
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
     std::string grid = "lambda cfg: (";
     for (Attribute extent : space)
-      grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true) + ", ";
+      grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
+                               &fullCoverageParameterNames) +
+              ", ";
     grid += "1, 1)";
     line("result = exhaustive_search(_CONFIGS, stream, " + grid +
              ", _intent_kernel, lambda cfg: (" + joinKernelArguments("cfg") +
@@ -311,7 +426,8 @@ private:
     line("cfg = _TUNE_CACHE[key]", 1);
     std::string launchGrid = "(";
     for (Attribute extent : space)
-      launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true) +
+      launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
+                                     &fullCoverageParameterNames) +
                     ", ";
     launchGrid += "1, 1)";
     line("return ct.launch(stream, " + launchGrid + ", _intent_kernel, (" +
@@ -375,6 +491,8 @@ private:
       assign(physical.getResult(), expressionString(physical.getExpression(), false));
     } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
       assign(program.getResult(), "ct.bid(" + std::to_string(program.getAxis()) + ")");
+    } else if (auto coordinate = dyn_cast<gpu::WorksetCoordinateOp>(operation)) {
+      values[coordinate.getResult()] = valueString(coordinate.getCoordinate());
     } else if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
       auto extent = cast<gpu::PhysicalExprAttr>(
           dim.getView().getType().getLayout().getExtents()[dim.getAxis()]);
@@ -532,12 +650,51 @@ private:
                  "), ct.bitcast(" + valueString(mma.getRhsScale()) +
                  ", ct.float8_e8m0fnu), " +
                  valueString(mma.getAccumulator()) + ")");
+    } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
+      unsigned count = reduce.getSourceCount();
+      ValueRange sources = reduce.getInputs().take_front(count);
+      ValueRange identities = reduce.getInputs().slice(count, count);
+      std::string source = count == 1 ? valueString(sources.front())
+                                      : tuple(sources);
+      std::string identity;
+      if (count == 1) {
+        identity = literal(scalarConstant(identities.front()));
+      } else {
+        identity = "(";
+        for (auto [index, value] : llvm::enumerate(identities)) {
+          if (index)
+            identity += ", ";
+          identity += literal(scalarConstant(value));
+        }
+        identity += ")";
+      }
+      std::string call = "ct.reduce(" + source + ", axis=" +
+                         std::to_string(reduce.getAxes().front()) +
+                         ", func=" +
+                         reductionHelpers.lookup(reduce.getOperation()) +
+                         ", identity=" + identity + ")";
+      if (count == 1) {
+        assign(reduce.getResult(0), call);
+      } else {
+        std::string resultNames;
+        for (auto [index, result] : llvm::enumerate(reduce.getResults())) {
+          if (index)
+            resultNames += ", ";
+          std::string name = newName();
+          values[result] = name;
+          resultNames += name;
+        }
+        line(resultNames + " = " + call);
+      }
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       static constexpr const char *functions[] = {"ct.sum", "ct.max", "ct.min"};
-      assign(reduce.getResult(),
-             std::string(functions[reduce.getKind()]) + "(" +
-                 valueString(reduce.getSource()) + ", axis=" +
-                 std::to_string(reduce.getAxis()) + ")");
+      std::string expression =
+          std::string(functions[reduce.getKind()]) + "(" +
+          valueString(reduce.getSource()) + ", axis=" +
+          std::to_string(reduce.getAxis()) + ")";
+      if (elementType(reduce.getResult().getType()).isInteger(1))
+        expression = "ct.astype(" + expression + ", ct.bool_)";
+      assign(reduce.getResult(), expression);
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
       assign(scan.getResult(), "ct.cumsum(" + valueString(scan.getSource()) +
                                    ", axis=" + std::to_string(scan.getAxis()) +
@@ -652,7 +809,8 @@ private:
     std::string input = valueString(unary.getInput());
     static constexpr const char *functions[] = {
         nullptr, nullptr, "ct.exp", "ct.exp2", "ct.log", "ct.sin", "ct.cos",
-        "ct.floor", "ct.erf", "ct.rsqrt", "ct.sigmoid", "ct.tanh", "ct.abs"};
+        "ct.floor", "ct.erf", "ct.rsqrt", "ct.sigmoid", "ct.tanh", "ct.abs",
+        "ct.sqrt"};
     if (unary.getOperatorKind() == 0)
       return "(-" + input + ")";
     if (unary.getOperatorKind() == 1)
@@ -664,6 +822,14 @@ private:
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source || source == target)
       return valueString(value);
+    if (source.getShape().size() > target.getShape().size()) {
+      kernel.emitError("cuTile broadcast source rank exceeds target rank");
+      failed = true;
+      return "<invalid-cutile-broadcast>";
+    }
+    if (source.getShape().size() == target.getShape().size())
+      return "ct.broadcast_to(" + valueString(value) + ", " +
+             fragmentShape(target) + ")";
     SmallVector<int64_t> targetForSource(source.getShape().size(), -1);
     for (auto [sourceIndex, sourceMapping] :
          llvm::enumerate(source.getAxisMaps())) {
@@ -678,6 +844,26 @@ private:
         }
       }
       if (targetForSource[sourceIndex] < 0) {
+        auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[sourceIndex]);
+        unsigned aligned = target.getShape().size() - source.getShape().size() +
+                           sourceIndex;
+        bool alignedAvailable = llvm::none_of(
+            targetForSource, [&](int64_t targetAxis) {
+              return targetAxis == static_cast<int64_t>(aligned);
+            });
+        if (extent.getKind() ==
+                static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+            extent.getValue() == 1 && alignedAvailable) {
+          targetForSource[sourceIndex] = aligned;
+          continue;
+        }
+        if (Operation *producer = value.getDefiningOp())
+          producer->emitOpError(
+              "cuTile broadcast source axis is absent from its target fragment")
+              << "; source=" << source << ", target=" << target;
+        else
+          kernel.emitError(
+              "cuTile broadcast block argument axis is absent from its target fragment");
         failed = true;
         return "<unmapped-cutile-broadcast>";
       }
@@ -770,13 +956,22 @@ private:
       parameters.push_back(parameter.getParameter().getName().getValue().str());
     });
     for (StringRef parameter : parameters)
-      result += ", " + configName.str() + "." + parameter.str();
+      result += ", " +
+                (fullCoverageParameters.count(parameter.str())
+                     ? parameter.str()
+                     : configName.str() + "." + parameter.str());
     return result;
   }
 
   std::string valueString(Value value) {
     auto found = values.find(value);
     if (found == values.end()) {
+      if (Operation *producer = value.getDefiningOp())
+        producer->emitOpError(
+            "cuTile terminal translation encountered an unmapped SSA value");
+      else
+        kernel.emitError(
+            "cuTile terminal translation encountered an unmapped block argument");
       failed = true;
       return "<missing>";
     }
@@ -827,10 +1022,13 @@ private:
   func::FuncOp kernel;
   raw_ostream &output;
   llvm::DenseMap<Value, std::string> values;
+  llvm::DenseMap<Operation *, std::string> reductionHelpers;
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
+  std::map<std::string, CoverageParameter> fullCoverageParameters;
+  llvm::StringSet<> fullCoverageParameterNames;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;

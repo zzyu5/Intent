@@ -3,6 +3,10 @@ import math
 import intent
 import intent.language as I
 
+from kernels.streaming.attention import empty_attention_summary
+from kernels.streaming.attention import merge_attention_summaries
+from kernels.streaming.attention import summarize_masked_attention_chunk
+
 
 BATCH = 8
 QUERY_HEADS = 32
@@ -34,13 +38,6 @@ def block_sparse_gqa_decode_partials(
     B, HQ, D = q.shape
     KV_HEADS = k.shape[2]
     K = k.shape[1]
-    S = block_indices.shape[2]
-    split_ranges = I.ragged(
-        outer=I.domain(0, SPLITS),
-        members=I.domain(0, S),
-        offsets=split_offsets,
-    )
-    block_tokens = I.domain(0, BLOCK_SIZE)
     local_query_head_axis = I.domain(0, HEAD_GROUP)
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, KV_HEADS)):
@@ -53,9 +50,17 @@ def block_sparse_gqa_decode_partials(
                 q,
                 index=(batch, query_head_indices, slice(None)),
             )
-            for split in I.parallel(split_ranges.outer):
-                selected = split_ranges[split]
-                selected_index = I.indices(selected)
+            for split in I.parallel(I.domain(0, SPLITS)):
+                selected_begin = I.cast(split_offsets[split], I.index)
+                selected_count = I.cast(
+                    split_offsets[split + 1] - split_offsets[split], I.index
+                )
+                token_count = selected_count * BLOCK_SIZE
+                flat_tokens = I.domain(0, token_count)
+                flat_token = I.indices(flat_tokens)
+                selected_ordinal = flat_token // BLOCK_SIZE
+                token_offset = flat_token % BLOCK_SIZE
+                selected_index = selected_begin + selected_ordinal
                 I.assume_in_bounds(selected_index, block_indices, axis=2)
                 selected_block = I.cast(
                     block_indices[batch, key_head, selected_index],
@@ -66,85 +71,62 @@ def block_sparse_gqa_decode_partials(
                     valid=selected_block >= 0,
                     fill=I.cast(0, I.index),
                 )
-                token_index = (
-                    safe_block[:, None] * BLOCK_SIZE
-                    + I.indices(block_tokens)[None, :]
-                )
+                token_index = safe_block * BLOCK_SIZE + token_offset
                 valid_token = (
-                    (selected_block[:, None] >= 0)
+                    (selected_block >= 0)
                     & (token_index < K)
                     & (token_index < I.cast(cache_lengths[batch], I.index))
                 )
                 safe_token_index = I.select(valid_token, token_index, 0)
-                selected_count = split_offsets[split + 1] - split_offsets[split]
-                token_count = selected_count * BLOCK_SIZE
-                key_block = I.reshape(
-                    I.gather(
-                        k,
-                        index=(
-                            batch,
-                            safe_token_index,
-                            key_head,
-                            slice(None),
-                        ),
+                key_block = I.gather(
+                    k,
+                    index=(
+                        batch,
+                        safe_token_index,
+                        key_head,
+                        slice(None),
                     ),
-                    (token_count, D),
                 )
-                value_block = I.reshape(
-                    I.gather(
-                        v,
-                        index=(
-                            batch,
-                            safe_token_index,
-                            key_head,
-                            slice(None),
-                        ),
+                value_block = I.gather(
+                    v,
+                    index=(
+                        batch,
+                        safe_token_index,
+                        key_head,
+                        slice(None),
                     ),
-                    (token_count, D),
                 )
-                flat_valid = I.reshape(valid_token, (token_count,))
-                scores = I.contract(
-                    query,
-                    key_block,
-                    reduce=((1, 1),),
-                    acc_dtype=I.f32,
+                flat_valid = valid_token
+                summary = I.region_fold(
+                    source=(
+                        key_block,
+                        value_block,
+                        token_index,
+                        flat_valid,
+                    ),
+                    axis=0,
+                    summarize=summarize_masked_attention_chunk,
+                    combine=merge_attention_summaries,
+                    identity=empty_attention_summary(local_query_head_axis, D),
+                    operands=(
+                        query,
+                        query_head_indices,
+                        scale,
+                    ),
                 )
-                scores = I.mask(
-                    scores * (scale * I.LOG2E),
-                    valid=flat_valid[None, :],
-                    fill=-I.inf,
-                )
-                maximum = I.reduce.max(scores, axis=1, identity=-I.inf)
-                safe_maximum = I.mask(
-                    maximum,
-                    valid=maximum != -I.inf,
-                    fill=0.0,
-                )
-                probability = I.mask(
-                    I.exp2(scores - safe_maximum[:, None]),
-                    valid=flat_valid[None, :],
-                    fill=0.0,
-                )
-                denominator = I.reduce.sum(
-                    probability,
-                    axis=1,
-                    identity=0.0,
-                )
-                accumulator = I.contract(
-                    I.cast(probability, I.f16),
-                    value_block,
-                    reduce=((1, 0),),
-                    acc_dtype=I.f32,
-                )
-                safe_denominator = I.mask(
-                    denominator,
-                    valid=denominator > 0.0,
-                    fill=1.0,
+                safe_denominator = I.select(
+                    summary.valid,
+                    summary.denominator,
+                    1.0,
                 )
                 I.scatter_unique(
                     partial_lse,
                     index=(batch, query_head_indices, split),
-                    value=maximum + I.log(safe_denominator) * I.LOG2E,
+                    value=I.select(
+                        summary.valid,
+                        summary.maximum + I.log(safe_denominator) * I.LOG2E,
+                        -I.inf,
+                    ),
                 )
                 I.scatter_unique(
                     partial_output,
@@ -154,7 +136,11 @@ def block_sparse_gqa_decode_partials(
                         split,
                         slice(None),
                     ),
-                    value=accumulator / safe_denominator[:, None],
+                    value=I.select(
+                        summary.valid[:, None],
+                        summary.accumulator / safe_denominator[:, None],
+                        0.0,
+                    ),
                 )
 
 

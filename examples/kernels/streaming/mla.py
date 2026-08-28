@@ -47,6 +47,41 @@ MLA_DECODE_SPLITS = 16
 
 
 @intent.fn
+def merge_natural_attention_summaries(lhs, rhs):
+    valid = lhs.valid | rhs.valid
+    maximum = I.select(lhs.valid, lhs.maximum, rhs.maximum)
+    maximum = I.select(
+        rhs.valid,
+        I.maximum(maximum, rhs.maximum),
+        maximum,
+    )
+    lhs_maximum = I.select(lhs.valid, lhs.maximum, maximum)
+    rhs_maximum = I.select(rhs.valid, rhs.maximum, maximum)
+    lhs_scale = I.select(
+        lhs.valid,
+        I.exp(lhs_maximum - maximum),
+        0.0,
+    )
+    rhs_scale = I.select(
+        rhs.valid,
+        I.exp(rhs_maximum - maximum),
+        0.0,
+    )
+    return I.record(
+        valid=valid,
+        maximum=maximum,
+        denominator=(
+            lhs_scale * lhs.denominator
+            + rhs_scale * rhs.denominator
+        ),
+        accumulator=(
+            lhs_scale[:, None] * lhs.accumulator
+            + rhs_scale[:, None] * rhs.accumulator
+        ),
+    )
+
+
+@intent.fn
 def summarize_mla_chunk(
     latent_chunk,
     rope_chunk,
@@ -410,11 +445,12 @@ def paged_mla_decode(
         page_token = coordinates % PAGE_SIZE
         for query_head in I.parallel(I.domain(0, HQ)):
             key_head = query_head // HEAD_GROUP
+            latent_values = latent_cache[physical_page, page_token, key_head, :]
             summary = I.region_fold(
                 source=(
-                    latent_cache[physical_page, page_token, key_head, :],
+                    latent_values,
                     rope_cache[physical_page, page_token, key_head, :],
-                    latent_cache[physical_page, page_token, key_head, :],
+                    latent_values,
                     coordinates,
                 ),
                 axis=0,
@@ -444,79 +480,74 @@ def paged_mla_decode_partials(
     page_offsets: I.In[I.i32, ("B_PLUS_1",)],
     page_indices: I.In[I.i32, ("S",)],
     sequence_lengths: I.In[I.i32, ("B",)],
-    split_offsets: I.In[I.i32, ("SP_PLUS_1",)],
     partial_lse: I.Out[I.f32, ("B", "HQ", "SPLITS")],
     partial_output: I.Out[I.f32, ("B", "HQ", "SPLITS", "C")],
     scale: I.f32,
     PAGE_SIZE: I.Constexpr[int],
     HEAD_GROUP: I.Constexpr[int],
     SPLITS: I.Constexpr[int],
-    BATCH_SIZE: I.Constexpr[int],
 ):
     B, HQ, C = q_latent.shape
     DR = q_rope.shape[2]
-    cache_tokens, HK, _ = latent_cache.shape
-    split_tokens = I.ragged(
-        outer=I.domain(0, BATCH_SIZE * SPLITS),
-        members=I.domain(0, cache_tokens),
-        offsets=split_offsets,
-    )
-    local_query_heads = I.domain(0, HEAD_GROUP)
-    for job in I.parallel(split_tokens.outer):
-        batch = job // SPLITS
-        split = job % SPLITS
+    HK = latent_cache.shape[1]
+    for batch in I.parallel(I.domain(0, B)):
         page_begin = I.cast(page_offsets[batch], I.index)
         sequence_length = I.cast(sequence_lengths[batch], I.index)
-        batch_token_begin = I.cast(split_offsets[batch * SPLITS], I.index)
-        selected = split_tokens[job]
-        logical_token = I.indices(selected) - batch_token_begin
-        active = (logical_token >= 0) & (logical_token < sequence_length)
-        page_slot = I.select(
-            active,
-            page_begin + logical_token // PAGE_SIZE,
-            0,
-        )
-        I.assume_in_bounds(page_slot, page_indices, axis=0)
-        physical_page = I.cast(page_indices[page_slot], I.index)
-        physical_token = I.select(
-            active,
-            physical_page * PAGE_SIZE + logical_token % PAGE_SIZE,
-            0,
-        )
-        I.assume_in_bounds(physical_token, latent_cache, axis=0)
-        I.assume_in_bounds(physical_token, rope_cache, axis=0)
-        for key_head in I.parallel(I.domain(0, HK)):
-            query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
-            summary = summarize_masked_mla_chunk_natural(
-                latent_cache[physical_token, key_head, :],
-                rope_cache[physical_token, key_head, :],
-                latent_cache[physical_token, key_head, :],
-                logical_token,
-                active,
-                I.gather(q_latent, index=(batch, query_heads, slice(None))),
-                I.gather(q_rope, index=(batch, query_heads, slice(None))),
-                I.full((HEAD_GROUP,), fill=0, dtype=I.index),
-                scale,
-            )
-            safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
-            I.scatter_unique(
-                partial_lse,
-                index=(batch, query_heads, split),
-                value=I.select(
-                    summary.valid,
-                    summary.maximum + I.log(safe_denominator),
-                    -I.inf,
-                ),
-            )
-            I.scatter_unique(
-                partial_output,
-                index=(batch, query_heads, split, slice(None)),
-                value=I.select(
-                    summary.valid[:, None],
-                    summary.accumulator / safe_denominator[:, None],
-                    0.0,
-                ),
-            )
+        split_extent = (sequence_length + SPLITS - 1) // SPLITS
+        for split in I.parallel(I.domain(0, SPLITS)):
+            selected_begin = split * split_extent
+            selected_end = I.minimum(selected_begin + split_extent, sequence_length)
+            selected = I.domain(selected_begin, selected_end)
+            logical_token = I.indices(selected)
+            active = logical_token < sequence_length
+            page_slot = page_begin + logical_token // PAGE_SIZE
+            I.assume_in_bounds(page_slot, page_indices, axis=0)
+            physical_page = I.cast(page_indices[page_slot], I.index)
+            physical_token = physical_page * PAGE_SIZE + logical_token % PAGE_SIZE
+            I.assume_in_bounds(physical_token, latent_cache, axis=0)
+            I.assume_in_bounds(physical_token, rope_cache, axis=0)
+            local_query_heads = I.domain(0, HEAD_GROUP)
+            for key_head in I.parallel(I.domain(0, HK)):
+                query_heads = key_head * HEAD_GROUP + I.indices(local_query_heads)
+                latent_values = latent_cache[physical_token, key_head, :]
+                summary = I.region_fold(
+                    source=(
+                        latent_values,
+                        rope_cache[physical_token, key_head, :],
+                        latent_values,
+                        logical_token,
+                        active,
+                    ),
+                    axis=0,
+                    summarize=summarize_masked_mla_chunk_natural,
+                    combine=merge_natural_attention_summaries,
+                    identity=empty_attention_summary(local_query_heads, C),
+                    operands=(
+                        I.gather(q_latent, index=(batch, query_heads, slice(None))),
+                        I.gather(q_rope, index=(batch, query_heads, slice(None))),
+                        query_heads,
+                        scale,
+                    ),
+                )
+                safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
+                I.scatter_unique(
+                    partial_lse,
+                    index=(batch, query_heads, split),
+                    value=I.select(
+                        summary.valid,
+                        summary.maximum + I.log(safe_denominator),
+                        -I.inf,
+                    ),
+                )
+                I.scatter_unique(
+                    partial_output,
+                    index=(batch, query_heads, split, slice(None)),
+                    value=I.select(
+                        summary.valid[:, None],
+                        summary.accumulator / safe_denominator[:, None],
+                        0.0,
+                    ),
+                )
 
 
 @intent.kernel
@@ -533,11 +564,12 @@ def absorbed_mla_decode(
     key_axis = I.domain(0, K)
     for batch in I.parallel(I.domain(0, B)):
         for head in I.parallel(I.domain(0, H)):
+            latent_values = latent_cache[batch, key_axis, :]
             summary = I.region_fold(
                 source=(
-                    latent_cache[batch, key_axis, :],
+                    latent_values,
                     rope_cache[batch, key_axis, :],
-                    latent_cache[batch, key_axis, :],
+                    latent_values,
                     I.indices(key_axis),
                 ),
                 axis=0,

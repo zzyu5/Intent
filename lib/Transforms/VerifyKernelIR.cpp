@@ -77,23 +77,15 @@ bool isCanonicalScalarType(Type type) {
 LogicalResult verifyTensorType(Operation *owner, RankedTensorType tensor) {
   if (failed(verifyCanonicalType(owner, tensor.getElementType())))
     return failure();
-  bool dynamic = tensor.getNumDynamicDims() != 0;
   auto encoding = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
   auto dimensionIDs = encoding ? encoding.getDimensions() : DenseI64ArrayAttr();
-  if (dynamic && (!dimensionIDs || dimensionIDs.size() != tensor.getRank()))
-    return owner->emitOpError(
-        "dynamic tensor type requires one canonical dimension identity per axis");
-  if (!encoding)
-    return success();
   if (!dimensionIDs || dimensionIDs.size() != tensor.getRank())
     return owner->emitOpError(
-        "tensor encoding may contain only canonical intent.dim_ids");
-  for (auto [axis, identity] : llvm::enumerate(dimensionIDs.asArrayRef())) {
-    if ((tensor.isDynamicDim(axis) && identity <= 0) ||
-        (!tensor.isDynamicDim(axis) && identity != 0))
+        "tensor type requires one canonical dimension identity per axis");
+  for (int64_t identity : dimensionIDs.asArrayRef())
+    if (identity <= 0)
       return owner->emitOpError(
-          "tensor dimension identities must be positive for dynamic axes and zero for static axes");
-  }
+          "tensor dimension identities must be positive for every logical axis");
   return success();
 }
 

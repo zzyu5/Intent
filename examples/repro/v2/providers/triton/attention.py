@@ -12,19 +12,43 @@ from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_com
 from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_partials
 from kernels.streaming.mla import paged_mla_decode_partials
 from kernels.streaming.paged_attention import paged_gqa_decode_partials
+from kernels.streaming.paged_attention import splitk_paged_gqa_decode_partials
 from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce
-from kernels.streaming.splitk_reduce import splitk_attention_bf16_to_f16_reduce
 from kernels.streaming.splitk_reduce import splitk_attention_f32_to_f16_reduce
 from kernels.routing.mqa_logits import fp8_mqa_logits
 
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import TRITON_PARAMETER_SCAN_CHUNK
+from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import ComparisonUnavailable
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
+
+
+def _segment_value(config):
+    values = tuple(
+        value for name, value in config.kwargs.items() if name.startswith("SEGMENT_N")
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def _fragment_dimension_value(config):
+    values = tuple(
+        value for name, value in config.kwargs.items() if name.startswith("FRAGMENT_D")
+    )
+    return values[0] if len(values) == 1 else None
+
+
+def _fragment_source_value(config):
+    values = tuple(
+        value for name, value in config.kwargs.items() if name.startswith("FRAGMENT_S")
+    )
+    return values[0] if len(values) == 1 else None
 
 
 def flash_attention_forward(context: Context) -> PreparedComparison:
@@ -34,11 +58,38 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
     k = torch.randn(shape, device="cuda", dtype=torch.float16)
     v = torch.randn(shape, device="cuda", dtype=torch.float16)
     scale = 1.0 / math.sqrt(dimension)
+    capability_major = torch.cuda.get_device_capability()[0]
+
+    def source_candidate(config) -> bool:
+        block_m = triton_parameter_value(
+            config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
+        )
+        segment_values = tuple(
+            value
+            for name, value in config.kwargs.items()
+            if name.startswith("SEGMENT_N")
+        )
+        if len(segment_values) != 1:
+            return False
+        block_n = segment_values[0]
+        if block_m not in (64, 128) or block_n not in (32, 64, 128):
+            return False
+        if block_m < block_n:
+            return False
+        if config.num_stages not in (2, 3, 4) or config.num_warps not in (4, 8):
+            return False
+        return not (
+            capability_major == 9
+            and block_m * block_n < 128 * 128
+            and config.num_warps == 8
+        )
+
     _, generated = compile_single(
         context,
         flash_attention_fwd,
         (q, k, v, scale),
         constexprs={"CAUSAL": True},
+        triton_config_filter=source_candidate,
     )
     runtime = load_module(
         context.project_root
@@ -46,10 +97,13 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
         "intent_v2_triton_flash_attention",
     )
     source_function = runtime.load_attention()
-    warp_specialize = torch.cuda.get_device_capability()[0] >= 10
+    warp_specialize = capability_major >= 10
     source = functional_launch(
         lambda: source_function(q, k, v, True, scale, warp_specialize)
     )
+    source_tuner = source_function.__self__.forward.__globals__.get("_attn_fwd")
+    if source_tuner is None or source_tuner.best_config is None:
+        raise RuntimeError("source FlashAttention did not expose its autotune winner")
     return PreparedComparison(generated, source, Tolerance(atol=2e-2, rtol=2e-2), cuda_graph=True)
 
 
@@ -65,6 +119,21 @@ def modern_flash_attention_forward(context: Context) -> PreparedComparison:
         flash_attention_fwd,
         (q, k, v, scale),
         constexprs={"CAUSAL": True},
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
+            )
+            == 128
+            and tuple(
+                value
+                for name, value in config.kwargs.items()
+                if name.startswith("SEGMENT_N")
+            )
+            == (128,)
+            and config.num_warps == 4
+            and config.num_stages == 1
+            and config.num_ctas == 1
+        ),
     )
     runtime = load_module(
         context.project_root / "source/triton/meta-applied-ai/support/runtime.py",
@@ -124,7 +193,20 @@ def flaggems_fp8_mqa_logits(context: Context) -> PreparedComparison:
     key_start = indices % 17
     key_end = keys - indices % 19
     arguments = (q, kv, kv_scale, head_weight, key_start, key_end)
-    _, generated = compile_single(context, fp8_mqa_logits, arguments)
+    _, generated = compile_single(
+        context,
+        fp8_mqa_logits,
+        arguments,
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=4
+            )
+            in (32, 64, 128)
+            and config.num_warps in (4, 8)
+            and config.num_stages in (2, 3)
+            and config.num_ctas == 1
+        ),
+    )
     runtime = load_module(
         context.project_root
         / "source/triton/flag-gems/routing/fp8_mqa_logits/fp8_mqa_logits_runtime.py",
@@ -174,6 +256,15 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         (batch,), sequence, device="cuda", dtype=torch.int32
     )
     scale = dimension**-0.5
+
+    def source_candidate(config) -> bool:
+        return (
+            triton_parameter_value(config, TRITON_PARAMETER_SCAN_CHUNK) == 32
+            and config.num_warps == 4
+            and config.num_stages == 2
+            and config.num_ctas == 1
+        )
+
     _, partials = compile_single(
         context,
         paged_gqa_decode_partials,
@@ -191,14 +282,20 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
             "SPLITS": splits,
-            "BATCH_SIZE": batch,
         },
+        triton_config_filter=source_candidate,
     )
     partial_lse, partial_output = partials.outputs()
     _, reduction = compile_single(
         context,
-        splitk_attention_bf16_to_f16_reduce,
+        splitk_attention_f32_to_f16_reduce,
         (partial_output, partial_lse),
+        triton_config_filter=lambda config: (
+            _fragment_dimension_value(config) == dimension
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
 
     def generated_launch():
@@ -285,9 +382,18 @@ def splitk_paged_attention(context: Context) -> PreparedComparison:
         (batch,), sequence, device="cuda", dtype=torch.int32
     )
     scale = dimension**-0.5
+
+    def source_candidate(config) -> bool:
+        return (
+            _segment_value(config) == page_size
+            and config.num_warps == 4
+            and config.num_stages == 1
+            and config.num_ctas == 1
+        )
+
     _, partials = compile_single(
         context,
-        paged_gqa_decode_partials,
+        splitk_paged_gqa_decode_partials,
         (
             q,
             key_cache,
@@ -302,14 +408,20 @@ def splitk_paged_attention(context: Context) -> PreparedComparison:
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
             "SPLITS": splits,
-            "BATCH_SIZE": batch,
         },
+        triton_config_filter=source_candidate,
     )
     partial_lse, partial_output = partials.outputs()
     _, reduction = compile_single(
         context,
         splitk_attention_weighted_sum_reduce,
         (partial_output, partial_lse),
+        triton_config_filter=lambda config: (
+            _fragment_dimension_value(config) == dimension
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
 
     def generated_launch():
@@ -346,7 +458,6 @@ def paged_mla(context: Context) -> PreparedComparison:
     key_dimension = latent_dimension + rope_dimension
     page_size, splits = 16, 8
     pages_per_sequence = sequence // page_size
-    tokens_per_split = sequence // splits
     pages = batch * pages_per_sequence
     q_latent = torch.randn(
         (batch, query_heads, latent_dimension),
@@ -380,13 +491,6 @@ def paged_mla(context: Context) -> PreparedComparison:
     lengths = torch.full(
         (batch,), sequence, device="cuda", dtype=torch.int32
     )
-    split_offsets = torch.arange(
-        0,
-        batch * sequence + 1,
-        tokens_per_split,
-        device="cuda",
-        dtype=torch.int32,
-    )
     scale = key_dimension**-0.5
     _, partials = compile_single(
         context,
@@ -399,21 +503,35 @@ def paged_mla(context: Context) -> PreparedComparison:
             page_offsets,
             page_indices,
             lengths,
-            split_offsets,
             scale,
         ),
         constexprs={
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
             "SPLITS": splits,
-            "BATCH_SIZE": batch,
         },
+        triton_config_filter=lambda config: (
+            _fragment_source_value(config) == 16
+            and _segment_value(config) == 32
+            and config.num_warps == 4
+            and config.num_stages == 2
+            and config.num_ctas == 1
+        ),
     )
     partial_lse, partial_output = partials.outputs()
     _, reduction = compile_single(
         context,
         splitk_attention_f32_to_f16_reduce,
         (partial_output, partial_lse),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=4
+            )
+            == 512
+            and config.num_warps == 4
+            and config.num_stages == 2
+            and config.num_ctas == 1
+        ),
     )
 
     def generated_launch():
@@ -500,6 +618,15 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         dtype=torch.int32,
     )
     scale = dimension**-0.5
+
+    def source_candidate(config) -> bool:
+        return (
+            _segment_value(config) == block_size
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        )
+
     _, partial = compile_single(
         context,
         block_sparse_gqa_decode_partials,
@@ -509,6 +636,7 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
             "BLOCK_SIZE": block_size,
             "SPLITS": splits,
         },
+        triton_config_filter=source_candidate,
     )
     partial_lse, partial_output = partial.outputs()
     _, combined = compile_single(
@@ -516,6 +644,12 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         block_sparse_gqa_decode_combine,
         (partial_lse, partial_output),
         constexprs={"SPLITS": splits},
+        triton_config_filter=lambda config: (
+            _fragment_dimension_value(config) == dimension
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
 
     def generated_launch():

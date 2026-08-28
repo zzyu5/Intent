@@ -162,8 +162,8 @@ LogicalResult TensorShapeAttr::verify(
   if (!dimensions)
     return emitError() << "tensor shape encoding requires dimension identities";
   for (int64_t identity : dimensions.asArrayRef())
-    if (identity < 0)
-      return emitError() << "tensor dimension identity must be non-negative";
+    if (identity <= 0)
+      return emitError() << "tensor dimension identity must be positive";
   return success();
 }
 
@@ -173,9 +173,9 @@ LogicalResult ShapeExprAttr::verify(
   if (kind > 2)
     return emitError() << "shape expression kind is outside the canonical enum";
   if (kind == 0)
-    return dimension == 0 && payload >= 0
+    return dimension > 0 && payload >= 0
                ? success()
-               : emitError() << "static shape expression requires a non-negative extent";
+               : emitError() << "static shape expression requires a positive identity and non-negative extent";
   if (dimension <= 0)
     return emitError() << "dynamic shape expression requires a positive identity";
   if ((kind == 1 && payload < 0) || (kind == 2 && payload != -1))

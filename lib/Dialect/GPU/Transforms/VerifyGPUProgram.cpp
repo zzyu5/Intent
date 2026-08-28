@@ -174,7 +174,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         count += candidate.getParameter().getName().getValue() == name;
       });
       if (count != 1) {
-        operation->emitOpError("physical parameter name is duplicated");
+        operation->emitOpError("physical parameter name is duplicated: ")
+            << name;
         return WalkResult::interrupt();
       }
     }

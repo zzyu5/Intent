@@ -280,10 +280,19 @@ FailureOr<SmallVector<Value>> materializeCoordinateDomains(
 FailureOr<Value> scalarFill(Operation *owner, Value fill) {
   if (!fill)
     return Value();
+  while (isa<gpu::FragmentType>(fill.getType())) {
+    if (auto splat = fill.getDefiningOp<gpu::SplatOp>()) {
+      fill = splat.getValue();
+      continue;
+    }
+    if (auto broadcast = fill.getDefiningOp<gpu::BroadcastOp>()) {
+      fill = broadcast.getValue();
+      continue;
+    }
+    break;
+  }
   if (!isa<gpu::FragmentType>(fill.getType()))
     return fill;
-  if (auto splat = fill.getDefiningOp<gpu::SplatOp>())
-    return splat.getValue();
   return owner->emitOpError(
       "cuTile gather padding must be an explicit scalar or splat");
 }
@@ -311,7 +320,41 @@ std::optional<uint64_t> nativeCombineKind(Region &region) {
     return 1;
   if (binary.getOperatorKind() == 8 || binary.getOperatorKind() == 10)
     return 2;
+  auto result = dyn_cast<gpu::FragmentType>(binary.getResult().getType());
+  if (result && result.getElementType().isInteger(1)) {
+    if (binary.getOperatorKind() == 12)
+      return 1;
+    if (binary.getOperatorKind() == 11)
+      return 2;
+  }
   return std::nullopt;
+}
+
+Attribute scalarConstant(Value value) {
+  while (true) {
+    if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
+      value = cast.getValue();
+      continue;
+    }
+    if (auto splat = value.getDefiningOp<gpu::SplatOp>()) {
+      value = splat.getValue();
+      continue;
+    }
+    if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>()) {
+      value = broadcast.getValue();
+      continue;
+    }
+    if (auto extract = value.getDefiningOp<gpu::ExtractOp>()) {
+      auto record = extract.getRecord().getDefiningOp<gpu::MakeRecordOp>();
+      if (record && extract.getField() < record.getFields().size()) {
+        value = record.getFields()[extract.getField()];
+        continue;
+      }
+    }
+    break;
+  }
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  return constant ? constant.getValue() : Attribute();
 }
 
 LogicalResult formNativeTiles(func::FuncOp kernel) {
@@ -430,20 +473,44 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
 
   for (gpu::ReduceOp reduce : reductions) {
     std::optional<uint64_t> kind = nativeCombineKind(reduce.getCombine());
-    if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
-        reduce.getCaptureCount() != 0 || reduce.getAxes().size() != 1 ||
-        reduce.getNumResults() != 1 || !kind)
+    bool native = reduce.getSourceCount() == 1 &&
+                  reduce.getIdentityCount() == 1 &&
+                  reduce.getCaptureCount() == 0 &&
+                  reduce.getAxes().size() == 1 &&
+                  reduce.getNumResults() == 1 && kind.has_value();
+    if (native) {
+      auto source =
+          dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
+      if (!source)
+        return reduce.emitOpError("cuTile native reduce source must be a tile");
+      OpBuilder builder(reduce);
+      auto replacement = builder.create<ReduceOp>(
+          reduce.getLoc(), reduce.getResultTypes().front(),
+          reduce.getInputs().front(), reduce.getAxes().front(), *kind);
+      reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
+      reduce.erase();
+      continue;
+    }
+
+    if (reduce.getSourceCount() == 0 ||
+        reduce.getSourceCount() != reduce.getIdentityCount() ||
+        reduce.getSourceCount() != reduce.getNumResults() ||
+        reduce.getCaptureCount() != 0 || reduce.getAxes().size() != 1)
       return reduce.emitOpError(
-          "cuTile native reduce requires one source/identity/axis and builtin add/max/min combine");
-    auto source = dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
-    if (!source)
-      return reduce.emitOpError("cuTile native reduce source must be a tile");
-    OpBuilder builder(reduce);
-    auto replacement = builder.create<ReduceOp>(
-        reduce.getLoc(), reduce.getResultTypes().front(), reduce.getInputs().front(),
-        reduce.getAxes().front(), *kind);
-    reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
-    reduce.erase();
+          "cuTile custom reduce requires matching non-empty source/identity/result schemas, one axis, and no captures");
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount()))
+      if (!isa<gpu::FragmentType>(source.getType()))
+        return reduce.emitOpError("cuTile custom reduce source must be a tile");
+    for (Value identity : reduce.getInputs().slice(
+             reduce.getSourceCount(), reduce.getIdentityCount()))
+      if (!scalarConstant(identity)) {
+        InFlightDiagnostic diagnostic = reduce.emitOpError(
+            "cuTile custom reduce identity must be an explicit scalar constant");
+        diagnostic << "; identity type=" << identity.getType();
+        if (Operation *producer = identity.getDefiningOp())
+          diagnostic << ", producer=" << producer->getName();
+        return failure();
+      }
   }
 
   for (gpu::ScanOp scan : scans) {
@@ -623,13 +690,14 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
     if (isa<TileLoadOp, TileStoreOp, ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
             ScatterStoreOp, AtomicRMWOp, ExtractScalarOp, MMAOp, ScaledMMAOp,
-            ReduceOp, ScanOp, gpu::ParameterOp,
-            gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::DelinearizeOp,
+            ReduceOp, ScanOp, gpu::ReduceOp, gpu::ParameterOp,
+            gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
+            gpu::DelinearizeOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
             gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
             gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
-            gpu::ExtractOp, arith::ConstantOp,
+            gpu::ExtractOp, gpu::YieldOp, arith::ConstantOp,
             scf::ForOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(operation))
       return WalkResult::advance();
     operation->emitOpError("is outside the closed cuTile provider surface");

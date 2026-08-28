@@ -7,6 +7,8 @@ from kernels.activation.pointwise import addcmul_broadcast_bf16
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import Tolerance
@@ -18,7 +20,22 @@ def addcmul(context: Context) -> PreparedComparison:
     scale = torch.randn(shape[:2], device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(shape[:2], device="cuda", dtype=torch.bfloat16)
     _, generated = compile_single(
-        context, addcmul_broadcast_bf16, (x, scale, bias)
+        context,
+        addcmul_broadcast_bf16,
+        (x, scale, bias),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
+            )
+            == 1
+            and triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
+            )
+            == 512
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
     runtime = load_module(
         context.project_root

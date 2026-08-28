@@ -22,6 +22,7 @@ def varlen_aligned_causal_depthwise_conv1d(
     C = chunk_indices.shape[0]
     packed_tokens = I.domain(0, U)
     channels = I.domain(0, D)
+    taps = I.domain(0, WIDTH)
     for chunk in I.parallel(I.domain(0, C)):
         I.assume_in_bounds(chunk, chunk_indices, axis=0)
         sequence = I.cast(chunk_indices[chunk, 0], I.index)
@@ -36,29 +37,34 @@ def varlen_aligned_causal_depthwise_conv1d(
         tokens = packed_tokens[token_start:token_end]
         token_indices = I.indices(tokens)
         channel_indices = I.indices(channels)
-        accumulation = I.zeros((tokens, D), dtype=I.f32)
-        for tap in range(WIDTH):
-            source_index = (
-                token_indices
-                - I.cast(WIDTH - 1, I.index)
-                + I.cast(tap, I.index)
-            )
-            valid = source_index >= sequence_start
-            safe_index = I.maximum(source_index, sequence_start)
-            value = I.gather(
-                x,
-                index=(safe_index[:, None], channel_indices[None, :]),
-            )
-            accumulation = accumulation + I.mask(
-                I.cast(value, I.f32)
-                * weight[channels, tap][None, :],
-                valid=valid[:, None],
-                fill=0.0,
-            )
+        tap_indices = I.indices(taps)
+        source_index = (
+            token_indices[:, None]
+            - I.cast(WIDTH - 1, I.index)
+            + tap_indices[None, :]
+        )
+        valid = source_index >= sequence_start
+        value = I.gather(
+            x,
+            index=(
+                source_index[:, :, None],
+                channel_indices[None, None, :],
+            ),
+            valid=valid[:, :, None],
+            fill=I.cast(0.0, I.bf16),
+        )
+        tap_weight = I.transpose(
+            I.cast(weight[channels, taps], I.f32), permutation=(1, 0)
+        )
+        accumulation = I.reduce.sum(
+            I.cast(value, I.f32) * tap_weight[None, :, :],
+            axis=1,
+            identity=0.0,
+        )
         accumulation = accumulation + I.cast(
             bias[channels], I.f32
         )[None, :]
-        sigmoid = 1.0 / (1.0 + I.exp(-accumulation))
+        sigmoid = I.sigmoid(accumulation)
         I.scatter_unique(
             output,
             index=(token_indices[:, None], channel_indices[None, :]),

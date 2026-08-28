@@ -9,16 +9,250 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <limits>
+#include <map>
+#include <optional>
+
 using namespace mlir;
 
 namespace intent::triton {
 namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_gpu.triton.legalized";
+constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
+constexpr int64_t maxTritonTensorElements = 1048576;
+
+struct TritonConfig {
+  std::map<std::string, int64_t> kernelParameters;
+  int64_t warps = 0;
+  int64_t stages = 0;
+  int64_t ctas = 0;
+};
+
+std::optional<int64_t>
+evaluateCompileTimeExpression(gpu::PhysicalExprAttr expression,
+                              const TritonConfig &config) {
+  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  if (kind == gpu::PhysicalExprKind::Constant)
+    return expression.getValue();
+  if (kind == gpu::PhysicalExprKind::Parameter) {
+    auto found = config.kernelParameters.find(expression.getSymbol().getValue().str());
+    return found == config.kernelParameters.end()
+               ? std::nullopt
+               : std::optional<int64_t>(found->second);
+  }
+  if (kind == gpu::PhysicalExprKind::Dimension ||
+      kind == gpu::PhysicalExprKind::ScalarABI)
+    return std::nullopt;
+
+  SmallVector<int64_t> operands;
+  for (Attribute operand : expression.getOperands()) {
+    std::optional<int64_t> value = evaluateCompileTimeExpression(
+        cast<gpu::PhysicalExprAttr>(operand), config);
+    if (!value)
+      return std::nullopt;
+    operands.push_back(*value);
+  }
+  auto checked = [](const __int128 value) -> std::optional<int64_t> {
+    if (value < std::numeric_limits<int64_t>::min() ||
+        value > std::numeric_limits<int64_t>::max())
+      return std::nullopt;
+    return static_cast<int64_t>(value);
+  };
+  if (kind == gpu::PhysicalExprKind::Add)
+    return checked(static_cast<__int128>(operands[0]) + operands[1]);
+  if (kind == gpu::PhysicalExprKind::Subtract)
+    return checked(static_cast<__int128>(operands[0]) - operands[1]);
+  if (kind == gpu::PhysicalExprKind::Multiply)
+    return checked(static_cast<__int128>(operands[0]) * operands[1]);
+  if (kind == gpu::PhysicalExprKind::Minimum)
+    return std::min(operands[0], operands[1]);
+  if (kind == gpu::PhysicalExprKind::Maximum)
+    return std::max(operands[0], operands[1]);
+  if (kind == gpu::PhysicalExprKind::Select)
+    return operands[0] ? operands[1] : operands[2];
+  if (kind == gpu::PhysicalExprKind::FloorDiv) {
+    if (operands[1] <= 0 || operands[0] < 0)
+      return std::nullopt;
+    return operands[0] / operands[1];
+  }
+  if (kind == gpu::PhysicalExprKind::CeilDiv) {
+    if (operands[1] <= 0 || operands[0] < 0)
+      return std::nullopt;
+    return checked((static_cast<__int128>(operands[0]) + operands[1] - 1) /
+                   operands[1]);
+  }
+  if (kind == gpu::PhysicalExprKind::NextPowerOfTwo) {
+    if (operands[0] <= 0)
+      return std::nullopt;
+    uint64_t value = static_cast<uint64_t>(operands[0] - 1);
+    for (unsigned shift = 1; shift < 64; shift <<= 1)
+      value |= value >> shift;
+    if (value == std::numeric_limits<uint64_t>::max() ||
+        value + 1 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return std::nullopt;
+    return static_cast<int64_t>(value + 1);
+  }
+  return std::nullopt;
+}
+
+bool isCompileTimeExpression(gpu::PhysicalExprAttr expression) {
+  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  if (kind == gpu::PhysicalExprKind::Constant ||
+      kind == gpu::PhysicalExprKind::Parameter)
+    return true;
+  if (kind == gpu::PhysicalExprKind::Dimension ||
+      kind == gpu::PhysicalExprKind::ScalarABI)
+    return false;
+  return llvm::all_of(expression.getOperands(), [](Attribute operand) {
+    return isCompileTimeExpression(cast<gpu::PhysicalExprAttr>(operand));
+  });
+}
+
+bool fragmentFitsTritonTensor(gpu::FragmentType fragment,
+                              const TritonConfig &config) {
+  __int128 elements = 1;
+  for (Attribute extent : fragment.getShape()) {
+    std::optional<int64_t> value = evaluateCompileTimeExpression(
+        cast<gpu::PhysicalExprAttr>(extent), config);
+    // Runtime dimensions and full-coverage heuristics are checked by Triton at
+    // specialization time.  This pass rejects only candidates whose typed
+    // compile-time shape is already known to be illegal.
+    if (!value)
+      return true;
+    if (*value <= 0)
+      return false;
+    elements *= *value;
+    if (elements > maxTritonTensorElements)
+      return false;
+  }
+  return true;
+}
+
+bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
+  if (auto fragment = dyn_cast<gpu::FragmentType>(type))
+    return fragmentFitsTritonTensor(fragment, config);
+  if (auto record = dyn_cast<gpu::RecordType>(type))
+    return llvm::all_of(record.getFieldTypes(), [&](Attribute field) {
+      return typeFitsTritonTensor(cast<TypeAttr>(field).getValue(), config);
+    });
+  return true;
+}
+
+LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
+  struct Domain {
+    StringRef name;
+    gpu::ParameterRole role;
+    ArrayRef<int64_t> candidates;
+    bool heuristic;
+  };
+  SmallVector<Domain> domains;
+  llvm::StringSet<> names;
+  WalkResult schema = kernel.walk([&](gpu::ParameterOp parameter) {
+    auto definition = parameter.getParameter();
+    StringRef name = definition.getName().getValue();
+    if (!names.insert(name).second) {
+      parameter.emitOpError("duplicates a Triton parameter name");
+      return WalkResult::interrupt();
+    }
+    domains.push_back({name,
+                       static_cast<gpu::ParameterRole>(definition.getRole()),
+                       definition.getCandidates().asArrayRef(),
+                       parameter->hasAttr(gpu::coverageDimensionAttr)});
+    return WalkResult::advance();
+  });
+  if (schema.wasInterrupted())
+    return failure();
+
+  SmallVector<TritonConfig> configs(1);
+  for (const Domain &domain : domains) {
+    if (domain.heuristic)
+      continue;
+    SmallVector<TritonConfig> expanded;
+    for (const TritonConfig &base : configs) {
+      for (int64_t candidate : domain.candidates) {
+        TritonConfig next = base;
+        switch (domain.role) {
+        case gpu::ParameterRole::ProviderWarps:
+          next.warps = candidate;
+          break;
+        case gpu::ParameterRole::ProviderStages:
+          next.stages = candidate;
+          break;
+        case gpu::ParameterRole::ProviderCTAs:
+          next.ctas = candidate;
+          break;
+        default:
+          next.kernelParameters[domain.name.str()] = candidate;
+          break;
+        }
+        expanded.push_back(std::move(next));
+      }
+    }
+    configs = std::move(expanded);
+  }
+
+  SmallVector<Attribute> encoded;
+  Builder builder(kernel.getContext());
+  for (const TritonConfig &config : configs) {
+    if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
+      return kernel.emitError("Triton provider parameter domains are incomplete");
+    bool legal = true;
+    kernel.walk([&](Operation *operation) {
+      if (!legal)
+        return WalkResult::interrupt();
+      if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
+        auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
+        if (!fragment || fragment.getShape().size() != 1) {
+          legal = false;
+          return WalkResult::interrupt();
+        }
+        std::optional<int64_t> extent = evaluateCompileTimeExpression(
+            cast<gpu::PhysicalExprAttr>(fragment.getShape()[0]), config);
+        if (extent && (*extent <= 0 ||
+                       (static_cast<uint64_t>(*extent) &
+                        (static_cast<uint64_t>(*extent) - 1)) != 0)) {
+          legal = false;
+          return WalkResult::interrupt();
+        }
+      }
+      for (Type type : operation->getResultTypes())
+        if (!typeFitsTritonTensor(type, config)) {
+          legal = false;
+          return WalkResult::interrupt();
+        }
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (BlockArgument argument : block.getArguments())
+            if (!typeFitsTritonTensor(argument.getType(), config)) {
+              legal = false;
+              return WalkResult::interrupt();
+            }
+      return WalkResult::advance();
+    });
+    if (!legal)
+      continue;
+    SmallVector<NamedAttribute> parameters;
+    for (const auto &[name, value] : config.kernelParameters)
+      parameters.push_back(builder.getNamedAttr(name, builder.getI64IntegerAttr(value)));
+    encoded.push_back(builder.getDictionaryAttr({
+        builder.getNamedAttr("parameters", builder.getDictionaryAttr(parameters)),
+        builder.getNamedAttr("num_warps", builder.getI64IntegerAttr(config.warps)),
+        builder.getNamedAttr("num_stages", builder.getI64IntegerAttr(config.stages)),
+        builder.getNamedAttr("num_ctas", builder.getI64IntegerAttr(config.ctas)),
+    }));
+  }
+  if (encoded.empty())
+    return kernel.emitError(
+        "all Triton parameter candidates violate typed fragment legality");
+  kernel->setAttr(gpu::tritonConfigsAttr, builder.getArrayAttr(encoded));
+  return success();
+}
 
 bool isTritonScalarType(Type type) {
   if (type.isIndex() || isa<Float16Type, BFloat16Type, Float32Type,
-                            Float64Type>(type))
+                            Float64Type, Float8E4M3FNType,
+                            Float8E5M2Type>(type))
     return true;
   if (auto integer = dyn_cast<IntegerType>(type))
     return integer.getWidth() == 1 || integer.getWidth() == 8 ||
@@ -90,21 +324,141 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
   for (gpu::GatherOp gather : gathers) {
     if (!gather.getValid())
       continue;
-    if (gather.getCoordinates().size() != 1 ||
-        !samePhysicalShape(gather.getValid().getType(),
-                           gather.getCoordinates().front().getType()) ||
+    auto scalarConstant = [](Value value) -> arith::ConstantOp {
+      while (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
+        value = broadcast.getValue();
+      while (auto splat = value.getDefiningOp<gpu::SplatOp>())
+        value = splat.getValue();
+      while (auto cast = value.getDefiningOp<gpu::CastOp>())
+        value = cast.getValue();
+      return value.getDefiningOp<arith::ConstantOp>();
+    };
+    auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
+    auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (gather.getCoordinates().size() == 1 &&
+        gather.getSourceAxes().size() == 1 && source && result &&
+        source.getShape().size() == result.getShape().size() + 1) {
+      unsigned selectedAxis = gather.getSourceAxes().front();
+      auto selectedExtent =
+          selectedAxis < source.getShape().size()
+              ? dyn_cast<gpu::PhysicalExprAttr>(source.getShape()[selectedAxis])
+              : gpu::PhysicalExprAttr();
+      bool compatible = selectedExtent &&
+                        selectedExtent.getKind() == static_cast<uint32_t>(
+                                                        gpu::PhysicalExprKind::Constant) &&
+                        selectedExtent.getValue() > 0;
+      unsigned resultAxis = 0;
+      for (unsigned sourceAxis = 0;
+           compatible && sourceAxis < source.getShape().size(); ++sourceAxis) {
+        if (sourceAxis == selectedAxis)
+          continue;
+        compatible = resultAxis < result.getShape().size() &&
+                     source.getShape()[sourceAxis] == result.getShape()[resultAxis];
+        ++resultAxis;
+      }
+      if (compatible) {
+        OpBuilder builder(gather);
+        SmallVector<Attribute> selectedShape(source.getShape().begin(),
+                                             source.getShape().end());
+        selectedShape[selectedAxis] = gpu::PhysicalExprAttr::get(
+            gather.getContext(),
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+            builder.getStringAttr(""), builder.getArrayAttr({}));
+        auto coordinateType = gpu::FragmentType::get(
+            gather.getContext(), gather.getCoordinates().front().getType(),
+            builder.getArrayAttr(selectedShape), source.getAxisMaps(),
+            source.getValidity(), source.getOwner());
+        auto predicateType = gpu::FragmentType::get(
+            gather.getContext(), builder.getI1Type(),
+            builder.getArrayAttr(selectedShape), source.getAxisMaps(),
+            source.getValidity(), source.getOwner());
+        auto selectedResultType = gpu::FragmentType::get(
+            gather.getContext(), result.getElementType(),
+            builder.getArrayAttr(selectedShape), source.getAxisMaps(),
+            result.getValidity(), result.getOwner());
+        Value coordinate = builder.create<gpu::BroadcastOp>(
+            gather.getLoc(), coordinateType, gather.getCoordinates().front());
+        Value valid = builder.create<gpu::BroadcastOp>(
+            gather.getLoc(), predicateType, gather.getValid());
+        Value fill = builder.create<gpu::BroadcastOp>(
+            gather.getLoc(), selectedResultType, gather.getFill());
+        FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinateType);
+        if (succeeded(zero)) {
+          Value safeIndex = builder.create<gpu::SelectOp>(
+              gather.getLoc(), coordinateType, valid, coordinate, *zero);
+          auto safeGather = builder.create<gpu::GatherOp>(
+              gather.getLoc(), selectedResultType, gather.getSource(),
+              ValueRange{safeIndex}, Value(), Value(), gather.getSourceAxes());
+          Value selected = builder.create<gpu::SelectOp>(
+              gather.getLoc(), selectedResultType, valid, safeGather.getResult(),
+              fill);
+          auto reshaped = builder.create<gpu::ReshapeOp>(
+              gather.getLoc(), result, selected, builder.getArrayAttr({}));
+          if (Attribute origin = gather->getAttr(gpu::originAttr))
+            reshaped->setAttr(gpu::originAttr, origin);
+          gather.getResult().replaceAllUsesWith(reshaped.getResult());
+          gather.erase();
+          continue;
+        }
+      }
+    }
+    if (gather.getCoordinates().size() == 1 &&
+        isa<gpu::FragmentType>(gather.getCoordinates().front().getType()) &&
+        gather.getSourceAxes().size() == 1 && source) {
+      unsigned axis = gather.getSourceAxes().front();
+      auto coordinate = scalarConstant(gather.getCoordinates().front());
+      auto predicate = scalarConstant(gather.getValid());
+      auto extent = axis < source.getShape().size()
+                        ? dyn_cast<gpu::PhysicalExprAttr>(source.getShape()[axis])
+                        : gpu::PhysicalExprAttr();
+      auto coordinateValue =
+          coordinate ? dyn_cast<IntegerAttr>(coordinate.getValue()) : IntegerAttr();
+      auto predicateValue = predicate ? dyn_cast<IntegerAttr>(predicate.getValue())
+                                      : IntegerAttr();
+      if (extent &&
+          extent.getKind() == static_cast<uint32_t>(
+                                  gpu::PhysicalExprKind::Constant) &&
+          coordinateValue && coordinateValue.getInt() >= 0 &&
+          coordinateValue.getInt() < extent.getValue() && predicateValue &&
+          predicateValue.getValue().isOne()) {
+        OpBuilder builder(gather);
+        auto replacement = builder.create<gpu::GatherOp>(
+            gather.getLoc(), gather.getResult().getType(), gather.getSource(),
+            gather.getCoordinates(), Value(), Value(), gather.getSourceAxes());
+        if (Attribute origin = gather->getAttr(gpu::originAttr))
+          replacement->setAttr(gpu::originAttr, origin);
+        gather.getResult().replaceAllUsesWith(replacement.getResult());
+        gather.erase();
+        continue;
+      }
+    }
+    if (gather.getCoordinates().size() != 1)
+      continue;
+    OpBuilder builder(gather);
+    Value coordinate = gather.getCoordinates().front();
+    if (!isa<gpu::FragmentType>(coordinate.getType())) {
+      auto predicateType = dyn_cast<gpu::FragmentType>(gather.getValid().getType());
+      if (!predicateType ||
+          !isa<IntegerType, IndexType>(coordinate.getType()))
+        continue;
+      auto coordinateType = gpu::FragmentType::get(
+          gather.getContext(), coordinate.getType(), predicateType.getShape(),
+          predicateType.getAxisMaps(), predicateType.getValidity(),
+          predicateType.getOwner());
+      coordinate = builder.create<gpu::BroadcastOp>(gather.getLoc(),
+                                                     coordinateType, coordinate);
+    }
+    if (!samePhysicalShape(gather.getValid().getType(), coordinate.getType()) ||
         !samePhysicalShape(gather.getValid().getType(),
                            gather.getResult().getType()))
       continue;
-    OpBuilder builder(gather);
     FailureOr<Value> zero =
-        zeroLike(builder, gather.getLoc(),
-                 gather.getCoordinates().front().getType());
+        zeroLike(builder, gather.getLoc(), coordinate.getType());
     if (failed(zero))
       continue;
     Value safeIndex = builder.create<gpu::SelectOp>(
-        gather.getLoc(), gather.getCoordinates().front().getType(),
-        gather.getValid(), gather.getCoordinates().front(), *zero);
+        gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate,
+        *zero);
     auto safeGather = builder.create<gpu::GatherOp>(
         gather.getLoc(), gather.getResult().getType(), gather.getSource(),
         ValueRange{safeIndex}, Value(), Value(), gather.getSourceAxes());
@@ -134,6 +488,34 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
   Value rhs = binary.getRhs();
   return (lhs == block.getArgument(0) && rhs == block.getArgument(1)) ||
          (lhs == block.getArgument(1) && rhs == block.getArgument(0));
+}
+
+bool isNativeAddReduce(gpu::ReduceOp reduce) {
+  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+      reduce.getCaptureCount() != 0 || reduce.getResults().size() != 1 ||
+      reduce.getCombine().empty() || reduce.getCombine().getBlocks().size() != 1)
+    return false;
+  Block &block = reduce.getCombine().front();
+  if (block.getNumArguments() != 2 ||
+      std::distance(block.begin(), block.end()) != 2)
+    return false;
+  auto binary = dyn_cast<gpu::BinaryOp>(block.front());
+  auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
+  if (!binary || binary.getOperatorKind() != 0 || !yield ||
+      yield.getValues().size() != 1 || yield.getValues().front() != binary)
+    return false;
+  Value lhs = binary.getLhs();
+  Value rhs = binary.getRhs();
+  return (lhs == block.getArgument(0) && rhs == block.getArgument(1)) ||
+         (lhs == block.getArgument(1) && rhs == block.getArgument(0));
+}
+
+void selectNativeReduceForms(func::FuncOp kernel) {
+  kernel.walk([&](gpu::ReduceOp reduce) {
+    if (isNativeAddReduce(reduce))
+      reduce->setAttr(reduceFormAttr,
+                      StringAttr::get(kernel.getContext(), "sum"));
+  });
 }
 
 LogicalResult legalizeScatterAdd(func::FuncOp kernel) {
@@ -346,15 +728,24 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     } else if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
-      if (!range.getExtent().getDefiningOp<arith::ConstantOp>() &&
-          !range.getExtent().getDefiningOp<gpu::ParameterOp>() &&
-          !range.getExtent().getDefiningOp<gpu::PhysicalExprOp>()) {
+      auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
+      auto physicalExtent =
+          fragment && fragment.getShape().size() == 1
+              ? dyn_cast<gpu::PhysicalExprAttr>(fragment.getShape()[0])
+              : gpu::PhysicalExprAttr();
+      if (!physicalExtent || !isCompileTimeExpression(physicalExtent)) {
         InFlightDiagnostic diagnostic = range.emitOpError(
-            "Triton tl.arange extent must be compile-time bound; extent is defined by ");
-        if (Operation *definition = range.getExtent().getDefiningOp())
-          diagnostic << definition->getName();
-        else
-          diagnostic << "a block argument";
+            "Triton tl.arange physical extent must be a compile-time physical expression");
+        diagnostic << "; source_id=" << range.getSourceId();
+        if (auto dimension =
+                range->getAttrOfType<IntegerAttr>(gpu::sourceDimensionAttr))
+          diagnostic << ", source_dimension=" << dimension.getInt();
+        unsigned loopDepth = 0;
+        for (Operation *parent = range->getParentOp(); parent;
+             parent = parent->getParentOp())
+          loopDepth += isa<scf::ForOp>(parent);
+        diagnostic << ", loop_depth=" << loopDepth
+                   << ", physical_extent=" << physicalExtent;
         diagnostic << (range.getResult().use_empty() ? " and is dead"
                                                       : " and still has live uses");
         for (Operation *user : range.getResult().getUsers()) {
@@ -363,6 +754,21 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             if (auto view = dyn_cast<gpu::ViewType>(load.getResource().getType()))
               diagnostic << "(abi=" << view.getAbiIndex() << ",source_axes=["
                          << load.getSourceAxes() << "])";
+            for (Operation *loadUser : load.getResult().getUsers()) {
+              diagnostic << "->" << loadUser->getName();
+              for (Value result : loadUser->getResults())
+                for (Operation *resultUser : result.getUsers()) {
+                  diagnostic << "->" << resultUser->getName();
+                  for (Value nextResult : resultUser->getResults())
+                    for (Operation *nextUser : nextResult.getUsers()) {
+                      diagnostic << "->" << nextUser->getName();
+                      if (auto reduction = dyn_cast<gpu::ReduceOp>(nextUser))
+                        diagnostic << "(axes=[" << reduction.getAxes()
+                                   << "],sources="
+                                   << reduction.getSourceCount() << ")";
+                    }
+                }
+            }
           }
         }
         return WalkResult::interrupt();
@@ -370,12 +776,16 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     } else if (auto gather = dyn_cast<gpu::GatherOp>(operation)) {
       if (gather.getValid()) {
         gather.emitOpError(
-            "requires safe-index legalization before Triton tl.gather");
+            "requires safe-index legalization before Triton tl.gather: source=")
+            << gather.getSource().getType()
+            << ", coordinate=" << gather.getCoordinates().front().getType()
+            << ", valid=" << gather.getValid().getType()
+            << ", fill=" << gather.getFill().getType()
+            << ", result=" << gather.getResult().getType();
         return WalkResult::interrupt();
       }
       if (gather.getCoordinates().size() != 1 ||
-          gather.getSourceAxes().size() != 1 ||
-          gather.getSourceAxes().front() != 0) {
+          gather.getSourceAxes().size() != 1) {
         gather.emitOpError(
             "requires provider legalization to one-axis tl.gather");
         return WalkResult::interrupt();
@@ -424,7 +834,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
 
     if (isa<gpu::ParameterOp, gpu::PhysicalExprOp, gpu::ProgramIdOp,
-            gpu::DelinearizeOp,
+            gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
             gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
@@ -471,6 +881,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
       failed(legalizeScatterAdd(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
+  selectNativeReduceForms(kernel);
   OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
   llvm::StringSet<> names;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -489,11 +900,13 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
     names.insert(name);
   };
   declareProviderParameter("NUM_WARPS", gpu::ParameterRole::ProviderWarps,
-                           ArrayRef<int64_t>{4, 8});
+                           ArrayRef<int64_t>{1, 2, 4, 8, 16, 32});
   declareProviderParameter("NUM_STAGES", gpu::ParameterRole::ProviderStages,
-                           ArrayRef<int64_t>{3, 4});
+                           ArrayRef<int64_t>{1, 2, 3, 4, 5, 6});
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ArrayRef<int64_t>{1});
+  if (failed(materializeLegalConfigs(kernel)))
+    return failure();
   if (failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

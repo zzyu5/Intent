@@ -71,6 +71,7 @@ cos = Intrinsic("cos")
 floor = Intrinsic("floor")
 erf = Intrinsic("erf")
 rsqrt = Intrinsic("rsqrt")
+sqrt = Intrinsic("sqrt")
 sigmoid = Intrinsic("sigmoid")
 tanh = Intrinsic("tanh")
 abs = Intrinsic("abs")
@@ -153,6 +154,7 @@ INTRINSICS = {
         floor,
         erf,
         rsqrt,
+        sqrt,
         sigmoid,
         tanh,
         abs,

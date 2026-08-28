@@ -16,6 +16,7 @@ class CompiledArtifact:
     _launcher: Callable[..., object] = field(repr=False)
     _runner: Callable[..., object] = field(repr=False)
     _backend_ir_collector: BackendIRCollector | None = field(repr=False)
+    _namespace: dict[str, object] = field(repr=False)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
 
     @property

@@ -13,14 +13,19 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cmath>
+#include <functional>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <sstream>
 
 using namespace mlir;
 
 namespace intent::triton {
 namespace {
+
+constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
 
 std::string pythonType(Type type, bool torch = false) {
   if (type.isIndex())
@@ -41,6 +46,10 @@ std::string pythonType(Type type, bool torch = false) {
     return torch ? "torch.float32" : "tl.float32";
   if (isa<Float64Type>(type))
     return torch ? "torch.float64" : "tl.float64";
+  if (isa<Float8E4M3FNType>(type))
+    return torch ? "torch.float8_e4m3fn" : "tl.float8e4nv";
+  if (isa<Float8E5M2Type>(type))
+    return torch ? "torch.float8_e5m2" : "tl.float8e5";
   return {};
 }
 
@@ -98,12 +107,6 @@ std::string fragmentShape(gpu::FragmentType fragment) {
   return result + ")";
 }
 
-struct ParameterDomain {
-  std::string name;
-  gpu::ParameterRole role;
-  SmallVector<int64_t> candidates;
-};
-
 struct Config {
   std::map<std::string, int64_t> kernelParameters;
   int64_t warps = 0;
@@ -111,58 +114,39 @@ struct Config {
   int64_t ctas = 0;
 };
 
-FailureOr<SmallVector<ParameterDomain>> parameterDomains(func::FuncOp kernel) {
-  SmallVector<ParameterDomain> domains;
-  llvm::StringSet<> names;
-  WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    StringRef name = schema.getName().getValue();
-    if (!names.insert(name).second) {
-      parameter.emitOpError("duplicates a Triton physical/provider parameter");
-      return WalkResult::interrupt();
-    }
-    domains.push_back({name.str(), static_cast<gpu::ParameterRole>(schema.getRole()),
-                       SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
-    return WalkResult::advance();
-  });
-  if (result.wasInterrupted())
-    return failure();
-  return domains;
-}
+struct CoverageParameter {
+  std::string dimension;
+  SmallVector<int64_t> candidates;
+};
 
 FailureOr<SmallVector<Config>> parameterConfigs(func::FuncOp kernel) {
-  FailureOr<SmallVector<ParameterDomain>> domains = parameterDomains(kernel);
-  if (failed(domains))
-    return failure();
-  SmallVector<Config> configs(1);
-  for (const ParameterDomain &domain : *domains) {
-    SmallVector<Config> expanded;
-    for (const Config &base : configs) {
-      for (int64_t candidate : domain.candidates) {
-        Config next = base;
-        switch (domain.role) {
-        case gpu::ParameterRole::ProviderWarps:
-          next.warps = candidate;
-          break;
-        case gpu::ParameterRole::ProviderStages:
-          next.stages = candidate;
-          break;
-        case gpu::ParameterRole::ProviderCTAs:
-          next.ctas = candidate;
-          break;
-        default:
-          next.kernelParameters[domain.name] = candidate;
-          break;
-        }
-        expanded.push_back(std::move(next));
-      }
-    }
-    configs = std::move(expanded);
+  auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::tritonConfigsAttr);
+  if (!encoded || encoded.empty())
+    return kernel.emitError(
+        "Triton legalization did not materialize a legal candidate set");
+  SmallVector<Config> configs;
+  for (Attribute candidate : encoded) {
+    auto dictionary = dyn_cast<DictionaryAttr>(candidate);
+    auto parameters = dictionary
+                          ? dictionary.getAs<DictionaryAttr>("parameters")
+                          : DictionaryAttr();
+    auto warps = dictionary ? dictionary.getAs<IntegerAttr>("num_warps")
+                            : IntegerAttr();
+    auto stages = dictionary ? dictionary.getAs<IntegerAttr>("num_stages")
+                             : IntegerAttr();
+    auto ctas = dictionary ? dictionary.getAs<IntegerAttr>("num_ctas")
+                           : IntegerAttr();
+    if (!dictionary || !parameters || !warps || !stages || !ctas)
+      return kernel.emitError("contains a malformed legalized Triton candidate");
+    Config config;
+    config.warps = warps.getInt();
+    config.stages = stages.getInt();
+    config.ctas = ctas.getInt();
+    for (NamedAttribute parameter : parameters)
+      config.kernelParameters[parameter.getName().strref().str()] =
+          cast<IntegerAttr>(parameter.getValue()).getInt();
+    configs.push_back(std::move(config));
   }
-  for (const Config &config : configs)
-    if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
-      return kernel.emitError(
-          "Triton provider parameter domains are incomplete");
   return configs;
 }
 
@@ -173,8 +157,14 @@ std::string literal(Attribute value) {
     return std::to_string(integer.getInt());
   }
   if (auto floating = dyn_cast<FloatAttr>(value)) {
+    double number = floating.getValueAsDouble();
+    if (std::isnan(number))
+      return "float(\"nan\")";
+    if (std::isinf(number))
+      return std::signbit(number) ? "-float(\"inf\")"
+                                  : "float(\"inf\")";
     std::ostringstream stream;
-    stream << std::setprecision(17) << floating.getValueAsDouble();
+    stream << std::setprecision(17) << number;
     std::string result = stream.str();
     if (result.find_first_of(".eE") == std::string::npos)
       result += ".0";
@@ -255,10 +245,34 @@ private:
       if (kind == "dimension")
         dimensionBindings[metadata.dimension] = metadata;
     }
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto schema = parameter.getParameter();
+      std::string name = schema.getName().getValue().str();
+      parameterRoles[name] = schema.getRole();
+      if (auto logicalDimension =
+              parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr))
+        parameterDimensions[name] = logicalDimension.getInt();
+      auto dimension =
+          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
+      if (!dimension)
+        return;
+      auto binding = dimensionBindings.find(dimension.getInt());
+      if (binding == dimensionBindings.end()) {
+        parameter.emitOpError(
+            "full-coverage parameter references a non-ABI dimension");
+        failed = true;
+        return;
+      }
+      parameterDimensions[name] = dimension.getInt();
+      fullCoverageParameters[name] = {
+          binding->second.name,
+          SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
+    });
   }
 
   void emitPreamble() {
-    output << "import torch\nimport triton\nimport triton.language as tl\n\n";
+    output << "import torch\nimport triton\nimport triton.language as tl\n"
+              "from triton.language.extra import libdevice\n\n";
   }
 
   void emitHelper(Operation *owner, Region &region, StringRef role) {
@@ -276,7 +290,9 @@ private:
     }
     output << "):\n";
     unsigned savedIndent = indent;
+    bool savedEmittingHelper = emittingHelper;
     indent = 1;
+    emittingHelper = true;
     for (Operation &operation : block.without_terminator())
       emitOperation(operation);
     auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
@@ -296,13 +312,16 @@ private:
       line(result);
     }
     indent = savedIndent;
+    emittingHelper = savedEmittingHelper;
     output << "\n";
   }
 
   void emitHelpers() {
     kernel.walk([&](Operation *operation) {
-      if (auto reduce = dyn_cast<gpu::ReduceOp>(operation))
-        emitHelper(operation, reduce.getCombine(), "reduce");
+      if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
+        if (!reduce->hasAttr(reduceFormAttr))
+          emitHelper(operation, reduce.getCombine(), "reduce");
+      }
       else if (auto scan = dyn_cast<gpu::ScanOp>(operation))
         emitHelper(operation, scan.getCombine(), "scan");
     });
@@ -313,6 +332,18 @@ private:
     if (mlir::failed(configs)) {
       failed = true;
       return;
+    }
+    for (const auto &[parameter, coverage] : fullCoverageParameters) {
+      output << "def _intent_cover_" << parameter << "(args):\n"
+             << "    bound = int(args[\"" << coverage.dimension << "\"])\n"
+             << "    for extent in (";
+      for (int64_t candidate : coverage.candidates)
+        output << candidate << ", ";
+      output << "):\n"
+             << "        if extent >= bound:\n"
+             << "            return extent\n"
+             << "    raise ValueError(\"no legal full-coverage extent for "
+             << parameter << "\")\n\n";
     }
     output << "@triton.autotune(\n    configs=[\n";
     for (const Config &config : *configs) {
@@ -340,7 +371,16 @@ private:
       firstKey = false;
       output << "\"" << metadata.name << "\"";
     }
-    output << "],\n)\n@triton.jit\ndef _intent_kernel(";
+    output << "],\n";
+    output << ")\n";
+    if (!fullCoverageParameters.empty()) {
+      output << "@triton.heuristics({\n";
+      for (const auto &[parameter, coverage] : fullCoverageParameters)
+        output << "    \"" << parameter << "\": _intent_cover_" << parameter
+               << ",\n";
+      output << "})\n";
+    }
+    output << "@triton.jit\ndef _intent_kernel(";
     bool first = true;
     for (const ViewABI &view : views) {
       if (!first)
@@ -383,6 +423,27 @@ private:
   }
 
   void emitLaunch() {
+    output << "_intent_parameter_roles = {";
+    bool firstRole = true;
+    for (const auto &[name, role] : parameterRoles) {
+      if (!firstRole)
+        output << ", ";
+      firstRole = false;
+      output << "\"" << name << "\": " << role;
+    }
+    output << "}\n";
+    output << "_intent_parameter_dimensions = {";
+    bool firstDimension = true;
+    for (const auto &[name, dimension] : parameterDimensions) {
+      if (!firstDimension)
+        output << ", ";
+      firstDimension = false;
+      output << "\"" << name << "\": " << dimension;
+    }
+    output << "}\n"
+              "for _intent_config in _intent_kernel.configs:\n"
+              "    _intent_config.intent_parameter_roles = _intent_parameter_roles\n"
+              "    _intent_config.intent_parameter_dimensions = _intent_parameter_dimensions\n\n";
     output << "def launch(";
     bool firstArgument = true;
     for (auto [index, view] : llvm::enumerate(views)) {
@@ -534,6 +595,10 @@ private:
              "tl.program_id(" + std::to_string(program.getAxis()) + ")");
       return;
     }
+    if (auto coordinate = dyn_cast<gpu::WorksetCoordinateOp>(operation)) {
+      values[coordinate.getResult()] = valueString(coordinate.getCoordinate());
+      return;
+    }
     if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
       auto view = dim.getView().getType();
       auto extent = cast<gpu::PhysicalExprAttr>(
@@ -582,13 +647,25 @@ private:
       return;
     }
     if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
+      auto fragment = cast<gpu::FragmentType>(range.getResult().getType());
+      auto physicalExtent =
+          cast<gpu::PhysicalExprAttr>(fragment.getShape()[0]);
       assign(range.getResult(), "(" + valueString(range.getStart()) +
                                     " + tl.arange(0, " +
-                                    valueString(range.getExtent()) + ") * " +
+                                    expressionString(physicalExtent, false) + ") * " +
                                     valueString(range.getStep()) + ")");
       return;
     }
     if (auto splat = dyn_cast<gpu::SplatOp>(operation)) {
+      // Triton reduce/scan helpers receive accumulator values directly and
+      // scalar operands broadcast through ordinary elementwise expressions.
+      // Their ABI has no outer-kernel constexpr shape parameters, so spelling
+      // a typed scalar splat with fragmentShape() would reference symbols that
+      // are intentionally outside the helper scope.
+      if (emittingHelper) {
+        assign(splat.getResult(), valueString(splat.getValue()));
+        return;
+      }
       auto type = splat.getResult().getType();
       assign(splat.getResult(), "tl.full(" + fragmentShape(type) + ", " +
                                     valueString(splat.getValue()) + ", " +
@@ -636,6 +713,7 @@ private:
       }
       if (transpose.getPermutation().size() == 1)
         permutation += ",";
+      permutation += ")";
       assign(transpose.getResult(), "tl.permute(" + valueString(transpose.getValue()) +
                                          ", " + permutation + ")") ;
       return;
@@ -685,9 +763,20 @@ private:
       auto view = cast<gpu::ViewType>(assumption.getResource().getType());
       auto extent = cast<gpu::PhysicalExprAttr>(
           view.getLayout().getExtents()[assumption.getAxis()]);
-      line("tl.assume((" + valueString(assumption.getIndex()) + " >= 0) & (" +
-           valueString(assumption.getIndex()) + " < " +
-           expressionString(extent, false) + "))");
+      std::string predicate =
+          "((" + valueString(assumption.getIndex()) + " >= 0) & (" +
+          valueString(assumption.getIndex()) + " < " +
+          expressionString(extent, false) + "))";
+      if (auto fragment =
+              dyn_cast<gpu::FragmentType>(assumption.getIndex().getType())) {
+        predicate = "(" + predicate + ").to(tl.int32)";
+        for (int64_t axis = static_cast<int64_t>(fragment.getShape().size()) - 1;
+             axis >= 0; --axis)
+          predicate = "tl.min(" + predicate + ", axis=" +
+                      std::to_string(axis) + ")";
+        predicate = "(" + predicate + " != 0)";
+      }
+      line("tl.assume(" + predicate + ")");
       return;
     }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
@@ -724,10 +813,20 @@ private:
         }
         sources += ")";
       }
-      std::string call = "tl.reduce(" + sources + ", axis=" +
-                         std::to_string(reduce.getAxes().front()) +
-                         ", combine_fn=" + helperNames.lookup(&operation).front() +
-                         ")";
+      std::string call;
+      if (auto form = reduce->getAttrOfType<StringAttr>(reduceFormAttr)) {
+        if (form.getValue() != "sum") {
+          reduce.emitOpError("has an unknown Triton native reduction form");
+          failed = true;
+          return;
+        }
+        call = "tl.sum(" + sources + ", axis=" +
+               std::to_string(reduce.getAxes().front()) + ")";
+      } else {
+        call = "tl.reduce(" + sources + ", axis=" +
+               std::to_string(reduce.getAxes().front()) +
+               ", combine_fn=" + helperNames.lookup(&operation).front() + ")";
+      }
       assignResults(reduce.getResults(), call);
       return;
     }
@@ -902,9 +1001,12 @@ private:
 
   std::string binaryExpression(gpu::BinaryOp binary) {
     static constexpr const char *operators[] = {
-        "+", "-", "*", "/", "//", "%", "**", nullptr, nullptr,
+        "+", "-", "*", "/", "//", "%", nullptr, nullptr, nullptr,
         nullptr, nullptr, "&", "|", "&", "|", "^", "<<", ">>"};
     uint64_t kind = binary.getOperatorKind();
+    if (kind == 6)
+      return "libdevice.pow(" + valueString(binary.getLhs()) + ", " +
+             valueString(binary.getRhs()) + ")";
     if (kind == 7 || kind == 9)
       return "tl.maximum(" + valueString(binary.getLhs()) + ", " +
              valueString(binary.getRhs()) + ")";
@@ -944,6 +1046,8 @@ private:
       return "tl.libdevice.tanh(" + input + ")";
     case 12:
       return "tl.abs(" + input + ")";
+    case 13:
+      return "tl.sqrt(" + input + ")";
     default:
       failed = true;
       return "<unsupported-unary>";
@@ -967,22 +1071,54 @@ private:
       return valueString(value);
     if (source == target)
       return valueString(value);
-    SmallVector<std::string> selectors;
-    for (Attribute targetMapping : target.getAxisMaps()) {
+    if (source.getShape().size() > target.getShape().size()) {
+      kernel.emitError("Triton broadcast source rank exceeds target rank");
+      failed = true;
+      return {};
+    }
+    // Triton broadcasts singleton extents implicitly.  An equal-rank
+    // intent_gpu.broadcast therefore changes only the logical extent carried
+    // by the typed program; emitting another indexing expression would insert
+    // a new rank instead of expanding the existing singleton axis.
+    if (source.getShape().size() == target.getShape().size())
+      return valueString(value);
+    SmallVector<std::optional<unsigned>> projection(target.getShape().size());
+    SmallVector<bool> sourceUsed(source.getShape().size(), false);
+    for (auto [targetIndex, targetMapping] :
+         llvm::enumerate(target.getAxisMaps())) {
       auto targetAxis = cast<gpu::AxisMapAttr>(targetMapping);
-      bool found = false;
-      for (Attribute sourceMapping : source.getAxisMaps()) {
+      for (auto [sourceIndex, sourceMapping] :
+           llvm::enumerate(source.getAxisMaps())) {
         auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
         if (sourceAxis.getSourceId() == targetAxis.getSourceId() &&
             sourceAxis.getSourceAxis() == targetAxis.getSourceAxis()) {
-          selectors.push_back(":");
-          found = true;
+          if (sourceUsed[sourceIndex]) {
+            kernel.emitError("Triton broadcast reuses one source axis ambiguously");
+            failed = true;
+            return {};
+          }
+          projection[targetIndex] = sourceIndex;
+          sourceUsed[sourceIndex] = true;
           break;
         }
       }
-      if (!found)
-        selectors.push_back("None");
     }
+    unsigned offset = target.getShape().size() - source.getShape().size();
+    for (unsigned sourceIndex = 0; sourceIndex < source.getShape().size();
+         ++sourceIndex) {
+      if (sourceUsed[sourceIndex])
+        continue;
+      unsigned targetIndex = offset + sourceIndex;
+      if (projection[targetIndex]) {
+        kernel.emitError("Triton broadcast axis mapping is ambiguous");
+        failed = true;
+        return {};
+      }
+      projection[targetIndex] = sourceIndex;
+    }
+    SmallVector<std::string> selectors;
+    for (std::optional<unsigned> sourceIndex : projection)
+      selectors.push_back(sourceIndex ? ":" : "None");
     std::string result = valueString(value) + "[";
     for (auto [index, selector] : llvm::enumerate(selectors)) {
       if (index)
@@ -1086,10 +1222,14 @@ private:
   SmallVector<MetadataABI> metadataArguments;
   llvm::StringMap<MetadataABI> metadataByName;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
+  std::map<std::string, CoverageParameter> fullCoverageParameters;
+  std::map<std::string, uint32_t> parameterRoles;
+  std::map<std::string, int64_t> parameterDimensions;
   llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
   unsigned indent = 0;
   unsigned counter = 0;
   unsigned helperCounter = 0;
+  bool emittingHelper = false;
   bool failed = false;
 };
 

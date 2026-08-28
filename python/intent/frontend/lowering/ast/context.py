@@ -409,7 +409,11 @@ class FunctionLowerer:
     ) -> MlirValue:
         dtype, source_shape = self.dtype_and_shape(value.type, node)
         target_shape = tuple(result_shape)
-        if tuple(source_shape) == target_shape:
+        if len(source_shape) == len(target_shape) and all(
+            self.compiler.builder.dimension_id(source)
+            == self.compiler.builder.dimension_id(target)
+            for source, target in zip(source_shape, target_shape)
+        ):
             return value
         if not target_shape:
             self.error(node, "tensor value cannot broadcast to a scalar")
@@ -427,7 +431,11 @@ class FunctionLowerer:
         for dimension in target_shape:
             if isinstance(dimension, StaticDim):
                 shape_relation.append(
-                    ShapeExpr(ShapeExprKind.STATIC, 0, dimension.value)
+                    ShapeExpr(
+                        ShapeExprKind.STATIC,
+                        self.compiler.builder.dimension_id(dimension),
+                        dimension.value,
+                    )
                 )
             else:
                 shape_relation.append(

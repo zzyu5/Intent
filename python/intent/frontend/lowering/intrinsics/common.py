@@ -136,7 +136,13 @@ def lower_shape(
     def append_extent(dimension: DimExpr, value: MlirValue | None = None) -> None:
         dimensions.append(dimension)
         if isinstance(dimension, StaticDim):
-            relation.append(ShapeExpr(ShapeExprKind.STATIC, 0, dimension.value))
+            relation.append(
+                ShapeExpr(
+                    ShapeExprKind.STATIC,
+                    lowerer.compiler.builder.dimension_id(dimension),
+                    dimension.value,
+                )
+            )
             return
         if value is None:
             raise TypeError("dynamic shape extent requires its canonical SSA value")
@@ -183,8 +189,15 @@ def lower_shape(
             if known and isinstance(value, int) and not isinstance(value, bool):
                 if value < 0:
                     lowerer.error(node, "shape dimensions must be non-negative")
-                dimensions.append(StaticDim(value))
-                relation.append(ShapeExpr(ShapeExprKind.STATIC, 0, value))
+                dimension = StaticDim(value)
+                dimensions.append(dimension)
+                relation.append(
+                    ShapeExpr(
+                        ShapeExprKind.STATIC,
+                        lowerer.compiler.builder.dimension_id(dimension),
+                        value,
+                    )
+                )
             elif isinstance(element, str):
                 dimension = SymbolDim(element)
                 append_extent(

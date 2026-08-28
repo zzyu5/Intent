@@ -6,6 +6,8 @@ from kernels.statistics.histogram import histogram_256
 
 from ...loading import load_module
 from ...measurement import compile_single
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -20,21 +22,31 @@ def histogram(context: Context) -> PreparedComparison:
         device="cuda",
         dtype=torch.int32,
     ).to(torch.float32)
-    generated_histogram = torch.zeros((256,), device="cuda", dtype=torch.float32)
     _, generated_base = compile_single(
-        context, histogram_256, (samples, generated_histogram)
+        context,
+        histogram_256,
+        (samples,),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(
+                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
+            )
+            == 1024
+            and config.num_warps == 4
+            and config.num_stages == 3
+            and config.num_ctas == 1
+        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
-        outputs=lambda: generated_histogram,
-        prepare=generated_histogram.zero_,
+        outputs=generated_base.outputs,
+        prepare=generated_base.outputs().zero_,
     )
     runtime = load_module(
         context.project_root
         / "source/triton/flag-gems/statistics/histogram/histc_runtime.py",
         "intent_v2_triton_flaggems_histogram",
     )
-    source_histogram = torch.zeros_like(generated_histogram)
+    source_histogram = torch.zeros_like(generated_base.outputs())
 
     def source_launch():
         runtime.MODULE.histc_kernel_simple[

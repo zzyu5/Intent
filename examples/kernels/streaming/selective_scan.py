@@ -59,8 +59,10 @@ def mamba_chunk_scan_fwd(
                 chunk_begin = chunk * S
                 chunk_end = I.minimum(chunk_begin + S, x.shape[1])
                 chunk_extent = chunk_end - chunk_begin
-                rows = I.domain(0, chunk_extent)
-                scan_columns = I.domain(0, chunk_extent)
+                row_axis = I.domain(0, S)
+                scan_axis = I.domain(0, S)
+                rows = row_axis[0:chunk_extent]
+                scan_columns = scan_axis[0:chunk_extent]
                 row_index = I.indices(rows)
                 column_index = I.indices(columns)
                 global_row = chunk_begin + row_index
@@ -174,8 +176,10 @@ def mamba_chunk_scan_bf16_fwd(
                 chunk_begin = chunk * S
                 chunk_end = I.minimum(chunk_begin + S, x.shape[1])
                 chunk_extent = chunk_end - chunk_begin
-                rows = I.domain(0, chunk_extent)
-                scan_columns = I.domain(0, chunk_extent)
+                row_axis = I.domain(0, S)
+                scan_axis = I.domain(0, S)
+                rows = row_axis[0:chunk_extent]
+                scan_columns = scan_axis[0:chunk_extent]
                 row_index = I.indices(rows)
                 column_index = I.indices(columns)
                 global_row = chunk_begin + row_index

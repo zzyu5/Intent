@@ -11,6 +11,8 @@ inline constexpr llvm::StringLiteral capabilitiesAttr =
 inline constexpr llvm::StringLiteral programSpaceAttr =
     "intent_gpu.program_space";
 inline constexpr llvm::StringLiteral gridRankAttr = "intent_gpu.grid_rank";
+inline constexpr llvm::StringLiteral coordinateRolesAttr =
+    "intent_gpu.coordinate_roles";
 inline constexpr llvm::StringLiteral originAttr = "intent_gpu.origin";
 inline constexpr llvm::StringLiteral effectOriginsAttr =
     "intent_gpu.effect_origins";
@@ -22,6 +24,14 @@ inline constexpr llvm::StringLiteral sourceAxisAttr = "intent_gpu.source_axis";
 inline constexpr llvm::StringLiteral sourceRankAttr = "intent_gpu.source_rank";
 inline constexpr llvm::StringLiteral sourceSubregionAttr =
     "intent_gpu.source_subregion";
+inline constexpr llvm::StringLiteral sourceDimensionAttr =
+    "intent_gpu.source_dimension";
+inline constexpr llvm::StringLiteral worksetCoordinateRangeAttr =
+    "intent_gpu.workset_coordinate_range";
+inline constexpr llvm::StringLiteral pointwiseWorksetAttr =
+    "intent_gpu.pointwise_workset";
+inline constexpr llvm::StringLiteral worksetAxisAttr =
+    "intent_gpu.workset_axis";
 inline constexpr llvm::StringLiteral executionGroupAttr =
     "intent_gpu.execution_group";
 inline constexpr llvm::StringLiteral segmentOffsetAttr =
@@ -29,6 +39,10 @@ inline constexpr llvm::StringLiteral segmentOffsetAttr =
 inline constexpr llvm::StringLiteral segmentLengthAttr =
     "intent_gpu.segment_length";
 inline constexpr llvm::StringLiteral unitRoleAttr = "intent_gpu.unit_role";
+inline constexpr llvm::StringLiteral coverageDimensionAttr =
+    "intent_gpu.coverage_dimension";
+inline constexpr llvm::StringLiteral reductionTraversalSourceAttr =
+    "intent_gpu.reduction_traversal_source";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
 
@@ -57,6 +71,19 @@ enum class ParameterRole : uint32_t {
   ProviderStages = 5,
   ProviderCTAs = 6,
   ProviderThreads = 7,
+  TraversalWorkers = 8,
+  TraversalGroup = 9,
+};
+
+enum class CoordinateRole : int64_t {
+  Unspecified = -1,
+  Workset = 0,
+  PointwiseOwnership = 1,
+  TiledWorkset = 2,
+  ContractionM = 3,
+  ContractionN = 4,
+  TraversalWorker = 5,
+  IndirectTraversal = 6,
 };
 
 } // namespace intent::gpu

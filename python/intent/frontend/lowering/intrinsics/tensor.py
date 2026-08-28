@@ -50,6 +50,7 @@ def lower_tensor_intrinsic(
         "floor": lambda context, call: _unary(context, call, UnaryOperator.FLOOR),
         "erf": lambda context, call: _unary(context, call, UnaryOperator.ERF),
         "rsqrt": lambda context, call: _unary(context, call, UnaryOperator.RSQRT),
+        "sqrt": lambda context, call: _unary(context, call, UnaryOperator.SQRT),
         "sigmoid": lambda context, call: _unary(context, call, UnaryOperator.SIGMOID),
         "tanh": lambda context, call: _unary(context, call, UnaryOperator.TANH),
         "abs": lambda context, call: _unary(context, call, UnaryOperator.ABS),

@@ -43,6 +43,11 @@ def batch_norm_training(
     spatials = I.domain(0, S)
     for channel in I.parallel(I.domain(0, C)):
         values = I.cast(x[batches, channel, spatials], I.f32)
+        identity = I.record(
+            count=I.cast(0, I.i32),
+            mean=I.cast(0.0, I.f32),
+            m2=I.cast(0.0, I.f32),
+        )
         summary = I.reduce(
             I.record(
                 count=I.full(values.shape, fill=1, dtype=I.i32),
@@ -50,11 +55,7 @@ def batch_norm_training(
                 m2=I.zeros(values.shape, dtype=I.f32),
             ),
             axis=(0, 1),
-            identity=I.record(
-                count=I.cast(0, I.i32),
-                mean=I.cast(0.0, I.f32),
-                m2=I.cast(0.0, I.f32),
-            ),
+            identity=identity,
             combine=welford_combine,
         )
         count, mean, m2 = summary.count, summary.mean, summary.m2
@@ -71,8 +72,9 @@ def batch_norm_training(
             * total_count
             / (total_count - 1.0)
         )
+        output_values = I.cast(x[batches, channel, spatials], I.f32)
         output[batches, channel, spatials] = I.cast(
-            (values - mean) * rstd * weight[channel] + bias[channel],
+            (output_values - mean) * rstd * weight[channel] + bias[channel],
             I.f16,
         )
         saved_mean[channel] = mean

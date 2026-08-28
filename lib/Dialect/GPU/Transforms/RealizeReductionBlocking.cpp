@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
@@ -47,6 +48,12 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
   });
 }
 
+bool isCompileTimeValue(Value value) {
+  return value.getDefiningOp<arith::ConstantOp>() ||
+         value.getDefiningOp<ParameterOp>() ||
+         value.getDefiningOp<PhysicalExprOp>();
+}
+
 bool requiresPhysicalRealization(ReduceOp reduce) {
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -56,6 +63,14 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
           return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
         }))
       return true;
+    for (int64_t axis : reduce.getAxes()) {
+      if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
+        continue;
+      auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+      if (extent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+        return true;
+    }
   }
   return false;
 }
@@ -91,7 +106,23 @@ FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
 MakeRangeOp sourceRange(Value value) {
   while (auto broadcast = value.getDefiningOp<BroadcastOp>())
     value = broadcast.getValue();
-  return value.getDefiningOp<MakeRangeOp>();
+  if (auto range = value.getDefiningOp<MakeRangeOp>())
+    return range;
+
+  // A physical traversal coordinate may be translated by a scalar base before
+  // it reaches a load (for example, group_begin + local_range).  The range is
+  // still the unique traversal authority in that expression.  Do not accept
+  // multiplication, two independent ranges, or range-on-the-right subtraction:
+  // those change the unit-step traversal rather than merely translating it.
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary || (binary.getOperatorKind() != 0 &&
+                  binary.getOperatorKind() != 1))
+    return {};
+  MakeRangeOp lhs = sourceRange(binary.getLhs());
+  MakeRangeOp rhs = sourceRange(binary.getRhs());
+  if ((lhs && rhs) || (binary.getOperatorKind() == 1 && rhs))
+    return {};
+  return lhs ? lhs : rhs;
 }
 
 FailureOr<Value> scalarSource(Value value) {
@@ -120,6 +151,38 @@ bool sameScalarValue(Value lhs, Value rhs) {
          leftConstant.getValue() == rightConstant.getValue();
 }
 
+bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
+  if (lhs == rhs)
+    return true;
+  if (depth >= 32 || lhs.getType() != rhs.getType())
+    return false;
+  FailureOr<Value> left = scalarSource(lhs);
+  FailureOr<Value> right = scalarSource(rhs);
+  if (succeeded(left) && succeeded(right) && (*left != lhs || *right != rhs))
+    return sameScalarExpression(*left, *right, depth + 1);
+  auto leftConstant = lhs.getDefiningOp<arith::ConstantOp>();
+  auto rightConstant = rhs.getDefiningOp<arith::ConstantOp>();
+  if (leftConstant || rightConstant)
+    return leftConstant && rightConstant &&
+           leftConstant.getValue() == rightConstant.getValue();
+  auto leftBinary = lhs.getDefiningOp<BinaryOp>();
+  auto rightBinary = rhs.getDefiningOp<BinaryOp>();
+  if (leftBinary || rightBinary)
+    return leftBinary && rightBinary &&
+           leftBinary.getOperatorKind() == rightBinary.getOperatorKind() &&
+           sameScalarExpression(leftBinary.getLhs(), rightBinary.getLhs(),
+                                depth + 1) &&
+           sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),
+                                depth + 1);
+  auto leftCast = lhs.getDefiningOp<CastOp>();
+  auto rightCast = rhs.getDefiningOp<CastOp>();
+  if (leftCast || rightCast)
+    return leftCast && rightCast &&
+           sameScalarExpression(leftCast.getValue(), rightCast.getValue(),
+                                depth + 1);
+  return false;
+}
+
 FragmentType replaceExtent(FragmentType source, unsigned axis,
                            PhysicalExprAttr extent, Type element = {}) {
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
@@ -127,7 +190,426 @@ FragmentType replaceExtent(FragmentType source, unsigned axis,
   return FragmentType::get(source.getContext(),
                            element ? element : source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
-                           source.getAxisMaps(), 2, source.getOwner());
+                           source.getAxisMaps(), source.getValidity(),
+                           source.getOwner());
+}
+
+FailureOr<unsigned> uniqueExtentAxis(FragmentType source,
+                                     PhysicalExprAttr extent) {
+  std::optional<unsigned> result;
+  for (auto [axis, attribute] : llvm::enumerate(source.getShape())) {
+    if (attribute != extent)
+      continue;
+    if (result)
+      return failure();
+    result = axis;
+  }
+  return result ? FailureOr<unsigned>(*result)
+                : FailureOr<unsigned>(failure());
+}
+
+FragmentType replaceMatchingExtent(FragmentType source,
+                                   PhysicalExprAttr from,
+                                   PhysicalExprAttr to) {
+  SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
+  for (Attribute &extent : shape)
+    if (extent == from)
+      extent = to;
+  return FragmentType::get(source.getContext(), source.getElementType(),
+                           ArrayAttr::get(source.getContext(), shape),
+                           source.getAxisMaps(), source.getValidity(),
+                           source.getOwner());
+}
+
+void collectRangesAndLoads(Value value, PhysicalExprAttr logicalExtent,
+                           SmallVectorImpl<MakeRangeOp> &ranges,
+                           SmallVectorImpl<LoadOp> &loads,
+                           llvm::SmallPtrSetImpl<Operation *> &visited) {
+  Operation *producer = value.getDefiningOp();
+  if (!producer || !visited.insert(producer).second)
+    return;
+  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
+    auto fragment = range.getResult().getType();
+    auto constant = range.getExtent().getDefiningOp<arith::ConstantOp>();
+    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                            : IntegerAttr();
+    if (fragment.getShape().size() == 1 &&
+        (fragment.getShape()[0] == logicalExtent ||
+         (logicalExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          integer && integer.getInt() == logicalExtent.getValue())))
+      ranges.push_back(range);
+  }
+  if (auto load = dyn_cast<LoadOp>(producer))
+    loads.push_back(load);
+  for (Value operand : producer->getOperands())
+    collectRangesAndLoads(operand, logicalExtent, ranges, loads, visited);
+}
+
+FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
+                                             Location location, Value predicate,
+                                             FragmentType source,
+                                             unsigned reductionAxis) {
+  auto base = dyn_cast<FragmentType>(predicate.getType());
+  if (!base || base.getShape().size() != 1 ||
+      reductionAxis >= source.getShape().size())
+    return failure();
+  SmallVector<Attribute> shape(source.getShape().size(),
+                               expression(source.getContext(),
+                                          PhysicalExprKind::Constant, 1));
+  shape[reductionAxis] = base.getShape()[0];
+  auto reshaped = FragmentType::get(
+      source.getContext(), builder.getI1Type(),
+      ArrayAttr::get(source.getContext(), shape), source.getAxisMaps(),
+      source.getValidity(), source.getOwner());
+  Value result = predicate;
+  if (base != reshaped)
+    result = builder.create<ReshapeOp>(location, reshaped, result,
+                                      builder.getArrayAttr({}));
+  auto target = FragmentType::get(
+      source.getContext(), builder.getI1Type(), source.getShape(),
+      source.getAxisMaps(), source.getValidity(), source.getOwner());
+  if (reshaped != target)
+    result = builder.create<BroadcastOp>(location, target, result);
+  return result;
+}
+
+Value zeroFill(OpBuilder &builder, Location location, FragmentType type);
+
+FailureOr<Value> clonePaddedProducer(
+    OpBuilder &builder, Location location, Value value,
+    PhysicalExprAttr logicalExtent, PhysicalExprAttr physicalExtent,
+    Value physicalExtentValue, IRMapping &mapping,
+    SmallVectorImpl<Value> &tailPredicates) {
+  if (Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment || !llvm::is_contained(fragment.getShape(), logicalExtent))
+    return value;
+  Operation *producer = value.getDefiningOp();
+  if (failed(uniqueExtentAxis(fragment, logicalExtent)))
+    return producer
+               ? (producer->emitOpError(
+                      "padded reduction value has an ambiguous logical extent"),
+                  FailureOr<Value>(failure()))
+               : FailureOr<Value>(failure());
+  if (!producer || producer->getNumResults() != 1 || producer->getNumRegions() != 0)
+    return producer
+               ? (producer->emitOpError(
+                      "padded reduction producer is not a single-result regionless operation"),
+                  FailureOr<Value>(failure()))
+               : FailureOr<Value>(failure());
+
+  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
+    auto paddedType =
+        replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+    auto padded = builder.create<MakeRangeOp>(
+        location, paddedType, range.getStart(), physicalExtentValue,
+        range.getStep(), range.getSourceId(), range.getSourceAxis());
+    if (Attribute origin = range->getAttr(originAttr))
+      padded->setAttr(originAttr, origin);
+    Value logicalLength = builder.create<arith::ConstantIndexOp>(
+        location, logicalExtent.getValue());
+    Value distance = builder.create<BinaryOp>(
+        location, builder.getIndexType(), logicalLength, range.getStep(), 2);
+    Value stop = builder.create<BinaryOp>(location, builder.getIndexType(),
+                                          range.getStart(), distance, 0);
+    Value stopFragment =
+        builder.create<BroadcastOp>(location, paddedType, stop);
+    auto predicateType = FragmentType::get(
+        builder.getContext(), builder.getI1Type(), paddedType.getShape(),
+        paddedType.getAxisMaps(), paddedType.getValidity(),
+        paddedType.getOwner());
+    Value predicate = builder.create<CompareOp>(
+        location, predicateType, padded.getResult(), stopFragment, 2);
+    tailPredicates.push_back(predicate);
+    mapping.map(value, padded.getResult());
+    return padded.getResult();
+  }
+
+  if (auto load = dyn_cast<LoadOp>(producer)) {
+    SmallVector<Value> coordinates;
+    for (Value coordinate : load.getCoordinates()) {
+      FailureOr<Value> replayed = clonePaddedProducer(
+          builder, location, coordinate, logicalExtent, physicalExtent,
+          physicalExtentValue, mapping, tailPredicates);
+      if (failed(replayed))
+        return failure();
+      coordinates.push_back(*replayed);
+    }
+    Value valid;
+    if (load.getValid()) {
+      FailureOr<Value> replayed = clonePaddedProducer(
+          builder, location, load.getValid(), logicalExtent, physicalExtent,
+          physicalExtentValue, mapping, tailPredicates);
+      if (failed(replayed))
+        return failure();
+      valid = *replayed;
+    }
+    Value fill;
+    if (load.getFill()) {
+      FailureOr<Value> replayed = clonePaddedProducer(
+          builder, location, load.getFill(), logicalExtent, physicalExtent,
+          physicalExtentValue, mapping, tailPredicates);
+      if (failed(replayed))
+        return failure();
+      fill = *replayed;
+    }
+    auto paddedType =
+        replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+    if (tailPredicates.empty())
+      return load.emitOpError(
+                 "padded reduction load has no logical tail predicate"),
+             failure();
+    FailureOr<unsigned> axis = uniqueExtentAxis(paddedType, physicalExtent);
+    if (failed(axis))
+      return failure();
+    Value tail;
+    for (Value base : tailPredicates) {
+      FailureOr<Value> current = predicateForReductionSource(
+          builder, location, base, paddedType, *axis);
+      if (failed(current))
+        return failure();
+      tail = tail ? Value(builder.create<BinaryOp>(
+                        location, current->getType(), tail, *current, 11))
+                  : *current;
+    }
+    auto predicateType = cast<FragmentType>(tail.getType());
+    if (valid) {
+      Type element = valid.getType();
+      if (auto validFragment = dyn_cast<FragmentType>(element))
+        element = validFragment.getElementType();
+      if (!element.isInteger(1))
+        return load.emitOpError(
+                   "padded reduction replay produced non-predicate validity"),
+               failure();
+      if (valid.getType() != predicateType)
+        valid = builder.create<BroadcastOp>(location, predicateType, valid);
+      valid = builder.create<BinaryOp>(location, predicateType, valid, tail, 11);
+    } else {
+      valid = tail;
+    }
+    if (!fill)
+      fill = zeroFill(builder, location, paddedType);
+    else if (fill.getType() != paddedType)
+      fill = builder.create<BroadcastOp>(location, paddedType, fill);
+    if (!fill)
+      return failure();
+    auto padded = builder.create<LoadOp>(
+        location, paddedType, load.getResource(), coordinates, valid, fill,
+        load.getSourceAxes());
+    if (Attribute origin = load->getAttr(originAttr))
+      padded->setAttr(originAttr, origin);
+    mapping.map(value, padded.getResult());
+    return padded.getResult();
+  }
+
+  for (Value operand : producer->getOperands()) {
+    FailureOr<Value> replayed = clonePaddedProducer(
+        builder, location, operand, logicalExtent, physicalExtent,
+        physicalExtentValue, mapping, tailPredicates);
+    if (failed(replayed))
+      return failure();
+    if (!mapping.lookupOrNull(operand) && *replayed != operand)
+      mapping.map(operand, *replayed);
+  }
+  Operation *clone = builder.clone(*producer, mapping);
+  auto paddedType =
+      replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+  clone->getResult(0).setType(paddedType);
+  mapping.map(value, clone->getResult(0));
+  return clone->getResult(0);
+}
+
+LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
+                                       PhysicalExprAttr logicalExtent,
+                                       PhysicalExprAttr physicalExtent) {
+  SmallVector<MakeRangeOp> ranges;
+  kernel.walk([&](MakeRangeOp range) {
+    auto type = range.getResult().getType();
+    auto constant = range.getExtent().getDefiningOp<arith::ConstantOp>();
+    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                            : IntegerAttr();
+    if (type.getShape().size() == 1 &&
+        (type.getShape()[0] == logicalExtent ||
+         (integer && integer.getInt() == logicalExtent.getValue())))
+      ranges.push_back(range);
+  });
+  if (ranges.empty())
+    return success();
+
+  SmallVector<LoadOp> loads;
+  SmallVector<StoreOp> stores;
+  kernel.walk([&](LoadOp load) { loads.push_back(load); });
+  kernel.walk([&](StoreOp store) { stores.push_back(store); });
+  llvm::SmallPtrSet<Operation *, 32> rangeSet;
+  for (MakeRangeOp range : ranges)
+    rangeSet.insert(range.getOperation());
+  auto relevantRanges = [&](ValueRange values) {
+    SmallVector<MakeRangeOp> result;
+    llvm::SmallPtrSet<Operation *, 32> visited;
+    SmallVector<LoadOp> ignoredLoads;
+    for (Value value : values) {
+      SmallVector<MakeRangeOp> candidates;
+      collectRangesAndLoads(value, logicalExtent, candidates, ignoredLoads,
+                            visited);
+      for (MakeRangeOp candidate : candidates)
+        if (rangeSet.contains(candidate.getOperation()) &&
+            !llvm::is_contained(result, candidate))
+          result.push_back(candidate);
+    }
+    return result;
+  };
+  llvm::DenseMap<Operation *, SmallVector<MakeRangeOp>> accessRanges;
+  for (LoadOp load : loads) {
+    SmallVector<Value> operands(load.getCoordinates());
+    if (load.getValid())
+      operands.push_back(load.getValid());
+    accessRanges[load.getOperation()] = relevantRanges(operands);
+  }
+  for (StoreOp store : stores) {
+    SmallVector<Value> operands(store.getCoordinates());
+    if (store.getValid())
+      operands.push_back(store.getValid());
+    accessRanges[store.getOperation()] = relevantRanges(operands);
+  }
+
+  bool ambiguous = false;
+  kernel.walk([&](Operation *operation) {
+    for (Value result : operation->getResults()) {
+      auto fragment = dyn_cast<FragmentType>(result.getType());
+      if (!fragment || !llvm::is_contained(fragment.getShape(), logicalExtent))
+        continue;
+      if (failed(uniqueExtentAxis(fragment, logicalExtent))) {
+        operation->emitOpError(
+            "static padded extent appears on multiple physical axes");
+        ambiguous = true;
+        return;
+      }
+      result.setType(
+          replaceMatchingExtent(fragment, logicalExtent, physicalExtent));
+    }
+  });
+  if (ambiguous)
+    return failure();
+
+  llvm::DenseMap<Operation *, Value> predicates;
+  for (MakeRangeOp range : ranges) {
+    OpBuilder builder(range);
+    retargetSourceExtent(range.getResult(), range.getSourceId(), physicalExtent);
+    Value physical = builder.create<arith::ConstantIndexOp>(
+        range.getLoc(), physicalExtent.getValue());
+    range->setOperand(1, physical);
+    builder.setInsertionPointAfter(range);
+    Value logical = builder.create<arith::ConstantIndexOp>(
+        range.getLoc(), logicalExtent.getValue());
+    Value distance = builder.create<BinaryOp>(
+        range.getLoc(), builder.getIndexType(), logical, range.getStep(), 2);
+    Value stop = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
+                                          range.getStart(), distance, 0);
+    auto coordinate = range.getResult().getType();
+    Value stopFragment =
+        builder.create<BroadcastOp>(range.getLoc(), coordinate, stop);
+    auto predicate = FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), coordinate.getShape(),
+        coordinate.getAxisMaps(), coordinate.getValidity(),
+        coordinate.getOwner());
+    predicates[range.getOperation()] = builder.create<CompareOp>(
+        range.getLoc(), predicate, range.getResult(), stopFragment, 2);
+  }
+
+  auto materializeTail = [&](OpBuilder &builder, Location location,
+                             FragmentType target,
+                             ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
+    FailureOr<unsigned> axis = uniqueExtentAxis(target, physicalExtent);
+    if (failed(axis) || sources.empty())
+      return failure();
+    Value result;
+    for (MakeRangeOp range : sources) {
+      Value base = predicates.lookup(range.getOperation());
+      FailureOr<Value> current = predicateForReductionSource(
+          builder, location, base, target, *axis);
+      if (failed(current))
+        return failure();
+      result = result ? Value(builder.create<BinaryOp>(
+                            location, current->getType(), result, *current, 11))
+                      : *current;
+    }
+    return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
+  };
+
+  for (LoadOp load : loads) {
+    if (!load->getBlock())
+      continue;
+    auto sources = accessRanges.lookup(load.getOperation());
+    auto type = dyn_cast<FragmentType>(load.getResult().getType());
+    if (!type || sources.empty())
+      continue;
+    OpBuilder builder(load);
+    FailureOr<Value> tail =
+        materializeTail(builder, load.getLoc(), type, sources);
+    if (failed(tail))
+      return load.emitOpError("cannot project static tail to padded load");
+    Value valid = *tail;
+    auto predicate = cast<FragmentType>(valid.getType());
+    if (load.getValid()) {
+      Value existing = load.getValid();
+      auto existingFragment = dyn_cast<FragmentType>(existing.getType());
+      if (!(existing.getType().isInteger(1) ||
+            (existingFragment &&
+             existingFragment.getElementType().isInteger(1))))
+        return load.emitOpError("padded load carried non-predicate validity");
+      if (existing.getType() != predicate)
+        existing = builder.create<BroadcastOp>(load.getLoc(), predicate, existing);
+      valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
+                                       11);
+    }
+    Value fill = load.getFill();
+    if (!fill)
+      fill = zeroFill(builder, load.getLoc(), type);
+    else if (fill.getType() != type)
+      fill = builder.create<BroadcastOp>(load.getLoc(), type, fill);
+    if (!fill)
+      return load.emitOpError("padded load element type has no zero fill");
+    auto replacement = builder.create<LoadOp>(
+        load.getLoc(), type, load.getResource(), load.getCoordinates(), valid,
+        fill, load.getSourceAxes());
+    if (Attribute origin = load->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    load.getResult().replaceAllUsesWith(replacement.getResult());
+    load.erase();
+  }
+
+  for (StoreOp store : stores) {
+    if (!store->getBlock())
+      continue;
+    auto sources = accessRanges.lookup(store.getOperation());
+    auto type = dyn_cast<FragmentType>(store.getValue().getType());
+    if (!type || sources.empty())
+      continue;
+    OpBuilder builder(store);
+    FailureOr<Value> tail =
+        materializeTail(builder, store.getLoc(), type, sources);
+    if (failed(tail))
+      return store.emitOpError("cannot project static tail to padded store");
+    Value valid = *tail;
+    auto predicate = cast<FragmentType>(valid.getType());
+    if (store.getValid()) {
+      Value existing = store.getValid();
+      if (existing.getType() != predicate)
+        existing =
+            builder.create<BroadcastOp>(store.getLoc(), predicate, existing);
+      valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
+                                       valid, 11);
+    }
+    auto replacement = builder.create<StoreOp>(
+        store.getLoc(), store.getResource(), store.getCoordinates(),
+        store.getValue(), valid, store.getSourceAxes(), store.getCollision());
+    if (Attribute origin = store->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    store.erase();
+  }
+  return success();
 }
 
 FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
@@ -145,7 +627,32 @@ FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
 
 bool isReplayableProducer(Operation *operation) {
   return isa<CastOp, UnaryOp, BinaryOp, BroadcastOp, SelectOp, CompareOp,
-             SplatOp>(operation);
+             SplatOp, ReshapeOp>(operation);
+}
+
+bool isReplayableWithoutLoad(Value value,
+                             llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (!isa<FragmentType>(value.getType()))
+    return true;
+  Operation *producer = value.getDefiningOp();
+  if (dyn_cast_or_null<MakeRangeOp>(producer))
+    return true;
+  if (auto extract = dyn_cast_or_null<ExtractOp>(producer)) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      return field < record.getFields().size() &&
+             isReplayableWithoutLoad(record.getFields()[field], visited);
+    }
+  }
+  if (!producer || isa<LoadOp>(producer) ||
+      !isReplayableProducer(producer) || producer->getNumRegions() != 0 ||
+      producer->getNumResults() != 1)
+    return false;
+  if (!visited.insert(producer).second)
+    return true;
+  return llvm::all_of(producer->getOperands(), [&](Value operand) {
+    return isReplayableWithoutLoad(operand, visited);
+  });
 }
 
 struct SourcePlan {
@@ -153,6 +660,7 @@ struct SourcePlan {
   uint64_t sourceId;
   unsigned reductionAxis;
   SmallVector<LoadOp> roots;
+  SmallVector<MakeRangeOp> ranges;
 };
 
 struct RootAccess {
@@ -200,11 +708,25 @@ LogicalResult collectLoadRoots(Value value, uint64_t sourceId,
   Operation *producer = value.getDefiningOp();
   if (!producer)
     return failure();
+  if (auto extract = dyn_cast<ExtractOp>(producer)) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      if (field >= record.getFields().size())
+        return failure();
+      return collectLoadRoots(record.getFields()[field], sourceId, roots,
+                              visited);
+    }
+  }
   if (auto load = dyn_cast<LoadOp>(producer)) {
     if (!llvm::is_contained(roots, load))
       roots.push_back(load);
     return success();
   }
+  // Coordinate ranges are typed traversal authorities, not data roots.  They
+  // are collected separately in SourcePlan::ranges and replayed from the
+  // selected chunk coordinate.
+  if (isa<MakeRangeOp>(producer))
+    return success();
   if (!isReplayableProducer(producer) || producer->getNumRegions() != 0 ||
       producer->getNumResults() != 1)
     return failure();
@@ -223,7 +745,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
   if (failed(mapping))
     return failure();
-  SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}};
+  SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}, {}};
   llvm::SmallPtrSet<Operation *, 16> visited;
   if (failed(collectLoadRoots(source, plan.sourceId, plan.roots, visited)) ||
       plan.roots.empty())
@@ -237,12 +759,60 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
                              IRMapping &mapping) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      if (field >= record.getFields().size())
+        return failure();
+      FailureOr<Value> replayed = replayValue(
+          builder, location, record.getFields()[field], sourceId,
+          blockedExtent, mapping);
+      if (succeeded(replayed) && !mapping.lookupOrNull(value))
+        mapping.map(value, *replayed);
+      return replayed;
+    }
+  }
   auto fragment = dyn_cast<FragmentType>(value.getType());
   FailureOr<unsigned> axis = fragment ? axisForSource(fragment, sourceId)
                                       : FailureOr<unsigned>(failure());
   if (!fragment || failed(axis))
     return value;
   Operation *producer = value.getDefiningOp();
+  if (auto load = dyn_cast_or_null<LoadOp>(producer)) {
+    SmallVector<Value> coordinates;
+    coordinates.reserve(load.getCoordinates().size());
+    for (Value coordinate : load.getCoordinates()) {
+      FailureOr<Value> replayed = replayValue(
+          builder, location, coordinate, sourceId, blockedExtent, mapping);
+      if (failed(replayed))
+        return failure();
+      coordinates.push_back(*replayed);
+    }
+    Value valid;
+    if (load.getValid()) {
+      FailureOr<Value> replayed = replayValue(
+          builder, location, load.getValid(), sourceId, blockedExtent, mapping);
+      if (failed(replayed))
+        return failure();
+      valid = *replayed;
+    }
+    Value fill;
+    if (load.getFill()) {
+      FailureOr<Value> replayed = replayValue(
+          builder, location, load.getFill(), sourceId, blockedExtent, mapping);
+      if (failed(replayed))
+        return failure();
+      fill = *replayed;
+    }
+    auto blockedType = replaceExtent(fragment, *axis, blockedExtent);
+    auto replayed = builder.create<LoadOp>(
+        location, blockedType, load.getResource(), coordinates, valid, fill,
+        load.getSourceAxes());
+    if (Attribute origin = load->getAttr(originAttr))
+      replayed->setAttr(originAttr, origin);
+    mapping.map(value, replayed.getResult());
+    return replayed.getResult();
+  }
   if (!producer || !isReplayableProducer(producer) ||
       producer->getNumRegions() != 0 || producer->getNumResults() != 1)
     return failure();
@@ -259,22 +829,55 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   FailureOr<unsigned> clonedAxis = axisForSource(clonedType, sourceId);
   if (failed(clonedAxis))
     return failure();
-  clone->getResult(0).setType(
-      replaceExtent(clonedType, *clonedAxis, blockedExtent));
+  bool introducedUnitAxis = false;
+  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+    auto extent = cast<PhysicalExprAttr>(clonedType.getShape()[*clonedAxis]);
+    auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
+    introducedUnitAxis =
+        extent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        extent.getValue() == 1 &&
+        (!input || failed(axisForSource(input, sourceId)));
+  }
+  if (!introducedUnitAxis)
+    clone->getResult(0).setType(
+        replaceExtent(clonedType, *clonedAxis, blockedExtent));
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
 }
 
+FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
+  SmallVector<Attribute> shape;
+  SmallVector<Attribute> mappings;
+  for (auto [axis, extent] : llvm::enumerate(source.getShape())) {
+    if (axis == erasedAxis)
+      continue;
+    shape.push_back(extent);
+    auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+    mappings.push_back(AxisMapAttr::get(
+        source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        mappings.size()));
+  }
+  return FragmentType::get(source.getContext(), source.getElementType(),
+                           ArrayAttr::get(source.getContext(), shape),
+                           ArrayAttr::get(source.getContext(), mappings),
+                           source.getValidity(), source.getOwner());
+}
+
 Value zeroFill(OpBuilder &builder, Location location, FragmentType type) {
-  Value zero;
+  TypedAttr zero;
   if (auto floating = dyn_cast<FloatType>(type.getElementType()))
-    zero = builder.create<arith::ConstantOp>(
-        location, floating, builder.getFloatAttr(floating, 0.0));
+    zero = builder.getFloatAttr(floating, 0.0);
   else if (auto integer = dyn_cast<IntegerType>(type.getElementType()))
-    zero = builder.create<arith::ConstantOp>(
-        location, integer, builder.getIntegerAttr(integer, 0));
-  return zero ? Value(builder.create<SplatOp>(location, type, zero)) : Value();
+    zero = builder.getIntegerAttr(integer, 0);
+  if (!zero)
+    return {};
+  FailureOr<Value> scalar = materializeScalarConstant(
+      builder, location, zero, type.getElementType());
+  return succeeded(scalar)
+             ? Value(builder.create<SplatOp>(location, type, *scalar))
+             : Value();
 }
 
 ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
@@ -304,6 +907,414 @@ ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
       DenseI64ArrayAttr::get(kernel.getContext(), candidates));
   return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
                                      schema);
+}
+
+FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
+                                             PhysicalExprAttr extent) {
+  if (extent.getKind() !=
+      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return failure();
+  StringRef name = extent.getSymbol().getValue();
+  StringRef identity = name;
+  uint64_t dimension = 0;
+  if (!identity.consume_front("FRAGMENT_D") ||
+      identity.getAsInteger(10, dimension))
+    return failure();
+  bool launchVisible = false;
+  for (BlockArgument argument : kernel.getArguments()) {
+    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
+    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
+    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
+    launchVisible |= kind && kind.getValue() == "dimension" && identity &&
+                     identity.getInt() == static_cast<int64_t>(dimension);
+  }
+  if (!launchVisible)
+    return failure();
+  ParameterOp parameter;
+  kernel.walk([&](ParameterOp candidate) {
+    if (candidate.getParameter().getName().getValue() == name)
+      parameter = candidate;
+  });
+  if (!parameter)
+    return failure();
+  static constexpr int64_t candidates[] = {
+      1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+      4096, 8192, 16384, 32768, 65536};
+  ParameterAttr schema = parameter.getParameter();
+  parameter->setAttr(
+      "parameter",
+      ParameterAttr::get(kernel.getContext(), schema.getName(), schema.getRole(),
+                         DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
+  parameter->setAttr(coverageDimensionAttr,
+                     IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                                      dimension));
+  return parameter;
+}
+
+FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
+                                          PhysicalExprAttr extent) {
+  if (extent.getKind() !=
+      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return failure();
+  ParameterOp result;
+  kernel.walk([&](ParameterOp parameter) {
+    if (!result && parameter.getParameter().getName() == extent.getSymbol())
+      result = parameter;
+  });
+  return result ? FailureOr<ParameterOp>(result)
+                : FailureOr<ParameterOp>(failure());
+}
+
+bool hasNonUnitFreeAxis(ReduceOp reduce) {
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment)
+      continue;
+    for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+      if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+        continue;
+      auto extent = cast<PhysicalExprAttr>(attribute);
+      if (extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1)
+        continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasSelectedSegmentExtent(ReduceOp reduce, func::FuncOp kernel) {
+  ParameterOp segment;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    int64_t axis = reduce.getAxes().empty() ? -1 : reduce.getAxes().front();
+    if (!fragment || axis < 0 ||
+        axis >= static_cast<int64_t>(fragment.getShape().size()))
+      return false;
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
+    if (failed(parameter) ||
+        (*parameter).getParameter().getRole() !=
+            static_cast<uint32_t>(ParameterRole::ScanChunk))
+      return false;
+    if (segment && segment != *parameter)
+      return false;
+    segment = *parameter;
+  }
+  return static_cast<bool>(segment);
+}
+
+FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension) {
+  for (BlockArgument argument : kernel.getArguments()) {
+    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
+    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
+    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
+    if (kind && kind.getValue() == "dimension" && identity &&
+        identity.getInt() == dimension)
+      return Value(argument);
+  }
+  return failure();
+}
+
+void collectSourceRanges(Value value, uint64_t sourceId,
+                         SmallVectorImpl<MakeRangeOp> &ranges,
+                         llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto loop = dyn_cast_or_null<scf::ForOp>(
+        argument.getOwner()->getParentOp());
+    if (!loop)
+      return;
+    for (auto [index, iterArgument] :
+         llvm::enumerate(loop.getRegionIterArgs()))
+      if (argument == iterArgument) {
+        collectSourceRanges(loop.getInitArgs()[index], sourceId, ranges,
+                            visited);
+        return;
+      }
+    return;
+  }
+  Operation *producer = value.getDefiningOp();
+  if (!producer || !visited.insert(producer).second)
+    return;
+  if (auto extract = dyn_cast<ExtractOp>(producer)) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      if (field < record.getFields().size())
+        collectSourceRanges(record.getFields()[field], sourceId, ranges, visited);
+      return;
+    }
+  }
+  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
+    if (range.getSourceId() == sourceId && !llvm::is_contained(ranges, range))
+      ranges.push_back(range);
+    return;
+  }
+  for (Value operand : producer->getOperands())
+    collectSourceRanges(operand, sourceId, ranges, visited);
+}
+
+bool sameLogicalSourceRange(MakeRangeOp lhs, MakeRangeOp rhs) {
+  if (lhs.getSourceId() != rhs.getSourceId() ||
+      lhs.getSourceAxis() != rhs.getSourceAxis())
+    return false;
+  auto leftDimension = lhs->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+  auto rightDimension = rhs->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+  if (!lhs->hasAttr(sourceSubregionAttr) &&
+      !rhs->hasAttr(sourceSubregionAttr) && leftDimension && rightDimension &&
+      leftDimension == rightDimension)
+    return true;
+  return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
+         sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
+         sameScalarExpression(lhs.getStep(), rhs.getStep());
+}
+
+FailureOr<MakeRangeOp> uniqueSourceRange(func::FuncOp kernel,
+                                         uint64_t sourceId) {
+  MakeRangeOp result;
+  bool ambiguous = false;
+  kernel.walk([&](MakeRangeOp candidate) {
+    if (candidate.getSourceId() != sourceId)
+      return;
+    if (!result) {
+      result = candidate;
+      return;
+    }
+    if (!sameLogicalSourceRange(result, candidate)) {
+      ambiguous = true;
+      return;
+    }
+  });
+  return result && !ambiguous ? FailureOr<MakeRangeOp>(result)
+                              : FailureOr<MakeRangeOp>(failure());
+}
+
+FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
+                                           func::FuncOp kernel) {
+  if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
+    return false;
+  int64_t reductionAxis = reduce.getAxes().front();
+  if (reductionAxis < 0)
+    return false;
+
+  PhysicalExprAttr logicalExtent;
+  SmallVector<SmallVector<MakeRangeOp>> componentRanges;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment ||
+        reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
+      return false;
+    auto extent =
+        dyn_cast<PhysicalExprAttr>(fragment.getShape()[reductionAxis]);
+    if (!extent || extent.getKind() !=
+                       static_cast<uint32_t>(PhysicalExprKind::Constant))
+      return false;
+    if (logicalExtent && logicalExtent != extent)
+      return false;
+    logicalExtent = extent;
+    SmallVector<MakeRangeOp> ranges;
+    SmallVector<LoadOp> loads;
+    llvm::SmallPtrSet<Operation *, 32> visited;
+    collectRangesAndLoads(source, extent, ranges, loads, visited);
+    llvm::sort(ranges, [](MakeRangeOp lhs, MakeRangeOp rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
+    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+    llvm::sort(loads, [](LoadOp lhs, LoadOp rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
+    loads.erase(std::unique(loads.begin(), loads.end()), loads.end());
+    componentRanges.push_back(std::move(ranges));
+  }
+  if (!logicalExtent || logicalExtent.getValue() <= 0)
+    return false;
+  PhysicalExprAttr physicalExtent = nextPowerOfTwo(logicalExtent);
+  if (physicalExtent == logicalExtent)
+    return false;
+  if (llvm::any_of(componentRanges,
+                   [](ArrayRef<MakeRangeOp> ranges) { return ranges.empty(); }))
+    return reduce.emitOpError(
+               "static non-power-of-two reduction source has no exact logical range"),
+           failure();
+
+  OpBuilder builder(reduce);
+  Value physicalExtentValue = builder.create<arith::ConstantIndexOp>(
+      reduce.getLoc(), physicalExtent.getValue());
+  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+    IRMapping mapping;
+    SmallVector<Value> tailPredicates;
+    FailureOr<Value> source = clonePaddedProducer(
+        builder, reduce.getLoc(), reduce.getInputs()[component], logicalExtent,
+        physicalExtent, physicalExtentValue, mapping, tailPredicates);
+    if (failed(source) || tailPredicates.empty())
+      return reduce.emitOpError(
+                 "static reduction producer cannot be replayed over its padded extent"),
+             failure();
+    auto sourceType = cast<FragmentType>(source->getType());
+    Value tail;
+    for (Value base : tailPredicates) {
+      FailureOr<Value> current = predicateForReductionSource(
+          builder, reduce.getLoc(), base, sourceType,
+          static_cast<unsigned>(reductionAxis));
+      if (failed(current))
+        return failure();
+      tail = tail ? Value(builder.create<BinaryOp>(
+                        reduce.getLoc(), current->getType(), tail, *current, 11))
+                  : *current;
+    }
+    Value identity =
+        reduce.getInputs()[reduce.getSourceCount() + component];
+    if (identity.getType() != sourceType)
+      identity = builder.create<BroadcastOp>(reduce.getLoc(), sourceType, identity);
+    Value selected = builder.create<SelectOp>(reduce.getLoc(), sourceType, tail,
+                                              *source, identity);
+    reduce->setOperand(component, selected);
+  }
+  eraseDeadPhysicalValues(kernel);
+  if (failed(
+          padRemainingStaticExtent(kernel, logicalExtent, physicalExtent)))
+    return failure();
+  return true;
+}
+
+FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
+                                          func::FuncOp kernel) {
+  if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
+    return false;
+  int64_t reductionAxis = reduce.getAxes().front();
+  if (reductionAxis < 0)
+    return false;
+
+  PhysicalExprAttr extent;
+  SmallVector<uint64_t> sourceIds;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment ||
+        reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
+      return false;
+    FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
+    if (failed(mapping))
+      return false;
+    PhysicalExprAttr current =
+        cast<PhysicalExprAttr>(fragment.getShape()[reductionAxis]);
+    if (extent && extent != current)
+      return false;
+    extent = current;
+    sourceIds.push_back(mapping->getSourceId());
+  }
+  if (!extent || extent.getKind() !=
+                     static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return false;
+  llvm::DenseMap<uint64_t, MakeRangeOp> ranges;
+  for (auto [source, sourceId] : llvm::zip(
+           reduce.getInputs().take_front(reduce.getSourceCount()), sourceIds)) {
+    SmallVector<MakeRangeOp> candidates;
+    llvm::SmallPtrSet<Operation *, 32> visited;
+    collectSourceRanges(source, sourceId, candidates, visited);
+    for (MakeRangeOp candidate : candidates) {
+      auto found = ranges.find(sourceId);
+      if (found != ranges.end() &&
+          !sameLogicalSourceRange(found->second, candidate))
+        return false;
+      ranges[sourceId] = candidate;
+    }
+  }
+  if (ranges.empty())
+    return false;
+  MakeRangeOp range = ranges.begin()->second;
+  if (range->hasAttr(sourceSubregionAttr))
+    return false;
+  FailureOr<ParameterOp> parameter = fullCoverageParameter(kernel, extent);
+  if (failed(parameter))
+    return false;
+  Value logicalExtent = range.getExtent();
+  if (isCompileTimeValue(logicalExtent)) {
+    auto sourceDimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+    auto coverageDimension =
+        (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    if (range->hasAttr(sourceSubregionAttr) || !sourceDimension ||
+        !coverageDimension ||
+        sourceDimension.getInt() != coverageDimension.getInt())
+      return false;
+    FailureOr<Value> launchExtent =
+        dimensionArgument(kernel, sourceDimension.getInt());
+    if (failed(launchExtent))
+      return false;
+    logicalExtent = *launchExtent;
+  }
+
+  auto coverageDimension =
+      (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+  if (!coverageDimension ||
+      failed(bindFullCoverageDimension(
+          kernel, coverageDimension.getInt(), parameter->getResult())))
+    return failure();
+
+  OpBuilder builder(reduce);
+  for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+    Value source = reduce.getInputs()[component];
+    auto found = ranges.find(sourceIds[component]);
+    if (found == ranges.end())
+      return false;
+    MakeRangeOp componentRange = found->second;
+    auto coordinateType =
+        cast<FragmentType>(componentRange.getResult().getType());
+    auto sourceType = cast<FragmentType>(source.getType());
+    Value stop = builder.create<BinaryOp>(
+        reduce.getLoc(), builder.getIndexType(), componentRange.getStart(),
+        logicalExtent, 0);
+    Value stopFragment =
+        builder.create<BroadcastOp>(reduce.getLoc(), coordinateType, stop);
+    auto coordinatePredicate = FragmentType::get(
+        reduce.getContext(), builder.getI1Type(), coordinateType.getShape(),
+        coordinateType.getAxisMaps(), coordinateType.getValidity(),
+        coordinateType.getOwner());
+    Value coordinateValid = builder.create<CompareOp>(
+        reduce.getLoc(), coordinatePredicate, componentRange.getResult(),
+        stopFragment, 2);
+    auto predicateType = FragmentType::get(
+        reduce.getContext(), builder.getI1Type(), sourceType.getShape(),
+        sourceType.getAxisMaps(), sourceType.getValidity(), sourceType.getOwner());
+    Value valid = coordinateValid;
+    if (valid.getType() != predicateType)
+      valid = builder.create<BroadcastOp>(reduce.getLoc(), predicateType, valid);
+    Value identity = reduce.getInputs()[reduce.getSourceCount() + component];
+    if (identity.getType() != sourceType)
+      identity = builder.create<BroadcastOp>(reduce.getLoc(), sourceType, identity);
+    Value selected = builder.create<SelectOp>(reduce.getLoc(), sourceType, valid,
+                                              source, identity);
+    reduce->setOperand(component, selected);
+  }
+  eraseDeadPhysicalValues(kernel);
+  return true;
+}
+
+LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment)
+      continue;
+    for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+      if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+        continue;
+      auto extent = cast<PhysicalExprAttr>(attribute);
+      if (extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+        continue;
+      FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
+      if (failed(parameter))
+        return reduce.emitOpError(
+            "reduction free axis has no physical parameter authority");
+      uint32_t role = (*parameter).getParameter().getRole();
+      bool ownership =
+          role == static_cast<uint32_t>(ParameterRole::OwnershipM) ||
+          role == static_cast<uint32_t>(ParameterRole::OwnershipN);
+      if (!ownership && !(*parameter)->hasAttr(coverageDimensionAttr))
+        return reduce.emitOpError(
+            "reduction free axis is neither ownership-blocked nor exact full coverage");
+    }
+  }
+  return success();
 }
 
 FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &region,
@@ -347,12 +1358,674 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   return results;
 }
 
+Type dataElementType(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragment.getElementType();
+  return type;
+}
+
+FragmentType withElementType(FragmentType schema, Type elementType) {
+  return FragmentType::get(schema.getContext(), elementType, schema.getShape(),
+                           schema.getAxisMaps(), schema.getValidity(),
+                           schema.getOwner());
+}
+
+bool sameExecutionSchema(FragmentType lhs, FragmentType rhs) {
+  return lhs.getShape() == rhs.getShape() &&
+         lhs.getAxisMaps() == rhs.getAxisMaps() &&
+         lhs.getValidity() == rhs.getValidity() &&
+         lhs.getOwner() == rhs.getOwner();
+}
+
+FailureOr<FragmentType> commonExecutionSchema(ValueRange values) {
+  FragmentType result;
+  for (Value value : values) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment)
+      continue;
+    if (!result || result.getShape().size() < fragment.getShape().size()) {
+      result = fragment;
+      continue;
+    }
+    if (result.getShape().size() == fragment.getShape().size() &&
+        !sameExecutionSchema(result, fragment))
+      return failure();
+  }
+  return result ? FailureOr<FragmentType>(result)
+                : FailureOr<FragmentType>(failure());
+}
+
+FailureOr<Value> alignToExecutionSchema(OpBuilder &builder, Location location,
+                                        Value value,
+                                        FragmentType executionSchema) {
+  FragmentType target =
+      withElementType(executionSchema, dataElementType(value.getType()));
+  if (value.getType() == target)
+    return value;
+  if (!isa<FragmentType>(value.getType()))
+    return Value(builder.create<SplatOp>(location, target, value));
+  auto source = cast<FragmentType>(value.getType());
+  if (source.getOwner() != target.getOwner() ||
+      source.getShape().size() > target.getShape().size())
+    return failure();
+  return Value(builder.create<BroadcastOp>(location, target, value));
+}
+
+bool canLiftCombineOperation(Operation &operation) {
+  return isa<arith::ConstantOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+             BitcastOp, MakeRecordOp, ExtractOp>(operation);
+}
+
+LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
+                                       TypeRange accumulatorTypes,
+                                       std::string &reason) {
+  if (source.empty() || !llvm::hasSingleElement(source)) {
+    reason = "multi-axis combine is not a single typed block";
+    return failure();
+  }
+  Block &sourceBlock = source.front();
+  if (sourceBlock.getNumArguments() < accumulatorTypes.size() * 2) {
+    reason = "multi-axis combine argument schema is incomplete";
+    return failure();
+  }
+  for (Operation &operation : sourceBlock.without_terminator())
+    if (!canLiftCombineOperation(operation)) {
+      reason = ("multi-axis combine contains a non-elementwise operation: " +
+                operation.getName().getStringRef())
+                   .str();
+      return failure();
+    }
+  auto sourceYield = dyn_cast<YieldOp>(sourceBlock.getTerminator());
+  if (!sourceYield || sourceYield.getValues().size() != accumulatorTypes.size()) {
+    reason = "multi-axis combine yield schema is incomplete";
+    return failure();
+  }
+
+  auto *targetBlock = new Block();
+  target.push_back(targetBlock);
+  Location location = source.getLoc();
+  for (Type type : accumulatorTypes)
+    targetBlock->addArgument(type, location);
+  for (Type type : accumulatorTypes)
+    targetBlock->addArgument(type, location);
+  for (BlockArgument capture :
+       sourceBlock.getArguments().drop_front(accumulatorTypes.size() * 2))
+    targetBlock->addArgument(capture.getType(), location);
+
+  IRMapping mapping;
+  for (auto [original, replacement] :
+       llvm::zip(sourceBlock.getArguments(), targetBlock->getArguments()))
+    mapping.map(original, replacement);
+  OpBuilder builder(targetBlock, targetBlock->end());
+
+  auto mappedOperands = [&](Operation &operation) {
+    SmallVector<Value> values;
+    for (Value operand : operation.getOperands()) {
+      Value mapped = mapping.lookupOrNull(operand);
+      values.push_back(mapped ? mapped : operand);
+    }
+    return values;
+  };
+  auto createLike = [&](Operation &operation, ValueRange operands,
+                        TypeRange results) {
+    OperationState state(operation.getLoc(), operation.getName());
+    state.addOperands(operands);
+    state.addTypes(results);
+    state.addAttributes(operation.getAttrs());
+    return builder.create(state);
+  };
+
+  for (Operation &operation : sourceBlock.without_terminator()) {
+    SmallVector<Value> operands = mappedOperands(operation);
+    SmallVector<Type> resultTypes;
+    bool changed = llvm::any_of(
+        llvm::zip(operation.getOperands(), operands), [](auto pair) {
+          return std::get<0>(pair).getType() != std::get<1>(pair).getType();
+        });
+    if (!changed) {
+      Operation *clone = builder.clone(operation, mapping);
+      for (auto [original, replacement] :
+           llvm::zip(operation.getResults(), clone->getResults()))
+        mapping.map(original, replacement);
+      continue;
+    }
+
+    if (auto record = dyn_cast<MakeRecordOp>(operation)) {
+      auto original = record.getResult().getType();
+      SmallVector<Attribute> fields;
+      for (Value field : operands)
+        fields.push_back(TypeAttr::get(field.getType()));
+      resultTypes.push_back(RecordType::get(
+          source.getContext(), original.getFieldNames(),
+          ArrayAttr::get(source.getContext(), fields), original.getOwner()));
+    } else if (auto extract = dyn_cast<ExtractOp>(operation)) {
+      auto record = dyn_cast<RecordType>(operands.front().getType());
+      if (!record || extract.getField() >= record.getFieldTypes().size()) {
+        reason = "lifted record projection lost its field schema";
+        return failure();
+      }
+      resultTypes.push_back(
+          cast<TypeAttr>(record.getFieldTypes()[extract.getField()]).getValue());
+    } else if (isa<UnaryOp, CastOp, BitcastOp>(operation)) {
+      auto schema = dyn_cast<FragmentType>(operands.front().getType());
+      if (!schema) {
+        reason = "lifted unary operation has no fragment execution schema";
+        return failure();
+      }
+      resultTypes.push_back(withElementType(
+          schema, dataElementType(operation.getResult(0).getType())));
+    } else if (isa<BinaryOp, CompareOp>(operation)) {
+      FailureOr<FragmentType> schema = commonExecutionSchema(operands);
+      if (failed(schema)) {
+        reason = "lifted binary operation has incompatible fragment schemas";
+        return failure();
+      }
+      for (Value &operand : operands) {
+        FailureOr<Value> aligned = alignToExecutionSchema(
+            builder, operation.getLoc(), operand, *schema);
+        if (failed(aligned)) {
+          reason = "lifted binary operand cannot be broadcast to its fragment";
+          return failure();
+        }
+        operand = *aligned;
+      }
+      Type element = isa<CompareOp>(operation)
+                         ? Type(builder.getI1Type())
+                         : dataElementType(operation.getResult(0).getType());
+      resultTypes.push_back(withElementType(*schema, element));
+    } else if (isa<SelectOp>(operation)) {
+      FailureOr<FragmentType> schema =
+          commonExecutionSchema(ValueRange(operands).drop_front());
+      if (failed(schema)) {
+        reason = "lifted select values have incompatible fragment schemas";
+        return failure();
+      }
+      for (Value &operand : operands) {
+        FailureOr<Value> aligned = alignToExecutionSchema(
+            builder, operation.getLoc(), operand, *schema);
+        if (failed(aligned)) {
+          reason = "lifted select operand cannot be broadcast to its fragment";
+          return failure();
+        }
+        operand = *aligned;
+      }
+      resultTypes.push_back(withElementType(
+          *schema, dataElementType(operation.getResult(0).getType())));
+    } else {
+      reason = "multi-axis combine operation cannot be lifted to a fragment";
+      return failure();
+    }
+
+    Operation *clone = createLike(operation, operands, resultTypes);
+    for (auto [original, replacement] :
+         llvm::zip(operation.getResults(), clone->getResults()))
+      mapping.map(original, replacement);
+  }
+
+  SmallVector<Value> yields;
+  for (Value value : sourceYield.getValues()) {
+    Value mapped = mapping.lookupOrNull(value);
+    if (!mapped) {
+      reason = "lifted multi-axis combine yield was not mapped";
+      return failure();
+    }
+    yields.push_back(mapped);
+  }
+  for (auto [value, type] : llvm::zip(yields, accumulatorTypes))
+    if (value.getType() != type) {
+      reason = "lifted multi-axis combine result type disagrees with its accumulator";
+      return failure();
+    }
+  builder.create<YieldOp>(sourceYield.getLoc(), yields);
+  return success();
+}
+
+FragmentType eraseFragmentAxes(FragmentType source,
+                               ArrayRef<int64_t> erasedAxes) {
+  SmallVector<Attribute> shape;
+  SmallVector<Attribute> mappings;
+  for (auto [axis, extent] : llvm::enumerate(source.getShape())) {
+    if (llvm::is_contained(erasedAxes, static_cast<int64_t>(axis)))
+      continue;
+    shape.push_back(extent);
+    auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+    mappings.push_back(AxisMapAttr::get(
+        source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        mappings.size()));
+  }
+  return FragmentType::get(source.getContext(), source.getElementType(),
+                           ArrayAttr::get(source.getContext(), shape),
+                           ArrayAttr::get(source.getContext(), mappings),
+                           source.getValidity(), source.getOwner());
+}
+
+bool isSingleComponentAddReduce(ReduceOp reduce) {
+  if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
+      reduce.getCaptureCount() != 0 || reduce.getCombine().empty() ||
+      reduce.getCombine().getBlocks().size() != 1)
+    return false;
+  Block &block = reduce.getCombine().front();
+  if (block.getNumArguments() != 2)
+    return false;
+  auto yield = dyn_cast<YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return false;
+  auto combine = yield.getValues().front().getDefiningOp<BinaryOp>();
+  return combine && combine->getBlock() == &block &&
+         combine.getOperatorKind() == 0 &&
+         combine.getLhs() == block.getArgument(0) &&
+         combine.getRhs() == block.getArgument(1) &&
+         std::distance(block.begin(), block.end()) == 2;
+}
+
+FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
+    ReduceOp reduce, func::FuncOp kernel, unsigned outerAxis,
+    MakeRangeOp traversalRange) {
+  if (traversalRange->hasAttr(sourceSubregionAttr))
+    return false;
+  for (Operation &operation : reduce.getCombine().front().without_terminator())
+    if (!canLiftCombineOperation(operation))
+      return false;
+
+  auto firstSource =
+      dyn_cast<FragmentType>(reduce.getInputs().front().getType());
+  if (!firstSource || outerAxis >= firstSource.getShape().size())
+    return false;
+  auto outerExtent =
+      dyn_cast<PhysicalExprAttr>(firstSource.getShape()[outerAxis]);
+  FailureOr<ParameterOp> coverage =
+      outerExtent ? fullCoverageParameter(kernel, outerExtent)
+                  : FailureOr<ParameterOp>(failure());
+  if (failed(coverage))
+    return false;
+  auto dimension =
+      (*coverage)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+  if (!dimension ||
+      failed(bindFullCoverageDimension(kernel, dimension.getInt(),
+                                       coverage->getResult())))
+    return reduce.emitOpError(
+               "multi-axis full-coverage fragment could not bind its logical dimension"),
+           failure();
+
+  SmallVector<int64_t> innerAxes;
+  for (int64_t axis : reduce.getAxes())
+    if (axis != static_cast<int64_t>(outerAxis))
+      innerAxes.push_back(axis);
+  if (innerAxes.empty())
+    return false;
+
+  SmallVector<Value> identities(
+      reduce.getInputs()
+          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+          .begin(),
+      reduce.getInputs()
+          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+          .end());
+  ValueRange captures = reduce.getInputs().drop_front(
+      reduce.getSourceCount() + reduce.getIdentityCount());
+  SmallVector<Type> innerResultTypes;
+  SmallVector<Value> innerIdentities;
+  OpBuilder builder(reduce);
+  for (auto [component, source] : llvm::enumerate(
+           reduce.getInputs().take_front(reduce.getSourceCount()))) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment || outerAxis >= fragment.getShape().size())
+      return reduce.emitOpError(
+                 "multi-axis full-coverage source lost its fragment schema"),
+             failure();
+    FragmentType result = eraseFragmentAxes(fragment, innerAxes);
+    if (result.getShape().empty())
+      return reduce.emitOpError(
+                 "multi-axis inner reduction did not retain its outer axis"),
+             failure();
+    innerResultTypes.push_back(result);
+    FailureOr<Value> identity = alignToExecutionSchema(
+        builder, reduce.getLoc(), identities[component], result);
+    if (failed(identity))
+      return reduce.emitOpError(
+                 "multi-axis identity cannot be projected over the retained fragment"),
+             failure();
+    innerIdentities.push_back(*identity);
+  }
+
+  SmallVector<Value> innerInputs(
+      reduce.getInputs().take_front(reduce.getSourceCount()).begin(),
+      reduce.getInputs().take_front(reduce.getSourceCount()).end());
+  innerInputs.append(innerIdentities.begin(), innerIdentities.end());
+  innerInputs.append(captures.begin(), captures.end());
+  OperationState innerState(reduce.getLoc(), ReduceOp::getOperationName());
+  innerState.addOperands(innerInputs);
+  innerState.addTypes(innerResultTypes);
+  innerState.addAttribute(
+      "axes", DenseI64ArrayAttr::get(reduce.getContext(), innerAxes));
+  innerState.addAttribute("source_count", reduce->getAttr("source_count"));
+  innerState.addAttribute("identity_count", reduce->getAttr("identity_count"));
+  innerState.addAttribute("capture_count", reduce->getAttr("capture_count"));
+  innerState.addRegion();
+  auto innerReduce = cast<ReduceOp>(builder.create(innerState));
+  if (Attribute origin = reduce->getAttr(originAttr))
+    innerReduce->setAttr(originAttr, origin);
+  std::string reason;
+  if (failed(cloneLiftedCombineRegion(reduce.getCombine(),
+                                      innerReduce.getCombine(),
+                                      innerResultTypes, reason)))
+    return reduce.emitOpError(
+               "multi-axis combine cannot execute over its retained fragment: ")
+           << reason;
+
+  unsigned outerResultAxis = 0;
+  for (unsigned axis = 0; axis < outerAxis; ++axis)
+    if (!llvm::is_contained(innerAxes, static_cast<int64_t>(axis)))
+      ++outerResultAxis;
+  SmallVector<Value> outerInputs(innerReduce.getResults().begin(),
+                                 innerReduce.getResults().end());
+  outerInputs.append(identities.begin(), identities.end());
+  outerInputs.append(captures.begin(), captures.end());
+  OperationState outerState(reduce.getLoc(), ReduceOp::getOperationName());
+  outerState.addOperands(outerInputs);
+  outerState.addTypes(reduce.getResultTypes());
+  outerState.addAttribute(
+      "axes", DenseI64ArrayAttr::get(
+                  reduce.getContext(),
+                  ArrayRef<int64_t>{static_cast<int64_t>(outerResultAxis)}));
+  outerState.addAttribute("source_count", reduce->getAttr("source_count"));
+  outerState.addAttribute("identity_count", reduce->getAttr("identity_count"));
+  outerState.addAttribute("capture_count", reduce->getAttr("capture_count"));
+  outerState.addRegion();
+  auto outerReduce = cast<ReduceOp>(builder.create(outerState));
+  if (Attribute origin = reduce->getAttr(originAttr))
+    outerReduce->setAttr(originAttr, origin);
+  IRMapping regionMapping;
+  reduce.getCombine().cloneInto(&outerReduce.getCombine(), regionMapping);
+
+  for (auto [oldResult, newResult] :
+       llvm::zip(reduce.getResults(), outerReduce.getResults()))
+    oldResult.replaceAllUsesWith(newResult);
+  reduce.erase();
+  eraseDeadPhysicalValues(kernel);
+  return true;
+}
+
+LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
+  if (!reduce->getBlock() || reduce.getAxes().size() <= 1)
+    return success();
+  if (reduce.getSourceCount() == 0)
+    return reduce.emitOpError(
+        "multi-axis reduction decomposition requires at least one source");
+
+  unsigned outerAxis = static_cast<unsigned>(reduce.getAxes().front());
+  SmallVector<SourcePlan> plans;
+  SmallVector<SmallVector<RootAccess>> accesses;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    FailureOr<SourcePlan> plan = analyzeSource(source, outerAxis);
+    if (failed(plan)) {
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      FailureOr<AxisMapAttr> mapping =
+          fragment ? axisMap(fragment, outerAxis)
+                   : FailureOr<AxisMapAttr>(failure());
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      if (!fragment || failed(mapping) ||
+          !isReplayableWithoutLoad(source, visited))
+        return reduce.emitOpError()
+               << "multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type="
+               << source.getType() << ", producer="
+               << (source.getDefiningOp()
+                       ? source.getDefiningOp()->getName().getStringRef()
+                       : StringRef("block argument"));
+      plan = SourcePlan{source, mapping->getSourceId(), outerAxis, {}};
+    }
+    SmallVector<RootAccess> roots;
+    for (LoadOp load : plan->roots) {
+      FailureOr<RootAccess> access = analyzeRoot(load, plan->sourceId);
+      if (failed(access))
+        return reduce.emitOpError(
+            "multi-axis reduction outer axis has no unit-step load coordinate");
+      roots.push_back(*access);
+    }
+    plans.push_back(*plan);
+    accesses.push_back(std::move(roots));
+  }
+
+  std::optional<RootAccess> master;
+  for (const auto &component : accesses)
+    if (!component.empty()) {
+      master = component.front();
+      break;
+    }
+  if (!master)
+    return reduce.emitOpError(
+        "multi-axis reduction has no load-rooted traversal authority");
+  for (const auto &component : accesses)
+    for (RootAccess access : component) {
+      if (access.range.getSourceId() != master->range.getSourceId() ||
+          access.range.getSourceAxis() != master->range.getSourceAxis() ||
+          !sameScalarValue(access.range.getStart(), master->range.getStart()) ||
+          !sameScalarValue(access.range.getExtent(), master->range.getExtent()) ||
+          !sameScalarValue(access.range.getStep(), master->range.getStep()))
+        return reduce.emitOpError(
+            "multi-axis reduction components do not share one exact outer traversal");
+    }
+
+  FailureOr<bool> fullCoverage = decomposeFullCoverageMultiAxisReduce(
+      reduce, kernel, outerAxis, master->range);
+  if (failed(fullCoverage))
+    return failure();
+  if (*fullCoverage)
+    return success();
+
+  SmallVector<int64_t> innerAxes;
+  for (int64_t axis : reduce.getAxes()) {
+    if (axis == static_cast<int64_t>(outerAxis))
+      continue;
+    innerAxes.push_back(axis > static_cast<int64_t>(outerAxis) ? axis - 1
+                                                               : axis);
+  }
+  if (innerAxes.empty())
+    return reduce.emitOpError(
+        "multi-axis reduction decomposition lost every inner axis");
+
+  SmallVector<Value> identities(
+      reduce.getInputs()
+          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+          .begin(),
+      reduce.getInputs()
+          .slice(reduce.getSourceCount(), reduce.getIdentityCount())
+          .end());
+  ValueRange captures = reduce.getInputs().drop_front(
+      reduce.getSourceCount() + reduce.getIdentityCount());
+  PhysicalExprAttr unitExtent =
+      expression(reduce.getContext(), PhysicalExprKind::Constant, 1);
+  OpBuilder builder(reduce);
+  Location location = reduce.getLoc();
+  Value stop = builder.create<BinaryOp>(
+      location, builder.getIndexType(), master->range.getStart(),
+      master->range.getExtent(), /*add=*/0);
+  bool bodyFailed = false;
+  std::string failureReason;
+  auto loop = builder.create<scf::ForOp>(
+      location, master->range.getStart(), stop, master->range.getStep(), identities,
+      [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
+          ValueRange carries) {
+        SmallVector<Value> innerSources;
+        for (auto [component, plan] : llvm::enumerate(plans)) {
+          IRMapping mapping;
+          for (RootAccess access : accesses[component]) {
+            mapping.map(access.range.getResult(), coordinate);
+            LoadOp load = access.load;
+            auto sourceType = cast<FragmentType>(load.getResult().getType());
+            FragmentType slicedType = replaceExtent(
+                sourceType, access.fragmentAxis, unitExtent);
+            SmallVector<Value> coordinates(load.getCoordinates());
+            FailureOr<Value> reducedCoordinate = replayValue(
+                nested, nestedLocation,
+                load.getCoordinates()[access.coordinateIndex], plan.sourceId,
+                unitExtent, mapping);
+            if (failed(reducedCoordinate)) {
+              bodyFailed = true;
+              failureReason =
+                  "reduced source coordinate could not be cloned into the outer loop";
+              return;
+            }
+            coordinates[access.coordinateIndex] = *reducedCoordinate;
+            using ReplayAxis =
+                std::tuple<uint64_t, PhysicalExprAttr, Value, Value>;
+            SmallVector<ReplayAxis> replayAxes{{
+                plan.sourceId, unitExtent, access.range.getResult(), coordinate}};
+            for (auto [coordinateIndex, original] :
+                 llvm::enumerate(load.getCoordinates())) {
+              if (coordinateIndex == access.coordinateIndex)
+                continue;
+              MakeRangeOp range = sourceRange(original);
+              if (!range)
+                continue;
+              if (!mapping.lookupOrNull(range.getResult())) {
+                auto rangeType = cast<FragmentType>(range.getResult().getType());
+                auto clone = nested.create<MakeRangeOp>(
+                    nestedLocation, rangeType, range.getStart(),
+                    range.getExtent(), range.getStep(), range.getSourceId(),
+                    range.getSourceAxis());
+                for (StringRef attribute :
+                     {sourceSubregionAttr, sourceDimensionAttr})
+                  if (Attribute value = range->getAttr(attribute))
+                    clone->setAttr(attribute, value);
+                mapping.map(range.getResult(), clone.getResult());
+              }
+              auto rangeType = cast<FragmentType>(range.getResult().getType());
+              replayAxes.emplace_back(
+                  range.getSourceId(),
+                  cast<PhysicalExprAttr>(rangeType.getShape()[0]),
+                  range.getResult(), mapping.lookupOrNull(range.getResult()));
+              FailureOr<Value> replayedCoordinate = replayValue(
+                  nested, nestedLocation, original, range.getSourceId(),
+                  cast<PhysicalExprAttr>(rangeType.getShape()[0]), mapping);
+              if (failed(replayedCoordinate)) {
+                bodyFailed = true;
+                failureReason =
+                    "non-reduced source coordinate could not be cloned into the outer loop";
+                return;
+              }
+              coordinates[coordinateIndex] = *replayedCoordinate;
+            }
+            Value valid;
+            if (load.getValid()) {
+              valid = load.getValid();
+              for (auto [sourceId, extent, originalRange, replacementRange] :
+                   replayAxes) {
+                IRMapping axisMapping;
+                axisMapping.map(originalRange, replacementRange);
+                FailureOr<Value> replayed = replayValue(
+                    nested, nestedLocation, valid, sourceId, extent,
+                    axisMapping);
+                if (failed(replayed)) {
+                  bodyFailed = true;
+                  failureReason =
+                      "source validity could not be cloned into the outer loop";
+                  return;
+                }
+                valid = *replayed;
+              }
+            }
+            Value fill;
+            if (load.getFill()) {
+              fill = load.getFill();
+              for (auto [sourceId, extent, originalRange, replacementRange] :
+                   replayAxes) {
+                IRMapping axisMapping;
+                axisMapping.map(originalRange, replacementRange);
+                FailureOr<Value> replayed = replayValue(
+                    nested, nestedLocation, fill, sourceId, extent,
+                    axisMapping);
+                if (failed(replayed)) {
+                  bodyFailed = true;
+                  failureReason =
+                      "source fill could not be cloned into the outer loop";
+                  return;
+                }
+                fill = *replayed;
+              }
+            }
+            auto slicedLoad = nested.create<LoadOp>(
+                nestedLocation, slicedType, load.getResource(), coordinates,
+                valid, fill, load.getSourceAxes());
+            mapping.map(load.getResult(), slicedLoad.getResult());
+          }
+          FailureOr<Value> replayed = replayValue(
+              nested, nestedLocation, plan.source, plan.sourceId, unitExtent,
+              mapping);
+          if (failed(replayed)) {
+            bodyFailed = true;
+            failureReason = "outer-axis source graph could not be sliced";
+            return;
+          }
+          auto sliced = dyn_cast<FragmentType>((*replayed).getType());
+          if (!sliced || outerAxis >= sliced.getShape().size()) {
+            bodyFailed = true;
+            failureReason = "outer-axis source lost its fragment schema";
+            return;
+          }
+          FragmentType squeezed = eraseFragmentAxis(sliced, outerAxis);
+          innerSources.push_back(nested.create<ReshapeOp>(
+              nestedLocation, squeezed, *replayed,
+              nested.getArrayAttr({})));
+        }
+        if (bodyFailed)
+          return;
+
+        SmallVector<Value> innerInputs(innerSources);
+        innerInputs.append(identities.begin(), identities.end());
+        innerInputs.append(captures.begin(), captures.end());
+        OperationState state(nestedLocation, ReduceOp::getOperationName());
+        state.addOperands(innerInputs);
+        state.addTypes(reduce.getResultTypes());
+        state.addAttribute("axes",
+                           DenseI64ArrayAttr::get(reduce.getContext(), innerAxes));
+        state.addAttribute("source_count", reduce->getAttr("source_count"));
+        state.addAttribute("identity_count", reduce->getAttr("identity_count"));
+        state.addAttribute("capture_count", reduce->getAttr("capture_count"));
+        state.addRegion();
+        auto innerReduce = cast<ReduceOp>(nested.create(state));
+        if (Attribute origin = reduce->getAttr(originAttr))
+          innerReduce->setAttr(originAttr, origin);
+        IRMapping regionMapping;
+        reduce.getCombine().cloneInto(&innerReduce.getCombine(), regionMapping);
+
+        SmallVector<Value> combineArguments(carries.begin(), carries.end());
+        combineArguments.append(innerReduce.getResults().begin(),
+                                innerReduce.getResults().end());
+        combineArguments.append(captures.begin(), captures.end());
+        FailureOr<SmallVector<Value>> combined = inlinePureRegion(
+            nested, innerReduce.getCombine(), combineArguments, failureReason);
+        if (failed(combined)) {
+          bodyFailed = true;
+          return;
+        }
+        nested.create<scf::YieldOp>(nestedLocation, *combined);
+      });
+  if (bodyFailed) {
+    loop.erase();
+    return reduce.emitOpError(
+               "multi-axis reduction decomposition failed: ")
+           << failureReason;
+  }
+  if (Attribute origin = reduce->getAttr(originAttr))
+    loop->setAttr(originAttr, origin);
+  loop->setAttr(reductionTraversalSourceAttr,
+                builder.getI64IntegerAttr(master->range.getSourceId()));
+  for (auto [oldResult, newResult] :
+       llvm::zip(reduce.getResults(), loop.getResults()))
+    oldResult.replaceAllUsesWith(newResult);
+  reduce.erase();
+  eraseDeadPhysicalValues(kernel);
+  return success();
+}
+
 LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                    ArrayRef<SourcePlan> sourcePlans,
                                    func::FuncOp kernel) {
   if (sourcePlans.empty())
     return reduce.emitOpError("runtime reduction has no physical sources");
   SmallVector<SmallVector<RootAccess>> accesses;
+  SmallVector<MakeRangeOp> traversalRanges;
   for (const SourcePlan &plan : sourcePlans) {
     auto source = cast<FragmentType>(plan.source.getType());
     for (auto [axis, extent] : llvm::enumerate(source.getShape()))
@@ -368,7 +2041,24 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             "load-rooted producer has no unit-step reduction coordinate");
       roots.push_back(*access);
     }
+    MakeRangeOp traversal;
+    for (RootAccess access : roots) {
+      if (traversal && !sameLogicalSourceRange(traversal, access.range))
+        return reduce.emitOpError(
+            "one reduction component has multiple physical source ranges");
+      traversal = access.range;
+    }
+    for (MakeRangeOp range : plan.ranges) {
+      if (traversal && !sameLogicalSourceRange(traversal, range))
+        return reduce.emitOpError(
+            "one reduction component has ambiguous range provenance");
+      traversal = range;
+    }
+    if (!traversal)
+      return reduce.emitOpError(
+          "runtime reduction has no exact physical range authority");
     accesses.push_back(std::move(roots));
+    traversalRanges.push_back(traversal);
   }
   for (Type result : reduce.getResultTypes())
     if (auto fragment = dyn_cast<FragmentType>(result))
@@ -378,29 +2068,75 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         return reduce.emitOpError(
             "runtime reduction result still has an unphysicalized free axis");
 
-  MakeRangeOp firstRange = accesses.front().front().range;
-  for (const auto &component : accesses)
-    for (RootAccess access : component)
-      if (access.range.getStart() != firstRange.getStart() ||
-          access.range.getExtent() != firstRange.getExtent() ||
-          access.range.getStep() != firstRange.getStep())
-        return reduce.emitOpError(
-            "runtime reduction producer roots require one lockstep source range");
-  std::string name =
-      ("REDUCE_CHUNK_" + Twine(sourcePlans.front().sourceId)).str();
-  ParameterOp chunk = getOrCreateParameter(
-      kernel, name, ParameterRole::Reduction, {32, 64, 128, 256});
+  MakeRangeOp firstRange = traversalRanges.front();
+  FailureOr<Value> firstEnd = resolveLogicalRangeEnd(kernel, firstRange);
+  if (failed(firstEnd))
+    return reduce.emitOpError(
+        "runtime reduction source range has no exact logical end");
+  for (MakeRangeOp range : traversalRanges) {
+    FailureOr<Value> end = resolveLogicalRangeEnd(kernel, range);
+    if (!sameLogicalSourceRange(firstRange, range) || failed(end) ||
+        !sameScalarExpression(*firstEnd, *end))
+      return reduce.emitOpError(
+          "runtime reduction components require one lockstep logical range");
+  }
+  auto firstSource = cast<FragmentType>(sourcePlans.front().source.getType());
+  PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
+      firstSource.getShape()[sourcePlans.front().reductionAxis]);
+  FailureOr<ParameterOp> fullCoverage = failure();
+  if (!hasNonUnitFreeAxis(reduce))
+    fullCoverage = fullCoverageParameter(kernel, sourceExtent);
+  FailureOr<ParameterOp> selectedChunk =
+      parameterForExtent(kernel, sourceExtent);
+  ParameterOp chunk;
+  if (!firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
+    chunk = *fullCoverage;
+  } else if (succeeded(selectedChunk) &&
+             !(*selectedChunk)->hasAttr(coverageDimensionAttr) &&
+             (*selectedChunk).getParameter().getRole() ==
+                 static_cast<uint32_t>(ParameterRole::Reduction)) {
+    chunk = *selectedChunk;
+  } else {
+    std::string name =
+        ("REDUCE_CHUNK_" + Twine(sourcePlans.front().sourceId)).str();
+    SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
+                                    256, 512, 1024, 2048, 4096};
+    if (sourceExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        sourceExtent.getValue() > 0) {
+      PhysicalExprAttr upper = nextPowerOfTwo(sourceExtent);
+      llvm::erase_if(candidates, [&](int64_t candidate) {
+        return candidate > upper.getValue();
+      });
+      if (candidates.empty())
+        candidates.push_back(upper.getValue());
+    }
+    chunk = getOrCreateParameter(kernel, name, ParameterRole::Reduction,
+                                 candidates);
+    if (chunk)
+      if (auto dimension =
+              firstRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
+        chunk->setAttr(dimensionAttr, dimension);
+  }
   if (!chunk)
     return failure();
   PhysicalExprAttr chunkExtent = expression(
       reduce.getContext(), PhysicalExprKind::Parameter, 0,
       chunk.getParameter().getName().getValue());
 
+  const bool vectorAccumulation =
+      isSingleComponentAddReduce(reduce) &&
+      succeeded(scalarSource(reduce.getInputs()[reduce.getSourceCount()]));
+  SmallVector<FragmentType> blockedSourceTypes;
+  for (const SourcePlan &plan : sourcePlans) {
+    auto originalSource = cast<FragmentType>(plan.source.getType());
+    blockedSourceTypes.push_back(
+        replaceExtent(originalSource, plan.reductionAxis, chunkExtent));
+  }
+
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
-  Value stop = builder.create<BinaryOp>(
-      location, builder.getIndexType(), firstRange.getStart(),
-      firstRange.getExtent(), 0);
+  Value stop = *firstEnd;
   SmallVector<Value> identities(
       reduce.getInputs()
           .slice(reduce.getSourceCount(), reduce.getIdentityCount())
@@ -411,22 +2147,94 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   ValueRange captures = reduce.getInputs().drop_front(
       reduce.getSourceCount() + reduce.getIdentityCount());
 
+  SmallVector<Value> loopInitials(identities);
+  if (vectorAccumulation) {
+    loopInitials.clear();
+    for (auto [identity, blockedType] :
+         llvm::zip(identities, blockedSourceTypes)) {
+      FailureOr<Value> scalar = scalarSource(identity);
+      if (failed(scalar))
+        return reduce.emitOpError(
+            "vector reduction accumulation lost its scalar identity");
+      Value initial = builder.create<SplatOp>(location, blockedType, *scalar);
+      loopInitials.push_back(initial);
+    }
+  }
+
   bool bodyFailed = false;
   std::string bodyFailure = "unknown producer replay failure";
   auto loop = builder.create<scf::ForOp>(
-      location, firstRange.getStart(), stop, chunk.getResult(), identities,
+      location, firstRange.getStart(), stop, chunk.getResult(), loopInitials,
       [&](OpBuilder &nested, Location nestedLocation, Value chunkStart,
           ValueRange carries) {
+        auto masterType = cast<FragmentType>(firstRange.getResult().getType());
+        SmallVector<Attribute> masterShape(masterType.getShape().begin(),
+                                           masterType.getShape().end());
+        masterShape[0] = chunkExtent;
+        auto blockedMaster = FragmentType::get(
+            reduce.getContext(), masterType.getElementType(),
+            ArrayAttr::get(reduce.getContext(), masterShape),
+            masterType.getAxisMaps(), 2, masterType.getOwner());
+        Value masterCoordinate = nested.create<MakeRangeOp>(
+            nestedLocation, blockedMaster, chunkStart, chunk.getResult(),
+            firstRange.getStep(), firstRange.getSourceId(),
+            firstRange.getSourceAxis());
+        Value masterEnd = nested.create<BroadcastOp>(nestedLocation,
+                                                     blockedMaster, stop);
+        auto masterPredicate = FragmentType::get(
+            reduce.getContext(), nested.getI1Type(), blockedMaster.getShape(),
+            blockedMaster.getAxisMaps(), 2, blockedMaster.getOwner());
+        Value sharedTail = nested.create<CompareOp>(
+            nestedLocation, masterPredicate, masterCoordinate, masterEnd, 2);
         SmallVector<Value> blockedSources;
         for (auto [component, plan] : llvm::enumerate(sourcePlans)) {
-          auto originalSource = cast<FragmentType>(plan.source.getType());
-          FragmentType blockedSource = replaceExtent(
-              originalSource, plan.reductionAxis, chunkExtent);
+          FragmentType blockedSource = blockedSourceTypes[component];
           auto blockedPredicate = FragmentType::get(
               reduce.getContext(), nested.getI1Type(), blockedSource.getShape(),
-              blockedSource.getAxisMaps(), 2, blockedSource.getOwner());
+              blockedSource.getAxisMaps(), blockedSource.getValidity(),
+              blockedSource.getOwner());
           IRMapping mapping;
           Value sourceTail;
+          for (MakeRangeOp range : plan.ranges) {
+            if (mapping.lookupOrNull(range.getResult()))
+              continue;
+            auto originalCoordinate = range.getResult().getType();
+            SmallVector<Attribute> coordinateShape(
+                originalCoordinate.getShape().begin(),
+                originalCoordinate.getShape().end());
+            coordinateShape[0] = chunkExtent;
+            auto blockedCoordinate = FragmentType::get(
+                reduce.getContext(), originalCoordinate.getElementType(),
+                ArrayAttr::get(reduce.getContext(), coordinateShape),
+                originalCoordinate.getAxisMaps(), originalCoordinate.getValidity(),
+                originalCoordinate.getOwner());
+            auto coordinate = nested.create<MakeRangeOp>(
+                nestedLocation, blockedCoordinate, chunkStart,
+                chunk.getResult(), range.getStep(), range.getSourceId(),
+                range.getSourceAxis());
+            for (StringRef attribute :
+                 {sourceSubregionAttr, sourceDimensionAttr})
+              if (Attribute value = range->getAttr(attribute))
+                coordinate->setAttr(attribute, value);
+            mapping.map(range.getResult(), coordinate.getResult());
+            Value end = nested.create<BroadcastOp>(nestedLocation,
+                                                   blockedCoordinate, stop);
+            auto coordinatePredicate = FragmentType::get(
+                reduce.getContext(), nested.getI1Type(),
+                blockedCoordinate.getShape(), blockedCoordinate.getAxisMaps(),
+                blockedCoordinate.getValidity(),
+                blockedCoordinate.getOwner());
+            Value valid = nested.create<CompareOp>(
+                nestedLocation, coordinatePredicate, coordinate.getResult(), end,
+                2);
+            Value projected = nested.create<BroadcastOp>(
+                nestedLocation, blockedPredicate, valid);
+            sourceTail = sourceTail
+                             ? Value(nested.create<BinaryOp>(
+                                   nestedLocation, blockedPredicate, sourceTail,
+                                   projected, /*and=*/11))
+                             : projected;
+          }
           for (RootAccess access : accesses[component]) {
             LoadOp load = access.load;
             MakeRangeOp range = access.range;
@@ -440,24 +2248,39 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             auto blockedCoordinate = FragmentType::get(
                 reduce.getContext(), range.getResult().getType().getElementType(),
                 ArrayAttr::get(reduce.getContext(), coordinateShape),
-                range.getResult().getType().getAxisMaps(), 2,
+                range.getResult().getType().getAxisMaps(),
+                range.getResult().getType().getValidity(),
                 range.getResult().getType().getOwner());
             Value coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart, chunk.getResult(),
                 range.getStep(), range.getSourceId(), range.getSourceAxis());
-            if (!mapping.lookupOrNull(range.getResult()))
-              mapping.map(range.getResult(), coordinate);
+            if (!mapping.lookupOrNull(range.getResult())) {
+              auto originalCoordinate = range.getResult().getType();
+              auto replayCoordinate = FragmentType::get(
+                  reduce.getContext(), originalCoordinate.getElementType(),
+                  blockedCoordinate.getShape(), blockedCoordinate.getAxisMaps(),
+                  originalCoordinate.getValidity(),
+                  originalCoordinate.getOwner());
+              Value mappedCoordinate = coordinate;
+              if (replayCoordinate != blockedCoordinate)
+                mappedCoordinate = nested.create<ReshapeOp>(
+                    nestedLocation, replayCoordinate, coordinate,
+                    nested.getArrayAttr({}));
+              mapping.map(range.getResult(), mappedCoordinate);
+            }
             Value end = nested.create<BroadcastOp>(nestedLocation,
                                                    blockedCoordinate, stop);
             auto coordinatePredicate = FragmentType::get(
                 reduce.getContext(), nested.getI1Type(),
-                blockedCoordinate.getShape(), blockedCoordinate.getAxisMaps(), 2,
+                blockedCoordinate.getShape(), blockedCoordinate.getAxisMaps(),
+                blockedCoordinate.getValidity(),
                 blockedCoordinate.getOwner());
             Value coordinateValid = nested.create<CompareOp>(
                 nestedLocation, coordinatePredicate, coordinate, end, 2);
             auto rootPredicate = FragmentType::get(
                 reduce.getContext(), nested.getI1Type(), blockedRoot.getShape(),
-                blockedRoot.getAxisMaps(), 2, blockedRoot.getOwner());
+                blockedRoot.getAxisMaps(), blockedRoot.getValidity(),
+                blockedRoot.getOwner());
             Value valid = nested.create<BroadcastOp>(nestedLocation,
                                                      rootPredicate,
                                                      coordinateValid);
@@ -500,7 +2323,16 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               }
             }
             SmallVector<Value> coordinates(load.getCoordinates());
-            coordinates[access.coordinateIndex] = coordinate;
+            FailureOr<Value> reducedCoordinate = replayValue(
+                nested, nestedLocation,
+                load.getCoordinates()[access.coordinateIndex], plan.sourceId,
+                chunkExtent, mapping);
+            if (failed(reducedCoordinate)) {
+              bodyFailed = true;
+              bodyFailure = "could not replay reduced source coordinate";
+              return;
+            }
+            coordinates[access.coordinateIndex] = *reducedCoordinate;
             Value blockedLoad = nested.create<LoadOp>(
                 nestedLocation, blockedRoot, load.getResource(), coordinates,
                 valid, fill, load.getSourceAxes());
@@ -513,9 +2345,13 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               nested, nestedLocation, plan.source, plan.sourceId, chunkExtent,
               mapping);
           if (failed(replayed) || !sourceTail) {
-            bodyFailed = true;
-            bodyFailure = "could not replay load-rooted pure producer graph";
-            return;
+            if (failed(replayed)) {
+              bodyFailed = true;
+              bodyFailure = "could not replay load-rooted pure producer graph";
+              return;
+            }
+            sourceTail = nested.create<BroadcastOp>(
+                nestedLocation, blockedPredicate, sharedTail);
           }
           Value identity = identities[component];
           if (identity.getType() != blockedSource)
@@ -526,6 +2362,14 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         }
         if (bodyFailed)
           return;
+
+        if (vectorAccumulation) {
+          Value combined = nested.create<BinaryOp>(
+              nestedLocation, blockedSourceTypes.front(), carries.front(),
+              blockedSources.front(), /*add=*/0);
+          nested.create<scf::YieldOp>(nestedLocation, combined);
+          return;
+        }
 
         SmallVector<Value> chunkInputs(blockedSources);
         chunkInputs.append(identities.begin(), identities.end());
@@ -566,8 +2410,29 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
            << bodyFailure;
   }
 
+  SmallVector<Value> realizedResults(loop.getResults().begin(),
+                                     loop.getResults().end());
+  if (vectorAccumulation) {
+    SmallVector<Value> finalInputs(realizedResults);
+    finalInputs.append(identities.begin(), identities.end());
+    OperationState state(location, ReduceOp::getOperationName());
+    state.addOperands(finalInputs);
+    state.addTypes(reduce.getResultTypes());
+    state.addAttribute("axes", reduce->getAttr("axes"));
+    state.addAttribute("source_count", reduce->getAttr("source_count"));
+    state.addAttribute("identity_count", reduce->getAttr("identity_count"));
+    state.addAttribute("capture_count", reduce->getAttr("capture_count"));
+    state.addRegion();
+    auto finalReduce = cast<ReduceOp>(builder.create(state));
+    if (Attribute origin = reduce->getAttr(originAttr))
+      finalReduce->setAttr(originAttr, origin);
+    IRMapping regionMapping;
+    reduce.getCombine().cloneInto(&finalReduce.getCombine(), regionMapping);
+    realizedResults.assign(finalReduce.getResults().begin(),
+                           finalReduce.getResults().end());
+  }
   for (auto [oldResult, newResult] :
-       llvm::zip(reduce.getResults(), loop.getResults()))
+       llvm::zip(reduce.getResults(), realizedResults))
     oldResult.replaceAllUsesWith(newResult);
   reduce.erase();
   eraseDeadPhysicalValues(kernel);
@@ -584,6 +2449,23 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   };
   if (reduce.getAxes().size() != 1 || reduce.getSourceCount() == 0)
     return unhandled("requires one reduction axis and at least one source");
+  if (hasSelectedSegmentExtent(reduce, kernel))
+    return success();
+  FailureOr<bool> staticPadding = realizeStaticPaddingReduce(reduce, kernel);
+  if (failed(staticPadding))
+    return failure();
+  if (*staticPadding) {
+    eraseDeadPhysicalValues(kernel);
+    return success();
+  }
+  FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
+  if (failed(fullCoverage))
+    return failure();
+  if (*fullCoverage)
+    return success();
+  if (hasNonUnitFreeAxis(reduce) &&
+      failed(bindReductionFreeAxes(reduce, kernel)))
+    return failure();
   int64_t reductionAxis = reduce.getAxes().front();
   SmallVector<SourcePlan> sourcePlans;
   SmallVector<LoadOp> sourceLoads;
@@ -591,19 +2473,44 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   SmallVector<unsigned> coordinateIndices;
   PhysicalExprAttr sourceExtent;
   bool hasDerivedSource = false;
+  bool hasRuntimeSourceRange = false;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment || reductionAxis < 0 ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
       return unhandled("source has no physical reduction axis");
     FailureOr<SourcePlan> plan = analyzeSource(source, reductionAxis);
-    if (failed(plan))
-      return unhandled(
-          "source is not a load-rooted pure producer on the reduction axis");
-    for (LoadOp root : plan->roots)
-      if (failed(analyzeRoot(root, plan->sourceId)))
+    if (failed(plan)) {
+      FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      if (failed(mapping) || !isReplayableWithoutLoad(source, visited))
+        return unhandled(
+            Twine("source is neither load-rooted nor replayable pure data on the reduction axis; producer=") +
+            (source.getDefiningOp()
+                 ? source.getDefiningOp()->getName().getStringRef()
+                 : StringRef("block argument")));
+      plan = SourcePlan{source, mapping->getSourceId(),
+                        static_cast<unsigned>(reductionAxis), {}, {}};
+    }
+    llvm::SmallPtrSet<Operation *, 32> rangeVisited;
+    collectSourceRanges(source, plan->sourceId, plan->ranges, rangeVisited);
+    if (plan->ranges.empty()) {
+      FailureOr<MakeRangeOp> authority =
+          uniqueSourceRange(kernel, plan->sourceId);
+      if (succeeded(authority))
+        plan->ranges.push_back(*authority);
+    }
+    if (plan->roots.empty() && plan->ranges.empty())
+      return reduce.emitOpError(
+          "pure reduction source has no exact physical range authority");
+    for (LoadOp root : plan->roots) {
+      FailureOr<RootAccess> rootAccess = analyzeRoot(root, plan->sourceId);
+      if (failed(rootAccess))
         return unhandled(
             "load-rooted producer has no unit-step reduction coordinate");
+      hasRuntimeSourceRange |=
+          !isCompileTimeValue(rootAccess->range.getExtent());
+    }
     PhysicalExprAttr extent =
         cast<PhysicalExprAttr>(fragment.getShape()[reductionAxis]);
     if (sourceExtent && sourceExtent != extent)
@@ -627,7 +2534,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   }
   if (!sourceExtent)
     return unhandled("reduction has no physical source extent");
-  if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource)
+  if (!isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
+      hasRuntimeSourceRange)
     return realizeRuntimeReduce(reduce, sourcePlans, kernel);
 
   PhysicalExprAttr blockExtent = nextPowerOfTwo(sourceExtent);
@@ -655,7 +2563,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     auto blockedCoordinate = FragmentType::get(
         reduce.getContext(), range.getResult().getType().getElementType(),
         ArrayAttr::get(reduce.getContext(), coordinateShape),
-        range.getResult().getType().getAxisMaps(), 2,
+        range.getResult().getType().getAxisMaps(),
+        range.getResult().getType().getValidity(),
         range.getResult().getType().getOwner());
     Value coordinate = builder.create<MakeRangeOp>(
         reduce.getLoc(), blockedCoordinate, range.getStart(), physicalExtent,
@@ -665,14 +2574,16 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         range.getExtent(), 0);
     auto coordinatePredicate = FragmentType::get(
         reduce.getContext(), builder.getI1Type(), blockedCoordinate.getShape(),
-        blockedCoordinate.getAxisMaps(), 2, blockedCoordinate.getOwner());
+        blockedCoordinate.getAxisMaps(), blockedCoordinate.getValidity(),
+        blockedCoordinate.getOwner());
     Value stopFragment =
         builder.create<BroadcastOp>(reduce.getLoc(), blockedCoordinate, stop);
     Value valid = builder.create<CompareOp>(
         reduce.getLoc(), coordinatePredicate, coordinate, stopFragment, 2);
     auto sourcePredicate = FragmentType::get(
         reduce.getContext(), builder.getI1Type(), blockedSource.getShape(),
-        blockedSource.getAxisMaps(), 2, blockedSource.getOwner());
+        blockedSource.getAxisMaps(), blockedSource.getValidity(),
+        blockedSource.getOwner());
     valid = builder.create<BroadcastOp>(reduce.getLoc(), sourcePredicate, valid);
     if (load.getValid()) {
       FailureOr<Value> scalar = scalarSource(load.getValid());
@@ -687,7 +2598,16 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (identity.getType() != blockedSource)
       fill = builder.create<BroadcastOp>(reduce.getLoc(), blockedSource, identity);
     SmallVector<Value> coordinates(load.getCoordinates());
-    coordinates[coordinateIndices[component]] = coordinate;
+    IRMapping coordinateMapping;
+    coordinateMapping.map(range.getResult(), coordinate);
+    FailureOr<Value> reducedCoordinate = replayValue(
+        builder, reduce.getLoc(),
+        load.getCoordinates()[coordinateIndices[component]],
+        range.getSourceId(), blockExtent, coordinateMapping);
+    if (failed(reducedCoordinate))
+      return reduce.emitOpError(
+          "could not replay translated full-coverage reduction coordinate");
+    coordinates[coordinateIndices[component]] = *reducedCoordinate;
     blockedSources.push_back(builder.create<LoadOp>(
         reduce.getLoc(), blockedSource, load.getResource(), coordinates, valid,
         fill, load.getSourceAxes()));
@@ -721,7 +2641,23 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
 
 } // namespace
 
+LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
+  FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
+  if (failed(physicalKernel))
+    return failure();
+  func::FuncOp kernel = *physicalKernel;
+  SmallVector<ReduceOp> reductions;
+  kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
+  for (ReduceOp reduce : reductions)
+    if (reduce->getBlock() && reduce.getAxes().size() > 1 &&
+        failed(decomposeMultiAxisReduce(reduce, kernel)))
+      return failure();
+  return success();
+}
+
 LogicalResult realizeReductionBlocking(ModuleOp module) {
+  if (failed(decomposeMultiAxisReductions(module)))
+    return failure();
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
