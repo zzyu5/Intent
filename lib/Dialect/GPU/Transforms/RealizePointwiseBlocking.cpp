@@ -403,6 +403,9 @@ FailureOr<Value> zeroFill(OpBuilder &builder, Location location,
 
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges);
+void collectProducerRanges(Value value, uint64_t sourceId,
+                           llvm::SmallPtrSetImpl<Operation *> &ranges,
+                           llvm::SmallPtrSetImpl<Operation *> &visited);
 
 bool hasTailPredicate(
     Value coordinate,
@@ -454,8 +457,10 @@ LogicalResult addTailValidity(func::FuncOp kernel,
                               bool includeStores) {
   SmallVector<LoadOp> loads;
   SmallVector<StoreOp> stores;
+  SmallVector<HistogramOp> histograms;
   kernel.walk([&](LoadOp load) { loads.push_back(load); });
   kernel.walk([&](StoreOp store) { stores.push_back(store); });
+  kernel.walk([&](HistogramOp histogram) { histograms.push_back(histogram); });
 
   for (LoadOp load : loads) {
     bool affected = llvm::any_of(load.getCoordinates(), [&](Value coordinate) {
@@ -493,6 +498,50 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       replacement->setAttr(originAttr, origin);
     load.getResult().replaceAllUsesWith(replacement.getResult());
     load.erase();
+  }
+
+  for (HistogramOp histogram : histograms) {
+    auto valueType = dyn_cast<FragmentType>(histogram.getValues().getType());
+    if (!valueType)
+      return histogram.emitOpError(
+          "pointwise blocked histogram must consume a physical fragment");
+    FragmentType validType = predicateType(valueType);
+    OpBuilder builder(histogram);
+    FailureOr<Value> existing = broadcastTo(
+        builder, histogram.getLoc(), histogram.getValid(), validType);
+    if (failed(existing))
+      return histogram.emitOpError(
+          "could not broadcast the existing histogram validity");
+    Value valid = *existing;
+    bool affected = false;
+    for (auto [rangeValue, predicate] : rangePredicates) {
+      auto range = rangeValue.getDefiningOp<MakeRangeOp>();
+      if (!range)
+        continue;
+      llvm::SmallPtrSet<Operation *, 8> ranges;
+      llvm::SmallPtrSet<Operation *, 32> visited;
+      collectProducerRanges(histogram.getValues(), range.getSourceId(), ranges,
+                            visited);
+      if (!ranges.contains(range.getOperation()))
+        continue;
+      FailureOr<Value> broadcast =
+          broadcastTo(builder, histogram.getLoc(), predicate, validType);
+      if (failed(broadcast))
+        return histogram.emitOpError(
+            "could not project pointwise tail validity onto histogram values");
+      valid = builder.create<BinaryOp>(histogram.getLoc(), validType, valid,
+                                       *broadcast, 11);
+      affected = true;
+    }
+    if (!affected)
+      continue;
+    auto replacement = builder.create<HistogramOp>(
+        histogram.getLoc(), histogram.getResult().getType(),
+        histogram.getValues(), histogram.getBins(), valid);
+    if (Attribute origin = histogram->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    histogram.getResult().replaceAllUsesWith(replacement.getResult());
+    histogram.erase();
   }
 
   if (!includeStores)
@@ -1807,16 +1856,24 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     return false;
   };
+  auto dependsOnHistogramSource = [&](ValueRange values, uint64_t sourceId) {
+    return llvm::any_of(values, [&](Value value) {
+      HistogramOp histogram = histogramSource(value);
+      return histogram && containsSource(histogram.getValues(), sourceId);
+    });
+  };
   for (MakeRangeOp range : dynamicRanges) {
     uint64_t sourceId = range.getSourceId();
     if (!ownershipSources.contains(sourceId)) {
       internalTraversalRanges.insert(range.getOperation());
       continue;
     }
-    bool requiredByEveryEffect = llvm::all_of(writeEffects, [&](const auto &effect) {
-      return dependsOnSource(effect.coordinates, sourceId) ||
-             dependsOnSource(effect.payloads, sourceId);
-    });
+    bool requiredByEveryEffect =
+        llvm::all_of(writeEffects, [&](const auto &effect) {
+          return dependsOnSource(effect.coordinates, sourceId) ||
+                 dependsOnSource(effect.payloads, sourceId) ||
+                 dependsOnHistogramSource(effect.payloads, sourceId);
+        });
     if (!requiredByEveryEffect)
       internalTraversalRanges.insert(range.getOperation());
   }

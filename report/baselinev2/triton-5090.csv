@@ -50,6 +50,6 @@ flaggems_fused_adamw,N8388608-fp32,0.157720,0.157680,1.000254,pass
 flaggems_addcmul,B64-C128-L4096-bf16,0.099936,0.085616,1.167258,pass
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.028840,0.087808,0.328444,pass
 flaggems_cumsum,8192x8192-fp32-axis1,0.349968,0.351984,0.994272,pass
-flaggems_histogram,N8388608-bins256-fp32,,,,candidate_contract_failed
+flaggems_histogram,N8388608-bins256-fp32,0.118432,1.238832,0.095600,pass
 flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.016144,0.020224,0.798260,pass
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,,,,source_compatibility_gap
