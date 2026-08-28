@@ -14,5 +14,6 @@ add_mlir_library(MLIRIntentGPUTransforms
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect
+  MLIRIntentGPUAnalysis
   MLIRIntentGPUDialect
 )

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -27,17 +28,7 @@ PhysicalExprAttr parameterExtent(ParameterAttr parameter) {
 }
 
 FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
-  std::optional<unsigned> result;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getSourceId() != sourceId)
-      continue;
-    if (result)
-      return failure();
-    result = mapping.getFragmentAxis();
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
+  return queryFragmentAxis(fragment, sourceId);
 }
 
 FailureOr<uint64_t> sourceForOperandAxis(Value operand, uint64_t sourceId) {
@@ -101,113 +92,56 @@ bool isUnitExtent(Attribute attribute) {
          expression.getValue() == 1;
 }
 
-MakeRangeOp sourceRange(Value value) {
-  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    value = broadcast.getValue();
-  return value.getDefiningOp<MakeRangeOp>();
-}
-
-bool isReplayableProducer(Operation *operation) {
-  return isa<CastOp, UnaryOp, BinaryOp, BroadcastOp, SelectOp, CompareOp,
-             SplatOp, ReshapeOp, TransposeOp, JoinOp>(operation);
-}
-
 struct SourcePlan {
   Value source;
   uint64_t sourceId;
+  uint64_t logicalSourceAxis;
   unsigned sourceAxis;
   bool hasLoads;
   SmallVector<MakeRangeOp> ranges;
 };
 
-LogicalResult collectRoots(Value value, uint64_t sourceId,
-                           bool &hasLoads,
-                           SmallVectorImpl<MakeRangeOp> &ranges,
-                           llvm::SmallPtrSetImpl<Operation *> &visited) {
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  FailureOr<unsigned> resultAxis =
-      fragment ? axisForSource(fragment, sourceId)
-               : FailureOr<unsigned>(failure());
-  if (!fragment || failed(resultAxis))
-    return success();
-  Operation *producer = value.getDefiningOp();
-  if (!producer)
-    return failure();
-  if (!visited.insert(producer).second)
-    return success();
-  if (auto load = dyn_cast<LoadOp>(producer)) {
-    if (!isa<ViewType>(load.getResource().getType()))
-      return load.emitOpError(
-          "region-fold source replay requires an immutable external-view load");
-    hasLoads = true;
-    for (Value operand : llvm::drop_begin(load->getOperands())) {
-      FailureOr<uint64_t> operandSource =
-          sourceForOperandAxis(operand, sourceId);
-      if (failed(operandSource))
-        continue;
-      if (failed(collectRoots(operand, *operandSource, hasLoads, ranges,
-                              visited)))
-        return failure();
-    }
-    return success();
-  }
-  if (auto gather = dyn_cast<GatherOp>(producer)) {
-    hasLoads = true;
-    for (Value operand : gather->getOperands()) {
-      FailureOr<uint64_t> operandSource =
-          sourceForOperandAxis(operand, sourceId);
-      if (failed(operandSource))
-        continue;
-      if (failed(collectRoots(operand, *operandSource, hasLoads, ranges,
-                              visited)))
-        return failure();
-    }
-    return success();
-  }
-  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    if (!llvm::is_contained(ranges, range))
-      ranges.push_back(range);
-    return success();
-  }
-  if (!isReplayableProducer(producer) || producer->getNumRegions() != 0 ||
-      producer->getNumResults() != 1)
-    return producer->emitOpError(
-        "cannot be replayed while slicing a region-fold source axis");
-  for (Value operand : producer->getOperands()) {
-    FailureOr<uint64_t> operandSource =
-        sourceForOperandAxis(operand, sourceId);
-    if (failed(operandSource))
-      continue;
-    if (failed(collectRoots(operand, *operandSource, hasLoads, ranges, visited)))
-      return failure();
-  }
-  return success();
-}
-
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || sourceAxis >= fragment.getShape().size())
     return failure();
-  Operation *sourceDefinition = source.getDefiningOp();
   auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
-  SourcePlan plan{source, mapping.getSourceId(), sourceAxis, false, {}};
-  llvm::SmallPtrSet<Operation *, 16> visited;
-  if (failed(collectRoots(source, plan.sourceId, plan.hasLoads, plan.ranges,
-                          visited)))
+  SourcePlan plan{source, mapping.getSourceId(), mapping.getSourceAxis(),
+                  sourceAxis, false, {}};
+  auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
     return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalSourceAxis logicalSource{mapping.getSourceId(),
+                                   mapping.getSourceAxis()};
+  PhysicalRangeFact fact = analysis.sourceRanges(source, logicalSource);
+  if (!fact.isExact())
+    return failure();
+  plan.ranges.assign(fact.roots.begin(), fact.roots.end());
+  for (Operation *access : fact.accesses) {
+    if (auto load = dyn_cast<LoadOp>(access)) {
+      if (!isa<ViewType>(load.getResource().getType()))
+        return load.emitOpError(
+            "region-fold source replay requires an immutable external-view load");
+      plan.hasLoads = true;
+      continue;
+    }
+    if (isa<GatherOp>(access)) {
+      plan.hasLoads = true;
+      continue;
+    }
+    return access->emitOpError(
+               "region-fold source replay encountered an unsupported access"),
+           failure();
+  }
   for (MakeRangeOp range : plan.ranges)
     if (!isUnitStep(range.getStep()))
       return range.emitOpError(
           "region-fold source traversal requires a unit-step physical range");
   if (plan.ranges.empty())
-    return sourceDefinition
-               ? sourceDefinition->emitOpError(
-                     "does not expose a load or range for the region-fold source axis")
-               : failure();
+    return failure();
   return plan;
 }
-
-Value zeroFill(OpBuilder &builder, Location location, FragmentType type);
 
 FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
                              uint64_t sourceId,
@@ -236,27 +170,17 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
                          Value valid) -> FailureOr<Value> {
     if (!segmentTail)
       return valid ? FailureOr<Value>(valid) : FailureOr<Value>(Value());
-    Value tail = segmentTail;
-    FragmentType predicate = predicateType(type);
     auto targetAxis = cast<AxisMapAttr>(type.getAxisMaps()[*axis]);
-    auto projected = FragmentType::get(
-        type.getContext(), builder.getI1Type(),
-        ArrayAttr::get(type.getContext(), {type.getShape()[*axis]}),
-        ArrayAttr::get(type.getContext(),
-                       {AxisMapAttr::get(type.getContext(),
-                                         targetAxis.getSourceId(),
-                                         targetAxis.getSourceAxis(), 0)}),
-        type.getValidity(), type.getOwner());
-    if (tail.getType() != projected)
-      tail = builder.create<BroadcastOp>(location, projected, tail);
-    if (tail.getType() != predicate)
-      tail = builder.create<BroadcastOp>(location, predicate, tail);
+    FailureOr<Value> tail = projectPredicateToFragment(
+        builder, location, segmentTail, type,
+        PhysicalSourceAxis{targetAxis.getSourceId(),
+                           targetAxis.getSourceAxis()});
+    if (failed(tail))
+      return failure();
     if (!valid)
-      return tail;
-    if (valid.getType() != predicate)
-      valid = builder.create<BroadcastOp>(location, predicate, valid);
-    return Value(builder.create<BinaryOp>(location, predicate, valid, tail,
-                                          BinaryOperator::LogicalAnd));
+      return *tail;
+    return materializeValidityConjunction(builder, location, valid, *tail,
+                                          type);
   };
   if (auto load = dyn_cast<LoadOp>(producer)) {
     SmallVector<Value> coordinates;
@@ -293,10 +217,12 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
       if (fill.getType() != resultType)
         fill = builder.create<BroadcastOp>(location, resultType, fill);
     } else {
-      fill = zeroFill(builder, location, resultType);
+      FailureOr<Value> zero =
+          materializeZeroFragment(builder, location, resultType);
+      if (failed(zero))
+        return failure();
+      fill = *zero;
     }
-    if (!fill)
-      return failure();
     auto clone = builder.create<LoadOp>(
         location, resultType, load.getResource(), coordinates, valid, fill,
         load.getSourceAxes());
@@ -343,10 +269,12 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
       if (fill.getType() != resultType)
         fill = builder.create<BroadcastOp>(location, resultType, fill);
     } else {
-      fill = zeroFill(builder, location, resultType);
+      FailureOr<Value> zero =
+          materializeZeroFragment(builder, location, resultType);
+      if (failed(zero))
+        return failure();
+      fill = *zero;
     }
-    if (!fill)
-      return failure();
     auto clone = builder.create<GatherOp>(
         location, resultType, *source, coordinates, valid, fill,
         gather.getSourceAxes());
@@ -355,8 +283,8 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     mapping.map(value, clone.getResult());
     return clone.getResult();
   }
-  if (!isReplayableProducer(producer) || producer->getNumRegions() != 0 ||
-      producer->getNumResults() != 1)
+  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+                            /*allowAccesses=*/false))
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = replayOperand(operand);
@@ -393,23 +321,6 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
-}
-
-Value zeroFill(OpBuilder &builder, Location location, FragmentType type) {
-  TypedAttr zero;
-  if (auto floating = dyn_cast<FloatType>(type.getElementType()))
-    zero = builder.getFloatAttr(floating, 0.0);
-  else if (auto integer = dyn_cast<IntegerType>(type.getElementType()))
-    zero = builder.getIntegerAttr(integer, 0);
-  else if (isa<IndexType>(type.getElementType()))
-    zero = builder.getIndexAttr(0);
-  if (!zero)
-    return {};
-  FailureOr<Value> scalar = materializeScalarConstant(
-      builder, location, zero, type.getElementType());
-  return succeeded(scalar)
-             ? Value(builder.create<SplatOp>(location, type, *scalar))
-             : Value();
 }
 
 LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
@@ -1176,9 +1087,8 @@ FailureOr<Type> slicedType(Type type, uint64_t sourceId,
 }
 
 bool isScanOutputPureConsumer(Operation *operation) {
-  return isa<CastOp, UnaryOp, BinaryOp, BroadcastOp, SelectOp, CompareOp,
-             SplatOp, ReshapeOp, TransposeOp, JoinOp, MakeRecordOp, ExtractOp>(
-      operation);
+  return isPhysicalReplayNode(operation, PhysicalReplayScope::Coordinate,
+                              /*allowAccesses=*/false);
 }
 
 LogicalResult collectScanOutputConsumers(RegionScanOp scan,
@@ -1375,6 +1285,14 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
   auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
   if (!yield || yield.getValues().size() != identities.size())
     return failure();
+  auto kernel = fold->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+  auto uniqueRange = [&](Value value) -> MakeRangeOp {
+    PhysicalRangeFact fact = analysis.sourceRanges(value);
+    return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
+  };
   for (CompareOp compare : fold.getSummarize().front().getOps<CompareOp>()) {
     BlockArgument lhs = rootHelperArgument(compare.getLhs());
     BlockArgument rhs = rootHelperArgument(compare.getRhs());
@@ -1399,8 +1317,8 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
         fold.getSourceCount() + fold.getIdentityCount());
     if (captureIndex >= captures.size())
       continue;
-    MakeRangeOp captureRange = sourceRange(captures[captureIndex]);
-    MakeRangeOp comparedSource = sourceRange(plans[sourceArgument].source);
+    MakeRangeOp captureRange = uniqueRange(captures[captureIndex]);
+    MakeRangeOp comparedSource = uniqueRange(plans[sourceArgument].source);
     auto comparedType = comparedSource
                             ? dyn_cast<FragmentType>(
                                   comparedSource.getResult().getType())
@@ -1485,14 +1403,14 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     unsigned planIndex;
   };
   SmallVector<SourceAssumption> sourceAssumptions;
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
   kernel.walk([&](AssumeInBoundsOp assumption) {
     for (auto [planIndex, plan] : llvm::enumerate(plans)) {
-      bool hasLoads = false;
-      SmallVector<MakeRangeOp> roots;
-      llvm::SmallPtrSet<Operation *, 16> visited;
-      if (failed(collectRoots(assumption.getIndex(), plan.sourceId, hasLoads,
-                              roots, visited)) ||
-          llvm::none_of(roots, [&](MakeRangeOp root) {
+      PhysicalRangeFact fact = physicalAnalysis.sourceRanges(
+          assumption.getIndex(),
+          PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis});
+      if (!fact.isExact() ||
+          llvm::none_of(fact.roots, [&](MakeRangeOp root) {
             return llvm::is_contained(plan.ranges, root);
           }))
         continue;

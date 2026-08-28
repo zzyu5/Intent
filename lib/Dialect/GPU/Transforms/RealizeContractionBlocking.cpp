@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -155,41 +156,20 @@ FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
 
 FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
                                         uint64_t sourceId) {
-  std::optional<unsigned> result;
-  for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
-    auto fragment = dyn_cast<FragmentType>(coordinate.getType());
-    if (!fragment)
-      continue;
-    bool matches = llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
-      return cast<AxisMapAttr>(attribute).getSourceId() == sourceId;
-    });
-    if (!matches)
-      continue;
-    if (result)
-      return failure();
-    result = index;
-  }
-  return result ? FailureOr<unsigned>(*result) : FailureOr<unsigned>(failure());
+  return queryCoordinateIndex(coordinates, sourceId);
 }
 
 MakeRangeOp sourceRange(Value value) {
-  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    value = broadcast.getValue();
-  return value.getDefiningOp<MakeRangeOp>();
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return {};
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact = analysis.sourceRanges(value);
+  return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
 }
 
 FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
-  std::optional<unsigned> result;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getSourceId() != sourceId)
-      continue;
-    if (result)
-      return failure();
-    result = mapping.getFragmentAxis();
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
+  return queryFragmentAxis(fragment, sourceId);
 }
 
 FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
@@ -244,47 +224,24 @@ bool hasExplicitPairedReductionRanges(ContractOp contract) {
          hasRanges(contract.getRhs(), *rhsMap);
 }
 
-bool isReplayableCoordinateProducer(Operation *operation) {
-  return isa<CastOp, UnaryOp, BinaryOp, BroadcastOp, SelectOp, CompareOp,
-             SplatOp, ReshapeOp, TransposeOp, JoinOp>(operation);
-}
-
 LogicalResult collectProducerRanges(
     Value value, uint64_t sourceId, SmallVectorImpl<MakeRangeOp> &ranges,
     llvm::SmallPtrSetImpl<Operation *> &visited) {
-  if (!containsSource(value, sourceId))
-    return success();
-  Operation *producer = value.getDefiningOp();
-  if (!producer)
+  (void)visited;
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
     return failure();
-  if (!visited.insert(producer).second)
-    return success();
-  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact = analysis.sourceRanges(value);
+  if (fact.state == PhysicalFactState::Unknown)
+    return failure();
+  for (MakeRangeOp range : fact.roots) {
     if (range.getSourceId() != sourceId)
-      return failure();
+      continue;
     if (!llvm::is_contained(ranges, range))
       ranges.push_back(range);
-    return success();
   }
-  if (auto load = dyn_cast<LoadOp>(producer)) {
-    for (Value operand : llvm::drop_begin(load->getOperands()))
-      if (failed(collectProducerRanges(operand, sourceId, ranges, visited)))
-        return failure();
-    return success();
-  }
-  if (auto gather = dyn_cast<GatherOp>(producer)) {
-    for (Value operand : gather->getOperands())
-      if (failed(collectProducerRanges(operand, sourceId, ranges, visited)))
-        return failure();
-    return success();
-  }
-  if (!isReplayableCoordinateProducer(producer) ||
-      producer->getNumRegions() != 0 || producer->getNumResults() != 1)
-    return failure();
-  for (Value operand : producer->getOperands())
-    if (failed(collectProducerRanges(operand, sourceId, ranges, visited)))
-      return failure();
-  return success();
+  return ranges.empty() ? failure() : success();
 }
 
 FailureOr<MakeRangeOp> producerRange(Value value, uint64_t sourceId) {
@@ -314,8 +271,8 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   Operation *producer = value.getDefiningOp();
   if (!producer || isa<MakeRangeOp>(producer))
     return failure();
-  if (!isa<LoadOp, GatherOp>(producer) &&
-      !isReplayableCoordinateProducer(producer))
+  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+                            /*allowAccesses=*/true))
     return failure();
   if (producer->getNumRegions() != 0 || producer->getNumResults() != 1)
     return failure();
@@ -366,119 +323,12 @@ bool isIntegerConstant(Value value, int64_t expected) {
   return integer && integer.getInt() == expected;
 }
 
-Value strippedScalarIdentity(Value value) {
-  value = strippedBroadcast(value);
-  while (true) {
-    if (auto cast = value.getDefiningOp<CastOp>()) {
-      value = strippedBroadcast(cast.getValue());
-      continue;
-    }
-    auto binary = value.getDefiningOp<BinaryOp>();
-    if (!binary)
-      return value;
-    if (binary.getOperatorKind() == BinaryOperator::Add) {
-      if (isIntegerConstant(binary.getLhs(), 0)) {
-        value = strippedBroadcast(binary.getRhs());
-        continue;
-      }
-      if (isIntegerConstant(binary.getRhs(), 0)) {
-        value = strippedBroadcast(binary.getLhs());
-        continue;
-      }
-    }
-    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
-      if (isIntegerConstant(binary.getLhs(), 0))
-        return binary.getLhs();
-      if (isIntegerConstant(binary.getRhs(), 0))
-        return binary.getRhs();
-      if (isIntegerConstant(binary.getLhs(), 1)) {
-        value = strippedBroadcast(binary.getRhs());
-        continue;
-      }
-      if (isIntegerConstant(binary.getRhs(), 1)) {
-        value = strippedBroadcast(binary.getLhs());
-        continue;
-      }
-    }
-    return value;
-  }
-}
-
 bool isTailPredicate(Value value,
                      ArrayRef<std::pair<MakeRangeOp, Value>> ranges) {
   if (!value)
     return true;
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
-    auto integer = dyn_cast<IntegerAttr>(constant.getValue());
-    return integer && integer.getType().isInteger(1) && integer.getInt() != 0;
-  }
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    return isTailPredicate(broadcast.getValue(), ranges);
-  if (auto splat = value.getDefiningOp<SplatOp>())
-    return isTailPredicate(splat.getValue(), ranges);
-  if (auto reshape = value.getDefiningOp<ReshapeOp>())
-    return isTailPredicate(reshape.getValue(), ranges);
-  if (auto transpose = value.getDefiningOp<TransposeOp>())
-    return isTailPredicate(transpose.getValue(), ranges);
-  if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
-    Type resultType = conjunction.getResult().getType();
-    Type elementType = resultType;
-    if (auto fragment = dyn_cast<FragmentType>(resultType))
-      elementType = fragment.getElementType();
-    bool logical = conjunction.getOperatorKind() == BinaryOperator::LogicalAnd;
-    bool bitwiseI1 = conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
-                     elementType.isInteger(1);
-    if (!logical && !bitwiseI1)
-      return false;
-    return isTailPredicate(conjunction.getLhs(), ranges) &&
-           isTailPredicate(conjunction.getRhs(), ranges);
-  }
-  auto comparison = value.getDefiningOp<CompareOp>();
-  if (!comparison || comparison.getPredicate() != ComparePredicate::Lt)
-    return false;
-  Value lhs = strippedBroadcast(comparison.getLhs());
-  Value rhs = strippedScalarIdentity(comparison.getRhs());
-  MakeRangeOp predicateRange = lhs.getDefiningOp<MakeRangeOp>();
-  if (predicateRange) {
-    Value start = strippedScalarIdentity(predicateRange.getStart());
-    Value extent = strippedScalarIdentity(predicateRange.getExtent());
-    if (isIntegerConstant(start, 0) && rhs == extent)
-      return true;
-    auto stop = rhs.getDefiningOp<BinaryOp>();
-    if (stop && stop.getOperatorKind() == BinaryOperator::Add &&
-        ((stop.getLhs() == predicateRange.getStart() &&
-          stop.getRhs() == predicateRange.getExtent()) ||
-         (stop.getRhs() == predicateRange.getStart() &&
-          stop.getLhs() == predicateRange.getExtent())))
-      return true;
-  }
-  bool matched = llvm::any_of(ranges, [&](std::pair<MakeRangeOp, Value> entry) {
-    Value expectedEnd = strippedScalarIdentity(entry.second);
-    if (lhs == entry.first->getResult(0))
-      return rhs == expectedEnd;
-    if (!predicateRange ||
-        predicateRange.getSourceId() != entry.first.getSourceId() ||
-        predicateRange.getSourceAxis() != entry.first.getSourceAxis())
-      return false;
-    auto predicateDimension =
-        predicateRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-    auto expectedDimension =
-        entry.first->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-    if (!predicateRange->hasAttr(sourceSubregionAttr) &&
-        !entry.first->hasAttr(sourceSubregionAttr) && predicateDimension &&
-        predicateDimension == expectedDimension)
-      return true;
-    if (!predicateRange->hasAttr(sourceSubregionAttr) &&
-        !entry.first->hasAttr(sourceSubregionAttr) &&
-        predicateRange.getSourceId() == entry.first.getSourceId() &&
-        rhs == expectedEnd)
-      return true;
-    return rhs == expectedEnd &&
-           predicateRange.getStart() == entry.first.getStart() &&
-           predicateRange.getExtent() == entry.first.getExtent() &&
-           predicateRange.getStep() == entry.first.getStep();
-  });
-  return matched;
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  return kernel && PhysicalProgramAnalysis(kernel).isTailPredicate(value, ranges);
 }
 
 bool hasRuntimeRange(Value value) {

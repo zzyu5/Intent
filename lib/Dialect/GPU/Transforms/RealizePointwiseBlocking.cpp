@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -368,39 +369,6 @@ FragmentType predicateType(FragmentType source) {
                            source.getOwner());
 }
 
-FailureOr<Value> broadcastTo(OpBuilder &builder, Location location, Value value,
-                             FragmentType target) {
-  if (value.getType() == target)
-    return value;
-  if (!isa<IntegerType, FloatType, IndexType, FragmentType>(value.getType()))
-    return failure();
-  Type element = value.getType();
-  if (auto fragment = dyn_cast<FragmentType>(element))
-    element = fragment.getElementType();
-  if (element != target.getElementType())
-    return failure();
-  return Value(builder.create<BroadcastOp>(location, target, value));
-}
-
-FailureOr<Value> zeroFill(OpBuilder &builder, Location location,
-                          FragmentType target) {
-  Type element = target.getElementType();
-  TypedAttr zero;
-  if (auto integer = dyn_cast<IntegerType>(element))
-    zero = builder.getIntegerAttr(integer, 0);
-  else if (auto floating = dyn_cast<FloatType>(element))
-    zero = builder.getFloatAttr(floating, 0.0);
-  else if (isa<IndexType>(element))
-    zero = builder.getIndexAttr(0);
-  else
-    return failure();
-  FailureOr<Value> scalar =
-      materializeScalarConstant(builder, location, zero, element);
-  if (failed(scalar))
-    return failure();
-  return Value(builder.create<BroadcastOp>(location, target, *scalar));
-}
-
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges);
 void collectProducerRanges(Value value, uint64_t sourceId,
@@ -425,7 +393,7 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   FragmentType target = predicateType(valueType);
   Value result;
   if (existing) {
-    FailureOr<Value> broadcast = broadcastTo(builder, location, existing, target);
+    FailureOr<Value> broadcast = materializeBroadcastToFragment(builder, location, existing, target);
     if (failed(broadcast))
       return failure();
     result = *broadcast;
@@ -441,7 +409,7 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       if (found == rangePredicates.end())
         continue;
       FailureOr<Value> broadcast =
-          broadcastTo(builder, location, found->second, target);
+          materializeBroadcastToFragment(builder, location, found->second, target);
       if (failed(broadcast))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
@@ -482,12 +450,12 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> broadcast =
-          broadcastTo(builder, load.getLoc(), load.getFill(), valueType);
+          materializeBroadcastToFragment(builder, load.getLoc(), load.getFill(), valueType);
       if (failed(broadcast))
         return load.emitOpError("could not broadcast the existing load fill");
       fill = *broadcast;
     } else {
-      FailureOr<Value> zero = zeroFill(builder, load.getLoc(), valueType);
+      FailureOr<Value> zero = materializeZeroFragment(builder, load.getLoc(), valueType);
       if (failed(zero))
         return load.emitOpError("pointwise load element type has no zero fill");
       fill = *zero;
@@ -508,7 +476,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
           "pointwise blocked histogram must consume a physical fragment");
     FragmentType validType = predicateType(valueType);
     OpBuilder builder(histogram);
-    FailureOr<Value> existing = broadcastTo(
+    FailureOr<Value> existing = materializeBroadcastToFragment(
         builder, histogram.getLoc(), histogram.getValid(), validType);
     if (failed(existing))
       return histogram.emitOpError(
@@ -526,7 +494,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       if (!ranges.contains(range.getOperation()))
         continue;
       FailureOr<Value> broadcast =
-          broadcastTo(builder, histogram.getLoc(), predicate, validType);
+          materializeBroadcastToFragment(builder, histogram.getLoc(), predicate, validType);
       if (failed(broadcast))
         return histogram.emitOpError(
             "could not project pointwise tail validity onto histogram values");
@@ -576,66 +544,21 @@ LogicalResult addTailValidity(func::FuncOp kernel,
 void collectProducerRanges(Value value, uint64_t sourceId,
                            llvm::SmallPtrSetImpl<Operation *> &ranges,
                            llvm::SmallPtrSetImpl<Operation *> &visited) {
-  Operation *producer = value.getDefiningOp();
-  if (!producer) {
-    auto argument = dyn_cast<BlockArgument>(value);
-    auto fragment = dyn_cast<FragmentType>(value.getType());
-    if (!argument || !fragment)
-      return;
-    FailureOr<unsigned> sourceAxis = failure();
-    for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps())) {
-      auto mapping = cast<AxisMapAttr>(attribute);
-      if (mapping.getSourceId() != sourceId)
-        continue;
-      if (succeeded(sourceAxis))
-        return;
-      sourceAxis = axis;
-    }
-    if (failed(sourceAxis))
-      return;
-    Operation *parent = argument.getOwner()->getParentOp();
-    Value outer;
-    if (auto fold = dyn_cast_or_null<RegionFoldOp>(parent)) {
-      if (argument.getOwner() == &fold.getSummarize().front() &&
-          argument.getArgNumber() < fold.getSourceCount())
-        outer = fold.getInputs()[argument.getArgNumber()];
-    } else if (auto scan = dyn_cast_or_null<RegionScanOp>(parent)) {
-      if (argument.getOwner() == &scan.getSummarize().front() &&
-          argument.getArgNumber() < scan.getSourceCount())
-        outer = scan.getInputs()[argument.getArgNumber()];
-    }
-    auto outerFragment = outer ? dyn_cast<FragmentType>(outer.getType())
-                               : FragmentType();
-    if (!outerFragment || *sourceAxis >= outerFragment.getAxisMaps().size())
-      return;
-    auto outerMapping =
-        cast<AxisMapAttr>(outerFragment.getAxisMaps()[*sourceAxis]);
-    collectProducerRanges(outer, outerMapping.getSourceId(), ranges, visited);
+  (void)visited;
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
     return;
-  }
-  if (!visited.insert(producer).second)
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact = analysis.sourceRanges(value);
+  if (fact.state == PhysicalFactState::Unknown)
     return;
-  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
+  for (MakeRangeOp range : fact.roots)
     if (range.getSourceId() == sourceId)
-      ranges.insert(producer);
-    return;
-  }
-  for (Value operand : producer->getOperands())
-    collectProducerRanges(operand, sourceId, ranges, visited);
+      ranges.insert(range.getOperation());
 }
 
 FailureOr<unsigned> sourceAxis(FragmentType fragment, uint64_t sourceId) {
-  std::optional<unsigned> result;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getSourceId() != sourceId)
-      continue;
-    if (result)
-      return failure();
-    result = mapping.getFragmentAxis();
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
+  return queryFragmentAxis(fragment, sourceId);
 }
 
 FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
@@ -656,33 +579,6 @@ bool containsSource(Value value, uint64_t sourceId) {
   return fragment && succeeded(sourceAxis(fragment, sourceId));
 }
 
-bool isReplayablePointwiseProducer(Operation *operation) {
-  return isa<LoadOp, GatherOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-             BitcastOp, BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
-             ContractOp, ScaledContractOp, SparseContractOp, ReduceOp>(operation);
-}
-
-bool isReplayablePointwiseValueGraph(
-    Value value, uint64_t sourceId,
-    llvm::SmallPtrSetImpl<Operation *> &visited) {
-  if (!containsSource(value, sourceId))
-    return true;
-  Operation *producer = value.getDefiningOp();
-  if (!producer)
-    return false;
-  if (!visited.insert(producer).second)
-    return true;
-  if (auto range = dyn_cast<MakeRangeOp>(producer))
-    return range.getSourceId() == sourceId;
-  if (!isReplayablePointwiseProducer(producer) ||
-      (producer->getNumRegions() != 0 && !isa<ReduceOp>(producer)) ||
-      producer->getNumResults() != 1)
-    return false;
-  return llvm::all_of(producer->getOperands(), [&](Value operand) {
-    return isReplayablePointwiseValueGraph(operand, sourceId, visited);
-  });
-}
-
 FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       uint64_t sourceId,
                                       PhysicalExprAttr blockedExtent,
@@ -701,9 +597,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     mapping.map(value, blockedRange);
     return blockedRange;
   }
-  if (!isReplayablePointwiseProducer(producer) ||
-      (producer->getNumRegions() != 0 && !isa<ReduceOp>(producer)) ||
-      producer->getNumResults() != 1)
+  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+                            /*allowAccesses=*/true))
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replacement = replayPointwiseValue(
@@ -728,14 +623,14 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     Value valid = mapped(existing);
     if (!blockedValidity)
       return valid;
-    FailureOr<Value> projected = broadcastTo(
+    FailureOr<Value> projected = materializeBroadcastToFragment(
         builder, producer->getLoc(), blockedValidity, predicateType(resultType));
     if (failed(projected))
       return failure();
     if (!valid)
       return *projected;
     FailureOr<Value> original =
-        broadcastTo(builder, producer->getLoc(), valid, predicateType(resultType));
+        materializeBroadcastToFragment(builder, producer->getLoc(), valid, predicateType(resultType));
     if (failed(original))
       return failure();
     return Value(builder.create<BinaryOp>(producer->getLoc(),
@@ -750,7 +645,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return failure();
     Value fill = mapped(load.getFill());
     if (*valid && !fill) {
-      FailureOr<Value> zero = zeroFill(builder, producer->getLoc(), resultType);
+      FailureOr<Value> zero = materializeZeroFragment(builder, producer->getLoc(), resultType);
       if (failed(zero))
         return failure();
       fill = *zero;
@@ -770,7 +665,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return failure();
     Value fill = mapped(gather.getFill());
     if (*valid && !fill) {
-      FailureOr<Value> zero = zeroFill(builder, producer->getLoc(), resultType);
+      FailureOr<Value> zero = materializeZeroFragment(builder, producer->getLoc(), resultType);
       if (failed(zero))
         return failure();
       fill = *zero;
@@ -1011,7 +906,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             failureReason = "write payload lost its physical fragment schema";
             return;
           }
-          FailureOr<Value> valid = broadcastTo(nested, location, tail,
+          FailureOr<Value> valid = materializeBroadcastToFragment(nested, location, tail,
                                                predicateType(payloadType));
           if (failed(valid)) {
             bodyFailed = true;
@@ -1027,7 +922,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
               failureReason = "write validity cannot be replayed in the tile loop";
               return;
             }
-            FailureOr<Value> projected = broadcastTo(
+            FailureOr<Value> projected = materializeBroadcastToFragment(
                 nested, location, *existing, predicateType(payloadType));
             if (failed(projected)) {
               bodyFailed = true;
@@ -1060,14 +955,14 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
 
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges) {
-  auto fragment = dyn_cast<FragmentType>(coordinate.getType());
-  if (!fragment)
+  auto kernel = coordinate.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
     return;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    collectProducerRanges(coordinate, cast<AxisMapAttr>(attribute).getSourceId(),
-                          ranges, visited);
-  }
+  PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).sourceRanges(coordinate);
+  if (fact.state == PhysicalFactState::Unknown)
+    return;
+  for (MakeRangeOp range : fact.roots)
+    ranges.insert(range.getOperation());
 }
 
 void collectStoreRanges(Value value, llvm::SmallPtrSetImpl<Operation *> &ranges,
@@ -1686,9 +1581,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       for (StoreOp store : candidateStores) {
         if (!storeUsesRange(store, range))
           continue;
-        llvm::SmallPtrSet<Operation *, 32> visited;
-        replayable &= isReplayablePointwiseValueGraph(
-            store.getValue(), range.getSourceId(), visited);
+        PhysicalProgramAnalysis analysis(kernel);
+        PhysicalReplayFact replay = analysis.replayability(
+            store.getValue(),
+            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
+        replayable &= replay.isReplayable();
       }
       // A value graph containing loop-carried or otherwise non-replayable
       // structure must remain one full fragment.  Tiling the writeback axis

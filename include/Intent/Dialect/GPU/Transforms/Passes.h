@@ -10,6 +10,8 @@
 
 namespace intent::gpu {
 
+struct PhysicalSourceAxis;
+
 mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
@@ -24,6 +26,21 @@ resolveLogicalRangeEnd(mlir::func::FuncOp kernel, MakeRangeOp range);
 mlir::FailureOr<mlir::Value>
 materializeScalarConstant(mlir::OpBuilder &builder, mlir::Location location,
                           mlir::Attribute value, mlir::Type resultType);
+mlir::FailureOr<mlir::Value>
+materializeBroadcastToFragment(mlir::OpBuilder &builder,
+                               mlir::Location location, mlir::Value value,
+                               FragmentType target);
+mlir::FailureOr<mlir::Value>
+materializeZeroFragment(mlir::OpBuilder &builder, mlir::Location location,
+                        FragmentType target);
+mlir::FailureOr<mlir::Value>
+projectPredicateToFragment(mlir::OpBuilder &builder, mlir::Location location,
+                           mlir::Value predicate, FragmentType target,
+                           PhysicalSourceAxis source);
+mlir::FailureOr<mlir::Value>
+materializeValidityConjunction(mlir::OpBuilder &builder,
+                               mlir::Location location, mlir::Value lhs,
+                               mlir::Value rhs, FragmentType valueType);
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 void eraseDeadPhysicalValues(mlir::func::FuncOp kernel);
 void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);

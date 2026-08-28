@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -138,9 +139,12 @@ bool preservesIntroducedUnitSourceAxis(Value value, uint64_t sourceId) {
 
 FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
                                   Value predicate, FragmentType target,
-                                  uint64_t sourceId) {
+                                  PhysicalSourceAxis source) {
   auto base = dyn_cast<FragmentType>(predicate.getType());
-  FailureOr<unsigned> axis = sourceAxis(target, sourceId);
+  PhysicalAxisProjection projection = queryFragmentAxis(target, source);
+  FailureOr<unsigned> axis =
+      projection.isExact() ? FailureOr<unsigned>(projection.fragmentAxis)
+                           : FailureOr<unsigned>(failure());
   if (!base || base.getShape().size() != 1 || failed(axis))
     return failure();
   SmallVector<Attribute> shape(
@@ -167,7 +171,8 @@ FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
   return result;
 }
 
-Value zeroFill(OpBuilder &builder, Location location, FragmentType type) {
+FailureOr<Value> zeroFill(OpBuilder &builder, Location location,
+                          FragmentType type) {
   TypedAttr zero;
   if (auto integer = dyn_cast<IntegerType>(type.getElementType()))
     zero = builder.getIntegerAttr(integer, 0);
@@ -176,12 +181,12 @@ Value zeroFill(OpBuilder &builder, Location location, FragmentType type) {
   else if (isa<IndexType>(type.getElementType()))
     zero = builder.getIndexAttr(0);
   if (!zero)
-    return {};
+    return failure();
   FailureOr<Value> scalar =
       materializeScalarConstant(builder, location, zero, type.getElementType());
   if (failed(scalar))
-    return {};
-  return builder.create<BroadcastOp>(location, type, *scalar);
+    return failure();
+  return Value(builder.create<BroadcastOp>(location, type, *scalar));
 }
 
 void collectParameterSymbols(Type type, llvm::StringSet<> &symbols) {
@@ -259,6 +264,60 @@ FailureOr<Value> materializeScalarConstant(OpBuilder &builder,
         FloatAttr::get(floatType, floating.getValueAsDouble())));
   }
   return failure();
+}
+
+FailureOr<Value> materializeBroadcastToFragment(OpBuilder &builder,
+                                                Location location, Value value,
+                                                FragmentType target) {
+  if (value.getType() == target)
+    return value;
+  Type element = value.getType();
+  if (auto fragment = dyn_cast<FragmentType>(element))
+    element = fragment.getElementType();
+  if (!isa<IntegerType, FloatType, IndexType>(element) ||
+      element != target.getElementType())
+    return failure();
+  return Value(builder.create<BroadcastOp>(location, target, value));
+}
+
+FailureOr<Value> materializeZeroFragment(OpBuilder &builder,
+                                         Location location,
+                                         FragmentType target) {
+  return zeroFill(builder, location, target);
+}
+
+FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
+                                            Location location, Value predicate,
+                                            FragmentType target,
+                                            PhysicalSourceAxis source) {
+  return projectPredicate(builder, location, predicate, target, source);
+}
+
+FailureOr<Value> materializeValidityConjunction(
+    OpBuilder &builder, Location location, Value lhs, Value rhs,
+    FragmentType valueType) {
+  auto predicateType = FragmentType::get(
+      valueType.getContext(), builder.getI1Type(), valueType.getShape(),
+      valueType.getAxisMaps(), valueType.getValidity(), valueType.getOwner());
+  Value result;
+  if (lhs) {
+    FailureOr<Value> projected =
+        materializeBroadcastToFragment(builder, location, lhs, predicateType);
+    if (failed(projected))
+      return failure();
+    result = *projected;
+  }
+  if (rhs) {
+    FailureOr<Value> projected =
+        materializeBroadcastToFragment(builder, location, rhs, predicateType);
+    if (failed(projected))
+      return failure();
+    result = result ? Value(builder.create<BinaryOp>(
+                          location, predicateType, result, *projected,
+                          BinaryOperator::LogicalAnd))
+                    : *projected;
+  }
+  return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
 FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
@@ -550,7 +609,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     for (MakeRangeOp range : sources) {
       FailureOr<Value> current = projectPredicate(
           builder, location, predicates.lookup(range.getOperation()), target,
-          range.getSourceId());
+          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
       if (failed(current))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
@@ -588,12 +647,13 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                                        BinaryOperator::LogicalAnd);
     }
     Value fill = load.getFill();
-    if (!fill)
-      fill = zeroFill(builder, load.getLoc(), type);
-    else if (fill.getType() != type)
+    if (!fill) {
+      FailureOr<Value> zero = zeroFill(builder, load.getLoc(), type);
+      if (failed(zero))
+        return load.emitOpError("full-coverage load has no neutral fill");
+      fill = *zero;
+    } else if (fill.getType() != type)
       fill = builder.create<BroadcastOp>(load.getLoc(), type, fill);
-    if (!fill)
-      return load.emitOpError("full-coverage load has no neutral fill");
     auto replacement = builder.create<LoadOp>(
         load.getLoc(), type, load.getResource(), load.getCoordinates(), valid,
         fill, load.getSourceAxes());
