@@ -46,7 +46,7 @@ flaggems_batch_norm_training,B32-C64-S4096-fp16,0.031392,0.024808,1.265398,pass
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.046656,0.051344,0.908694,pass
 flaggems_logsumexp,8192x8192-fp32,0.099184,0.111528,0.889319,pass
 flaggems_softmax_backward,4096x4097-fp32,0.089944,0.092120,0.976379,pass
-flaggems_fused_adamw,N8388608-fp32,,,,physical_program_verification_failed
+flaggems_fused_adamw,N8388608-fp32,0.083280,0.082992,1.003470,pass
 flaggems_addcmul,B64-C128-L4096-bf16,0.052648,0.069488,0.757656,pass
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.041736,0.051304,0.813504,pass
 flaggems_cumsum,8192x8192-fp32-axis1,0.182048,0.182144,0.999473,pass
