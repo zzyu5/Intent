@@ -796,41 +796,6 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   return replayed;
 }
 
-LogicalResult replayBlockedStorePayloads(func::FuncOp kernel,
-                                         MakeRangeOp original, Value blocked,
-                                         PhysicalExprAttr blockedExtent) {
-  SmallVector<StoreOp> stores;
-  kernel.walk([&](StoreOp store) { stores.push_back(store); });
-  IRMapping mapping;
-  mapping.map(original.getResult(), blocked);
-  for (StoreOp store : stores) {
-    bool usesRange = false;
-    for (Value coordinate : store.getCoordinates()) {
-      llvm::SmallPtrSet<Operation *, 8> ranges;
-      collectCoordinateRanges(coordinate, ranges);
-      usesRange |= ranges.contains(original.getOperation());
-    }
-    if (!usesRange || !containsSource(store.getValue(), original.getSourceId()))
-      continue;
-    OpBuilder builder(store);
-    FailureOr<Value> payload = replayPointwiseValue(
-        builder, store.getValue(), original.getSourceId(), blockedExtent,
-        blocked, Value(), mapping);
-    if (failed(payload)) {
-      auto existing = dyn_cast<FragmentType>(store.getValue().getType());
-      FailureOr<unsigned> axis =
-          existing ? sourceAxis(existing, original.getSourceId())
-                   : FailureOr<unsigned>(failure());
-      if (succeeded(axis) && existing.getShape()[*axis] == blockedExtent)
-        continue;
-      return store.emitOpError(
-          "pointwise blocked store payload cannot be replayed at the selected physical range");
-    }
-    store.getValueMutable().set(*payload);
-  }
-  return success();
-}
-
 bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
                                  uint64_t sourceId) {
   if (auto record = dyn_cast<RecordType>(type)) {
@@ -2464,8 +2429,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
       if (Attribute value = range->getAttr(attribute))
         blocked.getDefiningOp()->setAttr(attribute, value);
-    if (failed(replayBlockedStorePayloads(kernel, range, blocked, tileExtent)))
-      return failure();
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     Value valid = builder.create<CompareOp>(range.getLoc(), predicateType(blockedType),
                                             blocked, endFragment, 2);

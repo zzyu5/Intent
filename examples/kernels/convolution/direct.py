@@ -179,21 +179,33 @@ def causal_depthwise_conv1d_update_bf16(
 ):
     B, D = x.shape
     channels = I.domain(0, D)
+    taps = I.domain(0, CAUSAL_CONV_WIDTH)
+    channel_coordinates = I.indices(channels)
+    tap_coordinates = I.indices(taps)
+    source_coordinates = I.minimum(
+        tap_coordinates + 1, CAUSAL_CONV_WIDTH - 1
+    )
+    shifted = tap_coordinates < CAUSAL_CONV_WIDTH - 1
     for batch in I.parallel(I.domain(0, B)):
-        accumulator = bias[channels]
-        for tap in range(CAUSAL_CONV_WIDTH - 1):
-            shifted = state[batch, channels, tap + 1]
-            state[batch, channels, tap] = shifted
-            accumulator = accumulator + I.cast(shifted, I.f32) * weight[
-                channels, tap
-            ]
         current = x[batch, channels]
-        state[batch, channels, CAUSAL_CONV_WIDTH - 1] = current
-        accumulator = accumulator + I.cast(current, I.f32) * weight[
-            channels, CAUSAL_CONV_WIDTH - 1
-        ]
+        cache = I.gather(
+            state,
+            index=(
+                batch,
+                channel_coordinates[:, None],
+                source_coordinates[None, :],
+            ),
+            valid=shifted[None, :],
+            fill=current[:, None],
+        )
+        accumulator = bias[channels] + I.reduce.sum(
+            I.cast(cache, I.f32) * weight[channels, taps],
+            axis=1,
+            identity=0.0,
+        )
         if SILU:
             accumulator = accumulator * I.sigmoid(accumulator)
+        state[batch, channels, taps] = cache
         output[batch, channels] = I.cast(accumulator, I.bf16)
 
 

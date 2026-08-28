@@ -23,7 +23,7 @@ fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.124672,0.124672,1.000000,p
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.237984,0.439480,0.541513,pass
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.182544,0.192768,0.946962,pass
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057328,0.058704,0.976560,pass
-causal_conv1d_update,B32-D4096-W4-bf16,0.006384,0.006336,1.007576,pass
+causal_conv1d_update,B32-D4096-W4-bf16,0.006576,0.006112,1.075916,pass
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.012288,0.008208,1.497076,pass
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap
