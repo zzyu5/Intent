@@ -38,8 +38,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   if (failed(realizeRegionScans(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
-  if (failed(kernel) || failed(alignPointwiseValueRelations(*kernel)) ||
-      failed(alignAggregateValueRelations(*kernel)))
+  if (failed(kernel) || failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)))
     return failure();
   if (failed(verifyGPUProgram(module)))
     return failure();

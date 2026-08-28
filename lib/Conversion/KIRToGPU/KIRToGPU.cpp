@@ -40,11 +40,15 @@ RankedTensorType viewTensor(Value value) {
   return view ? dyn_cast<RankedTensorType>(view.getTensor()) : RankedTensorType();
 }
 
+bool isCanonicalEffect(Operation *operation) {
+  return isa<ViewStoreOp, BufferStoreOp, ScatterUniqueOp, ScatterReduceOp,
+             AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
+}
+
 ArrayAttr observableEffectOrigins(func::FuncOp function) {
   SmallVector<Attribute> origins;
   function.walk([&](Operation *operation) {
-    if (!isa<ViewStoreOp, ScatterUniqueOp, ScatterReduceOp, AtomicStoreOp,
-             AtomicRMWOp, AtomicCompareExchangeOp>(operation))
+    if (!isCanonicalEffect(operation))
       return;
     if (auto node = operation->getAttrOfType<IntegerAttr>("intent.node"))
       origins.push_back(node);
@@ -1341,6 +1345,16 @@ FailureOr<Type> convertContractResultType(
 
 LogicalResult collectDomainAxes(Value source,
                                 SmallVectorImpl<intent::DomainOp> &axes);
+
+struct OrderedIterationAxis {
+  Value start;
+  Value stop;
+  Value step;
+  Value coordinatePrototype;
+};
+
+LogicalResult collectOrderedIterationAxes(
+    Value source, SmallVectorImpl<OrderedIterationAxis> &axes);
 
 class ScalarRegionLowering {
 public:
@@ -4035,24 +4049,46 @@ private:
     if (auto forOperation = dyn_cast<intent::ForOp>(operation)) {
       if (forOperation.getInputs().empty())
         return forOperation.emitOpError("ordered for lacks its logical domain");
-      SmallVector<intent::DomainOp> axes;
-      if (failed(collectDomainAxes(forOperation.getInputs().front(), axes)) ||
+      SmallVector<OrderedIterationAxis> axes;
+      if (failed(collectOrderedIterationAxes(forOperation.getInputs().front(),
+                                             axes)) ||
           axes.empty())
         return forOperation.emitOpError(
-            "ordered for source is not an executable domain product");
+            "ordered for source has no exact domain/subregion iteration relation");
       SmallVector<Value> lowers, uppers, steps;
-      for (intent::DomainOp axis : axes) {
-        FailureOr<Value> lower = get(axis.getBounds()[0]);
-        FailureOr<Value> upper = get(axis.getBounds()[1]);
+      for (OrderedIterationAxis axis : axes) {
+        FailureOr<Value> lower = get(axis.start);
+        FailureOr<Value> upper = get(axis.stop);
+        FailureOr<Value> prototype = get(axis.coordinatePrototype);
+        if (failed(lower) || failed(upper) || failed(prototype))
+          return forOperation.emitOpError(
+              "ordered physical loop bounds are unavailable");
+        Type coordinateType = (*prototype).getType();
+        auto alignBound = [&](Value value) -> FailureOr<Value> {
+          if (value.getType() == coordinateType)
+            return value;
+          if (!isa<IntegerType, IndexType>(value.getType()) ||
+              !isa<IntegerType, IndexType>(coordinateType))
+            return failure();
+          return Value(builder.create<gpu::CastOp>(
+              location, coordinateType, value));
+        };
+        lower = alignBound(*lower);
+        upper = alignBound(*upper);
         if (failed(lower) || failed(upper))
-          return axis.emitOpError("ordered physical loop bounds are unavailable");
+          return forOperation.emitOpError(
+              "ordered physical subregion bounds cannot adopt their source coordinate type");
         Value step;
-        if (axis.getBounds().size() == 3) {
-          FailureOr<Value> lowered = get(axis.getBounds()[2]);
+        if (axis.step) {
+          FailureOr<Value> lowered = get(axis.step);
           if (failed(lowered))
-            return axis.emitOpError(
+            return forOperation.emitOpError(
                 "ordered physical loop step is unavailable");
-          step = *lowered;
+          FailureOr<Value> aligned = alignBound(*lowered);
+          if (failed(aligned))
+            return forOperation.emitOpError(
+                "ordered physical loop step cannot adopt its source coordinate type");
+          step = *aligned;
         } else if ((*lower).getType().isIndex()) {
           step = builder.create<arith::ConstantIndexOp>(location, 1);
         } else if (auto integer = dyn_cast<IntegerType>((*lower).getType())) {
@@ -4061,7 +4097,7 @@ private:
         }
         if (!step || (*lower).getType() != (*upper).getType() ||
             (*lower).getType() != step.getType())
-          return axis.emitOpError(
+          return forOperation.emitOpError(
               "ordered physical loop bounds must share one scalar type");
         lowers.push_back(*lower);
         uppers.push_back(*upper);
@@ -4260,6 +4296,39 @@ LogicalResult collectDomainAxes(Value source,
   return success();
 }
 
+LogicalResult collectOrderedIterationAxes(
+    Value source, SmallVectorImpl<OrderedIterationAxis> &axes) {
+  if (auto domain = source.getDefiningOp<intent::DomainOp>()) {
+    axes.push_back({domain.getBounds()[0], domain.getBounds()[1],
+                    domain.getBounds().size() == 3 ? domain.getBounds()[2]
+                                                   : Value(),
+                    domain.getBounds()[0]});
+    return success();
+  }
+  if (auto product = source.getDefiningOp<intent::DomainProductOp>()) {
+    for (Value component : product.getDomains())
+      if (failed(collectOrderedIterationAxes(component, axes)))
+        return failure();
+    return success();
+  }
+  auto subregion = source.getDefiningOp<intent::SubregionOp>();
+  if (!subregion || subregion.getInputs().empty())
+    return failure();
+  SmallVector<OrderedIterationAxis> parent;
+  if (failed(collectOrderedIterationAxes(subregion.getInputs().front(), parent)) ||
+      parent.size() != 1)
+    return failure();
+  unsigned operand = 1;
+  if (subregion.getHasStart())
+    parent.front().start = subregion.getInputs()[operand++];
+  if (subregion.getHasStop())
+    parent.front().stop = subregion.getInputs()[operand++];
+  if (operand != subregion.getInputs().size())
+    return failure();
+  axes.append(parent.begin(), parent.end());
+  return success();
+}
+
 LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
                                       func::FuncOp function) {
   MLIRContext *context = workset.operation.getContext();
@@ -4316,11 +4385,7 @@ LogicalResult collectParallelWorksets(
   SmallVector<intent::ParallelOp> children;
   bool hasDirectEffect = false;
   auto classifyWorksetOperation = [&](Operation *candidate) {
-    hasDirectEffect |=
-        isa<intent::ViewStoreOp, intent::ScatterUniqueOp,
-            intent::ScatterReduceOp, intent::AtomicStoreOp,
-            intent::AtomicRMWOp,
-            intent::AtomicCompareExchangeOp>(candidate);
+    hasDirectEffect |= isCanonicalEffect(candidate);
   };
   for (Operation &nested : body.without_terminator()) {
     if (auto child = dyn_cast<intent::ParallelOp>(nested)) {

@@ -1113,8 +1113,15 @@ bool supportsCartesianPointwiseValueGraph(
     for (Operation *user : value.getUsers()) {
       if (!visited.insert(user).second)
         continue;
-      if (user->getNumResults() == 0)
+      if (user->getNumResults() == 0) {
+        // A terminal pointwise store can consume the promoted fragment.  A
+        // control-flow terminator or effectful region cannot: promoting the
+        // predicate/carry would change scalar program structure into a lane
+        // program without a physical control-flow realization.
+        if (!isa<StoreOp>(user) || user->getNumRegions() != 0)
+          return false;
         continue;
+      }
       if (!isCartesianPointwiseValueOp(user) || user->getNumRegions() != 0)
         return false;
       for (Value result : user->getResults()) {
@@ -1235,6 +1242,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  auto finalizeValueRelations = [&]() -> LogicalResult {
+    if (failed(alignStructuredCaptureRelations(kernel)) ||
+        failed(alignAggregateValueRelations(kernel)) ||
+        failed(alignPointwiseValueRelations(kernel)))
+      return failure();
+    eraseDeadPhysicalValues(kernel);
+    return success();
+  };
 
   if (ownershipOnly) {
     SmallVector<WorksetCoordinateOp> pointwiseCoordinates;
@@ -1610,14 +1625,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return failure();
     if (!ownershipOnly && failed(realizeDistributedHistograms(kernel)))
       return failure();
-    if (failed(alignPointwiseValueRelations(kernel)))
-      return failure();
-    if (failed(alignAggregateValueRelations(kernel)))
-      return failure();
-    if (failed(alignStructuredCaptureRelations(kernel)))
-      return failure();
-    eraseDeadPhysicalValues(kernel);
-    return success();
+    return finalizeValueRelations();
   }
 
   SmallVector<DelinearizeOp> mappings;
@@ -2069,7 +2077,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     axes = std::move(selectedAxes);
     dynamicRanges = std::move(selectedRanges);
     if (dynamicRanges.empty())
-      return alignStructuredCaptureRelations(kernel);
+      return finalizeValueRelations();
   }
 
   OpBuilder mappingBuilder(mapping);
@@ -2390,16 +2398,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   if (failed(alignContractAccumulatorTypes(kernel)))
     return failure();
-  if (failed(alignPointwiseValueRelations(kernel)))
-    return failure();
-  if (failed(alignAggregateValueRelations(kernel)))
-    return failure();
   if (failed(bindStructurallyRequiredStaticFragments(kernel)))
     return failure();
-  if (failed(alignStructuredCaptureRelations(kernel)))
-    return failure();
-  eraseDeadPhysicalValues(kernel);
-  return success();
+  return finalizeValueRelations();
 }
 
 LogicalResult realizePointwiseOwnership(ModuleOp module) {
