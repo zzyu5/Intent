@@ -584,6 +584,31 @@ LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
   return success();
 }
 
+bool preservesSliceAssembly(Type slice, Type result) {
+  if (auto sliceFragment = dyn_cast<FragmentType>(slice)) {
+    auto resultFragment = dyn_cast<FragmentType>(result);
+    return resultFragment &&
+           sliceFragment.getElementType() == resultFragment.getElementType() &&
+           sliceFragment.getShape().size() ==
+               resultFragment.getShape().size() &&
+           sliceFragment.getAxisMaps() == resultFragment.getAxisMaps();
+  }
+  auto sliceRecord = dyn_cast<RecordType>(slice);
+  auto resultRecord = dyn_cast<RecordType>(result);
+  if (!sliceRecord || !resultRecord ||
+      sliceRecord.getFieldNames() != resultRecord.getFieldNames() ||
+      sliceRecord.getFieldTypes().size() !=
+          resultRecord.getFieldTypes().size())
+    return false;
+  return llvm::all_of(
+      llvm::zip(sliceRecord.getFieldTypes(), resultRecord.getFieldTypes()),
+      [](auto fields) {
+        return preservesSliceAssembly(
+            cast<TypeAttr>(std::get<0>(fields)).getValue(),
+            cast<TypeAttr>(std::get<1>(fields)).getValue());
+      });
+}
+
 LogicalResult verifyReduceLike(Operation *owner, ValueRange inputs,
                                ResultRange results, Region &combine,
                                uint64_t sourceCount, uint64_t identityCount,
@@ -723,12 +748,7 @@ LogicalResult RegionScanOp::verify() {
                                 emitted)))
     return failure();
   for (auto [slice, result] : llvm::zip(emitted, getResults().take_front(outputCount))) {
-    auto sliceFragment = dyn_cast<FragmentType>(slice);
-    auto resultFragment = dyn_cast<FragmentType>(result.getType());
-    if (!sliceFragment || !resultFragment ||
-        sliceFragment.getElementType() != resultFragment.getElementType() ||
-        sliceFragment.getShape().size() != resultFragment.getShape().size() ||
-        sliceFragment.getAxisMaps() != resultFragment.getAxisMaps())
+    if (!preservesSliceAssembly(slice, result.getType()))
       return emitOpError("region-scan output assembly relation is invalid");
   }
   return success();

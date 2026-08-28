@@ -128,6 +128,174 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
          });
 }
 
+void appendStructuredParentRelations(BlockArgument argument,
+                                     SmallVectorImpl<Value> &worklist) {
+  Block *block = argument.getOwner();
+  Region *region = block->getParent();
+  Operation *parent = region ? region->getParentOp() : nullptr;
+  unsigned index = argument.getArgNumber();
+  if (auto fold = dyn_cast_or_null<RegionFoldOp>(parent)) {
+    unsigned sources = fold.getSourceCount();
+    unsigned identities = fold.getIdentityCount();
+    if (region == &fold.getSummarize()) {
+      if (index < sources)
+        return;
+      unsigned capture = index - sources;
+      worklist.push_back(fold.getInputs()[sources + identities + capture]);
+      return;
+    }
+    if (region == &fold.getCombine()) {
+      unsigned component = index % identities;
+      worklist.push_back(fold.getInputs()[sources + component]);
+      worklist.push_back(fold.getResults()[component]);
+    }
+    return;
+  }
+  auto scan = dyn_cast_or_null<RegionScanOp>(parent);
+  if (!scan)
+    return;
+  unsigned sources = scan.getSourceCount();
+  unsigned identities = scan.getIdentityCount();
+  unsigned states = scan.getStateCount();
+  unsigned outputs = scan.getOutputCount();
+  unsigned stateOffset = sources + identities;
+  unsigned captureOffset = stateOffset + states;
+  if (region == &scan.getSummarize()) {
+    if (index < sources)
+      return;
+    worklist.push_back(scan.getInputs()[captureOffset + index - sources]);
+    return;
+  }
+  if (region == &scan.getCombine()) {
+    worklist.push_back(scan.getInputs()[sources + index % identities]);
+    return;
+  }
+  if (region == &scan.getApply()) {
+    if (index < identities) {
+      worklist.push_back(scan.getInputs()[sources + index]);
+      return;
+    }
+    unsigned state = index - identities;
+    worklist.push_back(scan.getInputs()[stateOffset + state]);
+    worklist.push_back(scan.getResults()[outputs + state]);
+    return;
+  }
+  if (region != &scan.getEmit() || index < sources)
+    return;
+  if (index < sources + states) {
+    unsigned state = index - sources;
+    worklist.push_back(scan.getInputs()[stateOffset + state]);
+    worklist.push_back(scan.getResults()[outputs + state]);
+    return;
+  }
+  worklist.push_back(
+      scan.getInputs()[captureOffset + index - sources - states]);
+}
+
+void appendStructuredChildRelations(Operation *user, Value value,
+                                    SmallVectorImpl<Value> &worklist) {
+  if (auto fold = dyn_cast<RegionFoldOp>(user)) {
+    unsigned sources = fold.getSourceCount();
+    unsigned identities = fold.getIdentityCount();
+    for (auto [index, operand] : llvm::enumerate(fold.getInputs())) {
+      if (operand != value)
+        continue;
+      if (index < sources)
+        continue;
+      if (index < sources + identities) {
+        unsigned component = index - sources;
+        worklist.push_back(fold.getResults()[component]);
+        Block &combine = fold.getCombine().front();
+        worklist.push_back(combine.getArgument(component));
+        worklist.push_back(combine.getArgument(identities + component));
+        continue;
+      }
+      Block &summarize = fold.getSummarize().front();
+      unsigned capture = index - sources - identities;
+      worklist.push_back(summarize.getArgument(sources + capture));
+    }
+    return;
+  }
+  auto scan = dyn_cast<RegionScanOp>(user);
+  if (!scan)
+    return;
+  unsigned sources = scan.getSourceCount();
+  unsigned identities = scan.getIdentityCount();
+  unsigned states = scan.getStateCount();
+  unsigned outputs = scan.getOutputCount();
+  unsigned stateOffset = sources + identities;
+  unsigned captureOffset = stateOffset + states;
+  for (auto [index, operand] : llvm::enumerate(scan.getInputs())) {
+    if (operand != value)
+      continue;
+    if (index < sources)
+      continue;
+    if (index < stateOffset) {
+      unsigned component = index - sources;
+      Block &combine = scan.getCombine().front();
+      Block &apply = scan.getApply().front();
+      worklist.push_back(combine.getArgument(component));
+      worklist.push_back(combine.getArgument(identities + component));
+      worklist.push_back(apply.getArgument(component));
+      continue;
+    }
+    if (index < captureOffset) {
+      unsigned state = index - stateOffset;
+      worklist.push_back(scan.getResults()[outputs + state]);
+      worklist.push_back(
+          scan.getApply().front().getArgument(identities + state));
+      worklist.push_back(scan.getEmit().front().getArgument(sources + state));
+      continue;
+    }
+    unsigned capture = index - captureOffset;
+    worklist.push_back(
+        scan.getSummarize().front().getArgument(sources + capture));
+    worklist.push_back(
+        scan.getEmit().front().getArgument(sources + states + capture));
+  }
+}
+
+void appendStructuredResultRelations(Value value,
+                                     SmallVectorImpl<Value> &worklist) {
+  auto result = dyn_cast<OpResult>(value);
+  if (!result)
+    return;
+  unsigned index = result.getResultNumber();
+  if (auto fold = dyn_cast<RegionFoldOp>(result.getOwner())) {
+    unsigned sources = fold.getSourceCount();
+    unsigned identities = fold.getIdentityCount();
+    worklist.push_back(fold.getInputs()[sources + index]);
+    worklist.push_back(fold.getCombine().front().getArgument(index));
+    worklist.push_back(
+        fold.getCombine().front().getArgument(identities + index));
+    worklist.push_back(
+        cast<YieldOp>(fold.getSummarize().front().getTerminator())
+            .getValues()[index]);
+    worklist.push_back(cast<YieldOp>(fold.getCombine().front().getTerminator())
+                           .getValues()[index]);
+    return;
+  }
+  auto scan = dyn_cast<RegionScanOp>(result.getOwner());
+  if (!scan)
+    return;
+  unsigned outputs = scan.getOutputCount();
+  if (index < outputs) {
+    worklist.push_back(
+        cast<YieldOp>(scan.getEmit().front().getTerminator()).getValues()[index]);
+    return;
+  }
+  unsigned state = index - outputs;
+  unsigned sources = scan.getSourceCount();
+  unsigned identities = scan.getIdentityCount();
+  unsigned stateOffset = sources + identities;
+  worklist.push_back(scan.getInputs()[stateOffset + state]);
+  worklist.push_back(
+      scan.getApply().front().getArgument(identities + state));
+  worklist.push_back(scan.getEmit().front().getArgument(sources + state));
+  worklist.push_back(
+      cast<YieldOp>(scan.getApply().front().getTerminator()).getValues()[state]);
+}
+
 FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
                                   Value predicate, FragmentType target,
                                   unsigned axis) {
@@ -323,6 +491,105 @@ FailureOr<Value> materializeValidityConjunction(
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
+LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
+  auto sameSchema = [](FragmentType lhs, FragmentType rhs) {
+    return lhs.getShape() == rhs.getShape() &&
+           lhs.getAxisMaps() == rhs.getAxisMaps() &&
+           lhs.getValidity() == rhs.getValidity() &&
+           lhs.getOwner() == rhs.getOwner();
+  };
+  auto align = [&](Operation *operation, unsigned operandIndex,
+                   FragmentType targetShape) -> LogicalResult {
+    Value value = operation->getOperand(operandIndex);
+    auto source = dyn_cast<FragmentType>(value.getType());
+    if (source && sameSchema(source, targetShape))
+      return success();
+    if (!source) {
+      if (!isa<IntegerType, FloatType, IndexType>(value.getType()))
+        return failure();
+      auto target = FragmentType::get(
+          kernel.getContext(), value.getType(), targetShape.getShape(),
+          targetShape.getAxisMaps(), targetShape.getValidity(),
+          targetShape.getOwner());
+      OpBuilder builder(operation);
+      Value replacement =
+          builder.create<SplatOp>(operation->getLoc(), target, value);
+      if (Operation *definition = value.getDefiningOp())
+        if (Attribute origin = definition->getAttr(originAttr))
+          replacement.getDefiningOp()->setAttr(originAttr, origin);
+      operation->setOperand(operandIndex, replacement);
+      return success();
+    }
+    if (source.getShape().size() > targetShape.getShape().size())
+      return failure();
+    for (Attribute sourceMapping : source.getAxisMaps()) {
+      auto sourceAxis = cast<AxisMapAttr>(sourceMapping);
+      if (!llvm::any_of(targetShape.getAxisMaps(), [&](Attribute targetMapping) {
+            auto targetAxis = cast<AxisMapAttr>(targetMapping);
+            return sourceAxis.getSourceId() == targetAxis.getSourceId() &&
+                   sourceAxis.getSourceAxis() == targetAxis.getSourceAxis();
+          }))
+        return failure();
+    }
+    Operation *definition = value.getDefiningOp();
+    auto target = FragmentType::get(
+        kernel.getContext(), source.getElementType(), targetShape.getShape(),
+        targetShape.getAxisMaps(), targetShape.getValidity(),
+        targetShape.getOwner());
+    OpBuilder builder(operation);
+    Value replacement;
+    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition))
+      replacement = builder.create<BroadcastOp>(operation->getLoc(), target,
+                                                broadcast.getValue());
+    else if (auto splat = dyn_cast_or_null<SplatOp>(definition))
+      replacement = builder.create<SplatOp>(operation->getLoc(), target,
+                                            splat.getValue());
+    else
+      replacement =
+          builder.create<BroadcastOp>(operation->getLoc(), target, value);
+    if (definition)
+      if (Attribute origin = definition->getAttr(originAttr))
+        replacement.getDefiningOp()->setAttr(originAttr, origin);
+    operation->setOperand(operandIndex, replacement);
+    return success();
+  };
+
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    FragmentType target;
+    if (operation->getNumResults() == 1)
+      target = dyn_cast<FragmentType>(operation->getResult(0).getType());
+    if (!target ||
+        !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
+            operation))
+      return WalkResult::advance();
+    for (unsigned index = 0; index < operation->getNumOperands(); ++index)
+      if (failed(align(operation, index, target)))
+        return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
+LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
+  kernel.walk([&](MakeRecordOp record) {
+    RecordType current = record.getResult().getType();
+    SmallVector<Attribute> fields;
+    fields.reserve(record.getFields().size());
+    for (Value field : record.getFields())
+      fields.push_back(TypeAttr::get(field.getType()));
+    record.getResult().setType(RecordType::get(
+        kernel.getContext(), current.getFieldNames(),
+        ArrayAttr::get(kernel.getContext(), fields), current.getOwner()));
+  });
+  kernel.walk([&](ExtractOp extract) {
+    RecordType record = extract.getRecord().getType();
+    if (extract.getField() < record.getFieldTypes().size())
+      extract.getResult().setType(
+          cast<TypeAttr>(record.getFieldTypes()[extract.getField()]).getValue());
+  });
+  return success();
+}
+
 FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
                                         MakeRangeOp range) {
   if (range->hasAttr(sourceSubregionAttr)) {
@@ -418,7 +685,7 @@ static void retargetExtent(Value root, AxisSelector selects,
   if (!llvm::is_contained(connectedExtents, Attribute(extent)))
     connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
-  llvm::SmallDenseSet<Value> visited;
+  llvm::DenseMap<Value, Type> visitedTypes;
   auto isSegmentSourceSlice = [](Value value) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument)
@@ -435,8 +702,10 @@ static void retargetExtent(Value root, AxisSelector selects,
   };
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
-    if (!visited.insert(value).second)
+    auto [visited, inserted] = visitedTypes.try_emplace(value, value.getType());
+    if (!inserted && visited->second == value.getType())
       continue;
+    visited->second = value.getType();
     // A structured segment slice has one exact extent authority: the segment
     // parameter owned by its region_fold/region_scan operation.  Pointwise
     // ownership retargeting must stop at that block argument regardless of
@@ -468,6 +737,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     if (auto extract = value.getDefiningOp<ExtractOp>())
       worklist.push_back(extract.getRecord());
     if (auto argument = dyn_cast<BlockArgument>(value)) {
+      appendStructuredParentRelations(argument, worklist);
       auto loop = dyn_cast_or_null<scf::ForOp>(
           argument.getOwner()->getParentOp());
       if (loop)
@@ -485,7 +755,14 @@ static void retargetExtent(Value root, AxisSelector selects,
           worklist.push_back(loop.getRegionIterArgs()[index]);
           worklist.push_back(loop.getBody()->getTerminator()->getOperand(index));
         }
+    appendStructuredResultRelations(value, worklist);
     for (Operation *user : value.getUsers()) {
+      if (isa<RegionFoldOp, RegionScanOp>(user)) {
+        appendStructuredChildRelations(user, value, worklist);
+        for (Value result : user->getResults())
+          worklist.push_back(result);
+        continue;
+      }
       if (auto loop = dyn_cast<scf::ForOp>(user))
         for (auto [index, init] : llvm::enumerate(loop.getInitArgs()))
           if (value == init) {
@@ -502,7 +779,7 @@ static void retargetExtent(Value root, AxisSelector selects,
             }
       if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
               ContractOp, ScaledContractOp, SparseContractOp, ReduceOp,
-              ScanOp, RegionFoldOp, RegionScanOp, RandomBitsOp,
+              ScanOp, RandomBitsOp,
               ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
               AtomicCompareExchangeOp>(user)) {
         worklist.append(user->getOperands().begin(), user->getOperands().end());
@@ -535,6 +812,68 @@ void retargetDimensionExtent(Value root, int64_t dimensionId,
                    return mapping.getDimensionId() == dimensionId;
                  },
                  extent);
+}
+
+LogicalResult alignStructuredCaptureRelations(func::FuncOp kernel) {
+  auto align = [&](Operation *owner, Value capture,
+                   BlockArgument argument) -> LogicalResult {
+    auto authority = dyn_cast<FragmentType>(capture.getType());
+    auto target = dyn_cast<FragmentType>(argument.getType());
+    if (!authority || !target)
+      return capture.getType() == argument.getType()
+                 ? success()
+                 : owner->emitOpError(
+                       "physical structured capture lost its parent schema");
+    if (authority.getElementType() != target.getElementType() ||
+        authority.getShape().size() != target.getShape().size() ||
+        authority.getAxisMaps() != target.getAxisMaps() ||
+        authority.getOwner() != target.getOwner())
+      return owner->emitOpError(
+          "physical structured capture changed its coordinate relation");
+    for (auto [axis, attribute] : llvm::enumerate(authority.getAxisMaps())) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      if (mapping.getDimensionId() <= 0)
+        continue;
+      retargetDimensionExtent(argument, mapping.getDimensionId(),
+                              cast<PhysicalExprAttr>(authority.getShape()[axis]));
+    }
+    return capture.getType() == argument.getType()
+               ? success()
+               : owner->emitOpError(
+                     "physical structured capture extent is inconsistent");
+  };
+
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+      unsigned sourceCount = fold.getSourceCount();
+      unsigned captureOffset = sourceCount + fold.getIdentityCount();
+      for (unsigned index = 0; index < fold.getCaptureCount(); ++index)
+        if (failed(align(operation, fold.getInputs()[captureOffset + index],
+                         fold.getSummarize().front().getArgument(sourceCount +
+                                                                 index))))
+          return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
+    auto scan = dyn_cast<RegionScanOp>(operation);
+    if (!scan)
+      return WalkResult::advance();
+    unsigned sourceCount = scan.getSourceCount();
+    unsigned stateCount = scan.getStateCount();
+    unsigned captureOffset =
+        sourceCount + scan.getIdentityCount() + stateCount;
+    for (unsigned index = 0; index < scan.getCaptureCount(); ++index) {
+      Value capture = scan.getInputs()[captureOffset + index];
+      if (failed(align(operation, capture,
+                       scan.getSummarize().front().getArgument(sourceCount +
+                                                               index))) ||
+          failed(align(operation, capture,
+                       scan.getEmit().front().getArgument(sourceCount +
+                                                          stateCount + index))))
+        return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
 }
 
 FailureOr<uint64_t> blockedDimension(Attribute attribute) {

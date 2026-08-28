@@ -30,6 +30,12 @@ void retargetSourceExtent(mlir::Value root, uint64_t sourceId,
                           PhysicalExprAttr extent);
 void retargetDimensionExtent(mlir::Value root, int64_t dimensionId,
                              PhysicalExprAttr extent);
+mlir::LogicalResult
+alignStructuredCaptureRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
+alignPointwiseValueRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
+alignAggregateValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);

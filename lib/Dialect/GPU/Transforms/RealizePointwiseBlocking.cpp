@@ -1057,87 +1057,6 @@ LogicalResult realizeDistributedHistograms(func::FuncOp kernel) {
   return success();
 }
 
-bool sameFragmentSchema(FragmentType lhs, FragmentType rhs) {
-  return lhs.getShape() == rhs.getShape() &&
-         lhs.getAxisMaps() == rhs.getAxisMaps() &&
-         lhs.getValidity() == rhs.getValidity() &&
-         lhs.getOwner() == rhs.getOwner();
-}
-
-LogicalResult alignExplicitBroadcastOperands(func::FuncOp kernel) {
-  auto align = [&](Operation *operation, unsigned operandIndex,
-                   FragmentType targetShape) -> LogicalResult {
-    Value value = operation->getOperand(operandIndex);
-    auto source = dyn_cast<FragmentType>(value.getType());
-    if (source && sameFragmentSchema(source, targetShape))
-      return success();
-    if (!source) {
-      if (!isa<IntegerType, FloatType, IndexType>(value.getType()))
-        return failure();
-      auto target = FragmentType::get(
-          kernel.getContext(), value.getType(), targetShape.getShape(),
-          targetShape.getAxisMaps(), targetShape.getValidity(),
-          targetShape.getOwner());
-      OpBuilder builder(operation);
-      Value replacement =
-          builder.create<SplatOp>(operation->getLoc(), target, value);
-      if (Operation *definition = value.getDefiningOp())
-        if (Attribute origin = definition->getAttr(originAttr))
-          replacement.getDefiningOp()->setAttr(originAttr, origin);
-      operation->setOperand(operandIndex, replacement);
-      return success();
-    }
-    if (source.getShape().size() > targetShape.getShape().size())
-      return failure();
-    for (Attribute sourceMapping : source.getAxisMaps()) {
-      auto sourceAxis = cast<AxisMapAttr>(sourceMapping);
-      if (!llvm::any_of(targetShape.getAxisMaps(), [&](Attribute targetMapping) {
-            auto targetAxis = cast<AxisMapAttr>(targetMapping);
-            return sourceAxis.getSourceId() == targetAxis.getSourceId() &&
-                   sourceAxis.getSourceAxis() == targetAxis.getSourceAxis();
-          }))
-        return failure();
-    }
-    Operation *definition = value.getDefiningOp();
-    auto target = FragmentType::get(
-        kernel.getContext(), source.getElementType(), targetShape.getShape(),
-        targetShape.getAxisMaps(), targetShape.getValidity(),
-        targetShape.getOwner());
-    OpBuilder builder(operation);
-    Value replacement;
-    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition))
-      replacement = builder.create<BroadcastOp>(operation->getLoc(), target,
-                                                broadcast.getValue());
-    else if (auto splat = dyn_cast_or_null<SplatOp>(definition))
-      replacement = builder.create<SplatOp>(
-          operation->getLoc(), target, splat.getValue());
-    else
-      replacement =
-          builder.create<BroadcastOp>(operation->getLoc(), target, value);
-    if (definition)
-      if (Attribute origin = definition->getAttr(originAttr))
-        replacement.getDefiningOp()->setAttr(originAttr, origin);
-    operation->setOperand(operandIndex, replacement);
-    return success();
-  };
-
-  WalkResult result = kernel.walk([&](Operation *operation) {
-    FragmentType target;
-    if (operation->getNumResults() == 1)
-      target = dyn_cast<FragmentType>(operation->getResult(0).getType());
-    if (!target)
-      return WalkResult::advance();
-    if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
-            operation))
-      return WalkResult::advance();
-    for (unsigned index = 0; index < operation->getNumOperands(); ++index)
-      if (failed(align(operation, index, target)))
-        return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
-}
-
 LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
   auto align = [](Operation *owner, Value accumulator,
                   Value result) -> LogicalResult {
@@ -1691,7 +1610,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return failure();
     if (!ownershipOnly && failed(realizeDistributedHistograms(kernel)))
       return failure();
-    if (failed(alignExplicitBroadcastOperands(kernel)))
+    if (failed(alignPointwiseValueRelations(kernel)))
+      return failure();
+    if (failed(alignAggregateValueRelations(kernel)))
+      return failure();
+    if (failed(alignStructuredCaptureRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();
@@ -2146,7 +2069,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     axes = std::move(selectedAxes);
     dynamicRanges = std::move(selectedRanges);
     if (dynamicRanges.empty())
-      return success();
+      return alignStructuredCaptureRelations(kernel);
   }
 
   OpBuilder mappingBuilder(mapping);
@@ -2467,9 +2390,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   if (failed(alignContractAccumulatorTypes(kernel)))
     return failure();
-  if (failed(alignExplicitBroadcastOperands(kernel)))
+  if (failed(alignPointwiseValueRelations(kernel)))
+    return failure();
+  if (failed(alignAggregateValueRelations(kernel)))
     return failure();
   if (failed(bindStructurallyRequiredStaticFragments(kernel)))
+    return failure();
+  if (failed(alignStructuredCaptureRelations(kernel)))
     return failure();
   eraseDeadPhysicalValues(kernel);
   return success();
