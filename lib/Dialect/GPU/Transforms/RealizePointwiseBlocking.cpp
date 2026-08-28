@@ -1818,11 +1818,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       continue;
     FailureOr<ParameterOp> parameter = blockingParameter(kernel, range);
     bool requiresBlockingParameter =
-        !internalTraversalRanges.contains(range.getOperation()) &&
-        ((ownershipOnly && ownershipSources.contains(range.getSourceId())) ||
-         (!ownershipOnly &&
-          (ownershipSources.contains(range.getSourceId()) ||
-           reuseTraversalRanges.contains(range.getOperation()))));
+        (ownershipOnly &&
+         ownershipSources.contains(range.getSourceId()) &&
+         !internalTraversalRanges.contains(range.getOperation())) ||
+        (!ownershipOnly &&
+         ((ownershipSources.contains(range.getSourceId()) &&
+           !internalTraversalRanges.contains(range.getOperation())) ||
+          reuseTraversalRanges.contains(range.getOperation())));
     if (failed(parameter) && requiresBlockingParameter) {
       auto logicalExtent = range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
       auto fragment = cast<FragmentType>(range.getResult().getType());
