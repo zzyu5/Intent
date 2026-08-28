@@ -7,9 +7,9 @@ varlen_gqa_decode_logits,B16-QH32-KVH8-S4096-D64-fp16,,,,kernel_ir_parse_failed
 paged_mla_decode,B32-QH128-KVH1-S8192-V128-R64-page64-fp16,,,,compiler_process_failed
 persistent_mla_decode,B8-H64-S16384-C128-R64-split4-fp16,,,,intent_implementation_gap
 conv2d,NHWC32x128x128x256-K3x3x256x512-fp16,,,,provider_program_verification_failed
-dense_gemm,M4096-N14336-K4096-fp16,,,,worker_timeout
+dense_gemm,M4096-N14336-K4096-fp16,2.320088,2.323152,0.998681,pass
 w4a8_gemm,M4096-N14336-K4096-int8-int4,,,,physical_program_verification_failed
-fp8_gemm,M4096-N14336-K4096-e4m3,,,,worker_timeout
+fp8_gemm,M4096-N14336-K4096-e4m3,1.137432,1.132624,1.004245,pass
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-fp16,,,,worker_timeout
 sparse_2to4_gemm,M8192-N14336-K8192-fp16,,,,physical_program_verification_failed
 deepgemm_fp8_2xacc,M4096-N4096-K4096-e4m3-bf16,,,,physical_program_verification_failed

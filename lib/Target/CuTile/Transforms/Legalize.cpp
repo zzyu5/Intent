@@ -129,16 +129,19 @@ bool derivesFromCoordinate(Value value, Value coordinate) {
   return false;
 }
 
-bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
-                        ArrayRef<int64_t> sourceAxes) {
+bool collectFullViewValidity(Value valid, Value resource, ValueRange coordinates,
+                             ArrayRef<int64_t> sourceAxes,
+                             llvm::DenseSet<int64_t> &coveredAxes) {
   if (!valid)
     return false;
   valid = stripBroadcast(valid);
   if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
     if (binary.getOperatorKind() != 11)
       return false;
-    return isFullViewValidity(binary.getLhs(), resource, coordinates, sourceAxes) &&
-           isFullViewValidity(binary.getRhs(), resource, coordinates, sourceAxes);
+    return collectFullViewValidity(binary.getLhs(), resource, coordinates,
+                                   sourceAxes, coveredAxes) &&
+           collectFullViewValidity(binary.getRhs(), resource, coordinates,
+                                   sourceAxes, coveredAxes);
   }
   auto compare = valid.getDefiningOp<gpu::CompareOp>();
   if (!compare || compare.getPredicate() != 2)
@@ -146,8 +149,20 @@ bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
     if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
         isViewExtent(compare.getRhs(), resource, sourceAxis))
-      return true;
+      return coveredAxes.insert(sourceAxis).second;
   return false;
+}
+
+bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
+                        ArrayRef<int64_t> sourceAxes) {
+  auto view = cast<gpu::ViewType>(resource.getType());
+  if (coordinates.size() != view.getRank() ||
+      sourceAxes.size() != view.getRank())
+    return false;
+  llvm::DenseSet<int64_t> coveredAxes;
+  return collectFullViewValidity(valid, resource, coordinates, sourceAxes,
+                                 coveredAxes) &&
+         coveredAxes.size() == view.getRank();
 }
 
 FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
@@ -357,6 +372,17 @@ Attribute scalarConstant(Value value) {
   return constant ? constant.getValue() : Attribute();
 }
 
+bool isZeroFill(Value value) {
+  Attribute constant = scalarConstant(value);
+  if (!constant)
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(constant))
+    return integer.getValue().isZero();
+  if (auto floating = dyn_cast<FloatAttr>(constant))
+    return floating.getValue().isZero();
+  return false;
+}
+
 LogicalResult formNativeTiles(func::FuncOp kernel) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
@@ -411,10 +437,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     Operation *replacementOperation = nullptr;
     if (succeeded(indices) &&
         isFullViewValidity(load.getValid(), load.getResource(),
-                           load.getCoordinates(), load.getSourceAxes())) {
+                           load.getCoordinates(), load.getSourceAxes()) &&
+        isZeroFill(load.getFill())) {
       auto replacement = builder.create<TileLoadOp>(
-          load.getLoc(), result, load.getResource(), *indices, load.getValid(),
-          load.getFill());
+          load.getLoc(), result, load.getResource(), *indices);
       replacementResult = replacement.getResult();
       replacementOperation = replacement;
     } else {

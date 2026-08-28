@@ -120,44 +120,6 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     coordinates[axis] = builder.create<gpu::ProgramIdOp>(
         mapping.getLoc(), builder.getIndexType(), coordinateToProgram[axis]);
 
-  if (hasRowOwnership && roles) {
-    std::optional<unsigned> rowAxis;
-    std::optional<unsigned> columnAxis;
-    for (unsigned axis = 0; axis < rank; ++axis) {
-      if (roles[axis] == contractionM)
-        rowAxis = axis;
-      if (roles[axis] == contractionN)
-        columnAxis = axis;
-    }
-    if (rowAxis && columnAxis) {
-      OpBuilder parameterBuilder(&kernel.getBody().front(),
-                                 kernel.getBody().front().begin());
-      auto schema = gpu::ParameterAttr::get(
-          module.getContext(), parameterBuilder.getStringAttr("GROUP_SIZE_M"),
-          static_cast<uint32_t>(gpu::ParameterRole::TraversalGroup),
-          DenseI64ArrayAttr::get(module.getContext(), {1, 2, 4, 8}));
-      Value groupSize = parameterBuilder.create<gpu::ParameterOp>(
-          mapping.getLoc(), parameterBuilder.getIndexType(), schema);
-      auto binary = [&](Value lhs, Value rhs, uint64_t kind) {
-        return builder.create<gpu::BinaryOp>(mapping.getLoc(),
-                                             builder.getIndexType(), lhs, rhs,
-                                             kind);
-      };
-      Value rowCount = mapping.getExtents()[*rowAxis];
-      Value columnCount = mapping.getExtents()[*columnAxis];
-      Value linear = binary(coordinates[*rowAxis],
-                            binary(coordinates[*columnAxis], rowCount, 2), 0);
-      Value programsPerGroup = binary(groupSize, columnCount, 2);
-      Value group = binary(linear, programsPerGroup, 4);
-      Value firstRow = binary(group, groupSize, 2);
-      Value liveRows = binary(rowCount, firstRow, 1);
-      Value activeGroupSize = binary(liveRows, groupSize, 10);
-      Value groupOffset = binary(linear, programsPerGroup, 5);
-      coordinates[*rowAxis] =
-          binary(firstRow, binary(groupOffset, activeGroupSize, 5), 0);
-      coordinates[*columnAxis] = binary(groupOffset, activeGroupSize, 4);
-    }
-  }
   for (auto [coordinate, replacement] :
        llvm::zip(mapping.getCoordinates(), coordinates))
     coordinate.replaceAllUsesWith(replacement);

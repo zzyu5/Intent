@@ -366,6 +366,32 @@ private:
       failed = true;
       return;
     }
+    std::map<std::string, uint32_t> parameterRoles;
+    std::map<std::string, int64_t> parameterDimensions;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      auto schema = parameter.getParameter();
+      std::string name = schema.getName().getValue().str();
+      parameterRoles[name] = schema.getRole();
+      if (auto dimension =
+              parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr))
+        parameterDimensions[name] = dimension.getInt();
+      if (auto dimension = parameter->getAttrOfType<IntegerAttr>(
+              gpu::coverageDimensionAttr))
+        parameterDimensions[name] = dimension.getInt();
+    });
+    output << "_intent_parameter_roles = {";
+    for (auto [index, item] : llvm::enumerate(parameterRoles)) {
+      if (index)
+        output << ", ";
+      output << "\"" << item.first << "\": " << item.second;
+    }
+    output << "}\n_intent_parameter_dimensions = {";
+    for (auto [index, item] : llvm::enumerate(parameterDimensions)) {
+      if (index)
+        output << ", ";
+      output << "\"" << item.first << "\": " << item.second;
+    }
+    output << "}\n";
     output << "_CONFIGS = (\n";
     for (const auto &config : *configs) {
       output << "    SimpleNamespace(";
@@ -591,9 +617,6 @@ private:
                          ", index=" + tuple(load.getTileIndices()) +
                          ", shape=" + fragmentShape(load.getResult().getType()) +
                          ", padding_mode=ct.PaddingMode.ZERO)";
-      if (load.getValid())
-        call = "ct.where(" + valueString(load.getValid()) + ", " + call +
-               ", " + valueString(load.getFill()) + ")";
       assign(load.getResult(), call);
     } else if (auto load = dyn_cast<ScalarLoadOp>(operation)) {
       std::string call = "ct.gather(" + valueString(load.getResource()) + ", " +

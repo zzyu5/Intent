@@ -76,17 +76,6 @@ LogicalResult TileLoadOp::verify() {
     return emitOpError("requires one tile-space index per source axis");
   if (view.getElementType() != result.getElementType())
     return emitOpError("view and tile element types disagree");
-  if (static_cast<bool>(getValid()) != static_cast<bool>(getFill()))
-    return emitOpError("requires validity and fill together");
-  if (getValid()) {
-    auto valid = dyn_cast<gpu::FragmentType>(getValid().getType());
-    auto fill = dyn_cast<gpu::FragmentType>(getFill().getType());
-    if (!valid || !fill || !valid.getElementType().isInteger(1) ||
-        !samePhysicalDomain(valid, result) ||
-        !samePhysicalDomain(fill, result) ||
-        fill.getElementType() != result.getElementType())
-      return emitOpError("validity/fill do not match the selected cuTile tile");
-  }
   return success();
 }
 

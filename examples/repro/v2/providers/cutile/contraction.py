@@ -10,6 +10,11 @@ from kernels.contraction.gemm import gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_bf16
 
 from ...measurement import compile_single
+from ...measurement import candidate_parameter_value
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_M
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import TRITON_PARAMETER_REDUCTION
+from ...measurement import TRITON_PARAMETER_TRAVERSAL_GROUP
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
@@ -66,6 +71,22 @@ def dense_gemm(context: Context) -> PreparedComparison:
         gemm,
         (a, b),
         constexprs={"ACTIVATION": Activation.NONE},
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_M
+            )
+            in (64, 128)
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N
+            )
+            in (64, 128)
+            and candidate_parameter_value(candidate, TRITON_PARAMETER_REDUCTION)
+            in (32, 64)
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_TRAVERSAL_GROUP
+            )
+            == 8
+        ),
     )
     source_module = official_source(
         context,

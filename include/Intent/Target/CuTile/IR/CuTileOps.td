@@ -10,13 +10,10 @@ class IntentCuTile_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentCuTile_Dialect, mnemonic, traits>;
 
 def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
-    AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$resource,
-                       Variadic<Index>:$tile_indices,
-                       Optional<IntentGPU_DataValue>:$valid,
-                       Optional<IntentGPU_DataValue>:$fill);
+                       Variadic<Index>:$tile_indices);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }

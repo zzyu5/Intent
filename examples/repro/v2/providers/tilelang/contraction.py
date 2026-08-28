@@ -18,6 +18,13 @@ from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from kernels.ragged.grouped_gemm import ragged_grouped_gemm_backward_weight
 
 from ...measurement import compile_single
+from ...measurement import candidate_parameter_value
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_M
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import TRITON_PARAMETER_PROVIDER_STAGES
+from ...measurement import TRITON_PARAMETER_PROVIDER_THREADS
+from ...measurement import TRITON_PARAMETER_REDUCTION
+from ...measurement import TRITON_PARAMETER_TRAVERSAL_GROUP
 from ...measurement import functional_launch
 from ...model import Context
 from ...model import PreparedComparison
@@ -36,6 +43,30 @@ def dense_gemm(context: Context) -> PreparedComparison:
         gemm,
         (a, b),
         constexprs={"ACTIVATION": Activation.NONE},
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_M
+            )
+            == 128
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N
+            )
+            == 128
+            and candidate_parameter_value(candidate, TRITON_PARAMETER_REDUCTION)
+            == 32
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_STAGES
+            )
+            == 3
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 128
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_TRAVERSAL_GROUP
+            )
+            == 1
+        ),
     )
     _, source_module = source_from_runtime(
         context,
@@ -178,7 +209,35 @@ def fp8_gemm(context: Context) -> PreparedComparison:
     torch_dtype = source_module.T.dtype(dtype).as_torch()
     lhs = torch.randn((m, k), device="cuda", dtype=torch.float16).to(torch_dtype)
     rhs = torch.randn((n, k), device="cuda", dtype=torch.float16).to(torch_dtype)
-    _, generated = compile_single(context, fp8_e4m3_matmul, (lhs, rhs))
+    _, generated = compile_single(
+        context,
+        fp8_e4m3_matmul,
+        (lhs, rhs),
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_M
+            )
+            == 128
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N
+            )
+            == 128
+            and candidate_parameter_value(candidate, TRITON_PARAMETER_REDUCTION)
+            == 64
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_STAGES
+            )
+            == 3
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 128
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_TRAVERSAL_GROUP
+            )
+            == 1
+        ),
+    )
     source_kernel = source_module.matmul.compile(
         M=m,
         N=n,
