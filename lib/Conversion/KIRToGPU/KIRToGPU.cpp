@@ -213,10 +213,10 @@ FailureOr<Value> retargetBroadcast(OpBuilder &builder, Location location,
   return replacement->getResult(0);
 }
 
-unsigned explicitRangeAxisCount(Value value) {
+llvm::SmallDenseSet<uint64_t> explicitRangeSources(Value value) {
   auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
   if (!fragment)
-    return 0;
+    return {};
   auto dependsOnRange = [&](Value root, uint64_t sourceId) {
     SmallVector<Value> worklist{root};
     llvm::SmallDenseSet<Value> visited;
@@ -263,7 +263,7 @@ unsigned explicitRangeAxisCount(Value value) {
     if (dependsOnRange(value, source))
       matched.insert(source);
   }
-  return matched.size();
+  return matched;
 }
 
 FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
@@ -335,14 +335,22 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     return success();
   auto leftLogical = dyn_cast_or_null<RankedTensorType>(logicalLhs);
   auto rightLogical = dyn_cast_or_null<RankedTensorType>(logicalRhs);
+  llvm::SmallDenseSet<uint64_t> leftRangeSources = explicitRangeSources(lhs);
+  llvm::SmallDenseSet<uint64_t> rightRangeSources = explicitRangeSources(rhs);
+  bool sameExplicitRanges =
+      leftRangeSources.size() == rightRangeSources.size() &&
+      llvm::all_of(leftRangeSources, [&](uint64_t sourceId) {
+        return rightRangeSources.contains(sourceId);
+      });
+  bool oneSideHasNoExplicitRange =
+      leftRangeSources.empty() || rightRangeSources.empty();
   if (leftLogical && rightLogical &&
       dimensionIds(leftLogical) == dimensionIds(rightLogical) &&
       left.getShape() == right.getShape() &&
       left.getOwner() == right.getOwner() &&
-      left.getValidity() == right.getValidity()) {
-    unsigned leftRanges = explicitRangeAxisCount(lhs);
-    unsigned rightRanges = explicitRangeAxisCount(rhs);
-    if (rightRanges > leftRanges) {
+      left.getValidity() == right.getValidity() &&
+      (sameExplicitRanges || oneSideHasNoExplicitRange)) {
+    if (rightRangeSources.size() > leftRangeSources.size()) {
       FailureOr<Value> aligned = retargetBroadcast(builder, location, lhs, right);
       if (failed(aligned))
         return failure();
@@ -786,6 +794,10 @@ std::optional<int64_t> sourceExtentDimension(Value source) {
   return identity > 0 ? std::optional<int64_t>(identity) : std::nullopt;
 }
 
+FailureOr<uint64_t> resultAxisIdentity(Operation *operation,
+                                       unsigned resultIndex = 0,
+                                       unsigned axis = 0);
+
 FailureOr<int64_t> physicalDimensionIdentity(Operation *origin,
                                              int64_t logicalIdentity) {
   if (!origin || logicalIdentity <= 0)
@@ -822,6 +834,31 @@ physicalAxisIdentity(Operation *origin, int64_t logicalIdentity,
                      unsigned logicalAxis) {
   if (!origin || logicalIdentity <= 0)
     return failure();
+  std::optional<std::pair<uint64_t, uint32_t>> local;
+  bool localConflict = false;
+  for (Value operand : origin->getOperands()) {
+    std::optional<int64_t> extentIdentity = sourceExtentDimension(operand);
+    if (!extentIdentity || *extentIdentity != logicalIdentity)
+      continue;
+    std::optional<std::pair<uint64_t, uint32_t>> candidate;
+    if (auto domain = dyn_cast<DomainType>(operand.getType())) {
+      if (domain.getRank() == 1)
+        candidate = std::make_pair(domain.getOriginId(), uint32_t{0});
+    } else if (auto region = dyn_cast<RegionType>(operand.getType())) {
+      if (region.getRank() == 1)
+        candidate = std::make_pair(region.getSourceId(), uint32_t{0});
+    }
+    if (!candidate)
+      continue;
+    if (local && *local != *candidate)
+      localConflict = true;
+    else
+      local = candidate;
+  }
+  if (localConflict)
+    return failure();
+  if (local)
+    return *local;
   func::FuncOp function = origin->getParentOfType<func::FuncOp>();
   if (!function)
     return std::make_pair(static_cast<uint64_t>(logicalIdentity),
@@ -850,8 +887,13 @@ physicalAxisIdentity(Operation *origin, int64_t logicalIdentity,
         physical = candidate;
     }
   });
-  if (conflict)
-    return failure();
+  if (conflict) {
+    FailureOr<uint64_t> identity =
+        resultAxisIdentity(origin, /*resultIndex=*/0, logicalAxis);
+    if (failed(identity))
+      return failure();
+    return std::make_pair(*identity, uint32_t{0});
+  }
   return physical ? FailureOr<std::pair<uint64_t, uint32_t>>(*physical)
                   : FailureOr<std::pair<uint64_t, uint32_t>>(
                         std::make_pair(static_cast<uint64_t>(logicalIdentity),
@@ -996,8 +1038,8 @@ Type convertScalarType(Type type, uint64_t owner = 1) {
 }
 
 FailureOr<uint64_t> resultAxisIdentity(Operation *operation,
-                                       unsigned resultIndex = 0,
-                                       unsigned axis = 0) {
+                                       unsigned resultIndex,
+                                       unsigned axis) {
   if (!operation || resultIndex >= operation->getNumResults())
     return failure();
   auto results = operation->getAttrOfType<ArrayAttr>("intent.result_nodes");

@@ -1437,7 +1437,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Value, Value> fixedRangePredicates;
   kernel.walk([&](MakeRangeOp range) {
     allRanges.push_back(range);
-    if (!hasCompileTimeExtent(range.getExtent())) {
+    auto parameter = range.getExtent().getDefiningOp<ParameterOp>();
+    if (!hasCompileTimeExtent(range.getExtent()) ||
+        (parameter && parameter->hasAttr(coverageDimensionAttr))) {
       dynamicRanges.push_back(range);
       return;
     }
@@ -1862,6 +1864,38 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return histogram && containsSource(histogram.getValues(), sourceId);
     });
   };
+  llvm::DenseMap<uint64_t, uint64_t> sourceDimensions;
+  llvm::MapVector<uint64_t, SmallVector<uint64_t>> dimensionSources;
+  for (MakeRangeOp range : dynamicRanges) {
+    auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+    if (!dimension || dimension.getInt() <= 0 ||
+        !ownershipSources.contains(range.getSourceId()))
+      continue;
+    uint64_t sourceId = range.getSourceId();
+    uint64_t dimensionId = dimension.getInt();
+    sourceDimensions[sourceId] = dimensionId;
+    if (!llvm::is_contained(dimensionSources[dimensionId], sourceId))
+      dimensionSources[dimensionId].push_back(sourceId);
+  }
+  auto effectDependsOn = [&](const WriteEffectFacts &effect,
+                             uint64_t sourceId) {
+    return dependsOnSource(effect.coordinates, sourceId) ||
+           dependsOnSource(effect.payloads, sourceId) ||
+           dependsOnHistogramSource(effect.payloads, sourceId);
+  };
+  llvm::SmallDenseSet<uint64_t> jointOwnershipDimensions;
+  for (auto [dimensionId, sources] : dimensionSources) {
+    if (sources.size() < 2)
+      continue;
+    bool onePreservedSourcePerEffect =
+        llvm::all_of(writeEffects, [&](const WriteEffectFacts &effect) {
+          return llvm::count_if(sources, [&](uint64_t sourceId) {
+                   return effectDependsOn(effect, sourceId);
+                 }) == 1;
+        });
+    if (onePreservedSourcePerEffect)
+      jointOwnershipDimensions.insert(dimensionId);
+  }
   for (MakeRangeOp range : dynamicRanges) {
     uint64_t sourceId = range.getSourceId();
     if (!ownershipSources.contains(sourceId)) {
@@ -1869,12 +1903,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       continue;
     }
     bool requiredByEveryEffect =
-        llvm::all_of(writeEffects, [&](const auto &effect) {
-          return dependsOnSource(effect.coordinates, sourceId) ||
-                 dependsOnSource(effect.payloads, sourceId) ||
-                 dependsOnHistogramSource(effect.payloads, sourceId);
+        llvm::all_of(writeEffects, [&](const WriteEffectFacts &effect) {
+          return effectDependsOn(effect, sourceId);
         });
-    if (!requiredByEveryEffect)
+    auto dimension = sourceDimensions.find(sourceId);
+    bool jointlyOwned =
+        dimension != sourceDimensions.end() &&
+        jointOwnershipDimensions.contains(dimension->second);
+    if (!requiredByEveryEffect && !jointlyOwned)
       internalTraversalRanges.insert(range.getOperation());
   }
   if (!ownershipOnly)

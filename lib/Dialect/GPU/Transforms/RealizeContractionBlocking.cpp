@@ -51,6 +51,24 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
 
 bool hasRuntimeRange(Value value);
 
+bool isFullCoverageExtent(Operation *origin, Attribute attribute) {
+  auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+  if (!origin || !extent ||
+      extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return false;
+  func::FuncOp kernel = origin->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return false;
+  bool fullCoverage = false;
+  kernel.walk([&](ParameterOp parameter) {
+    if (parameter.getParameter().getName() == extent.getSymbol() &&
+        parameter->hasAttr(coverageDimensionAttr))
+      fullCoverage = true;
+  });
+  return fullCoverage;
+}
+
 bool hasFragmentSchema(ContractOp contract) {
   return isa<FragmentType>(contract.getLhs().getType()) &&
          isa<FragmentType>(contract.getRhs().getType()) &&
@@ -70,8 +88,9 @@ bool requiresPhysicalRealization(ContractOp contract) {
   for (FragmentType type : {contract.getLhs().getType(),
                             contract.getRhs().getType(),
                             contract.getResult().getType()})
-    if (llvm::any_of(type.getShape(), [](Attribute extent) {
-          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
+    if (llvm::any_of(type.getShape(), [&](Attribute extent) {
+          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent)) ||
+                 isFullCoverageExtent(contract, extent);
         }))
       return true;
   return hasRuntimeRange(contract.getLhs()) || hasRuntimeRange(contract.getRhs());
@@ -82,8 +101,9 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
            contract.getLhs().getType(), contract.getLhsScale().getType(),
            contract.getRhs().getType(), contract.getRhsScale().getType(),
            contract.getAccumulator().getType(), contract.getResult().getType()})
-    if (llvm::any_of(type.getShape(), [](Attribute extent) {
-          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
+    if (llvm::any_of(type.getShape(), [&](Attribute extent) {
+          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent)) ||
+                 isFullCoverageExtent(contract, extent);
         }))
       return true;
   return hasRuntimeRange(contract.getLhs()) ||
