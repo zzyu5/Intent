@@ -171,15 +171,46 @@ def grouped_gemm(context: Context) -> PreparedComparison:
     source_autotuner.configs_top_k = 1.0
     group_x = list(x.view(experts, rows, hidden).unbind(0))
     group_weight = list(weight.unbind(0))
-    state: dict[str, object] = {}
+    source_outputs = [
+        torch.empty(
+            (rows, intermediate), device="cuda", dtype=torch.float16
+        )
+        for _ in range(experts)
+    ]
+    source_a_ptrs = torch.tensor(
+        [value.data_ptr() for value in group_x], device="cuda"
+    )
+    source_b_ptrs = torch.tensor(
+        [value.data_ptr() for value in group_weight], device="cuda"
+    )
+    source_c_ptrs = torch.tensor(
+        [value.data_ptr() for value in source_outputs], device="cuda"
+    )
+    source_sizes = torch.tensor(
+        [rows, intermediate, hidden] * experts,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    source_lds = torch.tensor(
+        [hidden, intermediate, intermediate] * experts,
+        dtype=torch.int32,
+        device="cuda",
+    )
 
     def launch():
-        state["outputs"] = source_function(group_x, group_weight)
+        source_autotuner[(resident_workers,)](
+            source_a_ptrs,
+            source_b_ptrs,
+            source_c_ptrs,
+            source_sizes,
+            source_lds,
+            experts,
+        )
 
     launch()
     source = PreparedLaunch(
         launch=launch,
-        outputs=lambda: torch.cat(state["outputs"], dim=0),
+        outputs=lambda: torch.cat(source_outputs, dim=0),
     )
     return PreparedComparison(
         generated,
