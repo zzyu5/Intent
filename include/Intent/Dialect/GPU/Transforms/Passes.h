@@ -12,6 +12,16 @@ namespace intent::gpu {
 
 struct PhysicalSourceAxis;
 
+enum class GPUProgramStage {
+  /// Construction has emitted a complete typed shell; structured operations
+  /// still own their explicit semantic regions but all effects and mappings
+  /// are already represented in GPU IR.
+  StructuredConstruction,
+  /// Every structured shell has been materialized into executable control,
+  /// carry, access and value flow.
+  Executable,
+};
+
 mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
@@ -42,6 +52,8 @@ materializeValidityConjunction(mlir::OpBuilder &builder,
                                mlir::Location location, mlir::Value lhs,
                                mlir::Value rhs, FragmentType valueType);
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
+mlir::LogicalResult verifyGPUProgramStage(mlir::ModuleOp module,
+                                          GPUProgramStage stage);
 void eraseDeadPhysicalValues(mlir::func::FuncOp kernel);
 void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
@@ -53,6 +65,7 @@ mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
+mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);
 mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module);
 
 } // namespace intent::gpu

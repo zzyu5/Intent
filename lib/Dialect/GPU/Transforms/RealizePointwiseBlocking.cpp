@@ -1251,22 +1251,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (ownershipOnly) {
     SmallVector<WorksetCoordinateOp> pointwiseCoordinates;
     kernel.walk([&](WorksetCoordinateOp coordinate) {
-      if (coordinate->hasAttr(pointwiseWorksetAttr))
-        pointwiseCoordinates.push_back(coordinate);
+      pointwiseCoordinates.push_back(coordinate);
     });
     SmallVector<MakeRangeOp> existingRanges;
     kernel.walk([&](MakeRangeOp range) { existingRanges.push_back(range); });
     SmallVector<WorksetCoordinateOp> lifted;
-    if (pointwiseCoordinates.size() == 1 && existingRanges.empty()) {
-      lifted.push_back(pointwiseCoordinates.front());
-    } else if (pointwiseCoordinates.size() > 2) {
-      lifted.append(pointwiseCoordinates.end() - 2,
-                    pointwiseCoordinates.end());
-    } else if (pointwiseCoordinates.size() == 2 && existingRanges.empty()) {
+    if (existingRanges.empty() && supportsCartesianPointwiseValueGraph(kernel))
       lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
-    }
-    if (!supportsCartesianPointwiseValueGraph(kernel))
-      lifted.clear();
 
     SmallVector<MakeRangeOp> liftedRanges;
     for (WorksetCoordinateOp coordinate : lifted) {
@@ -1818,12 +1809,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       const bool dynamicSubregion = range->hasAttr(sourceSubregionAttr);
+      auto sourceDimension =
+          range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+      const bool launchVisibleDimension =
+          sourceDimension &&
+          succeeded(dimensionArgument(kernel, sourceDimension.getInt()));
       if (dynamicSubregion ||
+          launchVisibleDimension ||
           (logicalExtent && physicalExtent.getKind() ==
                                 static_cast<uint32_t>(PhysicalExprKind::Constant))) {
         SmallVector<int64_t> candidates;
         if (dynamicSubregion) {
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256});
+        } else if (launchVisibleDimension) {
+          candidates.assign({8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+                             4096});
         } else {
           for (int64_t candidate : {8, 16, 32, 64, 128, 256, 512, 1024,
                                     2048, 4096})
@@ -1836,15 +1836,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                           kernel.getBody().front().begin());
         auto schema = ParameterAttr::get(
             module.getContext(),
-            builder.getStringAttr(
-                ("FRAGMENT_S" + Twine(range.getSourceId())).str()),
+            builder.getStringAttr(launchVisibleDimension
+                                      ? ("FRAGMENT_D" +
+                                         Twine(sourceDimension.getInt()))
+                                            .str()
+                                      : ("FRAGMENT_S" +
+                                         Twine(range.getSourceId()))
+                                            .str()),
             static_cast<uint32_t>(ParameterRole::OwnershipN),
             DenseI64ArrayAttr::get(module.getContext(), candidates));
         parameter = builder.create<ParameterOp>(
             range.getLoc(), builder.getIndexType(), schema);
-        if (auto dimension =
-                range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-          (*parameter)->setAttr(dimensionAttr, dimension);
+        if (sourceDimension)
+          (*parameter)->setAttr(dimensionAttr, sourceDimension);
         retargetSourceExtent(range.getResult(), range.getSourceId(),
                              fragmentExtent(*parameter));
       }

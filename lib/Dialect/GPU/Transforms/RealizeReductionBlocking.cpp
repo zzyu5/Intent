@@ -2573,17 +2573,19 @@ LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
 }
 
 LogicalResult realizeReductionBlocking(ModuleOp module) {
-  if (failed(decomposeMultiAxisReductions(module)))
-    return failure();
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
   SmallVector<ReduceOp> reductions;
   kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
-  for (ReduceOp reduce : reductions)
+  for (ReduceOp reduce : reductions) {
+    if (reduce.getAxes().size() > 1)
+      return reduce.emitOpError(
+          "reduction blocking requires prior multi-axis normalization");
     if (reduce->getBlock() && failed(realizeReduce(reduce, kernel)))
       return failure();
+  }
   return success();
 }
 

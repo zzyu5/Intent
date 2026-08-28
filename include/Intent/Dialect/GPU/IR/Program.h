@@ -28,8 +28,6 @@ inline constexpr llvm::StringLiteral sourceDimensionAttr =
     "intent_gpu.source_dimension";
 inline constexpr llvm::StringLiteral worksetCoordinateRangeAttr =
     "intent_gpu.workset_coordinate_range";
-inline constexpr llvm::StringLiteral pointwiseWorksetAttr =
-    "intent_gpu.pointwise_workset";
 inline constexpr llvm::StringLiteral worksetAxisAttr =
     "intent_gpu.workset_axis";
 inline constexpr llvm::StringLiteral executionGroupAttr =

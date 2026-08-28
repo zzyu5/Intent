@@ -70,7 +70,7 @@ FailureOr<func::FuncOp> getPhysicalKernel(ModuleOp module) {
   return kernels.front();
 }
 
-LogicalResult verifyGPUProgram(ModuleOp module) {
+LogicalResult verifyGPUProgramStage(ModuleOp module, GPUProgramStage stage) {
   if (failed(mlir::verify(module.getOperation())))
     return failure();
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
@@ -183,7 +183,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       if (failed(verifyExpressionSymbols(operation, physical.getExpression(),
                                          parameterNames, launchABI)))
         return WalkResult::interrupt();
-    if (isa<RegionFoldOp, RegionScanOp>(operation)) {
+    if (stage == GPUProgramStage::Executable &&
+        isa<RegionFoldOp, RegionScanOp>(operation)) {
       operation->emitOpError(
           "is not a complete physical program until segment traversal, source slicing, carry and output flow are materialized");
       return WalkResult::interrupt();
@@ -224,6 +225,10 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     return kernel.emitError(
         "physical kernel program mapping/effect coverage is incomplete");
   return success();
+}
+
+LogicalResult verifyGPUProgram(ModuleOp module) {
+  return verifyGPUProgramStage(module, GPUProgramStage::Executable);
 }
 
 } // namespace intent::gpu

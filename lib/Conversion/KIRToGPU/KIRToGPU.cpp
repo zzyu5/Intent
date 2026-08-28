@@ -1022,15 +1022,7 @@ FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
                                                       int64_t dimension) {
   if (!origin || dimension <= 0)
     return failure();
-  std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
-  gpu::ParameterOp declaration;
-  origin->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
-    if (!declaration && parameter.getParameter().getName() == name)
-      declaration = parameter;
-  });
-  if (!declaration)
-    return failure();
-  return parameterExpression(origin->getContext(), name);
+  return dimensionExpression(origin->getContext(), dimension);
 }
 
 FailureOr<PhysicalExprAttr> fragmentExtentExpression(RankedTensorType tensor,
@@ -4195,7 +4187,6 @@ struct ParallelWorkset {
   intent::ParallelOp operation;
   Block *body = nullptr;
   bool singleton = false;
-  bool pointwiseCoordinates = true;
   SmallVector<intent::DomainOp> axes;
   SmallVector<BlockArgument> coordinateArguments;
   SmallVector<PhysicalExprAttr> launchExtents;
@@ -4281,12 +4272,6 @@ LogicalResult collectParallelWorksets(
             intent::ScatterReduceOp, intent::AtomicStoreOp,
             intent::AtomicRMWOp,
             intent::AtomicCompareExchangeOp>(candidate);
-    current.pointwiseCoordinates &=
-        !isa<intent::ReduceOp, intent::ScanOp, intent::ContractOp,
-             intent::ScaledContractOp, intent::SparseContractOp,
-             intent::RegionFoldOp, intent::RegionScanOp,
-             intent::HistogramOp, intent::ForOp, intent::WhileOp,
-             intent::IfOp, intent::SubregionOp>(candidate);
   };
   for (Operation &nested : body.without_terminator()) {
     if (auto child = dyn_cast<intent::ParallelOp>(nested)) {
@@ -4370,40 +4355,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       abi->argumentAttrs);
   Block *entry = physical.addEntryBlock();
   builder.setInsertionPointToStart(entry);
-  llvm::SmallDenseSet<int64_t> fragmentDimensionSet(
-      abi->dimensionOrder.begin(), abi->dimensionOrder.end());
-  function.walk([&](Operation *operation) {
-    auto collect = [&](Type type) {
-      auto tensor = dyn_cast<RankedTensorType>(type);
-      DenseI64ArrayAttr identities = tensor ? dimensionIds(tensor)
-                                            : DenseI64ArrayAttr();
-      if (!tensor || !identities)
-        return;
-      for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef()))
-        if (tensor.isDynamicDim(axis) && identity > 0)
-          fragmentDimensionSet.insert(identity);
-    };
-    for (Type type : operation->getOperandTypes())
-      collect(type);
-    for (Type type : operation->getResultTypes())
-      collect(type);
-  });
-  SmallVector<int64_t> fragmentDimensions(fragmentDimensionSet.begin(),
-                                          fragmentDimensionSet.end());
-  llvm::sort(fragmentDimensions);
   llvm::DenseMap<StringAttr, Value> parameterValues;
-  for (int64_t dimension : fragmentDimensions) {
-    std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
-    auto parameter = gpu::ParameterAttr::get(
-        context, builder.getStringAttr(name),
-        static_cast<uint32_t>(gpu::ParameterRole::OwnershipN),
-        builder.getDenseI64ArrayAttr({64, 128, 256}));
-    auto declaration = builder.create<gpu::ParameterOp>(
-        function.getLoc(), builder.getIndexType(), parameter);
-    declaration->setAttr(gpu::dimensionAttr,
-                         builder.getI64IntegerAttr(dimension));
-    parameterValues[parameter.getName()] = declaration.getResult();
-  }
   SmallVector<Value> sourceArguments;
   sourceArguments.reserve(abi->physicalArgumentForSource.size());
   for (unsigned physicalIndex : abi->physicalArgumentForSource)
@@ -4453,13 +4405,11 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                     dimensionValues, parameterValues);
   auto formWorksetCoordinate = [&](OpBuilder &nested, Location location,
                                    intent::DomainOp domain, Value coordinate,
-                                   unsigned worksetAxis, bool pointwise) -> Value {
+                                   unsigned worksetAxis) -> Value {
     auto domainType = cast<intent::DomainType>(domain.getResult().getType());
     auto mapped = nested.create<gpu::WorksetCoordinateOp>(
         location, nested.getIndexType(), coordinate, domainType.getOriginId(),
         /*sourceAxis=*/0, /*sourceRank=*/1);
-    if (pointwise)
-      mapped->setAttr(gpu::pointwiseWorksetAttr, nested.getUnitAttr());
     mapped->setAttr(gpu::worksetAxisAttr,
                     nested.getI64IntegerAttr(worksetAxis));
     if (std::optional<int64_t> dimension =
@@ -4542,7 +4492,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                         scaled, BinaryOperator::Add);
         childValues[workset.coordinateArguments[axis]] = formWorksetCoordinate(
             builder, worksetLocation, workset.axes[axis], coordinate,
-            axis, workset.pointwiseCoordinates);
+            axis);
       }
       ScalarRegionLowering lowering(builder, std::move(childValues),
                                     sourceArguments, dimensionValues,
@@ -4598,8 +4548,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                             BinaryOperator::Add);
             childValues[workset.coordinateArguments[axis]] =
                 formWorksetCoordinate(nested, location, workset.axes[axis],
-                                      coordinate, axis,
-                                      workset.pointwiseCoordinates);
+                                      coordinate, axis);
           }
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,
@@ -4635,7 +4584,9 @@ LogicalResult lowerCanonicalKIRToGPU(ModuleOp module,
   SmallVector<func::FuncOp> functions(module.getOps<func::FuncOp>());
   if (functions.size() != 1)
     return module.emitError("GPU construction requires exactly one kernel entry");
-  return constructGPUProgram(module, capabilities, functions.front());
+  if (failed(constructGPUProgram(module, capabilities, functions.front())))
+    return failure();
+  return gpu::completeGPUProgramConstruction(module);
 }
 
 } // namespace intent
