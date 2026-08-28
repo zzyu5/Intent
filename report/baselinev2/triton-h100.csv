@@ -31,7 +31,7 @@ moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.578520,2.634624,0.978705,p
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,7.184000,4.243592,1.692905,pass
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.017792,0.014960,1.189305,pass
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.013392,0.013504,0.991706,pass
-mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.035920,0.043488,0.825975,pass
+mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.042784,0.052416,0.816239,pass
 mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.236904,0.182272,1.299728,pass
 paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.346568,0.304456,1.138319,pass
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.362176,0.797264,0.454274,pass
