@@ -1664,7 +1664,15 @@ private:
     };
     auto makeRange = [&](unsigned sourceAxis, Value start, Value stop,
                          Value step, uint64_t sourceId,
-                         PhysicalExprAttr physicalExtent) -> Value {
+                         PhysicalExprAttr physicalExtent) -> FailureOr<Value> {
+      FailureOr<Value> physicalStart = asIndex(operation->getLoc(), start);
+      FailureOr<Value> physicalStop = asIndex(operation->getLoc(), stop);
+      FailureOr<Value> physicalStep = asIndex(operation->getLoc(), step);
+      if (failed(physicalStart) || failed(physicalStop) || failed(physicalStep))
+        return failure();
+      start = *physicalStart;
+      stop = *physicalStop;
+      step = *physicalStep;
       Value one = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
       Value distance = createBinary(builder, operation->getLoc(),
                                     builder.getIndexType(), stop, start,
@@ -1679,8 +1687,8 @@ private:
                                   BinaryOperator::FloorDivide);
       auto type = fragmentType(operation->getContext(), builder.getIndexType(),
                                {physicalExtent}, {{sourceId, sourceAxis}});
-      return builder.create<gpu::MakeRangeOp>(
-          operation->getLoc(), type, start, extent, step, sourceId, sourceAxis);
+      return Value(builder.create<gpu::MakeRangeOp>(
+          operation->getLoc(), type, start, extent, step, sourceId, sourceAxis));
     };
     unsigned sourceAxis = 0;
     unsigned resultAxis = 0;
@@ -1757,13 +1765,15 @@ private:
           extent = *resultPhysicalExtent;
         }
         Value step = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
-        Value coordinate = makeRange(logicalSourceAxis, start, stop, step,
-                                     sourceId, extent);
+        FailureOr<Value> coordinate = makeRange(
+            logicalSourceAxis, start, stop, step, sourceId, extent);
+        if (failed(coordinate))
+          return failure();
         if (*dimension > 0)
-          coordinate.getDefiningOp()->setAttr(
+          coordinate->getDefiningOp()->setAttr(
               gpu::sourceDimensionAttr,
               builder.getI64IntegerAttr(*dimension));
-        coordinates.push_back(coordinate);
+        coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
         continue;
@@ -1841,20 +1851,22 @@ private:
             sourceDimension = identity.getInt();
         uint64_t sourceId = rangeType.getSourceId();
         uint32_t logicalSourceAxis = rangeType.getSourceAxis();
-        Value coordinate = makeRange(logicalSourceAxis, start, stop, step,
-                                     sourceId, extent);
+        FailureOr<Value> coordinate = makeRange(
+            logicalSourceAxis, start, stop, step, sourceId, extent);
+        if (failed(coordinate))
+          return failure();
         if ((*range).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
-          coordinate.getDefiningOp()->setAttr(gpu::sourceSubregionAttr,
-                                              builder.getUnitAttr());
+          coordinate->getDefiningOp()->setAttr(gpu::sourceSubregionAttr,
+                                               builder.getUnitAttr());
         if (auto identity =
                 (*range).getDefiningOp()->getAttr(gpu::sourceDimensionAttr))
-          coordinate.getDefiningOp()->setAttr(gpu::sourceDimensionAttr,
-                                              identity);
+          coordinate->getDefiningOp()->setAttr(gpu::sourceDimensionAttr,
+                                               identity);
         else if (sourceDimension)
-          coordinate.getDefiningOp()->setAttr(
+          coordinate->getDefiningOp()->setAttr(
               gpu::sourceDimensionAttr,
               builder.getI64IntegerAttr(*sourceDimension));
-        coordinates.push_back(coordinate);
+        coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
         continue;
@@ -1932,13 +1944,15 @@ private:
           sourceId = mapping.getSourceId();
           logicalSourceAxis = mapping.getSourceAxis();
         }
-        Value coordinate = makeRange(logicalSourceAxis, bounds[0], bounds[1],
-                                     bounds[2], sourceId, extent);
+        FailureOr<Value> coordinate = makeRange(
+            logicalSourceAxis, bounds[0], bounds[1], bounds[2], sourceId, extent);
+        if (failed(coordinate))
+          return failure();
         if (*dimension > 0)
-          coordinate.getDefiningOp()->setAttr(
+          coordinate->getDefiningOp()->setAttr(
               gpu::sourceDimensionAttr,
               builder.getI64IntegerAttr(*dimension));
-        coordinates.push_back(coordinate);
+        coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
         continue;
@@ -2297,6 +2311,23 @@ private:
     return retargetBroadcast(builder, operation->getLoc(), *value, target);
   }
 
+  FailureOr<Value> projectAccessOperand(Location location, Value value,
+                                        gpu::FragmentType accessType) {
+    if (!value)
+      return value;
+    Type element = value.getType();
+    if (auto source = dyn_cast<gpu::FragmentType>(element))
+      element = source.getElementType();
+    auto target = gpu::FragmentType::get(
+        value.getContext(), element, accessType.getShape(),
+        accessType.getAxisMaps(), accessType.getValidity(), accessType.getOwner());
+    if (value.getType() == target)
+      return value;
+    if (!isa<gpu::FragmentType>(value.getType()))
+      return Value(builder.create<gpu::SplatOp>(location, target, value));
+    return retargetBroadcast(builder, location, value, target);
+  }
+
   LogicalResult lower(Operation *operation) {
     if (operation->getNumResults() > 0) {
       bool complete = llvm::all_of(operation->getResults(),
@@ -2386,6 +2417,12 @@ private:
                     location, 1));
       if (failed(start) || failed(stop) || failed(step))
         return domain.emitOpError("physical domain bounds are unavailable");
+      start = asIndex(location, *start);
+      stop = asIndex(location, *stop);
+      step = asIndex(location, *step);
+      if (failed(start) || failed(stop) || failed(step))
+        return domain.emitOpError(
+            "physical domain bounds are not integer coordinates");
       auto type = gpu::RangeType::get(
           operation->getContext(), domain.getResult().getType().getOriginId(), 0);
       auto target =
@@ -2824,16 +2861,46 @@ private:
     }
     if (auto transpose = dyn_cast<intent::TransposeOp>(operation)) {
       FailureOr<Value> input = get(transpose.getInput());
-      FailureOr<Type> result =
-          convertDataType(transpose.getResult().getType(), operation);
-      if (failed(input) || failed(result) || !isa<gpu::FragmentType>(*result))
+      auto source = succeeded(input)
+                        ? dyn_cast<gpu::FragmentType>((*input).getType())
+                        : gpu::FragmentType();
+      auto logical = dyn_cast<RankedTensorType>(transpose.getInput().getType());
+      if (failed(input) || !source || !logical ||
+          source.getShape().size() < static_cast<size_t>(logical.getRank()))
         return transpose.emitOpError(
             "transpose has no physical fragment realization");
       SmallVector<int64_t> permutation;
       for (Attribute axis : transpose.getPermutation())
         permutation.push_back(cast<IntegerAttr>(axis).getInt());
+      unsigned prefix = source.getShape().size() - logical.getRank();
+      SmallVector<Attribute> shape;
+      SmallVector<Attribute> mappings;
+      auto appendAxis = [&](unsigned sourceAxis) {
+        shape.push_back(source.getShape()[sourceAxis]);
+        auto mapping =
+            cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            operation->getContext(), mapping.getSourceId(),
+            mapping.getSourceAxis(), mappings.size()));
+      };
+      for (unsigned axis = 0; axis < prefix; ++axis)
+        appendAxis(axis);
+      SmallVector<int64_t> physicalPermutation;
+      for (unsigned axis = 0; axis < prefix; ++axis)
+        physicalPermutation.push_back(axis);
+      for (int64_t axis : permutation) {
+        if (axis < 0 || axis >= logical.getRank())
+          return transpose.emitOpError(
+              "transpose permutation is outside the logical rank");
+        appendAxis(prefix + axis);
+        physicalPermutation.push_back(prefix + axis);
+      }
+      auto result = gpu::FragmentType::get(
+          operation->getContext(), source.getElementType(),
+          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+          source.getValidity(), source.getOwner());
       auto target = builder.create<gpu::TransposeOp>(
-          location, *result, *input, permutation);
+          location, result, *input, physicalPermutation);
       mapResults(operation, target);
       return success();
     }
@@ -3085,7 +3152,7 @@ private:
                inputs, reduce.getSourceCount() + reduce.getIdentityCount()))
         arguments.push_back(capture.getType());
       if (failed(lowerPureRegion(reduce.getCombine(), target.getCombine(),
-                                 arguments)))
+                                 arguments, results)))
         return failure();
       mapResults(operation, raw);
       return success();
@@ -3140,7 +3207,7 @@ private:
                inputs, scan.getSourceCount() + scan.getIdentityCount()))
         arguments.push_back(capture.getType());
       if (failed(lowerPureRegion(scan.getCombine(), target.getCombine(),
-                                 arguments)))
+                                 arguments, results)))
         return failure();
       mapResults(operation, raw);
       return success();
@@ -3358,23 +3425,25 @@ private:
       SmallVector<Type> summarizeArguments(sliceTypes);
       summarizeArguments.append(captureTypes);
       if (failed(lowerPureRegion(scan.getSummarize(), target.getSummarize(),
-                                 summarizeArguments)))
+                                 summarizeArguments, transitionTypes)))
         return failure();
       SmallVector<Type> combineArguments(transitionTypes);
       combineArguments.append(transitionTypes);
       if (failed(lowerPureRegion(scan.getCombine(), target.getCombine(),
-                                 combineArguments)))
+                                 combineArguments, transitionTypes)))
         return failure();
       SmallVector<Type> applyArguments(transitionTypes);
       applyArguments.append(stateTypes);
       if (failed(lowerPureRegion(scan.getApply(), target.getApply(),
-                                 applyArguments)))
+                                 applyArguments, stateTypes)))
         return failure();
       SmallVector<Type> emitArguments(sliceTypes);
       emitArguments.append(stateTypes);
       emitArguments.append(captureTypes);
+      SmallVector<Type> emittedTypes(
+          results.begin(), results.begin() + scan.getOutputCount());
       if (failed(lowerPureRegion(scan.getEmit(), target.getEmit(),
-                                 emitArguments)))
+                                 emitArguments, emittedTypes)))
         return failure();
       mapResults(operation, raw);
       return success();
@@ -3541,6 +3610,12 @@ private:
                                 (*counter).getType());
       if (failed(seed) || failed(counter) || failed(result))
         return random.emitOpError("Philox operands are unavailable");
+      auto seedType = dyn_cast<IntegerType>((*seed).getType());
+      if (!seedType || seedType.getWidth() != 64)
+        return random.emitOpError("Philox seed is not a 64-bit integer");
+      if (seedType != builder.getI64Type())
+        *seed = builder.create<gpu::BitcastOp>(location, builder.getI64Type(),
+                                               *seed);
       auto target = builder.create<gpu::RandomBitsOp>(location, *result, *seed,
                                                        *counter);
       mapResults(operation, target);
@@ -3613,13 +3688,10 @@ private:
       }
       if (auto target = dyn_cast<gpu::FragmentType>(*result)) {
         for (Value *operand : {&valid, &fill}) {
-          auto fragment = *operand
-                              ? dyn_cast<gpu::FragmentType>((*operand).getType())
-                              : gpu::FragmentType();
-          if (!fragment || samePhysicalShape(fragment, target))
+          if (!*operand)
             continue;
           FailureOr<Value> aligned =
-              retargetBroadcast(builder, location, *operand, target);
+              projectAccessOperand(location, *operand, target);
           if (failed(aligned))
             return gather.emitOpError(
                 "gather validity/fill cannot adopt its result relation");
@@ -3669,13 +3741,10 @@ private:
       }
       if (auto target = dyn_cast<gpu::FragmentType>(*result)) {
         for (Value *operand : {&valid, &fill}) {
-          auto fragment = *operand
-                              ? dyn_cast<gpu::FragmentType>((*operand).getType())
-                              : gpu::FragmentType();
-          if (!fragment || samePhysicalShape(fragment, target))
+          if (!*operand)
             continue;
           FailureOr<Value> aligned =
-              retargetBroadcast(builder, location, *operand, target);
+              projectAccessOperand(location, *operand, target);
           if (failed(aligned))
             return load.emitOpError(
                 "view-load validity/fill cannot adopt its result relation");

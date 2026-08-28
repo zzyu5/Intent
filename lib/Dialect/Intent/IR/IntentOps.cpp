@@ -1228,8 +1228,8 @@ LogicalResult verifyContract(Operation *operation) {
   if (name == "intent.scaled_contract") {
     auto lhsGroup = operation->getAttrOfType<IntegerAttr>("lhs_group_size");
     auto rhsGroup = operation->getAttrOfType<IntegerAttr>("rhs_group_size");
-    auto lhsFormat = operation->getAttrOfType<IntegerAttr>("lhs_format");
-    auto rhsFormat = operation->getAttrOfType<IntegerAttr>("rhs_format");
+    auto lhsFormat = operation->getAttrOfType<ScaledFormatAttr>("lhs_format");
+    auto rhsFormat = operation->getAttrOfType<ScaledFormatAttr>("rhs_format");
     if (!lhsGroup || !rhsGroup || lhsGroup.getInt() <= 0 ||
         rhsGroup.getInt() <= 0 || !lhsFormat || !rhsFormat)
       return operation->emitOpError("scaled contract format schema is incomplete");

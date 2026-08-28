@@ -90,11 +90,21 @@ FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
   return queryCoordinateIndex(coordinates, sourceId);
 }
 
-MakeRangeOp sourceRange(Value value) {
+MakeRangeOp sourceRange(Value value, std::optional<uint64_t> sourceId = std::nullopt) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return {};
-  PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).sourceRanges(value);
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact;
+  if (sourceId) {
+    PhysicalAxisProjection source =
+        queryUniqueSourceAxis(value.getType(), *sourceId);
+    if (!source.isExact())
+      return {};
+    fact = analysis.sourceRanges(value, source.source);
+  } else {
+    fact = analysis.sourceRanges(value);
+  }
   return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
 }
 
@@ -637,51 +647,12 @@ FailureOr<RootAccess> analyzeRoot(LoadOp load, uint64_t sourceId) {
     return load.emitOpError("reduction source provenance is absent from its root load");
   if (failed(coordinate))
     return load.emitOpError("reduction source provenance is absent from load coordinates");
-  auto range = sourceRange(load.getCoordinates()[*coordinate]);
+  auto range = sourceRange(load.getCoordinates()[*coordinate], sourceId);
   if (!range)
     return load.emitOpError("reduction load coordinate is not a physical range");
   if (!isUnitStep(range.getStep()))
     return load.emitOpError("reduction load range is not unit-step");
   return RootAccess{load, range, *coordinate, *fragmentAxis};
-}
-
-LogicalResult collectLoadRoots(Value value, uint64_t sourceId,
-                               SmallVectorImpl<LoadOp> &roots,
-                               llvm::SmallPtrSetImpl<Operation *> &visited) {
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  if (!fragment || failed(axisForSource(fragment, sourceId)))
-    return success();
-  Operation *producer = value.getDefiningOp();
-  if (!producer)
-    return failure();
-  if (auto extract = dyn_cast<ExtractOp>(producer)) {
-    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
-      uint64_t field = extract.getField();
-      if (field >= record.getFields().size())
-        return failure();
-      return collectLoadRoots(record.getFields()[field], sourceId, roots,
-                              visited);
-    }
-  }
-  if (auto load = dyn_cast<LoadOp>(producer)) {
-    if (!llvm::is_contained(roots, load))
-      roots.push_back(load);
-    return success();
-  }
-  // Coordinate ranges are typed traversal authorities, not data roots.  They
-  // are collected separately in SourcePlan::ranges and replayed from the
-  // selected chunk coordinate.
-  if (isa<MakeRangeOp>(producer))
-    return success();
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
-                            /*allowAccesses=*/false))
-    return failure();
-  if (!visited.insert(producer).second)
-    return success();
-  for (Value operand : producer->getOperands())
-    if (failed(collectLoadRoots(operand, sourceId, roots, visited)))
-      return failure();
-  return success();
 }
 
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
@@ -692,9 +663,23 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   if (failed(mapping))
     return failure();
   SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}, {}};
-  llvm::SmallPtrSet<Operation *, 16> visited;
-  if (failed(collectLoadRoots(source, plan.sourceId, plan.roots, visited)) ||
-      plan.roots.empty())
+  auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact fact = analysis.sourceRanges(
+      source, PhysicalSourceAxis{mapping->getSourceId(),
+                                 mapping->getSourceAxis()});
+  if (fact.state == PhysicalFactState::Unknown)
+    return failure();
+  for (MakeRangeOp range : fact.roots)
+    if (!llvm::is_contained(plan.ranges, range))
+      plan.ranges.push_back(range);
+  for (Operation *access : fact.accesses)
+    if (auto load = dyn_cast<LoadOp>(access);
+        load && !llvm::is_contained(plan.roots, load))
+      plan.roots.push_back(load);
+  if (plan.roots.empty())
     return failure();
   return plan;
 }

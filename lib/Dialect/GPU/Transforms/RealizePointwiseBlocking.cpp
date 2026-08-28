@@ -1081,17 +1081,18 @@ LogicalResult alignExplicitBroadcastOperands(func::FuncOp kernel) {
         targetShape.getOwner());
     OpBuilder builder(operation);
     Value replacement;
-    if (auto broadcast = dyn_cast<BroadcastOp>(definition))
+    if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition))
       replacement = builder.create<BroadcastOp>(operation->getLoc(), target,
                                                 broadcast.getValue());
-    else if (auto splat = dyn_cast<SplatOp>(definition))
+    else if (auto splat = dyn_cast_or_null<SplatOp>(definition))
       replacement = builder.create<SplatOp>(
           operation->getLoc(), target, splat.getValue());
     else
       replacement =
           builder.create<BroadcastOp>(operation->getLoc(), target, value);
-    if (Attribute origin = definition->getAttr(originAttr))
-      replacement.getDefiningOp()->setAttr(originAttr, origin);
+    if (definition)
+      if (Attribute origin = definition->getAttr(originAttr))
+        replacement.getDefiningOp()->setAttr(originAttr, origin);
     operation->setOperand(operandIndex, replacement);
     return success();
   };
