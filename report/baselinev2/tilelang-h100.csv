@@ -35,4 +35,4 @@ grouped_gemm_backward,rows256-512-1024-2048-K4096-N4096-fp16,,,,worker_timeout
 bitnet_int2_decode,M1-N4096-K4096-int8-int2,,,,physical_program_verification_failed
 dequant_bf16_fp4,M4096-N4096-K4096-bf16-fp4,,,,provider_jit_or_initial_launch_failed
 block_fp4_quant,8192x4096-block32-bf16,,,,intent_implementation_gap
-mhc_post,T4096-H2560-streams4-bf16,,,,physical_program_verification_failed
+mhc_post,T4096-H2560-streams4-bf16,,,,provider_jit_or_initial_launch_failed

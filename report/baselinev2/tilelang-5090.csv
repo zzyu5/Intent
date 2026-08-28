@@ -6,7 +6,7 @@ gqa_decode,B32-QH32-KVH8-S8192-D128-fp16,,,,physical_program_verification_failed
 varlen_gqa_decode_logits,B16-QH32-KVH8-S4096-D64-fp16,,,,kernel_ir_parse_failed
 paged_mla_decode,B32-QH128-KVH1-S8192-V128-R64-page64-fp16,,,,compiler_process_failed
 persistent_mla_decode,B8-H64-S16384-C128-R64-split4-fp16,,,,intent_implementation_gap
-conv2d,NHWC32x128x128x256-K3x3x256x512-fp16,,,,physical_program_verification_failed
+conv2d,NHWC32x128x128x256-K3x3x256x512-fp16,,,,provider_program_verification_failed
 dense_gemm,M4096-N14336-K4096-fp16,,,,worker_timeout
 w4a8_gemm,M4096-N14336-K4096-int8-int4,,,,physical_program_verification_failed
 fp8_gemm,M4096-N14336-K4096-e4m3,,,,worker_timeout
@@ -35,4 +35,4 @@ grouped_gemm_backward,rows256-512-1024-2048-K4096-N4096-fp16,,,,worker_timeout
 bitnet_int2_decode,M1-N4096-K4096-int8-int2,,,,physical_program_verification_failed
 dequant_bf16_fp4,M4096-N4096-K4096-bf16-fp4,,,,provider_jit_or_initial_launch_failed
 block_fp4_quant,8192x4096-block32-bf16,,,,intent_implementation_gap
-mhc_post,T4096-H2560-streams4-bf16,,,,physical_program_verification_failed
+mhc_post,T4096-H2560-streams4-bf16,0.124688,0.130664,0.954264,pass

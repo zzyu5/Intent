@@ -24,7 +24,7 @@ relu,8192x4096-fp16,0.087824,0.087808,1.000182,pass
 dropout,8192x4096-fp16-p0.1,0.087664,0.087680,0.999818,pass
 attention_sink_prefill,B1-S4096-QH32-KVH8-D128-bf16,,,,worker_timeout
 attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,,,,physical_program_verification_failed
-mhc_apply_residual,T2048-H4096-streams4-bf16,,,,physical_program_verification_failed
+mhc_apply_residual,T2048-H4096-streams4-bf16,0.110168,0.108208,1.018113,pass
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,,,,worker_timeout
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,,,,physical_program_verification_failed
 mhc_sinkhorn,T8192-streams4-fp32,0.053264,0.018432,2.889757,pass
