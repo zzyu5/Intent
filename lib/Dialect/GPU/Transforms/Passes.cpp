@@ -41,6 +41,9 @@ LogicalResult runSharedGPUPasses(ModuleOp module) {
   if (failed(realizeReductionBlocking(module)) ||
       failed(mlir::verify(module.getOperation())))
     return failure();
+  if (failed(refineProgramMapping(module)) ||
+      failed(mlir::verify(module.getOperation())))
+    return failure();
   // Structured realization replays source slices and may create new gathers.
   // Compose those typed access relations before provider legalization just as
   // we do for the access graph constructed directly from KIR.

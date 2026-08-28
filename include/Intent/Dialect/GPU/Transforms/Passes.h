@@ -35,6 +35,7 @@ mlir::LogicalResult decomposeMultiAxisReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
+mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
 mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module);
 
 } // namespace intent::gpu

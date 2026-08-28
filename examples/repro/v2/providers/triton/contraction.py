@@ -15,7 +15,9 @@ from ...measurement import functional_launch
 from ...measurement import TRITON_PARAMETER_OWNERSHIP_M
 from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
 from ...measurement import TRITON_PARAMETER_REDUCTION
+from ...measurement import TRITON_PARAMETER_RESIDENT_WORKERS
 from ...measurement import TRITON_PARAMETER_TRAVERSAL_GROUP
+from ...measurement import TRITON_PARAMETER_TRAVERSAL_WORKERS
 from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
@@ -55,6 +57,11 @@ _QKV_PROJECTION_CONFIGS = (
     }
     | {(64, 128, block_k, 4, 4) for block_k in (32, 64)}
 )
+
+_GROUPED_GEMM_CONFIGS = {
+    (128, 128, 64),
+    (64, 128, 64),
+}
 
 
 def _runtime(context: Context, path: str, name: str):
@@ -109,13 +116,59 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         device="cuda",
         dtype=torch.int32,
     )
-    _, generated = compile_single(context, ragged_grouped_gemm, (x, offsets, weight))
+    resident_workers = torch.cuda.get_device_properties("cuda").multi_processor_count
+    _, generated = compile_single(
+        context,
+        ragged_grouped_gemm,
+        (x, offsets, weight),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_M),
+            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
+            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION),
+        )
+        in _GROUPED_GEMM_CONFIGS
+        and triton_parameter_value(
+            config, TRITON_PARAMETER_TRAVERSAL_WORKERS
+        )
+        == 1
+        and triton_parameter_value(
+            config, TRITON_PARAMETER_RESIDENT_WORKERS
+        )
+        == resident_workers
+        and config.num_warps == 4
+        and config.num_stages == 3
+        and config.num_ctas == 1,
+    )
     runtime = _runtime(
         context,
         "source/triton/triton/gemm/grouped/08-grouped-gemm_runtime.py",
         "intent_v2_triton_grouped_gemm",
     )
     source_function = runtime.load_grouped_gemm()
+    source_autotuner = source_function.__globals__["grouped_matmul_kernel"]
+    source_configs = [
+        config
+        for config in source_autotuner.configs
+        if (
+            config.kwargs["BLOCK_SIZE_M"],
+            config.kwargs["BLOCK_SIZE_N"],
+            config.kwargs["BLOCK_SIZE_K"],
+        )
+        in _GROUPED_GEMM_CONFIGS
+        and config.kwargs["NUM_SM"] == resident_workers
+        and config.num_warps == 4
+        and config.num_stages == 3
+        and config.num_ctas == 1
+    ]
+    if len(source_configs) != len(_GROUPED_GEMM_CONFIGS):
+        raise RuntimeError(
+            "grouped GEMM source does not expose the generated/source common "
+            "persistent candidate set"
+        )
+    source_autotuner.configs = source_configs
+    source_autotuner.early_config_prune = None
+    source_autotuner.perf_model = None
+    source_autotuner.configs_top_k = 1.0
     group_x = list(x.view(experts, rows, hidden).unbind(0))
     group_weight = list(weight.unbind(0))
     state: dict[str, object] = {}

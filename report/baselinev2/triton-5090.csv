@@ -1,7 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status
 fused_softmax,8192x8192-fp16,0.176928,0.186680,0.947761,pass
 dense_gemm,M4096-N14336-K4096-fp16,2.081288,2.084560,0.998430,pass
-grouped_gemm,E8-M1024-K4096-N14336-fp16,,,,worker_timeout
+grouped_gemm,E8-M1024-K4096-N14336-fp16,5.400064,4.616704,1.169679,pass
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,3.331088,2.770560,1.202316,pass
 layer_norm,8192x4096-fp16,0.085776,0.089760,0.955615,pass
 flash_cross_entropy,8192x32768-bf16,0.342184,0.344616,0.992943,pass

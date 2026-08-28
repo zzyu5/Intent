@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizePointwiseBlocking.cpp
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp
+  RefineProgramMapping.cpp
   Passes.cpp
   Utilities.cpp
   VerifyGPUProgram.cpp

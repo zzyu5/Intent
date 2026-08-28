@@ -73,6 +73,7 @@ enum class ParameterRole : uint32_t {
   ProviderThreads = 7,
   TraversalWorkers = 8,
   TraversalGroup = 9,
+  ResidentWorkers = 10,
 };
 
 enum class CoordinateRole : int64_t {
