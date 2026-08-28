@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+from triton.runtime.errors import OutOfResources
 
 from kernels.backward.attention import attention_backward_delta
 from kernels.backward.attention import attention_backward_dkdv
@@ -49,6 +50,16 @@ def _fragment_source_value(config):
         value for name, value in config.kwargs.items() if name.startswith("FRAGMENT_S")
     )
     return values[0] if len(values) == 1 else None
+
+
+def _prepare_source_launch(launch) -> None:
+    try:
+        launch()
+    except OutOfResources as error:
+        raise ComparisonUnavailable(
+            "source_device_resource_gap",
+            f"vendored Triton source exceeds this device's resources: {error}",
+        ) from error
 
 
 def flash_attention_forward(context: Context) -> PreparedComparison:
@@ -152,7 +163,7 @@ def modern_flash_attention_forward(context: Context) -> PreparedComparison:
     def source_launch():
         source_module.flash(q, k, v, source_output, source_lse)
 
-    source_launch()
+    _prepare_source_launch(source_launch)
     source = PreparedLaunch(source_launch, lambda: source_output)
     return PreparedComparison(
         generated,
@@ -731,7 +742,7 @@ def flash_attention_backward(context: Context) -> PreparedComparison:
         / "source/triton/meta-applied-ai/attention/flash_backward/flash_backward.py",
         "intent_v2_triton_flash_backward_source",
     )
-    source_module.flash(q, k, v, output, lse)
+    _prepare_source_launch(lambda: source_module.flash(q, k, v, output, lse))
     grad_output = torch.randn_like(output) * 0.05
     scale = dimension**-0.5
     _, delta = compile_single(
