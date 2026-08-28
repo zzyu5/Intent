@@ -78,12 +78,16 @@ FailureOr<ParameterOp> blockingParameter(func::FuncOp kernel,
                     ? dyn_cast<PhysicalExprAttr>(fragment.getShape()[0])
                     : PhysicalExprAttr();
   std::string name;
-  if (range->hasAttr(sourceSubregionAttr))
-    name = ("FRAGMENT_S" + Twine(range.getSourceId())).str();
-  else if (extent &&
+  if (extent &&
       extent.getKind() ==
           static_cast<uint32_t>(PhysicalExprKind::Parameter))
     name = extent.getSymbol().getValue().str();
+  else if (FailureOr<uint64_t> dimension = rangeDimension(range);
+           succeeded(dimension) &&
+           succeeded(dimensionArgument(kernel, *dimension)))
+    name = ("FRAGMENT_D" + Twine(*dimension)).str();
+  else if (range->hasAttr(sourceSubregionAttr))
+    name = ("FRAGMENT_S" + Twine(range.getSourceId())).str();
   else if (range->hasAttr(worksetCoordinateRangeAttr)) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
     if (failed(dimension))
@@ -1441,6 +1445,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
+  llvm::SmallDenseSet<uint64_t> structuredSources;
+  for (Operation *operation : structuredTraversalRanges)
+    if (auto range = dyn_cast<MakeRangeOp>(operation))
+      structuredSources.insert(range.getSourceId());
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
@@ -1448,6 +1456,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
+      if (structuredSources.contains(range.getSourceId()))
+        continue;
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
       if (!sourceAxis)
         continue;
@@ -1660,12 +1670,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Attribute attribute : fragment.getAxisMaps())
       ownershipSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
   });
-  // A source axis consumed by a first-class structured operation is owned by
-  // that operation's physical realization.  A store coordinate using the same
-  // logical axis does not make pointwise mapping a second decision authority.
-  for (Operation *operation : structuredTraversalRanges)
-    if (auto range = dyn_cast<MakeRangeOp>(operation))
-      ownershipSources.erase(range.getSourceId());
+  // First-class structured operations own every physical projection of their
+  // logical source axes.  Pointwise ownership must not independently reblock a
+  // sibling projection of the same source axis merely because it also reaches
+  // an output coordinate.
+  for (uint64_t sourceId : structuredSources)
+    ownershipSources.erase(sourceId);
 
   if (auto roles =
           mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
@@ -1890,7 +1900,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto found = parameters.find(*dimensionId);
     if (found != parameters.end() && found->second != *parameter)
       return range.emitOpError(
-          "one logical dimension has multiple blocking parameters");
+                 "one logical dimension has multiple blocking parameters")
+             << "; dimension=" << *dimensionId << ", previous="
+             << found->second.getParameter().getName().getValue()
+             << ", current=" << parameter->getParameter().getName().getValue()
+             << ", source_id=" << range.getSourceId();
     parameters[*dimensionId] = *parameter;
     axes[*dimensionId].push_back(range);
     if (internalTraversalRanges.contains(range.getOperation()))
