@@ -1138,8 +1138,24 @@ LogicalResult alignExplicitBroadcastOperands(func::FuncOp kernel) {
                    FragmentType targetShape) -> LogicalResult {
     Value value = operation->getOperand(operandIndex);
     auto source = dyn_cast<FragmentType>(value.getType());
-    if (!source || sameFragmentSchema(source, targetShape))
+    if (source && sameFragmentSchema(source, targetShape))
       return success();
+    if (!source) {
+      if (!isa<IntegerType, FloatType, IndexType>(value.getType()))
+        return failure();
+      auto target = FragmentType::get(
+          kernel.getContext(), value.getType(), targetShape.getShape(),
+          targetShape.getAxisMaps(), targetShape.getValidity(),
+          targetShape.getOwner());
+      OpBuilder builder(operation);
+      Value replacement =
+          builder.create<SplatOp>(operation->getLoc(), target, value);
+      if (Operation *definition = value.getDefiningOp())
+        if (Attribute origin = definition->getAttr(originAttr))
+          replacement.getDefiningOp()->setAttr(originAttr, origin);
+      operation->setOperand(operandIndex, replacement);
+      return success();
+    }
     if (source.getShape().size() > targetShape.getShape().size())
       return failure();
     for (Attribute sourceMapping : source.getAxisMaps()) {
@@ -1251,14 +1267,63 @@ LogicalResult rankLiftPointwiseValueGraph(
                              original.getValidity(), original.getOwner());
   };
 
-  kernel.walk([&](Operation *operation) {
+  auto scalarLiftedType = [&](Type element) {
+    SmallVector<Attribute> shape;
+    SmallVector<Attribute> mappings;
+    for (auto [extent, mapping] : liftedAxes) {
+      shape.push_back(extent);
+      mappings.push_back(AxisMapAttr::get(
+          kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mappings.size()));
+    }
+    return FragmentType::get(
+        kernel.getContext(), element, ArrayAttr::get(kernel.getContext(), shape),
+        ArrayAttr::get(kernel.getContext(), mappings), /*validity=*/1,
+        /*owner=*/1);
+  };
+  auto carriesLiftedAxis = [&](FragmentType fragment) {
+    return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
+      auto axis = cast<AxisMapAttr>(attribute);
+      return llvm::any_of(liftedAxes, [&](const auto &lifted) {
+        return axis.getSourceId() == lifted.second.getSourceId() &&
+               axis.getSourceAxis() == lifted.second.getSourceAxis();
+      });
+    });
+  };
+
+  llvm::SmallDenseSet<Value> liftedValues;
+  for (MakeRangeOp range : liftedRanges)
+    liftedValues.insert(range.getResult());
+  WalkResult result = kernel.walk([&](Operation *operation) {
     if (isa<MakeRangeOp>(operation))
-      return;
-    for (Value result : operation->getResults())
-      if (auto fragment = dyn_cast<FragmentType>(result.getType()))
-        result.setType(liftedType(fragment));
+      return WalkResult::advance();
+    bool dependsOnLiftedRange =
+        llvm::any_of(operation->getOperands(), [&](Value operand) {
+          if (liftedValues.contains(operand))
+            return true;
+          auto fragment = dyn_cast<FragmentType>(operand.getType());
+          return fragment && carriesLiftedAxis(fragment);
+        });
+    if (!dependsOnLiftedRange)
+      return WalkResult::advance();
+    if (operation->getNumResults() == 0)
+      return WalkResult::advance();
+    if (!isCartesianPointwiseValueOp(operation) ||
+        operation->getNumRegions() != 0)
+      return WalkResult::interrupt();
+    for (Value value : operation->getResults()) {
+      Type type = value.getType();
+      if (auto fragment = dyn_cast<FragmentType>(type))
+        value.setType(liftedType(fragment));
+      else if (isa<IntegerType, FloatType, IndexType>(type))
+        value.setType(scalarLiftedType(type));
+      else
+        return WalkResult::interrupt();
+      liftedValues.insert(value);
+    }
+    return WalkResult::advance();
   });
-  return success();
+  return result.wasInterrupted() ? failure() : success();
 }
 
 } // namespace
