@@ -14,7 +14,7 @@ padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.004408,0.005552,0.7
 fused_add_rms_norm,8192x4096-bf16,0.177312,0.175872,1.008188,pass
 rms_norm,8192x4096-bf16,0.086528,0.085776,1.008767,pass
 xformers_rms_norm,8192x4096-bf16,0.075488,0.085776,0.880060,pass
-qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,,,,worker_timeout
+qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.847008,1.958376,0.943132,pass
 index_select,source65536-selected32768-hidden4096-fp16,0.364720,0.366272,0.995763,pass
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.520128,0.530520,0.980412,pass
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,2.545440,2.527920,1.006931,pass

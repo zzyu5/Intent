@@ -42,6 +42,20 @@ _DENSE_GEMM_CONFIGS = {
     (128, 32, 64, 4, 4),
 }
 
+_QKV_PROJECTION_CONFIGS = (
+    {
+        (32, 64, block_k, 2, num_stages)
+        for block_k in (32, 64)
+        for num_stages in range(2, 7)
+    }
+    | {
+        (32, 128, block_k, 4, num_stages)
+        for block_k in (32, 64)
+        for num_stages in range(2, 7)
+    }
+    | {(64, 128, block_k, 4, 4) for block_k in (32, 64)}
+)
+
 
 def _runtime(context: Context, path: str, name: str):
     return load_module(context.project_root / path, name)
@@ -134,6 +148,15 @@ def qkv_projection(context: Context) -> PreparedComparison:
         context,
         fused_qkv_projection,
         (x, packed_weights),
+        triton_config_filter=lambda config: (
+            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_M),
+            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
+            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION),
+            config.num_warps,
+            config.num_stages,
+        )
+        in _QKV_PROJECTION_CONFIGS
+        and config.num_ctas == 1,
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -145,6 +168,30 @@ def qkv_projection(context: Context) -> PreparedComparison:
         "intent_v2_triton_qkv_projection",
     )
     source_module = runtime.load_source()
+    source_autotuner = source_module._xformers_tiled_matmul_kernel
+    source_configs = [
+        config
+        for config in source_autotuner.configs
+        if (
+            config.kwargs["BLOCK_M"],
+            config.kwargs["BLOCK_N"],
+            config.kwargs["BLOCK_K"],
+            config.num_warps,
+            config.num_stages,
+        )
+        in _QKV_PROJECTION_CONFIGS
+        and config.kwargs["SPLIT_K"] == 1
+        and config.kwargs["GROUP_M"] == 8
+        and config.num_ctas == 1
+    ]
+    if len(source_configs) != len(_QKV_PROJECTION_CONFIGS):
+        raise RuntimeError(
+            "QKV source does not expose the generated/source common candidate set"
+        )
+    source_autotuner.configs = source_configs
+    source_autotuner.early_config_prune = None
+    source_autotuner.perf_model = None
+    source_autotuner.configs_top_k = 1.0
     source_outputs = tuple(
         torch.empty((tokens, projection), device="cuda", dtype=torch.float16)
         for _ in range(3)
