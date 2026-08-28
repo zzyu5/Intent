@@ -106,20 +106,6 @@ void collectRanges(Value value, const llvm::SmallPtrSetImpl<Operation *> &eligib
     collectRanges(operand, eligible, ranges, visited);
 }
 
-FailureOr<unsigned> sourceAxis(FragmentType fragment, uint64_t sourceId) {
-  std::optional<unsigned> result;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getSourceId() != sourceId)
-      continue;
-    if (result)
-      return failure();
-    result = mapping.getFragmentAxis();
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
-}
-
 bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   auto reshape = value.getDefiningOp<ReshapeOp>();
   auto result = dyn_cast<FragmentType>(value.getType());
@@ -351,14 +337,16 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
         range.getLoc(), builder.getIndexType(), range.getStart(),
         range.getExtent(), BinaryOperator::Add));
   }
-  auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-  if (dimension && !range->hasAttr(sourceSubregionAttr)) {
+  FailureOr<int64_t> dimension = querySourceDimension(
+      range.getResult().getType(),
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+  if (succeeded(dimension) && !range->hasAttr(sourceSubregionAttr)) {
     for (BlockArgument argument : kernel.getArguments()) {
       DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
       auto kind = attributes.getAs<StringAttr>(abiKindAttr);
       auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
       if (kind && kind.getValue() == "dimension" && identity &&
-          identity.getInt() == dimension.getInt())
+          identity.getInt() == *dimension)
         return Value(argument);
     }
     std::optional<int64_t> staticExtent;
@@ -369,7 +357,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
       auto identities = view.getLayout().getDimensionIds();
       auto extents = view.getLayout().getExtents();
       for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef())) {
-        if (identity != dimension.getInt())
+        if (identity != *dimension)
           continue;
         auto extent = cast<PhysicalExprAttr>(extents[axis]);
         if (extent.getKind() !=
@@ -615,11 +603,12 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       ArrayAttr::get(kernel.getContext(), {}));
   SmallVector<MakeRangeOp> ranges;
   kernel.walk([&](MakeRangeOp range) {
-    auto sourceDimension =
-        range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+    FailureOr<int64_t> sourceDimension = querySourceDimension(
+        range.getResult().getType(),
+        PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
     auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
-    if (!sourceDimension ||
-        sourceDimension.getInt() != static_cast<int64_t>(dimension) ||
+    if (failed(sourceDimension) ||
+        *sourceDimension != static_cast<int64_t>(dimension) ||
         range->hasAttr(sourceSubregionAttr) || !fragment ||
         fragment.getShape().size() != 1 ||
         fragment.getShape()[0] != parameterExtent)

@@ -125,9 +125,14 @@ Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
 
 void inheritRangeAuthority(Value derived, MakeRangeOp source) {
   Operation *operation = derived.getDefiningOp();
-  for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
-    if (Attribute value = source->getAttr(attribute))
-      operation->setAttr(attribute, value);
+  if (Attribute value = source->getAttr(sourceSubregionAttr))
+    operation->setAttr(sourceSubregionAttr, value);
+}
+
+FailureOr<int64_t> rangeDimension(MakeRangeOp range) {
+  return querySourceDimension(
+      range.getResult().getType(),
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
 }
 
 FailureOr<AxisMapAttr> axisMap(FragmentType fragment, unsigned axis) {
@@ -438,11 +443,10 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
                             .getSourceId();
     SmallVector<MakeRangeOp> subregions;
     kernel.walk([&](MakeRangeOp range) {
-      auto sourceDimension =
-          range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+      FailureOr<int64_t> sourceDimension = rangeDimension(range);
       if (range.getSourceId() == sourceId &&
-          range->hasAttr(sourceSubregionAttr) && sourceDimension &&
-          sourceDimension.getInt() == static_cast<int64_t>(dimension))
+          range->hasAttr(sourceSubregionAttr) && succeeded(sourceDimension) &&
+          *sourceDimension == static_cast<int64_t>(dimension))
         subregions.push_back(range);
     });
     for (MakeRangeOp range : subregions) {
@@ -1259,12 +1263,14 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction, {32, 64, 128});
   if (!blockK)
     return failure();
-  auto lhsDimension =
-      lhsRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-  auto rhsDimension =
-      rhsRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-  if (lhsDimension && rhsDimension && lhsDimension == rhsDimension)
-    blockK->setAttr(dimensionAttr, lhsDimension);
+  FailureOr<int64_t> lhsDimension = rangeDimension(lhsRange);
+  FailureOr<int64_t> rhsDimension = rangeDimension(rhsRange);
+  if (succeeded(lhsDimension) && succeeded(rhsDimension) &&
+      *lhsDimension == *rhsDimension)
+    blockK->setAttr(
+        dimensionAttr,
+        IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                         *lhsDimension));
   MLIRContext *context = kernel.getContext();
   PhysicalExprAttr unitK = parameterExpression(
       context, blockK.getParameter().getName().getValue());
@@ -1530,9 +1536,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
        {std::pair<ParameterOp, MakeRangeOp>{blockM, rowRange},
         std::pair<ParameterOp, MakeRangeOp>{blockN, columnRange},
         std::pair<ParameterOp, MakeRangeOp>{blockK, lhsReductionRange}})
-    if (auto dimension =
-            range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-      parameter->setAttr(dimensionAttr, dimension);
+    if (FailureOr<int64_t> dimension = rangeDimension(range);
+        succeeded(dimension))
+      parameter->setAttr(
+          dimensionAttr,
+          IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                           *dimension));
   ParameterOp rowWorkers;
   if (runtimeRowTraversal)
     rowWorkers = getOrCreateParameter(

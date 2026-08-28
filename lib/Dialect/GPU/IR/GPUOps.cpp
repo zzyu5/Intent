@@ -190,21 +190,20 @@ LogicalResult WorksetCoordinateOp::verify() {
   const int64_t sourceId = getSourceIdAttr().getInt();
   const int64_t sourceAxis = getSourceAxisAttr().getInt();
   const int64_t sourceRank = getSourceRankAttr().getInt();
+  const int64_t dimensionId = getDimensionIdAttr().getInt();
   if (sourceId <= 0)
     return emitOpError(
         "workset coordinate requires logical source provenance");
   if (sourceRank <= 0 || sourceAxis < 0 || sourceAxis >= sourceRank)
     return emitOpError(
         "workset coordinate source axis is outside its logical source rank");
+  if (dimensionId <= 0)
+    return emitOpError(
+        "workset coordinate requires a logical dimension identity");
   auto worksetAxis = (*this)->getAttrOfType<IntegerAttr>(worksetAxisAttr);
   if (!worksetAxis || worksetAxis.getInt() < 0)
     return emitOpError(
         "workset coordinate requires a non-negative physical workset axis");
-  if (auto dimension =
-          (*this)->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-    if (dimension.getInt() < 0)
-      return emitOpError(
-          "workset coordinate source dimension must be non-negative");
   return success();
 }
 

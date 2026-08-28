@@ -24,8 +24,6 @@ inline constexpr llvm::StringLiteral sourceAxisAttr = "intent_gpu.source_axis";
 inline constexpr llvm::StringLiteral sourceRankAttr = "intent_gpu.source_rank";
 inline constexpr llvm::StringLiteral sourceSubregionAttr =
     "intent_gpu.source_subregion";
-inline constexpr llvm::StringLiteral sourceDimensionAttr =
-    "intent_gpu.source_dimension";
 inline constexpr llvm::StringLiteral worksetCoordinateRangeAttr =
     "intent_gpu.workset_coordinate_range";
 inline constexpr llvm::StringLiteral worksetAxisAttr =

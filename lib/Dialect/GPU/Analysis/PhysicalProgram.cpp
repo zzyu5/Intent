@@ -126,21 +126,25 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
   if (!fragment)
     return result;
   std::optional<unsigned> axis;
+  std::optional<int64_t> dimension;
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
     if (mapping.getSourceId() != source.sourceId ||
         mapping.getSourceAxis() != source.sourceAxis)
       continue;
-    if (axis && *axis != mapping.getFragmentAxis()) {
+    if ((axis && *axis != mapping.getFragmentAxis()) ||
+        (dimension && *dimension != mapping.getDimensionId())) {
       result.state = PhysicalFactState::Ambiguous;
       return result;
     }
     axis = mapping.getFragmentAxis();
+    dimension = mapping.getDimensionId();
   }
-  if (!axis)
+  if (!axis || !dimension)
     return result;
   result.state = PhysicalFactState::Exact;
   result.fragmentAxis = *axis;
+  result.dimensionId = *dimension;
   return result;
 }
 
@@ -171,6 +175,19 @@ PhysicalDimensionProjection queryFragmentDimension(Type type,
   return result;
 }
 
+FailureOr<int64_t> querySourceDimension(Type type, PhysicalSourceAxis source) {
+  if (auto range = dyn_cast<RangeType>(type))
+    return range.getSourceId() == source.sourceId &&
+                   range.getSourceAxis() == source.sourceAxis &&
+                   range.getDimensionId() > 0
+               ? FailureOr<int64_t>(range.getDimensionId())
+               : FailureOr<int64_t>(failure());
+  PhysicalAxisProjection projection = queryFragmentAxis(type, source);
+  return projection.isExact() && projection.dimensionId > 0
+             ? FailureOr<int64_t>(projection.dimensionId)
+             : FailureOr<int64_t>(failure());
+}
+
 PhysicalAxisProjection queryUniqueSourceAxis(Type type, uint64_t sourceId) {
   PhysicalAxisProjection result;
   auto fragment = dyn_cast<FragmentType>(type);
@@ -178,6 +195,7 @@ PhysicalAxisProjection queryUniqueSourceAxis(Type type, uint64_t sourceId) {
     return result;
   std::optional<PhysicalSourceAxis> source;
   std::optional<unsigned> axis;
+  std::optional<int64_t> dimension;
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
     if (mapping.getSourceId() != sourceId)
@@ -185,18 +203,21 @@ PhysicalAxisProjection queryUniqueSourceAxis(Type type, uint64_t sourceId) {
     PhysicalSourceAxis current{mapping.getSourceId(),
                                mapping.getSourceAxis()};
     if ((source && !(*source == current)) ||
-        (axis && *axis != mapping.getFragmentAxis())) {
+        (axis && *axis != mapping.getFragmentAxis()) ||
+        (dimension && *dimension != mapping.getDimensionId())) {
       result.state = PhysicalFactState::Ambiguous;
       return result;
     }
     source = current;
     axis = mapping.getFragmentAxis();
+    dimension = mapping.getDimensionId();
   }
-  if (!source || !axis)
+  if (!source || !axis || !dimension)
     return result;
   result.state = PhysicalFactState::Exact;
   result.source = *source;
   result.fragmentAxis = *axis;
+  result.dimensionId = *dimension;
   return result;
 }
 
@@ -237,6 +258,9 @@ queryCoordinateIndex(ValueRange coordinates, PhysicalSourceAxis source) {
   if (!coordinateIndex)
     return result;
   result.state = PhysicalFactState::Exact;
+  PhysicalAxisProjection projection =
+      queryFragmentAxis(coordinates[*coordinateIndex].getType(), source);
+  result.dimensionId = projection.dimensionId;
   result.fragmentAxis = *coordinateIndex;
   return result;
 }
@@ -477,13 +501,18 @@ bool PhysicalProgramAnalysis::isTailPredicate(
         predicateRange.getSourceId() != expectedRange.getSourceId() ||
         predicateRange.getSourceAxis() != expectedRange.getSourceAxis())
       return false;
-    auto predicateDimension =
-        predicateRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-    auto expectedDimension =
-        expectedRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+    FailureOr<int64_t> predicateDimension = querySourceDimension(
+        predicateRange.getResult().getType(),
+        PhysicalSourceAxis{predicateRange.getSourceId(),
+                           predicateRange.getSourceAxis()});
+    FailureOr<int64_t> expectedDimension = querySourceDimension(
+        expectedRange.getResult().getType(),
+        PhysicalSourceAxis{expectedRange.getSourceId(),
+                           expectedRange.getSourceAxis()});
     if (!predicateRange->hasAttr(sourceSubregionAttr) &&
-        !expectedRange->hasAttr(sourceSubregionAttr) && predicateDimension &&
-        predicateDimension == expectedDimension)
+        !expectedRange->hasAttr(sourceSubregionAttr) &&
+        succeeded(predicateDimension) && succeeded(expectedDimension) &&
+        *predicateDimension == *expectedDimension)
       return true;
     if (!predicateRange->hasAttr(sourceSubregionAttr) &&
         !expectedRange->hasAttr(sourceSubregionAttr) &&

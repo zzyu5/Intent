@@ -42,6 +42,7 @@ bool isPhysicalReplayNode(mlir::Operation *operation,
 struct PhysicalAxisProjection {
   PhysicalFactState state = PhysicalFactState::Unknown;
   PhysicalSourceAxis source;
+  int64_t dimensionId = 0;
   unsigned fragmentAxis = 0;
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
@@ -61,6 +62,8 @@ PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source);
 PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
                                                    int64_t dimensionId);
+mlir::FailureOr<int64_t>
+querySourceDimension(mlir::Type type, PhysicalSourceAxis source);
 PhysicalAxisProjection queryUniqueSourceAxis(mlir::Type type,
                                              uint64_t sourceId);
 mlir::FailureOr<unsigned>

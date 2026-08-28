@@ -85,6 +85,12 @@ FailureOr<AxisMapAttr> axisMap(FragmentType fragment, unsigned axis) {
   return failure();
 }
 
+FailureOr<int64_t> rangeDimension(MakeRangeOp range) {
+  return querySourceDimension(
+      range.getResult().getType(),
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+}
+
 FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
                                         uint64_t sourceId) {
   return queryCoordinateIndex(coordinates, sourceId);
@@ -790,11 +796,11 @@ bool sameLogicalSourceRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   if (lhs.getSourceId() != rhs.getSourceId() ||
       lhs.getSourceAxis() != rhs.getSourceAxis())
     return false;
-  auto leftDimension = lhs->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-  auto rightDimension = rhs->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+  FailureOr<int64_t> leftDimension = rangeDimension(lhs);
+  FailureOr<int64_t> rightDimension = rangeDimension(rhs);
   if (!lhs->hasAttr(sourceSubregionAttr) &&
-      !rhs->hasAttr(sourceSubregionAttr) && leftDimension && rightDimension &&
-      leftDimension == rightDimension)
+      !rhs->hasAttr(sourceSubregionAttr) && succeeded(leftDimension) &&
+      succeeded(rightDimension) && *leftDimension == *rightDimension)
     return true;
   return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
          sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
@@ -966,15 +972,15 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     return false;
   Value logicalExtent = range.getExtent();
   if (isCompileTimeValue(logicalExtent)) {
-    auto sourceDimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+    FailureOr<int64_t> sourceDimension = rangeDimension(range);
     auto coverageDimension =
         (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
-    if (range->hasAttr(sourceSubregionAttr) || !sourceDimension ||
+    if (range->hasAttr(sourceSubregionAttr) || failed(sourceDimension) ||
         !coverageDimension ||
-        sourceDimension.getInt() != coverageDimension.getInt())
+        *sourceDimension != coverageDimension.getInt())
       return false;
     FailureOr<Value> launchExtent =
-        dimensionArgument(kernel, sourceDimension.getInt());
+        dimensionArgument(kernel, *sourceDimension);
     if (failed(launchExtent))
       return false;
     logicalExtent = *launchExtent;
@@ -1621,10 +1627,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                     nestedLocation, rangeType, range.getStart(),
                     range.getExtent(), range.getStep(), range.getSourceId(),
                     range.getSourceAxis());
-                for (StringRef attribute :
-                     {sourceSubregionAttr, sourceDimensionAttr})
-                  if (Attribute value = range->getAttr(attribute))
-                    clone->setAttr(attribute, value);
+                if (Attribute value = range->getAttr(sourceSubregionAttr))
+                  clone->setAttr(sourceSubregionAttr, value);
                 mapping.map(range.getResult(), clone.getResult());
               }
               auto rangeType = cast<FragmentType>(range.getResult().getType());
@@ -1859,9 +1863,11 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     chunk = getOrCreateParameter(kernel, name, ParameterRole::Reduction,
                                  candidates);
     if (chunk)
-      if (auto dimension =
-              firstRange->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-        chunk->setAttr(dimensionAttr, dimension);
+      if (FailureOr<int64_t> dimension = rangeDimension(firstRange);
+          succeeded(dimension))
+        chunk->setAttr(dimensionAttr,
+                       IntegerAttr::get(IntegerType::get(chunk.getContext(), 64),
+                                        *dimension));
   }
   if (!chunk)
     return failure();
@@ -1958,10 +1964,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 nestedLocation, blockedCoordinate, chunkStart,
                 chunk.getResult(), range.getStep(), range.getSourceId(),
                 range.getSourceAxis());
-            for (StringRef attribute :
-                 {sourceSubregionAttr, sourceDimensionAttr})
-              if (Attribute value = range->getAttr(attribute))
-                coordinate->setAttr(attribute, value);
+            if (Attribute value = range->getAttr(sourceSubregionAttr))
+              coordinate->setAttr(sourceSubregionAttr, value);
             mapping.map(range.getResult(), coordinate.getResult());
             Value end = nested.create<BroadcastOp>(nestedLocation,
                                                    blockedCoordinate, stop);

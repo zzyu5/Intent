@@ -1595,12 +1595,6 @@ private:
             valuePrototype = dyn_cast<gpu::FragmentType>((*value).getType());
         }
       }
-    auto resultDimension = [&](size_t resultAxis) -> FailureOr<int64_t> {
-      ArrayRef<int64_t> dimensions = relation.getResultDimensions();
-      if (resultAxis >= dimensions.size())
-        return failure();
-      return dimensions[resultAxis];
-    };
     auto resultExtent = [&](size_t axis,
                             PhysicalExprAttr fallback)
         -> FailureOr<PhysicalExprAttr> {
@@ -1721,8 +1715,18 @@ private:
           extent =
               cast<PhysicalExprAttr>(fragment.getShape()[sourceAxis]);
         }
-        FailureOr<int64_t> dimension = resultDimension(resultAxis);
-        if (failed(dimension))
+        int64_t dimension = 0;
+        if (view) {
+          auto dimensions = view.getLayout().getDimensionIds();
+          if (sourceAxis >= dimensions.size())
+            return failure();
+          dimension = dimensions[sourceAxis];
+        } else {
+          dimension = cast<gpu::AxisMapAttr>(
+                          fragment.getAxisMaps()[sourceAxis])
+                          .getDimensionId();
+        }
+        if (dimension <= 0)
           return failure();
         // A full slice of an already-physical fragment consumes that
         // fragment's current extent.  Reconstructing the helper-local logical
@@ -1736,13 +1740,9 @@ private:
         }
         Value step = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
         FailureOr<Value> coordinate = makeRange(
-            logicalSourceAxis, start, stop, step, sourceId, *dimension, extent);
+            logicalSourceAxis, start, stop, step, sourceId, dimension, extent);
         if (failed(coordinate))
           return failure();
-        if (*dimension > 0)
-          coordinate->getDefiningOp()->setAttr(
-              gpu::sourceDimensionAttr,
-              builder.getI64IntegerAttr(*dimension));
         coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
@@ -1802,9 +1802,6 @@ private:
         Value stop = rangeBound(operation->getLoc(), *range, 1);
         Value step = rangeBound(operation->getLoc(), *range, 2);
         auto rangeType = cast<gpu::RangeType>((*range).getType());
-        FailureOr<int64_t> dimension = resultDimension(resultAxis);
-        if (failed(dimension))
-          return failure();
         PhysicalExprAttr fallback = expression(
             operation->getContext(), PhysicalExprKind::Constant, 1);
         FailureOr<PhysicalExprAttr> physicalExtent =
@@ -1812,30 +1809,16 @@ private:
         if (failed(physicalExtent))
           return failure();
         PhysicalExprAttr extent = *physicalExtent;
-        std::optional<int64_t> sourceDimension =
-            sourceExtentDimension(operation->getOperand(position));
-        if (!sourceDimension)
-          if (auto identity =
-                  (*range).getDefiningOp()->getAttrOfType<IntegerAttr>(
-                      gpu::sourceDimensionAttr))
-            sourceDimension = identity.getInt();
         uint64_t sourceId = rangeType.getSourceId();
         uint32_t logicalSourceAxis = rangeType.getSourceAxis();
         FailureOr<Value> coordinate = makeRange(
-            logicalSourceAxis, start, stop, step, sourceId, *dimension, extent);
+            logicalSourceAxis, start, stop, step, sourceId,
+            rangeType.getDimensionId(), extent);
         if (failed(coordinate))
           return failure();
         if ((*range).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
           coordinate->getDefiningOp()->setAttr(gpu::sourceSubregionAttr,
                                                builder.getUnitAttr());
-        if (auto identity =
-                (*range).getDefiningOp()->getAttr(gpu::sourceDimensionAttr))
-          coordinate->getDefiningOp()->setAttr(gpu::sourceDimensionAttr,
-                                               identity);
-        else if (sourceDimension)
-          coordinate->getDefiningOp()->setAttr(
-              gpu::sourceDimensionAttr,
-              builder.getI64IntegerAttr(*sourceDimension));
         coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
@@ -1890,9 +1873,6 @@ private:
             (view && sourceAxis >= view.getRank()) ||
             (fragment && sourceAxis >= fragment.getShape().size()))
           return failure();
-        FailureOr<int64_t> dimension = resultDimension(resultAxis);
-        if (failed(dimension))
-          return failure();
         PhysicalExprAttr fallback =
             view ? cast<PhysicalExprAttr>(
                        view.getLayout().getExtents()[sourceAxis])
@@ -1904,25 +1884,29 @@ private:
         PhysicalExprAttr extent = *physicalExtent;
         uint64_t sourceId;
         uint32_t logicalSourceAxis = sourceAxis;
-        if (view)
+        int64_t dimension = 0;
+        if (view) {
           sourceId =
               (static_cast<uint64_t>(view.getAbiIndex()) + 1) * 65536 +
               sourceAxis + 1;
-        else {
+          auto dimensions = view.getLayout().getDimensionIds();
+          if (sourceAxis >= dimensions.size())
+            return failure();
+          dimension = dimensions[sourceAxis];
+        } else {
           auto mapping =
               cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
           sourceId = mapping.getSourceId();
           logicalSourceAxis = mapping.getSourceAxis();
+          dimension = mapping.getDimensionId();
         }
+        if (dimension <= 0)
+          return failure();
         FailureOr<Value> coordinate = makeRange(
             logicalSourceAxis, bounds[0], bounds[1], bounds[2], sourceId,
-            *dimension, extent);
+            dimension, extent);
         if (failed(coordinate))
           return failure();
-        if (*dimension > 0)
-          coordinate->getDefiningOp()->setAttr(
-              gpu::sourceDimensionAttr,
-              builder.getI64IntegerAttr(*dimension));
         coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
@@ -2409,8 +2393,6 @@ private:
           identity);
       auto target =
           builder.create<gpu::RangeOp>(location, type, *start, *stop, *step);
-      target->setAttr(gpu::sourceDimensionAttr,
-                      builder.getI64IntegerAttr(identity));
       mapResults(operation, target);
       bindExtentDimensions(domain.getExtentDimensions(),
                            rangeExtent(location, *start, *stop, *step));
@@ -2455,9 +2437,6 @@ private:
       auto target =
           builder.create<gpu::RangeOp>(location, type, start, stop, step);
       target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
-      if (auto identity =
-              (*source).getDefiningOp()->getAttr(gpu::sourceDimensionAttr))
-        target->setAttr(gpu::sourceDimensionAttr, identity);
       mapResults(operation, target);
       bindExtentDimensions(subregion.getExtentDimensions(),
                            rangeExtent(location, start, stop, step));
@@ -2544,8 +2523,6 @@ private:
           rangeType.getSourceAxis());
       if ((*source).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
         target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
-      target->setAttr(gpu::sourceDimensionAttr,
-                      builder.getI64IntegerAttr(rangeType.getDimensionId()));
       mapResults(operation, target);
       return success();
     }
@@ -4520,15 +4497,18 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                    intent::DomainOp domain, Value coordinate,
                                    unsigned worksetAxis) -> Value {
     auto domainType = cast<intent::DomainType>(domain.getResult().getType());
+    std::optional<int64_t> dimension =
+        sourceExtentDimension(domain.getResult());
+    if (!dimension || *dimension <= 0) {
+      domain.emitOpError(
+          "parallel workset coordinate has no logical dimension identity");
+      return {};
+    }
     auto mapped = nested.create<gpu::WorksetCoordinateOp>(
         location, nested.getIndexType(), coordinate, domainType.getOriginId(),
-        /*sourceAxis=*/0, /*sourceRank=*/1);
+        /*sourceAxis=*/0, /*sourceRank=*/1, *dimension);
     mapped->setAttr(gpu::worksetAxisAttr,
                     nested.getI64IntegerAttr(worksetAxis));
-    if (std::optional<int64_t> dimension =
-            sourceExtentDimension(domain.getResult()))
-      mapped->setAttr(gpu::sourceDimensionAttr,
-                      nested.getI64IntegerAttr(*dimension));
     return mapped.getResult();
   };
   bool dispatchLoweringFailed = false;

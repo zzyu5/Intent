@@ -34,7 +34,8 @@ def IntentGPU_WorksetCoordinateOp : IntentGPU_Op<"workset_coordinate", [Pure]> {
   let arguments = (ins Index:$coordinate,
                        I64Attr:$source_id,
                        I64Attr:$source_axis,
-                       I64Attr:$source_rank);
+                       I64Attr:$source_rank,
+                       I64Attr:$dimension_id);
   let results = (outs Index:$result);
   let hasVerifier = 1;
 }

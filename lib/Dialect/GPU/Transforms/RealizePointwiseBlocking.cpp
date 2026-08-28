@@ -62,6 +62,15 @@ FailureOr<Value> dimensionArgument(func::FuncOp kernel, uint64_t dimension) {
   return failure();
 }
 
+FailureOr<uint64_t> rangeDimension(MakeRangeOp range) {
+  FailureOr<int64_t> dimension = querySourceDimension(
+      range.getResult().getType(),
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+  return succeeded(dimension) && *dimension > 0
+             ? FailureOr<uint64_t>(*dimension)
+             : FailureOr<uint64_t>(failure());
+}
+
 FailureOr<ParameterOp> blockingParameter(func::FuncOp kernel,
                                          MakeRangeOp range) {
   auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
@@ -76,20 +85,20 @@ FailureOr<ParameterOp> blockingParameter(func::FuncOp kernel,
           static_cast<uint32_t>(PhysicalExprKind::Parameter))
     name = extent.getSymbol().getValue().str();
   else if (range->hasAttr(worksetCoordinateRangeAttr)) {
-    auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-    if (!dimension)
+    FailureOr<uint64_t> dimension = rangeDimension(range);
+    if (failed(dimension))
       return failure();
-    name = succeeded(dimensionArgument(kernel, dimension.getInt()))
-               ? ("FRAGMENT_D" + Twine(dimension.getInt())).str()
+    name = succeeded(dimensionArgument(kernel, *dimension))
+               ? ("FRAGMENT_D" + Twine(*dimension)).str()
                : ("FRAGMENT_S" + Twine(range.getSourceId())).str();
   }
   else if (range.getExtent().getDefiningOp<arith::ConstantIndexOp>())
     name = ("FRAGMENT_S" + Twine(range.getSourceId())).str();
-  else if (auto dimension =
-               range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-    name = ("FRAGMENT_D" + Twine(dimension.getInt())).str();
+  else if (FailureOr<uint64_t> dimension = rangeDimension(range);
+           succeeded(dimension))
+    name = ("FRAGMENT_D" + Twine(*dimension)).str();
   else
-    name = ("FRAGMENT_D" + Twine(range.getSourceId())).str();
+    return failure();
   ParameterOp result;
   kernel.walk([&](ParameterOp parameter) {
     if (!result && parameter.getParameter().getName() == name)
@@ -100,15 +109,25 @@ FailureOr<ParameterOp> blockingParameter(func::FuncOp kernel,
 }
 
 FailureOr<uint64_t> parameterDimension(ParameterOp parameter) {
+  if (auto coverage =
+          parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr))
+    return coverage.getInt() > 0
+               ? FailureOr<uint64_t>(coverage.getInt())
+               : FailureOr<uint64_t>(failure());
   StringRef name = parameter.getParameter().getName().getValue();
   bool fixed = name.consume_front("FRAGMENT_S");
-  if (!fixed && !name.consume_front("FRAGMENT_D"))
+  if (!fixed) {
+    auto dimension = parameter->getAttrOfType<IntegerAttr>(dimensionAttr);
+    return dimension && dimension.getInt() > 0
+               ? FailureOr<uint64_t>(dimension.getInt())
+               : FailureOr<uint64_t>(failure());
+  }
+  if (name.empty())
     return failure();
   uint64_t dimension = 0;
   if (name.getAsInteger(10, dimension))
     return failure();
-  return fixed ? FailureOr<uint64_t>(staticAxis(dimension))
-               : FailureOr<uint64_t>(dimension);
+  return staticAxis(dimension);
 }
 
 PhysicalExprAttr fragmentExtent(ParameterOp parameter) {
@@ -752,10 +771,11 @@ bool reductionConsumesDimension(gpu::ReduceOp reduce, int64_t dimension) {
       collectProducerRanges(source, sourceId, ranges, visited);
       if (llvm::any_of(ranges, [&](Operation *operation) {
             auto range = dyn_cast<MakeRangeOp>(operation);
-            auto sourceDimension =
-                range ? range->getAttrOfType<IntegerAttr>(sourceDimensionAttr)
-                      : IntegerAttr();
-            return sourceDimension && sourceDimension.getInt() == dimension;
+            FailureOr<uint64_t> sourceDimension =
+                range ? rangeDimension(range)
+                      : FailureOr<uint64_t>(failure());
+            return succeeded(sourceDimension) &&
+                   static_cast<int64_t>(*sourceDimension) == dimension;
           }))
         return true;
     }
@@ -844,9 +864,10 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         static_cast<uint32_t>(ParameterRole::OwnershipN),
         DenseI64ArrayAttr::get(kernel.getContext(), candidates));
     chunk = entry.create<ParameterOp>(range.getLoc(), entry.getIndexType(), schema);
-    if (auto dimension =
-            range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-      chunk->setAttr(dimensionAttr, dimension);
+    if (FailureOr<uint64_t> dimension = rangeDimension(range);
+        succeeded(dimension))
+      chunk->setAttr(dimensionAttr,
+                     entry.getI64IntegerAttr(*dimension));
   }
 
   auto originalType = dyn_cast<FragmentType>(range.getResult().getType());
@@ -883,9 +904,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         Value blocked = nested.create<MakeRangeOp>(
             location, blockedType, tileStart, chunk.getResult(), range.getStep(),
             range.getSourceId(), range.getSourceAxis());
-        for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
-          if (Attribute value = range->getAttr(attribute))
-            blocked.getDefiningOp()->setAttr(attribute, value);
+        if (Attribute value = range->getAttr(sourceSubregionAttr))
+          blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
         Value tail = nested.create<CompareOp>(
             location, predicateType(blockedType), blocked, end,
@@ -1276,24 +1296,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       Value step = builder.create<arith::ConstantIndexOp>(coordinate.getLoc(), 1);
       PhysicalExprAttr unit = expression(module.getContext(),
                                          PhysicalExprKind::Constant, 1);
-      auto dimension =
-          coordinate->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-      if (!dimension || dimension.getInt() <= 0)
+      int64_t dimension = coordinate.getDimensionId();
+      if (dimension <= 0)
         return coordinate.emitOpError(
             "workset coordinate has no logical dimension identity");
       auto type = FragmentType::get(
           module.getContext(), builder.getIndexType(), builder.getArrayAttr({unit}),
           builder.getArrayAttr({AxisMapAttr::get(
               module.getContext(), coordinate.getSourceId(),
-              coordinate.getSourceAxis(), dimension.getInt(),
+              coordinate.getSourceAxis(), dimension,
               /*fragmentAxis=*/0)}),
           /*validity=*/1, /*owner=*/1);
       auto range = builder.create<MakeRangeOp>(
           coordinate.getLoc(), type, coordinate.getResult(), extent, step,
           coordinate.getSourceId(), coordinate.getSourceAxis());
       range->setAttr(worksetCoordinateRangeAttr, builder.getUnitAttr());
-      if (Attribute dimension = coordinate->getAttr(sourceDimensionAttr))
-        range->setAttr(sourceDimensionAttr, dimension);
       coordinate.getResult().replaceAllUsesExcept(range.getResult(), range);
       liftedRanges.push_back(range);
     }
@@ -1436,9 +1453,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       llvm::SmallPtrSet<Operation *, 32> visited;
       std::optional<int64_t> sourceDimension;
-      if (auto dimension =
-              range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-        sourceDimension = dimension.getInt();
+      if (FailureOr<uint64_t> dimension = rangeDimension(range);
+          succeeded(dimension))
+        sourceDimension = *dimension;
       bool dependency = hasReductionDependency(store.getValue(),
                                                range.getSourceId(),
                                                sourceDimension, visited);
@@ -1520,9 +1537,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto blocked = builder.create<MakeRangeOp>(
           range.getLoc(), fragment, range.getStart(), extent, range.getStep(),
           range.getSourceId(), range.getSourceAxis());
-      for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
-        if (Attribute value = range->getAttr(attribute))
-          blocked->setAttr(attribute, value);
+      if (Attribute value = range->getAttr(sourceSubregionAttr))
+        blocked->setAttr(sourceSubregionAttr, value);
       Value endFragment =
           builder.create<BroadcastOp>(range.getLoc(), fragment, exactEnd);
       Value valid = builder.create<CompareOp>(
@@ -1716,12 +1732,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<uint64_t, uint64_t> sourceDimensions;
   llvm::MapVector<uint64_t, SmallVector<uint64_t>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
-    auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-    if (!dimension || dimension.getInt() <= 0 ||
+    FailureOr<uint64_t> dimension = rangeDimension(range);
+    if (failed(dimension) ||
         !ownershipSources.contains(range.getSourceId()))
       continue;
     uint64_t sourceId = range.getSourceId();
-    uint64_t dimensionId = dimension.getInt();
+    uint64_t dimensionId = *dimension;
     sourceDimensions[sourceId] = dimensionId;
     if (!llvm::is_contained(dimensionSources[dimensionId], sourceId))
       dimensionSources[dimensionId].push_back(sourceId);
@@ -1783,10 +1799,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               : FailureOr<uint64_t>(failure());
       if (succeeded(internalDimension)) {
         internalDimensions.insert(*internalDimension);
-      } else if (auto dimension =
-                     range->getAttrOfType<IntegerAttr>(sourceDimensionAttr)) {
-        internalDimensions.insert(dimension.getInt());
-      }
+      } else if (FailureOr<uint64_t> dimension = rangeDimension(range);
+                 succeeded(dimension))
+        internalDimensions.insert(*dimension);
       continue;
     }
     if (!ownershipOnly &&
@@ -1813,21 +1828,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       const bool dynamicSubregion = range->hasAttr(sourceSubregionAttr);
-      auto sourceDimension =
-          range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
-      if (!sourceDimension &&
-          physicalExtent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
-        StringRef symbol = physicalExtent.getSymbol().getValue();
-        uint64_t dimension = 0;
-        if (symbol.consume_front("D") &&
-            !symbol.getAsInteger(10, dimension))
-          sourceDimension = IntegerAttr::get(
-              IntegerType::get(kernel.getContext(), 64), dimension);
-      }
+      FailureOr<uint64_t> sourceDimension = rangeDimension(range);
       const bool launchVisibleDimension =
-          sourceDimension &&
-          succeeded(dimensionArgument(kernel, sourceDimension.getInt()));
+          succeeded(sourceDimension) &&
+          succeeded(dimensionArgument(kernel, *sourceDimension));
       if (dynamicSubregion ||
           launchVisibleDimension ||
           (logicalExtent && physicalExtent.getKind() ==
@@ -1852,7 +1856,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             module.getContext(),
             builder.getStringAttr(launchVisibleDimension
                                       ? ("FRAGMENT_D" +
-                                         Twine(sourceDimension.getInt()))
+                                         Twine(*sourceDimension))
                                             .str()
                                       : ("FRAGMENT_S" +
                                          Twine(range.getSourceId()))
@@ -1861,8 +1865,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             DenseI64ArrayAttr::get(module.getContext(), candidates));
         parameter = builder.create<ParameterOp>(
             range.getLoc(), builder.getIndexType(), schema);
-        if (sourceDimension)
-          (*parameter)->setAttr(dimensionAttr, sourceDimension);
+        if (succeeded(sourceDimension))
+          (*parameter)->setAttr(dimensionAttr,
+                                builder.getI64IntegerAttr(*sourceDimension));
       }
     }
     FailureOr<uint64_t> dimensionId =
@@ -2099,16 +2104,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ParameterOp parameter = parameters.lookup(dimensionId);
     FailureOr<Value> dimension = failure();
     arith::ConstantIndexOp staticExtent;
-    std::optional<uint64_t> sourceDimension;
-    if (auto identity =
-            range->getAttrOfType<IntegerAttr>(sourceDimensionAttr))
-      sourceDimension = identity.getInt();
+    FailureOr<uint64_t> sourceDimension = rangeDimension(range);
     if (isStaticAxis(dimensionId)) {
       staticExtent = range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
       if (staticExtent)
         dimension = Value(mappingBuilder.create<arith::ConstantIndexOp>(
             mapping.getLoc(), staticExtent.value()));
-      else if (sourceDimension)
+      else if (succeeded(sourceDimension))
         dimension = dimensionArgument(kernel, *sourceDimension);
     } else {
       dimension = dimensionArgument(kernel, dimensionId);
@@ -2148,9 +2150,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                            staticExtent.value());
     } else {
       uint64_t logicalDimension =
-          isStaticAxis(dimensionId) && sourceDimension ? *sourceDimension
-                                                       : dimensionId;
-      if (isStaticAxis(dimensionId) && !sourceDimension)
+          isStaticAxis(dimensionId) && succeeded(sourceDimension)
+              ? *sourceDimension
+              : dimensionId;
+      if (isStaticAxis(dimensionId) && failed(sourceDimension))
         return range.emitOpError(
             "range-local ownership axis lost its logical dimension extent");
       logical = expression(module.getContext(), PhysicalExprKind::Dimension, 0,
@@ -2276,9 +2279,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return range.emitOpError(
                  "dynamic pointwise range lost its canonical blocking dimension")
              << "; source_id=" << range.getSourceId()
-             << ", fragment=" << range.getResult().getType()
-             << ", source_dimension="
-             << range->getAttr(sourceDimensionAttr);
+             << ", fragment=" << range.getResult().getType();
     }
     Value tileCoordinate = tileCoordinates.lookup(*dimensionId);
     if (!tileCoordinate && internalDimensions.contains(*dimensionId))
@@ -2321,9 +2322,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    "workset coordinate range lost its logical dimension extent")
                << "; dimension=" << *dimensionId << ", source_id="
                << range.getSourceId() << ", parameter="
-               << parameter->getParameter().getName().getValue()
-               << ", source_dimension="
-               << range->getAttr(sourceDimensionAttr);
+               << parameter->getParameter().getName().getValue();
       Value remaining = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), dimension, tileOffset,
           BinaryOperator::Subtract);
@@ -2357,9 +2356,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     Value blocked = builder.create<MakeRangeOp>(
         range.getLoc(), blockedType, start, parameter->getResult(),
         range.getStep(), range.getSourceId(), range.getSourceAxis());
-    for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
-      if (Attribute value = range->getAttr(attribute))
-        blocked.getDefiningOp()->setAttr(attribute, value);
+    if (Attribute value = range->getAttr(sourceSubregionAttr))
+      blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     Value valid = builder.create<CompareOp>(range.getLoc(), predicateType(blockedType),
                                             blocked, endFragment,

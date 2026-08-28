@@ -738,9 +738,10 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         InFlightDiagnostic diagnostic = range.emitOpError(
             "Triton tl.arange physical extent must be a compile-time physical expression");
         diagnostic << "; source_id=" << range.getSourceId();
-        if (auto dimension =
-                range->getAttrOfType<IntegerAttr>(gpu::sourceDimensionAttr))
-          diagnostic << ", source_dimension=" << dimension.getInt();
+        if (fragment && fragment.getAxisMaps().size() == 1)
+          diagnostic << ", source_dimension="
+                     << cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[0])
+                            .getDimensionId();
         unsigned loopDepth = 0;
         for (Operation *parent = range->getParentOp(); parent;
              parent = parent->getParentOp())
