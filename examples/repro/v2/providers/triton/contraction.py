@@ -130,7 +130,7 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         and triton_parameter_value(
             config, TRITON_PARAMETER_TRAVERSAL_WORKERS
         )
-        == 1
+        == 8
         and triton_parameter_value(
             config, TRITON_PARAMETER_RESIDENT_WORKERS
         )

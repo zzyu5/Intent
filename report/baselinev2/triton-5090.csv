@@ -1,7 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status
 fused_softmax,8192x8192-fp16,0.176928,0.186680,0.947761,pass
 dense_gemm,M4096-N14336-K4096-fp16,2.081536,2.083904,0.998864,pass
-grouped_gemm,E8-M1024-K4096-N14336-fp16,5.395192,4.567808,1.181134,pass
+grouped_gemm,E8-M1024-K4096-N14336-fp16,4.691296,4.567840,1.027027,pass
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,3.331088,2.770560,1.202316,pass
 layer_norm,8192x4096-fp16,0.085776,0.089760,0.955615,pass
 flash_cross_entropy,8192x32768-bf16,0.342184,0.344616,0.992943,pass
@@ -27,7 +27,7 @@ causal_conv1d_update,B32-D4096-W4-bf16,0.006576,0.006112,1.075916,pass
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.012288,0.008208,1.497076,pass
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap
-moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.393552,2.377112,1.006916,pass
+moe_expert_projection,T2048-E8-top2-4096x14336-bf16,3.757712,2.370048,1.585500,pass
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,9.070104,3.384416,2.679961,pass
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.016144,0.014112,1.143991,pass
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.012048,0.012048,1.000000,pass

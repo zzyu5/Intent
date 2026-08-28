@@ -77,12 +77,6 @@ LogicalResult refineProgramMapping(ModuleOp module) {
             static_cast<uint32_t>(ParameterRole::TraversalWorkers))
       return mapping.emitOpError(
           "traversal-worker coordinate lacks its physical parameter");
-    ParameterAttr schema = parameter.getParameter();
-    parameter->setAttr(
-        "parameter",
-        ParameterAttr::get(module.getContext(), schema.getName(),
-                           schema.getRole(), DenseI64ArrayAttr::get(
-                                                 module.getContext(), {1})));
   }
 
   auto capabilities =
