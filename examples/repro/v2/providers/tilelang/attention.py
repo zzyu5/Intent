@@ -23,7 +23,11 @@ from kernels.streaming.block_sparse_attention import block_sparse_gqa_decode_par
 from kernels.streaming.mla import paged_mla_decode
 
 from ...measurement import compile_single
+from ...measurement import candidate_parameter_value
 from ...measurement import functional_launch
+from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
+from ...measurement import TRITON_PARAMETER_PROVIDER_THREADS
+from ...measurement import TRITON_PARAMETER_REDUCTION
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -400,6 +404,20 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
             "BLOCK_SIZE": block_size,
             "SPLITS": splits,
         },
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_REDUCTION, dimension=4
+            )
+            == dimension
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_REDUCTION, dimension=1
+            )
+            == block_size
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 128
+        ),
     )
     partial_lse, partial_output = partial.outputs()
     _, combined = compile_single(
@@ -407,6 +425,20 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         block_sparse_gqa_decode_combine,
         (partial_lse, partial_output),
         constexprs={"SPLITS": splits},
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
+            )
+            == query_heads
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_REDUCTION, dimension=1
+            )
+            == splits
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 128
+        ),
     )
 
     def generated_launch():

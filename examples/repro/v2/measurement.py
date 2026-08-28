@@ -69,7 +69,7 @@ def candidate_parameter_value(
     return values[0] if len(values) == 1 else None
 
 
-def _restrict_generated_candidates(
+def restrict_generated_candidates(
     context: Context,
     artifact,
     predicate: Callable[[GeneratedCandidate], bool],
@@ -167,7 +167,7 @@ def compile_single(
             "cannot combine Triton-specific and provider-neutral candidate filters",
         )
     if generated_candidate_filter is not None:
-        _restrict_generated_candidates(context, artifact, generated_candidate_filter)
+        restrict_generated_candidates(context, artifact, generated_candidate_filter)
     elif triton_config_filter is not None:
         triton_autotuner = artifact._namespace.get("_intent_kernel")
         configs = getattr(triton_autotuner, "configs", None)

@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
+#include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -12,6 +13,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <map>
 #include <sstream>
@@ -260,7 +262,75 @@ private:
     };
     for (const ParameterDomain &domain : domains)
       expand(domain.name, domain.candidates);
-    return configs;
+    SmallVector<std::map<std::string, int64_t>> legal;
+    for (auto &config : configs)
+      if (configurationIsLegal(config))
+        legal.push_back(std::move(config));
+    return legal;
+  }
+
+  std::optional<int64_t>
+  evaluate(gpu::PhysicalExprAttr expression,
+           const std::map<std::string, int64_t> &config) const {
+    auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+    if (kind == gpu::PhysicalExprKind::Constant)
+      return expression.getValue();
+    if (kind == gpu::PhysicalExprKind::Parameter) {
+      auto found = config.find(expression.getSymbol().getValue().str());
+      return found == config.end() ? std::nullopt
+                                   : std::optional<int64_t>(found->second);
+    }
+    SmallVector<int64_t> operands;
+    for (Attribute operand : expression.getOperands()) {
+      std::optional<int64_t> value =
+          evaluate(cast<gpu::PhysicalExprAttr>(operand), config);
+      if (!value)
+        return std::nullopt;
+      operands.push_back(*value);
+    }
+    if (kind == gpu::PhysicalExprKind::Add)
+      return operands[0] + operands[1];
+    if (kind == gpu::PhysicalExprKind::Subtract)
+      return operands[0] - operands[1];
+    if (kind == gpu::PhysicalExprKind::Multiply)
+      return operands[0] * operands[1];
+    if (kind == gpu::PhysicalExprKind::CeilDiv && operands[1] > 0)
+      return (operands[0] + operands[1] - 1) / operands[1];
+    if (kind == gpu::PhysicalExprKind::FloorDiv && operands[1] > 0)
+      return operands[0] / operands[1];
+    if (kind == gpu::PhysicalExprKind::Minimum)
+      return std::min(operands[0], operands[1]);
+    if (kind == gpu::PhysicalExprKind::Maximum)
+      return std::max(operands[0], operands[1]);
+    return std::nullopt;
+  }
+
+  bool configurationIsLegal(
+      const std::map<std::string, int64_t> &config) {
+    std::optional<int64_t> threads;
+    for (const auto &[name, role] : parameterRoles) {
+      if (role != static_cast<uint32_t>(gpu::ParameterRole::ProviderThreads))
+        continue;
+      auto found = config.find(name);
+      if (found != config.end())
+        threads = found->second;
+    }
+    if (!threads)
+      return true;
+    bool legal = true;
+    kernel.walk([&](GemmOp gemm) {
+      auto lhs = gemm.getLhs().getType();
+      auto rhs = gemm.getRhs().getType();
+      auto m = evaluate(cast<gpu::PhysicalExprAttr>(
+                            lhs.getShape()[gemm.getTransposeLhs() ? 1 : 0]),
+                        config);
+      auto n = evaluate(cast<gpu::PhysicalExprAttr>(
+                            rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]),
+                        config);
+      if (m && n)
+        legal &= isLegalMmaWarpPartition(*m, *n, *threads);
+    });
+    return legal;
   }
 
   void emitBuilder() {
@@ -287,7 +357,10 @@ private:
       }
       output << "},\n";
     }
-    output << "], warmup=3, rep=10)\n@tilelang.jit\ndef _intent_kernel(";
+    output << "], warmup=3, rep=10)\n"
+              "@tilelang.jit(pass_configs={"
+              "tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: True"
+              "})\ndef _intent_kernel(";
     bool first = true;
     auto argument = [&](StringRef text) {
       if (!first)
@@ -516,15 +589,25 @@ private:
     } else if (auto fill = dyn_cast<FillOp>(operation)) {
       line("T.fill(" + valueString(fill.getBuffer()) + ", " +
            valueString(fill.getValue()) + ")");
+    } else if (isa<SyncOp>(operation)) {
+      line("T.sync_threads()");
     } else if (auto copy = dyn_cast<CopyInOp>(operation)) {
-      line("T.copy(" + valueString(copy.getSource()) + index(copy.getOffsets()) +
+      line("T.copy(" + valueString(copy.getSource()) +
+           regionIndex(copy.getOffsets(), copy.getSourceAxes(),
+                       copy.getDestination().getType().getShape()) +
            ", " + valueString(copy.getDestination()) + ")");
     } else if (auto copy = dyn_cast<CopyOutOp>(operation)) {
       line("T.copy(" + valueString(copy.getSource()) + ", " +
-           valueString(copy.getDestination()) + index(copy.getOffsets()) + ")");
+           valueString(copy.getDestination()) +
+           regionIndex(copy.getOffsets(), copy.getDestinationAxes(),
+                       copy.getSource().getType().getShape()) +
+           ")");
     } else if (auto copy = dyn_cast<CastCopyOutOp>(operation)) {
       line("T.copy(" + valueString(copy.getSource()) + ", " +
-           valueString(copy.getDestination()) + index(copy.getOffsets()) + ")");
+           valueString(copy.getDestination()) +
+           regionIndex(copy.getOffsets(), copy.getDestinationAxes(),
+                       copy.getSource().getType().getShape()) +
+           ")");
     } else if (auto parallel = dyn_cast<ParallelOp>(operation)) {
       Block &body = parallel.getBody().front();
       std::string variables;
@@ -656,6 +739,26 @@ private:
       if (axis)
         result += ", ";
       result += valueString(offset);
+    }
+    return result + "]";
+  }
+
+  std::string regionIndex(ValueRange offsets, ArrayRef<int64_t> viewAxes,
+                          ArrayAttr bufferShape) {
+    SmallVector<std::optional<unsigned>> viewToBuffer(offsets.size());
+    for (auto [bufferAxis, viewAxis] : llvm::enumerate(viewAxes))
+      viewToBuffer[viewAxis] = bufferAxis;
+    std::string result = "[";
+    for (auto [viewAxis, offset] : llvm::enumerate(offsets)) {
+      if (viewAxis)
+        result += ", ";
+      std::string begin = valueString(offset);
+      result += begin;
+      if (std::optional<unsigned> bufferAxis = viewToBuffer[viewAxis])
+        result += ":(" + begin + " + " +
+                  expressionString(cast<gpu::PhysicalExprAttr>(
+                      bufferShape[*bufferAxis])) +
+                  ")";
     }
     return result + "]";
   }

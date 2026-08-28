@@ -122,6 +122,13 @@ Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
   return builder.create<CompareOp>(location, result, lhs, rhs, predicate);
 }
 
+void inheritRangeAuthority(Value derived, MakeRangeOp source) {
+  Operation *operation = derived.getDefiningOp();
+  for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
+    if (Attribute value = source->getAttr(attribute))
+      operation->setAttr(attribute, value);
+}
+
 FailureOr<AxisMapAttr> axisMap(FragmentType fragment, unsigned axis) {
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
@@ -1419,6 +1426,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         Value lhsK = nested.create<MakeRangeOp>(
             nestedLocation, lhsIndexType, kStart, blockK.getResult(), one,
             lhsMap->getSourceId(), lhsMap->getSourceAxis());
+        inheritRangeAuthority(lhsK, lhsRange);
         Value rhsOffset = binary(
             nested, nestedLocation, nested.getIndexType(), kStart,
             lhsRange.getStart(), 1);
@@ -1428,6 +1436,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
             rhsMap->getSourceId(), rhsMap->getSourceAxis());
+        inheritRangeAuthority(rhsK, rhsRange);
         IRMapping lhsReplay;
         IRMapping rhsReplay;
         for (MakeRangeOp range : lhsRanges)
@@ -1828,6 +1837,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
       columnMap->getSourceId(), columnMap->getSourceAxis());
+  inheritRangeAuthority(columns, columnRange);
   Value columnEnd = broadcast(builder, location, columnIndexType, columnStop);
   Value columnValid =
       compare(builder, location, columnPredicateType, columns, columnEnd, 2);
@@ -1836,6 +1846,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value rows = rowBuilder.create<MakeRangeOp>(
         location, rowIndexType, rowStart, blockM.getResult(), one,
         rowMap->getSourceId(), rowMap->getSourceAxis());
+    inheritRangeAuthority(rows, rowRange);
     Value rowEnd = broadcast(rowBuilder, location, rowIndexType, rowStop);
     Value rowValid =
         compare(rowBuilder, location, rowPredicateType, rows, rowEnd, 2);
@@ -1889,6 +1900,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           Value reductions = nested.create<MakeRangeOp>(
               nestedLocation, reductionIndexType, kStart, blockK.getResult(), one,
               lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis());
+          inheritRangeAuthority(reductions, lhsReductionRange);
           Value reductionEnd =
               broadcast(nested, nestedLocation, reductionIndexType, reductionStop);
           Value reductionValid = compare(nested, nestedLocation,
@@ -2468,9 +2480,11 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value rows = builder.create<MakeRangeOp>(
       location, rowIndexType, rowStart, blockM.getResult(), one,
       rowMap->getSourceId(), rowMap->getSourceAxis());
+  inheritRangeAuthority(rows, *rowRange);
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
       columnMap->getSourceId(), columnMap->getSourceAxis());
+  inheritRangeAuthority(columns, *columnRange);
   Value rowValid = compare(
       builder, location, rowPredicateType, rows,
       broadcast(builder, location, rowIndexType, rowStop), 2);
@@ -2488,6 +2502,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         Value blocks = nested.create<MakeRangeOp>(
             nestedLocation, blockIndexType, blockStart, blockK.getResult(), one,
             lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis());
+        inheritRangeAuthority(blocks, *blockRange);
         Value blockValid = compare(
             nested, nestedLocation, blockPredicateType, blocks,
             broadcast(nested, nestedLocation, blockIndexType, blockStop), 2);

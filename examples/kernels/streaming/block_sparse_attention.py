@@ -38,6 +38,7 @@ def block_sparse_gqa_decode_partials(
     B, HQ, D = q.shape
     KV_HEADS = k.shape[2]
     K = k.shape[1]
+    key_members = I.domain(0, K)
     local_query_head_axis = I.domain(0, HEAD_GROUP)
     for batch in I.parallel(I.domain(0, B)):
         for key_head in I.parallel(I.domain(0, KV_HEADS)):
@@ -55,65 +56,41 @@ def block_sparse_gqa_decode_partials(
                 selected_count = I.cast(
                     split_offsets[split + 1] - split_offsets[split], I.index
                 )
-                token_count = selected_count * BLOCK_SIZE
-                flat_tokens = I.domain(0, token_count)
-                flat_token = I.indices(flat_tokens)
-                selected_ordinal = flat_token // BLOCK_SIZE
-                token_offset = flat_token % BLOCK_SIZE
-                selected_index = selected_begin + selected_ordinal
-                I.assume_in_bounds(selected_index, block_indices, axis=2)
-                selected_block = I.cast(
-                    block_indices[batch, key_head, selected_index],
-                    I.index,
-                )
-                safe_block = I.mask(
-                    selected_block,
-                    valid=selected_block >= 0,
-                    fill=I.cast(0, I.index),
-                )
-                token_index = safe_block * BLOCK_SIZE + token_offset
-                valid_token = (
-                    (selected_block >= 0)
-                    & (token_index < K)
-                    & (token_index < I.cast(cache_lengths[batch], I.index))
-                )
-                safe_token_index = I.select(valid_token, token_index, 0)
-                key_block = I.gather(
-                    k,
-                    index=(
-                        batch,
-                        safe_token_index,
-                        key_head,
-                        slice(None),
-                    ),
-                )
-                value_block = I.gather(
-                    v,
-                    index=(
-                        batch,
-                        safe_token_index,
-                        key_head,
-                        slice(None),
-                    ),
-                )
-                flat_valid = valid_token
-                summary = I.region_fold(
-                    source=(
-                        key_block,
-                        value_block,
-                        token_index,
-                        flat_valid,
-                    ),
-                    axis=0,
-                    summarize=summarize_masked_attention_chunk,
-                    combine=merge_attention_summaries,
-                    identity=empty_attention_summary(local_query_head_axis, D),
-                    operands=(
+                summary = empty_attention_summary(local_query_head_axis, D)
+                for selected_ordinal in I.domain(0, selected_count):
+                    selected_index = selected_begin + selected_ordinal
+                    I.assume_in_bounds(selected_index, block_indices, axis=2)
+                    selected_block = I.cast(
+                        block_indices[batch, key_head, selected_index],
+                        I.index,
+                    )
+                    block_valid = selected_block >= 0
+                    safe_block = I.select(
+                        block_valid,
+                        selected_block,
+                        I.cast(0, I.index),
+                    )
+                    selected_block_begin = safe_block * BLOCK_SIZE
+                    selected_block_end = selected_block_begin + BLOCK_SIZE
+                    I.assume_in_bounds(selected_block_end - 1, k, axis=1)
+                    I.assume_in_bounds(selected_block_end - 1, v, axis=1)
+                    key_region = key_members[
+                        selected_block_begin:selected_block_end
+                    ]
+                    token_indices = I.indices(key_region)
+                    active = block_valid & (
+                        token_indices < I.cast(cache_lengths[batch], I.index)
+                    )
+                    block_summary = summarize_masked_attention_chunk(
+                        k[batch, key_region, key_head, :],
+                        v[batch, key_region, key_head, :],
+                        token_indices,
+                        active,
                         query,
                         query_head_indices,
                         scale,
-                    ),
-                )
+                    )
+                    summary = merge_attention_summaries(summary, block_summary)
                 safe_denominator = I.select(
                     summary.valid,
                     summary.denominator,

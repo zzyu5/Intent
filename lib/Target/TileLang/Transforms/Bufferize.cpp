@@ -34,6 +34,31 @@ bool isZero(Value value) {
   }
   if (auto splat = value.getDefiningOp<gpu::SplatOp>())
     return isZero(splat.getValue());
+  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
+    return isZero(broadcast.getValue());
+  if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>())
+    return isZero(reshape.getValue());
+  if (auto transpose = value.getDefiningOp<gpu::TransposeOp>())
+    return isZero(transpose.getValue());
+  if (auto select = value.getDefiningOp<gpu::SelectOp>())
+    return isZero(select.getTrueValue()) && isZero(select.getFalseValue());
+  return false;
+}
+
+bool isTrue(Value value) {
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>())
+    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+      return integer.getInt() == 1;
+  if (auto splat = value.getDefiningOp<gpu::SplatOp>())
+    return isTrue(splat.getValue());
+  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
+    return isTrue(broadcast.getValue());
+  if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>())
+    return isTrue(reshape.getValue());
+  if (auto transpose = value.getDefiningOp<gpu::TransposeOp>())
+    return isTrue(transpose.getValue());
+  if (auto select = value.getDefiningOp<gpu::SelectOp>())
+    return isTrue(select.getTrueValue()) && isTrue(select.getFalseValue());
   return false;
 }
 
@@ -62,6 +87,47 @@ std::optional<int64_t> constantValue(Value value) {
     return constantValue(range.getStep());
   }
   if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
+    auto equals = [&](Value operand, int64_t expected) {
+      std::optional<int64_t> actual = constantValue(operand);
+      return actual && *actual == expected;
+    };
+    switch (binary.getOperatorKind()) {
+    case 0: {
+      if (equals(binary.getLhs(), 0))
+        return constantValue(binary.getRhs());
+      if (equals(binary.getRhs(), 0))
+        return constantValue(binary.getLhs());
+      break;
+    }
+    case 1: {
+      if (equals(binary.getRhs(), 0))
+        return constantValue(binary.getLhs());
+      if (binary.getLhs() == binary.getRhs())
+        return 0;
+      if (auto add = binary.getLhs().getDefiningOp<gpu::BinaryOp>())
+        if (add.getOperatorKind() == 0) {
+          if (add.getLhs() == binary.getRhs())
+            return constantValue(add.getRhs());
+          if (add.getRhs() == binary.getRhs())
+            return constantValue(add.getLhs());
+        }
+      break;
+    }
+    case 2:
+      if (equals(binary.getLhs(), 0) || equals(binary.getRhs(), 0))
+        return 0;
+      if (equals(binary.getLhs(), 1))
+        return constantValue(binary.getRhs());
+      if (equals(binary.getRhs(), 1))
+        return constantValue(binary.getLhs());
+      break;
+    case 4:
+      if (equals(binary.getRhs(), 1))
+        return constantValue(binary.getLhs());
+      break;
+    default:
+      break;
+    }
     std::optional<int64_t> lhs = constantValue(binary.getLhs());
     std::optional<int64_t> rhs = constantValue(binary.getRhs());
     if (!lhs || !rhs)
@@ -86,6 +152,58 @@ std::optional<int64_t> constantValue(Value value) {
 bool isProvably(Value value, int64_t expected) {
   std::optional<int64_t> actual = constantValue(value);
   return actual && *actual == expected;
+}
+
+bool sameProvableValue(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  std::optional<int64_t> left = constantValue(lhs);
+  std::optional<int64_t> right = constantValue(rhs);
+  if (left && right)
+    return *left == *right;
+  if (lhs.getType() != rhs.getType())
+    return false;
+  if (auto leftBinary = lhs.getDefiningOp<gpu::BinaryOp>()) {
+    auto rightBinary = rhs.getDefiningOp<gpu::BinaryOp>();
+    if (!rightBinary ||
+        leftBinary.getOperatorKind() != rightBinary.getOperatorKind())
+      return false;
+    bool direct =
+        sameProvableValue(leftBinary.getLhs(), rightBinary.getLhs()) &&
+        sameProvableValue(leftBinary.getRhs(), rightBinary.getRhs());
+    if (direct)
+      return true;
+    uint64_t kind = leftBinary.getOperatorKind();
+    bool commutative = kind == 0 || kind == 2 || kind == 7 || kind == 8 ||
+                       kind == 9 || kind == 10 || kind == 11 || kind == 12 ||
+                       kind == 13 || kind == 14 || kind == 15;
+    return commutative &&
+           sameProvableValue(leftBinary.getLhs(), rightBinary.getRhs()) &&
+           sameProvableValue(leftBinary.getRhs(), rightBinary.getLhs());
+  }
+  if (auto leftCompare = lhs.getDefiningOp<gpu::CompareOp>()) {
+    auto rightCompare = rhs.getDefiningOp<gpu::CompareOp>();
+    return rightCompare &&
+           leftCompare.getPredicate() == rightCompare.getPredicate() &&
+           sameProvableValue(leftCompare.getLhs(), rightCompare.getLhs()) &&
+           sameProvableValue(leftCompare.getRhs(), rightCompare.getRhs());
+  }
+  if (auto leftSelect = lhs.getDefiningOp<gpu::SelectOp>()) {
+    auto rightSelect = rhs.getDefiningOp<gpu::SelectOp>();
+    return rightSelect &&
+           sameProvableValue(leftSelect.getCondition(),
+                             rightSelect.getCondition()) &&
+           sameProvableValue(leftSelect.getTrueValue(),
+                             rightSelect.getTrueValue()) &&
+           sameProvableValue(leftSelect.getFalseValue(),
+                             rightSelect.getFalseValue());
+  }
+  if (auto leftCast = lhs.getDefiningOp<gpu::CastOp>()) {
+    auto rightCast = rhs.getDefiningOp<gpu::CastOp>();
+    return rightCast &&
+           sameProvableValue(leftCast.getValue(), rightCast.getValue());
+  }
+  return false;
 }
 
 Value stripBroadcast(Value value) {
@@ -149,7 +267,40 @@ bool derivesFromCoordinate(Value value, Value coordinate) {
     return true;
   if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
     return derivesFromCoordinate(broadcast.getValue(), coordinate);
+  value = stripBroadcast(value);
+  coordinate = stripBroadcast(coordinate);
+  auto lhsRange = value.getDefiningOp<gpu::MakeRangeOp>();
+  auto rhsRange = coordinate.getDefiningOp<gpu::MakeRangeOp>();
+  if (lhsRange && rhsRange &&
+      lhsRange.getSourceId() == rhsRange.getSourceId() &&
+      lhsRange.getSourceAxis() == rhsRange.getSourceAxis() &&
+      sameProvableValue(lhsRange.getStart(), rhsRange.getStart()) &&
+      sameProvableValue(lhsRange.getExtent(), rhsRange.getExtent()) &&
+      sameProvableValue(lhsRange.getStep(), rhsRange.getStep()))
+    return true;
   return false;
+}
+
+bool hasExactRangeCoverage(Value coordinate, Value upperBound) {
+  coordinate = stripBroadcast(coordinate);
+  upperBound = stripBroadcast(upperBound);
+  auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>();
+  auto add = upperBound.getDefiningOp<gpu::BinaryOp>();
+  if (!range || !add || add.getOperatorKind() != 0 ||
+      !isProvably(range.getStep(), 1))
+    return false;
+  Value extent;
+  if (sameProvableValue(add.getLhs(), range.getStart()))
+    extent = add.getRhs();
+  else if (sameProvableValue(add.getRhs(), range.getStart()))
+    extent = add.getLhs();
+  else
+    return false;
+  if (extent == range.getExtent())
+    return true;
+  std::optional<int64_t> actual = constantValue(extent);
+  std::optional<int64_t> physical = constantValue(range.getExtent());
+  return actual && physical && *actual == *physical;
 }
 
 bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
@@ -157,6 +308,14 @@ bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
   if (!valid)
     return true;
   valid = stripBroadcast(valid);
+  if (isTrue(valid))
+    return true;
+  if (auto reshape = valid.getDefiningOp<gpu::ReshapeOp>())
+    return isFullViewValidity(reshape.getValue(), resource, coordinates,
+                              sourceAxes);
+  if (auto transpose = valid.getDefiningOp<gpu::TransposeOp>())
+    return isFullViewValidity(transpose.getValue(), resource, coordinates,
+                              sourceAxes);
   if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
     if (binary.getOperatorKind() != 11)
       return false;
@@ -170,7 +329,8 @@ bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
     return false;
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
     if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
-        isViewExtent(compare.getRhs(), resource, sourceAxis))
+        (isViewExtent(compare.getRhs(), resource, sourceAxis) ||
+         hasExactRangeCoverage(coordinate, compare.getRhs())))
       return true;
   return false;
 }
@@ -280,11 +440,16 @@ public:
       boundsAssumptions.push_back(op);
     });
 
-    for (gpu::LoadOp load : loads)
-      if (failed(lowerLoad(load, directContractOperands.contains(load.getResult())
-                                     ? 0u
-                                     : 1u)))
+    for (gpu::LoadOp load : loads) {
+      llvm::DenseSet<Value> visited;
+      if (failed(lowerLoad(load,
+                           feedsDirectContractOperand(load.getResult(), visited)
+                               ? 0u
+                               : 1u)))
         return failure();
+    }
+    if (failed(prepareFragmentLoopCarries()))
+      return failure();
     // Preserve physical SSA/program order across native computations.  A
     // second contraction may consume a reduction produced after an earlier
     // contraction (online softmax is the canonical example); lowering all
@@ -329,6 +494,22 @@ private:
     scf::ForOp loop;
     SmallVector<unsigned> indices;
   };
+
+  bool feedsDirectContractOperand(Value value,
+                                  llvm::DenseSet<Value> &visited) const {
+    if (!visited.insert(value).second)
+      return false;
+    if (directContractOperands.contains(value))
+      return true;
+    for (Operation *user : value.getUsers()) {
+      if (user->getNumResults() != 1 ||
+          !isa<gpu::CastOp, gpu::ReshapeOp, gpu::TransposeOp>(user))
+        continue;
+      if (feedsDirectContractOperand(user->getResult(0), visited))
+        return true;
+    }
+    return false;
+  }
 
   void flattenValue(OpBuilder &builder, Value value,
                     SmallVectorImpl<Value> &leaves) {
@@ -529,20 +710,30 @@ private:
     return result;
   }
 
-  FailureOr<SmallVector<unsigned>> copyInAxisOrder(
-      gpu::LoadOp load, gpu::FragmentType fragment) {
-    auto view = cast<gpu::ViewType>(load.getResource().getType());
-    if (load.getCoordinates().size() != view.getRank() ||
-        load.getSourceAxes().size() != view.getRank() ||
-        fragment.getShape().size() != view.getRank())
+  struct CopyLayout {
+    SmallVector<unsigned> bufferToFragment;
+    SmallVector<int64_t> viewAxes;
+  };
+
+  FailureOr<CopyLayout> copyLayout(ValueRange coordinates,
+                                   ArrayRef<int64_t> sourceAxes,
+                                   unsigned viewRank,
+                                   gpu::FragmentType fragment) {
+    if (coordinates.size() != viewRank || sourceAxes.size() != viewRank)
       return failure();
-    SmallVector<unsigned> bufferToFragment(view.getRank());
-    SmallVector<bool> assigned(view.getRank(), false);
+    SmallVector<std::optional<unsigned>> viewToFragment(viewRank);
+    SmallVector<bool> assignedView(viewRank, false);
+    SmallVector<bool> assignedFragment(fragment.getShape().size(), false);
     for (auto [coordinate, viewAxis] :
-         llvm::zip(load.getCoordinates(), load.getSourceAxes())) {
+         llvm::zip(coordinates, sourceAxes)) {
+      if (viewAxis < 0 || viewAxis >= static_cast<int64_t>(viewRank) ||
+          assignedView[viewAxis])
+        return failure();
+      assignedView[viewAxis] = true;
       auto coordinateType = dyn_cast<gpu::FragmentType>(coordinate.getType());
-      if (!coordinateType || coordinateType.getShape().size() != 1 ||
-          viewAxis < 0 || viewAxis >= static_cast<int64_t>(view.getRank()))
+      if (!coordinateType)
+        continue;
+      if (coordinateType.getShape().size() != 1)
         return failure();
       auto coordinateMap =
           cast<gpu::AxisMapAttr>(coordinateType.getAxisMaps()[0]);
@@ -556,14 +747,21 @@ private:
           fragmentAxis = axis;
         }
       }
-      if (!fragmentAxis || assigned[viewAxis])
+      if (!fragmentAxis || assignedFragment[*fragmentAxis])
         return failure();
-      bufferToFragment[viewAxis] = *fragmentAxis;
-      assigned[viewAxis] = true;
+      viewToFragment[viewAxis] = *fragmentAxis;
+      assignedFragment[*fragmentAxis] = true;
     }
-    if (llvm::any_of(assigned, [](bool value) { return !value; }))
+    if (llvm::any_of(assignedView, [](bool value) { return !value; }) ||
+        llvm::any_of(assignedFragment, [](bool value) { return !value; }))
       return failure();
-    return bufferToFragment;
+    CopyLayout result;
+    for (auto [viewAxis, fragmentAxis] : llvm::enumerate(viewToFragment))
+      if (fragmentAxis) {
+        result.viewAxes.push_back(viewAxis);
+        result.bufferToFragment.push_back(*fragmentAxis);
+      }
+    return result;
   }
 
   SmallVector<unsigned> identityAxisOrder(unsigned rank) {
@@ -830,6 +1028,14 @@ private:
              "TileLang bufferization cannot scalarize physical fragment producer ")
              << producer->getName();
     }
+    // Scalarization has rebuilt this pure fragment producer inside the
+    // provider-native lane loop.  Record every producer in the recursively
+    // scalarized DAG, not only the materialization root: post-loop pointwise
+    // chains can otherwise keep a bufferized scf.for result live even though
+    // all terminal structured/store consumers already use the rebuilt scalar
+    // graph.  Erasure remains use-driven, so a shared producer is retained
+    // until every consumer has been lowered.
+    lowered.insert(producer);
     memo[value] = result;
     return result;
   }
@@ -878,17 +1084,17 @@ private:
               "TileLang indirect access fragment cannot be materialized");
     FailureOr<SmallVector<Value>> offsets =
         accessOffsets(load, load.getCoordinates(), load.getSourceAxes());
-    FailureOr<Value> fill = scalarSplat(load.getFill());
-    FailureOr<SmallVector<unsigned>> copyOrder =
-        copyInAxisOrder(load, fragment);
-    bool directCopy = succeeded(offsets) && succeeded(copyOrder) &&
+    FailureOr<CopyLayout> layout =
+        copyLayout(load.getCoordinates(), load.getSourceAxes(), view.getRank(),
+                   fragment);
+    bool directCopy = succeeded(offsets) && succeeded(layout) &&
                       isFullViewValidity(load.getValid(), load.getResource(),
                                          load.getCoordinates(),
                                          load.getSourceAxes()) &&
-                      (!load.getFill() || (succeeded(fill) && isZero(*fill)));
+                      (!load.getFill() || isZero(load.getFill()));
     SmallVector<Attribute> allocationShape;
     if (directCopy)
-      for (unsigned fragmentAxis : *copyOrder)
+      for (unsigned fragmentAxis : layout->bufferToFragment)
         allocationShape.push_back(fragment.getShape()[fragmentAxis]);
     FailureOr<Value> allocation = allocateFor(
         load.getResult(), space, load,
@@ -901,9 +1107,11 @@ private:
     if (directCopy) {
       OpBuilder builder(load);
       builder.create<CopyInOp>(load.getLoc(), load.getResource(), *offsets,
-                               destination);
+                               destination,
+                               DenseI64ArrayAttr::get(kernel.getContext(),
+                                                      layout->viewAxes));
       if (space == 0)
-        sharedBufferAxes[load.getResult()] = *copyOrder;
+        sharedBufferAxes[load.getResult()] = layout->bufferToFragment;
     } else {
       FailureOr<ParallelOp> parallel = createParallel(load, fragment);
       if (failed(parallel))
@@ -941,9 +1149,13 @@ private:
       builder.create<BufferStoreOp>(load.getLoc(), destination,
                                     body.getArguments(), loaded);
       builder.create<YieldOp>(load.getLoc());
-      if (space == 0)
+      if (space == 0) {
         sharedBufferAxes[load.getResult()] =
             identityAxisOrder(fragment.getShape().size());
+        OpBuilder after(load);
+        after.setInsertionPointAfter(load);
+        after.create<SyncOp>(load.getLoc());
+      }
     }
     (space == 0 ? sharedBuffers : fragmentBuffers)[load.getResult()] =
         destination;
@@ -959,6 +1171,34 @@ private:
         space == 0 ? sharedBuffers : fragmentBuffers;
     if (Value existing = selected.lookup(value))
       return existing;
+    if (space == 0 && directContractOperands.contains(value))
+      if (auto transpose = value.getDefiningOp<gpu::TransposeOp>()) {
+        Value source = transpose.getValue();
+        if (Value existing = sharedBuffers.lookup(source)) {
+          ArrayRef<int64_t> permutation = transpose.getPermutation();
+          SmallVector<unsigned> sourceOrder = sharedBufferAxes.lookup(source);
+          if (sourceOrder.empty())
+            sourceOrder = identityAxisOrder(permutation.size());
+          if (permutation.size() != sourceOrder.size())
+            return transpose.emitOpError(
+                "TileLang shared transpose has inconsistent physical axes");
+          SmallVector<unsigned> inverse(permutation.size());
+          for (auto [targetAxis, sourceAxis] : llvm::enumerate(permutation)) {
+            if (sourceAxis < 0 ||
+                sourceAxis >= static_cast<int64_t>(permutation.size()))
+              return transpose.emitOpError(
+                  "TileLang shared transpose permutation is invalid");
+            inverse[sourceAxis] = targetAxis;
+          }
+          SmallVector<unsigned> targetOrder;
+          for (unsigned sourceAxis : sourceOrder)
+            targetOrder.push_back(inverse[sourceAxis]);
+          sharedBuffers[value] = existing;
+          sharedBufferAxes[value] = std::move(targetOrder);
+          lowered.insert(transpose);
+          return existing;
+        }
+      }
     if (auto loop = value.getDefiningOp<scf::ForOp>()) {
       if (failed(bufferizeFragmentLoopCarries(loop)))
         return failure();
@@ -996,12 +1236,13 @@ private:
     builder.create<BufferStoreOp>(owner->getLoc(), *allocation,
                                   body.getArguments(), *scalar);
     builder.create<YieldOp>(owner->getLoc());
+    if (space == 0) {
+      OpBuilder after(owner);
+      after.create<SyncOp>(owner->getLoc());
+    }
     selected[value] = *allocation;
     if (space == 0)
       sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
-    if (Operation *producer = value.getDefiningOp())
-      if (!isa<gpu::LoadOp>(producer))
-        lowered.insert(producer);
     return *allocation;
   }
 
@@ -1109,6 +1350,10 @@ private:
     builder.create<BufferStoreOp>(owner->getLoc(), *allocation,
                                   body.getArguments(), padded);
     builder.create<YieldOp>(owner->getLoc());
+    if (space == 0) {
+      OpBuilder after(owner);
+      after.create<SyncOp>(owner->getLoc());
+    }
     selected[value] = *allocation;
     if (space == 0)
       sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
@@ -1150,6 +1395,8 @@ private:
   }
 
   LogicalResult bufferizeFragmentLoopCarries(scf::ForOp loop) {
+    if (failed(prepareFragmentLoopCarries(loop)))
+      return failure();
     llvm::DenseSet<unsigned> alreadyDropped;
     for (unsigned index : loopDrops.lookup(loop.getOperation()))
       alreadyDropped.insert(index);
@@ -1165,14 +1412,12 @@ private:
       if (!isa<gpu::FragmentType>(argument.getType()) ||
           alreadyDropped.contains(index))
         continue;
-      FailureOr<Value> buffer = materialize(loop.getInitArgs()[index], 1, loop);
-      if (failed(buffer))
+      Value buffer = fragmentBuffers.lookup(argument);
+      if (!buffer)
         return loop.emitOpError(
-            "TileLang fragment loop identity cannot be materialized");
-      fragmentBuffers[argument] = *buffer;
-      fragmentBuffers[loop.getResult(index)] = *buffer;
+            "TileLang fragment loop carry was not prepared before transition lowering");
       indices.push_back(index);
-      carryBuffers.push_back(*buffer);
+      carryBuffers.push_back(buffer);
       transitions.push_back(yield.getOperand(index));
     }
 
@@ -1197,8 +1442,45 @@ private:
       if (failed(storeFragment(transition, carry, yield)))
         return loop.emitOpError(
             "TileLang fragment loop transition cannot be committed");
+      // The transition has become an explicit buffer update.  Break the old
+      // SSA carry edge immediately: leaving it attached to scf.yield keeps an
+      // already-materialized producer graph (and nested fragment-loop results)
+      // artificially live until the enclosing loop itself is rebuilt.
+      yield.setOperand(index, loop.getRegionIterArgs()[index]);
       loopDrops[loop.getOperation()].push_back(index);
     }
+    return success();
+  }
+
+  LogicalResult prepareFragmentLoopCarries(scf::ForOp loop) {
+    llvm::DenseSet<unsigned> alreadyDropped;
+    for (unsigned index : loopDrops.lookup(loop.getOperation()))
+      alreadyDropped.insert(index);
+    for (auto [index, argument] : llvm::enumerate(loop.getRegionIterArgs())) {
+      if (!isa<gpu::FragmentType>(argument.getType()) ||
+          alreadyDropped.contains(index) || fragmentBuffers.lookup(argument))
+        continue;
+      FailureOr<Value> buffer = materialize(loop.getInitArgs()[index], 1, loop);
+      if (failed(buffer))
+        return loop.emitOpError(
+            "TileLang fragment loop identity cannot be materialized");
+      fragmentBuffers[argument] = *buffer;
+      fragmentBuffers[loop.getResult(index)] = *buffer;
+    }
+    return success();
+  }
+
+  LogicalResult prepareFragmentLoopCarries() {
+    SmallVector<scf::ForOp> loops;
+    kernel.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
+      if (llvm::any_of(loop.getRegionIterArgs(), [](Value argument) {
+            return isa<gpu::FragmentType>(argument.getType());
+          }))
+        loops.push_back(loop);
+    });
+    for (scf::ForOp loop : loops)
+      if (failed(prepareFragmentLoopCarries(loop)))
+        return failure();
     return success();
   }
 
@@ -1462,10 +1744,18 @@ private:
     }
     FailureOr<SmallVector<Value>> offsets =
         accessOffsets(store, store.getCoordinates(), store.getSourceAxes());
-    if (succeeded(offsets) &&
+    FailureOr<CopyLayout> layout =
+        copyLayout(store.getCoordinates(), store.getSourceAxes(), view.getRank(),
+                   fragment);
+    SmallVector<unsigned> identity =
+        identityAxisOrder(fragment.getShape().size());
+    if (succeeded(offsets) && succeeded(layout) &&
+        layout->bufferToFragment == identity &&
         isFullViewValidity(store.getValid(), store.getResource(),
                            store.getCoordinates(), store.getSourceAxes())) {
       OpBuilder builder(store);
+      DenseI64ArrayAttr destinationAxes =
+          DenseI64ArrayAttr::get(kernel.getContext(), layout->viewAxes);
       if (auto cast = store.getValue().getDefiningOp<gpu::CastOp>()) {
         auto input = dyn_cast<gpu::FragmentType>(cast.getValue().getType());
         auto result = dyn_cast<gpu::FragmentType>(cast.getResult().getType());
@@ -1475,7 +1765,8 @@ private:
             input.getValidity() == result.getValidity() &&
             input.getOwner() == result.getOwner()) {
           builder.create<CastCopyOutOp>(store.getLoc(), source,
-                                        store.getResource(), *offsets);
+                                        store.getResource(), *offsets,
+                                        destinationAxes);
           lowered.insert(cast);
           lowered.insert(store);
           return success();
@@ -1485,7 +1776,7 @@ private:
       if (failed(source))
         return failure();
       builder.create<CopyOutOp>(store.getLoc(), *source, store.getResource(),
-                                *offsets);
+                                *offsets, destinationAxes);
     } else {
       FailureOr<Value> source = materialize(store.getValue(), 1, store);
       if (failed(source))

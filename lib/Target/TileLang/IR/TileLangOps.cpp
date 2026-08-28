@@ -5,10 +5,30 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallBitVector.h"
 
 using namespace mlir;
 
 namespace intent::tilelang {
+
+namespace {
+
+LogicalResult verifyCopyAxes(Operation *owner, ArrayRef<int64_t> axes,
+                             unsigned viewRank, unsigned bufferRank) {
+  if (axes.size() != bufferRank)
+    return owner->emitOpError(
+        "requires one external-view axis per physical buffer axis");
+  llvm::SmallBitVector seen(viewRank);
+  for (int64_t axis : axes) {
+    if (axis < 0 || axis >= static_cast<int64_t>(viewRank) || seen.test(axis))
+      return owner->emitOpError(
+          "copy axes must be distinct axes of the external view");
+    seen.set(axis);
+  }
+  return success();
+}
+
+} // namespace
 
 LogicalResult LaunchConfigOp::verify() {
   auto parameter = getThreads().getDefiningOp<gpu::ParameterOp>();
@@ -66,14 +86,17 @@ void FillOp::getEffects(
   effects.emplace_back(MemoryEffects::Write::get());
 }
 
+LogicalResult SyncOp::verify() { return success(); }
+
 LogicalResult CopyInOp::verify() {
   auto view = getSource().getType();
   auto buffer = getDestination().getType();
-  return getOffsets().size() == view.getRank() &&
-                 view.getElementType() == buffer.getElementType()
-             ? success()
-             : emitOpError(
-                   "requires one source-ordered offset per external view axis");
+  if (getOffsets().size() != view.getRank() ||
+      view.getElementType() != buffer.getElementType())
+    return emitOpError(
+        "requires one source-ordered offset per external view axis");
+  return verifyCopyAxes(*this, getSourceAxes(), view.getRank(),
+                        buffer.getShape().size());
 }
 
 void CopyInOp::getEffects(
@@ -85,11 +108,12 @@ void CopyInOp::getEffects(
 LogicalResult CopyOutOp::verify() {
   auto buffer = getSource().getType();
   auto view = getDestination().getType();
-  return getOffsets().size() == view.getRank() &&
-                 view.getElementType() == buffer.getElementType()
-             ? success()
-             : emitOpError(
-                   "requires one destination-ordered offset per external view axis");
+  if (getOffsets().size() != view.getRank() ||
+      view.getElementType() != buffer.getElementType())
+    return emitOpError(
+        "requires one destination-ordered offset per external view axis");
+  return verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
+                        buffer.getShape().size());
 }
 
 void CopyOutOp::getEffects(
@@ -105,11 +129,12 @@ LogicalResult CastCopyOutOp::verify() {
   Type destination = view.getElementType();
   bool numeric = isa<IntegerType, FloatType>(source) &&
                  isa<IntegerType, FloatType>(destination);
-  return getOffsets().size() == view.getRank() && numeric &&
-                 source != destination
-             ? success()
-             : emitOpError(
-                   "requires a numeric dtype-changing copy with one destination offset per view axis");
+  if (getOffsets().size() != view.getRank() || !numeric ||
+      source == destination)
+    return emitOpError(
+        "requires a numeric dtype-changing copy with one destination offset per view axis");
+  return verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
+                        buffer.getShape().size());
 }
 
 void CastCopyOutOp::getEffects(

@@ -1,5 +1,5 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status
-block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks128,,,,worker_timeout
+block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks128,0.120856,0.099168,1.218700,pass
 dense_flash_attention,B4-S4096-H32-D128-fp16-causal,,,,provider_program_verification_failed
 varlen_gqa_prefill,packed8-QH32-KVH8-D128-fp16-causal,,,,provider_program_verification_failed
 gqa_decode,B32-QH32-KVH8-S8192-D128-fp16,,,,physical_program_verification_failed
@@ -10,7 +10,7 @@ conv2d,NHWC32x128x128x256-K3x3x256x512-fp16,,,,provider_program_verification_fai
 dense_gemm,M4096-N14336-K4096-fp16,2.320088,2.323152,0.998681,pass
 w4a8_gemm,M4096-N14336-K4096-int8-int4,,,,physical_program_verification_failed
 fp8_gemm,M4096-N14336-K4096-e4m3,1.137432,1.132624,1.004245,pass
-grouped_gemm,rows256-512-1024-2048-K4096-N4096-fp16,,,,worker_timeout
+grouped_gemm,rows256-512-1024-2048-K4096-N4096-fp16,0.707344,0.602112,1.174771,pass
 sparse_2to4_gemm,M8192-N14336-K8192-fp16,,,,physical_program_verification_failed
 deepgemm_fp8_2xacc,M4096-N4096-K4096-e4m3-bf16,,,,physical_program_verification_failed
 online_softmax,8192x8192-fp16,,,,provider_program_verification_failed
@@ -31,7 +31,7 @@ sparse_mla_backward,B1-S4096-SKV8192-H64-D576-topk2048-bf16,,,,adapter_preparati
 fp8_lighting_indexer,S4096-SKV8192-H32-D64-fp8,,,,provider_program_verification_failed
 per_token_fp8,8192x8192-group128-f32-e4m3,0.294232,0.228544,1.287420,pass
 block_sparse_gemm,M4096-N4096-K4096-block128x128x32-50pct,,,,physical_program_verification_failed
-grouped_gemm_backward,rows256-512-1024-2048-K4096-N4096-fp16,,,,worker_timeout
+grouped_gemm_backward,rows256-512-1024-2048-K4096-N4096-fp16,1.599488,1.012752,1.579348,pass
 bitnet_int2_decode,M1-N4096-K4096-int8-int2,,,,physical_program_verification_failed
 dequant_bf16_fp4,M4096-N4096-K4096-bf16-fp4,,,,provider_jit_or_initial_launch_failed
 block_fp4_quant,8192x4096-block32-bf16,,,,intent_implementation_gap

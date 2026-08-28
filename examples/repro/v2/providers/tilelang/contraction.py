@@ -25,7 +25,9 @@ from ...measurement import TRITON_PARAMETER_PROVIDER_STAGES
 from ...measurement import TRITON_PARAMETER_PROVIDER_THREADS
 from ...measurement import TRITON_PARAMETER_REDUCTION
 from ...measurement import TRITON_PARAMETER_TRAVERSAL_GROUP
+from ...measurement import TRITON_PARAMETER_TRAVERSAL_WORKERS
 from ...measurement import functional_launch
+from ...measurement import restrict_generated_candidates
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -277,7 +279,33 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         (offsets, torch.tensor((sum(rows),), device="cuda", dtype=torch.int32))
     )
     _, generated = compile_single(
-        context, ragged_grouped_gemm, (a, group_offsets, b)
+        context,
+        ragged_grouped_gemm,
+        (a, group_offsets, b),
+        generated_candidate_filter=lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_M
+            )
+            == 64
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N
+            )
+            == 128
+            and candidate_parameter_value(candidate, TRITON_PARAMETER_REDUCTION)
+            == 64
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_STAGES
+            )
+            == 2
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 256
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_TRAVERSAL_WORKERS
+            )
+            == 8
+        ),
     )
     source = functional_launch(
         lambda: runtime.source.grouped_gemm(
@@ -390,6 +418,34 @@ def grouped_gemm_backward(context: Context) -> PreparedComparison:
         ragged_grouped_gemm_backward_weight,
         target=context.target,
         compiler=context.compiler,
+    )
+    restrict_generated_candidates(
+        context,
+        artifact,
+        lambda candidate: (
+            candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_M
+            )
+            == 64
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_OWNERSHIP_N
+            )
+            == 128
+            and candidate_parameter_value(candidate, TRITON_PARAMETER_REDUCTION)
+            == 64
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_STAGES
+            )
+            == 2
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_PROVIDER_THREADS
+            )
+            == 256
+            and candidate_parameter_value(
+                candidate, TRITON_PARAMETER_TRAVERSAL_GROUP
+            )
+            == 1
+        ),
     )
     generated = PreparedLaunch(
         launch=prepare_kernel_call(

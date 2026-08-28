@@ -43,12 +43,17 @@ def IntentTileLang_FillOp : IntentTileLang_Op<"fill", [
   let hasVerifier = 1;
 }
 
+def IntentTileLang_SyncOp : IntentTileLang_Op<"sync"> {
+  let hasVerifier = 1;
+}
+
 def IntentTileLang_CopyInOp : IntentTileLang_Op<"copy_in", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$source,
                        Variadic<Index>:$offsets,
-                       IntentTileLang_BufferValue:$destination);
+                       IntentTileLang_BufferValue:$destination,
+                       DenseI64ArrayAttr:$source_axes);
   let hasVerifier = 1;
 }
 
@@ -57,7 +62,8 @@ def IntentTileLang_CopyOutOp : IntentTileLang_Op<"copy_out", [
   ]> {
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentGPU_ViewValue:$destination,
-                       Variadic<Index>:$offsets);
+                       Variadic<Index>:$offsets,
+                       DenseI64ArrayAttr:$destination_axes);
   let hasVerifier = 1;
 }
 
@@ -66,7 +72,8 @@ def IntentTileLang_CastCopyOutOp : IntentTileLang_Op<"cast_copy_out", [
   ]> {
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentGPU_ViewValue:$destination,
-                       Variadic<Index>:$offsets);
+                       Variadic<Index>:$offsets,
+                       DenseI64ArrayAttr:$destination_axes);
   let hasVerifier = 1;
 }
 

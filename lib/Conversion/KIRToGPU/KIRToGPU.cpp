@@ -213,6 +213,35 @@ FailureOr<Value> retargetBroadcast(OpBuilder &builder, Location location,
   return replacement->getResult(0);
 }
 
+bool dependsOnLoopCarry(Value root) {
+  SmallVector<Value> worklist{root};
+  llvm::SmallDenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (auto argument = dyn_cast<BlockArgument>(current)) {
+      auto loop = dyn_cast_or_null<scf::ForOp>(
+          argument.getOwner()->getParentOp());
+      if (loop && argument != loop.getInductionVar())
+        return true;
+      // scf::ForOp invokes its body builder before the new operation is fully
+      // attached, so the parent op is not always queryable here.  Physical
+      // function arguments are views/scalars; a fragment/record block argument
+      // after the leading induction argument is therefore an in-construction
+      // loop carry and already owns the relation that the next state must keep.
+      if (argument.getArgNumber() > 0 &&
+          isa<gpu::FragmentType, gpu::RecordType>(argument.getType()))
+        return true;
+      continue;
+    }
+    if (Operation *definition = current.getDefiningOp())
+      worklist.append(definition->getOperands().begin(),
+                      definition->getOperands().end());
+  }
+  return false;
+}
+
 llvm::SmallDenseSet<uint64_t> explicitRangeSources(Value value) {
   auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
   if (!fragment)
@@ -229,18 +258,6 @@ llvm::SmallDenseSet<uint64_t> explicitRangeSources(Value value) {
           return true;
       }
       if (auto argument = dyn_cast<BlockArgument>(current)) {
-        // A physical region argument already carries the relation chosen for
-        // that region boundary.  During scf::For construction the parent loop
-        // is not necessarily queryable from the body-builder callback yet, so
-        // chasing only the initializer can make an established loop-carried
-        // source relation look anonymous.  Treat the typed block-argument
-        // relation itself as authoritative; this keeps elementwise alignment
-        // from retargeting a carry to a transient result-local axis.
-        if (auto argumentFragment = dyn_cast<gpu::FragmentType>(argument.getType()))
-          if (llvm::any_of(argumentFragment.getAxisMaps(), [&](Attribute axis) {
-                return cast<gpu::AxisMapAttr>(axis).getSourceId() == sourceId;
-              }))
-            return true;
         auto loop = dyn_cast_or_null<scf::ForOp>(
             argument.getOwner()->getParentOp());
         if (loop) {
@@ -335,6 +352,24 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     return success();
   auto leftLogical = dyn_cast_or_null<RankedTensorType>(logicalLhs);
   auto rightLogical = dyn_cast_or_null<RankedTensorType>(logicalRhs);
+  if (leftLogical && rightLogical &&
+      dimensionIds(leftLogical) == dimensionIds(rightLogical) &&
+      left.getShape() == right.getShape() &&
+      left.getOwner() == right.getOwner() &&
+      left.getValidity() == right.getValidity()) {
+    bool leftCarry = dependsOnLoopCarry(lhs);
+    bool rightCarry = dependsOnLoopCarry(rhs);
+    if (leftCarry != rightCarry) {
+      Value &projected = leftCarry ? rhs : lhs;
+      gpu::FragmentType target = leftCarry ? left : right;
+      FailureOr<Value> aligned =
+          retargetBroadcast(builder, location, projected, target);
+      if (failed(aligned))
+        return failure();
+      projected = *aligned;
+      return success();
+    }
+  }
   llvm::SmallDenseSet<uint64_t> leftRangeSources = explicitRangeSources(lhs);
   llvm::SmallDenseSet<uint64_t> rightRangeSources = explicitRangeSources(rhs);
   bool sameExplicitRanges =
@@ -4030,23 +4065,14 @@ private:
           Value yielded = std::get<1>(item);
           if (initial.getType() == yielded.getType())
             continue;
-          auto source = dyn_cast<gpu::FragmentType>(initial.getType());
-          auto target = dyn_cast<gpu::FragmentType>(yielded.getType());
-          if (!source || !target ||
-              source.getElementType() != target.getElementType() ||
-              source.getShape() != target.getShape() ||
-              source.getValidity() != target.getValidity() ||
-              source.getOwner() != target.getOwner()) {
-            nestedFailed = true;
-            break;
-          }
           // The loop-carried value keeps the physical relation established by
-          // its initializer.  A body expression may temporarily acquire a
-          // result-local axis identity, but that identity must not replace the
-          // source provenance carried across iterations.
+          // its initializer, recursively for record-valued algorithm state. A
+          // body expression may temporarily acquire result-local axis
+          // identities, but those identities must not replace the source
+          // provenance carried across iterations.
           OpBuilder before(yield);
-          FailureOr<Value> aligned =
-              retargetBroadcast(before, location, yielded, source);
+          FailureOr<Value> aligned = projectAccumulatorIdentity(
+              before, location, yielded, initial.getType());
           if (failed(aligned)) {
             nestedFailed = true;
             break;

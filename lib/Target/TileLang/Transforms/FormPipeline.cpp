@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -44,20 +45,78 @@ gpu::ParameterOp getOrCreateStages(func::FuncOp kernel) {
                                           schema);
 }
 
-bool hasNativeContract(scf::ForOp loop) {
-  return llvm::any_of(loop.getBody()->without_terminator(),
-                      [](Operation &operation) { return isa<GemmOp>(operation); });
+bool dependsOnSharedBuffer(Value value, llvm::DenseSet<Value> &active) {
+  if (!active.insert(value).second)
+    return false;
+  if (auto load = value.getDefiningOp<BufferLoadOp>()) {
+    active.erase(value);
+    return load.getBuffer().getType().getSpace() == 0;
+  }
+  Operation *producer = value.getDefiningOp();
+  bool dependent =
+      producer && llvm::any_of(producer->getOperands(), [&](Value operand) {
+        return dependsOnSharedBuffer(operand, active);
+      });
+  active.erase(value);
+  return dependent;
+}
+
+bool hasPipelineableContract(scf::ForOp loop) {
+  SmallVector<GemmOp> contracts;
+  bool transfer = false;
+  llvm::DenseSet<Value> contractOperands;
+  for (Operation &operation : loop.getBody()->without_terminator()) {
+    if (auto gemm = dyn_cast<GemmOp>(operation)) {
+      contracts.push_back(gemm);
+      contractOperands.insert(gemm.getLhs());
+      contractOperands.insert(gemm.getRhs());
+    }
+    transfer |= isa<CopyInOp>(operation);
+  }
+  if (contracts.empty())
+    return false;
+  llvm::DenseSet<Value> sharedRematerializedBuffers;
+  loop.walk([&](BufferStoreOp store) {
+    if (!contractOperands.contains(store.getBuffer()))
+      return;
+    llvm::DenseSet<Value> active;
+    if (dependsOnSharedBuffer(store.getValue(), active)) {
+      sharedRematerializedBuffers.insert(store.getBuffer());
+    } else {
+      transfer = true;
+    }
+  });
+  for (GemmOp gemm : contracts)
+    if (sharedRematerializedBuffers.contains(gemm.getLhs()) ||
+        sharedRematerializedBuffers.contains(gemm.getRhs()))
+      return false;
+  return transfer;
 }
 
 } // namespace
 
 LogicalResult formPipelines(func::FuncOp kernel) {
-  SmallVector<scf::ForOp> loops;
+  SmallVector<scf::ForOp> candidates;
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
-    if (loop.getNumResults() == 0 && hasNativeContract(loop) &&
+    if (loop.getNumResults() == 0 && hasPipelineableContract(loop) &&
         !loop->getParentOfType<PipelineOp>())
-      loops.push_back(loop);
+      candidates.push_back(loop);
   });
+  llvm::DenseSet<Operation *> candidateOperations;
+  for (scf::ForOp loop : candidates)
+    candidateOperations.insert(loop.getOperation());
+  SmallVector<scf::ForOp> loops;
+  for (scf::ForOp loop : candidates) {
+    bool nestedCandidate = false;
+    for (Operation *parent = loop->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (candidateOperations.contains(parent)) {
+        nestedCandidate = true;
+        break;
+      }
+    if (!nestedCandidate)
+      loops.push_back(loop);
+  }
   if (loops.empty())
     return success();
   gpu::ParameterOp stages = getOrCreateStages(kernel);

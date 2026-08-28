@@ -24,7 +24,7 @@ bool isTileLangScalarType(Type type) {
 
 bool isAllowed(Operation *operation) {
   return isa<LaunchConfigOp, PipelineOp, ParallelOp, YieldOp, AllocOp, ClearOp,
-             FillOp, CopyInOp, CopyOutOp, CastCopyOutOp, BufferLoadOp,
+             FillOp, SyncOp, CopyInOp, CopyOutOp, CastCopyOutOp, BufferLoadOp,
              BufferStoreOp,
              ViewLoadOp, ViewStoreOp, ReduceOp, ScanOp, GemmOp,
              gpu::ParameterOp, gpu::PhysicalExprOp, gpu::ProgramIdOp,

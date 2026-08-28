@@ -461,6 +461,9 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       Value value = builder.create<MakeRangeOp>(
           location, blockedRange, start, segment, range.getStep(),
           segmentMapping.getSourceId(), segmentMapping.getSourceAxis());
+      for (StringRef attribute : {sourceSubregionAttr, sourceDimensionAttr})
+        if (Attribute inherited = range->getAttr(attribute))
+          value.getDefiningOp()->setAttr(attribute, inherited);
       Value logicalStop = builder.create<BinaryOp>(
           location, builder.getIndexType(), range.getStart(), range.getExtent(),
           /*add=*/0);

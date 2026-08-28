@@ -27,18 +27,6 @@ Value stripBroadcast(Value value) {
   return value;
 }
 
-bool isPhysicalRangeEnd(MakeRangeOp range, Value value) {
-  auto addition = stripBroadcast(value).getDefiningOp<BinaryOp>();
-  if (!addition || addition.getOperatorKind() != 0)
-    return false;
-  Value lhs = stripBroadcast(addition.getLhs());
-  Value rhs = stripBroadcast(addition.getRhs());
-  Value start = stripBroadcast(range.getStart());
-  Value extent = stripBroadcast(range.getExtent());
-  return (lhs == start && rhs == extent) ||
-         (lhs == extent && rhs == start);
-}
-
 FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
                                  ArrayRef<Attribute> previousExtents,
                                  PhysicalExprAttr extent) {
@@ -275,6 +263,12 @@ FailureOr<Value> materializeScalarConstant(OpBuilder &builder,
 
 FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
                                         MakeRangeOp range) {
+  if (range->hasAttr(sourceSubregionAttr)) {
+    OpBuilder builder(range);
+    return Value(builder.create<BinaryOp>(
+        range.getLoc(), builder.getIndexType(), range.getStart(),
+        range.getExtent(), /*add=*/0));
+  }
   auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
   if (dimension && !range->hasAttr(sourceSubregionAttr)) {
     for (BlockArgument argument : kernel.getArguments()) {
@@ -329,9 +323,6 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
           comparison.getLhs() != coordinate)
         continue;
       Value candidate = stripBroadcast(comparison.getRhs());
-      if (range->hasAttr(sourceSubregionAttr) &&
-          isPhysicalRangeEnd(range, candidate))
-        continue;
       if (result && result != candidate)
         return failure();
       result = candidate;

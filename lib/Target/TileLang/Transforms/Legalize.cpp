@@ -9,6 +9,21 @@
 using namespace mlir;
 
 namespace intent::tilelang {
+
+bool isLegalMmaWarpPartition(int64_t m, int64_t n, int64_t threads) {
+  if (threads <= 0 || threads % 32 != 0 || m % 16 != 0 || n % 8 != 0)
+    return false;
+  int64_t warps = threads / 32;
+  for (int64_t mWarps = 1; mWarps <= warps; ++mWarps) {
+    if (warps % mWarps != 0)
+      continue;
+    int64_t nWarps = warps / mWarps;
+    if (m % (mWarps * 16) == 0 && n % (nWarps * 8) == 0)
+      return true;
+  }
+  return false;
+}
+
 namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_tilelang.legalized";
@@ -70,20 +85,6 @@ SmallVector<int64_t> extentCandidates(func::FuncOp kernel, Attribute attribute) 
   return result;
 }
 
-bool hasMmaWarpPartition(int64_t m, int64_t n, int64_t threads) {
-  if (threads <= 0 || threads % 32 != 0 || m % 16 != 0 || n % 8 != 0)
-    return false;
-  int64_t warps = threads / 32;
-  for (int64_t mWarps = 1; mWarps <= warps; ++mWarps) {
-    if (warps % mWarps != 0)
-      continue;
-    int64_t nWarps = warps / mWarps;
-    if (m % (mWarps * 16) == 0 && n % (nWarps * 8) == 0)
-      return true;
-  }
-  return false;
-}
-
 bool supportsThreads(func::FuncOp kernel, int64_t threads) {
   bool sawGemm = false;
   bool supported = true;
@@ -99,12 +100,12 @@ bool supportsThreads(func::FuncOp kernel, int64_t threads) {
       supported = false;
       return;
     }
+    bool hasLegalShape = false;
     for (int64_t m : mCandidates)
       for (int64_t n : nCandidates)
-        if (!hasMmaWarpPartition(m, n, threads)) {
-          supported = false;
-          return;
-        }
+        hasLegalShape |= isLegalMmaWarpPartition(m, n, threads);
+    if (!hasLegalShape)
+      supported = false;
   });
   return !sawGemm || supported;
 }
