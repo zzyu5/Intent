@@ -1119,21 +1119,34 @@ bool isCartesianPointwiseValueOp(Operation *operation) {
              CastOp, BitcastOp, LoadOp, GatherOp, RandomBitsOp>(operation);
 }
 
-bool supportsCartesianPointwiseValueGraph(func::FuncOp kernel) {
-  bool supported = true;
-  kernel.walk([&](Operation *operation) {
-    if (!supported || isa<MakeRangeOp>(operation))
-      return WalkResult::advance();
-    if (llvm::none_of(operation->getResultTypes(),
-                      [](Type type) { return isa<FragmentType>(type); }))
-      return WalkResult::advance();
-    if (!isCartesianPointwiseValueOp(operation)) {
-      supported = false;
-      return WalkResult::interrupt();
+bool supportsCartesianPointwiseValueGraph(
+    ArrayRef<WorksetCoordinateOp> coordinates) {
+  llvm::SmallDenseSet<Value> dependent;
+  SmallVector<Value> worklist;
+  for (WorksetCoordinateOp coordinate : coordinates) {
+    dependent.insert(coordinate.getResult());
+    worklist.push_back(coordinate.getResult());
+  }
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    for (Operation *user : value.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      if (user->getNumResults() == 0)
+        continue;
+      if (!isCartesianPointwiseValueOp(user) || user->getNumRegions() != 0)
+        return false;
+      for (Value result : user->getResults()) {
+        Type type = result.getType();
+        if (!isa<IntegerType, FloatType, IndexType, FragmentType>(type))
+          return false;
+        if (dependent.insert(result).second)
+          worklist.push_back(result);
+      }
     }
-    return WalkResult::advance();
-  });
-  return supported;
+  }
+  return true;
 }
 
 LogicalResult rankLiftPointwiseValueGraph(
@@ -1251,7 +1264,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<MakeRangeOp> existingRanges;
     kernel.walk([&](MakeRangeOp range) { existingRanges.push_back(range); });
     SmallVector<WorksetCoordinateOp> lifted;
-    if (existingRanges.empty() && supportsCartesianPointwiseValueGraph(kernel))
+    if (existingRanges.empty() &&
+        supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
       lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
 
     SmallVector<MakeRangeOp> liftedRanges;

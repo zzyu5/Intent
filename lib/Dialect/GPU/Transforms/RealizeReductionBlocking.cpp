@@ -177,33 +177,6 @@ FragmentType replaceExtent(FragmentType source, unsigned axis,
                            source.getOwner());
 }
 
-FailureOr<unsigned> uniqueExtentAxis(FragmentType source,
-                                     PhysicalExprAttr extent) {
-  std::optional<unsigned> result;
-  for (auto [axis, attribute] : llvm::enumerate(source.getShape())) {
-    if (attribute != extent)
-      continue;
-    if (result)
-      return failure();
-    result = axis;
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
-}
-
-FragmentType replaceMatchingExtent(FragmentType source,
-                                   PhysicalExprAttr from,
-                                   PhysicalExprAttr to) {
-  SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  for (Attribute &extent : shape)
-    if (extent == from)
-      extent = to;
-  return FragmentType::get(source.getContext(), source.getElementType(),
-                           ArrayAttr::get(source.getContext(), shape),
-                           source.getAxisMaps(), source.getValidity(),
-                           source.getOwner());
-}
-
 void collectRangesAndLoads(Value value, PhysicalExprAttr logicalExtent,
                            SmallVectorImpl<MakeRangeOp> &ranges,
                            SmallVectorImpl<LoadOp> &loads,
@@ -245,33 +218,59 @@ FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
       PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
 }
 
+void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
+                                PhysicalExprAttr logicalExtent,
+                                PhysicalExprAttr physicalExtent) {
+  auto retarget = [&](Value value) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment)
+      return;
+    PhysicalAxisProjection projected = queryFragmentAxis(fragment, source);
+    if (!projected.isExact() ||
+        fragment.getShape()[projected.fragmentAxis] != logicalExtent)
+      return;
+    value.setType(
+        replaceExtent(fragment, projected.fragmentAxis, physicalExtent));
+  };
+  for (Block &block : region) {
+    for (BlockArgument argument : block.getArguments())
+      retarget(argument);
+    block.walk([&](Operation *operation) {
+      for (Value result : operation->getResults())
+        retarget(result);
+    });
+  }
+}
+
 FailureOr<Value> clonePaddedProducer(
     OpBuilder &builder, Location location, Value value,
+    PhysicalSourceAxis reductionSource,
     PhysicalExprAttr logicalExtent, PhysicalExprAttr physicalExtent,
     Value physicalExtentValue, IRMapping &mapping,
     SmallVectorImpl<Value> &tailPredicates) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
   auto fragment = dyn_cast<FragmentType>(value.getType());
-  if (!fragment || !llvm::is_contained(fragment.getShape(), logicalExtent))
+  if (!fragment)
+    return value;
+  PhysicalAxisProjection projected =
+      queryFragmentAxis(fragment, reductionSource);
+  if (!projected.isExact())
+    return value;
+  unsigned reductionAxis = projected.fragmentAxis;
+  if (fragment.getShape()[reductionAxis] != logicalExtent)
     return value;
   Operation *producer = value.getDefiningOp();
-  if (failed(uniqueExtentAxis(fragment, logicalExtent)))
+  if (!producer || producer->getNumResults() != 1 ||
+      (producer->getNumRegions() != 0 && !isa<ReduceOp>(producer)))
     return producer
                ? (producer->emitOpError(
-                      "padded reduction value has an ambiguous logical extent"),
-                  FailureOr<Value>(failure()))
-               : FailureOr<Value>(failure());
-  if (!producer || producer->getNumResults() != 1 || producer->getNumRegions() != 0)
-    return producer
-               ? (producer->emitOpError(
-                      "padded reduction producer is not a single-result regionless operation"),
+                      "padded reduction producer is not a replayable single-result operation"),
                   FailureOr<Value>(failure()))
                : FailureOr<Value>(failure());
 
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    auto paddedType =
-        replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+    auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
     auto padded = builder.create<MakeRangeOp>(
         location, paddedType, range.getStart(), physicalExtentValue,
         range.getStep(), range.getSourceId(), range.getSourceAxis());
@@ -303,7 +302,8 @@ FailureOr<Value> clonePaddedProducer(
     SmallVector<Value> coordinates;
     for (Value coordinate : load.getCoordinates()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, coordinate, logicalExtent, physicalExtent,
+          builder, location, coordinate, reductionSource, logicalExtent,
+          physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
         return failure();
@@ -312,7 +312,8 @@ FailureOr<Value> clonePaddedProducer(
     Value valid;
     if (load.getValid()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getValid(), logicalExtent, physicalExtent,
+          builder, location, load.getValid(), reductionSource, logicalExtent,
+          physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
         return failure();
@@ -321,25 +322,22 @@ FailureOr<Value> clonePaddedProducer(
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getFill(), logicalExtent, physicalExtent,
+          builder, location, load.getFill(), reductionSource, logicalExtent,
+          physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
         return failure();
       fill = *replayed;
     }
-    auto paddedType =
-        replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+    auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
     if (tailPredicates.empty())
       return load.emitOpError(
                  "padded reduction load has no logical tail predicate"),
              failure();
-    FailureOr<unsigned> axis = uniqueExtentAxis(paddedType, physicalExtent);
-    if (failed(axis))
-      return failure();
     Value tail;
     for (Value base : tailPredicates) {
       FailureOr<Value> current = predicateForReductionSource(
-          builder, location, base, paddedType, *axis);
+          builder, location, base, paddedType, reductionAxis);
       if (failed(current))
         return failure();
       tail = tail ? Value(builder.create<BinaryOp>(
@@ -382,7 +380,8 @@ FailureOr<Value> clonePaddedProducer(
 
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = clonePaddedProducer(
-        builder, location, operand, logicalExtent, physicalExtent,
+        builder, location, operand, reductionSource, logicalExtent,
+        physicalExtent,
         physicalExtentValue, mapping, tailPredicates);
     if (failed(replayed))
       return failure();
@@ -390,223 +389,31 @@ FailureOr<Value> clonePaddedProducer(
       mapping.map(operand, *replayed);
   }
   Operation *clone = builder.clone(*producer, mapping);
-  auto paddedType =
-      replaceMatchingExtent(fragment, logicalExtent, physicalExtent);
+  if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
+    retargetHelperSourceExtent(clonedReduce.getCombine(), reductionSource,
+                               logicalExtent, physicalExtent);
+  auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
   clone->getResult(0).setType(paddedType);
   mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
-}
-
-LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
-                                       PhysicalExprAttr logicalExtent,
-                                       PhysicalExprAttr physicalExtent) {
-  SmallVector<MakeRangeOp> ranges;
-  kernel.walk([&](MakeRangeOp range) {
-    auto type = range.getResult().getType();
-    auto constant = range.getExtent().getDefiningOp<arith::ConstantOp>();
-    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-    if (type.getShape().size() == 1 &&
-        (type.getShape()[0] == logicalExtent ||
-         (integer && integer.getInt() == logicalExtent.getValue())))
-      ranges.push_back(range);
-  });
-  if (ranges.empty())
-    return success();
-
-  SmallVector<LoadOp> loads;
-  SmallVector<StoreOp> stores;
-  kernel.walk([&](LoadOp load) { loads.push_back(load); });
-  kernel.walk([&](StoreOp store) { stores.push_back(store); });
-  llvm::SmallPtrSet<Operation *, 32> rangeSet;
-  for (MakeRangeOp range : ranges)
-    rangeSet.insert(range.getOperation());
-  auto relevantRanges = [&](ValueRange values) {
-    SmallVector<MakeRangeOp> result;
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    SmallVector<LoadOp> ignoredLoads;
-    for (Value value : values) {
-      SmallVector<MakeRangeOp> candidates;
-      collectRangesAndLoads(value, logicalExtent, candidates, ignoredLoads,
-                            visited);
-      for (MakeRangeOp candidate : candidates)
-        if (rangeSet.contains(candidate.getOperation()) &&
-            !llvm::is_contained(result, candidate))
-          result.push_back(candidate);
-    }
-    return result;
-  };
-  llvm::DenseMap<Operation *, SmallVector<MakeRangeOp>> accessRanges;
-  for (LoadOp load : loads) {
-    SmallVector<Value> operands(load.getCoordinates());
-    if (load.getValid())
-      operands.push_back(load.getValid());
-    accessRanges[load.getOperation()] = relevantRanges(operands);
-  }
-  for (StoreOp store : stores) {
-    SmallVector<Value> operands(store.getCoordinates());
-    if (store.getValid())
-      operands.push_back(store.getValid());
-    accessRanges[store.getOperation()] = relevantRanges(operands);
-  }
-
-  bool ambiguous = false;
-  kernel.walk([&](Operation *operation) {
-    for (Value result : operation->getResults()) {
-      auto fragment = dyn_cast<FragmentType>(result.getType());
-      if (!fragment || !llvm::is_contained(fragment.getShape(), logicalExtent))
-        continue;
-      if (failed(uniqueExtentAxis(fragment, logicalExtent))) {
-        operation->emitOpError(
-            "static padded extent appears on multiple physical axes");
-        ambiguous = true;
-        return;
-      }
-      result.setType(
-          replaceMatchingExtent(fragment, logicalExtent, physicalExtent));
-    }
-  });
-  if (ambiguous)
-    return failure();
-
-  llvm::DenseMap<Operation *, Value> predicates;
-  for (MakeRangeOp range : ranges) {
-    OpBuilder builder(range);
-    retargetSourceExtent(range.getResult(), range.getSourceId(), physicalExtent);
-    Value physical = builder.create<arith::ConstantIndexOp>(
-        range.getLoc(), physicalExtent.getValue());
-    range->setOperand(1, physical);
-    builder.setInsertionPointAfter(range);
-    Value logical = builder.create<arith::ConstantIndexOp>(
-        range.getLoc(), logicalExtent.getValue());
-    Value distance = builder.create<BinaryOp>(
-        range.getLoc(), builder.getIndexType(), logical, range.getStep(),
-        BinaryOperator::Multiply);
-    Value stop = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                          range.getStart(), distance,
-                                          BinaryOperator::Add);
-    auto coordinate = range.getResult().getType();
-    Value stopFragment =
-        builder.create<BroadcastOp>(range.getLoc(), coordinate, stop);
-    auto predicate = FragmentType::get(
-        kernel.getContext(), builder.getI1Type(), coordinate.getShape(),
-        coordinate.getAxisMaps(), coordinate.getValidity(),
-        coordinate.getOwner());
-    predicates[range.getOperation()] = builder.create<CompareOp>(
-        range.getLoc(), predicate, range.getResult(), stopFragment,
-        ComparePredicate::Lt);
-  }
-
-  auto materializeTail = [&](OpBuilder &builder, Location location,
-                             FragmentType target,
-                             ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
-    FailureOr<unsigned> axis = uniqueExtentAxis(target, physicalExtent);
-    if (failed(axis) || sources.empty())
-      return failure();
-    Value result;
-    for (MakeRangeOp range : sources) {
-      Value base = predicates.lookup(range.getOperation());
-      FailureOr<Value> current = predicateForReductionSource(
-          builder, location, base, target, *axis);
-      if (failed(current))
-        return failure();
-      result = result ? Value(builder.create<BinaryOp>(
-                            location, current->getType(), result, *current,
-                            BinaryOperator::LogicalAnd))
-                      : *current;
-    }
-    return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
-  };
-
-  for (LoadOp load : loads) {
-    if (!load->getBlock())
-      continue;
-    auto sources = accessRanges.lookup(load.getOperation());
-    auto type = dyn_cast<FragmentType>(load.getResult().getType());
-    if (!type || sources.empty())
-      continue;
-    OpBuilder builder(load);
-    FailureOr<Value> tail =
-        materializeTail(builder, load.getLoc(), type, sources);
-    if (failed(tail))
-      return load.emitOpError("cannot project static tail to padded load");
-    Value valid = *tail;
-    auto predicate = cast<FragmentType>(valid.getType());
-    if (load.getValid()) {
-      Value existing = load.getValid();
-      auto existingFragment = dyn_cast<FragmentType>(existing.getType());
-      if (!(existing.getType().isInteger(1) ||
-            (existingFragment &&
-             existingFragment.getElementType().isInteger(1))))
-        return load.emitOpError("padded load carried non-predicate validity");
-      if (existing.getType() != predicate)
-        existing = builder.create<BroadcastOp>(load.getLoc(), predicate, existing);
-      valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
-                                       BinaryOperator::LogicalAnd);
-    }
-    Value fill = load.getFill();
-    if (!fill) {
-      FailureOr<Value> zero =
-          materializeZeroFragment(builder, load.getLoc(), type);
-      if (failed(zero))
-        return load.emitOpError("padded load element type has no zero fill");
-      fill = *zero;
-    } else if (fill.getType() != type)
-      fill = builder.create<BroadcastOp>(load.getLoc(), type, fill);
-    auto replacement = builder.create<LoadOp>(
-        load.getLoc(), type, load.getResource(), load.getCoordinates(), valid,
-        fill, load.getSourceAxes());
-    if (Attribute origin = load->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    load.getResult().replaceAllUsesWith(replacement.getResult());
-    load.erase();
-  }
-
-  for (StoreOp store : stores) {
-    if (!store->getBlock())
-      continue;
-    auto sources = accessRanges.lookup(store.getOperation());
-    auto type = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!type || sources.empty())
-      continue;
-    OpBuilder builder(store);
-    FailureOr<Value> tail =
-        materializeTail(builder, store.getLoc(), type, sources);
-    if (failed(tail))
-      return store.emitOpError("cannot project static tail to padded store");
-    Value valid = *tail;
-    auto predicate = cast<FragmentType>(valid.getType());
-    if (store.getValid()) {
-      Value existing = store.getValid();
-      if (existing.getType() != predicate)
-        existing =
-            builder.create<BroadcastOp>(store.getLoc(), predicate, existing);
-      valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
-                                       valid, BinaryOperator::LogicalAnd);
-    }
-    auto replacement = builder.create<StoreOp>(
-        store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), valid, store.getSourceAxes(), store.getCollision());
-    if (Attribute origin = store->getAttr(originAttr))
-      replacement->setAttr(originAttr, origin);
-    store.erase();
-  }
-  return success();
 }
 
 FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
   return queryFragmentAxis(fragment, sourceId);
 }
 
-bool isReplayableWithoutLoad(Value value,
+bool isReplayableWithoutLoad(Value value, uint64_t sourceId,
                              llvm::SmallPtrSetImpl<Operation *> &visited) {
   (void)visited;
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return false;
+  PhysicalAxisProjection source = queryUniqueSourceAxis(value.getType(), sourceId);
+  if (!source.isExact())
+    return false;
   PhysicalProgramAnalysis analysis(kernel);
   return analysis
-      .replayability(value, std::nullopt, PhysicalReplayScope::Coordinate,
+      .replayability(value, source.source, PhysicalReplayScope::Coordinate,
                      /*allowAccesses=*/false)
       .isReplayable();
 }
@@ -679,7 +486,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
     if (auto load = dyn_cast<LoadOp>(access);
         load && !llvm::is_contained(plan.roots, load))
       plan.roots.push_back(load);
-  if (plan.roots.empty())
+  if (plan.roots.empty() && plan.ranges.empty())
     return failure();
   return plan;
 }
@@ -1036,11 +843,18 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
   Value physicalExtentValue = builder.create<arith::ConstantIndexOp>(
       reduce.getLoc(), physicalExtent.getValue());
   for (unsigned component = 0; component < reduce.getSourceCount(); ++component) {
+    auto originalType =
+        cast<FragmentType>(reduce.getInputs()[component].getType());
+    auto sourceMap = cast<AxisMapAttr>(
+        originalType.getAxisMaps()[static_cast<unsigned>(reductionAxis)]);
+    PhysicalSourceAxis reductionSource{sourceMap.getSourceId(),
+                                       sourceMap.getSourceAxis()};
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
-        builder, reduce.getLoc(), reduce.getInputs()[component], logicalExtent,
-        physicalExtent, physicalExtentValue, mapping, tailPredicates);
+        builder, reduce.getLoc(), reduce.getInputs()[component], reductionSource,
+        logicalExtent, physicalExtent, physicalExtentValue, mapping,
+        tailPredicates);
     if (failed(source) || tailPredicates.empty())
       return reduce.emitOpError(
                  "static reduction producer cannot be replayed over its padded extent"),
@@ -1067,9 +881,6 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     reduce->setOperand(component, selected);
   }
   eraseDeadPhysicalValues(kernel);
-  if (failed(
-          padRemainingStaticExtent(kernel, logicalExtent, physicalExtent)))
-    return failure();
   return true;
 }
 
@@ -1661,7 +1472,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                    : FailureOr<AxisMapAttr>(failure());
       llvm::SmallPtrSet<Operation *, 16> visited;
       if (!fragment || failed(mapping) ||
-          !isReplayableWithoutLoad(source, visited))
+          !isReplayableWithoutLoad(source, mapping->getSourceId(), visited))
         return reduce.emitOpError()
                << "multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type="
                << source.getType() << ", producer="
@@ -2384,7 +2195,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (failed(plan)) {
       FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
       llvm::SmallPtrSet<Operation *, 16> visited;
-      if (failed(mapping) || !isReplayableWithoutLoad(source, visited))
+      if (failed(mapping) ||
+          !isReplayableWithoutLoad(source, mapping->getSourceId(), visited))
         return unhandled(
             Twine("source is neither load-rooted nor replayable pure data on the reduction axis; producer=") +
             (source.getDefiningOp()
