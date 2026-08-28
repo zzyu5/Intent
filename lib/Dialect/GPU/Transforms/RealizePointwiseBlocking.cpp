@@ -2299,6 +2299,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     Value tileCoordinate = tileCoordinates.lookup(*dimensionId);
     if (!tileCoordinate && internalDimensions.contains(*dimensionId))
       tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
+    if (!tileCoordinate && !range->hasAttr(sourceSubregionAttr)) {
+      if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
+        return range.emitOpError(
+            "program-local range has no exact full-coverage realization");
+      tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
+    }
     if (!tileCoordinate)
       return range.emitOpError(
                  "dynamic pointwise range has no physical tile coordinate")
