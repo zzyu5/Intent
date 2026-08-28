@@ -267,7 +267,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
     OpBuilder builder(range);
     return Value(builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), range.getStart(),
-        range.getExtent(), /*add=*/0));
+        range.getExtent(), BinaryOperator::Add));
   }
   auto dimension = range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
   if (dimension && !range->hasAttr(sourceSubregionAttr)) {
@@ -319,7 +319,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
         continue;
       }
       auto comparison = dyn_cast<CompareOp>(user);
-      if (!comparison || comparison.getPredicate() != 2 ||
+      if (!comparison || comparison.getPredicate() != ComparePredicate::Lt ||
           comparison.getLhs() != coordinate)
         continue;
       Value candidate = stripBroadcast(comparison.getRhs());
@@ -334,7 +334,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
   OpBuilder builder(range);
   return Value(builder.create<BinaryOp>(
       range.getLoc(), builder.getIndexType(), range.getStart(),
-      range.getExtent(), /*add=*/0));
+      range.getExtent(), BinaryOperator::Add));
 }
 
 void retargetSourceExtent(Value root, uint64_t sourceId,
@@ -527,10 +527,10 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     builder.setInsertionPointAfter(range);
     Value distance = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), logicalExtent, range.getStep(),
-        /*multiply=*/2);
+        BinaryOperator::Multiply);
     Value stop = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), range.getStart(), distance,
-        /*add=*/0);
+        BinaryOperator::Add);
     auto coordinate = cast<FragmentType>(range.getResult().getType());
     Value stopFragment =
         builder.create<BroadcastOp>(range.getLoc(), coordinate, stop);
@@ -540,7 +540,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         coordinate.getOwner());
     predicates[range.getOperation()] = builder.create<CompareOp>(
         range.getLoc(), predicate, range.getResult(), stopFragment,
-        /*less-than=*/2);
+        ComparePredicate::Lt);
   }
 
   auto materializeTail = [&](OpBuilder &builder, Location location,
@@ -555,7 +555,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
                             location, current->getType(), result, *current,
-                            /*and=*/11))
+                            BinaryOperator::LogicalAnd))
                       : *current;
     }
     return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
@@ -585,7 +585,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       if (existing.getType() != predicate)
         existing = builder.create<BroadcastOp>(load.getLoc(), predicate, existing);
       valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
-                                       /*and=*/11);
+                                       BinaryOperator::LogicalAnd);
     }
     Value fill = load.getFill();
     if (!fill)
@@ -622,7 +622,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         existing =
             builder.create<BroadcastOp>(store.getLoc(), predicate, existing);
       valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
-                                       valid, /*and=*/11);
+                                       valid, BinaryOperator::LogicalAnd);
     }
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),

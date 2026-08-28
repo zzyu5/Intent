@@ -20,7 +20,7 @@ PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
 
 Value multiply(OpBuilder &builder, Location location, Value lhs, Value rhs) {
   return builder.create<BinaryOp>(location, builder.getIndexType(), lhs, rhs,
-                                  /*operator_kind=*/2);
+                                  BinaryOperator::Multiply);
 }
 
 LogicalResult realizeGroupedContractionMapping(
@@ -61,7 +61,7 @@ LogicalResult realizeGroupedContractionMapping(
   OpBuilder builder(mapping);
   builder.setInsertionPointAfter(mapping);
   llvm::SmallPtrSet<Operation *, 16> swizzleOperations;
-  auto binary = [&](Value lhs, Value rhs, uint64_t kind) {
+  auto binary = [&](Value lhs, Value rhs, BinaryOperator kind) {
     auto operation = builder.create<BinaryOp>(mapping.getLoc(),
                                               builder.getIndexType(), lhs, rhs,
                                               kind);
@@ -72,16 +72,22 @@ LogicalResult realizeGroupedContractionMapping(
   Value columnCount = mapping.getExtents()[*columnAxis];
   Value row = mapping.getCoordinates()[*rowAxis];
   Value column = mapping.getCoordinates()[*columnAxis];
-  Value linear = binary(binary(row, columnCount, 2), column, 0);
-  Value programsPerGroup = binary(groupSize, columnCount, 2);
-  Value group = binary(linear, programsPerGroup, 4);
-  Value firstRow = binary(group, groupSize, 2);
-  Value liveRows = binary(rowCount, firstRow, 1);
-  Value activeGroupSize = binary(liveRows, groupSize, 10);
-  Value groupOffset = binary(linear, programsPerGroup, 5);
+  Value linear = binary(binary(row, columnCount, BinaryOperator::Multiply),
+                        column, BinaryOperator::Add);
+  Value programsPerGroup =
+      binary(groupSize, columnCount, BinaryOperator::Multiply);
+  Value group = binary(linear, programsPerGroup, BinaryOperator::FloorDivide);
+  Value firstRow = binary(group, groupSize, BinaryOperator::Multiply);
+  Value liveRows = binary(rowCount, firstRow, BinaryOperator::Subtract);
+  Value activeGroupSize =
+      binary(liveRows, groupSize, BinaryOperator::MinimumNum);
+  Value groupOffset = binary(linear, programsPerGroup, BinaryOperator::Remainder);
   Value groupedRow =
-      binary(firstRow, binary(groupOffset, activeGroupSize, 5), 0);
-  Value groupedColumn = binary(groupOffset, activeGroupSize, 4);
+      binary(firstRow,
+             binary(groupOffset, activeGroupSize, BinaryOperator::Remainder),
+             BinaryOperator::Add);
+  Value groupedColumn =
+      binary(groupOffset, activeGroupSize, BinaryOperator::FloorDivide);
 
   auto replaceExternalUses = [&](Value source, Value replacement) {
     for (OpOperand &use : llvm::make_early_inc_range(source.getUses()))

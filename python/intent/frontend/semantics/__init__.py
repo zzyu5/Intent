@@ -11,6 +11,7 @@ from .operations import IndexRelation
 from .operations import IndexTerm
 from .operations import IndexTermKind
 from .operations import OperationKind
+from .operations import ScaledFormatKind
 from .operations import ShapeExpr
 from .operations import ShapeExprKind
 from .operations import ShapeRelation

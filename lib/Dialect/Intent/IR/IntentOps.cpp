@@ -698,15 +698,15 @@ LogicalResult verifyDataOperation(Operation *operation) {
   Type result = operation->getResult(0).getType();
   if (name == "intent.unary") {
     Type input = operation->getOperand(0).getType();
-    auto kind = operation->getAttrOfType<IntegerAttr>("operator_kind");
-    if (!kind || kind.getInt() < 0 || kind.getInt() > 13 ||
-        !sameDataSchema(input, result))
+    auto kind = operation->getAttrOfType<UnaryOperatorAttr>("operator_kind");
+    if (!kind || !sameDataSchema(input, result))
       return operation->emitOpError("unary operator/schema is invalid");
-    if (kind.getInt() == 1)
+    if (kind.getValue() == UnaryOperator::Not)
       return isBooleanData(input)
                  ? success()
                  : operation->emitOpError("logical not requires bool data");
-    if (kind.getInt() == 0 || kind.getInt() == 12)
+    if (kind.getValue() == UnaryOperator::Negate ||
+        kind.getValue() == UnaryOperator::Abs)
       return isNumericData(input)
                  ? success()
                  : operation->emitOpError("numeric unary requires numeric data");
@@ -719,18 +719,22 @@ LogicalResult verifyDataOperation(Operation *operation) {
   if (name == "intent.binary") {
     Type lhs = operation->getOperand(0).getType();
     Type rhs = operation->getOperand(1).getType();
-    auto kind = operation->getAttrOfType<IntegerAttr>("operator_kind");
-    if (!kind || kind.getInt() < 0 || kind.getInt() > 17 ||
-        !sameDataSchema(lhs, rhs, false) ||
+    auto kind = operation->getAttrOfType<BinaryOperatorAttr>("operator_kind");
+    if (!kind || !sameDataSchema(lhs, rhs, false) ||
         !sameDataSchema(lhs, result, false))
       return operation->emitOpError("binary operator/schema is invalid");
-    int64_t value = kind.getInt();
-    if (value == 11 || value == 12)
+    BinaryOperator value = kind.getValue();
+    if (value == BinaryOperator::LogicalAnd ||
+        value == BinaryOperator::LogicalOr)
       return isBooleanData(lhs) && isBooleanData(rhs) && isBooleanData(result)
                  ? success()
                  : operation->emitOpError(
                        "logical binary operation requires bool data");
-    if (value >= 13) {
+    if (value == BinaryOperator::BitwiseAnd ||
+        value == BinaryOperator::BitwiseOr ||
+        value == BinaryOperator::BitwiseXor ||
+        value == BinaryOperator::LeftShift ||
+        value == BinaryOperator::RightShift) {
       Type lhsElement = getElementType(lhs);
       Type rhsElement = getElementType(rhs);
       Type resultElement = getElementType(result);
@@ -744,14 +748,17 @@ LogicalResult verifyDataOperation(Operation *operation) {
     if (!isNumericData(lhs) || !isNumericData(rhs) || !isNumericData(result))
       return operation->emitOpError(
           "arithmetic binary operation requires numeric data");
-    if (value == 3 && !isa<FloatType>(getElementType(lhs)))
+    if (value == BinaryOperator::TrueDivide &&
+        !isa<FloatType>(getElementType(lhs)))
       return operation->emitOpError(
           "true division requires explicitly floating operands");
-    if ((value == 4 || value == 5) &&
+    if ((value == BinaryOperator::FloorDivide ||
+         value == BinaryOperator::Remainder) &&
         !isa<IntegerType, IndexType, LogicalIndexType>(getElementType(lhs)))
       return operation->emitOpError(
           "floor division/remainder require integer/index operands");
-    if ((value == 9 || value == 10) &&
+    if ((value == BinaryOperator::MaximumNum ||
+         value == BinaryOperator::MinimumNum) &&
         !isa<FloatType>(getElementType(lhs)))
       return operation->emitOpError(
           "NaN-selecting min/max require floating operands");
@@ -761,9 +768,9 @@ LogicalResult verifyDataOperation(Operation *operation) {
   if (name == "intent.compare") {
     Type lhs = operation->getOperand(0).getType();
     Type rhs = operation->getOperand(1).getType();
-    auto predicate = operation->getAttrOfType<IntegerAttr>("predicate");
-    if (!predicate || predicate.getInt() < 0 || predicate.getInt() > 5 ||
-        !sameDataSchema(lhs, rhs, false) ||
+    auto predicate =
+        operation->getAttrOfType<ComparePredicateAttr>("predicate");
+    if (!predicate || !sameDataSchema(lhs, rhs, false) ||
         !sameDataSchema(lhs, result, false) || !isBooleanData(result) ||
         (!sameDataSchema(lhs, rhs) &&
          !(isNumericData(lhs) && isNumericData(rhs))))
@@ -1374,15 +1381,16 @@ LogicalResult verifyAtomic(Operation *operation) {
   auto target = getTensorSchema(targetType);
   if (!target || !isa<ViewType, BufferType>(targetType))
     return operation->emitOpError("atomic target must be a view or logical buffer");
-  auto order = operation->getAttrOfType<IntegerAttr>("ordering");
-  if (!order || order.getInt() < 0 || order.getInt() > 3)
+  auto order = operation->getAttrOfType<AtomicOrderingAttr>("ordering");
+  if (!order)
     return operation->emitOpError("atomic ordering is outside the language enum");
   StringRef name = operation->getName().getStringRef();
   if (auto view = dyn_cast<ViewType>(targetType); view && view.getAccess() != 2)
     return operation->emitOpError(
         "external atomic target must use InOut access semantics");
   if (name == "intent.atomic_load") {
-    if (order.getInt() != 0 && order.getInt() != 1)
+    if (order.getValue() != AtomicOrdering::Relaxed &&
+        order.getValue() != AtomicOrdering::Acquire)
       return operation->emitOpError("atomic load allows relaxed or acquire ordering");
     if (failed(verifyIndexedData(operation, operation->getResult(0).getType(),
                                  target.getElementType(), *relation,
@@ -1402,15 +1410,16 @@ LogicalResult verifyAtomic(Operation *operation) {
                                *relation, "atomic value")))
     return failure();
   if (name == "intent.atomic_store") {
-    if (order.getInt() != 0 && order.getInt() != 2)
+    if (order.getValue() != AtomicOrdering::Relaxed &&
+        order.getValue() != AtomicOrdering::Release)
       return operation->emitOpError("atomic store allows relaxed or release ordering");
     return verifyOperandPartition(
         operation, *relation,
         {static_cast<unsigned>(valueIndex.getInt())});
   }
   if (name == "intent.atomic_rmw") {
-    auto kind = operation->getAttrOfType<IntegerAttr>("kind");
-    if (!kind || kind.getInt() < 0 || kind.getInt() > 6 ||
+    auto kind = operation->getAttrOfType<AtomicRMWKindAttr>("kind");
+    if (!kind ||
         operation->getResult(0).getType() != valueType)
       return operation->emitOpError("atomic RMW schema is invalid");
     return verifyOperandPartition(

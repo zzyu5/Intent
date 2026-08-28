@@ -283,22 +283,19 @@ LogicalResult BroadcastOp::verify() {
 }
 
 LogicalResult UnaryOp::verify() {
-  if (getOperatorKind() > 13 || !sameShape(getInput().getType(), getResult().getType()) ||
+  if (!sameShape(getInput().getType(), getResult().getType()) ||
       elementType(getInput().getType()) != elementType(getResult().getType()))
     return emitOpError("unary physical schema is invalid");
   return success();
 }
 
 LogicalResult BinaryOp::verify() {
-  if (getOperatorKind() > 17)
-    return emitOpError("binary operator is outside the canonical enum");
   return verifyDataSchemas(getOperation(), {getLhs().getType(), getRhs().getType()},
                            getResult().getType());
 }
 
 LogicalResult CompareOp::verify() {
-  if (getPredicate() > 5 ||
-      !sameShape(getLhs().getType(), getRhs().getType()) ||
+  if (!sameShape(getLhs().getType(), getRhs().getType()) ||
       !sameExecutionShape(getLhs().getType(), getResult().getType()) ||
       elementType(getLhs().getType()) != elementType(getRhs().getType()) ||
       !elementType(getResult().getType()).isInteger(1)) {
@@ -730,7 +727,6 @@ LogicalResult ScaledContractOp::verify() {
   auto rhs = getRhs().getType();
   auto result = getResult().getType();
   if (getLhsGroupSize() == 0 || getRhsGroupSize() == 0 ||
-      getLhsFormat() > 2 || getRhsFormat() > 2 ||
       getAccumulator().getType() != result || lhs.getOwner() != rhs.getOwner() ||
       lhs.getOwner() != result.getOwner())
     return emitOpError("scaled-contract physical schema is invalid");
@@ -788,9 +784,9 @@ namespace {
 LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
                                   ValueRange coordinates, Value valid,
                                   ArrayRef<int64_t> sourceAxes,
-                                  uint64_t ordering, uint64_t sharing) {
+                                  AtomicOrdering ordering, uint64_t sharing) {
   if (coordinates.size() != rankOf(resource) ||
-      sourceAxes.size() != coordinates.size() || ordering > 3 || sharing > 2)
+      sourceAxes.size() != coordinates.size() || sharing > 2)
     return owner->emitOpError("atomic physical address/order schema is invalid");
   if (valid && !elementType(valid.getType()).isInteger(1))
     return owner->emitOpError("atomic validity must be a predicate");
@@ -820,7 +816,7 @@ LogicalResult AtomicStoreOp::verify() {
 }
 
 LogicalResult AtomicRMWOp::verify() {
-  if (getKind() > 6 || getResult().getType() != getValue().getType() ||
+  if (getResult().getType() != getValue().getType() ||
       resourceElementType(getResource().getType()) !=
           elementType(getValue().getType()) ||
       (getValid() && !sameShape(getValid().getType(), getValue().getType())))
@@ -829,7 +825,7 @@ LogicalResult AtomicRMWOp::verify() {
            << resourceElementType(getResource().getType())
            << ", value=" << getValue().getType()
            << ", result=" << getResult().getType()
-           << ", kind=" << getKind();
+           << ", kind=" << stringifyAtomicRMWKind(getKind());
   return verifyAtomicAddress(getOperation(), getResource().getType(),
                              getCoordinates(), getValid(), getSourceAxes(),
                              getOrdering(), getSharing());

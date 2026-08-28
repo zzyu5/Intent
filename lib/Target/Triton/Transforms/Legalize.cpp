@@ -480,7 +480,8 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
     return false;
   auto binary = dyn_cast<gpu::BinaryOp>(block.front());
   auto yield = dyn_cast<gpu::YieldOp>(block.back());
-  if (!binary || !yield || binary.getOperatorKind() != 0 ||
+  if (!binary || !yield ||
+      binary.getOperatorKind() != BinaryOperator::Add ||
       yield.getValues().size() != 1 ||
       yield.getValues().front() != binary.getResult())
     return false;
@@ -501,7 +502,7 @@ bool isNativeAddReduce(gpu::ReduceOp reduce) {
     return false;
   auto binary = dyn_cast<gpu::BinaryOp>(block.front());
   auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
-  if (!binary || binary.getOperatorKind() != 0 || !yield ||
+  if (!binary || binary.getOperatorKind() != BinaryOperator::Add || !yield ||
       yield.getValues().size() != 1 || yield.getValues().front() != binary)
     return false;
   Value lhs = binary.getLhs();
@@ -528,7 +529,7 @@ LogicalResult legalizeScatterAdd(func::FuncOp kernel) {
     auto atomic = builder.create<gpu::AtomicRMWOp>(
         scatter.getLoc(), scatter.getValue().getType(), scatter.getResource(),
         scatter.getCoordinates(), scatter.getValue(), scatter.getValid(),
-        /*kind=*/1, /*ordering=*/0, scatter.getSharing(),
+        AtomicRMWKind::Add, AtomicOrdering::Relaxed, scatter.getSharing(),
         scatter.getSourceAxes());
     if (Attribute origin = scatter->getAttr(gpu::originAttr))
       atomic->setAttr(gpu::originAttr, origin);
@@ -810,7 +811,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       Type rhsScaleElement =
           contract.getRhsScale().getType().getElementType();
       if ((lhsRank != 2 && lhsRank != 3) || rhsRank != lhsRank ||
-          contract.getLhsFormat() > 1 || contract.getRhsFormat() > 1 ||
+          contract.getLhsFormat() == ScaledFormat::E8M0 ||
+          contract.getRhsFormat() == ScaledFormat::E8M0 ||
           contract.getLhsGroupSize() != 32 ||
           contract.getRhsGroupSize() != 32 ||
           !lhsScaleElement.isUnsignedInteger(8) ||

@@ -92,20 +92,20 @@ std::optional<int64_t> constantValue(Value value) {
       return actual && *actual == expected;
     };
     switch (binary.getOperatorKind()) {
-    case 0: {
+    case BinaryOperator::Add: {
       if (equals(binary.getLhs(), 0))
         return constantValue(binary.getRhs());
       if (equals(binary.getRhs(), 0))
         return constantValue(binary.getLhs());
       break;
     }
-    case 1: {
+    case BinaryOperator::Subtract: {
       if (equals(binary.getRhs(), 0))
         return constantValue(binary.getLhs());
       if (binary.getLhs() == binary.getRhs())
         return 0;
       if (auto add = binary.getLhs().getDefiningOp<gpu::BinaryOp>())
-        if (add.getOperatorKind() == 0) {
+        if (add.getOperatorKind() == BinaryOperator::Add) {
           if (add.getLhs() == binary.getRhs())
             return constantValue(add.getRhs());
           if (add.getRhs() == binary.getRhs())
@@ -113,7 +113,7 @@ std::optional<int64_t> constantValue(Value value) {
         }
       break;
     }
-    case 2:
+    case BinaryOperator::Multiply:
       if (equals(binary.getLhs(), 0) || equals(binary.getRhs(), 0))
         return 0;
       if (equals(binary.getLhs(), 1))
@@ -121,7 +121,7 @@ std::optional<int64_t> constantValue(Value value) {
       if (equals(binary.getRhs(), 1))
         return constantValue(binary.getLhs());
       break;
-    case 4:
+    case BinaryOperator::FloorDivide:
       if (equals(binary.getRhs(), 1))
         return constantValue(binary.getLhs());
       break;
@@ -133,13 +133,13 @@ std::optional<int64_t> constantValue(Value value) {
     if (!lhs || !rhs)
       return std::nullopt;
     switch (binary.getOperatorKind()) {
-    case 0:
+    case BinaryOperator::Add:
       return *lhs + *rhs;
-    case 1:
+    case BinaryOperator::Subtract:
       return *lhs - *rhs;
-    case 2:
+    case BinaryOperator::Multiply:
       return *lhs * *rhs;
-    case 4:
+    case BinaryOperator::FloorDivide:
       return *rhs == 0 ? std::nullopt
                        : std::optional<int64_t>(*lhs / *rhs);
     default:
@@ -173,10 +173,17 @@ bool sameProvableValue(Value lhs, Value rhs) {
         sameProvableValue(leftBinary.getRhs(), rightBinary.getRhs());
     if (direct)
       return true;
-    uint64_t kind = leftBinary.getOperatorKind();
-    bool commutative = kind == 0 || kind == 2 || kind == 7 || kind == 8 ||
-                       kind == 9 || kind == 10 || kind == 11 || kind == 12 ||
-                       kind == 13 || kind == 14 || kind == 15;
+    BinaryOperator kind = leftBinary.getOperatorKind();
+    bool commutative =
+        kind == BinaryOperator::Add || kind == BinaryOperator::Multiply ||
+        kind == BinaryOperator::Maximum || kind == BinaryOperator::Minimum ||
+        kind == BinaryOperator::MaximumNum ||
+        kind == BinaryOperator::MinimumNum ||
+        kind == BinaryOperator::LogicalAnd ||
+        kind == BinaryOperator::LogicalOr ||
+        kind == BinaryOperator::BitwiseAnd ||
+        kind == BinaryOperator::BitwiseOr ||
+        kind == BinaryOperator::BitwiseXor;
     return commutative &&
            sameProvableValue(leftBinary.getLhs(), rightBinary.getRhs()) &&
            sameProvableValue(leftBinary.getRhs(), rightBinary.getLhs());
@@ -247,16 +254,21 @@ bool isViewExtent(Value value, Value resource, unsigned axis) {
     return isViewExtent(range.getStep(), resource, axis);
   }
   if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() == 0 && isProvably(binary.getLhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        isProvably(binary.getLhs(), 0))
       return isViewExtent(binary.getRhs(), resource, axis);
-    if (binary.getOperatorKind() == 0 && isProvably(binary.getRhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        isProvably(binary.getRhs(), 0))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == 1 && isProvably(binary.getRhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
+        isProvably(binary.getRhs(), 0))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if ((binary.getOperatorKind() == 2 || binary.getOperatorKind() == 4) &&
+    if ((binary.getOperatorKind() == BinaryOperator::Multiply ||
+         binary.getOperatorKind() == BinaryOperator::FloorDivide) &&
         isProvably(binary.getRhs(), 1))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == 2 && isProvably(binary.getLhs(), 1))
+    if (binary.getOperatorKind() == BinaryOperator::Multiply &&
+        isProvably(binary.getLhs(), 1))
       return isViewExtent(binary.getRhs(), resource, axis);
   }
   return false;
@@ -286,7 +298,7 @@ bool hasExactRangeCoverage(Value coordinate, Value upperBound) {
   upperBound = stripBroadcast(upperBound);
   auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>();
   auto add = upperBound.getDefiningOp<gpu::BinaryOp>();
-  if (!range || !add || add.getOperatorKind() != 0 ||
+  if (!range || !add || add.getOperatorKind() != BinaryOperator::Add ||
       !isProvably(range.getStep(), 1))
     return false;
   Value extent;
@@ -317,7 +329,7 @@ bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
     return isFullViewValidity(transpose.getValue(), resource, coordinates,
                               sourceAxes);
   if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() != 11)
+    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd)
       return false;
     return isFullViewValidity(binary.getLhs(), resource, coordinates,
                               sourceAxes) &&
@@ -325,7 +337,7 @@ bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
                               sourceAxes);
   }
   auto compare = valid.getDefiningOp<gpu::CompareOp>();
-  if (!compare || compare.getPredicate() != 2)
+  if (!compare || compare.getPredicate() != ComparePredicate::Lt)
     return false;
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
     if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
@@ -375,27 +387,27 @@ std::optional<uint64_t> nativeCombineKind(Region &region) {
         (binary.getLhs() == block.getArgument(1) &&
          binary.getRhs() == block.getArgument(0))))
     return std::nullopt;
-  if (binary.getOperatorKind() == 0)
+  if (binary.getOperatorKind() == BinaryOperator::Add)
     return 0;
-  if (binary.getOperatorKind() == 7 || binary.getOperatorKind() == 9)
+  if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
     return 1;
-  if (binary.getOperatorKind() == 8 || binary.getOperatorKind() == 10)
+  if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
     return 2;
   Type resultType = binary.getResult().getType();
   Type elementType = resultType;
   if (auto fragment = dyn_cast<gpu::FragmentType>(resultType))
     elementType = fragment.getElementType();
   if (elementType.isInteger(1)) {
-    if (binary.getOperatorKind() == 12)
+    if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
       return 4;
-    if (binary.getOperatorKind() == 11)
+    if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
       return 3;
   }
-  if (binary.getOperatorKind() == 13)
+  if (binary.getOperatorKind() == BinaryOperator::BitwiseAnd)
     return 3;
-  if (binary.getOperatorKind() == 14)
+  if (binary.getOperatorKind() == BinaryOperator::BitwiseOr)
     return 4;
-  if (binary.getOperatorKind() == 15)
+  if (binary.getOperatorKind() == BinaryOperator::BitwiseXor)
     return 5;
   return std::nullopt;
 }
@@ -924,12 +936,12 @@ private:
       if (!isProvably(range.getStep(), 1))
         scaled = builder.create<gpu::BinaryOp>(
             owner->getLoc(), builder.getIndexType(), scaled, range.getStep(),
-            /*multiply=*/2);
+            BinaryOperator::Multiply);
       result = scaled;
       if (!isProvably(range.getStart(), 0))
         result = builder.create<gpu::BinaryOp>(
             owner->getLoc(), builder.getIndexType(), range.getStart(), result,
-            /*add=*/0);
+            BinaryOperator::Add);
     } else if (auto splat = dyn_cast<gpu::SplatOp>(producer)) {
       result = splat.getValue();
     } else if (auto broadcast = dyn_cast<gpu::BroadcastOp>(producer)) {
@@ -967,7 +979,7 @@ private:
           builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
       Value first = builder.create<gpu::CompareOp>(
           owner->getLoc(), builder.getI1Type(), targetIndices[join.getAxis()],
-          zero, /*equal=*/0);
+          zero, ComparePredicate::Eq);
       result = builder.create<gpu::SelectOp>(
           owner->getLoc(), source.getElementType(), first, *lhs, *rhs);
     } else if (auto unary = dyn_cast<gpu::UnaryOp>(producer)) {
@@ -1332,10 +1344,10 @@ private:
           cast<gpu::PhysicalExprAttr>(logical));
       Value inBounds = builder.create<gpu::CompareOp>(
           owner->getLoc(), builder.getI1Type(), argument, extent,
-          /*less-than=*/2);
+          ComparePredicate::Lt);
       valid = builder.create<gpu::BinaryOp>(owner->getLoc(), builder.getI1Type(),
                                             valid, inBounds,
-                                            /*logical-and=*/13);
+                                            BinaryOperator::LogicalAnd);
     }
     DenseMap<Value, Value> memo;
     FailureOr<Value> scalar = scalarize(value, fragment, body.getArguments(),

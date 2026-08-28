@@ -155,7 +155,7 @@ FragmentType fragmentType(MLIRContext *context, Type element,
 }
 
 Value createBinary(OpBuilder &builder, Location location, Type result, Value lhs,
-                   Value rhs, uint64_t kind) {
+                   Value rhs, BinaryOperator kind) {
   auto left = lhs.getDefiningOp<arith::ConstantOp>();
   auto right = rhs.getDefiningOp<arith::ConstantOp>();
   auto leftInteger = left ? dyn_cast<IntegerAttr>(left.getValue()) : IntegerAttr();
@@ -164,15 +164,15 @@ Value createBinary(OpBuilder &builder, Location location, Type result, Value lhs
     int64_t l = leftInteger.getInt();
     int64_t r = rightInteger.getInt();
     std::optional<int64_t> folded;
-    if (kind == 0)
+    if (kind == BinaryOperator::Add)
       folded = l + r;
-    else if (kind == 1)
+    else if (kind == BinaryOperator::Subtract)
       folded = l - r;
-    else if (kind == 2)
+    else if (kind == BinaryOperator::Multiply)
       folded = l * r;
-    else if (kind == 4 && r != 0)
+    else if (kind == BinaryOperator::FloorDivide && r != 0)
       folded = l / r;
-    else if (kind == 11)
+    else if (kind == BinaryOperator::LogicalAnd)
       folded = l && r;
     if (folded)
       return builder.create<arith::ConstantOp>(
@@ -563,7 +563,7 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
 }
 
 Value createCompare(OpBuilder &builder, Location location, Type result, Value lhs,
-                    Value rhs, uint64_t predicate) {
+                    Value rhs, ComparePredicate predicate) {
   return builder.create<gpu::CompareOp>(location, result, lhs, rhs, predicate);
 }
 
@@ -790,24 +790,24 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value,
       return failure();
     PhysicalExprKind kind;
     switch (binary.getOperatorKind()) {
-    case 0:
+    case BinaryOperator::Add:
       kind = PhysicalExprKind::Add;
       break;
-    case 1:
+    case BinaryOperator::Subtract:
       kind = PhysicalExprKind::Subtract;
       break;
-    case 2:
+    case BinaryOperator::Multiply:
       kind = PhysicalExprKind::Multiply;
       break;
-    case 4:
+    case BinaryOperator::FloorDivide:
       kind = PhysicalExprKind::FloorDiv;
       break;
-    case 7:
-    case 9:
+    case BinaryOperator::Maximum:
+    case BinaryOperator::MaximumNum:
       kind = PhysicalExprKind::Maximum;
       break;
-    case 8:
-    case 10:
+    case BinaryOperator::Minimum:
+    case BinaryOperator::MinimumNum:
       kind = PhysicalExprKind::Minimum;
       break;
     default:
@@ -963,7 +963,7 @@ std::optional<int64_t> subregionStaticExtentBound(Operation *origin,
     Value stop = subregion.getInputs()[2];
     auto addedExtent = [&](Value candidate) -> std::optional<int64_t> {
       auto add = candidate.getDefiningOp<intent::BinaryOp>();
-      if (!add || add.getOperatorKind() != 0)
+      if (!add || add.getOperatorKind() != BinaryOperator::Add)
         return std::nullopt;
       if (add.getLhs() == start)
         return integerConstant(add.getRhs());
@@ -975,7 +975,8 @@ std::optional<int64_t> subregionStaticExtentBound(Operation *origin,
     if (!bound) {
       auto minimum = stop.getDefiningOp<intent::BinaryOp>();
       if (minimum &&
-          (minimum.getOperatorKind() == 8 || minimum.getOperatorKind() == 10)) {
+          (minimum.getOperatorKind() == BinaryOperator::Minimum ||
+           minimum.getOperatorKind() == BinaryOperator::MinimumNum)) {
         bound = addedExtent(minimum.getLhs());
         if (!bound)
           bound = addedExtent(minimum.getRhs());
@@ -983,16 +984,17 @@ std::optional<int64_t> subregionStaticExtentBound(Operation *origin,
     }
     if (!bound) {
       auto difference = stop.getDefiningOp<intent::BinaryOp>();
-      if (difference && difference.getOperatorKind() == 1) {
+      if (difference &&
+          difference.getOperatorKind() == BinaryOperator::Subtract) {
         Value base = difference.getRhs();
         auto minimum = difference.getLhs().getDefiningOp<intent::BinaryOp>();
         if (minimum &&
-            (minimum.getOperatorKind() == 8 ||
-             minimum.getOperatorKind() == 10)) {
+            (minimum.getOperatorKind() == BinaryOperator::Minimum ||
+             minimum.getOperatorKind() == BinaryOperator::MinimumNum)) {
           auto distanceFromBase = [&](Value candidate)
               -> std::optional<int64_t> {
             auto add = candidate.getDefiningOp<intent::BinaryOp>();
-            if (!add || add.getOperatorKind() != 0)
+            if (!add || add.getOperatorKind() != BinaryOperator::Add)
               return std::nullopt;
             if (add.getLhs() == base)
               return integerConstant(add.getRhs());
@@ -1476,12 +1478,14 @@ private:
   Value rangeExtent(Location location, Value start, Value stop, Value step) {
     Value one = builder.create<arith::ConstantIndexOp>(location, 1);
     Value distance = createBinary(builder, location, builder.getIndexType(), stop,
-                                  start, 1);
+                                  start, BinaryOperator::Subtract);
     Value adjusted = createBinary(
         builder, location, builder.getIndexType(), distance,
-        createBinary(builder, location, builder.getIndexType(), step, one, 1), 0);
+        createBinary(builder, location, builder.getIndexType(), step, one,
+                     BinaryOperator::Subtract),
+        BinaryOperator::Add);
     return createBinary(builder, location, builder.getIndexType(), adjusted, step,
-                        4);
+                        BinaryOperator::FloorDivide);
   }
 
   Value rangeBound(Location location, Value range, unsigned bound) {
@@ -1545,25 +1549,32 @@ private:
     if (failed(lhs) || failed(rhs))
       return failure();
     if (kind == PhysicalExprKind::Add)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 0);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::Add);
     if (kind == PhysicalExprKind::Subtract)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 1);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::Subtract);
     if (kind == PhysicalExprKind::Multiply)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 2);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::Multiply);
     if (kind == PhysicalExprKind::FloorDiv)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 4);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::FloorDivide);
     if (kind == PhysicalExprKind::Minimum)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 8);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::Minimum);
     if (kind == PhysicalExprKind::Maximum)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs, 7);
+      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
+                          BinaryOperator::Maximum);
     if (kind == PhysicalExprKind::CeilDiv) {
       Value one = builder.create<arith::ConstantIndexOp>(location, 1);
       Value adjusted = createBinary(
           builder, location, builder.getIndexType(), *lhs,
-          createBinary(builder, location, builder.getIndexType(), *rhs, one, 1),
-          0);
+          createBinary(builder, location, builder.getIndexType(), *rhs, one,
+                       BinaryOperator::Subtract),
+          BinaryOperator::Add);
       return createBinary(builder, location, builder.getIndexType(), adjusted,
-                          *rhs, 4);
+                          *rhs, BinaryOperator::FloorDivide);
     }
     return failure();
   }
@@ -1644,14 +1655,16 @@ private:
                          PhysicalExprAttr physicalExtent) -> Value {
       Value one = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
       Value distance = createBinary(builder, operation->getLoc(),
-                                    builder.getIndexType(), stop, start, 1);
+                                    builder.getIndexType(), stop, start,
+                                    BinaryOperator::Subtract);
       Value adjusted = createBinary(
           builder, operation->getLoc(), builder.getIndexType(), distance,
           createBinary(builder, operation->getLoc(), builder.getIndexType(), step,
-                       one, 1),
-          0);
+                       one, BinaryOperator::Subtract),
+          BinaryOperator::Add);
       Value extent = createBinary(builder, operation->getLoc(),
-                                  builder.getIndexType(), adjusted, step, 4);
+                                  builder.getIndexType(), adjusted, step,
+                                  BinaryOperator::FloorDivide);
       auto type = fragmentType(operation->getContext(), builder.getIndexType(),
                                {physicalExtent}, {{sourceId, sourceAxis}});
       return builder.create<gpu::MakeRangeOp>(
@@ -2476,14 +2489,15 @@ private:
       Value stop = rangeBound(location, *source, 1);
       Value step = rangeBound(location, *source, 2);
       Value distance = createBinary(builder, location, builder.getIndexType(),
-                                    stop, start, 1);
+                                    stop, start, BinaryOperator::Subtract);
       Value one = builder.create<arith::ConstantIndexOp>(location, 1);
       Value adjusted = createBinary(
           builder, location, builder.getIndexType(), distance,
-          createBinary(builder, location, builder.getIndexType(), step, one, 1),
-          0);
+          createBinary(builder, location, builder.getIndexType(), step, one,
+                       BinaryOperator::Subtract),
+          BinaryOperator::Add);
       Value extent = createBinary(builder, location, builder.getIndexType(),
-                                  adjusted, step, 4);
+                                  adjusted, step, BinaryOperator::FloorDivide);
       FailureOr<Type> result =
           convertDataType(indices.getResult().getType(), operation);
       if (failed(result) || !isa<gpu::FragmentType>(*result))
@@ -4471,26 +4485,28 @@ LogicalResult constructGPUProgram(ModuleOp module,
         return domain.emitOpError(
             "parallel workset runtime bounds are unavailable");
       Value distance = createBinary(builder, domain.getLoc(),
-                                    builder.getIndexType(), *stop, *start, 1);
+                                    builder.getIndexType(), *stop, *start,
+                                    BinaryOperator::Subtract);
       Value adjusted = createBinary(
           builder, domain.getLoc(), builder.getIndexType(), distance,
           createBinary(builder, domain.getLoc(), builder.getIndexType(), *step,
-                       one, 1),
-          0);
+                       one, BinaryOperator::Subtract),
+          BinaryOperator::Add);
       Value extent = createBinary(builder, domain.getLoc(),
-                                  builder.getIndexType(), adjusted, *step, 4);
+                                  builder.getIndexType(), adjusted, *step,
+                                  BinaryOperator::FloorDivide);
       runtimeExtents.push_back(extent);
       starts.push_back(*start);
       steps.push_back(*step);
       runtimeLength = createBinary(builder, domain.getLoc(),
                                    builder.getIndexType(), runtimeLength, extent,
-                                   2);
+                                   BinaryOperator::Multiply);
     }
     if (workset.singleton)
       runtimeExtents.push_back(one);
     Value segmentEnd = createBinary(builder, function.getLoc(),
                                     builder.getIndexType(), runtimeOffset,
-                                    runtimeLength, 0);
+                                    runtimeLength, BinaryOperator::Add);
     if (worksets.size() == 1) {
       SmallVector<Attribute> launchExtents(workset.launchExtents.begin(),
                                            workset.launchExtents.end());
@@ -4520,10 +4536,10 @@ LogicalResult constructGPUProgram(ModuleOp module,
           break;
         Value scaled = createBinary(builder, worksetLocation,
                                     builder.getIndexType(), localCoordinate,
-                                    steps[axis], 2);
+                                    steps[axis], BinaryOperator::Multiply);
         Value coordinate = createBinary(builder, worksetLocation,
                                         builder.getIndexType(), starts[axis],
-                                        scaled, 0);
+                                        scaled, BinaryOperator::Add);
         childValues[workset.coordinateArguments[axis]] = formWorksetCoordinate(
             builder, worksetLocation, workset.axes[axis], coordinate,
             axis, workset.pointwiseCoordinates);
@@ -4539,18 +4555,20 @@ LogicalResult constructGPUProgram(ModuleOp module,
       continue;
     }
     Value afterOffset = createCompare(builder, function.getLoc(),
-                                      builder.getI1Type(), pid, runtimeOffset, 5);
+                                      builder.getI1Type(), pid, runtimeOffset,
+                                      ComparePredicate::Ge);
     Value beforeEnd = createCompare(builder, function.getLoc(), builder.getI1Type(),
-                                    pid, segmentEnd, 2);
+                                    pid, segmentEnd, ComparePredicate::Lt);
     Value active = createBinary(builder, function.getLoc(), builder.getI1Type(),
-                                afterOffset, beforeEnd, 11);
+                                afterOffset, beforeEnd,
+                                BinaryOperator::LogicalAnd);
     Location worksetLocation = workset.singleton ? function.getLoc()
                                                  : workset.operation.getLoc();
     auto dispatch = builder.create<scf::IfOp>(
         worksetLocation, active,
         [&](OpBuilder &nested, Location location) {
           Value local = createBinary(nested, location, nested.getIndexType(), pid,
-                                     runtimeOffset, 1);
+                                     runtimeOffset, BinaryOperator::Subtract);
           SmallVector<Attribute> launchExtents(workset.launchExtents.begin(),
                                                workset.launchExtents.end());
           auto decoded = nested.create<gpu::DelinearizeOp>(
@@ -4573,9 +4591,11 @@ LogicalResult constructGPUProgram(ModuleOp module,
             if (workset.singleton)
               break;
             Value scaled = createBinary(nested, location, nested.getIndexType(),
-                                        localCoordinate, steps[axis], 2);
+                                        localCoordinate, steps[axis],
+                                        BinaryOperator::Multiply);
             Value coordinate = createBinary(nested, location, nested.getIndexType(),
-                                            starts[axis], scaled, 0);
+                                            starts[axis], scaled,
+                                            BinaryOperator::Add);
             childValues[workset.coordinateArguments[axis]] =
                 formWorksetCoordinate(nested, location, workset.axes[axis],
                                       coordinate, axis,

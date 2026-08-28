@@ -8,8 +8,10 @@ from intent.api import HelperDefinition
 from intent.frontend.mlir import MlirValue
 from intent.frontend.mlir.attributes import SparseFormatAttribute
 from intent.frontend.semantics import BinaryOperator
+from intent.frontend.semantics import ComparePredicate
 from intent.frontend.semantics import OperationKind
 from intent.frontend.semantics import RecordType
+from intent.frontend.semantics import ScaledFormatKind
 from intent.frontend.semantics import ScalarType
 from intent.frontend.semantics import StaticDim
 from intent.frontend.semantics import TensorType
@@ -1010,21 +1012,21 @@ def _argmax_combine_region(
         lowerer.location(node),
         operands=(lhs_value, rhs_value),
         result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": 4},
+        attributes={"predicate": ComparePredicate.GT},
     ).results[0]
     equal = lowerer.emit(
         OperationKind.COMPARE,
         lowerer.location(node),
         operands=(lhs_value, rhs_value),
         result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": 0},
+        attributes={"predicate": ComparePredicate.EQ},
     ).results[0]
     lower = lowerer.emit(
         OperationKind.COMPARE,
         lowerer.location(node),
         operands=(lhs_index, rhs_index),
         result_types=(ScalarType(intent_bool),),
-        attributes={"predicate": 3},
+        attributes={"predicate": ComparePredicate.LE},
     ).results[0]
     tied = lowerer.emit(
         OperationKind.BINARY,
@@ -1380,11 +1382,15 @@ def _contract_relations(
     return tuple(normalized_reduce), tuple(normalized_batch), result_shape
 
 
-def _scaled_format(lowerer: FunctionLowerer, node: ast.AST) -> int:
+def _scaled_format(lowerer: FunctionLowerer, node: ast.AST) -> ScaledFormatKind:
     value = lowerer.lower_expression(node)
     if not isinstance(value, ScaledFormat):
         lowerer.error(node, "scaled-contract format must be I.e2m1/I.e4m3/I.e8m0")
-    mapping = {"e2m1": 0, "e4m3": 1, "e8m0": 2}
+    mapping = {
+        "e2m1": ScaledFormatKind.E2M1,
+        "e4m3": ScaledFormatKind.E4M3,
+        "e8m0": ScaledFormatKind.E8M0,
+    }
     try:
         return mapping[value.name]
     except KeyError:

@@ -10,8 +10,14 @@ from intent.language import DType
 
 from ..semantics.operations import IndexRelation
 from ..semantics.operations import IndexTerm
+from ..semantics.operations import AtomicOrdering
+from ..semantics.operations import AtomicRMWKind
+from ..semantics.operations import BinaryOperator
+from ..semantics.operations import ComparePredicate
+from ..semantics.operations import ScaledFormatKind
 from ..semantics.operations import ShapeExpr
 from ..semantics.operations import ShapeRelation
+from ..semantics.operations import UnaryOperator
 from .types import quote
 
 
@@ -46,6 +52,25 @@ def emit_attribute(value: object) -> str:
         return f"@{value.name}"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, UnaryOperator):
+        return f"#intent.unary_operator<{value.name.lower()}>"
+    if isinstance(value, BinaryOperator):
+        return f"#intent.binary_operator<{value.name.lower()}>"
+    if isinstance(value, ComparePredicate):
+        return f"#intent.compare_predicate<{value.name.lower()}>"
+    if isinstance(value, AtomicOrdering):
+        return f"#intent.atomic_ordering<{value.name.lower()}>"
+    if isinstance(value, AtomicRMWKind):
+        spelling = {
+            AtomicRMWKind.MAX: "maximum",
+            AtomicRMWKind.MIN: "minimum",
+            AtomicRMWKind.AND: "bitwise_and",
+            AtomicRMWKind.OR: "bitwise_or",
+            AtomicRMWKind.XOR: "bitwise_xor",
+        }.get(value, value.name.lower())
+        return f"#intent.atomic_rmw_kind<{spelling}>"
+    if isinstance(value, ScaledFormatKind):
+        return f"#intent.scaled_format<{value.name.lower()}>"
     if isinstance(value, IntEnum):
         return f"{int(value)} : i64"
     if isinstance(value, int):

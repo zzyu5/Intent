@@ -4,6 +4,7 @@
 include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "Intent/Dialect/GPU/IR/GPUAttrs.td"
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
+include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -86,21 +87,22 @@ def IntentGPU_BroadcastOp : IntentGPU_Op<"broadcast", [Pure]> {
 }
 
 def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure]> {
-  let arguments = (ins IntentGPU_DataValue:$input, I64Attr:$operator_kind);
+  let arguments = (ins IntentGPU_DataValue:$input,
+                       Intent_UnaryOperatorAttr:$operator_kind);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
 
 def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
-                       I64Attr:$operator_kind);
+                       Intent_BinaryOperatorAttr:$operator_kind);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
 
 def IntentGPU_CompareOp : IntentGPU_Op<"compare", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
-                       I64Attr:$predicate);
+                       Intent_ComparePredicateAttr:$predicate);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
@@ -270,7 +272,8 @@ def IntentGPU_ScaledContractOp : IntentGPU_Op<"scaled_contract", [Pure]> {
                        DenseI64ArrayAttr:$rhs_reduction_axes,
                        DenseI64ArrayAttr:$lhs_batch_axes,
                        DenseI64ArrayAttr:$rhs_batch_axes,
-                       I64Attr:$lhs_format, I64Attr:$rhs_format,
+                       Intent_ScaledFormatAttr:$lhs_format,
+                       Intent_ScaledFormatAttr:$rhs_format,
                        I64Attr:$lhs_group_size, I64Attr:$rhs_group_size);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
@@ -319,7 +322,7 @@ def IntentGPU_AtomicLoadOp : IntentGPU_Op<"atomic_load", [
   let arguments = (ins IntentGPU_ResourceValue:$resource,
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        Optional<IntentGPU_DataValue>:$valid,
-                       I64Attr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
@@ -332,7 +335,7 @@ def IntentGPU_AtomicStoreOp : IntentGPU_Op<"atomic_store", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
-                       I64Attr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let hasVerifier = 1;
 }
@@ -344,7 +347,8 @@ def IntentGPU_AtomicRMWOp : IntentGPU_Op<"atomic_rmw", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
-                       I64Attr:$kind, I64Attr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicRMWKindAttr:$kind,
+                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
@@ -358,7 +362,7 @@ def IntentGPU_AtomicCompareExchangeOp : IntentGPU_Op<"atomic_compare_exchange", 
                        IntentGPU_DataValue:$expected,
                        IntentGPU_DataValue:$desired,
                        Optional<IntentGPU_DataValue>:$valid,
-                       I64Attr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_RecordValue:$result);
   let hasVerifier = 1;

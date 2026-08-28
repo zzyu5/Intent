@@ -115,12 +115,14 @@ MakeRangeOp sourceRange(Value value) {
   // multiplication, two independent ranges, or range-on-the-right subtraction:
   // those change the unit-step traversal rather than merely translating it.
   auto binary = value.getDefiningOp<BinaryOp>();
-  if (!binary || (binary.getOperatorKind() != 0 &&
-                  binary.getOperatorKind() != 1))
+  if (!binary ||
+      (binary.getOperatorKind() != BinaryOperator::Add &&
+       binary.getOperatorKind() != BinaryOperator::Subtract))
     return {};
   MakeRangeOp lhs = sourceRange(binary.getLhs());
   MakeRangeOp rhs = sourceRange(binary.getRhs());
-  if ((lhs && rhs) || (binary.getOperatorKind() == 1 && rhs))
+  if ((lhs && rhs) ||
+      (binary.getOperatorKind() == BinaryOperator::Subtract && rhs))
     return {};
   return lhs ? lhs : rhs;
 }
@@ -311,9 +313,11 @@ FailureOr<Value> clonePaddedProducer(
     Value logicalLength = builder.create<arith::ConstantIndexOp>(
         location, logicalExtent.getValue());
     Value distance = builder.create<BinaryOp>(
-        location, builder.getIndexType(), logicalLength, range.getStep(), 2);
+        location, builder.getIndexType(), logicalLength, range.getStep(),
+        BinaryOperator::Multiply);
     Value stop = builder.create<BinaryOp>(location, builder.getIndexType(),
-                                          range.getStart(), distance, 0);
+                                          range.getStart(), distance,
+                                          BinaryOperator::Add);
     Value stopFragment =
         builder.create<BroadcastOp>(location, paddedType, stop);
     auto predicateType = FragmentType::get(
@@ -321,7 +325,8 @@ FailureOr<Value> clonePaddedProducer(
         paddedType.getAxisMaps(), paddedType.getValidity(),
         paddedType.getOwner());
     Value predicate = builder.create<CompareOp>(
-        location, predicateType, padded.getResult(), stopFragment, 2);
+        location, predicateType, padded.getResult(), stopFragment,
+        ComparePredicate::Lt);
     tailPredicates.push_back(predicate);
     mapping.map(value, padded.getResult());
     return padded.getResult();
@@ -371,7 +376,8 @@ FailureOr<Value> clonePaddedProducer(
       if (failed(current))
         return failure();
       tail = tail ? Value(builder.create<BinaryOp>(
-                        location, current->getType(), tail, *current, 11))
+                        location, current->getType(), tail, *current,
+                        BinaryOperator::LogicalAnd))
                   : *current;
     }
     auto predicateType = cast<FragmentType>(tail.getType());
@@ -385,7 +391,8 @@ FailureOr<Value> clonePaddedProducer(
                failure();
       if (valid.getType() != predicateType)
         valid = builder.create<BroadcastOp>(location, predicateType, valid);
-      valid = builder.create<BinaryOp>(location, predicateType, valid, tail, 11);
+      valid = builder.create<BinaryOp>(location, predicateType, valid, tail,
+                                       BinaryOperator::LogicalAnd);
     } else {
       valid = tail;
     }
@@ -504,9 +511,11 @@ LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
     Value logical = builder.create<arith::ConstantIndexOp>(
         range.getLoc(), logicalExtent.getValue());
     Value distance = builder.create<BinaryOp>(
-        range.getLoc(), builder.getIndexType(), logical, range.getStep(), 2);
+        range.getLoc(), builder.getIndexType(), logical, range.getStep(),
+        BinaryOperator::Multiply);
     Value stop = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                          range.getStart(), distance, 0);
+                                          range.getStart(), distance,
+                                          BinaryOperator::Add);
     auto coordinate = range.getResult().getType();
     Value stopFragment =
         builder.create<BroadcastOp>(range.getLoc(), coordinate, stop);
@@ -515,7 +524,8 @@ LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
         coordinate.getAxisMaps(), coordinate.getValidity(),
         coordinate.getOwner());
     predicates[range.getOperation()] = builder.create<CompareOp>(
-        range.getLoc(), predicate, range.getResult(), stopFragment, 2);
+        range.getLoc(), predicate, range.getResult(), stopFragment,
+        ComparePredicate::Lt);
   }
 
   auto materializeTail = [&](OpBuilder &builder, Location location,
@@ -532,7 +542,8 @@ LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
       if (failed(current))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
-                            location, current->getType(), result, *current, 11))
+                            location, current->getType(), result, *current,
+                            BinaryOperator::LogicalAnd))
                       : *current;
     }
     return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
@@ -562,7 +573,7 @@ LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
       if (existing.getType() != predicate)
         existing = builder.create<BroadcastOp>(load.getLoc(), predicate, existing);
       valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
-                                       11);
+                                       BinaryOperator::LogicalAnd);
     }
     Value fill = load.getFill();
     if (!fill)
@@ -600,7 +611,7 @@ LogicalResult padRemainingStaticExtent(func::FuncOp kernel,
         existing =
             builder.create<BroadcastOp>(store.getLoc(), predicate, existing);
       valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
-                                       valid, 11);
+                                       valid, BinaryOperator::LogicalAnd);
     }
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
@@ -1159,7 +1170,8 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
       if (failed(current))
         return failure();
       tail = tail ? Value(builder.create<BinaryOp>(
-                        reduce.getLoc(), current->getType(), tail, *current, 11))
+                        reduce.getLoc(), current->getType(), tail, *current,
+                        BinaryOperator::LogicalAnd))
                   : *current;
     }
     Value identity =
@@ -1262,7 +1274,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     auto sourceType = cast<FragmentType>(source.getType());
     Value stop = builder.create<BinaryOp>(
         reduce.getLoc(), builder.getIndexType(), componentRange.getStart(),
-        logicalExtent, 0);
+        logicalExtent, BinaryOperator::Add);
     Value stopFragment =
         builder.create<BroadcastOp>(reduce.getLoc(), coordinateType, stop);
     auto coordinatePredicate = FragmentType::get(
@@ -1271,7 +1283,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
         coordinateType.getOwner());
     Value coordinateValid = builder.create<CompareOp>(
         reduce.getLoc(), coordinatePredicate, componentRange.getResult(),
-        stopFragment, 2);
+        stopFragment, ComparePredicate::Lt);
     auto predicateType = FragmentType::get(
         reduce.getContext(), builder.getI1Type(), sourceType.getShape(),
         sourceType.getAxisMaps(), sourceType.getValidity(), sourceType.getOwner());
@@ -1612,7 +1624,7 @@ bool isSingleComponentAddReduce(ReduceOp reduce) {
     return false;
   auto combine = yield.getValues().front().getDefiningOp<BinaryOp>();
   return combine && combine->getBlock() == &block &&
-         combine.getOperatorKind() == 0 &&
+         combine.getOperatorKind() == BinaryOperator::Add &&
          combine.getLhs() == block.getArgument(0) &&
          combine.getRhs() == block.getArgument(1) &&
          std::distance(block.begin(), block.end()) == 2;
@@ -1839,7 +1851,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   Location location = reduce.getLoc();
   Value stop = builder.create<BinaryOp>(
       location, builder.getIndexType(), master->range.getStart(),
-      master->range.getExtent(), /*add=*/0);
+      master->range.getExtent(), BinaryOperator::Add);
   bool bodyFailed = false;
   std::string failureReason;
   auto loop = builder.create<scf::ForOp>(
@@ -2185,7 +2197,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             reduce.getContext(), nested.getI1Type(), blockedMaster.getShape(),
             blockedMaster.getAxisMaps(), 2, blockedMaster.getOwner());
         Value sharedTail = nested.create<CompareOp>(
-            nestedLocation, masterPredicate, masterCoordinate, masterEnd, 2);
+            nestedLocation, masterPredicate, masterCoordinate, masterEnd,
+            ComparePredicate::Lt);
         SmallVector<Value> blockedSources;
         for (auto [component, plan] : llvm::enumerate(sourcePlans)) {
           FragmentType blockedSource = blockedSourceTypes[component];
@@ -2226,13 +2239,13 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 blockedCoordinate.getOwner());
             Value valid = nested.create<CompareOp>(
                 nestedLocation, coordinatePredicate, coordinate.getResult(), end,
-                2);
+                ComparePredicate::Lt);
             Value projected = nested.create<BroadcastOp>(
                 nestedLocation, blockedPredicate, valid);
             sourceTail = sourceTail
                              ? Value(nested.create<BinaryOp>(
                                    nestedLocation, blockedPredicate, sourceTail,
-                                   projected, /*and=*/11))
+                                   projected, BinaryOperator::LogicalAnd))
                              : projected;
           }
           for (RootAccess access : accesses[component]) {
@@ -2276,7 +2289,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 blockedCoordinate.getValidity(),
                 blockedCoordinate.getOwner());
             Value coordinateValid = nested.create<CompareOp>(
-                nestedLocation, coordinatePredicate, coordinate, end, 2);
+                nestedLocation, coordinatePredicate, coordinate, end,
+                ComparePredicate::Lt);
             auto rootPredicate = FragmentType::get(
                 reduce.getContext(), nested.getI1Type(), blockedRoot.getShape(),
                 blockedRoot.getAxisMaps(), blockedRoot.getValidity(),
@@ -2298,7 +2312,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 originalValid = nested.create<BroadcastOp>(
                     nestedLocation, rootPredicate, originalValid);
               valid = nested.create<BinaryOp>(nestedLocation, rootPredicate,
-                                              valid, originalValid, 11);
+                                              valid, originalValid,
+                                              BinaryOperator::LogicalAnd);
             }
             Value fill;
             if (load.getFill()) {
@@ -2366,7 +2381,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         if (vectorAccumulation) {
           Value combined = nested.create<BinaryOp>(
               nestedLocation, blockedSourceTypes.front(), carries.front(),
-              blockedSources.front(), /*add=*/0);
+              blockedSources.front(), BinaryOperator::Add);
           nested.create<scf::YieldOp>(nestedLocation, combined);
           return;
         }
@@ -2571,7 +2586,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         range.getStep(), range.getSourceId(), range.getSourceAxis());
     Value stop = builder.create<BinaryOp>(
         reduce.getLoc(), builder.getIndexType(), range.getStart(),
-        range.getExtent(), 0);
+        range.getExtent(), BinaryOperator::Add);
     auto coordinatePredicate = FragmentType::get(
         reduce.getContext(), builder.getI1Type(), blockedCoordinate.getShape(),
         blockedCoordinate.getAxisMaps(), blockedCoordinate.getValidity(),
@@ -2579,7 +2594,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     Value stopFragment =
         builder.create<BroadcastOp>(reduce.getLoc(), blockedCoordinate, stop);
     Value valid = builder.create<CompareOp>(
-        reduce.getLoc(), coordinatePredicate, coordinate, stopFragment, 2);
+        reduce.getLoc(), coordinatePredicate, coordinate, stopFragment,
+        ComparePredicate::Lt);
     auto sourcePredicate = FragmentType::get(
         reduce.getContext(), builder.getI1Type(), blockedSource.getShape(),
         blockedSource.getAxisMaps(), blockedSource.getValidity(),
@@ -2590,7 +2606,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       Value original = builder.create<BroadcastOp>(reduce.getLoc(),
                                                     sourcePredicate, *scalar);
       valid = builder.create<BinaryOp>(reduce.getLoc(), sourcePredicate, valid,
-                                       original, 11);
+                                       original, BinaryOperator::LogicalAnd);
     }
     Value identity =
         reduce.getInputs()[reduce.getSourceCount() + component];

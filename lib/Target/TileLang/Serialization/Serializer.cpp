@@ -555,9 +555,19 @@ private:
     } else if (auto unary = dyn_cast<gpu::UnaryOp>(operation)) {
       assign(unary.getResult(), unaryExpression(unary));
     } else if (auto compare = dyn_cast<gpu::CompareOp>(operation)) {
-      static constexpr const char *predicates[] = {"==", "!=", "<", "<=", ">", ">="};
+      auto predicate = [&]() -> StringRef {
+        switch (compare.getPredicate()) {
+        case ComparePredicate::Eq: return "==";
+        case ComparePredicate::Ne: return "!=";
+        case ComparePredicate::Lt: return "<";
+        case ComparePredicate::Le: return "<=";
+        case ComparePredicate::Gt: return ">";
+        case ComparePredicate::Ge: return ">=";
+        }
+        llvm_unreachable("unhandled Intent compare predicate");
+      }();
       assign(compare.getResult(), "(" + valueString(compare.getLhs()) + " " +
-                                      predicates[compare.getPredicate()] + " " +
+                                      predicate.str() + " " +
                                       valueString(compare.getRhs()) + ")");
     } else if (auto select = dyn_cast<gpu::SelectOp>(operation)) {
       assign(select.getResult(), "T.if_then_else(" +
@@ -706,31 +716,63 @@ private:
   }
 
   std::string binaryExpression(gpu::BinaryOp binary) {
-    static constexpr const char *operators[] = {
-        "+", "-", "*", "/", "//", "%", "**", nullptr, nullptr,
-        nullptr, nullptr, "&", "|", "&", "|", "^", "<<", ">>"};
-    uint64_t kind = binary.getOperatorKind();
-    if (kind == 7 || kind == 9)
+    auto infix = [&](StringRef spelling) {
+      return "(" + valueString(binary.getLhs()) + " " + spelling.str() + " " +
+             valueString(binary.getRhs()) + ")";
+    };
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add: return infix("+");
+    case BinaryOperator::Subtract: return infix("-");
+    case BinaryOperator::Multiply: return infix("*");
+    case BinaryOperator::TrueDivide: return infix("/");
+    case BinaryOperator::FloorDivide: return infix("//");
+    case BinaryOperator::Remainder: return infix("%");
+    case BinaryOperator::Power: return infix("**");
+    case BinaryOperator::MaximumNum:
       return "T.max(" + valueString(binary.getLhs()) + ", " +
              valueString(binary.getRhs()) + ")";
-    if (kind == 8 || kind == 10)
+    case BinaryOperator::MinimumNum:
       return "T.min(" + valueString(binary.getLhs()) + ", " +
              valueString(binary.getRhs()) + ")";
-    return "(" + valueString(binary.getLhs()) + " " + operators[kind] + " " +
-           valueString(binary.getRhs()) + ")";
+    case BinaryOperator::Maximum:
+    case BinaryOperator::Minimum:
+      binary.emitOpError(
+          "TileLang has no spelling that preserves Intent NaN-propagating min/max");
+      failed = true;
+      return "<unsupported-nan-propagating-minmax>";
+    case BinaryOperator::LogicalAnd:
+    case BinaryOperator::BitwiseAnd: return infix("&");
+    case BinaryOperator::LogicalOr:
+    case BinaryOperator::BitwiseOr: return infix("|");
+    case BinaryOperator::BitwiseXor: return infix("^");
+    case BinaryOperator::LeftShift: return infix("<<");
+    case BinaryOperator::RightShift: return infix(">>");
+    }
+    llvm_unreachable("unhandled Intent binary operator");
   }
 
   std::string unaryExpression(gpu::UnaryOp unary) {
     std::string input = valueString(unary.getInput());
-    static constexpr const char *functions[] = {
-        nullptr, nullptr, "T.exp", "T.exp2", "T.log", "T.sin", "T.cos",
-        "T.floor", "T.erf", "T.rsqrt", "T.sigmoid", "T.tanh", "T.abs",
-        "T.sqrt"};
-    if (unary.getOperatorKind() == 0)
-      return "(-" + input + ")";
-    if (unary.getOperatorKind() == 1)
-      return "(~" + input + ")";
-    return std::string(functions[unary.getOperatorKind()]) + "(" + input + ")";
+    auto call = [&](StringRef function) {
+      return function.str() + "(" + input + ")";
+    };
+    switch (unary.getOperatorKind()) {
+    case UnaryOperator::Negate: return "(-" + input + ")";
+    case UnaryOperator::Not: return "(~" + input + ")";
+    case UnaryOperator::Exp: return call("T.exp");
+    case UnaryOperator::Exp2: return call("T.exp2");
+    case UnaryOperator::Log: return call("T.log");
+    case UnaryOperator::Sin: return call("T.sin");
+    case UnaryOperator::Cos: return call("T.cos");
+    case UnaryOperator::Floor: return call("T.floor");
+    case UnaryOperator::Erf: return call("T.erf");
+    case UnaryOperator::Rsqrt: return call("T.rsqrt");
+    case UnaryOperator::Sigmoid: return call("T.sigmoid");
+    case UnaryOperator::Tanh: return call("T.tanh");
+    case UnaryOperator::Abs: return call("T.abs");
+    case UnaryOperator::Sqrt: return call("T.sqrt");
+    }
+    llvm_unreachable("unhandled Intent unary operator");
   }
 
   std::string index(ValueRange offsets) {

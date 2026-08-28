@@ -138,15 +138,16 @@ def Intent_ExtractOp : Intent_Op<"extract", [Pure]> {
 }
 
 def Intent_UnaryOp : Intent_UnaryDataOp<"unary"> {
-  let arguments = (ins Intent_DataValue:$input, I64Attr:$operator_kind);
+  let arguments = (ins Intent_DataValue:$input,
+                       Intent_UnaryOperatorAttr:$operator_kind);
 }
 def Intent_BinaryOp : Intent_BinaryDataOp<"binary"> {
   let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,
-                       I64Attr:$operator_kind);
+                       Intent_BinaryOperatorAttr:$operator_kind);
 }
 def Intent_CompareOp : Intent_Op<"compare", [Pure]> {
   let arguments = (ins Intent_DataValue:$lhs, Intent_DataValue:$rhs,
-                       I64Attr:$predicate);
+                       Intent_ComparePredicateAttr:$predicate);
   let results = (outs Intent_DataValue:$result);
 }
 def Intent_SelectOp : Intent_Op<"select", [Pure]> {
@@ -224,8 +225,8 @@ def Intent_ScaledContractOp : Intent_Op<"scaled_contract", [Pure]> {
                        AnyRankedTensor:$rhs_scale,
                        ArrayAttr:$reduce,
                        ArrayAttr:$batch,
-                       I64Attr:$lhs_format,
-                       I64Attr:$rhs_format,
+                       Intent_ScaledFormatAttr:$lhs_format,
+                       Intent_ScaledFormatAttr:$rhs_format,
                        I64Attr:$lhs_group_size,
                        I64Attr:$rhs_group_size);
   let results = (outs AnyRankedTensor:$result);
@@ -282,24 +283,27 @@ def Intent_BufferStoreOp : Intent_Op<"buffer_store", [MemoryEffects<[MemWrite]>]
 }
 def Intent_AtomicLoadOp : Intent_Op<"atomic_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$ordering);
+                       Intent_AtomicOrderingAttr:$ordering);
   let results = (outs Intent_DataValue:$result);
 }
 def Intent_AtomicStoreOp : Intent_Op<"atomic_store", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand, I64Attr:$ordering);
+                       I64Attr:$value_operand,
+                       Intent_AtomicOrderingAttr:$ordering);
   let results = (outs);
 }
 def Intent_AtomicRMWOp : Intent_Op<"atomic_rmw", [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
-                       I64Attr:$value_operand, I64Attr:$ordering, I64Attr:$kind);
+                       I64Attr:$value_operand,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       Intent_AtomicRMWKindAttr:$kind);
   let results = (outs Intent_DataValue:$result);
 }
 def Intent_AtomicCompareExchangeOp : Intent_Op<"atomic_compare_exchange",
     [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins Variadic<Intent_Value>:$inputs, Intent_IndexRelation:$index,
                        I64Attr:$expected_operand, I64Attr:$desired_operand,
-                       I64Attr:$ordering);
+                       Intent_AtomicOrderingAttr:$ordering);
   let results = (outs Intent_RecordValue:$result);
 }
 def Intent_RandomBitsOp : Intent_Op<"random_bits", [Pure]> {

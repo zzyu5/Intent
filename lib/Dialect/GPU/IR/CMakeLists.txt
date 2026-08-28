@@ -6,6 +6,7 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   IntentGPUIncGen
 
   LINK_LIBS PUBLIC
+  MLIRIntentDialect
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRSupport

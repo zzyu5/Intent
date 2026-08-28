@@ -3,6 +3,107 @@
 
 include "Intent/Dialect/Intent/IR/IntentDialect.td"
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
+
+class Intent_I32Enum<string name, string description,
+                     list<I32EnumAttrCase> cases>
+    : I32EnumAttr<name, description, cases> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::intent";
+}
+
+class Intent_I32EnumAttr<string mnemonic, Intent_I32Enum enumInfo>
+    : EnumAttr<Intent_Dialect, enumInfo, mnemonic> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def Intent_UnaryOperator : Intent_I32Enum<"UnaryOperator",
+    "Canonical unary arithmetic semantics", [
+      I32EnumAttrCase<"Negate", 0, "negate">,
+      I32EnumAttrCase<"Not", 1, "not">,
+      I32EnumAttrCase<"Exp", 2, "exp">,
+      I32EnumAttrCase<"Exp2", 3, "exp2">,
+      I32EnumAttrCase<"Log", 4, "log">,
+      I32EnumAttrCase<"Sin", 5, "sin">,
+      I32EnumAttrCase<"Cos", 6, "cos">,
+      I32EnumAttrCase<"Floor", 7, "floor">,
+      I32EnumAttrCase<"Erf", 8, "erf">,
+      I32EnumAttrCase<"Rsqrt", 9, "rsqrt">,
+      I32EnumAttrCase<"Sigmoid", 10, "sigmoid">,
+      I32EnumAttrCase<"Tanh", 11, "tanh">,
+      I32EnumAttrCase<"Abs", 12, "abs">,
+      I32EnumAttrCase<"Sqrt", 13, "sqrt">
+    ]>;
+def Intent_UnaryOperatorAttr :
+    Intent_I32EnumAttr<"unary_operator", Intent_UnaryOperator>;
+
+def Intent_BinaryOperator : Intent_I32Enum<"BinaryOperator",
+    "Canonical binary arithmetic semantics", [
+      I32EnumAttrCase<"Add", 0, "add">,
+      I32EnumAttrCase<"Subtract", 1, "subtract">,
+      I32EnumAttrCase<"Multiply", 2, "multiply">,
+      I32EnumAttrCase<"TrueDivide", 3, "true_divide">,
+      I32EnumAttrCase<"FloorDivide", 4, "floor_divide">,
+      I32EnumAttrCase<"Remainder", 5, "remainder">,
+      I32EnumAttrCase<"Power", 6, "power">,
+      I32EnumAttrCase<"Maximum", 7, "maximum">,
+      I32EnumAttrCase<"Minimum", 8, "minimum">,
+      I32EnumAttrCase<"MaximumNum", 9, "maximum_num">,
+      I32EnumAttrCase<"MinimumNum", 10, "minimum_num">,
+      I32EnumAttrCase<"LogicalAnd", 11, "logical_and">,
+      I32EnumAttrCase<"LogicalOr", 12, "logical_or">,
+      I32EnumAttrCase<"BitwiseAnd", 13, "bitwise_and">,
+      I32EnumAttrCase<"BitwiseOr", 14, "bitwise_or">,
+      I32EnumAttrCase<"BitwiseXor", 15, "bitwise_xor">,
+      I32EnumAttrCase<"LeftShift", 16, "left_shift">,
+      I32EnumAttrCase<"RightShift", 17, "right_shift">
+    ]>;
+def Intent_BinaryOperatorAttr :
+    Intent_I32EnumAttr<"binary_operator", Intent_BinaryOperator>;
+
+def Intent_ComparePredicate : Intent_I32Enum<"ComparePredicate",
+    "Canonical comparison predicate", [
+      I32EnumAttrCase<"Eq", 0, "eq">,
+      I32EnumAttrCase<"Ne", 1, "ne">,
+      I32EnumAttrCase<"Lt", 2, "lt">,
+      I32EnumAttrCase<"Le", 3, "le">,
+      I32EnumAttrCase<"Gt", 4, "gt">,
+      I32EnumAttrCase<"Ge", 5, "ge">
+    ]>;
+def Intent_ComparePredicateAttr :
+    Intent_I32EnumAttr<"compare_predicate", Intent_ComparePredicate>;
+
+def Intent_AtomicOrdering : Intent_I32Enum<"AtomicOrdering",
+    "Canonical atomic memory ordering", [
+      I32EnumAttrCase<"Relaxed", 0, "relaxed">,
+      I32EnumAttrCase<"Acquire", 1, "acquire">,
+      I32EnumAttrCase<"Release", 2, "release">,
+      I32EnumAttrCase<"AcquireRelease", 3, "acq_rel">
+    ]>;
+def Intent_AtomicOrderingAttr :
+    Intent_I32EnumAttr<"atomic_ordering", Intent_AtomicOrdering>;
+
+def Intent_AtomicRMWKind : Intent_I32Enum<"AtomicRMWKind",
+    "Canonical atomic read-modify-write operation", [
+      I32EnumAttrCase<"Exchange", 0, "exchange">,
+      I32EnumAttrCase<"Add", 1, "add">,
+      I32EnumAttrCase<"Maximum", 2, "maximum">,
+      I32EnumAttrCase<"Minimum", 3, "minimum">,
+      I32EnumAttrCase<"BitwiseAnd", 4, "bitwise_and">,
+      I32EnumAttrCase<"BitwiseOr", 5, "bitwise_or">,
+      I32EnumAttrCase<"BitwiseXor", 6, "bitwise_xor">
+    ]>;
+def Intent_AtomicRMWKindAttr :
+    Intent_I32EnumAttr<"atomic_rmw_kind", Intent_AtomicRMWKind>;
+
+def Intent_ScaledFormat : Intent_I32Enum<"ScaledFormat",
+    "Canonical block-scaled operand format", [
+      I32EnumAttrCase<"E2M1", 0, "e2m1">,
+      I32EnumAttrCase<"E4M3", 1, "e4m3">,
+      I32EnumAttrCase<"E8M0", 2, "e8m0">
+    ]>;
+def Intent_ScaledFormatAttr :
+    Intent_I32EnumAttr<"scaled_format", Intent_ScaledFormat>;
 
 def Intent_TensorShapeAttr : AttrDef<Intent_Dialect, "TensorShape"> {
   let mnemonic = "tensor_shape";

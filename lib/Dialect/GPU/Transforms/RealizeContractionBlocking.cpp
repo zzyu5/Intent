@@ -113,12 +113,12 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
 }
 
 Value binary(OpBuilder &builder, Location location, Type result, Value lhs,
-             Value rhs, uint64_t kind) {
+             Value rhs, BinaryOperator kind) {
   return builder.create<BinaryOp>(location, result, lhs, rhs, kind);
 }
 
 Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
-              Value rhs, uint64_t predicate) {
+              Value rhs, ComparePredicate predicate) {
   return builder.create<CompareOp>(location, result, lhs, rhs, predicate);
 }
 
@@ -376,7 +376,7 @@ Value strippedScalarIdentity(Value value) {
     auto binary = value.getDefiningOp<BinaryOp>();
     if (!binary)
       return value;
-    if (binary.getOperatorKind() == 0) {
+    if (binary.getOperatorKind() == BinaryOperator::Add) {
       if (isIntegerConstant(binary.getLhs(), 0)) {
         value = strippedBroadcast(binary.getRhs());
         continue;
@@ -386,7 +386,7 @@ Value strippedScalarIdentity(Value value) {
         continue;
       }
     }
-    if (binary.getOperatorKind() == 2) {
+    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
       if (isIntegerConstant(binary.getLhs(), 0))
         return binary.getLhs();
       if (isIntegerConstant(binary.getRhs(), 0))
@@ -421,14 +421,20 @@ bool isTailPredicate(Value value,
   if (auto transpose = value.getDefiningOp<TransposeOp>())
     return isTailPredicate(transpose.getValue(), ranges);
   if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
-    if (conjunction.getOperatorKind() != 11 &&
-        conjunction.getOperatorKind() != 13)
+    Type resultType = conjunction.getResult().getType();
+    Type elementType = resultType;
+    if (auto fragment = dyn_cast<FragmentType>(resultType))
+      elementType = fragment.getElementType();
+    bool logical = conjunction.getOperatorKind() == BinaryOperator::LogicalAnd;
+    bool bitwiseI1 = conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
+                     elementType.isInteger(1);
+    if (!logical && !bitwiseI1)
       return false;
     return isTailPredicate(conjunction.getLhs(), ranges) &&
            isTailPredicate(conjunction.getRhs(), ranges);
   }
   auto comparison = value.getDefiningOp<CompareOp>();
-  if (!comparison || comparison.getPredicate() != 2)
+  if (!comparison || comparison.getPredicate() != ComparePredicate::Lt)
     return false;
   Value lhs = strippedBroadcast(comparison.getLhs());
   Value rhs = strippedScalarIdentity(comparison.getRhs());
@@ -439,7 +445,7 @@ bool isTailPredicate(Value value,
     if (isIntegerConstant(start, 0) && rhs == extent)
       return true;
     auto stop = rhs.getDefiningOp<BinaryOp>();
-    if (stop && stop.getOperatorKind() == 0 &&
+    if (stop && stop.getOperatorKind() == BinaryOperator::Add &&
         ((stop.getLhs() == predicateRange.getStart() &&
           stop.getRhs() == predicateRange.getExtent()) ||
          (stop.getRhs() == predicateRange.getStart() &&
@@ -1084,7 +1090,7 @@ FailureOr<Value> projectPredicateForScalarAxis(
     return projectPredicateForScalarAxis(builder, location, splat.getValue(),
                                          root, coordinate, target);
   if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
-    if (conjunction.getOperatorKind() != 11)
+    if (conjunction.getOperatorKind() != BinaryOperator::LogicalAnd)
       return failure();
     FailureOr<Value> lhs = projectPredicateForScalarAxis(
         builder, location, conjunction.getLhs(), root, coordinate, target);
@@ -1093,12 +1099,13 @@ FailureOr<Value> projectPredicateForScalarAxis(
     if (failed(lhs) || failed(rhs))
       return failure();
     return Value(builder.create<BinaryOp>(location, target, *lhs, *rhs,
-                                          /*and=*/11));
+                                          BinaryOperator::LogicalAnd));
   }
   if (auto comparison = value.getDefiningOp<CompareOp>()) {
     Value lhs = strippedBroadcast(comparison.getLhs());
     Value rhs = strippedBroadcast(comparison.getRhs());
-    if (comparison.getPredicate() == 2 && lhs == root.getResult()) {
+    if (comparison.getPredicate() == ComparePredicate::Lt &&
+        lhs == root.getResult()) {
       FailureOr<Value> end = resolveLogicalRangeEnd(
           root->getParentOfType<func::FuncOp>(), root);
       if (failed(end) || rhs != *end)
@@ -1249,7 +1256,8 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
       return failure();
     }
     Value stop = binary(builder, location, builder.getIndexType(),
-                        lhsRange.getStart(), lhsRange.getExtent(), 0);
+                        lhsRange.getStart(), lhsRange.getExtent(),
+                        BinaryOperator::Add);
 
     FragmentType nestedLhsType = eraseFragmentAxis(currentLhsType, lhsAxis);
     FragmentType nestedRhsType = eraseFragmentAxis(currentRhsType, rhsAxis);
@@ -1429,10 +1437,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         inheritRangeAuthority(lhsK, lhsRange);
         Value rhsOffset = binary(
             nested, nestedLocation, nested.getIndexType(), kStart,
-            lhsRange.getStart(), 1);
+            lhsRange.getStart(), BinaryOperator::Subtract);
         Value rhsStart = binary(
             nested, nestedLocation, nested.getIndexType(),
-            rhsRange.getStart(), rhsOffset, 0);
+            rhsRange.getStart(), rhsOffset, BinaryOperator::Add);
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
             rhsMap->getSourceId(), rhsMap->getSourceAxis());
@@ -1711,12 +1719,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       columnResourceAxis);
   auto ceilDiv = [&](Value extent, Value divisor) {
     Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
-    Value adjusted = binary(mapBuilder, location, mapBuilder.getIndexType(), extent,
-                            binary(mapBuilder, location, mapBuilder.getIndexType(),
-                                   divisor, one, 1),
-                            0);
+    Value adjusted = binary(
+        mapBuilder, location, mapBuilder.getIndexType(), extent,
+        binary(mapBuilder, location, mapBuilder.getIndexType(), divisor, one,
+               BinaryOperator::Subtract),
+        BinaryOperator::Add);
     return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
-                  divisor, 4);
+                  divisor, BinaryOperator::FloorDivide);
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
@@ -1796,8 +1805,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   Value columnStart = binary(
       builder, location, builder.getIndexType(), columnRange.getStart(),
       binary(builder, location, builder.getIndexType(), columnTile,
-             blockN.getResult(), 2),
-      0);
+             blockN.getResult(), BinaryOperator::Multiply),
+      BinaryOperator::Add);
   Value columnStop = *columnLogicalEnd;
   Value reductionStop = *reductionLogicalEnd;
 
@@ -1840,7 +1849,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   inheritRangeAuthority(columns, columnRange);
   Value columnEnd = broadcast(builder, location, columnIndexType, columnStop);
   Value columnValid =
-      compare(builder, location, columnPredicateType, columns, columnEnd, 2);
+      compare(builder, location, columnPredicateType, columns, columnEnd,
+              ComparePredicate::Lt);
   auto emitRowBlock = [&](OpBuilder &rowBuilder,
                           Value rowStart) -> LogicalResult {
     Value rows = rowBuilder.create<MakeRangeOp>(
@@ -1849,7 +1859,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     inheritRangeAuthority(rows, rowRange);
     Value rowEnd = broadcast(rowBuilder, location, rowIndexType, rowStop);
     Value rowValid =
-        compare(rowBuilder, location, rowPredicateType, rows, rowEnd, 2);
+        compare(rowBuilder, location, rowPredicateType, rows, rowEnd,
+                ComparePredicate::Lt);
     Value blockedLhsRowCoordinate = rows;
     SmallVector<SmallVector<Value>> replayedStoreCoordinates;
     if (indirectRow) {
@@ -1905,19 +1916,21 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               broadcast(nested, nestedLocation, reductionIndexType, reductionStop);
           Value reductionValid = compare(nested, nestedLocation,
                                          reductionPredicateType, reductions,
-                                         reductionEnd, 2);
+                                         reductionEnd, ComparePredicate::Lt);
           Value lhsRows =
               broadcast(nested, nestedLocation, lhsPredicateType, rowValid);
           Value lhsReductions = broadcast(nested, nestedLocation,
                                           lhsPredicateType, reductionValid);
           Value lhsValid = binary(nested, nestedLocation, lhsPredicateType,
-                                  lhsRows, lhsReductions, 11);
+                                  lhsRows, lhsReductions,
+                                  BinaryOperator::LogicalAnd);
           Value rhsReductions = broadcast(nested, nestedLocation,
                                           rhsPredicateType, reductionValid);
           Value rhsColumns =
               broadcast(nested, nestedLocation, rhsPredicateType, columnValid);
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
-                                  rhsReductions, rhsColumns, 11);
+                                  rhsReductions, rhsColumns,
+                                  BinaryOperator::LogicalAnd);
           if (lhsLoad.getValid() && !indirectRow &&
               !isTailPredicate(lhsLoad.getValid(), lhsTailRanges)) {
             FailureOr<Value> original = retargetPredicate(
@@ -1927,7 +1940,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               return;
             }
             lhsValid = binary(nested, nestedLocation, lhsPredicateType, lhsValid,
-                              *original, 11);
+                              *original, BinaryOperator::LogicalAnd);
           }
           if (rhsLoad.getValid() &&
               !isTailPredicate(rhsLoad.getValid(), rhsTailRanges)) {
@@ -1938,7 +1951,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               return;
             }
             rhsValid = binary(nested, nestedLocation, rhsPredicateType, rhsValid,
-                              *original, 11);
+                              *original, BinaryOperator::LogicalAnd);
           }
           SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
           lhsCoordinates[*lhsRowCoordinate] = blockedLhsRowCoordinate;
@@ -1977,7 +1990,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value outputColumns =
         broadcast(rowBuilder, location, outputPredicateType, columnValid);
     Value outputValid = binary(rowBuilder, location, outputPredicateType,
-                               outputRows, outputColumns, 11);
+                               outputRows, outputColumns,
+                               BinaryOperator::LogicalAnd);
     for (auto [pathIndex, path] : llvm::enumerate(paths)) {
       Value output = loop.getResult(0);
       for (CastOp conversion : path.casts) {
@@ -2011,7 +2025,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           return path.store.emitOpError(
               "blocked contract output has non-scalar residual validity");
         valid = binary(rowBuilder, location, outputPredicateType, valid,
-                       *original, 11);
+                       *original, BinaryOperator::LogicalAnd);
       }
       auto replacement = rowBuilder.create<StoreOp>(
           location, path.store.getResource(), coordinates, output, valid,
@@ -2027,10 +2041,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value rowStart = binary(
         builder, location, builder.getIndexType(), rowRange.getStart(),
         binary(builder, location, builder.getIndexType(), rowWorker,
-               blockM.getResult(), 2),
-        0);
+               blockM.getResult(), BinaryOperator::Multiply),
+        BinaryOperator::Add);
     Value rowStep = binary(builder, location, builder.getIndexType(),
-                           blockM.getResult(), rowWorkers.getResult(), 2);
+                           blockM.getResult(), rowWorkers.getResult(),
+                           BinaryOperator::Multiply);
     auto rowLoop = builder.create<scf::ForOp>(
         location, rowStart, rowStop, rowStep, ValueRange{},
         [&](OpBuilder &nested, Location nestedLocation, Value rowStart,
@@ -2049,8 +2064,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value rowStart = binary(
         builder, location, builder.getIndexType(), rowRange.getStart(),
         binary(builder, location, builder.getIndexType(), rowTile,
-               blockM.getResult(), 2),
-        0);
+               blockM.getResult(), BinaryOperator::Multiply),
+        BinaryOperator::Add);
     if (failed(emitRowBlock(builder, rowStart)))
       return failure();
   }
@@ -2350,12 +2365,13 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       columnResourceAxis);
   auto ceilDiv = [&](Value extent, Value divisor) {
     Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
-    Value adjusted = binary(mapBuilder, location, mapBuilder.getIndexType(), extent,
-                            binary(mapBuilder, location, mapBuilder.getIndexType(),
-                                   divisor, one, 1),
-                            0);
+    Value adjusted = binary(
+        mapBuilder, location, mapBuilder.getIndexType(), extent,
+        binary(mapBuilder, location, mapBuilder.getIndexType(), divisor, one,
+               BinaryOperator::Subtract),
+        BinaryOperator::Add);
     return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
-                  divisor, 4);
+                  divisor, BinaryOperator::FloorDivide);
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
@@ -2419,19 +2435,22 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value rowStart = binary(
       builder, location, builder.getIndexType(), rowRange->getStart(),
       binary(builder, location, builder.getIndexType(), rowTile,
-             blockM.getResult(), 2),
-      0);
+             blockM.getResult(), BinaryOperator::Multiply),
+      BinaryOperator::Add);
   Value rowStop = binary(builder, location, builder.getIndexType(),
-                         rowRange->getStart(), rowRange->getExtent(), 0);
+                         rowRange->getStart(), rowRange->getExtent(),
+                         BinaryOperator::Add);
   Value columnStart = binary(
       builder, location, builder.getIndexType(), columnRange->getStart(),
       binary(builder, location, builder.getIndexType(), columnTile,
-             blockN.getResult(), 2),
-      0);
+             blockN.getResult(), BinaryOperator::Multiply),
+      BinaryOperator::Add);
   Value columnStop = binary(builder, location, builder.getIndexType(),
-                            columnRange->getStart(), columnRange->getExtent(), 0);
+                            columnRange->getStart(), columnRange->getExtent(),
+                            BinaryOperator::Add);
   Value blockStop = binary(builder, location, builder.getIndexType(),
-                           blockRange->getStart(), blockRange->getExtent(), 0);
+                           blockRange->getStart(), blockRange->getExtent(),
+                           BinaryOperator::Add);
 
   FragmentType rowIndexType = fragmentType(
       context, builder.getIndexType(), {unitM}, {*rowMap}, lhsType.getOwner());
@@ -2487,10 +2506,11 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   inheritRangeAuthority(columns, *columnRange);
   Value rowValid = compare(
       builder, location, rowPredicateType, rows,
-      broadcast(builder, location, rowIndexType, rowStop), 2);
+      broadcast(builder, location, rowIndexType, rowStop), ComparePredicate::Lt);
   Value columnValid = compare(
       builder, location, columnPredicateType, columns,
-      broadcast(builder, location, columnIndexType, columnStop), 2);
+      broadcast(builder, location, columnIndexType, columnStop),
+      ComparePredicate::Lt);
   Value accumulator = builder.create<SplatOp>(
       location, blockedResultType, *initialAccumulator);
   bool loopBodyFailed = false;
@@ -2505,33 +2525,36 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         inheritRangeAuthority(blocks, *blockRange);
         Value blockValid = compare(
             nested, nestedLocation, blockPredicateType, blocks,
-            broadcast(nested, nestedLocation, blockIndexType, blockStop), 2);
+            broadcast(nested, nestedLocation, blockIndexType, blockStop),
+            ComparePredicate::Lt);
         Value lhsRows = broadcast(nested, nestedLocation, lhsPredicateType,
                                   rowValid);
         Value lhsBlocks = broadcast(nested, nestedLocation, lhsPredicateType,
                                     blockValid);
         Value lhsValid = binary(nested, nestedLocation, lhsPredicateType,
-                                lhsRows, lhsBlocks, 11);
+                                lhsRows, lhsBlocks,
+                                BinaryOperator::LogicalAnd);
         Value lhsScaleRows = broadcast(
             nested, nestedLocation, lhsScalePredicateType, rowValid);
         Value lhsScaleBlocks = broadcast(
             nested, nestedLocation, lhsScalePredicateType, blockValid);
         Value lhsScaleValid = binary(
             nested, nestedLocation, lhsScalePredicateType, lhsScaleRows,
-            lhsScaleBlocks, 11);
+            lhsScaleBlocks, BinaryOperator::LogicalAnd);
         Value rhsBlocks = broadcast(nested, nestedLocation, rhsPredicateType,
                                     blockValid);
         Value rhsColumns = broadcast(nested, nestedLocation, rhsPredicateType,
                                      columnValid);
         Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
-                                rhsBlocks, rhsColumns, 11);
+                                rhsBlocks, rhsColumns,
+                                BinaryOperator::LogicalAnd);
         Value rhsScaleBlocks = broadcast(
             nested, nestedLocation, rhsScalePredicateType, blockValid);
         Value rhsScaleColumns = broadcast(
             nested, nestedLocation, rhsScalePredicateType, columnValid);
         Value rhsScaleValid = binary(
             nested, nestedLocation, rhsScalePredicateType, rhsScaleBlocks,
-            rhsScaleColumns, 11);
+            rhsScaleColumns, BinaryOperator::LogicalAnd);
 
         SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
         lhsCoordinates[*lhsRowCoordinate] = rows;
@@ -2594,7 +2617,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value outputColumns =
       broadcast(builder, location, outputPredicateType, columnValid);
   Value outputValid = binary(builder, location, outputPredicateType, outputRows,
-                             outputColumns, 11);
+                             outputColumns, BinaryOperator::LogicalAnd);
   for (StorePath &path : paths) {
     Value output = loop.getResult(0);
     for (CastOp conversion : path.casts) {

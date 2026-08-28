@@ -7,6 +7,8 @@ mlir_tablegen(IntentTypes.h.inc -gen-typedef-decls)
 mlir_tablegen(IntentTypes.cpp.inc -gen-typedef-defs)
 
 set(LLVM_TARGET_DEFINITIONS IntentAttrs.td)
+mlir_tablegen(IntentAttrsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(IntentAttrsEnums.cpp.inc -gen-enum-defs)
 mlir_tablegen(IntentAttrs.h.inc -gen-attrdef-decls)
 mlir_tablegen(IntentAttrs.cpp.inc -gen-attrdef-defs)
 

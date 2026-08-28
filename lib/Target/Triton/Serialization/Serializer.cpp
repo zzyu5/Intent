@@ -640,9 +640,19 @@ private:
       return;
     }
     if (auto compare = dyn_cast<gpu::CompareOp>(operation)) {
-      static constexpr const char *predicates[] = {"==", "!=", "<", "<=", ">", ">="};
+      auto predicate = [&]() -> StringRef {
+        switch (compare.getPredicate()) {
+        case ComparePredicate::Eq: return "==";
+        case ComparePredicate::Ne: return "!=";
+        case ComparePredicate::Lt: return "<";
+        case ComparePredicate::Le: return "<=";
+        case ComparePredicate::Gt: return ">";
+        case ComparePredicate::Ge: return ">=";
+        }
+        llvm_unreachable("unhandled Intent compare predicate");
+      }();
       assign(compare.getResult(), "(" + valueString(compare.getLhs()) + " " +
-                                      predicates[compare.getPredicate()] + " " +
+                                      predicate.str() + " " +
                                       valueString(compare.getRhs()) + ")");
       return;
     }
@@ -787,14 +797,21 @@ private:
       return;
     }
     if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
-      static constexpr const char *formats[] = {"e2m1", "e4m3", "e8m0"};
+      auto format = [](ScaledFormat value) -> StringRef {
+        switch (value) {
+        case ScaledFormat::E2M1: return "e2m1";
+        case ScaledFormat::E4M3: return "e4m3";
+        case ScaledFormat::E8M0: return "e8m0";
+        }
+        llvm_unreachable("unhandled Intent scaled format");
+      };
       assign(contract.getResult(),
              "tl.dot_scaled(" + valueString(contract.getLhs()) + ", " +
                  valueString(contract.getLhsScale()) + ", \"" +
-                 formats[contract.getLhsFormat()] + "\", " +
+                 format(contract.getLhsFormat()).str() + "\", " +
                  valueString(contract.getRhs()) + ", " +
                  valueString(contract.getRhsScale()) + ", \"" +
-                 formats[contract.getRhsFormat()] + "\", " +
+                 format(contract.getRhsFormat()).str() + "\", " +
                  valueString(contract.getAccumulator()) + ")");
       return;
     }
@@ -880,9 +897,19 @@ private:
       return;
     }
     if (auto atomic = dyn_cast<gpu::AtomicRMWOp>(operation)) {
-      static constexpr const char *operations[] = {
-          "xchg", "add", "max", "min", "and", "or", "xor"};
-      std::string call = "tl.atomic_" + std::string(operations[atomic.getKind()]) +
+      auto operationName = [](AtomicRMWKind kind) -> StringRef {
+        switch (kind) {
+        case AtomicRMWKind::Exchange: return "xchg";
+        case AtomicRMWKind::Add: return "add";
+        case AtomicRMWKind::Maximum: return "max";
+        case AtomicRMWKind::Minimum: return "min";
+        case AtomicRMWKind::BitwiseAnd: return "and";
+        case AtomicRMWKind::BitwiseOr: return "or";
+        case AtomicRMWKind::BitwiseXor: return "xor";
+        }
+        llvm_unreachable("unhandled Intent atomic RMW kind");
+      };
+      std::string call = "tl.atomic_" + operationName(atomic.getKind()).str() +
                          "(" +
                          pointer(atomic.getResource(), atomic.getCoordinates(),
                                  atomic.getSourceAxes(),
@@ -1000,53 +1027,70 @@ private:
   }
 
   std::string binaryExpression(gpu::BinaryOp binary) {
-    static constexpr const char *operators[] = {
-        "+", "-", "*", "/", "//", "%", nullptr, nullptr, nullptr,
-        nullptr, nullptr, "&", "|", "&", "|", "^", "<<", ">>"};
-    uint64_t kind = binary.getOperatorKind();
-    if (kind == 6)
-      return "libdevice.pow(" + valueString(binary.getLhs()) + ", " +
+    auto infix = [&](StringRef spelling) {
+      return "(" + valueString(binary.getLhs()) + " " + spelling.str() + " " +
              valueString(binary.getRhs()) + ")";
-    if (kind == 7 || kind == 9)
-      return "tl.maximum(" + valueString(binary.getLhs()) + ", " +
-             valueString(binary.getRhs()) + ")";
-    if (kind == 8 || kind == 10)
-      return "tl.minimum(" + valueString(binary.getLhs()) + ", " +
-             valueString(binary.getRhs()) + ")";
-    return "(" + valueString(binary.getLhs()) + " " + operators[kind] + " " +
-           valueString(binary.getRhs()) + ")";
+    };
+    auto call = [&](StringRef function, StringRef propagateNan = {}) {
+      std::string result = function.str() + "(" + valueString(binary.getLhs()) +
+                           ", " + valueString(binary.getRhs());
+      if (!propagateNan.empty())
+        result += ", propagate_nan=tl.PropagateNan." + propagateNan.str();
+      return result + ")";
+    };
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add: return infix("+");
+    case BinaryOperator::Subtract: return infix("-");
+    case BinaryOperator::Multiply: return infix("*");
+    case BinaryOperator::TrueDivide: return infix("/");
+    case BinaryOperator::FloorDivide: return infix("//");
+    case BinaryOperator::Remainder: return infix("%");
+    case BinaryOperator::Power: return call("libdevice.pow");
+    case BinaryOperator::Maximum: return call("tl.maximum", "ALL");
+    case BinaryOperator::Minimum: return call("tl.minimum", "ALL");
+    case BinaryOperator::MaximumNum: return call("tl.maximum", "NONE");
+    case BinaryOperator::MinimumNum: return call("tl.minimum", "NONE");
+    case BinaryOperator::LogicalAnd:
+    case BinaryOperator::BitwiseAnd: return infix("&");
+    case BinaryOperator::LogicalOr:
+    case BinaryOperator::BitwiseOr: return infix("|");
+    case BinaryOperator::BitwiseXor: return infix("^");
+    case BinaryOperator::LeftShift: return infix("<<");
+    case BinaryOperator::RightShift: return infix(">>");
+    }
+    llvm_unreachable("unhandled Intent binary operator");
   }
 
   std::string unaryExpression(gpu::UnaryOp unary) {
     std::string input = valueString(unary.getInput());
     switch (unary.getOperatorKind()) {
-    case 0:
+    case UnaryOperator::Negate:
       return "(-" + input + ")";
-    case 1:
+    case UnaryOperator::Not:
       return "(~" + input + ")";
-    case 2:
+    case UnaryOperator::Exp:
       return "tl.exp(" + input + ")";
-    case 3:
+    case UnaryOperator::Exp2:
       return "tl.exp2(" + input + ")";
-    case 4:
+    case UnaryOperator::Log:
       return "tl.log(" + input + ")";
-    case 5:
+    case UnaryOperator::Sin:
       return "tl.sin(" + input + ")";
-    case 6:
+    case UnaryOperator::Cos:
       return "tl.cos(" + input + ")";
-    case 7:
+    case UnaryOperator::Floor:
       return "tl.floor(" + input + ")";
-    case 8:
+    case UnaryOperator::Erf:
       return "tl.erf(" + input + ")";
-    case 9:
+    case UnaryOperator::Rsqrt:
       return "tl.rsqrt(" + input + ")";
-    case 10:
+    case UnaryOperator::Sigmoid:
       return "tl.sigmoid(" + input + ")";
-    case 11:
+    case UnaryOperator::Tanh:
       return "tl.libdevice.tanh(" + input + ")";
-    case 12:
+    case UnaryOperator::Abs:
       return "tl.abs(" + input + ")";
-    case 13:
+    case UnaryOperator::Sqrt:
       return "tl.sqrt(" + input + ")";
     default:
       failed = true;
@@ -1054,10 +1098,14 @@ private:
     }
   }
 
-  std::string atomicSemantics(uint64_t ordering) const {
-    static constexpr const char *semantics[] = {
-        "relaxed", "acquire", "release", "acq_rel"};
-    return semantics[ordering];
+  std::string atomicSemantics(AtomicOrdering ordering) const {
+    switch (ordering) {
+    case AtomicOrdering::Relaxed: return "relaxed";
+    case AtomicOrdering::Acquire: return "acquire";
+    case AtomicOrdering::Release: return "release";
+    case AtomicOrdering::AcquireRelease: return "acq_rel";
+    }
+    llvm_unreachable("unhandled Intent atomic ordering");
   }
 
   std::string atomicScope(uint64_t sharing) const {

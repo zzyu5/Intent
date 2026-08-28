@@ -12,6 +12,8 @@
 using namespace mlir;
 using namespace intent;
 
+#include "Intent/Dialect/Intent/IR/IntentAttrsEnums.cpp.inc"
+
 #define GET_DIALECT_DEF
 #include "Intent/Dialect/Intent/IR/IntentDialect.cpp.inc"
 

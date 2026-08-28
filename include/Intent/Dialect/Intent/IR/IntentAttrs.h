@@ -4,6 +4,8 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "mlir/IR/Attributes.h"
 
+#include "Intent/Dialect/Intent/IR/IntentAttrsEnums.h.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h.inc"
 

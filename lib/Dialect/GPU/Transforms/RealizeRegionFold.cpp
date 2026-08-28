@@ -256,7 +256,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     if (valid.getType() != predicate)
       valid = builder.create<BroadcastOp>(location, predicate, valid);
     return Value(builder.create<BinaryOp>(location, predicate, valid, tail,
-                                          /*and=*/11));
+                                          BinaryOperator::LogicalAnd));
   };
   if (auto load = dyn_cast<LoadOp>(producer)) {
     SmallVector<Value> coordinates;
@@ -454,7 +454,7 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
     auto buildRange = [&](MakeRangeOp range) -> Value {
       Value start = builder.create<BinaryOp>(
           location, builder.getIndexType(), range.getStart(), offset,
-          /*add=*/0);
+          BinaryOperator::Add);
       auto rangeType = cast<FragmentType>(range.getResult().getType());
       auto blockedRange =
           replaceSliceAxis(rangeType, 0, sliceExtent, segmentMapping);
@@ -466,12 +466,12 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
           value.getDefiningOp()->setAttr(attribute, inherited);
       Value logicalStop = builder.create<BinaryOp>(
           location, builder.getIndexType(), range.getStart(), range.getExtent(),
-          /*add=*/0);
+          BinaryOperator::Add);
       Value stopFragment =
           builder.create<BroadcastOp>(location, blockedRange, logicalStop);
       Value valid = builder.create<CompareOp>(
           location, predicateType(blockedRange), value, stopFragment,
-          /*less-than=*/2);
+          ComparePredicate::Lt);
       if (!tail)
         tail = valid;
       if (!segmentTail)
@@ -744,7 +744,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     if (predicate.getType() != target)
       predicate = builder.create<BroadcastOp>(value.getLoc(), target, predicate);
     return Value(builder.create<BinaryOp>(value.getLoc(), target, value,
-                                          predicate, /*and=*/11));
+                                          predicate,
+                                          BinaryOperator::LogicalAnd));
   };
   if (substituteSource && substituteTarget) {
     if (substituteSource == conjunctSource) {
@@ -872,13 +873,13 @@ std::optional<bool> booleanConstant(
     if (!lhsZero || !rhsZero)
       return finish(std::nullopt);
     switch (compare.getPredicate()) {
-    case 0:
-    case 3:
-    case 5:
+    case ComparePredicate::Eq:
+    case ComparePredicate::Le:
+    case ComparePredicate::Ge:
       return finish(true);
-    case 1:
-    case 2:
-    case 4:
+    case ComparePredicate::Ne:
+    case ComparePredicate::Lt:
+    case ComparePredicate::Gt:
       return finish(false);
     default:
       return finish(std::nullopt);
@@ -889,14 +890,16 @@ std::optional<bool> booleanConstant(
         booleanConstant(binary.getLhs(), falsePredicate, visiting);
     std::optional<bool> rhs =
         booleanConstant(binary.getRhs(), falsePredicate, visiting);
-    uint64_t kind = binary.getOperatorKind();
-    if (kind == 11 || kind == 13) {
+    BinaryOperator kind = binary.getOperatorKind();
+    if (kind == BinaryOperator::LogicalAnd ||
+        kind == BinaryOperator::BitwiseAnd) {
       if ((lhs && !*lhs) || (rhs && !*rhs))
         return finish(false);
       if (lhs && rhs)
         return finish(*lhs && *rhs);
     }
-    if (kind == 12 || kind == 14) {
+    if (kind == BinaryOperator::LogicalOr ||
+        kind == BinaryOperator::BitwiseOr) {
       if ((lhs && *lhs) || (rhs && *rhs))
         return finish(true);
       if (lhs && rhs)
@@ -955,10 +958,10 @@ bool isZeroConstant(Value value, Value falsePredicate,
     bool lhs = isZeroConstant(binary.getLhs(), falsePredicate, visiting);
     bool rhs = isZeroConstant(binary.getRhs(), falsePredicate, visiting);
     switch (binary.getOperatorKind()) {
-    case 0:
-    case 1:
+    case BinaryOperator::Add:
+    case BinaryOperator::Subtract:
       return finish(lhs && rhs);
-    case 2:
+    case BinaryOperator::Multiply:
       return finish(lhs || rhs);
     default:
       return finish(false);
@@ -1085,16 +1088,16 @@ bool isZeroWithSources(Value value, const llvm::SmallDenseSet<Value> &sources,
                                     sources, visiting));
   }
   if (auto unary = dyn_cast<UnaryOp>(definition))
-    return finish(unary.getOperatorKind() == 0 &&
+    return finish(unary.getOperatorKind() == UnaryOperator::Negate &&
                   isZeroWithSources(unary.getInput(), sources, visiting));
   if (auto binary = dyn_cast<BinaryOp>(definition)) {
     bool lhs = isZeroWithSources(binary.getLhs(), sources, visiting);
     bool rhs = isZeroWithSources(binary.getRhs(), sources, visiting);
     switch (binary.getOperatorKind()) {
-    case 0:
-    case 1:
+    case BinaryOperator::Add:
+    case BinaryOperator::Subtract:
       return finish(lhs && rhs);
-    case 2:
+    case BinaryOperator::Multiply:
       return finish(lhs || rhs);
     default:
       return finish(false);
@@ -1258,7 +1261,7 @@ FailureOr<Value> materializeScanConsumerValue(
     if (isSourceAxis) {
       physicalStart = builder.create<BinaryOp>(location, builder.getIndexType(),
                                                physicalStart, offset,
-                                               /*add=*/0);
+                                               BinaryOperator::Add);
       physicalExtent = segment;
       physicalType = replaceExtent(type, 0, sliceExtent);
     }
@@ -1329,7 +1332,7 @@ LogicalResult cloneScanOutputConsumers(
         if (valid.getType() != predicate)
           valid = builder.create<BroadcastOp>(location, predicate, valid);
         valid = builder.create<BinaryOp>(location, predicate, valid, tail,
-                                         /*and=*/11);
+                                         BinaryOperator::LogicalAnd);
       } else {
         valid = tail;
       }
@@ -1387,8 +1390,8 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     unsigned captureArgument =
         lhsCapture ? lhs.getArgNumber() : rhs.getArgNumber();
     bool sourceHasUpperBound =
-        (lhsCapture && compare.getPredicate() == 5) ||
-        (rhsCapture && compare.getPredicate() == 3);
+        (lhsCapture && compare.getPredicate() == ComparePredicate::Ge) ||
+        (rhsCapture && compare.getPredicate() == ComparePredicate::Le);
     if (!sourceHasUpperBound || sourceArgument >= plans.size())
       continue;
     unsigned captureIndex = captureArgument - sourceCount;
@@ -1418,35 +1421,35 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     Location location = fold.getLoc();
     Value captureWidth = builder.create<BinaryOp>(
         location, builder.getIndexType(), captureRange.getExtent(),
-        captureRange.getStep(), /*multiply=*/2);
+        captureRange.getStep(), BinaryOperator::Multiply);
     Value captureUpper = builder.create<BinaryOp>(
         location, builder.getIndexType(), captureRange.getStart(), captureWidth,
-        /*add=*/0);
+        BinaryOperator::Add);
     Value relativeUpper = builder.create<BinaryOp>(
         location, builder.getIndexType(), captureUpper, master.getStart(),
-        /*subtract=*/1);
+        BinaryOperator::Subtract);
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
     Value nonNegative = builder.create<BinaryOp>(
         location, builder.getIndexType(), relativeUpper, zero,
-        /*maximum=*/7);
+        BinaryOperator::Maximum);
     Value effectiveStop = builder.create<BinaryOp>(
         location, builder.getIndexType(), master.getExtent(), nonNegative,
-        /*minimum=*/8);
+        BinaryOperator::Minimum);
     Value relativeStart = builder.create<BinaryOp>(
         location, builder.getIndexType(), captureRange.getStart(),
-        master.getStart(), /*subtract=*/1);
+        master.getStart(), BinaryOperator::Subtract);
     Value nonNegativeStart = builder.create<BinaryOp>(
         location, builder.getIndexType(), relativeStart, zero,
-        /*maximum=*/7);
+        BinaryOperator::Maximum);
     Value boundedStart = builder.create<BinaryOp>(
         location, builder.getIndexType(), master.getExtent(), nonNegativeStart,
-        /*minimum=*/8);
+        BinaryOperator::Minimum);
     Value wholeSegments = builder.create<BinaryOp>(
         location, builder.getIndexType(), boundedStart, segment,
-        /*floor-divide=*/4);
+        BinaryOperator::FloorDivide);
     Value allTrueStop = builder.create<BinaryOp>(
         location, builder.getIndexType(), wholeSegments, segment,
-        /*multiply=*/2);
+        BinaryOperator::Multiply);
     return PredicatePartition{allTrueStop, effectiveStop,
                               compare.getResult()};
   }

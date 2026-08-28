@@ -175,6 +175,12 @@ class AtomicRMWKind(IntEnum):
     XOR = 6
 
 
+class ScaledFormatKind(IntEnum):
+    E2M1 = 0
+    E4M3 = 1
+    E8M0 = 2
+
+
 class IndexTermKind(IntEnum):
     FULL_SLICE = 0
     NEW_AXIS = 1

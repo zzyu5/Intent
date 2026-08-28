@@ -445,7 +445,8 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       if (failed(broadcast))
         return failure();
       result = result ? Value(builder.create<BinaryOp>(
-                            location, target, result, *broadcast, 11))
+                            location, target, result, *broadcast,
+                            BinaryOperator::LogicalAnd))
                       : *broadcast;
     }
   }
@@ -530,7 +531,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
         return histogram.emitOpError(
             "could not project pointwise tail validity onto histogram values");
       valid = builder.create<BinaryOp>(histogram.getLoc(), validType, valid,
-                                       *broadcast, 11);
+                                       *broadcast, BinaryOperator::LogicalAnd);
       affected = true;
     }
     if (!affected)
@@ -739,7 +740,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       return failure();
     return Value(builder.create<BinaryOp>(producer->getLoc(),
                                           predicateType(resultType), *original,
-                                          *projected, /*and=*/11));
+                                          *projected,
+                                          BinaryOperator::LogicalAnd));
   };
   Value replayed;
   if (auto load = dyn_cast<LoadOp>(producer)) {
@@ -957,12 +959,13 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   OpBuilder builder(stores.front());
   Value distance = builder.create<BinaryOp>(
       range.getLoc(), builder.getIndexType(), range.getExtent(), range.getStep(),
-      /*multiply=*/2);
+      BinaryOperator::Multiply);
   Value stop = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                        range.getStart(), distance, /*add=*/0);
+                                        range.getStart(), distance,
+                                        BinaryOperator::Add);
   Value loopStep = builder.create<BinaryOp>(
       range.getLoc(), builder.getIndexType(), chunk.getResult(), range.getStep(),
-      /*multiply=*/2);
+      BinaryOperator::Multiply);
   bool bodyFailed = false;
   std::string failureReason;
   auto loop = builder.create<scf::ForOp>(
@@ -977,7 +980,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
         Value tail = nested.create<CompareOp>(
             location, predicateType(blockedType), blocked, end,
-            /*less-than=*/2);
+            ComparePredicate::Lt);
         IRMapping mapping;
         mapping.map(range.getResult(), blocked);
         for (StoreOp store : stores) {
@@ -1033,7 +1036,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             }
             valid = Value(nested.create<BinaryOp>(
                 location, predicateType(payloadType), *valid, *projected,
-                /*and=*/11));
+                BinaryOperator::LogicalAnd));
           }
           auto replacement = nested.create<StoreOp>(
               location, store.getResource(), coordinates, *payload, *valid,
@@ -1132,7 +1135,8 @@ LogicalResult realizeDistributedHistograms(func::FuncOp kernel) {
     auto atomic = builder.create<AtomicRMWOp>(
         store.getLoc(), store.getValue().getType(), store.getResource(),
         store.getCoordinates(), store.getValue(), store.getValid(),
-        /*kind=*/1, /*ordering=*/0, /*sharing=*/1, store.getSourceAxes());
+        AtomicRMWKind::Add, AtomicOrdering::Relaxed, /*sharing=*/1,
+        store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       atomic->setAttr(originAttr, origin);
     store.erase();
@@ -1638,10 +1642,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           range.getLoc(), physicalExtent.getValue());
       Value exactDistance = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), range.getExtent(),
-          range.getStep(), 2);
+          range.getStep(), BinaryOperator::Multiply);
       Value exactEnd = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), range.getStart(),
-          exactDistance, 0);
+          exactDistance, BinaryOperator::Add);
       auto blocked = builder.create<MakeRangeOp>(
           range.getLoc(), fragment, range.getStart(), extent, range.getStep(),
           range.getSourceId(), range.getSourceAxis());
@@ -1652,7 +1656,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           builder.create<BroadcastOp>(range.getLoc(), fragment, exactEnd);
       Value valid = builder.create<CompareOp>(
           range.getLoc(), predicateType(fragment), blocked.getResult(),
-          endFragment, 2);
+          endFragment, ComparePredicate::Lt);
       range.getResult().replaceAllUsesWith(blocked.getResult());
       fixedRangePredicates[blocked.getResult()] = valid;
       range.erase();
@@ -2219,11 +2223,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         mapping.getLoc(), mappingBuilder.getIndexType(), *dimension,
         mappingBuilder.create<BinaryOp>(mapping.getLoc(),
                                         mappingBuilder.getIndexType(),
-                                        parameter.getResult(), one, 1),
-        0);
+                                        parameter.getResult(), one,
+                                        BinaryOperator::Subtract),
+        BinaryOperator::Add);
     Value tiles = mappingBuilder.create<BinaryOp>(
         mapping.getLoc(), mappingBuilder.getIndexType(), adjusted,
-        parameter.getResult(), 4);
+        parameter.getResult(), BinaryOperator::FloorDivide);
     PhysicalExprAttr logical;
     if (isStaticAxis(dimensionId) && staticExtent) {
       logical = expression(module.getContext(), PhysicalExprKind::Constant,
@@ -2311,7 +2316,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               "pointwise ownership mapping lost its blocking parameter");
         newCoordinate = mappingBuilder.create<BinaryOp>(
             mapping.getLoc(), mappingBuilder.getIndexType(), newCoordinate,
-            parameter.getResult(), 2);
+            parameter.getResult(), BinaryOperator::Multiply);
         oldCoordinate.replaceAllUsesWith(newCoordinate);
         PhysicalExprAttr extent = expression(
             module.getContext(), PhysicalExprKind::Parameter, 0,
@@ -2378,7 +2383,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
              << ", launch_extents=" << mapping->getAttr("launch_extents");
     Value tileOffset = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), tileCoordinate,
-        parameter->getResult(), 2);
+        parameter->getResult(), BinaryOperator::Multiply);
     Value start;
     Value end;
     if (range->hasAttr(worksetCoordinateRangeAttr)) {
@@ -2399,22 +2404,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                << ", source_dimension="
                << range->getAttr(sourceDimensionAttr);
       Value remaining = builder.create<BinaryOp>(
-          range.getLoc(), builder.getIndexType(), dimension, tileOffset, 1);
+          range.getLoc(), builder.getIndexType(), dimension, tileOffset,
+          BinaryOperator::Subtract);
       Value remainingDistance = builder.create<BinaryOp>(
-          range.getLoc(), builder.getIndexType(), remaining, range.getStep(), 2);
+          range.getLoc(), builder.getIndexType(), remaining, range.getStep(),
+          BinaryOperator::Multiply);
       end = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                     start, remainingDistance, 0);
+                                     start, remainingDistance,
+                                     BinaryOperator::Add);
     } else {
       Value scaledOffset = builder.create<BinaryOp>(
-          range.getLoc(), builder.getIndexType(), tileOffset, range.getStep(), 2);
+          range.getLoc(), builder.getIndexType(), tileOffset, range.getStep(),
+          BinaryOperator::Multiply);
       start = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), range.getStart(), scaledOffset,
-          0);
+          BinaryOperator::Add);
       Value logicalDistance = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), range.getExtent(),
-          range.getStep(), 2);
+          range.getStep(), BinaryOperator::Multiply);
       end = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                     range.getStart(), logicalDistance, 0);
+                                     range.getStart(), logicalDistance,
+                                     BinaryOperator::Add);
     }
     auto sourceType = cast<FragmentType>(range.getResult().getType());
     PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
@@ -2431,7 +2441,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         blocked.getDefiningOp()->setAttr(attribute, value);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     Value valid = builder.create<CompareOp>(range.getLoc(), predicateType(blockedType),
-                                            blocked, endFragment, 2);
+                                            blocked, endFragment,
+                                            ComparePredicate::Lt);
     range.getResult().replaceAllUsesWith(blocked);
     rangePredicates[blocked] = valid;
     range.erase();

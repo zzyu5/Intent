@@ -44,13 +44,13 @@ std::optional<int64_t> constantValue(Value value) {
     if (!lhs || !rhs)
       return std::nullopt;
     switch (binary.getOperatorKind()) {
-    case 0:
+    case BinaryOperator::Add:
       return *lhs + *rhs;
-    case 1:
+    case BinaryOperator::Subtract:
       return *lhs - *rhs;
-    case 2:
+    case BinaryOperator::Multiply:
       return *lhs * *rhs;
-    case 4:
+    case BinaryOperator::FloorDivide:
       return *rhs == 0 ? std::nullopt
                        : std::optional<int64_t>(*lhs / *rhs);
     default:
@@ -106,16 +106,21 @@ bool isViewExtent(Value value, Value resource, unsigned axis) {
     return isViewExtent(range.getStep(), resource, axis);
   }
   if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() == 0 && isProvably(binary.getLhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        isProvably(binary.getLhs(), 0))
       return isViewExtent(binary.getRhs(), resource, axis);
-    if (binary.getOperatorKind() == 0 && isProvably(binary.getRhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        isProvably(binary.getRhs(), 0))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == 1 && isProvably(binary.getRhs(), 0))
+    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
+        isProvably(binary.getRhs(), 0))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if ((binary.getOperatorKind() == 2 || binary.getOperatorKind() == 4) &&
+    if ((binary.getOperatorKind() == BinaryOperator::Multiply ||
+         binary.getOperatorKind() == BinaryOperator::FloorDivide) &&
         isProvably(binary.getRhs(), 1))
       return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == 2 && isProvably(binary.getLhs(), 1))
+    if (binary.getOperatorKind() == BinaryOperator::Multiply &&
+        isProvably(binary.getLhs(), 1))
       return isViewExtent(binary.getRhs(), resource, axis);
   }
   return false;
@@ -136,7 +141,7 @@ bool collectFullViewValidity(Value valid, Value resource, ValueRange coordinates
     return false;
   valid = stripBroadcast(valid);
   if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() != 11)
+    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd)
       return false;
     return collectFullViewValidity(binary.getLhs(), resource, coordinates,
                                    sourceAxes, coveredAxes) &&
@@ -144,7 +149,7 @@ bool collectFullViewValidity(Value valid, Value resource, ValueRange coordinates
                                    sourceAxes, coveredAxes);
   }
   auto compare = valid.getDefiningOp<gpu::CompareOp>();
-  if (!compare || compare.getPredicate() != 2)
+  if (!compare || compare.getPredicate() != ComparePredicate::Lt)
     return false;
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
     if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
@@ -170,13 +175,13 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
   if (isProvably(start, 0))
     return builder.create<arith::ConstantIndexOp>(location, 0).getResult();
   if (auto binary = start.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() == 2) {
+    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
       if (binary.getLhs() == extent)
         return binary.getRhs();
       if (binary.getRhs() == extent)
         return binary.getLhs();
     }
-    if (binary.getOperatorKind() == 0) {
+    if (binary.getOperatorKind() == BinaryOperator::Add) {
       if (isProvably(binary.getLhs(), 0))
         return tileIndex(builder, location, binary.getRhs(), extent);
       if (isProvably(binary.getRhs(), 0))
@@ -189,7 +194,8 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
   if (loop && argument == loop.getInductionVar() &&
       isProvably(loop.getLowerBound(), 0) && loop.getStep() == extent)
     return Value(builder.create<gpu::BinaryOp>(
-        location, builder.getIndexType(), start, extent, /*floor-div=*/4));
+        location, builder.getIndexType(), start, extent,
+        BinaryOperator::FloorDivide));
   return failure();
 }
 
@@ -329,17 +335,17 @@ std::optional<uint64_t> nativeCombineKind(Region &region) {
         (binary.getLhs() == block.getArgument(1) &&
          binary.getRhs() == block.getArgument(0))))
     return std::nullopt;
-  if (binary.getOperatorKind() == 0)
+  if (binary.getOperatorKind() == BinaryOperator::Add)
     return 0;
-  if (binary.getOperatorKind() == 7 || binary.getOperatorKind() == 9)
+  if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
     return 1;
-  if (binary.getOperatorKind() == 8 || binary.getOperatorKind() == 10)
+  if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
     return 2;
   auto result = dyn_cast<gpu::FragmentType>(binary.getResult().getType());
   if (result && result.getElementType().isInteger(1)) {
-    if (binary.getOperatorKind() == 12)
+    if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
       return 1;
-    if (binary.getOperatorKind() == 11)
+    if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
       return 2;
   }
   return std::nullopt;
@@ -578,8 +584,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1, 2} ||
         contract.getRhsReductionAxes() != ArrayRef<int64_t>{0, 1} ||
         !contract.getLhsBatchAxes().empty() ||
-        !contract.getRhsBatchAxes().empty() || contract.getLhsFormat() != 1 ||
-        contract.getRhsFormat() != 1 || contract.getLhsGroupSize() != 32 ||
+        !contract.getRhsBatchAxes().empty() ||
+        contract.getLhsFormat() != ScaledFormat::E4M3 ||
+        contract.getRhsFormat() != ScaledFormat::E4M3 ||
+        contract.getLhsGroupSize() != 32 ||
         contract.getRhsGroupSize() != 32)
       return contract.emitOpError(
           "cuTile scaled MMA requires E4M3/E8M0 group-32 adjacent reduction axes");
@@ -617,8 +625,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     }
     auto replacement = builder.create<AtomicRMWOp>(
         atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
-        *coordinates, atomic.getValue(), atomic.getKind(), atomic.getOrdering(),
-        atomic.getSharing());
+        *coordinates, atomic.getValue(), static_cast<uint64_t>(atomic.getKind()),
+        static_cast<uint64_t>(atomic.getOrdering()), atomic.getSharing());
     if (Attribute origin = atomic->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     atomic.getResult().replaceAllUsesWith(replacement.getResult());
