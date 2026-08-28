@@ -9,6 +9,7 @@ from intent.targets.base import Target
 
 from .toolchain import CompilationStageError
 from .toolchain import run_compiler
+from .toolchain import run_shared_compiler
 
 
 def compile(
@@ -38,3 +39,26 @@ def compile(
         raise CompilationStageError(
             "generated_source_materialization", str(error)
         ) from error
+
+
+def compile_shared_gpu(
+    definition: KernelDefinition[object, object],
+    *,
+    target: Target,
+    compiler: str | Path,
+    constexprs: dict[str, object] | None = None,
+) -> str:
+    try:
+        kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
+    except Exception as error:
+        raise CompilationStageError("frontend_kir", str(error)) from error
+    try:
+        resolved = target.resolve()
+    except Exception as error:
+        raise CompilationStageError("target_resolution", str(error)) from error
+    return run_shared_compiler(
+        compiler,
+        kernel_mlir,
+        resolved.compiler_options,
+        resolved.compiler_role,
+    )

@@ -74,3 +74,53 @@ def run_compiler(
                 "compiler_output", f"{role} produced an empty compiler output"
             )
         return source, realized_mlir
+
+
+def run_shared_compiler(
+    executable_path: str | Path,
+    module_text: str,
+    options: tuple[str, ...],
+    role: str,
+) -> str:
+    executable = Path(executable_path)
+    if not executable.is_file():
+        raise CompilationStageError(
+            "compiler_invocation", f"{role} does not exist: {executable}"
+        )
+    with tempfile.TemporaryDirectory(prefix="intentdsl-shared-") as directory:
+        mlir_path = Path(directory) / "shared-gpu.mlir"
+        try:
+            completed = subprocess.run(
+                [
+                    str(executable),
+                    *options,
+                    "--stop-after-shared",
+                    f"--ir-output={mlir_path}",
+                    "-",
+                ],
+                input=module_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as error:
+            raise CompilationStageError("compiler_invocation", str(error)) from error
+        if completed.returncode != 0:
+            stage = _STAGE_BY_EXIT_CODE.get(
+                completed.returncode, "compiler_process"
+            )
+            raise CompilationStageError(
+                stage,
+                f"{role} failed with exit code {completed.returncode}:\n"
+                f"{completed.stderr}{completed.stdout}",
+            )
+        if not mlir_path.is_file():
+            raise CompilationStageError(
+                "compiler_output", f"{role} did not produce shared GPU IR"
+            )
+        realized_mlir = mlir_path.read_text(encoding="utf-8")
+        if not realized_mlir:
+            raise CompilationStageError(
+                "compiler_output", f"{role} produced empty shared GPU IR"
+            )
+        return realized_mlir

@@ -1022,7 +1022,27 @@ FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
                                                       int64_t dimension) {
   if (!origin || dimension <= 0)
     return failure();
-  return dimensionExpression(origin->getContext(), dimension);
+  func::FuncOp function = origin->getParentOfType<func::FuncOp>();
+  if (function) {
+    bool launchVisible = false;
+    for (BlockArgument argument : function.getArguments()) {
+      auto tensor = viewTensor(argument);
+      auto identities = tensor ? dimensionIds(tensor) : DenseI64ArrayAttr();
+      launchVisible |=
+          identities && llvm::is_contained(identities.asArrayRef(), dimension);
+    }
+    if (launchVisible)
+      return dimensionExpression(origin->getContext(), dimension);
+  }
+  std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
+  gpu::ParameterOp declaration;
+  origin->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
+    if (!declaration && parameter.getParameter().getName() == name)
+      declaration = parameter;
+  });
+  return declaration ? FailureOr<PhysicalExprAttr>(
+                           parameterExpression(origin->getContext(), name))
+                     : FailureOr<PhysicalExprAttr>(failure());
 }
 
 FailureOr<PhysicalExprAttr> fragmentExtentExpression(RankedTensorType tensor,
@@ -4355,7 +4375,48 @@ LogicalResult constructGPUProgram(ModuleOp module,
       abi->argumentAttrs);
   Block *entry = physical.addEntryBlock();
   builder.setInsertionPointToStart(entry);
+  llvm::SmallDenseSet<int64_t> launchDimensions(abi->dimensionOrder.begin(),
+                                                abi->dimensionOrder.end());
+  llvm::SmallDenseSet<int64_t> derivedFragmentDimensions;
+  function.walk([&](Operation *operation) {
+    auto collect = [&](Type type) {
+      auto tensor = dyn_cast<RankedTensorType>(type);
+      DenseI64ArrayAttr identities = tensor ? dimensionIds(tensor)
+                                            : DenseI64ArrayAttr();
+      if (!tensor || !identities)
+        return;
+      for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef())) {
+        if (!tensor.isDynamicDim(axis) || identity <= 0)
+          continue;
+        FailureOr<int64_t> physicalIdentity =
+            physicalDimensionIdentity(operation, identity);
+        if (succeeded(physicalIdentity) &&
+            !launchDimensions.contains(*physicalIdentity))
+          derivedFragmentDimensions.insert(*physicalIdentity);
+      }
+    };
+    for (Type type : operation->getOperandTypes())
+      collect(type);
+    for (Type type : operation->getResultTypes())
+      collect(type);
+  });
   llvm::DenseMap<StringAttr, Value> parameterValues;
+  SmallVector<int64_t> orderedDerived(derivedFragmentDimensions.begin(),
+                                      derivedFragmentDimensions.end());
+  llvm::sort(orderedDerived);
+  for (int64_t dimension : orderedDerived) {
+    std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
+    auto parameter = gpu::ParameterAttr::get(
+        context, builder.getStringAttr(name),
+        static_cast<uint32_t>(gpu::ParameterRole::OwnershipN),
+        builder.getDenseI64ArrayAttr(
+            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}));
+    auto declaration = builder.create<gpu::ParameterOp>(
+        function.getLoc(), builder.getIndexType(), parameter);
+    declaration->setAttr(gpu::dimensionAttr,
+                         builder.getI64IntegerAttr(dimension));
+    parameterValues[parameter.getName()] = declaration.getResult();
+  }
   SmallVector<Value> sourceArguments;
   sourceArguments.reserve(abi->physicalArgumentForSource.size());
   for (unsigned physicalIndex : abi->physicalArgumentForSource)

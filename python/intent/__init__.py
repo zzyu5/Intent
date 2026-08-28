@@ -6,6 +6,7 @@ from .api import fn
 from .api import kernel
 from .compiler import CompilationStageError
 from .compiler import compile
+from .compiler import compile_shared_gpu
 from .diagnostics import DefinitionError
 from .diagnostics import IntentError
 from .diagnostics import LanguageUseError
@@ -29,6 +30,7 @@ __all__ = [
     "fn",
     "kernel",
     "compile",
+    "compile_shared_gpu",
     "CompiledArtifact",
     "CuTileTarget",
     "TileLangTarget",

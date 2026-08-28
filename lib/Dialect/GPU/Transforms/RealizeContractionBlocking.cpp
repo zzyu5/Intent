@@ -1457,24 +1457,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       {rhsReductionRange, *reductionLogicalEnd},
       {columnRange, *columnLogicalEnd},
   };
-  for (StorePath &path : paths)
-    if (path.store.getValid() &&
-        failed(scalarSource(path.store.getValid())) &&
-        !isTailPredicate(path.store.getValid(), outputTailRanges)) {
-      InFlightDiagnostic diagnostic = contract.emitOpError(
-          "cannot form a complete physical contraction: result store has non-tail residual validity");
-      diagnostic << "; predicate_type=" << path.store.getValid().getType();
-      if (Operation *definition = path.store.getValid().getDefiningOp())
-        diagnostic << ", predicate_op=" << definition->getName();
-      return failure();
-    }
-  if (lhsLoad.getValid() &&
-      failed(scalarSource(lhsLoad.getValid())) &&
-      !isTailPredicate(lhsLoad.getValid(), lhsTailRanges))
-    return unhandled("lhs load has non-tail residual validity");
-  if (rhsLoad.getValid() && failed(scalarSource(rhsLoad.getValid())) &&
-      !isTailPredicate(rhsLoad.getValid(), rhsTailRanges))
-    return unhandled("rhs load has non-scalar residual validity");
   if (lhsLoad.getFill() && !isZeroScalar(lhsLoad.getFill()))
     return unhandled("lhs invalid fill is not the contraction zero");
   if (rhsLoad.getFill() && !isZeroScalar(rhsLoad.getFill()))
@@ -1515,8 +1497,15 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       !segmentLength ||
       segmentOffset.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-      segmentOffset.getValue() != 0 || programSpace[0] != segmentLength)
-    return unhandled("current rule requires one full-program execution segment");
+      segmentOffset.getValue() != 0 || programSpace[0] != segmentLength) {
+    std::string details;
+    llvm::raw_string_ostream stream(details);
+    stream << "current rule requires one full-program execution segment"
+           << "; program_space=" << programSpace
+           << ", segment_offset=" << segmentOffset
+           << ", segment_length=" << segmentLength;
+    return unhandled(stream.str());
+  }
 
   unsigned rowResourceAxis = lhsLoad.getSourceAxes()[*lhsRowCoordinate];
   unsigned columnResourceAxis = rhsLoad.getSourceAxes()[*rhsColumnCoordinate];
@@ -1752,7 +1741,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value accumulator = rowBuilder.create<SplatOp>(
         location, blockedResultType, *initialAccumulator);
 
-    bool loopBodyFailed = false;
+    std::string loopBodyFailure;
     auto loop = rowBuilder.create<scf::ForOp>(
         location, lhsReductionRange.getStart(), reductionStop,
         blockK.getResult(), ValueRange{accumulator},
@@ -1786,7 +1775,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
             FailureOr<Value> original = retargetPredicate(
                 nested, nestedLocation, lhsLoad.getValid(), lhsPredicateType);
             if (failed(original)) {
-              loopBodyFailed = true;
+              loopBodyFailure = "lhs residual validity could not be retargeted";
               return;
             }
             lhsValid = binary(nested, nestedLocation, lhsPredicateType, lhsValid,
@@ -1797,7 +1786,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
             FailureOr<Value> original = retargetPredicate(
                 nested, nestedLocation, rhsLoad.getValid(), rhsPredicateType);
             if (failed(original)) {
-              loopBodyFailed = true;
+              loopBodyFailure = "rhs residual validity could not be retargeted";
               return;
             }
             rhsValid = binary(nested, nestedLocation, rhsPredicateType, rhsValid,
@@ -1814,7 +1803,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           FailureOr<Value> rhsFill = retargetFill(
               nested, nestedLocation, rhsLoad.getFill(), blockedRhsType);
           if (failed(lhsFill) || failed(rhsFill)) {
-            loopBodyFailed = true;
+            loopBodyFailure = failed(lhsFill) ? "lhs fill could not be retargeted"
+                                              : "rhs fill could not be retargeted";
             return;
           }
           Value lhs = nested.create<LoadOp>(
@@ -1829,10 +1819,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               ArrayRef<int64_t>{});
           nested.create<scf::YieldOp>(nestedLocation, product);
         });
-    if (loopBodyFailed) {
+    if (!loopBodyFailure.empty()) {
       loop.erase();
       return contract.emitOpError(
-          "blocked contraction could not materialize its loop body");
+                 "blocked contraction could not materialize its loop body: ")
+             << loopBodyFailure;
     }
 
     Value outputRows =

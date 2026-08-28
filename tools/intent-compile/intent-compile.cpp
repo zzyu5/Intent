@@ -69,6 +69,10 @@ int main(int argc, char **argv) {
                                               llvm::cl::init(""));
   llvm::cl::opt<std::string> sourceOutputFilename("source-output",
                                                   llvm::cl::init(""));
+  llvm::cl::opt<bool> stopAfterShared(
+      "stop-after-shared",
+      llvm::cl::desc("stop after the full shared GPU verifier"),
+      llvm::cl::init(false));
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
 
@@ -97,6 +101,23 @@ int main(int argc, char **argv) {
   }
   if (mlir::failed(intent::gpu::runSharedGPUPasses(*module)))
     return exitCode(ExitCode::PhysicalProgramVerification);
+  if (stopAfterShared) {
+    if (irOutputFilename.empty()) {
+      llvm::errs() << "--ir-output is required with --stop-after-shared\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    std::error_code error;
+    llvm::raw_fd_ostream irOutput(irOutputFilename, error,
+                                 llvm::sys::fs::OF_Text);
+    if (error) {
+      llvm::errs() << "cannot open physical IR output: " << error.message()
+                   << "\n";
+      return exitCode(ExitCode::CompilerOutput);
+    }
+    module->print(irOutput);
+    irOutput << "\n";
+    return exitCode(ExitCode::Success);
+  }
   std::string source;
   mlir::LogicalResult provider = mlir::failure();
   mlir::LogicalResult serialized = mlir::failure();

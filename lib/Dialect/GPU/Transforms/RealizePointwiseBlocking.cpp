@@ -328,6 +328,17 @@ LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
   if (!extent || extent.getKind() ==
                      static_cast<uint32_t>(PhysicalExprKind::Constant))
     return success();
+  if (extent.getKind() ==
+      static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+    StringRef symbol = extent.getSymbol().getValue();
+    if (!symbol.consume_front("D"))
+      return failure();
+    uint64_t dimension = 0;
+    return !symbol.getAsInteger(10, dimension) &&
+                   succeeded(dimensionArgument(kernel, dimension))
+               ? success()
+               : failure();
+  }
   if (extent.getKind() !=
       static_cast<uint32_t>(PhysicalExprKind::Parameter))
     return failure();
@@ -548,8 +559,11 @@ void collectProducerRanges(Value value, uint64_t sourceId,
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return;
+  PhysicalAxisProjection source = queryUniqueSourceAxis(value.getType(), sourceId);
+  if (!source.isExact())
+    return;
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value);
+  PhysicalRangeFact fact = analysis.sourceRanges(value, source.source);
   if (fact.state == PhysicalFactState::Unknown)
     return;
   for (MakeRangeOp range : fact.roots)
@@ -982,26 +996,6 @@ void collectStoreRanges(Value value, llvm::SmallPtrSetImpl<Operation *> &ranges,
   }
 }
 
-bool hasOnlyDirectStoreUsers(Value value,
-                             llvm::SmallPtrSetImpl<Operation *> &visited) {
-  bool foundStore = false;
-  for (Operation *user : value.getUsers()) {
-    if (!visited.insert(user).second)
-      continue;
-    if (isa<CastOp, BroadcastOp>(user)) {
-      if (!hasOnlyDirectStoreUsers(user->getResult(0), visited))
-        return false;
-      foundStore = true;
-      continue;
-    }
-    auto store = dyn_cast<StoreOp>(user);
-    if (!store || store.getValue() != value || store.getCollision() != 0)
-      return false;
-    foundStore = true;
-  }
-  return foundStore;
-}
-
 HistogramOp histogramSource(Value value) {
   while (Operation *producer = value.getDefiningOp()) {
     if (auto histogram = dyn_cast<HistogramOp>(producer))
@@ -1394,50 +1388,20 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     collectStoreRanges(histogram.getResult(), internalTraversalRanges, visited);
   });
   kernel.walk([&](ContractOp contract) {
-    llvm::SmallPtrSet<Operation *, 16> storeUsers;
-    if (hasOnlyDirectStoreUsers(contract.getResult(), storeUsers)) {
-      collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
-      llvm::SmallPtrSet<Operation *, 16> visited;
-      collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
-      return;
-    }
-    for (int64_t axis : contract.getLhsReductionAxes())
-      if (axis >= 0)
-        collectAxisInto(contract.getLhs(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
-    for (int64_t axis : contract.getRhsReductionAxes())
-      if (axis >= 0)
-        collectAxisInto(contract.getRhs(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
+    collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
   kernel.walk([&](ScaledContractOp contract) {
-    llvm::SmallPtrSet<Operation *, 16> storeUsers;
-    if (hasOnlyDirectStoreUsers(contract.getResult(), storeUsers)) {
-      collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getLhsScale(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getRhsScale(), structuredTraversalRanges);
-      collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
-      llvm::SmallPtrSet<Operation *, 16> visited;
-      collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
-      return;
-    }
-    for (int64_t axis : contract.getLhsReductionAxes())
-      if (axis >= 0) {
-        collectAxisInto(contract.getLhs(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
-        collectAxisInto(contract.getLhsScale(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
-      }
-    for (int64_t axis : contract.getRhsReductionAxes())
-      if (axis >= 0) {
-        collectAxisInto(contract.getRhs(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
-        collectAxisInto(contract.getRhsScale(), static_cast<uint64_t>(axis),
-                        structuredTraversalRanges);
-      }
+    collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getLhsScale(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getRhsScale(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
@@ -1659,6 +1623,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Attribute attribute : fragment.getAxisMaps())
       ownershipSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
   });
+  // A source axis consumed by a first-class structured operation is owned by
+  // that operation's physical realization.  A store coordinate using the same
+  // logical axis does not make pointwise mapping a second decision authority.
+  for (Operation *operation : structuredTraversalRanges)
+    if (auto range = dyn_cast<MakeRangeOp>(operation))
+      ownershipSources.erase(range.getSourceId());
 
   if (auto roles =
           mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
@@ -1798,19 +1768,42 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
       continue;
     }
+    if (!ownershipOnly &&
+        internalTraversalRanges.contains(range.getOperation()) &&
+        !reuseTraversalRanges.contains(range.getOperation()))
+      continue;
     if (ownershipOnly &&
         !ownershipSources.contains(range.getSourceId()))
       continue;
+    if (!ownershipOnly &&
+        !ownershipSources.contains(range.getSourceId()) &&
+        !internalTraversalRanges.contains(range.getOperation()) &&
+        !reuseTraversalRanges.contains(range.getOperation()))
+      continue;
     FailureOr<ParameterOp> parameter = blockingParameter(kernel, range);
-    if (failed(parameter) && ownershipOnly &&
-        ownershipSources.contains(range.getSourceId()) &&
-        !internalTraversalRanges.contains(range.getOperation())) {
+    bool requiresBlockingParameter =
+        !internalTraversalRanges.contains(range.getOperation()) &&
+        ((ownershipOnly && ownershipSources.contains(range.getSourceId())) ||
+         (!ownershipOnly &&
+          (ownershipSources.contains(range.getSourceId()) ||
+           reuseTraversalRanges.contains(range.getOperation()))));
+    if (failed(parameter) && requiresBlockingParameter) {
       auto logicalExtent = range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       const bool dynamicSubregion = range->hasAttr(sourceSubregionAttr);
       auto sourceDimension =
           range->getAttrOfType<IntegerAttr>(sourceDimensionAttr);
+      if (!sourceDimension &&
+          physicalExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+        StringRef symbol = physicalExtent.getSymbol().getValue();
+        uint64_t dimension = 0;
+        if (symbol.consume_front("D") &&
+            !symbol.getAsInteger(10, dimension))
+          sourceDimension = IntegerAttr::get(
+              IntegerType::get(kernel.getContext(), 64), dimension);
+      }
       const bool launchVisibleDimension =
           sourceDimension &&
           succeeded(dimensionArgument(kernel, sourceDimension.getInt()));
@@ -2201,6 +2194,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     replacement->setAttr(
         coordinateRolesAttr,
         DenseI64ArrayAttr::get(module.getContext(), coordinateRoles));
+    for (StringRef attribute : {executionGroupAttr, segmentOffsetAttr})
+      if (Attribute value = mapping->getAttr(attribute))
+        replacement->setAttr(attribute, value);
     for (auto [axis, pair] : llvm::enumerate(llvm::zip(
              mapping.getCoordinates(),
              replacement.getCoordinates().take_front(
@@ -2236,12 +2232,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     unsigned extra = mapping.getCoordinates().size();
     for (uint64_t dimensionId : appendedCoordinates)
       tileCoordinates[dimensionId] = replacement.getCoordinates()[extra++];
-    mapping.erase();
-
     PhysicalExprAttr total = cast<PhysicalExprAttr>(launchExtents.front());
     for (Attribute extent : llvm::drop_begin(launchExtents))
       total = binaryExpression(module.getContext(), PhysicalExprKind::Multiply,
                                total, cast<PhysicalExprAttr>(extent));
+    replacement->setAttr(segmentLengthAttr, total);
+    mapping.erase();
+    mapping = replacement;
     kernel->setAttr(programSpaceAttr,
                     ArrayAttr::get(module.getContext(), {total}));
   }
@@ -2254,13 +2251,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     FailureOr<uint64_t> dimensionId =
         failed(parameter) ? FailureOr<uint64_t>(failure())
                           : parameterDimension(*parameter);
-    if (failed(parameter) || failed(dimensionId))
+    if (failed(parameter) || failed(dimensionId)) {
+      if (!range->hasAttr(sourceSubregionAttr) &&
+          succeeded(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
+        continue;
       return range.emitOpError(
                  "dynamic pointwise range lost its canonical blocking dimension")
              << "; source_id=" << range.getSourceId()
              << ", fragment=" << range.getResult().getType()
              << ", source_dimension="
              << range->getAttr(sourceDimensionAttr);
+    }
     Value tileCoordinate = tileCoordinates.lookup(*dimensionId);
     if (!tileCoordinate && internalDimensions.contains(*dimensionId))
       tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
