@@ -122,12 +122,6 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   }
   if (!axis)
     return false;
-  auto extent = dyn_cast<PhysicalExprAttr>(result.getShape()[*axis]);
-  if (!extent ||
-      extent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-      extent.getValue() != 1)
-    return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   return !input || !llvm::any_of(input.getAxisMaps(), [&](Attribute attribute) {
            return selects(cast<AxisMapAttr>(attribute));
@@ -434,7 +428,8 @@ static void retargetExtent(Value root, AxisSelector selects,
       return argument.getOwner()->getParent() == &fold.getSummarize() &&
              argument.getArgNumber() < fold.getSourceCount();
     if (auto scan = dyn_cast_or_null<RegionScanOp>(parent))
-      return argument.getOwner()->getParent() == &scan.getSummarize() &&
+      return (argument.getOwner()->getParent() == &scan.getSummarize() ||
+              argument.getOwner()->getParent() == &scan.getEmit()) &&
              argument.getArgNumber() < scan.getSourceCount();
     return false;
   };

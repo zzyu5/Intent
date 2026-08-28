@@ -1138,6 +1138,43 @@ LogicalResult alignExplicitBroadcastOperands(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
+  auto align = [](Operation *owner, Value accumulator,
+                  Value result) -> LogicalResult {
+    if (accumulator.getType() == result.getType())
+      return success();
+    auto source = dyn_cast<FragmentType>(accumulator.getType());
+    auto target = dyn_cast<FragmentType>(result.getType());
+    if (!source || !target || source.getElementType() != target.getElementType() ||
+        source.getOwner() != target.getOwner() ||
+        source.getAxisMaps() != target.getAxisMaps())
+      return owner->emitOpError(
+          "pointwise ownership cannot preserve the contract accumulator relation");
+    accumulator.setType(target);
+    return success();
+  };
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    Value accumulator;
+    Value output;
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      accumulator = contract.getAccumulator();
+      output = contract.getResult();
+    } else if (auto contract = dyn_cast<ScaledContractOp>(operation)) {
+      accumulator = contract.getAccumulator();
+      output = contract.getResult();
+    } else if (auto contract = dyn_cast<SparseContractOp>(operation)) {
+      accumulator = contract.getAccumulator();
+      output = contract.getResult();
+    } else {
+      return WalkResult::advance();
+    }
+    return failed(align(operation, accumulator, output))
+               ? WalkResult::interrupt()
+               : WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 bool isCartesianPointwiseValueOp(Operation *operation) {
   return isa<SplatOp, BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
              CastOp, BitcastOp, LoadOp, GatherOp, RandomBitsOp>(operation);
@@ -1328,6 +1365,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Value, Value> fixedRangePredicates;
   kernel.walk([&](MakeRangeOp range) {
     allRanges.push_back(range);
+    // Helper-local ranges already describe one physical fold/scan slice.  The
+    // enclosing structured operation owns their segment relation; pointwise
+    // blocking may only revisit them after the helper has been materialized
+    // into the executable loop.
+    if (range->getParentOfType<RegionFoldOp>() ||
+        range->getParentOfType<RegionScanOp>())
+      return;
     auto parameter = range.getExtent().getDefiningOp<ParameterOp>();
     if (!hasCompileTimeExtent(range.getExtent()) ||
         (parameter && parameter->hasAttr(coverageDimensionAttr))) {
@@ -1354,6 +1398,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   // fold/scan/reduction/contract semantics before the owning pass sees them.
   llvm::SmallPtrSet<Operation *, 32> internalTraversalRanges;
   llvm::SmallPtrSet<Operation *, 32> structuredTraversalRanges;
+  llvm::SmallDenseSet<uint64_t> scanSegmentDimensions;
+  llvm::SmallDenseSet<uint64_t> scanSegmentSources;
   auto collectAxisInto = [&](Value source, uint64_t axis,
                              llvm::SmallPtrSetImpl<Operation *> &ranges) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -1399,8 +1445,37 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   kernel.walk([&](RegionScanOp scan) {
     ValueRange sources = scan.getInputs().take_front(scan.getSourceCount());
-    for (Value source : sources)
+    for (Value source : sources) {
       collectAxisInto(source, scan.getAxis(), structuredTraversalRanges);
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      if (fragment && scan.getAxis() < fragment.getAxisMaps().size()) {
+        auto mapping =
+            cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
+        int64_t dimension = mapping.getDimensionId();
+        if (dimension > 0)
+          scanSegmentDimensions.insert(static_cast<uint64_t>(dimension));
+        scanSegmentSources.insert(mapping.getSourceId());
+      }
+    }
+    auto collectProtectedSources = [&](Type type) {
+      auto fragment = dyn_cast<FragmentType>(type);
+      if (!fragment)
+        return;
+      for (Attribute attribute : fragment.getAxisMaps())
+        scanSegmentSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
+    };
+    for (Type type : scan->getOperandTypes())
+      collectProtectedSources(type);
+    for (Type type : scan->getResultTypes())
+      collectProtectedSources(type);
+    for (Region &region : scan->getRegions())
+      for (Block &block : region) {
+        for (BlockArgument argument : block.getArguments())
+          collectProtectedSources(argument.getType());
+        for (Operation &operation : block)
+          for (Type type : operation.getResultTypes())
+            collectProtectedSources(type);
+      }
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
   kernel.walk([&](ReduceOp reduce) {
@@ -1670,12 +1745,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Attribute attribute : fragment.getAxisMaps())
       ownershipSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
   });
-  // First-class structured operations own every physical projection of their
-  // logical source axes.  Pointwise ownership must not independently reblock a
-  // sibling projection of the same source axis merely because it also reaches
-  // an output coordinate.
-  for (uint64_t sourceId : structuredSources)
-    ownershipSources.erase(sourceId);
+  // Structured traversal ownership is attached to the exact range operations
+  // above, not erased source-wide here.  One immutable source axis may have a
+  // query ownership projection and an independent fold/scan segment
+  // projection; conflating them would discard a real physical decision.
 
   if (auto roles =
           mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
@@ -1720,6 +1793,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<uint64_t, ParameterOp> parameters;
   llvm::SmallDenseSet<uint64_t> ownershipDimensions;
   llvm::SmallDenseSet<uint64_t> internalDimensions;
+  auto hasPointwiseOwnership = [&](MakeRangeOp range) {
+    FailureOr<uint64_t> dimension = rangeDimension(range);
+    return ownershipSources.contains(range.getSourceId()) &&
+           !scanSegmentSources.contains(range.getSourceId()) &&
+           (failed(dimension) ||
+            !scanSegmentDimensions.contains(*dimension));
+  };
   auto dependsOnSource = [&](ValueRange values, uint64_t sourceId) {
     for (Value value : values) {
       auto fragment = dyn_cast<FragmentType>(value.getType());
@@ -1743,8 +1823,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::MapVector<uint64_t, SmallVector<uint64_t>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
-    if (failed(dimension) ||
-        !ownershipSources.contains(range.getSourceId()))
+    if (failed(dimension) || !hasPointwiseOwnership(range))
       continue;
     uint64_t sourceId = range.getSourceId();
     uint64_t dimensionId = *dimension;
@@ -1773,7 +1852,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   }
   for (MakeRangeOp range : dynamicRanges) {
     uint64_t sourceId = range.getSourceId();
-    if (!ownershipSources.contains(sourceId)) {
+    if (!hasPointwiseOwnership(range)) {
       internalTraversalRanges.insert(range.getOperation());
       continue;
     }
@@ -1818,21 +1897,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         internalTraversalRanges.contains(range.getOperation()) &&
         !reuseTraversalRanges.contains(range.getOperation()))
       continue;
-    if (ownershipOnly &&
-        !ownershipSources.contains(range.getSourceId()))
+    if (ownershipOnly && !hasPointwiseOwnership(range))
       continue;
     if (!ownershipOnly &&
-        !ownershipSources.contains(range.getSourceId()) &&
+        !hasPointwiseOwnership(range) &&
         !internalTraversalRanges.contains(range.getOperation()) &&
         !reuseTraversalRanges.contains(range.getOperation()))
       continue;
     FailureOr<ParameterOp> parameter = blockingParameter(kernel, range);
     bool requiresBlockingParameter =
-        (ownershipOnly &&
-         ownershipSources.contains(range.getSourceId()) &&
+        (ownershipOnly && hasPointwiseOwnership(range) &&
          !internalTraversalRanges.contains(range.getOperation())) ||
         (!ownershipOnly &&
-         ((ownershipSources.contains(range.getSourceId()) &&
+         ((hasPointwiseOwnership(range) &&
            !internalTraversalRanges.contains(range.getOperation())) ||
           reuseTraversalRanges.contains(range.getOperation())));
     if (failed(parameter) && requiresBlockingParameter) {
@@ -1909,7 +1986,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     axes[*dimensionId].push_back(range);
     if (internalTraversalRanges.contains(range.getOperation()))
       internalDimensions.insert(*dimensionId);
-    if (ownershipSources.contains(range.getSourceId()) &&
+    if (hasPointwiseOwnership(range) &&
         !internalTraversalRanges.contains(range.getOperation()))
       ownershipDimensions.insert(*dimensionId);
   }
@@ -2387,6 +2464,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                              /*includeStores=*/true)))
     return failure();
   if (failed(realizeDistributedHistograms(kernel)))
+    return failure();
+  if (failed(alignContractAccumulatorTypes(kernel)))
     return failure();
   if (failed(alignExplicitBroadcastOperands(kernel)))
     return failure();

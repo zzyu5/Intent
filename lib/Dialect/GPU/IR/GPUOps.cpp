@@ -507,8 +507,15 @@ LogicalResult ContractOp::verify() {
   auto accumulator = getAccumulator().getType();
   auto result = getResult().getType();
   if (accumulator != result || lhs.getOwner() != rhs.getOwner() ||
-      lhs.getOwner() != result.getOwner())
-    return emitOpError("physical contract relation/ownership is inconsistent");
+      lhs.getOwner() != result.getOwner()) {
+    InFlightDiagnostic diagnostic =
+        emitOpError("physical contract relation/ownership is inconsistent");
+    diagnostic << "; lhs_owner=" << lhs.getOwner()
+               << ", rhs_owner=" << rhs.getOwner()
+               << ", result_owner=" << result.getOwner()
+               << ", accumulator=" << accumulator << ", result=" << result;
+    return failure();
+  }
   return verifyContractAxes(getOperation(), lhs, rhs, result,
                             getLhsReductionAxes(), getRhsReductionAxes(),
                             getLhsBatchAxes(), getRhsBatchAxes());
@@ -564,8 +571,14 @@ LogicalResult verifySegmentSlice(Operation *owner, Type sourceType,
     } else if (source.getShape()[dimension] != slice.getShape()[dimension] ||
                source.getAxisMaps()[dimension] !=
                    slice.getAxisMaps()[dimension]) {
-      return owner->emitOpError(
+      InFlightDiagnostic diagnostic = owner->emitOpError(
           "physical region slice changed a non-segment extent or coordinate mapping");
+      diagnostic << "; axis=" << dimension
+                 << ", source_extent=" << source.getShape()[dimension]
+                 << ", slice_extent=" << slice.getShape()[dimension]
+                 << ", source_mapping=" << source.getAxisMaps()[dimension]
+                 << ", slice_mapping=" << slice.getAxisMaps()[dimension];
+      return failure();
     }
   }
   return success();

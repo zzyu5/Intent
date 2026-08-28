@@ -421,15 +421,20 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
 struct ExtentBinding {
   uint64_t sourceId;
   uint64_t sourceAxis;
+  int64_t dimensionId;
   Attribute extent;
   uint64_t actualSourceId;
   uint64_t actualSourceAxis;
+  int64_t actualDimensionId;
 };
 
 const ExtentBinding *findBinding(ArrayRef<ExtentBinding> bindings,
-                                 uint64_t sourceId, uint64_t sourceAxis) {
+                                 uint64_t sourceId, uint64_t sourceAxis,
+                                 int64_t dimensionId) {
   auto found = llvm::find_if(bindings, [&](const ExtentBinding &binding) {
-    return binding.sourceId == sourceId && binding.sourceAxis == sourceAxis;
+    return binding.sourceId == sourceId &&
+           binding.sourceAxis == sourceAxis &&
+           binding.dimensionId == dimensionId;
   });
   return found == bindings.end() ? nullptr : &*found;
 }
@@ -468,19 +473,23 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
           actualFragment.getAxisMaps()[*actualAxis]);
       if (const ExtentBinding *existing =
               findBinding(bindings, expectedMap.getSourceId(),
-                          expectedMap.getSourceAxis())) {
+                          expectedMap.getSourceAxis(),
+                          expectedMap.getDimensionId())) {
         if (existing->extent != extent ||
             existing->actualSourceId != actualMap.getSourceId() ||
-            existing->actualSourceAxis != actualMap.getSourceAxis()) {
+            existing->actualSourceAxis != actualMap.getSourceAxis() ||
+            existing->actualDimensionId != actualMap.getDimensionId()) {
           reason = "helper arguments bind one logical axis to incompatible physical extents";
           return failure();
         }
         continue;
       }
       bindings.push_back({expectedMap.getSourceId(),
-                          expectedMap.getSourceAxis(), extent,
+                          expectedMap.getSourceAxis(),
+                          expectedMap.getDimensionId(), extent,
                           actualMap.getSourceId(),
-                          actualMap.getSourceAxis()});
+                          actualMap.getSourceAxis(),
+                          actualMap.getDimensionId()});
     }
     return success();
   }
@@ -522,7 +531,7 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
       auto mapping = cast<AxisMapAttr>(attribute);
       const ExtentBinding *binding =
           findBinding(bindings, mapping.getSourceId(),
-                      mapping.getSourceAxis());
+                      mapping.getSourceAxis(), mapping.getDimensionId());
       if (!binding)
         continue;
       bool introducedUnitAxis = false;
@@ -542,7 +551,7 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
           mapping.getSourceAxis() != binding->actualSourceAxis) {
         mappings[axis] = AxisMapAttr::get(
             type.getContext(), binding->actualSourceId,
-            binding->actualSourceAxis, mapping.getDimensionId(), axis);
+            binding->actualSourceAxis, binding->actualDimensionId, axis);
         changed = true;
       }
     }
