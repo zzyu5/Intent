@@ -261,14 +261,6 @@ def rope_qk(context: Context) -> PreparedComparison:
         (generated_query, generated_key, cosine, sine),
         triton_config_filter=lambda config: (
             triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=4
-            )
-            == 1
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=6
-            )
-            == 1
-            and triton_parameter_value(
                 config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
             )
             == dimension // 2

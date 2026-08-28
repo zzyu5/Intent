@@ -20,7 +20,7 @@ scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.299720,0.301352,
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.214872,3.467312,0.927194,pass
 jagged_mean,B512-T33024-D128-fp32,0.014800,0.015552,0.951646,pass
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.163056,0.163024,1.000196,pass
-rope_qk,B4-S4096-QH32-KVH8-D128-fp16,,,,candidate_contract_failed
+rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.122248,0.402840,0.303465,pass
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.157424,0.159696,0.985773,pass
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,,,,candidate_contract_failed
 causal_conv1d_update,B32-D4096-W4-bf16,0.006040,0.005408,1.116864,pass
