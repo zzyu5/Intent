@@ -524,27 +524,6 @@ Value createCompare(OpBuilder &builder, Location location, Type result, Value lh
   return builder.create<gpu::CompareOp>(location, result, lhs, rhs, predicate);
 }
 
-FailureOr<TypedAttr> physicalConstant(Attribute value, Type resultType) {
-  auto typed = dyn_cast<TypedAttr>(value);
-  if (!typed)
-    return failure();
-  if (typed.getType() == resultType)
-    return typed;
-  if (isa<IndexType, IntegerType>(resultType)) {
-    auto integer = dyn_cast<IntegerAttr>(typed);
-    if (!integer)
-      return failure();
-    return TypedAttr(IntegerAttr::get(resultType, integer.getInt()));
-  }
-  if (isa<FloatType>(resultType)) {
-    auto floating = dyn_cast<FloatAttr>(typed);
-    if (!floating)
-      return failure();
-    return TypedAttr(FloatAttr::get(resultType, floating.getValueAsDouble()));
-  }
-  return failure();
-}
-
 struct MetadataBinding {
   int64_t dimension;
   unsigned sourceABI;
@@ -2225,14 +2204,14 @@ private:
     }
     Location location = operation->getLoc();
     if (auto constant = dyn_cast<intent::ConstantOp>(operation)) {
-      FailureOr<TypedAttr> value =
-          physicalConstant(constant.getValue(), constant.getResult().getType());
+      FailureOr<Value> value = gpu::materializeScalarConstant(
+          builder, location, constant.getValue(), constant.getResult().getType());
       if (failed(value))
         return constant.emitOpError(
             "constant cannot be represented by its physical result type");
-      auto target = builder.create<arith::ConstantOp>(
-          location, constant.getResult().getType(), *value);
-      mapResults(operation, target);
+      values[constant.getResult()] = *value;
+      if (Operation *target = value->getDefiningOp())
+        attachOrigin(operation, target);
       return success();
     }
     if (auto dim = dyn_cast<intent::DimOp>(operation)) {
@@ -3901,8 +3880,15 @@ private:
                                    orderedDepth);
         FailureOr<SmallVector<Value>> yielded =
             child.lowerBlock(sourceRegion.front());
-        if (failed(yielded))
+        if (failed(yielded) || yielded->size() != resultTypes.size())
           return failure();
+        for (auto [index, resultType] : llvm::enumerate(resultTypes)) {
+          FailureOr<Value> projected = projectAccumulatorIdentity(
+              nested, location, (*yielded)[index], resultType);
+          if (failed(projected))
+            return failure();
+          (*yielded)[index] = *projected;
+        }
         nested.create<scf::YieldOp>(location, *yielded);
         return success();
       };
@@ -4351,14 +4337,16 @@ LogicalResult constructGPUProgram(ModuleOp module,
     values[logical] = physicalView;
   for (Operation &operation : function.getBody().front()) {
     if (auto constant = dyn_cast<intent::ConstantOp>(operation)) {
-      FailureOr<TypedAttr> value =
-          physicalConstant(constant.getValue(), constant.getResult().getType());
+      FailureOr<Value> value = gpu::materializeScalarConstant(
+          builder, constant.getLoc(), constant.getValue(),
+          constant.getResult().getType());
       if (failed(value))
         return constant.emitOpError(
             "constant cannot be represented by its physical result type");
-      auto target = builder.create<arith::ConstantOp>(
-          constant.getLoc(), constant.getResult().getType(), *value);
-      values[constant.getResult()] = target;
+      values[constant.getResult()] = *value;
+      if (Operation *target = value->getDefiningOp())
+        if (Attribute node = operation.getAttr("intent.node"))
+          target->setAttr(gpu::originAttr, node);
     } else if (auto dim = dyn_cast<intent::DimOp>(operation)) {
       RankedTensorType tensor = viewTensor(dim.getSource());
       if (tensor && dim.getAxis() < static_cast<uint64_t>(tensor.getRank()) &&
