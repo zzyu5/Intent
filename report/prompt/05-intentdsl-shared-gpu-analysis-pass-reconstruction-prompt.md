@@ -194,6 +194,10 @@ axis index、record field index、component count等结构性整数不需要为�
 
 ## 八、两道强制闸门
 
+覆盖与重构有明确的先后关系：重构过程中遇到 coverage 失败，先将它归类为“缺少哪个 analysis/decision authority”，不在失败点就地增加规则补通。Coverage 是重构完成后的结果，不是与重构并行的另一项任务。
+
+原因是：在当前四个 family 文件各自推导 tail/replay/ownership 的结构下，关闭 coverage 最省事的做法就是继续往对应文件增加更窄的规则；原第五轮新增的约一万行后端正是这种推进方式的结果。Decision-authority 闸门最终虽然会拦住它，但到那时又已经多了几千行需要拆除的窄路径。
+
 两道闸门必须同时通过。任何一项没通过，本轮不能以“gap 已列出”结束。
 
 ### Shared executable coverage
