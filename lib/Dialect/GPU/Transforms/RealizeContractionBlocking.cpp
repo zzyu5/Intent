@@ -1746,8 +1746,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     if (existing.size() == mapping.getNumResults())
       llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
   coordinateRoles[mapping.getNumResults()] = static_cast<int64_t>(
-      runtimeRowTraversal ? CoordinateRole::TraversalWorker
-                          : CoordinateRole::ContractionM);
+      indirectRow ? CoordinateRole::IndirectTraversal
+                  : runtimeRowTraversal ? CoordinateRole::TraversalWorker
+                                        : CoordinateRole::ContractionM);
   coordinateRoles[mapping.getNumResults() + 1] =
       static_cast<int64_t>(CoordinateRole::ContractionN);
   expandedMapping->setAttr(
