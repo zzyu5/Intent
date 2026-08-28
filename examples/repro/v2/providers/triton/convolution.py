@@ -158,8 +158,6 @@ def varlen_causal_conv1d(context: Context) -> PreparedComparison:
                 config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
             )
             == 256
-            and config.kwargs.get("FRAGMENT_S8") == 1
-            and config.kwargs.get("FRAGMENT_S19") == 1
             and config.num_warps == 4
             and config.num_stages == 3
             and config.num_ctas == 1
