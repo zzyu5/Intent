@@ -65,7 +65,7 @@ void AllocOp::getEffects(
 }
 
 LogicalResult ClearOp::verify() {
-  return getBuffer().getType().getSpace() == 1
+  return getBuffer().getType().getSpace().getValue() == BufferSpace::Fragment
              ? success()
              : emitOpError("clear requires a fragment accumulator allocation");
 }
@@ -224,10 +224,29 @@ LogicalResult ReduceOp::verify() {
   auto source = getSource().getType();
   auto destination = getDestination().getType();
   if (static_cast<size_t>(getAxis()) >= source.getShape().size() ||
-      getKind() > 5 ||
       source.getElementType() != destination.getElementType() ||
-      source.getSpace() != 1 || destination.getSpace() != 1)
+      source.getSpace().getValue() != BufferSpace::Fragment ||
+      destination.getSpace().getValue() != BufferSpace::Fragment)
     return emitOpError("has an invalid native reduction schema");
+  switch (getKind()) {
+  case BinaryOperator::Add:
+  case BinaryOperator::MaximumNum:
+  case BinaryOperator::MinimumNum:
+    break;
+  case BinaryOperator::LogicalAnd:
+  case BinaryOperator::LogicalOr:
+    if (!source.getElementType().isInteger(1))
+      return emitOpError("logical native reduction requires i1 elements");
+    break;
+  case BinaryOperator::BitwiseAnd:
+  case BinaryOperator::BitwiseOr:
+  case BinaryOperator::BitwiseXor:
+    if (!isa<IntegerType>(source.getElementType()))
+      return emitOpError("bitwise native reduction requires integer elements");
+    break;
+  default:
+    return emitOpError("has no semantics-preserving TileLang native reduction");
+  }
   SmallVector<Attribute> expected;
   for (auto [axis, extent] : llvm::enumerate(source.getShape()))
     if (axis != static_cast<size_t>(getAxis()))
@@ -251,8 +270,10 @@ LogicalResult ScanOp::verify() {
   auto source = getSource().getType();
   auto destination = getDestination().getType();
   return static_cast<size_t>(getAxis()) < source.getShape().size() &&
-                 (getKind() == 0 || getKind() == 1) && source == destination &&
-                 source.getSpace() == 1
+                 (getKind() == BinaryOperator::Add ||
+                  getKind() == BinaryOperator::MaximumNum) &&
+                 source == destination &&
+                 source.getSpace().getValue() == BufferSpace::Fragment
              ? success()
              : emitOpError("has an invalid native scan schema");
 }
@@ -267,8 +288,10 @@ LogicalResult GemmOp::verify() {
   auto lhs = getLhs().getType();
   auto rhs = getRhs().getType();
   auto accumulator = getAccumulator().getType();
-  if (lhs.getSpace() != 0 || rhs.getSpace() != 0 ||
-      accumulator.getSpace() != 1 || lhs.getShape().size() != 2 ||
+  if (lhs.getSpace().getValue() != BufferSpace::Shared ||
+      rhs.getSpace().getValue() != BufferSpace::Shared ||
+      accumulator.getSpace().getValue() != BufferSpace::Fragment ||
+      lhs.getShape().size() != 2 ||
       rhs.getShape().size() != 2 || accumulator.getShape().size() != 2)
     return emitOpError("requires two shared operands and one fragment accumulator");
   Attribute lhsM = lhs.getShape()[getTransposeLhs() ? 1 : 0];

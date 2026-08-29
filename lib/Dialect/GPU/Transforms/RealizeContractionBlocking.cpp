@@ -643,7 +643,7 @@ bool collectStorePaths(Value value, SmallVector<CastOp> casts,
       continue;
     }
     auto store = dyn_cast<StoreOp>(user);
-    if (!store || store.getValue() != value || store.getCollision() != 0)
+    if (!store || store.getValue() != value)
       return false;
     paths.push_back({std::move(casts), store});
   }
@@ -1891,7 +1891,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       }
       auto replacement = rowBuilder.create<StoreOp>(
           location, path.store.getResource(), coordinates, output, valid,
-          path.store.getSourceAxes(), path.store.getCollision());
+          path.store.getSourceAxes());
       if (Attribute origin = path.store->getAttr(originAttr))
         replacement->setAttr(originAttr, origin);
     }
@@ -2549,7 +2549,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     coordinates[*storeColumn] = columns;
     auto replacement = builder.create<StoreOp>(
         location, path.store.getResource(), coordinates, output, outputValid,
-        path.store.getSourceAxes(), path.store.getCollision());
+        path.store.getSourceAxes());
     if (Attribute origin = path.store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
   }

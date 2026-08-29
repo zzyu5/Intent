@@ -201,8 +201,7 @@ def IntentGPU_StoreOp : IntentGPU_Op<"store", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
-                       DenseI64ArrayAttr:$source_axes,
-                       I64Attr:$collision);
+                       DenseI64ArrayAttr:$source_axes);
   let hasVerifier = 1;
 }
 
@@ -287,8 +286,7 @@ def IntentGPU_SparseContractOp : IntentGPU_Op<"sparse_contract", [Pure]> {
                        IntentGPU_FragmentValue:$rhs,
                        Index:$logical_extent,
                        IntentGPU_FragmentValue:$accumulator,
-                       I64Attr:$format,
-                       I64Attr:$compression_axis,
+                       Intent_SparseFormat:$format,
                        DenseI64ArrayAttr:$lhs_reduction_axes,
                        DenseI64ArrayAttr:$rhs_reduction_axes,
                        DenseI64ArrayAttr:$lhs_batch_axes,
@@ -313,7 +311,7 @@ def IntentGPU_ScatterReduceOp : IntentGPU_Op<"scatter_reduce", [
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
                        DenseI64ArrayAttr:$source_axes,
-                       I64Attr:$sharing);
+                       IntentGPU_AtomicSharingDomainAttr:$sharing);
   let regions = (region SizedRegion<1>:$combine);
   let hasVerifier = 1;
 }
@@ -324,7 +322,8 @@ def IntentGPU_AtomicLoadOp : IntentGPU_Op<"atomic_load", [
   let arguments = (ins IntentGPU_ResourceValue:$resource,
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        Optional<IntentGPU_DataValue>:$valid,
-                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       IntentGPU_AtomicSharingDomainAttr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
@@ -337,7 +336,8 @@ def IntentGPU_AtomicStoreOp : IntentGPU_Op<"atomic_store", [
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
-                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       IntentGPU_AtomicSharingDomainAttr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let hasVerifier = 1;
 }
@@ -350,7 +350,8 @@ def IntentGPU_AtomicRMWOp : IntentGPU_Op<"atomic_rmw", [
                        IntentGPU_DataValue:$value,
                        Optional<IntentGPU_DataValue>:$valid,
                        Intent_AtomicRMWKindAttr:$kind,
-                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       IntentGPU_AtomicSharingDomainAttr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
@@ -364,7 +365,8 @@ def IntentGPU_AtomicCompareExchangeOp : IntentGPU_Op<"atomic_compare_exchange", 
                        IntentGPU_DataValue:$expected,
                        IntentGPU_DataValue:$desired,
                        Optional<IntentGPU_DataValue>:$valid,
-                       Intent_AtomicOrderingAttr:$ordering, I64Attr:$sharing,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       IntentGPU_AtomicSharingDomainAttr:$sharing,
                        DenseI64ArrayAttr:$source_axes);
   let results = (outs IntentGPU_RecordValue:$result);
   let hasVerifier = 1;

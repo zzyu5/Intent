@@ -2,6 +2,7 @@
 #define INTENT_TARGET_CUTILE_IR_CUTILEOPS_TD
 
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
+include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Target/CuTile/IR/CuTileDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -81,9 +82,9 @@ def IntentCuTile_AtomicRMWOp : IntentCuTile_Op<"atomic_rmw", [
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        Variadic<IntentGPU_DataValue>:$coordinates,
                        IntentGPU_DataValue:$value,
-                       I64Attr:$kind,
-                       I64Attr:$ordering,
-                       I64Attr:$sharing);
+                       Intent_AtomicRMWKindAttr:$kind,
+                       Intent_AtomicOrderingAttr:$ordering,
+                       IntentGPU_AtomicSharingDomainAttr:$sharing);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
@@ -113,7 +114,10 @@ def IntentCuTile_ScaledMMAOp : IntentCuTile_Op<"scaled_mma", [Pure]> {
                        IntentGPU_FragmentValue:$rhs,
                        IntentGPU_FragmentValue:$rhs_scale,
                        IntentGPU_FragmentValue:$accumulator,
-                       I64Attr:$group_size);
+                       Intent_ScaledFormatAttr:$lhs_format,
+                       Intent_ScaledFormatAttr:$rhs_format,
+                       I64Attr:$lhs_group_size,
+                       I64Attr:$rhs_group_size);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }
@@ -121,7 +125,7 @@ def IntentCuTile_ScaledMMAOp : IntentCuTile_Op<"scaled_mma", [Pure]> {
 def IntentCuTile_ReduceOp : IntentCuTile_Op<"reduce", [Pure]> {
   let arguments = (ins IntentGPU_FragmentValue:$source,
                        I64Attr:$axis,
-                       I64Attr:$kind);
+                       Intent_BinaryOperatorAttr:$kind);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
@@ -129,7 +133,7 @@ def IntentCuTile_ReduceOp : IntentCuTile_Op<"reduce", [Pure]> {
 def IntentCuTile_ScanOp : IntentCuTile_Op<"scan", [Pure]> {
   let arguments = (ins IntentGPU_FragmentValue:$source,
                        I64Attr:$axis,
-                       I64Attr:$kind,
+                       Intent_BinaryOperatorAttr:$kind,
                        BoolAttr:$reverse);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;

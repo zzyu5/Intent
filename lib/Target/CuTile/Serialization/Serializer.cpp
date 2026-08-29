@@ -720,9 +720,18 @@ private:
         line(resultNames + " = " + call);
       }
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      static constexpr const char *functions[] = {"ct.sum", "ct.max", "ct.min"};
+      auto nativeReduction = [](BinaryOperator kind) -> StringRef {
+        switch (kind) {
+        case BinaryOperator::Add: return "ct.sum";
+        case BinaryOperator::MaximumNum:
+        case BinaryOperator::LogicalOr: return "ct.max";
+        case BinaryOperator::MinimumNum:
+        case BinaryOperator::LogicalAnd: return "ct.min";
+        default: llvm_unreachable("unverified cuTile native reduction kind");
+        }
+      };
       std::string expression =
-          std::string(functions[reduce.getKind()]) + "(" +
+          nativeReduction(reduce.getKind()).str() + "(" +
           valueString(reduce.getSource()) + ", axis=" +
           std::to_string(reduce.getAxis()) + ")";
       if (elementType(reduce.getResult().getType()).isInteger(1))
@@ -734,20 +743,43 @@ private:
                                    ", reverse=" +
                                    (scan.getReverse() ? "True" : "False") + ")");
     } else if (auto atomic = dyn_cast<AtomicRMWOp>(operation)) {
-      static constexpr const char *operations[] = {
-          "xchg", "add", "max", "min", "and", "or", "xor"};
-      static constexpr const char *orders[] = {
-          "RELAXED", "ACQUIRE", "RELEASE", "ACQ_REL"};
-      static constexpr const char *scopes[] = {"BLOCK", "DEVICE", "SYS"};
+      auto atomicOperation = [](AtomicRMWKind kind) -> StringRef {
+        switch (kind) {
+        case AtomicRMWKind::Exchange: return "xchg";
+        case AtomicRMWKind::Add: return "add";
+        case AtomicRMWKind::Maximum: return "max";
+        case AtomicRMWKind::Minimum: return "min";
+        case AtomicRMWKind::BitwiseAnd: return "and";
+        case AtomicRMWKind::BitwiseOr: return "or";
+        case AtomicRMWKind::BitwiseXor: return "xor";
+        }
+        llvm_unreachable("unhandled atomic RMW kind");
+      };
+      auto atomicOrder = [](AtomicOrdering ordering) -> StringRef {
+        switch (ordering) {
+        case AtomicOrdering::Relaxed: return "RELAXED";
+        case AtomicOrdering::Acquire: return "ACQUIRE";
+        case AtomicOrdering::Release: return "RELEASE";
+        case AtomicOrdering::AcquireRelease: return "ACQ_REL";
+        }
+        llvm_unreachable("unhandled atomic ordering");
+      };
+      auto atomicScope = [](gpu::AtomicSharingDomain sharing) -> StringRef {
+        switch (sharing) {
+        case gpu::AtomicSharingDomain::ProgramInstance: return "BLOCK";
+        case gpu::AtomicSharingDomain::KernelInvocation: return "DEVICE";
+        }
+        llvm_unreachable("unhandled atomic sharing domain");
+      };
       assign(atomic.getResult(),
-             "ct.atomic_" + std::string(operations[atomic.getKind()]) + "(" +
+             "ct.atomic_" + atomicOperation(atomic.getKind()).str() + "(" +
                  valueString(atomic.getResource()) + ", " +
                  tuple(atomic.getCoordinates()) + ", " +
                  valueString(atomic.getValue()) +
                  ", check_bounds=True, memory_order=ct.MemoryOrder." +
-                 orders[atomic.getOrdering()] +
+                 atomicOrder(atomic.getOrdering()).str() +
                  ", memory_scope=ct.MemoryScope." +
-                 scopes[atomic.getSharing()] + ")");
+                 atomicScope(atomic.getSharing()).str() + ")");
     } else if (auto extract = dyn_cast<ExtractScalarOp>(operation)) {
       std::string shape = "(";
       for (unsigned axis = 0;

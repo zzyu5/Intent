@@ -691,12 +691,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
                               load.getCoordinates(), load.getSourceAxes())))
         return WalkResult::interrupt();
     } else if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
-      if (store.getCollision() != 0 ||
-          failed(verifyAccess(operation, store.getResource(),
+      if (failed(verifyAccess(operation, store.getResource(),
                               store.getCoordinates(), store.getSourceAxes()))) {
-        if (store.getCollision() != 0)
-          store.emitOpError(
-              "requires collision legalization before Triton serialization");
         return WalkResult::interrupt();
       }
     } else if (auto atomic = dyn_cast<gpu::AtomicStoreOp>(operation)) {
@@ -709,6 +705,11 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
     } else if (auto atomic =
                    dyn_cast<gpu::AtomicCompareExchangeOp>(operation)) {
+      if (atomic.getValid()) {
+        atomic.emitOpError(
+            "Triton tl.atomic_cas has no mask and cannot preserve physical validity");
+        return WalkResult::interrupt();
+      }
       if (failed(verifyAccess(operation, atomic.getResource(),
                               atomic.getCoordinates(), atomic.getSourceAxes())))
         return WalkResult::interrupt();

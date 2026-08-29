@@ -591,7 +591,10 @@ private:
       return;
     } else if (auto allocation = dyn_cast<AllocOp>(operation)) {
       auto type = allocation.getResult().getType();
-      std::string function = type.getSpace() == 0 ? "T.alloc_shared" : "T.alloc_fragment";
+      std::string function =
+          type.getSpace().getValue() == BufferSpace::Shared
+              ? "T.alloc_shared"
+              : "T.alloc_fragment";
       assign(allocation.getResult(), function + "(" + shape(type.getShape()) +
                                          ", " + tileLangType(type.getElementType()) + ")");
     } else if (auto clear = dyn_cast<ClearOp>(operation)) {
@@ -660,15 +663,27 @@ private:
       if (store.getValid())
         --indent;
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      static constexpr const char *functions[] = {
-          "T.reduce_sum", "T.reduce_max", "T.reduce_min",
-          "T.reduce_bitand", "T.reduce_bitor", "T.reduce_bitxor"};
-      line(std::string(functions[reduce.getKind()]) + "(" +
+      auto nativeReduction = [](BinaryOperator kind) -> StringRef {
+        switch (kind) {
+        case BinaryOperator::Add: return "T.reduce_sum";
+        case BinaryOperator::MaximumNum: return "T.reduce_max";
+        case BinaryOperator::MinimumNum: return "T.reduce_min";
+        case BinaryOperator::LogicalAnd:
+        case BinaryOperator::BitwiseAnd: return "T.reduce_bitand";
+        case BinaryOperator::LogicalOr:
+        case BinaryOperator::BitwiseOr: return "T.reduce_bitor";
+        case BinaryOperator::BitwiseXor: return "T.reduce_bitxor";
+        default: llvm_unreachable("unverified TileLang native reduction kind");
+        }
+      };
+      line(nativeReduction(reduce.getKind()).str() + "(" +
            valueString(reduce.getSource()) + ", " +
            valueString(reduce.getDestination()) + ", dim=" +
            std::to_string(reduce.getAxis()) + ", clear=False)");
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
-      std::string function = scan.getKind() == 0 ? "T.cumsum" : "T.cummax";
+      std::string function = scan.getKind() == BinaryOperator::Add
+                                 ? "T.cumsum"
+                                 : "T.cummax";
       line(function + "(" + valueString(scan.getSource()) + ", " +
            valueString(scan.getDestination()) + ", dim=" +
            std::to_string(scan.getAxis()) + ", reverse=" +

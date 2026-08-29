@@ -622,8 +622,7 @@ void LoadOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects)
 LogicalResult StoreOp::verify() {
   unsigned coordinateCount = getCoordinates().size();
   if (coordinateCount != rankOf(getResource().getType()) ||
-      getSourceAxes().size() != coordinateCount ||
-      getCollision() > 2)
+      getSourceAxes().size() != coordinateCount)
     return emitOpError("store coordinate/effect schema is inconsistent");
   if (getValid() && (!elementType(getValid().getType()).isInteger(1) ||
                      !sameShape(getValid().getType(), getValue().getType())))
@@ -917,15 +916,17 @@ LogicalResult SparseContractOp::verify() {
   auto lhs = getCompressed().getType();
   auto rhs = getRhs().getType();
   auto result = getResult().getType();
-  if (getFormat() > 1 ||
-      getCompressionAxis() >= getCompressed().getType().getShape().size() ||
+  if (!getFormat() ||
+      getFormat().getCompressionAxis() >=
+          getCompressed().getType().getShape().size() ||
       getAccumulator().getType() != result || lhs.getOwner() != rhs.getOwner() ||
       lhs.getOwner() != result.getOwner())
     return emitOpError("sparse-contract physical schema is invalid");
   return verifyContractAxes(getOperation(), lhs, rhs, result,
                             getLhsReductionAxes(), getRhsReductionAxes(),
                             getLhsBatchAxes(), getRhsBatchAxes(),
-                            static_cast<int64_t>(getCompressionAxis()));
+                            static_cast<int64_t>(
+                                getFormat().getCompressionAxis()));
 }
 
 LogicalResult HistogramOp::verify() {
@@ -939,7 +940,7 @@ LogicalResult HistogramOp::verify() {
 
 LogicalResult ScatterReduceOp::verify() {
   if (getCoordinates().size() != rankOf(getResource().getType()) ||
-      getSourceAxes().size() != getCoordinates().size() || getSharing() > 2)
+      getSourceAxes().size() != getCoordinates().size())
     return emitOpError("scatter-reduce address rank is invalid");
   if (resourceElementType(getResource().getType()) !=
           elementType(getValue().getType()) ||
@@ -962,9 +963,12 @@ namespace {
 LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
                                   ValueRange coordinates, Value valid,
                                   ArrayRef<int64_t> sourceAxes,
-                                  AtomicOrdering ordering, uint64_t sharing) {
+                                  AtomicOrdering ordering,
+                                  AtomicSharingDomain sharing) {
+  (void)ordering;
+  (void)sharing;
   if (coordinates.size() != rankOf(resource) ||
-      sourceAxes.size() != coordinates.size() || sharing > 2)
+      sourceAxes.size() != coordinates.size())
     return owner->emitOpError("atomic physical address/order schema is invalid");
   if (valid && !elementType(valid.getType()).isInteger(1))
     return owner->emitOpError("atomic validity must be a predicate");

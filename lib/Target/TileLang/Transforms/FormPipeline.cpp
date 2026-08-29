@@ -50,7 +50,8 @@ bool dependsOnSharedBuffer(Value value, llvm::DenseSet<Value> &active) {
     return false;
   if (auto load = value.getDefiningOp<BufferLoadOp>()) {
     active.erase(value);
-    return load.getBuffer().getType().getSpace() == 0;
+    return load.getBuffer().getType().getSpace().getValue() ==
+           BufferSpace::Shared;
   }
   Operation *producer = value.getDefiningOp();
   bool dependent =

@@ -1108,9 +1108,12 @@ private:
     llvm_unreachable("unhandled Intent atomic ordering");
   }
 
-  std::string atomicScope(uint64_t sharing) const {
-    static constexpr const char *scopes[] = {"cta", "gpu", "sys"};
-    return scopes[sharing];
+  std::string atomicScope(gpu::AtomicSharingDomain sharing) const {
+    switch (sharing) {
+    case gpu::AtomicSharingDomain::ProgramInstance: return "cta";
+    case gpu::AtomicSharingDomain::KernelInvocation: return "gpu";
+    }
+    llvm_unreachable("unhandled atomic sharing domain");
   }
 
   std::string broadcastValue(Value value, gpu::FragmentType target) {

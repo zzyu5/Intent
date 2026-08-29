@@ -318,7 +318,7 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
       "cuTile gather padding must be an explicit scalar or splat");
 }
 
-std::optional<uint64_t> nativeCombineKind(Region &region) {
+std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   if (!llvm::hasSingleElement(region))
     return std::nullopt;
   Block &block = region.front();
@@ -336,17 +336,17 @@ std::optional<uint64_t> nativeCombineKind(Region &region) {
          binary.getRhs() == block.getArgument(0))))
     return std::nullopt;
   if (binary.getOperatorKind() == BinaryOperator::Add)
-    return 0;
+    return BinaryOperator::Add;
   if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
-    return 1;
+    return BinaryOperator::MaximumNum;
   if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
-    return 2;
+    return BinaryOperator::MinimumNum;
   auto result = dyn_cast<gpu::FragmentType>(binary.getResult().getType());
   if (result && result.getElementType().isInteger(1)) {
     if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
-      return 1;
+      return BinaryOperator::LogicalOr;
     if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
-      return 2;
+      return BinaryOperator::LogicalAnd;
   }
   return std::nullopt;
 }
@@ -504,7 +504,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   }
 
   for (gpu::ReduceOp reduce : reductions) {
-    std::optional<uint64_t> kind = nativeCombineKind(reduce.getCombine());
+    std::optional<BinaryOperator> kind = nativeCombineKind(reduce.getCombine());
     bool native = reduce.getSourceCount() == 1 &&
                   reduce.getIdentityCount() == 1 &&
                   reduce.getCaptureCount() == 0 &&
@@ -546,10 +546,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   }
 
   for (gpu::ScanOp scan : scans) {
-    std::optional<uint64_t> kind = nativeCombineKind(scan.getCombine());
+    std::optional<BinaryOperator> kind = nativeCombineKind(scan.getCombine());
     if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
         scan.getCaptureCount() != 0 || scan.getNumResults() != 1 || !kind ||
-        *kind != 0 || !scan.getInclusive() || scan.getReverse())
+        *kind != BinaryOperator::Add || !scan.getInclusive() ||
+        scan.getReverse())
       return scan.emitOpError(
           "cuTile native scan requires one source/identity, inclusive forward additive combine");
     auto source = dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
@@ -595,7 +596,9 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     auto replacement = builder.create<ScaledMMAOp>(
         contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
         contract.getLhsScale(), contract.getRhs(), contract.getRhsScale(),
-        contract.getAccumulator(), contract.getLhsGroupSize());
+        contract.getAccumulator(), contract.getLhsFormat(),
+        contract.getRhsFormat(), contract.getLhsGroupSize(),
+        contract.getRhsGroupSize());
     if (Attribute origin = contract->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     contract.getResult().replaceAllUsesWith(replacement.getResult());
@@ -625,8 +628,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     }
     auto replacement = builder.create<AtomicRMWOp>(
         atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
-        *coordinates, atomic.getValue(), static_cast<uint64_t>(atomic.getKind()),
-        static_cast<uint64_t>(atomic.getOrdering()), atomic.getSharing());
+        *coordinates, atomic.getValue(), atomic.getKind(), atomic.getOrdering(),
+        atomic.getSharing());
     if (Attribute origin = atomic->getAttr(gpu::originAttr))
       replacement->setAttr(gpu::originAttr, origin);
     atomic.getResult().replaceAllUsesWith(replacement.getResult());
@@ -635,7 +638,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
 
   for (gpu::StoreOp store : stores) {
     auto view = dyn_cast<gpu::ViewType>(store.getResource().getType());
-    if (!view || store.getCollision() != 0)
+    if (!view)
       return store.emitOpError(
           "cuTile native store requires an external unique-write view");
     OpBuilder builder(store);

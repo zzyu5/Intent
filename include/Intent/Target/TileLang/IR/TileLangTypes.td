@@ -2,6 +2,7 @@
 #define INTENT_TARGET_TILELANG_IR_TILELANGTYPES_TD
 
 include "Intent/Target/TileLang/IR/TileLangDialect.td"
+include "Intent/Target/TileLang/IR/TileLangAttrs.td"
 include "mlir/IR/AttrTypeBase.td"
 
 def IntentTileLang_BufferType : TypeDef<IntentTileLang_Dialect, "Buffer"> {
@@ -10,7 +11,7 @@ def IntentTileLang_BufferType : TypeDef<IntentTileLang_Dialect, "Buffer"> {
   let parameters = (ins
     "::mlir::Type":$elementType,
     "::mlir::ArrayAttr":$shape,
-    "uint32_t":$space
+    "::intent::tilelang::BufferSpaceAttr":$space
   );
   let assemblyFormat = "`<` $elementType `,` $shape `,` $space `>`";
   let genVerifyDecl = 1;

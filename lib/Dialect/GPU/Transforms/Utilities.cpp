@@ -838,7 +838,7 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
       continue;
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), *valid, store.getSourceAxes(), store.getCollision());
+        store.getValue(), *valid, store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
@@ -1432,7 +1432,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     }
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), valid, store.getSourceAxes(), store.getCollision());
+        store.getValue(), valid, store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();

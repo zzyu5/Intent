@@ -186,8 +186,7 @@ void ScatterStoreOp::getEffects(
 
 LogicalResult AtomicRMWOp::verify() {
   auto view = getResource().getType();
-  if (getCoordinates().size() != view.getRank() || getKind() > 6 ||
-      getOrdering() > 3 || getSharing() > 2 ||
+  if (getCoordinates().size() != view.getRank() ||
       getValue().getType() != getResult().getType() ||
       elementType(getValue().getType()) != view.getElementType())
     return emitOpError(
@@ -272,7 +271,10 @@ LogicalResult ScaledMMAOp::verify() {
   if (!inner ||
       inner.getKind() !=
           static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
-      inner.getValue() != static_cast<int64_t>(getGroupSize()) ||
+      inner.getValue() != static_cast<int64_t>(getLhsGroupSize()) ||
+      getLhsGroupSize() != getRhsGroupSize() ||
+      getLhsFormat() != ScaledFormat::E4M3 ||
+      getRhsFormat() != ScaledFormat::E4M3 ||
       !lhsScale.getElementType().isUnsignedInteger(8) ||
       !rhsScale.getElementType().isUnsignedInteger(8) ||
       !accumulator.getElementType().isF32())
@@ -282,16 +284,27 @@ LogicalResult ScaledMMAOp::verify() {
 
 LogicalResult ReduceOp::verify() {
   if (static_cast<size_t>(getAxis()) >=
-          getSource().getType().getShape().size() ||
-      getKind() > 2)
+      getSource().getType().getShape().size())
     return emitOpError("has an invalid cuTile native reduction axis/kind");
-  return success();
+  switch (getKind()) {
+  case BinaryOperator::Add:
+  case BinaryOperator::MaximumNum:
+  case BinaryOperator::MinimumNum:
+    return success();
+  case BinaryOperator::LogicalOr:
+  case BinaryOperator::LogicalAnd:
+    return elementType(getResult().getType()).isInteger(1)
+               ? success()
+               : emitOpError("logical reduction kind requires an i1 result");
+  default:
+    return emitOpError("has no semantics-preserving cuTile native reduction");
+  }
 }
 
 LogicalResult ScanOp::verify() {
   if (static_cast<size_t>(getAxis()) >=
           getSource().getType().getShape().size() ||
-      getKind() != 0)
+      getKind() != BinaryOperator::Add)
     return emitOpError("cuTile native scan currently requires additive cumsum");
   return getResult().getType() == getSource().getType()
              ? success()

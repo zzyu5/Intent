@@ -714,7 +714,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       return store.emitOpError("could not form pointwise store validity");
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        payload, *valid, store.getSourceAxes(), store.getCollision());
+        payload, *valid, store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
@@ -1051,7 +1051,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           }
           auto replacement = nested.create<StoreOp>(
               location, store.getResource(), coordinates, *payload, *valid,
-              store.getSourceAxes(), store.getCollision());
+              store.getSourceAxes());
           if (Attribute origin = store->getAttr(originAttr))
             replacement->setAttr(originAttr, origin);
         }
@@ -1126,7 +1126,8 @@ LogicalResult realizeDistributedHistograms(func::FuncOp kernel) {
     auto atomic = builder.create<AtomicRMWOp>(
         store.getLoc(), store.getValue().getType(), store.getResource(),
         store.getCoordinates(), store.getValue(), store.getValid(),
-        AtomicRMWKind::Add, AtomicOrdering::Relaxed, /*sharing=*/1,
+        AtomicRMWKind::Add, AtomicOrdering::Relaxed,
+        AtomicSharingDomain::KernelInvocation,
         store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       atomic->setAttr(originAttr, origin);

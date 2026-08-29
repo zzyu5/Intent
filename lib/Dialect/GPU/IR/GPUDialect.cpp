@@ -14,6 +14,8 @@
 using namespace mlir;
 using namespace intent::gpu;
 
+#include "Intent/Dialect/GPU/IR/GPUAttrsEnums.cpp.inc"
+
 #define GET_DIALECT_DEF
 #include "Intent/Dialect/GPU/IR/GPUDialect.cpp.inc"
 

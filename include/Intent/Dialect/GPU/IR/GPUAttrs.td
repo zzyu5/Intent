@@ -3,6 +3,27 @@
 
 include "Intent/Dialect/GPU/IR/GPUDialect.td"
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
+
+class IntentGPU_I32Enum<string name, string description,
+                        list<I32EnumAttrCase> cases>
+    : I32EnumAttr<name, description, cases> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::intent::gpu";
+}
+
+class IntentGPU_I32EnumAttr<string mnemonic, IntentGPU_I32Enum enumInfo>
+    : EnumAttr<IntentGPU_Dialect, enumInfo, mnemonic> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+def IntentGPU_AtomicSharingDomain : IntentGPU_I32Enum<
+    "AtomicSharingDomain", "Logical participants in one physical atomic object", [
+      I32EnumAttrCase<"ProgramInstance", 0, "program_instance">,
+      I32EnumAttrCase<"KernelInvocation", 1, "kernel_invocation">
+    ]>;
+def IntentGPU_AtomicSharingDomainAttr : IntentGPU_I32EnumAttr<
+    "atomic_sharing", IntentGPU_AtomicSharingDomain>;
 
 def IntentGPU_PhysicalExprAttr : AttrDef<IntentGPU_Dialect, "PhysicalExpr"> {
   let mnemonic = "expr";

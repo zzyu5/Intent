@@ -370,7 +370,7 @@ FailureOr<SmallVector<Value>> accessOffsets(Operation *owner,
   return offsets;
 }
 
-std::optional<uint64_t> nativeCombineKind(Region &region) {
+std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   if (!llvm::hasSingleElement(region))
     return std::nullopt;
   Block &block = region.front();
@@ -388,27 +388,27 @@ std::optional<uint64_t> nativeCombineKind(Region &region) {
          binary.getRhs() == block.getArgument(0))))
     return std::nullopt;
   if (binary.getOperatorKind() == BinaryOperator::Add)
-    return 0;
+    return BinaryOperator::Add;
   if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
-    return 1;
+    return BinaryOperator::MaximumNum;
   if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
-    return 2;
+    return BinaryOperator::MinimumNum;
   Type resultType = binary.getResult().getType();
   Type elementType = resultType;
   if (auto fragment = dyn_cast<gpu::FragmentType>(resultType))
     elementType = fragment.getElementType();
   if (elementType.isInteger(1)) {
     if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
-      return 4;
+      return BinaryOperator::LogicalOr;
     if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
-      return 3;
+      return BinaryOperator::LogicalAnd;
   }
   if (binary.getOperatorKind() == BinaryOperator::BitwiseAnd)
-    return 3;
+    return BinaryOperator::BitwiseAnd;
   if (binary.getOperatorKind() == BinaryOperator::BitwiseOr)
-    return 4;
+    return BinaryOperator::BitwiseOr;
   if (binary.getOperatorKind() == BinaryOperator::BitwiseXor)
-    return 5;
+    return BinaryOperator::BitwiseXor;
   return std::nullopt;
 }
 
@@ -454,10 +454,10 @@ public:
 
     for (gpu::LoadOp load : loads) {
       llvm::DenseSet<Value> visited;
-      if (failed(lowerLoad(load,
-                           feedsDirectContractOperand(load.getResult(), visited)
-                               ? 0u
-                               : 1u)))
+      if (failed(lowerLoad(
+              load, feedsDirectContractOperand(load.getResult(), visited)
+                        ? BufferSpace::Shared
+                        : BufferSpace::Fragment)))
         return failure();
     }
     if (failed(prepareFragmentLoopCarries()))
@@ -656,13 +656,15 @@ private:
     }
   }
 
-  FailureOr<Value> allocateFor(Value value, unsigned space, Operation *before,
+  FailureOr<Value> allocateFor(Value value, BufferSpace space, Operation *before,
                                ArrayAttr shape = {}) {
     auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
     if (!fragment)
       return failure();
-    auto type = BufferType::get(kernel.getContext(), fragment.getElementType(),
-                                shape ? shape : fragment.getShape(), space);
+    auto type = BufferType::get(
+        kernel.getContext(), fragment.getElementType(),
+        shape ? shape : fragment.getShape(),
+        BufferSpaceAttr::get(kernel.getContext(), space));
     OpBuilder builder(allocationAnchor(before));
     return builder.create<AllocOp>(before->getLoc(), type).getResult();
   }
@@ -1052,7 +1054,7 @@ private:
     return result;
   }
 
-  LogicalResult lowerLoad(gpu::LoadOp load, unsigned space) {
+  LogicalResult lowerLoad(gpu::LoadOp load, BufferSpace space) {
     auto fragment = dyn_cast<gpu::FragmentType>(load.getResult().getType());
     auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
     if (!view)
@@ -1091,7 +1093,7 @@ private:
     for (Value value : accessFragments)
       if (isa<gpu::FragmentType>(value.getType()) && !findBuffer(value) &&
           dependsOnBufferedFragment(value))
-        if (failed(materialize(value, 1, load)))
+        if (failed(materialize(value, BufferSpace::Fragment, load)))
           return load.emitOpError(
               "TileLang indirect access fragment cannot be materialized");
     FailureOr<SmallVector<Value>> offsets =
@@ -1122,7 +1124,7 @@ private:
                                destination,
                                DenseI64ArrayAttr::get(kernel.getContext(),
                                                       layout->viewAxes));
-      if (space == 0)
+      if (space == BufferSpace::Shared)
         sharedBufferAxes[load.getResult()] = layout->bufferToFragment;
     } else {
       FailureOr<ParallelOp> parallel = createParallel(load, fragment);
@@ -1161,7 +1163,7 @@ private:
       builder.create<BufferStoreOp>(load.getLoc(), destination,
                                     body.getArguments(), loaded);
       builder.create<YieldOp>(load.getLoc());
-      if (space == 0) {
+      if (space == BufferSpace::Shared) {
         sharedBufferAxes[load.getResult()] =
             identityAxisOrder(fragment.getShape().size());
         OpBuilder after(load);
@@ -1169,21 +1171,22 @@ private:
         after.create<SyncOp>(load.getLoc());
       }
     }
-    (space == 0 ? sharedBuffers : fragmentBuffers)[load.getResult()] =
+    (space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers)[load.getResult()] =
         destination;
     lowered.insert(load);
     return success();
   }
 
-  FailureOr<Value> materialize(Value value, unsigned space, Operation *owner) {
+  FailureOr<Value> materialize(Value value, BufferSpace space,
+                               Operation *owner) {
     auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
     if (!fragment)
       return failure();
     DenseMap<Value, Value> &selected =
-        space == 0 ? sharedBuffers : fragmentBuffers;
+        space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers;
     if (Value existing = selected.lookup(value))
       return existing;
-    if (space == 0 && directContractOperands.contains(value))
+    if (space == BufferSpace::Shared && directContractOperands.contains(value))
       if (auto transpose = value.getDefiningOp<gpu::TransposeOp>()) {
         Value source = transpose.getValue();
         if (Value existing = sharedBuffers.lookup(source)) {
@@ -1248,12 +1251,12 @@ private:
     builder.create<BufferStoreOp>(owner->getLoc(), *allocation,
                                   body.getArguments(), *scalar);
     builder.create<YieldOp>(owner->getLoc());
-    if (space == 0) {
+    if (space == BufferSpace::Shared) {
       OpBuilder after(owner);
       after.create<SyncOp>(owner->getLoc());
     }
     selected[value] = *allocation;
-    if (space == 0)
+    if (space == BufferSpace::Shared)
       sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
     return *allocation;
   }
@@ -1314,13 +1317,13 @@ private:
                                                 accumulatorShape)));
   }
 
-  FailureOr<Value> materializePadded(Value value, unsigned space,
+  FailureOr<Value> materializePadded(Value value, BufferSpace space,
                                      Operation *owner, ArrayAttr shape) {
     auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
     if (!fragment || !shape)
       return failure();
     DenseMap<Value, Value> &selected =
-        space == 0 ? sharedBuffers : fragmentBuffers;
+        space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers;
     if (Value existing = selected.lookup(value))
       if (cast<BufferType>(existing.getType()).getShape() == shape)
         return existing;
@@ -1362,12 +1365,12 @@ private:
     builder.create<BufferStoreOp>(owner->getLoc(), *allocation,
                                   body.getArguments(), padded);
     builder.create<YieldOp>(owner->getLoc());
-    if (space == 0) {
+    if (space == BufferSpace::Shared) {
       OpBuilder after(owner);
       after.create<SyncOp>(owner->getLoc());
     }
     selected[value] = *allocation;
-    if (space == 0)
+    if (space == BufferSpace::Shared)
       sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
     return *allocation;
   }
@@ -1385,7 +1388,7 @@ private:
           auto operandFragment = dyn_cast<gpu::FragmentType>(operand.getType());
           if (operandFragment && operandFragment.getShape() == fragment.getShape() &&
               operandFragment.getAxisMaps() == fragment.getAxisMaps())
-            if (failed(materializePadded(operand, 1, before,
+            if (failed(materializePadded(operand, BufferSpace::Fragment, before,
                                          destinationShape)))
               return failure();
         }
@@ -1440,7 +1443,8 @@ private:
     SmallVector<Value> snapshots;
     for (auto [transition, carry] : llvm::zip(transitions, carryBuffers)) {
       ArrayAttr shape = cast<BufferType>(carry.getType()).getShape();
-      FailureOr<Value> snapshot = allocateFor(transition, 1, yield, shape);
+      FailureOr<Value> snapshot =
+          allocateFor(transition, BufferSpace::Fragment, yield, shape);
       if (failed(snapshot) ||
           failed(storeFragment(transition, *snapshot, yield)))
         return loop.emitOpError(
@@ -1472,7 +1476,8 @@ private:
       if (!isa<gpu::FragmentType>(argument.getType()) ||
           alreadyDropped.contains(index) || fragmentBuffers.lookup(argument))
         continue;
-      FailureOr<Value> buffer = materialize(loop.getInitArgs()[index], 1, loop);
+      FailureOr<Value> buffer =
+          materialize(loop.getInitArgs()[index], BufferSpace::Fragment, loop);
       if (failed(buffer))
         return loop.emitOpError(
             "TileLang fragment loop identity cannot be materialized");
@@ -1516,7 +1521,8 @@ private:
     if (Value existing = fragmentBuffers.lookup(accumulator)) {
       if (cast<BufferType>(existing.getType()).getShape() == shape)
         return existing;
-      return materializePadded(accumulator, 1, contract, shape);
+      return materializePadded(accumulator, BufferSpace::Fragment, contract,
+                               shape);
     }
     auto argument = dyn_cast<BlockArgument>(accumulator);
     auto loop = argument
@@ -1535,7 +1541,7 @@ private:
         return contract.emitOpError(
             "TileLang native GEMM requires a scalar-filled physical accumulator");
       FailureOr<Value> allocation =
-          allocateFor(contract.getResult(), 1, loop, shape);
+          allocateFor(contract.getResult(), BufferSpace::Fragment, loop, shape);
       if (failed(allocation))
         return failure();
       OpBuilder builder(loop);
@@ -1549,7 +1555,8 @@ private:
     FailureOr<Value> initial = scalarSplat(accumulator);
     if (succeeded(initial)) {
       FailureOr<Value> allocation =
-          allocateFor(contract.getResult(), 1, contract, shape);
+          allocateFor(contract.getResult(), BufferSpace::Fragment, contract,
+                      shape);
       if (failed(allocation))
         return failure();
       OpBuilder builder(contract);
@@ -1558,7 +1565,8 @@ private:
       fragmentBuffers[contract.getResult()] = *allocation;
       return *allocation;
     }
-    return materializePadded(accumulator, 1, contract, shape);
+    return materializePadded(accumulator, BufferSpace::Fragment, contract,
+                             shape);
   }
 
   LogicalResult lowerContract(gpu::ContractOp contract) {
@@ -1586,13 +1594,17 @@ private:
     bool repackedLhs = lhsShape != lhsType.getShape();
     bool repackedRhs = rhsShape != rhsType.getShape();
     FailureOr<Value> lhs = repackedLhs
-                               ? materializePadded(contract.getLhs(), 0,
+                               ? materializePadded(contract.getLhs(),
+                                                   BufferSpace::Shared,
                                                    contract, lhsShape)
-                               : materialize(contract.getLhs(), 0, contract);
+                               : materialize(contract.getLhs(),
+                                             BufferSpace::Shared, contract);
     FailureOr<Value> rhs = repackedRhs
-                               ? materializePadded(contract.getRhs(), 0,
+                               ? materializePadded(contract.getRhs(),
+                                                   BufferSpace::Shared,
                                                    contract, rhsShape)
-                               : materialize(contract.getRhs(), 0, contract);
+                               : materialize(contract.getRhs(),
+                                             BufferSpace::Shared, contract);
     FailureOr<Value> accumulator =
         contractAccumulator(contract, accumulatorShape);
     if (failed(lhs) || failed(rhs) || failed(accumulator))
@@ -1624,7 +1636,7 @@ private:
   }
 
   LogicalResult lowerReduce(gpu::ReduceOp reduce) {
-    std::optional<uint64_t> kind = nativeCombineKind(reduce.getCombine());
+    std::optional<BinaryOperator> kind = nativeCombineKind(reduce.getCombine());
     if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
         reduce.getCaptureCount() != 0 || reduce.getAxes().size() != 1 ||
         reduce.getNumResults() != 1 || !kind)
@@ -1635,7 +1647,7 @@ private:
     if (!sourceType)
       return reduce.emitOpError("TileLang native reduce source must be a fragment");
     FailureOr<Value> source =
-        materialize(reduce.getInputs().front(), 1, reduce);
+        materialize(reduce.getInputs().front(), BufferSpace::Fragment, reduce);
     FailureOr<Value> identity =
         scalarSplat(reduce.getInputs()[reduce.getSourceCount()]);
     if (failed(source) || failed(identity))
@@ -1645,7 +1657,8 @@ private:
     unsigned reductionAxis = reduce.getAxes().front();
     if (sourceBuffer.getShape()[reductionAxis] !=
         sourceType.getShape()[reductionAxis]) {
-      source = materializePadded(reduce.getInputs().front(), 1, reduce,
+      source = materializePadded(reduce.getInputs().front(),
+                                 BufferSpace::Fragment, reduce,
                                  sourceType.getShape());
       if (failed(source))
         return failure();
@@ -1665,8 +1678,8 @@ private:
     if (failed(destinationShape))
       return failure();
     auto destinationType = BufferType::get(
-        kernel.getContext(), sourceType.getElementType(),
-        *destinationShape, 1);
+        kernel.getContext(), sourceType.getElementType(), *destinationShape,
+        BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Fragment));
     OpBuilder allocationBuilder(allocationAnchor(reduce));
     Value destination =
         allocationBuilder.create<AllocOp>(reduce.getLoc(), destinationType);
@@ -1690,23 +1703,27 @@ private:
   }
 
   LogicalResult lowerScan(gpu::ScanOp scan) {
-    std::optional<uint64_t> kind = nativeCombineKind(scan.getCombine());
+    std::optional<BinaryOperator> kind = nativeCombineKind(scan.getCombine());
     if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
         scan.getCaptureCount() != 0 || scan.getNumResults() != 1 || !kind ||
-        (*kind != 0 && *kind != 1) || !scan.getInclusive())
+        (*kind != BinaryOperator::Add &&
+         *kind != BinaryOperator::MaximumNum) ||
+        !scan.getInclusive())
       return scan.emitOpError(
           "TileLang native scan requires one inclusive builtin add/max component");
     auto sourceType =
         dyn_cast<gpu::FragmentType>(scan.getInputs().front().getType());
     if (!sourceType)
       return scan.emitOpError("TileLang native scan source must be a fragment");
-    FailureOr<Value> source = materialize(scan.getInputs().front(), 1, scan);
+    FailureOr<Value> source =
+        materialize(scan.getInputs().front(), BufferSpace::Fragment, scan);
     if (failed(source))
       return failure();
     auto sourceBuffer = cast<BufferType>((*source).getType());
     if (sourceBuffer.getShape()[scan.getAxis()] !=
         sourceType.getShape()[scan.getAxis()]) {
-      source = materializePadded(scan.getInputs().front(), 1, scan,
+      source = materializePadded(scan.getInputs().front(), BufferSpace::Fragment,
+                                 scan,
                                  sourceType.getShape());
       if (failed(source))
         return failure();
@@ -1717,7 +1734,7 @@ private:
       return failure();
     auto destinationType = BufferType::get(
         kernel.getContext(), sourceType.getElementType(), *destinationShape,
-        1);
+        BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Fragment));
     OpBuilder allocationBuilder(allocationAnchor(scan));
     Value destination =
         allocationBuilder.create<AllocOp>(scan.getLoc(), destinationType);
@@ -1730,9 +1747,6 @@ private:
   }
 
   LogicalResult lowerStore(gpu::StoreOp store) {
-    if (store.getCollision() != 0)
-      return store.emitOpError(
-          "TileLang unique-store lowering cannot realize a collision operation");
     auto fragment = dyn_cast<gpu::FragmentType>(store.getValue().getType());
     auto view = dyn_cast<gpu::ViewType>(store.getResource().getType());
     if (!view)
@@ -1784,13 +1798,15 @@ private:
           return success();
         }
       }
-      FailureOr<Value> source = materialize(store.getValue(), 1, store);
+      FailureOr<Value> source =
+          materialize(store.getValue(), BufferSpace::Fragment, store);
       if (failed(source))
         return failure();
       builder.create<CopyOutOp>(store.getLoc(), *source, store.getResource(),
                                 *offsets, destinationAxes);
     } else {
-      FailureOr<Value> source = materialize(store.getValue(), 1, store);
+      FailureOr<Value> source =
+          materialize(store.getValue(), BufferSpace::Fragment, store);
       if (failed(source))
         return failure();
       FailureOr<ParallelOp> parallel = createParallel(store, fragment);
@@ -1947,7 +1963,8 @@ private:
       for (Value initial : loop.getInitArgs()) {
         auto type = BufferType::get(
             kernel.getContext(), initial.getType(),
-            before.getArrayAttr({constantExtent(kernel.getContext(), 1)}), 1);
+            before.getArrayAttr({constantExtent(kernel.getContext(), 1)}),
+            BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Fragment));
         Value buffer = before.create<AllocOp>(loop.getLoc(), type);
         before.create<FillOp>(loop.getLoc(), buffer, initial);
         buffers.push_back(buffer);

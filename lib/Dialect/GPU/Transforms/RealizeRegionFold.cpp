@@ -1267,7 +1267,7 @@ LogicalResult cloneScanOutputConsumers(
         coordinates.push_back(mappedValue(mapping, coordinate));
       auto replacement = builder.create<StoreOp>(
           location, mappedValue(mapping, store.getResource()), coordinates,
-          value, valid, store.getSourceAxes(), store.getCollision());
+          value, valid, store.getSourceAxes());
       if (Attribute origin = store->getAttr(originAttr))
         replacement->setAttr(originAttr, origin);
       continue;

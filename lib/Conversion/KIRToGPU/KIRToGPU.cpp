@@ -3614,7 +3614,7 @@ private:
       auto format = contract.getFormat();
       auto target = builder.create<gpu::SparseContractOp>(
           location, *result, *compressed, *metadata, *rhs, *logicalExtent,
-          *accumulator, format.getKind(), format.getCompressionAxis(),
+          *accumulator, format,
           lhsReduction, rhsReduction, lhsBatch, rhsBatch);
       mapResults(operation, target);
       return success();
@@ -3832,7 +3832,7 @@ private:
         return store.emitOpError(
             "view-store value cannot preserve its physical result relation");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes, 0);
+          location, *resource, *coordinates, *value, Value(), *axes);
       if (Attribute node = operation->getAttr("intent.node"))
         target->setAttr(gpu::originAttr, node);
       return success();
@@ -3851,7 +3851,7 @@ private:
           failed(value))
         return store.emitOpError("buffer store physical relation is unavailable");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes, 0);
+          location, *resource, *coordinates, *value, Value(), *axes);
       attachOrigin(operation, target);
       return success();
     }
@@ -3869,7 +3869,7 @@ private:
           failed(value))
         return store.emitOpError("unique scatter is not a scalar physical access");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes, 0);
+          location, *resource, *coordinates, *value, Value(), *axes);
       if (Attribute node = operation->getAttr("intent.node"))
         target->setAttr(gpu::originAttr, node);
       return success();
@@ -3894,9 +3894,11 @@ private:
       state.addOperands(*value);
       state.addAttribute("source_axes", builder.getDenseI64ArrayAttr(*axes));
       state.addAttribute(
-          "sharing",
-          builder.getI64IntegerAttr(
-              isa<gpu::ViewType>((*resource).getType()) ? 1 : 0));
+          "sharing", gpu::AtomicSharingDomainAttr::get(
+                         operation->getContext(),
+                         isa<gpu::ViewType>((*resource).getType())
+                             ? gpu::AtomicSharingDomain::KernelInvocation
+                             : gpu::AtomicSharingDomain::ProgramInstance));
       state.addAttribute("operandSegmentSizes",
                          builder.getDenseI32ArrayAttr(
                              {1, static_cast<int32_t>(coordinates->size()), 1, 0}));
@@ -3922,7 +3924,10 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(result))
         return atomic.emitOpError("atomic load address/result is unavailable");
-      uint64_t sharing = isa<gpu::ViewType>((*resource).getType()) ? 1 : 0;
+      gpu::AtomicSharingDomain sharing =
+          isa<gpu::ViewType>((*resource).getType())
+              ? gpu::AtomicSharingDomain::KernelInvocation
+              : gpu::AtomicSharingDomain::ProgramInstance;
       auto target = builder.create<gpu::AtomicLoadOp>(
           location, *result, *resource, *coordinates, Value(),
           atomic.getOrdering(), sharing, *axes);
@@ -3942,7 +3947,10 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
         return atomic.emitOpError("atomic store address/value is unavailable");
-      uint64_t sharing = isa<gpu::ViewType>((*resource).getType()) ? 1 : 0;
+      gpu::AtomicSharingDomain sharing =
+          isa<gpu::ViewType>((*resource).getType())
+              ? gpu::AtomicSharingDomain::KernelInvocation
+              : gpu::AtomicSharingDomain::ProgramInstance;
       auto target = builder.create<gpu::AtomicStoreOp>(
           location, *resource, *coordinates, *value, Value(),
           atomic.getOrdering(), sharing, *axes);
@@ -3966,7 +3974,10 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value) || failed(result))
         return atomic.emitOpError("atomic RMW address/value is unavailable");
-      uint64_t sharing = isa<gpu::ViewType>((*resource).getType()) ? 1 : 0;
+      gpu::AtomicSharingDomain sharing =
+          isa<gpu::ViewType>((*resource).getType())
+              ? gpu::AtomicSharingDomain::KernelInvocation
+              : gpu::AtomicSharingDomain::ProgramInstance;
       auto target = builder.create<gpu::AtomicRMWOp>(
           location, *result, *resource, *coordinates, *value, Value(),
           atomic.getKind(), atomic.getOrdering(), sharing, *axes);
@@ -3994,7 +4005,10 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(expected) || failed(desired) || failed(result))
         return atomic.emitOpError("compare-exchange address/value is unavailable");
-      uint64_t sharing = isa<gpu::ViewType>((*resource).getType()) ? 1 : 0;
+      gpu::AtomicSharingDomain sharing =
+          isa<gpu::ViewType>((*resource).getType())
+              ? gpu::AtomicSharingDomain::KernelInvocation
+              : gpu::AtomicSharingDomain::ProgramInstance;
       auto target = builder.create<gpu::AtomicCompareExchangeOp>(
           location, *result, *resource, *coordinates, *expected, *desired,
           Value(), atomic.getOrdering(), sharing, *axes);

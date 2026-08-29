@@ -2,6 +2,7 @@
 #define INTENT_TARGET_TILELANG_IR_TILELANGTYPES_H
 
 #include "Intent/Target/TileLang/IR/TileLangDialect.h"
+#include "Intent/Target/TileLang/IR/TileLangAttrs.h"
 #include "mlir/IR/Types.h"
 
 #define GET_TYPEDEF_CLASSES

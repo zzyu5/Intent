@@ -2,6 +2,7 @@
 #define INTENT_TARGET_TILELANG_IR_TILELANGOPS_TD
 
 include "Intent/Dialect/GPU/IR/GPUTypes.td"
+include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Target/TileLang/IR/TileLangDialect.td"
 include "Intent/Target/TileLang/IR/TileLangTypes.td"
 include "mlir/IR/OpBase.td"
@@ -132,7 +133,7 @@ def IntentTileLang_ReduceOp : IntentTileLang_Op<"reduce", [
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentTileLang_BufferValue:$destination,
                        I64Attr:$axis,
-                       I64Attr:$kind);
+                       Intent_BinaryOperatorAttr:$kind);
   let hasVerifier = 1;
 }
 
@@ -142,7 +143,7 @@ def IntentTileLang_ScanOp : IntentTileLang_Op<"scan", [
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentTileLang_BufferValue:$destination,
                        I64Attr:$axis,
-                       I64Attr:$kind,
+                       Intent_BinaryOperatorAttr:$kind,
                        BoolAttr:$reverse);
   let hasVerifier = 1;
 }
