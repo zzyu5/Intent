@@ -455,7 +455,11 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
   Block &sourceEntry = function.getBody().front();
   auto parameterSchema =
       function->getAttrOfType<ArrayAttr>("intent.parameters");
-  if (!parameterSchema || parameterSchema.size() != sourceEntry.getNumArguments())
+  auto parameterNodes =
+      function->getAttrOfType<ArrayAttr>("intent.parameter_nodes");
+  if (!parameterSchema || !parameterNodes ||
+      parameterSchema.size() != sourceEntry.getNumArguments() ||
+      parameterNodes.size() != sourceEntry.getNumArguments())
     return function.emitError("canonical ABI parameter schema is missing");
 
   for (auto [abi, argument] : llvm::enumerate(sourceEntry.getArguments())) {
@@ -499,11 +503,14 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
       continue;
     }
     auto tensor = dyn_cast<RankedTensorType>(logicalView.getTensor());
+    auto parameterNode = dyn_cast<IntegerAttr>(parameterNodes[abi]);
     DenseI64ArrayAttr canonicalIds =
         tensor ? dimensionIds(tensor) : DenseI64ArrayAttr();
-    if (!tensor ||
+    if (!tensor || !parameterNode || parameterNode.getInt() < 0 ||
         (canonicalIds && canonicalIds.size() != tensor.getRank()))
-      return function.emitError("view lost canonical dimension identities");
+      return function.emitError(
+          "view lost canonical source or dimension identities");
+    uint64_t sourceId = static_cast<uint64_t>(parameterNode.getInt()) + 1;
     SmallVector<int64_t> ids(tensor.getRank(), 0);
     if (canonicalIds)
       llvm::copy(canonicalIds.asArrayRef(), ids.begin());
@@ -537,7 +544,7 @@ FailureOr<PhysicalABI> buildPhysicalABI(func::FuncOp function,
         constraints.getAlias(), constraints.getNoalias());
     result.arguments.push_back(gpu::ViewType::get(
         context, tensor.getElementType(), tensor.getRank(), logicalView.getAccess(),
-        abi, layout));
+        abi, sourceId, layout));
     result.argumentAttrs.push_back(builder.getDictionaryAttr({
         builder.getNamedAttr(gpu::abiKindAttr, builder.getStringAttr("view")),
         builder.getNamedAttr(gpu::abiNameAttr, builder.getStringAttr(name)),
@@ -1754,9 +1761,7 @@ private:
           stop = builder.create<gpu::DimOp>(operation->getLoc(),
                                             builder.getIndexType(), *resource,
                                             sourceAxis);
-          sourceId =
-              (static_cast<uint64_t>(view.getAbiIndex()) + 1) * 65536 +
-              sourceAxis + 1;
+          sourceId = view.getSourceId();
           extent = cast<PhysicalExprAttr>(
               view.getLayout().getExtents()[sourceAxis]);
         } else {
@@ -1951,9 +1956,7 @@ private:
         int64_t dimension = 0;
         bool derived = false;
         if (view) {
-          sourceId =
-              (static_cast<uint64_t>(view.getAbiIndex()) + 1) * 65536 +
-              sourceAxis + 1;
+          sourceId = view.getSourceId();
           auto dimensions = view.getLayout().getDimensionIds();
           if (sourceAxis >= dimensions.size())
             return failure();
@@ -4418,6 +4421,10 @@ LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
 LogicalResult constructGPUProgram(ModuleOp module,
                                   const GPUCapabilities &capabilities,
                                   func::FuncOp function) {
+  Attribute sourceOrigin = function->getAttr("intent.source");
+  if (!sourceOrigin)
+    return function.emitError(
+        "canonical kernel has no stable source origin for physical construction");
   CanonicalKernelAnalysis canonicalAnalysis(module);
   FailureOr<SmallVector<LogicalWorksetFact, 4>> logicalWorksets =
       canonicalAnalysis.logicalWorksets(function);
@@ -4472,11 +4479,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       builder.getNamedAttr(gpu::gridRankAttr, builder.getI64IntegerAttr(1)),
       builder.getNamedAttr(gpu::effectOriginsAttr,
                            observableEffectOrigins(function)),
-      builder.getNamedAttr(
-          gpu::originAttr,
-          function->getAttr("intent.source")
-              ? function->getAttr("intent.source")
-              : builder.getStringAttr(function.getName())),
+      builder.getNamedAttr(gpu::originAttr, sourceOrigin),
   };
   builder.setInsertionPointAfter(function);
   auto physical = builder.create<func::FuncOp>(

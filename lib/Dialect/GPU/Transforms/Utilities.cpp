@@ -91,21 +91,6 @@ bool carriesExtent(Type type, AxisSelector selects,
   });
 }
 
-void collectRanges(Value value, const llvm::SmallPtrSetImpl<Operation *> &eligible,
-                   SmallVectorImpl<MakeRangeOp> &ranges,
-                   llvm::SmallPtrSetImpl<Operation *> &visited) {
-  Operation *producer = value.getDefiningOp();
-  if (!producer || !visited.insert(producer).second)
-    return;
-  if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    if (eligible.contains(producer) && !llvm::is_contained(ranges, range))
-      ranges.push_back(range);
-    return;
-  }
-  for (Value operand : producer->getOperands())
-    collectRanges(operand, eligible, ranges, visited);
-}
-
 bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   auto reshape = value.getDefiningOp<ReshapeOp>();
   auto result = dyn_cast<FragmentType>(value.getType());
@@ -1219,13 +1204,6 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   llvm::SmallPtrSet<Operation *, 32> rangeSet;
   for (MakeRangeOp range : ranges)
     rangeSet.insert(range.getOperation());
-  auto relevantRanges = [&](ValueRange values) {
-    SmallVector<MakeRangeOp> result;
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    for (Value value : values)
-      collectRanges(value, rangeSet, result, visited);
-    return result;
-  };
 
   SmallVector<LoadOp> loads;
   SmallVector<GatherOp> gathers;
@@ -1245,23 +1223,44 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   kernel.walk(
       [&](AtomicCompareExchangeOp atomic) { atomicCAS.push_back(atomic); });
   llvm::DenseMap<Operation *, SmallVector<MakeRangeOp>> accessRanges;
+  PhysicalProgramAnalysis accessAnalysis(kernel);
+  auto recordAccessRanges = [&](Operation *access) -> LogicalResult {
+    PhysicalAccessFootprint footprint = accessAnalysis.footprint(access);
+    if (footprint.state != PhysicalFactState::Exact ||
+        footprint.rangeState != PhysicalFactState::Exact)
+      return access->emitOpError(
+          "full-coverage rewrite requires one exact physical access footprint");
+    auto &relevant = accessRanges[access];
+    for (MakeRangeOp range : footprint.ranges)
+      if (rangeSet.contains(range.getOperation()) &&
+          !llvm::is_contained(relevant, range))
+        relevant.push_back(range);
+    return success();
+  };
   for (LoadOp load : loads)
-    accessRanges[load.getOperation()] = relevantRanges(load.getCoordinates());
+    if (failed(recordAccessRanges(load)))
+      return failure();
   for (GatherOp gather : gathers)
-    accessRanges[gather.getOperation()] = relevantRanges(gather.getCoordinates());
+    if (failed(recordAccessRanges(gather)))
+      return failure();
   for (StoreOp store : stores)
-    accessRanges[store.getOperation()] = relevantRanges(store.getCoordinates());
+    if (failed(recordAccessRanges(store)))
+      return failure();
   for (ScatterReduceOp scatter : scatters)
-    accessRanges[scatter.getOperation()] =
-        relevantRanges(scatter.getCoordinates());
+    if (failed(recordAccessRanges(scatter)))
+      return failure();
   for (AtomicLoadOp atomic : atomicLoads)
-    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+    if (failed(recordAccessRanges(atomic)))
+      return failure();
   for (AtomicStoreOp atomic : atomicStores)
-    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+    if (failed(recordAccessRanges(atomic)))
+      return failure();
   for (AtomicRMWOp atomic : atomicRMWs)
-    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+    if (failed(recordAccessRanges(atomic)))
+      return failure();
   for (AtomicCompareExchangeOp atomic : atomicCAS)
-    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+    if (failed(recordAccessRanges(atomic)))
+      return failure();
 
   llvm::DenseMap<Operation *, Value> predicates;
   for (MakeRangeOp range : ranges) {

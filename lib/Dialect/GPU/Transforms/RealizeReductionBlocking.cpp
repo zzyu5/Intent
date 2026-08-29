@@ -512,10 +512,10 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   return plan;
 }
 
-FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
-                             PhysicalSourceAxis source,
-                             PhysicalExprAttr blockedExtent,
-                             IRMapping &mapping) {
+FailureOr<Value> replayValueImpl(OpBuilder &builder, Location location,
+                                 Value value, PhysicalSourceAxis source,
+                                 PhysicalExprAttr blockedExtent,
+                                 IRMapping &mapping) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
   if (auto extract = value.getDefiningOp<ExtractOp>()) {
@@ -523,7 +523,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
       uint64_t field = extract.getField();
       if (field >= record.getFields().size())
         return failure();
-      FailureOr<Value> replayed = replayValue(
+      FailureOr<Value> replayed = replayValueImpl(
           builder, location, record.getFields()[field], source,
           blockedExtent, mapping);
       if (succeeded(replayed) && !mapping.lookupOrNull(value))
@@ -544,7 +544,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     SmallVector<Value> coordinates;
     coordinates.reserve(load.getCoordinates().size());
     for (Value coordinate : load.getCoordinates()) {
-      FailureOr<Value> replayed = replayValue(
+      FailureOr<Value> replayed = replayValueImpl(
           builder, location, coordinate, source, blockedExtent, mapping);
       if (failed(replayed))
         return failure();
@@ -552,7 +552,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     }
     Value valid;
     if (load.getValid()) {
-      FailureOr<Value> replayed = replayValue(
+      FailureOr<Value> replayed = replayValueImpl(
           builder, location, load.getValid(), source, blockedExtent, mapping);
       if (failed(replayed))
         return failure();
@@ -560,7 +560,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     }
     Value fill;
     if (load.getFill()) {
-      FailureOr<Value> replayed = replayValue(
+      FailureOr<Value> replayed = replayValueImpl(
           builder, location, load.getFill(), source, blockedExtent, mapping);
       if (failed(replayed))
         return failure();
@@ -579,8 +579,8 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
                             /*allowAccesses=*/false))
     return failure();
   for (Value operand : producer->getOperands()) {
-    FailureOr<Value> replayed =
-        replayValue(builder, location, operand, source, blockedExtent, mapping);
+    FailureOr<Value> replayed = replayValueImpl(
+        builder, location, operand, source, blockedExtent, mapping);
     if (failed(replayed))
       return failure();
     if (!mapping.lookupOrNull(operand))
@@ -615,6 +615,22 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
+}
+
+FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
+                             PhysicalSourceAxis source,
+                             PhysicalExprAttr blockedExtent,
+                             IRMapping &mapping) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      value, source, PhysicalReplayScope::ValueGraph,
+      /*allowAccesses=*/true);
+  if (!replay.isReplayable())
+    return failure();
+  return replayValueImpl(builder, location, value, source, blockedExtent,
+                         mapping);
 }
 
 FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
@@ -888,6 +904,13 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     PhysicalSourceAxis reductionSource{sourceMap.getSourceId(),
                                        sourceMap.getSourceAxis(),
                                        sourceMap.getDerived()};
+    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+        reduce.getInputs()[component], reductionSource,
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
+    if (!replay.isReplayable())
+      return reduce.emitOpError(
+                 "static reduction producer has no exact shared replay fact"),
+             failure();
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(

@@ -183,7 +183,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       return kernel.emitError("physical ABI argument names must be unique");
     if (kind.getValue() == "view") {
       auto view = dyn_cast<ViewType>(type);
-      if (!view || view.getAbiIndex() != index)
+      if (!view || view.getAbiIndex() != index || view.getSourceId() == 0)
         return kernel.emitError("view ABI argument has a non-view physical type");
     } else if (kind.getValue() == "dimension" ||
                kind.getValue() == "stride") {

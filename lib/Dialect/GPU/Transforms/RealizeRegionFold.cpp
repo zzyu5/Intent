@@ -118,11 +118,11 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   return plan;
 }
 
-FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
-                             PhysicalSourceAxis source,
-                             PhysicalExprAttr blockedExtent,
-                             IRMapping &mapping, Value segmentTail = {},
-                             AxisMapAttr segmentMapping = {}) {
+FailureOr<Value> replayValueImpl(OpBuilder &builder, Location location,
+                                 Value value, PhysicalSourceAxis source,
+                                 PhysicalExprAttr blockedExtent,
+                                 IRMapping &mapping, Value segmentTail = {},
+                                 AxisMapAttr segmentMapping = {}) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
   auto fragment = dyn_cast<FragmentType>(value.getType());
@@ -140,8 +140,8 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
         queryFragmentAxis(operand.getType(), source);
     if (!operandProjection.isExact())
       return operand;
-    return replayValue(builder, location, operand, source,
-                       blockedExtent, mapping, segmentTail, segmentMapping);
+    return replayValueImpl(builder, location, operand, source, blockedExtent,
+                           mapping, segmentTail, segmentMapping);
   };
   auto combineTail = [&](FragmentType type,
                          Value valid) -> FailureOr<Value> {
@@ -300,6 +300,23 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
+}
+
+FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
+                             PhysicalSourceAxis source,
+                             PhysicalExprAttr blockedExtent,
+                             IRMapping &mapping, Value segmentTail = {},
+                             AxisMapAttr segmentMapping = {}) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      value, source, PhysicalReplayScope::ValueGraph,
+      /*allowAccesses=*/true);
+  if (!replay.isReplayable())
+    return failure();
+  return replayValueImpl(builder, location, value, source, blockedExtent,
+                         mapping, segmentTail, segmentMapping);
 }
 
 LogicalResult buildSourceSlices(OpBuilder &builder, Location location,

@@ -21,7 +21,6 @@ inline constexpr llvm::StringLiteral abiNameAttr = "intent_gpu.abi_name";
 inline constexpr llvm::StringLiteral dimensionAttr = "intent_gpu.dimension";
 inline constexpr llvm::StringLiteral sourceABIAttr = "intent_gpu.source_abi";
 inline constexpr llvm::StringLiteral sourceAxisAttr = "intent_gpu.source_axis";
-inline constexpr llvm::StringLiteral sourceRankAttr = "intent_gpu.source_rank";
 inline constexpr llvm::StringLiteral sourceSubregionAttr =
     "intent_gpu.source_subregion";
 inline constexpr llvm::StringLiteral worksetCoordinateRangeAttr =
@@ -34,7 +33,6 @@ inline constexpr llvm::StringLiteral segmentOffsetAttr =
     "intent_gpu.segment_offset";
 inline constexpr llvm::StringLiteral segmentLengthAttr =
     "intent_gpu.segment_length";
-inline constexpr llvm::StringLiteral unitRoleAttr = "intent_gpu.unit_role";
 inline constexpr llvm::StringLiteral coverageDimensionAttr =
     "intent_gpu.coverage_dimension";
 inline constexpr llvm::StringLiteral reductionTraversalSourceAttr =

@@ -444,49 +444,6 @@ CanonicalKernelAnalysis::resultProvenance(OpResult result) {
   return {};
 }
 
-SmallVector<ShapeAxisFact, 4>
-CanonicalKernelAnalysis::shapeFacts(Value value) const {
-  auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  if (!tensor) {
-    if (auto view = dyn_cast<ViewType>(value.getType()))
-      tensor = dyn_cast<RankedTensorType>(view.getTensor());
-    else if (auto buffer = dyn_cast<BufferType>(value.getType()))
-      tensor = dyn_cast<RankedTensorType>(buffer.getTensor());
-  }
-  if (!tensor)
-    return {};
-  DenseI64ArrayAttr ids = dimensionIDs(tensor);
-  SmallVector<ShapeAxisFact, 4> facts;
-  facts.reserve(tensor.getRank());
-  Operation *definition = value.getDefiningOp();
-  auto relation = definition
-                      ? definition->getAttrOfType<ShapeRelationAttr>("shape")
-                      : ShapeRelationAttr();
-  for (unsigned axis = 0; axis < tensor.getRank(); ++axis) {
-    ShapeAxisFact fact;
-    fact.dimensionIdentity = ids ? ids[axis] : 0;
-    if (!tensor.isDynamicDim(axis)) {
-      fact.kind = ShapeAxisKind::Static;
-      fact.staticExtent = tensor.getDimSize(axis);
-    } else if (!definition) {
-      fact.kind = ShapeAxisKind::ABI;
-    } else if (relation && axis < relation.getAxes().size()) {
-      auto entry = dyn_cast<ShapeExprAttr>(relation.getAxes()[axis]);
-      if (entry && entry.getKind() == 1) {
-        int64_t operand = entry.getPayload();
-        if (operand >= 0 && operand < definition->getNumOperands()) {
-          fact.kind = ShapeAxisKind::SSAExtent;
-          fact.extent = definition->getOperand(operand);
-        }
-      } else if (entry && entry.getKind() == 2) {
-        fact.kind = ShapeAxisKind::Inferred;
-      }
-    }
-    facts.push_back(fact);
-  }
-  return facts;
-}
-
 FailureOr<IndexRelationFact>
 CanonicalKernelAnalysis::indexRelation(Operation *operation) {
   auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
@@ -653,8 +610,6 @@ LogicalResult CanonicalKernelAnalysis::verify() {
       result = failure();
       return WalkResult::interrupt();
     }
-    for (Value value : operation->getResults())
-      (void)shapeFacts(value);
     return WalkResult::advance();
   });
   return result;

@@ -230,11 +230,11 @@ FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source) {
   return queryExactLogicalRange(fact);
 }
 
-FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value, PhysicalSourceAxis source,
-                                   PhysicalExprAttr blockedExtent,
-                                   MakeRangeOp root, Value replacement,
-                                   IRMapping &mapping) {
+FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
+                                       Value value, PhysicalSourceAxis source,
+                                       PhysicalExprAttr blockedExtent,
+                                       MakeRangeOp root, Value replacement,
+                                       IRMapping &mapping) {
   if (value == root.getResult())
     return replacement;
   if (Value mapped = mapping.lookupOrNull(value))
@@ -250,7 +250,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   if (producer->getNumRegions() != 0 || producer->getNumResults() != 1)
     return failure();
   for (Value operand : producer->getOperands()) {
-    FailureOr<Value> replayed = replaySourceValue(
+    FailureOr<Value> replayed = replaySourceValueImpl(
         builder, location, operand, source, blockedExtent, root, replacement,
         mapping);
     if (failed(replayed))
@@ -281,6 +281,23 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
   return clone->getResult(0);
+}
+
+FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
+                                   Value value, PhysicalSourceAxis source,
+                                   PhysicalExprAttr blockedExtent,
+                                   MakeRangeOp root, Value replacement,
+                                   IRMapping &mapping) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      value, source, PhysicalReplayScope::Coordinate,
+      /*allowAccesses=*/true);
+  if (!replay.isReplayable())
+    return failure();
+  return replaySourceValueImpl(builder, location, value, source, blockedExtent,
+                               root, replacement, mapping);
 }
 
 Value strippedBroadcast(Value value) {

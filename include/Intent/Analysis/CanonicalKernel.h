@@ -26,15 +26,6 @@ struct CoordinateProvenance {
   llvm::SmallVector<CoordinateOrigin, 2> origins;
 };
 
-enum class ShapeAxisKind { Static, ABI, SSAExtent, Inferred, Derived };
-
-struct ShapeAxisFact {
-  ShapeAxisKind kind = ShapeAxisKind::Derived;
-  int64_t dimensionIdentity = 0;
-  std::optional<int64_t> staticExtent;
-  mlir::Value extent;
-};
-
 struct IndexTermFact {
   int64_t kind = 0;
   std::optional<unsigned> sourceAxis;
@@ -97,7 +88,6 @@ public:
   mlir::LogicalResult verify();
 
   CoordinateProvenance coordinateProvenance(mlir::Value value);
-  llvm::SmallVector<ShapeAxisFact, 4> shapeFacts(mlir::Value value) const;
   mlir::FailureOr<IndexRelationFact>
   indexRelation(mlir::Operation *operation);
   mlir::FailureOr<llvm::SmallVector<LogicalWorksetFact, 4>>

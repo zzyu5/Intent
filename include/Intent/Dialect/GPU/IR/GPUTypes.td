@@ -14,10 +14,11 @@ def IntentGPU_ViewType : TypeDef<IntentGPU_Dialect, "View"> {
     "uint32_t":$rank,
     "uint32_t":$access,
     "uint32_t":$abiIndex,
+    "uint64_t":$sourceId,
     "::intent::gpu::ViewLayoutAttr":$layout
   );
   let assemblyFormat =
-      "`<` $elementType `,` $rank `,` $access `,` $abiIndex `,` $layout `>`";
+      "`<` $elementType `,` $rank `,` $access `,` $abiIndex `,` $sourceId `,` $layout `>`";
   let genVerifyDecl = 1;
 }
 
