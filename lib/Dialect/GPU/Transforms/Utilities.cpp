@@ -14,6 +14,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include <functional>
 #include <optional>
 
 using namespace mlir;
@@ -610,6 +611,74 @@ FailureOr<Value> materializeValidityConjunction(
                     : *projected;
   }
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
+}
+
+FailureOr<Value> materializeRetargetedValidity(
+    OpBuilder &builder, Location location, Value original,
+    ArrayRef<std::pair<MakeRangeOp, Value>> originalTailRanges,
+    Value physicalTail, FragmentType target) {
+  func::FuncOp kernel;
+  if (!originalTailRanges.empty())
+    kernel = originalTailRanges.front().first->getParentOfType<func::FuncOp>();
+  else if (original)
+    if (Operation *definition = original.getDefiningOp())
+      kernel = definition->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+
+  std::function<FailureOr<Value>(Value)> residual =
+      [&](Value value) -> FailureOr<Value> {
+    if (!value || analysis.isTailPredicate(value, originalTailRanges))
+      return Value();
+    if (value.getType().isInteger(1))
+      return value;
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+      return residual(broadcast.getValue());
+    if (auto splat = value.getDefiningOp<SplatOp>())
+      return residual(splat.getValue());
+    if (auto reshape = value.getDefiningOp<ReshapeOp>())
+      return residual(reshape.getValue());
+    if (auto transpose = value.getDefiningOp<TransposeOp>())
+      return residual(transpose.getValue());
+    auto conjunction = value.getDefiningOp<BinaryOp>();
+    if (!conjunction)
+      return failure();
+    Type element = conjunction.getResult().getType();
+    if (auto fragment = dyn_cast<FragmentType>(element))
+      element = fragment.getElementType();
+    bool logical =
+        conjunction.getOperatorKind() == BinaryOperator::LogicalAnd;
+    bool bitwiseI1 =
+        conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
+        element.isInteger(1);
+    if (!logical && !bitwiseI1)
+      return failure();
+    FailureOr<Value> lhs = residual(conjunction.getLhs());
+    FailureOr<Value> rhs = residual(conjunction.getRhs());
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    if (!*lhs)
+      return *rhs;
+    if (!*rhs)
+      return *lhs;
+    if (!(*lhs).getType().isInteger(1) || !(*rhs).getType().isInteger(1))
+      return failure();
+    return Value(builder.create<BinaryOp>(location, builder.getI1Type(), *lhs,
+                                          *rhs,
+                                          BinaryOperator::LogicalAnd));
+  };
+
+  FailureOr<Value> authorResidual = residual(original);
+  if (failed(authorResidual))
+    return failure();
+  if (!*authorResidual)
+    return physicalTail;
+  if (!physicalTail)
+    return materializeBroadcastToFragment(builder, location, *authorResidual,
+                                          target);
+  return materializeValidityConjunction(builder, location, physicalTail,
+                                        *authorResidual, target);
 }
 
 LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {

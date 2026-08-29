@@ -62,6 +62,14 @@ mlir::FailureOr<mlir::Value>
 materializeValidityConjunction(mlir::OpBuilder &builder,
                                mlir::Location location, mlir::Value lhs,
                                mlir::Value rhs, FragmentType valueType);
+/// Replaces the tail portion of an existing validity predicate with the tail
+/// selected by the current physical rewrite while preserving scalar author
+/// predicates.  Shape-dependent residual predicates fail instead of being
+/// silently discarded or guessed from surrounding structure.
+mlir::FailureOr<mlir::Value> materializeRetargetedValidity(
+    mlir::OpBuilder &builder, mlir::Location location, mlir::Value original,
+    llvm::ArrayRef<std::pair<MakeRangeOp, mlir::Value>> originalTailRanges,
+    mlir::Value physicalTail, FragmentType target);
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 void eraseDeadPhysicalValues(mlir::func::FuncOp kernel);
 void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);

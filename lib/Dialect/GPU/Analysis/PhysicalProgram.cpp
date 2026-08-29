@@ -1264,6 +1264,10 @@ bool PhysicalProgramAnalysis::isTailPredicate(
     Value expectedEnd = stripScalarIdentity(entry.second);
     if (lhs == expectedRange.getResult())
       return rhs == expectedEnd;
+    if (comparison->hasAttr(physicalTailAttr) && predicateRange &&
+        sameLogicalRange(predicateRange, expectedRange) &&
+        sameScalarExpression(rhs, expectedEnd))
+      return true;
     if (!predicateRange ||
         !(sourceAxisIdentity(predicateRange) ==
           sourceAxisIdentity(expectedRange)))

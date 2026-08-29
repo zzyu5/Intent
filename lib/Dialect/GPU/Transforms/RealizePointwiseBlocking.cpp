@@ -980,9 +980,11 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         if (Attribute value = range->getAttr(sourceSubregionAttr))
           blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
-        Value tail = nested.create<CompareOp>(
+        auto tailComparison = nested.create<CompareOp>(
             location, predicateType(blockedType), blocked, end,
             ComparePredicate::Lt);
+        tailComparison->setAttr(physicalTailAttr, nested.getUnitAttr());
+        Value tail = tailComparison.getResult();
         IRMapping mapping;
         mapping.map(range.getResult(), blocked);
         for (StoreOp store : stores) {
@@ -1675,9 +1677,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         blocked->setAttr(sourceSubregionAttr, value);
       Value endFragment =
           builder.create<BroadcastOp>(range.getLoc(), fragment, exactEnd);
-      Value valid = builder.create<CompareOp>(
+      auto validComparison = builder.create<CompareOp>(
           range.getLoc(), predicateType(fragment), blocked.getResult(),
           endFragment, ComparePredicate::Lt);
+      validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
+      Value valid = validComparison.getResult();
       range.getResult().replaceAllUsesWith(blocked.getResult());
       fixedRangePredicates[blocked.getResult()] = valid;
       range.erase();
@@ -2483,9 +2487,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (Attribute value = range->getAttr(sourceSubregionAttr))
       blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
-    Value valid = builder.create<CompareOp>(range.getLoc(), predicateType(blockedType),
-                                            blocked, endFragment,
-                                            ComparePredicate::Lt);
+    auto validComparison = builder.create<CompareOp>(
+        range.getLoc(), predicateType(blockedType), blocked, endFragment,
+        ComparePredicate::Lt);
+    validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
+    Value valid = validComparison.getResult();
     range.getResult().replaceAllUsesWith(blocked);
     rangePredicates[blocked] = valid;
     range.erase();

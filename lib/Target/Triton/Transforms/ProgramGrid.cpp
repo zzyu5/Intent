@@ -31,6 +31,9 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
   SmallVector<unsigned> programOrder;
   auto roles =
       mapping->getAttrOfType<DenseI64ArrayAttr>(gpu::coordinateRolesAttr);
+  if (roles && roles.size() != rank)
+    return mapping.emitOpError(
+        "Triton program-grid legalization requires one role per coordinate");
   const int64_t workset =
       static_cast<int64_t>(gpu::CoordinateRole::Workset);
   const int64_t pointwiseOwnership =
@@ -120,10 +123,22 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     coordinates[axis] = builder.create<gpu::ProgramIdOp>(
         mapping.getLoc(), builder.getIndexType(), coordinateToProgram[axis]);
 
-  for (auto [coordinate, replacement] :
-       llvm::zip(mapping.getCoordinates(), coordinates))
-    coordinate.replaceAllUsesWith(replacement);
-  mapping.erase();
+  // Preserve the shared DelinearizeOp as the execution-group carrier.  The
+  // provider grid only changes how the original row-major linear program id is
+  // obtained: reconstruct that id from the permuted Triton grid coordinates,
+  // then let the existing mapping continue to define runtime workset
+  // coordinates, segment coverage and all mapping attributes.
+  Value linear = coordinates.front();
+  for (unsigned axis = 1; axis < rank; ++axis) {
+    linear = builder.create<gpu::BinaryOp>(
+        mapping.getLoc(), builder.getIndexType(), linear,
+        mapping.getExtents()[axis],
+        BinaryOperator::Multiply);
+    linear = builder.create<gpu::BinaryOp>(
+        mapping.getLoc(), builder.getIndexType(), linear, coordinates[axis],
+        BinaryOperator::Add);
+  }
+  mapping->setOperand(0, linear);
   if (linearProgram->use_empty())
     linearProgram.erase();
   return success();

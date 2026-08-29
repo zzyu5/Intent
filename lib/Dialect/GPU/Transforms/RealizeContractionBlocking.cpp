@@ -120,7 +120,10 @@ Value binary(OpBuilder &builder, Location location, Type result, Value lhs,
 
 Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
               Value rhs, ComparePredicate predicate) {
-  return builder.create<CompareOp>(location, result, lhs, rhs, predicate);
+  auto comparison =
+      builder.create<CompareOp>(location, result, lhs, rhs, predicate);
+  comparison->setAttr(physicalTailAttr, builder.getUnitAttr());
+  return comparison.getResult();
 }
 
 void inheritRangeAuthority(Value derived, MakeRangeOp source) {
@@ -599,16 +602,6 @@ bool isZeroScalar(Value value) {
 Value broadcast(OpBuilder &builder, Location location, FragmentType result,
                 Value value) {
   return builder.create<BroadcastOp>(location, result, value);
-}
-
-FailureOr<Value> retargetPredicate(OpBuilder &builder, Location location,
-                                   Value original, FragmentType result) {
-  if (!original)
-    return failure();
-  FailureOr<Value> scalar = scalarSource(original);
-  if (failed(scalar) || !(*scalar).getType().isInteger(1))
-    return failure();
-  return Value(builder.create<BroadcastOp>(location, result, *scalar));
 }
 
 FailureOr<Value> retargetFill(OpBuilder &builder, Location location,
@@ -1794,28 +1787,20 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
                                   rhsReductions, rhsColumns,
                                   BinaryOperator::LogicalAnd);
-          if (lhsLoad.getValid() && !indirectRow &&
-              !isTailPredicate(lhsLoad.getValid(), lhsTailRanges)) {
-            FailureOr<Value> original = retargetPredicate(
-                nested, nestedLocation, lhsLoad.getValid(), lhsPredicateType);
-            if (failed(original)) {
-              loopBodyFailure = "lhs residual validity could not be retargeted";
-              return;
-            }
-            lhsValid = binary(nested, nestedLocation, lhsPredicateType, lhsValid,
-                              *original, BinaryOperator::LogicalAnd);
+          FailureOr<Value> retargetedLhs = materializeRetargetedValidity(
+              nested, nestedLocation, lhsLoad.getValid(), lhsTailRanges,
+              lhsValid, lhsPredicateType);
+          FailureOr<Value> retargetedRhs = materializeRetargetedValidity(
+              nested, nestedLocation, rhsLoad.getValid(), rhsTailRanges,
+              rhsValid, rhsPredicateType);
+          if (failed(retargetedLhs) || failed(retargetedRhs)) {
+            loopBodyFailure = failed(retargetedLhs)
+                                  ? "lhs residual validity could not be retargeted"
+                                  : "rhs residual validity could not be retargeted";
+            return;
           }
-          if (rhsLoad.getValid() &&
-              !isTailPredicate(rhsLoad.getValid(), rhsTailRanges)) {
-            FailureOr<Value> original = retargetPredicate(
-                nested, nestedLocation, rhsLoad.getValid(), rhsPredicateType);
-            if (failed(original)) {
-              loopBodyFailure = "rhs residual validity could not be retargeted";
-              return;
-            }
-            rhsValid = binary(nested, nestedLocation, rhsPredicateType, rhsValid,
-                              *original, BinaryOperator::LogicalAnd);
-          }
+          lhsValid = *retargetedLhs;
+          rhsValid = *retargetedRhs;
           SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
           lhsCoordinates[*lhsRowCoordinate] = blockedLhsRowCoordinate;
           lhsCoordinates[*lhsReductionCoordinate] = reductions;
@@ -1883,19 +1868,14 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       if (!indirectRow)
         coordinates[*storeRow] = rows;
       coordinates[*storeColumn] = columns;
-      Value valid = outputValid;
-      if (path.store.getValid() && !indirectRow &&
-          !isTailPredicate(path.store.getValid(), outputTailRanges)) {
-        FailureOr<Value> original = retargetPredicate(
-            rowBuilder, location, path.store.getValid(), outputPredicateType);
-        if (failed(original))
-          return path.store.emitOpError(
-              "blocked contract output has non-scalar residual validity");
-        valid = binary(rowBuilder, location, outputPredicateType, valid,
-                       *original, BinaryOperator::LogicalAnd);
-      }
+      FailureOr<Value> valid = materializeRetargetedValidity(
+          rowBuilder, location, path.store.getValid(), outputTailRanges,
+          outputValid, outputPredicateType);
+      if (failed(valid))
+        return path.store.emitOpError(
+            "blocked contract output has non-scalar residual validity");
       auto replacement = rowBuilder.create<StoreOp>(
-          location, path.store.getResource(), coordinates, output, valid,
+          location, path.store.getResource(), coordinates, output, *valid,
           path.store.getSourceAxes());
       if (Attribute origin = path.store->getAttr(originAttr))
         replacement->setAttr(originAttr, origin);
@@ -2455,6 +2435,28 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
             nested, nestedLocation, rhsScalePredicateType, rhsScaleBlocks,
             rhsScaleColumns, BinaryOperator::LogicalAnd);
 
+        FailureOr<Value> retargetedLhs = materializeRetargetedValidity(
+            nested, nestedLocation, lhsLoad.getValid(), lhsTailRanges,
+            lhsValid, lhsPredicateType);
+        FailureOr<Value> retargetedLhsScale = materializeRetargetedValidity(
+            nested, nestedLocation, lhsScaleLoad.getValid(),
+            lhsScaleTailRanges, lhsScaleValid, lhsScalePredicateType);
+        FailureOr<Value> retargetedRhs = materializeRetargetedValidity(
+            nested, nestedLocation, rhsLoad.getValid(), rhsTailRanges,
+            rhsValid, rhsPredicateType);
+        FailureOr<Value> retargetedRhsScale = materializeRetargetedValidity(
+            nested, nestedLocation, rhsScaleLoad.getValid(),
+            rhsScaleTailRanges, rhsScaleValid, rhsScalePredicateType);
+        if (failed(retargetedLhs) || failed(retargetedLhsScale) ||
+            failed(retargetedRhs) || failed(retargetedRhsScale)) {
+          loopBodyFailed = true;
+          return;
+        }
+        lhsValid = *retargetedLhs;
+        lhsScaleValid = *retargetedLhsScale;
+        rhsValid = *retargetedRhs;
+        rhsScaleValid = *retargetedRhsScale;
+
         SmallVector<Value> lhsCoordinates(lhsLoad.getCoordinates());
         lhsCoordinates[*lhsRowCoordinate] = rows;
         lhsCoordinates[*lhsBlockCoordinate] = blocks;
@@ -2550,8 +2552,13 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
           "blocked scaled-contract output lost source coordinates");
     coordinates[*storeRow] = rows;
     coordinates[*storeColumn] = columns;
+    FailureOr<Value> valid = materializeRetargetedValidity(
+        builder, location, path.store.getValid(), outputTailRanges,
+        outputValid, outputPredicateType);
+    if (failed(valid))
+      return reject("result store residual validity could not be retargeted");
     auto replacement = builder.create<StoreOp>(
-        location, path.store.getResource(), coordinates, output, outputValid,
+        location, path.store.getResource(), coordinates, output, *valid,
         path.store.getSourceAxes());
     if (Attribute origin = path.store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);

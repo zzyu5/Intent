@@ -78,6 +78,25 @@ struct SourcePlan {
   SmallVector<MakeRangeOp> ranges;
 };
 
+LogicalResult verifyLockstepPhysicalTraversal(Operation *structured,
+                                              ArrayRef<SourcePlan> plans) {
+  if (plans.empty() || plans.front().ranges.empty())
+    return structured->emitOpError(
+        "region source traversal has no physical range authority");
+  MakeRangeOp master = plans.front().ranges.front();
+  for (const SourcePlan &plan : plans) {
+    for (MakeRangeOp range : plan.ranges) {
+      if (samePhysicalScalarExpression(range.getStart(), master.getStart()) &&
+          samePhysicalScalarExpression(range.getExtent(), master.getExtent()) &&
+          samePhysicalScalarExpression(range.getStep(), master.getStep()))
+        continue;
+      return structured->emitOpError(
+          "region sources do not have one lockstep physical traversal");
+    }
+  }
+  return success();
+}
+
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || sourceAxis >= fragment.getShape().size())
@@ -377,9 +396,11 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
           BinaryOperator::Add);
       Value stopFragment =
           builder.create<BroadcastOp>(location, blockedRange, logicalStop);
-      Value valid = builder.create<CompareOp>(
+      auto validComparison = builder.create<CompareOp>(
           location, predicateType(blockedRange), value, stopFragment,
           ComparePredicate::Lt);
+      validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
+      Value valid = validComparison.getResult();
       if (!tail)
         tail = valid;
       if (!segmentTail)
@@ -1417,6 +1438,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           "region-fold source is not a sliceable unit-step physical value graph");
     plans.push_back(*plan);
   }
+  if (failed(verifyLockstepPhysicalTraversal(fold, plans)))
+    return failure();
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        fold.getSummarize().front().getArguments().take_front(
@@ -1624,6 +1647,8 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           "region-scan source is not a sliceable unit-step physical value graph");
     plans.push_back(*plan);
   }
+  if (failed(verifyLockstepPhysicalTraversal(scan, plans)))
+    return failure();
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        scan.getSummarize().front().getArguments().take_front(

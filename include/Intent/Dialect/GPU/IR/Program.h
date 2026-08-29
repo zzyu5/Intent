@@ -41,6 +41,8 @@ inline constexpr llvm::StringLiteral parameterSourceAttr =
     "intent_gpu.parameter_source";
 inline constexpr llvm::StringLiteral pointwiseChunkAttr =
     "intent_gpu.pointwise_chunk";
+inline constexpr llvm::StringLiteral physicalTailAttr =
+    "intent_gpu.physical_tail";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
 
