@@ -4,9 +4,96 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+
+#include <optional>
+
 using namespace mlir;
 
 namespace intent::triton {
+
+namespace {
+
+bool dependsOn(Value value, Value root,
+               llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (value == root)
+    return true;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return dependsOn(operand, root, visited);
+  });
+}
+
+FailureOr<SmallVector<unsigned>>
+writeEffectProgramOrder(func::FuncOp kernel, gpu::DelinearizeOp mapping) {
+  const unsigned rank = mapping.getCoordinates().size();
+  SmallVector<std::optional<int64_t>> resourceAxes(rank);
+  bool sawStore = false;
+  bool ambiguous = false;
+
+  kernel.walk([&](gpu::StoreOp store) {
+    sawStore = true;
+    if (!isa<gpu::ViewType>(store.getResource().getType())) {
+      ambiguous = true;
+      return;
+    }
+    for (unsigned programAxis = 0; programAxis < rank; ++programAxis) {
+      std::optional<int64_t> storeAxis;
+      for (auto [coordinateIndex, coordinate] :
+           llvm::enumerate(store.getCoordinates())) {
+        llvm::SmallPtrSet<Operation *, 16> visited;
+        if (!dependsOn(coordinate, mapping.getCoordinates()[programAxis],
+                       visited))
+          continue;
+        int64_t sourceAxis = store.getSourceAxes()[coordinateIndex];
+        if (storeAxis && *storeAxis != sourceAxis) {
+          ambiguous = true;
+          return;
+        }
+        storeAxis = sourceAxis;
+      }
+      if (!storeAxis) {
+        ambiguous = true;
+        return;
+      }
+      if (resourceAxes[programAxis] &&
+          *resourceAxes[programAxis] != *storeAxis) {
+        ambiguous = true;
+        return;
+      }
+      resourceAxes[programAxis] = *storeAxis;
+    }
+  });
+
+  bool hasOtherWrites = false;
+  kernel.walk([&](Operation *operation) {
+    hasOtherWrites |= isa<gpu::ScatterReduceOp, gpu::AtomicStoreOp,
+                          gpu::AtomicRMWOp, gpu::AtomicCompareExchangeOp>(
+        operation);
+  });
+  if (!sawStore || ambiguous || hasOtherWrites ||
+      llvm::any_of(resourceAxes, [](const std::optional<int64_t> &axis) {
+        return !axis.has_value();
+      }))
+    return failure();
+
+  for (unsigned lhs = 0; lhs < rank; ++lhs)
+    for (unsigned rhs = lhs + 1; rhs < rank; ++rhs)
+      if (resourceAxes[lhs] == resourceAxes[rhs])
+        return failure();
+
+  SmallVector<unsigned> order;
+  for (unsigned axis = 0; axis < rank; ++axis)
+    order.push_back(axis);
+  llvm::stable_sort(order, [&](unsigned lhs, unsigned rhs) {
+    return *resourceAxes[lhs] > *resourceAxes[rhs];
+  });
+  return order;
+}
+
+} // namespace
 
 LogicalResult legalizeProgramGrid(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = gpu::getPhysicalKernel(module);
@@ -87,6 +174,10 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     for (unsigned axis = 0; axis < rank; ++axis)
       if (!llvm::is_contained(programOrder, axis))
         programOrder.push_back(axis);
+  } else if (FailureOr<SmallVector<unsigned>> effectOrder =
+                 writeEffectProgramOrder(kernel, mapping);
+             succeeded(effectOrder)) {
+    programOrder = std::move(*effectOrder);
   } else {
     for (unsigned axis = 0; axis < rank; ++axis)
       if (roles[axis] == workset)
@@ -99,12 +190,10 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
         programOrder.push_back(axis);
   }
 
-  // The shared mapping records which coordinates own fragments and which
-  // remain program-internal traversal drivers.  Triton puts pointwise
-  // fragment ownership before an unowned driver, preserves the established
-  // row-major order when all coordinates own output, and keeps ragged
-  // contraction workers in their explicit worker order.  No access or
-  // structured operation is rebuilt here.
+  // Specialized traversal forms retain their typed shared ordering.  For an
+  // ordinary workset, use the current write-coordinate graph only when every
+  // external effect gives the same unambiguous resource-axis order; otherwise
+  // preserve the shared order.  No access or structured operation is rebuilt.
   SmallVector<Attribute> gridExtents;
   for (unsigned coordinateAxis : programOrder)
     gridExtents.push_back(mapping.getLaunchExtents()[coordinateAxis]);

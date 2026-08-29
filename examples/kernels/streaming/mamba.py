@@ -224,32 +224,19 @@ def mamba3_siso_step(
         for head in I.parallel(I.domain(0, MAMBA3_HEADS)):
             angle_region = angle_dimensions
             value_region = value_dimensions
-            pair_indices = I.indices(angle_region) * 2
             query_head = head // HEAD_GROUP
-            query_first = I.cast(
-                query[batch, query_head, pair_indices], I.f32
-            )
-            query_second = I.cast(
-                query[batch, query_head, pair_indices + 1], I.f32
-            )
-            key_first = I.cast(
-                key[batch, query_head, pair_indices], I.f32
-            )
-            key_second = I.cast(
-                key[batch, query_head, pair_indices + 1], I.f32
-            )
-            query_first = query_first + I.cast(
-                query_bias[head, pair_indices], I.f32
-            )
-            query_second = query_second + I.cast(
-                query_bias[head, pair_indices + 1], I.f32
-            )
-            key_first = key_first + I.cast(
-                key_bias[head, pair_indices], I.f32
-            )
-            key_second = key_second + I.cast(
-                key_bias[head, pair_indices + 1], I.f32
-            )
+            query_block = I.cast(
+                query[batch, query_head, qk_dimensions], I.f32
+            ) + I.cast(query_bias[head, qk_dimensions], I.f32)
+            key_block = I.cast(
+                key[batch, query_head, qk_dimensions], I.f32
+            ) + I.cast(key_bias[head, qk_dimensions], I.f32)
+            query_pairs = I.reshape(query_block, (angle_region, 2))
+            key_pairs = I.reshape(key_block, (angle_region, 2))
+            query_first = query_pairs[:, 0]
+            query_second = query_pairs[:, 1]
+            key_first = key_pairs[:, 0]
+            key_second = key_pairs[:, 1]
 
             angle_delta = (
                 2.0
@@ -291,41 +278,22 @@ def mamba3_siso_step(
             trap_value = I.sigmoid(trap[batch, head])
             beta = alpha * dt[batch, head] * (1.0 - trap_value)
             gamma = trap_value * dt[batch, head]
-            previous_key_first = input_key_state[
-                batch, head, pair_indices
-            ]
-            previous_key_second = input_key_state[
-                batch, head, pair_indices + 1
-            ]
+            previous_key = input_key_state[batch, head, qk_dimensions]
             previous_value = input_value_state[
                 batch, head, value_region
             ]
             current_value = I.cast(
                 value[batch, head, value_region], I.f32
             )
-            state_first = (
+            state = (
                 input_ssm_state[
-                    batch, head, value_region, pair_indices
+                    batch, head, value_region, qk_dimensions
                 ]
                 * alpha
                 + (beta * previous_value)[:, None]
-                * previous_key_first[None, :]
+                * previous_key[None, :]
                 + (gamma * current_value)[:, None]
-                * I.cast(rotated_key_first, I.f32)[None, :]
-            )
-            state_second = (
-                input_ssm_state[
-                    batch, head, value_region, pair_indices + 1
-                ]
-                * alpha
-                + (beta * previous_value)[:, None]
-                * previous_key_second[None, :]
-                + (gamma * current_value)[:, None]
-                * I.cast(rotated_key_second, I.f32)[None, :]
-            )
-            state = I.reshape(
-                I.join(state_first, state_second),
-                (value_region, qk_dimensions),
+                * I.cast(rotated_key, I.f32)[None, :]
             )
             output_ssm_state[batch, head, value_region, qk_dimensions] = state
             rotated_query = I.reshape(

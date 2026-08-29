@@ -23,9 +23,9 @@ fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,,,,candidate_contract_failed
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.236064,0.439768,0.536792,pass
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,,,,provider_program_verification_failed
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,,,,provider_program_verification_failed
-causal_conv1d_update,B32-D4096-W4-bf16,0.006496,0.006144,1.057292,pass
+causal_conv1d_update,B32-D4096-W4-bf16,0.006144,0.006152,0.998700,pass
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,,,,provider_program_verification_failed
-mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.012288,0.008720,1.409174,pass
+mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008536,0.008192,1.041992,pass
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,,,,source_device_resource_gap
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.387616,2.368848,1.007923,pass
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,9.478016,3.387672,2.797796,pass
