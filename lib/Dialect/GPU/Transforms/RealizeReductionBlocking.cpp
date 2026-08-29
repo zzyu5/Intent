@@ -176,7 +176,8 @@ FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
   auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[reductionAxis]);
   return projectPredicateToFragment(
       builder, location, predicate, source,
-      PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+      PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()});
 }
 
 void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
@@ -234,7 +235,8 @@ FailureOr<Value> clonePaddedProducer(
     auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
     auto padded = builder.create<MakeRangeOp>(
         location, paddedType, range.getStart(), physicalExtentValue,
-        range.getStep(), range.getSourceId(), range.getSourceAxis());
+        range.getStep(), range.getSourceId(), range.getSourceAxis(),
+        range.getDerived());
     if (Attribute origin = range->getAttr(originAttr))
       padded->setAttr(originAttr, origin);
     Value logicalLength = builder.create<arith::ConstantIndexOp>(
@@ -271,7 +273,8 @@ FailureOr<Value> clonePaddedProducer(
           FailureOr<Value> replayed = clonePaddedProducer(
               builder, location, broadcast.getValue(),
               PhysicalSourceAxis{inputMapping.getSourceId(),
-                                 inputMapping.getSourceAxis()},
+                                 inputMapping.getSourceAxis(),
+                                 inputMapping.getDerived()},
               logicalExtent, physicalExtent, physicalExtentValue, mapping,
               tailPredicates);
           if (failed(replayed))
@@ -508,7 +511,8 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalSourceAxis physicalSource{mapping->getSourceId(),
-                                    mapping->getSourceAxis()};
+                                    mapping->getSourceAxis(),
+                                    mapping->getDerived()};
   const bool repeatedOccurrence =
       queryFragmentAxes(fragment, physicalSource).size() > 1;
   PhysicalRangeFact fact =
@@ -643,7 +647,7 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), mappings.size()));
+        mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
@@ -923,7 +927,8 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     auto sourceMap = cast<AxisMapAttr>(
         originalType.getAxisMaps()[static_cast<unsigned>(reductionAxis)]);
     PhysicalSourceAxis reductionSource{sourceMap.getSourceId(),
-                                       sourceMap.getSourceAxis()};
+                                       sourceMap.getSourceAxis(),
+                                       sourceMap.getDerived()};
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
@@ -995,7 +1000,8 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[reductionAxis]);
     PhysicalRangeFact fact = analysis.sourceRanges(
         source,
-        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()});
     if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())
       fact = analysis.axisRanges(source, reductionAxis);
     for (MakeRangeOp candidate : fact.roots) {
@@ -1096,7 +1102,8 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
               "reduction free axis has no logical dimension authority");
         pending.emplace_back(
             source,
-            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()},
             mapping.getDimensionId());
         continue;
       }
@@ -1447,7 +1454,7 @@ FragmentType eraseFragmentAxes(FragmentType source,
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), mappings.size()));
+        mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
@@ -1739,7 +1746,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 auto clone = nested.create<MakeRangeOp>(
                     nestedLocation, rangeType, range.getStart(),
                     range.getExtent(), range.getStep(), range.getSourceId(),
-                    range.getSourceAxis());
+                    range.getSourceAxis(), range.getDerived());
                 if (Attribute value = range->getAttr(sourceSubregionAttr))
                   clone->setAttr(sourceSubregionAttr, value);
                 mapping.map(range.getResult(), clone.getResult());
@@ -1874,7 +1881,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   loop->setAttr(reductionTraversalSourceAttr,
                 PhysicalSourceAttr::get(builder.getContext(),
                                         master->range.getSourceId(),
-                                        master->range.getSourceAxis()));
+                                        master->range.getSourceAxis(),
+                                        master->range.getDerived()));
   for (auto [oldResult, newResult] :
        llvm::zip(reduce.getResults(), loop.getResults()))
     oldResult.replaceAllUsesWith(newResult);
@@ -2052,7 +2060,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         Value masterCoordinate = nested.create<MakeRangeOp>(
             nestedLocation, blockedMaster, chunkStart, chunk.getResult(),
             firstRange.getStep(), firstRange.getSourceId(),
-            firstRange.getSourceAxis());
+            firstRange.getSourceAxis(), firstRange.getDerived());
         Value masterEnd = nested.create<BroadcastOp>(nestedLocation,
                                                      blockedMaster, stop);
         auto masterPredicate = FragmentType::get(
@@ -2086,7 +2094,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             auto coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart,
                 chunk.getResult(), range.getStep(), range.getSourceId(),
-                range.getSourceAxis());
+                range.getSourceAxis(), range.getDerived());
             if (Attribute value = range->getAttr(sourceSubregionAttr))
               coordinate->setAttr(sourceSubregionAttr, value);
             mapping.map(range.getResult(), coordinate.getResult());
@@ -2126,7 +2134,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 range.getResult().getType().getOwner());
             Value coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart, chunk.getResult(),
-                range.getStep(), range.getSourceId(), range.getSourceAxis());
+                range.getStep(), range.getSourceId(), range.getSourceAxis(),
+                range.getDerived());
             if (!mapping.lookupOrNull(range.getResult())) {
               auto originalCoordinate = range.getResult().getType();
               auto replayCoordinate = FragmentType::get(
@@ -2461,7 +2470,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         range.getResult().getType().getOwner());
     Value coordinate = builder.create<MakeRangeOp>(
         reduce.getLoc(), blockedCoordinate, range.getStart(), physicalExtent,
-        range.getStep(), range.getSourceId(), range.getSourceAxis());
+        range.getStep(), range.getSourceId(), range.getSourceAxis(),
+        range.getDerived());
     Value stop = builder.create<BinaryOp>(
         reduce.getLoc(), builder.getIndexType(), range.getStart(),
         range.getExtent(), BinaryOperator::Add);

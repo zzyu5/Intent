@@ -468,7 +468,7 @@ FragmentType transposeLastTwo(FragmentType source) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), resultAxis));
+        mapping.getDimensionId(), resultAxis, mapping.getDerived()));
   }
   return FragmentType::get(
       source.getContext(), source.getElementType(),
@@ -550,7 +550,8 @@ FragmentType fragmentType(MLIRContext *context, Type element,
   for (auto [axis, source] : llvm::enumerate(sourceMappings))
     mappings.push_back(AxisMapAttr::get(context, source.getSourceId(),
                                         source.getSourceAxis(),
-                                        source.getDimensionId(), axis));
+                                        source.getDimensionId(), axis,
+                                        source.getDerived()));
   return FragmentType::get(context, element, ArrayAttr::get(context, extents),
                            ArrayAttr::get(context, mappings), 1, owner);
 }
@@ -765,7 +766,7 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
     auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
     mappings.push_back(AxisMapAttr::get(
         source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), mappings.size()));
+        mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
   }
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
@@ -1291,7 +1292,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           ValueRange carries) {
         Value lhsK = nested.create<MakeRangeOp>(
             nestedLocation, lhsIndexType, kStart, blockK.getResult(), one,
-            lhsMap->getSourceId(), lhsMap->getSourceAxis());
+            lhsMap->getSourceId(), lhsMap->getSourceAxis(),
+            lhsMap->getDerived());
         inheritRangeAuthority(lhsK, lhsRange);
         Value rhsOffset = binary(
             nested, nestedLocation, nested.getIndexType(), kStart,
@@ -1301,7 +1303,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             rhsRange.getStart(), rhsOffset, BinaryOperator::Add);
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
-            rhsMap->getSourceId(), rhsMap->getSourceAxis());
+            rhsMap->getSourceId(), rhsMap->getSourceAxis(),
+            rhsMap->getDerived());
         inheritRangeAuthority(rhsK, rhsRange);
         IRMapping lhsReplay;
         IRMapping rhsReplay;
@@ -1693,7 +1696,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
-      columnMap->getSourceId(), columnMap->getSourceAxis());
+      columnMap->getSourceId(), columnMap->getSourceAxis(),
+      columnMap->getDerived());
   inheritRangeAuthority(columns, columnRange);
   Value columnEnd = broadcast(builder, location, columnIndexType, columnStop);
   Value columnValid =
@@ -1703,7 +1707,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                           Value rowStart) -> LogicalResult {
     Value rows = rowBuilder.create<MakeRangeOp>(
         location, rowIndexType, rowStart, blockM.getResult(), one,
-        rowMap->getSourceId(), rowMap->getSourceAxis());
+        rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
     inheritRangeAuthority(rows, rowRange);
     Value rowEnd = broadcast(rowBuilder, location, rowIndexType, rowStop);
     Value rowValid =
@@ -1762,7 +1766,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
             ValueRange carries) {
           Value reductions = nested.create<MakeRangeOp>(
               nestedLocation, reductionIndexType, kStart, blockK.getResult(), one,
-              lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis());
+              lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis(),
+              lhsReductionMap->getDerived());
           inheritRangeAuthority(reductions, lhsReductionRange);
           Value reductionEnd =
               broadcast(nested, nestedLocation, reductionIndexType, reductionStop);
@@ -2386,11 +2391,12 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
 
   Value rows = builder.create<MakeRangeOp>(
       location, rowIndexType, rowStart, blockM.getResult(), one,
-      rowMap->getSourceId(), rowMap->getSourceAxis());
+      rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
   inheritRangeAuthority(rows, *rowRange);
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
-      columnMap->getSourceId(), columnMap->getSourceAxis());
+      columnMap->getSourceId(), columnMap->getSourceAxis(),
+      columnMap->getDerived());
   inheritRangeAuthority(columns, *columnRange);
   Value rowValid = compare(
       builder, location, rowPredicateType, rows,
@@ -2409,7 +2415,8 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
           ValueRange carries) {
         Value blocks = nested.create<MakeRangeOp>(
             nestedLocation, blockIndexType, blockStart, blockK.getResult(), one,
-            lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis());
+            lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis(),
+            lhsBlockMap->getDerived());
         inheritRangeAuthority(blocks, *blockRange);
         Value blockValid = compare(
             nested, nestedLocation, blockPredicateType, blocks,

@@ -27,7 +27,8 @@ Attribute dimensionAxisKey(MLIRContext *context, uint64_t dimension) {
 }
 
 Attribute sourceAxisKey(MLIRContext *context, PhysicalSourceAxis source) {
-  return PhysicalSourceAttr::get(context, source.sourceId, source.sourceAxis);
+  return PhysicalSourceAttr::get(context, source.sourceId, source.sourceAxis,
+                                 source.derived);
 }
 
 bool isSourceAxisKey(Attribute axis) { return isa<PhysicalSourceAttr>(axis); }
@@ -42,7 +43,8 @@ FailureOr<uint64_t> axisDimension(Attribute axis) {
 FailureOr<PhysicalSourceAxis> axisSource(Attribute axis) {
   auto source = dyn_cast<PhysicalSourceAttr>(axis);
   return source ? FailureOr<PhysicalSourceAxis>(PhysicalSourceAxis{
-                      source.getSourceId(), source.getSourceAxis()})
+                      source.getSourceId(), source.getSourceAxis(),
+                      source.getDerived()})
                 : FailureOr<PhysicalSourceAxis>(failure());
 }
 
@@ -82,7 +84,8 @@ FailureOr<Value> dimensionArgument(func::FuncOp kernel, uint64_t dimension) {
 FailureOr<uint64_t> rangeDimension(MakeRangeOp range) {
   FailureOr<int64_t> dimension = querySourceDimension(
       range.getResult().getType(),
-      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()});
   return succeeded(dimension) && *dimension > 0
              ? FailureOr<uint64_t>(*dimension)
              : FailureOr<uint64_t>(failure());
@@ -621,7 +624,8 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       llvm::SmallPtrSet<Operation *, 8> ranges;
       collectProducerRanges(
           histogram.getValues(),
-          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()},
           ranges);
       if (!ranges.contains(range.getOperation()))
         continue;
@@ -684,7 +688,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
           shape.push_back(extent);
           mappings.push_back(AxisMapAttr::get(
               store.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-              mapping.getDimensionId(), mappings.size()));
+              mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
         }
       }
       if (shape.empty())
@@ -905,7 +909,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no write effect");
 
-  PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis()};
+  PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
   std::string name = ("POINTWISE_CHUNK_S" + Twine(logicalSource.sourceId) +
                       "_A" + Twine(logicalSource.sourceAxis))
                          .str();
@@ -915,8 +920,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     auto source =
         parameter->getAttrOfType<PhysicalSourceAttr>(parameterSourceAttr);
     if (!parameter->hasAttr(pointwiseChunkAttr) || !source ||
-        !(PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()} ==
-          logicalSource))
+        !(PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis(),
+                             source.getDerived()} == logicalSource))
       return;
     if (chunk && chunk != parameter)
       ambiguousChunk = true;
@@ -938,7 +943,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     chunk->setAttr(parameterSourceAttr,
                    PhysicalSourceAttr::get(kernel.getContext(),
                                            logicalSource.sourceId,
-                                           logicalSource.sourceAxis));
+                                           logicalSource.sourceAxis,
+                                           logicalSource.derived));
     chunk->setAttr(pointwiseChunkAttr, entry.getUnitAttr());
     if (FailureOr<uint64_t> dimension = rangeDimension(range);
         succeeded(dimension))
@@ -979,7 +985,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       [&](OpBuilder &nested, Location location, Value tileStart, ValueRange) {
         Value blocked = nested.create<MakeRangeOp>(
             location, blockedType, tileStart, chunk.getResult(), range.getStep(),
-            range.getSourceId(), range.getSourceAxis());
+            range.getSourceId(), range.getSourceAxis(), range.getDerived());
         if (Attribute value = range->getAttr(sourceSubregionAttr))
           blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
@@ -1227,7 +1233,7 @@ LogicalResult rankLiftPointwiseValueGraph(
       shape.push_back(extent);
       mappings.push_back(AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), mappings.size()));
+          mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
     };
     for (auto [extent, mapping] : liftedAxes) {
       bool present = llvm::any_of(original.getAxisMaps(), [&](Attribute attribute) {
@@ -1254,7 +1260,7 @@ LogicalResult rankLiftPointwiseValueGraph(
       shape.push_back(extent);
       mappings.push_back(AxisMapAttr::get(
           kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), mappings.size()));
+          mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
     }
     return FragmentType::get(
         kernel.getContext(), element, ArrayAttr::get(kernel.getContext(), shape),
@@ -1355,11 +1361,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           builder.getArrayAttr({AxisMapAttr::get(
               module.getContext(), coordinate.getSourceId(),
               coordinate.getSourceAxis(), dimension,
-              /*fragmentAxis=*/0)}),
+              /*fragmentAxis=*/0, /*derived=*/false)}),
           /*validity=*/1, /*owner=*/1);
       auto range = builder.create<MakeRangeOp>(
           coordinate.getLoc(), type, coordinate.getResult(), extent, step,
-          coordinate.getSourceId(), coordinate.getSourceAxis());
+          coordinate.getSourceId(), coordinate.getSourceAxis(),
+          /*derived=*/false);
       range->setAttr(worksetCoordinateRangeAttr, builder.getUnitAttr());
       coordinate.getResult().replaceAllUsesExcept(range.getResult(), range);
       liftedRanges.push_back(range);
@@ -1417,7 +1424,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
     collectProducerRanges(
         source,
-        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()},
         ranges);
   };
   std::function<void(Value, llvm::SmallPtrSetImpl<Operation *> &)>
@@ -1437,7 +1445,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto mapping = cast<AxisMapAttr>(attribute);
       collectProducerRanges(
           value,
-          PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+          PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()},
           ranges);
     }
   };
@@ -1450,7 +1459,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
       PhysicalSourceAxis physical{mapping.getSourceId(),
-                                  mapping.getSourceAxis()};
+                                  mapping.getSourceAxis(),
+                                  mapping.getDerived()};
       if (!llvm::is_contained(segmentSources, physical))
         segmentSources.push_back(physical);
     }
@@ -1458,7 +1468,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       region.walk([&](MakeRangeOp range) {
         if (llvm::is_contained(
                 segmentSources,
-                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()}))
+                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()}))
           structuredTraversalRanges.insert(range.getOperation());
       });
   };
@@ -1480,31 +1491,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (dimension > 0)
           scanSegmentDimensions.insert(static_cast<uint64_t>(dimension));
         scanSegmentSources.insert(
-            {mapping.getSourceId(), mapping.getSourceAxis()});
+            {mapping.getSourceId(), mapping.getSourceAxis(),
+             mapping.getDerived()});
       }
     }
-    auto collectProtectedSources = [&](Type type) {
-      auto fragment = dyn_cast<FragmentType>(type);
-      if (!fragment)
-        return;
-      for (Attribute attribute : fragment.getAxisMaps()) {
-        auto mapping = cast<AxisMapAttr>(attribute);
-        scanSegmentSources.insert(
-            {mapping.getSourceId(), mapping.getSourceAxis()});
-      }
-    };
-    for (Type type : scan->getOperandTypes())
-      collectProtectedSources(type);
-    for (Type type : scan->getResultTypes())
-      collectProtectedSources(type);
-    for (Region &region : scan->getRegions())
-      for (Block &block : region) {
-        for (BlockArgument argument : block.getArguments())
-          collectProtectedSources(argument.getType());
-        for (Operation &operation : block)
-          for (Type type : operation.getResultTypes())
-            collectProtectedSources(type);
-      }
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
   kernel.walk([&](ReduceOp reduce) {
@@ -1543,7 +1533,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
         PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
             source,
-            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()},
             PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
         bool structuredBlocker = llvm::any_of(
             replay.blockers, [](Operation *blocker) {
@@ -1598,8 +1589,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
-      PhysicalSourceAxis logicalSource{range.getSourceId(),
-                                       range.getSourceAxis()};
+      PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
       if (structuredSources.contains(logicalSource))
         continue;
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
@@ -1689,7 +1680,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           exactDistance, BinaryOperator::Add);
       auto blocked = builder.create<MakeRangeOp>(
           range.getLoc(), fragment, range.getStart(), extent, range.getStep(),
-          range.getSourceId(), range.getSourceAxis());
+          range.getSourceId(), range.getSourceAxis(), range.getDerived());
       if (Attribute value = range->getAttr(sourceSubregionAttr))
         blocked->setAttr(sourceSubregionAttr, value);
       Value endFragment =
@@ -1729,7 +1720,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         PhysicalProgramAnalysis analysis(kernel);
         PhysicalReplayFact replay = analysis.replayability(
             store.getValue(),
-            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()},
             PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
         replayable &= replay.isReplayable();
       }
@@ -1787,7 +1779,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       for (Attribute attribute : fragment.getAxisMaps()) {
         auto mapping = cast<AxisMapAttr>(attribute);
         ownershipSources.insert(
-            {mapping.getSourceId(), mapping.getSourceAxis()});
+            {mapping.getSourceId(), mapping.getSourceAxis(),
+             mapping.getDerived()});
       }
     }
   };
@@ -1812,7 +1805,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Attribute attribute : fragment.getAxisMaps()) {
       auto mapping = cast<AxisMapAttr>(attribute);
       ownershipSources.insert(
-          {mapping.getSourceId(), mapping.getSourceAxis()});
+          {mapping.getSourceId(), mapping.getSourceAxis(),
+           mapping.getDerived()});
     }
   });
   // Structured traversal ownership is attached to the exact range operations
@@ -1865,7 +1859,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallDenseSet<Attribute> internalAxes;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
-    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
     return ownershipSources.contains(source) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
@@ -1895,7 +1890,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     FailureOr<uint64_t> dimension = rangeDimension(range);
     if (failed(dimension) || !hasPointwiseOwnership(range))
       continue;
-    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
     uint64_t dimensionId = *dimension;
     sourceDimensions[source] = dimensionId;
     if (!llvm::is_contained(dimensionSources[dimensionId], source))
@@ -1921,7 +1917,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       jointOwnershipDimensions.insert(dimensionId);
   }
   for (MakeRangeOp range : dynamicRanges) {
-    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
     if (!hasPointwiseOwnership(range)) {
       internalTraversalRanges.insert(range.getOperation());
       continue;
@@ -2012,7 +2009,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         }
         OpBuilder builder(&kernel.getBody().front(),
                           kernel.getBody().front().begin());
-        PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+        PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
         auto schema = ParameterAttr::get(
             module.getContext(),
             builder.getStringAttr(launchVisibleDimension
@@ -2033,7 +2031,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           (*parameter)->setAttr(
               parameterSourceAttr,
               PhysicalSourceAttr::get(module.getContext(), source.sourceId,
-                                      source.sourceAxis));
+                                      source.sourceAxis, source.derived));
       }
     }
     FailureOr<Attribute> axis =
@@ -2082,14 +2080,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Attribute axis : ownershipAxes) {
       bool losesPromotedAxis = false;
       for (MakeRangeOp range : axes.lookup(axis)) {
-        PhysicalSourceAxis sourceAxis{range.getSourceId(),
-                                      range.getSourceAxis()};
+        PhysicalSourceAxis sourceAxis{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
         kernel.walk([&](BroadcastOp broadcast) {
           auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
           auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
           if (!source || !target ||
-              !queryFragmentAxis(source, sourceAxis).isExact() ||
-              queryFragmentAxis(target, sourceAxis).isExact())
+              queryFragmentAxes(source, sourceAxis).empty() ||
+              !queryFragmentAxes(target, sourceAxis).empty())
             return;
           losesPromotedAxis = true;
         });
@@ -2156,7 +2154,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             llvm::SmallPtrSet<Operation *, 8> ranges;
             collectProducerRanges(
                 coordinate,
-                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()},
                 ranges);
             if (!ranges.empty())
               sourceAxis = std::max(sourceAxis,
@@ -2194,7 +2193,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         // types or the provider tuning surface.
         retargetSourceExtent(
             range.getResult(),
-            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                           range.getDerived()},
             unitExtent);
       }
     }
@@ -2422,7 +2422,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             parameter.getParameter().getName().getValue());
         llvm::SmallDenseSet<PhysicalSourceAxis> propagatedSources;
         for (MakeRangeOp range : axes.lookup(*axisKey)) {
-          PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+          PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
           if (propagatedSources.insert(source).second)
             retargetSourceExtent(newCoordinate, source, extent);
         }
@@ -2542,7 +2543,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         sourceType.getOwner());
     Value blocked = builder.create<MakeRangeOp>(
         range.getLoc(), blockedType, start, parameter->getResult(),
-        range.getStep(), range.getSourceId(), range.getSourceAxis());
+        range.getStep(), range.getSourceId(), range.getSourceAxis(),
+        range.getDerived());
     if (Attribute value = range->getAttr(sourceSubregionAttr))
       blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);

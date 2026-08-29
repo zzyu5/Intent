@@ -46,7 +46,8 @@ FragmentType replaceSliceAxis(FragmentType source, unsigned axis,
   shape[axis] = extent;
   mappings[axis] = AxisMapAttr::get(
       source.getContext(), segmentMapping.getSourceId(),
-      segmentMapping.getSourceAxis(), segmentMapping.getDimensionId(), axis);
+      segmentMapping.getSourceAxis(), segmentMapping.getDimensionId(), axis,
+      segmentMapping.getDerived());
   return FragmentType::get(
       source.getContext(), source.getElementType(),
       ArrayAttr::get(source.getContext(), shape),
@@ -354,7 +355,8 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
           replaceSliceAxis(rangeType, 0, sliceExtent, segmentMapping);
       Value value = builder.create<MakeRangeOp>(
           location, blockedRange, start, segment, range.getStep(),
-          segmentMapping.getSourceId(), segmentMapping.getSourceAxis());
+          segmentMapping.getSourceId(), segmentMapping.getSourceAxis(),
+          segmentMapping.getDerived());
       if (Attribute inherited = range->getAttr(sourceSubregionAttr))
         value.getDefiningOp()->setAttr(sourceSubregionAttr, inherited);
       Value logicalStop = builder.create<BinaryOp>(
@@ -406,19 +408,21 @@ struct ExtentBinding {
   uint64_t sourceId;
   uint64_t sourceAxis;
   int64_t dimensionId;
+  bool derived;
   Attribute extent;
   uint64_t actualSourceId;
   uint64_t actualSourceAxis;
   int64_t actualDimensionId;
+  bool actualDerived;
 };
 
 const ExtentBinding *findBinding(ArrayRef<ExtentBinding> bindings,
                                  uint64_t sourceId, uint64_t sourceAxis,
-                                 int64_t dimensionId) {
+                                 int64_t dimensionId, bool derived) {
   auto found = llvm::find_if(bindings, [&](const ExtentBinding &binding) {
     return binding.sourceId == sourceId &&
            binding.sourceAxis == sourceAxis &&
-           binding.dimensionId == dimensionId;
+           binding.dimensionId == dimensionId && binding.derived == derived;
   });
   return found == bindings.end() ? nullptr : &*found;
 }
@@ -458,11 +462,13 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
       if (const ExtentBinding *existing =
               findBinding(bindings, expectedMap.getSourceId(),
                           expectedMap.getSourceAxis(),
-                          expectedMap.getDimensionId())) {
+                          expectedMap.getDimensionId(),
+                          expectedMap.getDerived())) {
         if (existing->extent != extent ||
             existing->actualSourceId != actualMap.getSourceId() ||
             existing->actualSourceAxis != actualMap.getSourceAxis() ||
-            existing->actualDimensionId != actualMap.getDimensionId()) {
+            existing->actualDimensionId != actualMap.getDimensionId() ||
+            existing->actualDerived != actualMap.getDerived()) {
           reason = "helper arguments bind one logical axis to incompatible physical extents";
           return failure();
         }
@@ -470,10 +476,11 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
       }
       bindings.push_back({expectedMap.getSourceId(),
                           expectedMap.getSourceAxis(),
-                          expectedMap.getDimensionId(), extent,
+                          expectedMap.getDimensionId(), expectedMap.getDerived(),
+                          extent,
                           actualMap.getSourceId(),
                           actualMap.getSourceAxis(),
-                          actualMap.getDimensionId()});
+                          actualMap.getDimensionId(), actualMap.getDerived()});
     }
     return success();
   }
@@ -494,12 +501,13 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
   return success();
 }
 
-bool carriesAxis(Type type, uint64_t sourceId, uint64_t sourceAxis) {
+bool carriesAxis(Type type, AxisMapAttr expected) {
   auto fragment = dyn_cast<FragmentType>(type);
   return fragment && llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
            auto mapping = cast<AxisMapAttr>(attribute);
-           return mapping.getSourceId() == sourceId &&
-                  mapping.getSourceAxis() == sourceAxis;
+           return mapping.getSourceId() == expected.getSourceId() &&
+                  mapping.getSourceAxis() == expected.getSourceAxis() &&
+                  mapping.getDerived() == expected.getDerived();
          });
 }
 
@@ -515,15 +523,15 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
       auto mapping = cast<AxisMapAttr>(attribute);
       const ExtentBinding *binding =
           findBinding(bindings, mapping.getSourceId(),
-                      mapping.getSourceAxis(), mapping.getDimensionId());
+                      mapping.getSourceAxis(), mapping.getDimensionId(),
+                      mapping.getDerived());
       if (!binding)
         continue;
       bool introducedUnitAxis = false;
       if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
         introducedUnitAxis =
             isUnitExtent(shape[axis]) &&
-            !carriesAxis(reshape.getValue().getType(), mapping.getSourceId(),
-                         mapping.getSourceAxis());
+            !carriesAxis(reshape.getValue().getType(), mapping);
       }
       if (introducedUnitAxis)
         continue;
@@ -532,10 +540,12 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
         changed = true;
       }
       if (mapping.getSourceId() != binding->actualSourceId ||
-          mapping.getSourceAxis() != binding->actualSourceAxis) {
+          mapping.getSourceAxis() != binding->actualSourceAxis ||
+          mapping.getDerived() != binding->actualDerived) {
         mappings[axis] = AxisMapAttr::get(
             type.getContext(), binding->actualSourceId,
-            binding->actualSourceAxis, binding->actualDimensionId, axis);
+            binding->actualSourceAxis, binding->actualDimensionId, axis,
+            binding->actualDerived);
         changed = true;
       }
     }
@@ -639,7 +649,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
               {AxisMapAttr::get(target.getContext(),
                                 targetMapping.getSourceId(),
                                 targetMapping.getSourceAxis(),
-                                targetMapping.getDimensionId(), 0)}),
+                                targetMapping.getDimensionId(), 0,
+                                targetMapping.getDerived())}),
           target.getValidity(), target.getOwner());
       if (predicate.getType() != projected)
         predicate = builder.create<BroadcastOp>(value.getLoc(), projected,
@@ -1056,11 +1067,19 @@ bool scanTailIsIdentity(RegionScanOp scan, ArrayRef<SourcePlan> plans,
 }
 
 FailureOr<Type> slicedType(Type type, PhysicalSourceAxis source,
-                           PhysicalExprAttr extent) {
+                           PhysicalExprAttr extent,
+                           Operation *producer = nullptr) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
     PhysicalAxisProjection axis = queryFragmentAxis(fragment, source);
     if (!axis.isExact())
       return type;
+    if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
+      bool introducedUnitAxis =
+          isUnitExtent(fragment.getShape()[axis.fragmentAxis]) &&
+          queryFragmentAxes(reshape.getValue().getType(), source).empty();
+      if (introducedUnitAxis)
+        return type;
+    }
     return Type(replaceExtent(fragment, axis.fragmentAxis, extent));
   }
   if (auto record = dyn_cast<RecordType>(type)) {
@@ -1172,7 +1191,7 @@ FailureOr<Value> materializeScanConsumerValue(
     }
     Value result = builder.create<MakeRangeOp>(
         location, physicalType, physicalStart, physicalExtent, *step,
-        range.getSourceId(), range.getSourceAxis());
+        range.getSourceId(), range.getSourceAxis(), range.getDerived());
     mapping.map(value, result);
     return result;
   }
@@ -1193,7 +1212,8 @@ FailureOr<Value> materializeScanConsumerValue(
   Operation *clone = builder.clone(*definition, mapping);
   for (auto [original, result] :
        llvm::zip(definition->getResults(), clone->getResults())) {
-    FailureOr<Type> type = slicedType(result.getType(), source, sliceExtent);
+    FailureOr<Type> type =
+        slicedType(result.getType(), source, sliceExtent, clone);
     if (failed(type))
       return failure();
     result.setType(*type);
@@ -1255,7 +1275,8 @@ LogicalResult cloneScanOutputConsumers(
     Operation *clone = builder.clone(*operation, mapping);
     for (auto [original, result] :
          llvm::zip(operation->getResults(), clone->getResults())) {
-      FailureOr<Type> type = slicedType(result.getType(), source, sliceExtent);
+      FailureOr<Type> type =
+          slicedType(result.getType(), source, sliceExtent, clone);
       if (failed(type)) {
         reason = "region-scan output consumer has no sliced physical type";
         return failure();

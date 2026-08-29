@@ -19,9 +19,11 @@ namespace intent::gpu {
 struct PhysicalSourceAxis {
   uint64_t sourceId = 0;
   uint64_t sourceAxis = 0;
+  bool derived = false;
 
   bool operator==(const PhysicalSourceAxis &other) const {
-    return sourceId == other.sourceId && sourceAxis == other.sourceAxis;
+    return sourceId == other.sourceId && sourceAxis == other.sourceAxis &&
+           derived == other.derived;
   }
 };
 
@@ -219,14 +221,15 @@ namespace llvm {
 template <> struct DenseMapInfo<intent::gpu::PhysicalSourceAxis> {
   static inline intent::gpu::PhysicalSourceAxis getEmptyKey() {
     return {DenseMapInfo<uint64_t>::getEmptyKey(),
-            DenseMapInfo<uint64_t>::getEmptyKey()};
+            DenseMapInfo<uint64_t>::getEmptyKey(), false};
   }
   static inline intent::gpu::PhysicalSourceAxis getTombstoneKey() {
     return {DenseMapInfo<uint64_t>::getTombstoneKey(),
-            DenseMapInfo<uint64_t>::getTombstoneKey()};
+            DenseMapInfo<uint64_t>::getTombstoneKey(), false};
   }
   static unsigned getHashValue(const intent::gpu::PhysicalSourceAxis &value) {
-    return static_cast<unsigned>(hash_combine(value.sourceId, value.sourceAxis));
+    return static_cast<unsigned>(
+        hash_combine(value.sourceId, value.sourceAxis, value.derived));
   }
   static bool isEqual(const intent::gpu::PhysicalSourceAxis &lhs,
                       const intent::gpu::PhysicalSourceAxis &rhs) {

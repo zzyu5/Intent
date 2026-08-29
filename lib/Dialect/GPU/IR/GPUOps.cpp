@@ -334,7 +334,8 @@ LogicalResult MakeRangeOp::verify() {
     return emitOpError("physical range must produce a rank-one index fragment");
   auto mapping = dyn_cast<AxisMapAttr>(result.getAxisMaps()[0]);
   if (!mapping || mapping.getSourceId() != static_cast<uint64_t>(getSourceId()) ||
-      mapping.getSourceAxis() != static_cast<uint32_t>(getSourceAxis()))
+      mapping.getSourceAxis() != static_cast<uint32_t>(getSourceAxis()) ||
+      mapping.getDerived() != getDerived())
     return emitOpError("physical range result lost logical provenance");
   return success();
 }
@@ -436,9 +437,10 @@ LogicalResult ReshapeOp::verify() {
   auto result = dyn_cast<FragmentType>(getResult().getType());
   if (!source || !result || source.getElementType() != result.getElementType() ||
       source.getOwner() != result.getOwner() || !getReassociation() ||
-      !sameElementCount(source, result))
+      !sameElementCount(source, result)) {
     return emitOpError("reshape physical schema is invalid: source=")
            << getValue().getType() << ", result=" << getResult().getType();
+  }
   unsigned nextSource = 0;
   unsigned nextResult = 0;
   for (Attribute attribute : getReassociation()) {
@@ -855,7 +857,9 @@ LogicalResult RegionScanOp::verify() {
   for (unsigned index = 0; index < stateCount; ++index) {
     Type state = getInputs()[stateOffset + index].getType();
     if (state != getResults()[outputCount + index].getType())
-      return emitOpError("region-scan final-state type disagrees");
+      return emitOpError("region-scan final-state type disagrees: input=")
+             << state << ", result="
+             << getResults()[outputCount + index].getType();
     states.push_back(state);
   }
   SmallVector<Type> captures;

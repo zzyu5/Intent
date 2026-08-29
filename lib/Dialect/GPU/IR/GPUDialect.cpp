@@ -96,9 +96,11 @@ LogicalResult ParameterAttr::verify(
 
 LogicalResult AxisMapAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, uint64_t sourceId,
-    uint32_t sourceAxis, int64_t dimensionId, uint32_t fragmentAxis) {
+    uint32_t sourceAxis, int64_t dimensionId, uint32_t fragmentAxis,
+    bool derived) {
   (void)sourceAxis;
   (void)fragmentAxis;
+  (void)derived;
   return sourceId != 0 && dimensionId > 0
              ? success()
              : emitError()
@@ -202,8 +204,9 @@ LogicalResult FragmentType::verify(
 
 LogicalResult RangeType::verify(function_ref<InFlightDiagnostic()> emitError,
                                 uint64_t sourceId, uint32_t sourceAxis,
-                                int64_t dimensionId) {
+                                int64_t dimensionId, bool derived) {
   (void)sourceAxis;
+  (void)derived;
   return sourceId != 0 && dimensionId > 0
              ? success()
              : emitError()

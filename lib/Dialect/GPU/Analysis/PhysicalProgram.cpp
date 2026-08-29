@@ -155,8 +155,8 @@ bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
     if (axis < 0 || axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
       continue;
     auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
-    if (PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()} ==
-        source)
+    if (PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis(),
+                           mapping.getDerived()} == source)
       return true;
   }
   return false;
@@ -198,7 +198,8 @@ PhysicalParameterBinding queryParameterBinding(ParameterOp parameter) {
   if (auto source =
           parameter->getAttrOfType<PhysicalSourceAttr>(parameterSourceAttr))
     result.source =
-        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()};
+        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis(),
+                           source.getDerived()};
   result.state = result.dimension || result.source ? PhysicalFactState::Exact
                                                    : PhysicalFactState::Unknown;
   return result;
@@ -230,7 +231,8 @@ FailureOr<ParameterOp> queryBlockingParameter(func::FuncOp kernel,
                     static_cast<uint32_t>(PhysicalExprKind::Parameter))
     return queryParameterBySymbol(kernel, extent.getSymbol());
 
-  PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+  PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                            range.getDerived()};
   FailureOr<int64_t> dimension = queryRangeDimension(range);
   ParameterOp sourceMatch;
   ParameterOp dimensionMatch;
@@ -279,7 +281,8 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
     if (mapping.getSourceId() != source.sourceId ||
-        mapping.getSourceAxis() != source.sourceAxis)
+        mapping.getSourceAxis() != source.sourceAxis ||
+        mapping.getDerived() != source.derived)
       continue;
     if ((axis && *axis != mapping.getFragmentAxis()) ||
         (dimension && *dimension != mapping.getDimensionId())) {
@@ -321,7 +324,8 @@ bool samePhysicalScalarExpression(Value lhs, Value rhs) {
 
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   if (!lhs || !rhs || lhs.getSourceId() != rhs.getSourceId() ||
-      lhs.getSourceAxis() != rhs.getSourceAxis())
+      lhs.getSourceAxis() != rhs.getSourceAxis() ||
+      lhs.getDerived() != rhs.getDerived())
     return false;
   FailureOr<int64_t> leftDimension = queryRangeDimension(lhs);
   FailureOr<int64_t> rightDimension = queryRangeDimension(rhs);
@@ -359,7 +363,8 @@ queryFragmentAxes(Type type, PhysicalSourceAxis source) {
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
     if (mapping.getSourceId() != source.sourceId ||
-        mapping.getSourceAxis() != source.sourceAxis)
+        mapping.getSourceAxis() != source.sourceAxis ||
+        mapping.getDerived() != source.derived)
       continue;
     results.push_back(PhysicalAxisProjection{
         PhysicalFactState::Exact, source, mapping.getDimensionId(),
@@ -399,6 +404,7 @@ FailureOr<int64_t> querySourceDimension(Type type, PhysicalSourceAxis source) {
   if (auto range = dyn_cast<RangeType>(type))
     return range.getSourceId() == source.sourceId &&
                    range.getSourceAxis() == source.sourceAxis &&
+                   range.getDerived() == source.derived &&
                    range.getDimensionId() > 0
                ? FailureOr<int64_t>(range.getDimensionId())
                : FailureOr<int64_t>(failure());
@@ -418,7 +424,7 @@ PhysicalAxisProjection queryUniqueSourceAxis(Type type, uint64_t sourceId) {
   std::optional<int64_t> dimension;
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getSourceId() != sourceId)
+    if (mapping.getSourceId() != sourceId || mapping.getDerived())
       continue;
     PhysicalSourceAxis current{mapping.getSourceId(),
                                mapping.getSourceAxis()};
@@ -526,7 +532,8 @@ bool PhysicalProgramAnalysis::carriesSource(Type type,
     return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
       auto mapping = cast<AxisMapAttr>(attribute);
       return mapping.getSourceId() == source.sourceId &&
-             mapping.getSourceAxis() == source.sourceAxis;
+             mapping.getSourceAxis() == source.sourceAxis &&
+             mapping.getDerived() == source.derived;
     });
   if (auto record = dyn_cast<RecordType>(type))
     return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
@@ -601,7 +608,8 @@ void PhysicalProgramAnalysis::collectRanges(
     return;
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
     if (!source || (range.getSourceId() == source->sourceId &&
-                    range.getSourceAxis() == source->sourceAxis))
+                    range.getSourceAxis() == source->sourceAxis &&
+                    range.getDerived() == source->derived))
       appendUnique(result.roots, range);
     return;
   }
@@ -701,7 +709,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
           cast<AxisMapAttr>(sourceType.getAxisMaps()[fragmentAxis]);
       if (mapping.getSourceId() != expected.getSourceId() ||
           mapping.getSourceAxis() != expected.getSourceAxis() ||
-          mapping.getDimensionId() != expected.getDimensionId())
+          mapping.getDimensionId() != expected.getDimensionId() ||
+          mapping.getDerived() != expected.getDerived())
         continue;
       followed = true;
       collectAxisRanges(scanSource, fragmentAxis, result, visited);
@@ -742,7 +751,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
         auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
         if (mapping.getSourceId() != expected.getSourceId() ||
             mapping.getSourceAxis() != expected.getSourceAxis() ||
-            mapping.getDimensionId() != expected.getDimensionId())
+            mapping.getDimensionId() != expected.getDimensionId() ||
+            mapping.getDerived() != expected.getDerived())
           continue;
         if (inputAxis) {
           result.state = PhysicalFactState::Ambiguous;
@@ -793,7 +803,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
           coordinateType.getAxisMaps()[fragmentAxis]);
       if (mapping.getSourceId() != expected.getSourceId() ||
           mapping.getSourceAxis() != expected.getSourceAxis() ||
-          mapping.getDimensionId() != expected.getDimensionId())
+          mapping.getDimensionId() != expected.getDimensionId() ||
+          mapping.getDerived() != expected.getDerived())
         continue;
       if (found) {
         result.state = PhysicalFactState::Ambiguous;
@@ -1037,7 +1048,8 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
           loop->getAttrOfType<PhysicalSourceAttr>(reductionTraversalSourceAttr);
       if (traversal &&
           PhysicalSourceAxis{traversal.getSourceId(),
-                             traversal.getSourceAxis()} == source) {
+                             traversal.getSourceAxis(),
+                             traversal.getDerived()} == source) {
         exact.depends = true;
         return exact;
       }

@@ -36,10 +36,11 @@ def IntentGPU_AxisMapAttr : AttrDef<IntentGPU_Dialect, "AxisMap"> {
     "uint64_t":$sourceId,
     "uint32_t":$sourceAxis,
     "int64_t":$dimensionId,
-    "uint32_t":$fragmentAxis
+    "uint32_t":$fragmentAxis,
+    "bool":$derived
   );
   let assemblyFormat =
-      "`<` $sourceId `,` $sourceAxis `,` $dimensionId `,` $fragmentAxis `>`";
+      "`<` $sourceId `,` $sourceAxis `,` $dimensionId `,` $fragmentAxis `,` $derived `>`";
   let genVerifyDecl = 1;
 }
 
@@ -48,9 +49,10 @@ def IntentGPU_PhysicalSourceAttr : AttrDef<IntentGPU_Dialect, "PhysicalSource"> 
   let summary = "One immutable logical source-axis identity";
   let parameters = (ins
     "uint64_t":$sourceId,
-    "uint32_t":$sourceAxis
+    "uint32_t":$sourceAxis,
+    "bool":$derived
   );
-  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `>`";
+  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `,` $derived `>`";
 }
 
 def IntentGPU_ReshapeGroupAttr : AttrDef<IntentGPU_Dialect, "ReshapeGroup"> {

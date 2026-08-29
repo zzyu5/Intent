@@ -42,9 +42,11 @@ def IntentGPU_RangeType : TypeDef<IntentGPU_Dialect, "Range"> {
   let parameters = (ins
     "uint64_t":$sourceId,
     "uint32_t":$sourceAxis,
-    "int64_t":$dimensionId
+    "int64_t":$dimensionId,
+    "bool":$derived
   );
-  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `,` $dimensionId `>`";
+  let assemblyFormat =
+      "`<` $sourceId `,` $sourceAxis `,` $dimensionId `,` $derived `>`";
   let genVerifyDecl = 1;
 }
 
