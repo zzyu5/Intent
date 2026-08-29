@@ -72,8 +72,7 @@ bool isUnitExtent(Attribute attribute) {
 
 struct SourcePlan {
   Value source;
-  uint64_t sourceId;
-  uint64_t logicalSourceAxis;
+  PhysicalSourceAxis sourceIdentity;
   unsigned sourceAxis;
   bool hasLoads;
   SmallVector<MakeRangeOp> ranges;
@@ -86,15 +85,12 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, sourceAxis);
   if (failed(mapping))
     return failure();
-  SourcePlan plan{source, mapping->getSourceId(), mapping->getSourceAxis(),
-                  sourceAxis, false, {}};
+  SourcePlan plan{source, sourceAxisIdentity(*mapping), sourceAxis, false, {}};
   auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalSourceAxis logicalSource{mapping->getSourceId(),
-                                   mapping->getSourceAxis()};
-  PhysicalRangeFact fact = analysis.sourceRanges(source, logicalSource);
+  PhysicalRangeFact fact = analysis.axisRanges(source, sourceAxis);
   if (failed(queryExactLogicalRange(fact)))
     return failure();
   plan.ranges.assign(fact.roots.begin(), fact.roots.end());
@@ -154,8 +150,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     auto targetAxis = cast<AxisMapAttr>(type.getAxisMaps()[*axis]);
     FailureOr<Value> tail = projectPredicateToFragment(
         builder, location, segmentTail, type,
-        PhysicalSourceAxis{targetAxis.getSourceId(),
-                           targetAxis.getSourceAxis()});
+        sourceAxisIdentity(targetAxis));
     if (failed(tail))
       return failure();
     if (!valid)
@@ -332,7 +327,8 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       bool sameSliceSchema =
           candidate.source == plan.source &&
           sliceTypes[previous] == sliceTypes[planIndex];
-      if (sameSliceSchema && candidate.sourceId == plan.sourceId &&
+      if (sameSliceSchema &&
+          candidate.sourceIdentity == plan.sourceIdentity &&
           candidate.sourceAxis == plan.sourceAxis &&
           candidate.ranges == plan.ranges) {
         sharedRelation = previous;
@@ -385,8 +381,7 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       return failure();
     }
     FailureOr<Value> replayed = replayValue(
-        builder, location, plan.source,
-        PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis}, sliceExtent,
+        builder, location, plan.source, plan.sourceIdentity, sliceExtent,
         mapping, tail, segmentMapping);
     if (failed(replayed)) {
       reason = "source pure producer graph cannot be replayed";
@@ -442,7 +437,8 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
            llvm::enumerate(actualFragment.getAxisMaps())) {
         auto actualMap = cast<AxisMapAttr>(candidate);
         if (actualMap.getSourceId() == expectedMap.getSourceId() &&
-            actualMap.getSourceAxis() == expectedMap.getSourceAxis()) {
+            actualMap.getSourceAxis() == expectedMap.getSourceAxis() &&
+            actualMap.getDerived() == expectedMap.getDerived()) {
           actualAxis = axis;
           break;
         }
@@ -1425,8 +1421,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   kernel.walk([&](AssumeInBoundsOp assumption) {
     for (auto [planIndex, plan] : llvm::enumerate(plans)) {
       PhysicalRangeFact fact = physicalAnalysis.sourceRanges(
-          assumption.getIndex(),
-          PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis});
+          assumption.getIndex(), plan.sourceIdentity);
       FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
       if (failed(range) ||
           llvm::none_of(fact.roots, [&](MakeRangeOp root) {
@@ -1436,9 +1431,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           }))
         continue;
       sourceAssumptions.push_back(
-          {assumption,
-           PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis},
-           static_cast<unsigned>(planIndex)});
+          {assumption, plan.sourceIdentity, static_cast<unsigned>(planIndex)});
       break;
     }
   });
@@ -1693,8 +1686,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           sliceMapping.map(output, slice);
         if (failed(cloneScanOutputConsumers(
                 nested, nestedLocation, outputConsumers, sliceMapping,
-                PhysicalSourceAxis{plans.front().sourceId,
-                                   plans.front().logicalSourceAxis},
+                plans.front().sourceIdentity,
                 sliceExtent, segmentTail,
                 scan, offset, segment.getResult(), failureReason))) {
           bodyFailed = true;

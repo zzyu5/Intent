@@ -193,7 +193,7 @@ bool hasExplicitPairedReductionRanges(ContractOp contract) {
     SmallVector<MakeRangeOp> ranges;
     if (failed(collectProducerRanges(
             value,
-            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            sourceAxisIdentity(mapping),
             ranges)) ||
         ranges.empty())
       return false;
@@ -704,14 +704,13 @@ bool hasRangeContractForm(ContractOp contract) {
   for (auto [load, mapping] : axes) {
     FailureOr<unsigned> coordinate = queryCoordinatePosition(
         load.getCoordinates(),
-        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+        sourceAxisIdentity(mapping));
     if (failed(coordinate))
       return false;
     Value value = load.getCoordinates()[*coordinate];
     if (!sourceRange(value) &&
         failed(producerRange(
-            value, PhysicalSourceAxis{mapping.getSourceId(),
-                                      mapping.getSourceAxis()})))
+            value, sourceAxisIdentity(mapping))))
       return false;
   }
   SmallVector<StorePath> paths;
@@ -782,15 +781,14 @@ FragmentType retargetFragmentToCoordinateRanges(
     auto mapping = cast<AxisMapAttr>(attribute);
     FailureOr<unsigned> coordinate = queryCoordinatePosition(
         coordinates,
-        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+        sourceAxisIdentity(mapping));
     if (failed(coordinate))
       continue;
     MakeRangeOp range = sourceRange(coordinates[*coordinate]);
     if (!range) {
       FailureOr<MakeRangeOp> root =
           producerRange(coordinates[*coordinate],
-                        PhysicalSourceAxis{mapping.getSourceId(),
-                                           mapping.getSourceAxis()});
+                        sourceAxisIdentity(mapping));
       if (succeeded(root))
         range = *root;
     }
@@ -915,7 +913,7 @@ FailureOr<Value> projectPredicateForScalarAxis(
     return Value();
   if (!containsSource(
           value,
-          PhysicalSourceAxis{root.getSourceId(), root.getSourceAxis()})) {
+          sourceAxisIdentity(root))) {
     if (value.getType() == target)
       return value;
     Type element = value.getType();
@@ -1230,7 +1228,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
                        SmallVectorImpl<MakeRangeOp> &ranges) {
     if (failed(collectProducerRanges(
             value,
-            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            sourceAxisIdentity(mapping),
             ranges)) ||
         ranges.empty())
       return failure();
@@ -1314,11 +1312,11 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           rhsReplay.map(range.getResult(), rhsK);
         FailureOr<Value> lhs = replaySourceValue(
             nested, nestedLocation, contract.getLhs(),
-            PhysicalSourceAxis{lhsMap->getSourceId(), lhsMap->getSourceAxis()},
+            sourceAxisIdentity(*lhsMap),
             unitK, lhsRange, lhsK, lhsReplay);
         FailureOr<Value> rhs = replaySourceValue(
             nested, nestedLocation, contract.getRhs(),
-            PhysicalSourceAxis{rhsMap->getSourceId(), rhsMap->getSourceAxis()},
+            sourceAxisIdentity(*rhsMap),
             unitK, rhsRange, rhsK, rhsReplay);
         if (failed(lhs) || failed(rhs)) {
           bodyFailed = true;
@@ -1384,18 +1382,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   FailureOr<unsigned> lhsRowCoordinate = queryCoordinatePosition(
       lhsLoad.getCoordinates(),
-      PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
+      sourceAxisIdentity(*rowMap));
   FailureOr<unsigned> lhsReductionCoordinate = queryCoordinatePosition(
       lhsLoad.getCoordinates(),
-      PhysicalSourceAxis{lhsReductionMap->getSourceId(),
-                         lhsReductionMap->getSourceAxis()});
+      sourceAxisIdentity(*lhsReductionMap));
   FailureOr<unsigned> rhsReductionCoordinate = queryCoordinatePosition(
       rhsLoad.getCoordinates(),
-      PhysicalSourceAxis{rhsReductionMap->getSourceId(),
-                         rhsReductionMap->getSourceAxis()});
+      sourceAxisIdentity(*rhsReductionMap));
   FailureOr<unsigned> rhsColumnCoordinate = queryCoordinatePosition(
       rhsLoad.getCoordinates(),
-      PhysicalSourceAxis{columnMap->getSourceId(), columnMap->getSourceAxis()});
+      sourceAxisIdentity(*columnMap));
   if (failed(lhsRowCoordinate) || failed(lhsReductionCoordinate) ||
       failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate))
     return unhandled("load coordinates do not cover all free/reduction axes");
@@ -1405,8 +1401,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   if (!rowRange) {
     FailureOr<MakeRangeOp> discovered =
         producerRange(originalLhsRowCoordinate,
-                      PhysicalSourceAxis{rowMap->getSourceId(),
-                                         rowMap->getSourceAxis()});
+                      sourceAxisIdentity(*rowMap));
     if (succeeded(discovered))
       rowRange = *discovered;
   }
@@ -1476,13 +1471,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     kernel.walk([&](AssumeInBoundsOp assumption) {
       if (!containsSource(
               assumption.getIndex(),
-              PhysicalSourceAxis{rowMap->getSourceId(),
-                                 rowMap->getSourceAxis()}))
+              sourceAxisIdentity(*rowMap)))
         return;
       FailureOr<MakeRangeOp> root =
           producerRange(assumption.getIndex(),
-                        PhysicalSourceAxis{rowMap->getSourceId(),
-                                           rowMap->getSourceAxis()});
+                        sourceAxisIdentity(*rowMap));
       if (succeeded(root) && sameLogicalRange(*root, rowRange))
         rowAssumptions.push_back(assumption);
     });
@@ -1720,7 +1713,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       replay.map(rowRange.getResult(), rows);
       FailureOr<Value> rowCoordinate = replaySourceValue(
           rowBuilder, location, originalLhsRowCoordinate,
-          PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()},
+          sourceAxisIdentity(*rowMap),
           unitM, rowRange, rows, replay);
       if (failed(rowCoordinate))
         return contract.emitOpError(
@@ -1729,7 +1722,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       for (AssumeInBoundsOp assumption : rowAssumptions) {
         FailureOr<Value> index = replaySourceValue(
             rowBuilder, location, assumption.getIndex(),
-            PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()},
+            sourceAxisIdentity(*rowMap),
             unitM, rowRange, rows, replay);
         if (failed(index))
           return assumption.emitOpError(
@@ -1744,8 +1737,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         for (Value coordinate : path.store.getCoordinates()) {
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, coordinate,
-              PhysicalSourceAxis{rowMap->getSourceId(),
-                                 rowMap->getSourceAxis()},
+              sourceAxisIdentity(*rowMap),
               unitM, rowRange, rows, replay);
           if (failed(replayed))
             return path.store.emitOpError(
@@ -1865,13 +1857,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                       : SmallVector<Value>(path.store.getCoordinates());
       FailureOr<unsigned> storeColumn = queryCoordinatePosition(
           path.store.getCoordinates(),
-          PhysicalSourceAxis{columnMap->getSourceId(),
-                             columnMap->getSourceAxis()});
+          sourceAxisIdentity(*columnMap));
       FailureOr<unsigned> storeRow;
       if (!indirectRow)
         storeRow = queryCoordinatePosition(
             path.store.getCoordinates(),
-            PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
+            sourceAxisIdentity(*rowMap));
       if ((!indirectRow && failed(storeRow)) || failed(storeColumn))
         return path.store.emitOpError(
             "blocked contract output lost its logical source coordinates");
@@ -2024,7 +2015,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   auto scaleMapFor = [&](FragmentType scale,
                          AxisMapAttr data) -> FailureOr<AxisMapAttr> {
     PhysicalAxisProjection projection = queryFragmentAxis(
-        scale, PhysicalSourceAxis{data.getSourceId(), data.getSourceAxis()});
+        scale, sourceAxisIdentity(data));
     return projection.isExact() ? queryAxisMap(scale, projection.fragmentAxis)
                                 : FailureOr<AxisMapAttr>(failure());
   };
@@ -2046,8 +2037,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       failed(rhsScaleBlockMap) || failed(rhsScaleColumnMap))
     return reject("data and scale operands do not preserve the paired coordinate provenance");
   auto sameSource = [](AxisMapAttr lhs, AxisMapAttr rhs) {
-    return PhysicalSourceAxis{lhs.getSourceId(), lhs.getSourceAxis()} ==
-           PhysicalSourceAxis{rhs.getSourceId(), rhs.getSourceAxis()};
+    return sourceAxisIdentity(lhs) == sourceAxisIdentity(rhs);
   };
   auto sameDimension = [](AxisMapAttr lhs, AxisMapAttr rhs) {
     return lhs.getDimensionId() > 0 &&
@@ -2065,13 +2055,13 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
                       AxisMapAttr source) -> FailureOr<MakeRangeOp> {
     FailureOr<unsigned> coordinate = queryCoordinatePosition(
         load.getCoordinates(),
-        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()});
+        sourceAxisIdentity(source));
     if (failed(coordinate))
       return failure();
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact fact = analysis.sourceRanges(
         load.getCoordinates()[*coordinate],
-        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()});
+        sourceAxisIdentity(source));
     return queryExactLogicalRange(fact);
   };
   FailureOr<MakeRangeOp> rowRange = rangeFor(lhsLoad, *rowMap);
@@ -2198,7 +2188,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   auto coordinateFor = [](ValueRange coordinates, AxisMapAttr mapping) {
     return queryCoordinatePosition(
         coordinates,
-        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+        sourceAxisIdentity(mapping));
   };
   FailureOr<unsigned> lhsRowCoordinate =
       coordinateFor(lhsLoad.getCoordinates(), *rowMap);
@@ -2467,8 +2457,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         FailureOr<Value> rhsScaleColumn = replaySourceValue(
             nested, nestedLocation,
             rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
-            PhysicalSourceAxis{columnMap->getSourceId(),
-                               columnMap->getSourceAxis()},
+            sourceAxisIdentity(*columnMap),
             unitN, *rhsScaleColumnRange, columns,
             rhsScaleReplay);
         if (failed(rhsScaleColumn)) {
@@ -2538,10 +2527,10 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     SmallVector<Value> coordinates(path.store.getCoordinates());
     FailureOr<unsigned> storeRow = queryCoordinatePosition(
         path.store.getCoordinates(),
-        PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
+        sourceAxisIdentity(*rowMap));
     FailureOr<unsigned> storeColumn = queryCoordinatePosition(
         path.store.getCoordinates(),
-        PhysicalSourceAxis{columnMap->getSourceId(), columnMap->getSourceAxis()});
+        sourceAxisIdentity(*columnMap));
     if (failed(storeRow) || failed(storeColumn))
       return path.store.emitOpError(
           "blocked scaled-contract output lost source coordinates");

@@ -27,6 +27,9 @@ struct PhysicalSourceAxis {
   }
 };
 
+PhysicalSourceAxis sourceAxisIdentity(AxisMapAttr mapping);
+PhysicalSourceAxis sourceAxisIdentity(MakeRangeOp range);
+
 enum class PhysicalFactState { Exact, Unknown, Ambiguous };
 
 enum class PhysicalReplayScope {
@@ -59,8 +62,6 @@ struct PhysicalDimensionProjection {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
-mlir::FailureOr<unsigned> queryFragmentAxis(mlir::Type type,
-                                            uint64_t sourceId);
 PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source);
 llvm::SmallVector<PhysicalAxisProjection, 2>
@@ -69,10 +70,6 @@ PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
                                                    int64_t dimensionId);
 mlir::FailureOr<int64_t>
 querySourceDimension(mlir::Type type, PhysicalSourceAxis source);
-PhysicalAxisProjection queryUniqueSourceAxis(mlir::Type type,
-                                             uint64_t sourceId);
-mlir::FailureOr<unsigned>
-queryCoordinateIndex(mlir::ValueRange coordinates, uint64_t sourceId);
 PhysicalAxisProjection
 queryCoordinateIndex(mlir::ValueRange coordinates, PhysicalSourceAxis source);
 mlir::FailureOr<unsigned>
@@ -170,16 +167,16 @@ public:
 
   mlir::FailureOr<unsigned> fragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source) const;
-  mlir::FailureOr<unsigned> fragmentAxis(mlir::Type type,
-                                         uint64_t sourceId) const;
   mlir::FailureOr<unsigned>
   coordinateIndex(mlir::ValueRange coordinates,
                   PhysicalSourceAxis source) const;
-  mlir::FailureOr<unsigned> coordinateIndex(mlir::ValueRange coordinates,
-                                            uint64_t sourceId) const;
   PhysicalRangeFact sourceRanges(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt);
+  /// Exact current-program ranges for a typed logical source axis.  This is
+  /// used only when a replayable pure value carries the axis in its type but
+  /// has no producer edge to the coordinate value.
+  PhysicalRangeFact programRanges(PhysicalSourceAxis source);
   /// Exact range roots that make one concrete fragment axis vary.  Unlike a
   /// source-id query, this preserves repeated occurrences of the same logical
   /// source in Cartesian/indexed values.

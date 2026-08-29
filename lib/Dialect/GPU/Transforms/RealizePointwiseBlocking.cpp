@@ -394,18 +394,11 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
   auto sourceMapping =
       cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact sourceRanges = analysis.sourceRanges(
-      source, PhysicalSourceAxis{sourceMapping.getSourceId(),
-                                 sourceMapping.getSourceAxis()});
-  if (sourceRanges.state == PhysicalFactState::Unknown ||
-      sourceRanges.roots.empty())
-    sourceRanges = analysis.axisRanges(source, axis);
+  PhysicalRangeFact sourceRanges = analysis.axisRanges(source, axis);
   if (sourceRanges.state == PhysicalFactState::Unknown ||
       sourceRanges.roots.empty()) {
     PhysicalReplayFact replay = analysis.replayability(
-        source,
-        PhysicalSourceAxis{sourceMapping.getSourceId(),
-                           sourceMapping.getSourceAxis()},
+        source, sourceAxisIdentity(sourceMapping),
         PhysicalReplayScope::ValueGraph, /*allowAccesses=*/false);
     if (!sourceRanges.roots.empty() || !replay.isReplayable()) {
       InFlightDiagnostic diagnostic = kernel.emitError(
@@ -474,13 +467,15 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
       coverageDimensionAttr,
       IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalSourceAxis physicalSource{mapping.getSourceId(),
-                                    mapping.getSourceAxis()};
-  PhysicalRangeFact ranges = analysis.sourceRanges(source, physicalSource);
-  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty())
-    ranges = analysis.axisRanges(source, axis);
-  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty())
+  PhysicalRangeFact ranges = analysis.axisRanges(source, axis);
+  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty()) {
+    InFlightDiagnostic diagnostic = kernel.emitError(
+        "structured reduction source has no exact axis-range authority");
+    diagnostic << "; source_type=" << source.getType() << ", axis=" << axis;
+    for (Operation *blocker : ranges.blockers)
+      diagnostic << ", blocker=" << blocker->getName();
     return failure();
+  }
   PhysicalExprAttr covered = fragmentExtent(parameter);
   for (MakeRangeOp range : ranges.roots) {
     FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
@@ -2131,51 +2126,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       for (Attribute axis : scalarWorksetAxes)
         ownershipAxes.erase(axis);
     }
-  }
-
-  // Static logical axes are local tensor structure, not independent runtime
-  // workset dimensions.  They therefore do not consume the two dynamic
-  // ownership axes used for pointwise lane promotion.  Counting them against
-  // that budget silently scalarizes an adjacent dynamic axis whenever a
-  // pointwise value has a fixed innermost vector dimension.
-  unsigned dynamicOwnershipCount = llvm::count_if(
-      ownershipAxes, [](Attribute axis) { return !isSourceAxisKey(axis); });
-  if (ownershipOnly && dynamicOwnershipCount > 2) {
-    SmallVector<std::pair<int64_t, Attribute>> ranked;
-    for (Attribute axis : ownershipAxes) {
-      if (isSourceAxisKey(axis))
-        continue;
-      int64_t sourceAxis = -1;
-      for (MakeRangeOp range : axes.lookup(axis)) {
-        kernel.walk([&](StoreOp store) {
-          for (auto [coordinateIndex, coordinate] :
-               llvm::enumerate(store.getCoordinates())) {
-            if (coordinateIndex >= store.getSourceAxes().size())
-              continue;
-            llvm::SmallPtrSet<Operation *, 8> ranges;
-            collectProducerRanges(
-                coordinate,
-                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
-                           range.getDerived()},
-                ranges);
-            if (!ranges.empty())
-              sourceAxis = std::max(sourceAxis,
-                                    store.getSourceAxes()[coordinateIndex]);
-          }
-        });
-      }
-      ranked.emplace_back(sourceAxis, axis);
-    }
-    llvm::stable_sort(ranked, [](const auto &lhs, const auto &rhs) {
-      return lhs.first > rhs.first;
-    });
-    llvm::SmallDenseSet<Attribute> selected;
-    for (Attribute axis : ownershipAxes)
-      if (isSourceAxisKey(axis))
-        selected.insert(axis);
-    for (auto [_, axis] : ArrayRef(ranked).take_front(2))
-      selected.insert(axis);
-    ownershipAxes = std::move(selected);
   }
 
   if (ownershipOnly) {

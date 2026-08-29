@@ -875,8 +875,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
         range.getExtent(), BinaryOperator::Add));
   }
   FailureOr<int64_t> dimension = querySourceDimension(
-      range.getResult().getType(),
-      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+      range.getResult().getType(), sourceAxisIdentity(range));
   if (succeeded(dimension) && !range->hasAttr(sourceSubregionAttr)) {
     for (BlockArgument argument : kernel.getArguments()) {
       DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
@@ -1074,7 +1073,8 @@ void retargetSourceExtent(Value root, PhysicalSourceAxis source,
       root,
       [=](AxisMapAttr mapping) {
         return mapping.getSourceId() == source.sourceId &&
-               mapping.getSourceAxis() == source.sourceAxis;
+               mapping.getSourceAxis() == source.sourceAxis &&
+               mapping.getDerived() == source.derived;
       },
       extent);
 }
@@ -1197,8 +1197,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   llvm::DenseMap<Operation *, Value> logicalExtents;
   kernel.walk([&](MakeRangeOp range) {
     FailureOr<int64_t> sourceDimension = querySourceDimension(
-        range.getResult().getType(),
-        PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+        range.getResult().getType(), sourceAxisIdentity(range));
     auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
     if (failed(sourceDimension) ||
         *sourceDimension != static_cast<int64_t>(dimension) ||
@@ -1210,10 +1209,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     logicalExtents[range.getOperation()] = range.getExtent();
   });
   for (MakeRangeOp range : ranges)
-    retargetSourceExtent(
-        range.getResult(),
-        PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
-        parameterExtent);
+    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                         parameterExtent);
   if (ranges.empty() || llvm::all_of(ranges, [&](MakeRangeOp range) {
         return range.getExtent() == physicalExtent;
       }))
@@ -1298,8 +1295,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     Value result;
     for (MakeRangeOp range : sources) {
       SmallVector<PhysicalAxisProjection, 2> projections = queryFragmentAxes(
-          target,
-          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+          target, sourceAxisIdentity(range));
       if (projections.empty())
         return failure();
       for (PhysicalAxisProjection projection : projections) {

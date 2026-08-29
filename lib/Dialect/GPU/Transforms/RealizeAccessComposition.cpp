@@ -116,8 +116,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
       return failure();
     }
     PhysicalAxisProjection target = queryCoordinateIndex(
-        sourceLoad.getCoordinates(),
-        PhysicalSourceAxis{mapping->getSourceId(), mapping->getSourceAxis()});
+        sourceLoad.getCoordinates(), sourceAxisIdentity(*mapping));
     if (!target.isExact() || target.dimensionId != mapping->getDimensionId()) {
       gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
@@ -204,8 +203,7 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
       return false;
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-    PhysicalSourceAxis physicalSource{expected.getSourceId(),
-                                      expected.getSourceAxis()};
+    PhysicalSourceAxis physicalSource = sourceAxisIdentity(expected);
     PhysicalAxisProjection resultAxis =
         queryFragmentAxis(result, physicalSource);
     PhysicalAxisProjection coordinateAxis =
@@ -264,8 +262,7 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
       return false;
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-    PhysicalSourceAxis physicalSource{expected.getSourceId(),
-                                      expected.getSourceAxis()};
+    PhysicalSourceAxis physicalSource = sourceAxisIdentity(expected);
     PhysicalAxisProjection resultAxis =
         queryFragmentAxis(result, physicalSource);
     if (resultAxis.state == PhysicalFactState::Ambiguous)
