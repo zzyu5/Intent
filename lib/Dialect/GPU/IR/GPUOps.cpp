@@ -774,16 +774,37 @@ LogicalResult verifyReduceLike(Operation *owner, ValueRange inputs,
   return verifyHelperRegion(owner, combine, arguments, accumulators);
 }
 
+bool typeCarriesAxis(Type type, int64_t axis) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return axis >= 0 &&
+           axis < static_cast<int64_t>(fragment.getShape().size());
+  auto record = dyn_cast<RecordType>(type);
+  return record && llvm::all_of(record.getFieldTypes(), [&](Attribute field) {
+           return typeCarriesAxis(cast<TypeAttr>(field).getValue(), axis);
+         });
+}
+
 } // namespace
 
 LogicalResult ReduceOp::verify() {
   if (getAxes().empty())
     return emitOpError("physical reduce requires at least one axis");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : getAxes()) {
+    if (!axes.insert(axis).second)
+      return emitOpError("physical reduce axes must be unique");
+    for (Value source : getInputs().take_front(getSourceCount()))
+      if (!typeCarriesAxis(source.getType(), axis))
+        return emitOpError("physical reduce axis is outside a source schema");
+  }
   return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
                           getSourceCount(), getIdentityCount(), getCaptureCount());
 }
 
 LogicalResult ScanOp::verify() {
+  for (Value source : getInputs().take_front(getSourceCount()))
+    if (!typeCarriesAxis(source.getType(), getAxis()))
+      return emitOpError("physical scan axis is outside a source schema");
   return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
                           getSourceCount(), getIdentityCount(), getCaptureCount());
 }
@@ -948,6 +969,13 @@ LogicalResult ScatterReduceOp::verify() {
        (!elementType(getValid().getType()).isInteger(1) ||
         !sameShape(getValid().getType(), getValue().getType()))))
     return emitOpError("scatter-reduce value/validity schema is invalid");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : getSourceAxes())
+    if (axis < 0 ||
+        axis >= static_cast<int64_t>(rankOf(getResource().getType())) ||
+        !axes.insert(axis).second)
+      return emitOpError(
+          "scatter-reduce source-axis mapping is not a bijection");
   SmallVector<Type> arguments{getValue().getType(), getValue().getType()};
   SmallVector<Type> results{getValue().getType()};
   return verifyHelperRegion(getOperation(), getCombine(), arguments, results);
@@ -972,6 +1000,12 @@ LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
     return owner->emitOpError("atomic physical address/order schema is invalid");
   if (valid && !elementType(valid.getType()).isInteger(1))
     return owner->emitOpError("atomic validity must be a predicate");
+  llvm::DenseSet<int64_t> axes;
+  for (int64_t axis : sourceAxes)
+    if (axis < 0 || axis >= static_cast<int64_t>(rankOf(resource)) ||
+        !axes.insert(axis).second)
+      return owner->emitOpError(
+          "atomic source-axis mapping is not a bijection");
   return success();
 }
 

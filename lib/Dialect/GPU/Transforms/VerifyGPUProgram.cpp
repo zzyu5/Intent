@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -61,6 +62,76 @@ void collectTypeExpressions(Type type,
 bool hasObservableEffect(Operation *operation) {
   return isa<StoreOp, ScatterReduceOp, AtomicStoreOp, AtomicRMWOp,
              AtomicCompareExchangeOp>(operation);
+}
+
+bool isPhysicalAccess(Operation *operation) {
+  return isa<LoadOp, GatherOp, StoreOp, ScatterReduceOp, AtomicLoadOp,
+             AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp>(operation);
+}
+
+bool requiresRangeProvenance(Value coordinate) {
+  auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+  if (!fragment)
+    return false;
+  return llvm::any_of(fragment.getShape(), [](Attribute extent) {
+    auto expression = cast<PhysicalExprAttr>(extent);
+    return expression.getKind() !=
+               static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+           expression.getValue() != 1;
+  });
+}
+
+LogicalResult verifyStructuredSegment(Operation *operation,
+                                      func::FuncOp kernel,
+                                      ParameterAttr segment) {
+  FailureOr<ParameterOp> declaration =
+      queryParameterBySymbol(kernel, segment.getName());
+  if (failed(declaration) || declaration->getParameter() != segment)
+    return operation->emitOpError(
+        "structured segment does not reference one exact physical parameter declaration");
+  return segment.getRole() ==
+                 static_cast<uint32_t>(ParameterRole::ScanChunk)
+             ? success()
+             : operation->emitOpError(
+                   "structured segment parameter has the wrong physical role");
+}
+
+LogicalResult verifyBufferDataflow(func::FuncOp kernel,
+                                   PhysicalProgramAnalysis &analysis) {
+  llvm::DenseSet<uint64_t> instances;
+  LogicalResult result = success();
+  kernel.walk([&](BufferOp buffer) {
+    if (failed(result))
+      return WalkResult::interrupt();
+    BufferType type = buffer.getResult().getType();
+    if (!instances.insert(type.getInstance()).second) {
+      buffer.emitOpError("physical buffer instance identity is duplicated");
+      result = failure();
+      return WalkResult::interrupt();
+    }
+    bool lifetimeMatches =
+        (type.getScope().getValue() == BufferScope::ProgramPrivate &&
+         type.getLifetime().getValue() == BufferLifetime::Program) ||
+        (type.getScope().getValue() == BufferScope::IterationPrivate &&
+         type.getLifetime().getValue() == BufferLifetime::Iteration);
+    if (!lifetimeMatches) {
+      buffer.emitOpError(
+          "physical buffer allocation scope and dynamic lifetime disagree");
+      result = failure();
+      return WalkResult::interrupt();
+    }
+    PhysicalBufferDataflowFact fact = analysis.bufferDataflow(buffer);
+    if (!fact.isExact()) {
+      InFlightDiagnostic diagnostic = buffer.emitOpError(
+          "physical buffer dataflow is not exact in the current program");
+      for (Operation *blocker : fact.blockers)
+        diagnostic << "; blocker=" << blocker->getName();
+      result = failure();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return result;
 }
 
 } // namespace
@@ -153,6 +224,9 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       return kernel.emitError("unknown physical ABI argument kind");
     }
   }
+  SmallVector<PhysicalExprAttr> abiExpressions;
+  for (Type type : kernel.getArgumentTypes())
+    collectTypeExpressions(type, abiExpressions);
   kernel.walk([&](ParameterOp parameter) {
     parameterNames.insert(parameter.getParameter().getName().getValue());
   });
@@ -160,6 +234,10 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     if (failed(verifyExpressionSymbols(kernel, cast<PhysicalExprAttr>(extent),
                                        parameterNames, launchABI,
                                        launchDimensions)))
+      return failure();
+  for (PhysicalExprAttr expression : abiExpressions)
+    if (failed(verifyExpressionSymbols(kernel, expression, parameterNames,
+                                       launchABI, launchDimensions)))
       return failure();
 
   bool hasProgramId = false;
@@ -173,6 +251,9 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   }
   llvm::DenseSet<int64_t> actualEffectOrigins;
   llvm::DenseSet<int64_t> programAxes;
+  llvm::DenseMap<int64_t, std::pair<PhysicalExprAttr, PhysicalExprAttr>>
+      executionGroups;
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
   WalkResult result = kernel.walk([&](Operation *operation) {
     StringRef dialect = operation->getName().getDialectNamespace();
     if (dialect == "intent") {
@@ -209,6 +290,55 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       }
       hasProgramId = true;
     }
+    Attribute groupAttribute = operation->getAttr(executionGroupAttr);
+    Attribute offsetAttribute = operation->getAttr(segmentOffsetAttr);
+    Attribute lengthAttribute = operation->getAttr(segmentLengthAttr);
+    if (groupAttribute || offsetAttribute || lengthAttribute) {
+      auto group = dyn_cast_or_null<IntegerAttr>(groupAttribute);
+      auto offset = dyn_cast_or_null<PhysicalExprAttr>(offsetAttribute);
+      auto length = dyn_cast_or_null<PhysicalExprAttr>(lengthAttribute);
+      if (!group || group.getInt() < 0 || !offset || !length) {
+        operation->emitOpError(
+            "physical execution segment requires typed group, offset and length together");
+        return WalkResult::interrupt();
+      }
+      if (failed(verifyExpressionSymbols(operation, offset, parameterNames,
+                                         launchABI, launchDimensions)) ||
+          failed(verifyExpressionSymbols(operation, length, parameterNames,
+                                         launchABI, launchDimensions)))
+        return WalkResult::interrupt();
+      auto [entry, inserted] = executionGroups.try_emplace(
+          group.getInt(), std::make_pair(offset, length));
+      if (!inserted && entry->second != std::make_pair(offset, length)) {
+        operation->emitOpError(
+            "one physical execution group has conflicting segment bounds");
+        return WalkResult::interrupt();
+      }
+    }
+    if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+      if (failed(verifyStructuredSegment(operation, kernel, fold.getSegment())))
+        return WalkResult::interrupt();
+    } else if (auto scan = dyn_cast<RegionScanOp>(operation)) {
+      if (failed(verifyStructuredSegment(operation, kernel, scan.getSegment())))
+        return WalkResult::interrupt();
+    }
+    if (isPhysicalAccess(operation)) {
+      PhysicalAccessFootprint footprint = physicalAnalysis.footprint(operation);
+      if (footprint.state != PhysicalFactState::Exact) {
+        operation->emitOpError(
+            "physical access has no exact current-IR footprint");
+        return WalkResult::interrupt();
+      }
+      bool needsRanges = llvm::any_of(footprint.coordinates,
+                                      requiresRangeProvenance);
+      if (needsRanges && footprint.rangeState != PhysicalFactState::Exact) {
+        InFlightDiagnostic diagnostic = operation->emitOpError(
+            "non-scalar physical access has unknown range provenance");
+        for (Operation *blocker : footprint.blockers)
+          diagnostic << "; blocker=" << blocker->getName();
+        return WalkResult::interrupt();
+      }
+    }
     if (hasObservableEffect(operation)) {
       auto origin = operation->getAttrOfType<IntegerAttr>(originAttr);
       if (!origin || !actualEffectOrigins.insert(origin.getInt()).second) {
@@ -218,6 +348,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       }
     }
     SmallVector<PhysicalExprAttr> expressions;
+    for (Type type : operation->getOperandTypes())
+      collectTypeExpressions(type, expressions);
     for (Type type : operation->getResultTypes())
       collectTypeExpressions(type, expressions);
     for (Region &region : operation->getRegions())
@@ -232,11 +364,17 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   });
   if (result.wasInterrupted())
     return failure();
+  for (int64_t group = 0;
+       group < static_cast<int64_t>(executionGroups.size()); ++group)
+    if (!executionGroups.contains(group))
+      return kernel.emitError(
+          "physical execution group identities must be dense from zero");
   if (!hasProgramId || programAxes.size() != static_cast<size_t>(gridRank) ||
+      executionGroups.empty() ||
       actualEffectOrigins != expectedEffectOrigins)
     return kernel.emitError(
         "physical kernel program mapping/effect coverage is incomplete");
-  return success();
+  return verifyBufferDataflow(kernel, physicalAnalysis);
 }
 
 } // namespace intent::gpu

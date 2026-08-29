@@ -578,6 +578,8 @@ bool isTritonExpression(gpu::PhysicalExprAttr expression) {
     if (expression.getOperands().size() != 1)
       return false;
     break;
+  default:
+    return false;
   }
   return llvm::all_of(expression.getOperands(), [](Attribute operand) {
     return isTritonExpression(cast<gpu::PhysicalExprAttr>(operand));
@@ -914,7 +916,8 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
                            ArrayRef<int64_t>{1, 2, 3, 4, 5, 6});
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ArrayRef<int64_t>{1});
-  if (failed(materializeLegalConfigs(kernel)))
+  if (failed(materializeLegalConfigs(kernel)) ||
+      failed(gpu::verifyGPUProgram(module)))
     return failure();
   if (failed(verifyTritonProgram(module)))
     return failure();

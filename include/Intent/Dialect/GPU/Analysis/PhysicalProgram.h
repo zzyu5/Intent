@@ -141,12 +141,24 @@ queryBlockingParameter(mlir::func::FuncOp kernel, MakeRangeOp range);
 /// Exact current-IR access relation, or an explicit conservative result.
 struct PhysicalAccessFootprint {
   PhysicalFactState state = PhysicalFactState::Unknown;
+  PhysicalFactState rangeState = PhysicalFactState::Unknown;
   mlir::Value resource;
   llvm::SmallVector<mlir::Value, 4> coordinates;
   llvm::SmallVector<int64_t, 4> sourceAxes;
   llvm::SmallVector<MakeRangeOp, 4> ranges;
+  llvm::SmallVector<mlir::Operation *, 4> blockers;
   mlir::Value validity;
   mlir::Value fill;
+};
+
+/// Current-IR initialization and resource-use legality for one physical
+/// mutable buffer.  Exact means every read is dominated either by a direct
+/// initializing write or by a proven full-domain loop/branch initialization.
+struct PhysicalBufferDataflowFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  llvm::SmallVector<mlir::Operation *, 4> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
 /// Recomputable facts derived only from the current executable GPU IR.
@@ -181,6 +193,7 @@ public:
       mlir::Value value, PhysicalSourceAxis source,
       std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
+  PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 
   /// Recognizes a predicate composed only from exact range-end comparisons,
   /// predicate-preserving shape operations and boolean conjunction.  This is
