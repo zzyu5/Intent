@@ -1276,20 +1276,22 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                              ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
     Value result;
     for (MakeRangeOp range : sources) {
-      PhysicalAxisProjection projection = queryFragmentAxis(
+      SmallVector<PhysicalAxisProjection, 2> projections = queryFragmentAxes(
           target,
           PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
-      if (!projection.isExact())
+      if (projections.empty())
         return failure();
-      FailureOr<Value> current = projectPredicate(
-          builder, location, predicates.lookup(range.getOperation()), target,
-          projection.fragmentAxis);
-      if (failed(current))
-        return failure();
-      result = result ? Value(builder.create<BinaryOp>(
-                            location, current->getType(), result, *current,
-                            BinaryOperator::LogicalAnd))
-                      : *current;
+      for (PhysicalAxisProjection projection : projections) {
+        FailureOr<Value> current = projectPredicate(
+            builder, location, predicates.lookup(range.getOperation()), target,
+            projection.fragmentAxis);
+        if (failed(current))
+          return failure();
+        result = result ? Value(builder.create<BinaryOp>(
+                              location, current->getType(), result, *current,
+                              BinaryOperator::LogicalAnd))
+                        : *current;
+      }
     }
     return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
   };

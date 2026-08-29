@@ -60,6 +60,8 @@ mlir::FailureOr<unsigned> queryFragmentAxis(mlir::Type type,
                                             uint64_t sourceId);
 PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source);
+llvm::SmallVector<PhysicalAxisProjection, 2>
+queryFragmentAxes(mlir::Type type, PhysicalSourceAxis source);
 PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
                                                    int64_t dimensionId);
 mlir::FailureOr<int64_t>

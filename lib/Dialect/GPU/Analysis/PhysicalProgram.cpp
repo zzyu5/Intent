@@ -148,6 +148,24 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
   return result;
 }
 
+SmallVector<PhysicalAxisProjection, 2>
+queryFragmentAxes(Type type, PhysicalSourceAxis source) {
+  SmallVector<PhysicalAxisProjection, 2> results;
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment)
+    return results;
+  for (Attribute attribute : fragment.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    if (mapping.getSourceId() != source.sourceId ||
+        mapping.getSourceAxis() != source.sourceAxis)
+      continue;
+    results.push_back(PhysicalAxisProjection{
+        PhysicalFactState::Exact, source, mapping.getDimensionId(),
+        mapping.getFragmentAxis()});
+  }
+  return results;
+}
+
 PhysicalDimensionProjection queryFragmentDimension(Type type,
                                                    int64_t dimensionId) {
   PhysicalDimensionProjection result;
