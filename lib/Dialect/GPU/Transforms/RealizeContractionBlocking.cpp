@@ -1962,37 +1962,77 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     return contract.emitOpError()
            << "cannot form a complete block-scaled contraction: " << reason;
   };
+  ArrayRef<int64_t> lhsReduction = contract.getLhsReductionAxes();
+  ArrayRef<int64_t> rhsReduction = contract.getRhsReductionAxes();
   if (!lhsLoad || !lhsScaleLoad || !rhsLoad || !rhsScaleLoad ||
       lhsType.getShape().size() != 3 || lhsScaleType.getShape().size() != 2 ||
       rhsType.getShape().size() != 3 || rhsScaleType.getShape().size() != 2 ||
-      resultType.getShape().size() != 2 ||
-      contract.getLhsReductionAxes() != ArrayRef<int64_t>{1, 2} ||
-      contract.getRhsReductionAxes() != ArrayRef<int64_t>{0, 1} ||
-      !contract.getLhsBatchAxes().empty() ||
+      resultType.getShape().size() != 2 || lhsReduction.size() != 2 ||
+      rhsReduction.size() != 2 || !contract.getLhsBatchAxes().empty() ||
       !contract.getRhsBatchAxes().empty())
-    return reject("requires direct rank-3 data/rank-2 scale loads, two adjacent reduction axes, and no batch axes");
+    return reject("requires direct rank-3 data/rank-2 scale loads, two reduction pairs, one free axis per operand, and no batch axes");
   if (contract.getLhsGroupSize() <= 0 ||
       contract.getLhsGroupSize() != contract.getRhsGroupSize())
     return reject("requires one equal positive scale-group size");
-  auto innerExtent = cast<PhysicalExprAttr>(lhsType.getShape()[2]);
-  auto rhsInnerExtent = cast<PhysicalExprAttr>(rhsType.getShape()[1]);
-  if (innerExtent.getKind() !=
-          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-      rhsInnerExtent != innerExtent ||
-      static_cast<uint64_t>(innerExtent.getValue()) !=
-          contract.getLhsGroupSize())
+  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
+      lhsType, lhsReduction, contract.getLhsBatchAxes());
+  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
+      rhsType, rhsReduction, contract.getRhsBatchAxes());
+  if (failed(lhsFree) || failed(rhsFree))
+    return reject("data operands do not have one unique free axis");
+  std::optional<unsigned> innerPair;
+  for (unsigned pair = 0; pair < lhsReduction.size(); ++pair) {
+    auto lhsExtent = cast<PhysicalExprAttr>(
+        lhsType.getShape()[lhsReduction[pair]]);
+    auto rhsExtent = cast<PhysicalExprAttr>(
+        rhsType.getShape()[rhsReduction[pair]]);
+    bool groupExtent =
+        lhsExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        rhsExtent == lhsExtent &&
+        static_cast<uint64_t>(lhsExtent.getValue()) ==
+            contract.getLhsGroupSize();
+    if (!groupExtent)
+      continue;
+    if (innerPair)
+      return reject("scale group relation is ambiguous across reduction pairs");
+    innerPair = pair;
+  }
+  if (!innerPair)
     return reject("the innermost physical reduction extent must equal the scale group size");
+  unsigned blockPair = *innerPair == 0 ? 1 : 0;
+  unsigned lhsBlockAxis = lhsReduction[blockPair];
+  unsigned lhsInnerAxis = lhsReduction[*innerPair];
+  unsigned rhsBlockAxis = rhsReduction[blockPair];
+  unsigned rhsInnerAxis = rhsReduction[*innerPair];
+  auto innerExtent =
+      cast<PhysicalExprAttr>(lhsType.getShape()[lhsInnerAxis]);
 
-  FailureOr<AxisMapAttr> rowMap = axisMap(lhsType, 0);
-  FailureOr<AxisMapAttr> lhsBlockMap = axisMap(lhsType, 1);
-  FailureOr<AxisMapAttr> lhsInnerMap = axisMap(lhsType, 2);
-  FailureOr<AxisMapAttr> rhsBlockMap = axisMap(rhsType, 0);
-  FailureOr<AxisMapAttr> rhsInnerMap = axisMap(rhsType, 1);
-  FailureOr<AxisMapAttr> columnMap = axisMap(rhsType, 2);
-  FailureOr<AxisMapAttr> lhsScaleRowMap = axisMap(lhsScaleType, 0);
-  FailureOr<AxisMapAttr> lhsScaleBlockMap = axisMap(lhsScaleType, 1);
-  FailureOr<AxisMapAttr> rhsScaleBlockMap = axisMap(rhsScaleType, 0);
-  FailureOr<AxisMapAttr> rhsScaleColumnMap = axisMap(rhsScaleType, 1);
+  FailureOr<AxisMapAttr> rowMap = axisMap(lhsType, *lhsFree);
+  FailureOr<AxisMapAttr> lhsBlockMap = axisMap(lhsType, lhsBlockAxis);
+  FailureOr<AxisMapAttr> lhsInnerMap = axisMap(lhsType, lhsInnerAxis);
+  FailureOr<AxisMapAttr> rhsBlockMap = axisMap(rhsType, rhsBlockAxis);
+  FailureOr<AxisMapAttr> rhsInnerMap = axisMap(rhsType, rhsInnerAxis);
+  FailureOr<AxisMapAttr> columnMap = axisMap(rhsType, *rhsFree);
+  auto scaleMapFor = [&](FragmentType scale,
+                         AxisMapAttr data) -> FailureOr<AxisMapAttr> {
+    PhysicalAxisProjection projection = queryFragmentAxis(
+        scale, PhysicalSourceAxis{data.getSourceId(), data.getSourceAxis()});
+    return projection.isExact() ? axisMap(scale, projection.fragmentAxis)
+                                : FailureOr<AxisMapAttr>(failure());
+  };
+  FailureOr<AxisMapAttr> lhsScaleRowMap =
+      succeeded(rowMap) ? scaleMapFor(lhsScaleType, *rowMap)
+                        : FailureOr<AxisMapAttr>(failure());
+  FailureOr<AxisMapAttr> lhsScaleBlockMap =
+      succeeded(lhsBlockMap) ? scaleMapFor(lhsScaleType, *lhsBlockMap)
+                             : FailureOr<AxisMapAttr>(failure());
+  FailureOr<AxisMapAttr> rhsScaleBlockMap =
+      succeeded(rhsBlockMap) ? scaleMapFor(rhsScaleType, *rhsBlockMap)
+                             : FailureOr<AxisMapAttr>(failure());
+  FailureOr<AxisMapAttr> rhsScaleColumnMap =
+      succeeded(columnMap) ? scaleMapFor(rhsScaleType, *columnMap)
+                           : FailureOr<AxisMapAttr>(failure());
   if (failed(rowMap) || failed(lhsBlockMap) || failed(lhsInnerMap) ||
       failed(rhsBlockMap) || failed(rhsInnerMap) || failed(columnMap) ||
       failed(lhsScaleRowMap) || failed(lhsScaleBlockMap) ||
@@ -2006,34 +2046,37 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     return reject("data and scale operands do not preserve the paired coordinate provenance");
 
   auto rangeFor = [&](LoadOp load,
-                      uint64_t sourceId) -> FailureOr<MakeRangeOp> {
-    FailureOr<unsigned> coordinate =
-        coordinateForSource(load.getCoordinates(), sourceId);
+                      AxisMapAttr source) -> FailureOr<MakeRangeOp> {
+    FailureOr<unsigned> coordinate = coordinateForSource(
+        load.getCoordinates(), source.getSourceId());
     if (failed(coordinate))
       return failure();
-    auto range = sourceRange(load.getCoordinates()[*coordinate]);
-    return range ? FailureOr<MakeRangeOp>(range)
-                 : FailureOr<MakeRangeOp>(failure());
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact fact = analysis.sourceRanges(
+        load.getCoordinates()[*coordinate],
+        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()});
+    return fact.isUnique() ? FailureOr<MakeRangeOp>(fact.roots.front())
+                           : FailureOr<MakeRangeOp>(failure());
   };
-  FailureOr<MakeRangeOp> rowRange = rangeFor(lhsLoad, rowMap->getSourceId());
+  FailureOr<MakeRangeOp> rowRange = rangeFor(lhsLoad, *rowMap);
   FailureOr<MakeRangeOp> blockRange =
-      rangeFor(lhsLoad, lhsBlockMap->getSourceId());
+      rangeFor(lhsLoad, *lhsBlockMap);
   FailureOr<MakeRangeOp> innerRange =
-      rangeFor(lhsLoad, lhsInnerMap->getSourceId());
+      rangeFor(lhsLoad, *lhsInnerMap);
   FailureOr<MakeRangeOp> columnRange =
-      rangeFor(rhsLoad, columnMap->getSourceId());
+      rangeFor(rhsLoad, *columnMap);
   FailureOr<MakeRangeOp> lhsScaleRowRange =
-      rangeFor(lhsScaleLoad, lhsScaleRowMap->getSourceId());
+      rangeFor(lhsScaleLoad, *lhsScaleRowMap);
   FailureOr<MakeRangeOp> lhsScaleBlockRange =
-      rangeFor(lhsScaleLoad, lhsScaleBlockMap->getSourceId());
+      rangeFor(lhsScaleLoad, *lhsScaleBlockMap);
   FailureOr<MakeRangeOp> rhsBlockRange =
-      rangeFor(rhsLoad, rhsBlockMap->getSourceId());
+      rangeFor(rhsLoad, *rhsBlockMap);
   FailureOr<MakeRangeOp> rhsInnerRange =
-      rangeFor(rhsLoad, rhsInnerMap->getSourceId());
+      rangeFor(rhsLoad, *rhsInnerMap);
   FailureOr<MakeRangeOp> rhsScaleBlockRange =
-      rangeFor(rhsScaleLoad, rhsScaleBlockMap->getSourceId());
+      rangeFor(rhsScaleLoad, *rhsScaleBlockMap);
   FailureOr<MakeRangeOp> rhsScaleColumnRange =
-      rangeFor(rhsScaleLoad, rhsScaleColumnMap->getSourceId());
+      rangeFor(rhsScaleLoad, *rhsScaleColumnMap);
   if (failed(rowRange) || failed(blockRange) || failed(innerRange) ||
       failed(columnRange) || failed(lhsScaleRowRange) ||
       failed(lhsScaleBlockRange) || failed(rhsBlockRange) ||
@@ -2422,7 +2465,18 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         rhsCoordinates[*rhsColumnCoordinate] = columns;
         SmallVector<Value> rhsScaleCoordinates(rhsScaleLoad.getCoordinates());
         rhsScaleCoordinates[*rhsScaleBlockCoordinate] = blocks;
-        rhsScaleCoordinates[*rhsScaleColumnCoordinate] = columns;
+        IRMapping rhsScaleReplay;
+        rhsScaleReplay.map(rhsScaleColumnRange->getResult(), columns);
+        FailureOr<Value> rhsScaleColumn = replaySourceValue(
+            nested, nestedLocation,
+            rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
+            columnMap->getSourceId(), unitN, *rhsScaleColumnRange, columns,
+            rhsScaleReplay);
+        if (failed(rhsScaleColumn)) {
+          loopBodyFailed = true;
+          return;
+        }
+        rhsScaleCoordinates[*rhsScaleColumnCoordinate] = *rhsScaleColumn;
         FailureOr<Value> lhsFill = retargetFill(
             nested, nestedLocation, lhsLoad.getFill(), blockedLhsType);
         FailureOr<Value> lhsScaleFill = retargetFill(
