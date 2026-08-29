@@ -129,9 +129,8 @@ FragmentType replaceExtent(FragmentType source, unsigned axis,
                            source.getOwner());
 }
 
-void collectRangesAndLoads(Value value, PhysicalExprAttr logicalExtent,
-                           SmallVectorImpl<MakeRangeOp> &ranges,
-                           SmallVectorImpl<LoadOp> &loads) {
+void collectRanges(Value value, PhysicalExprAttr logicalExtent,
+                   SmallVectorImpl<MakeRangeOp> &ranges) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return;
@@ -150,10 +149,6 @@ void collectRangesAndLoads(Value value, PhysicalExprAttr logicalExtent,
         !llvm::is_contained(ranges, range))
       ranges.push_back(range);
   }
-  for (Operation *access : fact.accesses)
-    if (auto load = dyn_cast<LoadOp>(access);
-        load && !llvm::is_contained(loads, load))
-      loads.push_back(load);
 }
 
 FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
@@ -870,16 +865,11 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
       return false;
     logicalExtent = extent;
     SmallVector<MakeRangeOp> ranges;
-    SmallVector<LoadOp> loads;
-    collectRangesAndLoads(source, extent, ranges, loads);
+    collectRanges(source, extent, ranges);
     llvm::sort(ranges, [](MakeRangeOp lhs, MakeRangeOp rhs) {
       return lhs->isBeforeInBlock(rhs);
     });
     ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
-    llvm::sort(loads, [](LoadOp lhs, LoadOp rhs) {
-      return lhs->isBeforeInBlock(rhs);
-    });
-    loads.erase(std::unique(loads.begin(), loads.end()), loads.end());
     componentRanges.push_back(std::move(ranges));
   }
   if (!logicalExtent || logicalExtent.getValue() <= 0)

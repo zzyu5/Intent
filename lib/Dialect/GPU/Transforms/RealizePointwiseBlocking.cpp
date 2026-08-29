@@ -2362,16 +2362,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             mapping.getLoc(), mappingBuilder.getIndexType(), newCoordinate,
             parameter.getResult(), BinaryOperator::Multiply);
         oldCoordinate.replaceAllUsesWith(newCoordinate);
-        PhysicalExprAttr extent = expression(
-            module.getContext(), PhysicalExprKind::Parameter, 0,
-            parameter.getParameter().getName().getValue());
-        llvm::SmallDenseSet<PhysicalSourceAxis> propagatedSources;
-        for (MakeRangeOp range : axes.lookup(*axisKey)) {
-          PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
-                              range.getDerived()};
-          if (propagatedSources.insert(source).second)
-            retargetSourceExtent(newCoordinate, source, extent);
-        }
         continue;
       }
       oldCoordinate.replaceAllUsesWith(newCoordinate);
