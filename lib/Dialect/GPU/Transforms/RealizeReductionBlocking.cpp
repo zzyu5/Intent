@@ -12,6 +12,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
+#include <tuple>
+
 using namespace mlir;
 
 namespace intent::gpu {
@@ -731,6 +733,64 @@ FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
                 : FailureOr<ParameterOp>(failure());
 }
 
+FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension);
+
+FailureOr<ParameterOp> parameterForDimension(func::FuncOp kernel,
+                                             int64_t dimension) {
+  ParameterOp result;
+  bool ambiguous = false;
+  kernel.walk([&](ParameterOp parameter) {
+    auto bound = parameter->getAttrOfType<IntegerAttr>(dimensionAttr);
+    auto coverage =
+        parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+    bool matches = (bound && bound.getInt() == dimension) ||
+                   (coverage && coverage.getInt() == dimension);
+    if (!matches)
+      return;
+    uint32_t role = parameter.getParameter().getRole();
+    bool ownership =
+        role == static_cast<uint32_t>(ParameterRole::OwnershipM) ||
+        role == static_cast<uint32_t>(ParameterRole::OwnershipN);
+    if (!ownership && !coverage)
+      return;
+    if (result && result != parameter) {
+      ambiguous = true;
+      return;
+    }
+    result = parameter;
+  });
+  return result && !ambiguous ? FailureOr<ParameterOp>(result)
+                              : FailureOr<ParameterOp>(failure());
+}
+
+PhysicalExprAttr selectedParameterExtent(ParameterOp parameter) {
+  ParameterAttr schema = parameter.getParameter();
+  StringRef name = schema.getName().getValue();
+  if (name.starts_with("FRAGMENT_S") && schema.getCandidates().size() == 1)
+    return expression(parameter.getContext(), PhysicalExprKind::Constant,
+                      schema.getCandidates()[0]);
+  return expression(parameter.getContext(), PhysicalExprKind::Parameter, 0,
+                    name);
+}
+
+FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,
+                                                         int64_t dimension) {
+  if (dimension <= 0 || failed(dimensionArgument(kernel, dimension)))
+    return failure();
+  static constexpr int64_t candidates[] = {
+      1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+      4096, 8192, 16384, 32768, 65536};
+  ParameterOp parameter = getOrCreateParameter(
+      kernel, ("REDUCE_FULL_D" + Twine(dimension)).str(),
+      ParameterRole::OwnershipN, candidates);
+  if (!parameter)
+    return failure();
+  parameter->setAttr(
+      coverageDimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  return parameter;
+}
+
 bool hasNonUnitFreeAxis(ReduceOp reduce) {
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -1040,6 +1100,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
 }
 
 LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
+  SmallVector<std::tuple<Value, PhysicalSourceAxis, int64_t>> pending;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
@@ -1048,9 +1109,24 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
         continue;
       auto extent = cast<PhysicalExprAttr>(attribute);
+      if (isCompileTimeExtent(extent))
+        continue;
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      if (extent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+        if (mapping.getDimensionId() <= 0)
+          return reduce.emitOpError(
+              "reduction free axis has no logical dimension authority");
+        pending.emplace_back(
+            source,
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            mapping.getDimensionId());
+        continue;
+      }
       if (extent.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Parameter))
-        continue;
+        return reduce.emitOpError(
+            "reduction free axis has no physical parameter authority");
       FailureOr<ParameterOp> parameter = parameterForExtent(kernel, extent);
       if (failed(parameter))
         return reduce.emitOpError(
@@ -1063,6 +1139,59 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
         return reduce.emitOpError(
             "reduction free axis is neither ownership-blocked nor exact full coverage");
     }
+  }
+
+  for (auto [source, sourceAxis, dimension] : pending) {
+    FailureOr<ParameterOp> parameter = parameterForDimension(kernel, dimension);
+    bool fullCoverage = false;
+    if (failed(parameter)) {
+      parameter = fullCoverageParameterForDimension(kernel, dimension);
+      fullCoverage = succeeded(parameter);
+    }
+    if (failed(parameter))
+      return reduce.emitOpError(
+                 "reduction free axis has neither prior ownership nor exact full-coverage authority")
+             << "; dimension=" << dimension;
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact ranges = analysis.sourceRanges(source, sourceAxis);
+    if (ranges.roots.empty()) {
+      // A free axis introduced by a typed broadcast has no coordinate range of
+      // its own.  Its dimension identity is nevertheless exact, so project
+      // only this value flow onto the already selected ownership extent.
+      retargetDimensionExtent(source, dimension,
+                              selectedParameterExtent(*parameter));
+      if (fullCoverage)
+        return reduce.emitOpError(
+                   "reduction full-coverage free axis has no coordinate range for tail validity")
+               << "; source_id=" << sourceAxis.sourceId
+               << ", source_axis=" << sourceAxis.sourceAxis
+               << ", dimension=" << dimension;
+      continue;
+    }
+    if (ranges.state == PhysicalFactState::Unknown)
+      return reduce.emitOpError(
+                 "reduction free axis has no physical range projection")
+             << "; source_id=" << sourceAxis.sourceId
+             << ", source_axis=" << sourceAxis.sourceAxis
+             << ", dimension=" << dimension;
+    MakeRangeOp authority = ranges.roots.front();
+    if (!llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+          return sameLogicalSourceRange(authority, range);
+        }))
+      return reduce.emitOpError(
+                 "reduction free axis has conflicting physical range projections")
+             << "; source_id=" << sourceAxis.sourceId
+             << ", source_axis=" << sourceAxis.sourceAxis
+             << ", dimension=" << dimension;
+    for (MakeRangeOp range : ranges.roots)
+      retargetDimensionExtent(range.getResult(), dimension,
+                              selectedParameterExtent(*parameter));
+    if (fullCoverage &&
+        failed(bindFullCoverageDimension(kernel, dimension,
+                                         parameter->getResult())))
+      return reduce.emitOpError(
+                 "reduction free axis full-coverage binding failed")
+             << "; dimension=" << dimension;
   }
   return success();
 }

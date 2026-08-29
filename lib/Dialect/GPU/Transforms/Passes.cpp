@@ -46,9 +46,17 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   if (failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeContractionBlocking(module)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeReductionBlocking(module)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignReductionIdentityRelations(*kernel)) ||
+      failed(alignReductionYieldRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Structured realization replays source slices and may create new gathers.

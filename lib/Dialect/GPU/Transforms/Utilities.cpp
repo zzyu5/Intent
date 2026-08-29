@@ -717,6 +717,130 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
+  auto predicateType = [&](FragmentType value) {
+    return FragmentType::get(
+        kernel.getContext(), IntegerType::get(kernel.getContext(), 1),
+        value.getShape(), value.getAxisMaps(), value.getValidity(),
+        value.getOwner());
+  };
+  auto project = [&](OpBuilder &builder, Location location, Value value,
+                     Type target) -> FailureOr<Value> {
+    if (!value)
+      return failure();
+    return projectPhysicalValueToSchema(builder, location, value, target);
+  };
+
+  SmallVector<LoadOp> loads;
+  SmallVector<GatherOp> gathers;
+  SmallVector<StoreOp> stores;
+  kernel.walk([&](LoadOp load) { loads.push_back(load); });
+  kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
+  kernel.walk([&](StoreOp store) { stores.push_back(store); });
+
+  for (LoadOp load : loads) {
+    if (!load.getValid() && !load.getFill())
+      continue;
+    if (!load.getValid())
+      return load.emitOpError("load fill has no validity authority");
+    OpBuilder builder(load);
+    Type valueType = load.getResult().getType();
+    Type validType = builder.getI1Type();
+    if (auto fragment = dyn_cast<FragmentType>(valueType))
+      validType = predicateType(fragment);
+    FailureOr<Value> valid = project(builder, load.getLoc(), load.getValid(),
+                                     validType);
+    if (failed(valid))
+      return load.emitOpError("cannot align load validity with its value schema");
+    FailureOr<Value> fill = failure();
+    if (load.getFill())
+      fill = project(builder, load.getLoc(), load.getFill(), valueType);
+    else if (auto fragment = dyn_cast<FragmentType>(valueType))
+      fill = materializeZeroFragment(builder, load.getLoc(), fragment);
+    else {
+      TypedAttr zero;
+      if (auto integer = dyn_cast<IntegerType>(valueType))
+        zero = builder.getIntegerAttr(integer, 0);
+      else if (auto floating = dyn_cast<FloatType>(valueType))
+        zero = builder.getFloatAttr(floating, 0.0);
+      else if (isa<IndexType>(valueType))
+        zero = builder.getIndexAttr(0);
+      if (zero)
+        fill = materializeScalarConstant(builder, load.getLoc(), zero, valueType);
+    }
+    if (failed(fill))
+      return load.emitOpError("cannot align load fill with its value schema");
+    if (*valid == load.getValid() && *fill == load.getFill())
+      continue;
+    auto replacement = builder.create<LoadOp>(
+        load.getLoc(), valueType, load.getResource(), load.getCoordinates(),
+        *valid, *fill, load.getSourceAxes());
+    if (Attribute origin = load->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    load.getResult().replaceAllUsesWith(replacement.getResult());
+    load.erase();
+  }
+
+  for (GatherOp gather : gathers) {
+    if (!gather.getValid() && !gather.getFill())
+      continue;
+    if (!gather.getValid())
+      return gather.emitOpError("gather fill has no validity authority");
+    OpBuilder builder(gather);
+    Type valueType = gather.getResult().getType();
+    auto fragment = dyn_cast<FragmentType>(valueType);
+    if (!fragment) {
+      if (gather.getValid() && gather.getFill())
+        continue;
+      return gather.emitOpError(
+          "scalar gather validity and fill must remain paired");
+    }
+    FailureOr<Value> valid = project(
+        builder, gather.getLoc(), gather.getValid(), predicateType(fragment));
+    if (failed(valid))
+      return gather.emitOpError(
+          "cannot align gather validity with its value schema");
+    FailureOr<Value> fill =
+        gather.getFill()
+            ? project(builder, gather.getLoc(), gather.getFill(), valueType)
+            : materializeZeroFragment(builder, gather.getLoc(), fragment);
+    if (failed(fill))
+      return gather.emitOpError("cannot align gather fill with its value schema");
+    if (*valid == gather.getValid() && *fill == gather.getFill())
+      continue;
+    auto replacement = builder.create<GatherOp>(
+        gather.getLoc(), valueType, gather.getSource(), gather.getCoordinates(),
+        *valid, *fill, gather.getSourceAxes());
+    if (Attribute origin = gather->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    gather.erase();
+  }
+
+  for (StoreOp store : stores) {
+    if (!store.getValid())
+      continue;
+    auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
+    if (!valueType)
+      continue;
+    OpBuilder builder(store);
+    FailureOr<Value> valid = project(
+        builder, store.getLoc(), store.getValid(), predicateType(valueType));
+    if (failed(valid))
+      return store.emitOpError(
+          "cannot align store validity with its value schema");
+    if (*valid == store.getValid())
+      continue;
+    auto replacement = builder.create<StoreOp>(
+        store.getLoc(), store.getResource(), store.getCoordinates(),
+        store.getValue(), *valid, store.getSourceAxes(), store.getCollision());
+    if (Attribute origin = store->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    store.erase();
+  }
+  return success();
+}
+
 LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
   kernel.walk([&](MakeRecordOp record) {
     RecordType current = record.getResult().getType();

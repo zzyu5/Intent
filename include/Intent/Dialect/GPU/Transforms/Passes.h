@@ -36,6 +36,8 @@ mlir::LogicalResult
 alignPointwiseValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignAggregateValueRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
+alignAccessValueRelations(mlir::func::FuncOp kernel);
 mlir::FailureOr<mlir::Value>
 projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
                              mlir::Value value, mlir::Type target);

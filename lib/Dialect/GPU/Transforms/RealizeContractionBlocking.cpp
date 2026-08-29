@@ -1047,9 +1047,13 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
         rhsValid = *projected;
       }
       FailureOr<Value> lhsFill =
-          retargetFill(builder, location, lhsLoad.getFill(), currentLhsType);
+          lhsValid ? retargetFill(builder, location, lhsLoad.getFill(),
+                                  currentLhsType)
+                   : FailureOr<Value>(Value());
       FailureOr<Value> rhsFill =
-          retargetFill(builder, location, rhsLoad.getFill(), currentRhsType);
+          rhsValid ? retargetFill(builder, location, rhsLoad.getFill(),
+                                  currentRhsType)
+                   : FailureOr<Value>(Value());
       if (failed(lhsFill) || failed(rhsFill)) {
         failureReason =
             "invalid-value fill cannot be retargeted after erasing a reduction axis";
