@@ -27,19 +27,6 @@ PhysicalExprAttr parameterExtent(ParameterAttr parameter) {
       parameter.getName(), ArrayAttr::get(parameter.getContext(), {}));
 }
 
-FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
-  return queryFragmentAxis(fragment, sourceId);
-}
-
-FailureOr<uint64_t> sourceForOperandAxis(Value operand, uint64_t sourceId) {
-  auto fragment = dyn_cast<FragmentType>(operand.getType());
-  if (!fragment)
-    return failure();
-  if (succeeded(axisForSource(fragment, sourceId)))
-    return sourceId;
-  return failure();
-}
-
 FragmentType replaceExtent(FragmentType source, unsigned axis,
                            PhysicalExprAttr extent, Type element = {}) {
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
@@ -74,16 +61,6 @@ FragmentType predicateType(FragmentType source) {
       source.getOwner());
 }
 
-bool isUnitStep(Value value) {
-  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-    return constant.value() == 1;
-  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<RangeOp>();
-    return range && bound.getBound() == 2 && isUnitStep(range.getStep());
-  }
-  return false;
-}
-
 bool isUnitExtent(Attribute attribute) {
   auto expression = dyn_cast<PhysicalExprAttr>(attribute);
   return expression &&
@@ -105,17 +82,19 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || sourceAxis >= fragment.getShape().size())
     return failure();
-  auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
-  SourcePlan plan{source, mapping.getSourceId(), mapping.getSourceAxis(),
+  FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, sourceAxis);
+  if (failed(mapping))
+    return failure();
+  SourcePlan plan{source, mapping->getSourceId(), mapping->getSourceAxis(),
                   sourceAxis, false, {}};
   auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalSourceAxis logicalSource{mapping.getSourceId(),
-                                   mapping.getSourceAxis()};
+  PhysicalSourceAxis logicalSource{mapping->getSourceId(),
+                                   mapping->getSourceAxis()};
   PhysicalRangeFact fact = analysis.sourceRanges(source, logicalSource);
-  if (!fact.isExact())
+  if (failed(queryExactLogicalRange(fact)))
     return failure();
   plan.ranges.assign(fact.roots.begin(), fact.roots.end());
   for (Operation *access : fact.accesses) {
@@ -134,36 +113,37 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
                "region-fold source replay encountered an unsupported access"),
            failure();
   }
-  for (MakeRangeOp range : plan.ranges)
-    if (!isUnitStep(range.getStep()))
-      return range.emitOpError(
-          "region-fold source traversal requires a unit-step physical range");
+  if (!fact.unitStep)
+    return plan.ranges.front().emitOpError(
+        "region-fold source traversal requires a unit-step physical range");
   if (plan.ranges.empty())
     return failure();
   return plan;
 }
 
 FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
-                             uint64_t sourceId,
+                             PhysicalSourceAxis source,
                              PhysicalExprAttr blockedExtent,
                              IRMapping &mapping, Value segmentTail = {},
                              AxisMapAttr segmentMapping = {}) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
   auto fragment = dyn_cast<FragmentType>(value.getType());
-  FailureOr<unsigned> axis = fragment ? axisForSource(fragment, sourceId)
-                                      : FailureOr<unsigned>(failure());
+  PhysicalAxisProjection projection = queryFragmentAxis(value.getType(), source);
+  FailureOr<unsigned> axis = projection.isExact()
+                                 ? FailureOr<unsigned>(projection.fragmentAxis)
+                                 : FailureOr<unsigned>(failure());
   if (!fragment || failed(axis))
     return value;
   Operation *producer = value.getDefiningOp();
   if (!producer)
     return failure();
   auto replayOperand = [&](Value operand) -> FailureOr<Value> {
-    FailureOr<uint64_t> operandSource =
-        sourceForOperandAxis(operand, sourceId);
-    if (failed(operandSource))
+    PhysicalAxisProjection operandProjection =
+        queryFragmentAxis(operand.getType(), source);
+    if (!operandProjection.isExact())
       return operand;
-    return replayValue(builder, location, operand, *operandSource,
+    return replayValue(builder, location, operand, source,
                        blockedExtent, mapping, segmentTail, segmentMapping);
   };
   auto combineTail = [&](FragmentType type,
@@ -295,9 +275,12 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   }
   Operation *clone = builder.clone(*producer, mapping);
   auto clonedType = dyn_cast<FragmentType>(clone->getResult(0).getType());
+  PhysicalAxisProjection clonedProjection =
+      queryFragmentAxis(clone->getResult(0).getType(), source);
   FailureOr<unsigned> clonedAxis =
-      clonedType ? axisForSource(clonedType, sourceId)
-                 : FailureOr<unsigned>(failure());
+      clonedType && clonedProjection.isExact()
+          ? FailureOr<unsigned>(clonedProjection.fragmentAxis)
+          : FailureOr<unsigned>(failure());
   if (!clonedType || failed(clonedAxis))
     return failure();
   // A reshape may introduce a unit axis which a following broadcast expands.
@@ -309,7 +292,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
   if (isa<ReshapeOp>(producer) && isUnitExtent(clonedType.getShape()[*clonedAxis])) {
     preservesIntroducedUnitAxis = llvm::none_of(
         producer->getOperands(), [&](Value operand) {
-          return succeeded(sourceForOperandAxis(operand, sourceId));
+          return queryFragmentAxis(operand.getType(), source).isExact();
         });
   }
   if (!preservesIntroducedUnitAxis)
@@ -400,8 +383,9 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       return failure();
     }
     FailureOr<Value> replayed = replayValue(
-        builder, location, plan.source, plan.sourceId, sliceExtent, mapping,
-        tail, segmentMapping);
+        builder, location, plan.source,
+        PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis}, sliceExtent,
+        mapping, tail, segmentMapping);
     if (failed(replayed)) {
       reason = "source pure producer graph cannot be replayed";
       return failure();
@@ -1071,19 +1055,19 @@ bool scanTailIsIdentity(RegionScanOp scan, ArrayRef<SourcePlan> plans,
   return true;
 }
 
-FailureOr<Type> slicedType(Type type, uint64_t sourceId,
+FailureOr<Type> slicedType(Type type, PhysicalSourceAxis source,
                            PhysicalExprAttr extent) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
-    FailureOr<unsigned> axis = axisForSource(fragment, sourceId);
-    if (failed(axis))
+    PhysicalAxisProjection axis = queryFragmentAxis(fragment, source);
+    if (!axis.isExact())
       return type;
-    return Type(replaceExtent(fragment, *axis, extent));
+    return Type(replaceExtent(fragment, axis.fragmentAxis, extent));
   }
   if (auto record = dyn_cast<RecordType>(type)) {
     SmallVector<Attribute> fields;
     for (Attribute field : record.getFieldTypes()) {
       FailureOr<Type> converted =
-          slicedType(cast<TypeAttr>(field).getValue(), sourceId, extent);
+          slicedType(cast<TypeAttr>(field).getValue(), source, extent);
       if (failed(converted))
         return failure();
       fields.push_back(TypeAttr::get(*converted));
@@ -1150,7 +1134,8 @@ Value mappedValue(IRMapping &mapping, Value value) {
 
 FailureOr<Value> materializeScanConsumerValue(
     OpBuilder &builder, Location location, RegionScanOp scan, Value value,
-    IRMapping &mapping, uint64_t sourceId, PhysicalExprAttr sliceExtent,
+    IRMapping &mapping, PhysicalSourceAxis source,
+    PhysicalExprAttr sliceExtent,
     Value offset, Value segment, std::string &reason) {
   if (!value)
     return Value();
@@ -1162,18 +1147,19 @@ FailureOr<Value> materializeScanConsumerValue(
     return value;
   if (auto range = dyn_cast<MakeRangeOp>(definition)) {
     FailureOr<Value> start = materializeScanConsumerValue(
-        builder, location, scan, range.getStart(), mapping, sourceId,
+        builder, location, scan, range.getStart(), mapping, source,
         sliceExtent, offset, segment, reason);
     FailureOr<Value> extent = materializeScanConsumerValue(
-        builder, location, scan, range.getExtent(), mapping, sourceId,
+        builder, location, scan, range.getExtent(), mapping, source,
         sliceExtent, offset, segment, reason);
     FailureOr<Value> step = materializeScanConsumerValue(
-        builder, location, scan, range.getStep(), mapping, sourceId,
+        builder, location, scan, range.getStep(), mapping, source,
         sliceExtent, offset, segment, reason);
     if (failed(start) || failed(extent) || failed(step))
       return failure();
     auto type = cast<FragmentType>(range.getResult().getType());
-    bool isSourceAxis = succeeded(axisForSource(type, sourceId));
+    PhysicalAxisProjection sourceAxis = queryFragmentAxis(type, source);
+    bool isSourceAxis = sourceAxis.isExact();
     Value physicalStart = *start;
     Value physicalExtent = *extent;
     FragmentType physicalType = type;
@@ -1197,7 +1183,7 @@ FailureOr<Value> materializeScanConsumerValue(
   }
   for (Value operand : definition->getOperands()) {
     FailureOr<Value> materialized = materializeScanConsumerValue(
-        builder, location, scan, operand, mapping, sourceId, sliceExtent,
+        builder, location, scan, operand, mapping, source, sliceExtent,
         offset, segment, reason);
     if (failed(materialized))
       return failure();
@@ -1205,14 +1191,14 @@ FailureOr<Value> materializeScanConsumerValue(
       mapping.map(operand, *materialized);
   }
   Operation *clone = builder.clone(*definition, mapping);
-  for (auto [source, result] :
+  for (auto [original, result] :
        llvm::zip(definition->getResults(), clone->getResults())) {
-    FailureOr<Type> type = slicedType(result.getType(), sourceId, sliceExtent);
+    FailureOr<Type> type = slicedType(result.getType(), source, sliceExtent);
     if (failed(type))
       return failure();
     result.setType(*type);
-    if (!mapping.lookupOrNull(source))
-      mapping.map(source, result);
+    if (!mapping.lookupOrNull(original))
+      mapping.map(original, result);
   }
   Value result = mapping.lookupOrNull(value);
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
@@ -1220,7 +1206,8 @@ FailureOr<Value> materializeScanConsumerValue(
 
 LogicalResult cloneScanOutputConsumers(
     OpBuilder &builder, Location location, ArrayRef<Operation *> consumers,
-    IRMapping &mapping, uint64_t sourceId, PhysicalExprAttr sliceExtent,
+    IRMapping &mapping, PhysicalSourceAxis source,
+    PhysicalExprAttr sliceExtent,
     Value segmentTail, RegionScanOp scan, Value offset, Value segment,
     std::string &reason) {
   for (Operation *operation : consumers) {
@@ -1228,7 +1215,7 @@ LogicalResult cloneScanOutputConsumers(
       if (mapping.lookupOrNull(operand))
         continue;
       FailureOr<Value> materialized = materializeScanConsumerValue(
-          builder, location, scan, operand, mapping, sourceId, sliceExtent,
+          builder, location, scan, operand, mapping, source, sliceExtent,
           offset, segment, reason);
       if (failed(materialized))
         return failure();
@@ -1266,16 +1253,16 @@ LogicalResult cloneScanOutputConsumers(
       continue;
     }
     Operation *clone = builder.clone(*operation, mapping);
-    for (auto [source, result] :
+    for (auto [original, result] :
          llvm::zip(operation->getResults(), clone->getResults())) {
-      FailureOr<Type> type = slicedType(result.getType(), sourceId, sliceExtent);
+      FailureOr<Type> type = slicedType(result.getType(), source, sliceExtent);
       if (failed(type)) {
         reason = "region-scan output consumer has no sliced physical type";
         return failure();
       }
       result.setType(*type);
-      if (!mapping.lookupOrNull(source))
-        mapping.map(source, result);
+      if (!mapping.lookupOrNull(original))
+        mapping.map(original, result);
     }
   }
   return success();
@@ -1300,7 +1287,8 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
   PhysicalProgramAnalysis analysis(kernel);
   auto uniqueRange = [&](Value value) -> MakeRangeOp {
     PhysicalRangeFact fact = analysis.sourceRanges(value);
-    return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
+    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+    return succeeded(range) ? *range : MakeRangeOp();
   };
   for (CompareOp compare : fold.getSummarize().front().getOps<CompareOp>()) {
     BlockArgument lhs = rootHelperArgument(compare.getLhs());
@@ -1333,8 +1321,8 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
                                   comparedSource.getResult().getType())
                             : FragmentType();
     auto masterType = dyn_cast<FragmentType>(master.getResult().getType());
-    if (!captureRange || !comparedSource || !isUnitStep(captureRange.getStep()) ||
-        !isUnitStep(comparedSource.getStep()) ||
+    if (!captureRange || !comparedSource || !isUnitStepRange(captureRange) ||
+        !isUnitStepRange(comparedSource) ||
         !comparedType || !masterType || comparedType.getShape().size() != 1 ||
         masterType.getShape().size() != 1 ||
         comparedType.getShape()[0] != masterType.getShape()[0])
@@ -1408,7 +1396,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
   struct SourceAssumption {
     AssumeInBoundsOp operation;
-    uint64_t sourceId;
+    PhysicalSourceAxis source;
     unsigned planIndex;
   };
   SmallVector<SourceAssumption> sourceAssumptions;
@@ -1418,13 +1406,18 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       PhysicalRangeFact fact = physicalAnalysis.sourceRanges(
           assumption.getIndex(),
           PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis});
-      if (!fact.isExact() ||
+      FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+      if (failed(range) ||
           llvm::none_of(fact.roots, [&](MakeRangeOp root) {
-            return llvm::is_contained(plan.ranges, root);
+            return llvm::any_of(plan.ranges, [&](MakeRangeOp planned) {
+              return sameLogicalRange(planned, root);
+            });
           }))
         continue;
       sourceAssumptions.push_back(
-          {assumption, plan.sourceId, static_cast<unsigned>(planIndex)});
+          {assumption,
+           PhysicalSourceAxis{plan.sourceId, plan.logicalSourceAxis},
+           static_cast<unsigned>(planIndex)});
       break;
     }
   });
@@ -1476,7 +1469,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       }
       FailureOr<Value> index = replayValue(
           nested, nestedLocation, sourceAssumption.operation.getIndex(),
-          sourceAssumption.sourceId, sliceExtent,
+          sourceAssumption.source, sliceExtent,
           *sourceMappings[sourceAssumption.planIndex], segmentTail);
       if (failed(index)) {
         failureReason =
@@ -1679,7 +1672,9 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           sliceMapping.map(output, slice);
         if (failed(cloneScanOutputConsumers(
                 nested, nestedLocation, outputConsumers, sliceMapping,
-                plans.front().sourceId, sliceExtent, segmentTail,
+                PhysicalSourceAxis{plans.front().sourceId,
+                                   plans.front().logicalSourceAxis},
+                sliceExtent, segmentTail,
                 scan, offset, segment.getResult(), failureReason))) {
           bodyFailed = true;
           return;

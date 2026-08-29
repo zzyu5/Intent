@@ -127,6 +127,16 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
                               depth + 1);
 }
 
+bool isUnitStepValue(Value value) {
+  if (std::optional<int64_t> constant = integerConstant(value))
+    return *constant == 1;
+  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
+    auto range = bound.getRange().getDefiningOp<RangeOp>();
+    return range && bound.getBound() == 2 && isUnitStepValue(range.getStep());
+  }
+  return false;
+}
+
 } // namespace
 
 bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
@@ -213,6 +223,10 @@ bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
   return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
          sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
          sameScalarExpression(lhs.getStep(), rhs.getStep());
+}
+
+bool isUnitStepRange(MakeRangeOp range) {
+  return range && isUnitStepValue(range.getStep());
 }
 
 FailureOr<MakeRangeOp>
@@ -516,10 +530,8 @@ PhysicalRangeFact PhysicalProgramAnalysis::sourceRanges(
     result.state = PhysicalFactState::Unknown;
   else if (result.roots.size() > 1)
     result.state = PhysicalFactState::Ambiguous;
-  if (result.isUnique()) {
-    std::optional<int64_t> step = integerConstant(result.roots.front().getStep());
-    result.unitStep = step && *step == 1;
-  }
+  result.unitStep = !result.roots.empty() &&
+                    llvm::all_of(result.roots, isUnitStepRange);
   if (!source)
     unrestrictedRangeCache.try_emplace(value, result);
   return result;
@@ -764,10 +776,8 @@ PhysicalRangeFact PhysicalProgramAnalysis::axisRanges(Value value,
     result.state = PhysicalFactState::Unknown;
   else if (result.roots.size() > 1)
     result.state = PhysicalFactState::Ambiguous;
-  if (result.isUnique()) {
-    std::optional<int64_t> step = integerConstant(result.roots.front().getStep());
-    result.unitStep = step && *step == 1;
-  }
+  result.unitStep = !result.roots.empty() &&
+                    llvm::all_of(result.roots, isUnitStepRange);
   return result;
 }
 
@@ -791,6 +801,8 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return;
     }
   }
+  if (!isa<FragmentType, RecordType>(value.getType()))
+    return;
   if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {

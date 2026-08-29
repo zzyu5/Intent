@@ -90,6 +90,7 @@ struct PhysicalRangeFact {
 };
 
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs);
+bool isUnitStepRange(MakeRangeOp range);
 mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
     const PhysicalRangeFact &fact);
 

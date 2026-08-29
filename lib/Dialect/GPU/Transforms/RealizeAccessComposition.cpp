@@ -25,39 +25,9 @@ bool isTrue(Value value) {
   return integer && integer.getType().isInteger(1) && integer.getInt() != 0;
 }
 
-FailureOr<AxisMapAttr> fragmentAxisMap(FragmentType type, unsigned axis) {
-  for (Attribute attribute : type.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getFragmentAxis() == axis)
-      return mapping;
-  }
-  return failure();
-}
-
-FailureOr<unsigned> coordinateForMap(ValueRange coordinates,
-                                     AxisMapAttr expected) {
-  std::optional<unsigned> result;
-  for (auto [index, coordinate] : llvm::enumerate(coordinates)) {
-    auto fragment = dyn_cast<FragmentType>(coordinate.getType());
-    if (!fragment)
-      continue;
-    bool matches = llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
-      auto mapping = cast<AxisMapAttr>(attribute);
-      return mapping.getSourceId() == expected.getSourceId() &&
-             mapping.getSourceAxis() == expected.getSourceAxis();
-    });
-    if (!matches)
-      continue;
-    if (result)
-      return failure();
-    result = index;
-  }
-  return result ? FailureOr<unsigned>(*result)
-                : FailureOr<unsigned>(failure());
-}
-
 FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
-                                     FragmentType target, IRMapping &mapping) {
+                                     FragmentType target, IRMapping &mapping,
+                                     PhysicalProgramAnalysis &analysis) {
   if (!value)
     return Value();
   if (Value replacement = mapping.lookupOrNull(value))
@@ -65,14 +35,15 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return value;
+  PhysicalReplayFact replay = analysis.replayability(
+      value, std::nullopt, PhysicalReplayScope::Coordinate,
+      /*allowAccesses=*/false);
   Operation *producer = value.getDefiningOp();
-  if (!producer ||
-      !isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
-                            /*allowAccesses=*/false))
+  if (!producer || isa<MakeRangeOp>(producer) || !replay.isReplayable())
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replacement =
-        replayFragmentValue(builder, operand, target, mapping);
+        replayFragmentValue(builder, operand, target, mapping, analysis);
     if (failed(replacement))
       return failure();
     if (*replacement != operand && !mapping.lookupOrNull(operand))
@@ -135,29 +106,30 @@ LogicalResult composeLoadGather(GatherOp gather) {
         sourceAxis >= static_cast<int64_t>(sourceType.getShape().size()))
       return gather.emitOpError("gather source axis is outside its loaded value");
     FailureOr<AxisMapAttr> mapping =
-        fragmentAxisMap(sourceType, static_cast<unsigned>(sourceAxis));
+        queryAxisMap(sourceType, static_cast<unsigned>(sourceAxis));
     if (failed(mapping))
       return gather.emitOpError("gather source axis lost coordinate provenance");
-    FailureOr<unsigned> target =
-        coordinateForMap(sourceLoad.getCoordinates(), *mapping);
-    if (failed(target))
+    PhysicalAxisProjection target = queryCoordinateIndex(
+        sourceLoad.getCoordinates(),
+        PhysicalSourceAxis{mapping->getSourceId(), mapping->getSourceAxis()});
+    if (!target.isExact())
       return gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
-    Value original = sourceLoad.getCoordinates()[*target];
+    Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
     replay.map(original, coordinate);
     PhysicalRangeFact roots = analysis.sourceRanges(original);
     if (roots.isUnique() && !replay.lookupOrNull(roots.roots.front().getResult()))
       replay.map(roots.roots.front().getResult(), coordinate);
-    coordinates[*target] = coordinate;
+    coordinates[target.fragmentAxis] = coordinate;
   }
 
   OpBuilder builder(gather);
   FailureOr<Value> sourceValid = replayFragmentValue(
       builder, sourceLoad.getValid(), cast<FragmentType>(gather.getResult().getType()),
-      replay);
+      replay, analysis);
   FailureOr<Value> sourceFill = replayFragmentValue(
       builder, sourceLoad.getFill(), cast<FragmentType>(gather.getResult().getType()),
-      replay);
+      replay, analysis);
   if (failed(sourceValid) || failed(sourceFill))
     return gather.emitOpError(
         "source access validity/fill cannot follow composed coordinates");
@@ -218,24 +190,21 @@ LogicalResult composeIdentityFragmentGather(GatherOp gather) {
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
       return success();
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-    std::optional<unsigned> resultAxis;
-    for (auto [axis, attribute] : llvm::enumerate(result.getAxisMaps())) {
-      auto mapping = cast<AxisMapAttr>(attribute);
-      if (mapping.getSourceId() == expected.getSourceId() &&
-          mapping.getSourceAxis() == expected.getSourceAxis()) {
-        if (resultAxis)
-          return success();
-        resultAxis = axis;
-      }
-    }
+    PhysicalSourceAxis physicalSource{expected.getSourceId(),
+                                      expected.getSourceAxis()};
+    PhysicalAxisProjection resultAxis =
+        queryFragmentAxis(result, physicalSource);
+    PhysicalAxisProjection coordinateAxis =
+        queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-    if (!resultAxis || !coordinateType ||
-        source.getShape()[sourceAxis] != result.getShape()[*resultAxis] ||
+    if (!resultAxis.isExact() || !coordinateAxis.isExact() || !coordinateType ||
+        source.getShape()[sourceAxis] !=
+            result.getShape()[resultAxis.fragmentAxis] ||
         coordinateType.getShape().size() != 1 ||
         coordinateType.getShape()[0] != source.getShape()[sourceAxis] ||
-        failed(coordinateForMap(ValueRange{coordinate}, expected)))
+        coordinateAxis.fragmentAxis != 0)
       return success();
-    represented[*resultAxis] = true;
+    represented[resultAxis.fragmentAxis] = true;
   }
   for (auto [axis, extent] : llvm::enumerate(result.getShape())) {
     if (represented[axis])
@@ -274,26 +243,26 @@ LogicalResult projectFragmentGather(GatherOp gather) {
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
       return success();
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-    std::optional<unsigned> resultAxis;
-    for (auto [axis, attribute] : llvm::enumerate(result.getAxisMaps())) {
-      auto mapping = cast<AxisMapAttr>(attribute);
-      if (mapping.getSourceId() == expected.getSourceId() &&
-          mapping.getSourceAxis() == expected.getSourceAxis()) {
-        if (resultAxis)
-          return success();
-        resultAxis = axis;
-      }
-    }
-    if (!resultAxis) {
+    PhysicalSourceAxis physicalSource{expected.getSourceId(),
+                                      expected.getSourceAxis()};
+    PhysicalAxisProjection resultAxis =
+        queryFragmentAxis(result, physicalSource);
+    if (resultAxis.state == PhysicalFactState::Ambiguous)
+      return success();
+    if (!resultAxis.isExact()) {
       selectedCoordinates.push_back(coordinate);
       selectedAxes.push_back(sourceAxis);
       continue;
     }
+    PhysicalAxisProjection coordinateAxis =
+        queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-    if (!coordinateType || coordinateType.getShape().size() != 1 ||
-        source.getShape()[sourceAxis] != result.getShape()[*resultAxis] ||
+    if (!coordinateAxis.isExact() || !coordinateType ||
+        coordinateType.getShape().size() != 1 ||
+        source.getShape()[sourceAxis] !=
+            result.getShape()[resultAxis.fragmentAxis] ||
         coordinateType.getShape()[0] != source.getShape()[sourceAxis] ||
-        failed(coordinateForMap(ValueRange{coordinate}, expected)))
+        coordinateAxis.fragmentAxis != 0)
       return success();
     projected = true;
   }
