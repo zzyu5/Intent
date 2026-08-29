@@ -125,6 +125,10 @@ public:
   PhysicalRangeFact sourceRanges(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt);
+  /// Exact range roots that make one concrete fragment axis vary.  Unlike a
+  /// source-id query, this preserves repeated occurrences of the same logical
+  /// source in Cartesian/indexed values.
+  PhysicalRangeFact axisRanges(mlir::Value value, unsigned fragmentAxis);
   PhysicalReplayFact replayability(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt,
@@ -149,6 +153,9 @@ private:
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalRangeFact &result,
                      llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
+  void collectAxisRanges(mlir::Value value, unsigned fragmentAxis,
+                         PhysicalRangeFact &result,
+                         llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
   void analyzeReplay(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalReplayScope scope, bool allowAccesses,

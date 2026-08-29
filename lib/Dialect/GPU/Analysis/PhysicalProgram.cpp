@@ -424,6 +424,224 @@ PhysicalRangeFact PhysicalProgramAnalysis::sourceRanges(
   return result;
 }
 
+void PhysicalProgramAnalysis::collectAxisRanges(
+    Value value, unsigned fragmentAxis, PhysicalRangeFact &result,
+    SmallPtrSetImpl<Operation *> &visited) {
+  if (!value)
+    return;
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment || fragmentAxis >= fragment.getShape().size()) {
+    result.state = PhysicalFactState::Unknown;
+    return;
+  }
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Value outer = structuredSourceForArgument(argument);
+    auto outerFragment = outer ? dyn_cast<FragmentType>(outer.getType())
+                               : FragmentType();
+    if (!outerFragment || fragmentAxis >= outerFragment.getShape().size()) {
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
+    collectAxisRanges(outer, fragmentAxis, result, visited);
+    return;
+  }
+  Operation *operation = value.getDefiningOp();
+  if (!operation || !visited.insert(operation).second)
+    return;
+  if (auto range = dyn_cast<MakeRangeOp>(operation)) {
+    if (fragmentAxis == 0)
+      appendUnique(result.roots, range);
+    else
+      result.state = PhysicalFactState::Unknown;
+    return;
+  }
+  if (auto extract = dyn_cast<ExtractOp>(operation)) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      if (extract.getField() >= record.getFields().size()) {
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+      collectAxisRanges(record.getFields()[extract.getField()], fragmentAxis,
+                        result, visited);
+      return;
+    }
+  }
+  if (auto splat = dyn_cast<SplatOp>(operation))
+    return;
+  if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    if (!input)
+      return;
+    if (input.getShape().size() > fragment.getShape().size()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    if (input.getShape().size() != fragment.getShape().size()) {
+      auto expected =
+          cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+      std::optional<unsigned> inputAxis;
+      for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
+        auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
+        if (mapping.getSourceId() != expected.getSourceId() ||
+            mapping.getSourceAxis() != expected.getSourceAxis() ||
+            mapping.getDimensionId() != expected.getDimensionId())
+          continue;
+        if (inputAxis) {
+          result.state = PhysicalFactState::Ambiguous;
+          return;
+        }
+        inputAxis = axis;
+      }
+      if (!inputAxis)
+        return;
+      collectAxisRanges(broadcast.getValue(), *inputAxis, result, visited);
+      return;
+    }
+    unsigned offset = fragment.getShape().size() - input.getShape().size();
+    if (fragmentAxis < offset)
+      return;
+    unsigned inputAxis = fragmentAxis - offset;
+    auto inputExtent = cast<PhysicalExprAttr>(input.getShape()[inputAxis]);
+    auto outputExtent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+    if (inputExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        inputExtent.getValue() == 1 && inputExtent != outputExtent)
+      return;
+    collectAxisRanges(broadcast.getValue(), inputAxis, result, visited);
+    return;
+  }
+  if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+    ArrayRef<int64_t> permutation = transpose.getPermutation();
+    if (fragmentAxis >= permutation.size() || permutation[fragmentAxis] < 0) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    collectAxisRanges(transpose.getValue(),
+                      static_cast<unsigned>(permutation[fragmentAxis]), result,
+                      visited);
+    return;
+  }
+  if (auto load = dyn_cast<LoadOp>(operation)) {
+    appendUnique(result.accesses, operation);
+    auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+    bool found = false;
+    for (Value coordinate : load.getCoordinates()) {
+      auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+      if (!coordinateType ||
+          fragmentAxis >= coordinateType.getShape().size())
+        continue;
+      auto mapping = cast<AxisMapAttr>(
+          coordinateType.getAxisMaps()[fragmentAxis]);
+      if (mapping.getSourceId() != expected.getSourceId() ||
+          mapping.getSourceAxis() != expected.getSourceAxis() ||
+          mapping.getDimensionId() != expected.getDimensionId())
+        continue;
+      if (found) {
+        result.state = PhysicalFactState::Ambiguous;
+        return;
+      }
+      found = true;
+      collectAxisRanges(coordinate, fragmentAxis, result, visited);
+    }
+    if (!found) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+    }
+    return;
+  }
+  if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+    auto opResult = dyn_cast<OpResult>(value);
+    if (!opResult || opResult.getResultNumber() >= reduce.getSourceCount()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    auto source = dyn_cast<FragmentType>(
+        reduce.getInputs()[opResult.getResultNumber()].getType());
+    if (!source) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    llvm::SmallDenseSet<int64_t> reduced(reduce.getAxes().begin(),
+                                         reduce.getAxes().end());
+    SmallVector<unsigned> freeAxes;
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+      if (!reduced.contains(axis))
+        freeAxes.push_back(axis);
+    if (fragmentAxis >= freeAxes.size()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    collectAxisRanges(reduce.getInputs()[opResult.getResultNumber()],
+                      freeAxes[fragmentAxis], result, visited);
+    return;
+  }
+  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+    auto opResult = dyn_cast<OpResult>(value);
+    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (!opResult || !yield ||
+        opResult.getResultNumber() >= yield.getResults().size()) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+      return;
+    }
+    collectAxisRanges(yield.getResults()[opResult.getResultNumber()],
+                      fragmentAxis, result, visited);
+    return;
+  }
+  if (auto select = dyn_cast<SelectOp>(operation)) {
+    for (Value selected : {select.getTrueValue(), select.getFalseValue()}) {
+      auto selectedType = dyn_cast<FragmentType>(selected.getType());
+      if (!selectedType ||
+          selectedType.getShape().size() != fragment.getShape().size() ||
+          fragmentAxis >= selectedType.getShape().size())
+        continue;
+      collectAxisRanges(selected, fragmentAxis, result, visited);
+    }
+    return;
+  }
+  if (!isCoordinateReplayNode(operation)) {
+    result.state = PhysicalFactState::Unknown;
+    appendUnique(result.blockers, operation);
+    return;
+  }
+  bool followed = false;
+  for (Value operand : operation->getOperands()) {
+    auto operandType = dyn_cast<FragmentType>(operand.getType());
+    if (!operandType || operandType.getShape().size() != fragment.getShape().size() ||
+        fragmentAxis >= operandType.getShape().size())
+      continue;
+    followed = true;
+    collectAxisRanges(operand, fragmentAxis, result, visited);
+  }
+  if (!followed && !operation->getOperands().empty()) {
+    result.state = PhysicalFactState::Unknown;
+    appendUnique(result.blockers, operation);
+  }
+}
+
+PhysicalRangeFact PhysicalProgramAnalysis::axisRanges(Value value,
+                                                      unsigned fragmentAxis) {
+  PhysicalRangeFact result;
+  result.state = PhysicalFactState::Exact;
+  SmallPtrSet<Operation *, 32> visited;
+  collectAxisRanges(value, fragmentAxis, result, visited);
+  if (result.state == PhysicalFactState::Unknown || !result.blockers.empty() ||
+      result.roots.empty())
+    result.state = PhysicalFactState::Unknown;
+  else if (result.roots.size() > 1)
+    result.state = PhysicalFactState::Ambiguous;
+  if (result.isUnique()) {
+    std::optional<int64_t> step = integerConstant(result.roots.front().getStep());
+    result.unitStep = step && *step == 1;
+  }
+  return result;
+}
+
 void PhysicalProgramAnalysis::analyzeReplay(
     Value value, std::optional<PhysicalSourceAxis> source,
     PhysicalReplayScope scope, bool allowAccesses,

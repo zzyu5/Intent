@@ -460,6 +460,7 @@ struct SourcePlan {
   Value source;
   uint64_t sourceId;
   unsigned reductionAxis;
+  MakeRangeOp reductionRange;
   SmallVector<LoadOp> roots;
   SmallVector<MakeRangeOp> ranges;
 };
@@ -481,23 +482,76 @@ bool isUnitStep(Value value) {
   return false;
 }
 
-FailureOr<RootAccess> analyzeRoot(LoadOp load, uint64_t sourceId) {
+bool sameLogicalSourceRange(MakeRangeOp lhs, MakeRangeOp rhs);
+
+FailureOr<MakeRangeOp> exactLogicalRange(const PhysicalRangeFact &fact) {
+  if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())
+    return failure();
+  MakeRangeOp first = fact.roots.front();
+  return llvm::all_of(fact.roots, [&](MakeRangeOp range) {
+           return sameLogicalSourceRange(first, range);
+         })
+             ? FailureOr<MakeRangeOp>(first)
+             : FailureOr<MakeRangeOp>(failure());
+}
+
+FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
   auto fragment = dyn_cast<FragmentType>(load.getResult().getType());
   if (!fragment)
     return load.emitOpError("reduction producer root is not a fragment load");
-  FailureOr<unsigned> fragmentAxis = axisForSource(fragment, sourceId);
-  FailureOr<unsigned> coordinate =
-      coordinateForSource(load.getCoordinates(), sourceId);
-  if (failed(fragmentAxis))
-    return load.emitOpError("reduction source provenance is absent from its root load");
-  if (failed(coordinate))
-    return load.emitOpError("reduction source provenance is absent from load coordinates");
-  auto range = sourceRange(load.getCoordinates()[*coordinate], sourceId);
-  if (!range)
-    return load.emitOpError("reduction load coordinate is not a physical range");
-  if (!isUnitStep(range.getStep()))
+  auto kernel = load->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalProgramAnalysis analysis(kernel);
+  std::optional<unsigned> fragmentAxis;
+  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+    PhysicalRangeFact fact = analysis.axisRanges(load.getResult(), axis);
+    if (!fact.isUnique() || fact.roots.front() != reductionRange)
+      continue;
+    if (fragmentAxis)
+      return load.emitOpError(
+          "reduction range drives multiple root fragment axes");
+    fragmentAxis = axis;
+  }
+  if (!fragmentAxis) {
+    FailureOr<unsigned> legacy =
+        axisForSource(fragment, reductionRange.getSourceId());
+    if (succeeded(legacy))
+      fragmentAxis = *legacy;
+  }
+  if (!fragmentAxis)
+    return load.emitOpError(
+        "reduction source provenance is absent from its root load");
+  std::optional<unsigned> coordinate;
+  for (auto [index, value] : llvm::enumerate(load.getCoordinates())) {
+    auto type = dyn_cast<FragmentType>(value.getType());
+    if (!type || *fragmentAxis >= type.getShape().size())
+      continue;
+    PhysicalRangeFact fact = analysis.axisRanges(value, *fragmentAxis);
+    if (!fact.isUnique() || fact.roots.front() != reductionRange)
+      continue;
+    if (coordinate)
+      return load.emitOpError(
+          "reduction range drives multiple load coordinates");
+    coordinate = index;
+  }
+  if (!coordinate) {
+    FailureOr<unsigned> legacy =
+        coordinateForSource(load.getCoordinates(), reductionRange.getSourceId());
+    if (succeeded(legacy)) {
+      MakeRangeOp range =
+          sourceRange(load.getCoordinates()[*legacy],
+                      reductionRange.getSourceId());
+      if (range && sameLogicalSourceRange(range, reductionRange))
+        coordinate = *legacy;
+    }
+  }
+  if (!coordinate)
+    return load.emitOpError(
+        "reduction source provenance is absent from load coordinates");
+  if (!isUnitStep(reductionRange.getStep()))
     return load.emitOpError("reduction load range is not unit-step");
-  return RootAccess{load, range, *coordinate, *fragmentAxis};
+  return RootAccess{load, reductionRange, *coordinate, *fragmentAxis};
 }
 
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
@@ -507,18 +561,26 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
   if (failed(mapping))
     return failure();
-  SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}, {}};
+  SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}, {}, {}};
   auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(
-      source, PhysicalSourceAxis{mapping->getSourceId(),
-                                 mapping->getSourceAxis()});
-  if (fact.state == PhysicalFactState::Unknown)
+  PhysicalSourceAxis physicalSource{mapping->getSourceId(),
+                                    mapping->getSourceAxis()};
+  const bool repeatedOccurrence =
+      queryFragmentAxes(fragment, physicalSource).size() > 1;
+  PhysicalRangeFact fact =
+      repeatedOccurrence
+          ? analysis.axisRanges(source, reductionAxis)
+          : analysis.sourceRanges(source, physicalSource);
+  FailureOr<MakeRangeOp> authority = exactLogicalRange(fact);
+  if (failed(authority))
     return failure();
+  plan.reductionRange = *authority;
   for (MakeRangeOp range : fact.roots)
-    if (!llvm::is_contained(plan.ranges, range))
+    if (sameLogicalSourceRange(plan.reductionRange, range) &&
+        !llvm::is_contained(plan.ranges, range))
       plan.ranges.push_back(range);
   for (Operation *access : fact.accesses)
     if (auto load = dyn_cast<LoadOp>(access);
@@ -1651,11 +1713,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                << (source.getDefiningOp()
                        ? source.getDefiningOp()->getName().getStringRef()
                        : StringRef("block argument"));
-      plan = SourcePlan{source, mapping->getSourceId(), outerAxis, {}};
+      plan = SourcePlan{source, mapping->getSourceId(), outerAxis, {}, {}, {}};
     }
     SmallVector<RootAccess> roots;
     for (LoadOp load : plan->roots) {
-      FailureOr<RootAccess> access = analyzeRoot(load, plan->sourceId);
+      FailureOr<RootAccess> access = analyzeRoot(load, plan->reductionRange);
       if (failed(access))
         return reduce.emitOpError(
             "multi-axis reduction outer axis has no unit-step load coordinate");
@@ -1920,7 +1982,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       }
     SmallVector<RootAccess> roots;
     for (LoadOp load : plan.roots) {
-      FailureOr<RootAccess> access = analyzeRoot(load, plan.sourceId);
+      FailureOr<RootAccess> access = analyzeRoot(load, plan.reductionRange);
       if (failed(access))
         return reduce.emitOpError(
             "load-rooted producer has no unit-step reduction coordinate");
@@ -2381,10 +2443,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
                  ? source.getDefiningOp()->getName().getStringRef()
                  : StringRef("block argument")));
       plan = SourcePlan{source, mapping->getSourceId(),
-                        static_cast<unsigned>(reductionAxis), {}, {}};
+                        static_cast<unsigned>(reductionAxis), {}, {}, {}};
     }
-    llvm::SmallPtrSet<Operation *, 32> rangeVisited;
-    collectSourceRanges(source, plan->sourceId, plan->ranges, rangeVisited);
     if (plan->ranges.empty()) {
       FailureOr<MakeRangeOp> authority =
           uniqueSourceRange(kernel, plan->sourceId);
@@ -2395,7 +2455,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       return reduce.emitOpError(
           "pure reduction source has no exact physical range authority");
     for (LoadOp root : plan->roots) {
-      FailureOr<RootAccess> rootAccess = analyzeRoot(root, plan->sourceId);
+      FailureOr<RootAccess> rootAccess =
+          analyzeRoot(root, plan->reductionRange);
       if (failed(rootAccess))
         return unhandled(
             "load-rooted producer has no unit-step reduction coordinate");
@@ -2410,7 +2471,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     hasDerivedSource |=
         plan->roots.size() != 1 || plan->source != plan->roots.front().getResult();
     if (!hasDerivedSource) {
-      RootAccess access = *analyzeRoot(plan->roots.front(), plan->sourceId);
+      RootAccess access =
+          *analyzeRoot(plan->roots.front(), plan->reductionRange);
       Value identity = reduce.getInputs()[reduce.getSourceCount() +
                                           sourcePlans.size()];
       if (access.load.getValid() &&
