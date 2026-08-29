@@ -7,33 +7,33 @@ using namespace mlir;
 namespace intent::gpu {
 
 LogicalResult completeGPUProgramConstruction(ModuleOp module) {
-  auto verifyStructured = [&] {
-    return verifyGPUProgramStage(module,
-                                 GPUProgramStage::StructuredConstruction);
-  };
-  if (failed(verifyStructured()))
+  // Region fold/scan are complete executable structured operations: their
+  // source slices, helper regions, carry and result assembly are verified by
+  // the operations themselves.  Subsequent realization rewrites one complete
+  // program into another; it does not finish a construction-time shell.
+  if (failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeAccessComposition(module)) ||
-      failed(verifyStructured()))
+      failed(verifyGPUProgram(module)))
     return failure();
   // Normalize multi-axis reductions while their complete logical source
   // traversals are still intact.  This separates structured consumers from
   // pointwise consumers before ownership blocking rewrites shared ranges.
   if (failed(decomposeMultiAxisReductions(module)) ||
-      failed(verifyStructured()))
+      failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizePointwiseOwnership(module)) ||
-      failed(verifyStructured()))
+      failed(verifyGPUProgram(module)))
     return failure();
   // Establish every ownership/internal physical range while the structured
   // operations still expose which logical axes they consume.  Later
   // structured passes lower those already-physical slices into loops and
   // primitives; they must not be asked to reconstruct range provenance.
   if (failed(realizePointwiseBlocking(module)) ||
-      failed(verifyStructured()))
+      failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionFolds(module)) ||
-      failed(verifyStructured()))
+      failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionScans(module)))
     return failure();
@@ -41,7 +41,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   if (failed(kernel) || failed(alignReductionIdentityRelations(*kernel)) ||
       failed(alignAggregateValueRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
-      failed(alignReductionYieldRelations(*kernel)))
+      failed(alignReductionYieldRelations(*kernel)) ||
+      failed(verifyGPUProgram(module)))
     return failure();
   if (failed(verifyGPUProgram(module)))
     return failure();
