@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -107,6 +108,17 @@ struct PhysicalReplayFact {
   bool isReplayable() const { return state == PhysicalFactState::Exact; }
 };
 
+/// Exact dependence of one current physical value on a structured reduction
+/// traversal. Unknown is conservative and carries the operations that prevent
+/// the relation from being established.
+struct PhysicalReductionDependencyFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  bool depends = false;
+  llvm::SmallVector<mlir::Operation *, 2> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
 /// Exact current-IR access relation, or an explicit conservative result.
 struct PhysicalAccessFootprint {
   PhysicalFactState state = PhysicalFactState::Unknown;
@@ -146,6 +158,9 @@ public:
       std::optional<PhysicalSourceAxis> source = std::nullopt,
       PhysicalReplayScope scope = PhysicalReplayScope::Coordinate,
       bool allowAccesses = true);
+  PhysicalReductionDependencyFact reductionDependency(
+      mlir::Value value, PhysicalSourceAxis source,
+      std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
 
   /// Recognizes a predicate composed only from exact range-end comparisons,
@@ -182,5 +197,25 @@ private:
 };
 
 } // namespace intent::gpu
+
+namespace llvm {
+template <> struct DenseMapInfo<intent::gpu::PhysicalSourceAxis> {
+  static inline intent::gpu::PhysicalSourceAxis getEmptyKey() {
+    return {DenseMapInfo<uint64_t>::getEmptyKey(),
+            DenseMapInfo<uint64_t>::getEmptyKey()};
+  }
+  static inline intent::gpu::PhysicalSourceAxis getTombstoneKey() {
+    return {DenseMapInfo<uint64_t>::getTombstoneKey(),
+            DenseMapInfo<uint64_t>::getTombstoneKey()};
+  }
+  static unsigned getHashValue(const intent::gpu::PhysicalSourceAxis &value) {
+    return static_cast<unsigned>(hash_combine(value.sourceId, value.sourceAxis));
+  }
+  static bool isEqual(const intent::gpu::PhysicalSourceAxis &lhs,
+                      const intent::gpu::PhysicalSourceAxis &rhs) {
+    return lhs == rhs;
+  }
+};
+} // namespace llvm
 
 #endif

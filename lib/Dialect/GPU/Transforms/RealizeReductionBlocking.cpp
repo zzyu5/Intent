@@ -1872,7 +1872,9 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (Attribute origin = reduce->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
   loop->setAttr(reductionTraversalSourceAttr,
-                builder.getI64IntegerAttr(master->range.getSourceId()));
+                PhysicalSourceAttr::get(builder.getContext(),
+                                        master->range.getSourceId(),
+                                        master->range.getSourceAxis()));
   for (auto [oldResult, newResult] :
        llvm::zip(reduce.getResults(), loop.getResults()))
     oldResult.replaceAllUsesWith(newResult);

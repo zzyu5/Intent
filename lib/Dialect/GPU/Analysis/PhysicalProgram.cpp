@@ -6,6 +6,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <functional>
+
 using namespace mlir;
 
 namespace intent::gpu {
@@ -135,6 +137,27 @@ bool isUnitStepValue(Value value) {
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     return range && bound.getBound() == 2 && isUnitStepValue(range.getStep());
+  }
+  return false;
+}
+
+bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
+                                 PhysicalSourceAxis source) {
+  if (auto record = dyn_cast<RecordType>(type))
+    return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
+      return reductionTypeConsumesSource(cast<TypeAttr>(field).getValue(), axes,
+                                         source);
+    });
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment)
+    return false;
+  for (int64_t axis : axes) {
+    if (axis < 0 || axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
+      continue;
+    auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+    if (PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()} ==
+        source)
+      return true;
   }
   return false;
 }
@@ -880,6 +903,98 @@ PhysicalReplayFact PhysicalProgramAnalysis::replayability(
   SmallPtrSet<Operation *, 32> visited;
   analyzeReplay(value, source, scope, allowAccesses, result, visited);
   return result;
+}
+
+PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
+    Value value, PhysicalSourceAxis source,
+    std::optional<int64_t> sourceDimension) {
+  SmallPtrSet<Operation *, 32> visited;
+  std::function<PhysicalReductionDependencyFact(Value)> analyze =
+      [&](Value current) -> PhysicalReductionDependencyFact {
+    PhysicalReductionDependencyFact exact;
+    exact.state = PhysicalFactState::Exact;
+    Operation *operation = current.getDefiningOp();
+    if (!operation || !visited.insert(operation).second)
+      return exact;
+    if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      for (Value input :
+           reduce.getInputs().take_front(reduce.getSourceCount())) {
+        if (reductionTypeConsumesSource(input.getType(), reduce.getAxes(),
+                                        source)) {
+          exact.depends = true;
+          return exact;
+        }
+        if (!sourceDimension)
+          continue;
+        auto fragment = dyn_cast<FragmentType>(input.getType());
+        if (!fragment)
+          continue;
+        for (int64_t axis : reduce.getAxes()) {
+          if (axis < 0 ||
+              axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
+            continue;
+          auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+          PhysicalRangeFact ranges = sourceRanges(
+              input, PhysicalSourceAxis{mapping.getSourceId(),
+                                        mapping.getSourceAxis()});
+          if (llvm::any_of(ranges.roots, [&](MakeRangeOp range) {
+                FailureOr<int64_t> dimension = queryRangeDimension(range);
+                return succeeded(dimension) &&
+                       *dimension == *sourceDimension;
+              })) {
+            exact.depends = true;
+            return exact;
+          }
+        }
+      }
+    }
+    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      auto traversal =
+          loop->getAttrOfType<PhysicalSourceAttr>(reductionTraversalSourceAttr);
+      if (traversal &&
+          PhysicalSourceAxis{traversal.getSourceId(),
+                             traversal.getSourceAxis()} == source) {
+        exact.depends = true;
+        return exact;
+      }
+      auto result = dyn_cast<OpResult>(current);
+      auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      if (!result || !yield ||
+          result.getResultNumber() >= loop.getInitArgs().size()) {
+        exact.state = PhysicalFactState::Unknown;
+        appendUnique(exact.blockers, operation);
+        return exact;
+      }
+      unsigned index = result.getResultNumber();
+      for (Value related :
+           {loop.getInitArgs()[index], yield.getResults()[index]}) {
+        PhysicalReductionDependencyFact nested = analyze(related);
+        if (nested.depends)
+          return nested;
+        if (!nested.isExact()) {
+          exact.state = PhysicalFactState::Unknown;
+          llvm::append_range(exact.blockers, nested.blockers);
+        }
+      }
+      return exact;
+    }
+    if (operation->getNumRegions() != 0) {
+      exact.state = PhysicalFactState::Unknown;
+      appendUnique(exact.blockers, operation);
+      return exact;
+    }
+    for (Value operand : operation->getOperands()) {
+      PhysicalReductionDependencyFact nested = analyze(operand);
+      if (nested.depends)
+        return nested;
+      if (!nested.isExact()) {
+        exact.state = PhysicalFactState::Unknown;
+        llvm::append_range(exact.blockers, nested.blockers);
+      }
+    }
+    return exact;
+  };
+  return analyze(value);
 }
 
 bool PhysicalProgramAnalysis::isTailPredicate(

@@ -43,6 +43,16 @@ def IntentGPU_AxisMapAttr : AttrDef<IntentGPU_Dialect, "AxisMap"> {
   let genVerifyDecl = 1;
 }
 
+def IntentGPU_PhysicalSourceAttr : AttrDef<IntentGPU_Dialect, "PhysicalSource"> {
+  let mnemonic = "source";
+  let summary = "One immutable logical source-axis identity";
+  let parameters = (ins
+    "uint64_t":$sourceId,
+    "uint32_t":$sourceAxis
+  );
+  let assemblyFormat = "`<` $sourceId `,` $sourceAxis `>`";
+}
+
 def IntentGPU_ReshapeGroupAttr : AttrDef<IntentGPU_Dialect, "ReshapeGroup"> {
   let mnemonic = "reshape_group";
   let summary = "One contiguous row-major physical reshape reassociation group";

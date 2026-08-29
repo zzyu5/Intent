@@ -553,9 +553,8 @@ FragmentType predicateType(FragmentType source) {
 
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges);
-void collectProducerRanges(Value value, uint64_t sourceId,
-                           llvm::SmallPtrSetImpl<Operation *> &ranges,
-                           llvm::SmallPtrSetImpl<Operation *> &visited);
+void collectProducerRanges(Value value, PhysicalSourceAxis source,
+                           llvm::SmallPtrSetImpl<Operation *> &ranges);
 
 bool hasTailPredicate(
     Value coordinate,
@@ -670,9 +669,10 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       if (!range)
         continue;
       llvm::SmallPtrSet<Operation *, 8> ranges;
-      llvm::SmallPtrSet<Operation *, 32> visited;
-      collectProducerRanges(histogram.getValues(), range.getSourceId(), ranges,
-                            visited);
+      collectProducerRanges(
+          histogram.getValues(),
+          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+          ranges);
       if (!ranges.contains(range.getOperation()))
         continue;
       FailureOr<Value> broadcast =
@@ -768,71 +768,69 @@ LogicalResult addTailValidity(func::FuncOp kernel,
   return success();
 }
 
-void collectProducerRanges(Value value, uint64_t sourceId,
-                           llvm::SmallPtrSetImpl<Operation *> &ranges,
-                           llvm::SmallPtrSetImpl<Operation *> &visited) {
-  (void)visited;
+void collectProducerRanges(Value value, PhysicalSourceAxis source,
+                           llvm::SmallPtrSetImpl<Operation *> &ranges) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return;
-  PhysicalAxisProjection source = queryUniqueSourceAxis(value.getType(), sourceId);
-  if (!source.isExact())
+  if (!queryFragmentAxis(value.getType(), source).isExact())
     return;
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value, source.source);
+  PhysicalRangeFact fact = analysis.sourceRanges(value, source);
   if (fact.state == PhysicalFactState::Unknown)
     return;
   for (MakeRangeOp range : fact.roots)
-    if (range.getSourceId() == sourceId)
+    if (range.getSourceId() == source.sourceId &&
+        range.getSourceAxis() == source.sourceAxis)
       ranges.insert(range.getOperation());
 }
 
-FailureOr<unsigned> sourceAxis(FragmentType fragment, uint64_t sourceId) {
-  return queryFragmentAxis(fragment, sourceId);
-}
-
-FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
+FragmentType replaceSourceExtent(FragmentType source, PhysicalSourceAxis logical,
                                  PhysicalExprAttr extent) {
-  FailureOr<unsigned> axis = sourceAxis(source, sourceId);
-  if (failed(axis))
+  PhysicalAxisProjection axis = queryFragmentAxis(source, logical);
+  if (!axis.isExact())
     return source;
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  shape[*axis] = extent;
+  shape[axis.fragmentAxis] = extent;
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
                            source.getAxisMaps(), source.getValidity(),
                            source.getOwner());
 }
 
-bool containsSource(Value value, uint64_t sourceId) {
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  return fragment && succeeded(sourceAxis(fragment, sourceId));
+bool containsSource(Value value, PhysicalSourceAxis source) {
+  return queryFragmentAxis(value.getType(), source).isExact();
 }
 
 FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
-                                      uint64_t sourceId,
+                                      PhysicalSourceAxis source,
                                       PhysicalExprAttr blockedExtent,
                                       Value blockedRange, Value blockedValidity,
                                       IRMapping &mapping) {
   if (Value replacement = mapping.lookupOrNull(value))
     return replacement;
-  if (!containsSource(value, sourceId))
+  if (!containsSource(value, source))
     return value;
   Operation *producer = value.getDefiningOp();
   if (!producer)
     return failure();
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    if (range.getSourceId() != sourceId)
+    if (range.getSourceId() != source.sourceId ||
+        range.getSourceAxis() != source.sourceAxis)
       return failure();
     mapping.map(value, blockedRange);
     return blockedRange;
   }
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                            /*allowAccesses=*/true))
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel ||
+      !PhysicalProgramAnalysis(kernel)
+           .replayability(value, source, PhysicalReplayScope::ValueGraph,
+                          /*allowAccesses=*/true)
+           .isReplayable())
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replacement = replayPointwiseValue(
-        builder, operand, sourceId, blockedExtent, blockedRange,
+        builder, operand, source, blockedExtent, blockedRange,
         blockedValidity, mapping);
     if (failed(replacement))
       return failure();
@@ -842,7 +840,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   auto result = dyn_cast<FragmentType>(producer->getResult(0).getType());
   if (!result)
     return failure();
-  FragmentType resultType = replaceSourceExtent(result, sourceId, blockedExtent);
+  FragmentType resultType = replaceSourceExtent(result, source, blockedExtent);
   auto mapped = [&](Value operand) {
     if (!operand)
       return Value();
@@ -910,7 +908,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
       clone->setAttr(originAttr, origin);
     replayed = clone.getResult();
   } else if (auto reshape = dyn_cast<ReshapeOp>(producer);
-             reshape && !containsSource(reshape.getValue(), sourceId)) {
+             reshape && !containsSource(reshape.getValue(), source)) {
     replayed = builder.create<BroadcastOp>(producer->getLoc(), resultType,
                                            mapped(reshape.getValue()));
   } else {
@@ -921,95 +919,6 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   if (!mapping.lookupOrNull(value))
     mapping.map(value, replayed);
   return replayed;
-}
-
-bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
-                                 uint64_t sourceId) {
-  if (auto record = dyn_cast<RecordType>(type)) {
-    return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
-      return reductionTypeConsumesSource(cast<TypeAttr>(field).getValue(), axes,
-                                         sourceId);
-    });
-  }
-  auto fragment = dyn_cast<FragmentType>(type);
-  if (!fragment)
-    return false;
-  for (int64_t axis : axes) {
-    if (axis < 0 || axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
-      continue;
-    if (cast<AxisMapAttr>(fragment.getAxisMaps()[axis]).getSourceId() == sourceId)
-      return true;
-  }
-  return false;
-}
-
-bool reductionConsumesSource(gpu::ReduceOp reduce, uint64_t sourceId) {
-  for (Value source :
-       reduce.getInputs().take_front(reduce.getSourceCount())) {
-    if (reductionTypeConsumesSource(source.getType(), reduce.getAxes(), sourceId))
-      return true;
-  }
-  return false;
-}
-
-bool reductionConsumesDimension(gpu::ReduceOp reduce, int64_t dimension) {
-  for (Value source :
-       reduce.getInputs().take_front(reduce.getSourceCount())) {
-    auto fragment = dyn_cast<FragmentType>(source.getType());
-    if (!fragment)
-      continue;
-    for (int64_t axis : reduce.getAxes()) {
-      if (axis < 0 || axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
-        continue;
-      uint64_t sourceId =
-          cast<AxisMapAttr>(fragment.getAxisMaps()[axis]).getSourceId();
-      llvm::SmallPtrSet<Operation *, 8> ranges;
-      llvm::SmallPtrSet<Operation *, 32> visited;
-      collectProducerRanges(source, sourceId, ranges, visited);
-      if (llvm::any_of(ranges, [&](Operation *operation) {
-            auto range = dyn_cast<MakeRangeOp>(operation);
-            FailureOr<uint64_t> sourceDimension =
-                range ? rangeDimension(range)
-                      : FailureOr<uint64_t>(failure());
-            return succeeded(sourceDimension) &&
-                   static_cast<int64_t>(*sourceDimension) == dimension;
-          }))
-        return true;
-    }
-  }
-  return false;
-}
-
-bool hasReductionDependency(Value value, uint64_t sourceId,
-                            std::optional<int64_t> sourceDimension,
-                            llvm::SmallPtrSetImpl<Operation *> &visited) {
-  Operation *producer = value.getDefiningOp();
-  if (!producer || !visited.insert(producer).second)
-    return false;
-  if (auto reduce = dyn_cast<ReduceOp>(producer))
-    if (reductionConsumesSource(reduce, sourceId) ||
-        (sourceDimension &&
-         reductionConsumesDimension(reduce, *sourceDimension)))
-      return true;
-  if (auto loop = dyn_cast<scf::ForOp>(producer)) {
-    auto traversal =
-        loop->getAttrOfType<IntegerAttr>(reductionTraversalSourceAttr);
-    if (traversal && static_cast<uint64_t>(traversal.getInt()) == sourceId)
-      return true;
-    auto result = dyn_cast<OpResult>(value);
-    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    if (!result || !yield || result.getResultNumber() >= loop.getInitArgs().size())
-      return false;
-    unsigned index = result.getResultNumber();
-    if (hasReductionDependency(loop.getInitArgs()[index], sourceId,
-                               sourceDimension, visited) ||
-        hasReductionDependency(yield.getResults()[index], sourceId,
-                               sourceDimension, visited))
-      return true;
-  }
-  return llvm::any_of(producer->getOperands(), [&](Value operand) {
-    return hasReductionDependency(operand, sourceId, sourceDimension, visited);
-  });
 }
 
 bool storeUsesRange(StoreOp store, MakeRangeOp range) {
@@ -1095,6 +1004,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       BinaryOperator::Multiply);
   bool bodyFailed = false;
   std::string failureReason;
+  PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis()};
   auto loop = builder.create<scf::ForOp>(
       range.getLoc(), range.getStart(), stop, loopStep, ValueRange{},
       [&](OpBuilder &nested, Location location, Value tileStart, ValueRange) {
@@ -1111,7 +1021,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         mapping.map(range.getResult(), blocked);
         for (StoreOp store : stores) {
           FailureOr<Value> payload = replayPointwiseValue(
-              nested, store.getValue(), range.getSourceId(), chunkExtent,
+              nested, store.getValue(), logicalSource, chunkExtent,
               blocked, tail, mapping);
           if (failed(payload)) {
             bodyFailed = true;
@@ -1121,7 +1031,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           SmallVector<Value> coordinates;
           for (Value coordinate : store.getCoordinates()) {
             FailureOr<Value> replayed = replayPointwiseValue(
-                nested, coordinate, range.getSourceId(), chunkExtent, blocked,
+                nested, coordinate, logicalSource, chunkExtent, blocked,
                 tail, mapping);
             if (failed(replayed)) {
               bodyFailed = true;
@@ -1146,7 +1056,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           }
           if (store.getValid()) {
             FailureOr<Value> existing = replayPointwiseValue(
-                nested, store.getValid(), range.getSourceId(), chunkExtent,
+                nested, store.getValid(), logicalSource, chunkExtent,
                 blocked, tail, mapping);
             if (failed(existing)) {
               bodyFailed = true;
@@ -1529,16 +1439,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 32> internalTraversalRanges;
   llvm::SmallPtrSet<Operation *, 32> structuredTraversalRanges;
   llvm::SmallDenseSet<uint64_t> scanSegmentDimensions;
-  llvm::SmallDenseSet<uint64_t> scanSegmentSources;
+  llvm::SmallDenseSet<PhysicalSourceAxis> scanSegmentSources;
   auto collectAxisInto = [&](Value source, uint64_t axis,
                              llvm::SmallPtrSetImpl<Operation *> &ranges) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment || axis >= fragment.getAxisMaps().size())
       return;
-    uint64_t sourceId =
-        cast<AxisMapAttr>(fragment.getAxisMaps()[axis]).getSourceId();
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    collectProducerRanges(source, sourceId, ranges, visited);
+    auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+    collectProducerRanges(
+        source,
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+        ranges);
   };
   std::function<void(Value, llvm::SmallPtrSetImpl<Operation *> &)>
       collectAllAxesInto = [&](Value value,
@@ -1554,24 +1465,31 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (MakeRangeOp range : all.roots)
       ranges.insert(range.getOperation());
     for (Attribute attribute : fragment.getAxisMaps()) {
-      uint64_t sourceId = cast<AxisMapAttr>(attribute).getSourceId();
-      llvm::SmallPtrSet<Operation *, 32> visited;
-      collectProducerRanges(value, sourceId, ranges, visited);
+      auto mapping = cast<AxisMapAttr>(attribute);
+      collectProducerRanges(
+          value,
+          PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+          ranges);
     }
   };
   auto collectStructuredRegionRanges = [&](Operation *structured,
                                            ValueRange sources, uint64_t axis) {
-    llvm::SmallDenseSet<uint64_t> segmentSources;
+    SmallVector<PhysicalSourceAxis> segmentSources;
     for (Value source : sources) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment || axis >= fragment.getAxisMaps().size())
         continue;
-      segmentSources.insert(
-          cast<AxisMapAttr>(fragment.getAxisMaps()[axis]).getSourceId());
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      PhysicalSourceAxis physical{mapping.getSourceId(),
+                                  mapping.getSourceAxis()};
+      if (!llvm::is_contained(segmentSources, physical))
+        segmentSources.push_back(physical);
     }
     for (Region &region : structured->getRegions())
       region.walk([&](MakeRangeOp range) {
-        if (segmentSources.contains(range.getSourceId()))
+        if (llvm::is_contained(
+                segmentSources,
+                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()}))
           structuredTraversalRanges.insert(range.getOperation());
       });
   };
@@ -1592,15 +1510,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         int64_t dimension = mapping.getDimensionId();
         if (dimension > 0)
           scanSegmentDimensions.insert(static_cast<uint64_t>(dimension));
-        scanSegmentSources.insert(mapping.getSourceId());
+        scanSegmentSources.insert(
+            {mapping.getSourceId(), mapping.getSourceAxis()});
       }
     }
     auto collectProtectedSources = [&](Type type) {
       auto fragment = dyn_cast<FragmentType>(type);
       if (!fragment)
         return;
-      for (Attribute attribute : fragment.getAxisMaps())
-        scanSegmentSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
+      for (Attribute attribute : fragment.getAxisMaps()) {
+        auto mapping = cast<AxisMapAttr>(attribute);
+        scanSegmentSources.insert(
+            {mapping.getSourceId(), mapping.getSourceAxis()});
+      }
     };
     for (Type type : scan->getOperandTypes())
       collectProtectedSources(type);
@@ -1696,10 +1618,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
-  llvm::SmallDenseSet<uint64_t> structuredSources;
+  llvm::SmallDenseSet<PhysicalSourceAxis> structuredSources;
   for (Operation *operation : structuredTraversalRanges)
     if (auto range = dyn_cast<MakeRangeOp>(operation))
-      structuredSources.insert(range.getSourceId());
+      structuredSources.insert({range.getSourceId(), range.getSourceAxis()});
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
@@ -1707,20 +1629,21 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
-      if (structuredSources.contains(range.getSourceId()))
+      PhysicalSourceAxis logicalSource{range.getSourceId(),
+                                       range.getSourceAxis()};
+      if (structuredSources.contains(logicalSource))
         continue;
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
       if (!sourceAxis)
         continue;
-      llvm::SmallPtrSet<Operation *, 32> visited;
       std::optional<int64_t> sourceDimension;
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
           succeeded(dimension))
         sourceDimension = *dimension;
-      bool dependency = hasReductionDependency(store.getValue(),
-                                               range.getSourceId(),
-                                               sourceDimension, visited);
-      if (!dependency)
+      PhysicalReductionDependencyFact dependency =
+          PhysicalProgramAnalysis(kernel).reductionDependency(
+              store.getValue(), logicalSource, sourceDimension);
+      if (!dependency.isExact() || !dependency.depends)
         continue;
       candidates.emplace_back(range, *sourceAxis);
       innermostSourceAxis = std::max(innermostSourceAxis, *sourceAxis);
@@ -1882,7 +1805,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<Value> payloads;
   };
   SmallVector<WriteEffectFacts> writeEffects;
-  llvm::SmallDenseSet<uint64_t> ownershipSources;
+  llvm::SmallDenseSet<PhysicalSourceAxis> ownershipSources;
   auto collectOwnership = [&](ValueRange coordinates, ValueRange payloads) {
     WriteEffectFacts effect;
     effect.coordinates.append(coordinates.begin(), coordinates.end());
@@ -1893,7 +1816,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (!fragment)
         continue;
       for (Attribute attribute : fragment.getAxisMaps()) {
-        ownershipSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
+        auto mapping = cast<AxisMapAttr>(attribute);
+        ownershipSources.insert(
+            {mapping.getSourceId(), mapping.getSourceAxis()});
       }
     }
   };
@@ -1915,8 +1840,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   kernel.walk([&](HistogramOp histogram) {
     auto fragment = cast<FragmentType>(histogram.getValues().getType());
-    for (Attribute attribute : fragment.getAxisMaps())
-      ownershipSources.insert(cast<AxisMapAttr>(attribute).getSourceId());
+    for (Attribute attribute : fragment.getAxisMaps()) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      ownershipSources.insert(
+          {mapping.getSourceId(), mapping.getSourceAxis()});
+    }
   });
   // Structured traversal ownership is attached to the exact range operations
   // above, not erased source-wide here.  One immutable source axis may have a
@@ -1968,47 +1896,47 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallDenseSet<uint64_t> internalDimensions;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
-    return ownershipSources.contains(range.getSourceId()) &&
-           !scanSegmentSources.contains(range.getSourceId()) &&
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+    return ownershipSources.contains(source) &&
+           !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
             !scanSegmentDimensions.contains(*dimension));
   };
-  auto dependsOnSource = [&](ValueRange values, uint64_t sourceId) {
+  auto dependsOnSource = [&](ValueRange values, PhysicalSourceAxis source) {
     for (Value value : values) {
-      auto fragment = dyn_cast<FragmentType>(value.getType());
-      if (!fragment || failed(sourceAxis(fragment, sourceId)))
+      if (!queryFragmentAxis(value.getType(), source).isExact())
         continue;
       llvm::SmallPtrSet<Operation *, 8> ranges;
-      llvm::SmallPtrSet<Operation *, 32> visited;
-      collectProducerRanges(value, sourceId, ranges, visited);
+      collectProducerRanges(value, source, ranges);
       if (!ranges.empty())
         return true;
     }
     return false;
   };
-  auto dependsOnHistogramSource = [&](ValueRange values, uint64_t sourceId) {
+  auto dependsOnHistogramSource = [&](ValueRange values,
+                                      PhysicalSourceAxis source) {
     return llvm::any_of(values, [&](Value value) {
       HistogramOp histogram = histogramSource(value);
-      return histogram && containsSource(histogram.getValues(), sourceId);
+      return histogram && containsSource(histogram.getValues(), source);
     });
   };
-  llvm::DenseMap<uint64_t, uint64_t> sourceDimensions;
-  llvm::MapVector<uint64_t, SmallVector<uint64_t>> dimensionSources;
+  llvm::DenseMap<PhysicalSourceAxis, uint64_t> sourceDimensions;
+  llvm::MapVector<uint64_t, SmallVector<PhysicalSourceAxis>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
     if (failed(dimension) || !hasPointwiseOwnership(range))
       continue;
-    uint64_t sourceId = range.getSourceId();
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
     uint64_t dimensionId = *dimension;
-    sourceDimensions[sourceId] = dimensionId;
-    if (!llvm::is_contained(dimensionSources[dimensionId], sourceId))
-      dimensionSources[dimensionId].push_back(sourceId);
+    sourceDimensions[source] = dimensionId;
+    if (!llvm::is_contained(dimensionSources[dimensionId], source))
+      dimensionSources[dimensionId].push_back(source);
   }
   auto effectDependsOn = [&](const WriteEffectFacts &effect,
-                             uint64_t sourceId) {
-    return dependsOnSource(effect.coordinates, sourceId) ||
-           dependsOnSource(effect.payloads, sourceId) ||
-           dependsOnHistogramSource(effect.payloads, sourceId);
+                             PhysicalSourceAxis source) {
+    return dependsOnSource(effect.coordinates, source) ||
+           dependsOnSource(effect.payloads, source) ||
+           dependsOnHistogramSource(effect.payloads, source);
   };
   llvm::SmallDenseSet<uint64_t> jointOwnershipDimensions;
   for (auto [dimensionId, sources] : dimensionSources) {
@@ -2016,24 +1944,24 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       continue;
     bool onePreservedSourcePerEffect =
         llvm::all_of(writeEffects, [&](const WriteEffectFacts &effect) {
-          return llvm::count_if(sources, [&](uint64_t sourceId) {
-                   return effectDependsOn(effect, sourceId);
+          return llvm::count_if(sources, [&](PhysicalSourceAxis source) {
+                   return effectDependsOn(effect, source);
                  }) == 1;
         });
     if (onePreservedSourcePerEffect)
       jointOwnershipDimensions.insert(dimensionId);
   }
   for (MakeRangeOp range : dynamicRanges) {
-    uint64_t sourceId = range.getSourceId();
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
     if (!hasPointwiseOwnership(range)) {
       internalTraversalRanges.insert(range.getOperation());
       continue;
     }
     bool requiredByEveryEffect =
         llvm::all_of(writeEffects, [&](const WriteEffectFacts &effect) {
-          return effectDependsOn(effect, sourceId);
+          return effectDependsOn(effect, source);
         });
-    auto dimension = sourceDimensions.find(sourceId);
+    auto dimension = sourceDimensions.find(source);
     bool jointlyOwned =
         dimension != sourceDimensions.end() &&
         jointOwnershipDimensions.contains(dimension->second);
@@ -2172,12 +2100,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (uint64_t dimensionId : ownershipDimensions) {
       bool losesPromotedAxis = false;
       for (MakeRangeOp range : axes.lookup(dimensionId)) {
-        uint64_t sourceId = range.getSourceId();
+        PhysicalSourceAxis sourceAxis{range.getSourceId(),
+                                      range.getSourceAxis()};
         kernel.walk([&](BroadcastOp broadcast) {
           auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
           auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
-          if (!source || !target || failed(sourceAxis(source, sourceId)) ||
-              succeeded(sourceAxis(target, sourceId)))
+          if (!source || !target ||
+              !queryFragmentAxis(source, sourceAxis).isExact() ||
+              queryFragmentAxis(target, sourceAxis).isExact())
             return;
           losesPromotedAxis = true;
         });
@@ -2244,9 +2174,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             if (coordinateIndex >= store.getSourceAxes().size())
               continue;
             llvm::SmallPtrSet<Operation *, 8> ranges;
-            llvm::SmallPtrSet<Operation *, 32> visited;
-            collectProducerRanges(coordinate, range.getSourceId(), ranges,
-                                  visited);
+            collectProducerRanges(
+                coordinate,
+                PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+                ranges);
             if (!ranges.empty())
               sourceAxis = std::max(sourceAxis,
                                     store.getSourceAxes()[coordinateIndex]);
