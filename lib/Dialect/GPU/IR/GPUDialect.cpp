@@ -105,6 +105,27 @@ LogicalResult AxisMapAttr::verify(
                    << "axis mapping requires source and logical-dimension identities";
 }
 
+LogicalResult ReshapeGroupAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    DenseI64ArrayAttr sourceAxes, DenseI64ArrayAttr resultAxes) {
+  if (!sourceAxes || !resultAxes ||
+      (sourceAxes.empty() && resultAxes.empty()))
+    return emitError()
+           << "reshape group must cover at least one source or result axis";
+  auto consecutive = [](ArrayRef<int64_t> axes) {
+    return llvm::all_of(llvm::seq<size_t>(1, axes.size()), [&](size_t index) {
+      return axes[index] == axes[index - 1] + 1;
+    });
+  };
+  if ((!sourceAxes.empty() && sourceAxes[0] < 0) ||
+      (!resultAxes.empty() && resultAxes[0] < 0) ||
+      !consecutive(sourceAxes.asArrayRef()) ||
+      !consecutive(resultAxes.asArrayRef()))
+    return emitError()
+           << "reshape group axes must be non-negative and consecutive";
+  return success();
+}
+
 LogicalResult ViewLayoutAttr::verify(
     function_ref<InFlightDiagnostic()> emitError,
     ArrayAttr extents, DenseI64ArrayAttr dimensionIds, bool hasStrides,

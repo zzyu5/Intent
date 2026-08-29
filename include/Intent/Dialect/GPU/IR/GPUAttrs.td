@@ -43,6 +43,17 @@ def IntentGPU_AxisMapAttr : AttrDef<IntentGPU_Dialect, "AxisMap"> {
   let genVerifyDecl = 1;
 }
 
+def IntentGPU_ReshapeGroupAttr : AttrDef<IntentGPU_Dialect, "ReshapeGroup"> {
+  let mnemonic = "reshape_group";
+  let summary = "One contiguous row-major physical reshape reassociation group";
+  let parameters = (ins
+    "::mlir::DenseI64ArrayAttr":$sourceAxes,
+    "::mlir::DenseI64ArrayAttr":$resultAxes
+  );
+  let assemblyFormat = "`<` $sourceAxes `,` $resultAxes `>`";
+  let genVerifyDecl = 1;
+}
+
 def IntentGPU_ViewLayoutAttr : AttrDef<IntentGPU_Dialect, "ViewLayout"> {
   let mnemonic = "view_layout";
   let summary = "Host-visible physical view shape, stride and alias contract";

@@ -1903,9 +1903,17 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             return;
           }
           FragmentType squeezed = eraseFragmentAxis(sliced, outerAxis);
+          FailureOr<ArrayAttr> reassociation =
+              inferReshapeReassociation(sliced, squeezed);
+          if (failed(reassociation)) {
+            bodyFailed = true;
+            failureReason =
+                "outer-axis source has no exact row-major reassociation";
+            return;
+          }
           innerSources.push_back(nested.create<ReshapeOp>(
               nestedLocation, squeezed, *replayed,
-              nested.getArrayAttr({})));
+              *reassociation));
         }
         if (bodyFailed)
           return;
@@ -2210,10 +2218,20 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                   originalCoordinate.getValidity(),
                   originalCoordinate.getOwner());
               Value mappedCoordinate = coordinate;
-              if (replayCoordinate != blockedCoordinate)
+              if (replayCoordinate != blockedCoordinate) {
+                FailureOr<ArrayAttr> reassociation =
+                    inferReshapeReassociation(blockedCoordinate,
+                                              replayCoordinate);
+                if (failed(reassociation)) {
+                  bodyFailed = true;
+                  bodyFailure =
+                      "reduction coordinate has no exact row-major reassociation";
+                  return;
+                }
                 mappedCoordinate = nested.create<ReshapeOp>(
                     nestedLocation, replayCoordinate, coordinate,
-                    nested.getArrayAttr({}));
+                    *reassociation);
+              }
               mapping.map(range.getResult(), mappedCoordinate);
             }
             Value end = nested.create<BroadcastOp>(nestedLocation,

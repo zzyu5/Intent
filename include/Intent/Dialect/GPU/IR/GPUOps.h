@@ -13,4 +13,13 @@
 #define GET_OP_CLASSES
 #include "Intent/Dialect/GPU/IR/GPUOps.h.inc"
 
+namespace intent::gpu {
+
+mlir::FailureOr<mlir::ArrayAttr>
+inferReshapeReassociation(FragmentType source, FragmentType result,
+                          unsigned sourcePrefix = 0,
+                          unsigned resultPrefix = 0);
+
+} // namespace intent::gpu
+
 #endif

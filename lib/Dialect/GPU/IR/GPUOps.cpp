@@ -80,6 +80,17 @@ bool sameElementCount(FragmentType lhs, FragmentType rhs) {
          left.orderedTerms == right.orderedTerms;
 }
 
+bool sameElementCount(ArrayRef<Attribute> lhs, ArrayRef<Attribute> rhs) {
+  PhysicalProduct left;
+  PhysicalProduct right;
+  for (Attribute extent : lhs)
+    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), left);
+  for (Attribute extent : rhs)
+    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), right);
+  return left.valid && right.valid && left.constant == right.constant &&
+         left.orderedTerms == right.orderedTerms;
+}
+
 LogicalResult verifyDataSchemas(Operation *operation, TypeRange operands,
                                 Type result, bool resultIsPredicate = false) {
   for (auto [index, operand] : llvm::enumerate(operands))
@@ -173,6 +184,79 @@ LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
 }
 
 } // namespace
+
+FailureOr<ArrayAttr>
+inferReshapeReassociation(FragmentType source, FragmentType result,
+                          unsigned sourcePrefix, unsigned resultPrefix) {
+  if (!source || !result || sourcePrefix > source.getShape().size() ||
+      resultPrefix > result.getShape().size())
+    return failure();
+  ArrayRef<Attribute> sourceShape =
+      source.getShape().getValue().drop_front(sourcePrefix);
+  ArrayRef<Attribute> resultShape =
+      result.getShape().getValue().drop_front(resultPrefix);
+  unsigned sourceRank = sourceShape.size();
+  unsigned resultRank = resultShape.size();
+  unsigned sourceBegin = 0;
+  unsigned resultBegin = 0;
+  SmallVector<Attribute> groups;
+  MLIRContext *context = source.getContext();
+  while (sourceBegin < sourceRank && resultBegin < resultRank) {
+    std::optional<std::pair<unsigned, unsigned>> match;
+    for (unsigned sourceEnd = sourceBegin + 1;
+         sourceEnd <= sourceRank && !match; ++sourceEnd) {
+      for (unsigned resultEnd = resultBegin + 1;
+           resultEnd <= resultRank; ++resultEnd) {
+        if (!sameElementCount(
+                sourceShape.slice(sourceBegin, sourceEnd - sourceBegin),
+                resultShape.slice(resultBegin, resultEnd - resultBegin)))
+          continue;
+        match = std::make_pair(sourceEnd, resultEnd);
+        break;
+      }
+    }
+    if (!match)
+      return failure();
+    SmallVector<int64_t> sourceAxes;
+    SmallVector<int64_t> resultAxes;
+    for (unsigned axis = sourceBegin; axis < match->first; ++axis)
+      sourceAxes.push_back(axis);
+    for (unsigned axis = resultBegin; axis < match->second; ++axis)
+      resultAxes.push_back(axis);
+    groups.push_back(ReshapeGroupAttr::get(
+        context, DenseI64ArrayAttr::get(context, sourceAxes),
+        DenseI64ArrayAttr::get(context, resultAxes)));
+    sourceBegin = match->first;
+    resultBegin = match->second;
+  }
+  if (sourceBegin < sourceRank) {
+    ArrayRef<Attribute> remaining = sourceShape.drop_front(sourceBegin);
+    if (!sameElementCount(remaining, ArrayRef<Attribute>()))
+      return failure();
+    SmallVector<int64_t> sourceAxes;
+    for (unsigned axis = sourceBegin; axis < sourceRank; ++axis)
+      sourceAxes.push_back(axis);
+    groups.push_back(ReshapeGroupAttr::get(
+        context, DenseI64ArrayAttr::get(context, sourceAxes),
+        DenseI64ArrayAttr::get(context, {})));
+    sourceBegin = sourceRank;
+  }
+  if (resultBegin < resultRank) {
+    ArrayRef<Attribute> remaining = resultShape.drop_front(resultBegin);
+    if (!sameElementCount(ArrayRef<Attribute>(), remaining))
+      return failure();
+    SmallVector<int64_t> resultAxes;
+    for (unsigned axis = resultBegin; axis < resultRank; ++axis)
+      resultAxes.push_back(axis);
+    groups.push_back(ReshapeGroupAttr::get(
+        context, DenseI64ArrayAttr::get(context, {}),
+        DenseI64ArrayAttr::get(context, resultAxes)));
+    resultBegin = resultRank;
+  }
+  if (sourceBegin != sourceRank || resultBegin != resultRank)
+    return failure();
+  return ArrayAttr::get(context, groups);
+}
 
 LogicalResult ParameterOp::verify() {
   return getParameter().getCandidates().empty()
@@ -355,6 +439,64 @@ LogicalResult ReshapeOp::verify() {
       !sameElementCount(source, result))
     return emitOpError("reshape physical schema is invalid: source=")
            << getValue().getType() << ", result=" << getResult().getType();
+  unsigned nextSource = 0;
+  unsigned nextResult = 0;
+  for (Attribute attribute : getReassociation()) {
+    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
+    if (!group ||
+        (!group.getSourceAxes().empty() &&
+         group.getSourceAxes()[0] != nextSource) ||
+        (!group.getResultAxes().empty() &&
+         group.getResultAxes()[0] != nextResult))
+      return emitOpError(
+          "reshape reassociation must consecutively cover both physical shapes");
+    ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
+    ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
+    if (!sourceAxes.empty())
+      nextSource = sourceAxes.back() + 1;
+    if (!resultAxes.empty())
+      nextResult = resultAxes.back() + 1;
+  }
+  unsigned logicalSourceRank = nextSource;
+  unsigned logicalResultRank = nextResult;
+  if (logicalSourceRank > source.getShape().size() ||
+      logicalResultRank > result.getShape().size())
+    return emitOpError("reshape reassociation axis is out of bounds");
+  unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
+  unsigned resultPrefix = result.getShape().size() - logicalResultRank;
+  if (sourcePrefix != resultPrefix)
+    return emitOpError(
+        "reshape must preserve its physical execution prefix: source=")
+           << source << ", result=" << result;
+  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+    if (source.getShape()[axis] != result.getShape()[axis] ||
+        source.getAxisMaps()[axis] != result.getAxisMaps()[axis])
+      return emitOpError(
+          "reshape changed a physical execution-prefix axis");
+
+  nextSource = 0;
+  nextResult = 0;
+  for (Attribute attribute : getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
+    ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
+    SmallVector<Attribute> sourceExtents;
+    SmallVector<Attribute> resultExtents;
+    for (int64_t axis : sourceAxes)
+      sourceExtents.push_back(source.getShape()[sourcePrefix + axis]);
+    for (int64_t axis : resultAxes)
+      resultExtents.push_back(result.getShape()[resultPrefix + axis]);
+    if (!sameElementCount(sourceExtents, resultExtents))
+      return emitOpError(
+          "reshape reassociation group does not preserve row-major elements");
+    if (!sourceAxes.empty())
+      nextSource = sourceAxes.back() + 1;
+    if (!resultAxes.empty())
+      nextResult = resultAxes.back() + 1;
+  }
+  if (nextSource != logicalSourceRank || nextResult != logicalResultRank)
+    return emitOpError(
+        "reshape reassociation does not cover every logical physical axis");
   return success();
 }
 

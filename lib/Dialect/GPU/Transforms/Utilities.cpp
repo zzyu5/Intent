@@ -315,9 +315,14 @@ FailureOr<Value> projectPredicate(OpBuilder &builder, Location location,
       ArrayAttr::get(target.getContext(), shape), target.getAxisMaps(),
       target.getValidity(), target.getOwner());
   Value result = predicate;
-  if (base != reshaped)
+  if (base != reshaped) {
+    FailureOr<ArrayAttr> reassociation =
+        inferReshapeReassociation(base, reshaped);
+    if (failed(reassociation))
+      return failure();
     result = builder.create<ReshapeOp>(location, reshaped, result,
-                                      builder.getArrayAttr({}));
+                                      *reassociation);
+  }
   auto projected = FragmentType::get(
       target.getContext(), builder.getI1Type(), target.getShape(),
       target.getAxisMaps(), target.getValidity(), target.getOwner());

@@ -392,8 +392,13 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
           Value selected = builder.create<gpu::SelectOp>(
               gather.getLoc(), selectedResultType, valid, safeGather.getResult(),
               fill);
+          FailureOr<ArrayAttr> reassociation =
+              gpu::inferReshapeReassociation(selectedResultType, result);
+          if (failed(reassociation))
+            return gather.emitOpError(
+                "gather fallback has no exact row-major reassociation");
           auto reshaped = builder.create<gpu::ReshapeOp>(
-              gather.getLoc(), result, selected, builder.getArrayAttr({}));
+              gather.getLoc(), result, selected, *reassociation);
           if (Attribute origin = gather->getAttr(gpu::originAttr))
             reshaped->setAttr(gpu::originAttr, origin);
           gather.getResult().replaceAllUsesWith(reshaped.getResult());
