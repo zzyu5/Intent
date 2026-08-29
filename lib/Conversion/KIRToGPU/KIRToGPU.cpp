@@ -1,5 +1,6 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 
+#include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -933,11 +934,16 @@ FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
     else
       declaration = parameter;
   });
-  return declaration && !ambiguous
-             ? FailureOr<PhysicalExprAttr>(parameterExpression(
-                   origin->getContext(),
-                   declaration.getParameter().getName().getValue()))
-             : FailureOr<PhysicalExprAttr>(failure());
+  if (ambiguous)
+    return failure();
+  if (declaration)
+    return parameterExpression(origin->getContext(),
+                               declaration.getParameter().getName().getValue());
+  // A non-launch-visible derived axis starts with one owned member.  The
+  // blocking pass may later enlarge that complete scalar baseline and create a
+  // parameter, but construction must not preselect one candidate domain for
+  // every dynamic tensor dimension before any consumer exists.
+  return expression(origin->getContext(), PhysicalExprKind::Constant, 1);
 }
 
 FailureOr<PhysicalExprAttr> fragmentExtentExpression(RankedTensorType tensor,
@@ -1278,9 +1284,6 @@ FailureOr<Type> convertContractResultType(
       left.getOwner()));
 }
 
-LogicalResult collectDomainAxes(Value source,
-                                SmallVectorImpl<intent::DomainOp> &axes);
-
 struct OrderedIterationAxis {
   Value start;
   Value stop;
@@ -1297,10 +1300,10 @@ public:
                        ArrayRef<Value> views,
                        llvm::DenseMap<int64_t, Value> dimensions,
                        llvm::DenseMap<StringAttr, Value> parameters,
-                       unsigned orderedDepth = 0)
+                       CanonicalKernelAnalysis &canonicalAnalysis)
       : builder(builder), values(std::move(values)), views(views),
         dimensions(std::move(dimensions)), parameters(std::move(parameters)),
-        orderedDepth(orderedDepth) {}
+        canonicalAnalysis(canonicalAnalysis) {}
 
   FailureOr<SmallVector<Value>> lowerBlock(Block &source) {
     for (Operation &operation : source) {
@@ -1364,6 +1367,68 @@ private:
       target->setAttr(gpu::originAttr, node);
   }
 
+  FailureOr<gpu::ParameterAttr>
+  getOrCreateRegionSegment(Operation *operation) {
+    RegionSegmentFact fact = canonicalAnalysis.regionSegment(operation);
+    if (!fact.isExact())
+      return operation->emitOpError(
+          "region segmentation has no exact canonical source relation");
+    std::string name =
+        ("SEGMENT_N" + Twine(fact.operationIdentity) + "_D" +
+         Twine(fact.dimensionIdentity))
+            .str();
+    auto schema = gpu::ParameterAttr::get(
+        operation->getContext(), builder.getStringAttr(name),
+        static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),
+        builder.getDenseI64ArrayAttr(
+            {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+             32768, 65536}));
+    Operation *parent = builder.getInsertionBlock()->getParentOp();
+    func::FuncOp physical = dyn_cast<func::FuncOp>(parent);
+    if (!physical)
+      physical = parent->getParentOfType<func::FuncOp>();
+    if (!physical)
+      return operation->emitOpError(
+          "region segment decision has no physical kernel scope");
+
+    gpu::ParameterOp declaration;
+    bool ambiguous = false;
+    physical.walk([&](gpu::ParameterOp parameter) {
+      auto origin = parameter->getAttrOfType<IntegerAttr>(gpu::originAttr);
+      auto dimension =
+          parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
+      if (!origin || !dimension || origin.getInt() != fact.operationIdentity ||
+          dimension.getInt() != fact.dimensionIdentity ||
+          parameter.getParameter().getRole() !=
+              static_cast<uint32_t>(gpu::ParameterRole::ScanChunk))
+        return;
+      if (declaration)
+        ambiguous = true;
+      else
+        declaration = parameter;
+    });
+    if (ambiguous)
+      return operation->emitOpError(
+          "region segment decision has multiple physical declarations");
+    if (declaration && declaration.getParameter() != schema)
+      return operation->emitOpError(
+          "region segment decision is bound to conflicting candidates");
+    if (!declaration) {
+      OpBuilder declarationBuilder(&physical.getBody().front(),
+                                   physical.getBody().front().begin());
+      declaration = declarationBuilder.create<gpu::ParameterOp>(
+          operation->getLoc(), declarationBuilder.getIndexType(), schema);
+      declaration->setAttr(
+          gpu::originAttr,
+          declarationBuilder.getI64IntegerAttr(fact.operationIdentity));
+      declaration->setAttr(
+          gpu::dimensionAttr,
+          declarationBuilder.getI64IntegerAttr(fact.dimensionIdentity));
+    }
+    parameters[schema.getName()] = declaration.getResult();
+    return schema;
+  }
+
   LogicalResult lowerPureRegion(Region &source, Region &target,
                                 ArrayRef<Type> argumentTypes,
                                 ArrayRef<Type> resultTypes = {}) {
@@ -1380,7 +1445,7 @@ private:
       childValues[from] = to;
     builder.setInsertionPointToStart(block);
     ScalarRegionLowering child(builder, std::move(childValues), views,
-                               dimensions, parameters, orderedDepth);
+                               dimensions, parameters, canonicalAnalysis);
     FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source.front());
     if (failed(yielded))
       return failure();
@@ -3265,44 +3330,10 @@ private:
         inputs[operand] = *identity;
       }
       Block &sourceSummary = fold.getSummarize().front();
-      int64_t sourceDimension = 0;
-      for (unsigned index = 0; index < fold.getSourceCount(); ++index) {
-        auto tensor = dyn_cast<RankedTensorType>(fold.getInputs()[index].getType());
-        DenseI64ArrayAttr ids = tensor ? dimensionIds(tensor)
-                                       : DenseI64ArrayAttr();
-        if (!tensor || fold.getAxis() >= static_cast<uint64_t>(tensor.getRank()) ||
-            !ids || ids[fold.getAxis()] <= 0 ||
-            (sourceDimension != 0 && ids[fold.getAxis()] != sourceDimension))
-          return fold.emitOpError(
-              "region-fold sources do not share one canonical slice dimension");
-        sourceDimension = ids[fold.getAxis()];
-      }
-      auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
-      if (!node || node.getInt() < 0)
-        return fold.emitOpError(
-            "region-fold has no stable identity for its segment decision");
-      std::string name =
-          ("SEGMENT_N" + Twine(node.getInt()) + "_D" +
-           Twine(sourceDimension))
-              .str();
-      auto segment = gpu::ParameterAttr::get(
-          operation->getContext(), builder.getStringAttr(name),
-          static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),
-          builder.getDenseI64ArrayAttr(
-              {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
-               32768, 65536}));
-      gpu::ParameterOp declaration;
-      operation->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
-            if (declaration ||
-                parameter.getParameter().getName() != segment.getName())
-              return;
-            parameter->setAttr("parameter", segment);
-            declaration = parameter;
-          });
-      if (!declaration)
-        declaration = builder.create<gpu::ParameterOp>(
-            location, builder.getIndexType(), segment);
-      parameters[segment.getName()] = declaration.getResult();
+      FailureOr<gpu::ParameterAttr> segment =
+          getOrCreateRegionSegment(operation);
+      if (failed(segment))
+        return failure();
       OperationState state(location, gpu::RegionFoldOp::getOperationName());
       state.addOperands(inputs);
       state.addTypes(results);
@@ -3313,7 +3344,7 @@ private:
                          builder.getI64IntegerAttr(fold.getIdentityCount()));
       state.addAttribute("capture_count",
                          builder.getI64IntegerAttr(fold.getCaptureCount()));
-      state.addAttribute("segment", segment);
+      state.addAttribute("segment", *segment);
       state.addRegion();
       state.addRegion();
       Operation *raw = builder.create(state);
@@ -3325,7 +3356,9 @@ private:
         auto prototype = dyn_cast<FragmentType>(inputs[index].getType());
         FailureOr<FragmentType> converted =
             tensor && prototype
-                ? convertSegmentSliceType(tensor, prototype, fold.getAxis(), name)
+                ? convertSegmentSliceType(
+                      tensor, prototype, fold.getAxis(),
+                      (*segment).getName().getValue())
                 : FailureOr<FragmentType>(failure());
         if (failed(converted))
           return fold.emitOpError(
@@ -3375,44 +3408,10 @@ private:
         results.push_back(*converted);
       }
       Block &sourceSummary = scan.getSummarize().front();
-      int64_t sourceDimension = 0;
-      for (unsigned index = 0; index < scan.getSourceCount(); ++index) {
-        auto tensor = dyn_cast<RankedTensorType>(scan.getInputs()[index].getType());
-        DenseI64ArrayAttr ids = tensor ? dimensionIds(tensor)
-                                       : DenseI64ArrayAttr();
-        if (!tensor || scan.getAxis() >= static_cast<uint64_t>(tensor.getRank()) ||
-            !ids || ids[scan.getAxis()] <= 0 ||
-            (sourceDimension != 0 && ids[scan.getAxis()] != sourceDimension))
-          return scan.emitOpError(
-              "region-scan sources do not share one canonical slice dimension");
-        sourceDimension = ids[scan.getAxis()];
-      }
-      auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
-      if (!node || node.getInt() < 0)
-        return scan.emitOpError(
-            "region-scan has no stable identity for its segment decision");
-      std::string name =
-          ("SEGMENT_N" + Twine(node.getInt()) + "_D" +
-           Twine(sourceDimension))
-              .str();
-      auto segment = gpu::ParameterAttr::get(
-          operation->getContext(), builder.getStringAttr(name),
-          static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),
-          builder.getDenseI64ArrayAttr(
-              {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
-               32768, 65536}));
-      gpu::ParameterOp declaration;
-      operation->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
-            if (declaration ||
-                parameter.getParameter().getName() != segment.getName())
-              return;
-            parameter->setAttr("parameter", segment);
-            declaration = parameter;
-          });
-      if (!declaration)
-        declaration = builder.create<gpu::ParameterOp>(
-            location, builder.getIndexType(), segment);
-      parameters[segment.getName()] = declaration.getResult();
+      FailureOr<gpu::ParameterAttr> segment =
+          getOrCreateRegionSegment(operation);
+      if (failed(segment))
+        return failure();
       OperationState state(location, gpu::RegionScanOp::getOperationName());
       state.addOperands(inputs);
       state.addTypes(results);
@@ -3427,7 +3426,7 @@ private:
                          builder.getI64IntegerAttr(scan.getCaptureCount()));
       state.addAttribute("output_count",
                          builder.getI64IntegerAttr(scan.getOutputCount()));
-      state.addAttribute("segment", segment);
+      state.addAttribute("segment", *segment);
       for (unsigned region = 0; region < 4; ++region)
         state.addRegion();
       Operation *raw = builder.create(state);
@@ -3439,7 +3438,9 @@ private:
         auto prototype = dyn_cast<FragmentType>(inputs[index].getType());
         FailureOr<FragmentType> converted =
             tensor && prototype
-                ? convertSegmentSliceType(tensor, prototype, scan.getAxis(), name)
+                ? convertSegmentSliceType(
+                      tensor, prototype, scan.getAxis(),
+                      (*segment).getName().getValue())
                 : FailureOr<FragmentType>(failure());
         if (failed(converted))
           return scan.emitOpError(
@@ -3663,15 +3664,29 @@ private:
       FailureOr<FragmentType> valueType = convertTensorType(tensor, operation);
       if (failed(valueType))
         return buffer.emitOpError("logical buffer shape is not physicalizable");
-      FailureOr<PhysicalAxisIdentity> instance = resultAxisIdentity(operation);
-      if (failed(instance))
+      LogicalBufferFact allocation = canonicalAnalysis.logicalBuffer(operation);
+      if (!allocation.isExact())
         return buffer.emitOpError(
-            "logical buffer has no canonical physical instance identity");
+            "logical buffer has no exact canonical allocation fact");
+      gpu::BufferScope scope =
+          allocation.scope == LogicalBufferScope::ProgramPrivate
+              ? gpu::BufferScope::ProgramPrivate
+              : gpu::BufferScope::IterationPrivate;
+      gpu::BufferLifetime lifetime =
+          allocation.scope == LogicalBufferScope::ProgramPrivate
+              ? gpu::BufferLifetime::Program
+              : gpu::BufferLifetime::Iteration;
       auto physicalType = gpu::BufferType::get(
           operation->getContext(), tensor.getElementType(), valueType->getShape(),
-          /*scope=*/orderedDepth == 0 ? 0 : 1, instance->sourceId,
-          /*owner=*/1, buffer.getInitialOperand() ? 0 : 1,
-          /*lifetime=*/orderedDepth == 0 ? 0 : 1,
+          gpu::BufferScopeAttr::get(operation->getContext(), scope),
+          allocation.instanceIdentity,
+          /*owner=*/1,
+          gpu::BufferInitializationAttr::get(
+              operation->getContext(),
+              allocation.hasFullInitialValue
+                  ? gpu::BufferInitialization::FullValue
+                  : gpu::BufferInitialization::FirstWrite),
+          gpu::BufferLifetimeAttr::get(operation->getContext(), lifetime),
           /*visibility=*/0, /*workspace=*/false);
       Value initial;
       if (buffer.getInitialOperand()) {
@@ -4099,7 +4114,7 @@ private:
           targetBlock.back().erase();
         OpBuilder nested(&targetBlock, targetBlock.begin());
         ScalarRegionLowering child(nested, values, views, dimensions, parameters,
-                                   orderedDepth);
+                                   canonicalAnalysis);
         FailureOr<SmallVector<Value>> yielded =
             child.lowerBlock(sourceRegion.front());
         if (failed(yielded) || yielded->size() != resultTypes.size())
@@ -4204,7 +4219,7 @@ private:
                    source.getArguments().drop_front(axes.size()), carries))
             childValues[argument] = carry;
           ScalarRegionLowering child(nested, std::move(childValues), views,
-                                     dimensions, parameters, orderedDepth + 1);
+                                     dimensions, parameters, canonicalAnalysis);
           FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source);
           if (failed(yielded)) {
             nestedFailed = true;
@@ -4281,7 +4296,7 @@ private:
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(before);
         ScalarRegionLowering child(builder, std::move(childValues), views,
-                                   dimensions, parameters, orderedDepth + 1);
+                                   dimensions, parameters, canonicalAnalysis);
         Block &source = whileOperation.getBefore().front();
         for (Operation &nested : source.without_terminator())
           if (failed(child.lower(&nested)))
@@ -4311,7 +4326,7 @@ private:
           childValues[source] = targetArgument;
         builder.setInsertionPointToStart(after);
         ScalarRegionLowering child(builder, std::move(childValues), views,
-                                   dimensions, parameters, orderedDepth + 1);
+                                   dimensions, parameters, canonicalAnalysis);
         FailureOr<SmallVector<Value>> yielded =
             child.lowerBlock(whileOperation.getAfter().front());
         if (failed(yielded))
@@ -4341,7 +4356,7 @@ private:
   ArrayRef<Value> views;
   llvm::DenseMap<int64_t, Value> dimensions;
   llvm::DenseMap<StringAttr, Value> parameters;
-  unsigned orderedDepth;
+  CanonicalKernelAnalysis &canonicalAnalysis;
 };
 
 struct ParallelWorkset {
@@ -4353,24 +4368,6 @@ struct ParallelWorkset {
   SmallVector<PhysicalExprAttr> launchExtents;
   PhysicalExprAttr launchLength;
 };
-
-LogicalResult collectDomainAxes(Value source,
-                                SmallVectorImpl<intent::DomainOp> &axes) {
-  if (auto domain = source.getDefiningOp<intent::DomainOp>()) {
-    axes.push_back(domain);
-    return success();
-  }
-  auto product = source.getDefiningOp<intent::DomainProductOp>();
-  if (!product) {
-    emitError(source.getLoc())
-        << "parallel GPU workset must have a launch-visible domain product";
-    return failure();
-  }
-  for (Value component : product.getDomains())
-    if (failed(collectDomainAxes(component, axes)))
-      return failure();
-  return success();
-}
 
 LogicalResult collectOrderedIterationAxes(
     Value source, SmallVectorImpl<OrderedIterationAxis> &axes) {
@@ -4436,79 +4433,40 @@ LogicalResult finalizeParallelWorkset(ParallelWorkset &workset,
   return success();
 }
 
-LogicalResult collectParallelWorksets(
-    intent::ParallelOp operation, func::FuncOp function,
-    ArrayRef<intent::DomainOp> parentAxes,
-    ArrayRef<BlockArgument> parentArguments,
-    SmallVectorImpl<ParallelWorkset> &worksets) {
-  ParallelWorkset current;
-  current.operation = operation;
-  current.axes.append(parentAxes.begin(), parentAxes.end());
-  current.coordinateArguments.append(parentArguments.begin(),
-                                     parentArguments.end());
-  SmallVector<intent::DomainOp> localAxes;
-  if (failed(collectDomainAxes(operation.getSource(), localAxes)) ||
-      localAxes.empty())
-    return failure();
-  current.axes.append(localAxes.begin(), localAxes.end());
-  Block &body = operation.getBody().front();
-  if (body.getNumArguments() != localAxes.size())
-    return operation.emitOpError(
-        "parallel body coordinates do not match its domain product");
-  current.coordinateArguments.append(body.getArguments().begin(),
-                                     body.getArguments().end());
-
-  SmallVector<intent::ParallelOp> children;
-  bool hasDirectEffect = false;
-  auto classifyWorksetOperation = [&](Operation *candidate) {
-    hasDirectEffect |= isCanonicalEffect(candidate);
-  };
-  for (Operation &nested : body.without_terminator()) {
-    if (auto child = dyn_cast<intent::ParallelOp>(nested)) {
-      children.push_back(child);
-      continue;
-    }
-    classifyWorksetOperation(&nested);
-    nested.walk([&](Operation *candidate) {
-      if (candidate != &nested)
-        classifyWorksetOperation(candidate);
-    });
-  }
-  if (!children.empty()) {
-    if (hasDirectEffect)
-      return operation.emitOpError(
-          "one parallel region cannot mix direct effects with nested independent worksets");
-    for (intent::ParallelOp child : children)
-      if (failed(collectParallelWorksets(child, function, current.axes,
-                                         current.coordinateArguments, worksets)))
-        return failure();
-    return success();
-  }
-
-  current.body = &body;
-  if (failed(finalizeParallelWorkset(current, function)))
-    return failure();
-  worksets.push_back(std::move(current));
-  return success();
-}
-
 LogicalResult constructGPUProgram(ModuleOp module,
                                   const GPUCapabilities &capabilities,
                                   func::FuncOp function) {
+  CanonicalKernelAnalysis canonicalAnalysis(module);
+  FailureOr<SmallVector<LogicalWorksetFact, 4>> logicalWorksets =
+      canonicalAnalysis.logicalWorksets(function);
+  if (failed(logicalWorksets))
+    return failure();
   SmallVector<ParallelWorkset> worksets;
-  for (Operation &operation : function.getBody().front())
-    if (auto parallel = dyn_cast<intent::ParallelOp>(operation)) {
-      if (failed(collectParallelWorksets(parallel, function, {}, {}, worksets)))
+  for (const LogicalWorksetFact &fact : *logicalWorksets) {
+    if (!fact.isExact() || !fact.body)
+      return function.emitError(
+          "canonical workset analysis produced an incomplete execution group");
+    ParallelWorkset workset;
+    workset.operation = dyn_cast_or_null<intent::ParallelOp>(fact.parallel);
+    workset.body = fact.body;
+    workset.singleton = fact.singleton;
+    workset.coordinateArguments.append(fact.coordinates.begin(),
+                                       fact.coordinates.end());
+    for (Value domainValue : fact.domains) {
+      auto domain = domainValue.getDefiningOp<intent::DomainOp>();
+      if (!domain)
+        return function.emitError(
+            "canonical workset axis is not a typed domain value");
+      workset.axes.push_back(domain);
+    }
+    if (workset.singleton) {
+      workset.launchExtents.push_back(
+          expression(function.getContext(), PhysicalExprKind::Constant, 1));
+      workset.launchLength = workset.launchExtents.front();
+    } else if (failed(finalizeParallelWorkset(workset, function))) {
         return failure();
     }
-  if (worksets.empty()) {
-    ParallelWorkset singleton;
-    singleton.body = &function.getBody().front();
-    singleton.singleton = true;
-    singleton.launchExtents.push_back(
-        expression(function.getContext(), PhysicalExprKind::Constant, 1));
-    singleton.launchLength = singleton.launchExtents.front();
-    worksets.push_back(std::move(singleton));
+    worksets.push_back(std::move(workset));
   }
 
   MLIRContext *context = module.getContext();
@@ -4545,48 +4503,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       abi->argumentAttrs);
   Block *entry = physical.addEntryBlock();
   builder.setInsertionPointToStart(entry);
-  llvm::SmallDenseSet<int64_t> launchDimensions(abi->dimensionOrder.begin(),
-                                                abi->dimensionOrder.end());
-  llvm::SmallDenseSet<int64_t> derivedFragmentDimensions;
-  function.walk([&](Operation *operation) {
-    auto collect = [&](Type type) {
-      auto tensor = dyn_cast<RankedTensorType>(type);
-      DenseI64ArrayAttr identities = tensor ? dimensionIds(tensor)
-                                            : DenseI64ArrayAttr();
-      if (!tensor || !identities)
-        return;
-      for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef())) {
-        if (!tensor.isDynamicDim(axis) || identity <= 0)
-          continue;
-        FailureOr<int64_t> physicalIdentity =
-            physicalDimensionIdentity(operation, identity);
-        if (succeeded(physicalIdentity) &&
-            !launchDimensions.contains(*physicalIdentity))
-          derivedFragmentDimensions.insert(*physicalIdentity);
-      }
-    };
-    for (Type type : operation->getOperandTypes())
-      collect(type);
-    for (Type type : operation->getResultTypes())
-      collect(type);
-  });
   llvm::DenseMap<StringAttr, Value> parameterValues;
-  SmallVector<int64_t> orderedDerived(derivedFragmentDimensions.begin(),
-                                      derivedFragmentDimensions.end());
-  llvm::sort(orderedDerived);
-  for (int64_t dimension : orderedDerived) {
-    std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
-    auto parameter = gpu::ParameterAttr::get(
-        context, builder.getStringAttr(name),
-        static_cast<uint32_t>(gpu::ParameterRole::OwnershipN),
-        builder.getDenseI64ArrayAttr(
-            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}));
-    auto declaration = builder.create<gpu::ParameterOp>(
-        function.getLoc(), builder.getIndexType(), parameter);
-    declaration->setAttr(gpu::dimensionAttr,
-                         builder.getI64IntegerAttr(dimension));
-    parameterValues[parameter.getName()] = declaration.getResult();
-  }
   SmallVector<Value> sourceArguments;
   sourceArguments.reserve(abi->physicalArgumentForSource.size());
   for (unsigned physicalIndex : abi->physicalArgumentForSource)
@@ -4633,7 +4550,8 @@ LogicalResult constructGPUProgram(ModuleOp module,
   PhysicalExprAttr launchOffset =
       expression(context, PhysicalExprKind::Constant, 0);
   ScalarRegionLowering rootLowering(builder, values, sourceArguments,
-                                    dimensionValues, parameterValues);
+                                    dimensionValues, parameterValues,
+                                    canonicalAnalysis);
   auto formWorksetCoordinate = [&](OpBuilder &nested, Location location,
                                    intent::DomainOp domain, Value coordinate,
                                    unsigned worksetAxis) -> Value {
@@ -4730,7 +4648,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
       }
       ScalarRegionLowering lowering(builder, std::move(childValues),
                                     sourceArguments, dimensionValues,
-                                    parameterValues);
+                                    parameterValues, canonicalAnalysis);
       if (failed(lowering.lowerBlock(sourceBlock)))
         return failure();
       runtimeOffset = segmentEnd;
@@ -4786,7 +4704,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
           }
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,
-                                        parameterValues);
+                                        parameterValues, canonicalAnalysis);
           if (failed(lowering.lowerBlock(sourceBlock)))
             dispatchLoweringFailed = true;
         });

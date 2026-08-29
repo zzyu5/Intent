@@ -3,6 +3,7 @@
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
@@ -159,6 +160,84 @@ bool loopCoversBuffer(Operation *operation, Value buffer) {
   Block &body = operation->getRegion(0).front();
   return body.getNumArguments() > 0 &&
          definitelyWritesCoordinate(body, buffer, body.getArgument(0));
+}
+
+LogicalResult collectDomainValues(Value source,
+                                  SmallVectorImpl<Value> &domains) {
+  if (isa_and_nonnull<DomainOp>(source.getDefiningOp())) {
+    domains.push_back(source);
+    return success();
+  }
+  auto product = source.getDefiningOp<DomainProductOp>();
+  if (!product)
+    return failure();
+  for (Value component : product.getDomains())
+    if (failed(collectDomainValues(component, domains)))
+      return failure();
+  return success();
+}
+
+bool hasObservableWrite(Operation *operation) {
+  auto interface = dyn_cast<MemoryEffectOpInterface>(operation);
+  if (!interface)
+    return false;
+  SmallVector<MemoryEffects::EffectInstance> effects;
+  interface.getEffects(effects);
+  return llvm::any_of(effects, [](const MemoryEffects::EffectInstance &effect) {
+    return isa<MemoryEffects::Write>(effect.getEffect());
+  });
+}
+
+LogicalResult collectLogicalWorkset(
+    ParallelOp parallel, ArrayRef<Value> parentDomains,
+    ArrayRef<BlockArgument> parentCoordinates,
+    SmallVectorImpl<LogicalWorksetFact> &worksets) {
+  LogicalWorksetFact current;
+  current.parallel = parallel;
+  current.domains.append(parentDomains.begin(), parentDomains.end());
+  current.coordinates.append(parentCoordinates.begin(),
+                             parentCoordinates.end());
+  SmallVector<Value> localDomains;
+  if (failed(collectDomainValues(parallel.getSource(), localDomains)) ||
+      localDomains.empty())
+    return parallel.emitOpError(
+        "parallel workset requires a finite canonical domain product");
+  Block &body = parallel.getBody().front();
+  if (body.getNumArguments() != localDomains.size())
+    return parallel.emitOpError(
+        "parallel coordinates do not match the canonical domain product");
+  current.domains.append(localDomains.begin(), localDomains.end());
+  current.coordinates.append(body.getArguments().begin(),
+                             body.getArguments().end());
+
+  SmallVector<ParallelOp> children;
+  bool directWrite = false;
+  for (Operation &nested : body.without_terminator()) {
+    if (auto child = dyn_cast<ParallelOp>(nested)) {
+      children.push_back(child);
+      continue;
+    }
+    directWrite |= hasObservableWrite(&nested);
+    nested.walk([&](Operation *candidate) {
+      if (candidate != &nested)
+        directWrite |= hasObservableWrite(candidate);
+    });
+  }
+  if (!children.empty()) {
+    if (directWrite)
+      return parallel.emitOpError(
+          "parallel region mixes direct writes with nested independent worksets");
+    for (ParallelOp child : children)
+      if (failed(collectLogicalWorkset(child, current.domains,
+                                       current.coordinates, worksets)))
+        return failure();
+    return success();
+  }
+
+  current.state = CanonicalFactState::Exact;
+  current.body = &body;
+  worksets.push_back(std::move(current));
+  return success();
 }
 
 void intersectInitialization(BufferInitializationState &destination,
@@ -469,11 +548,103 @@ CanonicalKernelAnalysis::indexRelation(Operation *operation) {
   return result;
 }
 
+FailureOr<SmallVector<LogicalWorksetFact, 4>>
+CanonicalKernelAnalysis::logicalWorksets(func::FuncOp function) const {
+  SmallVector<LogicalWorksetFact, 4> worksets;
+  for (Operation &operation : function.getBody().front())
+    if (auto parallel = dyn_cast<ParallelOp>(operation))
+      if (failed(collectLogicalWorkset(parallel, {}, {}, worksets)))
+        return failure();
+  if (worksets.empty()) {
+    LogicalWorksetFact singleton;
+    singleton.state = CanonicalFactState::Exact;
+    singleton.body = &function.getBody().front();
+    singleton.singleton = true;
+    worksets.push_back(std::move(singleton));
+  }
+  return worksets;
+}
+
+LogicalBufferFact
+CanonicalKernelAnalysis::logicalBuffer(Operation *operation) const {
+  LogicalBufferFact fact;
+  auto buffer = dyn_cast_or_null<BufferOp>(operation);
+  if (!buffer)
+    return fact;
+  auto type = dyn_cast<BufferType>(buffer.getResult().getType());
+  if (!type || type.getOriginId() == 0)
+    return fact;
+  fact.state = CanonicalFactState::Exact;
+  fact.instanceIdentity = type.getOriginId();
+  fact.hasFullInitialValue = static_cast<bool>(buffer.getInitialOperand());
+  for (Operation *parent = operation->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isa<ForOp, WhileOp>(parent)) {
+      fact.scope = LogicalBufferScope::IterationPrivate;
+      break;
+    }
+    if (isa<func::FuncOp>(parent))
+      break;
+  }
+  return fact;
+}
+
+RegionSegmentFact
+CanonicalKernelAnalysis::regionSegment(Operation *operation) const {
+  RegionSegmentFact fact;
+  uint64_t axis = 0;
+  ValueRange sources;
+  if (auto fold = dyn_cast_or_null<RegionFoldOp>(operation)) {
+    axis = fold.getAxis();
+    sources = fold.getInputs().take_front(fold.getSourceCount());
+  } else if (auto scan = dyn_cast_or_null<RegionScanOp>(operation)) {
+    axis = scan.getAxis();
+    sources = scan.getInputs().take_front(scan.getSourceCount());
+  } else {
+    return fact;
+  }
+  int64_t dimension = 0;
+  for (Value source : sources) {
+    auto tensor = dyn_cast<RankedTensorType>(source.getType());
+    DenseI64ArrayAttr ids = tensor ? dimensionIDs(tensor)
+                                   : DenseI64ArrayAttr();
+    if (!tensor || axis >= static_cast<uint64_t>(tensor.getRank()) || !ids ||
+        ids[axis] <= 0 || (dimension != 0 && ids[axis] != dimension))
+      return fact;
+    dimension = ids[axis];
+  }
+  auto node = operation->getAttrOfType<IntegerAttr>("intent.node");
+  if (!node || node.getInt() < 0 || dimension <= 0)
+    return fact;
+  fact.state = CanonicalFactState::Exact;
+  fact.dimensionIdentity = dimension;
+  fact.operationIdentity = node.getInt();
+  return fact;
+}
+
 LogicalResult CanonicalKernelAnalysis::verify() {
   LogicalResult result = success();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (failed(logicalWorksets(function)))
+      return failure();
     BufferInitializationState state;
     if (failed(verifyBufferInitializationRegion(function.getBody(), state)))
+      return failure();
+    WalkResult constructionFacts = function.walk([&](Operation *operation) {
+      if (isa<BufferOp>(operation) && !logicalBuffer(operation).isExact()) {
+        operation->emitOpError(
+            "canonical buffer has no exact lexical allocation fact");
+        return WalkResult::interrupt();
+      }
+      if (isa<RegionFoldOp, RegionScanOp>(operation) &&
+          !regionSegment(operation).isExact()) {
+        operation->emitOpError(
+            "canonical region operation has no exact segment source relation");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (constructionFacts.wasInterrupted())
       return failure();
   }
   module.walk([&](Operation *operation) {

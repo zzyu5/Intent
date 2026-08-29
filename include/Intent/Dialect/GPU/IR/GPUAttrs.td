@@ -25,6 +25,32 @@ def IntentGPU_AtomicSharingDomain : IntentGPU_I32Enum<
 def IntentGPU_AtomicSharingDomainAttr : IntentGPU_I32EnumAttr<
     "atomic_sharing", IntentGPU_AtomicSharingDomain>;
 
+def IntentGPU_BufferScope : IntentGPU_I32Enum<
+    "BufferScope", "Logical allocation scope of a physical mutable buffer", [
+      I32EnumAttrCase<"ProgramPrivate", 0, "program_private">,
+      I32EnumAttrCase<"IterationPrivate", 1, "iteration_private">,
+      I32EnumAttrCase<"InvocationWorkspace", 2, "invocation_workspace">
+    ]>;
+def IntentGPU_BufferScopeAttr : IntentGPU_I32EnumAttr<
+    "buffer_scope", IntentGPU_BufferScope>;
+
+def IntentGPU_BufferInitialization : IntentGPU_I32Enum<
+    "BufferInitialization", "Initialization obligation of a physical buffer", [
+      I32EnumAttrCase<"FullValue", 0, "full_value">,
+      I32EnumAttrCase<"FirstWrite", 1, "first_write">
+    ]>;
+def IntentGPU_BufferInitializationAttr : IntentGPU_I32EnumAttr<
+    "buffer_initialization", IntentGPU_BufferInitialization>;
+
+def IntentGPU_BufferLifetime : IntentGPU_I32Enum<
+    "BufferLifetime", "Dynamic lifetime of one physical allocation instance", [
+      I32EnumAttrCase<"Program", 0, "program">,
+      I32EnumAttrCase<"Iteration", 1, "iteration">,
+      I32EnumAttrCase<"Invocation", 2, "invocation">
+    ]>;
+def IntentGPU_BufferLifetimeAttr : IntentGPU_I32EnumAttr<
+    "buffer_lifetime", IntentGPU_BufferLifetime>;
+
 def IntentGPU_PhysicalExprAttr : AttrDef<IntentGPU_Dialect, "PhysicalExpr"> {
   let mnemonic = "expr";
   let summary = "Typed launch or compile-time physical integer expression";

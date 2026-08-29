@@ -56,11 +56,11 @@ def IntentGPU_BufferType : TypeDef<IntentGPU_Dialect, "Buffer"> {
   let parameters = (ins
     "::mlir::Type":$elementType,
     "::mlir::ArrayAttr":$shape,
-    "uint32_t":$scope,
+    "::intent::gpu::BufferScopeAttr":$scope,
     "uint64_t":$instance,
     "uint64_t":$owner,
-    "uint32_t":$initialization,
-    "uint32_t":$lifetime,
+    "::intent::gpu::BufferInitializationAttr":$initialization,
+    "::intent::gpu::BufferLifetimeAttr":$lifetime,
     "uint32_t":$visibility,
     "bool":$workspace
   );

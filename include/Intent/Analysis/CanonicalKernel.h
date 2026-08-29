@@ -3,6 +3,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -49,6 +50,43 @@ struct IndexRelationFact {
   llvm::SmallVector<IndexTermFact, 4> terms;
 };
 
+enum class CanonicalFactState { Exact, Unknown, Ambiguous };
+
+/// One canonical independent instance domain and the connected program slice
+/// executed for each instance.  This is semantic input to physical program
+/// construction, not a GPU grid decision.
+struct LogicalWorksetFact {
+  CanonicalFactState state = CanonicalFactState::Unknown;
+  mlir::Operation *parallel = nullptr;
+  mlir::Block *body = nullptr;
+  bool singleton = false;
+  llvm::SmallVector<mlir::Value, 4> domains;
+  llvm::SmallVector<mlir::BlockArgument, 4> coordinates;
+
+  bool isExact() const { return state == CanonicalFactState::Exact; }
+};
+
+enum class LogicalBufferScope { ProgramPrivate, IterationPrivate };
+
+/// Lexical allocation semantics of one canonical logical buffer.
+struct LogicalBufferFact {
+  CanonicalFactState state = CanonicalFactState::Unknown;
+  LogicalBufferScope scope = LogicalBufferScope::ProgramPrivate;
+  uint64_t instanceIdentity = 0;
+  bool hasFullInitialValue = false;
+
+  bool isExact() const { return state == CanonicalFactState::Exact; }
+};
+
+/// Canonical source relation shared by a region-fold/scan segment decision.
+struct RegionSegmentFact {
+  CanonicalFactState state = CanonicalFactState::Unknown;
+  int64_t dimensionIdentity = 0;
+  int64_t operationIdentity = -1;
+
+  bool isExact() const { return state == CanonicalFactState::Exact; }
+};
+
 /// Immutable, recomputable facts derived only from canonical Intent KIR.
 /// This analysis does not select physical structure and is never executable
 /// authority.
@@ -62,6 +100,10 @@ public:
   llvm::SmallVector<ShapeAxisFact, 4> shapeFacts(mlir::Value value) const;
   mlir::FailureOr<IndexRelationFact>
   indexRelation(mlir::Operation *operation);
+  mlir::FailureOr<llvm::SmallVector<LogicalWorksetFact, 4>>
+  logicalWorksets(mlir::func::FuncOp function) const;
+  LogicalBufferFact logicalBuffer(mlir::Operation *operation) const;
+  RegionSegmentFact regionSegment(mlir::Operation *operation) const;
 
 private:
   CoordinateProvenance computeCoordinateProvenance(mlir::Value value);

@@ -1042,7 +1042,8 @@ LogicalResult BufferOp::verify() {
   if (type.getWorkspace())
     return emitOpError(
         "invocation workspace must be an explicit hidden ABI resource");
-  if ((type.getInitialization() == 0) !=
+  if ((type.getInitialization().getValue() ==
+       BufferInitialization::FullValue) !=
       static_cast<bool>(getInitialValue()))
     return emitOpError(
         "buffer initializer disagrees with its initialization obligation");

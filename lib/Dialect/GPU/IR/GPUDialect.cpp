@@ -217,16 +217,17 @@ LogicalResult RangeType::verify(function_ref<InFlightDiagnostic()> emitError,
 
 LogicalResult BufferType::verify(
     function_ref<InFlightDiagnostic()> emitError, Type elementType,
-    ArrayAttr shape, uint32_t scope, uint64_t instance, uint64_t owner,
-    uint32_t initialization, uint32_t lifetime, uint32_t visibility,
-    bool workspace) {
-  if (!elementType || !shape || shape.empty() || scope > 2 || instance == 0 ||
-      owner == 0 || initialization > 2 || lifetime > 2 || visibility > 2)
+    ArrayAttr shape, BufferScopeAttr scope, uint64_t instance, uint64_t owner,
+    BufferInitializationAttr initialization, BufferLifetimeAttr lifetime,
+    uint32_t visibility, bool workspace) {
+  if (!elementType || !shape || shape.empty() || !scope || instance == 0 ||
+      owner == 0 || !initialization || !lifetime || visibility > 2)
     return emitError() << "physical buffer schema is incomplete";
   for (Attribute extent : shape)
     if (!mlir::isa<PhysicalExprAttr>(extent))
       return emitError() << "buffer extents must be typed physical expressions";
-  if (workspace != (scope == 2))
+  if (workspace !=
+      (scope.getValue() == BufferScope::InvocationWorkspace))
     return emitError() << "workspace flag and invocation scope disagree";
   return success();
 }

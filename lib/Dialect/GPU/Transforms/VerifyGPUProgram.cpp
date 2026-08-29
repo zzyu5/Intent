@@ -146,7 +146,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         launchABI.insert(name.getValue());
     } else if (kind.getValue() == "workspace") {
       auto buffer = dyn_cast<BufferType>(type);
-      if (!buffer || !buffer.getWorkspace())
+      if (!buffer || !buffer.getWorkspace() ||
+          buffer.getScope().getValue() != BufferScope::InvocationWorkspace)
         return kernel.emitError("workspace ABI argument has a non-workspace type");
     } else {
       return kernel.emitError("unknown physical ABI argument kind");
