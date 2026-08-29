@@ -129,21 +129,6 @@ void inheritRangeAuthority(Value derived, MakeRangeOp source) {
     operation->setAttr(sourceSubregionAttr, value);
 }
 
-FailureOr<int64_t> rangeDimension(MakeRangeOp range) {
-  return querySourceDimension(
-      range.getResult().getType(),
-      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
-}
-
-FailureOr<AxisMapAttr> axisMap(FragmentType fragment, unsigned axis) {
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getFragmentAxis() == axis)
-      return mapping;
-  }
-  return failure();
-}
-
 FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
                                    ArrayRef<int64_t> reduction,
                                    ArrayRef<int64_t> batch) {
@@ -159,45 +144,36 @@ FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
   return result ? FailureOr<unsigned>(*result) : FailureOr<unsigned>(failure());
 }
 
-FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
-                                        uint64_t sourceId) {
-  return queryCoordinateIndex(coordinates, sourceId);
-}
-
 MakeRangeOp sourceRange(Value value) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return {};
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact fact = analysis.sourceRanges(value);
-  return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
+  FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+  return succeeded(range) ? *range : MakeRangeOp();
 }
 
-FailureOr<unsigned> axisForSource(FragmentType fragment, uint64_t sourceId) {
-  return queryFragmentAxis(fragment, sourceId);
-}
-
-FragmentType replaceSourceExtent(FragmentType source, uint64_t sourceId,
+FragmentType replaceSourceExtent(FragmentType source, PhysicalSourceAxis logical,
                                  PhysicalExprAttr extent) {
-  FailureOr<unsigned> axis = axisForSource(source, sourceId);
-  if (failed(axis))
+  PhysicalAxisProjection axis = queryFragmentAxis(source, logical);
+  if (!axis.isExact())
     return source;
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  shape[*axis] = extent;
+  shape[axis.fragmentAxis] = extent;
   return FragmentType::get(source.getContext(), source.getElementType(),
                            ArrayAttr::get(source.getContext(), shape),
                            source.getAxisMaps(), source.getValidity(),
                            source.getOwner());
 }
 
-bool containsSource(Value value, uint64_t sourceId) {
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  return fragment && succeeded(axisForSource(fragment, sourceId));
+bool containsSource(Value value, PhysicalSourceAxis source) {
+  return queryFragmentAxis(value.getType(), source).isExact();
 }
 
 LogicalResult collectProducerRanges(
-    Value value, uint64_t sourceId, SmallVectorImpl<MakeRangeOp> &ranges,
-    llvm::SmallPtrSetImpl<Operation *> &visited);
+    Value value, PhysicalSourceAxis source,
+    SmallVectorImpl<MakeRangeOp> &ranges);
 
 bool hasExplicitPairedReductionRanges(ContractOp contract) {
   if (contract.getLhsReductionAxes().size() != 1 ||
@@ -208,16 +184,17 @@ bool hasExplicitPairedReductionRanges(ContractOp contract) {
   if (!lhsType || !rhsType)
     return false;
   FailureOr<AxisMapAttr> lhsMap =
-      axisMap(lhsType, contract.getLhsReductionAxes().front());
+      queryAxisMap(lhsType, contract.getLhsReductionAxes().front());
   FailureOr<AxisMapAttr> rhsMap =
-      axisMap(rhsType, contract.getRhsReductionAxes().front());
+      queryAxisMap(rhsType, contract.getRhsReductionAxes().front());
   if (failed(lhsMap) || failed(rhsMap))
     return false;
   auto hasRanges = [&](Value value, AxisMapAttr mapping) {
     SmallVector<MakeRangeOp> ranges;
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    if (failed(collectProducerRanges(value, mapping.getSourceId(), ranges,
-                                     visited)) ||
+    if (failed(collectProducerRanges(
+            value,
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            ranges)) ||
         ranges.empty())
       return false;
     return llvm::all_of(ranges, [&](MakeRangeOp range) {
@@ -230,40 +207,32 @@ bool hasExplicitPairedReductionRanges(ContractOp contract) {
 }
 
 LogicalResult collectProducerRanges(
-    Value value, uint64_t sourceId, SmallVectorImpl<MakeRangeOp> &ranges,
-    llvm::SmallPtrSetImpl<Operation *> &visited) {
-  (void)visited;
+    Value value, PhysicalSourceAxis source,
+    SmallVectorImpl<MakeRangeOp> &ranges) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value);
+  PhysicalRangeFact fact = analysis.sourceRanges(value, source);
   if (fact.state == PhysicalFactState::Unknown)
     return failure();
-  for (MakeRangeOp range : fact.roots) {
-    if (range.getSourceId() != sourceId)
-      continue;
+  for (MakeRangeOp range : fact.roots)
     if (!llvm::is_contained(ranges, range))
       ranges.push_back(range);
-  }
   return ranges.empty() ? failure() : success();
 }
 
-FailureOr<MakeRangeOp> producerRange(Value value, uint64_t sourceId) {
-  if (MakeRangeOp direct = sourceRange(value))
-    return direct.getSourceId() == sourceId
-               ? FailureOr<MakeRangeOp>(direct)
-               : FailureOr<MakeRangeOp>(failure());
-  SmallVector<MakeRangeOp> ranges;
-  llvm::SmallPtrSet<Operation *, 16> visited;
-  if (failed(collectProducerRanges(value, sourceId, ranges, visited)) ||
-      ranges.size() != 1)
+FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
     return failure();
-  return ranges.front();
+  PhysicalRangeFact fact =
+      PhysicalProgramAnalysis(kernel).sourceRanges(value, source);
+  return queryExactLogicalRange(fact);
 }
 
 FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value, uint64_t sourceId,
+                                   Value value, PhysicalSourceAxis source,
                                    PhysicalExprAttr blockedExtent,
                                    MakeRangeOp root, Value replacement,
                                    IRMapping &mapping) {
@@ -271,7 +240,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     return replacement;
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
-  if (!containsSource(value, sourceId))
+  if (!containsSource(value, source))
     return value;
   Operation *producer = value.getDefiningOp();
   if (!producer || isa<MakeRangeOp>(producer))
@@ -283,7 +252,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     return failure();
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = replaySourceValue(
-        builder, location, operand, sourceId, blockedExtent, root, replacement,
+        builder, location, operand, source, blockedExtent, root, replacement,
         mapping);
     if (failed(replayed))
       return failure();
@@ -294,10 +263,10 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   if (!originalResultType)
     return failure();
   FragmentType targetType =
-      replaceSourceExtent(originalResultType, sourceId, blockedExtent);
+      replaceSourceExtent(originalResultType, source, blockedExtent);
   if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
     auto inputType = dyn_cast<FragmentType>(reshape.getValue().getType());
-    if (!inputType || failed(axisForSource(inputType, sourceId))) {
+    if (!inputType || !queryFragmentAxis(inputType, source).isExact()) {
       Value input = mapping.lookupOrDefault(reshape.getValue());
       auto broadcast = builder.create<BroadcastOp>(location, targetType, input);
       if (!mapping.lookupOrNull(value))
@@ -340,13 +309,16 @@ bool hasRuntimeRange(Value value) {
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return false;
-  llvm::SmallDenseSet<uint64_t> sources;
-  for (Attribute attribute : fragment.getAxisMaps())
-    sources.insert(cast<AxisMapAttr>(attribute).getSourceId());
-  for (uint64_t sourceId : sources) {
+  SmallVector<PhysicalSourceAxis> sources;
+  for (Attribute attribute : fragment.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis()};
+    if (!llvm::is_contained(sources, source))
+      sources.push_back(source);
+  }
+  for (PhysicalSourceAxis source : sources) {
     SmallVector<MakeRangeOp> ranges;
-    llvm::SmallPtrSet<Operation *, 16> visited;
-    if (failed(collectProducerRanges(value, sourceId, ranges, visited)))
+    if (failed(collectProducerRanges(value, source, ranges)))
       continue;
     for (MakeRangeOp range : ranges) {
       Value extent = range.getExtent();
@@ -443,7 +415,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
                             .getSourceId();
     SmallVector<MakeRangeOp> subregions;
     kernel.walk([&](MakeRangeOp range) {
-      FailureOr<int64_t> sourceDimension = rangeDimension(range);
+      FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
       if (range.getSourceId() == sourceId &&
           range->hasAttr(sourceSubregionAttr) && succeeded(sourceDimension) &&
           *sourceDimension == static_cast<int64_t>(dimension))
@@ -723,24 +695,35 @@ bool hasRangeContractForm(ContractOp contract) {
             rhsLoad, rhs,
             static_cast<unsigned>(contract.getRhsReductionAxes().front())},
         std::tuple<LoadOp, FragmentType, unsigned>{rhsLoad, rhs, *rhsFree}}) {
-    FailureOr<AxisMapAttr> mapping = axisMap(fragment, axis);
+    FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, axis);
     if (failed(mapping))
       return false;
     axes.emplace_back(load, *mapping);
   }
   for (auto [load, mapping] : axes) {
-    FailureOr<unsigned> coordinate =
-        coordinateForSource(load.getCoordinates(), mapping.getSourceId());
+    FailureOr<unsigned> coordinate = queryCoordinatePosition(
+        load.getCoordinates(),
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
     if (failed(coordinate))
       return false;
     Value value = load.getCoordinates()[*coordinate];
     if (!sourceRange(value) &&
-        failed(producerRange(value, mapping.getSourceId())))
+        failed(producerRange(
+            value, PhysicalSourceAxis{mapping.getSourceId(),
+                                      mapping.getSourceAxis()})))
       return false;
   }
   SmallVector<StorePath> paths;
   llvm::SmallPtrSet<Operation *, 8> visited;
   return collectStorePaths(contract.getResult(), {}, paths, visited);
+}
+
+bool hasSelectedFreeAxes(ContractOp contract) {
+  return llvm::all_of(contract.getResult().getType().getShape(),
+                      [](Attribute extent) {
+                        return isCompileTimeExtent(
+                            cast<PhysicalExprAttr>(extent));
+                      });
 }
 
 ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
@@ -796,14 +779,17 @@ FragmentType retargetFragmentToCoordinateRanges(
   bool changed = false;
   for (auto [axis, attribute] : llvm::enumerate(source.getAxisMaps())) {
     auto mapping = cast<AxisMapAttr>(attribute);
-    FailureOr<unsigned> coordinate =
-        coordinateForSource(coordinates, mapping.getSourceId());
+    FailureOr<unsigned> coordinate = queryCoordinatePosition(
+        coordinates,
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
     if (failed(coordinate))
       continue;
     MakeRangeOp range = sourceRange(coordinates[*coordinate]);
     if (!range) {
       FailureOr<MakeRangeOp> root =
-          producerRange(coordinates[*coordinate], mapping.getSourceId());
+          producerRange(coordinates[*coordinate],
+                        PhysicalSourceAxis{mapping.getSourceId(),
+                                           mapping.getSourceAxis()});
       if (succeeded(root))
         range = *root;
     }
@@ -926,7 +912,9 @@ FailureOr<Value> projectPredicateForScalarAxis(
     Value coordinate, FragmentType target) {
   if (!value)
     return Value();
-  if (!containsSource(value, root.getSourceId())) {
+  if (!containsSource(
+          value,
+          PhysicalSourceAxis{root.getSourceId(), root.getSourceAxis()})) {
     if (value.getType() == target)
       return value;
     Type element = value.getType();
@@ -1076,20 +1064,25 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
 
     unsigned lhsAxis = currentLhsReductions.front();
     unsigned rhsAxis = currentRhsReductions.front();
-    FailureOr<AxisMapAttr> lhsMapping = axisMap(currentLhsType, lhsAxis);
-    FailureOr<AxisMapAttr> rhsMapping = axisMap(currentRhsType, rhsAxis);
+    FailureOr<AxisMapAttr> lhsMapping = queryAxisMap(currentLhsType, lhsAxis);
+    FailureOr<AxisMapAttr> rhsMapping = queryAxisMap(currentRhsType, rhsAxis);
     if (failed(lhsMapping) || failed(rhsMapping)) {
       failureReason = "a reduction pair has no unique physical axis mapping";
       return failure();
     }
-    if (lhsMapping->getSourceId() != rhsMapping->getSourceId()) {
+    PhysicalSourceAxis lhsSource{lhsMapping->getSourceId(),
+                                 lhsMapping->getSourceAxis()};
+    PhysicalSourceAxis rhsSource{rhsMapping->getSourceId(),
+                                 rhsMapping->getSourceAxis()};
+    if (lhsMapping->getDimensionId() <= 0 ||
+        lhsMapping->getDimensionId() != rhsMapping->getDimensionId()) {
       failureReason = "a reduction pair does not share physical source provenance";
       return failure();
     }
-    FailureOr<unsigned> lhsCoordinate = coordinateForSource(
-        currentLhsCoordinates, lhsMapping->getSourceId());
-    FailureOr<unsigned> rhsCoordinate = coordinateForSource(
-        currentRhsCoordinates, rhsMapping->getSourceId());
+    FailureOr<unsigned> lhsCoordinate =
+        queryCoordinatePosition(currentLhsCoordinates, lhsSource);
+    FailureOr<unsigned> rhsCoordinate =
+        queryCoordinatePosition(currentRhsCoordinates, rhsSource);
     if (failed(lhsCoordinate) || failed(rhsCoordinate)) {
       failureReason = "a reduction pair has no unique access coordinate";
       return failure();
@@ -1100,7 +1093,10 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
       failureReason = "a reduction pair coordinate has no physical range root";
       return failure();
     }
-    if (lhsRange.getSourceId() != rhsRange.getSourceId()) {
+    FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
+    FailureOr<int64_t> rhsDimension = queryRangeDimension(rhsRange);
+    if (failed(lhsDimension) || failed(rhsDimension) ||
+        *lhsDimension != *rhsDimension) {
       failureReason = "a reduction pair range root provenance differs";
       return failure();
     }
@@ -1224,16 +1220,17 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
 
   unsigned lhsReduction = contract.getLhsReductionAxes().front();
   unsigned rhsReduction = contract.getRhsReductionAxes().front();
-  FailureOr<AxisMapAttr> lhsMap = axisMap(lhsType, lhsReduction);
-  FailureOr<AxisMapAttr> rhsMap = axisMap(rhsType, rhsReduction);
+  FailureOr<AxisMapAttr> lhsMap = queryAxisMap(lhsType, lhsReduction);
+  FailureOr<AxisMapAttr> rhsMap = queryAxisMap(rhsType, rhsReduction);
   if (failed(lhsMap) || failed(rhsMap))
     return contract.emitOpError(
         "reduction-only contraction blocking lost paired reduction provenance");
   auto rangesFor = [&](Value value, AxisMapAttr mapping,
                        SmallVectorImpl<MakeRangeOp> &ranges) {
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    if (failed(collectProducerRanges(value, mapping.getSourceId(), ranges,
-                                     visited)) ||
+    if (failed(collectProducerRanges(
+            value,
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            ranges)) ||
         ranges.empty())
       return failure();
     return llvm::all_of(ranges, [&](MakeRangeOp range) {
@@ -1267,8 +1264,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction, {32, 64, 128});
   if (!blockK)
     return failure();
-  FailureOr<int64_t> lhsDimension = rangeDimension(lhsRange);
-  FailureOr<int64_t> rhsDimension = rangeDimension(rhsRange);
+  FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
+  FailureOr<int64_t> rhsDimension = queryRangeDimension(rhsRange);
   if (succeeded(lhsDimension) && succeeded(rhsDimension) &&
       *lhsDimension == *rhsDimension)
     blockK->setAttr(
@@ -1313,10 +1310,12 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         for (MakeRangeOp range : rhsRanges)
           rhsReplay.map(range.getResult(), rhsK);
         FailureOr<Value> lhs = replaySourceValue(
-            nested, nestedLocation, contract.getLhs(), lhsMap->getSourceId(),
+            nested, nestedLocation, contract.getLhs(),
+            PhysicalSourceAxis{lhsMap->getSourceId(), lhsMap->getSourceAxis()},
             unitK, lhsRange, lhsK, lhsReplay);
         FailureOr<Value> rhs = replaySourceValue(
-            nested, nestedLocation, contract.getRhs(), rhsMap->getSourceId(),
+            nested, nestedLocation, contract.getRhs(),
+            PhysicalSourceAxis{rhsMap->getSourceId(), rhsMap->getSourceAxis()},
             unitK, rhsRange, rhsK, rhsReplay);
         if (failed(lhs) || failed(rhs)) {
           bodyFailed = true;
@@ -1369,23 +1368,31 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     return unhandled("each operand must have one physical free axis");
   unsigned lhsReduction = contract.getLhsReductionAxes().front();
   unsigned rhsReduction = contract.getRhsReductionAxes().front();
-  FailureOr<AxisMapAttr> rowMap = axisMap(lhsType, *lhsFree);
-  FailureOr<AxisMapAttr> lhsReductionMap = axisMap(lhsType, lhsReduction);
-  FailureOr<AxisMapAttr> rhsReductionMap = axisMap(rhsType, rhsReduction);
-  FailureOr<AxisMapAttr> columnMap = axisMap(rhsType, *rhsFree);
+  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, *lhsFree);
+  FailureOr<AxisMapAttr> lhsReductionMap = queryAxisMap(lhsType, lhsReduction);
+  FailureOr<AxisMapAttr> rhsReductionMap = queryAxisMap(rhsType, rhsReduction);
+  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, *rhsFree);
   if (failed(rowMap) || failed(lhsReductionMap) || failed(rhsReductionMap) ||
       failed(columnMap) ||
-      lhsReductionMap->getSourceId() != rhsReductionMap->getSourceId())
+      lhsReductionMap->getDimensionId() <= 0 ||
+      lhsReductionMap->getDimensionId() !=
+          rhsReductionMap->getDimensionId())
     return unhandled("paired reduction coordinates lack one shared provenance");
 
-  FailureOr<unsigned> lhsRowCoordinate =
-      coordinateForSource(lhsLoad.getCoordinates(), rowMap->getSourceId());
-  FailureOr<unsigned> lhsReductionCoordinate = coordinateForSource(
-      lhsLoad.getCoordinates(), lhsReductionMap->getSourceId());
-  FailureOr<unsigned> rhsReductionCoordinate = coordinateForSource(
-      rhsLoad.getCoordinates(), rhsReductionMap->getSourceId());
-  FailureOr<unsigned> rhsColumnCoordinate =
-      coordinateForSource(rhsLoad.getCoordinates(), columnMap->getSourceId());
+  FailureOr<unsigned> lhsRowCoordinate = queryCoordinatePosition(
+      lhsLoad.getCoordinates(),
+      PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
+  FailureOr<unsigned> lhsReductionCoordinate = queryCoordinatePosition(
+      lhsLoad.getCoordinates(),
+      PhysicalSourceAxis{lhsReductionMap->getSourceId(),
+                         lhsReductionMap->getSourceAxis()});
+  FailureOr<unsigned> rhsReductionCoordinate = queryCoordinatePosition(
+      rhsLoad.getCoordinates(),
+      PhysicalSourceAxis{rhsReductionMap->getSourceId(),
+                         rhsReductionMap->getSourceAxis()});
+  FailureOr<unsigned> rhsColumnCoordinate = queryCoordinatePosition(
+      rhsLoad.getCoordinates(),
+      PhysicalSourceAxis{columnMap->getSourceId(), columnMap->getSourceAxis()});
   if (failed(lhsRowCoordinate) || failed(lhsReductionCoordinate) ||
       failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate))
     return unhandled("load coordinates do not cover all free/reduction axes");
@@ -1394,7 +1401,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   const bool indirectRow = !rowRange;
   if (!rowRange) {
     FailureOr<MakeRangeOp> discovered =
-        producerRange(originalLhsRowCoordinate, rowMap->getSourceId());
+        producerRange(originalLhsRowCoordinate,
+                      PhysicalSourceAxis{rowMap->getSourceId(),
+                                         rowMap->getSourceAxis()});
     if (succeeded(discovered))
       rowRange = *discovered;
   }
@@ -1403,8 +1412,15 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   auto rhsReductionRange =
       sourceRange(rhsLoad.getCoordinates()[*rhsReductionCoordinate]);
   auto columnRange = sourceRange(rhsLoad.getCoordinates()[*rhsColumnCoordinate]);
+  FailureOr<int64_t> lhsReductionDimension =
+      lhsReductionRange ? queryRangeDimension(lhsReductionRange)
+                        : FailureOr<int64_t>(failure());
+  FailureOr<int64_t> rhsReductionDimension =
+      rhsReductionRange ? queryRangeDimension(rhsReductionRange)
+                        : FailureOr<int64_t>(failure());
   if (!rowRange || !lhsReductionRange || !rhsReductionRange || !columnRange ||
-      lhsReductionRange.getSourceId() != rhsReductionRange.getSourceId())
+      failed(lhsReductionDimension) || failed(rhsReductionDimension) ||
+      *lhsReductionDimension != *rhsReductionDimension)
     return unhandled("physical coordinates are not explicit compatible ranges");
   FailureOr<Value> rowLogicalEnd = resolveLogicalRangeEnd(kernel, rowRange);
   FailureOr<Value> reductionLogicalEnd =
@@ -1421,35 +1437,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       indirectRow || rowRange->hasAttr(sourceSubregionAttr) ||
       (rowSourceRange && rowSourceRange->hasAttr(sourceSubregionAttr));
 
-  FailureOr<Value> rowStep = scalarSource(rowRange.getStep());
-  FailureOr<Value> reductionStep = scalarSource(lhsReductionRange.getStep());
-  FailureOr<Value> columnStep = scalarSource(columnRange.getStep());
-  auto isUnit = [](FailureOr<Value> value) {
-    if (failed(value))
-      return false;
-    Value current = *value;
-    while (true) {
-      if (auto bound = current.getDefiningOp<RangeBoundOp>()) {
-        if (bound.getBound() != 2)
-          return false;
-        auto range = bound.getRange().getDefiningOp<RangeOp>();
-        if (!range)
-          return false;
-        current = range.getStep();
-        continue;
-      }
-      if (auto cast = current.getDefiningOp<CastOp>()) {
-        current = cast.getValue();
-        continue;
-      }
-      break;
-    }
-    auto constant = current.getDefiningOp<arith::ConstantOp>();
-    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-    return integer && integer.getInt() == 1;
-  };
-  if (!isUnit(rowStep) || !isUnit(reductionStep) || !isUnit(columnStep))
+  if (!isUnitStepRange(rowRange) ||
+      !isUnitStepRange(lhsReductionRange) ||
+      !isUnitStepRange(columnRange))
     return unhandled("blocking currently requires unit-step source ranges");
 
   SmallVector<StorePath> paths;
@@ -1481,11 +1471,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   SmallVector<AssumeInBoundsOp> rowAssumptions;
   if (indirectRow)
     kernel.walk([&](AssumeInBoundsOp assumption) {
-      if (!containsSource(assumption.getIndex(), rowMap->getSourceId()))
+      if (!containsSource(
+              assumption.getIndex(),
+              PhysicalSourceAxis{rowMap->getSourceId(),
+                                 rowMap->getSourceAxis()}))
         return;
       FailureOr<MakeRangeOp> root =
-          producerRange(assumption.getIndex(), rowMap->getSourceId());
-      if (succeeded(root) && *root == rowRange)
+          producerRange(assumption.getIndex(),
+                        PhysicalSourceAxis{rowMap->getSourceId(),
+                                           rowMap->getSourceAxis()});
+      if (succeeded(root) && sameLogicalRange(*root, rowRange))
         rowAssumptions.push_back(assumption);
     });
 
@@ -1540,7 +1535,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
        {std::pair<ParameterOp, MakeRangeOp>{blockM, rowRange},
         std::pair<ParameterOp, MakeRangeOp>{blockN, columnRange},
         std::pair<ParameterOp, MakeRangeOp>{blockK, lhsReductionRange}})
-    if (FailureOr<int64_t> dimension = rangeDimension(range);
+    if (FailureOr<int64_t> dimension = queryRangeDimension(range);
         succeeded(dimension))
       parameter->setAttr(
           dimensionAttr,
@@ -1721,7 +1716,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       replay.map(rowRange.getResult(), rows);
       FailureOr<Value> rowCoordinate = replaySourceValue(
           rowBuilder, location, originalLhsRowCoordinate,
-          rowMap->getSourceId(), unitM, rowRange, rows, replay);
+          PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()},
+          unitM, rowRange, rows, replay);
       if (failed(rowCoordinate))
         return contract.emitOpError(
             "blocked contraction could not replay its row coordinate graph");
@@ -1729,7 +1725,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       for (AssumeInBoundsOp assumption : rowAssumptions) {
         FailureOr<Value> index = replaySourceValue(
             rowBuilder, location, assumption.getIndex(),
-            rowMap->getSourceId(), unitM, rowRange, rows, replay);
+            PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()},
+            unitM, rowRange, rows, replay);
         if (failed(index))
           return assumption.emitOpError(
               "blocked contraction could not replay an in-bounds assertion");
@@ -1742,8 +1739,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         SmallVector<Value> coordinates;
         for (Value coordinate : path.store.getCoordinates()) {
           FailureOr<Value> replayed = replaySourceValue(
-              rowBuilder, location, coordinate, rowMap->getSourceId(), unitM,
-              rowRange, rows, replay);
+              rowBuilder, location, coordinate,
+              PhysicalSourceAxis{rowMap->getSourceId(),
+                                 rowMap->getSourceAxis()},
+              unitM, rowRange, rows, replay);
           if (failed(replayed))
             return path.store.emitOpError(
                 "blocked contraction could not replay an output coordinate graph");
@@ -1859,12 +1858,15 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       SmallVector<Value> coordinates =
           indirectRow ? replayedStoreCoordinates[pathIndex]
                       : SmallVector<Value>(path.store.getCoordinates());
-      FailureOr<unsigned> storeColumn = coordinateForSource(
-          path.store.getCoordinates(), columnMap->getSourceId());
+      FailureOr<unsigned> storeColumn = queryCoordinatePosition(
+          path.store.getCoordinates(),
+          PhysicalSourceAxis{columnMap->getSourceId(),
+                             columnMap->getSourceAxis()});
       FailureOr<unsigned> storeRow;
       if (!indirectRow)
-        storeRow = coordinateForSource(path.store.getCoordinates(),
-                                       rowMap->getSourceId());
+        storeRow = queryCoordinatePosition(
+            path.store.getCoordinates(),
+            PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
       if ((!indirectRow && failed(storeRow)) || failed(storeColumn))
         return path.store.emitOpError(
             "blocked contract output lost its logical source coordinates");
@@ -2008,17 +2010,17 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   auto innerExtent =
       cast<PhysicalExprAttr>(lhsType.getShape()[lhsInnerAxis]);
 
-  FailureOr<AxisMapAttr> rowMap = axisMap(lhsType, *lhsFree);
-  FailureOr<AxisMapAttr> lhsBlockMap = axisMap(lhsType, lhsBlockAxis);
-  FailureOr<AxisMapAttr> lhsInnerMap = axisMap(lhsType, lhsInnerAxis);
-  FailureOr<AxisMapAttr> rhsBlockMap = axisMap(rhsType, rhsBlockAxis);
-  FailureOr<AxisMapAttr> rhsInnerMap = axisMap(rhsType, rhsInnerAxis);
-  FailureOr<AxisMapAttr> columnMap = axisMap(rhsType, *rhsFree);
+  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, *lhsFree);
+  FailureOr<AxisMapAttr> lhsBlockMap = queryAxisMap(lhsType, lhsBlockAxis);
+  FailureOr<AxisMapAttr> lhsInnerMap = queryAxisMap(lhsType, lhsInnerAxis);
+  FailureOr<AxisMapAttr> rhsBlockMap = queryAxisMap(rhsType, rhsBlockAxis);
+  FailureOr<AxisMapAttr> rhsInnerMap = queryAxisMap(rhsType, rhsInnerAxis);
+  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, *rhsFree);
   auto scaleMapFor = [&](FragmentType scale,
                          AxisMapAttr data) -> FailureOr<AxisMapAttr> {
     PhysicalAxisProjection projection = queryFragmentAxis(
         scale, PhysicalSourceAxis{data.getSourceId(), data.getSourceAxis()});
-    return projection.isExact() ? axisMap(scale, projection.fragmentAxis)
+    return projection.isExact() ? queryAxisMap(scale, projection.fragmentAxis)
                                 : FailureOr<AxisMapAttr>(failure());
   };
   FailureOr<AxisMapAttr> lhsScaleRowMap =
@@ -2036,27 +2038,36 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   if (failed(rowMap) || failed(lhsBlockMap) || failed(lhsInnerMap) ||
       failed(rhsBlockMap) || failed(rhsInnerMap) || failed(columnMap) ||
       failed(lhsScaleRowMap) || failed(lhsScaleBlockMap) ||
-      failed(rhsScaleBlockMap) || failed(rhsScaleColumnMap) ||
-      rowMap->getSourceId() != lhsScaleRowMap->getSourceId() ||
-      lhsBlockMap->getSourceId() != rhsBlockMap->getSourceId() ||
-      lhsBlockMap->getSourceId() != lhsScaleBlockMap->getSourceId() ||
-      lhsBlockMap->getSourceId() != rhsScaleBlockMap->getSourceId() ||
-      lhsInnerMap->getSourceId() != rhsInnerMap->getSourceId() ||
-      columnMap->getSourceId() != rhsScaleColumnMap->getSourceId())
+      failed(rhsScaleBlockMap) || failed(rhsScaleColumnMap))
+    return reject("data and scale operands do not preserve the paired coordinate provenance");
+  auto sameSource = [](AxisMapAttr lhs, AxisMapAttr rhs) {
+    return PhysicalSourceAxis{lhs.getSourceId(), lhs.getSourceAxis()} ==
+           PhysicalSourceAxis{rhs.getSourceId(), rhs.getSourceAxis()};
+  };
+  auto sameDimension = [](AxisMapAttr lhs, AxisMapAttr rhs) {
+    return lhs.getDimensionId() > 0 &&
+           lhs.getDimensionId() == rhs.getDimensionId();
+  };
+  if (!sameSource(*rowMap, *lhsScaleRowMap) ||
+      !sameDimension(*lhsBlockMap, *rhsBlockMap) ||
+      !sameSource(*lhsBlockMap, *lhsScaleBlockMap) ||
+      !sameDimension(*lhsBlockMap, *rhsScaleBlockMap) ||
+      !sameDimension(*lhsInnerMap, *rhsInnerMap) ||
+      !sameSource(*columnMap, *rhsScaleColumnMap))
     return reject("data and scale operands do not preserve the paired coordinate provenance");
 
   auto rangeFor = [&](LoadOp load,
                       AxisMapAttr source) -> FailureOr<MakeRangeOp> {
-    FailureOr<unsigned> coordinate = coordinateForSource(
-        load.getCoordinates(), source.getSourceId());
+    FailureOr<unsigned> coordinate = queryCoordinatePosition(
+        load.getCoordinates(),
+        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()});
     if (failed(coordinate))
       return failure();
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact fact = analysis.sourceRanges(
         load.getCoordinates()[*coordinate],
         PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()});
-    return fact.isUnique() ? FailureOr<MakeRangeOp>(fact.roots.front())
-                           : FailureOr<MakeRangeOp>(failure());
+    return queryExactLogicalRange(fact);
   };
   FailureOr<MakeRangeOp> rowRange = rangeFor(lhsLoad, *rowMap);
   FailureOr<MakeRangeOp> blockRange =
@@ -2083,34 +2094,8 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       failed(rhsInnerRange) || failed(rhsScaleBlockRange) ||
       failed(rhsScaleColumnRange))
     return reject("physical data coordinates are not explicit source ranges");
-  auto isUnit = [](Value value) {
-    FailureOr<Value> scalar = scalarSource(value);
-    if (failed(scalar))
-      return false;
-    Value current = *scalar;
-    while (true) {
-      if (auto bound = current.getDefiningOp<RangeBoundOp>()) {
-        if (bound.getBound() != 2)
-          return false;
-        auto range = bound.getRange().getDefiningOp<RangeOp>();
-        if (!range)
-          return false;
-        current = range.getStep();
-        continue;
-      }
-      if (auto cast = current.getDefiningOp<CastOp>()) {
-        current = cast.getValue();
-        continue;
-      }
-      break;
-    }
-    auto constant = current.getDefiningOp<arith::ConstantOp>();
-    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-    return integer && integer.getInt() == 1;
-  };
-  if (!isUnit(rowRange->getStep()) || !isUnit(blockRange->getStep()) ||
-      !isUnit(innerRange->getStep()) || !isUnit(columnRange->getStep()))
+  if (!isUnitStepRange(*rowRange) || !isUnitStepRange(*blockRange) ||
+      !isUnitStepRange(*innerRange) || !isUnitStepRange(*columnRange))
     return reject("blocking currently requires unit-step source ranges");
   SmallVector<StorePath> paths;
   llvm::SmallPtrSet<Operation *, 8> visited;
@@ -2205,26 +2190,31 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       segmentOffset.getValue() != 0 || programSpace[0] != segmentLength)
     return reject("requires one complete current program segment");
 
+  auto coordinateFor = [](ValueRange coordinates, AxisMapAttr mapping) {
+    return queryCoordinatePosition(
+        coordinates,
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+  };
   FailureOr<unsigned> lhsRowCoordinate =
-      coordinateForSource(lhsLoad.getCoordinates(), rowMap->getSourceId());
+      coordinateFor(lhsLoad.getCoordinates(), *rowMap);
   FailureOr<unsigned> lhsBlockCoordinate =
-      coordinateForSource(lhsLoad.getCoordinates(), lhsBlockMap->getSourceId());
+      coordinateFor(lhsLoad.getCoordinates(), *lhsBlockMap);
   FailureOr<unsigned> lhsInnerCoordinate =
-      coordinateForSource(lhsLoad.getCoordinates(), lhsInnerMap->getSourceId());
-  FailureOr<unsigned> lhsScaleRowCoordinate = coordinateForSource(
-      lhsScaleLoad.getCoordinates(), rowMap->getSourceId());
-  FailureOr<unsigned> lhsScaleBlockCoordinate = coordinateForSource(
-      lhsScaleLoad.getCoordinates(), lhsBlockMap->getSourceId());
+      coordinateFor(lhsLoad.getCoordinates(), *lhsInnerMap);
+  FailureOr<unsigned> lhsScaleRowCoordinate =
+      coordinateFor(lhsScaleLoad.getCoordinates(), *lhsScaleRowMap);
+  FailureOr<unsigned> lhsScaleBlockCoordinate =
+      coordinateFor(lhsScaleLoad.getCoordinates(), *lhsScaleBlockMap);
   FailureOr<unsigned> rhsBlockCoordinate =
-      coordinateForSource(rhsLoad.getCoordinates(), rhsBlockMap->getSourceId());
+      coordinateFor(rhsLoad.getCoordinates(), *rhsBlockMap);
   FailureOr<unsigned> rhsInnerCoordinate =
-      coordinateForSource(rhsLoad.getCoordinates(), rhsInnerMap->getSourceId());
+      coordinateFor(rhsLoad.getCoordinates(), *rhsInnerMap);
   FailureOr<unsigned> rhsColumnCoordinate =
-      coordinateForSource(rhsLoad.getCoordinates(), columnMap->getSourceId());
-  FailureOr<unsigned> rhsScaleBlockCoordinate = coordinateForSource(
-      rhsScaleLoad.getCoordinates(), rhsBlockMap->getSourceId());
-  FailureOr<unsigned> rhsScaleColumnCoordinate = coordinateForSource(
-      rhsScaleLoad.getCoordinates(), columnMap->getSourceId());
+      coordinateFor(rhsLoad.getCoordinates(), *columnMap);
+  FailureOr<unsigned> rhsScaleBlockCoordinate =
+      coordinateFor(rhsScaleLoad.getCoordinates(), *rhsScaleBlockMap);
+  FailureOr<unsigned> rhsScaleColumnCoordinate =
+      coordinateFor(rhsScaleLoad.getCoordinates(), *rhsScaleColumnMap);
   if (failed(lhsRowCoordinate) || failed(lhsBlockCoordinate) ||
       failed(lhsInnerCoordinate) || failed(lhsScaleRowCoordinate) ||
       failed(lhsScaleBlockCoordinate) || failed(rhsBlockCoordinate) ||
@@ -2470,7 +2460,9 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         FailureOr<Value> rhsScaleColumn = replaySourceValue(
             nested, nestedLocation,
             rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
-            columnMap->getSourceId(), unitN, *rhsScaleColumnRange, columns,
+            PhysicalSourceAxis{columnMap->getSourceId(),
+                               columnMap->getSourceAxis()},
+            unitN, *rhsScaleColumnRange, columns,
             rhsScaleReplay);
         if (failed(rhsScaleColumn)) {
           loopBodyFailed = true;
@@ -2537,10 +2529,12 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       output = builder.create<CastOp>(location, converted, output);
     }
     SmallVector<Value> coordinates(path.store.getCoordinates());
-    FailureOr<unsigned> storeRow = coordinateForSource(
-        path.store.getCoordinates(), rowMap->getSourceId());
-    FailureOr<unsigned> storeColumn = coordinateForSource(
-        path.store.getCoordinates(), columnMap->getSourceId());
+    FailureOr<unsigned> storeRow = queryCoordinatePosition(
+        path.store.getCoordinates(),
+        PhysicalSourceAxis{rowMap->getSourceId(), rowMap->getSourceAxis()});
+    FailureOr<unsigned> storeColumn = queryCoordinatePosition(
+        path.store.getCoordinates(),
+        PhysicalSourceAxis{columnMap->getSourceId(), columnMap->getSourceAxis()});
     if (failed(storeRow) || failed(storeColumn))
       return path.store.emitOpError(
           "blocked scaled-contract output lost source coordinates");
@@ -2603,6 +2597,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       if (!rangeSingleReduction &&
           contract.getLhsReductionAxes().size() == 1 &&
           contract.getRhsReductionAxes().size() == 1 &&
+          hasSelectedFreeAxes(contract) &&
           hasExplicitPairedReductionRanges(contract)) {
         if (failed(realizeReductionTraversal(contract, kernel)))
           return failure();

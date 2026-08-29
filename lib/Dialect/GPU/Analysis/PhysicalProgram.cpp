@@ -130,6 +130,8 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
 bool isUnitStepValue(Value value) {
   if (std::optional<int64_t> constant = integerConstant(value))
     return *constant == 1;
+  if (auto cast = value.getDefiningOp<CastOp>())
+    return isUnitStepValue(cast.getValue());
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     return range && bound.getBound() == 2 && isUnitStepValue(range.getStep());
@@ -374,6 +376,13 @@ queryCoordinateIndex(ValueRange coordinates, PhysicalSourceAxis source) {
   result.dimensionId = projection.dimensionId;
   result.fragmentAxis = *coordinateIndex;
   return result;
+}
+
+FailureOr<unsigned> queryCoordinatePosition(ValueRange coordinates,
+                                            PhysicalSourceAxis source) {
+  PhysicalAxisProjection result = queryCoordinateIndex(coordinates, source);
+  return result.isExact() ? FailureOr<unsigned>(result.fragmentAxis)
+                          : FailureOr<unsigned>(failure());
 }
 
 PhysicalProgramAnalysis::PhysicalProgramAnalysis(func::FuncOp kernel)

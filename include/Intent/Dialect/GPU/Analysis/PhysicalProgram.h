@@ -72,6 +72,9 @@ mlir::FailureOr<unsigned>
 queryCoordinateIndex(mlir::ValueRange coordinates, uint64_t sourceId);
 PhysicalAxisProjection
 queryCoordinateIndex(mlir::ValueRange coordinates, PhysicalSourceAxis source);
+mlir::FailureOr<unsigned>
+queryCoordinatePosition(mlir::ValueRange coordinates,
+                        PhysicalSourceAxis source);
 mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
                                          unsigned fragmentAxis);
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
