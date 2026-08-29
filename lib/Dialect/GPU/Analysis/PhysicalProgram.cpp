@@ -705,9 +705,7 @@ void PhysicalProgramAnalysis::collectRanges(
   if (!operation || !visited.insert(operation).second)
     return;
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
-    if (!source || (range.getSourceId() == source->sourceId &&
-                    range.getSourceAxis() == source->sourceAxis &&
-                    range.getDerived() == source->derived))
+    if (!source || sourceAxisIdentity(range) == *source)
       appendUnique(result.roots, range);
     return;
   }
@@ -833,10 +831,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
         continue;
       auto mapping =
           cast<AxisMapAttr>(sourceType.getAxisMaps()[fragmentAxis]);
-      if (mapping.getSourceId() != expected.getSourceId() ||
-          mapping.getSourceAxis() != expected.getSourceAxis() ||
-          mapping.getDimensionId() != expected.getDimensionId() ||
-          mapping.getDerived() != expected.getDerived())
+      if (!(sourceAxisIdentity(mapping) == sourceAxisIdentity(expected)) ||
+          mapping.getDimensionId() != expected.getDimensionId())
         continue;
       followed = true;
       collectAxisRanges(scanSource, fragmentAxis, result, visited);
@@ -875,10 +871,8 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       std::optional<unsigned> inputAxis;
       for (unsigned axis = 0; axis < input.getShape().size(); ++axis) {
         auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
-        if (mapping.getSourceId() != expected.getSourceId() ||
-            mapping.getSourceAxis() != expected.getSourceAxis() ||
-            mapping.getDimensionId() != expected.getDimensionId() ||
-            mapping.getDerived() != expected.getDerived())
+        if (!(sourceAxisIdentity(mapping) == sourceAxisIdentity(expected)) ||
+            mapping.getDimensionId() != expected.getDimensionId())
           continue;
         if (inputAxis) {
           result.state = PhysicalFactState::Ambiguous;

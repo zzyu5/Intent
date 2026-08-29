@@ -35,6 +35,8 @@ provider lowering 或 runtime 前,先从 `doc/index.md` 进入并完整阅读对
 宁可一轮只给出一个问题,也不要给我一堆自洽但没用的产物。
 
 ## 验证
+自查必须对照 ref/triton 或 ref/tilelang 的同类实现，给出双方 file:line、具体差异与实际后果；找不出具体差异等于未完成。
+
 唯一允许的验证:一条可手动执行的 repro 命令,
 把 DSL 例子 emit 成后端代码并实际跑一次对数值。
 不建 test 目录,不用 pytest,不留 fixture。
