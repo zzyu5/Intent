@@ -13,6 +13,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -555,11 +556,56 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     });
     if (!affected)
       continue;
-    auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!valueType)
-      return store.emitOpError(
-          "pointwise blocked store must consume a physical fragment");
     OpBuilder builder(store);
+    Value payload = store.getValue();
+    auto valueType = dyn_cast<FragmentType>(payload.getType());
+    if (!valueType) {
+      if (!isa<IntegerType, FloatType, IndexType>(payload.getType()))
+        return store.emitOpError(
+            "pointwise blocked store has no projectable value schema");
+      SmallVector<Attribute> shape;
+      SmallVector<Attribute> mappings;
+      std::optional<uint64_t> owner;
+      for (Value coordinate : store.getCoordinates()) {
+        auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+        if (!fragment)
+          continue;
+        if (owner && *owner != fragment.getOwner())
+          return store.emitOpError(
+              "pointwise store coordinates have conflicting ownership");
+        owner = fragment.getOwner();
+        for (auto [extent, attribute] :
+             llvm::zip(fragment.getShape(), fragment.getAxisMaps())) {
+          auto mapping = cast<AxisMapAttr>(attribute);
+          auto found = llvm::find_if(mappings, [&](Attribute existing) {
+            auto axis = cast<AxisMapAttr>(existing);
+            return axis.getSourceId() == mapping.getSourceId() &&
+                   axis.getSourceAxis() == mapping.getSourceAxis();
+          });
+          if (found != mappings.end())
+            continue;
+          shape.push_back(extent);
+          mappings.push_back(AxisMapAttr::get(
+              store.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+              mapping.getDimensionId(), mappings.size()));
+        }
+      }
+      if (shape.empty())
+        return store.emitOpError(
+            "pointwise blocked store has no coordinate fragment authority");
+      auto target = FragmentType::get(
+          store.getContext(), payload.getType(),
+          ArrayAttr::get(store.getContext(), shape),
+          ArrayAttr::get(store.getContext(), mappings), /*validity=*/1,
+          owner.value_or(1));
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, store.getLoc(), payload, target);
+      if (failed(projected))
+        return store.emitOpError(
+            "pointwise store value cannot be projected to its coordinate schema");
+      payload = *projected;
+      valueType = target;
+    }
     FailureOr<Value> valid = accessValidity(
         builder, store.getLoc(), store.getCoordinates(), rangePredicates,
         valueType, store.getValid());
@@ -567,7 +613,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
       return store.emitOpError("could not form pointwise store validity");
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), *valid, store.getSourceAxes(), store.getCollision());
+        payload, *valid, store.getSourceAxes(), store.getCollision());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
@@ -1346,11 +1392,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 32> visited;
     collectProducerRanges(source, sourceId, ranges, visited);
   };
-  auto collectAllAxesInto = [&](Value value,
-                                llvm::SmallPtrSetImpl<Operation *> &ranges) {
+  std::function<void(Value, llvm::SmallPtrSetImpl<Operation *> &)>
+      collectAllAxesInto = [&](Value value,
+                               llvm::SmallPtrSetImpl<Operation *> &ranges) {
     auto fragment = dyn_cast<FragmentType>(value.getType());
-    if (!fragment)
+    if (!fragment) {
+      if (auto record = value.getDefiningOp<MakeRecordOp>())
+        for (Value field : record.getFields())
+          collectAllAxesInto(field, ranges);
       return;
+    }
+    PhysicalRangeFact all = PhysicalProgramAnalysis(kernel).sourceRanges(value);
+    for (MakeRangeOp range : all.roots)
+      ranges.insert(range.getOperation());
     for (Attribute attribute : fragment.getAxisMaps()) {
       uint64_t sourceId = cast<AxisMapAttr>(attribute).getSourceId();
       llvm::SmallPtrSet<Operation *, 32> visited;
@@ -1452,6 +1506,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     collectAllAxesInto(contract.getLhsScale(), structuredTraversalRanges);
     collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
     collectAllAxesInto(contract.getRhsScale(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
+  });
+  kernel.walk([&](SparseContractOp contract) {
+    collectAllAxesInto(contract.getCompressed(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getMetadata(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
     collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
@@ -1803,7 +1865,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (!ownershipOnly)
     for (MakeRangeOp range : dynamicRanges) {
       if (!internalTraversalRanges.contains(range.getOperation()) ||
-          structuredTraversalRanges.contains(range.getOperation()))
+          structuredTraversalRanges.contains(range.getOperation()) ||
+          reuseTraversalRanges.contains(range.getOperation()))
         continue;
       if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
         return range.emitOpError(
