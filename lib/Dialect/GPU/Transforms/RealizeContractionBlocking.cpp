@@ -198,8 +198,7 @@ bool hasExplicitPairedReductionRanges(ContractOp contract) {
         ranges.empty())
       return false;
     return llvm::all_of(ranges, [&](MakeRangeOp range) {
-      return range.getSourceId() == mapping.getSourceId() &&
-             range.getSourceAxis() == mapping.getSourceAxis();
+      return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
     });
   };
   return hasRanges(contract.getLhs(), *lhsMap) &&
@@ -415,8 +414,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     SmallVector<MakeRangeOp> subregions;
     kernel.walk([&](MakeRangeOp range) {
       FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
-      if (range.getSourceId() == source.sourceId &&
-          range.getSourceAxis() == source.sourceAxis &&
+      if (sourceAxisIdentity(range) == source &&
           range->hasAttr(sourceSubregionAttr) && succeeded(sourceDimension) &&
           *sourceDimension == static_cast<int64_t>(dimension))
         subregions.push_back(range);
@@ -1233,8 +1231,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         ranges.empty())
       return failure();
     return llvm::all_of(ranges, [&](MakeRangeOp range) {
-             return range.getSourceId() == mapping.getSourceId() &&
-                    range.getSourceAxis() == mapping.getSourceAxis();
+             return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
            })
                ? success()
                : failure();

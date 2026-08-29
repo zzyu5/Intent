@@ -199,11 +199,6 @@ public:
       mlir::Value value,
       llvm::ArrayRef<std::pair<MakeRangeOp, mlir::Value>> ranges) const;
 
-  /// Explicitly drops cached current-IR facts.  Callers normally discard the
-  /// analysis object instead; this exists for transformations with phased
-  /// query/rewrite/query structure.
-  void invalidate();
-
 private:
   void collectRanges(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,

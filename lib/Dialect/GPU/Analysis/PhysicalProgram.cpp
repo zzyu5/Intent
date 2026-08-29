@@ -1394,8 +1394,4 @@ PhysicalProgramAnalysis::bufferDataflow(BufferOp buffer) {
   return result;
 }
 
-void PhysicalProgramAnalysis::invalidate() {
-  unrestrictedRangeCache.clear();
-}
-
 } // namespace intent::gpu

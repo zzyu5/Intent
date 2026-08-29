@@ -282,8 +282,7 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
       retargetSourceExtent(root, source, fixedExtent);
     SmallVector<MakeRangeOp> ranges;
     kernel.walk([&](MakeRangeOp range) {
-      if (range.getSourceId() == source.sourceId &&
-          range.getSourceAxis() == source.sourceAxis)
+      if (sourceAxisIdentity(range) == source)
         ranges.push_back(range);
     });
     for (MakeRangeOp range : ranges) {
@@ -675,8 +674,7 @@ LogicalResult addTailValidity(func::FuncOp kernel,
           auto mapping = cast<AxisMapAttr>(attribute);
           auto found = llvm::find_if(mappings, [&](Attribute existing) {
             auto axis = cast<AxisMapAttr>(existing);
-            return axis.getSourceId() == mapping.getSourceId() &&
-                   axis.getSourceAxis() == mapping.getSourceAxis();
+            return sourceAxisIdentity(axis) == sourceAxisIdentity(mapping);
           });
           if (found != mappings.end())
             continue;
@@ -729,8 +727,7 @@ void collectProducerRanges(Value value, PhysicalSourceAxis source,
   if (fact.state == PhysicalFactState::Unknown)
     return;
   for (MakeRangeOp range : fact.roots)
-    if (range.getSourceId() == source.sourceId &&
-        range.getSourceAxis() == source.sourceAxis)
+    if (sourceAxisIdentity(range) == source)
       ranges.insert(range.getOperation());
 }
 
@@ -764,8 +761,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   if (!producer)
     return failure();
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    if (range.getSourceId() != source.sourceId ||
-        range.getSourceAxis() != source.sourceAxis)
+    if (!(sourceAxisIdentity(range) == source))
       return failure();
     mapping.map(value, blockedRange);
     return blockedRange;
@@ -1234,8 +1230,7 @@ LogicalResult rankLiftPointwiseValueGraph(
     for (auto [extent, mapping] : liftedAxes) {
       bool present = llvm::any_of(original.getAxisMaps(), [&](Attribute attribute) {
         auto axis = cast<AxisMapAttr>(attribute);
-        return axis.getSourceId() == mapping.getSourceId() &&
-               axis.getSourceAxis() == mapping.getSourceAxis();
+        return sourceAxisIdentity(axis) == sourceAxisIdentity(mapping);
       });
       if (!present)
         appendAxis(extent, mapping);
@@ -1267,8 +1262,7 @@ LogicalResult rankLiftPointwiseValueGraph(
     return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
       auto axis = cast<AxisMapAttr>(attribute);
       return llvm::any_of(liftedAxes, [&](const auto &lifted) {
-        return axis.getSourceId() == lifted.second.getSourceId() &&
-               axis.getSourceAxis() == lifted.second.getSourceAxis();
+        return sourceAxisIdentity(axis) == sourceAxisIdentity(lifted.second);
       });
     });
   };

@@ -662,8 +662,8 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
       auto sourceAxis = cast<AxisMapAttr>(sourceMapping);
       if (!llvm::any_of(targetShape.getAxisMaps(), [&](Attribute targetMapping) {
             auto targetAxis = cast<AxisMapAttr>(targetMapping);
-            return sourceAxis.getSourceId() == targetAxis.getSourceId() &&
-                   sourceAxis.getSourceAxis() == targetAxis.getSourceAxis();
+            return sourceAxisIdentity(sourceAxis) ==
+                   sourceAxisIdentity(targetAxis);
           }))
         return failure();
     }

@@ -131,9 +131,7 @@ FragmentType replaceExtent(FragmentType source, unsigned axis,
 
 void collectRangesAndLoads(Value value, PhysicalExprAttr logicalExtent,
                            SmallVectorImpl<MakeRangeOp> &ranges,
-                           SmallVectorImpl<LoadOp> &loads,
-                           llvm::SmallPtrSetImpl<Operation *> &visited) {
-  (void)visited;
+                           SmallVectorImpl<LoadOp> &loads) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return;
@@ -383,9 +381,7 @@ FailureOr<Value> clonePaddedProducer(
   return clone->getResult(0);
 }
 
-bool isReplayableWithoutLoad(Value value, PhysicalSourceAxis source,
-                             llvm::SmallPtrSetImpl<Operation *> &visited) {
-  (void)visited;
+bool isReplayableWithoutLoad(Value value, PhysicalSourceAxis source) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return false;
@@ -859,8 +855,7 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     logicalExtent = extent;
     SmallVector<MakeRangeOp> ranges;
     SmallVector<LoadOp> loads;
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    collectRangesAndLoads(source, extent, ranges, loads, visited);
+    collectRangesAndLoads(source, extent, ranges, loads);
     llvm::sort(ranges, [](MakeRangeOp lhs, MakeRangeOp rhs) {
       return lhs->isBeforeInBlock(rhs);
     });
@@ -1583,9 +1578,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       FailureOr<AxisMapAttr> mapping =
           fragment ? queryAxisMap(fragment, outerAxis)
                    : FailureOr<AxisMapAttr>(failure());
-      llvm::SmallPtrSet<Operation *, 16> visited;
       if (!fragment || failed(mapping) ||
-          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping), visited))
+          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping)))
         return reduce.emitOpError()
                << "multi-axis reduction outer axis is neither load-rooted nor a replayable pure source; source type="
                << source.getType() << ", producer="
@@ -2345,9 +2339,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     FailureOr<SourcePlan> plan = analyzeSource(source, reductionAxis);
     if (failed(plan)) {
       FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
-      llvm::SmallPtrSet<Operation *, 16> visited;
       if (failed(mapping) ||
-          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping), visited))
+          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping)))
         return unhandled(
             Twine("source is neither load-rooted nor replayable pure data on the reduction axis; producer=") +
             (source.getDefiningOp()
@@ -2513,12 +2506,31 @@ LogicalResult decomposeMultiAxisReductions(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  SmallVector<ReduceOp> reductions;
-  kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
-  for (ReduceOp reduce : reductions)
-    if (reduce->getBlock() && reduce.getAxes().size() > 1 &&
-        failed(decomposeMultiAxisReduce(reduce, kernel)))
-      return failure();
+  auto remainingExcessAxes = [&]() {
+    uint64_t result = 0;
+    kernel.walk([&](ReduceOp reduce) {
+      if (reduce.getAxes().size() > 1)
+        result += reduce.getAxes().size() - 1;
+    });
+    return result;
+  };
+  uint64_t previous = remainingExcessAxes();
+  while (previous != 0) {
+    SmallVector<ReduceOp> reductions;
+    kernel.walk([&](ReduceOp reduce) {
+      if (reduce.getAxes().size() > 1)
+        reductions.push_back(reduce);
+    });
+    for (ReduceOp reduce : reductions)
+      if (reduce->getBlock() &&
+          failed(decomposeMultiAxisReduce(reduce, kernel)))
+        return failure();
+    uint64_t current = remainingExcessAxes();
+    if (current >= previous)
+      return kernel.emitError(
+          "multi-axis reduction normalization made no structural progress");
+    previous = current;
+  }
   return success();
 }
 

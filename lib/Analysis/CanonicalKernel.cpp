@@ -31,11 +31,10 @@ CoordinateProvenance knownWithoutCoordinates() {
 }
 
 Value absoluteCoordinateSource(Value source) {
-  while (Operation *definition = source.getDefiningOp()) {
-    if (definition->getName().getStringRef() != "intent.subregion" ||
-        definition->getNumOperands() == 0)
+  while (auto subregion = source.getDefiningOp<SubregionOp>()) {
+    if (subregion.getInputs().empty())
       break;
-    source = definition->getOperand(0);
+    source = subregion.getInputs().front();
   }
   return source;
 }
@@ -46,10 +45,10 @@ DenseI64ArrayAttr dimensionIDs(RankedTensorType tensor) {
 }
 
 std::optional<int64_t> constantInteger(Value value) {
-  Operation *definition = value.getDefiningOp();
-  if (!definition || definition->getName().getStringRef() != "intent.constant")
+  auto constant = value.getDefiningOp<ConstantOp>();
+  if (!constant)
     return std::nullopt;
-  if (auto integer = definition->getAttrOfType<IntegerAttr>("value"))
+  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
     return integer.getInt();
   return std::nullopt;
 }
@@ -90,7 +89,7 @@ FailureOr<IndexAccessKey> accessKey(Operation *operation) {
 }
 
 bool isFullBufferStore(Operation *operation) {
-  if (operation->getName().getStringRef() != "intent.buffer_store")
+  if (!isa_and_nonnull<BufferStoreOp>(operation))
     return false;
   auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
   auto terms = relation ? relation.getTerms() : ArrayAttr();
@@ -105,14 +104,14 @@ bool isFullBufferStore(Operation *operation) {
 bool definitelyWritesCoordinate(Block &block, Value buffer,
                                 BlockArgument coordinate) {
   for (Operation &operation : block) {
-    StringRef name = operation.getName().getStringRef();
-    if (name == "intent.buffer_store" && operation.getOperand(0) == buffer) {
+    if (auto store = dyn_cast<BufferStoreOp>(operation);
+        store && store.getInputs().front() == buffer) {
       FailureOr<IndexAccessKey> key = accessKey(&operation);
       if (succeeded(key) && key->operands.size() == 1 &&
           key->operands.front() == coordinate)
         return true;
     }
-    if (name == "intent.if" && operation.getNumRegions() == 2 &&
+    if (isa<IfOp>(operation) && operation.getNumRegions() == 2 &&
         definitelyWritesCoordinate(operation.getRegion(0).front(), buffer,
                                    coordinate) &&
         definitelyWritesCoordinate(operation.getRegion(1).front(), buffer,
@@ -123,8 +122,8 @@ bool definitelyWritesCoordinate(Block &block, Value buffer,
 }
 
 bool loopCoversBuffer(Operation *operation, Value buffer) {
-  if (operation->getName().getStringRef() != "intent.for" ||
-      operation->getNumOperands() == 0 || operation->getNumRegions() != 1)
+  auto loop = dyn_cast_or_null<ForOp>(operation);
+  if (!loop || loop.getInputs().empty() || operation->getNumRegions() != 1)
     return false;
   auto bufferType = dyn_cast<BufferType>(buffer.getType());
   auto tensor = bufferType
@@ -132,15 +131,15 @@ bool loopCoversBuffer(Operation *operation, Value buffer) {
                     : RankedTensorType();
   if (!tensor || tensor.getRank() != 1)
     return false;
-  Operation *domain = operation->getOperand(0).getDefiningOp();
-  if (!domain || domain->getName().getStringRef() != "intent.domain" ||
-      (domain->getNumOperands() != 2 && domain->getNumOperands() != 3) ||
-      constantInteger(domain->getOperand(0)) != 0)
+  auto domain = loop.getInputs().front().getDefiningOp<DomainOp>();
+  if (!domain || (domain.getBounds().size() != 2 &&
+                  domain.getBounds().size() != 3) ||
+      constantInteger(domain.getBounds().front()) != 0)
     return false;
-  if (domain->getNumOperands() == 3 &&
-      constantInteger(domain->getOperand(2)) != 1)
+  if (domain.getBounds().size() == 3 &&
+      constantInteger(domain.getBounds()[2]) != 1)
     return false;
-  Value stop = domain->getOperand(1);
+  Value stop = domain.getBounds()[1];
   if (tensor.hasStaticShape()) {
     if (constantInteger(stop) != tensor.getDimSize(0))
       return false;
@@ -157,7 +156,7 @@ bool loopCoversBuffer(Operation *operation, Value buffer) {
         definition->getOperand(entry.getPayload()) != stop)
       return false;
   }
-  Block &body = operation->getRegion(0).front();
+  Block &body = loop.getBody().front();
   return body.getNumArguments() > 0 &&
          definitelyWritesCoordinate(body, buffer, body.getArgument(0));
 }
@@ -265,15 +264,14 @@ LogicalResult verifyBufferInitializationRegion(
   if (!llvm::hasSingleElement(region))
     return failure();
   for (Operation &operation : region.front()) {
-    StringRef name = operation.getName().getStringRef();
-    if (name == "intent.buffer") {
+    if (auto allocation = dyn_cast<BufferOp>(operation)) {
       Value buffer = operation.getResult(0);
-      if (operation.hasAttr("initial_operand"))
+      if (allocation.getInitialOperand())
         state.complete.insert(buffer);
       continue;
     }
-    if (name == "intent.buffer_load") {
-      Value buffer = operation.getOperand(0);
+    if (auto load = dyn_cast<BufferLoadOp>(operation)) {
+      Value buffer = load.getInputs().front();
       FailureOr<IndexAccessKey> key = accessKey(&operation);
       bool initialized = state.complete.contains(buffer);
       if (!initialized && succeeded(key))
@@ -283,8 +281,8 @@ LogicalResult verifyBufferInitializationRegion(
             "logical buffer read is not dominated by a write of the same element set");
       continue;
     }
-    if (name == "intent.buffer_store") {
-      Value buffer = operation.getOperand(0);
+    if (auto store = dyn_cast<BufferStoreOp>(operation)) {
+      Value buffer = store.getInputs().front();
       if (isFullBufferStore(&operation)) {
         state.complete.insert(buffer);
       } else if (FailureOr<IndexAccessKey> key = accessKey(&operation);
@@ -294,7 +292,7 @@ LogicalResult verifyBufferInitializationRegion(
       }
       continue;
     }
-    if (name == "intent.if") {
+    if (isa<IfOp>(operation)) {
       BufferInitializationState thenState = state;
       BufferInitializationState elseState = state;
       if (failed(verifyBufferInitializationRegion(operation.getRegion(0),
@@ -306,19 +304,18 @@ LogicalResult verifyBufferInitializationRegion(
       state = std::move(thenState);
       continue;
     }
-    if (name == "intent.for" || name == "intent.parallel" ||
-        name == "intent.while") {
+    if (isa<ForOp, ParallelOp, WhileOp>(operation)) {
       for (Region &nested : operation.getRegions()) {
         BufferInitializationState nestedState = state;
         if (failed(verifyBufferInitializationRegion(nested, nestedState)))
           return failure();
       }
-      if (name == "intent.for") {
+      if (isa<ForOp>(operation)) {
         SmallVector<Value> buffers;
         for (auto &entry : state.points)
           buffers.push_back(entry.first);
         operation.getRegion(0).walk([&](Operation *nested) {
-          if (nested->getName().getStringRef() == "intent.buffer_store" &&
+          if (isa<BufferStoreOp>(nested) &&
               !llvm::is_contained(buffers, nested->getOperand(0)))
             buffers.push_back(nested->getOperand(0));
         });
@@ -370,8 +367,7 @@ CoordinateProvenance CanonicalKernelAnalysis::blockArgumentProvenance(
   Operation *owner = argument.getOwner()->getParentOp();
   if (!owner)
     return knownWithoutCoordinates();
-  StringRef name = owner->getName().getStringRef();
-  if (name == "intent.parallel" || name == "intent.for") {
+  if (isa<ParallelOp, ForOp>(owner)) {
     auto domain = dyn_cast<DomainType>(owner->getOperand(0).getType());
     auto region = dyn_cast<RegionType>(owner->getOperand(0).getType());
     unsigned rank = domain ? domain.getRank() : region ? region.getRank() : 0;
@@ -387,7 +383,7 @@ CoordinateProvenance CanonicalKernelAnalysis::blockArgumentProvenance(
                ? coordinateProvenance(owner->getOperand(carry))
                : CoordinateProvenance();
   }
-  if (name == "intent.region_fold" || name == "intent.region_scan") {
+  if (isa<RegionFoldOp, RegionScanOp>(owner)) {
     auto sourceCount = owner->getAttrOfType<IntegerAttr>("source_count");
     if (sourceCount && argument.getArgNumber() < sourceCount.getInt())
       return coordinateProvenance(
@@ -399,8 +395,7 @@ CoordinateProvenance CanonicalKernelAnalysis::blockArgumentProvenance(
 CoordinateProvenance
 CanonicalKernelAnalysis::resultProvenance(OpResult result) {
   Operation *operation = result.getOwner();
-  StringRef name = operation->getName().getStringRef();
-  if (name == "intent.indices") {
+  if (isa<IndicesOp>(operation)) {
     CoordinateProvenance provenance = knownWithoutCoordinates();
     auto axis = operation->getAttrOfType<IntegerAttr>("tensor_axis");
     auto rank = cast<RankedTensorType>(operation->getResult(0).getType()).getRank();
@@ -415,22 +410,18 @@ CanonicalKernelAnalysis::resultProvenance(OpResult result) {
       provenance.known = false;
     return provenance;
   }
-  if (name == "intent.constant" || name == "intent.dim" ||
-      name == "intent.region_end" || name == "intent.random_bits" ||
-      name == "intent.contract" || name == "intent.scaled_contract" ||
-      name == "intent.sparse_contract" || name == "intent.histogram" ||
-      name == "intent.view_load" || name == "intent.buffer_load" ||
-      name.starts_with("intent.atomic_"))
+  if (isa<ConstantOp, DimOp, RegionEndOp, RandomBitsOp, ContractOp,
+          ScaledContractOp, SparseContractOp, HistogramOp, ViewLoadOp,
+          BufferLoadOp, AtomicLoadOp, AtomicStoreOp, AtomicRMWOp,
+          AtomicCompareExchangeOp>(operation))
     return knownWithoutCoordinates();
 
-  if (name == "intent.extract") {
+  if (isa<ExtractOp>(operation)) {
     Value product = operation->getOperand(0);
     auto field = operation->getAttrOfType<IntegerAttr>("field");
     if (field) {
       if (Operation *definition = product.getDefiningOp();
-          definition &&
-          (definition->getName().getStringRef() == "intent.make_tuple" ||
-           definition->getName().getStringRef() == "intent.make_record") &&
+          definition && isa<MakeTupleOp, MakeRecordOp>(definition) &&
           field.getInt() >= 0 &&
           field.getInt() < definition->getNumOperands())
         return coordinateProvenance(definition->getOperand(field.getInt()));
@@ -438,16 +429,12 @@ CanonicalKernelAnalysis::resultProvenance(OpResult result) {
     return coordinateProvenance(product);
   }
 
-  if (name == "intent.gather" || name == "intent.reshape" ||
-      name == "intent.broadcast" || name == "intent.transpose" ||
-      name == "intent.cast" || name == "intent.bitcast" ||
-      name == "intent.unary" || name == "intent.full")
+  if (isa<GatherOp, ReshapeOp, BroadcastOp, TransposeOp, CastOp, BitcastOp,
+          UnaryOp, FullOp>(operation))
     return coordinateProvenance(operation->getOperand(0));
 
-  if (name == "intent.binary" || name == "intent.compare" ||
-      name == "intent.join" || name == "intent.select" ||
-      name == "intent.mask" || name == "intent.make_tuple" ||
-      name == "intent.make_record") {
+  if (isa<BinaryOp, CompareOp, JoinOp, SelectOp, MaskOp, MakeTupleOp,
+          MakeRecordOp>(operation)) {
     CoordinateProvenance combined = knownWithoutCoordinates();
     for (Value operand : operation->getOperands())
       appendOrigins(combined, coordinateProvenance(operand));
@@ -650,8 +637,7 @@ LogicalResult CanonicalKernelAnalysis::verify() {
   module.walk([&](Operation *operation) {
     if (failed(result))
       return WalkResult::interrupt();
-    StringRef name = operation->getName().getStringRef();
-    if (name == "intent.indices") {
+    if (isa<IndicesOp>(operation)) {
       CoordinateProvenance provenance =
           coordinateProvenance(operation->getResult(0));
       if (!provenance.known || provenance.origins.size() != 1) {
