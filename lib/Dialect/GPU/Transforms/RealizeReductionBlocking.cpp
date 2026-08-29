@@ -51,6 +51,15 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
   });
 }
 
+bool containsPhysicalParameter(PhysicalExprAttr expression) {
+  if (expression.getKind() ==
+      static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return true;
+  return llvm::any_of(expression.getOperands(), [](Attribute operand) {
+    return containsPhysicalParameter(cast<PhysicalExprAttr>(operand));
+  });
+}
+
 bool isCompileTimeValue(Value value) {
   return value.getDefiningOp<arith::ConstantOp>() ||
          value.getDefiningOp<ParameterOp>() ||
@@ -62,16 +71,11 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
       continue;
-    if (llvm::any_of(fragment.getShape(), [](Attribute extent) {
-          return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
-        }))
-      return true;
     for (int64_t axis : reduce.getAxes()) {
       if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
         continue;
       auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-      if (extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+      if (containsPhysicalParameter(extent))
         return true;
     }
   }
