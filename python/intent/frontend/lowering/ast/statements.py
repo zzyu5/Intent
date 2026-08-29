@@ -296,6 +296,10 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
                 continue
             lowerer.error(node, f"runtime branch cannot select differing compile-time metadata {name!r}")
         merge_names.append(name)
+        snapshot_type = _expression_type(snapshot[name]) if name in snapshot else None
+        if snapshot_type is not None:
+            merge_types[name] = snapshot_type
+            continue
         for branch_value in branch_values:
             branch_type = _expression_type(branch_value)
             if branch_type is not None:
@@ -317,6 +321,8 @@ def _lower_if(lowerer: object, node: ast.If) -> None:
             expression = environment[name]
             expected = merge_types.get(name)
             value_result = lowerer.materialize(expression, node, expected)
+            if expected is not None:
+                value_result = lowerer.project_value_schema(value_result, expected, node)
             values.append(value_result)
         lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=tuple(values))
         lowerer.current_block = saved_block
@@ -444,7 +450,14 @@ def _lower_for(lowerer: object, node: ast.For) -> None:
     lowerer.loop_stack.append(LoopContext(opcode, carried_names))
     lowerer.lower_statements(body)
     if not lowerer.is_terminated(block):
-        yielded = tuple(lowerer.materialize(lowerer.environment[name], node) for name in carried_names)
+        yielded = tuple(
+            lowerer.project_value_schema(
+                lowerer.materialize(lowerer.environment[name], node, initial.type),
+                initial.type,
+                node,
+            )
+            for name, initial in zip(carried_names, initial_values)
+        )
         lowerer.emit(OperationKind.YIELD, lowerer.location(node), operands=yielded)
     lowerer.loop_stack.pop()
     lowerer.current_block = saved_block

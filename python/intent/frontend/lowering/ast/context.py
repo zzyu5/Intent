@@ -41,6 +41,7 @@ from intent.language import index as intent_index
 from intent.frontend.semantics import EffectKind
 from intent.frontend.semantics import ResourceKind
 from intent.frontend.semantics import RegionType
+from intent.frontend.semantics import RecordType
 
 from ...diagnostics.errors import FrontendError
 from .model import ConstexprBinding
@@ -254,6 +255,85 @@ class FunctionLowerer:
                 result_types=(result_type,),
             ).results[0]
         self.error(node, "expression is compile-time metadata, not an SSA value")
+
+    def project_value_schema(
+        self,
+        value: MlirValue,
+        expected_type: ValueType,
+        node: ast.AST,
+    ) -> MlirValue:
+        if self._same_emitted_type(value.type, expected_type):
+            return value
+        if not self.types_compatible_for_literal(value.type, expected_type):
+            self.error(node, f"value type {value.type} does not match {expected_type}")
+        if isinstance(value.type, TensorType) and isinstance(expected_type, TensorType):
+            return self.broadcast_value(value, expected_type.shape, node)
+        if isinstance(value.type, TupleType) and isinstance(expected_type, TupleType):
+            components = []
+            for index, (actual, expected) in enumerate(
+                zip(value.type.components, expected_type.components)
+            ):
+                component = self.emit(
+                    OperationKind.EXTRACT,
+                    self.location(node),
+                    operands=(value,),
+                    result_types=(actual,),
+                    attributes={"field": index},
+                ).results[0]
+                components.append(self.project_value_schema(component, expected, node))
+            return self.emit(
+                OperationKind.MAKE_TUPLE,
+                self.location(node),
+                operands=tuple(components),
+                result_types=(expected_type,),
+            ).results[0]
+        if isinstance(value.type, RecordType) and isinstance(expected_type, RecordType):
+            fields = []
+            for index, ((_, actual), (_, expected)) in enumerate(
+                zip(value.type.fields, expected_type.fields)
+            ):
+                field = self.emit(
+                    OperationKind.EXTRACT,
+                    self.location(node),
+                    operands=(value,),
+                    result_types=(actual,),
+                    attributes={"field": index},
+                ).results[0]
+                fields.append(self.project_value_schema(field, expected, node))
+            return self.emit(
+                OperationKind.MAKE_RECORD,
+                self.location(node),
+                operands=tuple(fields),
+                result_types=(expected_type,),
+            ).results[0]
+        return value
+
+    def _same_emitted_type(self, actual: ValueType, expected: ValueType) -> bool:
+        if isinstance(actual, TensorType) and isinstance(expected, TensorType):
+            return (
+                actual.dtype == expected.dtype
+                and len(actual.shape) == len(expected.shape)
+                and all(
+                    self.compiler.builder.dimension_id(lhs)
+                    == self.compiler.builder.dimension_id(rhs)
+                    for lhs, rhs in zip(actual.shape, expected.shape)
+                )
+            )
+        if isinstance(actual, TupleType) and isinstance(expected, TupleType):
+            return len(actual.components) == len(expected.components) and all(
+                self._same_emitted_type(lhs, rhs)
+                for lhs, rhs in zip(actual.components, expected.components)
+            )
+        if isinstance(actual, RecordType) and isinstance(expected, RecordType):
+            return (
+                tuple(name for name, _ in actual.fields)
+                == tuple(name for name, _ in expected.fields)
+                and all(
+                    self._same_emitted_type(lhs, rhs)
+                    for (_, lhs), (_, rhs) in zip(actual.fields, expected.fields)
+                )
+            )
+        return actual == expected
 
     def emit_literal(
         self,
