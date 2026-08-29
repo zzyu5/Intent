@@ -361,13 +361,11 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     if (role == static_cast<uint32_t>(ParameterRole::ScanChunk) ||
         role == static_cast<uint32_t>(ParameterRole::Reduction))
       continue;
-    StringRef name = parameter->getParameter().getName().getValue();
-    if (!name.consume_front("FRAGMENT_D"))
+    PhysicalParameterBinding binding = queryParameterBinding(*parameter);
+    if (!binding.isExact() || !binding.dimension)
       return parameter->emitOpError(
           "native contraction coverage parameter has no logical dimension");
-    uint64_t dimension = 0;
-    if (name.getAsInteger(10, dimension))
-      return failure();
+    uint64_t dimension = *binding.dimension;
     bool launchVisible = false;
     for (BlockArgument argument : kernel.getArguments()) {
       DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
@@ -410,13 +408,15 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
     // Retarget only the exact provenance carried by this operand axis.
     PhysicalExprAttr parameterExtent = parameterExpression(
         kernel.getContext(), parameter->getParameter().getName().getValue());
-    uint64_t sourceId = cast<AxisMapAttr>(
-                            fragment.getAxisMaps()[static_cast<unsigned>(axis)])
-                            .getSourceId();
+    auto sourceMapping = cast<AxisMapAttr>(
+        fragment.getAxisMaps()[static_cast<unsigned>(axis)]);
+    PhysicalSourceAxis source{sourceMapping.getSourceId(),
+                              sourceMapping.getSourceAxis()};
     SmallVector<MakeRangeOp> subregions;
     kernel.walk([&](MakeRangeOp range) {
       FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
-      if (range.getSourceId() == sourceId &&
+      if (range.getSourceId() == source.sourceId &&
+          range.getSourceAxis() == source.sourceAxis &&
           range->hasAttr(sourceSubregionAttr) && succeeded(sourceDimension) &&
           *sourceDimension == static_cast<int64_t>(dimension))
         subregions.push_back(range);
@@ -425,7 +425,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
       if (failed(resolveLogicalRangeEnd(kernel, range)))
         return range.emitOpError(
             "native contraction subregion has no exact logical tail bound");
-      retargetSourceExtent(range.getResult(), sourceId, parameterExtent);
+      retargetSourceExtent(range.getResult(), source, parameterExtent);
       range->setOperand(1, parameter->getResult());
     }
   }

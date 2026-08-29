@@ -768,12 +768,12 @@ FailureOr<ParameterOp> parameterForDimension(func::FuncOp kernel,
 
 PhysicalExprAttr selectedParameterExtent(ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
-  StringRef name = schema.getName().getValue();
-  if (name.starts_with("FRAGMENT_S") && schema.getCandidates().size() == 1)
+  PhysicalParameterBinding binding = queryParameterBinding(parameter);
+  if (binding.source && schema.getCandidates().size() == 1)
     return expression(parameter.getContext(), PhysicalExprKind::Constant,
                       schema.getCandidates()[0]);
   return expression(parameter.getContext(), PhysicalExprKind::Parameter, 0,
-                    name);
+                    schema.getName().getValue());
 }
 
 FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,

@@ -18,11 +18,18 @@ namespace {
 LogicalResult verifyExpressionSymbols(Operation *owner,
                                       PhysicalExprAttr expression,
                                       const llvm::StringSet<> &parameters,
-                                      const llvm::StringSet<> &launchABI) {
+                                      const llvm::StringSet<> &launchABI,
+                                      const llvm::DenseSet<int64_t> &dimensions) {
   auto kind = static_cast<PhysicalExprKind>(expression.getKind());
   if (kind == PhysicalExprKind::Parameter &&
       !parameters.contains(expression.getSymbol().getValue()))
     return owner->emitOpError("launch expression references an undeclared physical parameter");
+  if (kind == PhysicalExprKind::Dimension &&
+      (expression.getValue() <= 0 ||
+       !dimensions.contains(expression.getValue())))
+    return owner->emitOpError(
+               "physical dimension expression has no matching ABI identity: ")
+           << expression.getValue();
   if ((kind == PhysicalExprKind::Dimension ||
        kind == PhysicalExprKind::ScalarABI) &&
       !launchABI.contains(expression.getSymbol().getValue()))
@@ -31,7 +38,7 @@ LogicalResult verifyExpressionSymbols(Operation *owner,
            << expression.getSymbol();
   for (Attribute operand : expression.getOperands())
     if (failed(verifyExpressionSymbols(owner, cast<PhysicalExprAttr>(operand),
-                                       parameters, launchABI)))
+                                       parameters, launchABI, dimensions)))
       return failure();
   return success();
 }
@@ -94,6 +101,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   llvm::StringSet<> parameterNames;
   llvm::StringSet<> launchABI;
   llvm::StringSet<> abiNames;
+  llvm::DenseSet<int64_t> launchDimensions;
   for (auto [index, type] : llvm::enumerate(kernel.getArgumentTypes())) {
     DictionaryAttr attrs = kernel.getArgAttrDict(index);
     auto kind = attrs.getAs<StringAttr>(abiKindAttr);
@@ -122,6 +130,13 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         return kernel.emitError(
             "metadata ABI source binding does not name an axis of its physical view");
       launchABI.insert(name.getValue());
+      if (kind.getValue() == "dimension") {
+        auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
+        if (!dimension || dimension.getInt() <= 0 ||
+            !launchDimensions.insert(dimension.getInt()).second)
+          return kernel.emitError(
+              "dimension ABI identities must be unique positive integers");
+      }
     } else if (kind.getValue() == "scalar" ||
                kind.getValue() == "constexpr" ||
                kind.getValue() == "value") {
@@ -142,7 +157,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   });
   for (Attribute extent : programSpace)
     if (failed(verifyExpressionSymbols(kernel, cast<PhysicalExprAttr>(extent),
-                                       parameterNames, launchABI)))
+                                       parameterNames, launchABI,
+                                       launchDimensions)))
       return failure();
 
   bool hasProgramId = false;
@@ -181,7 +197,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     }
     if (auto physical = dyn_cast<PhysicalExprOp>(operation))
       if (failed(verifyExpressionSymbols(operation, physical.getExpression(),
-                                         parameterNames, launchABI)))
+                                         parameterNames, launchABI,
+                                         launchDimensions)))
         return WalkResult::interrupt();
     if (auto program = dyn_cast<ProgramIdOp>(operation)) {
       if (program.getAxis() >= static_cast<uint64_t>(gridRank) ||
@@ -208,7 +225,7 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
           collectTypeExpressions(argument.getType(), expressions);
     for (PhysicalExprAttr expression : expressions)
       if (failed(verifyExpressionSymbols(operation, expression, parameterNames,
-                                         launchABI)))
+                                         launchABI, launchDimensions)))
         return WalkResult::interrupt();
     return WalkResult::advance();
   });

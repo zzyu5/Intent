@@ -227,14 +227,14 @@ bool isViewExtent(Value value, Value resource, unsigned axis) {
       return false;
     DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
     auto kind = attrs.getAs<StringAttr>(gpu::abiKindAttr);
-    auto name = attrs.getAs<StringAttr>(gpu::abiNameAttr);
+    auto dimension = attrs.getAs<IntegerAttr>(gpu::dimensionAttr);
     auto view = cast<gpu::ViewType>(resource.getType());
     auto extent =
         cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-    return kind && kind.getValue() == "dimension" && name &&
+    return kind && kind.getValue() == "dimension" && dimension &&
            extent.getKind() ==
                static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension) &&
-           name.getValue() == extent.getSymbol().getValue();
+           dimension.getInt() == extent.getValue();
   }
   if (auto dim = value.getDefiningOp<gpu::DimOp>())
     return dim.getView() == resource && dim.getAxis() == axis;

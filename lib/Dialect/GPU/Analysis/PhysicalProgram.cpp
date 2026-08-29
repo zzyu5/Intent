@@ -177,6 +177,90 @@ bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
              : isValueReplayNode(operation);
 }
 
+PhysicalParameterBinding queryParameterBinding(ParameterOp parameter) {
+  PhysicalParameterBinding result;
+  if (!parameter)
+    return result;
+  auto dimension = parameter->getAttrOfType<IntegerAttr>(dimensionAttr);
+  auto coverage = parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
+  if (dimension && dimension.getInt() <= 0)
+    return result;
+  if (coverage && coverage.getInt() <= 0)
+    return result;
+  if (dimension && coverage && dimension.getInt() != coverage.getInt()) {
+    result.state = PhysicalFactState::Ambiguous;
+    return result;
+  }
+  if (coverage)
+    result.dimension = coverage.getInt();
+  else if (dimension)
+    result.dimension = dimension.getInt();
+  if (auto source =
+          parameter->getAttrOfType<PhysicalSourceAttr>(parameterSourceAttr))
+    result.source =
+        PhysicalSourceAxis{source.getSourceId(), source.getSourceAxis()};
+  result.state = result.dimension || result.source ? PhysicalFactState::Exact
+                                                   : PhysicalFactState::Unknown;
+  return result;
+}
+
+FailureOr<ParameterOp> queryParameterBySymbol(func::FuncOp kernel,
+                                              StringAttr symbol) {
+  ParameterOp result;
+  bool ambiguous = false;
+  kernel.walk([&](ParameterOp parameter) {
+    if (parameter.getParameter().getName() != symbol)
+      return;
+    if (result && result != parameter)
+      ambiguous = true;
+    else
+      result = parameter;
+  });
+  return result && !ambiguous ? FailureOr<ParameterOp>(result)
+                              : FailureOr<ParameterOp>(failure());
+}
+
+FailureOr<ParameterOp> queryBlockingParameter(func::FuncOp kernel,
+                                              MakeRangeOp range) {
+  auto fragment = dyn_cast<FragmentType>(range.getResult().getType());
+  auto extent = fragment && fragment.getShape().size() == 1
+                    ? dyn_cast<PhysicalExprAttr>(fragment.getShape()[0])
+                    : PhysicalExprAttr();
+  if (extent && extent.getKind() ==
+                    static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return queryParameterBySymbol(kernel, extent.getSymbol());
+
+  PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis()};
+  FailureOr<int64_t> dimension = queryRangeDimension(range);
+  ParameterOp sourceMatch;
+  ParameterOp dimensionMatch;
+  bool sourceAmbiguous = false;
+  bool dimensionAmbiguous = false;
+  kernel.walk([&](ParameterOp parameter) {
+    PhysicalParameterBinding binding = queryParameterBinding(parameter);
+    if (!binding.isExact())
+      return;
+    if (binding.source && *binding.source == source) {
+      if (sourceMatch && sourceMatch != parameter)
+        sourceAmbiguous = true;
+      else
+        sourceMatch = parameter;
+    }
+    if (succeeded(dimension) && binding.dimension &&
+        *binding.dimension == *dimension) {
+      if (dimensionMatch && dimensionMatch != parameter)
+        dimensionAmbiguous = true;
+      else
+        dimensionMatch = parameter;
+    }
+  });
+  if (sourceMatch && !sourceAmbiguous)
+    return sourceMatch;
+  return dimensionMatch && !dimensionAmbiguous
+             ? FailureOr<ParameterOp>(dimensionMatch)
+             : FailureOr<ParameterOp>(failure());
+}
+
 FailureOr<unsigned> queryFragmentAxis(Type type, uint64_t sourceId) {
   PhysicalAxisProjection result = queryUniqueSourceAxis(type, sourceId);
   return result.isExact() ? FailureOr<unsigned>(result.fragmentAxis)

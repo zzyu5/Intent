@@ -68,7 +68,7 @@ PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
 }
 
 PhysicalExprAttr dimensionExpression(MLIRContext *context, int64_t dimension) {
-  return expression(context, PhysicalExprKind::Dimension, 0,
+  return expression(context, PhysicalExprKind::Dimension, dimension,
                     ("D" + Twine(dimension)).str());
 }
 
@@ -913,15 +913,22 @@ FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
     if (launchVisible)
       return dimensionExpression(origin->getContext(), dimension);
   }
-  std::string name = ("FRAGMENT_D" + Twine(dimension)).str();
   gpu::ParameterOp declaration;
+  bool ambiguous = false;
   origin->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
-    if (!declaration && parameter.getParameter().getName() == name)
+    auto binding = parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
+    if (!binding || binding.getInt() != dimension)
+      return;
+    if (declaration && declaration != parameter)
+      ambiguous = true;
+    else
       declaration = parameter;
   });
-  return declaration ? FailureOr<PhysicalExprAttr>(
-                           parameterExpression(origin->getContext(), name))
-                     : FailureOr<PhysicalExprAttr>(failure());
+  return declaration && !ambiguous
+             ? FailureOr<PhysicalExprAttr>(parameterExpression(
+                   origin->getContext(),
+                   declaration.getParameter().getName().getValue()))
+             : FailureOr<PhysicalExprAttr>(failure());
 }
 
 FailureOr<PhysicalExprAttr> fragmentExtentExpression(RankedTensorType tensor,
@@ -1421,11 +1428,8 @@ private:
       return Value(builder.create<arith::ConstantIndexOp>(location,
                                                            expression.getValue()));
     if (kind == PhysicalExprKind::Dimension) {
-      StringRef symbol = expression.getSymbol().getValue();
-      if (!symbol.consume_front("D"))
-        return failure();
-      int64_t identity = 0;
-      if (symbol.getAsInteger(10, identity))
+      int64_t identity = expression.getValue();
+      if (identity <= 0)
         return failure();
       auto found = dimensions.find(identity);
       return found == dimensions.end() ? FailureOr<Value>(failure())

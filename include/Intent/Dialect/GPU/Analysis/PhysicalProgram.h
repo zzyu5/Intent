@@ -119,6 +119,23 @@ struct PhysicalReductionDependencyFact {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
+/// Typed logical relation carried by one physical parameter declaration.  The
+/// parameter name remains only its compile-time symbol; consumers must not
+/// recover a dimension or source axis from that spelling.
+struct PhysicalParameterBinding {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  std::optional<int64_t> dimension;
+  std::optional<PhysicalSourceAxis> source;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
+PhysicalParameterBinding queryParameterBinding(ParameterOp parameter);
+mlir::FailureOr<ParameterOp>
+queryParameterBySymbol(mlir::func::FuncOp kernel, mlir::StringAttr symbol);
+mlir::FailureOr<ParameterOp>
+queryBlockingParameter(mlir::func::FuncOp kernel, MakeRangeOp range);
+
 /// Exact current-IR access relation, or an explicit conservative result.
 struct PhysicalAccessFootprint {
   PhysicalFactState state = PhysicalFactState::Unknown;

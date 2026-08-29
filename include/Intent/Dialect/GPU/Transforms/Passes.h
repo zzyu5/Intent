@@ -16,7 +16,7 @@ mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
-void retargetSourceExtent(mlir::Value root, uint64_t sourceId,
+void retargetSourceExtent(mlir::Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent);
 void retargetDimensionExtent(mlir::Value root, int64_t dimensionId,
                              PhysicalExprAttr extent);

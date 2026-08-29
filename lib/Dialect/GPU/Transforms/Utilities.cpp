@@ -938,10 +938,7 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
   if (result)
     return result;
 
-  OpBuilder builder(range);
-  return Value(builder.create<BinaryOp>(
-      range.getLoc(), builder.getIndexType(), range.getStart(),
-      range.getExtent(), BinaryOperator::Add));
+  return failure();
 }
 
 static void retargetExtent(Value root, AxisSelector selects,
@@ -1071,11 +1068,14 @@ static void retargetExtent(Value root, AxisSelector selects,
   }
 }
 
-void retargetSourceExtent(Value root, uint64_t sourceId,
+void retargetSourceExtent(Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent) {
   retargetExtent(
       root,
-      [=](AxisMapAttr mapping) { return mapping.getSourceId() == sourceId; },
+      [=](AxisMapAttr mapping) {
+        return mapping.getSourceId() == source.sourceId &&
+               mapping.getSourceAxis() == source.sourceAxis;
+      },
       extent);
 }
 
@@ -1167,13 +1167,9 @@ FailureOr<uint64_t> blockedDimension(Attribute attribute) {
       block.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Parameter))
     return failure();
-  StringRef name = logical.getSymbol().getValue();
-  if (!name.consume_front("D"))
-    return failure();
-  uint64_t dimension = 0;
-  return name.getAsInteger(10, dimension)
-             ? FailureOr<uint64_t>(failure())
-             : FailureOr<uint64_t>(dimension);
+  return logical.getValue() > 0
+             ? FailureOr<uint64_t>(logical.getValue())
+             : FailureOr<uint64_t>(failure());
 }
 
 bool hasBlockedDimension(func::FuncOp kernel, uint64_t dimension) {
@@ -1214,7 +1210,10 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     logicalExtents[range.getOperation()] = range.getExtent();
   });
   for (MakeRangeOp range : ranges)
-    retargetSourceExtent(range.getResult(), range.getSourceId(), parameterExtent);
+    retargetSourceExtent(
+        range.getResult(),
+        PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()},
+        parameterExtent);
   if (ranges.empty() || llvm::all_of(ranges, [&](MakeRangeOp range) {
         return range.getExtent() == physicalExtent;
       }))
