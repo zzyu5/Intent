@@ -1187,26 +1187,13 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   auto parameter = physicalExtent.getDefiningOp<ParameterOp>();
   if (!parameter)
     return failure();
-  Value logicalExtent;
-  for (BlockArgument argument : kernel.getArguments()) {
-    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-    if (kind && kind.getValue() == "dimension" && identity &&
-        identity.getInt() == static_cast<int64_t>(dimension)) {
-      logicalExtent = argument;
-      break;
-    }
-  }
-  if (!logicalExtent)
-    return failure();
-
   PhysicalExprAttr parameterExtent = PhysicalExprAttr::get(
       kernel.getContext(),
       static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
       parameter.getParameter().getName(),
       ArrayAttr::get(kernel.getContext(), {}));
   SmallVector<MakeRangeOp> ranges;
+  llvm::DenseMap<Operation *, Value> logicalExtents;
   kernel.walk([&](MakeRangeOp range) {
     FailureOr<int64_t> sourceDimension = querySourceDimension(
         range.getResult().getType(),
@@ -1219,6 +1206,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         fragment.getShape()[0] != parameterExtent)
       return;
     ranges.push_back(range);
+    logicalExtents[range.getOperation()] = range.getExtent();
   });
   for (MakeRangeOp range : ranges)
     retargetSourceExtent(range.getResult(), range.getSourceId(), parameterExtent);
@@ -1239,20 +1227,49 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
   };
 
   SmallVector<LoadOp> loads;
+  SmallVector<GatherOp> gathers;
   SmallVector<StoreOp> stores;
+  SmallVector<ScatterReduceOp> scatters;
+  SmallVector<AtomicLoadOp> atomicLoads;
+  SmallVector<AtomicStoreOp> atomicStores;
+  SmallVector<AtomicRMWOp> atomicRMWs;
+  SmallVector<AtomicCompareExchangeOp> atomicCAS;
   kernel.walk([&](LoadOp load) { loads.push_back(load); });
+  kernel.walk([&](GatherOp gather) { gathers.push_back(gather); });
   kernel.walk([&](StoreOp store) { stores.push_back(store); });
+  kernel.walk([&](ScatterReduceOp scatter) { scatters.push_back(scatter); });
+  kernel.walk([&](AtomicLoadOp atomic) { atomicLoads.push_back(atomic); });
+  kernel.walk([&](AtomicStoreOp atomic) { atomicStores.push_back(atomic); });
+  kernel.walk([&](AtomicRMWOp atomic) { atomicRMWs.push_back(atomic); });
+  kernel.walk(
+      [&](AtomicCompareExchangeOp atomic) { atomicCAS.push_back(atomic); });
   llvm::DenseMap<Operation *, SmallVector<MakeRangeOp>> accessRanges;
   for (LoadOp load : loads)
     accessRanges[load.getOperation()] = relevantRanges(load.getCoordinates());
+  for (GatherOp gather : gathers)
+    accessRanges[gather.getOperation()] = relevantRanges(gather.getCoordinates());
   for (StoreOp store : stores)
     accessRanges[store.getOperation()] = relevantRanges(store.getCoordinates());
+  for (ScatterReduceOp scatter : scatters)
+    accessRanges[scatter.getOperation()] =
+        relevantRanges(scatter.getCoordinates());
+  for (AtomicLoadOp atomic : atomicLoads)
+    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+  for (AtomicStoreOp atomic : atomicStores)
+    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+  for (AtomicRMWOp atomic : atomicRMWs)
+    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
+  for (AtomicCompareExchangeOp atomic : atomicCAS)
+    accessRanges[atomic.getOperation()] = relevantRanges(atomic.getCoordinates());
 
   llvm::DenseMap<Operation *, Value> predicates;
   for (MakeRangeOp range : ranges) {
     OpBuilder builder(range);
     range->setOperand(1, physicalExtent);
     builder.setInsertionPointAfter(range);
+    Value logicalExtent = logicalExtents.lookup(range.getOperation());
+    if (!logicalExtent)
+      return failure();
     Value distance = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), logicalExtent, range.getStep(),
         BinaryOperator::Multiply);
@@ -1294,6 +1311,27 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       }
     }
     return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
+  };
+
+  auto combineValidity = [&](OpBuilder &builder, Location location,
+                             FragmentType type, ArrayRef<MakeRangeOp> sources,
+                             Value existing) -> FailureOr<Value> {
+    FailureOr<Value> tail = materializeTail(builder, location, type, sources);
+    if (failed(tail))
+      return failure();
+    Value valid = *tail;
+    auto predicate = cast<FragmentType>(valid.getType());
+    if (!existing)
+      return valid;
+    Type element = existing.getType();
+    if (auto fragment = dyn_cast<FragmentType>(element))
+      element = fragment.getElementType();
+    if (!element.isInteger(1))
+      return failure();
+    if (existing.getType() != predicate)
+      existing = builder.create<BroadcastOp>(location, predicate, existing);
+    return Value(builder.create<BinaryOp>(location, predicate, existing, valid,
+                                          BinaryOperator::LogicalAnd));
   };
 
   for (LoadOp load : loads) {
@@ -1339,6 +1377,34 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     load.erase();
   }
 
+  for (GatherOp gather : gathers) {
+    auto sources = accessRanges.lookup(gather.getOperation());
+    auto type = dyn_cast<FragmentType>(gather.getResult().getType());
+    if (!gather->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(gather);
+    FailureOr<Value> valid = combineValidity(
+        builder, gather.getLoc(), type, sources, gather.getValid());
+    if (failed(valid))
+      return gather.emitOpError(
+          "cannot project full-coverage dimension to gather validity");
+    Value fill = gather.getFill();
+    if (!fill) {
+      FailureOr<Value> zero = zeroFill(builder, gather.getLoc(), type);
+      if (failed(zero))
+        return gather.emitOpError("full-coverage gather has no neutral fill");
+      fill = *zero;
+    } else if (fill.getType() != type)
+      fill = builder.create<BroadcastOp>(gather.getLoc(), type, fill);
+    auto replacement = builder.create<GatherOp>(
+        gather.getLoc(), type, gather.getSource(), gather.getCoordinates(),
+        *valid, fill, gather.getSourceAxes());
+    if (Attribute origin = gather->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    gather.erase();
+  }
+
   for (StoreOp store : stores) {
     auto sources = accessRanges.lookup(store.getOperation());
     auto type = dyn_cast<FragmentType>(store.getValue().getType());
@@ -1366,6 +1432,118 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
+  }
+
+  for (ScatterReduceOp scatter : scatters) {
+    auto sources = accessRanges.lookup(scatter.getOperation());
+    auto type = dyn_cast<FragmentType>(scatter.getValue().getType());
+    if (!scatter->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(scatter);
+    FailureOr<Value> valid = combineValidity(
+        builder, scatter.getLoc(), type, sources, scatter.getValid());
+    if (failed(valid))
+      return scatter.emitOpError(
+          "cannot project full-coverage dimension to scatter validity");
+    OperationState state(scatter.getLoc(), ScatterReduceOp::getOperationName());
+    state.addOperands(scatter.getResource());
+    state.addOperands(scatter.getCoordinates());
+    state.addOperands(scatter.getValue());
+    state.addOperands(*valid);
+    for (NamedAttribute attribute : scatter->getAttrs())
+      if (attribute.getName() != "operandSegmentSizes")
+        state.addAttribute(attribute.getName(), attribute.getValue());
+    state.addAttribute(
+        "operandSegmentSizes",
+        builder.getDenseI32ArrayAttr(
+            {1, static_cast<int32_t>(scatter.getCoordinates().size()), 1, 1}));
+    state.addRegion();
+    auto replacement = cast<ScatterReduceOp>(builder.create(state));
+    replacement.getCombine().takeBody(scatter.getCombine());
+    scatter.erase();
+  }
+
+  for (AtomicLoadOp atomic : atomicLoads) {
+    auto sources = accessRanges.lookup(atomic.getOperation());
+    auto type = dyn_cast<FragmentType>(atomic.getResult().getType());
+    if (!atomic->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(atomic);
+    FailureOr<Value> valid = combineValidity(
+        builder, atomic.getLoc(), type, sources, atomic.getValid());
+    if (failed(valid))
+      return atomic.emitOpError(
+          "cannot project full-coverage dimension to atomic-load validity");
+    auto replacement = builder.create<AtomicLoadOp>(
+        atomic.getLoc(), type, atomic.getResource(), atomic.getCoordinates(),
+        *valid, atomic.getOrdering(), atomic.getSharing(), atomic.getSourceAxes());
+    if (Attribute origin = atomic->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    atomic.getResult().replaceAllUsesWith(replacement.getResult());
+    atomic.erase();
+  }
+
+  for (AtomicStoreOp atomic : atomicStores) {
+    auto sources = accessRanges.lookup(atomic.getOperation());
+    auto type = dyn_cast<FragmentType>(atomic.getValue().getType());
+    if (!atomic->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(atomic);
+    FailureOr<Value> valid = combineValidity(
+        builder, atomic.getLoc(), type, sources, atomic.getValid());
+    if (failed(valid))
+      return atomic.emitOpError(
+          "cannot project full-coverage dimension to atomic-store validity");
+    auto replacement = builder.create<AtomicStoreOp>(
+        atomic.getLoc(), atomic.getResource(), atomic.getCoordinates(),
+        atomic.getValue(), *valid, atomic.getOrdering(), atomic.getSharing(),
+        atomic.getSourceAxes());
+    if (Attribute origin = atomic->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    atomic.erase();
+  }
+
+  for (AtomicRMWOp atomic : atomicRMWs) {
+    auto sources = accessRanges.lookup(atomic.getOperation());
+    auto type = dyn_cast<FragmentType>(atomic.getValue().getType());
+    if (!atomic->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(atomic);
+    FailureOr<Value> valid = combineValidity(
+        builder, atomic.getLoc(), type, sources, atomic.getValid());
+    if (failed(valid))
+      return atomic.emitOpError(
+          "cannot project full-coverage dimension to atomic-RMW validity");
+    auto replacement = builder.create<AtomicRMWOp>(
+        atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
+        atomic.getCoordinates(), atomic.getValue(), *valid, atomic.getKind(),
+        atomic.getOrdering(), atomic.getSharing(), atomic.getSourceAxes());
+    if (Attribute origin = atomic->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    atomic.getResult().replaceAllUsesWith(replacement.getResult());
+    atomic.erase();
+  }
+
+  for (AtomicCompareExchangeOp atomic : atomicCAS) {
+    auto sources = accessRanges.lookup(atomic.getOperation());
+    auto type = dyn_cast<FragmentType>(atomic.getExpected().getType());
+    if (!atomic->getBlock() || !type || sources.empty())
+      continue;
+    OpBuilder builder(atomic);
+    FailureOr<Value> valid = combineValidity(
+        builder, atomic.getLoc(), type, sources, atomic.getValid());
+    if (failed(valid))
+      return atomic.emitOpError(
+          "cannot project full-coverage dimension to compare-exchange validity");
+    auto replacement = builder.create<AtomicCompareExchangeOp>(
+        atomic.getLoc(), atomic.getResult().getType(), atomic.getResource(),
+        atomic.getCoordinates(), atomic.getExpected(), atomic.getDesired(),
+        *valid, atomic.getOrdering(), atomic.getSharing(),
+        atomic.getSourceAxes());
+    if (Attribute origin = atomic->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    atomic.getResult().replaceAllUsesWith(replacement.getResult());
+    atomic.erase();
   }
   return success();
 }

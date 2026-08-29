@@ -604,6 +604,9 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
   else if (auto store = dyn_cast<StoreOp>(access))
     collect(store.getResource(), store.getCoordinates(), store.getSourceAxes(),
             store.getValid(), {});
+  else if (auto scatter = dyn_cast<ScatterReduceOp>(access))
+    collect(scatter.getResource(), scatter.getCoordinates(),
+            scatter.getSourceAxes(), scatter.getValid(), {});
   else if (auto atomic = dyn_cast<AtomicLoadOp>(access))
     collect(atomic.getResource(), atomic.getCoordinates(), atomic.getSourceAxes(),
             atomic.getValid(), {});

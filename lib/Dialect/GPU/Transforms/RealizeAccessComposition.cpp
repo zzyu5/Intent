@@ -1,11 +1,13 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/IRMapping.h"
 
 using namespace mlir;
 
@@ -54,19 +56,79 @@ FailureOr<unsigned> coordinateForMap(ValueRange coordinates,
                 : FailureOr<unsigned>(failure());
 }
 
+FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
+                                     FragmentType target, IRMapping &mapping) {
+  if (!value)
+    return Value();
+  if (Value replacement = mapping.lookupOrNull(value))
+    return replacement;
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment)
+    return value;
+  Operation *producer = value.getDefiningOp();
+  if (!producer ||
+      !isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+                            /*allowAccesses=*/false))
+    return failure();
+  for (Value operand : producer->getOperands()) {
+    FailureOr<Value> replacement =
+        replayFragmentValue(builder, operand, target, mapping);
+    if (failed(replacement))
+      return failure();
+    if (*replacement != operand && !mapping.lookupOrNull(operand))
+      mapping.map(operand, *replacement);
+  }
+  Operation *clone = builder.clone(*producer, mapping);
+  for (Value result : clone->getResults()) {
+    auto original = dyn_cast<FragmentType>(result.getType());
+    if (!original)
+      continue;
+    result.setType(FragmentType::get(
+        target.getContext(), original.getElementType(), target.getShape(),
+        target.getAxisMaps(), target.getValidity(), target.getOwner()));
+  }
+  Value result = clone->getResult(0);
+  mapping.map(value, result);
+  return result;
+}
+
+FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
+                                   FragmentType valueType, Value lhs,
+                                   Value rhs) {
+  auto predicate = FragmentType::get(
+      valueType.getContext(), builder.getI1Type(), valueType.getShape(),
+      valueType.getAxisMaps(), valueType.getValidity(), valueType.getOwner());
+  for (Value *value : {&lhs, &rhs}) {
+    if (!*value)
+      continue;
+    if ((*value).getType() != predicate) {
+      FailureOr<Value> projected =
+          materializeBroadcastToFragment(builder, location, *value, predicate);
+      if (failed(projected))
+        return failure();
+      *value = *projected;
+    }
+  }
+  if (!lhs)
+    return rhs;
+  if (!rhs)
+    return lhs;
+  return Value(builder.create<BinaryOp>(location, predicate, lhs, rhs,
+                                        BinaryOperator::LogicalAnd));
+}
+
 LogicalResult composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
   if (!sourceType || !sourceLoad ||
       !isa<ViewType>(sourceLoad.getResource().getType()))
     return success();
-  if (sourceLoad.getValid() || sourceLoad.getFill())
-    return gather.emitOpError(
-        "cannot compose a source load with residual validity/fill");
   if (gather.getCoordinates().size() != gather.getSourceAxes().size())
     return gather.emitOpError("gather coordinate/source-axis schema is incomplete");
 
   SmallVector<Value> coordinates(sourceLoad.getCoordinates());
+  IRMapping replay;
+  PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
   for (auto [coordinate, sourceAxis] :
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (sourceAxis < 0 ||
@@ -81,13 +143,57 @@ LogicalResult composeLoadGather(GatherOp gather) {
     if (failed(target))
       return gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
+    Value original = sourceLoad.getCoordinates()[*target];
+    replay.map(original, coordinate);
+    PhysicalRangeFact roots = analysis.sourceRanges(original);
+    if (roots.isUnique() && !replay.lookupOrNull(roots.roots.front().getResult()))
+      replay.map(roots.roots.front().getResult(), coordinate);
     coordinates[*target] = coordinate;
   }
 
   OpBuilder builder(gather);
+  FailureOr<Value> sourceValid = replayFragmentValue(
+      builder, sourceLoad.getValid(), cast<FragmentType>(gather.getResult().getType()),
+      replay);
+  FailureOr<Value> sourceFill = replayFragmentValue(
+      builder, sourceLoad.getFill(), cast<FragmentType>(gather.getResult().getType()),
+      replay);
+  if (failed(sourceValid) || failed(sourceFill))
+    return gather.emitOpError(
+        "source access validity/fill cannot follow composed coordinates");
+  FailureOr<Value> valid = combinePredicates(
+      builder, gather.getLoc(), cast<FragmentType>(gather.getResult().getType()),
+      *sourceValid, gather.getValid());
+  if (failed(valid))
+    return gather.emitOpError(
+        "source and gather validity cannot share the composed result relation");
+  Value fill = *sourceFill;
+  if (sourceLoad.getValid() && gather.getValid()) {
+    Value gatherFill = gather.getFill();
+    if (!fill || !gatherFill)
+      return gather.emitOpError(
+          "composed conditional access requires both source and gather fill");
+    auto result = cast<FragmentType>(gather.getResult().getType());
+    if (fill.getType() != result)
+      fill = builder.create<BroadcastOp>(gather.getLoc(), result, fill);
+    if (gatherFill.getType() != result)
+      gatherFill =
+          builder.create<BroadcastOp>(gather.getLoc(), result, gatherFill);
+    Value condition = gather.getValid();
+    auto predicate = FragmentType::get(
+        result.getContext(), builder.getI1Type(), result.getShape(),
+        result.getAxisMaps(), result.getValidity(), result.getOwner());
+    if (condition.getType() != predicate)
+      condition =
+          builder.create<BroadcastOp>(gather.getLoc(), predicate, condition);
+    fill = builder.create<SelectOp>(gather.getLoc(), result, condition, fill,
+                                    gatherFill);
+  } else if (gather.getValid()) {
+    fill = gather.getFill();
+  }
   auto replacement = builder.create<LoadOp>(
       gather.getLoc(), gather.getResult().getType(), sourceLoad.getResource(),
-      coordinates, gather.getValid(), gather.getFill(),
+      coordinates, *valid, fill,
       sourceLoad.getSourceAxes());
   if (Attribute origin = sourceLoad->getAttr(originAttr))
     replacement->setAttr(originAttr, origin);

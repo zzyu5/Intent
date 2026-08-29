@@ -374,7 +374,7 @@ LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
   FailureOr<uint64_t> dimension =
       parameter ? parameterDimension(parameter)
                 : FailureOr<uint64_t>(failure());
-  if (failed(dimension) || failed(dimensionArgument(kernel, *dimension)))
+  if (failed(dimension))
     return failure();
   if (auto covered =
           parameter->getAttrOfType<IntegerAttr>(coverageDimensionAttr)) {
