@@ -182,33 +182,16 @@ FailureOr<Value> retargetBroadcast(OpBuilder &builder, Location location,
   return replacement->getResult(0);
 }
 
-bool dependsOnLoopCarry(Value root) {
-  SmallVector<Value> worklist{root};
-  llvm::SmallDenseSet<Value> visited;
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    if (auto argument = dyn_cast<BlockArgument>(current)) {
-      auto loop = dyn_cast_or_null<scf::ForOp>(
-          argument.getOwner()->getParentOp());
-      if (loop && argument != loop.getInductionVar())
-        return true;
-      // scf::ForOp invokes its body builder before the new operation is fully
-      // attached, so the parent op is not always queryable here.  Physical
-      // function arguments are views/scalars; a fragment/record block argument
-      // after the leading induction argument is therefore an in-construction
-      // loop carry and already owns the relation that the next state must keep.
-      if (argument.getArgNumber() > 0 &&
-          isa<gpu::FragmentType, gpu::RecordType>(argument.getType()))
-        return true;
-      continue;
-    }
-    if (Operation *definition = current.getDefiningOp())
-      worklist.append(definition->getOperands().begin(),
-                      definition->getOperands().end());
-  }
-  return false;
+bool carriesLogicalDimensions(gpu::FragmentType fragment,
+                              RankedTensorType logical) {
+  DenseI64ArrayAttr dimensions = dimensionIds(logical);
+  if (!dimensions ||
+      static_cast<size_t>(dimensions.size()) != fragment.getAxisMaps().size())
+    return false;
+  for (auto [axis, mapping] : llvm::enumerate(fragment.getAxisMaps()))
+    if (cast<gpu::AxisMapAttr>(mapping).getDimensionId() != dimensions[axis])
+      return false;
+  return true;
 }
 
 FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
@@ -245,14 +228,13 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
   auto rightLogical = dyn_cast_or_null<RankedTensorType>(logicalRhs);
   if (leftLogical && rightLogical &&
       dimensionIds(leftLogical) == dimensionIds(rightLogical) &&
-      left.getShape() == right.getShape() &&
       left.getOwner() == right.getOwner() &&
       left.getValidity() == right.getValidity()) {
-    bool leftCarry = dependsOnLoopCarry(lhs);
-    bool rightCarry = dependsOnLoopCarry(rhs);
-    if (leftCarry != rightCarry) {
-      Value &projected = leftCarry ? rhs : lhs;
-      gpu::FragmentType target = leftCarry ? left : right;
+    bool leftMatches = carriesLogicalDimensions(left, leftLogical);
+    bool rightMatches = carriesLogicalDimensions(right, rightLogical);
+    if (leftMatches != rightMatches) {
+      Value &projected = leftMatches ? rhs : lhs;
+      gpu::FragmentType target = leftMatches ? left : right;
       FailureOr<Value> aligned =
           retargetBroadcast(builder, location, projected, target);
       if (failed(aligned))

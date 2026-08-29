@@ -35,16 +35,11 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   if (failed(realizeRegionFolds(module)) ||
       failed(verifyGPUProgram(module)))
     return failure();
-  if (failed(realizeRegionScans(module)))
-    return failure();
-  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
-  if (failed(kernel) || failed(alignReductionIdentityRelations(*kernel)) ||
-      failed(alignAggregateValueRelations(*kernel)) ||
-      failed(alignPointwiseValueRelations(*kernel)) ||
-      failed(alignReductionYieldRelations(*kernel)) ||
+  if (failed(realizeRegionScans(module)) ||
       failed(verifyGPUProgram(module)))
     return failure();
-  if (failed(verifyGPUProgram(module)))
+  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
+  if (failed(kernel))
     return failure();
   if (failed(realizeContractionBlocking(module)) ||
       failed(alignAggregateValueRelations(*kernel)) ||

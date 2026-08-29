@@ -88,14 +88,16 @@ FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
                                         BinaryOperator::LogicalAnd));
 }
 
-LogicalResult composeLoadGather(GatherOp gather) {
+FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
   if (!sourceType || !sourceLoad ||
       !isa<ViewType>(sourceLoad.getResource().getType()))
-    return success();
-  if (gather.getCoordinates().size() != gather.getSourceAxes().size())
-    return gather.emitOpError("gather coordinate/source-axis schema is incomplete");
+    return false;
+  if (gather.getCoordinates().size() != gather.getSourceAxes().size()) {
+    gather.emitOpError("gather coordinate/source-axis schema is incomplete");
+    return failure();
+  }
 
   SmallVector<Value> coordinates(sourceLoad.getCoordinates());
   IRMapping replay;
@@ -103,18 +105,24 @@ LogicalResult composeLoadGather(GatherOp gather) {
   for (auto [coordinate, sourceAxis] :
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (sourceAxis < 0 ||
-        sourceAxis >= static_cast<int64_t>(sourceType.getShape().size()))
-      return gather.emitOpError("gather source axis is outside its loaded value");
+        sourceAxis >= static_cast<int64_t>(sourceType.getShape().size())) {
+      gather.emitOpError("gather source axis is outside its loaded value");
+      return failure();
+    }
     FailureOr<AxisMapAttr> mapping =
         queryAxisMap(sourceType, static_cast<unsigned>(sourceAxis));
-    if (failed(mapping))
-      return gather.emitOpError("gather source axis lost coordinate provenance");
+    if (failed(mapping)) {
+      gather.emitOpError("gather source axis lost coordinate provenance");
+      return failure();
+    }
     PhysicalAxisProjection target = queryCoordinateIndex(
         sourceLoad.getCoordinates(),
         PhysicalSourceAxis{mapping->getSourceId(), mapping->getSourceAxis()});
-    if (!target.isExact())
-      return gather.emitOpError(
+    if (!target.isExact() || target.dimensionId != mapping->getDimensionId()) {
+      gather.emitOpError(
           "loaded source coordinate cannot be composed with gather indexing");
+      return failure();
+    }
     Value original = sourceLoad.getCoordinates()[target.fragmentAxis];
     replay.map(original, coordinate);
     PhysicalRangeFact roots = analysis.sourceRanges(original);
@@ -130,21 +138,27 @@ LogicalResult composeLoadGather(GatherOp gather) {
   FailureOr<Value> sourceFill = replayFragmentValue(
       builder, sourceLoad.getFill(), cast<FragmentType>(gather.getResult().getType()),
       replay, analysis);
-  if (failed(sourceValid) || failed(sourceFill))
-    return gather.emitOpError(
+  if (failed(sourceValid) || failed(sourceFill)) {
+    gather.emitOpError(
         "source access validity/fill cannot follow composed coordinates");
+    return failure();
+  }
   FailureOr<Value> valid = combinePredicates(
       builder, gather.getLoc(), cast<FragmentType>(gather.getResult().getType()),
       *sourceValid, gather.getValid());
-  if (failed(valid))
-    return gather.emitOpError(
+  if (failed(valid)) {
+    gather.emitOpError(
         "source and gather validity cannot share the composed result relation");
+    return failure();
+  }
   Value fill = *sourceFill;
   if (sourceLoad.getValid() && gather.getValid()) {
     Value gatherFill = gather.getFill();
-    if (!fill || !gatherFill)
-      return gather.emitOpError(
+    if (!fill || !gatherFill) {
+      gather.emitOpError(
           "composed conditional access requires both source and gather fill");
+      return failure();
+    }
     auto result = cast<FragmentType>(gather.getResult().getType());
     if (fill.getType() != result)
       fill = builder.create<BroadcastOp>(gather.getLoc(), result, fill);
@@ -173,22 +187,22 @@ LogicalResult composeLoadGather(GatherOp gather) {
   gather.erase();
   if (sourceLoad->getBlock() && sourceLoad.getResult().use_empty())
     sourceLoad.erase();
-  return success();
+  return true;
 }
 
-LogicalResult composeIdentityFragmentGather(GatherOp gather) {
+FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
   if (!source || !result || gather.getCoordinates().size() != source.getShape().size() ||
       gather.getSourceAxes().size() != source.getShape().size() ||
       (gather.getValid() && !isTrue(gather.getValid())))
-    return success();
+    return false;
   SmallVector<bool> represented(result.getShape().size(), false);
   for (auto [coordinate, sourceAxis] :
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (sourceAxis < 0 ||
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
-      return success();
+      return false;
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     PhysicalSourceAxis physicalSource{expected.getSourceId(),
                                       expected.getSourceAxis()};
@@ -196,14 +210,21 @@ LogicalResult composeIdentityFragmentGather(GatherOp gather) {
         queryFragmentAxis(result, physicalSource);
     PhysicalAxisProjection coordinateAxis =
         queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
+    auto resultMapping =
+        resultAxis.isExact()
+            ? dyn_cast<AxisMapAttr>(result.getAxisMaps()[resultAxis.fragmentAxis])
+            : AxisMapAttr();
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-    if (!resultAxis.isExact() || !coordinateAxis.isExact() || !coordinateType ||
+    if (!resultAxis.isExact() || !coordinateAxis.isExact() || !resultMapping ||
+        resultMapping.getDimensionId() != expected.getDimensionId() ||
+        coordinateAxis.dimensionId != expected.getDimensionId() ||
+        !coordinateType ||
         source.getShape()[sourceAxis] !=
             result.getShape()[resultAxis.fragmentAxis] ||
         coordinateType.getShape().size() != 1 ||
         coordinateType.getShape()[0] != source.getShape()[sourceAxis] ||
         coordinateAxis.fragmentAxis != 0)
-      return success();
+      return false;
     represented[resultAxis.fragmentAxis] = true;
   }
   for (auto [axis, extent] : llvm::enumerate(result.getShape())) {
@@ -214,7 +235,7 @@ LogicalResult composeIdentityFragmentGather(GatherOp gather) {
         expression.getKind() !=
             static_cast<uint32_t>(PhysicalExprKind::Constant) ||
         expression.getValue() != 1)
-      return success();
+      return false;
   }
   OpBuilder builder(gather);
   auto replacement = builder.create<BroadcastOp>(
@@ -223,16 +244,16 @@ LogicalResult composeIdentityFragmentGather(GatherOp gather) {
     replacement->setAttr(originAttr, origin);
   gather.getResult().replaceAllUsesWith(replacement.getResult());
   gather.erase();
-  return success();
+  return true;
 }
 
-LogicalResult projectFragmentGather(GatherOp gather) {
+FailureOr<bool> projectFragmentGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
   if (!source || !result ||
       gather.getCoordinates().size() != source.getShape().size() ||
       gather.getSourceAxes().size() != source.getShape().size())
-    return success();
+    return false;
 
   SmallVector<Value> selectedCoordinates;
   SmallVector<int64_t> selectedAxes;
@@ -241,14 +262,14 @@ LogicalResult projectFragmentGather(GatherOp gather) {
        llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
     if (sourceAxis < 0 ||
         sourceAxis >= static_cast<int64_t>(source.getShape().size()))
-      return success();
+      return false;
     auto expected = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     PhysicalSourceAxis physicalSource{expected.getSourceId(),
                                       expected.getSourceAxis()};
     PhysicalAxisProjection resultAxis =
         queryFragmentAxis(result, physicalSource);
     if (resultAxis.state == PhysicalFactState::Ambiguous)
-      return success();
+      return false;
     if (!resultAxis.isExact()) {
       selectedCoordinates.push_back(coordinate);
       selectedAxes.push_back(sourceAxis);
@@ -256,18 +277,23 @@ LogicalResult projectFragmentGather(GatherOp gather) {
     }
     PhysicalAxisProjection coordinateAxis =
         queryCoordinateIndex(ValueRange{coordinate}, physicalSource);
+    auto resultMapping =
+        dyn_cast<AxisMapAttr>(result.getAxisMaps()[resultAxis.fragmentAxis]);
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-    if (!coordinateAxis.isExact() || !coordinateType ||
+    if (!coordinateAxis.isExact() || !resultMapping ||
+        resultMapping.getDimensionId() != expected.getDimensionId() ||
+        coordinateAxis.dimensionId != expected.getDimensionId() ||
+        !coordinateType ||
         coordinateType.getShape().size() != 1 ||
         source.getShape()[sourceAxis] !=
             result.getShape()[resultAxis.fragmentAxis] ||
         coordinateType.getShape()[0] != source.getShape()[sourceAxis] ||
         coordinateAxis.fragmentAxis != 0)
-      return success();
+      return false;
     projected = true;
   }
   if (!projected || selectedCoordinates.empty())
-    return success();
+    return false;
 
   OpBuilder builder(gather);
   auto replacement = builder.create<GatherOp>(
@@ -277,7 +303,7 @@ LogicalResult projectFragmentGather(GatherOp gather) {
     replacement->setAttr(originAttr, origin);
   gather.getResult().replaceAllUsesWith(replacement.getResult());
   gather.erase();
-  return success();
+  return true;
 }
 
 } // namespace
@@ -286,18 +312,35 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
-  SmallVector<GatherOp> gathers;
-  physicalKernel->walk([&](GatherOp gather) { gathers.push_back(gather); });
-  for (GatherOp gather : gathers)
-    if (gather->getBlock()) {
-      if (failed(composeIdentityFragmentGather(gather)))
+  bool changed;
+  do {
+    changed = false;
+    SmallVector<GatherOp> gathers;
+    physicalKernel->walk([&](GatherOp gather) { gathers.push_back(gather); });
+    for (GatherOp gather : gathers) {
+      if (!gather->getBlock())
+        continue;
+      FailureOr<bool> identity = composeIdentityFragmentGather(gather);
+      if (failed(identity))
         return failure();
-      if (gather->getBlock() && failed(projectFragmentGather(gather)))
+      if (*identity) {
+        changed = true;
+        continue;
+      }
+      FailureOr<bool> projection = projectFragmentGather(gather);
+      if (failed(projection))
         return failure();
-      if (gather->getBlock() && failed(composeLoadGather(gather)))
+      if (*projection) {
+        changed = true;
+        continue;
+      }
+      FailureOr<bool> load = composeLoadGather(gather);
+      if (failed(load))
         return failure();
+      changed |= *load;
     }
-  eraseDeadPhysicalValues(*physicalKernel);
+    eraseDeadPhysicalValues(*physicalKernel);
+  } while (changed);
   return success();
 }
 
