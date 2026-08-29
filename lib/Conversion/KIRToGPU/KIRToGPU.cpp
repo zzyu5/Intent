@@ -1996,6 +1996,37 @@ private:
           operation->getContext(), logicalTensor.getElementType(),
           builder.getArrayAttr(tailShape), builder.getArrayAttr(tailMappings),
           prototypeFragment.getValidity(), prototypeFragment.getOwner()));
+    } else if (logicalTensor) {
+      ArrayRef<int64_t> dimensions = relation.getResultDimensions();
+      if (dimensions.size() != static_cast<size_t>(logicalTensor.getRank()))
+        return failure();
+      SmallVector<Attribute> shape;
+      SmallVector<Attribute> mappings;
+      for (unsigned axis = 0; axis < dimensions.size(); ++axis) {
+        PhysicalExprAttr extent;
+        if (logicalTensor.isDynamicDim(axis)) {
+          FailureOr<PhysicalExprAttr> dynamicExtent =
+              fragmentExtentExpression(logicalTensor, operation, axis);
+          if (failed(dynamicExtent))
+            return failure();
+          extent = *dynamicExtent;
+        } else {
+          extent = expression(operation->getContext(),
+                              PhysicalExprKind::Constant,
+                              logicalTensor.getDimSize(axis));
+        }
+        FailureOr<uint64_t> identity =
+            resultAxisIdentity(operation, /*resultIndex=*/0, axis);
+        if (!extent || dimensions[axis] <= 0 || failed(identity))
+          return failure();
+        shape.push_back(extent);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            operation->getContext(), *identity, 0, dimensions[axis], axis));
+      }
+      converted = Type(gpu::FragmentType::get(
+          operation->getContext(), logicalTensor.getElementType(),
+          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
+          /*validity=*/1, liftedOwner));
     } else {
       converted = convertDataType(logical, operation, prototype);
     }
@@ -2055,8 +2086,6 @@ private:
     unsigned advancedRank =
         relation.getResultDimensions().size() - basicResultAxes;
     bool advancedMapped = false;
-    const bool externalView =
-        isa<intent::ViewType>(operation->getOperand(0).getType());
     auto resultDimension = [&](size_t axis) -> FailureOr<int64_t> {
       ArrayRef<int64_t> dimensions = relation.getResultDimensions();
       if (axis < liftedRank || axis - liftedRank >= dimensions.size())
@@ -2075,7 +2104,7 @@ private:
         shape[resultAxis] = source.getShape()[mapping.getFragmentAxis()];
         mappings.push_back(gpu::AxisMapAttr::get(
             operation->getContext(), mapping.getSourceId(),
-            mapping.getSourceAxis(), mapping.getDimensionId(), resultAxis++));
+            mapping.getSourceAxis(), *dimension, resultAxis++));
       }
       return success();
     };
@@ -2175,9 +2204,6 @@ private:
             if (auto mapping = advancedAxisMapping(axis)) {
               sourceId = mapping.getSourceId();
               sourceAxis = mapping.getSourceAxis();
-            } else if (*dimension > 0 && externalView) {
-              sourceId = static_cast<uint64_t>(*dimension);
-              sourceAxis = 0;
             } else {
               FailureOr<uint64_t> identity =
                   resultAxisIdentity(operation, /*resultIndex=*/0, resultAxis);
