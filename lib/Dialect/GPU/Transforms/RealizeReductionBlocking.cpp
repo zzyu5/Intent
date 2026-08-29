@@ -82,26 +82,6 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
   return false;
 }
 
-FailureOr<AxisMapAttr> axisMap(FragmentType fragment, unsigned axis) {
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    if (mapping.getFragmentAxis() == axis)
-      return mapping;
-  }
-  return failure();
-}
-
-FailureOr<int64_t> rangeDimension(MakeRangeOp range) {
-  return querySourceDimension(
-      range.getResult().getType(),
-      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
-}
-
-FailureOr<unsigned> coordinateForSource(ValueRange coordinates,
-                                        uint64_t sourceId) {
-  return queryCoordinateIndex(coordinates, sourceId);
-}
-
 MakeRangeOp sourceRange(Value value, std::optional<uint64_t> sourceId = std::nullopt) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
@@ -117,7 +97,8 @@ MakeRangeOp sourceRange(Value value, std::optional<uint64_t> sourceId = std::nul
   } else {
     fact = analysis.sourceRanges(value);
   }
-  return fact.isUnique() ? fact.roots.front() : MakeRangeOp();
+  FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+  return succeeded(range) ? *range : MakeRangeOp();
 }
 
 FailureOr<Value> scalarSource(Value value) {
@@ -144,38 +125,6 @@ bool sameScalarValue(Value lhs, Value rhs) {
   auto rightConstant = (*right).getDefiningOp<arith::ConstantOp>();
   return leftConstant && rightConstant &&
          leftConstant.getValue() == rightConstant.getValue();
-}
-
-bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
-  if (lhs == rhs)
-    return true;
-  if (depth >= 32 || lhs.getType() != rhs.getType())
-    return false;
-  FailureOr<Value> left = scalarSource(lhs);
-  FailureOr<Value> right = scalarSource(rhs);
-  if (succeeded(left) && succeeded(right) && (*left != lhs || *right != rhs))
-    return sameScalarExpression(*left, *right, depth + 1);
-  auto leftConstant = lhs.getDefiningOp<arith::ConstantOp>();
-  auto rightConstant = rhs.getDefiningOp<arith::ConstantOp>();
-  if (leftConstant || rightConstant)
-    return leftConstant && rightConstant &&
-           leftConstant.getValue() == rightConstant.getValue();
-  auto leftBinary = lhs.getDefiningOp<BinaryOp>();
-  auto rightBinary = rhs.getDefiningOp<BinaryOp>();
-  if (leftBinary || rightBinary)
-    return leftBinary && rightBinary &&
-           leftBinary.getOperatorKind() == rightBinary.getOperatorKind() &&
-           sameScalarExpression(leftBinary.getLhs(), rightBinary.getLhs(),
-                                depth + 1) &&
-           sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),
-                                depth + 1);
-  auto leftCast = lhs.getDefiningOp<CastOp>();
-  auto rightCast = rhs.getDefiningOp<CastOp>();
-  if (leftCast || rightCast)
-    return leftCast && rightCast &&
-           sameScalarExpression(leftCast.getValue(), rightCast.getValue(),
-                                depth + 1);
-  return false;
 }
 
 FragmentType replaceExtent(FragmentType source, unsigned axis,
@@ -486,19 +435,6 @@ bool isUnitStep(Value value) {
   return false;
 }
 
-bool sameLogicalSourceRange(MakeRangeOp lhs, MakeRangeOp rhs);
-
-FailureOr<MakeRangeOp> exactLogicalRange(const PhysicalRangeFact &fact) {
-  if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())
-    return failure();
-  MakeRangeOp first = fact.roots.front();
-  return llvm::all_of(fact.roots, [&](MakeRangeOp range) {
-           return sameLogicalSourceRange(first, range);
-         })
-             ? FailureOr<MakeRangeOp>(first)
-             : FailureOr<MakeRangeOp>(failure());
-}
-
 FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
   auto fragment = dyn_cast<FragmentType>(load.getResult().getType());
   if (!fragment)
@@ -510,7 +446,8 @@ FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
   std::optional<unsigned> fragmentAxis;
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     PhysicalRangeFact fact = analysis.axisRanges(load.getResult(), axis);
-    if (!fact.isUnique() || fact.roots.front() != reductionRange)
+    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+    if (failed(range) || !sameLogicalRange(*range, reductionRange))
       continue;
     if (fragmentAxis)
       return load.emitOpError(
@@ -541,12 +478,12 @@ FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
   }
   if (!coordinate) {
     FailureOr<unsigned> legacy =
-        coordinateForSource(load.getCoordinates(), reductionRange.getSourceId());
+        queryCoordinateIndex(load.getCoordinates(), reductionRange.getSourceId());
     if (succeeded(legacy)) {
       MakeRangeOp range =
           sourceRange(load.getCoordinates()[*legacy],
                       reductionRange.getSourceId());
-      if (range && sameLogicalSourceRange(range, reductionRange))
+      if (range && sameLogicalRange(range, reductionRange))
         coordinate = *legacy;
     }
   }
@@ -562,7 +499,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || reductionAxis >= fragment.getShape().size())
     return failure();
-  FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
+  FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
   if (failed(mapping))
     return failure();
   SourcePlan plan{source, mapping->getSourceId(), reductionAxis, {}, {}, {}};
@@ -578,12 +515,12 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
       repeatedOccurrence
           ? analysis.axisRanges(source, reductionAxis)
           : analysis.sourceRanges(source, physicalSource);
-  FailureOr<MakeRangeOp> authority = exactLogicalRange(fact);
+  FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
   if (failed(authority))
     return failure();
   plan.reductionRange = *authority;
   for (MakeRangeOp range : fact.roots)
-    if (sameLogicalSourceRange(plan.reductionRange, range) &&
+    if (sameLogicalRange(plan.reductionRange, range) &&
         !llvm::is_contained(plan.ranges, range))
       plan.ranges.push_back(range);
   for (Operation *access : fact.accesses)
@@ -909,37 +846,6 @@ FailureOr<Value> dimensionArgument(func::FuncOp kernel, int64_t dimension) {
   return failure();
 }
 
-void collectSourceRanges(Value value, uint64_t sourceId,
-                         SmallVectorImpl<MakeRangeOp> &ranges,
-                         llvm::SmallPtrSetImpl<Operation *> &visited) {
-  (void)visited;
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return;
-  PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value);
-  if (fact.state == PhysicalFactState::Unknown)
-    return;
-  for (MakeRangeOp range : fact.roots)
-    if (range.getSourceId() == sourceId && !llvm::is_contained(ranges, range))
-      ranges.push_back(range);
-}
-
-bool sameLogicalSourceRange(MakeRangeOp lhs, MakeRangeOp rhs) {
-  if (lhs.getSourceId() != rhs.getSourceId() ||
-      lhs.getSourceAxis() != rhs.getSourceAxis())
-    return false;
-  FailureOr<int64_t> leftDimension = rangeDimension(lhs);
-  FailureOr<int64_t> rightDimension = rangeDimension(rhs);
-  if (!lhs->hasAttr(sourceSubregionAttr) &&
-      !rhs->hasAttr(sourceSubregionAttr) && succeeded(leftDimension) &&
-      succeeded(rightDimension) && *leftDimension == *rightDimension)
-    return true;
-  return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
-         sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
-         sameScalarExpression(lhs.getStep(), rhs.getStep());
-}
-
 FailureOr<MakeRangeOp> uniqueSourceRange(func::FuncOp kernel,
                                          uint64_t sourceId) {
   MakeRangeOp result;
@@ -951,7 +857,7 @@ FailureOr<MakeRangeOp> uniqueSourceRange(func::FuncOp kernel,
       result = candidate;
       return;
     }
-    if (!sameLogicalSourceRange(result, candidate)) {
+    if (!sameLogicalRange(result, candidate)) {
       ambiguous = true;
       return;
     }
@@ -1068,7 +974,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     if (!fragment ||
         reductionAxis >= static_cast<int64_t>(fragment.getShape().size()))
       return false;
-    FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
+    FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
     if (failed(mapping))
       return false;
     PhysicalExprAttr current =
@@ -1095,7 +1001,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     for (MakeRangeOp candidate : fact.roots) {
       auto found = ranges.find(sourceId);
       if (found != ranges.end() &&
-          !sameLogicalSourceRange(found->second, candidate))
+          !sameLogicalRange(found->second, candidate))
         return false;
       ranges[sourceId] = candidate;
     }
@@ -1110,7 +1016,7 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
     return false;
   Value logicalExtent = range.getExtent();
   if (isCompileTimeValue(logicalExtent)) {
-    FailureOr<int64_t> sourceDimension = rangeDimension(range);
+    FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
     auto coverageDimension =
         (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr);
     if (range->hasAttr(sourceSubregionAttr) || failed(sourceDimension) ||
@@ -1247,7 +1153,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << ", dimension=" << dimension;
     MakeRangeOp authority = ranges.roots.front();
     if (!llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
-          return sameLogicalSourceRange(authority, range);
+          return sameLogicalRange(authority, range);
         }))
       return reduce.emitOpError(
                  "reduction free axis has conflicting physical range projections")
@@ -1711,7 +1617,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (failed(plan)) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       FailureOr<AxisMapAttr> mapping =
-          fragment ? axisMap(fragment, outerAxis)
+          fragment ? queryAxisMap(fragment, outerAxis)
                    : FailureOr<AxisMapAttr>(failure());
       llvm::SmallPtrSet<Operation *, 16> visited;
       if (!fragment || failed(mapping) ||
@@ -2007,13 +1913,13 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     }
     MakeRangeOp traversal;
     for (RootAccess access : roots) {
-      if (traversal && !sameLogicalSourceRange(traversal, access.range))
+      if (traversal && !sameLogicalRange(traversal, access.range))
         return reduce.emitOpError(
             "one reduction component has multiple physical source ranges");
       traversal = access.range;
     }
     for (MakeRangeOp range : plan.ranges) {
-      if (traversal && !sameLogicalSourceRange(traversal, range))
+      if (traversal && !sameLogicalRange(traversal, range))
         return reduce.emitOpError(
             "one reduction component has ambiguous range provenance");
       traversal = range;
@@ -2039,8 +1945,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         "runtime reduction source range has no exact logical end");
   for (MakeRangeOp range : traversalRanges) {
     FailureOr<Value> end = resolveLogicalRangeEnd(kernel, range);
-    if (!sameLogicalSourceRange(firstRange, range) || failed(end) ||
-        !sameScalarExpression(*firstEnd, *end))
+    if (!sameLogicalRange(firstRange, range) || failed(end) ||
+        !samePhysicalScalarExpression(*firstEnd, *end))
       return reduce.emitOpError(
           "runtime reduction components require one lockstep logical range");
   }
@@ -2078,7 +1984,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     chunk = getOrCreateParameter(kernel, name, ParameterRole::Reduction,
                                  candidates);
     if (chunk)
-      if (FailureOr<int64_t> dimension = rangeDimension(firstRange);
+      if (FailureOr<int64_t> dimension = queryRangeDimension(firstRange);
           succeeded(dimension))
         chunk->setAttr(dimensionAttr,
                        IntegerAttr::get(IntegerType::get(chunk.getContext(), 64),
@@ -2465,7 +2371,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       return unhandled("source has no physical reduction axis");
     FailureOr<SourcePlan> plan = analyzeSource(source, reductionAxis);
     if (failed(plan)) {
-      FailureOr<AxisMapAttr> mapping = axisMap(fragment, reductionAxis);
+      FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
       llvm::SmallPtrSet<Operation *, 16> visited;
       if (failed(mapping) ||
           !isReplayableWithoutLoad(source, mapping->getSourceId(), visited))

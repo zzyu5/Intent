@@ -97,6 +97,36 @@ void appendUnique(SmallVectorImpl<Operation *> &destination,
     destination.push_back(operation);
 }
 
+bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
+  if (lhs == rhs)
+    return true;
+  if (depth >= 32 || lhs.getType() != rhs.getType())
+    return false;
+  Value left = stripScalarIdentity(lhs);
+  Value right = stripScalarIdentity(rhs);
+  if (left != lhs || right != rhs)
+    return sameScalarExpression(left, right, depth + 1);
+  auto leftConstant = lhs.getDefiningOp<arith::ConstantOp>();
+  auto rightConstant = rhs.getDefiningOp<arith::ConstantOp>();
+  if (leftConstant || rightConstant)
+    return leftConstant && rightConstant &&
+           leftConstant.getValue() == rightConstant.getValue();
+  auto leftBinary = lhs.getDefiningOp<BinaryOp>();
+  auto rightBinary = rhs.getDefiningOp<BinaryOp>();
+  if (leftBinary || rightBinary)
+    return leftBinary && rightBinary &&
+           leftBinary.getOperatorKind() == rightBinary.getOperatorKind() &&
+           sameScalarExpression(leftBinary.getLhs(), rightBinary.getLhs(),
+                                depth + 1) &&
+           sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),
+                                depth + 1);
+  auto leftCast = lhs.getDefiningOp<CastOp>();
+  auto rightCast = rhs.getDefiningOp<CastOp>();
+  return leftCast && rightCast &&
+         sameScalarExpression(leftCast.getValue(), rightCast.getValue(),
+                              depth + 1);
+}
+
 } // namespace
 
 bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
@@ -146,6 +176,55 @@ PhysicalAxisProjection queryFragmentAxis(Type type,
   result.fragmentAxis = *axis;
   result.dimensionId = *dimension;
   return result;
+}
+
+FailureOr<AxisMapAttr> queryAxisMap(Type type, unsigned fragmentAxis) {
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment)
+    return failure();
+  for (Attribute attribute : fragment.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    if (mapping.getFragmentAxis() == fragmentAxis)
+      return mapping;
+  }
+  return failure();
+}
+
+FailureOr<int64_t> queryRangeDimension(MakeRangeOp range) {
+  return querySourceDimension(
+      range.getResult().getType(),
+      PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis()});
+}
+
+bool samePhysicalScalarExpression(Value lhs, Value rhs) {
+  return sameScalarExpression(lhs, rhs);
+}
+
+bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
+  if (!lhs || !rhs || lhs.getSourceId() != rhs.getSourceId() ||
+      lhs.getSourceAxis() != rhs.getSourceAxis())
+    return false;
+  FailureOr<int64_t> leftDimension = queryRangeDimension(lhs);
+  FailureOr<int64_t> rightDimension = queryRangeDimension(rhs);
+  if (!lhs->hasAttr(sourceSubregionAttr) &&
+      !rhs->hasAttr(sourceSubregionAttr) && succeeded(leftDimension) &&
+      succeeded(rightDimension) && *leftDimension == *rightDimension)
+    return true;
+  return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
+         sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
+         sameScalarExpression(lhs.getStep(), rhs.getStep());
+}
+
+FailureOr<MakeRangeOp>
+queryExactLogicalRange(const PhysicalRangeFact &fact) {
+  if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())
+    return failure();
+  MakeRangeOp first = fact.roots.front();
+  return llvm::all_of(fact.roots, [&](MakeRangeOp range) {
+           return sameLogicalRange(first, range);
+         })
+             ? FailureOr<MakeRangeOp>(first)
+             : FailureOr<MakeRangeOp>(failure());
 }
 
 SmallVector<PhysicalAxisProjection, 2>
@@ -748,6 +827,21 @@ void PhysicalProgramAnalysis::analyzeReplay(
     result.state = PhysicalFactState::Unknown;
     return;
   }
+  if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+    WalkResult helper = reduce.getCombine().walk([&](Operation *nested) {
+      if (isa<YieldOp, arith::ConstantOp>(nested))
+        return WalkResult::advance();
+      if (!isPhysicalReplayNode(nested, PhysicalReplayScope::Coordinate,
+                                /*allowAccesses=*/false)) {
+        appendUnique(result.blockers, nested);
+        result.state = PhysicalFactState::Unknown;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (helper.wasInterrupted())
+      return;
+  }
   if (operation->getNumRegions() != 0 && !isa<ReduceOp>(operation)) {
     appendUnique(result.blockers, operation);
     result.state = PhysicalFactState::Unknown;
@@ -802,20 +896,6 @@ bool PhysicalProgramAnalysis::isTailPredicate(
   Value lhs = stripBroadcast(comparison.getLhs());
   Value rhs = stripScalarIdentity(comparison.getRhs());
   MakeRangeOp predicateRange = lhs.getDefiningOp<MakeRangeOp>();
-  if (predicateRange) {
-    Value start = stripScalarIdentity(predicateRange.getStart());
-    Value extent = stripScalarIdentity(predicateRange.getExtent());
-    auto zero = integerConstant(start);
-    if (zero && *zero == 0 && rhs == extent)
-      return true;
-    auto stop = rhs.getDefiningOp<BinaryOp>();
-    if (stop && stop.getOperatorKind() == BinaryOperator::Add &&
-        ((stop.getLhs() == predicateRange.getStart() &&
-          stop.getRhs() == predicateRange.getExtent()) ||
-         (stop.getRhs() == predicateRange.getStart() &&
-          stop.getLhs() == predicateRange.getExtent())))
-      return true;
-  }
   return llvm::any_of(ranges, [&](const auto &entry) {
     MakeRangeOp expectedRange = entry.first;
     Value expectedEnd = stripScalarIdentity(entry.second);

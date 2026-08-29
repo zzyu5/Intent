@@ -72,6 +72,10 @@ mlir::FailureOr<unsigned>
 queryCoordinateIndex(mlir::ValueRange coordinates, uint64_t sourceId);
 PhysicalAxisProjection
 queryCoordinateIndex(mlir::ValueRange coordinates, PhysicalSourceAxis source);
+mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
+                                         unsigned fragmentAxis);
+mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
+bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
 
 /// All current-IR range roots that carry one requested source axis.
 struct PhysicalRangeFact {
@@ -84,6 +88,10 @@ struct PhysicalRangeFact {
   bool isExact() const { return state == PhysicalFactState::Exact; }
   bool isUnique() const { return isExact() && roots.size() == 1; }
 };
+
+bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs);
+mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
+    const PhysicalRangeFact &fact);
 
 /// Whether a value can be mechanically rebuilt after replacing one source
 /// range.  This is a fact about the current graph; it never performs cloning.
