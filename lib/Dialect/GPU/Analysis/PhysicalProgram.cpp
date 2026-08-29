@@ -326,28 +326,35 @@ bool PhysicalProgramAnalysis::carriesSource(Type type,
   return false;
 }
 
-Value PhysicalProgramAnalysis::structuredSourceForArgument(
+SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
     BlockArgument argument) const {
+  SmallVector<Value, 2> sources;
   Block *block = argument.getOwner();
   Operation *owner = block ? block->getParentOp() : nullptr;
   if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner)) {
     if (block == &fold.getSummarize().front() &&
         argument.getArgNumber() < fold.getSourceCount())
-      return fold.getInputs()[argument.getArgNumber()];
+      sources.push_back(fold.getInputs()[argument.getArgNumber()]);
+    return sources;
   }
   if (auto scan = dyn_cast_or_null<RegionScanOp>(owner)) {
     if (block == &scan.getSummarize().front() &&
         argument.getArgNumber() < scan.getSourceCount())
-      return scan.getInputs()[argument.getArgNumber()];
+      sources.push_back(scan.getInputs()[argument.getArgNumber()]);
+    return sources;
   }
   if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
     if (argument == loop.getInductionVar())
-      return {};
+      return sources;
     unsigned offset = argument.getArgNumber() - 1;
-    if (offset < loop.getInitArgs().size())
-      return loop.getInitArgs()[offset];
+    if (offset >= loop.getInitArgs().size())
+      return sources;
+    sources.push_back(loop.getInitArgs()[offset]);
+    if (auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+        yield && offset < yield.getResults().size())
+      sources.push_back(yield.getResults()[offset]);
   }
-  return {};
+  return sources;
 }
 
 void PhysicalProgramAnalysis::collectRanges(
@@ -371,12 +378,13 @@ void PhysicalProgramAnalysis::collectRanges(
   if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
-    Value outer = structuredSourceForArgument(argument);
-    if (!outer) {
+    SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
+    if (outer.empty()) {
       result.state = PhysicalFactState::Unknown;
       return;
     }
-    collectRanges(outer, source, result, visited);
+    for (Value related : outer)
+      collectRanges(related, source, result, visited);
     return;
   }
   Operation *operation = value.getDefiningOp();
@@ -449,14 +457,19 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   if (auto argument = dyn_cast<BlockArgument>(value)) {
-    Value outer = structuredSourceForArgument(argument);
-    auto outerFragment = outer ? dyn_cast<FragmentType>(outer.getType())
-                               : FragmentType();
-    if (!outerFragment || fragmentAxis >= outerFragment.getShape().size()) {
+    SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
+    bool followed = false;
+    for (Value related : outer) {
+      auto outerFragment = dyn_cast<FragmentType>(related.getType());
+      if (!outerFragment || fragmentAxis >= outerFragment.getShape().size())
+        continue;
+      followed = true;
+      collectAxisRanges(related, fragmentAxis, result, visited);
+    }
+    if (!followed) {
       result.state = PhysicalFactState::Unknown;
       return;
     }
-    collectAxisRanges(outer, fragmentAxis, result, visited);
     return;
   }
   Operation *operation = value.getDefiningOp();
@@ -702,12 +715,20 @@ void PhysicalProgramAnalysis::analyzeReplay(
   if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
-    Value outer = structuredSourceForArgument(argument);
-    if (!outer) {
+    Operation *owner = argument.getOwner()->getParentOp();
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner);
+        loop && argument != loop.getInductionVar()) {
+      appendUnique(result.blockers, loop);
       result.state = PhysicalFactState::Unknown;
       return;
     }
-    analyzeReplay(outer, source, scope, allowAccesses, result, visited);
+    SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
+    if (outer.empty()) {
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
+    for (Value related : outer)
+      analyzeReplay(related, source, scope, allowAccesses, result, visited);
     return;
   }
   Operation *operation = value.getDefiningOp();

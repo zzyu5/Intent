@@ -161,7 +161,8 @@ private:
                      PhysicalReplayScope scope, bool allowAccesses,
                      PhysicalReplayFact &result,
                      llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
-  mlir::Value structuredSourceForArgument(mlir::BlockArgument argument) const;
+  llvm::SmallVector<mlir::Value, 2>
+  structuredSourcesForArgument(mlir::BlockArgument argument) const;
   bool carriesSource(mlir::Type type, PhysicalSourceAxis source) const;
 
   mlir::func::FuncOp kernel;

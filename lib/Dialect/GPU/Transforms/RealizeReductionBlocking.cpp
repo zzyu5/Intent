@@ -2433,6 +2433,11 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     eraseDeadPhysicalValues(kernel);
     return success();
   }
+  // A fixed fragment already gives the first-class reduction a complete
+  // physical axis. Replaying its producer graph into another chunk loop would
+  // duplicate structured loop carries without adding a physical decision.
+  if (!required)
+    return success();
   FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
   if (failed(fullCoverage))
     return failure();
