@@ -36,6 +36,13 @@ mlir::LogicalResult
 alignPointwiseValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignAggregateValueRelations(mlir::func::FuncOp kernel);
+mlir::FailureOr<mlir::Value>
+projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
+                             mlir::Value value, mlir::Type target);
+mlir::LogicalResult
+alignReductionIdentityRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
+alignReductionYieldRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);

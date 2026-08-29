@@ -435,6 +435,137 @@ FailureOr<Value> materializeBroadcastToFragment(OpBuilder &builder,
   return Value(builder.create<BroadcastOp>(location, target, value));
 }
 
+FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
+                                              Location location, Value value,
+                                              Type target) {
+  if (value.getType() == target)
+    return value;
+  if (auto fragment = dyn_cast<FragmentType>(target)) {
+    Type sourceElement = value.getType();
+    if (auto source = dyn_cast<FragmentType>(sourceElement))
+      sourceElement = source.getElementType();
+    if (sourceElement != fragment.getElementType())
+      return failure();
+    Operation *projection = nullptr;
+    if (isa<IntegerType, FloatType, IndexType>(value.getType()))
+      projection = builder.create<SplatOp>(location, fragment, value);
+    else if (isa<FragmentType>(value.getType()))
+      projection = builder.create<BroadcastOp>(location, fragment, value);
+    if (!projection)
+      return failure();
+    if (Operation *definition = value.getDefiningOp())
+      if (Attribute origin = definition->getAttr(originAttr))
+        projection->setAttr(originAttr, origin);
+    return projection->getResult(0);
+  }
+  auto targetRecord = dyn_cast<RecordType>(target);
+  auto sourceRecord = dyn_cast<RecordType>(value.getType());
+  if (!targetRecord || !sourceRecord ||
+      sourceRecord.getFieldNames() != targetRecord.getFieldNames() ||
+      sourceRecord.getFieldTypes().size() !=
+          targetRecord.getFieldTypes().size())
+    return failure();
+  auto record = value.getDefiningOp<MakeRecordOp>();
+  SmallVector<Value> projectedFields;
+  for (auto [index, targetField] :
+       llvm::enumerate(targetRecord.getFieldTypes())) {
+    Type sourceType =
+        cast<TypeAttr>(sourceRecord.getFieldTypes()[index]).getValue();
+    Value field = record
+                      ? record.getFields()[index]
+                      : Value(builder.create<ExtractOp>(location, sourceType,
+                                                        value, index));
+    FailureOr<Value> projected = projectPhysicalValueToSchema(
+        builder, location, field, cast<TypeAttr>(targetField).getValue());
+    if (failed(projected))
+      return failure();
+    projectedFields.push_back(*projected);
+  }
+  auto projected =
+      builder.create<MakeRecordOp>(location, targetRecord, projectedFields);
+  if (Operation *definition = value.getDefiningOp())
+    if (Attribute origin = definition->getAttr(originAttr))
+      projected->setAttr(originAttr, origin);
+  return projected.getResult();
+}
+
+LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    auto align = [&](ValueRange inputs, ValueRange results, Region &combine,
+                     uint64_t sourceCount,
+                     uint64_t identityCount) -> LogicalResult {
+      if (identityCount != results.size())
+        return failure();
+      OpBuilder builder(operation);
+      for (unsigned index = 0; index < identityCount; ++index) {
+        unsigned operand = sourceCount + index;
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, operation->getLoc(), inputs[operand],
+            results[index].getType());
+        if (failed(projected))
+          return operation->emitOpError(
+              "physical reduction identity cannot adopt its result relation");
+        operation->setOperand(operand, *projected);
+      }
+      if (!llvm::hasSingleElement(combine) ||
+          combine.front().getNumArguments() < 2 * identityCount)
+        return operation->emitOpError(
+            "physical reduction helper has no complete accumulator schema");
+      for (unsigned index = 0; index < identityCount; ++index) {
+        Type target = results[index].getType();
+        combine.front().getArgument(index).setType(target);
+        combine.front().getArgument(identityCount + index).setType(target);
+      }
+      return success();
+    };
+    if (auto reduce = dyn_cast<ReduceOp>(operation))
+      return failed(align(reduce.getInputs(), reduce.getResults(),
+                          reduce.getCombine(),
+                          reduce.getSourceCount(), reduce.getIdentityCount()))
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    if (auto scan = dyn_cast<ScanOp>(operation))
+      return failed(align(scan.getInputs(), scan.getResults(), scan.getCombine(),
+                          scan.getSourceCount(), scan.getIdentityCount()))
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
+LogicalResult alignReductionYieldRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    Region *combine = nullptr;
+    ValueRange results;
+    if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      combine = &reduce.getCombine();
+      results = reduce.getResults();
+    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
+      combine = &scan.getCombine();
+      results = scan.getResults();
+    } else {
+      return WalkResult::advance();
+    }
+    if (!combine || !llvm::hasSingleElement(*combine))
+      return WalkResult::interrupt();
+    auto yield = dyn_cast<YieldOp>(combine->front().getTerminator());
+    if (!yield || yield.getValues().size() != results.size())
+      return WalkResult::interrupt();
+    OpBuilder builder(yield);
+    for (auto [index, target] : llvm::enumerate(results)) {
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, operation->getLoc(), yield.getValues()[index],
+          target.getType());
+      if (failed(projected))
+        return WalkResult::interrupt();
+      yield->setOperand(index, *projected);
+    }
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 FailureOr<Value> materializeZeroFragment(OpBuilder &builder,
                                          Location location,
                                          FragmentType target) {
@@ -558,9 +689,25 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
     FragmentType target;
     if (operation->getNumResults() == 1)
       target = dyn_cast<FragmentType>(operation->getResult(0).getType());
-    if (!target ||
-        !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
+    if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
             operation))
+      return WalkResult::advance();
+    if (!target && operation->getNumResults() == 1 &&
+        isa<IntegerType, FloatType, IndexType>(
+            operation->getResult(0).getType())) {
+      FragmentType prototype;
+      for (Value operand : operation->getOperands())
+        if ((prototype = dyn_cast<FragmentType>(operand.getType())))
+          break;
+      if (prototype) {
+        target = FragmentType::get(
+            kernel.getContext(), operation->getResult(0).getType(),
+            prototype.getShape(), prototype.getAxisMaps(),
+            prototype.getValidity(), prototype.getOwner());
+        operation->getResult(0).setType(target);
+      }
+    }
+    if (!target)
       return WalkResult::advance();
     for (unsigned index = 0; index < operation->getNumOperands(); ++index)
       if (failed(align(operation, index, target)))

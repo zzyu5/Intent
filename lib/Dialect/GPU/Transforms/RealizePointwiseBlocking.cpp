@@ -1244,8 +1244,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   func::FuncOp kernel = *physicalKernel;
   auto finalizeValueRelations = [&]() -> LogicalResult {
     if (failed(alignStructuredCaptureRelations(kernel)) ||
+        failed(alignReductionIdentityRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignPointwiseValueRelations(kernel)))
+        failed(alignPointwiseValueRelations(kernel)) ||
+        failed(alignReductionYieldRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();

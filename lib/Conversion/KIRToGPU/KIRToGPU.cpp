@@ -255,45 +255,8 @@ bool dependsOnLoopCarry(Value root) {
 
 FailureOr<Value> projectAccumulatorIdentity(OpBuilder &builder, Location location,
                                             Value identity, Type accumulator) {
-  if (identity.getType() == accumulator)
-    return identity;
-  if (auto target = dyn_cast<gpu::RecordType>(accumulator)) {
-    auto source = dyn_cast<gpu::RecordType>(identity.getType());
-    if (!source || source.getFieldNames() != target.getFieldNames() ||
-        source.getFieldTypes().size() != target.getFieldTypes().size())
-      return failure();
-    SmallVector<Value> fields;
-    auto record = identity.getDefiningOp<gpu::MakeRecordOp>();
-    for (auto [index, targetField] :
-         llvm::enumerate(target.getFieldTypes())) {
-      Type sourceType = cast<TypeAttr>(source.getFieldTypes()[index]).getValue();
-      Value field = record
-                        ? record.getFields()[index]
-                        : Value(builder.create<gpu::ExtractOp>(
-                              location, sourceType, identity, index));
-      FailureOr<Value> projected = projectAccumulatorIdentity(
-          builder, location, field, cast<TypeAttr>(targetField).getValue());
-      if (failed(projected))
-        return failure();
-      fields.push_back(*projected);
-    }
-    return Value(
-        builder.create<gpu::MakeRecordOp>(location, target, fields).getResult());
-  }
-  auto target = dyn_cast<gpu::FragmentType>(accumulator);
-  if (!target)
-    return failure();
-  if (identity.getType() == target.getElementType()) {
-    auto splat = builder.create<gpu::SplatOp>(location, target, identity);
-    if (Operation *definition = identity.getDefiningOp())
-      if (Attribute origin = definition->getAttr(gpu::originAttr))
-        splat->setAttr(gpu::originAttr, origin);
-    return splat.getResult();
-  }
-  auto source = dyn_cast<gpu::FragmentType>(identity.getType());
-  if (!source || source.getElementType() != target.getElementType())
-    return failure();
-  return retargetBroadcast(builder, location, identity, target);
+  return gpu::projectPhysicalValueToSchema(builder, location, identity,
+                                           accumulator);
 }
 
 LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,

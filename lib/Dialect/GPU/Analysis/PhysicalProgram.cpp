@@ -14,7 +14,7 @@ namespace {
 bool isCoordinateReplayNode(Operation *operation) {
   return isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
              BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
-             MakeRecordOp, ExtractOp>(operation);
+             MakeRecordOp, ExtractOp, RandomBitsOp>(operation);
 }
 
 bool isValueReplayNode(Operation *operation) {

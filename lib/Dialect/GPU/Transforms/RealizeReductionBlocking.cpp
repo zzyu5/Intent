@@ -449,7 +449,7 @@ bool isReplayableWithoutLoad(Value value, uint64_t sourceId,
     return false;
   PhysicalProgramAnalysis analysis(kernel);
   return analysis
-      .replayability(value, source.source, PhysicalReplayScope::Coordinate,
+      .replayability(value, source.source, PhysicalReplayScope::ValueGraph,
                      /*allowAccesses=*/false)
       .isReplayable();
 }
@@ -587,7 +587,7 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
     mapping.map(value, replayed.getResult());
     return replayed.getResult();
   }
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
                             /*allowAccesses=*/false))
     return failure();
   for (Value operand : producer->getOperands()) {
@@ -599,6 +599,13 @@ FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
       mapping.map(operand, *replayed);
   }
   Operation *clone = builder.clone(*producer, mapping);
+  if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
+    retargetHelperSourceExtent(
+        clonedReduce.getCombine(),
+        PhysicalSourceAxis{sourceId,
+                           cast<AxisMapAttr>(fragment.getAxisMaps()[*axis])
+                               .getSourceAxis()},
+        cast<PhysicalExprAttr>(fragment.getShape()[*axis]), blockedExtent);
   auto clonedType = cast<FragmentType>(clone->getResult(0).getType());
   FailureOr<unsigned> clonedAxis = axisForSource(clonedType, sourceId);
   if (failed(clonedAxis))
