@@ -295,14 +295,17 @@ FailureOr<unsigned> PhysicalProgramAnalysis::coordinateIndex(
 
 bool PhysicalProgramAnalysis::carriesSource(Type type,
                                             PhysicalSourceAxis source) const {
-  auto fragment = dyn_cast<FragmentType>(type);
-  if (!fragment)
-    return false;
-  return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    return mapping.getSourceId() == source.sourceId &&
-           mapping.getSourceAxis() == source.sourceAxis;
-  });
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      return mapping.getSourceId() == source.sourceId &&
+             mapping.getSourceAxis() == source.sourceAxis;
+    });
+  if (auto record = dyn_cast<RecordType>(type))
+    return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
+      return carriesSource(cast<TypeAttr>(field).getValue(), source);
+    });
+  return false;
 }
 
 Value PhysicalProgramAnalysis::structuredSourceForArgument(
@@ -335,6 +338,18 @@ void PhysicalProgramAnalysis::collectRanges(
     SmallPtrSetImpl<Operation *> &visited) {
   if (!value)
     return;
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      if (field >= record.getFields().size()) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, extract);
+        return;
+      }
+      collectRanges(record.getFields()[field], source, result, visited);
+      return;
+    }
+  }
   if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
@@ -396,7 +411,22 @@ void PhysicalProgramAnalysis::analyzeReplay(
     PhysicalReplayScope scope, bool allowAccesses,
     PhysicalReplayFact &result,
     SmallPtrSetImpl<Operation *> &visited) {
-  if (!value || (source && !carriesSource(value.getType(), *source)))
+  if (!value)
+    return;
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      uint64_t field = extract.getField();
+      if (field >= record.getFields().size()) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, extract);
+        return;
+      }
+      analyzeReplay(record.getFields()[field], source, scope, allowAccesses,
+                    result, visited);
+      return;
+    }
+  }
+  if (source && !carriesSource(value.getType(), *source))
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Value outer = structuredSourceForArgument(argument);
