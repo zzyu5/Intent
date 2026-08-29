@@ -388,6 +388,20 @@ void PhysicalProgramAnalysis::collectRanges(
       appendUnique(result.roots, range);
     return;
   }
+  if (auto scan = dyn_cast<ScanOp>(operation)) {
+    bool followed = false;
+    for (Value scanSource : scan.getInputs().take_front(scan.getSourceCount())) {
+      if (source && !carriesSource(scanSource.getType(), *source))
+        continue;
+      followed = true;
+      collectRanges(scanSource, source, result, visited);
+    }
+    if (!followed) {
+      appendUnique(result.blockers, operation);
+      result.state = PhysicalFactState::Unknown;
+    }
+    return;
+  }
   if (isAccessNode(operation))
     appendUnique(result.accesses, operation);
   if (!isValueReplayNode(operation) && !isAccessNode(operation)) {
@@ -453,6 +467,29 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       appendUnique(result.roots, range);
     else
       result.state = PhysicalFactState::Unknown;
+    return;
+  }
+  if (auto scan = dyn_cast<ScanOp>(operation)) {
+    auto expected =
+        cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+    bool followed = false;
+    for (Value scanSource : scan.getInputs().take_front(scan.getSourceCount())) {
+      auto sourceType = dyn_cast<FragmentType>(scanSource.getType());
+      if (!sourceType || fragmentAxis >= sourceType.getShape().size())
+        continue;
+      auto mapping =
+          cast<AxisMapAttr>(sourceType.getAxisMaps()[fragmentAxis]);
+      if (mapping.getSourceId() != expected.getSourceId() ||
+          mapping.getSourceAxis() != expected.getSourceAxis() ||
+          mapping.getDimensionId() != expected.getDimensionId())
+        continue;
+      followed = true;
+      collectAxisRanges(scanSource, fragmentAxis, result, visited);
+    }
+    if (!followed) {
+      result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, operation);
+    }
     return;
   }
   if (auto extract = dyn_cast<ExtractOp>(operation)) {

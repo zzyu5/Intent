@@ -397,6 +397,153 @@ LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
   return bindFullCoverageDimension(kernel, *dimension, parameter.getResult());
 }
 
+LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
+                                      uint64_t axis) {
+  auto fragment = dyn_cast<FragmentType>(source.getType());
+  if (!fragment || axis >= fragment.getShape().size())
+    return failure();
+  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+  if (!extent || extent.getKind() !=
+                     static_cast<uint32_t>(PhysicalExprKind::Dimension))
+    return requireFullDimensionCoverage(kernel, source, axis);
+  StringRef symbol = extent.getSymbol().getValue();
+  if (!symbol.consume_front("D"))
+    return failure();
+  uint64_t dimension = 0;
+  if (symbol.getAsInteger(10, dimension) ||
+      failed(dimensionArgument(kernel, dimension)))
+    return failure();
+  std::string parameterName = ("FULL_D" + Twine(dimension)).str();
+  ParameterOp parameter;
+  kernel.walk([&](ParameterOp candidate) {
+    if (!parameter &&
+        candidate.getParameter().getName().getValue() == parameterName)
+      parameter = candidate;
+  });
+  if (!parameter) {
+    static constexpr int64_t candidates[] = {
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    OpBuilder builder(&kernel.getBody().front(),
+                      kernel.getBody().front().begin());
+    auto schema = ParameterAttr::get(
+        kernel.getContext(), builder.getStringAttr(parameterName),
+        static_cast<uint32_t>(ParameterRole::ScanChunk),
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
+    parameter = builder.create<ParameterOp>(source.getLoc(),
+                                            builder.getIndexType(), schema);
+  }
+  parameter->setAttr(
+      dimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  parameter->setAttr(
+      coverageDimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  PhysicalExprAttr covered = fragmentExtent(parameter);
+  auto sourceMapping =
+      cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact sourceRanges = analysis.sourceRanges(
+      source, PhysicalSourceAxis{sourceMapping.getSourceId(),
+                                 sourceMapping.getSourceAxis()});
+  if (sourceRanges.state == PhysicalFactState::Unknown ||
+      sourceRanges.roots.empty())
+    sourceRanges = analysis.axisRanges(source, axis);
+  if (sourceRanges.state == PhysicalFactState::Unknown ||
+      sourceRanges.roots.empty()) {
+    PhysicalReplayFact replay = analysis.replayability(
+        source,
+        PhysicalSourceAxis{sourceMapping.getSourceId(),
+                           sourceMapping.getSourceAxis()},
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/false);
+    if (!sourceRanges.roots.empty() || !replay.isReplayable()) {
+      InFlightDiagnostic diagnostic = kernel.emitError(
+          "scan source has no exact full-coverage range authority");
+      diagnostic << "; source_type=" << source.getType();
+      for (Operation *blocker : sourceRanges.blockers)
+        diagnostic << ", blocker=" << blocker->getName();
+      return failure();
+    }
+  }
+  for (MakeRangeOp range : sourceRanges.roots) {
+    FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
+    if (failed(rangeIdentity) || *rangeIdentity != dimension ||
+        range->hasAttr(sourceSubregionAttr))
+      return range.emitOpError(
+          "scan source range does not match its full-coverage dimension");
+    retargetDimensionExtent(range.getResult(), dimension, covered);
+  }
+  retargetDimensionExtent(source, dimension, covered);
+  if (failed(
+          bindFullCoverageDimension(kernel, dimension, parameter.getResult())))
+    return kernel.emitError(
+        "scan source could not bind its exact full-coverage parameter");
+  return success();
+}
+
+LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
+                                                      Value source,
+                                                      uint64_t axis) {
+  auto fragment = dyn_cast<FragmentType>(source.getType());
+  if (!fragment || axis >= fragment.getShape().size())
+    return failure();
+  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+  if (!extent || extent.getKind() ==
+                     static_cast<uint32_t>(PhysicalExprKind::Constant))
+    return success();
+  auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+  int64_t dimension = mapping.getDimensionId();
+  if (dimension <= 0 ||
+      failed(dimensionArgument(kernel, static_cast<uint64_t>(dimension))))
+    return failure();
+  std::string parameterName = ("FULL_D" + Twine(dimension)).str();
+  ParameterOp parameter;
+  kernel.walk([&](ParameterOp candidate) {
+    if (!parameter &&
+        candidate.getParameter().getName().getValue() == parameterName)
+      parameter = candidate;
+  });
+  if (!parameter) {
+    static constexpr int64_t candidates[] = {
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
+    OpBuilder builder(&kernel.getBody().front(),
+                      kernel.getBody().front().begin());
+    auto schema = ParameterAttr::get(
+        kernel.getContext(), builder.getStringAttr(parameterName),
+        static_cast<uint32_t>(ParameterRole::Reduction),
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
+    parameter = builder.create<ParameterOp>(source.getLoc(),
+                                            builder.getIndexType(), schema);
+  }
+  parameter->setAttr(
+      dimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  parameter->setAttr(
+      coverageDimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalSourceAxis physicalSource{mapping.getSourceId(),
+                                    mapping.getSourceAxis()};
+  PhysicalRangeFact ranges = analysis.sourceRanges(source, physicalSource);
+  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty())
+    ranges = analysis.axisRanges(source, axis);
+  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty())
+    return failure();
+  PhysicalExprAttr covered = fragmentExtent(parameter);
+  for (MakeRangeOp range : ranges.roots) {
+    FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
+    if (failed(rangeIdentity) ||
+        *rangeIdentity != static_cast<uint64_t>(dimension) ||
+        range->hasAttr(sourceSubregionAttr))
+      return failure();
+    retargetDimensionExtent(range.getResult(), dimension, covered);
+  }
+  retargetDimensionExtent(source, dimension, covered);
+  if (failed(bindFullCoverageDimension(
+          kernel, static_cast<uint64_t>(dimension), parameter.getResult())))
+    return failure();
+  return success();
+}
+
 FragmentType predicateType(FragmentType source) {
   return FragmentType::get(source.getContext(), IntegerType::get(source.getContext(), 1),
                            source.getShape(), source.getAxisMaps(),
@@ -1293,7 +1440,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(alignReductionIdentityRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
         failed(alignPointwiseValueRelations(kernel)) ||
-        failed(alignReductionYieldRelations(kernel)))
+        failed(alignReductionYieldRelations(kernel)) ||
+        failed(alignAccessValueRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();
@@ -1481,7 +1629,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       collectAxisInto(source, scan.getAxis(), structuredTraversalRanges);
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
       scanCoverageFailed |=
-          failed(requireFullDimensionCoverage(kernel, source, scan.getAxis()));
+          failed(requireScanFullCoverage(kernel, source, scan.getAxis()));
     for (Value result : scan.getResults()) {
       llvm::SmallPtrSet<Operation *, 16> visited;
       collectStoreRanges(result, internalTraversalRanges, visited);
@@ -1490,6 +1638,36 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (scanCoverageFailed)
     return kernel.emitError(
         "dynamic scan axis has no launch-visible full-coverage realization");
+  SmallVector<std::pair<Value, uint64_t>> structuredReductionSources;
+  kernel.walk([&](ReduceOp reduce) {
+    for (Value source :
+         reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      if (!fragment)
+        continue;
+      for (int64_t axis : reduce.getAxes()) {
+        if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
+          continue;
+        auto mapping =
+            cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+            source,
+            PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()},
+            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true);
+        bool structuredBlocker = llvm::any_of(
+            replay.blockers, [](Operation *blocker) {
+              return isa<ScanOp, scf::ForOp>(blocker);
+            });
+        if (structuredBlocker)
+          structuredReductionSources.emplace_back(source,
+                                                   static_cast<uint64_t>(axis));
+      }
+    }
+  });
+  for (auto [source, axis] : structuredReductionSources)
+    if (failed(requireStructuredReductionFullCoverage(kernel, source, axis)))
+      return kernel.emitError(
+          "structured reduction source has no exact full-coverage realization");
   kernel.walk([&](HistogramOp histogram) {
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(histogram.getResult(), internalTraversalRanges, visited);

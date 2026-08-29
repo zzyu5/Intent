@@ -745,11 +745,18 @@ FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
       static_cast<uint32_t>(PhysicalExprKind::Parameter))
     return failure();
   StringRef name = extent.getSymbol().getValue();
-  StringRef identity = name;
-  uint64_t dimension = 0;
-  if (!identity.consume_front("FRAGMENT_D") ||
-      identity.getAsInteger(10, dimension))
+  ParameterOp parameter;
+  kernel.walk([&](ParameterOp candidate) {
+    if (candidate.getParameter().getName().getValue() == name)
+      parameter = candidate;
+  });
+  auto coverage = parameter
+                      ? parameter->getAttrOfType<IntegerAttr>(
+                            coverageDimensionAttr)
+                      : IntegerAttr();
+  if (!parameter || !coverage || coverage.getInt() <= 0)
     return failure();
+  uint64_t dimension = static_cast<uint64_t>(coverage.getInt());
   bool launchVisible = false;
   for (BlockArgument argument : kernel.getArguments()) {
     DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
@@ -759,13 +766,6 @@ FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
                      identity.getInt() == static_cast<int64_t>(dimension);
   }
   if (!launchVisible)
-    return failure();
-  ParameterOp parameter;
-  kernel.walk([&](ParameterOp candidate) {
-    if (candidate.getParameter().getName().getValue() == name)
-      parameter = candidate;
-  });
-  if (!parameter)
     return failure();
   static constexpr int64_t candidates[] = {
       1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
@@ -1078,12 +1078,17 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
                      static_cast<uint32_t>(PhysicalExprKind::Parameter))
     return false;
   llvm::DenseMap<uint64_t, MakeRangeOp> ranges;
+  PhysicalProgramAnalysis analysis(kernel);
   for (auto [source, sourceId] : llvm::zip(
            reduce.getInputs().take_front(reduce.getSourceCount()), sourceIds)) {
-    SmallVector<MakeRangeOp> candidates;
-    llvm::SmallPtrSet<Operation *, 32> visited;
-    collectSourceRanges(source, sourceId, candidates, visited);
-    for (MakeRangeOp candidate : candidates) {
+    auto fragment = cast<FragmentType>(source.getType());
+    auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[reductionAxis]);
+    PhysicalRangeFact fact = analysis.sourceRanges(
+        source,
+        PhysicalSourceAxis{mapping.getSourceId(), mapping.getSourceAxis()});
+    if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())
+      fact = analysis.axisRanges(source, reductionAxis);
+    for (MakeRangeOp candidate : fact.roots) {
       auto found = ranges.find(sourceId);
       if (found != ranges.end() &&
           !sameLogicalSourceRange(found->second, candidate))
