@@ -51,6 +51,7 @@ BroadcastProjection queryAxisProjection(FragmentType source,
     return result;
   result.targetToSource.resize(target.getShape().size());
   SmallVector<bool> sourceUsed(source.getShape().size(), false);
+  const unsigned offset = target.getShape().size() - source.getShape().size();
 
   auto bindUnique = [&](unsigned sourceIndex,
                         function_ref<bool(AxisMapAttr)> selects) {
@@ -59,20 +60,54 @@ BroadcastProjection queryAxisProjection(FragmentType source,
       if (result.targetToSource[targetIndex] ||
           !selects(cast<AxisMapAttr>(mapping)))
         continue;
-      if (selected) {
-        result.state = BroadcastProjectionState::Ambiguous;
-        return false;
-      }
-      selected = targetIndex;
+      if (!selected || targetIndex == offset + sourceIndex)
+        selected = targetIndex;
     }
     if (!selected)
       return true;
+    unsigned matches = llvm::count_if(
+        llvm::enumerate(target.getAxisMaps()), [&](auto item) {
+          return !result.targetToSource[item.index()] &&
+                 selects(cast<AxisMapAttr>(item.value()));
+        });
+    if (matches > 1 && *selected != offset + sourceIndex) {
+      result.state = BroadcastProjectionState::Ambiguous;
+      return false;
+    }
     result.targetToSource[*selected] = sourceIndex;
     sourceUsed[sourceIndex] = true;
     return true;
   };
 
+  // Broadcast semantics align source axes with the trailing target axes.  Use
+  // that explicit occurrence relation before source-identity matching: one
+  // logical source axis may legitimately occur more than once in a Cartesian
+  // result, and identity-first matching would let the wrong occurrence consume
+  // the positional target.  A non-singleton positional pair must still carry
+  // either the same immutable source or the same logical dimension.
   for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
+    unsigned targetIndex = offset + sourceIndex;
+    auto sourceAxis = cast<AxisMapAttr>(mapping);
+    auto targetAxis = cast<AxisMapAttr>(target.getAxisMaps()[targetIndex]);
+    auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[sourceIndex]);
+    bool singleton =
+        sourceExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        sourceExtent.getValue() == 1;
+    bool sameSource =
+        sourceAxis.getSourceId() == targetAxis.getSourceId() &&
+        sourceAxis.getSourceAxis() == targetAxis.getSourceAxis() &&
+        sourceAxis.getDerived() == targetAxis.getDerived();
+    if (!singleton && !sameSource &&
+        sourceAxis.getDimensionId() != targetAxis.getDimensionId())
+      continue;
+    result.targetToSource[targetIndex] = sourceIndex;
+    sourceUsed[sourceIndex] = true;
+  }
+
+  for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
+    if (sourceUsed[sourceIndex])
+      continue;
     auto sourceAxis = cast<AxisMapAttr>(mapping);
     if (!bindUnique(sourceIndex, [&](AxisMapAttr targetAxis) {
           return sourceAxis.getSourceId() == targetAxis.getSourceId() &&
@@ -115,10 +150,11 @@ BroadcastProjection queryAxisProjection(FragmentType source,
         }))
       return result;
   }
-  // Pointwise and explicit broadcast semantics align any still-unmatched axes
-  // from the trailing dimension.  This is only the axis relation: broadcast
-  // legality additionally checks equal extents or a singleton source below.
-  const unsigned offset = target.getShape().size() - source.getShape().size();
+  // Any remaining axes use the broadcast operation's explicit trailing-axis
+  // relation.  Typed positional pairs were consumed first so repeated source
+  // occurrences cannot steal one another's target; this final step also keeps
+  // physical rematerializations whose producer and consumer carry different
+  // derived source identities.
   for (unsigned sourceIndex = 0; sourceIndex < source.getShape().size();
        ++sourceIndex) {
     if (sourceUsed[sourceIndex])
