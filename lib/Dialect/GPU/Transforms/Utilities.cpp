@@ -234,7 +234,7 @@ void collectSelectedExtents(Type type, AxisSelector selects,
 bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   auto reshape = value.getDefiningOp<ReshapeOp>();
   auto result = dyn_cast<FragmentType>(value.getType());
-  if (!reshape || !result)
+  if (!result)
     return false;
   std::optional<unsigned> axis;
   for (Attribute attribute : result.getAxisMaps()) {
@@ -247,6 +247,39 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
   }
   if (!axis)
     return false;
+  auto extent = cast<PhysicalExprAttr>(result.getShape()[*axis]);
+  bool unit = extent.getKind() ==
+                  static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+              extent.getValue() == 1;
+  if (!unit)
+    return false;
+  if (!reshape) {
+    bool expanded = false;
+    for (Operation *user : value.getUsers()) {
+      auto broadcast = dyn_cast<BroadcastOp>(user);
+      if (!broadcast || broadcast.getValue() != value) {
+        if (llvm::any_of(user->getResultTypes(), [&](Type type) {
+              return carriesSelectedAxis(type, selects);
+            }))
+          return false;
+        continue;
+      }
+      auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
+      BroadcastProjection projection =
+          target ? queryAxisProjection(result, target) : BroadcastProjection();
+      if (!target || !projection.isExact())
+        return false;
+      std::optional<unsigned> targetAxis;
+      for (auto [candidate, sourceAxis] :
+           llvm::enumerate(projection.targetToSource))
+        if (sourceAxis && *sourceAxis == *axis)
+          targetAxis = candidate;
+      if (!targetAxis)
+        return false;
+      expanded |= target.getShape()[*targetAxis] != result.getShape()[*axis];
+    }
+    return expanded;
+  }
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   return !input || !llvm::any_of(input.getAxisMaps(), [&](Attribute attribute) {
            return selects(cast<AxisMapAttr>(attribute));
@@ -1372,6 +1405,21 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
   };
 
   WalkResult result = kernel.walk([&](Operation *operation) {
+    if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
+      auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
+      auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      if (!target || !source)
+        return WalkResult::advance();
+      FailureOr<FragmentType> refined =
+          refinePhysicalSchema(kernel, target, ValueRange{broadcast.getValue()});
+      if (failed(refined)) {
+        broadcast.emitOpError(
+            "broadcast result has no unique physical source projection");
+        return WalkResult::interrupt();
+      }
+      broadcast.getResult().setType(*refined);
+      return WalkResult::advance();
+    }
     FragmentType target;
     if (operation->getNumResults() == 1)
       target = dyn_cast<FragmentType>(operation->getResult(0).getType());
@@ -1708,7 +1756,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     if (followLogicalDimension) {
       Operation *definition = value.getDefiningOp();
       if (isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-                          BitcastOp>(definition)) {
+                          BitcastOp, ReshapeOp>(definition)) {
         worklist.append(definition->getOperands().begin(),
                         definition->getOperands().end());
       } else if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {

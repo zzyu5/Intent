@@ -811,6 +811,15 @@ void PhysicalProgramAnalysis::collectRanges(
       appendUnique(result.roots, range);
     return;
   }
+  // Reshape preserves the row-major coordinate relation carried by its
+  // reassociation groups.  Source-specific range queries follow that typed
+  // relation through the input instead of treating reshape as an opaque value
+  // producer.  Any genuinely incompatible roots remain ambiguous in
+  // sourceRanges(), where all collected ranges are compared.
+  if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+    collectRanges(reshape.getValue(), source, result, visited);
+    return;
+  }
   // These operations are typed coordinate leaves.  They do not contribute a
   // fragment range root, but reaching one is an exact end of provenance rather
   // than an unknown operation in the producer graph.

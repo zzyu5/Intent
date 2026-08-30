@@ -217,18 +217,49 @@ inferReshapeReassociation(FragmentType source, FragmentType result,
   unsigned resultBegin = 0;
   SmallVector<Attribute> groups;
   MLIRContext *context = source.getContext();
+  auto relationScore = [&](unsigned sourceBegin, unsigned sourceEnd,
+                           unsigned resultBegin, unsigned resultEnd) {
+    unsigned score = 0;
+    for (unsigned resultAxis = resultBegin; resultAxis < resultEnd;
+         ++resultAxis) {
+      auto resultMap = cast<AxisMapAttr>(
+          result.getAxisMaps()[resultPrefix + resultAxis]);
+      unsigned best = 0;
+      for (unsigned sourceAxis = sourceBegin; sourceAxis < sourceEnd;
+           ++sourceAxis) {
+        auto sourceMap = cast<AxisMapAttr>(
+            source.getAxisMaps()[sourcePrefix + sourceAxis]);
+        if (sourceMap.getSourceId() == resultMap.getSourceId() &&
+            sourceMap.getSourceAxis() == resultMap.getSourceAxis() &&
+            sourceMap.getDerived() == resultMap.getDerived()) {
+          best = 2;
+          break;
+        }
+        if (sourceMap.getDimensionId() > 0 &&
+            sourceMap.getDimensionId() == resultMap.getDimensionId())
+          best = std::max(best, 1u);
+      }
+      score += best;
+    }
+    return score;
+  };
   while (sourceBegin < sourceRank && resultBegin < resultRank) {
     std::optional<std::pair<unsigned, unsigned>> match;
+    unsigned bestScore = 0;
     for (unsigned sourceEnd = sourceBegin + 1;
-         sourceEnd <= sourceRank && !match; ++sourceEnd) {
+         sourceEnd <= sourceRank; ++sourceEnd) {
       for (unsigned resultEnd = resultBegin + 1;
            resultEnd <= resultRank; ++resultEnd) {
         if (!sameElementCount(
                 sourceShape.slice(sourceBegin, sourceEnd - sourceBegin),
                 resultShape.slice(resultBegin, resultEnd - resultBegin)))
           continue;
-        match = std::make_pair(sourceEnd, resultEnd);
-        break;
+        unsigned score =
+            relationScore(sourceBegin, sourceEnd, resultBegin, resultEnd);
+        if (!match || score > bestScore) {
+          match = std::make_pair(sourceEnd, resultEnd);
+          bestScore = score;
+        }
       }
     }
     if (!match)

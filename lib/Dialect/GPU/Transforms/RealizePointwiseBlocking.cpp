@@ -336,8 +336,38 @@ bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
   });
 }
 
-LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
-                                      uint64_t axis) {
+bool isZeroScanIdentity(Value value) {
+  while (true) {
+    if (auto splat = value.getDefiningOp<SplatOp>()) {
+      value = splat.getValue();
+      continue;
+    }
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+      value = broadcast.getValue();
+      continue;
+    }
+    if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+      value = reshape.getValue();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<CastOp>()) {
+      value = cast.getValue();
+      continue;
+    }
+    break;
+  }
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+    return integer.getValue().isZero();
+  if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
+    return floating.getValue().isZero();
+  return false;
+}
+
+LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
+                                      Value source, uint64_t axis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || axis >= fragment.getShape().size())
     return failure();
@@ -347,6 +377,50 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
   int64_t dimension = sourceMapping.getDimensionId();
   if (dimension <= 0)
     return requireFullDimensionCoverage(kernel, source, axis);
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact sourceRanges = analysis.axisRanges(source, axis);
+  if (sourceRanges.state == PhysicalFactState::Unknown ||
+      sourceRanges.roots.empty()) {
+    PhysicalReplayFact replay = analysis.replayability(
+        source, sourceAxisIdentity(sourceMapping),
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/false);
+    if (!sourceRanges.roots.empty() || !replay.isReplayable()) {
+      InFlightDiagnostic diagnostic = kernel.emitError(
+          "scan source has no exact full-coverage range authority");
+      diagnostic << "; source_type=" << source.getType();
+      for (Operation *blocker : sourceRanges.blockers)
+        diagnostic << ", blocker=" << blocker->getName();
+      return failure();
+    }
+  }
+  bool subregion = llvm::any_of(sourceRanges.roots, [](MakeRangeOp range) {
+    return range->hasAttr(sourceSubregionAttr);
+  });
+  if (subregion) {
+    if (scan.getSourceCount() != 1 || scan.getIdentityCount() != 1 ||
+        scan.getCaptureCount() != 0 ||
+        queryBinaryCombineKind(scan.getCombine()) != BinaryOperator::Add ||
+        !isZeroScanIdentity(
+            scan.getInputs()[scan.getSourceCount()]))
+      return scan.emitOpError(
+          "dynamic subregion scan has no proven tail-neutral combine");
+    auto chunkExtent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    if (chunkExtent.getKind() !=
+            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        chunkExtent.getValue() <= 0)
+      return scan.emitOpError(
+          "dynamic subregion scan has no static source bound");
+    PhysicalSourceAxis sourceAxis = sourceAxisIdentity(sourceMapping);
+    for (MakeRangeOp range : sourceRanges.roots) {
+      if (!range->hasAttr(sourceSubregionAttr) || !isUnitStepRange(range) ||
+          !(sourceAxisIdentity(range) == sourceAxis))
+        return range.emitOpError(
+            "subregion scan source has incompatible physical ranges");
+      retargetSourceExtent(range.getResult(), sourceAxis, chunkExtent);
+    }
+    retargetDimensionExtent(source, dimension, chunkExtent);
+    return success();
+  }
   if (failed(dimensionArgument(kernel, dimension)))
     return failure();
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
@@ -375,22 +449,6 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
       coverageDimensionAttr,
       IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
   PhysicalExprAttr covered = fragmentExtent(parameter);
-  PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact sourceRanges = analysis.axisRanges(source, axis);
-  if (sourceRanges.state == PhysicalFactState::Unknown ||
-      sourceRanges.roots.empty()) {
-    PhysicalReplayFact replay = analysis.replayability(
-        source, sourceAxisIdentity(sourceMapping),
-        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/false);
-    if (!sourceRanges.roots.empty() || !replay.isReplayable()) {
-      InFlightDiagnostic diagnostic = kernel.emitError(
-          "scan source has no exact full-coverage range authority");
-      diagnostic << "; source_type=" << source.getType();
-      for (Operation *blocker : sourceRanges.blockers)
-        diagnostic << ", blocker=" << blocker->getName();
-      return failure();
-    }
-  }
   for (MakeRangeOp range : sourceRanges.roots) {
     FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
     if (failed(rangeIdentity) ||
@@ -424,6 +482,14 @@ FragmentType predicateType(FragmentType source) {
                            source.getShape(), source.getAxisMaps(),
                            source.getValidity(),
                            source.getOwner());
+}
+
+bool tailPredicateProjectsTo(FragmentType target, MakeRangeOp range) {
+  if (range->hasAttr(sourceSubregionAttr))
+    return queryFragmentAxis(target, sourceAxisIdentity(range)).isExact();
+  FailureOr<int64_t> dimension = queryRangeDimension(range);
+  return succeeded(dimension) &&
+         queryFragmentDimension(target, *dimension).isExact();
 }
 
 void collectCoordinateRanges(Value coordinate,
@@ -462,7 +528,8 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
       if (!range)
         continue;
       auto found = rangePredicates.find(range.getResult());
-      if (found == rangePredicates.end())
+      if (found == rangePredicates.end() ||
+          !tailPredicateProjectsTo(target, range))
         continue;
       FailureOr<Value> broadcast =
           materializeBroadcastToFragment(builder, location, found->second, target);
@@ -1333,13 +1400,17 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges) {
   auto kernel = coordinate.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
+  auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+  if (!kernel || !fragment)
     return;
-  PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).sourceRanges(coordinate);
-  if (fact.state == PhysicalFactState::Unknown)
-    return;
-  for (MakeRangeOp range : fact.roots)
-    ranges.insert(range.getOperation());
+  PhysicalProgramAnalysis analysis(kernel);
+  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+    PhysicalRangeFact fact = analysis.axisRanges(coordinate, axis);
+    if (fact.state != PhysicalFactState::Exact)
+      continue;
+    for (MakeRangeOp range : fact.roots)
+      ranges.insert(range.getOperation());
+  }
 }
 
 void collectStoreRanges(Value value, llvm::SmallPtrSetImpl<Operation *> &ranges,
@@ -1661,12 +1732,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       dynamicRanges.push_back(range);
       return;
     }
-    if (ownershipOnly &&
-        PhysicalProgramAnalysis(kernel)
+    if (PhysicalProgramAnalysis(kernel)
             .axisRealization(range.getResult(), 0)
             .constructionScalarSeed) {
-      dynamicRanges.push_back(range);
-      return;
+      bool launchVisible = false;
+      if (FailureOr<uint64_t> dimension = rangeDimension(range);
+          succeeded(dimension))
+        launchVisible = succeeded(dimensionArgument(kernel, *dimension));
+      if (ownershipOnly || launchVisible) {
+        dynamicRanges.push_back(range);
+        return;
+      }
     }
     if (!ownershipOnly ||
         !range.getExtent().getDefiningOp<arith::ConstantIndexOp>())
@@ -1813,7 +1889,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       collectAxisInto(source, scan.getAxis(), structuredTraversalRanges);
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
       scanCoverageFailed |=
-          failed(requireScanFullCoverage(kernel, source, scan.getAxis()));
+          failed(requireScanFullCoverage(kernel, scan, source, scan.getAxis()));
   });
   if (scanCoverageFailed)
     return kernel.emitError(
@@ -1903,7 +1979,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
       PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
-                              range.getDerived()};
+                                       range.getDerived()};
       if (structuredTraversalRanges.contains(range.getOperation()) &&
           !reductionTraversalRanges.contains(range.getOperation()))
         continue;
@@ -1934,6 +2010,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (reuseTraversalRanges.contains(range.getOperation()) &&
           !llvm::is_contained(dynamicRanges, range))
         dynamicRanges.push_back(range);
+  llvm::SmallPtrSet<Operation *, 16> writeTraversalRanges;
   for (Operation *operation : structuredTraversalRanges) {
     auto range = dyn_cast<MakeRangeOp>(operation);
     bool writeOwnership = range && llvm::any_of(candidateStores, [&](StoreOp store) {
@@ -1942,6 +2019,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                storeUsesRange(store, candidate);
       });
     });
+    if (writeOwnership)
+      writeTraversalRanges.insert(operation);
     if (reductionTraversalRanges.contains(operation) || !writeOwnership)
       internalTraversalRanges.insert(operation);
   }
@@ -1953,6 +2032,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
              extent.getKind() ==
                  static_cast<uint32_t>(PhysicalExprKind::Constant);
     });
+  {
+    llvm::SmallPtrSet<Operation *, 32> seen;
+    llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
+      return !seen.insert(range.getOperation()).second;
+    });
+  }
   if (!ownershipOnly) {
     SmallVector<MakeRangeOp> unresolved;
     for (MakeRangeOp range : dynamicRanges) {
@@ -1975,12 +2060,23 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     dynamicRanges = std::move(unresolved);
     unresolved.clear();
     for (MakeRangeOp range : dynamicRanges) {
-      if (reuseTraversalRanges.contains(range.getOperation())) {
+      auto fragment = cast<FragmentType>(range.getResult().getType());
+      auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+      if (PhysicalProgramAnalysis(kernel)
+              .axisRealization(range.getResult(), 0)
+              .constructionScalarSeed) {
         unresolved.push_back(range);
         continue;
       }
-      auto fragment = cast<FragmentType>(range.getResult().getType());
-      auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+      const bool fixedSubregion =
+          range->hasAttr(sourceSubregionAttr) &&
+          physicalExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant);
+      if (!fixedSubregion &&
+          reuseTraversalRanges.contains(range.getOperation())) {
+        unresolved.push_back(range);
+        continue;
+      }
       if (physicalExtent.getKind() !=
           static_cast<uint32_t>(PhysicalExprKind::Constant)) {
         unresolved.push_back(range);
@@ -2021,6 +2117,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   if (!ownershipOnly)
     llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
       return structuredTraversalRanges.contains(range.getOperation()) &&
+             !writeTraversalRanges.contains(range.getOperation()) &&
              !reuseTraversalRanges.contains(range.getOperation());
     });
   if (!ownershipOnly) {
@@ -2076,10 +2173,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       reuseTraversalRanges.erase(range.getOperation());
       internalTraversalRanges.insert(range.getOperation());
     }
-    eraseDeadPhysicalValues(kernel);
     llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
-      return llvm::is_contained(realized, range);
+      return llvm::any_of(realized, [&](MakeRangeOp realizedRange) {
+        return sameLogicalRange(range, realizedRange);
+      });
     });
+    eraseDeadPhysicalValues(kernel);
     llvm::erase_if(dynamicRanges, [](MakeRangeOp range) {
       return !range->getBlock() || range.getResult().use_empty();
     });
@@ -2293,10 +2392,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           dynamicRanges.push_back(range);
       }
   }
+  SmallVector<MakeRangeOp> fullCoverageRanges;
   if (!ownershipOnly)
     for (MakeRangeOp range : dynamicRanges) {
       if (!internalTraversalRanges.contains(range.getOperation()) ||
-          structuredTraversalRanges.contains(range.getOperation()) ||
+          (structuredTraversalRanges.contains(range.getOperation()) &&
+           !writeTraversalRanges.contains(range.getOperation())) ||
           reductionFreeRanges.contains(range.getOperation()) ||
           reuseTraversalRanges.contains(range.getOperation()))
         continue;
@@ -2305,7 +2406,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    "internal pointwise traversal has no exact full-coverage realization")
                << "; source_id=" << range.getSourceId()
                << ", fragment=" << range.getResult().getType();
+      fullCoverageRanges.push_back(range);
     }
+  llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
+    return llvm::is_contained(fullCoverageRanges, range);
+  });
   for (MakeRangeOp range : dynamicRanges) {
     if (ownershipOnly &&
         internalTraversalRanges.contains(range.getOperation())) {

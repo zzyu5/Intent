@@ -19,6 +19,13 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+void inheritRangeAuthority(Operation *target, MakeRangeOp source) {
+  for (StringRef name :
+       {originAttr, sourceSubregionAttr, worksetCoordinateRangeAttr})
+    if (Attribute value = source->getAttr(name))
+      target->setAttr(name, value);
+}
+
 PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
                             int64_t value = 0, StringRef symbol = {},
                             ArrayRef<Attribute> operands = {}) {
@@ -244,8 +251,7 @@ FailureOr<Value> clonePaddedProducer(
         location, paddedType, range.getStart(), physicalExtentValue,
         range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
-    if (Attribute origin = range->getAttr(originAttr))
-      padded->setAttr(originAttr, origin);
+    inheritRangeAuthority(padded, range);
     Value logicalLength = builder.create<arith::ConstantIndexOp>(
         location, logicalExtent.getValue());
     Value distance = builder.create<BinaryOp>(
@@ -1724,8 +1730,10 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     for (RootAccess access : component) {
       if (access.range.getSourceId() != master->range.getSourceId() ||
           access.range.getSourceAxis() != master->range.getSourceAxis() ||
-          !sameScalarValue(access.range.getStart(), master->range.getStart()) ||
-          !sameScalarValue(access.range.getExtent(), master->range.getExtent()) ||
+          !sameScalarValue(access.range.getLogicalStart(),
+                           master->range.getLogicalStart()) ||
+          !sameScalarValue(access.range.getLogicalStop(),
+                           master->range.getLogicalStop()) ||
           !sameScalarValue(access.range.getStep(), master->range.getStep()))
         return reduce.emitOpError(
             "multi-axis reduction components do not share one exact outer traversal");
@@ -1762,13 +1770,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       expression(reduce.getContext(), PhysicalExprKind::Constant, 1);
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
-  Value stop = builder.create<BinaryOp>(
-      location, builder.getIndexType(), master->range.getStart(),
-      master->range.getExtent(), BinaryOperator::Add);
   bool bodyFailed = false;
   std::string failureReason;
   auto loop = builder.create<scf::ForOp>(
-      location, master->range.getStart(), stop, master->range.getStep(), identities,
+      location, master->range.getLogicalStart(),
+      master->range.getLogicalStop(), master->range.getStep(), identities,
       [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
           ValueRange carries) {
         SmallVector<Value> innerSources;
@@ -1811,8 +1817,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                     range.getExtent(), range.getStep(), range.getLogicalStart(),
                     range.getLogicalStop(), range.getSourceId(),
                     range.getSourceAxis(), range.getDerived());
-                if (Attribute value = range->getAttr(sourceSubregionAttr))
-                  clone->setAttr(sourceSubregionAttr, value);
+                inheritRangeAuthority(clone, range);
                 mapping.map(range.getResult(), clone.getResult());
               }
               auto rangeType = cast<FragmentType>(range.getResult().getType());
@@ -1889,17 +1894,23 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             return;
           }
           FragmentType squeezed = eraseFragmentAxis(sliced, outerAxis);
-          FailureOr<ArrayAttr> reassociation =
-              inferReshapeReassociation(sliced, squeezed);
-          if (failed(reassociation)) {
-            bodyFailed = true;
-            failureReason =
-                "outer-axis source has no exact row-major reassociation";
-            return;
+          SmallVector<Attribute> reassociation;
+          unsigned resultAxis = 0;
+          for (unsigned sourceAxis = 0;
+               sourceAxis < sliced.getShape().size(); ++sourceAxis) {
+            SmallVector<int64_t> resultAxes;
+            if (sourceAxis != outerAxis)
+              resultAxes.push_back(resultAxis++);
+            reassociation.push_back(ReshapeGroupAttr::get(
+                reduce.getContext(),
+                DenseI64ArrayAttr::get(
+                    reduce.getContext(),
+                    {static_cast<int64_t>(sourceAxis)}),
+                DenseI64ArrayAttr::get(reduce.getContext(), resultAxes)));
           }
           innerSources.push_back(nested.create<ReshapeOp>(
               nestedLocation, squeezed, *replayed,
-              *reassociation));
+              ArrayAttr::get(reduce.getContext(), reassociation)));
         }
         if (bodyFailed)
           return;
@@ -2130,6 +2141,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             firstRange.getStep(), firstRange.getLogicalStart(),
             firstRange.getLogicalStop(), firstRange.getSourceId(),
             firstRange.getSourceAxis(), firstRange.getDerived());
+        inheritRangeAuthority(masterCoordinate.getDefiningOp(), firstRange);
         Value masterEnd = nested.create<BroadcastOp>(nestedLocation,
                                                      blockedMaster, stop);
         auto masterPredicate = FragmentType::get(
@@ -2167,8 +2179,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 chunk.getResult(), range.getStep(), range.getLogicalStart(),
                 range.getLogicalStop(), range.getSourceId(),
                 range.getSourceAxis(), range.getDerived());
-            if (Attribute value = range->getAttr(sourceSubregionAttr))
-              coordinate->setAttr(sourceSubregionAttr, value);
+            inheritRangeAuthority(coordinate, range);
             mapping.map(range.getResult(), coordinate.getResult());
             Value end = nested.create<BroadcastOp>(nestedLocation,
                                                    blockedCoordinate, stop);
@@ -2208,6 +2219,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 nestedLocation, blockedCoordinate, chunkStart, chunk.getResult(),
                 range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
                 range.getSourceId(), range.getSourceAxis(), range.getDerived());
+            inheritRangeAuthority(coordinate.getDefiningOp(), range);
             if (!mapping.lookupOrNull(range.getResult())) {
               auto originalCoordinate = range.getResult().getType();
               auto replayCoordinate = FragmentType::get(
@@ -2563,6 +2575,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         reduce.getLoc(), blockedCoordinate, range.getStart(), physicalExtent,
         range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
+    inheritRangeAuthority(coordinate.getDefiningOp(), range);
     Value stop = builder.create<BinaryOp>(
         reduce.getLoc(), builder.getIndexType(), range.getStart(),
         range.getExtent(), BinaryOperator::Add);

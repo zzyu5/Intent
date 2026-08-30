@@ -2181,15 +2181,21 @@ private:
         unsigned localAxis = advancedAxis - alignedStart;
         if (localAxis >= static_cast<unsigned>(logical.getRank()))
           continue;
-        const int64_t logicalDimension = logicalDimensions[localAxis];
-        if (logicalDimension <= 0)
+        // A singleton advanced-index operand is broadcast along this result
+        // axis and therefore carries no coordinate variation for it.  Let the
+        // non-singleton operand provide the axis relation instead of treating
+        // the two broadcast operands as conflicting coordinate authorities.
+        if (!logical.isDynamicDim(localAxis) &&
+            logical.getDimSize(localAxis) == 1)
+          continue;
+        if (logicalDimensions[localAxis] <= 0 ||
+            source.getShape().size() <
+                static_cast<unsigned>(logical.getRank()))
           return {};
-        gpu::PhysicalDimensionProjection projection =
-            gpu::queryFragmentDimension(source, logicalDimension);
-        if (!projection.isExact())
-          return {};
+        unsigned physicalAxis =
+            source.getShape().size() - logical.getRank() + localAxis;
         auto mapping = cast<gpu::AxisMapAttr>(
-            source.getAxisMaps()[projection.fragmentAxis]);
+            source.getAxisMaps()[physicalAxis]);
         auto sameMapping = [](gpu::AxisMapAttr lhs, gpu::AxisMapAttr rhs) {
           return lhs.getSourceId() == rhs.getSourceId() &&
                  lhs.getSourceAxis() == rhs.getSourceAxis() &&
@@ -2473,9 +2479,17 @@ private:
       }
       auto logical = subregion.getResult().getType();
       auto sourceRange = cast<gpu::RangeType>((*source).getType());
+      if (subregion.getExtentDimensions().size() != 1)
+        return subregion.emitOpError(
+            "physical subregion requires one logical extent identity");
+      int64_t extentDimension =
+          cast<IntegerAttr>(subregion.getExtentDimensions()[0]).getInt();
+      if (extentDimension <= 0)
+        return subregion.emitOpError(
+            "physical subregion has no logical extent identity");
       auto type = gpu::RangeType::get(
           operation->getContext(), logical.getSourceId(), 0,
-          sourceRange.getDimensionId(), sourceRange.getDerived());
+          extentDimension, sourceRange.getDerived());
       auto target =
           builder.create<gpu::RangeOp>(location, type, start, stop, step);
       target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
