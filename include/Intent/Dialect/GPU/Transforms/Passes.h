@@ -92,6 +92,9 @@ mlir::FailureOr<mlir::Value> materializeRetargetedValidity(
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 void eraseDeadPhysicalValues(mlir::func::FuncOp kernel);
 void eraseUnusedPhysicalParameters(mlir::func::FuncOp kernel);
+mlir::LogicalResult replacePhysicalParameter(mlir::func::FuncOp kernel,
+                                             ParameterOp previous,
+                                             ParameterOp replacement);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);

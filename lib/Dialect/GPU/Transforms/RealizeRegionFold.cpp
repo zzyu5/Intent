@@ -1129,7 +1129,7 @@ struct PredicatePartition {
 FailureOr<PredicatePartition>
 predicatePartition(OpBuilder &builder, RegionFoldOp fold,
                    ArrayRef<SourcePlan> plans, MakeRangeOp master,
-                   ValueRange identities, Value segment) {
+                   Value masterExtent, ValueRange identities, Value segment) {
   auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
   if (!yield || yield.getValues().size() != identities.size())
     return failure();
@@ -1200,7 +1200,7 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
         location, builder.getIndexType(), relativeUpper, zero,
         BinaryOperator::Maximum);
     Value effectiveStop = builder.create<BinaryOp>(
-        location, builder.getIndexType(), master.getExtent(), nonNegative,
+        location, builder.getIndexType(), masterExtent, nonNegative,
         BinaryOperator::Minimum);
     Value relativeStart = builder.create<BinaryOp>(
         location, builder.getIndexType(), captureRange.getStart(),
@@ -1209,7 +1209,7 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
         location, builder.getIndexType(), relativeStart, zero,
         BinaryOperator::Maximum);
     Value boundedStart = builder.create<BinaryOp>(
-        location, builder.getIndexType(), master.getExtent(), nonNegativeStart,
+        location, builder.getIndexType(), masterExtent, nonNegativeStart,
         BinaryOperator::Minimum);
     Value wholeSegments = builder.create<BinaryOp>(
         location, builder.getIndexType(), boundedStart, segment,
@@ -1291,7 +1291,13 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   OpBuilder builder(fold);
   Location location = fold.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  Value stop = master.getExtent();
+  FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, master);
+  if (failed(logicalEnd))
+    return fold.emitOpError(
+        "region-fold traversal has no exact logical upper bound");
+  Value stop = builder.create<BinaryOp>(
+      location, builder.getIndexType(), *logicalEnd, master.getStart(),
+      BinaryOperator::Subtract);
   PhysicalExprAttr sliceExtent = parameterExtent(fold.getSegment());
   SmallVector<Value> identities(
       fold.getInputs()
@@ -1303,7 +1309,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   ValueRange captures = fold.getInputs().drop_front(
       fold.getSourceCount() + fold.getIdentityCount());
   FailureOr<PredicatePartition> partition = predicatePartition(
-      builder, fold, plans, master, identities, segment.getResult());
+      builder, fold, plans, master, stop, identities, segment.getResult());
   Value memberPredicate =
       summaryMembershipPredicate(fold, identities, fold.getSegment());
   if (!memberPredicate)
@@ -1514,10 +1520,17 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   OpBuilder builder(scan);
   Location location = scan.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, master);
+  if (failed(logicalEnd))
+    return scan.emitOpError(
+        "region-scan traversal has no exact logical upper bound");
+  Value traversalExtent = builder.create<BinaryOp>(
+      location, builder.getIndexType(), *logicalEnd, master.getStart(),
+      BinaryOperator::Subtract);
   PhysicalExprAttr sliceExtent = parameterExtent(scan.getSegment());
   bool bodyFailed = false;
   auto loop = builder.create<scf::ForOp>(
-      location, zero, master.getExtent(), segment.getResult(), identities,
+      location, zero, traversalExtent, segment.getResult(), identities,
       [&](OpBuilder &nested, Location nestedLocation, Value offset,
           ValueRange prefix) {
         SmallVector<Value> slices;

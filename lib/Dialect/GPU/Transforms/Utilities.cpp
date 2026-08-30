@@ -25,6 +25,123 @@ namespace {
 
 void collectParameterSymbols(Attribute attribute, llvm::StringSet<> &symbols);
 
+PhysicalExprAttr replaceParameterSymbol(PhysicalExprAttr expression,
+                                        StringAttr previous,
+                                        StringAttr replacement) {
+  if (expression.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+      expression.getSymbol() == previous)
+    return PhysicalExprAttr::get(
+        expression.getContext(), expression.getKind(), expression.getValue(),
+        replacement, expression.getOperands());
+  SmallVector<Attribute> operands;
+  bool changed = false;
+  for (Attribute operand : expression.getOperands()) {
+    auto rewritten = replaceParameterSymbol(
+        cast<PhysicalExprAttr>(operand), previous, replacement);
+    operands.push_back(rewritten);
+    changed |= rewritten != operand;
+  }
+  return changed
+             ? PhysicalExprAttr::get(
+                   expression.getContext(), expression.getKind(),
+                   expression.getValue(), expression.getSymbol(),
+                   ArrayAttr::get(expression.getContext(), operands))
+             : expression;
+}
+
+Attribute replaceParameterSymbol(Attribute attribute, StringAttr previous,
+                                 StringAttr replacement);
+
+Type replaceParameterSymbol(Type type, StringAttr previous,
+                            StringAttr replacement) {
+  if (auto fragment = dyn_cast<FragmentType>(type)) {
+    auto shape = cast<ArrayAttr>(replaceParameterSymbol(
+        fragment.getShape(), previous, replacement));
+    if (shape == fragment.getShape())
+      return type;
+    return FragmentType::get(type.getContext(), fragment.getElementType(), shape,
+                             fragment.getAxisMaps(), fragment.getValidity(),
+                             fragment.getOwner());
+  }
+  if (auto buffer = dyn_cast<BufferType>(type)) {
+    auto shape = cast<ArrayAttr>(replaceParameterSymbol(
+        buffer.getShape(), previous, replacement));
+    Type element = replaceParameterSymbol(buffer.getElementType(), previous,
+                                          replacement);
+    if (shape == buffer.getShape() && element == buffer.getElementType())
+      return type;
+    return BufferType::get(type.getContext(), element, shape, buffer.getScope(),
+                           buffer.getInstance(), buffer.getOwner(),
+                           buffer.getInitialization(), buffer.getLifetime(),
+                           buffer.getVisibility(), buffer.getWorkspace());
+  }
+  if (auto view = dyn_cast<ViewType>(type)) {
+    ViewLayoutAttr layout = view.getLayout();
+    auto extents = cast<ArrayAttr>(replaceParameterSymbol(
+        layout.getExtents(), previous, replacement));
+    auto strides = cast<ArrayAttr>(replaceParameterSymbol(
+        layout.getStrides(), previous, replacement));
+    if (extents == layout.getExtents() && strides == layout.getStrides())
+      return type;
+    auto rewrittenLayout = ViewLayoutAttr::get(
+        type.getContext(), extents, layout.getDimensionIds(),
+        layout.getHasStrides(), strides, layout.getAlias(), layout.getNoalias());
+    return ViewType::get(type.getContext(), view.getElementType(), view.getRank(),
+                         view.getAccess(), view.getAbiIndex(), view.getSourceId(),
+                         rewrittenLayout);
+  }
+  if (auto record = dyn_cast<RecordType>(type)) {
+    auto fields = cast<ArrayAttr>(replaceParameterSymbol(
+        record.getFieldTypes(), previous, replacement));
+    if (fields == record.getFieldTypes())
+      return type;
+    return RecordType::get(type.getContext(), record.getFieldNames(), fields,
+                           record.getOwner());
+  }
+  return type;
+}
+
+Attribute replaceParameterSymbol(Attribute attribute, StringAttr previous,
+                                 StringAttr replacement) {
+  if (!attribute)
+    return attribute;
+  if (auto expression = dyn_cast<PhysicalExprAttr>(attribute))
+    return replaceParameterSymbol(expression, previous, replacement);
+  if (auto array = dyn_cast<ArrayAttr>(attribute)) {
+    SmallVector<Attribute> elements;
+    bool changed = false;
+    for (Attribute element : array) {
+      Attribute rewritten =
+          replaceParameterSymbol(element, previous, replacement);
+      elements.push_back(rewritten);
+      changed |= rewritten != element;
+    }
+    return changed ? Attribute(ArrayAttr::get(attribute.getContext(), elements))
+                   : attribute;
+  }
+  if (auto dictionary = dyn_cast<DictionaryAttr>(attribute)) {
+    SmallVector<NamedAttribute> elements;
+    bool changed = false;
+    for (NamedAttribute element : dictionary) {
+      Attribute rewritten = replaceParameterSymbol(
+          element.getValue(), previous, replacement);
+      elements.emplace_back(element.getName(), rewritten);
+      changed |= rewritten != element.getValue();
+    }
+    return changed
+               ? Attribute(DictionaryAttr::get(attribute.getContext(), elements))
+               : attribute;
+  }
+  if (auto typed = dyn_cast<TypeAttr>(attribute)) {
+    Type rewritten =
+        replaceParameterSymbol(typed.getValue(), previous, replacement);
+    return rewritten != typed.getValue() ? Attribute(TypeAttr::get(rewritten))
+                                         : attribute;
+  }
+  return attribute;
+}
+
 using AxisSelector = llvm::function_ref<bool(AxisMapAttr)>;
 
 FragmentType replaceExtent(FragmentType source, AxisSelector selects,
@@ -2217,6 +2334,55 @@ void eraseUnusedPhysicalParameters(func::FuncOp kernel) {
     if (isMemoryEffectFree(operation) || isa<LoadOp, GatherOp>(operation))
       operation->erase();
   }
+}
+
+LogicalResult replacePhysicalParameter(func::FuncOp kernel,
+                                       ParameterOp previous,
+                                       ParameterOp replacement) {
+  if (!previous || !replacement || previous == replacement)
+    return success();
+  StringAttr previousName = previous.getParameter().getName();
+  StringAttr replacementName = replacement.getParameter().getName();
+  previous.getResult().replaceAllUsesWith(replacement.getResult());
+  kernel.walk([&](Operation *operation) {
+    for (Value result : operation->getResults())
+      result.setType(replaceParameterSymbol(result.getType(), previousName,
+                                            replacementName));
+    SmallVector<NamedAttribute> attributes;
+    bool changed = false;
+    for (NamedAttribute attribute : operation->getAttrs()) {
+      Attribute rewritten = replaceParameterSymbol(
+          attribute.getValue(), previousName, replacementName);
+      attributes.emplace_back(attribute.getName(), rewritten);
+      changed |= rewritten != attribute.getValue();
+    }
+    if (changed)
+      operation->setAttrs(
+          DictionaryAttr::get(operation->getContext(), attributes));
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments())
+          argument.setType(replaceParameterSymbol(
+              argument.getType(), previousName, replacementName));
+  });
+
+  llvm::StringSet<> remaining;
+  kernel.walk([&](Operation *operation) {
+    for (Type type : operation->getResultTypes())
+      collectParameterSymbols(type, remaining);
+    for (NamedAttribute attribute : operation->getAttrs())
+      collectParameterSymbols(attribute.getValue(), remaining);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments())
+          collectParameterSymbols(argument.getType(), remaining);
+  });
+  if (!previous.getResult().use_empty() ||
+      remaining.contains(previousName.getValue()))
+    return previous.emitOpError(
+        "physical parameter refinement left a second executable authority");
+  previous.erase();
+  return success();
 }
 
 } // namespace intent::gpu

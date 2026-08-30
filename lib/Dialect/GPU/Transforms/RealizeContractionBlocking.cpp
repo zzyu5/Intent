@@ -177,12 +177,19 @@ bool containsSource(Value value, PhysicalSourceAxis source) {
 }
 
 FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
+  auto roles =
+      mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr);
+  if (!roles || roles.size() != mapping.getNumResults())
+    return failure();
+  const int64_t pointwiseOwnership =
+      static_cast<int64_t>(CoordinateRole::PointwiseOwnership);
   llvm::SmallDenseSet<unsigned, 2> axes;
   llvm::SmallPtrSet<Operation *, 16> visited;
   std::function<void(Value)> collect = [&](Value current) {
     for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates()))
       if (current == coordinate) {
-        axes.insert(axis);
+        if (roles[axis] == pointwiseOwnership)
+          axes.insert(axis);
         return;
       }
     Operation *producer = current.getDefiningOp();
@@ -195,6 +202,34 @@ FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
   collect(value);
   return axes.size() == 1 ? FailureOr<unsigned>(*axes.begin())
                           : FailureOr<unsigned>(failure());
+}
+
+LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
+                                       FailureOr<unsigned> mappingAxis,
+                                       ParameterOp replacement) {
+  if (failed(mappingAxis))
+    return success();
+  FailureOr<ParameterOp> previous = queryBlockingParameter(kernel, range);
+  if (failed(previous))
+    return range.emitOpError(
+        "pointwise ownership axis has no typed blocking parameter to refine");
+  if (*previous == replacement)
+    return success();
+  if (previous->getParameter().getRole() !=
+      static_cast<uint32_t>(ParameterRole::OwnershipN))
+    return previous->emitOpError(
+        "contraction can only refine a provisional pointwise ownership parameter");
+  for (StringRef attribute : {dimensionAttr, parameterSourceAttr,
+                              coverageDimensionAttr}) {
+    Attribute inherited = (*previous)->getAttr(attribute);
+    Attribute current = replacement->getAttr(attribute);
+    if (inherited && current && inherited != current)
+      return replacement.emitOpError(
+          "contraction ownership refinement has conflicting parameter bindings");
+    if (inherited && !current)
+      replacement->setAttr(attribute, inherited);
+  }
+  return replacePhysicalParameter(kernel, *previous, replacement);
 }
 
 LogicalResult collectProducerRanges(
@@ -795,6 +830,77 @@ LoadOp matrixOperandLoad(Value value) {
   return transpose.getValue().getDefiningOp<LoadOp>();
 }
 
+FailureOr<unsigned> accessCoordinatePosition(LoadOp load,
+                                             AxisMapAttr mapping) {
+  if (FailureOr<unsigned> direct = queryCoordinatePosition(
+          load.getCoordinates(), sourceAxisIdentity(mapping));
+      succeeded(direct))
+    return direct;
+  auto kernel = load->getParentOfType<func::FuncOp>();
+  if (kernel) {
+    PhysicalProgramAnalysis analysis(kernel);
+    std::optional<unsigned> replayed;
+    for (auto [position, coordinate] :
+         llvm::enumerate(load.getCoordinates())) {
+      PhysicalRangeFact fact =
+          analysis.sourceRanges(coordinate, sourceAxisIdentity(mapping));
+      if (failed(queryExactLogicalRange(fact)))
+        continue;
+      if (replayed)
+        return failure();
+      replayed = position;
+    }
+    if (replayed)
+      return *replayed;
+  }
+  auto result = dyn_cast<FragmentType>(load.getResult().getType());
+  if (result && result.getShape().size() == load.getCoordinates().size() &&
+      llvm::all_of(load.getCoordinates(), [](Value coordinate) {
+        auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+        return fragment && fragment.getShape().size() == 1;
+      }) &&
+      mapping.getFragmentAxis() < load.getCoordinates().size())
+    return mapping.getFragmentAxis();
+  auto view = dyn_cast<ViewType>(load.getResource().getType());
+  if (!view || mapping.getDimensionId() <= 0)
+    return failure();
+  std::optional<unsigned> resourceAxis;
+  for (auto [axis, dimension] :
+       llvm::enumerate(view.getLayout().getDimensionIds().asArrayRef())) {
+    if (dimension != mapping.getDimensionId())
+      continue;
+    if (resourceAxis)
+      return failure();
+    resourceAxis = axis;
+  }
+  if (!resourceAxis)
+    return failure();
+  std::optional<unsigned> coordinate;
+  for (auto [position, axis] : llvm::enumerate(load.getSourceAxes())) {
+    if (axis != *resourceAxis)
+      continue;
+    if (coordinate)
+      return failure();
+    coordinate = position;
+  }
+  return coordinate ? FailureOr<unsigned>(*coordinate)
+                    : FailureOr<unsigned>(failure());
+}
+
+FailureOr<unsigned> directRankOneAccessPosition(ValueRange coordinates,
+                                                Type valueType,
+                                                unsigned valueAxis) {
+  auto fragment = dyn_cast<FragmentType>(valueType);
+  if (!fragment || fragment.getShape().size() != coordinates.size() ||
+      valueAxis >= coordinates.size() ||
+      !llvm::all_of(coordinates, [](Value coordinate) {
+        auto type = dyn_cast<FragmentType>(coordinate.getType());
+        return type && type.getShape().size() == 1;
+      }))
+    return failure();
+  return valueAxis;
+}
+
 bool hasRangeContractForm(ContractOp contract) {
   auto lhsLoad = matrixOperandLoad(contract.getLhs());
   auto rhsLoad = matrixOperandLoad(contract.getRhs());
@@ -827,9 +933,7 @@ bool hasRangeContractForm(ContractOp contract) {
     axes.emplace_back(load, *mapping);
   }
   for (auto [load, mapping] : axes) {
-    FailureOr<unsigned> coordinate = queryCoordinatePosition(
-        load.getCoordinates(),
-        sourceAxisIdentity(mapping));
+    FailureOr<unsigned> coordinate = accessCoordinatePosition(load, mapping);
     if (failed(coordinate))
       return false;
     Value value = load.getCoordinates()[*coordinate];
@@ -849,6 +953,32 @@ bool hasSelectedFreeAxes(ContractOp contract) {
                         return isCompileTimeExtent(
                             cast<PhysicalExprAttr>(extent));
                       });
+}
+
+bool freeAxesNeedRealization(ContractOp contract, func::FuncOp kernel) {
+  FragmentType lhs = contract.getLhs().getType();
+  FragmentType rhs = contract.getRhs().getType();
+  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
+      lhs, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
+  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
+      rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
+  if (failed(lhsFree) || failed(rhsFree))
+    return true;
+  PhysicalProgramAnalysis analysis(kernel);
+  for (auto [value, axis] :
+       {std::pair<Value, unsigned>{contract.getLhs(), *lhsFree},
+        std::pair<Value, unsigned>{contract.getRhs(), *rhsFree}}) {
+    PhysicalAxisRealizationFact fact = analysis.axisRealization(value, axis);
+    if (!fact.isExact() || !fact.physicalized)
+      return true;
+  }
+  return false;
+}
+
+bool hasCompleteStorePath(ContractOp contract) {
+  SmallVector<StorePath> paths;
+  llvm::SmallPtrSet<Operation *, 8> visited;
+  return collectStorePaths(contract.getResult(), {}, paths, visited);
 }
 
 ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
@@ -1533,21 +1663,29 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           rhsReductionMap->getDimensionId())
     return unhandled("paired reduction coordinates lack one shared provenance");
 
-  FailureOr<unsigned> lhsRowCoordinate = queryCoordinatePosition(
-      lhsLoad.getCoordinates(),
-      sourceAxisIdentity(*rowMap));
-  FailureOr<unsigned> lhsReductionCoordinate = queryCoordinatePosition(
-      lhsLoad.getCoordinates(),
-      sourceAxisIdentity(*lhsReductionMap));
-  FailureOr<unsigned> rhsReductionCoordinate = queryCoordinatePosition(
-      rhsLoad.getCoordinates(),
-      sourceAxisIdentity(*rhsReductionMap));
-  FailureOr<unsigned> rhsColumnCoordinate = queryCoordinatePosition(
-      rhsLoad.getCoordinates(),
-      sourceAxisIdentity(*columnMap));
+  FailureOr<unsigned> lhsRowCoordinate =
+      accessCoordinatePosition(lhsLoad, *rowMap);
+  FailureOr<unsigned> lhsReductionCoordinate =
+      accessCoordinatePosition(lhsLoad, *lhsReductionMap);
+  FailureOr<unsigned> rhsReductionCoordinate =
+      accessCoordinatePosition(rhsLoad, *rhsReductionMap);
+  FailureOr<unsigned> rhsColumnCoordinate =
+      accessCoordinatePosition(rhsLoad, *columnMap);
   if (failed(lhsRowCoordinate) || failed(lhsReductionCoordinate) ||
-      failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate))
-    return unhandled("load coordinates do not cover all free/reduction axes");
+      failed(rhsReductionCoordinate) || failed(rhsColumnCoordinate)) {
+    std::string details;
+    llvm::raw_string_ostream stream(details);
+    stream << "load coordinates do not cover all free/reduction axes"
+           << "; lhs_row=" << succeeded(lhsRowCoordinate)
+           << ", lhs_reduction=" << succeeded(lhsReductionCoordinate)
+           << ", rhs_reduction=" << succeeded(rhsReductionCoordinate)
+           << ", rhs_column=" << succeeded(rhsColumnCoordinate)
+           << ", row_map=" << *rowMap << ", lhs_coordinate_types=[";
+    llvm::interleaveComma(lhsLoad.getCoordinates(), stream,
+                          [&](Value coordinate) { stream << coordinate.getType(); });
+    stream << "]";
+    return unhandled(stream.str());
+  }
   Value originalLhsRowCoordinate = lhsLoad.getCoordinates()[*lhsRowCoordinate];
   auto rowRange = sourceRange(originalLhsRowCoordinate);
   const bool indirectRow = !rowRange;
@@ -1684,6 +1822,19 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction, {32, 64, 128});
   if (!blockM || !blockN || !blockK)
     return failure();
+  FailureOr<unsigned> existingRowAxis =
+      mappingAxisForScalar(rowRange.getStart(), mapping);
+  FailureOr<unsigned> existingColumnAxis =
+      mappingAxisForScalar(columnRange.getStart(), mapping);
+  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
+      *existingRowAxis == *existingColumnAxis)
+    return unhandled(
+        "row and column ownership share one mapping coordinate that cannot be refined independently");
+  if (failed(refineOwnershipParameter(kernel, rowRange, existingRowAxis,
+                                      blockM)) ||
+      failed(refineOwnershipParameter(kernel, columnRange, existingColumnAxis,
+                                      blockN)))
+    return failure();
   for (auto [parameter, range] :
        {std::pair<ParameterOp, MakeRangeOp>{blockM, rowRange},
         std::pair<ParameterOp, MakeRangeOp>{blockN, columnRange},
@@ -1730,14 +1881,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
-  FailureOr<unsigned> existingRowAxis =
-      mappingAxisForScalar(rowRange.getStart(), mapping);
-  FailureOr<unsigned> existingColumnAxis =
-      mappingAxisForScalar(columnRange.getStart(), mapping);
-  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
-      *existingRowAxis == *existingColumnAxis)
-    return unhandled(
-        "row and column ownership share one mapping coordinate that cannot be refined independently");
   SmallVector<Value> mappingExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
@@ -1822,11 +1965,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   OpBuilder builder(contract);
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   Value rowStop = *rowLogicalEnd;
-  Value columnStart = binary(
-      builder, location, builder.getIndexType(), columnRange.getStart(),
-      binary(builder, location, builder.getIndexType(), columnTile,
-             blockN.getResult(), BinaryOperator::Multiply),
-      BinaryOperator::Add);
+  Value columnStart = columnRange.getStart();
+  if (failed(existingColumnAxis))
+    columnStart = binary(
+        builder, location, builder.getIndexType(), columnStart,
+        binary(builder, location, builder.getIndexType(), columnTile,
+               blockN.getResult(), BinaryOperator::Multiply),
+        BinaryOperator::Add);
   Value columnStop = *columnLogicalEnd;
   Value reductionStop = *reductionLogicalEnd;
 
@@ -2030,11 +2175,18 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       FailureOr<unsigned> storeColumn = queryCoordinatePosition(
           path.store.getCoordinates(),
           sourceAxisIdentity(*columnMap));
+      if (failed(storeColumn))
+        storeColumn = directRankOneAccessPosition(
+            path.store.getCoordinates(), path.store.getValue().getType(), 1);
       FailureOr<unsigned> storeRow;
-      if (!indirectRow)
+      if (!indirectRow) {
         storeRow = queryCoordinatePosition(
             path.store.getCoordinates(),
             sourceAxisIdentity(*rowMap));
+        if (failed(storeRow))
+          storeRow = directRankOneAccessPosition(
+              path.store.getCoordinates(), path.store.getValue().getType(), 0);
+      }
       if ((!indirectRow && failed(storeRow)) || failed(storeColumn))
         return path.store.emitOpError(
             "blocked contract output lost its logical source coordinates");
@@ -2058,11 +2210,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   if (runtimeRowTraversal) {
     bool rowBodyFailed = false;
-    Value rowStart = binary(
-        builder, location, builder.getIndexType(), rowRange.getStart(),
-        binary(builder, location, builder.getIndexType(), rowWorker,
-               blockM.getResult(), BinaryOperator::Multiply),
-        BinaryOperator::Add);
+    Value rowStart = rowRange.getStart();
+    if (failed(existingRowAxis))
+      rowStart = binary(
+          builder, location, builder.getIndexType(), rowStart,
+          binary(builder, location, builder.getIndexType(), rowWorker,
+                 blockM.getResult(), BinaryOperator::Multiply),
+          BinaryOperator::Add);
     Value rowStep = binary(builder, location, builder.getIndexType(),
                            blockM.getResult(), rowWorkers.getResult(),
                            BinaryOperator::Multiply);
@@ -2081,11 +2235,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       return failure();
     }
   } else {
-    Value rowStart = binary(
-        builder, location, builder.getIndexType(), rowRange.getStart(),
-        binary(builder, location, builder.getIndexType(), rowTile,
-               blockM.getResult(), BinaryOperator::Multiply),
-        BinaryOperator::Add);
+    Value rowStart = rowRange.getStart();
+    if (failed(existingRowAxis))
+      rowStart = binary(
+          builder, location, builder.getIndexType(), rowStart,
+          binary(builder, location, builder.getIndexType(), rowTile,
+                 blockM.getResult(), BinaryOperator::Multiply),
+          BinaryOperator::Add);
     if (failed(emitRowBlock(builder, rowStart)))
       return failure();
   }
@@ -2389,6 +2545,19 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction, {2, 4, 8});
   if (!blockM || !blockN || !blockK)
     return failure();
+  FailureOr<unsigned> existingRowAxis =
+      mappingAxisForScalar(rowRange->getStart(), mapping);
+  FailureOr<unsigned> existingColumnAxis =
+      mappingAxisForScalar(columnRange->getStart(), mapping);
+  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
+      *existingRowAxis == *existingColumnAxis)
+    return reject(
+        "row and column ownership share one mapping coordinate that cannot be refined independently");
+  if (failed(refineOwnershipParameter(kernel, *rowRange, existingRowAxis,
+                                      blockM)) ||
+      failed(refineOwnershipParameter(kernel, *columnRange, existingColumnAxis,
+                                      blockN)))
+    return failure();
   for (auto [parameter, range] :
        {std::pair<ParameterOp, MakeRangeOp>{blockM, *rowRange},
         std::pair<ParameterOp, MakeRangeOp>{blockN, *columnRange},
@@ -2424,14 +2593,6 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
-  FailureOr<unsigned> existingRowAxis =
-      mappingAxisForScalar(rowRange->getStart(), mapping);
-  FailureOr<unsigned> existingColumnAxis =
-      mappingAxisForScalar(columnRange->getStart(), mapping);
-  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
-      *existingRowAxis == *existingColumnAxis)
-    return reject(
-        "row and column ownership share one mapping coordinate that cannot be refined independently");
   SmallVector<Value> mappingExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
@@ -2504,19 +2665,23 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
 
   OpBuilder builder(contract);
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-  Value rowStart = binary(
-      builder, location, builder.getIndexType(), rowRange->getStart(),
-      binary(builder, location, builder.getIndexType(), rowTile,
-             blockM.getResult(), BinaryOperator::Multiply),
-      BinaryOperator::Add);
+  Value rowStart = rowRange->getStart();
+  if (failed(existingRowAxis))
+    rowStart = binary(
+        builder, location, builder.getIndexType(), rowStart,
+        binary(builder, location, builder.getIndexType(), rowTile,
+               blockM.getResult(), BinaryOperator::Multiply),
+        BinaryOperator::Add);
   Value rowStop = binary(builder, location, builder.getIndexType(),
                          rowRange->getStart(), rowRange->getExtent(),
                          BinaryOperator::Add);
-  Value columnStart = binary(
-      builder, location, builder.getIndexType(), columnRange->getStart(),
-      binary(builder, location, builder.getIndexType(), columnTile,
-             blockN.getResult(), BinaryOperator::Multiply),
-      BinaryOperator::Add);
+  Value columnStart = columnRange->getStart();
+  if (failed(existingColumnAxis))
+    columnStart = binary(
+        builder, location, builder.getIndexType(), columnStart,
+        binary(builder, location, builder.getIndexType(), columnTile,
+               blockN.getResult(), BinaryOperator::Multiply),
+        BinaryOperator::Add);
   Value columnStop = binary(builder, location, builder.getIndexType(),
                             columnRange->getStart(), columnRange->getExtent(),
                             BinaryOperator::Add);
@@ -2813,9 +2978,19 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
           contract.getRhsReductionAxes().size() == 1 &&
           contract.getLhsBatchAxes().empty() &&
           contract.getRhsBatchAxes().empty() &&
+          !freeAxesNeedRealization(contract, kernel) &&
           hasSelectedFreeAxes(contract) &&
           hasExplicitPairedReductionRanges(contract)) {
         if (failed(realizeReductionTraversal(contract, kernel)))
+          return failure();
+      } else if (!rangeSingleReduction &&
+                 contract.getLhsReductionAxes().size() == 1 &&
+                 contract.getRhsReductionAxes().size() == 1 &&
+                 contract.getLhsBatchAxes().empty() &&
+                 contract.getRhsBatchAxes().empty() &&
+                 hasCompleteStorePath(contract) &&
+                 freeAxesNeedRealization(contract, kernel)) {
+        if (failed(realizeContract(contract, kernel)))
           return failure();
       } else if (!rangeSingleReduction &&
                  contract.getLhsReductionAxes().size() == 1 &&
