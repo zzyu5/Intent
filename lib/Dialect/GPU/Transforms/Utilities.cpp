@@ -1286,9 +1286,29 @@ static void retargetExtent(Value root, AxisSelector selects,
     // new traversal with the one being retargeted.
     if (!carriesExtent(value.getType(), selects, connectedExtents))
       continue;
-    if (!preservesIntroducedUnitAxis(value, selects))
-      value.setType(
-          replaceExtent(value.getType(), selects, previousExtents, extent));
+    if (!preservesIntroducedUnitAxis(value, selects)) {
+      Type replacement =
+          replaceExtent(value.getType(), selects, previousExtents, extent);
+      if (replacement != value.getType()) {
+        value.setType(replacement);
+        // A make_range owns both the fragment schema and the SSA extent used
+        // to materialize that schema.  Retarget them from the same physical
+        // decision; leaving the operand behind creates two executable
+        // authorities for one traversal.
+        if (auto range = value.getDefiningOp<MakeRangeOp>()) {
+          OpBuilder builder(range);
+          Value physicalExtent;
+          if (extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant))
+            physicalExtent = builder.create<arith::ConstantIndexOp>(
+                range.getLoc(), extent.getValue());
+          else
+            physicalExtent = builder.create<PhysicalExprOp>(
+                range.getLoc(), builder.getIndexType(), extent);
+          range->setOperand(1, physicalExtent);
+        }
+      }
+    }
     // Product fields and structured helper arguments are part of the same
     // physical value flow even though MLIR does not connect them with ordinary
     // result uses.  A blocking decision for one provenance axis must cross

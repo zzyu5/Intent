@@ -364,9 +364,13 @@ LogicalResult MakeRangeOp::verify() {
     InFlightDiagnostic diagnostic = emitOpError(
         "physical range extent does not match its result fragment extent");
     diagnostic << "; result_extent=" << result.getShape()[0]
-               << ", extent_operand=" << getExtent();
+               << ", extent_operand=" << getExtent()
+               << ", source_id=" << getSourceId()
+               << ", source_axis=" << getSourceAxis();
     if (Operation *producer = getExtent().getDefiningOp())
       diagnostic << ", extent_producer=" << producer->getName();
+    if (Operation *parent = (*this)->getParentOp())
+      diagnostic << ", parent=" << parent->getName();
     return failure();
   }
   return success();

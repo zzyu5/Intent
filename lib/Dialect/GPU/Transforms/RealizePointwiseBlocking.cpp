@@ -2474,17 +2474,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   bool mappingChanged = false;
   SmallVector<std::pair<Attribute, unsigned>> reusedCoordinates;
   SmallVector<Attribute> appendedCoordinates;
+  auto staticLogicalExtent = [](MakeRangeOp range) -> std::optional<int64_t> {
+    auto start = range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
+    auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
+    auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    if (!start || !stop || !step || step.value() <= 0 ||
+        stop.value() < start.value())
+      return std::nullopt;
+    int64_t distance = stop.value() - start.value();
+    return (distance + step.value() - 1) / step.value();
+  };
   for (auto [axisKey, ranges] : axes) {
     MakeRangeOp range = ranges.front();
     ParameterOp parameter = parameters.lookup(axisKey);
     Value dimension;
-    arith::ConstantIndexOp staticExtent;
+    std::optional<int64_t> staticExtent;
     FailureOr<uint64_t> sourceDimension = rangeDimension(range);
     if (isSourceAxisKey(axisKey)) {
-      staticExtent = range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
+      staticExtent = staticLogicalExtent(range);
       if (staticExtent)
         dimension = mappingBuilder.create<arith::ConstantIndexOp>(
-            mapping.getLoc(), staticExtent.value());
+            mapping.getLoc(), *staticExtent);
       else if (succeeded(sourceDimension)) {
         FailureOr<Value> argument =
             dimensionArgument(kernel, *sourceDimension);
@@ -2531,7 +2541,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     PhysicalExprAttr logical;
     if (isSourceAxisKey(axisKey) && staticExtent) {
       logical = expression(module.getContext(), PhysicalExprKind::Constant,
-                           staticExtent.value());
+                           *staticExtent);
     } else {
       FailureOr<uint64_t> dimensionId = axisDimension(axisKey);
       uint64_t logicalDimension =
