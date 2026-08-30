@@ -1815,9 +1815,10 @@ private:
             rangeType.getDimensionId(), rangeType.getDerived(), extent);
         if (failed(coordinate))
           return failure();
-        if ((*range).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
+        if (Attribute subregion =
+                (*range).getDefiningOp()->getAttr(gpu::sourceSubregionAttr))
           coordinate->getDefiningOp()->setAttr(gpu::sourceSubregionAttr,
-                                               builder.getUnitAttr());
+                                               subregion);
         coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
@@ -2492,7 +2493,12 @@ private:
           extentDimension, sourceRange.getDerived());
       auto target =
           builder.create<gpu::RangeOp>(location, type, start, stop, step);
-      target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
+      if (sourceRange.getDimensionId() <= 0)
+        return subregion.emitOpError(
+            "physical subregion source has no parent dimension identity");
+      target->setAttr(
+          gpu::sourceSubregionAttr,
+          builder.getI64IntegerAttr(sourceRange.getDimensionId()));
       mapResults(operation, target);
       bindExtentDimensions(subregion.getExtentDimensions(),
                            rangeExtent(location, start, stop, step));
@@ -2580,8 +2586,9 @@ private:
           location, resultType, start, *extent, step, start, stop,
           rangeType.getSourceId(), rangeType.getSourceAxis(),
           rangeType.getDerived());
-      if ((*source).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
-        target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
+      if (Attribute subregion =
+              (*source).getDefiningOp()->getAttr(gpu::sourceSubregionAttr))
+        target->setAttr(gpu::sourceSubregionAttr, subregion);
       mapResults(operation, target);
       return success();
     }

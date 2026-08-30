@@ -556,6 +556,15 @@ bool isUnitStepRange(MakeRangeOp range) {
   return range && isUnitStepValue(range.getStep());
 }
 
+FailureOr<int64_t> querySubregionParentDimension(MakeRangeOp range) {
+  if (!range)
+    return failure();
+  auto parent = range->getAttrOfType<IntegerAttr>(sourceSubregionAttr);
+  return parent && parent.getInt() > 0
+             ? FailureOr<int64_t>(parent.getInt())
+             : FailureOr<int64_t>(failure());
+}
+
 FailureOr<MakeRangeOp>
 queryExactLogicalRange(const PhysicalRangeFact &fact) {
   if (fact.state == PhysicalFactState::Unknown || fact.roots.empty())

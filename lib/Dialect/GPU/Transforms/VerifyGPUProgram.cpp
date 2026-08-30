@@ -282,6 +282,16 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
                                          parameterNames, launchABI,
                                          launchDimensions)))
         return WalkResult::interrupt();
+    if (operation->hasAttr(sourceSubregionAttr)) {
+      auto parent =
+          operation->getAttrOfType<IntegerAttr>(sourceSubregionAttr);
+      if (!parent || parent.getInt() <= 0 ||
+          !launchDimensions.contains(parent.getInt())) {
+        operation->emitOpError(
+            "physical subregion requires one launch-visible parent dimension");
+        return WalkResult::interrupt();
+      }
+    }
     if (auto program = dyn_cast<ProgramIdOp>(operation)) {
       if (program.getAxis() >= static_cast<uint64_t>(gridRank) ||
           !programAxes.insert(program.getAxis()).second) {

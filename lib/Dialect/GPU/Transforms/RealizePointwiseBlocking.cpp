@@ -91,6 +91,39 @@ FailureOr<uint64_t> rangeDimension(MakeRangeOp range) {
              : FailureOr<uint64_t>(failure());
 }
 
+FailureOr<uint64_t> ownershipDimension(MakeRangeOp range) {
+  FailureOr<int64_t> parent = querySubregionParentDimension(range);
+  if (succeeded(parent))
+    return static_cast<uint64_t>(*parent);
+  return rangeDimension(range);
+}
+
+FailureOr<ParameterOp> queryOwnershipBlockingParameter(func::FuncOp kernel,
+                                                       MakeRangeOp range) {
+  FailureOr<ParameterOp> direct = queryBlockingParameter(kernel, range);
+  if (succeeded(direct))
+    return *direct;
+  FailureOr<int64_t> parent = querySubregionParentDimension(range);
+  if (failed(parent))
+    return failure();
+  ParameterOp result;
+  bool ambiguous = false;
+  kernel.walk([&](ParameterOp parameter) {
+    PhysicalParameterBinding binding = queryParameterBinding(parameter);
+    if (!binding.isExact() || !binding.dimension ||
+        *binding.dimension != *parent ||
+        parameter.getParameter().getRole() !=
+            static_cast<uint32_t>(ParameterRole::OwnershipN))
+      return;
+    if (result && result != parameter)
+      ambiguous = true;
+    else
+      result = parameter;
+  });
+  return result && !ambiguous ? FailureOr<ParameterOp>(result)
+                              : FailureOr<ParameterOp>(failure());
+}
+
 FailureOr<Attribute> parameterAxis(ParameterOp parameter) {
   PhysicalParameterBinding binding = queryParameterBinding(parameter);
   if (!binding.isExact())
@@ -1736,7 +1769,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             .axisRealization(range.getResult(), 0)
             .constructionScalarSeed) {
       bool launchVisible = false;
-      if (FailureOr<uint64_t> dimension = rangeDimension(range);
+      if (FailureOr<uint64_t> dimension = ownershipDimension(range);
           succeeded(dimension))
         launchVisible = succeeded(dimensionArgument(kernel, *dimension));
       if (ownershipOnly || launchVisible) {
@@ -1974,6 +2007,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
+  auto storeDirectlyUsesRange = [&](StoreOp store, MakeRangeOp range) {
+    if (!storeUsesRange(store, range))
+      return false;
+    PhysicalSourceAxis source = sourceAxisIdentity(range);
+    return llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
+      if (!queryFragmentAxis(coordinate.getType(), source).isExact())
+        return false;
+      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+          coordinate, source, PhysicalReplayScope::Coordinate,
+          /*allowAccesses=*/true);
+      return replay.isReplayable() && !replay.crossesAccess;
+    });
+  };
   for (StoreOp store : candidateStores) {
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
@@ -2013,24 +2059,30 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 16> writeTraversalRanges;
   for (Operation *operation : structuredTraversalRanges) {
     auto range = dyn_cast<MakeRangeOp>(operation);
-    bool writeOwnership = range && llvm::any_of(candidateStores, [&](StoreOp store) {
-      return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
-        return sameLogicalRange(range, candidate) &&
-               storeUsesRange(store, candidate);
-      });
-    });
+    bool writeOwnership = range &&
+        llvm::any_of(candidateStores, [&](StoreOp store) {
+          return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
+            return sameLogicalRange(range, candidate) &&
+                   storeDirectlyUsesRange(store, candidate);
+          });
+        });
     if (writeOwnership)
       writeTraversalRanges.insert(operation);
     if (reductionTraversalRanges.contains(operation) || !writeOwnership)
       internalTraversalRanges.insert(operation);
   }
   if (ownershipOnly)
-    llvm::erase_if(dynamicRanges, [](MakeRangeOp range) {
+    llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+      FailureOr<int64_t> parent = querySubregionParentDimension(range);
+      bool hasLaunchParent =
+          succeeded(parent) &&
+          succeeded(dimensionArgument(kernel, static_cast<uint64_t>(*parent)));
       return range->hasAttr(sourceSubregionAttr) &&
              extent.getKind() ==
-                 static_cast<uint32_t>(PhysicalExprKind::Constant);
+                 static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             !hasLaunchParent;
     });
   {
     llvm::SmallPtrSet<Operation *, 32> seen;
@@ -2206,6 +2258,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   };
   SmallVector<WriteEffectFacts> writeEffects;
   llvm::SmallDenseSet<PhysicalSourceAxis> ownershipSources;
+  llvm::SmallDenseSet<PhysicalSourceAxis> directOwnershipSources;
   auto collectOwnership = [&](ValueRange coordinates, ValueRange payloads) {
     WriteEffectFacts effect;
     effect.coordinates.append(coordinates.begin(), coordinates.end());
@@ -2243,11 +2296,28 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto fragment = cast<FragmentType>(histogram.getValues().getType());
     for (Attribute attribute : fragment.getAxisMaps()) {
       auto mapping = cast<AxisMapAttr>(attribute);
-      ownershipSources.insert(
-          {mapping.getSourceId(), mapping.getSourceAxis(),
-           mapping.getDerived()});
+      PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis(),
+                                mapping.getDerived()};
+      ownershipSources.insert(source);
+      directOwnershipSources.insert(source);
     }
   });
+  for (const WriteEffectFacts &effect : writeEffects)
+    for (Value coordinate : effect.coordinates) {
+      auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+      if (!fragment)
+        continue;
+      for (Attribute attribute : fragment.getAxisMaps()) {
+        auto mapping = cast<AxisMapAttr>(attribute);
+        PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis(),
+                                  mapping.getDerived()};
+        PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+            coordinate, source, PhysicalReplayScope::Coordinate,
+            /*allowAccesses=*/true);
+        if (replay.isReplayable() && !replay.crossesAccess)
+          directOwnershipSources.insert(source);
+      }
+    }
   // Structured traversal ownership is attached to the exact range operations
   // above, not erased source-wide here.  One immutable source axis may have a
   // query ownership projection and an independent fold/scan segment
@@ -2297,10 +2367,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
-    FailureOr<uint64_t> dimension = rangeDimension(range);
+    FailureOr<uint64_t> dimension = ownershipDimension(range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     return ownershipSources.contains(source) &&
+           directOwnershipSources.contains(source) &&
            !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
@@ -2327,7 +2398,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<PhysicalSourceAxis, uint64_t> sourceDimensions;
   llvm::MapVector<uint64_t, SmallVector<PhysicalSourceAxis>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
-    FailureOr<uint64_t> dimension = rangeDimension(range);
+    FailureOr<uint64_t> dimension = ownershipDimension(range);
     if (failed(dimension) || !hasPointwiseOwnership(range))
       continue;
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
@@ -2437,7 +2508,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         !internalTraversalRanges.contains(range.getOperation()) &&
         !reuseTraversalRanges.contains(range.getOperation()))
       continue;
-    FailureOr<ParameterOp> parameter = queryBlockingParameter(kernel, range);
+    FailureOr<ParameterOp> parameter =
+        queryOwnershipBlockingParameter(kernel, range);
     bool requiresBlockingParameter =
         (ownershipOnly && hasPointwiseOwnership(range) &&
          !internalTraversalRanges.contains(range.getOperation())) ||
@@ -2450,7 +2522,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       const bool dynamicSubregion = range->hasAttr(sourceSubregionAttr);
-      FailureOr<uint64_t> sourceDimension = rangeDimension(range);
+      FailureOr<uint64_t> sourceDimension = ownershipDimension(range);
       const bool launchVisibleDimension =
           succeeded(sourceDimension) &&
           succeeded(dimensionArgument(kernel, *sourceDimension));
@@ -2684,7 +2756,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ParameterOp parameter = parameters.lookup(axisKey);
     Value dimension;
     std::optional<int64_t> staticExtent;
-    FailureOr<uint64_t> sourceDimension = rangeDimension(range);
+    FailureOr<uint64_t> sourceDimension = ownershipDimension(range);
     if (isSourceAxisKey(axisKey)) {
       staticExtent = staticLogicalExtent(range);
       if (staticExtent)

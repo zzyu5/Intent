@@ -149,6 +149,10 @@ struct PhysicalLockstepTraversalFact {
 
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs);
 bool isUnitStepRange(MakeRangeOp range);
+/// The launch-visible parent dimension of a narrowed logical subregion.  The
+/// subregion keeps its own extent identity in RangeType/AxisMapAttr; this
+/// relation only supplies the program-space upper bound used for ownership.
+mlir::FailureOr<int64_t> querySubregionParentDimension(MakeRangeOp range);
 mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
     const PhysicalRangeFact &fact);
 
