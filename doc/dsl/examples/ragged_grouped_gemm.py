@@ -9,8 +9,6 @@ def ragged_grouped_gemm(
     weight: I.In[I.f16, ("G", "K", "N")],
     output: I.Out[I.f16, ("R", "N")],
 ):
-    # Interface precondition: offsets.shape[0] == G + 1, offsets is
-    # nondecreasing, offsets[0] == 0, and offsets[G] == R.
     R, K = x.shape
     G, _, N = weight.shape
     reduction = I.domain(0, K)

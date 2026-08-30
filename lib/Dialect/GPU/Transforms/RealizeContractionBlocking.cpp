@@ -2032,10 +2032,19 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     return success();
   if (!requiresPhysicalRealization(contract))
     return success();
-  auto lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
-  auto lhsScaleLoad = contract.getLhsScale().getDefiningOp<LoadOp>();
-  auto rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
-  auto rhsScaleLoad = contract.getRhsScale().getDefiningOp<LoadOp>();
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
+  auto sourceLoad = [&](Value value) -> LoadOp {
+    PhysicalReplayFact fact = physicalAnalysis.replayability(
+        value, std::nullopt, PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/true);
+    return fact.isReplayable() && fact.accesses.size() == 1
+               ? dyn_cast<LoadOp>(fact.accesses.front())
+               : LoadOp();
+  };
+  auto lhsLoad = sourceLoad(contract.getLhs());
+  auto lhsScaleLoad = sourceLoad(contract.getLhsScale());
+  auto rhsLoad = sourceLoad(contract.getRhs());
+  auto rhsScaleLoad = sourceLoad(contract.getRhsScale());
   auto lhsType = contract.getLhs().getType();
   auto lhsScaleType = contract.getLhsScale().getType();
   auto rhsType = contract.getRhs().getType();
@@ -2047,56 +2056,36 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   };
   ArrayRef<int64_t> lhsReduction = contract.getLhsReductionAxes();
   ArrayRef<int64_t> rhsReduction = contract.getRhsReductionAxes();
+  bool fixedAxes = lhsReduction.size() == 2 && rhsReduction.size() == 2 &&
+                   lhsReduction[0] == 1 && lhsReduction[1] == 2 &&
+                   rhsReduction[0] == 0 && rhsReduction[1] == 1 &&
+                   contract.getLhsBatchAxes().empty() &&
+                   contract.getRhsBatchAxes().empty();
   if (!lhsLoad || !lhsScaleLoad || !rhsLoad || !rhsScaleLoad ||
       lhsType.getShape().size() != 3 || lhsScaleType.getShape().size() != 2 ||
       rhsType.getShape().size() != 3 || rhsScaleType.getShape().size() != 2 ||
-      resultType.getShape().size() != 2 || lhsReduction.size() != 2 ||
-      rhsReduction.size() != 2 || !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
-    return reject("requires direct rank-3 data/rank-2 scale loads, two reduction pairs, one free axis per operand, and no batch axes");
+      resultType.getShape().size() != 2 || !fixedAxes)
+    return reject("requires one replayable source load for every operand and the closed [M,G,C]/[M,G] x [G,C,N]/[N,G] schema");
   if (contract.getLhsGroupSize() <= 0 ||
       contract.getLhsGroupSize() != contract.getRhsGroupSize())
     return reject("requires one equal positive scale-group size");
-  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
-      lhsType, lhsReduction, contract.getLhsBatchAxes());
-  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
-      rhsType, rhsReduction, contract.getRhsBatchAxes());
-  if (failed(lhsFree) || failed(rhsFree))
-    return reject("data operands do not have one unique free axis");
-  std::optional<unsigned> innerPair;
-  for (unsigned pair = 0; pair < lhsReduction.size(); ++pair) {
-    auto lhsExtent = cast<PhysicalExprAttr>(
-        lhsType.getShape()[lhsReduction[pair]]);
-    auto rhsExtent = cast<PhysicalExprAttr>(
-        rhsType.getShape()[rhsReduction[pair]]);
-    bool groupExtent =
-        lhsExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        rhsExtent == lhsExtent &&
-        static_cast<uint64_t>(lhsExtent.getValue()) ==
-            contract.getLhsGroupSize();
-    if (!groupExtent)
-      continue;
-    if (innerPair)
-      return reject("scale group relation is ambiguous across reduction pairs");
-    innerPair = pair;
-  }
-  if (!innerPair)
-    return reject("the innermost physical reduction extent must equal the scale group size");
-  unsigned blockPair = *innerPair == 0 ? 1 : 0;
-  unsigned lhsBlockAxis = lhsReduction[blockPair];
-  unsigned lhsInnerAxis = lhsReduction[*innerPair];
-  unsigned rhsBlockAxis = rhsReduction[blockPair];
-  unsigned rhsInnerAxis = rhsReduction[*innerPair];
-  auto innerExtent =
+  constexpr unsigned lhsFree = 0;
+  constexpr unsigned lhsBlockAxis = 1;
+  constexpr unsigned lhsInnerAxis = 2;
+  constexpr unsigned rhsBlockAxis = 0;
+  constexpr unsigned rhsInnerAxis = 1;
+  constexpr unsigned rhsFree = 2;
+  auto lhsInnerExtent =
       cast<PhysicalExprAttr>(lhsType.getShape()[lhsInnerAxis]);
+  auto rhsInnerExtent =
+      cast<PhysicalExprAttr>(rhsType.getShape()[rhsInnerAxis]);
 
-  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, *lhsFree);
+  FailureOr<AxisMapAttr> rowMap = queryAxisMap(lhsType, lhsFree);
   FailureOr<AxisMapAttr> lhsBlockMap = queryAxisMap(lhsType, lhsBlockAxis);
   FailureOr<AxisMapAttr> lhsInnerMap = queryAxisMap(lhsType, lhsInnerAxis);
   FailureOr<AxisMapAttr> rhsBlockMap = queryAxisMap(rhsType, rhsBlockAxis);
   FailureOr<AxisMapAttr> rhsInnerMap = queryAxisMap(rhsType, rhsInnerAxis);
-  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, *rhsFree);
+  FailureOr<AxisMapAttr> columnMap = queryAxisMap(rhsType, rhsFree);
   auto scaleMapFor = [&](FragmentType scale,
                          AxisMapAttr data) -> FailureOr<AxisMapAttr> {
     PhysicalAxisProjection projection = queryFragmentAxis(
@@ -2432,34 +2421,33 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       context, builder.getI1Type(), {unitN}, {*columnMap}, rhsType.getOwner());
   FragmentType blockPredicateType = fragmentType(
       context, builder.getI1Type(), {unitK}, {*lhsBlockMap}, lhsType.getOwner());
-  PhysicalExprAttr unitInner = innerExtent;
   FragmentType blockedLhsType = fragmentType(
-      context, lhsType.getElementType(), {unitM, unitK, unitInner},
+      context, lhsType.getElementType(), {unitM, unitK, lhsInnerExtent},
       {*rowMap, *lhsBlockMap, *lhsInnerMap}, lhsType.getOwner());
   FragmentType blockedLhsScaleType = fragmentType(
       context, lhsScaleType.getElementType(), {unitM, unitK},
       {*lhsScaleRowMap, *lhsScaleBlockMap}, lhsScaleType.getOwner());
   FragmentType blockedRhsType = fragmentType(
-      context, rhsType.getElementType(), {unitK, unitInner, unitN},
+      context, rhsType.getElementType(), {unitK, rhsInnerExtent, unitN},
       {*rhsBlockMap, *rhsInnerMap, *columnMap}, rhsType.getOwner());
   FragmentType blockedRhsScaleType = fragmentType(
-      context, rhsScaleType.getElementType(), {unitK, unitN},
-      {*rhsScaleBlockMap, *rhsScaleColumnMap}, rhsScaleType.getOwner());
+      context, rhsScaleType.getElementType(), {unitN, unitK},
+      {*rhsScaleColumnMap, *rhsScaleBlockMap}, rhsScaleType.getOwner());
   FragmentType blockedResultType = fragmentType(
       context, resultType.getElementType(), {unitM, unitN},
       {*rowMap, *columnMap}, resultType.getOwner());
   FragmentType lhsPredicateType = fragmentType(
-      context, builder.getI1Type(), {unitM, unitK, unitInner},
+      context, builder.getI1Type(), {unitM, unitK, lhsInnerExtent},
       {*rowMap, *lhsBlockMap, *lhsInnerMap}, lhsType.getOwner());
   FragmentType lhsScalePredicateType = fragmentType(
       context, builder.getI1Type(), {unitM, unitK},
       {*lhsScaleRowMap, *lhsScaleBlockMap}, lhsScaleType.getOwner());
   FragmentType rhsPredicateType = fragmentType(
-      context, builder.getI1Type(), {unitK, unitInner, unitN},
+      context, builder.getI1Type(), {unitK, rhsInnerExtent, unitN},
       {*rhsBlockMap, *rhsInnerMap, *columnMap}, rhsType.getOwner());
   FragmentType rhsScalePredicateType = fragmentType(
-      context, builder.getI1Type(), {unitK, unitN},
-      {*rhsScaleBlockMap, *rhsScaleColumnMap}, rhsScaleType.getOwner());
+      context, builder.getI1Type(), {unitN, unitK},
+      {*rhsScaleColumnMap, *rhsScaleBlockMap}, rhsScaleType.getOwner());
   FragmentType outputPredicateType = fragmentType(
       context, builder.getI1Type(), {unitM, unitN},
       {*rowMap, *columnMap}, resultType.getOwner());

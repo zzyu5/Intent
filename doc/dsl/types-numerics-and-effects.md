@@ -16,7 +16,7 @@
 
 physical lane shape、padding、layout、address width和target encoding不进入canonical value type。
 
-Tuple和record是immutable structural product types，不是ranked tensor或memory layout。Tuple type由固定component序列定义；record type由有序、唯一的field names及逐字段value types定义。它们可包含不同shape/dtype的tensor components，也可嵌套；不提供统一`.shape`或`.dtype`。它们可作为SSA、helper result、loop carry、logical-buffer element schema和structured accumulator，但不直接进入public kernel ABI或external-view element type。
+Tuple和record是immutable structural product types，不是ranked tensor或memory layout。Tuple type由固定component序列定义；record type由有序、唯一的field names及逐字段value types定义。它们可包含不同shape/dtype的tensor components，也可嵌套；不提供统一`.shape`或`.dtype`。它们可作为SSA、helper result、loop carry和structured accumulator，但不直接进入logical buffer、public kernel ABI或external-view element type。Logical buffer只保存ranked tensor中的单一scalar element dtype。
 
 `i4/u4/fp4`不作为普通可寻址tensor element type。普通packed data使用`u8/u16/u32` carrier，加显式index、shift、mask、sign extension与scale arithmetic。FP4等microscaling formats由scaled-contract schema定义。
 
@@ -24,7 +24,7 @@ Tuple和record是immutable structural product types，不是ranked tensor或memo
 
 logical `index`使用signed 64-bit arithmetic。physical address width由compiler根据shape、stride与bounds证明后选择，不能改变logical index结果。
 
-dynamic extent是有identity的runtime shape value。不同dynamic extents只有在来自同一value、operation产生明确equality relation，或调用前置条件声明相等时才兼容。
+dynamic extent是有identity的runtime shape value。不同dynamic extents只有在来自同一value或operation产生明确equality relation时才兼容。
 
 tensor rank与logical extents来自domains/subregions和shape transforms。broadcast、reshape与join的规则见[`logical-program.md`](../programming-model/logical-program.md)。
 
@@ -126,7 +126,7 @@ scaled-contract schema定义logical element format、carrier packing、scale enc
 - `e4m3`采用上文`f8e4m3fn`的8-bit encoding；
 - `e8m0` scale是8-bit无sign exponent，code `0..254`表示`2^(code-127)`，code `255`表示NaN scale。
 
-group size是正logical index。沿声明的group axis，logical coordinate `k`读取scale element `k // group_size`；decoded logical element先乘对应scale，再进入paired-axis multiply-add。scale tensor的其它axes按operation声明的shape relation与operand axes对齐，不允许provider自行选择另一group relation。
+group size是正logical index。Scaled contract的closed positional schema为lhs carrier/scale `[M,G,C_lhs]`/`[M,G]`与rhs carrier/scale `[G,C_rhs,N]`/`[N,G]`；两侧使用同一个`G`与相同group size，reduction固定配对`G`和carrier-inner axes。沿flatten后的logical K，coordinate `k`读取group `k // group_size`的scale；`C_lhs/C_rhs`分别等于`group_size / elements_per_carrier(format)`。Decoded logical element先乘对应scale，再进入paired-axis multiply-add。其它rank或axis order必须由作者用普通logical transforms显式归一，shared/provider不得从shape猜另一group relation。
 
 sparse-contract schema定义compressed ordering、metadata到logical reduction positions的解释、invalid metadata与accumulator。canonical metadata是logical positions，不直接使用某个instruction要求的packed metadata layout：
 
@@ -177,7 +177,7 @@ canonical effects区分：
 - `scatter_reduce`；
 - atomic load/store/RMW/CAS。
 
-unique store要求active destination mapping injective，或由调用前置条件保证。`scatter_reduce`使用typed pure combine定义重复地址的合并，不承诺每次更新的linearization或old value。ordinary ordered control中的effects保持program order；unordered parallel iterations之间若可能访问同一地址，必须由unique、scatter-reduction或atomic semantics消解，否则程序非法。
+unique store要求active destination mapping可证明injective。`scatter_reduce`使用typed pure combine定义重复地址的合并，不承诺每次更新的linearization或old value。ordinary ordered control中的effects保持program order；unordered parallel iterations之间若可能访问同一地址，必须由unique、scatter-reduction或atomic semantics消解，否则程序非法。
 
 plain logical copy使用read→immutable SSA value→write表达，不建立独立canonical op。non-atomic read/write/gather/scatter不带memory order或physical scope。
 
@@ -228,14 +228,11 @@ result = (c0, c1, c2, c3)[word]
 
 它不读取target、program、thread、lane或调用序号。`uniform(..., dtype=f32)`固定为`f32(bits >> 8) * 2^-24`，结果位于`[0,1)`；normal等复合distribution使用普通DSL helper构造。provider只有在证明native RNG产生同一bit stream时才能替换该integer computation。
 
-## 13. Preconditions
+## 13. Closed typed input constraints
 
-作者可以声明不能由type/shape单独证明的调用前置条件，例如：
+当前语言只提供两类closed typed输入约束：
 
-- index in bounds；
-- indices sorted/unique；
-- dynamic extents equal；
-- views non-alias；
-- external encoded data满足format要求。
+- `I.assume_in_bounds(index, view_or_buffer, axis=...)`声明给定typed index relation在指定resource axis内；
+- external view annotation中的`alias/noalias`约束base allocation relation。
 
-precondition不生成runtime clamp、修复或fallback。违反前置条件是调用方错误。
+语言不提供接受任意bool expression的`assume`，也不把alignment、contiguity、sorted/unique、shape equality或encoded-format validity作为优化hint。将来只有真实kernel无法由现有类型、relation和operations表达时才增加新的约束；新增项必须具有closed typed schema、明确违反语义以及唯一canonical KIR表示，不能成为开放式布尔断言或授权优化的hint。

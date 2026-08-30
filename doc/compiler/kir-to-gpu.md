@@ -129,7 +129,7 @@ Initial conversion完成后必须验证：
 - all physical values具有合法scalar/fragment types；
 - every runtime program-space extent只依赖launch-visible values，data-derived member domains仍有完整的program-internal traversal；
 - every buffer的allocation scope、instance identity、initialization mode/coverage、ownership与visibility完整；
-- every dynamic/indexed access由explicit guard、已验证relation或KIR calling precondition证明在目标resource范围内；
+- every dynamic/indexed access由explicit guard、已验证relation或canonical `assume_in_bounds`证明在目标resource范围内；
 - every physical coordinate expression具有source identity/rank与完整SSA provenance，slice/broadcast/reshape/transpose/helper-call composition与KIR relation等价；
 - every active-member/range narrowing都是原relation的显式subset，并具有typed predicate/range proof；不能从shape、op name或origin side record重建；
 - every atomic op保存order、logical sharing domain与result semantics，并能从physical mapping得到合法provider scope；

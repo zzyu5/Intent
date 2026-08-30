@@ -1162,10 +1162,11 @@ LogicalResult verifyRegionScan(Operation *operation) {
 }
 
 LogicalResult verifyContract(Operation *operation) {
+  StringRef name = operation->getName().getStringRef();
   auto lhs = dyn_cast<RankedTensorType>(operation->getOperand(0).getType());
-  unsigned rhsIndex = operation->getName().getStringRef() == "intent.scaled_contract"
+  unsigned rhsIndex = name == "intent.scaled_contract"
                           ? 2
-                          : operation->getName().getStringRef() == "intent.sparse_contract"
+                          : name == "intent.sparse_contract"
                                 ? 2
                                 : 1;
   auto rhs = dyn_cast<RankedTensorType>(operation->getOperand(rhsIndex).getType());
@@ -1178,9 +1179,52 @@ LogicalResult verifyContract(Operation *operation) {
       getAxisPairs(operation, "batch", lhs.getRank(), rhs.getRank());
   if (failed(reductions) || failed(batches) || reductions->empty())
     return operation->emitOpError("contract requires at least one reduction pair");
+  if (name == "intent.scaled_contract") {
+    auto lhsScale = dyn_cast<RankedTensorType>(operation->getOperand(1).getType());
+    auto rhsScale = dyn_cast<RankedTensorType>(operation->getOperand(3).getType());
+    auto lhsGroup = operation->getAttrOfType<IntegerAttr>("lhs_group_size");
+    auto rhsGroup = operation->getAttrOfType<IntegerAttr>("rhs_group_size");
+    auto lhsFormat = operation->getAttrOfType<ScaledFormatAttr>("lhs_format");
+    auto rhsFormat = operation->getAttrOfType<ScaledFormatAttr>("rhs_format");
+    bool fixedAxes =
+        reductions->size() == 2 && batches->empty() &&
+        (*reductions)[0] == std::make_pair(1u, 0u) &&
+        (*reductions)[1] == std::make_pair(2u, 1u);
+    if (!lhsScale || !rhsScale || lhs.getRank() != 3 ||
+        lhsScale.getRank() != 2 || rhs.getRank() != 3 ||
+        rhsScale.getRank() != 2 || !fixedAxes || !lhsGroup || !rhsGroup ||
+        lhsGroup.getInt() <= 0 || lhsGroup != rhsGroup || !lhsFormat ||
+        !rhsFormat)
+      return operation->emitOpError(
+          "scaled contract requires the closed [M,G,C]/[M,G] x [G,C,N]/[N,G] schema");
+    auto carrierExtent = [](ScaledFormat format,
+                            int64_t group) -> std::optional<int64_t> {
+      int64_t packing = format == ScaledFormat::E2M1 ? 2 : 1;
+      if (group % packing != 0)
+        return std::nullopt;
+      return group / packing;
+    };
+    std::optional<int64_t> lhsCarrier =
+        carrierExtent(lhsFormat.getValue(), lhsGroup.getInt());
+    std::optional<int64_t> rhsCarrier =
+        carrierExtent(rhsFormat.getValue(), rhsGroup.getInt());
+    if (!lhsCarrier || !rhsCarrier || lhs.getDimSize(2) != *lhsCarrier ||
+        rhs.getDimSize(1) != *rhsCarrier ||
+        !sameDimension(lhs, 0, lhsScale, 0) ||
+        !sameDimension(lhs, 1, lhsScale, 1) ||
+        !sameDimension(lhs, 1, rhs, 0) ||
+        !sameDimension(lhs, 1, rhsScale, 1) ||
+        !sameDimension(rhs, 2, rhsScale, 0) || result.getRank() != 2 ||
+        !sameDimension(lhs, 0, result, 0) ||
+        !sameDimension(rhs, 2, result, 1) || !isNumericData(lhsScale) ||
+        !isNumericData(rhsScale) || !isNumericData(result))
+      return operation->emitOpError(
+          "scaled contract operands violate the closed scale-axis relation");
+    return success();
+  }
   llvm::DenseSet<unsigned> lhsUsed;
   llvm::DenseSet<unsigned> rhsUsed;
-  bool sparse = operation->getName().getStringRef() == "intent.sparse_contract";
+  bool sparse = name == "intent.sparse_contract";
   auto sparseFormat =
       sparse ? operation->getAttrOfType<SparseFormatAttr>("format")
              : SparseFormatAttr();
@@ -1224,16 +1268,7 @@ LogicalResult verifyContract(Operation *operation) {
   if (!isNumericData(result))
     return operation->emitOpError(
         "contract accumulator/result element type must be numeric");
-  StringRef name = operation->getName().getStringRef();
-  if (name == "intent.scaled_contract") {
-    auto lhsGroup = operation->getAttrOfType<IntegerAttr>("lhs_group_size");
-    auto rhsGroup = operation->getAttrOfType<IntegerAttr>("rhs_group_size");
-    auto lhsFormat = operation->getAttrOfType<ScaledFormatAttr>("lhs_format");
-    auto rhsFormat = operation->getAttrOfType<ScaledFormatAttr>("rhs_format");
-    if (!lhsGroup || !rhsGroup || lhsGroup.getInt() <= 0 ||
-        rhsGroup.getInt() <= 0 || !lhsFormat || !rhsFormat)
-      return operation->emitOpError("scaled contract format schema is incomplete");
-  } else if (name == "intent.sparse_contract") {
+  if (name == "intent.sparse_contract") {
     auto format = operation->getAttrOfType<SparseFormatAttr>("format");
     if (!format || format.getCompressionAxis() >= lhs.getRank() ||
         !operation->getOperand(3).getType().isIndex())

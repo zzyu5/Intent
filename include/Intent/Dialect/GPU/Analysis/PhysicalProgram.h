@@ -130,6 +130,7 @@ mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
 struct PhysicalReplayFact {
   PhysicalFactState state = PhysicalFactState::Unknown;
   bool crossesAccess = false;
+  llvm::SmallVector<mlir::Operation *, 2> accesses;
   llvm::SmallVector<mlir::Operation *, 2> blockers;
 
   bool isReplayable() const { return state == PhysicalFactState::Exact; }

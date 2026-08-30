@@ -42,7 +42,7 @@ Broadcast保存显式axis map；transpose/permute组合axis permutation；reshap
 
 ## 2. Shape 与 tensor values
 
-tensor value 的每个 dynamic extent 是有 identity 的 runtime shape value。两个未知 extent 不会因为“都是 dynamic”而自动相等；相等只能来自同一 value、operation 明确产生的 shape relation，或调用方必须满足的前置条件。
+tensor value 的每个 dynamic extent 是有 identity 的 runtime shape value。两个未知 extent 不会因为“都是 dynamic”而自动相等；相等只能来自同一 value或operation明确产生的shape relation。
 
 pointwise surface 允许 scalar 与 size-one broadcasting，frontend 将其归一为显式 canonical broadcast relation：
 
@@ -156,7 +156,7 @@ emit(A ++ B, state)
 - reduce 保存 accumulator schema、axes、identity 与 typed pure combine；
 - scan 保存相同 combine，并定义 direction 与 inclusive/exclusive prefixes；
 - contract 保存二元 multiply-add contraction 的 paired batch/reduction axes、free axes 与 accumulator；
-- scaled contract 保存 microscaling formats、scale relation与逻辑 contraction；
+- scaled contract 用closed `[M,G,C]/[M,G] × [G,C,N]/[N,G]` positional schema保存microscaling formats、scale relation与逻辑contraction；
 - sparse contract 保存 compressed values、typed format schema、metadata interpretation与逻辑 contraction；
 - histogram 保存 values 到 count tensor 的 binning semantics。
 
@@ -207,7 +207,7 @@ canonical Kernel IR 不建立独立 RaggedOp 或 MembersOp。`ragged(...)`、`me
 - read 的 invalid lane不访问 source，并返回显式 fill；
 - invalid write lane不产生 effect。
 
-ordinary assignment 与 unique scatter使用 arbitrary-index unique store；目的 relation必须可证明 injective，或由调用前置条件保证。collision reduction使用独立 `scatter_reduce` 与 typed combine。atomic load/store/RMW/CAS保存不可分割性、modification order、旧值和 memory order。
+ordinary assignment 与 unique scatter使用 arbitrary-index unique store；目的 relation必须可证明 injective。collision reduction使用独立 `scatter_reduce` 与 typed combine。atomic load/store/RMW/CAS保存不可分割性、modification order、旧值和 memory order。
 
 Intent 不提供 canonical copy op。一次 immutable SSA read 加 indexed write 已完整定义 snapshot、mapping、validity、cast、alias 与 effect order；bulk transfer、async copy、DMA/TMA和同步协议由 physical program形成。
 

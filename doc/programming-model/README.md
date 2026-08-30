@@ -43,7 +43,7 @@ Intent source + specialization + external target selection
 - Triton/cuTile/TileLang API form、autotune candidates 与 winner；
 - provider capability 或设备型号分支。
 
-作者可以写索引范围、别名、shape equality 等调用前置条件；它们限制合法输入，不是物理实现提示。
+作者可用`I.assume_in_bounds`声明typed index relation的范围，并用external-view annotation声明`alias/noalias`。语言没有一般布尔precondition或优化hint；其它输入关系必须由类型、普通operations或未来被真实kernel逼出的closed typed construct表达。
 
 ## 5. Logical subregion 不是 physical tile
 

@@ -614,13 +614,45 @@ def _scaled_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
         for value in (lhs, lhs_scale, rhs, rhs_scale)
     ):
         lowerer.error(node, "I.scaled_contract operands and scales must be tensors")
-    reduce, batch, result_shape = _contract_relations(lowerer, lhs, rhs, bound, node)
     lhs_format = _scaled_format(lowerer, bound["lhs_format"])
     rhs_format = _scaled_format(lowerer, bound["rhs_format"])
     lhs_group = require_static_int(lowerer, bound["lhs_group_size"])
     rhs_group = require_static_int(lowerer, bound["rhs_group_size"])
-    if lhs_group <= 0 or rhs_group <= 0:
-        lowerer.error(node, "scaled-contract group sizes must be positive")
+    if lhs_group <= 0 or lhs_group != rhs_group:
+        lowerer.error(node, "scaled-contract requires one equal positive group size")
+    reduce = tuple(
+        (left % lhs.type.rank, right % rhs.type.rank)
+        for left, right in _axis_pairs(lowerer, bound["reduce"], "reduction")
+    )
+    batch = _axis_pairs(lowerer, bound["batch"], "batch") if "batch" in bound else ()
+    if (
+        lhs.type.rank != 3
+        or lhs_scale.type.rank != 2
+        or rhs.type.rank != 3
+        or rhs_scale.type.rank != 2
+        or reduce != ((1, 0), (2, 1))
+        or batch
+    ):
+        lowerer.error(
+            node,
+            "scaled-contract requires lhs/lhs-scale [M,G,C]/[M,G], "
+            "rhs/rhs-scale [G,C,N]/[N,G], reduce=((1,0),(2,1)), and no batch axes",
+        )
+    lhs_carrier = lhs_group // (2 if lhs_format is ScaledFormatKind.E2M1 else 1)
+    rhs_carrier = rhs_group // (2 if rhs_format is ScaledFormatKind.E2M1 else 1)
+    if (
+        lhs_group % (2 if lhs_format is ScaledFormatKind.E2M1 else 1)
+        or rhs_group % (2 if rhs_format is ScaledFormatKind.E2M1 else 1)
+        or lhs.type.shape[2] != StaticDim(lhs_carrier)
+        or rhs.type.shape[1] != StaticDim(rhs_carrier)
+        or not dims_compatible(lhs.type.shape[0], lhs_scale.type.shape[0])
+        or not dims_compatible(lhs.type.shape[1], lhs_scale.type.shape[1])
+        or not dims_compatible(lhs.type.shape[1], rhs.type.shape[0])
+        or not dims_compatible(lhs.type.shape[1], rhs_scale.type.shape[1])
+        or not dims_compatible(rhs.type.shape[2], rhs_scale.type.shape[0])
+    ):
+        lowerer.error(node, "scaled-contract operands violate the closed scale-axis relation")
+    result_shape = (lhs.type.shape[0], rhs.type.shape[2])
     return lowerer.emit(
         OperationKind.SCALED_CONTRACT,
         lowerer.location(node),

@@ -26,7 +26,7 @@ def block_scaled_matmul(
         lhs[rows, k_blocks, k_inner],
         lhs_scale[rows, k_blocks],
         rhs[k_blocks, k_inner, columns],
-        rhs_scale[k_blocks, columns],
+        I.transpose(rhs_scale[k_blocks, columns], (1, 0)),
         lhs_format=I.e4m3,
         rhs_format=I.e4m3,
         lhs_group_size=32,
@@ -113,13 +113,13 @@ def deepgemm_fp8_2xacc(
     result = I.scaled_contract(
         lhs[rows, blocks, reduction],
         lhs_scale[rows, blocks],
-        rhs[columns, blocks, reduction],
+        I.transpose(rhs[columns, blocks, reduction], (1, 2, 0)),
         rhs_scale[column_blocks, blocks],
         lhs_format=I.e4m3,
         rhs_format=I.e4m3,
         lhs_group_size=128,
         rhs_group_size=128,
-        reduce=((1, 1), (2, 2)),
+        reduce=((1, 0), (2, 1)),
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(

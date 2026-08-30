@@ -1384,6 +1384,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
   }
   if (isAccessNode(operation)) {
     result.crossesAccess = true;
+    appendUnique(result.accesses, operation);
     if (!allowAccesses) {
       appendUnique(result.blockers, operation);
       result.state = PhysicalFactState::Unknown;

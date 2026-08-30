@@ -927,15 +927,62 @@ LogicalResult RegionScanOp::verify() {
 
 LogicalResult ScaledContractOp::verify() {
   auto lhs = getLhs().getType();
+  auto lhsScale = getLhsScale().getType();
   auto rhs = getRhs().getType();
+  auto rhsScale = getRhsScale().getType();
   auto result = getResult().getType();
-  if (getLhsGroupSize() == 0 || getRhsGroupSize() == 0 ||
+  auto sameLogicalAxis = [](FragmentType left, unsigned leftAxis,
+                            FragmentType right, unsigned rightAxis) {
+    auto lhsMap = cast<AxisMapAttr>(left.getAxisMaps()[leftAxis]);
+    auto rhsMap = cast<AxisMapAttr>(right.getAxisMaps()[rightAxis]);
+    return lhsMap.getDimensionId() > 0 &&
+           lhsMap.getDimensionId() == rhsMap.getDimensionId();
+  };
+  auto constantExtent = [](FragmentType value,
+                           unsigned axis) -> std::optional<int64_t> {
+    auto extent = cast<PhysicalExprAttr>(value.getShape()[axis]);
+    return extent.getKind() ==
+                   static_cast<uint32_t>(PhysicalExprKind::Constant)
+               ? std::optional<int64_t>(extent.getValue())
+               : std::nullopt;
+  };
+  auto carrierExtent = [](ScaledFormat format,
+                          uint64_t group) -> std::optional<int64_t> {
+    uint64_t packing = format == ScaledFormat::E2M1 ? 2 : 1;
+    return group % packing == 0
+               ? std::optional<int64_t>(group / packing)
+               : std::nullopt;
+  };
+  ArrayRef<int64_t> lhsReduction = getLhsReductionAxes();
+  ArrayRef<int64_t> rhsReduction = getRhsReductionAxes();
+  bool fixedAxes = lhsReduction.size() == 2 && rhsReduction.size() == 2 &&
+                   lhsReduction[0] == 1 && lhsReduction[1] == 2 &&
+                   rhsReduction[0] == 0 && rhsReduction[1] == 1 &&
+                   getLhsBatchAxes().empty() && getRhsBatchAxes().empty();
+  if (getLhsGroupSize() == 0 ||
+      getLhsGroupSize() != getRhsGroupSize() ||
       getAccumulator().getType() != result || lhs.getOwner() != rhs.getOwner() ||
-      lhs.getOwner() != result.getOwner())
+      lhs.getOwner() != lhsScale.getOwner() ||
+      lhs.getOwner() != rhsScale.getOwner() || lhs.getOwner() != result.getOwner() ||
+      lhs.getShape().size() != 3 || lhsScale.getShape().size() != 2 ||
+      rhs.getShape().size() != 3 || rhsScale.getShape().size() != 2 ||
+      result.getShape().size() != 2 || !fixedAxes)
     return emitOpError("scaled-contract physical schema is invalid");
-  return verifyContractAxes(getOperation(), lhs, rhs, result,
-                            getLhsReductionAxes(), getRhsReductionAxes(),
-                            getLhsBatchAxes(), getRhsBatchAxes());
+  std::optional<int64_t> lhsCarrier =
+      carrierExtent(getLhsFormat(), getLhsGroupSize());
+  std::optional<int64_t> rhsCarrier =
+      carrierExtent(getRhsFormat(), getRhsGroupSize());
+  if (!lhsCarrier || !rhsCarrier || constantExtent(lhs, 2) != lhsCarrier ||
+      constantExtent(rhs, 1) != rhsCarrier ||
+      !sameLogicalAxis(lhs, 0, lhsScale, 0) ||
+      !sameLogicalAxis(lhs, 1, lhsScale, 1) ||
+      !sameLogicalAxis(lhs, 1, rhs, 0) ||
+      !sameLogicalAxis(lhs, 1, rhsScale, 1) ||
+      !sameLogicalAxis(rhs, 2, rhsScale, 0) ||
+      !sameLogicalAxis(lhs, 0, result, 0) ||
+      !sameLogicalAxis(rhs, 2, result, 1))
+    return emitOpError("scaled-contract physical scale-axis relation is invalid");
+  return success();
 }
 
 LogicalResult SparseContractOp::verify() {

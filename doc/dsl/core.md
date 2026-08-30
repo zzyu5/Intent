@@ -83,7 +83,7 @@ Python tuple literal与tuple-valued helper result构造固定长度、按位置�
 - component可以是scalar、ranked tensor、tuple或nested record，不要求相同dtype、rank或shape；
 - tuple使用静态位置选择或解构，record使用静态`.field`选择；
 - type identity分别包含tuple component顺序，或record字段名、字段顺序与逐字段类型；
-- 它们可作helper values、loop carry、logical-buffer element schema与structured-operation accumulator/identity；
+- 它们可作helper values、loop carry与structured-operation accumulator/identity；
 - 它们不直接成为kernel public runtime parameter、external-view element或host-visible return。跨kernel状态要拆成显式views/scalars。
 
 Tuple/record不拥有统一`.shape`或`.dtype`；要取tensor shape，先选中具体component。它们也不是`join`：`join`产生具有单一element dtype和新logical axis的ranked tensor。
@@ -271,23 +271,28 @@ axis permutation、将多个free/reduction axes双射flatten为M/K/N、MMA选择
 
 ```python
 acc = I.scaled_contract(
-    lhs,
-    lhs_scale,
-    rhs,
-    rhs_scale,
+    lhs_mgc,       # [M, G, C_lhs]
+    lhs_scale_mg,  # [M, G]
+    rhs_gcn,       # [G, C_rhs, N]
+    rhs_scale_ng,  # [N, G]
     lhs_format=I.e2m1,
     rhs_format=I.e4m3,
     lhs_group_size=32,
     rhs_group_size=32,
-    reduce=((1, 0),),
+    reduce=((1, 0), (2, 1)),
     batch=(),
     acc_dtype=I.f32,
 )
 ```
 
-scaled contract是first-class local tensor operation。formats、packed logical element order、scale tensors到logical groups的relation、contraction axes、accumulator与rounding属于算法语义。K packing、native scaled MMA、layout与storage不属于调用。`e2m1/e4m3/e8m0`的bit encoding、group coordinate与特殊值见[`types-numerics-and-effects.md`](types-numerics-and-effects.md)。
+scaled contract是first-class local tensor operation。它使用一个closed positional schema表达scale-axis relation，而不是让shared pass从rank、shape或附近indexing反推：
 
-它继承ordinary contract的全部axis规则：非空且唯一的reduction pairs、互不重叠的batch pairs、free/result axis order与multiply-add accumulator semantics。scale relation只增加operand value interpretation，不改变contraction定义。
+- lhs carrier固定为`[M, G, C_lhs]`，lhs scale固定为`[M, G]`；
+- rhs carrier固定为`[G, C_rhs, N]`，rhs scale固定为`[N, G]`；
+- `reduce`固定为`((1, 0), (2, 1))`，`batch`固定为空，result为`[M, N]`；
+- 两侧group size相同；`G`是同一个logical scale-group axis；`C_lhs/C_rhs`由各自format的每carrier logical element数与group size唯一确定。
+
+这里的`G`是scaled value interpretation的一部分，不是compiler-selected blocking。Formats、packed logical element order、scale tensors到logical groups的relation、accumulator与rounding属于算法语义；native scaled MMA、layout、storage与把`[G,C]`重新flatten成provider K axis属于physical lowering。`e2m1/e4m3/e8m0`的bit encoding、group coordinate与特殊值见[`types-numerics-and-effects.md`](types-numerics-and-effects.md)。其它rank、axis permutation或batch形态由作者先用普通transpose/reshape与外层control归一到该closed schema，不形成第二种scaled-contract axis convention。
 
 普通packed INT4/INT2不是scaled contract。作者使用carrier tensor、bit/index arithmetic、sign extension、zero-point与scale表达其logical values，再调用ordinary contract。
 
@@ -350,7 +355,7 @@ canonical operations继续区分：
 - arbitrary-index unique store；
 - `scatter_reduce`。
 
-unique store要求destination relation可证明injective或由precondition保证。`scatter_reduce`保存typed combine与collision semantics。
+unique store要求destination relation可证明injective。`scatter_reduce`保存typed combine与collision semantics。
 
 logical buffer是kernel-local mutable state；作者定义shape、dtype、initialization与read/write order，不指定physical residency。
 
