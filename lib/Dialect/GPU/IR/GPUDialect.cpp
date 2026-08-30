@@ -77,9 +77,17 @@ LogicalResult PhysicalExprAttr::verify(
   if (!symbol.empty() || value != 0)
     return emitError() << "composed physical expression cannot carry a symbol or literal payload";
   unsigned expected = kind == 8 ? 3 : kind == 12 ? 1 : 2;
-  return operands.size() == expected
-             ? success()
-             : emitError() << "composed physical expression has the wrong arity";
+  if (operands.size() != expected)
+    return emitError() << "composed physical expression has the wrong arity";
+  if (kind == static_cast<uint32_t>(PhysicalExprKind::CeilDiv) ||
+      kind == static_cast<uint32_t>(PhysicalExprKind::FloorDiv)) {
+    auto divisor = mlir::cast<PhysicalExprAttr>(operands[1]);
+    if (divisor.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        divisor.getValue() == 0)
+      return emitError() << "physical division requires a nonzero divisor";
+  }
+  return success();
 }
 
 LogicalResult ParameterAttr::verify(
@@ -232,6 +240,16 @@ LogicalResult BufferType::verify(
   if (workspace !=
       (scope.getValue() == BufferScope::InvocationWorkspace))
     return emitError() << "workspace flag and invocation scope disagree";
+  bool lifetimeMatches =
+      (scope.getValue() == BufferScope::ProgramPrivate &&
+       lifetime.getValue() == BufferLifetime::Program) ||
+      (scope.getValue() == BufferScope::IterationPrivate &&
+       lifetime.getValue() == BufferLifetime::Iteration) ||
+      (scope.getValue() == BufferScope::InvocationWorkspace &&
+       lifetime.getValue() == BufferLifetime::Invocation);
+  if (!lifetimeMatches)
+    return emitError()
+           << "physical buffer allocation scope and lifetime disagree";
   return success();
 }
 

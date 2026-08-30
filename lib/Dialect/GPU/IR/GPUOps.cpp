@@ -1045,11 +1045,33 @@ LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
                                   ArrayRef<int64_t> sourceAxes,
                                   AtomicOrdering ordering,
                                   AtomicSharingDomain sharing) {
-  (void)ordering;
-  (void)sharing;
   if (coordinates.size() != rankOf(resource) ||
       sourceAxes.size() != coordinates.size())
     return owner->emitOpError("atomic physical address/order schema is invalid");
+  bool orderingLegal =
+      (isa<AtomicLoadOp>(owner) &&
+       (ordering == AtomicOrdering::Relaxed ||
+        ordering == AtomicOrdering::Acquire)) ||
+      (isa<AtomicStoreOp>(owner) &&
+       (ordering == AtomicOrdering::Relaxed ||
+        ordering == AtomicOrdering::Release)) ||
+      isa<AtomicRMWOp, AtomicCompareExchangeOp>(owner);
+  if (!orderingLegal)
+    return owner->emitOpError(
+        "atomic ordering is illegal for this physical operation");
+  if (auto buffer = dyn_cast<BufferType>(resource)) {
+    AtomicSharingDomain expected =
+        buffer.getScope().getValue() == BufferScope::InvocationWorkspace
+            ? AtomicSharingDomain::KernelInvocation
+            : AtomicSharingDomain::ProgramInstance;
+    if (sharing != expected)
+      return owner->emitOpError(
+          "atomic sharing domain disagrees with its physical allocation scope");
+  } else if (isa<ViewType>(resource) &&
+             sharing != AtomicSharingDomain::KernelInvocation) {
+    return owner->emitOpError(
+        "external-view atomic must cover the kernel invocation");
+  }
   if (valid && !elementType(valid.getType()).isInteger(1))
     return owner->emitOpError("atomic validity must be a predicate");
   llvm::DenseSet<int64_t> axes;
