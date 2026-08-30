@@ -454,6 +454,13 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
+FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
+                                      PhysicalSourceAxis source,
+                                      PhysicalExprAttr blockedExtent,
+                                      Value blockedRange, Value blockedValidity,
+                                      Operation *insertionAnchor,
+                                      IRMapping &mapping);
+
 LogicalResult addTailValidity(func::FuncOp kernel,
                               llvm::DenseMap<Value, Value> &rangePredicates,
                               bool includeStores) {
@@ -559,6 +566,52 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     OpBuilder builder(store);
     Value payload = store.getValue();
     auto valueType = dyn_cast<FragmentType>(payload.getType());
+    if (valueType) {
+      SmallVector<MakeRangeOp> blockedRanges;
+      for (Value coordinate : store.getCoordinates()) {
+        llvm::SmallPtrSet<Operation *, 8> roots;
+        collectCoordinateRanges(coordinate, roots);
+        for (Operation *root : roots) {
+          auto range = dyn_cast<MakeRangeOp>(root);
+          if (range && rangePredicates.contains(range.getResult()) &&
+              !llvm::is_contained(blockedRanges, range))
+            blockedRanges.push_back(range);
+        }
+      }
+      for (MakeRangeOp range : blockedRanges) {
+        FailureOr<int64_t> dimension = queryRangeDimension(range);
+        PhysicalDimensionProjection projection =
+            succeeded(dimension)
+                ? queryFragmentDimension(valueType, *dimension)
+                : PhysicalDimensionProjection{};
+        if (!projection.isExact())
+          continue;
+        auto rangeType = cast<FragmentType>(range.getResult().getType());
+        auto blockedExtent =
+            cast<PhysicalExprAttr>(rangeType.getShape()[0]);
+        if (valueType.getShape()[projection.fragmentAxis] == blockedExtent)
+          continue;
+        IRMapping mapping;
+        FailureOr<Value> replayed = replayPointwiseValue(
+            builder, payload, sourceAxisIdentity(range), blockedExtent,
+            range.getResult(), rangePredicates.lookup(range.getResult()),
+            store.getOperation(), mapping);
+        if (failed(replayed))
+          return store.emitOpError(
+                     "pointwise store payload cannot be replayed to its blocked coordinate")
+                 << "; source_id=" << range.getSourceId()
+                 << ", source_axis=" << range.getSourceAxis()
+                 << ", dimension="
+                 << (succeeded(dimension) ? *dimension : -1)
+                 << ", payload=" << payload.getType()
+                 << ", coordinate=" << range.getResult().getType();
+        payload = *replayed;
+        valueType = dyn_cast<FragmentType>(payload.getType());
+        if (!valueType)
+          return store.emitOpError(
+              "pointwise replay lost the store payload fragment schema");
+      }
+    }
     if (!valueType) {
       if (!isa<IntegerType, FloatType, IndexType>(payload.getType()))
         return store.emitOpError(
@@ -1778,6 +1831,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     });
   if (!ownershipOnly) {
     SmallVector<MakeRangeOp> realized;
+    SmallVector<MakeRangeOp> nonReplayable;
     for (MakeRangeOp range : dynamicRanges) {
       if (!reuseTraversalRanges.contains(range.getOperation()))
         continue;
@@ -1808,11 +1862,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       // would require cloning author control flow, which is not a pointwise
       // realization.  The ordinary internal-range path below binds an exact
       // full-coverage extent instead.
-      if (!replayable)
+      if (!replayable) {
+        nonReplayable.push_back(range);
         continue;
+      }
       if (failed(realizeReusePointwiseTraversal(kernel, range)))
         return failure();
       realized.push_back(range);
+    }
+    for (MakeRangeOp range : nonReplayable) {
+      reuseTraversalRanges.erase(range.getOperation());
+      internalTraversalRanges.insert(range.getOperation());
     }
     eraseDeadPhysicalValues(kernel);
     llvm::erase_if(dynamicRanges, [&](MakeRangeOp range) {
@@ -1935,11 +1995,43 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Attribute, ParameterOp> parameters;
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
+  llvm::SmallPtrSet<Operation *, 16> nonReplayableOwnershipRanges;
+  SmallVector<StoreOp> replayStores;
+  kernel.walk([&](StoreOp store) { replayStores.push_back(store); });
+  for (MakeRangeOp range : dynamicRanges) {
+    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                              range.getDerived()};
+    FailureOr<uint64_t> dimension = rangeDimension(range);
+    for (StoreOp store : replayStores) {
+      bool coordinateCarriesTraversal =
+          succeeded(dimension) &&
+          llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
+            return llvm::any_of(
+                queryFragmentAxes(coordinate.getType(), source),
+                [&](const PhysicalAxisProjection &projection) {
+                  return projection.dimensionId ==
+                         static_cast<int64_t>(*dimension);
+                });
+          });
+      if (!coordinateCarriesTraversal)
+        continue;
+      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+          store.getValue(), source, PhysicalReplayScope::ValueGraph,
+          /*allowAccesses=*/true, store.getOperation(),
+          succeeded(dimension) ? std::optional<int64_t>(*dimension)
+                               : std::nullopt);
+      if (!replay.isReplayable()) {
+        nonReplayableOwnershipRanges.insert(range.getOperation());
+        break;
+      }
+    }
+  }
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     return ownershipSources.contains(source) &&
+           !nonReplayableOwnershipRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
             !scanSegmentDimensions.contains(*dimension));

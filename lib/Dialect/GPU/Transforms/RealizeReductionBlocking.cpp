@@ -129,28 +129,6 @@ FragmentType replaceExtent(FragmentType source, unsigned axis,
                            source.getOwner());
 }
 
-void collectRanges(Value value, PhysicalExprAttr logicalExtent,
-                   SmallVectorImpl<MakeRangeOp> &ranges) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return;
-  PhysicalProgramAnalysis analysis(kernel);
-  PhysicalRangeFact fact = analysis.sourceRanges(value);
-  for (MakeRangeOp range : fact.roots) {
-    auto fragment = range.getResult().getType();
-    auto constant = range.getExtent().getDefiningOp<arith::ConstantOp>();
-    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-    if (fragment.getShape().size() == 1 &&
-        (fragment.getShape()[0] == logicalExtent ||
-         (logicalExtent.getKind() ==
-              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-          integer && integer.getInt() == logicalExtent.getValue())) &&
-        !llvm::is_contained(ranges, range))
-      ranges.push_back(range);
-  }
-}
-
 FailureOr<Value> predicateForReductionSource(OpBuilder &builder,
                                              Location location, Value predicate,
                                              FragmentType source,
@@ -191,6 +169,7 @@ void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
 FailureOr<Value> clonePaddedProducer(
     OpBuilder &builder, Location location, Value value,
     PhysicalSourceAxis reductionSource,
+    ArrayRef<MakeRangeOp> selectedRanges,
     PhysicalExprAttr logicalExtent, PhysicalExprAttr physicalExtent,
     Value physicalExtentValue, IRMapping &mapping,
     SmallVectorImpl<Value> &tailPredicates) {
@@ -199,11 +178,18 @@ FailureOr<Value> clonePaddedProducer(
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return value;
-  PhysicalAxisProjection projected =
-      queryFragmentAxis(fragment, reductionSource);
-  if (!projected.isExact())
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalRangeAxisFact selected =
+      PhysicalProgramAnalysis(kernel).rangeAxes(value, selectedRanges);
+  if (!selected.isExact())
+    return failure();
+  if (selected.fragmentAxes.empty())
     return value;
-  unsigned reductionAxis = projected.fragmentAxis;
+  if (selected.fragmentAxes.size() != 1)
+    return failure();
+  unsigned reductionAxis = selected.fragmentAxes.front();
   if (fragment.getShape()[reductionAxis] != logicalExtent)
     return value;
   Operation *producer = value.getDefiningOp();
@@ -258,7 +244,7 @@ FailureOr<Value> clonePaddedProducer(
               builder, location, broadcast.getValue(),
               PhysicalSourceAxis{inputMapping.getSourceId(),
                                  inputMapping.getSourceAxis(),
-                                 inputMapping.getDerived()},
+                                 inputMapping.getDerived()}, selectedRanges,
               logicalExtent, physicalExtent, physicalExtentValue, mapping,
               tailPredicates);
           if (failed(replayed))
@@ -280,7 +266,8 @@ FailureOr<Value> clonePaddedProducer(
     SmallVector<Value> coordinates;
     for (Value coordinate : load.getCoordinates()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, coordinate, reductionSource, logicalExtent,
+          builder, location, coordinate, reductionSource, selectedRanges,
+          logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
@@ -290,7 +277,8 @@ FailureOr<Value> clonePaddedProducer(
     Value valid;
     if (load.getValid()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getValid(), reductionSource, logicalExtent,
+          builder, location, load.getValid(), reductionSource, selectedRanges,
+          logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
@@ -300,7 +288,8 @@ FailureOr<Value> clonePaddedProducer(
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getFill(), reductionSource, logicalExtent,
+          builder, location, load.getFill(), reductionSource, selectedRanges,
+          logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
       if (failed(replayed))
@@ -358,7 +347,8 @@ FailureOr<Value> clonePaddedProducer(
 
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = clonePaddedProducer(
-        builder, location, operand, reductionSource, logicalExtent,
+        builder, location, operand, reductionSource, selectedRanges,
+        logicalExtent,
         physicalExtent,
         physicalExtentValue, mapping, tailPredicates);
     if (failed(replayed))
@@ -850,7 +840,6 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     return false;
 
   PhysicalExprAttr logicalExtent;
-  SmallVector<SmallVector<MakeRangeOp>> componentRanges;
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment ||
@@ -864,19 +853,81 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     if (logicalExtent && logicalExtent != extent)
       return false;
     logicalExtent = extent;
-    SmallVector<MakeRangeOp> ranges;
-    collectRanges(source, extent, ranges);
-    llvm::sort(ranges, [](MakeRangeOp lhs, MakeRangeOp rhs) {
-      return lhs->isBeforeInBlock(rhs);
-    });
-    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
-    componentRanges.push_back(std::move(ranges));
   }
   if (!logicalExtent || logicalExtent.getValue() <= 0)
     return false;
   PhysicalExprAttr physicalExtent = nextPowerOfTwo(logicalExtent);
   if (physicalExtent == logicalExtent)
     return false;
+
+  SmallVector<SmallVector<MakeRangeOp>> componentRanges;
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = cast<FragmentType>(source.getType());
+    PhysicalProgramAnalysis analysis(kernel);
+    PhysicalRangeFact reductionRanges =
+        analysis.axisRanges(source, static_cast<unsigned>(reductionAxis));
+    FailureOr<MakeRangeOp> authority =
+        queryExactLogicalRange(reductionRanges);
+    if (failed(authority) && reductionRanges.roots.empty()) {
+      auto mapping = cast<AxisMapAttr>(
+          fragment.getAxisMaps()[static_cast<unsigned>(reductionAxis)]);
+      PhysicalSourceAxis reductionSource{mapping.getSourceId(),
+                                         mapping.getSourceAxis(),
+                                         mapping.getDerived()};
+      PhysicalRangeFact programRanges =
+          analysis.programRanges(reductionSource);
+      PhysicalRangeFact dimensionRanges;
+      dimensionRanges.state = PhysicalFactState::Exact;
+      for (MakeRangeOp range : programRanges.roots) {
+        FailureOr<int64_t> dimension = queryRangeDimension(range);
+        if (succeeded(dimension) &&
+            *dimension == mapping.getDimensionId())
+          dimensionRanges.roots.push_back(range);
+      }
+      if (dimensionRanges.roots.empty())
+        dimensionRanges.state = PhysicalFactState::Unknown;
+      else if (dimensionRanges.roots.size() > 1)
+        dimensionRanges.state = PhysicalFactState::Ambiguous;
+      dimensionRanges.unitStep =
+          !dimensionRanges.roots.empty() &&
+          llvm::all_of(dimensionRanges.roots, isUnitStepRange);
+      authority = queryExactLogicalRange(dimensionRanges);
+      if (succeeded(authority))
+        reductionRanges = std::move(dimensionRanges);
+    }
+    SmallVector<MakeRangeOp> ranges(reductionRanges.roots.begin(),
+                                    reductionRanges.roots.end());
+    llvm::sort(ranges, [](MakeRangeOp lhs, MakeRangeOp rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
+    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+    if (failed(authority)) {
+      InFlightDiagnostic diagnostic = reduce.emitOpError(
+          "static non-power-of-two reduction axis has no exact range authority");
+      diagnostic << "; range_state="
+                 << static_cast<unsigned>(reductionRanges.state)
+                 << ", roots=" << reductionRanges.roots.size()
+                 << ", blockers=" << reductionRanges.blockers.size()
+                 << ", source_type=" << source.getType();
+      if (Operation *definition = source.getDefiningOp()) {
+        diagnostic << ", source_def=" << definition->getName();
+        for (Value operand : definition->getOperands())
+          if (Operation *operandDefinition = operand.getDefiningOp())
+            diagnostic << ", operand_def=" << operandDefinition->getName();
+      }
+      for (MakeRangeOp root : reductionRanges.roots) {
+        FailureOr<int64_t> dimension = queryRangeDimension(root);
+        diagnostic << ", root=(source_id=" << root.getSourceId()
+                   << ",source_axis=" << root.getSourceAxis()
+                   << ",dimension="
+                   << (succeeded(dimension) ? *dimension : -1) << ")";
+      }
+      for (Operation *blocker : reductionRanges.blockers)
+        diagnostic << ", blocker=" << blocker->getName();
+      return failure();
+    }
+    componentRanges.push_back(std::move(ranges));
+  }
   if (llvm::any_of(componentRanges,
                    [](ArrayRef<MakeRangeOp> ranges) { return ranges.empty(); }))
     return reduce.emitOpError(
@@ -905,12 +956,22 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
         builder, reduce.getLoc(), reduce.getInputs()[component], reductionSource,
-        logicalExtent, physicalExtent, physicalExtentValue, mapping,
+        componentRanges[component], logicalExtent, physicalExtent,
+        physicalExtentValue, mapping,
         tailPredicates);
-    if (failed(source) || tailPredicates.empty())
-      return reduce.emitOpError(
-                 "static reduction producer cannot be replayed over its padded extent"),
-             failure();
+    if (failed(source) || tailPredicates.empty()) {
+      PhysicalRangeAxisFact selected =
+          PhysicalProgramAnalysis(kernel).rangeAxes(
+              reduce.getInputs()[component], componentRanges[component]);
+      InFlightDiagnostic diagnostic = reduce.emitOpError(
+          "static reduction producer cannot be replayed over its padded extent");
+      diagnostic << "; selected_state=" << static_cast<unsigned>(selected.state)
+                 << ", selected_axes=" << selected.fragmentAxes.size()
+                 << ", selected_ranges=" << componentRanges[component].size()
+                 << ", replay_failed=" << failed(source)
+                 << ", tail_count=" << tailPredicates.size();
+      return failure();
+    }
     auto sourceType = cast<FragmentType>(source->getType());
     Value tail;
     for (Value base : tailPredicates) {
