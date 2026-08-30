@@ -91,9 +91,22 @@ FailureOr<uint64_t> rangeDimension(MakeRangeOp range) {
              : FailureOr<uint64_t>(failure());
 }
 
-FailureOr<uint64_t> ownershipDimension(MakeRangeOp range) {
+bool hasAccessDependentSubregionBounds(func::FuncOp kernel, MakeRangeOp range) {
+  if (!range->hasAttr(sourceSubregionAttr))
+    return false;
+  PhysicalProgramAnalysis analysis(kernel);
+  for (Value bound : {range.getLogicalStart(), range.getLogicalStop()}) {
+    PhysicalRangeFact provenance = analysis.sourceRanges(bound);
+    if (!provenance.accesses.empty())
+      return true;
+  }
+  return false;
+}
+
+FailureOr<uint64_t> ownershipDimension(func::FuncOp kernel,
+                                       MakeRangeOp range) {
   FailureOr<int64_t> parent = querySubregionParentDimension(range);
-  if (succeeded(parent))
+  if (succeeded(parent) && !hasAccessDependentSubregionBounds(kernel, range))
     return static_cast<uint64_t>(*parent);
   return rangeDimension(range);
 }
@@ -1769,7 +1782,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             .axisRealization(range.getResult(), 0)
             .constructionScalarSeed) {
       bool launchVisible = false;
-      if (FailureOr<uint64_t> dimension = ownershipDimension(range);
+      if (FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
           succeeded(dimension))
         launchVisible = succeeded(dimensionArgument(kernel, *dimension));
       if (ownershipOnly || launchVisible) {
@@ -2080,6 +2093,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       FailureOr<int64_t> parent = querySubregionParentDimension(range);
       bool hasLaunchParent =
           succeeded(parent) &&
+          !hasAccessDependentSubregionBounds(kernel, range) &&
           succeeded(dimensionArgument(kernel, static_cast<uint64_t>(*parent)));
       return range->hasAttr(sourceSubregionAttr) &&
              extent.getKind() ==
@@ -2369,7 +2383,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
-    FailureOr<uint64_t> dimension = ownershipDimension(range);
+    FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     return ownershipSources.contains(source) &&
@@ -2401,7 +2415,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<PhysicalSourceAxis, uint64_t> sourceDimensions;
   llvm::MapVector<uint64_t, SmallVector<PhysicalSourceAxis>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
-    FailureOr<uint64_t> dimension = ownershipDimension(range);
+    FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     if (failed(dimension) || !hasPointwiseOwnership(range))
       continue;
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
@@ -2525,7 +2539,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto physicalExtent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       const bool dynamicSubregion = range->hasAttr(sourceSubregionAttr);
-      FailureOr<uint64_t> sourceDimension = ownershipDimension(range);
+      FailureOr<uint64_t> sourceDimension =
+          ownershipDimension(kernel, range);
       const bool launchVisibleDimension =
           succeeded(sourceDimension) &&
           succeeded(dimensionArgument(kernel, *sourceDimension));
@@ -2759,7 +2774,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ParameterOp parameter = parameters.lookup(axisKey);
     Value dimension;
     std::optional<int64_t> staticExtent;
-    FailureOr<uint64_t> sourceDimension = ownershipDimension(range);
+    FailureOr<uint64_t> sourceDimension = ownershipDimension(kernel, range);
     if (isSourceAxisKey(axisKey)) {
       staticExtent = staticLogicalExtent(range);
       if (staticExtent)
