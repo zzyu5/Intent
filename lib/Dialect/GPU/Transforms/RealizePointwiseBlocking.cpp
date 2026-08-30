@@ -2063,7 +2063,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         llvm::any_of(candidateStores, [&](StoreOp store) {
           return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
             return sameLogicalRange(range, candidate) &&
-                   storeDirectlyUsesRange(store, candidate);
+                   (candidate->hasAttr(sourceSubregionAttr)
+                        ? storeDirectlyUsesRange(store, candidate)
+                        : storeUsesRange(store, candidate));
           });
         });
     if (writeOwnership)
@@ -2371,7 +2373,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     return ownershipSources.contains(source) &&
-           directOwnershipSources.contains(source) &&
+           (!range->hasAttr(sourceSubregionAttr) ||
+            directOwnershipSources.contains(source)) &&
            !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
