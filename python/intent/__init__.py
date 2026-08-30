@@ -16,6 +16,8 @@ from .runtime import CompiledArtifact
 from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
+from .targets import TritonConfig
+from .targets import TritonParameterBinding
 
 
 __all__ = [
@@ -35,6 +37,8 @@ __all__ = [
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",
+    "TritonConfig",
+    "TritonParameterBinding",
     "FrontendError",
     "lower_to_mlir",
 ]

@@ -73,6 +73,10 @@ int main(int argc, char **argv) {
       "stop-after-shared",
       llvm::cl::desc("stop after the full shared GPU verifier"),
       llvm::cl::init(false));
+  llvm::cl::list<std::string> tritonConfigs(
+      "triton-config",
+      llvm::cl::desc("complete Triton config tuple; repeat for autotune"),
+      llvm::cl::ZeroOrMore);
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
 
@@ -123,7 +127,13 @@ int main(int argc, char **argv) {
   mlir::LogicalResult serialized = mlir::failure();
   switch (target) {
   case TargetKind::Triton:
-    provider = intent::triton::legalizeGPUProgram(*module);
+    {
+      llvm::SmallVector<llvm::StringRef> configs;
+      configs.reserve(tritonConfigs.size());
+      for (const std::string &config : tritonConfigs)
+        configs.push_back(config);
+      provider = intent::triton::legalizeGPUProgram(*module, configs);
+    }
     if (mlir::succeeded(provider))
       serialized = intent::triton::serializeProgram(*module, source);
     break;

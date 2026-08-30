@@ -9,10 +9,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 
 using namespace mlir;
 
@@ -31,6 +33,99 @@ struct TritonConfig {
   int64_t stages = 0;
   int64_t ctas = 0;
 };
+
+struct RequestedBinding {
+  gpu::ParameterRole role;
+  std::optional<int64_t> dimension;
+  int64_t value;
+};
+
+struct RequestedConfig {
+  SmallVector<RequestedBinding> bindings;
+  int64_t warps = 0;
+  int64_t stages = 0;
+  int64_t ctas = 0;
+};
+
+std::optional<gpu::ParameterRole> parseParameterRole(StringRef spelling) {
+  int64_t value = llvm::StringSwitch<int64_t>(spelling)
+                      .Case("ownership_m", static_cast<int64_t>(
+                                               gpu::ParameterRole::OwnershipM))
+                      .Case("ownership_n", static_cast<int64_t>(
+                                               gpu::ParameterRole::OwnershipN))
+                      .Case("reduction", static_cast<int64_t>(
+                                             gpu::ParameterRole::Reduction))
+                      .Case("scan_chunk", static_cast<int64_t>(
+                                              gpu::ParameterRole::ScanChunk))
+                      .Case("traversal_workers",
+                            static_cast<int64_t>(
+                                gpu::ParameterRole::TraversalWorkers))
+                      .Case("traversal_group",
+                            static_cast<int64_t>(
+                                gpu::ParameterRole::TraversalGroup))
+                      .Case("resident_workers",
+                            static_cast<int64_t>(
+                                gpu::ParameterRole::ResidentWorkers))
+                      .Default(-1);
+  return value < 0
+             ? std::nullopt
+             : std::optional<gpu::ParameterRole>(
+                   static_cast<gpu::ParameterRole>(value));
+}
+
+FailureOr<RequestedConfig> parseCompleteConfig(func::FuncOp kernel,
+                                               StringRef specification) {
+  RequestedConfig result;
+  SmallVector<StringRef> fields;
+  specification.split(fields, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  if (fields.empty())
+    return kernel.emitError("Triton complete config tuple is empty");
+  llvm::StringSet<> providerFields;
+  std::set<std::pair<uint32_t, std::optional<int64_t>>> bindings;
+  for (StringRef field : fields) {
+    auto [key, valueText] = field.split('=');
+    int64_t value = 0;
+    if (key.empty() || valueText.empty() || valueText.getAsInteger(10, value) ||
+        value <= 0)
+      return kernel.emitError("Triton complete config has an invalid binding: ")
+             << field;
+    if (key == "num_warps" || key == "num_stages" || key == "num_ctas") {
+      if (!providerFields.insert(key).second)
+        return kernel.emitError("Triton complete config duplicates provider binding: ")
+               << key;
+      if (key == "num_warps")
+        result.warps = value;
+      else if (key == "num_stages")
+        result.stages = value;
+      else
+        result.ctas = value;
+      continue;
+    }
+    auto [roleText, dimensionText] = key.split('@');
+    std::optional<gpu::ParameterRole> role = parseParameterRole(roleText);
+    if (!role)
+      return kernel.emitError("Triton complete config has an unknown role: ")
+             << roleText;
+    std::optional<int64_t> dimension;
+    if (!dimensionText.empty()) {
+      int64_t parsed = 0;
+      if (dimensionText.getAsInteger(10, parsed) || parsed <= 0)
+        return kernel.emitError(
+                   "Triton complete config has an invalid dimension: ")
+               << dimensionText;
+      dimension = parsed;
+    }
+    auto identity = std::make_pair(static_cast<uint32_t>(*role), dimension);
+    if (!bindings.insert(identity).second)
+      return kernel.emitError("Triton complete config duplicates a typed role binding: ")
+             << key;
+    result.bindings.push_back({*role, dimension, value});
+  }
+  if (result.warps <= 0 || result.stages <= 0 || result.ctas <= 0)
+    return kernel.emitError(
+        "Triton complete config must bind num_warps, num_stages and num_ctas");
+  return result;
+}
 
 int64_t staticDefault(gpu::ParameterRole role) {
   switch (role) {
@@ -184,12 +279,14 @@ bool typeFitsTritonTensor(Type type, const TritonConfig &config) {
   return true;
 }
 
-LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
+LogicalResult materializeLegalConfigs(func::FuncOp kernel,
+                                      ArrayRef<StringRef> completeConfigs) {
   struct Domain {
     StringRef name;
     gpu::ParameterRole role;
     ArrayRef<int64_t> candidates;
     bool heuristic;
+    gpu::PhysicalParameterBinding binding;
   };
   SmallVector<Domain> domains;
   llvm::StringSet<> names;
@@ -203,36 +300,95 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
     domains.push_back({name,
                        static_cast<gpu::ParameterRole>(definition.getRole()),
                        definition.getCandidates().asArrayRef(),
-                       parameter->hasAttr(gpu::coverageDimensionAttr)});
+                       parameter->hasAttr(gpu::coverageDimensionAttr),
+                       gpu::queryParameterBinding(parameter)});
     return WalkResult::advance();
   });
   if (schema.wasInterrupted())
     return failure();
 
-  TritonConfig defaultConfig;
-  for (const Domain &domain : domains) {
-    if (domain.heuristic)
-      continue;
-    int64_t binding = selectStaticDefault(domain.role, domain.candidates);
-    switch (domain.role) {
-    case gpu::ParameterRole::ProviderWarps:
-      defaultConfig.warps = binding;
-      break;
-    case gpu::ParameterRole::ProviderStages:
-      defaultConfig.stages = binding;
-      break;
-    case gpu::ParameterRole::ProviderCTAs:
-      defaultConfig.ctas = binding;
-      break;
-    default:
-      defaultConfig.kernelParameters[domain.name.str()] = binding;
-      break;
+  SmallVector<TritonConfig> configs;
+  if (completeConfigs.empty()) {
+    TritonConfig defaultConfig;
+    for (const Domain &domain : domains) {
+      if (domain.heuristic)
+        continue;
+      int64_t binding = selectStaticDefault(domain.role, domain.candidates);
+      switch (domain.role) {
+      case gpu::ParameterRole::ProviderWarps:
+        defaultConfig.warps = binding;
+        break;
+      case gpu::ParameterRole::ProviderStages:
+        defaultConfig.stages = binding;
+        break;
+      case gpu::ParameterRole::ProviderCTAs:
+        defaultConfig.ctas = binding;
+        break;
+      default:
+        defaultConfig.kernelParameters[domain.name.str()] = binding;
+        break;
+      }
+    }
+    configs.push_back(std::move(defaultConfig));
+  } else {
+    for (StringRef specification : completeConfigs) {
+      FailureOr<RequestedConfig> requested =
+          parseCompleteConfig(kernel, specification);
+      if (failed(requested))
+        return failure();
+      TritonConfig config;
+      config.warps = requested->warps;
+      config.stages = requested->stages;
+      config.ctas = requested->ctas;
+      llvm::SmallDenseSet<unsigned> boundDomains;
+      for (const RequestedBinding &binding : requested->bindings) {
+        SmallVector<unsigned> matches;
+        for (auto [index, domain] : llvm::enumerate(domains)) {
+          if (domain.heuristic || domain.role != binding.role ||
+              domain.role == gpu::ParameterRole::ProviderWarps ||
+              domain.role == gpu::ParameterRole::ProviderStages ||
+              domain.role == gpu::ParameterRole::ProviderCTAs)
+            continue;
+          if (binding.dimension &&
+              (!domain.binding.isExact() || !domain.binding.dimension ||
+               *domain.binding.dimension != *binding.dimension))
+            continue;
+          matches.push_back(index);
+        }
+        if (matches.size() != 1)
+          return kernel.emitError(
+                     "Triton complete config role binding is not unique: role=")
+                 << static_cast<uint32_t>(binding.role)
+                 << ", dimension="
+                 << (binding.dimension ? Twine(*binding.dimension) : Twine("none"));
+        unsigned index = matches.front();
+        const Domain &domain = domains[index];
+        if (!llvm::is_contained(domain.candidates, binding.value))
+          return kernel.emitError(
+                     "Triton complete config value is outside its typed domain: ")
+                 << domain.name << "=" << binding.value;
+        if (!boundDomains.insert(index).second)
+          return kernel.emitError(
+              "Triton complete config binds one physical parameter twice");
+        config.kernelParameters[domain.name.str()] = binding.value;
+      }
+      for (auto [index, domain] : llvm::enumerate(domains)) {
+        if (domain.heuristic || domain.role == gpu::ParameterRole::ProviderWarps ||
+            domain.role == gpu::ParameterRole::ProviderStages ||
+            domain.role == gpu::ParameterRole::ProviderCTAs)
+          continue;
+        if (!boundDomains.contains(index))
+          return kernel.emitError(
+                     "Triton complete config omits physical parameter: ")
+                 << domain.name;
+      }
+      configs.push_back(std::move(config));
     }
   }
 
   SmallVector<Attribute> encoded;
   Builder builder(kernel.getContext());
-  for (const TritonConfig &config : ArrayRef<TritonConfig>(defaultConfig)) {
+  for (const TritonConfig &config : configs) {
     if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
       return kernel.emitError("Triton provider parameter domains are incomplete");
     bool legal = true;
@@ -988,7 +1144,8 @@ LogicalResult verifyTritonProgram(ModuleOp module) {
   return verifyKernel(kernels.front());
 }
 
-LogicalResult legalizeGPUProgram(ModuleOp module) {
+LogicalResult legalizeGPUProgram(ModuleOp module,
+                                 ArrayRef<StringRef> completeConfigs) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> physicalKernel = gpu::getPhysicalKernel(module);
@@ -1026,7 +1183,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
                            ArrayRef<int64_t>{1, 2, 3, 4, 5, 6});
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ArrayRef<int64_t>{1});
-  if (failed(materializeLegalConfigs(kernel)) ||
+  if (failed(materializeLegalConfigs(kernel, completeConfigs)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   selectContractForms(kernel);
