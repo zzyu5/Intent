@@ -30,6 +30,48 @@ struct TritonConfig {
   int64_t ctas = 0;
 };
 
+int64_t staticDefault(gpu::ParameterRole role) {
+  switch (role) {
+  case gpu::ParameterRole::OwnershipM:
+  case gpu::ParameterRole::OwnershipN:
+    return 64;
+  case gpu::ParameterRole::Reduction:
+    return 32;
+  case gpu::ParameterRole::ScanChunk:
+    return 128;
+  case gpu::ParameterRole::TraversalWorkers:
+    return 1;
+  case gpu::ParameterRole::TraversalGroup:
+    return 8;
+  case gpu::ParameterRole::ResidentWorkers:
+    return std::numeric_limits<int64_t>::max();
+  case gpu::ParameterRole::ProviderWarps:
+    return 4;
+  case gpu::ParameterRole::ProviderStages:
+    return 2;
+  case gpu::ParameterRole::ProviderCTAs:
+    return 1;
+  case gpu::ParameterRole::ProviderThreads:
+    return 128;
+  case gpu::ParameterRole::FullCoverage:
+    llvm_unreachable("full-coverage parameters are bound by runtime extents");
+  }
+  llvm_unreachable("unknown physical parameter role");
+}
+
+int64_t selectStaticDefault(gpu::ParameterRole role,
+                            ArrayRef<int64_t> candidates) {
+  int64_t requested = staticDefault(role);
+  int64_t selected = candidates.front();
+  for (int64_t candidate : candidates) {
+    if (candidate == requested)
+      return candidate;
+    if (candidate <= requested && candidate > selected)
+      selected = candidate;
+  }
+  return selected;
+}
+
 std::optional<int64_t>
 evaluateCompileTimeExpression(gpu::PhysicalExprAttr expression,
                               const TritonConfig &config) {
@@ -165,37 +207,30 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
   if (schema.wasInterrupted())
     return failure();
 
-  SmallVector<TritonConfig> configs(1);
+  TritonConfig defaultConfig;
   for (const Domain &domain : domains) {
     if (domain.heuristic)
       continue;
-    SmallVector<TritonConfig> expanded;
-    for (const TritonConfig &base : configs) {
-      for (int64_t candidate : domain.candidates) {
-        TritonConfig next = base;
-        switch (domain.role) {
-        case gpu::ParameterRole::ProviderWarps:
-          next.warps = candidate;
-          break;
-        case gpu::ParameterRole::ProviderStages:
-          next.stages = candidate;
-          break;
-        case gpu::ParameterRole::ProviderCTAs:
-          next.ctas = candidate;
-          break;
-        default:
-          next.kernelParameters[domain.name.str()] = candidate;
-          break;
-        }
-        expanded.push_back(std::move(next));
-      }
+    int64_t binding = selectStaticDefault(domain.role, domain.candidates);
+    switch (domain.role) {
+    case gpu::ParameterRole::ProviderWarps:
+      defaultConfig.warps = binding;
+      break;
+    case gpu::ParameterRole::ProviderStages:
+      defaultConfig.stages = binding;
+      break;
+    case gpu::ParameterRole::ProviderCTAs:
+      defaultConfig.ctas = binding;
+      break;
+    default:
+      defaultConfig.kernelParameters[domain.name.str()] = binding;
+      break;
     }
-    configs = std::move(expanded);
   }
 
   SmallVector<Attribute> encoded;
   Builder builder(kernel.getContext());
-  for (const TritonConfig &config : configs) {
+  for (const TritonConfig &config : ArrayRef<TritonConfig>(defaultConfig)) {
     if (config.warps <= 0 || config.stages <= 0 || config.ctas <= 0)
       return kernel.emitError("Triton provider parameter domains are incomplete");
     bool legal = true;
