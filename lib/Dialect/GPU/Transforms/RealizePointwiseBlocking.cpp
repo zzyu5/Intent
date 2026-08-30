@@ -1062,12 +1062,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   for (SmallVector<StoreOp> &group : storeGroups) {
   OpBuilder builder(group.front());
   Operation *loopInsertionAnchor = group.front().getOperation();
-  Value distance = builder.create<BinaryOp>(
-      range.getLoc(), builder.getIndexType(), range.getExtent(), range.getStep(),
-      BinaryOperator::Multiply);
-  Value stop = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                        range.getStart(), distance,
-                                        BinaryOperator::Add);
+  Value stop = range.getLogicalStop();
   Value loopStep = builder.create<BinaryOp>(
       range.getLoc(), builder.getIndexType(), chunk.getResult(), range.getStep(),
       BinaryOperator::Multiply);
@@ -1511,9 +1506,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (range->getParentOfType<RegionFoldOp>() ||
         range->getParentOfType<RegionScanOp>())
       return;
-    auto parameter = range.getExtent().getDefiningOp<ParameterOp>();
-    if (!hasCompileTimeExtent(range.getExtent()) ||
-        (parameter && parameter->hasAttr(coverageDimensionAttr))) {
+    if (!hasCompileTimeExtent(range.getExtent())) {
+      dynamicRanges.push_back(range);
+      return;
+    }
+    if (ownershipOnly &&
+        PhysicalProgramAnalysis(kernel)
+            .axisRealization(range.getResult(), 0)
+            .constructionScalarSeed) {
       dynamicRanges.push_back(range);
       return;
     }
@@ -1537,6 +1537,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   // fold/scan/reduction/contract semantics before the owning pass sees them.
   llvm::SmallPtrSet<Operation *, 32> internalTraversalRanges;
   llvm::SmallPtrSet<Operation *, 32> structuredTraversalRanges;
+  llvm::SmallPtrSet<Operation *, 32> reductionTraversalRanges;
+  llvm::SmallPtrSet<Operation *, 32> reductionFreeRanges;
+  llvm::SmallPtrSet<Operation *, 32> fullCoverageReductionRanges;
   llvm::SmallDenseSet<uint64_t> scanSegmentDimensions;
   llvm::SmallDenseSet<PhysicalSourceAxis> scanSegmentSources;
   auto collectAxisInto = [&](Value source, uint64_t axis,
@@ -1620,13 +1623,81 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
+  struct ReductionTraversal {
+    Value source;
+    unsigned axis;
+    bool exactFullDimension;
+    SmallVector<MakeRangeOp> ranges;
+  };
+  SmallVector<ReductionTraversal> reductionTraversals;
   kernel.walk([&](ReduceOp reduce) {
-    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount()))
-      for (int64_t axis : reduce.getAxes())
-        if (axis >= 0)
-          collectAxisInto(source, static_cast<uint64_t>(axis),
-                          structuredTraversalRanges);
+    for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      if (!fragment)
+        continue;
+      for (int64_t rawAxis : reduce.getAxes()) {
+        if (rawAxis < 0 ||
+            rawAxis >= static_cast<int64_t>(fragment.getShape().size()))
+          continue;
+        unsigned axis = static_cast<unsigned>(rawAxis);
+        PhysicalAxisRealizationFact fact =
+            PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+        auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        int64_t dimension = mapping.getDimensionId();
+        bool exactFullDimension =
+            fact.isExact() && dimension > 0 && !fact.roots.empty() &&
+            succeeded(dimensionArgument(kernel, dimension)) &&
+            llvm::all_of(fact.roots, [&](MakeRangeOp range) {
+              FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
+              return succeeded(rangeDimension) &&
+                     *rangeDimension == dimension &&
+                     !range->hasAttr(sourceSubregionAttr);
+            });
+        ReductionTraversal traversal{source, axis, exactFullDimension, {}};
+        for (MakeRangeOp range : allRanges) {
+          if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
+                return sameLogicalRange(root, range);
+              }))
+            continue;
+          traversal.ranges.push_back(range);
+          structuredTraversalRanges.insert(range.getOperation());
+          reductionTraversalRanges.insert(range.getOperation());
+        }
+        reductionTraversals.push_back(std::move(traversal));
+      }
+      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+        if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+          continue;
+        PhysicalAxisRealizationFact fact =
+            PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+        for (MakeRangeOp range : fact.roots) {
+          structuredTraversalRanges.insert(range.getOperation());
+          reductionFreeRanges.insert(range.getOperation());
+        }
+      }
+    }
   });
+
+  SmallVector<StoreOp> reductionStores;
+  kernel.walk([&](StoreOp store) { reductionStores.push_back(store); });
+  for (const ReductionTraversal &traversal : reductionTraversals) {
+    bool hasWritebackTraversal = false;
+    for (StoreOp store : reductionStores) {
+      if (!llvm::any_of(traversal.ranges, [&](MakeRangeOp range) {
+            return storeUsesRange(store, range);
+          }))
+        continue;
+      hasWritebackTraversal = true;
+    }
+    if (hasWritebackTraversal && traversal.exactFullDimension &&
+        failed(requireFullDimensionCoverage(kernel, traversal.source,
+                                            traversal.axis)))
+      return kernel.emitError(
+          "reduction source reused by writeback has no program-local full-coverage realization");
+    if (hasWritebackTraversal && traversal.exactFullDimension)
+      for (MakeRangeOp range : traversal.ranges)
+        fullCoverageReductionRanges.insert(range.getOperation());
+  }
   bool scanCoverageFailed = false;
   kernel.walk([&](ScanOp scan) {
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
@@ -1677,34 +1748,39 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(histogram.getResult(), internalTraversalRanges, visited);
   });
+  llvm::SmallPtrSet<Operation *, 32> contractionTraversalRanges;
   kernel.walk([&](ContractOp contract) {
-    collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
   kernel.walk([&](ScaledContractOp contract) {
-    collectAllAxesInto(contract.getLhs(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getLhsScale(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getRhsScale(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getLhs(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getLhsScale(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getRhsScale(), contractionTraversalRanges);
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
   kernel.walk([&](SparseContractOp contract) {
-    collectAllAxesInto(contract.getCompressed(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getMetadata(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getRhs(), structuredTraversalRanges);
-    collectAllAxesInto(contract.getResult(), structuredTraversalRanges);
+    collectAllAxesInto(contract.getCompressed(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getMetadata(), contractionTraversalRanges);
+    collectAllAxesInto(contract.getRhs(), contractionTraversalRanges);
     llvm::SmallPtrSet<Operation *, 16> visited;
     collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
   });
-  llvm::SmallDenseSet<PhysicalSourceAxis> structuredSources;
-  for (Operation *operation : structuredTraversalRanges)
+  SmallVector<MakeRangeOp> contractionAuthorities;
+  for (Operation *operation : contractionTraversalRanges)
     if (auto range = dyn_cast<MakeRangeOp>(operation))
-      structuredSources.insert({range.getSourceId(), range.getSourceAxis()});
+      contractionAuthorities.push_back(range);
+  for (MakeRangeOp range : allRanges)
+    if (llvm::any_of(contractionAuthorities, [&](MakeRangeOp authority) {
+          return sameLogicalRange(authority, range);
+        }))
+      contractionTraversalRanges.insert(range.getOperation());
+  structuredTraversalRanges.insert(contractionTraversalRanges.begin(),
+                                   contractionTraversalRanges.end());
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
@@ -1714,7 +1790,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (MakeRangeOp range : allRanges) {
       PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
-      if (structuredSources.contains(logicalSource))
+      if (structuredTraversalRanges.contains(range.getOperation()) &&
+          !reductionTraversalRanges.contains(range.getOperation()))
         continue;
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
       if (!sourceAxis)
@@ -1723,11 +1800,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
           succeeded(dimension))
         sourceDimension = *dimension;
-      PhysicalReductionDependencyFact dependency =
-          PhysicalProgramAnalysis(kernel).reductionDependency(
-              store.getValue(), logicalSource, sourceDimension);
-      if (!dependency.isExact() || !dependency.depends)
-        continue;
+      if (reductionTraversalRanges.contains(range.getOperation())) {
+        if (fullCoverageReductionRanges.contains(range.getOperation()))
+          continue;
+      } else {
+        PhysicalReductionDependencyFact dependency =
+            PhysicalProgramAnalysis(kernel).reductionDependency(
+                store.getValue(), logicalSource, sourceDimension);
+        if (!dependency.isExact() || !dependency.depends)
+          continue;
+      }
       candidates.emplace_back(range, *sourceAxis);
       innermostSourceAxis = std::max(innermostSourceAxis, *sourceAxis);
     }
@@ -1746,9 +1828,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   for (Operation *operation : structuredTraversalRanges) {
     auto range = dyn_cast<MakeRangeOp>(operation);
     bool writeOwnership = range && llvm::any_of(candidateStores, [&](StoreOp store) {
-      return storeUsesRange(store, range);
+      return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
+        return sameLogicalRange(range, candidate) &&
+               storeUsesRange(store, candidate);
+      });
     });
-    if (!writeOwnership)
+    if (reductionTraversalRanges.contains(operation) || !writeOwnership)
       internalTraversalRanges.insert(operation);
   }
   if (ownershipOnly)
@@ -2032,6 +2117,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                               range.getDerived()};
     return ownershipSources.contains(source) &&
            !nonReplayableOwnershipRanges.contains(range.getOperation()) &&
+           !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
             !scanSegmentDimensions.contains(*dimension));
@@ -2104,10 +2190,29 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     if (!requiredByEveryEffect && !jointlyOwned)
       internalTraversalRanges.insert(range.getOperation());
   }
+  if (ownershipOnly) {
+    SmallVector<MakeRangeOp> ownershipSeeds;
+    for (MakeRangeOp range : dynamicRanges)
+      if (hasPointwiseOwnership(range) &&
+          !internalTraversalRanges.contains(range.getOperation()))
+        ownershipSeeds.push_back(range);
+    for (MakeRangeOp seed : ownershipSeeds)
+      for (MakeRangeOp range : allRanges) {
+        if (range->getParentOfType<RegionFoldOp>() ||
+            range->getParentOfType<RegionScanOp>() ||
+            reductionTraversalRanges.contains(range.getOperation()) ||
+            !sameLogicalRange(seed, range))
+          continue;
+        internalTraversalRanges.erase(range.getOperation());
+        if (!llvm::is_contained(dynamicRanges, range))
+          dynamicRanges.push_back(range);
+      }
+  }
   if (!ownershipOnly)
     for (MakeRangeOp range : dynamicRanges) {
       if (!internalTraversalRanges.contains(range.getOperation()) ||
           structuredTraversalRanges.contains(range.getOperation()) ||
+          reductionFreeRanges.contains(range.getOperation()) ||
           reuseTraversalRanges.contains(range.getOperation()))
         continue;
       if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
@@ -2244,38 +2349,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   }
   if (!ownershipOnly)
     ownershipAxes.clear();
-
-  if (ownershipOnly) {
-    SmallVector<Attribute> nonLiftableAxes;
-    for (Attribute axis : ownershipAxes) {
-      bool losesPromotedAxis = false;
-      for (MakeRangeOp range : axes.lookup(axis)) {
-        PhysicalSourceAxis sourceAxis{range.getSourceId(), range.getSourceAxis(),
-                              range.getDerived()};
-        kernel.walk([&](BroadcastOp broadcast) {
-          auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
-          auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
-          if (!source || !target ||
-              queryFragmentAxes(source, sourceAxis).empty() ||
-              !queryFragmentAxes(target, sourceAxis).empty())
-            return;
-          losesPromotedAxis = true;
-        });
-        if (losesPromotedAxis)
-          break;
-      }
-      if (losesPromotedAxis)
-        nonLiftableAxes.push_back(axis);
-    }
-    // A BroadcastOp whose result does not carry a promoted source axis can
-    // only expand a singleton value along its existing target axes.  Keeping
-    // a non-unit candidate for that dimension would create an invalid
-    // equal-rank broadcast and leave provider autotune to discover the error.
-    // Until the physical value graph contains an explicit rank-lifted result,
-    // keep that workset dimension as a scalar program coordinate.
-    for (Attribute axis : nonLiftableAxes)
-      ownershipAxes.erase(axis);
-  }
 
   if (ownershipOnly) {
     llvm::SmallDenseSet<Attribute> internalOwnershipAxes;
@@ -2578,9 +2651,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(parameter) ? FailureOr<Attribute>(failure())
                           : parameterAxis(*parameter);
     if (failed(parameter) || failed(axisKey)) {
-      if (!range->hasAttr(sourceSubregionAttr) &&
-          succeeded(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
-        continue;
       return range.emitOpError(
                  "dynamic pointwise range lost its canonical blocking dimension")
              << "; source_id=" << range.getSourceId()
@@ -2589,12 +2659,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     Value tileCoordinate = tileCoordinates.lookup(*axisKey);
     if (!tileCoordinate && internalAxes.contains(*axisKey))
       tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
-    if (!tileCoordinate && !range->hasAttr(sourceSubregionAttr)) {
-      if (failed(requireFullDimensionCoverage(kernel, range.getResult(), 0)))
-        return range.emitOpError(
-            "program-local range has no exact full-coverage realization");
-      tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
-    }
     if (!tileCoordinate)
       return range.emitOpError(
                  "dynamic pointwise range has no physical tile coordinate")
@@ -2649,22 +2713,22 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       start = builder.create<BinaryOp>(
           range.getLoc(), builder.getIndexType(), range.getStart(), scaledOffset,
           BinaryOperator::Add);
-      Value logicalDistance = builder.create<BinaryOp>(
-          range.getLoc(), builder.getIndexType(), range.getExtent(),
-          range.getStep(), BinaryOperator::Multiply);
-      end = builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
-                                     range.getStart(), logicalDistance,
-                                     BinaryOperator::Add);
+      end = range.getLogicalStop();
     }
     auto sourceType = cast<FragmentType>(range.getResult().getType());
     PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
+    Value physicalExtent = parameter->getResult();
+    if (tileExtent.getKind() ==
+        static_cast<uint32_t>(PhysicalExprKind::Constant))
+      physicalExtent = builder.create<arith::ConstantIndexOp>(
+          range.getLoc(), tileExtent.getValue());
     auto blockedType = FragmentType::get(
         module.getContext(), sourceType.getElementType(),
         builder.getArrayAttr({tileExtent}), sourceType.getAxisMaps(),
         sourceType.getValidity(),
         sourceType.getOwner());
     Value blocked = builder.create<MakeRangeOp>(
-        range.getLoc(), blockedType, start, parameter->getResult(),
+        range.getLoc(), blockedType, start, physicalExtent,
         range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
     if (Attribute value = range->getAttr(sourceSubregionAttr))

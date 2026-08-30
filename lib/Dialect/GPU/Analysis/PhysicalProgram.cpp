@@ -142,6 +142,23 @@ bool isUnitStepValue(Value value) {
   return false;
 }
 
+bool isProvablySingletonLogicalRange(MakeRangeOp range) {
+  std::optional<int64_t> start = integerConstant(range.getLogicalStart());
+  std::optional<int64_t> stop = integerConstant(range.getLogicalStop());
+  std::optional<int64_t> step = integerConstant(range.getStep());
+  if (start && stop && step && *step > 0)
+    return *stop > *start && *stop - *start <= *step;
+
+  Value logicalStop = stripScalarIdentity(range.getLogicalStop());
+  auto add = logicalStop.getDefiningOp<BinaryOp>();
+  if (!add || add.getOperatorKind() != BinaryOperator::Add)
+    return false;
+  return (sameScalarExpression(add.getLhs(), range.getLogicalStart()) &&
+          sameScalarExpression(add.getRhs(), range.getStep())) ||
+         (sameScalarExpression(add.getRhs(), range.getLogicalStart()) &&
+          sameScalarExpression(add.getLhs(), range.getStep()));
+}
+
 bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
                                  PhysicalSourceAxis source) {
   if (auto record = dyn_cast<RecordType>(type))
@@ -530,26 +547,27 @@ queryFragmentAxes(Type type, PhysicalSourceAxis source) {
 
 SmallVector<PhysicalAxisProjection, 2>
 queryRangeProjections(Type type, MakeRangeOp range) {
-  SmallVector<PhysicalAxisProjection, 2> results =
+  SmallVector<PhysicalAxisProjection, 2> sourceResults =
       queryFragmentAxes(type, sourceAxisIdentity(range));
   FailureOr<int64_t> dimension = queryRangeDimension(range);
-  if (!results.empty()) {
-    if (succeeded(dimension))
-      llvm::erase_if(results, [&](const PhysicalAxisProjection &projection) {
-        return projection.dimensionId != *dimension;
-      });
-    return results;
+  if (succeeded(dimension)) {
+    SmallVector<PhysicalAxisProjection, 2> dimensionResults = sourceResults;
+    llvm::erase_if(dimensionResults,
+                   [&](const PhysicalAxisProjection &projection) {
+      return projection.dimensionId != *dimension;
+    });
+    if (!dimensionResults.empty())
+      return dimensionResults;
+    PhysicalDimensionProjection projection =
+        queryFragmentDimension(type, *dimension);
+    if (projection.isExact())
+      return {PhysicalAxisProjection{
+          PhysicalFactState::Exact, sourceAxisIdentity(range), *dimension,
+          projection.fragmentAxis}};
   }
-  if (failed(dimension))
-    return results;
-  PhysicalDimensionProjection projection =
-      queryFragmentDimension(type, *dimension);
-  if (!projection.isExact())
-    return results;
-  results.push_back(PhysicalAxisProjection{
-      PhysicalFactState::Exact, sourceAxisIdentity(range), *dimension,
-      projection.fragmentAxis});
-  return results;
+  return sourceResults.size() == 1
+             ? sourceResults
+             : SmallVector<PhysicalAxisProjection, 2>{};
 }
 
 PhysicalDimensionProjection queryFragmentDimension(Type type,
@@ -577,6 +595,24 @@ PhysicalDimensionProjection queryFragmentDimension(Type type,
   result.state = PhysicalFactState::Exact;
   result.fragmentAxis = *axis;
   return result;
+}
+
+SmallVector<PhysicalDimensionProjection, 2>
+queryFragmentDimensions(Type type, int64_t dimensionId) {
+  SmallVector<PhysicalDimensionProjection, 2> results;
+  if (dimensionId <= 0)
+    return results;
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment)
+    return results;
+  for (Attribute attribute : fragment.getAxisMaps()) {
+    auto mapping = cast<AxisMapAttr>(attribute);
+    if (mapping.getDimensionId() != dimensionId)
+      continue;
+    results.push_back(PhysicalDimensionProjection{
+        PhysicalFactState::Exact, dimensionId, mapping.getFragmentAxis()});
+  }
+  return results;
 }
 
 FailureOr<int64_t> querySourceDimension(Type type, PhysicalSourceAxis source) {
@@ -778,8 +814,13 @@ PhysicalRangeFact PhysicalProgramAnalysis::sourceRanges(
   if (result.state == PhysicalFactState::Unknown || !result.blockers.empty() ||
       result.roots.empty())
     result.state = PhysicalFactState::Unknown;
-  else if (result.roots.size() > 1)
-    result.state = PhysicalFactState::Ambiguous;
+  else if (result.roots.size() > 1) {
+    MakeRangeOp authority = result.roots.front();
+    if (!llvm::all_of(result.roots, [&](MakeRangeOp range) {
+          return sameLogicalRange(authority, range);
+        }))
+      result.state = PhysicalFactState::Ambiguous;
+  }
   result.unitStep = !result.roots.empty() &&
                     llvm::all_of(result.roots, isUnitStepRange);
   if (!source)
@@ -1030,37 +1071,80 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   if (auto load = dyn_cast<LoadOp>(operation)) {
     appendUnique(result.accesses, operation);
     auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
-    bool found = false;
-    for (Value coordinate : load.getCoordinates()) {
-      auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-      if (!coordinateType)
-        continue;
-      std::optional<unsigned> coordinateAxis;
-      if (fragmentAxis < coordinateType.getAxisMaps().size()) {
-        auto candidate = cast<AxisMapAttr>(
-            coordinateType.getAxisMaps()[fragmentAxis]);
-        if (sourceAxisIdentity(candidate) == sourceAxisIdentity(expected) &&
-            candidate.getDimensionId() == expected.getDimensionId())
-          coordinateAxis = fragmentAxis;
+    using CoordinateOccurrence = std::pair<Value, unsigned>;
+    enum class OccurrencePriority {
+      SourceAndDimension,
+      Dimension,
+      UniqueSource,
+    };
+    auto selectOccurrence = [&](OccurrencePriority priority)
+        -> SmallVector<CoordinateOccurrence, 2> {
+      SmallVector<CoordinateOccurrence, 2> occurrences;
+      for (Value coordinate : load.getCoordinates()) {
+        auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+        if (!coordinateType)
+          continue;
+        SmallVector<unsigned, 2> axes;
+        if (priority == OccurrencePriority::Dimension) {
+          for (PhysicalDimensionProjection projection : queryFragmentDimensions(
+                   coordinateType, expected.getDimensionId()))
+            axes.push_back(projection.fragmentAxis);
+        } else {
+          SmallVector<PhysicalAxisProjection, 2> projections =
+              queryFragmentAxes(coordinateType, sourceAxisIdentity(expected));
+          if (priority == OccurrencePriority::SourceAndDimension)
+            llvm::erase_if(projections,
+                           [&](const PhysicalAxisProjection &projection) {
+              return projection.dimensionId != expected.getDimensionId();
+            });
+          else if (projections.size() != 1)
+            projections.clear();
+          for (PhysicalAxisProjection projection : projections)
+            axes.push_back(projection.fragmentAxis);
+        }
+        SmallVector<unsigned, 2> sameOccurrence;
+        llvm::copy_if(axes, std::back_inserter(sameOccurrence),
+                      [&](unsigned axis) { return axis == fragmentAxis; });
+        if (sameOccurrence.size() == 1)
+          axes = std::move(sameOccurrence);
+        for (unsigned axis : axes)
+          occurrences.emplace_back(coordinate, axis);
       }
-      PhysicalAxisProjection sourceAxis = queryFragmentAxis(
-          coordinateType,
-          PhysicalSourceAxis{expected.getSourceId(), expected.getSourceAxis(),
-                             expected.getDerived()});
-      PhysicalDimensionProjection dimensionAxis =
-          queryFragmentDimension(coordinateType, expected.getDimensionId());
-      if (!coordinateAxis && sourceAxis.isExact())
-        coordinateAxis = sourceAxis.fragmentAxis;
-      else if (!coordinateAxis && dimensionAxis.isExact())
-        coordinateAxis = dimensionAxis.fragmentAxis;
-      if (!coordinateAxis)
-        continue;
-      found = true;
-      collectAxisRanges(coordinate, *coordinateAxis, result, visited);
-    }
-    if (!found) {
+      return occurrences;
+    };
+    SmallVector<CoordinateOccurrence, 2> occurrences =
+        selectOccurrence(OccurrencePriority::SourceAndDimension);
+    if (occurrences.empty())
+      occurrences = selectOccurrence(OccurrencePriority::Dimension);
+    if (occurrences.empty())
+      occurrences = selectOccurrence(OccurrencePriority::UniqueSource);
+    if (occurrences.empty()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
+      return;
+    }
+    for (const CoordinateOccurrence &occurrence : occurrences) {
+      PhysicalRangeFact nested = axisRanges(occurrence.first, occurrence.second);
+      if (nested.state == PhysicalFactState::Unknown ||
+          !nested.blockers.empty()) {
+        result.state = PhysicalFactState::Unknown;
+        for (Operation *blocker : nested.blockers)
+          appendUnique(result.blockers, blocker);
+        continue;
+      }
+      for (MakeRangeOp range : nested.roots)
+        appendUnique(result.roots, range);
+      for (Operation *access : nested.accesses)
+        appendUnique(result.accesses, access);
+    }
+    if (result.state != PhysicalFactState::Unknown && !result.roots.empty()) {
+      MakeRangeOp authority = result.roots.front();
+      if (!llvm::all_of(result.roots, [&](MakeRangeOp range) {
+            return sameLogicalRange(authority, range);
+          })) {
+        result.state = PhysicalFactState::Ambiguous;
+        appendUnique(result.blockers, operation);
+      }
     }
     return;
   }
@@ -1177,10 +1261,58 @@ PhysicalRangeFact PhysicalProgramAnalysis::axisRanges(Value value,
   collectAxisRanges(value, fragmentAxis, result, visited);
   if (result.state == PhysicalFactState::Unknown || !result.blockers.empty())
     result.state = PhysicalFactState::Unknown;
-  else if (result.roots.size() > 1)
-    result.state = PhysicalFactState::Ambiguous;
+  else if (result.roots.size() > 1) {
+    MakeRangeOp authority = result.roots.front();
+    if (!llvm::all_of(result.roots, [&](MakeRangeOp range) {
+          return sameLogicalRange(authority, range);
+        }))
+      result.state = PhysicalFactState::Ambiguous;
+  }
   result.unitStep = !result.roots.empty() &&
                     llvm::all_of(result.roots, isUnitStepRange);
+  return result;
+}
+
+PhysicalAxisRealizationFact
+PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
+  PhysicalAxisRealizationFact result;
+  result.fragmentAxis = fragmentAxis;
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment || fragmentAxis >= fragment.getShape().size() ||
+      fragmentAxis >= fragment.getAxisMaps().size())
+    return result;
+
+  auto mapping = dyn_cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+  if (!mapping || !extent)
+    return result;
+  result.source = sourceAxisIdentity(mapping);
+  result.dimensionId = mapping.getDimensionId();
+
+  PhysicalRangeFact ranges = axisRanges(value, fragmentAxis);
+  result.roots.append(ranges.roots.begin(), ranges.roots.end());
+  result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
+  result.constructionScalarSeed =
+      extent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      extent.getValue() == 1 && !ranges.roots.empty() &&
+      llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+        return !isProvablySingletonLogicalRange(range);
+      });
+  result.physicalized =
+      !result.constructionScalarSeed &&
+      (ranges.roots.empty() ||
+       llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+         return valueMatchesExtent(range.getExtent(), extent);
+       }));
+  if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
+    return result;
+  if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges))) {
+    result.state = PhysicalFactState::Ambiguous;
+    return result;
+  }
+
+  result.state = PhysicalFactState::Exact;
   return result;
 }
 

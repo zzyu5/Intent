@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -50,8 +51,6 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
   });
 }
 
-bool hasUnrealizedPhysicalRange(Value value);
-
 bool isFullCoverageExtent(Operation *origin, Attribute attribute) {
   auto extent = dyn_cast<PhysicalExprAttr>(attribute);
   if (!origin || !extent ||
@@ -85,6 +84,21 @@ bool hasFragmentSchema(ScaledContractOp contract) {
          isa<FragmentType>(contract.getResult().getType());
 }
 
+bool hasUnrealizedPhysicalAxis(Value value) {
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!fragment || !kernel)
+    return false;
+  PhysicalProgramAnalysis analysis(kernel);
+  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+    PhysicalAxisRealizationFact fact = analysis.axisRealization(value, axis);
+    if (fact.constructionScalarSeed ||
+        (fact.isExact() && !fact.physicalized))
+      return true;
+  }
+  return false;
+}
+
 bool requiresPhysicalRealization(ContractOp contract) {
   for (FragmentType type : {contract.getLhs().getType(),
                             contract.getRhs().getType(),
@@ -94,8 +108,8 @@ bool requiresPhysicalRealization(ContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
-  return hasUnrealizedPhysicalRange(contract.getLhs()) ||
-         hasUnrealizedPhysicalRange(contract.getRhs());
+  return hasUnrealizedPhysicalAxis(contract.getLhs()) ||
+         hasUnrealizedPhysicalAxis(contract.getRhs());
 }
 
 bool requiresPhysicalRealization(ScaledContractOp contract) {
@@ -108,10 +122,10 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
-  return hasUnrealizedPhysicalRange(contract.getLhs()) ||
-         hasUnrealizedPhysicalRange(contract.getLhsScale()) ||
-         hasUnrealizedPhysicalRange(contract.getRhs()) ||
-         hasUnrealizedPhysicalRange(contract.getRhsScale());
+  return hasUnrealizedPhysicalAxis(contract.getLhs()) ||
+         hasUnrealizedPhysicalAxis(contract.getLhsScale()) ||
+         hasUnrealizedPhysicalAxis(contract.getRhs()) ||
+         hasUnrealizedPhysicalAxis(contract.getRhsScale());
 }
 
 Value binary(OpBuilder &builder, Location location, Type result, Value lhs,
@@ -403,47 +417,6 @@ bool isTailPredicate(Value value,
     return true;
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   return kernel && PhysicalProgramAnalysis(kernel).isTailPredicate(value, ranges);
-}
-
-bool hasUnrealizedPhysicalRange(Value value) {
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  if (!fragment)
-    return false;
-  SmallVector<PhysicalSourceAxis> sources;
-  for (Attribute attribute : fragment.getAxisMaps()) {
-    auto mapping = cast<AxisMapAttr>(attribute);
-    PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis(),
-                              mapping.getDerived()};
-    if (!llvm::is_contained(sources, source))
-      sources.push_back(source);
-  }
-  for (PhysicalSourceAxis source : sources) {
-    SmallVector<MakeRangeOp> ranges;
-    if (failed(collectProducerRanges(value, source, ranges)))
-      continue;
-    for (MakeRangeOp range : ranges) {
-      Value extent = range.getExtent();
-      if (!extent.getDefiningOp<arith::ConstantOp>() &&
-          !extent.getDefiningOp<ParameterOp>() &&
-          !extent.getDefiningOp<PhysicalExprOp>())
-        return true;
-      if (extent.getDefiningOp<ParameterOp>() ||
-          extent.getDefiningOp<PhysicalExprOp>())
-        continue;
-      if (!isIntegerConstant(extent, 1))
-        continue;
-      bool coversLogicalRange =
-          isIntegerConstant(range.getStep(), 1) &&
-          isIntegerConstant(range.getLogicalStart(), 0) &&
-          samePhysicalScalarExpression(range.getStart(),
-                                       range.getLogicalStart()) &&
-          samePhysicalScalarExpression(range.getExtent(),
-                                       range.getLogicalStop());
-      if (!coversLogicalRange)
-        return true;
-    }
-  }
-  return false;
 }
 
 FailureOr<ParameterOp> parameterForExtent(func::FuncOp kernel,
@@ -1613,13 +1586,17 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     });
 
   DelinearizeOp mapping;
-  for (Operation &operation : *contract->getBlock()) {
-    auto candidate = dyn_cast<DelinearizeOp>(operation);
-    if (!candidate || !candidate.getLinear().getDefiningOp<ProgramIdOp>())
-      continue;
-    if (candidate->isBeforeInBlock(contract))
+  DominanceInfo dominance(kernel);
+  kernel.walk([&](DelinearizeOp candidate) {
+    if (!candidate.getLinear().getDefiningOp<ProgramIdOp>() ||
+        !dominance.dominates(candidate.getOperation(), contract.getOperation()))
+      return;
+    if (mapping &&
+        dominance.dominates(mapping.getOperation(), candidate.getOperation()))
       mapping = candidate;
-  }
+    else if (!mapping)
+      mapping = candidate;
+  });
   if (!mapping)
     return unhandled("contract is not dominated by the current program mapping");
   auto programSpace = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);

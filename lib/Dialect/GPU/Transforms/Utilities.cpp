@@ -590,6 +590,231 @@ FailureOr<Value> materializeZeroFragment(OpBuilder &builder,
   return zeroFill(builder, location, target);
 }
 
+FailureOr<Value> materializeReplayedValue(
+    OpBuilder &builder, Location location, Value value,
+    PhysicalSourceAxis source, PhysicalExprAttr blockedExtent,
+    IRMapping &mapping, ReplayMaterializationOptions options) {
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      value, source, options.scope, options.allowAccesses);
+  if (!replay.isReplayable())
+    return failure();
+
+  auto replaceReplayAxis = [&](FragmentType type, unsigned axis) {
+    SmallVector<Attribute> shape(type.getShape().begin(), type.getShape().end());
+    SmallVector<Attribute> axes(type.getAxisMaps().begin(),
+                                type.getAxisMaps().end());
+    shape[axis] = blockedExtent;
+    if (options.segmentMapping)
+      axes[axis] = AxisMapAttr::get(
+          type.getContext(), options.segmentMapping.getSourceId(),
+          options.segmentMapping.getSourceAxis(),
+          options.segmentMapping.getDimensionId(), axis,
+          options.segmentMapping.getDerived());
+    return FragmentType::get(
+        type.getContext(), type.getElementType(),
+        ArrayAttr::get(type.getContext(), shape),
+        ArrayAttr::get(type.getContext(), axes), type.getValidity(),
+        type.getOwner());
+  };
+  auto isUnitExtent = [](Attribute attribute) {
+    auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+    return extent &&
+           extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           extent.getValue() == 1;
+  };
+  auto retargetHelperSourceExtent = [&](Region &region,
+                                        PhysicalExprAttr logicalExtent) {
+    auto retarget = [&](Value current) {
+      auto fragment = dyn_cast<FragmentType>(current.getType());
+      PhysicalAxisProjection projection =
+          fragment ? queryFragmentAxis(fragment, source)
+                   : PhysicalAxisProjection{};
+      if (!fragment || !projection.isExact() ||
+          fragment.getShape()[projection.fragmentAxis] != logicalExtent)
+        return;
+      current.setType(replaceReplayAxis(fragment, projection.fragmentAxis));
+    };
+    for (Block &block : region) {
+      for (BlockArgument argument : block.getArguments())
+        retarget(argument);
+      block.walk([&](Operation *operation) {
+        for (Value result : operation->getResults())
+          retarget(result);
+      });
+    }
+  };
+
+  std::function<FailureOr<Value>(Value)> materialize =
+      [&](Value current) -> FailureOr<Value> {
+    if (Value mapped = mapping.lookupOrNull(current))
+      return mapped;
+    if (auto extract = current.getDefiningOp<ExtractOp>()) {
+      if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+        uint64_t field = extract.getField();
+        if (field >= record.getFields().size())
+          return failure();
+        FailureOr<Value> replayed = materialize(record.getFields()[field]);
+        if (succeeded(replayed) && !mapping.lookupOrNull(current))
+          mapping.map(current, *replayed);
+        return replayed;
+      }
+    }
+
+    auto fragment = dyn_cast<FragmentType>(current.getType());
+    PhysicalAxisProjection projection =
+        fragment ? queryFragmentAxis(fragment, source)
+                 : PhysicalAxisProjection{};
+    if (!fragment || !projection.isExact())
+      return current;
+    unsigned axis = projection.fragmentAxis;
+    Operation *producer = current.getDefiningOp();
+    if (!producer)
+      return failure();
+
+    auto replayOperand = [&](Value operand) -> FailureOr<Value> {
+      PhysicalAxisProjection operandProjection =
+          queryFragmentAxis(operand.getType(), source);
+      return operandProjection.isExact() ? materialize(operand)
+                                         : FailureOr<Value>(operand);
+    };
+    auto combineTail = [&](FragmentType target,
+                           Value valid) -> FailureOr<Value> {
+      if (!options.segmentTail)
+        return valid ? FailureOr<Value>(valid)
+                     : FailureOr<Value>(Value());
+      auto targetAxis = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
+      FailureOr<Value> tail = projectPredicateToFragment(
+          builder, location, options.segmentTail, target,
+          sourceAxisIdentity(targetAxis));
+      if (failed(tail))
+        return failure();
+      if (!valid)
+        return *tail;
+      return materializeValidityConjunction(builder, location, valid, *tail,
+                                            target);
+    };
+    auto replayFill = [&](Value fill,
+                          FragmentType target) -> FailureOr<Value> {
+      if (fill) {
+        FailureOr<Value> replayed = replayOperand(fill);
+        if (failed(replayed))
+          return failure();
+        fill = *replayed;
+        if (fill.getType() != target)
+          fill = builder.create<BroadcastOp>(location, target, fill);
+        return fill;
+      }
+      if (!options.materializeZeroFill)
+        return Value();
+      return materializeZeroFragment(builder, location, target);
+    };
+
+    if (auto load = dyn_cast<LoadOp>(producer)) {
+      SmallVector<Value> coordinates;
+      for (Value coordinate : load.getCoordinates()) {
+        FailureOr<Value> replayed = replayOperand(coordinate);
+        if (failed(replayed))
+          return failure();
+        coordinates.push_back(*replayed);
+      }
+      Value valid;
+      if (load.getValid()) {
+        FailureOr<Value> replayed = replayOperand(load.getValid());
+        if (failed(replayed))
+          return failure();
+        valid = *replayed;
+      }
+      FragmentType resultType = replaceReplayAxis(fragment, axis);
+      FailureOr<Value> combined = combineTail(resultType, valid);
+      if (failed(combined))
+        return failure();
+      FailureOr<Value> fill = replayFill(load.getFill(), resultType);
+      if (failed(fill))
+        return failure();
+      auto clone = builder.create<LoadOp>(
+          location, resultType, load.getResource(), coordinates, *combined,
+          *fill, load.getSourceAxes());
+      if (Attribute origin = load->getAttr(originAttr))
+        clone->setAttr(originAttr, origin);
+      mapping.map(current, clone.getResult());
+      return clone.getResult();
+    }
+    if (auto gather = dyn_cast<GatherOp>(producer)) {
+      FailureOr<Value> replayedSource = replayOperand(gather.getSource());
+      if (failed(replayedSource))
+        return failure();
+      SmallVector<Value> coordinates;
+      for (Value coordinate : gather.getCoordinates()) {
+        FailureOr<Value> replayed = replayOperand(coordinate);
+        if (failed(replayed))
+          return failure();
+        coordinates.push_back(*replayed);
+      }
+      Value valid;
+      if (gather.getValid()) {
+        FailureOr<Value> replayed = replayOperand(gather.getValid());
+        if (failed(replayed))
+          return failure();
+        valid = *replayed;
+      }
+      FragmentType resultType = replaceReplayAxis(fragment, axis);
+      FailureOr<Value> combined = combineTail(resultType, valid);
+      if (failed(combined))
+        return failure();
+      FailureOr<Value> fill = replayFill(gather.getFill(), resultType);
+      if (failed(fill))
+        return failure();
+      auto clone = builder.create<GatherOp>(
+          location, resultType, *replayedSource, coordinates, *combined, *fill,
+          gather.getSourceAxes());
+      if (Attribute origin = gather->getAttr(originAttr))
+        clone->setAttr(originAttr, origin);
+      mapping.map(current, clone.getResult());
+      return clone.getResult();
+    }
+    if (!isPhysicalReplayNode(producer, options.scope,
+                              /*allowAccesses=*/false))
+      return failure();
+    for (Value operand : producer->getOperands()) {
+      FailureOr<Value> replayed = replayOperand(operand);
+      if (failed(replayed))
+        return failure();
+      if (!mapping.lookupOrNull(operand) && *replayed != operand)
+        mapping.map(operand, *replayed);
+    }
+    Operation *clone = builder.clone(*producer, mapping);
+    auto result = dyn_cast<OpResult>(current);
+    if (!result || result.getResultNumber() >= clone->getNumResults())
+      return failure();
+    Value clonedValue = clone->getResult(result.getResultNumber());
+    if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
+      retargetHelperSourceExtent(
+          clonedReduce.getCombine(),
+          cast<PhysicalExprAttr>(fragment.getShape()[axis]));
+    auto clonedType = dyn_cast<FragmentType>(clonedValue.getType());
+    if (!clonedType || axis >= clonedType.getShape().size())
+      return failure();
+    bool introducedUnitAxis = false;
+    if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
+      auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
+      introducedUnitAxis =
+          isUnitExtent(clonedType.getShape()[axis]) &&
+          (!input || !queryFragmentAxis(input, source).isExact());
+    }
+    if (!introducedUnitAxis)
+      clonedValue.setType(replaceReplayAxis(clonedType, axis));
+    if (!mapping.lookupOrNull(current))
+      mapping.map(current, clonedValue);
+    return clonedValue;
+  };
+
+  return materialize(value);
+}
+
 FailureOr<Value> projectPredicateToFragment(OpBuilder &builder,
                                             Location location, Value predicate,
                                             FragmentType target,
@@ -1372,7 +1597,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       ArrayAttr::get(kernel.getContext(), {}));
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact ranges = analysis.axisRanges(source, fragmentAxis);
-  if (ranges.state == PhysicalFactState::Ambiguous)
+  if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges)))
     return kernel.emitError(
         "full-coverage source has ambiguous physical range authority");
   if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty()) {
@@ -1414,7 +1639,6 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       parameter.getParameter().getName(),
       ArrayAttr::get(kernel.getContext(), {}));
   SmallVector<MakeRangeOp> ranges;
-  llvm::DenseMap<Operation *, Value> logicalExtents;
   kernel.walk([&](MakeRangeOp range) {
     FailureOr<int64_t> sourceDimension = querySourceDimension(
         range.getResult().getType(), sourceAxisIdentity(range));
@@ -1425,14 +1649,15 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         fragment.getShape().size() != 1)
       return;
     ranges.push_back(range);
-    logicalExtents[range.getOperation()] = range.getExtent();
   });
+  bool alreadyBound = !ranges.empty() &&
+                      llvm::all_of(ranges, [&](MakeRangeOp range) {
+                        return range.getExtent() == physicalExtent;
+                      });
   for (MakeRangeOp range : ranges)
     retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
                          parameterExtent);
-  if (ranges.empty() || llvm::all_of(ranges, [&](MakeRangeOp range) {
-        return range.getExtent() == physicalExtent;
-      }))
+  if (ranges.empty() || alreadyBound)
     return success();
 
   llvm::SmallPtrSet<Operation *, 32> rangeSet;
@@ -1501,14 +1726,24 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     OpBuilder builder(range);
     range->setOperand(1, physicalExtent);
     builder.setInsertionPointAfter(range);
-    Value logicalExtent = logicalExtents.lookup(range.getOperation());
-    if (!logicalExtent)
-      return failure();
     Value distance = builder.create<BinaryOp>(
+        range.getLoc(), builder.getIndexType(), range.getLogicalStop(),
+        range.getLogicalStart(), BinaryOperator::Subtract);
+    Value one = builder.create<arith::ConstantIndexOp>(range.getLoc(), 1);
+    Value adjusted = builder.create<BinaryOp>(
+        range.getLoc(), builder.getIndexType(), distance,
+        builder.create<BinaryOp>(range.getLoc(), builder.getIndexType(),
+                                 range.getStep(), one,
+                                 BinaryOperator::Subtract),
+        BinaryOperator::Add);
+    Value logicalExtent = builder.create<BinaryOp>(
+        range.getLoc(), builder.getIndexType(), adjusted, range.getStep(),
+        BinaryOperator::FloorDivide);
+    Value logicalDistance = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), logicalExtent, range.getStep(),
         BinaryOperator::Multiply);
     Value stop = builder.create<BinaryOp>(
-        range.getLoc(), builder.getIndexType(), range.getStart(), distance,
+        range.getLoc(), builder.getIndexType(), range.getStart(), logicalDistance,
         BinaryOperator::Add);
     auto coordinate = cast<FragmentType>(range.getResult().getType());
     Value stopFragment =
@@ -1529,6 +1764,18 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     for (MakeRangeOp range : sources) {
       SmallVector<PhysicalAxisProjection, 2> projections =
           queryRangeProjections(target, range);
+      if (FailureOr<int64_t> dimension = queryRangeDimension(range);
+          succeeded(dimension))
+        for (PhysicalDimensionProjection occurrence :
+             queryFragmentDimensions(target, *dimension))
+          if (!llvm::any_of(projections,
+                            [&](const PhysicalAxisProjection &projection) {
+                              return projection.fragmentAxis ==
+                                     occurrence.fragmentAxis;
+                            }))
+            projections.push_back(PhysicalAxisProjection{
+                PhysicalFactState::Exact, sourceAxisIdentity(range), *dimension,
+                occurrence.fragmentAxis});
       if (projections.empty())
         return failure();
       for (PhysicalAxisProjection projection : projections) {

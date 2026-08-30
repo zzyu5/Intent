@@ -1493,43 +1493,8 @@ private:
       }
       return failure();
     }
-    if (expression.getOperands().size() != 2)
-      return failure();
-    FailureOr<Value> lhs = physicalExtentValue(
-        location, cast<PhysicalExprAttr>(expression.getOperands()[0]));
-    FailureOr<Value> rhs = physicalExtentValue(
-        location, cast<PhysicalExprAttr>(expression.getOperands()[1]));
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    if (kind == PhysicalExprKind::Add)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::Add);
-    if (kind == PhysicalExprKind::Subtract)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::Subtract);
-    if (kind == PhysicalExprKind::Multiply)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::Multiply);
-    if (kind == PhysicalExprKind::FloorDiv)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::FloorDivide);
-    if (kind == PhysicalExprKind::Minimum)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::Minimum);
-    if (kind == PhysicalExprKind::Maximum)
-      return createBinary(builder, location, builder.getIndexType(), *lhs, *rhs,
-                          BinaryOperator::Maximum);
-    if (kind == PhysicalExprKind::CeilDiv) {
-      Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-      Value adjusted = createBinary(
-          builder, location, builder.getIndexType(), *lhs,
-          createBinary(builder, location, builder.getIndexType(), *rhs, one,
-                       BinaryOperator::Subtract),
-          BinaryOperator::Add);
-      return createBinary(builder, location, builder.getIndexType(), adjusted,
-                          *rhs, BinaryOperator::FloorDivide);
-    }
-    return failure();
+    return Value(builder.create<gpu::PhysicalExprOp>(
+        location, builder.getIndexType(), expression));
   }
 
   FailureOr<PhysicalExprAttr> physicalShapeExpression(Value value,
@@ -1676,23 +1641,15 @@ private:
       start = *physicalStart;
       stop = *physicalStop;
       step = *physicalStep;
-      Value one = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
-      Value distance = createBinary(builder, operation->getLoc(),
-                                    builder.getIndexType(), stop, start,
-                                    BinaryOperator::Subtract);
-      Value adjusted = createBinary(
-          builder, operation->getLoc(), builder.getIndexType(), distance,
-          createBinary(builder, operation->getLoc(), builder.getIndexType(), step,
-                       one, BinaryOperator::Subtract),
-          BinaryOperator::Add);
-      Value extent = createBinary(builder, operation->getLoc(),
-                                  builder.getIndexType(), adjusted, step,
-                                  BinaryOperator::FloorDivide);
+      FailureOr<Value> extent =
+          physicalExtentValue(operation->getLoc(), physicalExtent);
+      if (failed(extent))
+        return failure();
       auto type = fragmentType(operation->getContext(), builder.getIndexType(),
                                {physicalExtent},
                                {{sourceId, sourceAxis, dimensionId, derived}});
       return Value(builder.create<gpu::MakeRangeOp>(
-          operation->getLoc(), type, start, extent, step, start, stop, sourceId,
+          operation->getLoc(), type, start, *extent, step, start, stop, sourceId,
           sourceAxis, derived));
     };
     unsigned sourceAxis = 0;
@@ -2583,22 +2540,20 @@ private:
       Value start = rangeBound(location, *source, 0);
       Value stop = rangeBound(location, *source, 1);
       Value step = rangeBound(location, *source, 2);
-      Value distance = createBinary(builder, location, builder.getIndexType(),
-                                    stop, start, BinaryOperator::Subtract);
-      Value one = builder.create<arith::ConstantIndexOp>(location, 1);
-      Value adjusted = createBinary(
-          builder, location, builder.getIndexType(), distance,
-          createBinary(builder, location, builder.getIndexType(), step, one,
-                       BinaryOperator::Subtract),
-          BinaryOperator::Add);
-      Value extent = createBinary(builder, location, builder.getIndexType(),
-                                  adjusted, step, BinaryOperator::FloorDivide);
       FailureOr<Type> result =
           convertDataType(indices.getResult().getType(), operation);
       if (failed(result) || !isa<gpu::FragmentType>(*result))
         return indices.emitOpError("indices result has no physical fragment type");
       auto rangeType = cast<gpu::RangeType>((*source).getType());
       auto genericType = cast<gpu::FragmentType>(*result);
+      if (genericType.getShape().size() != 1)
+        return indices.emitOpError(
+            "range indices require one physical fragment extent");
+      FailureOr<Value> extent = physicalExtentValue(
+          location, cast<gpu::PhysicalExprAttr>(genericType.getShape()[0]));
+      if (failed(extent))
+        return indices.emitOpError(
+            "range indices physical extent is not materialized");
       auto resultType = gpu::FragmentType::get(
           operation->getContext(), genericType.getElementType(),
           genericType.getShape(),
@@ -2608,7 +2563,7 @@ private:
               rangeType.getDerived())}),
           genericType.getValidity(), genericType.getOwner());
       auto target = builder.create<gpu::MakeRangeOp>(
-          location, resultType, start, extent, step, start, stop,
+          location, resultType, start, *extent, step, start, stop,
           rangeType.getSourceId(), rangeType.getSourceAxis(),
           rangeType.getDerived());
       if ((*source).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))

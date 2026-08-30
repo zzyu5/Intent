@@ -71,6 +71,8 @@ llvm::SmallVector<PhysicalAxisProjection, 2>
 queryRangeProjections(mlir::Type type, MakeRangeOp range);
 PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
                                                    int64_t dimensionId);
+llvm::SmallVector<PhysicalDimensionProjection, 2>
+queryFragmentDimensions(mlir::Type type, int64_t dimensionId);
 mlir::FailureOr<int64_t>
 querySourceDimension(mlir::Type type, PhysicalSourceAxis source);
 PhysicalAxisProjection
@@ -93,6 +95,24 @@ struct PhysicalRangeFact {
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
   bool isUnique() const { return isExact() && roots.size() == 1; }
+};
+
+/// Whether one current fragment axis has been materialized over its exact
+/// physical range.  Construction may legally seed a dynamic logical axis with
+/// a scalar fragment; that scalar type is not evidence that the traversal has
+/// already been blocked.  Consumers use this fact instead of comparing shape
+/// attributes or range operands independently.
+struct PhysicalAxisRealizationFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  PhysicalSourceAxis source;
+  int64_t dimensionId = 0;
+  unsigned fragmentAxis = 0;
+  llvm::SmallVector<MakeRangeOp, 2> roots;
+  llvm::SmallVector<mlir::Operation *, 2> blockers;
+  bool constructionScalarSeed = false;
+  bool physicalized = false;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
 /// Exact fragment axes whose current coordinate provenance reaches one of a
@@ -210,6 +230,8 @@ public:
   /// source-id query, this preserves repeated occurrences of the same logical
   /// source in Cartesian/indexed values.
   PhysicalRangeFact axisRanges(mlir::Value value, unsigned fragmentAxis);
+  PhysicalAxisRealizationFact axisRealization(mlir::Value value,
+                                               unsigned fragmentAxis);
   PhysicalRangeAxisFact rangeAxes(mlir::Value value,
                                   llvm::ArrayRef<MakeRangeOp> roots);
   PhysicalLockstepTraversalFact

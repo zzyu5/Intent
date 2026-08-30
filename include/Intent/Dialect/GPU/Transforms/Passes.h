@@ -1,16 +1,24 @@
 #ifndef INTENT_DIALECT_GPU_TRANSFORMS_PASSES_H
 #define INTENT_DIALECT_GPU_TRANSFORMS_PASSES_H
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LogicalResult.h"
 
 namespace intent::gpu {
 
-struct PhysicalSourceAxis;
+struct ReplayMaterializationOptions {
+  PhysicalReplayScope scope = PhysicalReplayScope::ValueGraph;
+  bool allowAccesses = true;
+  mlir::Value segmentTail;
+  AxisMapAttr segmentMapping;
+  bool materializeZeroFill = false;
+};
 
 mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
@@ -55,6 +63,11 @@ materializeBroadcastToFragment(mlir::OpBuilder &builder,
 mlir::FailureOr<mlir::Value>
 materializeZeroFragment(mlir::OpBuilder &builder, mlir::Location location,
                         FragmentType target);
+mlir::FailureOr<mlir::Value> materializeReplayedValue(
+    mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
+    PhysicalSourceAxis source, PhysicalExprAttr blockedExtent,
+    mlir::IRMapping &mapping,
+    ReplayMaterializationOptions options = {});
 mlir::FailureOr<mlir::Value>
 projectPredicateToFragment(mlir::OpBuilder &builder, mlir::Location location,
                            mlir::Value predicate, FragmentType target,

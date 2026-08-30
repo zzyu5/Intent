@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
@@ -35,6 +36,21 @@ bool sameExecutionShape(Type lhs, Type rhs) {
   return !left || (left.getShape() == right.getShape() &&
                    left.getValidity() == right.getValidity() &&
                    left.getOwner() == right.getOwner());
+}
+
+bool valueMatchesPhysicalExtent(Value value, PhysicalExprAttr extent) {
+  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
+    return physical.getExpression() == extent;
+  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  if (kind == PhysicalExprKind::Constant) {
+    auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
+    return constant && constant.value() == extent.getValue();
+  }
+  if (kind == PhysicalExprKind::Parameter) {
+    auto parameter = value.getDefiningOp<ParameterOp>();
+    return parameter && parameter.getParameter().getName() == extent.getSymbol();
+  }
+  return false;
 }
 
 struct PhysicalProduct {
@@ -342,6 +358,17 @@ LogicalResult MakeRangeOp::verify() {
       mapping.getSourceAxis() != static_cast<uint32_t>(getSourceAxis()) ||
       mapping.getDerived() != getDerived())
     return emitOpError("physical range result lost logical provenance");
+  auto physicalExtent = dyn_cast<PhysicalExprAttr>(result.getShape()[0]);
+  if (!physicalExtent ||
+      !valueMatchesPhysicalExtent(getExtent(), physicalExtent)) {
+    InFlightDiagnostic diagnostic = emitOpError(
+        "physical range extent does not match its result fragment extent");
+    diagnostic << "; result_extent=" << result.getShape()[0]
+               << ", extent_operand=" << getExtent();
+    if (Operation *producer = getExtent().getDefiningOp())
+      diagnostic << ", extent_producer=" << producer->getName();
+    return failure();
+  }
   return success();
 }
 

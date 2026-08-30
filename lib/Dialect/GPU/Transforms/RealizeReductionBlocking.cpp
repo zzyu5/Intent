@@ -51,15 +51,6 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
   });
 }
 
-bool containsPhysicalParameter(PhysicalExprAttr expression) {
-  if (expression.getKind() ==
-      static_cast<uint32_t>(PhysicalExprKind::Parameter))
-    return true;
-  return llvm::any_of(expression.getOperands(), [](Attribute operand) {
-    return containsPhysicalParameter(cast<PhysicalExprAttr>(operand));
-  });
-}
-
 bool isCompileTimeValue(Value value) {
   return value.getDefiningOp<arith::ConstantOp>() ||
          value.getDefiningOp<ParameterOp>() ||
@@ -67,6 +58,10 @@ bool isCompileTimeValue(Value value) {
 }
 
 bool requiresPhysicalRealization(ReduceOp reduce) {
+  auto kernel = reduce->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return true;
+  PhysicalProgramAnalysis analysis(kernel);
   for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
     auto fragment = dyn_cast<FragmentType>(source.getType());
     if (!fragment)
@@ -74,12 +69,46 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
     for (int64_t axis : reduce.getAxes()) {
       if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
         continue;
-      auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-      if (containsPhysicalParameter(extent))
+      PhysicalAxisRealizationFact fact =
+          analysis.axisRealization(source, static_cast<unsigned>(axis));
+      if (fact.constructionScalarSeed ||
+          (fact.isExact() && !fact.physicalized))
         return true;
     }
   }
   return false;
+}
+
+bool hasNonUnitFreeAxis(ReduceOp reduce);
+
+LogicalResult realizeConstructionScalarReductionAxes(ReduceOp reduce,
+                                                      func::FuncOp kernel) {
+  if (hasNonUnitFreeAxis(reduce))
+    return success();
+  SmallVector<std::pair<Value, unsigned>> pending;
+  PhysicalProgramAnalysis analysis(kernel);
+  for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment)
+      continue;
+    for (int64_t rawAxis : reduce.getAxes()) {
+      if (rawAxis < 0 ||
+          rawAxis >= static_cast<int64_t>(fragment.getShape().size()))
+        continue;
+      unsigned axis = static_cast<unsigned>(rawAxis);
+      PhysicalAxisRealizationFact fact = analysis.axisRealization(source, axis);
+      if (fact.constructionScalarSeed &&
+          llvm::none_of(fact.roots, [](MakeRangeOp range) {
+            return range->hasAttr(sourceSubregionAttr);
+          }))
+        pending.emplace_back(source, axis);
+    }
+  }
+  for (auto [source, axis] : pending)
+    if (failed(realizeFullCoverageDimension(kernel, source, axis)))
+      return reduce.emitOpError(
+          "construction scalar reduction axis has no exact full-coverage realization");
+  return success();
 }
 
 MakeRangeOp sourceRange(Value value) {
@@ -405,26 +434,21 @@ bool isUnitStep(Value value) {
   return false;
 }
 
-FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
+FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange,
+                                  unsigned reductionAxis) {
   auto fragment = dyn_cast<FragmentType>(load.getResult().getType());
-  if (!fragment)
+  if (!fragment || reductionAxis >= fragment.getShape().size())
     return load.emitOpError("reduction producer root is not a fragment load");
   auto kernel = load->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  std::optional<unsigned> fragmentAxis;
-  for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
-    PhysicalRangeFact fact = analysis.axisRanges(load.getResult(), axis);
-    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
-    if (failed(range) || !sameLogicalRange(*range, reductionRange))
-      continue;
-    if (fragmentAxis)
-      return load.emitOpError(
-          "reduction range drives multiple root fragment axes");
-    fragmentAxis = axis;
-  }
-  if (!fragmentAxis) {
+  PhysicalRangeFact resultRanges =
+      analysis.axisRanges(load.getResult(), reductionAxis);
+  FailureOr<MakeRangeOp> resultAuthority =
+      queryExactLogicalRange(resultRanges);
+  if (failed(resultAuthority) ||
+      !sameLogicalRange(*resultAuthority, reductionRange)) {
     InFlightDiagnostic diagnostic = load.emitOpError(
         "reduction source provenance is absent from its root load");
     diagnostic << "; reduction_range=" << reductionRange.getResult().getType()
@@ -433,32 +457,41 @@ FailureOr<RootAccess> analyzeRoot(LoadOp load, MakeRangeOp reductionRange) {
       diagnostic << ", coordinate=" << value.getType();
     return failure();
   }
-  std::optional<unsigned> coordinate;
+  SmallVector<std::pair<unsigned, unsigned>, 2> occurrences;
   for (auto [index, value] : llvm::enumerate(load.getCoordinates())) {
     auto type = dyn_cast<FragmentType>(value.getType());
-    if (!type || *fragmentAxis >= type.getShape().size())
+    if (!type)
       continue;
-    PhysicalRangeFact fact = analysis.axisRanges(value, *fragmentAxis);
-    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
-    if (failed(range) || !sameLogicalRange(*range, reductionRange))
-      continue;
-    if (coordinate)
-      return load.emitOpError(
-          "reduction range drives multiple load coordinates");
-    coordinate = index;
+    for (PhysicalAxisProjection projection :
+         queryRangeProjections(type, reductionRange)) {
+      PhysicalRangeFact fact = analysis.axisRanges(value, projection.fragmentAxis);
+      FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+      if (failed(range) || !sameLogicalRange(*range, reductionRange))
+        continue;
+      occurrences.emplace_back(index, projection.fragmentAxis);
+    }
   }
-  if (!coordinate) {
+  SmallVector<std::pair<unsigned, unsigned>, 2> alignedOccurrences;
+  llvm::copy_if(occurrences, std::back_inserter(alignedOccurrences),
+                [&](const auto &occurrence) {
+                  return occurrence.second == reductionAxis;
+                });
+  if (alignedOccurrences.size() == 1)
+    occurrences = std::move(alignedOccurrences);
+  if (occurrences.size() != 1) {
     InFlightDiagnostic diagnostic = load.emitOpError(
         "reduction source provenance is absent from load coordinates");
     diagnostic << "; reduction_range=" << reductionRange.getResult().getType()
-               << ", fragment_axis=" << *fragmentAxis;
+               << ", fragment_axis=" << reductionAxis
+               << ", matching_occurrences=" << occurrences.size();
     for (Value value : load.getCoordinates())
       diagnostic << ", coordinate=" << value.getType();
     return failure();
   }
   if (!isUnitStep(reductionRange.getStep()))
     return load.emitOpError("reduction load range is not unit-step");
-  return RootAccess{load, reductionRange, *coordinate, *fragmentAxis};
+  return RootAccess{load, reductionRange, occurrences.front().first,
+                    reductionAxis};
 }
 
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
@@ -473,13 +506,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   if (!kernel)
     return failure();
   PhysicalProgramAnalysis analysis(kernel);
-  PhysicalSourceAxis physicalSource = plan.sourceIdentity;
-  const bool repeatedOccurrence =
-      queryFragmentAxes(fragment, physicalSource).size() > 1;
-  PhysicalRangeFact fact =
-      repeatedOccurrence
-          ? analysis.axisRanges(source, reductionAxis)
-          : analysis.sourceRanges(source, physicalSource);
+  PhysicalRangeFact fact = analysis.axisRanges(source, reductionAxis);
   FailureOr<MakeRangeOp> authority = queryExactLogicalRange(fact);
   if (failed(authority))
     return failure();
@@ -495,127 +522,6 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
   if (plan.roots.empty() && plan.ranges.empty())
     return failure();
   return plan;
-}
-
-FailureOr<Value> replayValueImpl(OpBuilder &builder, Location location,
-                                 Value value, PhysicalSourceAxis source,
-                                 PhysicalExprAttr blockedExtent,
-                                 IRMapping &mapping) {
-  if (Value mapped = mapping.lookupOrNull(value))
-    return mapped;
-  if (auto extract = value.getDefiningOp<ExtractOp>()) {
-    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
-      uint64_t field = extract.getField();
-      if (field >= record.getFields().size())
-        return failure();
-      FailureOr<Value> replayed = replayValueImpl(
-          builder, location, record.getFields()[field], source,
-          blockedExtent, mapping);
-      if (succeeded(replayed) && !mapping.lookupOrNull(value))
-        mapping.map(value, *replayed);
-      return replayed;
-    }
-  }
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  PhysicalAxisProjection projection =
-      fragment ? queryFragmentAxis(fragment, source) : PhysicalAxisProjection{};
-  FailureOr<unsigned> axis =
-      projection.isExact() ? FailureOr<unsigned>(projection.fragmentAxis)
-                           : FailureOr<unsigned>(failure());
-  if (!fragment || failed(axis))
-    return value;
-  Operation *producer = value.getDefiningOp();
-  if (auto load = dyn_cast_or_null<LoadOp>(producer)) {
-    SmallVector<Value> coordinates;
-    coordinates.reserve(load.getCoordinates().size());
-    for (Value coordinate : load.getCoordinates()) {
-      FailureOr<Value> replayed = replayValueImpl(
-          builder, location, coordinate, source, blockedExtent, mapping);
-      if (failed(replayed))
-        return failure();
-      coordinates.push_back(*replayed);
-    }
-    Value valid;
-    if (load.getValid()) {
-      FailureOr<Value> replayed = replayValueImpl(
-          builder, location, load.getValid(), source, blockedExtent, mapping);
-      if (failed(replayed))
-        return failure();
-      valid = *replayed;
-    }
-    Value fill;
-    if (load.getFill()) {
-      FailureOr<Value> replayed = replayValueImpl(
-          builder, location, load.getFill(), source, blockedExtent, mapping);
-      if (failed(replayed))
-        return failure();
-      fill = *replayed;
-    }
-    auto blockedType = replaceExtent(fragment, *axis, blockedExtent);
-    auto replayed = builder.create<LoadOp>(
-        location, blockedType, load.getResource(), coordinates, valid, fill,
-        load.getSourceAxes());
-    if (Attribute origin = load->getAttr(originAttr))
-      replayed->setAttr(originAttr, origin);
-    mapping.map(value, replayed.getResult());
-    return replayed.getResult();
-  }
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                            /*allowAccesses=*/false))
-    return failure();
-  for (Value operand : producer->getOperands()) {
-    FailureOr<Value> replayed = replayValueImpl(
-        builder, location, operand, source, blockedExtent, mapping);
-    if (failed(replayed))
-      return failure();
-    if (!mapping.lookupOrNull(operand))
-      mapping.map(operand, *replayed);
-  }
-  Operation *clone = builder.clone(*producer, mapping);
-  if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
-    retargetHelperSourceExtent(
-        clonedReduce.getCombine(), source,
-        cast<PhysicalExprAttr>(fragment.getShape()[*axis]), blockedExtent);
-  auto clonedType = cast<FragmentType>(clone->getResult(0).getType());
-  PhysicalAxisProjection clonedProjection = queryFragmentAxis(clonedType, source);
-  FailureOr<unsigned> clonedAxis =
-      clonedProjection.isExact()
-          ? FailureOr<unsigned>(clonedProjection.fragmentAxis)
-          : FailureOr<unsigned>(failure());
-  if (failed(clonedAxis))
-    return failure();
-  bool introducedUnitAxis = false;
-  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-    auto extent = cast<PhysicalExprAttr>(clonedType.getShape()[*clonedAxis]);
-    auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-    introducedUnitAxis =
-        extent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        extent.getValue() == 1 &&
-        (!input || !queryFragmentAxis(input, source).isExact());
-  }
-  if (!introducedUnitAxis)
-    clone->getResult(0).setType(
-        replaceExtent(clonedType, *clonedAxis, blockedExtent));
-  if (!mapping.lookupOrNull(value))
-    mapping.map(value, clone->getResult(0));
-  return clone->getResult(0);
-}
-
-FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
-                             PhysicalSourceAxis source,
-                             PhysicalExprAttr blockedExtent,
-                             IRMapping &mapping) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-      value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true);
-  if (!replay.isReplayable())
-    return failure();
-  return replayValueImpl(builder, location, value, source, blockedExtent,
-                         mapping);
 }
 
 FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
@@ -1118,11 +1024,15 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
         continue;
       auto extent = cast<PhysicalExprAttr>(attribute);
-      if (isCompileTimeExtent(extent))
+      PhysicalAxisRealizationFact realization =
+          PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+      if (isCompileTimeExtent(extent) &&
+          !realization.constructionScalarSeed)
         continue;
       auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
-      if (extent.getKind() ==
-          static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
+      if (realization.constructionScalarSeed ||
+          extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Dimension)) {
         if (mapping.getDimensionId() <= 0)
           return reduce.emitOpError(
               "reduction free axis has no logical dimension authority");
@@ -1665,7 +1575,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
     }
     SmallVector<RootAccess> roots;
     for (LoadOp load : plan->roots) {
-      FailureOr<RootAccess> access = analyzeRoot(load, plan->reductionRange);
+      FailureOr<RootAccess> access =
+          analyzeRoot(load, plan->reductionRange, plan->reductionAxis);
       if (failed(access))
         return reduce.emitOpError(
             "multi-axis reduction outer axis has no unit-step load coordinate");
@@ -1745,7 +1656,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             FragmentType slicedType = replaceExtent(
                 sourceType, access.fragmentAxis, unitExtent);
             SmallVector<Value> coordinates(load.getCoordinates());
-            FailureOr<Value> reducedCoordinate = replayValue(
+            FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
                 plan.sourceIdentity, unitExtent, mapping);
@@ -1784,7 +1695,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                   sourceAxisIdentity(range),
                   cast<PhysicalExprAttr>(rangeType.getShape()[0]),
                   range.getResult(), mapping.lookupOrNull(range.getResult()));
-              FailureOr<Value> replayedCoordinate = replayValue(
+              FailureOr<Value> replayedCoordinate = materializeReplayedValue(
                   nested, nestedLocation, original, sourceAxisIdentity(range),
                   cast<PhysicalExprAttr>(rangeType.getShape()[0]), mapping);
               if (failed(replayedCoordinate)) {
@@ -1802,7 +1713,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                    replayAxes) {
                 IRMapping axisMapping;
                 axisMapping.map(originalRange, replacementRange);
-                FailureOr<Value> replayed = replayValue(
+                FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, valid, source, extent,
                     axisMapping);
                 if (failed(replayed)) {
@@ -1821,7 +1732,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                    replayAxes) {
                 IRMapping axisMapping;
                 axisMapping.map(originalRange, replacementRange);
-                FailureOr<Value> replayed = replayValue(
+                FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, fill, source, extent,
                     axisMapping);
                 if (failed(replayed)) {
@@ -1838,7 +1749,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 valid, fill, load.getSourceAxes());
             mapping.map(load.getResult(), slicedLoad.getResult());
           }
-          FailureOr<Value> replayed = replayValue(
+          FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
               unitExtent, mapping);
           if (failed(replayed)) {
@@ -1943,7 +1854,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       }
     SmallVector<RootAccess> roots;
     for (LoadOp load : plan.roots) {
-      FailureOr<RootAccess> access = analyzeRoot(load, plan.reductionRange);
+      FailureOr<RootAccess> access =
+          analyzeRoot(load, plan.reductionRange, plan.reductionAxis);
       if (failed(access))
         return reduce.emitOpError(
             "load-rooted producer has no unit-step reduction coordinate");
@@ -1991,6 +1903,9 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   auto firstSource = cast<FragmentType>(sourcePlans.front().source.getType());
   PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
       firstSource.getShape()[sourcePlans.front().reductionAxis]);
+  PhysicalAxisRealizationFact sourceRealization =
+      PhysicalProgramAnalysis(kernel).axisRealization(
+          sourcePlans.front().source, sourcePlans.front().reductionAxis);
   FailureOr<ParameterOp> fullCoverage = failure();
   if (!hasNonUnitFreeAxis(reduce))
     fullCoverage = fullCoverageParameter(kernel, sourceExtent);
@@ -2012,7 +1927,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             .str();
     SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
-    if (sourceExtent.getKind() ==
+    if (!sourceRealization.constructionScalarSeed &&
+        sourceExtent.getKind() ==
             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
         sourceExtent.getValue() > 0) {
       PhysicalExprAttr upper = nextPowerOfTwo(sourceExtent);
@@ -2211,7 +2127,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                                      rootPredicate,
                                                      coordinateValid);
             if (load.getValid()) {
-              FailureOr<Value> original = replayValue(
+              FailureOr<Value> original = materializeReplayedValue(
                   nested, nestedLocation, load.getValid(), plan.sourceIdentity,
                   chunkExtent, mapping);
               if (failed(original)) {
@@ -2229,7 +2145,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             }
             Value fill;
             if (load.getFill()) {
-              FailureOr<Value> replayedFill = replayValue(
+              FailureOr<Value> replayedFill = materializeReplayedValue(
                   nested, nestedLocation, load.getFill(), plan.sourceIdentity,
                   chunkExtent, mapping);
               if (failed(replayedFill)) {
@@ -2252,7 +2168,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               fill = *zero;
             }
             SmallVector<Value> coordinates(load.getCoordinates());
-            FailureOr<Value> reducedCoordinate = replayValue(
+            FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
                 plan.sourceIdentity, chunkExtent, mapping);
@@ -2270,7 +2186,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               sourceTail = nested.create<BroadcastOp>(
                   nestedLocation, blockedPredicate, coordinateValid);
           }
-          FailureOr<Value> replayed = replayValue(
+          FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
               chunkExtent, mapping);
           if (failed(replayed) || !sourceTail) {
@@ -2369,6 +2285,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 }
 
 LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
+  if (failed(bindReductionFreeAxes(reduce, kernel)))
+    return failure();
+  if (failed(realizeConstructionScalarReductionAxes(reduce, kernel)))
+    return failure();
   const bool required = requiresPhysicalRealization(reduce);
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
     return required ? reduce.emitOpError()
@@ -2397,9 +2317,6 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     return failure();
   if (*fullCoverage)
     return success();
-  if (hasNonUnitFreeAxis(reduce) &&
-      failed(bindReductionFreeAxes(reduce, kernel)))
-    return failure();
   int64_t reductionAxis = reduce.getAxes().front();
   SmallVector<SourcePlan> sourcePlans;
   SmallVector<LoadOp> sourceLoads;
@@ -2416,13 +2333,27 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     FailureOr<SourcePlan> plan = analyzeSource(source, reductionAxis);
     if (failed(plan)) {
       FailureOr<AxisMapAttr> mapping = queryAxisMap(fragment, reductionAxis);
-      if (failed(mapping) ||
-          !isReplayableWithoutLoad(source, sourceAxisIdentity(*mapping)))
-        return unhandled(
-            Twine("source is neither load-rooted nor replayable pure data on the reduction axis; producer=") +
-            (source.getDefiningOp()
-                 ? source.getDefiningOp()->getName().getStringRef()
-                 : StringRef("block argument")));
+      bool replayable = succeeded(mapping) &&
+                        isReplayableWithoutLoad(
+                            source, sourceAxisIdentity(*mapping));
+      if (failed(mapping) || !replayable) {
+        PhysicalRangeFact ranges =
+            PhysicalProgramAnalysis(kernel).axisRanges(source, reductionAxis);
+        InFlightDiagnostic diagnostic = reduce.emitOpError(
+            "cannot form a complete physical reduction: source is neither load-rooted nor replayable pure data on the reduction axis");
+        diagnostic << "; producer="
+                   << (source.getDefiningOp()
+                           ? source.getDefiningOp()->getName().getStringRef()
+                           : StringRef("block argument"))
+                   << ", range_state="
+                   << static_cast<unsigned>(ranges.state)
+                   << ", roots=" << ranges.roots.size()
+                   << ", accesses=" << ranges.accesses.size()
+                   << ", blockers=" << ranges.blockers.size();
+        for (Operation *blocker : ranges.blockers)
+          diagnostic << ", blocker=" << blocker->getName();
+        return failure();
+      }
       plan = SourcePlan{source, sourceAxisIdentity(*mapping),
                         static_cast<unsigned>(reductionAxis), {}, {}, {}};
     }
@@ -2438,7 +2369,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
           "pure reduction source has no exact physical range authority");
     for (LoadOp root : plan->roots) {
       FailureOr<RootAccess> rootAccess =
-          analyzeRoot(root, plan->reductionRange);
+          analyzeRoot(root, plan->reductionRange, plan->reductionAxis);
       if (failed(rootAccess))
         return unhandled(
             "load-rooted producer has no unit-step reduction coordinate");
@@ -2453,8 +2384,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     hasDerivedSource |=
         plan->roots.size() != 1 || plan->source != plan->roots.front().getResult();
     if (!hasDerivedSource) {
-      RootAccess access =
-          *analyzeRoot(plan->roots.front(), plan->reductionRange);
+      RootAccess access = *analyzeRoot(
+          plan->roots.front(), plan->reductionRange, plan->reductionAxis);
       Value identity = reduce.getInputs()[reduce.getSourceCount() +
                                           sourcePlans.size()];
       if (access.load.getValid() &&
@@ -2537,7 +2468,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     SmallVector<Value> coordinates(load.getCoordinates());
     IRMapping coordinateMapping;
     coordinateMapping.map(range.getResult(), coordinate);
-    FailureOr<Value> reducedCoordinate = replayValue(
+    FailureOr<Value> reducedCoordinate = materializeReplayedValue(
         builder, reduce.getLoc(),
         load.getCoordinates()[coordinateIndices[component]],
         sourceAxisIdentity(range), blockExtent, coordinateMapping);

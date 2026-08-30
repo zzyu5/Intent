@@ -115,207 +115,6 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
   return plan;
 }
 
-FailureOr<Value> replayValueImpl(OpBuilder &builder, Location location,
-                                 Value value, PhysicalSourceAxis source,
-                                 PhysicalExprAttr blockedExtent,
-                                 IRMapping &mapping, Value segmentTail = {},
-                                 AxisMapAttr segmentMapping = {}) {
-  if (Value mapped = mapping.lookupOrNull(value))
-    return mapped;
-  auto fragment = dyn_cast<FragmentType>(value.getType());
-  PhysicalAxisProjection projection = queryFragmentAxis(value.getType(), source);
-  FailureOr<unsigned> axis = projection.isExact()
-                                 ? FailureOr<unsigned>(projection.fragmentAxis)
-                                 : FailureOr<unsigned>(failure());
-  if (!fragment || failed(axis))
-    return value;
-  Operation *producer = value.getDefiningOp();
-  if (!producer)
-    return failure();
-  auto replayOperand = [&](Value operand) -> FailureOr<Value> {
-    PhysicalAxisProjection operandProjection =
-        queryFragmentAxis(operand.getType(), source);
-    if (!operandProjection.isExact())
-      return operand;
-    return replayValueImpl(builder, location, operand, source, blockedExtent,
-                           mapping, segmentTail, segmentMapping);
-  };
-  auto combineTail = [&](FragmentType type,
-                         Value valid) -> FailureOr<Value> {
-    if (!segmentTail)
-      return valid ? FailureOr<Value>(valid) : FailureOr<Value>(Value());
-    auto targetAxis = cast<AxisMapAttr>(type.getAxisMaps()[*axis]);
-    FailureOr<Value> tail = projectPredicateToFragment(
-        builder, location, segmentTail, type,
-        sourceAxisIdentity(targetAxis));
-    if (failed(tail))
-      return failure();
-    if (!valid)
-      return *tail;
-    return materializeValidityConjunction(builder, location, valid, *tail,
-                                          type);
-  };
-  if (auto load = dyn_cast<LoadOp>(producer)) {
-    SmallVector<Value> coordinates;
-    for (Value coordinate : load.getCoordinates()) {
-      FailureOr<Value> replayed = replayOperand(coordinate);
-      if (failed(replayed))
-        return failure();
-      coordinates.push_back(*replayed);
-    }
-    Value valid;
-    if (load.getValid()) {
-      FailureOr<Value> replayed = replayOperand(load.getValid());
-      if (failed(replayed))
-        return failure();
-      valid = *replayed;
-    }
-    auto resultType = segmentMapping
-                          ? replaceSliceAxis(
-                                cast<FragmentType>(load.getResult().getType()),
-                                *axis, blockedExtent, segmentMapping)
-                          : replaceExtent(
-                                cast<FragmentType>(load.getResult().getType()),
-                                *axis, blockedExtent);
-    FailureOr<Value> combined = combineTail(resultType, valid);
-    if (failed(combined))
-      return failure();
-    valid = *combined;
-    Value fill;
-    if (load.getFill()) {
-      FailureOr<Value> replayed = replayOperand(load.getFill());
-      if (failed(replayed))
-        return failure();
-      fill = *replayed;
-      if (fill.getType() != resultType)
-        fill = builder.create<BroadcastOp>(location, resultType, fill);
-    } else {
-      FailureOr<Value> zero =
-          materializeZeroFragment(builder, location, resultType);
-      if (failed(zero))
-        return failure();
-      fill = *zero;
-    }
-    auto clone = builder.create<LoadOp>(
-        location, resultType, load.getResource(), coordinates, valid, fill,
-        load.getSourceAxes());
-    if (Attribute origin = load->getAttr(originAttr))
-      clone->setAttr(originAttr, origin);
-    mapping.map(value, clone.getResult());
-    return clone.getResult();
-  }
-  if (auto gather = dyn_cast<GatherOp>(producer)) {
-    FailureOr<Value> source = replayOperand(gather.getSource());
-    if (failed(source))
-      return failure();
-    SmallVector<Value> coordinates;
-    for (Value coordinate : gather.getCoordinates()) {
-      FailureOr<Value> replayed = replayOperand(coordinate);
-      if (failed(replayed))
-        return failure();
-      coordinates.push_back(*replayed);
-    }
-    Value valid;
-    if (gather.getValid()) {
-      FailureOr<Value> replayed = replayOperand(gather.getValid());
-      if (failed(replayed))
-        return failure();
-      valid = *replayed;
-    }
-    auto resultType = segmentMapping
-                          ? replaceSliceAxis(
-                                cast<FragmentType>(gather.getResult().getType()),
-                                *axis, blockedExtent, segmentMapping)
-                          : replaceExtent(
-                                cast<FragmentType>(gather.getResult().getType()),
-                                *axis, blockedExtent);
-    FailureOr<Value> combined = combineTail(resultType, valid);
-    if (failed(combined))
-      return failure();
-    valid = *combined;
-    Value fill;
-    if (gather.getFill()) {
-      FailureOr<Value> replayed = replayOperand(gather.getFill());
-      if (failed(replayed))
-        return failure();
-      fill = *replayed;
-      if (fill.getType() != resultType)
-        fill = builder.create<BroadcastOp>(location, resultType, fill);
-    } else {
-      FailureOr<Value> zero =
-          materializeZeroFragment(builder, location, resultType);
-      if (failed(zero))
-        return failure();
-      fill = *zero;
-    }
-    auto clone = builder.create<GatherOp>(
-        location, resultType, *source, coordinates, valid, fill,
-        gather.getSourceAxes());
-    if (Attribute origin = gather->getAttr(originAttr))
-      clone->setAttr(originAttr, origin);
-    mapping.map(value, clone.getResult());
-    return clone.getResult();
-  }
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
-                            /*allowAccesses=*/false))
-    return failure();
-  for (Value operand : producer->getOperands()) {
-    FailureOr<Value> replayed = replayOperand(operand);
-    if (failed(replayed))
-      return failure();
-    if (!mapping.lookupOrNull(operand))
-      mapping.map(operand, *replayed);
-  }
-  Operation *clone = builder.clone(*producer, mapping);
-  auto clonedType = dyn_cast<FragmentType>(clone->getResult(0).getType());
-  PhysicalAxisProjection clonedProjection =
-      queryFragmentAxis(clone->getResult(0).getType(), source);
-  FailureOr<unsigned> clonedAxis =
-      clonedType && clonedProjection.isExact()
-          ? FailureOr<unsigned>(clonedProjection.fragmentAxis)
-          : FailureOr<unsigned>(failure());
-  if (!clonedType || failed(clonedAxis))
-    return failure();
-  // A reshape may introduce a unit axis which a following broadcast expands.
-  // Replacing that unit extent with the region segment would change the number
-  // of elements represented by the reshape (D -> segment x D).  Preserve the
-  // unit reshape here; the replayed broadcast remains responsible for binding
-  // the sliced source extent.
-  bool preservesIntroducedUnitAxis = false;
-  if (isa<ReshapeOp>(producer) && isUnitExtent(clonedType.getShape()[*clonedAxis])) {
-    preservesIntroducedUnitAxis = llvm::none_of(
-        producer->getOperands(), [&](Value operand) {
-          return queryFragmentAxis(operand.getType(), source).isExact();
-        });
-  }
-  if (!preservesIntroducedUnitAxis)
-    clone->getResult(0).setType(
-        segmentMapping
-            ? replaceSliceAxis(clonedType, *clonedAxis, blockedExtent,
-                               segmentMapping)
-            : replaceExtent(clonedType, *clonedAxis, blockedExtent));
-  if (!mapping.lookupOrNull(value))
-    mapping.map(value, clone->getResult(0));
-  return clone->getResult(0);
-}
-
-FailureOr<Value> replayValue(OpBuilder &builder, Location location, Value value,
-                             PhysicalSourceAxis source,
-                             PhysicalExprAttr blockedExtent,
-                             IRMapping &mapping, Value segmentTail = {},
-                             AxisMapAttr segmentMapping = {}) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-      value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true);
-  if (!replay.isReplayable())
-    return failure();
-  return replayValueImpl(builder, location, value, source, blockedExtent,
-                         mapping, segmentTail, segmentMapping);
-}
-
 LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
                                 ArrayRef<SourcePlan> plans,
                                 ArrayRef<FragmentType> sliceTypes, Value offset,
@@ -395,9 +194,14 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
       reason = "source slice has no tail predicate";
       return failure();
     }
-    FailureOr<Value> replayed = replayValue(
+    ReplayMaterializationOptions replayOptions;
+    replayOptions.scope = PhysicalReplayScope::Coordinate;
+    replayOptions.segmentTail = tail;
+    replayOptions.segmentMapping = segmentMapping;
+    replayOptions.materializeZeroFill = true;
+    FailureOr<Value> replayed = materializeReplayedValue(
         builder, location, plan.source, plan.sourceIdentity, sliceExtent,
-        mapping, tail, segmentMapping);
+        mapping, replayOptions);
     if (failed(replayed)) {
       reason = "source pure producer graph cannot be replayed";
       return failure();
@@ -1528,10 +1332,14 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
             "region-fold source assertion has no matching slice mapping";
         return failure();
       }
-      FailureOr<Value> index = replayValue(
+      ReplayMaterializationOptions replayOptions;
+      replayOptions.scope = PhysicalReplayScope::Coordinate;
+      replayOptions.segmentTail = segmentTail;
+      replayOptions.materializeZeroFill = true;
+      FailureOr<Value> index = materializeReplayedValue(
           nested, nestedLocation, sourceAssumption.operation.getIndex(),
           sourceAssumption.source, sliceExtent,
-          *sourceMappings[sourceAssumption.planIndex], segmentTail);
+          *sourceMappings[sourceAssumption.planIndex], replayOptions);
       if (failed(index)) {
         failureReason =
             "region-fold source assertion could not be replayed for a physical slice";
