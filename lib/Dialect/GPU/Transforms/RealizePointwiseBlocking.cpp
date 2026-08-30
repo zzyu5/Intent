@@ -1667,7 +1667,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 32> structuredTraversalRanges;
   llvm::SmallPtrSet<Operation *, 32> reductionTraversalRanges;
   llvm::SmallPtrSet<Operation *, 32> reductionFreeRanges;
-  llvm::SmallPtrSet<Operation *, 32> fullCoverageReductionRanges;
   llvm::SmallDenseSet<uint64_t> scanSegmentDimensions;
   llvm::SmallDenseSet<PhysicalSourceAxis> scanSegmentSources;
   auto collectAxisInto = [&](Value source, uint64_t axis,
@@ -1751,13 +1750,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
-  struct ReductionTraversal {
-    Value source;
-    unsigned axis;
-    bool exactFullDimension;
-    SmallVector<MakeRangeOp> ranges;
-  };
-  SmallVector<ReductionTraversal> reductionTraversals;
   kernel.walk([&](ReduceOp reduce) {
     for (Value source : reduce.getInputs().take_front(reduce.getSourceCount())) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -1770,28 +1762,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         unsigned axis = static_cast<unsigned>(rawAxis);
         PhysicalAxisRealizationFact fact =
             PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
-        auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
-        int64_t dimension = mapping.getDimensionId();
-        bool exactFullDimension =
-            fact.isExact() && dimension > 0 && !fact.roots.empty() &&
-            succeeded(dimensionArgument(kernel, dimension)) &&
-            llvm::all_of(fact.roots, [&](MakeRangeOp range) {
-              FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
-              return succeeded(rangeDimension) &&
-                     *rangeDimension == dimension &&
-                     !range->hasAttr(sourceSubregionAttr);
-            });
-        ReductionTraversal traversal{source, axis, exactFullDimension, {}};
         for (MakeRangeOp range : allRanges) {
           if (!llvm::any_of(fact.roots, [&](MakeRangeOp root) {
                 return sameLogicalRange(root, range);
               }))
             continue;
-          traversal.ranges.push_back(range);
           structuredTraversalRanges.insert(range.getOperation());
           reductionTraversalRanges.insert(range.getOperation());
         }
-        reductionTraversals.push_back(std::move(traversal));
       }
       for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
         if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
@@ -1806,26 +1784,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
   });
 
-  SmallVector<StoreOp> reductionStores;
-  kernel.walk([&](StoreOp store) { reductionStores.push_back(store); });
-  for (const ReductionTraversal &traversal : reductionTraversals) {
-    bool hasWritebackTraversal = false;
-    for (StoreOp store : reductionStores) {
-      if (!llvm::any_of(traversal.ranges, [&](MakeRangeOp range) {
-            return storeUsesRange(store, range);
-          }))
-        continue;
-      hasWritebackTraversal = true;
-    }
-    if (hasWritebackTraversal && traversal.exactFullDimension &&
-        failed(requireFullDimensionCoverage(kernel, traversal.source,
-                                            traversal.axis)))
-      return kernel.emitError(
-          "reduction source reused by writeback has no program-local full-coverage realization");
-    if (hasWritebackTraversal && traversal.exactFullDimension)
-      for (MakeRangeOp range : traversal.ranges)
-        fullCoverageReductionRanges.insert(range.getOperation());
-  }
   bool scanCoverageFailed = false;
   kernel.walk([&](ScanOp scan) {
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
@@ -1928,16 +1886,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
           succeeded(dimension))
         sourceDimension = *dimension;
-      if (reductionTraversalRanges.contains(range.getOperation())) {
-        if (fullCoverageReductionRanges.contains(range.getOperation()))
-          continue;
-      } else {
-        PhysicalReductionDependencyFact dependency =
-            PhysicalProgramAnalysis(kernel).reductionDependency(
-                store.getValue(), logicalSource, sourceDimension);
-        if (!dependency.isExact() || !dependency.depends)
-          continue;
-      }
+      PhysicalReductionDependencyFact dependency =
+          PhysicalProgramAnalysis(kernel).reductionDependency(
+              store.getValue(), logicalSource, sourceDimension);
+      if (!dependency.isExact() || !dependency.depends)
+        continue;
       candidates.emplace_back(range, *sourceAxis);
       innermostSourceAxis = std::max(innermostSourceAxis, *sourceAxis);
     }

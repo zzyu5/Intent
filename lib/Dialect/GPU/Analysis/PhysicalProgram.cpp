@@ -1653,19 +1653,12 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
     if (!operation || !visited.insert(operation).second)
       return exact;
     if (auto range = dyn_cast<MakeRangeOp>(operation)) {
-      if (sourceAxisIdentity(range) == source) {
-        if (sourceDimension) {
-          FailureOr<int64_t> dimension = queryRangeDimension(range);
-          if (failed(dimension)) {
-            exact.state = PhysicalFactState::Unknown;
-            appendUnique(exact.blockers, operation);
-            return exact;
-          }
-          exact.depends = *dimension == *sourceDimension;
-        } else {
-          exact.depends = true;
-        }
-      }
+      // Reaching a coordinate proves an ordinary value dependency, not a
+      // reduction dependency.  Only an operation that removes or carries this
+      // axis may turn the fact into `depends=true` below.  Treating every range
+      // leaf as a reduction made pointwise ownership axes both program-mapped
+      // and internally traversed, so different programs replayed overlapping
+      // writeback domains.
       return exact;
     }
     if (auto reduce = dyn_cast<ReduceOp>(operation)) {
@@ -1698,6 +1691,18 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
           }
         }
       }
+      return exact;
+    }
+    if (auto scan = dyn_cast<ScanOp>(operation)) {
+      for (Value input : scan.getInputs().take_front(scan.getSourceCount()))
+        if (reductionTypeConsumesSource(
+                input.getType(),
+                ArrayRef<int64_t>{static_cast<int64_t>(scan.getAxis())},
+                source)) {
+          exact.depends = true;
+          return exact;
+        }
+      return exact;
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       auto traversal =
