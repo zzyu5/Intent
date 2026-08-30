@@ -131,20 +131,33 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   }
 
   OpBuilder builder(gather);
+  auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!resultType) {
+    if (sourceLoad.getValid() || sourceLoad.getFill() || gather.getValid() ||
+        gather.getFill())
+      return false;
+    auto replacement = builder.create<LoadOp>(
+        gather.getLoc(), gather.getResult().getType(), sourceLoad.getResource(),
+        coordinates, Value(), Value(), sourceLoad.getSourceAxes());
+    if (Attribute origin = sourceLoad->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    gather.erase();
+    if (sourceLoad->getBlock() && sourceLoad.getResult().use_empty())
+      sourceLoad.erase();
+    return true;
+  }
   FailureOr<Value> sourceValid = replayFragmentValue(
-      builder, sourceLoad.getValid(), cast<FragmentType>(gather.getResult().getType()),
-      replay, analysis);
+      builder, sourceLoad.getValid(), resultType, replay, analysis);
   FailureOr<Value> sourceFill = replayFragmentValue(
-      builder, sourceLoad.getFill(), cast<FragmentType>(gather.getResult().getType()),
-      replay, analysis);
+      builder, sourceLoad.getFill(), resultType, replay, analysis);
   if (failed(sourceValid) || failed(sourceFill)) {
     gather.emitOpError(
         "source access validity/fill cannot follow composed coordinates");
     return failure();
   }
   FailureOr<Value> valid = combinePredicates(
-      builder, gather.getLoc(), cast<FragmentType>(gather.getResult().getType()),
-      *sourceValid, gather.getValid());
+      builder, gather.getLoc(), resultType, *sourceValid, gather.getValid());
   if (failed(valid)) {
     gather.emitOpError(
         "source and gather validity cannot share the composed result relation");
@@ -158,7 +171,7 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
           "composed conditional access requires both source and gather fill");
       return failure();
     }
-    auto result = cast<FragmentType>(gather.getResult().getType());
+    auto result = resultType;
     if (fill.getType() != result)
       fill = builder.create<BroadcastOp>(gather.getLoc(), result, fill);
     if (gatherFill.getType() != result)

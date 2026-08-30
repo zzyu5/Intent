@@ -69,6 +69,7 @@ def IntentGPU_RangeBoundOp : IntentGPU_Op<"range_bound", [Pure]> {
 
 def IntentGPU_MakeRangeOp : IntentGPU_Op<"make_range", [Pure]> {
   let arguments = (ins Index:$start, Index:$extent, Index:$step,
+                       Index:$logical_start, Index:$logical_stop,
                        I64Attr:$source_id,
                        I64Attr:$source_axis,
                        DefaultValuedAttr<BoolAttr, "false">:$derived);

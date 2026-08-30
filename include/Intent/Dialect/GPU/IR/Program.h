@@ -74,6 +74,7 @@ enum class ParameterRole : uint32_t {
   TraversalWorkers = 8,
   TraversalGroup = 9,
   ResidentWorkers = 10,
+  FullCoverage = 11,
 };
 
 enum class CoordinateRole : int64_t {

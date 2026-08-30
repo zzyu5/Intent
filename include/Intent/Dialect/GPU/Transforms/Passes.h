@@ -28,6 +28,8 @@ mlir::LogicalResult
 alignAggregateValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignAccessValueRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
+refreshReshapeRelations(mlir::func::FuncOp kernel);
 mlir::FailureOr<mlir::Value>
 projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
                              mlir::Value value, mlir::Type target);
@@ -38,6 +40,9 @@ alignReductionYieldRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);
+mlir::LogicalResult realizeFullCoverageDimension(mlir::func::FuncOp kernel,
+                                                 mlir::Value source,
+                                                 unsigned fragmentAxis);
 mlir::FailureOr<mlir::Value>
 resolveLogicalRangeEnd(mlir::func::FuncOp kernel, MakeRangeOp range);
 mlir::FailureOr<mlir::Value>

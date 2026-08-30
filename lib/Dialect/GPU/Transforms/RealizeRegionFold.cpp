@@ -387,15 +387,14 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
           replaceSliceAxis(rangeType, 0, sliceExtent, segmentMapping);
       Value value = builder.create<MakeRangeOp>(
           location, blockedRange, start, segment, range.getStep(),
+          range.getLogicalStart(), range.getLogicalStop(),
           segmentMapping.getSourceId(), segmentMapping.getSourceAxis(),
           segmentMapping.getDerived());
       if (Attribute inherited = range->getAttr(sourceSubregionAttr))
         value.getDefiningOp()->setAttr(sourceSubregionAttr, inherited);
-      Value logicalStop = builder.create<BinaryOp>(
-          location, builder.getIndexType(), range.getStart(), range.getExtent(),
-          BinaryOperator::Add);
       Value stopFragment =
-          builder.create<BroadcastOp>(location, blockedRange, logicalStop);
+          builder.create<BroadcastOp>(location, blockedRange,
+                                      range.getLogicalStop());
       auto validComparison = builder.create<CompareOp>(
           location, predicateType(blockedRange), value, stopFragment,
           ComparePredicate::Lt);
@@ -1225,6 +1224,7 @@ FailureOr<Value> materializeScanConsumerValue(
     }
     Value result = builder.create<MakeRangeOp>(
         location, physicalType, physicalStart, physicalExtent, *step,
+        range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
     mapping.map(value, result);
     return result;

@@ -157,19 +157,6 @@ MakeRangeOp sourceRange(Value value) {
   return succeeded(range) ? *range : MakeRangeOp();
 }
 
-FragmentType replaceSourceExtent(FragmentType source, PhysicalSourceAxis logical,
-                                 PhysicalExprAttr extent) {
-  PhysicalAxisProjection axis = queryFragmentAxis(source, logical);
-  if (!axis.isExact())
-    return source;
-  SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  shape[axis.fragmentAxis] = extent;
-  return FragmentType::get(source.getContext(), source.getElementType(),
-                           ArrayAttr::get(source.getContext(), shape),
-                           source.getAxisMaps(), source.getValidity(),
-                           source.getOwner());
-}
-
 bool containsSource(Value value, PhysicalSourceAxis source) {
   return queryFragmentAxis(value.getType(), source).isExact();
 }
@@ -234,41 +221,87 @@ FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source) {
 }
 
 FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
-                                       Value value, PhysicalSourceAxis source,
+                                       Value value,
                                        PhysicalExprAttr blockedExtent,
-                                       MakeRangeOp root, Value replacement,
+                                       ArrayRef<MakeRangeOp> roots,
+                                       Value replacement,
                                        IRMapping &mapping) {
-  if (value == root.getResult())
-    return replacement;
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
-  if (!containsSource(value, source))
+  if (llvm::any_of(roots,
+                   [&](MakeRangeOp range) { return value == range.getResult(); }))
+    return replacement;
+  auto originalResultType = dyn_cast<FragmentType>(value.getType());
+  if (!originalResultType)
+    return value;
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return failure();
+  PhysicalRangeAxisFact selected =
+      PhysicalProgramAnalysis(kernel).rangeAxes(value, roots);
+  if (!selected.isExact()) {
+    InFlightDiagnostic diagnostic =
+        value.getDefiningOp()
+            ? value.getDefiningOp()->emitOpError(
+                  "selected range roots have no exact fragment-axis projection")
+            : kernel.emitError(
+                  "selected range roots have no exact fragment-axis projection");
+    for (Operation *blocker : selected.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
+    diagnostic << "; value_type=" << value.getType();
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+      diagnostic << "; broadcast_input_type=" << broadcast.getValue().getType();
+    return failure();
+  }
+  if (selected.fragmentAxes.empty())
     return value;
   Operation *producer = value.getDefiningOp();
-  if (!producer || isa<MakeRangeOp>(producer))
+  if (!producer || isa<MakeRangeOp>(producer)) {
+    if (producer)
+      producer->emitOpError(
+          "selected range root was not bound to its blocked replacement");
     return failure();
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
-                            /*allowAccesses=*/true))
+  }
+  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+                            /*allowAccesses=*/true)) {
+    producer->emitOpError(
+        "selected range value is not a replayable physical value node");
     return failure();
-  if (producer->getNumRegions() != 0 || producer->getNumResults() != 1)
+  }
+  if (producer->getNumRegions() != 0 || producer->getNumResults() != 1) {
+    producer->emitOpError(
+        "selected range value does not have a single replayable result");
     return failure();
+  }
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = replaySourceValueImpl(
-        builder, location, operand, source, blockedExtent, root, replacement,
-        mapping);
-    if (failed(replayed))
+        builder, location, operand, blockedExtent, roots, replacement, mapping);
+    if (failed(replayed)) {
+      producer->emitOpError(
+          "selected range value has an operand that cannot be replayed");
       return failure();
+    }
     if (*replayed != operand && !mapping.lookupOrNull(operand))
       mapping.map(operand, *replayed);
   }
-  auto originalResultType = dyn_cast<FragmentType>(producer->getResult(0).getType());
-  if (!originalResultType)
-    return failure();
-  FragmentType targetType =
-      replaceSourceExtent(originalResultType, source, blockedExtent);
+  SmallVector<Attribute> targetShape(originalResultType.getShape().begin(),
+                                     originalResultType.getShape().end());
+  for (unsigned axis : selected.fragmentAxes)
+    targetShape[axis] = blockedExtent;
+  FragmentType targetType = FragmentType::get(
+      originalResultType.getContext(), originalResultType.getElementType(),
+      ArrayAttr::get(originalResultType.getContext(), targetShape),
+      originalResultType.getAxisMaps(), originalResultType.getValidity(),
+      originalResultType.getOwner());
   if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-    auto inputType = dyn_cast<FragmentType>(reshape.getValue().getType());
-    if (!inputType || !queryFragmentAxis(inputType, source).isExact()) {
+    PhysicalRangeAxisFact input =
+        PhysicalProgramAnalysis(kernel).rangeAxes(reshape.getValue(), roots);
+    if (!input.isExact()) {
+      reshape.emitOpError(
+          "reshape input has no exact selected-range axis projection");
+      return failure();
+    }
+    if (input.fragmentAxes.empty()) {
       Value input = mapping.lookupOrDefault(reshape.getValue());
       auto broadcast = builder.create<BroadcastOp>(location, targetType, input);
       if (!mapping.lookupOrNull(value))
@@ -276,10 +309,33 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
       return broadcast.getResult();
     }
   }
-  Operation *clone = builder.clone(*producer, mapping);
+  IRMapping cloneMapping(mapping);
+  Value accumulator;
+  if (auto contract = dyn_cast<ContractOp>(producer))
+    accumulator = contract.getAccumulator();
+  else if (auto contract = dyn_cast<ScaledContractOp>(producer))
+    accumulator = contract.getAccumulator();
+  else if (auto contract = dyn_cast<SparseContractOp>(producer))
+    accumulator = contract.getAccumulator();
+  if (accumulator) {
+    Value current = mapping.lookupOrDefault(accumulator);
+    if (current.getType() != targetType) {
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, location, current, targetType);
+      if (failed(projected)) {
+        producer->emitOpError(
+            "replayed structured value accumulator cannot adopt its result schema");
+        return failure();
+      }
+      cloneMapping.map(accumulator, *projected);
+    }
+  }
+  Operation *clone = builder.clone(*producer, cloneMapping);
   auto resultType = dyn_cast<FragmentType>(clone->getResult(0).getType());
-  if (!resultType)
+  if (!resultType) {
+    clone->emitOpError("replayed value did not preserve a fragment result");
     return failure();
+  }
   clone->getResult(0).setType(targetType);
   if (!mapping.lookupOrNull(value))
     mapping.map(value, clone->getResult(0));
@@ -287,20 +343,44 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
 }
 
 FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value, PhysicalSourceAxis source,
+                                   Value value,
                                    PhysicalExprAttr blockedExtent,
-                                   MakeRangeOp root, Value replacement,
+                                   ArrayRef<MakeRangeOp> roots,
+                                   Value replacement,
                                    IRMapping &mapping) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
   PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-      value, source, PhysicalReplayScope::Coordinate,
+      value, std::nullopt, PhysicalReplayScope::ValueGraph,
       /*allowAccesses=*/true);
-  if (!replay.isReplayable())
+  if (!replay.isReplayable()) {
+    InFlightDiagnostic diagnostic =
+        value.getDefiningOp()
+            ? value.getDefiningOp()->emitOpError(
+                  "contraction operand has no exact coordinate replay fact")
+            : kernel.emitError(
+                  "contraction operand has no exact coordinate replay fact");
+    for (Operation *blocker : replay.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
     return failure();
-  return replaySourceValueImpl(builder, location, value, source, blockedExtent,
-                               root, replacement, mapping);
+  }
+  FailureOr<Value> result = replaySourceValueImpl(
+      builder, location, value, blockedExtent, roots, replacement, mapping);
+  if (failed(result))
+    (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
+        ->emitError("coordinate replay could not rebuild the current value graph");
+  return result;
+}
+
+FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
+                                   Value value, PhysicalSourceAxis source,
+                                   PhysicalExprAttr blockedExtent,
+                                   MakeRangeOp root, Value replacement,
+                                   IRMapping &mapping) {
+  (void)source;
+  return replaySourceValue(builder, location, value, blockedExtent,
+                           ArrayRef<MakeRangeOp>(root), replacement, mapping);
 }
 
 Value strippedBroadcast(Value value) {
@@ -916,36 +996,44 @@ FailureOr<Value> projectBroadcast(OpBuilder &builder, Location location,
 
 FailureOr<Value> projectPredicateForScalarAxis(
     OpBuilder &builder, Location location, Value value, MakeRangeOp root,
-    Value coordinate, FragmentType target) {
+    Value coordinate, FragmentType target,
+    PhysicalProgramAnalysis &analysis) {
   if (!value)
     return Value();
-  if (!containsSource(
-          value,
-          sourceAxisIdentity(root))) {
+  FailureOr<int64_t> sourceDimension = queryRangeDimension(root);
+  PhysicalReductionDependencyFact dependency = analysis.reductionDependency(
+      value, sourceAxisIdentity(root),
+      succeeded(sourceDimension)
+          ? std::optional<int64_t>(*sourceDimension)
+          : std::nullopt);
+  if (!dependency.isExact()) {
+    InFlightDiagnostic diagnostic = root.emitOpError(
+        "validity predicate has no exact source-range dependency");
+    for (Operation *blocker : dependency.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
+    return failure();
+  }
+  if (!dependency.depends) {
     if (value.getType() == target)
       return value;
-    Type element = value.getType();
-    if (auto fragment = dyn_cast<FragmentType>(element))
-      element = fragment.getElementType();
-    if (element != target.getElementType()) {
-      return failure();
-    }
-    return Value(builder.create<BroadcastOp>(location, target, value));
+    return projectBroadcast(builder, location, value, target);
   }
   if (auto broadcast = value.getDefiningOp<BroadcastOp>())
     return projectPredicateForScalarAxis(builder, location,
                                          broadcast.getValue(), root,
-                                         coordinate, target);
+                                         coordinate, target, analysis);
   if (auto splat = value.getDefiningOp<SplatOp>())
     return projectPredicateForScalarAxis(builder, location, splat.getValue(),
-                                         root, coordinate, target);
+                                         root, coordinate, target, analysis);
   if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
     if (conjunction.getOperatorKind() != BinaryOperator::LogicalAnd)
       return failure();
     FailureOr<Value> lhs = projectPredicateForScalarAxis(
-        builder, location, conjunction.getLhs(), root, coordinate, target);
+        builder, location, conjunction.getLhs(), root, coordinate, target,
+        analysis);
     FailureOr<Value> rhs = projectPredicateForScalarAxis(
-        builder, location, conjunction.getRhs(), root, coordinate, target);
+        builder, location, conjunction.getRhs(), root, coordinate, target,
+        analysis);
     if (failed(lhs) || failed(rhs))
       return failure();
     return Value(builder.create<BinaryOp>(location, target, *lhs, *rhs,
@@ -956,12 +1044,8 @@ FailureOr<Value> projectPredicateForScalarAxis(
     Value rhs = strippedBroadcast(comparison.getRhs());
     if (comparison.getPredicate() == ComparePredicate::Lt &&
         lhs == root.getResult()) {
-      FailureOr<Value> end = resolveLogicalRangeEnd(
-          root->getParentOfType<func::FuncOp>(), root);
-      if (failed(end) || rhs != *end)
-        return failure();
       Value scalar = builder.create<CompareOp>(
-          location, builder.getI1Type(), coordinate, *end,
+          location, builder.getI1Type(), coordinate, rhs,
           comparison.getPredicate());
       return Value(builder.create<SplatOp>(location, target, scalar));
     }
@@ -994,6 +1078,8 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
   Location location = contract.getLoc();
   bool failedBody = false;
   std::string failureReason;
+  PhysicalProgramAnalysis predicateAnalysis(
+      contract->getParentOfType<func::FuncOp>());
 
   std::function<FailureOr<Value>(
       OpBuilder &, FragmentType, FragmentType, SmallVector<Value>,
@@ -1152,13 +1238,14 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
           nestedRhsCoordinates[*rhsCoordinate] = coordinate;
           FailureOr<Value> nestedLhsValid = projectPredicateForScalarAxis(
               nested, nestedLocation, currentLhsValid, lhsRange, coordinate,
-              nestedLhsPredicateType);
+              nestedLhsPredicateType, predicateAnalysis);
           FailureOr<Value> nestedRhsValid = projectPredicateForScalarAxis(
               nested, nestedLocation, currentRhsValid, rhsRange, coordinate,
-              nestedRhsPredicateType);
+              nestedRhsPredicateType, predicateAnalysis);
           if (failed(nestedLhsValid) || failed(nestedRhsValid)) {
-            failureReason =
-                "tail validity could not be projected while scalarizing a reduction pair";
+            failureReason = failed(nestedLhsValid)
+                                ? "lhs tail validity could not be projected while scalarizing a reduction pair"
+                                : "rhs tail validity could not be projected while scalarizing a reduction pair";
             failedBody = true;
             return;
           }
@@ -1232,14 +1319,14 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   if (failed(lhsMap) || failed(rhsMap))
     return contract.emitOpError(
         "reduction-only contraction blocking lost paired reduction provenance");
-  auto rangesFor = [&](Value value, AxisMapAttr mapping,
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
+  auto rangesFor = [&](Value value, unsigned fragmentAxis, AxisMapAttr mapping,
                        SmallVectorImpl<MakeRangeOp> &ranges) {
-    if (failed(collectProducerRanges(
-            value,
-            sourceAxisIdentity(mapping),
-            ranges)) ||
-        ranges.empty())
+    PhysicalRangeFact fact =
+        physicalAnalysis.axisRanges(value, fragmentAxis);
+    if (failed(queryExactLogicalRange(fact)) || !fact.unitStep)
       return failure();
+    ranges.assign(fact.roots.begin(), fact.roots.end());
     return llvm::all_of(ranges, [&](MakeRangeOp range) {
              return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
            })
@@ -1248,8 +1335,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   };
   SmallVector<MakeRangeOp> lhsRanges;
   SmallVector<MakeRangeOp> rhsRanges;
-  if (failed(rangesFor(contract.getLhs(), *lhsMap, lhsRanges)) ||
-      failed(rangesFor(contract.getRhs(), *rhsMap, rhsRanges)))
+  if (failed(rangesFor(contract.getLhs(), lhsReduction, *lhsMap, lhsRanges)) ||
+      failed(rangesFor(contract.getRhs(), rhsReduction, *rhsMap, rhsRanges)))
     return contract.emitOpError(
         "reduction-only contraction blocking requires explicit paired ranges");
   MakeRangeOp lhsRange = lhsRanges.front();
@@ -1297,6 +1384,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           ValueRange carries) {
         Value lhsK = nested.create<MakeRangeOp>(
             nestedLocation, lhsIndexType, kStart, blockK.getResult(), one,
+            lhsRange.getLogicalStart(), lhsRange.getLogicalStop(),
             lhsMap->getSourceId(), lhsMap->getSourceAxis(),
             lhsMap->getDerived());
         inheritRangeAuthority(lhsK, lhsRange);
@@ -1308,6 +1396,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             rhsRange.getStart(), rhsOffset, BinaryOperator::Add);
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
+            rhsRange.getLogicalStart(), rhsRange.getLogicalStop(),
             rhsMap->getSourceId(), rhsMap->getSourceAxis(),
             rhsMap->getDerived());
         inheritRangeAuthority(rhsK, rhsRange);
@@ -1318,13 +1407,11 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         for (MakeRangeOp range : rhsRanges)
           rhsReplay.map(range.getResult(), rhsK);
         FailureOr<Value> lhs = replaySourceValue(
-            nested, nestedLocation, contract.getLhs(),
-            sourceAxisIdentity(*lhsMap),
-            unitK, lhsRange, lhsK, lhsReplay);
+            nested, nestedLocation, contract.getLhs(), unitK, lhsRanges, lhsK,
+            lhsReplay);
         FailureOr<Value> rhs = replaySourceValue(
-            nested, nestedLocation, contract.getRhs(),
-            sourceAxisIdentity(*rhsMap),
-            unitK, rhsRange, rhsK, rhsReplay);
+            nested, nestedLocation, contract.getRhs(), unitK, rhsRanges, rhsK,
+            rhsReplay);
         if (failed(lhs) || failed(rhs)) {
           bodyFailed = true;
           return;
@@ -1696,6 +1783,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
 
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
+      columnRange.getLogicalStart(), columnRange.getLogicalStop(),
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, columnRange);
@@ -1707,6 +1795,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                           Value rowStart) -> LogicalResult {
     Value rows = rowBuilder.create<MakeRangeOp>(
         location, rowIndexType, rowStart, blockM.getResult(), one,
+        rowRange.getLogicalStart(), rowRange.getLogicalStop(),
         rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
     inheritRangeAuthority(rows, rowRange);
     Value rowEnd = broadcast(rowBuilder, location, rowIndexType, rowStop);
@@ -1765,6 +1854,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
             ValueRange carries) {
           Value reductions = nested.create<MakeRangeOp>(
               nestedLocation, reductionIndexType, kStart, blockK.getResult(), one,
+              lhsReductionRange.getLogicalStart(),
+              lhsReductionRange.getLogicalStop(),
               lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis(),
               lhsReductionMap->getDerived());
           inheritRangeAuthority(reductions, lhsReductionRange);
@@ -2375,10 +2466,12 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
 
   Value rows = builder.create<MakeRangeOp>(
       location, rowIndexType, rowStart, blockM.getResult(), one,
+      rowRange->getLogicalStart(), rowRange->getLogicalStop(),
       rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
   inheritRangeAuthority(rows, *rowRange);
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
+      columnRange->getLogicalStart(), columnRange->getLogicalStop(),
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, *columnRange);
@@ -2399,6 +2492,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
           ValueRange carries) {
         Value blocks = nested.create<MakeRangeOp>(
             nestedLocation, blockIndexType, blockStart, blockK.getResult(), one,
+            blockRange->getLogicalStart(), blockRange->getLogicalStop(),
             lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis(),
             lhsBlockMap->getDerived());
         inheritRangeAuthority(blocks, *blockRange);

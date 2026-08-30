@@ -330,7 +330,12 @@ LogicalResult RangeBoundOp::verify() {
 
 LogicalResult MakeRangeOp::verify() {
   auto result = getResult().getType();
-  if (result.getShape().size() != 1 || result.getElementType() != getStart().getType())
+  if (result.getShape().size() != 1 ||
+      result.getElementType() != getStart().getType() ||
+      getExtent().getType() != getStart().getType() ||
+      getStep().getType() != getStart().getType() ||
+      getLogicalStart().getType() != getStart().getType() ||
+      getLogicalStop().getType() != getStart().getType())
     return emitOpError("physical range must produce a rank-one index fragment");
   auto mapping = dyn_cast<AxisMapAttr>(result.getAxisMaps()[0]);
   if (!mapping || mapping.getSourceId() != static_cast<uint64_t>(getSourceId()) ||

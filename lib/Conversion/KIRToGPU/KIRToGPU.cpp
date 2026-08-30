@@ -1,6 +1,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -900,38 +901,10 @@ FailureOr<PhysicalExprAttr> fragmentExtentForDimension(Operation *origin,
                                                       int64_t dimension) {
   if (!origin || dimension <= 0)
     return failure();
-  func::FuncOp function = origin->getParentOfType<func::FuncOp>();
-  if (function) {
-    bool launchVisible = false;
-    for (BlockArgument argument : function.getArguments()) {
-      auto tensor = viewTensor(argument);
-      auto identities = tensor ? dimensionIds(tensor) : DenseI64ArrayAttr();
-      launchVisible |=
-          identities && llvm::is_contained(identities.asArrayRef(), dimension);
-    }
-    if (launchVisible)
-      return dimensionExpression(origin->getContext(), dimension);
-  }
-  gpu::ParameterOp declaration;
-  bool ambiguous = false;
-  origin->getParentOfType<ModuleOp>().walk([&](gpu::ParameterOp parameter) {
-    auto binding = parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr);
-    if (!binding || binding.getInt() != dimension)
-      return;
-    if (declaration && declaration != parameter)
-      ambiguous = true;
-    else
-      declaration = parameter;
-  });
-  if (ambiguous)
-    return failure();
-  if (declaration)
-    return parameterExpression(origin->getContext(),
-                               declaration.getParameter().getName().getValue());
-  // A non-launch-visible derived axis starts with one owned member.  The
-  // blocking pass may later enlarge that complete scalar baseline and create a
-  // parameter, but construction must not preselect one candidate domain for
-  // every dynamic tensor dimension before any consumer exists.
+  // Construction owns one logical member until a shared decision pass binds a
+  // compile-time blocking parameter.  Runtime launch dimensions remain in
+  // program-space, ranges and validity; a parameter selected for another
+  // traversal of the same logical dimension is not an extent authority here.
   return expression(origin->getContext(), PhysicalExprKind::Constant, 1);
 }
 
@@ -1719,8 +1692,8 @@ private:
                                {physicalExtent},
                                {{sourceId, sourceAxis, dimensionId, derived}});
       return Value(builder.create<gpu::MakeRangeOp>(
-          operation->getLoc(), type, start, extent, step, sourceId, sourceAxis,
-          derived));
+          operation->getLoc(), type, start, extent, step, start, stop, sourceId,
+          sourceAxis, derived));
     };
     unsigned sourceAxis = 0;
     unsigned resultAxis = 0;
@@ -2190,6 +2163,17 @@ private:
         return failure();
       return dimensions[axis - liftedRank];
     };
+    auto resultIdentity = [&](unsigned axis)
+        -> FailureOr<PhysicalAxisIdentity> {
+      if (operation->getNumResults() != 0)
+        return resultAxisIdentity(operation, /*resultIndex=*/0, axis);
+      if (axis >= fragment.getAxisMaps().size())
+        return failure();
+      auto mapping = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      return PhysicalAxisIdentity{mapping.getSourceId(), mapping.getSourceAxis(),
+                                  mapping.getDimensionId(),
+                                  mapping.getDerived()};
+    };
     auto appendCoordinate = [&](Value value) -> LogicalResult {
       auto source = dyn_cast<gpu::FragmentType>(value.getType());
       if (!source)
@@ -2209,10 +2193,10 @@ private:
     };
     auto advancedAxisMapping = [&](unsigned advancedAxis)
         -> gpu::AxisMapAttr {
-      gpu::AxisMapAttr unitMapping;
-      gpu::AxisMapAttr nonUnitMapping;
-      bool ambiguousUnit = false;
-      bool ambiguousNonUnit = false;
+      ArrayRef<int64_t> resultDimensions = relation.getResultDimensions();
+      if (advancedAxis >= resultDimensions.size())
+        return {};
+      gpu::AxisMapAttr selected;
       unsigned coordinateIndex = 0;
       for (Attribute attribute : relation.getTerms()) {
         auto term = cast<IndexTermAttr>(attribute);
@@ -2227,48 +2211,45 @@ private:
         if (position < 0 || position >= operation->getNumOperands() ||
             !isa<RankedTensorType>(operation->getOperand(position).getType()))
           continue;
+        auto logical =
+            cast<RankedTensorType>(operation->getOperand(position).getType());
         auto source = dyn_cast<gpu::FragmentType>(current.getType());
-        if (!source || source.getShape().size() > advancedRank)
+        DenseI64ArrayAttr logicalDimensions = dimensionIds(logical);
+        if (!source || !logicalDimensions ||
+            logical.getRank() > static_cast<int64_t>(advancedRank))
           continue;
-        unsigned alignedStart = advancedRank - source.getShape().size();
+        unsigned alignedStart = advancedRank - logical.getRank();
         if (advancedAxis < alignedStart)
           continue;
         unsigned localAxis = advancedAxis - alignedStart;
-        auto mapping =
-            cast<gpu::AxisMapAttr>(source.getAxisMaps()[localAxis]);
-        auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[localAxis]);
-        bool unit = extent.getKind() ==
-                        static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-                    extent.getValue() == 1;
+        if (localAxis >= static_cast<unsigned>(logical.getRank()))
+          continue;
+        const int64_t logicalDimension = logicalDimensions[localAxis];
+        if (logicalDimension <= 0)
+          return {};
+        gpu::PhysicalDimensionProjection projection =
+            gpu::queryFragmentDimension(source, logicalDimension);
+        if (!projection.isExact())
+          return {};
+        auto mapping = cast<gpu::AxisMapAttr>(
+            source.getAxisMaps()[projection.fragmentAxis]);
         auto sameMapping = [](gpu::AxisMapAttr lhs, gpu::AxisMapAttr rhs) {
           return lhs.getSourceId() == rhs.getSourceId() &&
                  lhs.getSourceAxis() == rhs.getSourceAxis() &&
+                 lhs.getDimensionId() == rhs.getDimensionId() &&
                  lhs.getDerived() == rhs.getDerived();
         };
-        if (!unit) {
-          if (!nonUnitMapping)
-            nonUnitMapping = mapping;
-          else if (!sameMapping(nonUnitMapping, mapping))
-            ambiguousNonUnit = true;
-          continue;
-        }
-        if (!unitMapping)
-          unitMapping = mapping;
-        else if (!sameMapping(unitMapping, mapping))
-          ambiguousUnit = true;
+        if (selected && !sameMapping(selected, mapping))
+          return {};
+        selected = mapping;
       }
-      if (ambiguousNonUnit)
-        return {};
-      if (nonUnitMapping)
-        return nonUnitMapping;
-      return ambiguousUnit ? gpu::AxisMapAttr() : unitMapping;
+      return selected;
     };
     for (Attribute attribute : relation.getTerms()) {
       auto term = cast<IndexTermAttr>(attribute);
       if (term.getKind() == 1) {
         FailureOr<int64_t> dimension = resultDimension(resultAxis);
-        FailureOr<PhysicalAxisIdentity> identity =
-            resultAxisIdentity(operation, /*resultIndex=*/0, resultAxis);
+        FailureOr<PhysicalAxisIdentity> identity = resultIdentity(resultAxis);
         if (failed(dimension) || *dimension <= 0 || failed(identity))
           return failure();
         mappings.push_back(gpu::AxisMapAttr::get(
@@ -2307,7 +2288,7 @@ private:
                   mapping.getDerived()};
             } else {
               FailureOr<PhysicalAxisIdentity> derivedIdentity =
-                  resultAxisIdentity(operation, /*resultIndex=*/0, resultAxis);
+                  resultIdentity(resultAxis);
               if (failed(derivedIdentity))
                 return failure();
               identity = *derivedIdentity;
@@ -2584,7 +2565,8 @@ private:
                 mapping.getDerived())}),
             fragment.getValidity(), fragment.getOwner());
         Value coordinate = builder.create<gpu::MakeRangeOp>(
-            location, coordinateType, zero, *physicalExtent, one,
+            location, coordinateType, zero, *physicalExtent, one, zero,
+            *physicalExtent,
             mapping.getSourceId(), mapping.getSourceAxis(),
             mapping.getDerived());
         auto resultType = gpu::FragmentType::get(
@@ -2626,8 +2608,9 @@ private:
               rangeType.getDerived())}),
           genericType.getValidity(), genericType.getOwner());
       auto target = builder.create<gpu::MakeRangeOp>(
-          location, resultType, start, extent, step, rangeType.getSourceId(),
-          rangeType.getSourceAxis(), rangeType.getDerived());
+          location, resultType, start, extent, step, start, stop,
+          rangeType.getSourceId(), rangeType.getSourceAxis(),
+          rangeType.getDerived());
       if ((*source).getDefiningOp()->hasAttr(gpu::sourceSubregionAttr))
         target->setAttr(gpu::sourceSubregionAttr, builder.getUnitAttr());
       mapResults(operation, target);
@@ -2801,6 +2784,7 @@ private:
             "reshape result has no complete canonical shape relation");
       SmallVector<PhysicalExprAttr> logicalResultExtents;
       std::optional<unsigned> inferredAxis;
+      SmallVector<unsigned> unresolvedAxes;
       PhysicalExprAttr knownResultProduct = expression(
           operation->getContext(), PhysicalExprKind::Constant, 1);
       for (auto [axis, attribute] : llvm::enumerate(relation)) {
@@ -2834,12 +2818,9 @@ private:
             launched = candidate;
           }
           if (!launched) {
-            FailureOr<PhysicalExprAttr> derived = physicalShapeExpression(
-                operation->getOperand(operand), operation);
-            if (failed(derived))
-              return reshape.emitOpError(
-                  "reshape dynamic extent has no exact physical authority");
-            launched = *derived;
+            unresolvedAxes.push_back(axis);
+            logicalResultExtents.push_back(PhysicalExprAttr());
+            continue;
           }
           physical = *launched;
         } else if (extent.getKind() == 2) {
@@ -2847,6 +2828,7 @@ private:
             return reshape.emitOpError(
                 "reshape has more than one inferred physical extent");
           inferredAxis = axis;
+          unresolvedAxes.push_back(axis);
           logicalResultExtents.push_back(PhysicalExprAttr());
           continue;
         } else {
@@ -2858,16 +2840,26 @@ private:
             operation->getContext(), PhysicalExprKind::Multiply,
             knownResultProduct, physical);
       }
-      if (inferredAxis) {
-        PhysicalExprAttr sourceProduct = expression(
-            operation->getContext(), PhysicalExprKind::Constant, 1);
-        for (Attribute extent : llvm::drop_begin(source.getShape(), worksetRank))
-          sourceProduct = binaryExpression(
-              operation->getContext(), PhysicalExprKind::Multiply,
-              sourceProduct, cast<PhysicalExprAttr>(extent));
-        logicalResultExtents[*inferredAxis] = binaryExpression(
-            operation->getContext(), PhysicalExprKind::FloorDiv,
-            sourceProduct, knownResultProduct);
+      PhysicalExprAttr sourceProduct = expression(
+          operation->getContext(), PhysicalExprKind::Constant, 1);
+      for (Attribute extent : llvm::drop_begin(source.getShape(), worksetRank))
+        sourceProduct = binaryExpression(
+            operation->getContext(), PhysicalExprKind::Multiply,
+            sourceProduct, cast<PhysicalExprAttr>(extent));
+      if (!unresolvedAxes.empty()) {
+        if (unresolvedAxes.size() == 1) {
+          logicalResultExtents[unresolvedAxes.front()] = binaryExpression(
+              operation->getContext(), PhysicalExprKind::FloorDiv,
+              sourceProduct, knownResultProduct);
+        } else if (sourceProduct == knownResultProduct) {
+          for (unsigned axis : unresolvedAxes)
+            logicalResultExtents[axis] = expression(
+                operation->getContext(), PhysicalExprKind::Constant, 1);
+        } else {
+          return reshape.emitOpError(
+              "reshape has multiple result axes without an exact physical "
+              "extent relation");
+        }
       }
       for (auto [axis, extent] : llvm::enumerate(logicalResultExtents)) {
         shape.push_back(extent);
@@ -4225,7 +4217,16 @@ private:
               if (!nestedFailed)
                 bodyBuilder.create<scf::YieldOp>(location, yielded);
             });
-        auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+        if (nestedFailed) {
+          loop.erase();
+          return {};
+        }
+        auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+        if (!yield) {
+          nestedFailed = true;
+          loop.erase();
+          return {};
+        }
         for (auto [index, item] : llvm::enumerate(llvm::zip(
                  loop.getInitArgs(), yield.getOperands()))) {
           Value initial = std::get<0>(item);
@@ -4245,6 +4246,10 @@ private:
             break;
           }
           yield->setOperand(index, *aligned);
+        }
+        if (nestedFailed) {
+          loop.erase();
+          return {};
         }
         loopResults.append(loop.getResults().begin(), loop.getResults().end());
         return loopResults;

@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Hashing.h"
@@ -66,6 +67,8 @@ PhysicalAxisProjection queryFragmentAxis(mlir::Type type,
                                          PhysicalSourceAxis source);
 llvm::SmallVector<PhysicalAxisProjection, 2>
 queryFragmentAxes(mlir::Type type, PhysicalSourceAxis source);
+llvm::SmallVector<PhysicalAxisProjection, 2>
+queryRangeProjections(mlir::Type type, MakeRangeOp range);
 PhysicalDimensionProjection queryFragmentDimension(mlir::Type type,
                                                    int64_t dimensionId);
 mlir::FailureOr<int64_t>
@@ -90,6 +93,18 @@ struct PhysicalRangeFact {
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
   bool isUnique() const { return isExact() && roots.size() == 1; }
+};
+
+/// Exact fragment axes whose current coordinate provenance reaches one of a
+/// selected set of physical range roots.  This distinguishes repeated uses of
+/// one logical source axis in different result positions without inventing a
+/// second source identity.
+struct PhysicalRangeAxisFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  llvm::SmallVector<unsigned, 2> fragmentAxes;
+  llvm::SmallVector<mlir::Operation *, 2> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs);
@@ -181,11 +196,15 @@ public:
   /// source-id query, this preserves repeated occurrences of the same logical
   /// source in Cartesian/indexed values.
   PhysicalRangeFact axisRanges(mlir::Value value, unsigned fragmentAxis);
+  PhysicalRangeAxisFact rangeAxes(mlir::Value value,
+                                  llvm::ArrayRef<MakeRangeOp> roots);
   PhysicalReplayFact replayability(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt,
       PhysicalReplayScope scope = PhysicalReplayScope::Coordinate,
-      bool allowAccesses = true);
+      bool allowAccesses = true,
+      mlir::Operation *insertionAnchor = nullptr,
+      std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalReductionDependencyFact reductionDependency(
       mlir::Value value, PhysicalSourceAxis source,
       std::optional<int64_t> sourceDimension = std::nullopt);
@@ -210,6 +229,9 @@ private:
   void analyzeReplay(mlir::Value value,
                      std::optional<PhysicalSourceAxis> source,
                      PhysicalReplayScope scope, bool allowAccesses,
+                     mlir::Operation *insertionAnchor,
+                     std::optional<int64_t> sourceDimension,
+                     mlir::DominanceInfo *dominance,
                      PhysicalReplayFact &result,
                      llvm::SmallPtrSetImpl<mlir::Operation *> &visited);
   llvm::SmallVector<mlir::Value, 2>

@@ -14,6 +14,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 
@@ -23,12 +24,6 @@ namespace intent::gpu {
 namespace {
 
 void collectParameterSymbols(Attribute attribute, llvm::StringSet<> &symbols);
-
-Value stripBroadcast(Value value) {
-  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    value = broadcast.getValue();
-  return value;
-}
 
 using AxisSelector = llvm::function_ref<bool(AxisMapAttr)>;
 
@@ -114,8 +109,15 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
          });
 }
 
+bool selectsSegmentAxis(Type type, uint64_t axis, AxisSelector selects) {
+  auto fragment = dyn_cast<FragmentType>(type);
+  return fragment && axis < fragment.getAxisMaps().size() &&
+         selects(cast<AxisMapAttr>(fragment.getAxisMaps()[axis]));
+}
+
 void appendStructuredParentRelations(BlockArgument argument,
-                                     SmallVectorImpl<Value> &worklist) {
+                                     SmallVectorImpl<Value> &worklist,
+                                     AxisSelector selects) {
   Block *block = argument.getOwner();
   Region *region = block->getParent();
   Operation *parent = region ? region->getParentOp() : nullptr;
@@ -124,8 +126,11 @@ void appendStructuredParentRelations(BlockArgument argument,
     unsigned sources = fold.getSourceCount();
     unsigned identities = fold.getIdentityCount();
     if (region == &fold.getSummarize()) {
-      if (index < sources)
+      if (index < sources) {
+        if (!selectsSegmentAxis(argument.getType(), fold.getAxis(), selects))
+          worklist.push_back(fold.getInputs()[index]);
         return;
+      }
       unsigned capture = index - sources;
       worklist.push_back(fold.getInputs()[sources + identities + capture]);
       return;
@@ -147,8 +152,11 @@ void appendStructuredParentRelations(BlockArgument argument,
   unsigned stateOffset = sources + identities;
   unsigned captureOffset = stateOffset + states;
   if (region == &scan.getSummarize()) {
-    if (index < sources)
+    if (index < sources) {
+      if (!selectsSegmentAxis(argument.getType(), scan.getAxis(), selects))
+        worklist.push_back(scan.getInputs()[index]);
       return;
+    }
     worklist.push_back(scan.getInputs()[captureOffset + index - sources]);
     return;
   }
@@ -166,8 +174,13 @@ void appendStructuredParentRelations(BlockArgument argument,
     worklist.push_back(scan.getResults()[outputs + state]);
     return;
   }
-  if (region != &scan.getEmit() || index < sources)
+  if (region != &scan.getEmit())
     return;
+  if (index < sources) {
+    if (!selectsSegmentAxis(argument.getType(), scan.getAxis(), selects))
+      worklist.push_back(scan.getInputs()[index]);
+    return;
+  }
   if (index < sources + states) {
     unsigned state = index - sources;
     worklist.push_back(scan.getInputs()[stateOffset + state]);
@@ -179,15 +192,21 @@ void appendStructuredParentRelations(BlockArgument argument,
 }
 
 void appendStructuredChildRelations(Operation *user, Value value,
-                                    SmallVectorImpl<Value> &worklist) {
+                                    SmallVectorImpl<Value> &worklist,
+                                    AxisSelector selects) {
   if (auto fold = dyn_cast<RegionFoldOp>(user)) {
     unsigned sources = fold.getSourceCount();
     unsigned identities = fold.getIdentityCount();
     for (auto [index, operand] : llvm::enumerate(fold.getInputs())) {
       if (operand != value)
         continue;
-      if (index < sources)
+      if (index < sources) {
+        BlockArgument slice =
+            fold.getSummarize().front().getArgument(index);
+        if (!selectsSegmentAxis(slice.getType(), fold.getAxis(), selects))
+          worklist.push_back(slice);
         continue;
+      }
       if (index < sources + identities) {
         unsigned component = index - sources;
         worklist.push_back(fold.getResults()[component]);
@@ -214,8 +233,16 @@ void appendStructuredChildRelations(Operation *user, Value value,
   for (auto [index, operand] : llvm::enumerate(scan.getInputs())) {
     if (operand != value)
       continue;
-    if (index < sources)
+    if (index < sources) {
+      BlockArgument summarize =
+          scan.getSummarize().front().getArgument(index);
+      BlockArgument emit = scan.getEmit().front().getArgument(index);
+      if (!selectsSegmentAxis(summarize.getType(), scan.getAxis(), selects)) {
+        worklist.push_back(summarize);
+        worklist.push_back(emit);
+      }
       continue;
+    }
     if (index < stateOffset) {
       unsigned component = index - sources;
       Block &combine = scan.getCombine().front();
@@ -900,6 +927,56 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk([&](ReshapeOp reshape) {
+    auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
+    auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
+    if (!source || !target) {
+      reshape.emitOpError(
+          "reshape relation requires physical fragment operands and result");
+      return WalkResult::interrupt();
+    }
+    unsigned logicalSourceRank = 0;
+    unsigned logicalResultRank = 0;
+    for (Attribute attribute : reshape.getReassociation()) {
+      auto group = dyn_cast<ReshapeGroupAttr>(attribute);
+      if (!group) {
+        reshape.emitOpError("reshape relation contains an untyped group");
+        return WalkResult::interrupt();
+      }
+      if (!group.getSourceAxes().empty())
+        logicalSourceRank =
+            std::max(logicalSourceRank,
+                     static_cast<unsigned>(
+                         group.getSourceAxes().asArrayRef().back() + 1));
+      if (!group.getResultAxes().empty())
+        logicalResultRank =
+            std::max(logicalResultRank,
+                     static_cast<unsigned>(
+                         group.getResultAxes().asArrayRef().back() + 1));
+    }
+    if (logicalSourceRank > source.getShape().size() ||
+        logicalResultRank > target.getShape().size()) {
+      reshape.emitOpError(
+          "reshape relation rank exceeds the current physical fragments");
+      return WalkResult::interrupt();
+    }
+    unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
+    unsigned resultPrefix = target.getShape().size() - logicalResultRank;
+    FailureOr<ArrayAttr> reassociation = inferReshapeReassociation(
+        source, target, sourcePrefix, resultPrefix);
+    if (failed(reassociation)) {
+      reshape.emitOpError(
+          "current physical extents have no exact row-major reshape relation")
+          << "; source=" << source << "; target=" << target;
+      return WalkResult::interrupt();
+    }
+    reshape->setAttr("reassociation", *reassociation);
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
   kernel.walk([&](MakeRecordOp record) {
     RecordType current = record.getResult().getType();
@@ -922,76 +999,8 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
 
 FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
                                         MakeRangeOp range) {
-  if (range->hasAttr(sourceSubregionAttr)) {
-    OpBuilder builder(range);
-    return Value(builder.create<BinaryOp>(
-        range.getLoc(), builder.getIndexType(), range.getStart(),
-        range.getExtent(), BinaryOperator::Add));
-  }
-  FailureOr<int64_t> dimension = querySourceDimension(
-      range.getResult().getType(), sourceAxisIdentity(range));
-  if (succeeded(dimension) && !range->hasAttr(sourceSubregionAttr)) {
-    for (BlockArgument argument : kernel.getArguments()) {
-      DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
-      auto kind = attributes.getAs<StringAttr>(abiKindAttr);
-      auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
-      if (kind && kind.getValue() == "dimension" && identity &&
-          identity.getInt() == *dimension)
-        return Value(argument);
-    }
-    std::optional<int64_t> staticExtent;
-    for (BlockArgument argument : kernel.getArguments()) {
-      auto view = dyn_cast<ViewType>(argument.getType());
-      if (!view)
-        continue;
-      auto identities = view.getLayout().getDimensionIds();
-      auto extents = view.getLayout().getExtents();
-      for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef())) {
-        if (identity != *dimension)
-          continue;
-        auto extent = cast<PhysicalExprAttr>(extents[axis]);
-        if (extent.getKind() !=
-            static_cast<uint32_t>(PhysicalExprKind::Constant))
-          return failure();
-        if (staticExtent && *staticExtent != extent.getValue())
-          return failure();
-        staticExtent = extent.getValue();
-      }
-    }
-    if (staticExtent) {
-      OpBuilder builder(range);
-      return Value(builder.create<arith::ConstantIndexOp>(range.getLoc(),
-                                                          *staticExtent));
-    }
-  }
-
-  Value result;
-  SmallVector<Value> worklist{range.getResult()};
-  llvm::SmallDenseSet<Value> visited;
-  while (!worklist.empty()) {
-    Value coordinate = worklist.pop_back_val();
-    if (!visited.insert(coordinate).second)
-      continue;
-    for (Operation *user : coordinate.getUsers()) {
-      if (isa<BroadcastOp, ReshapeOp, TransposeOp>(user) &&
-          user->getNumResults() == 1) {
-        worklist.push_back(user->getResult(0));
-        continue;
-      }
-      auto comparison = dyn_cast<CompareOp>(user);
-      if (!comparison || comparison.getPredicate() != ComparePredicate::Lt ||
-          comparison.getLhs() != coordinate)
-        continue;
-      Value candidate = stripBroadcast(comparison.getRhs());
-      if (result && result != candidate)
-        return failure();
-      result = candidate;
-    }
-  }
-  if (result)
-    return result;
-
-  return failure();
+  (void)kernel;
+  return range.getLogicalStop();
 }
 
 static void retargetExtent(Value root, AxisSelector selects,
@@ -1012,18 +1021,20 @@ static void retargetExtent(Value root, AxisSelector selects,
     connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
   llvm::DenseMap<Value, Type> visitedTypes;
-  auto isSegmentSourceSlice = [](Value value) {
+  auto isSegmentSourceSlice = [&](Value value) {
     auto argument = dyn_cast<BlockArgument>(value);
     if (!argument)
       return false;
     Operation *parent = argument.getOwner()->getParentOp();
     if (auto fold = dyn_cast_or_null<RegionFoldOp>(parent))
       return argument.getOwner()->getParent() == &fold.getSummarize() &&
-             argument.getArgNumber() < fold.getSourceCount();
+             argument.getArgNumber() < fold.getSourceCount() &&
+             selectsSegmentAxis(argument.getType(), fold.getAxis(), selects);
     if (auto scan = dyn_cast_or_null<RegionScanOp>(parent))
       return (argument.getOwner()->getParent() == &scan.getSummarize() ||
               argument.getOwner()->getParent() == &scan.getEmit()) &&
-             argument.getArgNumber() < scan.getSourceCount();
+             argument.getArgNumber() < scan.getSourceCount() &&
+             selectsSegmentAxis(argument.getType(), scan.getAxis(), selects);
     return false;
   };
   while (!worklist.empty()) {
@@ -1033,9 +1044,9 @@ static void retargetExtent(Value root, AxisSelector selects,
       continue;
     visited->second = value.getType();
     // A structured segment slice has one exact extent authority: the segment
-    // parameter owned by its region_fold/region_scan operation.  Pointwise
-    // ownership retargeting must stop at that block argument regardless of
-    // which logical provenance reached the structured boundary.
+    // parameter owned by its region_fold/region_scan operation.  Retargeting
+    // stops only for that segmented axis; every non-segment axis must preserve
+    // the source schema across the helper boundary.
     if (isSegmentSourceSlice(value))
       continue;
     // Each make_range is an independent physical traversal authority.  A
@@ -1063,7 +1074,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     if (auto extract = value.getDefiningOp<ExtractOp>())
       worklist.push_back(extract.getRecord());
     if (auto argument = dyn_cast<BlockArgument>(value)) {
-      appendStructuredParentRelations(argument, worklist);
+      appendStructuredParentRelations(argument, worklist, selects);
       auto loop = dyn_cast_or_null<scf::ForOp>(
           argument.getOwner()->getParentOp());
       if (loop)
@@ -1084,7 +1095,7 @@ static void retargetExtent(Value root, AxisSelector selects,
     appendStructuredResultRelations(value, worklist);
     for (Operation *user : value.getUsers()) {
       if (isa<RegionFoldOp, RegionScanOp>(user)) {
-        appendStructuredChildRelations(user, value, worklist);
+        appendStructuredChildRelations(user, value, worklist, selects);
         for (Value result : user->getResults())
           worklist.push_back(result);
         continue;
@@ -1237,6 +1248,161 @@ bool hasBlockedDimension(func::FuncOp kernel, uint64_t dimension) {
   return found;
 }
 
+LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
+                                           unsigned fragmentAxis) {
+  auto fragment = dyn_cast<FragmentType>(source.getType());
+  if (!fragment || fragmentAxis >= fragment.getShape().size())
+    return failure();
+  auto mapping =
+      dyn_cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+  if (!mapping || mapping.getDimensionId() <= 0)
+    return failure();
+  const int64_t dimension = mapping.getDimensionId();
+  auto currentExtent =
+      cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+
+  Value runtimeDimension;
+  for (BlockArgument argument : kernel.getArguments()) {
+    DictionaryAttr attributes = kernel.getArgAttrDict(argument.getArgNumber());
+    auto kind = attributes.getAs<StringAttr>(abiKindAttr);
+    auto identity = attributes.getAs<IntegerAttr>(dimensionAttr);
+    if (kind && kind.getValue() == "dimension" && identity &&
+        identity.getInt() == dimension) {
+      if (runtimeDimension && runtimeDimension != argument)
+        return kernel.emitError(
+            "logical dimension has multiple runtime ABI authorities");
+      runtimeDimension = argument;
+    }
+  }
+
+  std::optional<int64_t> staticDimension;
+  for (BlockArgument argument : kernel.getArguments()) {
+    auto view = dyn_cast<ViewType>(argument.getType());
+    if (!view)
+      continue;
+    for (auto [axis, identity] :
+         llvm::enumerate(view.getLayout().getDimensionIds().asArrayRef())) {
+      if (identity != dimension)
+        continue;
+      auto extent = cast<PhysicalExprAttr>(
+          view.getLayout().getExtents()[axis]);
+      if (extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Constant))
+        continue;
+      if (staticDimension && *staticDimension != extent.getValue())
+        return kernel.emitError(
+            "logical dimension has conflicting static ABI extents");
+      staticDimension = extent.getValue();
+    }
+  }
+  if (!runtimeDimension && staticDimension &&
+      currentExtent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+      currentExtent.getValue() == *staticDimension)
+    return success();
+  if (!runtimeDimension)
+    return kernel.emitError(
+        "full-coverage physicalization has no runtime or static dimension authority");
+
+  ParameterOp parameter;
+  if (currentExtent.getKind() ==
+      static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+    FailureOr<ParameterOp> declaration =
+        queryParameterBySymbol(kernel, currentExtent.getSymbol());
+    if (succeeded(declaration)) {
+      auto covered = (*declaration)->getAttrOfType<IntegerAttr>(
+          coverageDimensionAttr);
+      if (covered && covered.getInt() == dimension)
+        parameter = *declaration;
+    }
+  }
+  if (!parameter) {
+    kernel.walk([&](ParameterOp candidate) {
+      auto covered = candidate->getAttrOfType<IntegerAttr>(
+          coverageDimensionAttr);
+      if (!covered || covered.getInt() != dimension)
+        return;
+      if (parameter && parameter != candidate) {
+        parameter = ParameterOp();
+        return;
+      }
+      parameter = candidate;
+    });
+  }
+  static constexpr int64_t candidates[] = {
+      1,    2,    4,     8,     16,    32,    64,    128,   256,
+      512,  1024, 2048,  4096,  8192,  16384, 32768, 65536};
+  if (!parameter) {
+    std::string name = ("FULL_D" + Twine(dimension)).str();
+    bool nameCollision = false;
+    kernel.walk([&](ParameterOp candidate) {
+      nameCollision |=
+          candidate.getParameter().getName().getValue() == name;
+    });
+    if (nameCollision)
+      return kernel.emitError(
+          "full-coverage parameter name is already owned by another decision");
+    OpBuilder builder(&kernel.getBody().front(),
+                      kernel.getBody().front().begin());
+    auto schema = ParameterAttr::get(
+        kernel.getContext(), builder.getStringAttr(name),
+        static_cast<uint32_t>(ParameterRole::FullCoverage),
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
+    parameter = builder.create<ParameterOp>(source.getLoc(),
+                                            builder.getIndexType(), schema);
+  } else {
+    ParameterAttr schema = parameter.getParameter();
+    parameter->setAttr(
+        "parameter",
+        ParameterAttr::get(
+            kernel.getContext(), schema.getName(), schema.getRole(),
+            DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
+  }
+  parameter->setAttr(
+      dimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+  parameter->setAttr(
+      coverageDimensionAttr,
+      IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
+
+  auto covered = PhysicalExprAttr::get(
+      kernel.getContext(),
+      static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
+      parameter.getParameter().getName(),
+      ArrayAttr::get(kernel.getContext(), {}));
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact ranges = analysis.axisRanges(source, fragmentAxis);
+  if (ranges.state == PhysicalFactState::Ambiguous)
+    return kernel.emitError(
+        "full-coverage source has ambiguous physical range authority");
+  if (ranges.state == PhysicalFactState::Unknown || ranges.roots.empty()) {
+    PhysicalReplayFact replay = analysis.replayability(
+        source, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/false);
+    if (!ranges.roots.empty() || !replay.isReplayable()) {
+      InFlightDiagnostic diagnostic = kernel.emitError(
+          "full-coverage source has no exact physical range authority");
+      for (Operation *blocker : ranges.blockers)
+        diagnostic << "; blocker=" << blocker->getName();
+      return failure();
+    }
+  }
+  for (MakeRangeOp range : ranges.roots) {
+    FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
+    if (failed(rangeDimension) || *rangeDimension != dimension ||
+        range->hasAttr(sourceSubregionAttr))
+      return range.emitOpError(
+          "full-coverage range does not cover the selected logical dimension");
+    retargetDimensionExtent(range.getResult(), dimension, covered);
+  }
+  retargetDimensionExtent(source, dimension, covered);
+  if (failed(bindFullCoverageDimension(kernel, dimension,
+                                       parameter.getResult())))
+    return kernel.emitError(
+        "full-coverage decision could not preserve access validity");
+  return success();
+}
+
 LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                                         Value physicalExtent) {
   auto parameter = physicalExtent.getDefiningOp<ParameterOp>();
@@ -1256,8 +1422,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     if (failed(sourceDimension) ||
         *sourceDimension != static_cast<int64_t>(dimension) ||
         range->hasAttr(sourceSubregionAttr) || !fragment ||
-        fragment.getShape().size() != 1 ||
-        fragment.getShape()[0] != parameterExtent)
+        fragment.getShape().size() != 1)
       return;
     ranges.push_back(range);
     logicalExtents[range.getOperation()] = range.getExtent();
@@ -1362,8 +1527,8 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                              ArrayRef<MakeRangeOp> sources) -> FailureOr<Value> {
     Value result;
     for (MakeRangeOp range : sources) {
-      SmallVector<PhysicalAxisProjection, 2> projections = queryFragmentAxes(
-          target, sourceAxisIdentity(range));
+      SmallVector<PhysicalAxisProjection, 2> projections =
+          queryRangeProjections(target, range);
       if (projections.empty())
         return failure();
       for (PhysicalAxisProjection projection : projections) {

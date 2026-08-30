@@ -219,8 +219,8 @@ FailureOr<Value> clonePaddedProducer(
     auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
     auto padded = builder.create<MakeRangeOp>(
         location, paddedType, range.getStart(), physicalExtentValue,
-        range.getStep(), range.getSourceId(), range.getSourceAxis(),
-        range.getDerived());
+        range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
+        range.getSourceId(), range.getSourceAxis(), range.getDerived());
     if (Attribute origin = range->getAttr(originAttr))
       padded->setAttr(originAttr, origin);
     Value logicalLength = builder.create<arith::ConstantIndexOp>(
@@ -1711,7 +1711,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 auto rangeType = cast<FragmentType>(range.getResult().getType());
                 auto clone = nested.create<MakeRangeOp>(
                     nestedLocation, rangeType, range.getStart(),
-                    range.getExtent(), range.getStep(), range.getSourceId(),
+                    range.getExtent(), range.getStep(), range.getLogicalStart(),
+                    range.getLogicalStop(), range.getSourceId(),
                     range.getSourceAxis(), range.getDerived());
                 if (Attribute value = range->getAttr(sourceSubregionAttr))
                   clone->setAttr(sourceSubregionAttr, value);
@@ -2028,7 +2029,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             masterType.getAxisMaps(), 2, masterType.getOwner());
         Value masterCoordinate = nested.create<MakeRangeOp>(
             nestedLocation, blockedMaster, chunkStart, chunk.getResult(),
-            firstRange.getStep(), firstRange.getSourceId(),
+            firstRange.getStep(), firstRange.getLogicalStart(),
+            firstRange.getLogicalStop(), firstRange.getSourceId(),
             firstRange.getSourceAxis(), firstRange.getDerived());
         Value masterEnd = nested.create<BroadcastOp>(nestedLocation,
                                                      blockedMaster, stop);
@@ -2062,7 +2064,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 originalCoordinate.getOwner());
             auto coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart,
-                chunk.getResult(), range.getStep(), range.getSourceId(),
+                chunk.getResult(), range.getStep(), range.getLogicalStart(),
+                range.getLogicalStop(), range.getSourceId(),
                 range.getSourceAxis(), range.getDerived());
             if (Attribute value = range->getAttr(sourceSubregionAttr))
               coordinate->setAttr(sourceSubregionAttr, value);
@@ -2103,8 +2106,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 range.getResult().getType().getOwner());
             Value coordinate = nested.create<MakeRangeOp>(
                 nestedLocation, blockedCoordinate, chunkStart, chunk.getResult(),
-                range.getStep(), range.getSourceId(), range.getSourceAxis(),
-                range.getDerived());
+                range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
+                range.getSourceId(), range.getSourceAxis(), range.getDerived());
             if (!mapping.lookupOrNull(range.getResult())) {
               auto originalCoordinate = range.getResult().getType();
               auto replayCoordinate = FragmentType::get(
@@ -2439,8 +2442,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
         range.getResult().getType().getOwner());
     Value coordinate = builder.create<MakeRangeOp>(
         reduce.getLoc(), blockedCoordinate, range.getStart(), physicalExtent,
-        range.getStep(), range.getSourceId(), range.getSourceAxis(),
-        range.getDerived());
+        range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
+        range.getSourceId(), range.getSourceAxis(), range.getDerived());
     Value stop = builder.create<BinaryOp>(
         reduce.getLoc(), builder.getIndexType(), range.getStart(),
         range.getExtent(), BinaryOperator::Add);

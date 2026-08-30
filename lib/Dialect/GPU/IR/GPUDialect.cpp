@@ -86,7 +86,7 @@ LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
     uint32_t role, DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::ResidentWorkers) ||
+      role > static_cast<uint32_t>(ParameterRole::FullCoverage) ||
       !candidates || candidates.empty())
     return emitError() << "physical parameter requires a name, role and candidates";
   llvm::DenseSet<int64_t> unique;
@@ -117,6 +117,8 @@ LogicalResult ReshapeGroupAttr::verify(
     return emitError()
            << "reshape group must cover at least one source or result axis";
   auto consecutive = [](ArrayRef<int64_t> axes) {
+    if (axes.size() < 2)
+      return true;
     return llvm::all_of(llvm::seq<size_t>(1, axes.size()), [&](size_t index) {
       return axes[index] == axes[index - 1] + 1;
     });
