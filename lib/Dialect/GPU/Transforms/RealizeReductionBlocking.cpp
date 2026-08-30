@@ -197,6 +197,7 @@ void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
 
 FailureOr<Value> clonePaddedProducer(
     OpBuilder &builder, Location location, Value value,
+    std::optional<unsigned> projectedAxis,
     PhysicalSourceAxis reductionSource,
     ArrayRef<MakeRangeOp> selectedRanges,
     PhysicalExprAttr logicalExtent, PhysicalExprAttr physicalExtent,
@@ -214,11 +215,18 @@ FailureOr<Value> clonePaddedProducer(
       PhysicalProgramAnalysis(kernel).rangeAxes(value, selectedRanges);
   if (!selected.isExact())
     return failure();
-  if (selected.fragmentAxes.empty())
-    return value;
-  if (selected.fragmentAxes.size() != 1)
+  if (selected.fragmentAxes.size() > 1)
     return failure();
-  unsigned reductionAxis = selected.fragmentAxes.front();
+  if (!selected.fragmentAxes.empty() && projectedAxis &&
+      selected.fragmentAxes.front() != *projectedAxis)
+    return failure();
+  if (!projectedAxis && !selected.fragmentAxes.empty())
+    projectedAxis = selected.fragmentAxes.front();
+  if (!projectedAxis)
+    return value;
+  unsigned reductionAxis = *projectedAxis;
+  if (reductionAxis >= fragment.getShape().size())
+    return failure();
   if (fragment.getShape()[reductionAxis] != logicalExtent)
     return value;
   Operation *producer = value.getDefiningOp();
@@ -262,40 +270,65 @@ FailureOr<Value> clonePaddedProducer(
 
   if (auto broadcast = dyn_cast<BroadcastOp>(producer)) {
     auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-    if (input && input.getShape().size() <= fragment.getShape().size()) {
-      unsigned offset = fragment.getShape().size() - input.getShape().size();
-      if (reductionAxis >= offset) {
-        unsigned inputAxis = reductionAxis - offset;
-        if (input.getShape()[inputAxis] == logicalExtent) {
-          auto inputMapping =
-              cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
-          FailureOr<Value> replayed = clonePaddedProducer(
-              builder, location, broadcast.getValue(),
-              PhysicalSourceAxis{inputMapping.getSourceId(),
-                                 inputMapping.getSourceAxis(),
-                                 inputMapping.getDerived()}, selectedRanges,
-              logicalExtent, physicalExtent, physicalExtentValue, mapping,
-              tailPredicates);
-          if (failed(replayed))
-            return failure();
-          auto paddedType =
-              replaceExtent(fragment, reductionAxis, physicalExtent);
-          auto padded =
-              builder.create<BroadcastOp>(location, paddedType, *replayed);
-          if (Attribute origin = broadcast->getAttr(originAttr))
-            padded->setAttr(originAttr, origin);
-          mapping.map(value, padded.getResult());
-          return padded.getResult();
-        }
+    auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
+    if (!input) {
+      auto padded = builder.create<BroadcastOp>(location, paddedType,
+                                                broadcast.getValue());
+      if (Attribute origin = broadcast->getAttr(originAttr))
+        padded->setAttr(originAttr, origin);
+      mapping.map(value, padded.getResult());
+      return padded.getResult();
+    }
+    BroadcastProjection projection =
+        queryAxisProjection(input, fragment);
+    if (!projection.isExact() ||
+        reductionAxis >= projection.targetToSource.size()) {
+      InFlightDiagnostic diagnostic = broadcast.emitOpError(
+          "padded broadcast has no exact source-axis projection");
+      diagnostic << "; input=" << broadcast.getValue().getType()
+                 << "; result=" << fragment
+                 << "; reduction_axis=" << reductionAxis;
+      return failure();
+    }
+    Value replayed = broadcast.getValue();
+    if (std::optional<unsigned> inputAxis =
+            projection.targetToSource[reductionAxis]) {
+      auto inputExtent =
+          cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
+      bool expandsSingleton =
+          inputExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          inputExtent.getValue() == 1 &&
+          input.getShape()[*inputAxis] != fragment.getShape()[reductionAxis];
+      if (!expandsSingleton) {
+        auto inputMapping =
+            cast<AxisMapAttr>(input.getAxisMaps()[*inputAxis]);
+        FailureOr<Value> replacement = clonePaddedProducer(
+            builder, location, broadcast.getValue(), *inputAxis,
+            PhysicalSourceAxis{inputMapping.getSourceId(),
+                               inputMapping.getSourceAxis(),
+                               inputMapping.getDerived()},
+            selectedRanges, logicalExtent, physicalExtent,
+            physicalExtentValue, mapping, tailPredicates);
+        if (failed(replacement))
+          return failure();
+        replayed = *replacement;
       }
     }
+    auto padded =
+        builder.create<BroadcastOp>(location, paddedType, replayed);
+    if (Attribute origin = broadcast->getAttr(originAttr))
+      padded->setAttr(originAttr, origin);
+    mapping.map(value, padded.getResult());
+    return padded.getResult();
   }
 
   if (auto load = dyn_cast<LoadOp>(producer)) {
     SmallVector<Value> coordinates;
     for (Value coordinate : load.getCoordinates()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, coordinate, reductionSource, selectedRanges,
+          builder, location, coordinate, std::nullopt, reductionSource,
+          selectedRanges,
           logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
@@ -306,7 +339,8 @@ FailureOr<Value> clonePaddedProducer(
     Value valid;
     if (load.getValid()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getValid(), reductionSource, selectedRanges,
+          builder, location, load.getValid(), reductionAxis, reductionSource,
+          selectedRanges,
           logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
@@ -317,7 +351,8 @@ FailureOr<Value> clonePaddedProducer(
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> replayed = clonePaddedProducer(
-          builder, location, load.getFill(), reductionSource, selectedRanges,
+          builder, location, load.getFill(), reductionAxis, reductionSource,
+          selectedRanges,
           logicalExtent,
           physicalExtent,
           physicalExtentValue, mapping, tailPredicates);
@@ -375,8 +410,25 @@ FailureOr<Value> clonePaddedProducer(
   }
 
   for (Value operand : producer->getOperands()) {
+    std::optional<unsigned> operandAxis;
+    if (auto operandType = dyn_cast<FragmentType>(operand.getType())) {
+      BroadcastProjection projection = queryAxisProjection(operandType, fragment);
+      if (projection.isExact() &&
+          reductionAxis < projection.targetToSource.size())
+        operandAxis = projection.targetToSource[reductionAxis];
+      if (operandAxis) {
+        auto operandExtent =
+            cast<PhysicalExprAttr>(operandType.getShape()[*operandAxis]);
+        if (operandExtent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            operandExtent.getValue() == 1 &&
+            operandType.getShape()[*operandAxis] !=
+                fragment.getShape()[reductionAxis])
+          operandAxis.reset();
+      }
+    }
     FailureOr<Value> replayed = clonePaddedProducer(
-        builder, location, operand, reductionSource, selectedRanges,
+        builder, location, operand, operandAxis, reductionSource, selectedRanges,
         logicalExtent,
         physicalExtent,
         physicalExtentValue, mapping, tailPredicates);
@@ -897,7 +949,8 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     IRMapping mapping;
     SmallVector<Value> tailPredicates;
     FailureOr<Value> source = clonePaddedProducer(
-        builder, reduce.getLoc(), reduce.getInputs()[component], reductionSource,
+        builder, reduce.getLoc(), reduce.getInputs()[component],
+        static_cast<unsigned>(reductionAxis), reductionSource,
         componentRanges[component], logicalExtent, physicalExtent,
         physicalExtentValue, mapping,
         tailPredicates);
@@ -1148,6 +1201,42 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       return reduce.emitOpError(
                  "reduction free axis full-coverage binding failed")
              << "; dimension=" << dimension;
+  }
+
+  if (reduce.getSourceCount() != reduce.getResults().size())
+    return reduce.emitOpError(
+        "physical reduction needs one result schema per source component");
+  llvm::SmallDenseSet<int64_t> reducedAxes(reduce.getAxes().begin(),
+                                           reduce.getAxes().end());
+  for (auto [source, result] : llvm::zip_equal(
+           reduce.getInputs().take_front(reduce.getSourceCount()),
+           reduce.getResults())) {
+    auto sourceType = dyn_cast<FragmentType>(source.getType());
+    if (!sourceType)
+      continue;
+    SmallVector<Attribute> shape;
+    SmallVector<Attribute> mappings;
+    for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
+      if (reducedAxes.contains(static_cast<int64_t>(axis)))
+        continue;
+      shape.push_back(extent);
+      auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
+      mappings.push_back(AxisMapAttr::get(
+          reduce.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), static_cast<uint32_t>(mappings.size()),
+          mapping.getDerived()));
+    }
+    Type element = result.getType();
+    if (auto current = dyn_cast<FragmentType>(element))
+      element = current.getElementType();
+    if (shape.empty()) {
+      result.setType(element);
+      continue;
+    }
+    result.setType(FragmentType::get(
+        reduce.getContext(), element, ArrayAttr::get(reduce.getContext(), shape),
+        ArrayAttr::get(reduce.getContext(), mappings), sourceType.getValidity(),
+        sourceType.getOwner()));
   }
   return success();
 }

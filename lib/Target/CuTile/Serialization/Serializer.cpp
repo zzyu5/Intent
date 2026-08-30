@@ -919,8 +919,10 @@ private:
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source || source == target)
       return valueString(value);
-    if (source.getShape().size() > target.getShape().size()) {
-      kernel.emitError("cuTile broadcast source rank exceeds target rank");
+    gpu::BroadcastProjection projection =
+        gpu::queryBroadcastProjection(source, target);
+    if (!projection.isExact()) {
+      kernel.emitError("cuTile broadcast lost its shared axis projection");
       failed = true;
       return "<invalid-cutile-broadcast>";
     }
@@ -928,43 +930,10 @@ private:
       return "ct.broadcast_to(" + valueString(value) + ", " +
              fragmentShape(target) + ")";
     SmallVector<int64_t> targetForSource(source.getShape().size(), -1);
-    for (auto [sourceIndex, sourceMapping] :
-         llvm::enumerate(source.getAxisMaps())) {
-      auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
-      for (auto [targetIndex, targetMapping] :
-           llvm::enumerate(target.getAxisMaps())) {
-        auto targetAxis = cast<gpu::AxisMapAttr>(targetMapping);
-        if (sourceAxis.getSourceId() == targetAxis.getSourceId() &&
-            sourceAxis.getSourceAxis() == targetAxis.getSourceAxis()) {
-          targetForSource[sourceIndex] = targetIndex;
-          break;
-        }
-      }
-      if (targetForSource[sourceIndex] < 0) {
-        auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[sourceIndex]);
-        unsigned aligned = target.getShape().size() - source.getShape().size() +
-                           sourceIndex;
-        bool alignedAvailable = llvm::none_of(
-            targetForSource, [&](int64_t targetAxis) {
-              return targetAxis == static_cast<int64_t>(aligned);
-            });
-        if (extent.getKind() ==
-                static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
-            extent.getValue() == 1 && alignedAvailable) {
-          targetForSource[sourceIndex] = aligned;
-          continue;
-        }
-        if (Operation *producer = value.getDefiningOp())
-          producer->emitOpError(
-              "cuTile broadcast source axis is absent from its target fragment")
-              << "; source=" << source << ", target=" << target;
-        else
-          kernel.emitError(
-              "cuTile broadcast block argument axis is absent from its target fragment");
-        failed = true;
-        return "<unmapped-cutile-broadcast>";
-      }
-    }
+    for (auto [targetIndex, sourceIndex] :
+         llvm::enumerate(projection.targetToSource))
+      if (sourceIndex)
+        targetForSource[*sourceIndex] = targetIndex;
 
     SmallVector<unsigned> sourceOrder(source.getShape().size());
     std::iota(sourceOrder.begin(), sourceOrder.end(), 0);

@@ -2407,14 +2407,19 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                    << parameter->getParameter().getName().getValue();
       return failure();
     }
-    if (FailureOr<PhysicalSourceAxis> source = axisSource(*axis);
-        succeeded(source))
-      retargetSourceExtent(range.getResult(), *source,
-                           fragmentExtent(*parameter));
-    else if (FailureOr<uint64_t> dimension = axisDimension(*axis);
-             succeeded(dimension))
+    // Pointwise ownership is shared by every value carrying the same
+    // canonical logical dimension, even when an elementwise result has a new
+    // provenance identity.  Propagate through that typed relation first; the
+    // source identity remains the fallback for range-local/derived axes that
+    // have no canonical dimension.
+    if (FailureOr<uint64_t> dimension = rangeDimension(range);
+        succeeded(dimension))
       retargetDimensionExtent(range.getResult(), *dimension,
                               fragmentExtent(*parameter));
+    else if (FailureOr<PhysicalSourceAxis> source = axisSource(*axis);
+             succeeded(source))
+      retargetSourceExtent(range.getResult(), *source,
+                           fragmentExtent(*parameter));
     else
       return range.emitOpError("blocking parameter has no typed axis binding");
     auto found = parameters.find(*axis);

@@ -34,6 +34,8 @@ alignStructuredCaptureRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignPointwiseValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
+alignAccessResultRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
 alignAggregateValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignAccessValueRelations(mlir::func::FuncOp kernel);

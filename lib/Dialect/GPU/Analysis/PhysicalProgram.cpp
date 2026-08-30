@@ -1315,11 +1315,10 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
         return !isProvablySingletonLogicalRange(range);
       });
   result.physicalized =
-      !result.constructionScalarSeed &&
-      (ranges.roots.empty() ||
-       llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+      !result.constructionScalarSeed && !ranges.roots.empty() &&
+      llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
          return valueMatchesExtent(range.getExtent(), extent);
-       }));
+       });
   if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
     return result;
   if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges))) {

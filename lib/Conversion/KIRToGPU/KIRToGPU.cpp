@@ -2676,7 +2676,7 @@ private:
                   sourceType.getAxisMaps()[physicalSourceAxis]);
               resultMapping = gpu::AxisMapAttr::get(
                   operation->getContext(), sourceMapping.getSourceId(),
-                  sourceMapping.getSourceAxis(), resultMapping.getDimensionId(),
+                  sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(),
                   resultAxis, sourceMapping.getDerived());
             }
           }

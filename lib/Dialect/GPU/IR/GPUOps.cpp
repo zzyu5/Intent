@@ -389,6 +389,13 @@ LogicalResult BroadcastOp::verify() {
         input.getOwner() != result.getOwner() ||
         input.getShape().size() > result.getShape().size())
       return emitOpError("broadcast physical schema is invalid");
+    BroadcastProjection projection = queryBroadcastProjection(input, result);
+    if (!projection.isExact())
+      return emitOpError(
+                 projection.state == BroadcastProjectionState::Ambiguous
+                     ? "broadcast physical axis projection is ambiguous"
+                     : "broadcast physical axis projection is unknown")
+             << "; input=" << input << "; result=" << result;
   } else if (getValue().getType() != getResult().getType().getElementType()) {
       return emitOpError("scalar broadcast element type disagrees: value=")
              << getValue().getType()

@@ -1122,53 +1122,23 @@ private:
       return valueString(value);
     if (source == target)
       return valueString(value);
-    if (source.getShape().size() > target.getShape().size()) {
-      kernel.emitError("Triton broadcast source rank exceeds target rank");
+    gpu::BroadcastProjection projection =
+        gpu::queryBroadcastProjection(source, target);
+    if (!projection.isExact()) {
+      kernel.emitError("Triton broadcast lost its shared axis projection");
       failed = true;
       return {};
     }
-    // Triton broadcasts singleton extents implicitly.  An equal-rank
-    // intent_gpu.broadcast therefore changes only the logical extent carried
-    // by the typed program; emitting another indexing expression would insert
-    // a new rank instead of expanding the existing singleton axis.
-    if (source.getShape().size() == target.getShape().size())
-      return valueString(value);
-    SmallVector<std::optional<unsigned>> projection(target.getShape().size());
-    SmallVector<bool> sourceUsed(source.getShape().size(), false);
-    for (auto [targetIndex, targetMapping] :
-         llvm::enumerate(target.getAxisMaps())) {
-      auto targetAxis = cast<gpu::AxisMapAttr>(targetMapping);
-      for (auto [sourceIndex, sourceMapping] :
-           llvm::enumerate(source.getAxisMaps())) {
-        auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
-        if (sourceAxis.getSourceId() == targetAxis.getSourceId() &&
-            sourceAxis.getSourceAxis() == targetAxis.getSourceAxis()) {
-          if (sourceUsed[sourceIndex]) {
-            kernel.emitError("Triton broadcast reuses one source axis ambiguously");
-            failed = true;
-            return {};
-          }
-          projection[targetIndex] = sourceIndex;
-          sourceUsed[sourceIndex] = true;
-          break;
-        }
-      }
-    }
-    unsigned offset = target.getShape().size() - source.getShape().size();
-    for (unsigned sourceIndex = 0; sourceIndex < source.getShape().size();
-         ++sourceIndex) {
-      if (sourceUsed[sourceIndex])
-        continue;
-      unsigned targetIndex = offset + sourceIndex;
-      if (projection[targetIndex]) {
-        kernel.emitError("Triton broadcast axis mapping is ambiguous");
-        failed = true;
-        return {};
-      }
-      projection[targetIndex] = sourceIndex;
+    if (source.getShape().size() == target.getShape().size()) {
+      std::string shape = "(";
+      for (Attribute extent : target.getShape())
+        shape += expressionString(cast<gpu::PhysicalExprAttr>(extent), false) +
+                 ", ";
+      shape += ")";
+      return "tl.broadcast_to(" + valueString(value) + ", " + shape + ")";
     }
     SmallVector<std::string> selectors;
-    for (std::optional<unsigned> sourceIndex : projection)
+    for (std::optional<unsigned> sourceIndex : projection.targetToSource)
       selectors.push_back(sourceIndex ? ":" : "None");
     std::string result = valueString(value) + "[";
     for (auto [index, selector] : llvm::enumerate(selectors)) {

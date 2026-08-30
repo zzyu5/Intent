@@ -43,6 +43,129 @@ bool isCompileTimePhysicalExpr(PhysicalExprAttr expression) {
 
 } // namespace
 
+BroadcastProjection queryAxisProjection(FragmentType source,
+                                        FragmentType target) {
+  BroadcastProjection result;
+  if (source.getOwner() != target.getOwner() ||
+      source.getShape().size() > target.getShape().size())
+    return result;
+  result.targetToSource.resize(target.getShape().size());
+  SmallVector<bool> sourceUsed(source.getShape().size(), false);
+
+  auto bindUnique = [&](unsigned sourceIndex,
+                        function_ref<bool(AxisMapAttr)> selects) {
+    std::optional<unsigned> selected;
+    for (auto [targetIndex, mapping] : llvm::enumerate(target.getAxisMaps())) {
+      if (result.targetToSource[targetIndex] ||
+          !selects(cast<AxisMapAttr>(mapping)))
+        continue;
+      if (selected) {
+        result.state = BroadcastProjectionState::Ambiguous;
+        return false;
+      }
+      selected = targetIndex;
+    }
+    if (!selected)
+      return true;
+    result.targetToSource[*selected] = sourceIndex;
+    sourceUsed[sourceIndex] = true;
+    return true;
+  };
+
+  for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
+    auto sourceAxis = cast<AxisMapAttr>(mapping);
+    if (!bindUnique(sourceIndex, [&](AxisMapAttr targetAxis) {
+          return sourceAxis.getSourceId() == targetAxis.getSourceId() &&
+                 sourceAxis.getSourceAxis() == targetAxis.getSourceAxis() &&
+                 sourceAxis.getDerived() == targetAxis.getDerived();
+        }))
+      return result;
+  }
+  for (auto [sourceIndex, mapping] : llvm::enumerate(source.getAxisMaps())) {
+    if (sourceUsed[sourceIndex])
+      continue;
+    auto sourceAxis = cast<AxisMapAttr>(mapping);
+    auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[sourceIndex]);
+    bool singleton =
+        sourceExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        sourceExtent.getValue() == 1;
+    if (singleton)
+      continue;
+    unsigned sourceOccurrences = llvm::count_if(
+        llvm::enumerate(source.getAxisMaps()), [&](auto item) {
+          if (sourceUsed[item.index()])
+            return false;
+          return cast<AxisMapAttr>(item.value()).getDimensionId() ==
+                 sourceAxis.getDimensionId();
+        });
+    unsigned targetOccurrences = llvm::count_if(
+        llvm::enumerate(target.getAxisMaps()), [&](auto item) {
+          if (result.targetToSource[item.index()])
+            return false;
+          return cast<AxisMapAttr>(item.value()).getDimensionId() ==
+                 sourceAxis.getDimensionId();
+        });
+    if (sourceOccurrences > 1 || targetOccurrences > 1) {
+      result.state = BroadcastProjectionState::Ambiguous;
+      return result;
+    }
+    if (!bindUnique(sourceIndex, [&](AxisMapAttr targetAxis) {
+          return sourceAxis.getDimensionId() == targetAxis.getDimensionId();
+        }))
+      return result;
+  }
+  // Pointwise and explicit broadcast semantics align any still-unmatched axes
+  // from the trailing dimension.  This is only the axis relation: broadcast
+  // legality additionally checks equal extents or a singleton source below.
+  const unsigned offset = target.getShape().size() - source.getShape().size();
+  for (unsigned sourceIndex = 0; sourceIndex < source.getShape().size();
+       ++sourceIndex) {
+    if (sourceUsed[sourceIndex])
+      continue;
+    unsigned targetIndex = offset + sourceIndex;
+    if (result.targetToSource[targetIndex])
+      return result;
+    result.targetToSource[targetIndex] = sourceIndex;
+    sourceUsed[sourceIndex] = true;
+  }
+
+  unsigned previous = 0;
+  bool sawSource = false;
+  for (std::optional<unsigned> sourceIndex : result.targetToSource) {
+    if (!sourceIndex)
+      continue;
+    if (sawSource && *sourceIndex <= previous)
+      return result;
+    previous = *sourceIndex;
+    sawSource = true;
+  }
+  result.state = BroadcastProjectionState::Exact;
+  return result;
+}
+
+BroadcastProjection queryBroadcastProjection(FragmentType source,
+                                              FragmentType target) {
+  BroadcastProjection result = queryAxisProjection(source, target);
+  if (!result.isExact())
+    return result;
+  for (auto [targetAxis, sourceAxis] :
+       llvm::enumerate(result.targetToSource)) {
+    if (!sourceAxis)
+      continue;
+    auto sourceExtent = cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
+    bool singleton =
+        sourceExtent.getKind() ==
+            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+        sourceExtent.getValue() == 1;
+    if (!singleton && source.getShape()[*sourceAxis] != target.getShape()[targetAxis]) {
+      result.state = BroadcastProjectionState::Unknown;
+      return result;
+    }
+  }
+  return result;
+}
+
 void IntentGPUDialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST

@@ -35,19 +35,29 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   // structured passes lower those already-physical slices into loops and
   // primitives; they must not be asked to reconstruct range provenance.
   if (failed(realizePointwiseBlocking(module)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionFolds(module)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionScans(module)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeReductionBlocking(module)) ||
       failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignReductionIdentityRelations(*kernel)) ||
       failed(alignReductionYieldRelations(*kernel)) ||
@@ -57,6 +67,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
     return failure();
   if (failed(realizeContractionBlocking(module)) ||
       failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
@@ -66,6 +77,9 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   // Compose those typed access relations before provider legalization just as
   // we do for the access graph constructed directly from KIR.
   if (failed(realizeAccessComposition(module)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
