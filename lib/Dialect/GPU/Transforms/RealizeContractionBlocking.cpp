@@ -176,6 +176,27 @@ bool containsSource(Value value, PhysicalSourceAxis source) {
   return queryFragmentAxis(value.getType(), source).isExact();
 }
 
+FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
+  llvm::SmallDenseSet<unsigned, 2> axes;
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  std::function<void(Value)> collect = [&](Value current) {
+    for (auto [axis, coordinate] : llvm::enumerate(mapping.getCoordinates()))
+      if (current == coordinate) {
+        axes.insert(axis);
+        return;
+      }
+    Operation *producer = current.getDefiningOp();
+    if (!producer || producer->getNumRegions() != 0 ||
+        !visited.insert(producer).second)
+      return;
+    for (Value operand : producer->getOperands())
+      collect(operand);
+  };
+  collect(value);
+  return axes.size() == 1 ? FailureOr<unsigned>(*axes.begin())
+                          : FailureOr<unsigned>(failure());
+}
+
 LogicalResult collectProducerRanges(
     Value value, PhysicalSourceAxis source,
     SmallVectorImpl<MakeRangeOp> &ranges);
@@ -1709,12 +1730,15 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
+  FailureOr<unsigned> existingRowAxis =
+      mappingAxisForScalar(rowRange.getStart(), mapping);
+  FailureOr<unsigned> existingColumnAxis =
+      mappingAxisForScalar(columnRange.getStart(), mapping);
+  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
+      *existingRowAxis == *existingColumnAxis)
+    return unhandled(
+        "row and column ownership share one mapping coordinate that cannot be refined independently");
   SmallVector<Value> mappingExtents(mapping.getExtents());
-  if (runtimeRowTraversal)
-    mappingExtents.push_back(rowWorkers.getResult());
-  else
-    mappingExtents.push_back(rowTiles);
-  mappingExtents.push_back(columnTiles);
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
   auto rowExpression = cast<PhysicalExprAttr>(
@@ -1725,30 +1749,47 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       cast<ViewType>(rhsLoad.getResource().getType())
           .getLayout()
           .getExtents()[columnResourceAxis]);
-  if (runtimeRowTraversal)
-    launchExtents.push_back(unitRowWorkers);
-  else
-    launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
-                                              rowExpression, unitM));
-  launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
-                                            columnExpression, unitN));
   SmallVector<Type> mappingTypes(mapping.getResultTypes());
-  mappingTypes.push_back(mapBuilder.getIndexType());
-  mappingTypes.push_back(mapBuilder.getIndexType());
-  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
-      location, mappingTypes, mapping.getLinear(), mappingExtents,
-      mapBuilder.getArrayAttr(launchExtents));
-  SmallVector<int64_t> coordinateRoles(expandedMapping.getNumResults(), -1);
+  SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
   if (auto existing =
           mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr))
     if (existing.size() == mapping.getNumResults())
       llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
-  coordinateRoles[mapping.getNumResults()] = static_cast<int64_t>(
+  auto bindMappingAxis = [&](FailureOr<unsigned> existing, Value extent,
+                             PhysicalExprAttr launchExtent,
+                             CoordinateRole role) {
+    unsigned axis;
+    if (succeeded(existing)) {
+      axis = *existing;
+      mappingExtents[axis] = extent;
+      launchExtents[axis] = launchExtent;
+    } else {
+      axis = mappingExtents.size();
+      mappingExtents.push_back(extent);
+      launchExtents.push_back(launchExtent);
+      mappingTypes.push_back(mapBuilder.getIndexType());
+      coordinateRoles.push_back(-1);
+    }
+    coordinateRoles[axis] = static_cast<int64_t>(role);
+    return axis;
+  };
+  unsigned rowMappingAxis = bindMappingAxis(
+      existingRowAxis, runtimeRowTraversal ? rowWorkers.getResult() : rowTiles,
+      runtimeRowTraversal
+          ? unitRowWorkers
+          : binaryExpression(context, PhysicalExprKind::CeilDiv, rowExpression,
+                             unitM),
       indirectRow ? CoordinateRole::IndirectTraversal
                   : runtimeRowTraversal ? CoordinateRole::TraversalWorker
                                         : CoordinateRole::ContractionM);
-  coordinateRoles[mapping.getNumResults() + 1] =
-      static_cast<int64_t>(CoordinateRole::ContractionN);
+  unsigned columnMappingAxis = bindMappingAxis(
+      existingColumnAxis, columnTiles,
+      binaryExpression(context, PhysicalExprKind::CeilDiv, columnExpression,
+                       unitN),
+      CoordinateRole::ContractionN);
+  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
+      location, mappingTypes, mapping.getLinear(), mappingExtents,
+      mapBuilder.getArrayAttr(launchExtents));
   expandedMapping->setAttr(
       coordinateRolesAttr,
       DenseI64ArrayAttr::get(context, coordinateRoles));
@@ -1765,14 +1806,13 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
            mapping.getCoordinates(),
            expandedMapping.getCoordinates().take_front(mapping.getNumResults())))
     oldCoordinate.replaceAllUsesWith(newCoordinate);
-  Value rowTile;
-  Value rowWorker;
-  unsigned physicalAxis = mapping.getNumResults();
-  if (runtimeRowTraversal)
-    rowWorker = expandedMapping.getCoordinates()[physicalAxis++];
-  else
-    rowTile = expandedMapping.getCoordinates()[physicalAxis++];
-  Value columnTile = expandedMapping.getCoordinates()[physicalAxis];
+  Value rowTile = runtimeRowTraversal
+                      ? Value()
+                      : expandedMapping.getCoordinates()[rowMappingAxis];
+  Value rowWorker = runtimeRowTraversal
+                        ? expandedMapping.getCoordinates()[rowMappingAxis]
+                        : Value();
+  Value columnTile = expandedMapping.getCoordinates()[columnMappingAxis];
   mapping.erase();
   kernel->setAttr(programSpaceAttr,
                   ArrayAttr::get(context, {segmentLength}));
@@ -2349,6 +2389,16 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction, {2, 4, 8});
   if (!blockM || !blockN || !blockK)
     return failure();
+  for (auto [parameter, range] :
+       {std::pair<ParameterOp, MakeRangeOp>{blockM, *rowRange},
+        std::pair<ParameterOp, MakeRangeOp>{blockN, *columnRange},
+        std::pair<ParameterOp, MakeRangeOp>{blockK, *blockRange}})
+    if (FailureOr<int64_t> dimension = queryRangeDimension(range);
+        succeeded(dimension))
+      parameter->setAttr(
+          dimensionAttr,
+          IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                           *dimension));
   PhysicalExprAttr unitM = parameterExpression(
       context, blockM.getParameter().getName().getValue());
   PhysicalExprAttr unitN = parameterExpression(
@@ -2374,9 +2424,15 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   };
   Value rowTiles = ceilDiv(rowExtent, blockM.getResult());
   Value columnTiles = ceilDiv(columnExtent, blockN.getResult());
+  FailureOr<unsigned> existingRowAxis =
+      mappingAxisForScalar(rowRange->getStart(), mapping);
+  FailureOr<unsigned> existingColumnAxis =
+      mappingAxisForScalar(columnRange->getStart(), mapping);
+  if (succeeded(existingRowAxis) && succeeded(existingColumnAxis) &&
+      *existingRowAxis == *existingColumnAxis)
+    return reject(
+        "row and column ownership share one mapping coordinate that cannot be refined independently");
   SmallVector<Value> mappingExtents(mapping.getExtents());
-  mappingExtents.push_back(rowTiles);
-  mappingExtents.push_back(columnTiles);
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
   auto rowExpression = cast<PhysicalExprAttr>(
@@ -2387,25 +2443,43 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       cast<ViewType>(rhsLoad.getResource().getType())
           .getLayout()
           .getExtents()[columnResourceAxis]);
-  launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
-                                            rowExpression, unitM));
-  launchExtents.push_back(binaryExpression(context, PhysicalExprKind::CeilDiv,
-                                            columnExpression, unitN));
   SmallVector<Type> mappingTypes(mapping.getResultTypes());
-  mappingTypes.push_back(mapBuilder.getIndexType());
-  mappingTypes.push_back(mapBuilder.getIndexType());
-  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
-      location, mappingTypes, mapping.getLinear(), mappingExtents,
-      mapBuilder.getArrayAttr(launchExtents));
-  SmallVector<int64_t> coordinateRoles(expandedMapping.getNumResults(), -1);
+  SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
   if (auto existing =
           mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr))
     if (existing.size() == mapping.getNumResults())
       llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
-  coordinateRoles[mapping.getNumResults()] =
-      static_cast<int64_t>(CoordinateRole::ContractionM);
-  coordinateRoles[mapping.getNumResults() + 1] =
-      static_cast<int64_t>(CoordinateRole::ContractionN);
+  auto bindMappingAxis = [&](FailureOr<unsigned> existing, Value extent,
+                             PhysicalExprAttr launchExtent,
+                             CoordinateRole role) {
+    unsigned axis;
+    if (succeeded(existing)) {
+      axis = *existing;
+      mappingExtents[axis] = extent;
+      launchExtents[axis] = launchExtent;
+    } else {
+      axis = mappingExtents.size();
+      mappingExtents.push_back(extent);
+      launchExtents.push_back(launchExtent);
+      mappingTypes.push_back(mapBuilder.getIndexType());
+      coordinateRoles.push_back(-1);
+    }
+    coordinateRoles[axis] = static_cast<int64_t>(role);
+    return axis;
+  };
+  unsigned rowMappingAxis = bindMappingAxis(
+      existingRowAxis, rowTiles,
+      binaryExpression(context, PhysicalExprKind::CeilDiv, rowExpression,
+                       unitM),
+      CoordinateRole::ContractionM);
+  unsigned columnMappingAxis = bindMappingAxis(
+      existingColumnAxis, columnTiles,
+      binaryExpression(context, PhysicalExprKind::CeilDiv, columnExpression,
+                       unitN),
+      CoordinateRole::ContractionN);
+  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
+      location, mappingTypes, mapping.getLinear(), mappingExtents,
+      mapBuilder.getArrayAttr(launchExtents));
   expandedMapping->setAttr(
       coordinateRolesAttr,
       DenseI64ArrayAttr::get(context, coordinateRoles));
@@ -2422,9 +2496,8 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
            mapping.getCoordinates(),
            expandedMapping.getCoordinates().take_front(mapping.getNumResults())))
     oldCoordinate.replaceAllUsesWith(newCoordinate);
-  unsigned physicalAxis = mapping.getNumResults();
-  Value rowTile = expandedMapping.getCoordinates()[physicalAxis++];
-  Value columnTile = expandedMapping.getCoordinates()[physicalAxis];
+  Value rowTile = expandedMapping.getCoordinates()[rowMappingAxis];
+  Value columnTile = expandedMapping.getCoordinates()[columnMappingAxis];
   mapping.erase();
   kernel->setAttr(programSpaceAttr,
                   ArrayAttr::get(context, {segmentLength}));
