@@ -303,6 +303,48 @@ bool samePhysicalShape(Type lhs, Type rhs) {
           left.getOwner() == right.getOwner());
 }
 
+std::optional<unsigned>
+expandedGatherAxis(gpu::FragmentType source, gpu::FragmentType result,
+                   unsigned selectedSourceAxis) {
+  if (source.getOwner() != result.getOwner() ||
+      source.getShape().size() >= result.getShape().size() ||
+      selectedSourceAxis >= source.getShape().size())
+    return std::nullopt;
+
+  SmallVector<std::optional<unsigned>> sourceToResult(source.getShape().size());
+  SmallVector<bool> resultUsed(result.getShape().size(), false);
+  for (auto [sourceIndex, sourceMapping] :
+       llvm::enumerate(source.getAxisMaps())) {
+    auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
+    for (auto [resultIndex, resultMapping] :
+         llvm::enumerate(result.getAxisMaps())) {
+      auto resultAxis = cast<gpu::AxisMapAttr>(resultMapping);
+      if (sourceAxis.getSourceId() != resultAxis.getSourceId() ||
+          sourceAxis.getSourceAxis() != resultAxis.getSourceAxis())
+        continue;
+      if (sourceToResult[sourceIndex] || resultUsed[resultIndex] ||
+          source.getShape()[sourceIndex] != result.getShape()[resultIndex])
+        return std::nullopt;
+      sourceToResult[sourceIndex] = resultIndex;
+      resultUsed[resultIndex] = true;
+    }
+    if (!sourceToResult[sourceIndex])
+      return std::nullopt;
+  }
+
+  for (auto [resultIndex, used] : llvm::enumerate(resultUsed)) {
+    if (used)
+      continue;
+    auto extent = dyn_cast<gpu::PhysicalExprAttr>(result.getShape()[resultIndex]);
+    if (!extent ||
+        extent.getKind() !=
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+        extent.getValue() != 1)
+      return std::nullopt;
+  }
+  return sourceToResult[selectedSourceAxis];
+}
+
 FailureOr<Value> zeroLike(OpBuilder &builder, Location location, Type type) {
   Type scalarType = elementType(type);
   Value zero;
@@ -335,6 +377,51 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
     };
     auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
     auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+    if (gather.getCoordinates().size() == 1 &&
+        gather.getSourceAxes().size() == 1 && source && result &&
+        source.getShape().size() < result.getShape().size()) {
+      std::optional<unsigned> selectedAxis = expandedGatherAxis(
+          source, result, gather.getSourceAxes().front());
+      if (selectedAxis) {
+        OpBuilder builder(gather);
+        auto expandedSourceType = gpu::FragmentType::get(
+            gather.getContext(), source.getElementType(), result.getShape(),
+            result.getAxisMaps(), result.getValidity(), result.getOwner());
+        Value expandedSource = builder.create<gpu::BroadcastOp>(
+            gather.getLoc(), expandedSourceType, gather.getSource());
+        Value coordinate = gather.getCoordinates().front();
+        auto coordinateType = gpu::FragmentType::get(
+            gather.getContext(), coordinate.getType(), result.getShape(),
+            result.getAxisMaps(), result.getValidity(), result.getOwner());
+        if (auto coordinateFragment =
+                dyn_cast<gpu::FragmentType>(coordinate.getType())) {
+          coordinateType = gpu::FragmentType::get(
+              gather.getContext(), coordinateFragment.getElementType(),
+              result.getShape(), result.getAxisMaps(), result.getValidity(),
+              result.getOwner());
+        }
+        coordinate = builder.create<gpu::BroadcastOp>(
+            gather.getLoc(), coordinateType, coordinate);
+        FailureOr<Value> zero =
+            zeroLike(builder, gather.getLoc(), coordinateType);
+        if (succeeded(zero)) {
+          Value safeIndex = builder.create<gpu::SelectOp>(
+              gather.getLoc(), coordinateType, gather.getValid(), coordinate,
+              *zero);
+          auto safeGather = builder.create<gpu::GatherOp>(
+              gather.getLoc(), result, expandedSource, ValueRange{safeIndex},
+              Value(), Value(), ArrayRef<int64_t>{static_cast<int64_t>(*selectedAxis)});
+          auto selected = builder.create<gpu::SelectOp>(
+              gather.getLoc(), result, gather.getValid(), safeGather.getResult(),
+              gather.getFill());
+          if (Attribute origin = gather->getAttr(gpu::originAttr))
+            selected->setAttr(gpu::originAttr, origin);
+          gather.getResult().replaceAllUsesWith(selected.getResult());
+          gather.erase();
+          continue;
+        }
+      }
+    }
     if (gather.getCoordinates().size() == 1 &&
         gather.getSourceAxes().size() == 1 && source && result &&
         source.getShape().size() == result.getShape().size() + 1) {
