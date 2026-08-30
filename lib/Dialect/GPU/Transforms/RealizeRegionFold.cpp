@@ -78,26 +78,8 @@ struct SourcePlan {
   SmallVector<MakeRangeOp> ranges;
 };
 
-LogicalResult verifyLockstepPhysicalTraversal(Operation *structured,
-                                              ArrayRef<SourcePlan> plans) {
-  if (plans.empty() || plans.front().ranges.empty())
-    return structured->emitOpError(
-        "region source traversal has no physical range authority");
-  MakeRangeOp master = plans.front().ranges.front();
-  for (const SourcePlan &plan : plans) {
-    for (MakeRangeOp range : plan.ranges) {
-      if (samePhysicalScalarExpression(range.getStart(), master.getStart()) &&
-          samePhysicalScalarExpression(range.getExtent(), master.getExtent()) &&
-          samePhysicalScalarExpression(range.getStep(), master.getStep()))
-        continue;
-      return structured->emitOpError(
-          "region sources do not have one lockstep physical traversal");
-    }
-  }
-  return success();
-}
-
-FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
+FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
+                                    PhysicalProgramAnalysis &analysis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || sourceAxis >= fragment.getShape().size())
     return failure();
@@ -105,10 +87,6 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis) {
   if (failed(mapping))
     return failure();
   SourcePlan plan{source, sourceAxisIdentity(*mapping), sourceAxis, false, {}};
-  auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
-    return failure();
-  PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact fact = analysis.axisRanges(source, sourceAxis);
   if (failed(queryExactLogicalRange(fact)))
     return failure();
@@ -1099,27 +1077,41 @@ bool scanTailIsIdentity(RegionScanOp scan, ArrayRef<SourcePlan> plans,
   return true;
 }
 
-FailureOr<Type> slicedType(Type type, PhysicalSourceAxis source,
+FailureOr<Type> slicedType(Type type,
+                           ArrayRef<PhysicalSourceAxis> sources,
                            PhysicalExprAttr extent,
                            Operation *producer = nullptr) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
-    PhysicalAxisProjection axis = queryFragmentAxis(fragment, source);
-    if (!axis.isExact())
+    std::optional<PhysicalAxisProjection> selected;
+    for (PhysicalSourceAxis source : sources) {
+      PhysicalAxisProjection axis = queryFragmentAxis(fragment, source);
+      if (axis.state == PhysicalFactState::Ambiguous)
+        return failure();
+      if (!axis.isExact())
+        continue;
+      if (selected && selected->fragmentAxis != axis.fragmentAxis)
+        return failure();
+      selected = axis;
+    }
+    if (!selected)
       return type;
     if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
       bool introducedUnitAxis =
-          isUnitExtent(fragment.getShape()[axis.fragmentAxis]) &&
-          queryFragmentAxes(reshape.getValue().getType(), source).empty();
+          isUnitExtent(fragment.getShape()[selected->fragmentAxis]) &&
+          llvm::none_of(sources, [&](PhysicalSourceAxis source) {
+            return !queryFragmentAxes(reshape.getValue().getType(), source)
+                        .empty();
+          });
       if (introducedUnitAxis)
         return type;
     }
-    return Type(replaceExtent(fragment, axis.fragmentAxis, extent));
+    return Type(replaceExtent(fragment, selected->fragmentAxis, extent));
   }
   if (auto record = dyn_cast<RecordType>(type)) {
     SmallVector<Attribute> fields;
     for (Attribute field : record.getFieldTypes()) {
       FailureOr<Type> converted =
-          slicedType(cast<TypeAttr>(field).getValue(), source, extent);
+          slicedType(cast<TypeAttr>(field).getValue(), sources, extent);
       if (failed(converted))
         return failure();
       fields.push_back(TypeAttr::get(*converted));
@@ -1186,7 +1178,7 @@ Value mappedValue(IRMapping &mapping, Value value) {
 
 FailureOr<Value> materializeScanConsumerValue(
     OpBuilder &builder, Location location, RegionScanOp scan, Value value,
-    IRMapping &mapping, PhysicalSourceAxis source,
+    IRMapping &mapping, ArrayRef<PhysicalSourceAxis> sources,
     PhysicalExprAttr sliceExtent,
     Value offset, Value segment, std::string &reason) {
   if (!value)
@@ -1199,19 +1191,20 @@ FailureOr<Value> materializeScanConsumerValue(
     return value;
   if (auto range = dyn_cast<MakeRangeOp>(definition)) {
     FailureOr<Value> start = materializeScanConsumerValue(
-        builder, location, scan, range.getStart(), mapping, source,
+        builder, location, scan, range.getStart(), mapping, sources,
         sliceExtent, offset, segment, reason);
     FailureOr<Value> extent = materializeScanConsumerValue(
-        builder, location, scan, range.getExtent(), mapping, source,
+        builder, location, scan, range.getExtent(), mapping, sources,
         sliceExtent, offset, segment, reason);
     FailureOr<Value> step = materializeScanConsumerValue(
-        builder, location, scan, range.getStep(), mapping, source,
+        builder, location, scan, range.getStep(), mapping, sources,
         sliceExtent, offset, segment, reason);
     if (failed(start) || failed(extent) || failed(step))
       return failure();
     auto type = cast<FragmentType>(range.getResult().getType());
-    PhysicalAxisProjection sourceAxis = queryFragmentAxis(type, source);
-    bool isSourceAxis = sourceAxis.isExact();
+    bool isSourceAxis = llvm::any_of(sources, [&](PhysicalSourceAxis source) {
+      return sourceAxisIdentity(range) == source;
+    });
     Value physicalStart = *start;
     Value physicalExtent = *extent;
     FragmentType physicalType = type;
@@ -1236,7 +1229,7 @@ FailureOr<Value> materializeScanConsumerValue(
   }
   for (Value operand : definition->getOperands()) {
     FailureOr<Value> materialized = materializeScanConsumerValue(
-        builder, location, scan, operand, mapping, source, sliceExtent,
+        builder, location, scan, operand, mapping, sources, sliceExtent,
         offset, segment, reason);
     if (failed(materialized))
       return failure();
@@ -1247,7 +1240,7 @@ FailureOr<Value> materializeScanConsumerValue(
   for (auto [original, result] :
        llvm::zip(definition->getResults(), clone->getResults())) {
     FailureOr<Type> type =
-        slicedType(result.getType(), source, sliceExtent, clone);
+        slicedType(result.getType(), sources, sliceExtent, clone);
     if (failed(type))
       return failure();
     result.setType(*type);
@@ -1260,7 +1253,7 @@ FailureOr<Value> materializeScanConsumerValue(
 
 LogicalResult cloneScanOutputConsumers(
     OpBuilder &builder, Location location, ArrayRef<Operation *> consumers,
-    IRMapping &mapping, PhysicalSourceAxis source,
+    IRMapping &mapping, ArrayRef<PhysicalSourceAxis> sources,
     PhysicalExprAttr sliceExtent,
     Value segmentTail, RegionScanOp scan, Value offset, Value segment,
     std::string &reason) {
@@ -1269,7 +1262,7 @@ LogicalResult cloneScanOutputConsumers(
       if (mapping.lookupOrNull(operand))
         continue;
       FailureOr<Value> materialized = materializeScanConsumerValue(
-          builder, location, scan, operand, mapping, source, sliceExtent,
+          builder, location, scan, operand, mapping, sources, sliceExtent,
           offset, segment, reason);
       if (failed(materialized))
         return failure();
@@ -1310,7 +1303,7 @@ LogicalResult cloneScanOutputConsumers(
     for (auto [original, result] :
          llvm::zip(operation->getResults(), clone->getResults())) {
       FailureOr<Type> type =
-          slicedType(result.getType(), source, sliceExtent, clone);
+          slicedType(result.getType(), sources, sliceExtent, clone);
       if (failed(type)) {
         reason = "region-scan output consumer has no sliced physical type";
         return failure();
@@ -1430,16 +1423,31 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   ParameterOp segment = findParameter(kernel, fold.getSegment());
   if (!segment)
     return fold.emitOpError("region-fold segment parameter is not declared");
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
   SmallVector<SourcePlan> plans;
+  SmallVector<Value> sources;
+  SmallVector<unsigned> sourceAxes;
   for (Value source : fold.getInputs().take_front(fold.getSourceCount())) {
-    FailureOr<SourcePlan> plan = analyzeSource(source, fold.getAxis());
+    FailureOr<SourcePlan> plan =
+        analyzeSource(source, fold.getAxis(), physicalAnalysis);
     if (failed(plan))
       return fold.emitOpError(
           "region-fold source is not a sliceable unit-step physical value graph");
     plans.push_back(*plan);
+    sources.push_back(source);
+    sourceAxes.push_back(fold.getAxis());
   }
-  if (failed(verifyLockstepPhysicalTraversal(fold, plans)))
+  PhysicalLockstepTraversalFact traversal =
+      physicalAnalysis.lockstepTraversal(sources, sourceAxes);
+  if (!traversal.isExact()) {
+    InFlightDiagnostic diagnostic = fold.emitOpError(
+        traversal.state == PhysicalLockstepState::Inconsistent
+            ? "region sources have inconsistent physical traversals"
+            : "region source traversal is not exactly known");
+    for (Operation *blocker : traversal.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
     return failure();
+  }
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        fold.getSummarize().front().getArguments().take_front(
@@ -1457,7 +1465,6 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     unsigned planIndex;
   };
   SmallVector<SourceAssumption> sourceAssumptions;
-  PhysicalProgramAnalysis physicalAnalysis(kernel);
   kernel.walk([&](AssumeInBoundsOp assumption) {
     for (auto [planIndex, plan] : llvm::enumerate(plans)) {
       PhysicalRangeFact fact = physicalAnalysis.sourceRanges(
@@ -1476,7 +1483,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     }
   });
 
-  MakeRangeOp master = plans.front().ranges.front();
+  MakeRangeOp master = traversal.authority;
   OpBuilder builder(fold);
   Location location = fold.getLoc();
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
@@ -1639,16 +1646,35 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
   ParameterOp segment = findParameter(kernel, scan.getSegment());
   if (!segment)
     return scan.emitOpError("region-scan segment parameter is not declared");
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
   SmallVector<SourcePlan> plans;
+  SmallVector<Value> sources;
+  SmallVector<unsigned> sourceAxes;
   for (Value source : scan.getInputs().take_front(scan.getSourceCount())) {
-    FailureOr<SourcePlan> plan = analyzeSource(source, scan.getAxis());
+    FailureOr<SourcePlan> plan =
+        analyzeSource(source, scan.getAxis(), physicalAnalysis);
     if (failed(plan))
       return scan.emitOpError(
           "region-scan source is not a sliceable unit-step physical value graph");
     plans.push_back(*plan);
+    sources.push_back(source);
+    sourceAxes.push_back(scan.getAxis());
   }
-  if (failed(verifyLockstepPhysicalTraversal(scan, plans)))
+  PhysicalLockstepTraversalFact traversal =
+      physicalAnalysis.lockstepTraversal(sources, sourceAxes);
+  if (!traversal.isExact()) {
+    InFlightDiagnostic diagnostic = scan.emitOpError(
+        traversal.state == PhysicalLockstepState::Inconsistent
+            ? "region sources have inconsistent physical traversals"
+            : "region source traversal is not exactly known");
+    for (Operation *blocker : traversal.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
     return failure();
+  }
+  SmallVector<PhysicalSourceAxis> outputSources;
+  for (const SourcePlan &plan : plans)
+    if (!llvm::is_contained(outputSources, plan.sourceIdentity))
+      outputSources.push_back(plan.sourceIdentity);
   SmallVector<FragmentType> sliceTypes;
   for (BlockArgument argument :
        scan.getSummarize().front().getArguments().take_front(
@@ -1659,7 +1685,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           "region-scan source slice has no physical fragment schema");
     sliceTypes.push_back(fragment);
   }
-  MakeRangeOp master = plans.front().ranges.front();
+  MakeRangeOp master = traversal.authority;
   ValueRange identities = scan.getInputs().slice(scan.getSourceCount(),
                                                  scan.getIdentityCount());
   if (!scanTailIsIdentity(scan, plans, identities))
@@ -1728,8 +1754,7 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
           sliceMapping.map(output, slice);
         if (failed(cloneScanOutputConsumers(
                 nested, nestedLocation, outputConsumers, sliceMapping,
-                plans.front().sourceIdentity,
-                sliceExtent, segmentTail,
+                outputSources, sliceExtent, segmentTail,
                 scan, offset, segment.getResult(), failureReason))) {
           bodyFailed = true;
           return;

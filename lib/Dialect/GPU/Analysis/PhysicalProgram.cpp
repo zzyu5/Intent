@@ -1237,6 +1237,60 @@ PhysicalProgramAnalysis::rangeAxes(Value value,
   return result;
 }
 
+PhysicalLockstepTraversalFact PhysicalProgramAnalysis::lockstepTraversal(
+    ValueRange sources, ArrayRef<unsigned> fragmentAxes) {
+  PhysicalLockstepTraversalFact result;
+  if (sources.empty() || sources.size() != fragmentAxes.size())
+    return result;
+  auto sameLogicalTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
+    FailureOr<int64_t> lhsDimension = queryRangeDimension(lhs);
+    FailureOr<int64_t> rhsDimension = queryRangeDimension(rhs);
+    if (!lhs->hasAttr(sourceSubregionAttr) &&
+        !rhs->hasAttr(sourceSubregionAttr) && succeeded(lhsDimension) &&
+        succeeded(rhsDimension) && *lhsDimension == *rhsDimension)
+      return true;
+    return samePhysicalScalarExpression(lhs.getLogicalStart(),
+                                        rhs.getLogicalStart()) &&
+           samePhysicalScalarExpression(lhs.getLogicalStop(),
+                                        rhs.getLogicalStop());
+  };
+  auto sameTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
+    return samePhysicalScalarExpression(lhs.getStart(), rhs.getStart()) &&
+           samePhysicalScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
+           samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
+  };
+  for (auto [source, fragmentAxis] : llvm::zip(sources, fragmentAxes)) {
+    PhysicalRangeFact ranges = axisRanges(source, fragmentAxis);
+    FailureOr<MakeRangeOp> sourceAuthority = queryExactLogicalRange(ranges);
+    if (failed(sourceAuthority)) {
+      result.state = ranges.state == PhysicalFactState::Unknown
+                         ? PhysicalLockstepState::Unknown
+                         : PhysicalLockstepState::Inconsistent;
+      result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
+      return result;
+    }
+    if (!llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+          return sameTraversal(*sourceAuthority, range) &&
+                 sameLogicalTraversal(*sourceAuthority, range);
+        })) {
+      result.state = PhysicalLockstepState::Inconsistent;
+      return result;
+    }
+    if (!result.authority) {
+      result.authority = *sourceAuthority;
+      continue;
+    }
+    if (!sameTraversal(result.authority, *sourceAuthority) ||
+        !sameLogicalTraversal(result.authority, *sourceAuthority)) {
+      result.state = PhysicalLockstepState::Inconsistent;
+      return result;
+    }
+  }
+  result.state = result.authority ? PhysicalLockstepState::Exact
+                                  : PhysicalLockstepState::Unknown;
+  return result;
+}
+
 void PhysicalProgramAnalysis::analyzeReplay(
     Value value, std::optional<PhysicalSourceAxis> source,
     PhysicalReplayScope scope, bool allowAccesses,

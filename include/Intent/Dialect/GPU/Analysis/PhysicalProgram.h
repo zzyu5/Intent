@@ -107,6 +107,19 @@ struct PhysicalRangeAxisFact {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
+enum class PhysicalLockstepState { Exact, Unknown, Inconsistent };
+
+/// One current physical traversal shared by several structured sources.  The
+/// selected MakeRange operation is only a canonical SSA carrier after all
+/// source ranges have been proven equivalent.
+struct PhysicalLockstepTraversalFact {
+  PhysicalLockstepState state = PhysicalLockstepState::Unknown;
+  MakeRangeOp authority;
+  llvm::SmallVector<mlir::Operation *, 4> blockers;
+
+  bool isExact() const { return state == PhysicalLockstepState::Exact; }
+};
+
 bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs);
 bool isUnitStepRange(MakeRangeOp range);
 mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
@@ -198,6 +211,9 @@ public:
   PhysicalRangeFact axisRanges(mlir::Value value, unsigned fragmentAxis);
   PhysicalRangeAxisFact rangeAxes(mlir::Value value,
                                   llvm::ArrayRef<MakeRangeOp> roots);
+  PhysicalLockstepTraversalFact
+  lockstepTraversal(mlir::ValueRange sources,
+                    llvm::ArrayRef<unsigned> fragmentAxes);
   PhysicalReplayFact replayability(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt,
