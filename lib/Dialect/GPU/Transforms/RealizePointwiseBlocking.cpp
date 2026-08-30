@@ -2080,43 +2080,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Attribute, ParameterOp> parameters;
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
-  llvm::SmallPtrSet<Operation *, 16> nonReplayableOwnershipRanges;
-  SmallVector<StoreOp> replayStores;
-  kernel.walk([&](StoreOp store) { replayStores.push_back(store); });
-  for (MakeRangeOp range : dynamicRanges) {
-    PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
-                              range.getDerived()};
-    FailureOr<uint64_t> dimension = rangeDimension(range);
-    for (StoreOp store : replayStores) {
-      bool coordinateCarriesTraversal =
-          succeeded(dimension) &&
-          llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
-            return llvm::any_of(
-                queryFragmentAxes(coordinate.getType(), source),
-                [&](const PhysicalAxisProjection &projection) {
-                  return projection.dimensionId ==
-                         static_cast<int64_t>(*dimension);
-                });
-          });
-      if (!coordinateCarriesTraversal)
-        continue;
-      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-          store.getValue(), source, PhysicalReplayScope::ValueGraph,
-          /*allowAccesses=*/true, store.getOperation(),
-          succeeded(dimension) ? std::optional<int64_t>(*dimension)
-                               : std::nullopt);
-      if (!replay.isReplayable()) {
-        nonReplayableOwnershipRanges.insert(range.getOperation());
-        break;
-      }
-    }
-  }
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = rangeDimension(range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
     return ownershipSources.contains(source) &&
-           !nonReplayableOwnershipRanges.contains(range.getOperation()) &&
            !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
