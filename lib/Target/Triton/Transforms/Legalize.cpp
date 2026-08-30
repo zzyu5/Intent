@@ -349,30 +349,17 @@ expandedGatherAxis(gpu::FragmentType source, gpu::FragmentType result,
       selectedSourceAxis >= source.getShape().size())
     return std::nullopt;
 
-  SmallVector<std::optional<unsigned>> sourceToResult(source.getShape().size());
-  SmallVector<bool> resultUsed(result.getShape().size(), false);
-  for (auto [sourceIndex, sourceMapping] :
-       llvm::enumerate(source.getAxisMaps())) {
-    auto sourceAxis = cast<gpu::AxisMapAttr>(sourceMapping);
-    for (auto [resultIndex, resultMapping] :
-         llvm::enumerate(result.getAxisMaps())) {
-      auto resultAxis = cast<gpu::AxisMapAttr>(resultMapping);
-      if (sourceAxis.getSourceId() != resultAxis.getSourceId() ||
-          sourceAxis.getSourceAxis() != resultAxis.getSourceAxis())
-        continue;
-      if (sourceToResult[sourceIndex] || resultUsed[resultIndex] ||
-          source.getShape()[sourceIndex] != result.getShape()[resultIndex])
-        return std::nullopt;
-      sourceToResult[sourceIndex] = resultIndex;
-      resultUsed[resultIndex] = true;
-    }
-    if (!sourceToResult[sourceIndex])
-      return std::nullopt;
-  }
-
-  for (auto [resultIndex, used] : llvm::enumerate(resultUsed)) {
-    if (used)
+  gpu::BroadcastProjection projection = gpu::queryBroadcastProjection(source, result);
+  if (!projection.isExact())
+    return std::nullopt;
+  std::optional<unsigned> selected;
+  for (auto [resultIndex, sourceIndex] :
+       llvm::enumerate(projection.targetToSource)) {
+    if (sourceIndex) {
+      if (*sourceIndex == selectedSourceAxis)
+        selected = resultIndex;
       continue;
+    }
     auto extent = dyn_cast<gpu::PhysicalExprAttr>(result.getShape()[resultIndex]);
     if (!extent ||
         extent.getKind() !=
@@ -380,7 +367,7 @@ expandedGatherAxis(gpu::FragmentType source, gpu::FragmentType result,
         extent.getValue() != 1)
       return std::nullopt;
   }
-  return sourceToResult[selectedSourceAxis];
+  return selected;
 }
 
 FailureOr<Value> zeroLike(OpBuilder &builder, Location location, Type type) {
