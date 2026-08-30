@@ -1055,10 +1055,6 @@ void PhysicalProgramAnalysis::collectAxisRanges(
         coordinateAxis = dimensionAxis.fragmentAxis;
       if (!coordinateAxis)
         continue;
-      if (found) {
-        result.state = PhysicalFactState::Ambiguous;
-        return;
-      }
       found = true;
       collectAxisRanges(coordinate, *coordinateAxis, result, visited);
     }

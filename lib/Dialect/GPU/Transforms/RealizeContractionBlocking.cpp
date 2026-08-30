@@ -50,7 +50,7 @@ bool isCompileTimeExtent(PhysicalExprAttr expression) {
   });
 }
 
-bool hasRuntimeRange(Value value);
+bool hasUnrealizedPhysicalRange(Value value);
 
 bool isFullCoverageExtent(Operation *origin, Attribute attribute) {
   auto extent = dyn_cast<PhysicalExprAttr>(attribute);
@@ -94,7 +94,8 @@ bool requiresPhysicalRealization(ContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
-  return hasRuntimeRange(contract.getLhs()) || hasRuntimeRange(contract.getRhs());
+  return hasUnrealizedPhysicalRange(contract.getLhs()) ||
+         hasUnrealizedPhysicalRange(contract.getRhs());
 }
 
 bool requiresPhysicalRealization(ScaledContractOp contract) {
@@ -107,10 +108,10 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
-  return hasRuntimeRange(contract.getLhs()) ||
-         hasRuntimeRange(contract.getLhsScale()) ||
-         hasRuntimeRange(contract.getRhs()) ||
-         hasRuntimeRange(contract.getRhsScale());
+  return hasUnrealizedPhysicalRange(contract.getLhs()) ||
+         hasUnrealizedPhysicalRange(contract.getLhsScale()) ||
+         hasUnrealizedPhysicalRange(contract.getRhs()) ||
+         hasUnrealizedPhysicalRange(contract.getRhsScale());
 }
 
 Value binary(OpBuilder &builder, Location location, Type result, Value lhs,
@@ -404,14 +405,15 @@ bool isTailPredicate(Value value,
   return kernel && PhysicalProgramAnalysis(kernel).isTailPredicate(value, ranges);
 }
 
-bool hasRuntimeRange(Value value) {
+bool hasUnrealizedPhysicalRange(Value value) {
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment)
     return false;
   SmallVector<PhysicalSourceAxis> sources;
   for (Attribute attribute : fragment.getAxisMaps()) {
     auto mapping = cast<AxisMapAttr>(attribute);
-    PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis()};
+    PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis(),
+                              mapping.getDerived()};
     if (!llvm::is_contained(sources, source))
       sources.push_back(source);
   }
@@ -424,6 +426,20 @@ bool hasRuntimeRange(Value value) {
       if (!extent.getDefiningOp<arith::ConstantOp>() &&
           !extent.getDefiningOp<ParameterOp>() &&
           !extent.getDefiningOp<PhysicalExprOp>())
+        return true;
+      if (extent.getDefiningOp<ParameterOp>() ||
+          extent.getDefiningOp<PhysicalExprOp>())
+        continue;
+      if (!isIntegerConstant(extent, 1))
+        continue;
+      bool coversLogicalRange =
+          isIntegerConstant(range.getStep(), 1) &&
+          isIntegerConstant(range.getLogicalStart(), 0) &&
+          samePhysicalScalarExpression(range.getStart(),
+                                       range.getLogicalStart()) &&
+          samePhysicalScalarExpression(range.getExtent(),
+                                       range.getLogicalStop());
+      if (!coversLogicalRange)
         return true;
     }
   }
@@ -1324,6 +1340,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
                        SmallVectorImpl<MakeRangeOp> &ranges) {
     PhysicalRangeFact fact =
         physicalAnalysis.axisRanges(value, fragmentAxis);
+    if (failed(queryExactLogicalRange(fact)) &&
+        queryFragmentAxes(value.getType(), sourceAxisIdentity(mapping)).size() ==
+            1)
+      fact = physicalAnalysis.sourceRanges(value, sourceAxisIdentity(mapping));
     if (failed(queryExactLogicalRange(fact)) || !fact.unitStep)
       return failure();
     ranges.assign(fact.roots.begin(), fact.roots.end());
@@ -1336,9 +1356,27 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   SmallVector<MakeRangeOp> lhsRanges;
   SmallVector<MakeRangeOp> rhsRanges;
   if (failed(rangesFor(contract.getLhs(), lhsReduction, *lhsMap, lhsRanges)) ||
-      failed(rangesFor(contract.getRhs(), rhsReduction, *rhsMap, rhsRanges)))
-    return contract.emitOpError(
+      failed(rangesFor(contract.getRhs(), rhsReduction, *rhsMap, rhsRanges))) {
+    PhysicalRangeFact lhsFact =
+        physicalAnalysis.axisRanges(contract.getLhs(), lhsReduction);
+    PhysicalRangeFact rhsFact =
+        physicalAnalysis.axisRanges(contract.getRhs(), rhsReduction);
+    InFlightDiagnostic diagnostic = contract.emitOpError(
         "reduction-only contraction blocking requires explicit paired ranges");
+    diagnostic << "; lhs_state=" << static_cast<unsigned>(lhsFact.state)
+               << ", lhs_roots=" << lhsFact.roots.size()
+               << ", lhs_blockers=" << lhsFact.blockers.size()
+               << ", rhs_state=" << static_cast<unsigned>(rhsFact.state)
+               << ", rhs_roots=" << rhsFact.roots.size()
+               << ", rhs_blockers=" << rhsFact.blockers.size()
+               << ", lhs_type=" << contract.getLhs().getType()
+               << ", rhs_type=" << contract.getRhs().getType();
+    for (Operation *blocker : lhsFact.blockers)
+      diagnostic << ", lhs_blocker=" << blocker->getName();
+    for (Operation *blocker : rhsFact.blockers)
+      diagnostic << ", rhs_blocker=" << blocker->getName();
+    return failure();
+  }
   MakeRangeOp lhsRange = lhsRanges.front();
   MakeRangeOp rhsRange = rhsRanges.front();
   FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(kernel, lhsRange);
@@ -2696,6 +2734,8 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       if (!rangeSingleReduction &&
           contract.getLhsReductionAxes().size() == 1 &&
           contract.getRhsReductionAxes().size() == 1 &&
+          contract.getLhsBatchAxes().empty() &&
+          contract.getRhsBatchAxes().empty() &&
           hasSelectedFreeAxes(contract) &&
           hasExplicitPairedReductionRanges(contract)) {
         if (failed(realizeReductionTraversal(contract, kernel)))
