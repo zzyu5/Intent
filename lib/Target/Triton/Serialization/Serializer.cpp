@@ -790,6 +790,25 @@ private:
       return;
     }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
+      auto form = contract->getAttrOfType<StringAttr>(
+          "intent_gpu.triton.contract_form");
+      if (form && form.getValue() == "multiply_sum") {
+        unsigned rank = contract.getLhs().getType().getShape().size();
+        std::string element = pythonType(elementType(contract.getResult().getType()));
+        std::string lhs = "tl.expand_dims(" + valueString(contract.getLhs()) +
+                          ", axis=" + std::to_string(rank) + ").to(" +
+                          element + ")";
+        std::string rhs = "tl.expand_dims(" + valueString(contract.getRhs()) +
+                          ", axis=" + std::to_string(rank - 2) + ").to(" +
+                          element + ")";
+        std::string reduced =
+            "tl.sum((" + lhs + " * " + rhs + "), axis=" +
+            std::to_string(rank - 1) + ")";
+        assign(contract.getResult(), "(" + reduced + " + " +
+                                         valueString(contract.getAccumulator()) +
+                                         ")");
+        return;
+      }
       assign(contract.getResult(), "tl.dot(" + valueString(contract.getLhs()) +
                                       ", " + valueString(contract.getRhs()) +
                                       ", " + valueString(contract.getAccumulator()) +

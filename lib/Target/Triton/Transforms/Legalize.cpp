@@ -21,6 +21,8 @@ namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_gpu.triton.legalized";
 constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
+constexpr llvm::StringLiteral contractFormAttr =
+    "intent_gpu.triton.contract_form";
 constexpr int64_t maxTritonTensorElements = 1048576;
 
 struct TritonConfig {
@@ -623,6 +625,24 @@ void selectNativeReduceForms(func::FuncOp kernel) {
   });
 }
 
+void selectContractForms(func::FuncOp kernel) {
+  kernel.walk([&](gpu::ContractOp contract) {
+    auto lhs = contract.getLhs().getType();
+    if (lhs.getShape().empty())
+      return;
+    auto reductionExtent =
+        dyn_cast<gpu::PhysicalExprAttr>(
+            lhs.getShape()[lhs.getShape().size() - 1]);
+    if (!reductionExtent ||
+        reductionExtent.getKind() !=
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+        reductionExtent.getValue() >= 16)
+      return;
+    contract->setAttr(contractFormAttr,
+                      StringAttr::get(kernel.getContext(), "multiply_sum"));
+  });
+}
+
 LogicalResult legalizeScatterAdd(func::FuncOp kernel) {
   SmallVector<gpu::ScatterReduceOp> scatters;
   kernel.walk([&](gpu::ScatterReduceOp scatter) { scatters.push_back(scatter); });
@@ -1022,6 +1042,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
   if (failed(materializeLegalConfigs(kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
+  selectContractForms(kernel);
   if (failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
