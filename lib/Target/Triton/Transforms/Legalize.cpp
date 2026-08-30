@@ -628,7 +628,11 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
     uint32_t role = parameter.getParameter().getRole();
-    if (role < static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps))
+    bool providerRole =
+        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps) ||
+        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderStages) ||
+        role == static_cast<uint32_t>(gpu::ParameterRole::ProviderCTAs);
+    if (!providerRole)
       return;
     if (!providerRoles.insert(role).second) {
       parameter.emitOpError("duplicates a Triton provider-parameter role");
