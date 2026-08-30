@@ -456,6 +456,7 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
 
 FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       PhysicalSourceAxis source,
+                                      ArrayRef<int64_t> traversalDimensions,
                                       PhysicalExprAttr blockedExtent,
                                       Value blockedRange, Value blockedValidity,
                                       Operation *insertionAnchor,
@@ -592,8 +593,10 @@ LogicalResult addTailValidity(func::FuncOp kernel,
         if (valueType.getShape()[projection.fragmentAxis] == blockedExtent)
           continue;
         IRMapping mapping;
+        SmallVector<int64_t> traversalDimensions{*dimension};
         FailureOr<Value> replayed = replayPointwiseValue(
-            builder, payload, sourceAxisIdentity(range), blockedExtent,
+            builder, payload, sourceAxisIdentity(range), traversalDimensions,
+            blockedExtent,
             range.getResult(), rangePredicates.lookup(range.getResult()),
             store.getOperation(), mapping);
         if (failed(replayed))
@@ -689,17 +692,44 @@ void collectProducerRanges(Value value, PhysicalSourceAxis source,
       ranges.insert(range.getOperation());
 }
 
-FragmentType replaceSourceExtent(FragmentType source, PhysicalSourceAxis logical,
-                                 PhysicalExprAttr extent) {
-  PhysicalAxisProjection axis = queryFragmentAxis(source, logical);
-  if (!axis.isExact())
-    return source;
-  SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
-  shape[axis.fragmentAxis] = extent;
-  return FragmentType::get(source.getContext(), source.getElementType(),
-                           ArrayAttr::get(source.getContext(), shape),
-                           source.getAxisMaps(), source.getValidity(),
-                           source.getOwner());
+Type replaceTraversalExtent(Type type, PhysicalSourceAxis source,
+                            ArrayRef<int64_t> dimensions,
+                            PhysicalExprAttr extent) {
+  if (auto fragment = dyn_cast<FragmentType>(type)) {
+    SmallVector<Attribute> shape(fragment.getShape().begin(),
+                                 fragment.getShape().end());
+    bool changed = false;
+    for (const PhysicalAxisProjection &projection :
+         queryFragmentAxes(fragment, source)) {
+      if (!llvm::is_contained(dimensions, projection.dimensionId))
+        continue;
+      shape[projection.fragmentAxis] = extent;
+      changed = true;
+    }
+    return changed ? Type(FragmentType::get(
+                         fragment.getContext(), fragment.getElementType(),
+                         ArrayAttr::get(fragment.getContext(), shape),
+                         fragment.getAxisMaps(), fragment.getValidity(),
+                         fragment.getOwner()))
+                   : type;
+  }
+  auto record = dyn_cast<RecordType>(type);
+  if (!record)
+    return type;
+  SmallVector<Attribute> fields;
+  bool changed = false;
+  for (Attribute field : record.getFieldTypes()) {
+    Type current = cast<TypeAttr>(field).getValue();
+    Type replacement =
+        replaceTraversalExtent(current, source, dimensions, extent);
+    fields.push_back(TypeAttr::get(replacement));
+    changed |= replacement != current;
+  }
+  return changed ? Type(RecordType::get(
+                       type.getContext(), record.getFieldNames(),
+                       ArrayAttr::get(type.getContext(), fields),
+                       record.getOwner()))
+                 : type;
 }
 
 bool containsSource(Value value, PhysicalSourceAxis source) {
@@ -707,11 +737,35 @@ bool containsSource(Value value, PhysicalSourceAxis source) {
 }
 
 bool containsTraversal(Value value, PhysicalSourceAxis source,
-                       int64_t dimension) {
-  return llvm::any_of(queryFragmentAxes(value.getType(), source),
-                      [&](const PhysicalAxisProjection &projection) {
-                        return projection.dimensionId == dimension;
-                      });
+                       ArrayRef<int64_t> dimensions) {
+  std::function<bool(Type)> contains = [&](Type type) {
+    if (auto fragment = dyn_cast<FragmentType>(type))
+      return llvm::any_of(queryFragmentAxes(fragment, source),
+                          [&](const PhysicalAxisProjection &projection) {
+                            return llvm::is_contained(dimensions,
+                                                      projection.dimensionId);
+                          });
+    auto record = dyn_cast<RecordType>(type);
+    return record && llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
+             return contains(cast<TypeAttr>(field).getValue());
+           });
+  };
+  return contains(value.getType());
+}
+
+void collectTraversalDimensions(Type type, PhysicalSourceAxis source,
+                                SmallVectorImpl<int64_t> &dimensions) {
+  if (auto fragment = dyn_cast<FragmentType>(type)) {
+    for (const PhysicalAxisProjection &projection :
+         queryFragmentAxes(fragment, source))
+      if (!llvm::is_contained(dimensions, projection.dimensionId))
+        dimensions.push_back(projection.dimensionId);
+    return;
+  }
+  if (auto record = dyn_cast<RecordType>(type))
+    for (Attribute field : record.getFieldTypes())
+      collectTraversalDimensions(cast<TypeAttr>(field).getValue(), source,
+                                 dimensions);
 }
 
 FailureOr<FragmentType> coordinateValueSchema(Type element,
@@ -755,6 +809,7 @@ FailureOr<FragmentType> coordinateValueSchema(Type element,
 
 FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       PhysicalSourceAxis source,
+                                      ArrayRef<int64_t> traversalDimensions,
                                       PhysicalExprAttr blockedExtent,
                                       Value blockedRange, Value blockedValidity,
                                       Operation *insertionAnchor,
@@ -770,7 +825,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   if (failed(blockedDimension))
     return insertionAnchor->emitOpError(
         "pointwise replay has no exact blocked-dimension authority");
-  if (!containsTraversal(value, source, *blockedDimension)) {
+  if (!containsTraversal(value, source, traversalDimensions)) {
     DominanceInfo dominance(kernel);
     if (dominance.dominates(value, insertionAnchor))
       return value;
@@ -779,15 +834,18 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   if (!producer)
     return insertionAnchor->emitOpError(
         "pointwise replay cannot rematerialize a non-dominating block argument");
-  if (producer->getNumResults() != 1)
+  auto selectedResult = dyn_cast<OpResult>(value);
+  if (!selectedResult ||
+      selectedResult.getResultNumber() >= producer->getNumResults())
     return producer->emitOpError(
-        "pointwise replay requires a single-result producer");
+        "pointwise replay has no exact producer result occurrence");
   if (auto range = dyn_cast<MakeRangeOp>(producer)) {
-    if (sourceAxisIdentity(range) == source) {
+    FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
+    if (sourceAxisIdentity(range) == source && succeeded(rangeDimension) &&
+        *rangeDimension == *blockedDimension) {
       mapping.map(value, blockedRange);
       return blockedRange;
     }
-    FailureOr<int64_t> rangeDimension = queryRangeDimension(range);
     auto originalType = dyn_cast<FragmentType>(range.getResult().getType());
     if (!blocked || failed(rangeDimension) || failed(blockedDimension) ||
         *rangeDimension != *blockedDimension || !originalType ||
@@ -814,28 +872,36 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     mapping.map(value, projected);
     return projected;
   }
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-      value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, insertionAnchor, *blockedDimension);
-  if (!replay.isReplayable()) {
-    InFlightDiagnostic diagnostic = producer->emitOpError(
-        "pointwise value has no exact insertion-point replay fact");
-    for (Operation *blocker : replay.blockers)
-      diagnostic << "; blocker=" << blocker->getName();
-    return failure();
+  SmallVector<int64_t> valueDimensions;
+  collectTraversalDimensions(value.getType(), source, valueDimensions);
+  for (int64_t dimension : valueDimensions) {
+    if (!llvm::is_contained(traversalDimensions, dimension))
+      continue;
+    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+        value, source, PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/true, insertionAnchor, dimension);
+    if (!replay.isReplayable()) {
+      InFlightDiagnostic diagnostic = producer->emitOpError(
+          "pointwise value has no exact insertion-point replay fact");
+      diagnostic << "; dimension=" << dimension;
+      for (Operation *blocker : replay.blockers)
+        diagnostic << "; blocker=" << blocker->getName();
+      return failure();
+    }
   }
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replacement = replayPointwiseValue(
-        builder, operand, source, blockedExtent, blockedRange,
+        builder, operand, source, traversalDimensions, blockedExtent, blockedRange,
         blockedValidity, insertionAnchor, mapping);
     if (failed(replacement))
       return failure();
     if (*replacement != operand && !mapping.lookupOrNull(operand))
       mapping.map(operand, *replacement);
   }
-  auto result = dyn_cast<FragmentType>(producer->getResult(0).getType());
+  auto result = dyn_cast<FragmentType>(value.getType());
   FragmentType resultType =
-      result ? replaceSourceExtent(result, source, blockedExtent)
+      result ? dyn_cast<FragmentType>(replaceTraversalExtent(
+                   result, source, traversalDimensions, blockedExtent))
              : FragmentType();
   auto mapped = [&](Value operand) {
     if (!operand)
@@ -915,9 +981,47 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                            mapped(reshape.getValue()));
   } else {
     Operation *clone = builder.clone(*producer, mapping);
-    if (resultType)
-      clone->getResult(0).setType(resultType);
-    replayed = clone->getResult(0);
+    for (auto [original, cloned] :
+         llvm::zip(producer->getResults(), clone->getResults())) {
+      cloned.setType(replaceTraversalExtent(
+          original.getType(), source, traversalDimensions, blockedExtent));
+      if (!mapping.lookupOrNull(original))
+        mapping.map(original, cloned);
+    }
+    if (isa<ReduceOp, ScanOp, RegionFoldOp, RegionScanOp>(clone))
+      for (Region &region : clone->getRegions())
+        for (Block &block : region) {
+          for (BlockArgument argument : block.getArguments())
+            argument.setType(replaceTraversalExtent(
+                argument.getType(), source, traversalDimensions, blockedExtent));
+          block.walk([&](Operation *nested) {
+            for (Value nestedResult : nested->getResults())
+              nestedResult.setType(replaceTraversalExtent(
+                  nestedResult.getType(), source, traversalDimensions,
+                  blockedExtent));
+            auto range = dyn_cast<MakeRangeOp>(nested);
+            FailureOr<int64_t> dimension =
+                range ? queryRangeDimension(range)
+                      : FailureOr<int64_t>(failure());
+            if (!range || !(sourceAxisIdentity(range) == source) ||
+                failed(dimension) ||
+                !llvm::is_contained(traversalDimensions, *dimension))
+              return;
+            // Helper-local ranges are complete physical values too.  When a
+            // structured producer is replayed for a wider ownership fragment,
+            // its local coordinate carrier must use that same physical extent;
+            // changing only the result type leaves an illegal one-lane range.
+            bool coveredItsLocalDomain =
+                samePhysicalScalarExpression(range.getStart(),
+                                             range.getLogicalStart()) &&
+                samePhysicalScalarExpression(range.getExtent(),
+                                             range.getLogicalStop());
+            range->setOperand(1, blocked.getExtent());
+            if (coveredItsLocalDomain)
+              range->setOperand(4, blocked.getExtent());
+          });
+        }
+    replayed = clone->getResult(selectedResult.getResultNumber());
   }
   if (!mapping.lookupOrNull(value))
     mapping.map(value, replayed);
@@ -947,6 +1051,23 @@ std::optional<int64_t> storeAxisForRange(StoreOp store, MakeRangeOp range) {
   return result;
 }
 
+FailureOr<SmallVector<int64_t>>
+traversalDimensionsForStores(ArrayRef<StoreOp> stores, MakeRangeOp range) {
+  FailureOr<int64_t> coordinateDimension = queryRangeDimension(range);
+  if (failed(coordinateDimension))
+    return failure();
+  PhysicalSourceAxis source = sourceAxisIdentity(range);
+  SmallVector<int64_t> dimensions{*coordinateDimension};
+  for (StoreOp store : stores) {
+    collectTraversalDimensions(store.getValue().getType(), source, dimensions);
+    if (store.getValid())
+      collectTraversalDimensions(store.getValid().getType(), source, dimensions);
+    for (Value coordinate : store.getCoordinates())
+      collectTraversalDimensions(coordinate.getType(), source, dimensions);
+  }
+  return dimensions;
+}
+
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              MakeRangeOp range) {
   SmallVector<StoreOp> stores;
@@ -957,6 +1078,11 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   if (stores.empty())
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no write effect");
+  FailureOr<SmallVector<int64_t>> traversalDimensions =
+      traversalDimensionsForStores(stores, range);
+  if (failed(traversalDimensions))
+    return range.emitOpError(
+        "reuse-sensitive pointwise traversal has no typed coordinate/data relation");
 
   PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
@@ -995,10 +1121,6 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                            logicalSource.sourceAxis,
                                            logicalSource.derived));
     chunk->setAttr(pointwiseChunkAttr, entry.getUnitAttr());
-    if (FailureOr<uint64_t> dimension = rangeDimension(range);
-        succeeded(dimension))
-      chunk->setAttr(dimensionAttr,
-                     entry.getI64IntegerAttr(*dimension));
   }
 
   auto originalType = dyn_cast<FragmentType>(range.getResult().getType());
@@ -1017,10 +1139,6 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   // traversal.  The internal writeback loop below owns a distinct blocked
   // range and replays only the store-side value graph against it.
 
-  FailureOr<int64_t> traversalDimension = queryRangeDimension(range);
-  if (failed(traversalDimension))
-    return range.emitOpError(
-        "reuse-sensitive pointwise traversal has no exact logical dimension");
   llvm::MapVector<Block *, SmallVector<StoreOp>> storesByBlock;
   for (StoreOp store : stores)
     storesByBlock[store->getBlock()].push_back(store);
@@ -1028,13 +1146,20 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   PhysicalProgramAnalysis replayAnalysis(kernel);
   auto canReplayAt = [&](StoreOp store, Operation *anchor) {
     auto replayable = [&](Value value) {
-      return !value ||
-             replayAnalysis
+      if (!value)
+        return true;
+      SmallVector<int64_t> valueDimensions;
+      collectTraversalDimensions(value.getType(), logicalSource,
+                                 valueDimensions);
+      for (int64_t dimension : valueDimensions)
+        if (llvm::is_contained(*traversalDimensions, dimension) &&
+            !replayAnalysis
                  .replayability(value, logicalSource,
                                 PhysicalReplayScope::ValueGraph,
-                                /*allowAccesses=*/true, anchor,
-                                *traversalDimension)
-                 .isReplayable();
+                                /*allowAccesses=*/true, anchor, dimension)
+                 .isReplayable())
+          return false;
+      return true;
     };
     if (!replayable(store.getValue()) || !replayable(store.getValid()))
       return false;
@@ -1087,7 +1212,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         mapping.map(range.getResult(), blocked);
         for (StoreOp store : group) {
           FailureOr<Value> payload = replayPointwiseValue(
-              nested, store.getValue(), logicalSource, chunkExtent,
+              nested, store.getValue(), logicalSource, *traversalDimensions,
+              chunkExtent,
               blocked, tail, loopInsertionAnchor, mapping);
           if (failed(payload)) {
             bodyFailed = true;
@@ -1097,7 +1223,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           SmallVector<Value> coordinates;
           for (Value coordinate : store.getCoordinates()) {
             FailureOr<Value> replayed = replayPointwiseValue(
-                nested, coordinate, logicalSource, chunkExtent, blocked,
+                nested, coordinate, logicalSource, *traversalDimensions,
+                chunkExtent, blocked,
                 tail, loopInsertionAnchor, mapping);
             if (failed(replayed)) {
               bodyFailed = true;
@@ -1137,7 +1264,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           }
           if (store.getValid()) {
             FailureOr<Value> existing = replayPointwiseValue(
-                nested, store.getValid(), logicalSource, chunkExtent,
+                nested, store.getValid(), logicalSource, *traversalDimensions,
+                chunkExtent,
                 blocked, tail, loopInsertionAnchor, mapping);
             if (failed(existing)) {
               bodyFailed = true;
@@ -1928,19 +2056,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       });
       if (currentStores.empty())
         continue;
-      FailureOr<uint64_t> traversalDimension = rangeDimension(range);
+      FailureOr<SmallVector<int64_t>> traversalDimensions =
+          traversalDimensionsForStores(currentStores, range);
+      if (failed(traversalDimensions)) {
+        nonReplayable.push_back(range);
+        continue;
+      }
       for (StoreOp store : currentStores) {
         PhysicalProgramAnalysis analysis(kernel);
-        PhysicalReplayFact replay = analysis.replayability(
-            store.getValue(),
-            PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
-                           range.getDerived()},
-            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
-            store.getOperation(),
-            succeeded(traversalDimension)
-                ? std::optional<int64_t>(*traversalDimension)
-                : std::nullopt);
-        replayable &= replay.isReplayable();
+        PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
+                                  range.getDerived()};
+        SmallVector<int64_t> valueDimensions;
+        collectTraversalDimensions(store.getValue().getType(), source,
+                                   valueDimensions);
+        for (int64_t dimension : valueDimensions) {
+          if (!llvm::is_contained(*traversalDimensions, dimension))
+            continue;
+          PhysicalReplayFact replay = analysis.replayability(
+              store.getValue(), source, PhysicalReplayScope::ValueGraph,
+              /*allowAccesses=*/true, store.getOperation(), dimension);
+          replayable &= replay.isReplayable();
+        }
       }
       // A value graph containing loop-carried or otherwise non-replayable
       // structure must remain one full fragment.  Tiling the writeback axis

@@ -348,6 +348,21 @@ bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
              : isValueReplayNode(operation);
 }
 
+bool typeCarriesTraversal(Type type, PhysicalSourceAxis source,
+                          int64_t dimension) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return llvm::any_of(queryFragmentAxes(fragment, source),
+                        [&](const PhysicalAxisProjection &projection) {
+                          return projection.dimensionId == dimension;
+                        });
+  if (auto record = dyn_cast<RecordType>(type))
+    return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
+      return typeCarriesTraversal(cast<TypeAttr>(field).getValue(), source,
+                                  dimension);
+    });
+  return false;
+}
+
 PhysicalParameterBinding queryParameterBinding(ParameterOp parameter) {
   PhysicalParameterBinding result;
   if (!parameter)
@@ -1518,6 +1533,62 @@ void PhysicalProgramAnalysis::analyzeReplay(
       result.state = PhysicalFactState::Unknown;
       return;
     }
+  } else if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+    if (!source || !sourceDimension) {
+      appendUnique(result.blockers, operation);
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
+    for (Value segmentSource :
+         fold.getInputs().take_front(fold.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(segmentSource.getType());
+      if (!fragment || fold.getAxis() >= fragment.getAxisMaps().size()) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+      auto mapping =
+          cast<AxisMapAttr>(fragment.getAxisMaps()[fold.getAxis()]);
+      if (sourceAxisIdentity(mapping) == *source &&
+          mapping.getDimensionId() == *sourceDimension) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+    }
+    for (Value operand : fold.getInputs())
+      if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
+        analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
+                      sourceDimension, dominance, result, visited);
+    return;
+  } else if (auto scan = dyn_cast<RegionScanOp>(operation)) {
+    if (!source || !sourceDimension) {
+      appendUnique(result.blockers, operation);
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
+    for (Value segmentSource :
+         scan.getInputs().take_front(scan.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(segmentSource.getType());
+      if (!fragment || scan.getAxis() >= fragment.getAxisMaps().size()) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+      auto mapping =
+          cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
+      if (sourceAxisIdentity(mapping) == *source &&
+          mapping.getDimensionId() == *sourceDimension) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+    }
+    for (Value operand : scan.getInputs())
+      if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
+        analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
+                      sourceDimension, dominance, result, visited);
+    return;
   } else if (!isPhysicalReplayNode(operation, scope, allowAccesses)) {
     appendUnique(result.blockers, operation);
     result.state = PhysicalFactState::Unknown;
