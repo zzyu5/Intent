@@ -1,5 +1,6 @@
 #include "PassDetail.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -371,43 +372,27 @@ FailureOr<SmallVector<Value>> accessOffsets(Operation *owner,
 }
 
 std::optional<BinaryOperator> nativeCombineKind(Region &region) {
-  if (!llvm::hasSingleElement(region))
+  std::optional<BinaryOperator> kind = gpu::queryBinaryCombineKind(region);
+  if (!kind)
     return std::nullopt;
-  Block &block = region.front();
-  if (block.getNumArguments() != 2 ||
-      std::distance(block.begin(), block.end()) != 2)
-    return std::nullopt;
-  auto binary = dyn_cast<gpu::BinaryOp>(block.front());
-  auto yield = dyn_cast<gpu::YieldOp>(block.back());
-  if (!binary || !yield || yield.getValues().size() != 1 ||
-      yield.getValues().front() != binary.getResult())
-    return std::nullopt;
-  if (!((binary.getLhs() == block.getArgument(0) &&
-         binary.getRhs() == block.getArgument(1)) ||
-        (binary.getLhs() == block.getArgument(1) &&
-         binary.getRhs() == block.getArgument(0))))
-    return std::nullopt;
-  if (binary.getOperatorKind() == BinaryOperator::Add)
-    return BinaryOperator::Add;
-  if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
-    return BinaryOperator::MaximumNum;
-  if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
-    return BinaryOperator::MinimumNum;
-  Type resultType = binary.getResult().getType();
+  if (*kind == BinaryOperator::Add || *kind == BinaryOperator::MaximumNum ||
+      *kind == BinaryOperator::MinimumNum)
+    return kind;
+  Type resultType = region.front().getArgument(0).getType();
   Type elementType = resultType;
   if (auto fragment = dyn_cast<gpu::FragmentType>(resultType))
     elementType = fragment.getElementType();
   if (elementType.isInteger(1)) {
-    if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
+    if (*kind == BinaryOperator::LogicalOr)
       return BinaryOperator::LogicalOr;
-    if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
+    if (*kind == BinaryOperator::LogicalAnd)
       return BinaryOperator::LogicalAnd;
   }
-  if (binary.getOperatorKind() == BinaryOperator::BitwiseAnd)
+  if (*kind == BinaryOperator::BitwiseAnd)
     return BinaryOperator::BitwiseAnd;
-  if (binary.getOperatorKind() == BinaryOperator::BitwiseOr)
+  if (*kind == BinaryOperator::BitwiseOr)
     return BinaryOperator::BitwiseOr;
-  if (binary.getOperatorKind() == BinaryOperator::BitwiseXor)
+  if (*kind == BinaryOperator::BitwiseXor)
     return BinaryOperator::BitwiseXor;
   return std::nullopt;
 }

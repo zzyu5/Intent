@@ -85,6 +85,13 @@ mlir::FailureOr<AxisMapAttr> queryAxisMap(mlir::Type type,
 mlir::FailureOr<int64_t> queryRangeDimension(MakeRangeOp range);
 bool samePhysicalScalarExpression(mlir::Value lhs, mlir::Value rhs);
 
+/// Returns the single typed binary operation implemented by a two-argument
+/// combine region. Physical broadcast projections inserted while aligning
+/// helper arguments do not change that semantic operation and are ignored.
+/// Arbitrary arithmetic, casts, reshapes, or captures remain unknown.
+std::optional<BinaryOperator>
+queryBinaryCombineKind(mlir::Region &region);
+
 /// All current-IR range roots that carry one requested source axis.
 struct PhysicalRangeFact {
   PhysicalFactState state = PhysicalFactState::Unknown;

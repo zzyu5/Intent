@@ -1,5 +1,6 @@
 #include "Intent/Target/Triton/Transforms/Passes.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -566,21 +567,8 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
 }
 
 bool isAddCombine(gpu::ScatterReduceOp scatter) {
-  Block &block = scatter.getCombine().front();
-  if (block.getNumArguments() != 2 ||
-      std::distance(block.begin(), block.end()) != 2)
-    return false;
-  auto binary = dyn_cast<gpu::BinaryOp>(block.front());
-  auto yield = dyn_cast<gpu::YieldOp>(block.back());
-  if (!binary || !yield ||
-      binary.getOperatorKind() != BinaryOperator::Add ||
-      yield.getValues().size() != 1 ||
-      yield.getValues().front() != binary.getResult())
-    return false;
-  Value lhs = binary.getLhs();
-  Value rhs = binary.getRhs();
-  return (lhs == block.getArgument(0) && rhs == block.getArgument(1)) ||
-         (lhs == block.getArgument(1) && rhs == block.getArgument(0));
+  return gpu::queryBinaryCombineKind(scatter.getCombine()) ==
+         BinaryOperator::Add;
 }
 
 bool isNativeAddReduce(gpu::ReduceOp reduce) {
@@ -588,19 +576,8 @@ bool isNativeAddReduce(gpu::ReduceOp reduce) {
       reduce.getCaptureCount() != 0 || reduce.getResults().size() != 1 ||
       reduce.getCombine().empty() || reduce.getCombine().getBlocks().size() != 1)
     return false;
-  Block &block = reduce.getCombine().front();
-  if (block.getNumArguments() != 2 ||
-      std::distance(block.begin(), block.end()) != 2)
-    return false;
-  auto binary = dyn_cast<gpu::BinaryOp>(block.front());
-  auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
-  if (!binary || binary.getOperatorKind() != BinaryOperator::Add || !yield ||
-      yield.getValues().size() != 1 || yield.getValues().front() != binary)
-    return false;
-  Value lhs = binary.getLhs();
-  Value rhs = binary.getRhs();
-  return (lhs == block.getArgument(0) && rhs == block.getArgument(1)) ||
-         (lhs == block.getArgument(1) && rhs == block.getArgument(0));
+  return gpu::queryBinaryCombineKind(reduce.getCombine()) ==
+         BinaryOperator::Add;
 }
 
 void selectNativeReduceForms(func::FuncOp kernel) {

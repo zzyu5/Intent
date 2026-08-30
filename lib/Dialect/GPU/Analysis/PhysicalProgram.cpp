@@ -45,6 +45,12 @@ Value stripBroadcast(Value value) {
   return value;
 }
 
+Value stripCombineProjection(Value value) {
+  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
+    value = broadcast.getValue();
+  return value;
+}
+
 Value stripScalarIdentity(Value value) {
   value = stripBroadcast(value);
   while (true) {
@@ -334,6 +340,27 @@ bool precedingRegionInitializesBuffer(Operation *read, BufferOp buffer,
 }
 
 } // namespace
+
+std::optional<BinaryOperator> queryBinaryCombineKind(Region &region) {
+  if (!llvm::hasSingleElement(region))
+    return std::nullopt;
+  Block &block = region.front();
+  if (block.getNumArguments() != 2)
+    return std::nullopt;
+  auto yield = dyn_cast_or_null<YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return std::nullopt;
+  Value result = stripCombineProjection(yield.getValues().front());
+  auto binary = result.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return std::nullopt;
+  Value lhs = stripCombineProjection(binary.getLhs());
+  Value rhs = stripCombineProjection(binary.getRhs());
+  if (!((lhs == block.getArgument(0) && rhs == block.getArgument(1)) ||
+        (lhs == block.getArgument(1) && rhs == block.getArgument(0))))
+    return std::nullopt;
+  return binary.getOperatorKind();
+}
 
 bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
                           bool allowAccesses) {

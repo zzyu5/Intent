@@ -1,5 +1,6 @@
 #include "Intent/Target/CuTile/Transforms/Passes.h"
 
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -319,33 +320,18 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
 }
 
 std::optional<BinaryOperator> nativeCombineKind(Region &region) {
-  if (!llvm::hasSingleElement(region))
+  std::optional<BinaryOperator> kind = gpu::queryBinaryCombineKind(region);
+  if (!kind)
     return std::nullopt;
-  Block &block = region.front();
-  if (block.getNumArguments() != 2 ||
-      std::distance(block.begin(), block.end()) != 2)
-    return std::nullopt;
-  auto binary = dyn_cast<gpu::BinaryOp>(block.front());
-  auto yield = dyn_cast<gpu::YieldOp>(block.back());
-  if (!binary || !yield || yield.getValues().size() != 1 ||
-      yield.getValues().front() != binary.getResult())
-    return std::nullopt;
-  if (!((binary.getLhs() == block.getArgument(0) &&
-         binary.getRhs() == block.getArgument(1)) ||
-        (binary.getLhs() == block.getArgument(1) &&
-         binary.getRhs() == block.getArgument(0))))
-    return std::nullopt;
-  if (binary.getOperatorKind() == BinaryOperator::Add)
-    return BinaryOperator::Add;
-  if (binary.getOperatorKind() == BinaryOperator::MaximumNum)
-    return BinaryOperator::MaximumNum;
-  if (binary.getOperatorKind() == BinaryOperator::MinimumNum)
-    return BinaryOperator::MinimumNum;
-  auto result = dyn_cast<gpu::FragmentType>(binary.getResult().getType());
+  if (*kind == BinaryOperator::Add || *kind == BinaryOperator::MaximumNum ||
+      *kind == BinaryOperator::MinimumNum)
+    return kind;
+  auto result =
+      dyn_cast<gpu::FragmentType>(region.front().getArgument(0).getType());
   if (result && result.getElementType().isInteger(1)) {
-    if (binary.getOperatorKind() == BinaryOperator::LogicalOr)
+    if (*kind == BinaryOperator::LogicalOr)
       return BinaryOperator::LogicalOr;
-    if (binary.getOperatorKind() == BinaryOperator::LogicalAnd)
+    if (*kind == BinaryOperator::LogicalAnd)
       return BinaryOperator::LogicalAnd;
   }
   return std::nullopt;
