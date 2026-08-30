@@ -364,11 +364,20 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
                                    Value replacement,
                                    IRMapping &mapping) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel)
+  if (!kernel || roots.empty())
+    return failure();
+  PhysicalSourceAxis source = sourceAxisIdentity(roots.front());
+  FailureOr<int64_t> dimension = queryRangeDimension(roots.front());
+  if (failed(dimension) ||
+      !llvm::all_of(roots, [&](MakeRangeOp root) {
+        FailureOr<int64_t> current = queryRangeDimension(root);
+        return sourceAxisIdentity(root) == source && succeeded(current) &&
+               *current == *dimension;
+      }))
     return failure();
   PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
-      value, std::nullopt, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true);
+      value, source, PhysicalReplayScope::ValueGraph,
+      /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
   if (!replay.isReplayable()) {
     InFlightDiagnostic diagnostic =
         value.getDefiningOp()
@@ -393,9 +402,27 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
                                    PhysicalExprAttr blockedExtent,
                                    MakeRangeOp root, Value replacement,
                                    IRMapping &mapping) {
-  (void)source;
-  return replaySourceValue(builder, location, value, blockedExtent,
-                           ArrayRef<MakeRangeOp>(root), replacement, mapping);
+  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  FailureOr<int64_t> dimension = queryRangeDimension(root);
+  if (!kernel || !(sourceAxisIdentity(root) == source) || failed(dimension))
+    return failure();
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      value, source, PhysicalReplayScope::ValueGraph,
+      /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
+  if (!replay.isReplayable()) {
+    InFlightDiagnostic diagnostic =
+        value.getDefiningOp()
+            ? value.getDefiningOp()->emitOpError(
+                  "contraction operand has no exact source-scoped replay fact")
+            : kernel.emitError(
+                  "contraction operand has no exact source-scoped replay fact");
+    for (Operation *blocker : replay.blockers)
+      diagnostic << "; blocker=" << blocker->getName();
+    return failure();
+  }
+  return replaySourceValueImpl(builder, location, value, blockedExtent,
+                               ArrayRef<MakeRangeOp>(root), replacement,
+                               mapping);
 }
 
 Value strippedBroadcast(Value value) {
