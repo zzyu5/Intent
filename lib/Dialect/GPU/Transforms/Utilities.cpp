@@ -583,18 +583,43 @@ FailureOr<Value> materializeScalarConstant(OpBuilder &builder,
   return failure();
 }
 
-FailureOr<Value> materializeBroadcastToFragment(OpBuilder &builder,
-                                                Location location, Value value,
-                                                FragmentType target) {
+static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
+                                             Location location, Value value,
+                                             FragmentType target) {
   if (value.getType() == target)
     return value;
   Type element = value.getType();
-  if (auto fragment = dyn_cast<FragmentType>(element))
-    element = fragment.getElementType();
+  auto source = dyn_cast<FragmentType>(element);
+  if (source)
+    element = source.getElementType();
   if (!isa<IntegerType, FloatType, IndexType>(element) ||
       element != target.getElementType())
     return failure();
-  return Value(builder.create<BroadcastOp>(location, target, value));
+  Operation *projection = nullptr;
+  if (!source) {
+    projection = builder.create<SplatOp>(location, target, value);
+  } else if (auto splat = value.getDefiningOp<SplatOp>()) {
+    projection = builder.create<SplatOp>(location, target, splat.getValue());
+  } else if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    if (!input || queryBroadcastProjection(input, target).isExact())
+      projection = builder.create<BroadcastOp>(location, target,
+                                               broadcast.getValue());
+  }
+  if (!projection && queryBroadcastProjection(source, target).isExact())
+    projection = builder.create<BroadcastOp>(location, target, value);
+  if (!projection)
+    return failure();
+  if (Operation *definition = value.getDefiningOp())
+    if (Attribute origin = definition->getAttr(originAttr))
+      projection->setAttr(originAttr, origin);
+  return projection->getResult(0);
+}
+
+FailureOr<Value> materializeBroadcastToFragment(OpBuilder &builder,
+                                                Location location, Value value,
+                                                FragmentType target) {
+  return projectFragmentValue(builder, location, value, target);
 }
 
 FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
@@ -602,24 +627,8 @@ FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
                                               Type target) {
   if (value.getType() == target)
     return value;
-  if (auto fragment = dyn_cast<FragmentType>(target)) {
-    Type sourceElement = value.getType();
-    if (auto source = dyn_cast<FragmentType>(sourceElement))
-      sourceElement = source.getElementType();
-    if (sourceElement != fragment.getElementType())
-      return failure();
-    Operation *projection = nullptr;
-    if (isa<IntegerType, FloatType, IndexType>(value.getType()))
-      projection = builder.create<SplatOp>(location, fragment, value);
-    else if (isa<FragmentType>(value.getType()))
-      projection = builder.create<BroadcastOp>(location, fragment, value);
-    if (!projection)
-      return failure();
-    if (Operation *definition = value.getDefiningOp())
-      if (Attribute origin = definition->getAttr(originAttr))
-        projection->setAttr(originAttr, origin);
-    return projection->getResult(0);
-  }
+  if (auto fragment = dyn_cast<FragmentType>(target))
+    return projectFragmentValue(builder, location, value, fragment);
   auto targetRecord = dyn_cast<RecordType>(target);
   auto sourceRecord = dyn_cast<RecordType>(value.getType());
   if (!targetRecord || !sourceRecord ||
@@ -953,8 +962,13 @@ FailureOr<Value> materializeReplayedValue(
         if (failed(replayed))
           return failure();
         fill = *replayed;
-        if (fill.getType() != target)
-          fill = builder.create<BroadcastOp>(location, target, fill);
+        if (fill.getType() != target) {
+          FailureOr<Value> projected =
+              projectPhysicalValueToSchema(builder, location, fill, target);
+          if (failed(projected))
+            return failure();
+          fill = *projected;
+        }
         return fill;
       }
       if (!options.materializeZeroFill)
@@ -2255,8 +2269,13 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       element = fragment.getElementType();
     if (!element.isInteger(1))
       return failure();
-    if (existing.getType() != predicate)
-      existing = builder.create<BroadcastOp>(location, predicate, existing);
+    if (existing.getType() != predicate) {
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, location, existing, predicate);
+      if (failed(projected))
+        return failure();
+      existing = *projected;
+    }
     return Value(builder.create<BinaryOp>(location, predicate, existing, valid,
                                           BinaryOperator::LogicalAnd));
   };
@@ -2282,8 +2301,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       if (!element.isInteger(1))
         return load.emitOpError(
             "full-coverage load carried non-predicate validity");
-      if (existing.getType() != predicate)
-        existing = builder.create<BroadcastOp>(load.getLoc(), predicate, existing);
+      if (existing.getType() != predicate) {
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, load.getLoc(), existing, predicate);
+        if (failed(projected))
+          return load.emitOpError(
+              "full-coverage validity has no exact physical projection");
+        existing = *projected;
+      }
       valid = builder.create<BinaryOp>(load.getLoc(), predicate, existing, valid,
                                        BinaryOperator::LogicalAnd);
     }
@@ -2293,8 +2318,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       if (failed(zero))
         return load.emitOpError("full-coverage load has no neutral fill");
       fill = *zero;
-    } else if (fill.getType() != type)
-      fill = builder.create<BroadcastOp>(load.getLoc(), type, fill);
+    } else if (fill.getType() != type) {
+      FailureOr<Value> projected =
+          projectPhysicalValueToSchema(builder, load.getLoc(), fill, type);
+      if (failed(projected))
+        return load.emitOpError(
+            "full-coverage fill has no exact physical projection");
+      fill = *projected;
+    }
     auto replacement = builder.create<LoadOp>(
         load.getLoc(), type, load.getResource(), load.getCoordinates(), valid,
         fill, load.getSourceAxes());
@@ -2321,8 +2352,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
       if (failed(zero))
         return gather.emitOpError("full-coverage gather has no neutral fill");
       fill = *zero;
-    } else if (fill.getType() != type)
-      fill = builder.create<BroadcastOp>(gather.getLoc(), type, fill);
+    } else if (fill.getType() != type) {
+      FailureOr<Value> projected =
+          projectPhysicalValueToSchema(builder, gather.getLoc(), fill, type);
+      if (failed(projected))
+        return gather.emitOpError(
+            "full-coverage fill has no exact physical projection");
+      fill = *projected;
+    }
     auto replacement = builder.create<GatherOp>(
         gather.getLoc(), type, gather.getSource(), gather.getCoordinates(),
         *valid, fill, gather.getSourceAxes());
@@ -2347,9 +2384,14 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
     auto predicate = cast<FragmentType>(valid.getType());
     if (store.getValid()) {
       Value existing = store.getValid();
-      if (existing.getType() != predicate)
-        existing =
-            builder.create<BroadcastOp>(store.getLoc(), predicate, existing);
+      if (existing.getType() != predicate) {
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, store.getLoc(), existing, predicate);
+        if (failed(projected))
+          return store.emitOpError(
+              "full-coverage validity has no exact physical projection");
+        existing = *projected;
+      }
       valid = builder.create<BinaryOp>(store.getLoc(), predicate, existing,
                                        valid, BinaryOperator::LogicalAnd);
     }
