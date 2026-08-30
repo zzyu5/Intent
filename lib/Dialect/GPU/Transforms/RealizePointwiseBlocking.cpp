@@ -306,21 +306,48 @@ LogicalResult requireFullDimensionCoverage(func::FuncOp kernel, Value source,
   return realizeFullCoverageDimension(kernel, source, axis);
 }
 
+bool hasExactStaticFullCoverage(func::FuncOp kernel, Value source,
+                                uint64_t axis) {
+  auto fragment = dyn_cast<FragmentType>(source.getType());
+  if (!fragment || axis >= fragment.getShape().size())
+    return false;
+  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+  if (!extent || extent.getKind() !=
+                     static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      extent.getValue() <= 0)
+    return false;
+  PhysicalAxisRealizationFact fact =
+      PhysicalProgramAnalysis(kernel).axisRealization(source, axis);
+  if (!fact.isExact() || !fact.physicalized || fact.constructionScalarSeed ||
+      fact.roots.empty())
+    return false;
+  return llvm::all_of(fact.roots, [&](MakeRangeOp range) {
+    if (range->hasAttr(sourceSubregionAttr) ||
+        !samePhysicalScalarExpression(range.getStart(),
+                                      range.getLogicalStart()))
+      return false;
+    auto start = range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
+    auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
+    auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    return start && stop && step && step.value() > 0 &&
+           stop.value() >= start.value() &&
+           static_cast<__int128>(extent.getValue()) * step.value() >=
+               static_cast<__int128>(stop.value() - start.value());
+  });
+}
+
 LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
                                       uint64_t axis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || axis >= fragment.getShape().size())
     return failure();
-  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-  if (extent && extent.getKind() ==
-                    static_cast<uint32_t>(PhysicalExprKind::Constant))
+  if (hasExactStaticFullCoverage(kernel, source, axis))
     return success();
-  if (!extent || extent.getKind() !=
-                     static_cast<uint32_t>(PhysicalExprKind::Dimension))
+  auto sourceMapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+  int64_t dimension = sourceMapping.getDimensionId();
+  if (dimension <= 0)
     return requireFullDimensionCoverage(kernel, source, axis);
-  int64_t dimension = extent.getValue();
-  if (dimension <= 0 ||
-      failed(dimensionArgument(kernel, dimension)))
+  if (failed(dimensionArgument(kernel, dimension)))
     return failure();
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
   ParameterOp parameter;
@@ -348,8 +375,6 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, Value source,
       coverageDimensionAttr,
       IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), dimension));
   PhysicalExprAttr covered = fragmentExtent(parameter);
-  auto sourceMapping =
-      cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
   PhysicalProgramAnalysis analysis(kernel);
   PhysicalRangeFact sourceRanges = analysis.axisRanges(source, axis);
   if (sourceRanges.state == PhysicalFactState::Unknown ||
@@ -389,9 +414,7 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || axis >= fragment.getShape().size())
     return failure();
-  auto extent = dyn_cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-  if (extent && extent.getKind() ==
-                    static_cast<uint32_t>(PhysicalExprKind::Constant))
+  if (hasExactStaticFullCoverage(kernel, source, axis))
     return success();
   return realizeFullCoverageDimension(kernel, source, axis);
 }
@@ -1791,10 +1814,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
       scanCoverageFailed |=
           failed(requireScanFullCoverage(kernel, source, scan.getAxis()));
-    for (Value result : scan.getResults()) {
-      llvm::SmallPtrSet<Operation *, 16> visited;
-      collectStoreRanges(result, internalTraversalRanges, visited);
-    }
   });
   if (scanCoverageFailed)
     return kernel.emitError(
@@ -1867,6 +1886,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       contractionTraversalRanges.insert(range.getOperation());
   structuredTraversalRanges.insert(contractionTraversalRanges.begin(),
                                    contractionTraversalRanges.end());
+  SmallVector<MakeRangeOp> structuredAuthorities;
+  for (Operation *operation : structuredTraversalRanges)
+    if (auto range = dyn_cast<MakeRangeOp>(operation))
+      structuredAuthorities.push_back(range);
+  for (MakeRangeOp range : allRanges)
+    if (llvm::any_of(structuredAuthorities, [&](MakeRangeOp authority) {
+          return sameLogicalRange(authority, range);
+        }))
+      structuredTraversalRanges.insert(range.getOperation());
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });

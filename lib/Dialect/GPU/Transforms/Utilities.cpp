@@ -1816,9 +1816,21 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       nameCollision |=
           candidate.getParameter().getName().getValue() == name;
     });
-    if (nameCollision)
-      return kernel.emitError(
+    if (nameCollision) {
+      InFlightDiagnostic diagnostic = kernel.emitError(
           "full-coverage parameter name is already owned by another decision");
+      kernel.walk([&](ParameterOp candidate) {
+        if (candidate.getParameter().getName().getValue() != name)
+          return;
+        diagnostic << "; role=" << candidate.getParameter().getRole();
+        if (auto covered = candidate->getAttrOfType<IntegerAttr>(
+                coverageDimensionAttr))
+          diagnostic << ", coverage_dimension=" << covered.getInt();
+        if (auto bound = candidate->getAttrOfType<IntegerAttr>(dimensionAttr))
+          diagnostic << ", dimension=" << bound.getInt();
+      });
+      return failure();
+    }
     OpBuilder builder(&kernel.getBody().front(),
                       kernel.getBody().front().begin());
     auto schema = ParameterAttr::get(
