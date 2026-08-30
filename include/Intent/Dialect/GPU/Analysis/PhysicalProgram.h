@@ -235,6 +235,8 @@ public:
   PhysicalRangeAxisFact rangeAxes(mlir::Value value,
                                   llvm::ArrayRef<MakeRangeOp> roots);
   PhysicalLockstepTraversalFact
+  lockstepRanges(llvm::ArrayRef<MakeRangeOp> ranges);
+  PhysicalLockstepTraversalFact
   lockstepTraversal(mlir::ValueRange sources,
                     llvm::ArrayRef<unsigned> fragmentAxes);
   PhysicalReplayFact replayability(

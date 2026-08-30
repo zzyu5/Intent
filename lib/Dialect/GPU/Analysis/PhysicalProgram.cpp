@@ -22,7 +22,7 @@ bool isCoordinateReplayNode(Operation *operation) {
 
 bool isValueReplayNode(Operation *operation) {
   return isCoordinateReplayNode(operation) ||
-         isa<ContractOp, ScaledContractOp, SparseContractOp, ReduceOp>(
+         isa<ContractOp, ScaledContractOp, SparseContractOp, ReduceOp, ScanOp>(
              operation);
 }
 
@@ -337,11 +337,11 @@ bool precedingRegionInitializesBuffer(Operation *read, BufferOp buffer,
 
 bool isPhysicalReplayNode(Operation *operation, PhysicalReplayScope scope,
                           bool allowAccesses) {
-  if (!operation || operation->getNumResults() != 1)
+  if (!operation || operation->getNumResults() == 0)
     return false;
   if (isAccessNode(operation))
     return allowAccesses && operation->getNumRegions() == 0;
-  if (operation->getNumRegions() != 0 && !isa<ReduceOp>(operation))
+  if (operation->getNumRegions() != 0 && !isa<ReduceOp, ScanOp>(operation))
     return false;
   return scope == PhysicalReplayScope::Coordinate
              ? isCoordinateReplayNode(operation)
@@ -1370,6 +1370,27 @@ PhysicalLockstepTraversalFact PhysicalProgramAnalysis::lockstepTraversal(
   PhysicalLockstepTraversalFact result;
   if (sources.empty() || sources.size() != fragmentAxes.size())
     return result;
+  SmallVector<MakeRangeOp> authorities;
+  for (auto [source, fragmentAxis] : llvm::zip(sources, fragmentAxes)) {
+    PhysicalRangeFact ranges = axisRanges(source, fragmentAxis);
+    PhysicalLockstepTraversalFact sourceFact = lockstepRanges(ranges.roots);
+    if (!sourceFact.isExact()) {
+      result.state = sourceFact.state;
+      result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
+      result.blockers.append(sourceFact.blockers.begin(),
+                             sourceFact.blockers.end());
+      return result;
+    }
+    authorities.push_back(sourceFact.authority);
+  }
+  return lockstepRanges(authorities);
+}
+
+PhysicalLockstepTraversalFact
+PhysicalProgramAnalysis::lockstepRanges(ArrayRef<MakeRangeOp> ranges) {
+  PhysicalLockstepTraversalFact result;
+  if (ranges.empty())
+    return result;
   auto sameLogicalTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
     FailureOr<int64_t> lhsDimension = queryRangeDimension(lhs);
     FailureOr<int64_t> rhsDimension = queryRangeDimension(rhs);
@@ -1387,35 +1408,14 @@ PhysicalLockstepTraversalFact PhysicalProgramAnalysis::lockstepTraversal(
            samePhysicalScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
            samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
   };
-  for (auto [source, fragmentAxis] : llvm::zip(sources, fragmentAxes)) {
-    PhysicalRangeFact ranges = axisRanges(source, fragmentAxis);
-    FailureOr<MakeRangeOp> sourceAuthority = queryExactLogicalRange(ranges);
-    if (failed(sourceAuthority)) {
-      result.state = ranges.state == PhysicalFactState::Unknown
-                         ? PhysicalLockstepState::Unknown
-                         : PhysicalLockstepState::Inconsistent;
-      result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
-      return result;
-    }
-    if (!llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
-          return sameTraversal(*sourceAuthority, range) &&
-                 sameLogicalTraversal(*sourceAuthority, range);
-        })) {
+  result.authority = ranges.front();
+  for (MakeRangeOp range : llvm::drop_begin(ranges))
+    if (!sameTraversal(result.authority, range) ||
+        !sameLogicalTraversal(result.authority, range)) {
       result.state = PhysicalLockstepState::Inconsistent;
       return result;
     }
-    if (!result.authority) {
-      result.authority = *sourceAuthority;
-      continue;
-    }
-    if (!sameTraversal(result.authority, *sourceAuthority) ||
-        !sameLogicalTraversal(result.authority, *sourceAuthority)) {
-      result.state = PhysicalLockstepState::Inconsistent;
-      return result;
-    }
-  }
-  result.state = result.authority ? PhysicalLockstepState::Exact
-                                  : PhysicalLockstepState::Unknown;
+  result.state = PhysicalLockstepState::Exact;
   return result;
 }
 
@@ -1523,8 +1523,13 @@ void PhysicalProgramAnalysis::analyzeReplay(
     result.state = PhysicalFactState::Unknown;
     return;
   }
-  if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-    WalkResult helper = reduce.getCombine().walk([&](Operation *nested) {
+  Region *combine = nullptr;
+  if (auto reduce = dyn_cast<ReduceOp>(operation))
+    combine = &reduce.getCombine();
+  else if (auto scan = dyn_cast<ScanOp>(operation))
+    combine = &scan.getCombine();
+  if (combine) {
+    WalkResult helper = combine->walk([&](Operation *nested) {
       if (isa<YieldOp, arith::ConstantOp>(nested))
         return WalkResult::advance();
       if (!isPhysicalReplayNode(nested, PhysicalReplayScope::Coordinate,
@@ -1538,7 +1543,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     if (helper.wasInterrupted())
       return;
   }
-  if (operation->getNumRegions() != 0 && !isa<ReduceOp>(operation)) {
+  if (operation->getNumRegions() != 0 && !isa<ReduceOp, ScanOp>(operation)) {
     appendUnique(result.blockers, operation);
     result.state = PhysicalFactState::Unknown;
     return;

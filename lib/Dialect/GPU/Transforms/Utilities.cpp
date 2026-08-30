@@ -597,7 +597,8 @@ FailureOr<Value> materializeReplayedValue(
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalReplayFact replay = analysis.replayability(
       value, source, options.scope, options.allowAccesses);
   if (!replay.isReplayable())
     return failure();
@@ -618,6 +619,62 @@ FailureOr<Value> materializeReplayedValue(
         ArrayAttr::get(type.getContext(), shape),
         ArrayAttr::get(type.getContext(), axes), type.getValidity(),
         type.getOwner());
+  };
+  std::function<Type(Type)> replaceReplayType = [&](Type type) -> Type {
+    if (auto fragment = dyn_cast<FragmentType>(type)) {
+      PhysicalAxisProjection projection = queryFragmentAxis(fragment, source);
+      return projection.isExact()
+                 ? Type(replaceReplayAxis(fragment, projection.fragmentAxis))
+                 : type;
+    }
+    auto record = dyn_cast<RecordType>(type);
+    if (!record)
+      return type;
+    SmallVector<Attribute> fields;
+    bool changed = false;
+    for (Attribute field : record.getFieldTypes()) {
+      Type current = cast<TypeAttr>(field).getValue();
+      Type replacement = replaceReplayType(current);
+      fields.push_back(TypeAttr::get(replacement));
+      changed |= replacement != current;
+    }
+    return changed ? Type(RecordType::get(
+                         type.getContext(), record.getFieldNames(),
+                         ArrayAttr::get(type.getContext(), fields),
+                         record.getOwner()))
+                   : type;
+  };
+  auto carriesReplaySource = [&](Type type) {
+    return replaceReplayType(type) != type;
+  };
+  auto selectedReplayAxis = [&](Value current)
+      -> std::optional<unsigned> {
+    auto fragment = dyn_cast<FragmentType>(current.getType());
+    PhysicalAxisProjection projection =
+        fragment ? queryFragmentAxis(fragment, source)
+                 : PhysicalAxisProjection{};
+    if (!fragment || !projection.isExact())
+      return std::nullopt;
+    if (options.traversalRanges.empty())
+      return projection.fragmentAxis;
+    PhysicalRangeFact fact =
+        analysis.axisRanges(current, projection.fragmentAxis);
+    if (fact.roots.empty()) {
+      Operation *producer = current.getDefiningOp();
+      bool neutralSchemaCarrier = isa_and_nonnull<SplatOp>(producer);
+      if (auto broadcast = dyn_cast_or_null<BroadcastOp>(producer))
+        neutralSchemaCarrier |=
+            !isa<FragmentType, RecordType>(broadcast.getValue().getType());
+      return neutralSchemaCarrier
+                 ? std::optional<unsigned>(projection.fragmentAxis)
+                 : std::nullopt;
+    }
+    SmallVector<MakeRangeOp> combined(fact.roots.begin(), fact.roots.end());
+    combined.append(options.traversalRanges.begin(),
+                    options.traversalRanges.end());
+    return analysis.lockstepRanges(combined).isExact()
+               ? std::optional<unsigned>(projection.fragmentAxis)
+               : std::nullopt;
   };
   auto isUnitExtent = [](Attribute attribute) {
     auto extent = dyn_cast<PhysicalExprAttr>(attribute);
@@ -662,23 +719,71 @@ FailureOr<Value> materializeReplayedValue(
           mapping.map(current, *replayed);
         return replayed;
       }
+      if (carriesReplaySource(extract.getRecord().getType())) {
+        FailureOr<Value> replayedRecord = materialize(extract.getRecord());
+        if (failed(replayedRecord))
+          return failure();
+        Type target = replaceReplayType(current.getType());
+        Value replayed = builder.create<ExtractOp>(
+            location, target, *replayedRecord, extract.getField());
+        mapping.map(current, replayed);
+        return replayed;
+      }
     }
 
     auto fragment = dyn_cast<FragmentType>(current.getType());
-    PhysicalAxisProjection projection =
-        fragment ? queryFragmentAxis(fragment, source)
-                 : PhysicalAxisProjection{};
-    if (!fragment || !projection.isExact())
+    if (!fragment && carriesReplaySource(current.getType())) {
+      Operation *producer = current.getDefiningOp();
+      if (!producer ||
+          !isPhysicalReplayNode(producer, options.scope,
+                                /*allowAccesses=*/false))
+        return failure();
+      for (Value operand : producer->getOperands()) {
+        if (!carriesReplaySource(operand.getType()))
+          continue;
+        FailureOr<Value> replayed = materialize(operand);
+        if (failed(replayed))
+          return failure();
+        if (!mapping.lookupOrNull(operand) && *replayed != operand)
+          mapping.map(operand, *replayed);
+      }
+      Operation *clone = builder.clone(*producer, mapping);
+      for (auto [original, result] :
+           llvm::zip(producer->getResults(), clone->getResults())) {
+        result.setType(replaceReplayType(result.getType()));
+        if (!mapping.lookupOrNull(original))
+          mapping.map(original, result);
+      }
+      Region *combine = nullptr;
+      if (auto reduce = dyn_cast<ReduceOp>(clone))
+        combine = &reduce.getCombine();
+      else if (auto scan = dyn_cast<ScanOp>(clone))
+        combine = &scan.getCombine();
+      if (combine)
+        for (Block &block : *combine) {
+          for (BlockArgument argument : block.getArguments())
+            argument.setType(replaceReplayType(argument.getType()));
+          block.walk([&](Operation *operation) {
+            for (Value result : operation->getResults())
+              result.setType(replaceReplayType(result.getType()));
+          });
+        }
+      auto result = dyn_cast<OpResult>(current);
+      if (!result || result.getResultNumber() >= clone->getNumResults())
+        return failure();
+      Value replayed = clone->getResult(result.getResultNumber());
+      return replayed;
+    }
+    std::optional<unsigned> projection = selectedReplayAxis(current);
+    if (!fragment || !projection)
       return current;
-    unsigned axis = projection.fragmentAxis;
+    unsigned axis = *projection;
     Operation *producer = current.getDefiningOp();
     if (!producer)
       return failure();
 
     auto replayOperand = [&](Value operand) -> FailureOr<Value> {
-      PhysicalAxisProjection operandProjection =
-          queryFragmentAxis(operand.getType(), source);
-      return operandProjection.isExact() ? materialize(operand)
+      return selectedReplayAxis(operand) ? materialize(operand)
                                          : FailureOr<Value>(operand);
     };
     auto combineTail = [&](FragmentType target,
@@ -787,6 +892,14 @@ FailureOr<Value> materializeReplayedValue(
         mapping.map(operand, *replayed);
     }
     Operation *clone = builder.clone(*producer, mapping);
+    bool structuredResults = isa<ReduceOp, ScanOp>(clone);
+    for (auto [original, cloned] :
+         llvm::zip(producer->getResults(), clone->getResults())) {
+      if (structuredResults)
+        cloned.setType(replaceReplayType(cloned.getType()));
+      if (!mapping.lookupOrNull(original))
+        mapping.map(original, cloned);
+    }
     auto result = dyn_cast<OpResult>(current);
     if (!result || result.getResultNumber() >= clone->getNumResults())
       return failure();
@@ -794,6 +907,10 @@ FailureOr<Value> materializeReplayedValue(
     if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
       retargetHelperSourceExtent(
           clonedReduce.getCombine(),
+          cast<PhysicalExprAttr>(fragment.getShape()[axis]));
+    if (auto clonedScan = dyn_cast<ScanOp>(clone))
+      retargetHelperSourceExtent(
+          clonedScan.getCombine(),
           cast<PhysicalExprAttr>(fragment.getShape()[axis]));
     auto clonedType = dyn_cast<FragmentType>(clonedValue.getType());
     if (!clonedType || axis >= clonedType.getShape().size())
@@ -807,8 +924,6 @@ FailureOr<Value> materializeReplayedValue(
     }
     if (!introducedUnitAxis)
       clonedValue.setType(replaceReplayAxis(clonedType, axis));
-    if (!mapping.lookupOrNull(current))
-      mapping.map(current, clonedValue);
     return clonedValue;
   };
 

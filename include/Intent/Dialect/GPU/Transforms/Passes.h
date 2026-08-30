@@ -15,6 +15,7 @@ namespace intent::gpu {
 struct ReplayMaterializationOptions {
   PhysicalReplayScope scope = PhysicalReplayScope::ValueGraph;
   bool allowAccesses = true;
+  llvm::ArrayRef<MakeRangeOp> traversalRanges;
   mlir::Value segmentTail;
   AxisMapAttr segmentMapping;
   bool materializeZeroFill = false;
