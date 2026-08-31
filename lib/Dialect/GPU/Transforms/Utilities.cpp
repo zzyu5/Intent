@@ -1969,7 +1969,13 @@ static void retargetExtent(Value root, AxisSelector selects,
               ? carriesSelectedAxis(value.getType(), selects)
               : carriesExtent(value.getType(), selects, connectedExtents)))
       continue;
-    if (!preservesIntroducedUnitAxis(value, selects)) {
+    // The root is the value whose physical extent this decision owns.  A
+    // construction-time singleton on that root is only a conservative seed;
+    // it cannot veto the decision and leave a make_range type out of sync with
+    // its extent operand.  The guard applies only while propagating through
+    // downstream value flow, where a genuinely introduced unit axis must stay
+    // scalar across an expanding broadcast.
+    if (value == root || !preservesIntroducedUnitAxis(value, selects)) {
       SmallVector<Attribute> replaceableExtents(previousExtents.begin(),
                                                 previousExtents.end());
       if (followLogicalDimension) {
