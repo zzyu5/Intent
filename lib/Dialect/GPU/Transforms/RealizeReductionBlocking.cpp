@@ -651,7 +651,11 @@ ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
     if (schema.getRole() != static_cast<uint32_t>(role) ||
         schema.getCandidates() != expectedCandidates) {
       existing.emitOpError(
-          "physical parameter name is reused with a different role or candidate domain");
+          "physical parameter name is reused with a different role or candidate domain")
+          << "; name=" << name << "; existing_role=" << schema.getRole()
+          << "; requested_role=" << static_cast<uint32_t>(role)
+          << "; existing_candidates=" << schema.getCandidates()
+          << "; requested_candidates=" << expectedCandidates;
       return ParameterOp();
     }
     return existing;
@@ -2035,9 +2039,6 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
   auto firstSource = cast<FragmentType>(sourcePlans.front().source.getType());
   PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
       firstSource.getShape()[sourcePlans.front().reductionAxis]);
-  PhysicalAxisRealizationFact sourceRealization =
-      PhysicalProgramAnalysis(kernel).axisRealization(
-          sourcePlans.front().source, sourcePlans.front().reductionAxis);
   FailureOr<ParameterOp> fullCoverage = failure();
   if (!hasNonUnitFreeAxis(reduce))
     fullCoverage = fullCoverageParameter(kernel, sourceExtent);
@@ -2059,17 +2060,6 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             .str();
     SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
-    if (!sourceRealization.constructionScalarSeed &&
-        sourceExtent.getKind() ==
-            static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-        sourceExtent.getValue() > 0) {
-      PhysicalExprAttr upper = nextPowerOfTwo(sourceExtent);
-      llvm::erase_if(candidates, [&](int64_t candidate) {
-        return candidate > upper.getValue();
-      });
-      if (candidates.empty())
-        candidates.push_back(upper.getValue());
-    }
     chunk = getOrCreateParameter(kernel, name, ParameterRole::Reduction,
                                  candidates);
     if (chunk)
@@ -2080,7 +2070,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                         *dimension));
   }
   if (!chunk)
-    return failure();
+    return reduce.emitOpError(
+               "reduction blocking has no unique physical parameter relation")
+           << "; source=" << sourcePlans.front().source.getType()
+           << "; axis=" << sourcePlans.front().reductionAxis;
   PhysicalExprAttr chunkExtent = expression(
       reduce.getContext(), PhysicalExprKind::Parameter, 0,
       chunk.getParameter().getName().getValue());

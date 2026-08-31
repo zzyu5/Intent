@@ -996,7 +996,11 @@ ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
     if (schema.getRole() != static_cast<uint32_t>(role) ||
         schema.getCandidates() != expectedCandidates) {
       existing.emitOpError(
-          "physical parameter name is reused with a different role or candidate domain");
+          "physical parameter name is reused with a different role or candidate domain")
+          << "; name=" << name << "; existing_role=" << schema.getRole()
+          << "; requested_role=" << static_cast<uint32_t>(role)
+          << "; existing_candidates=" << schema.getCandidates()
+          << "; requested_candidates=" << expectedCandidates;
       return ParameterOp();
     }
     return existing;
