@@ -88,6 +88,50 @@ FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
                                         BinaryOperator::LogicalAnd));
 }
 
+FailureOr<bool> composeSelectLoad(SelectOp select) {
+  auto resultType = dyn_cast<FragmentType>(select.getResult().getType());
+  auto load = select.getTrueValue().getDefiningOp<LoadOp>();
+  if (!resultType || !load || !load.getResult().hasOneUse())
+    return false;
+
+  Value fill = select.getFalseValue();
+  if (load.getValid()) {
+    if (!load.getFill() || load.getFill() != fill)
+      return false;
+  } else if (load.getFill()) {
+    return false;
+  }
+
+  OpBuilder builder(select);
+  FailureOr<Value> valid = combinePredicates(
+      builder, select.getLoc(), resultType, load.getValid(),
+      select.getCondition());
+  if (failed(valid)) {
+    select.emitOpError(
+        "masked load predicate cannot adopt the loaded value relation");
+    return failure();
+  }
+  if (fill.getType() != resultType) {
+    FailureOr<Value> projected = materializeBroadcastToFragment(
+        builder, select.getLoc(), fill, resultType);
+    if (failed(projected)) {
+      select.emitOpError(
+          "masked load fill cannot adopt the loaded value relation");
+      return failure();
+    }
+    fill = *projected;
+  }
+  auto replacement = builder.create<LoadOp>(
+      select.getLoc(), resultType, load.getResource(), load.getCoordinates(),
+      *valid, fill, load.getSourceAxes());
+  if (Attribute origin = load->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  select.getResult().replaceAllUsesWith(replacement.getResult());
+  select.erase();
+  load.erase();
+  return true;
+}
+
 FailureOr<bool> composeLoadGather(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   auto sourceLoad = gather.getSource().getDefiningOp<LoadOp>();
@@ -325,6 +369,16 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
   bool changed;
   do {
     changed = false;
+    SmallVector<SelectOp> selects;
+    physicalKernel->walk([&](SelectOp select) { selects.push_back(select); });
+    for (SelectOp select : selects) {
+      if (!select->getBlock())
+        continue;
+      FailureOr<bool> load = composeSelectLoad(select);
+      if (failed(load))
+        return failure();
+      changed |= *load;
+    }
     SmallVector<GatherOp> gathers;
     physicalKernel->walk([&](GatherOp gather) { gathers.push_back(gather); });
     for (GatherOp gather : gathers) {
