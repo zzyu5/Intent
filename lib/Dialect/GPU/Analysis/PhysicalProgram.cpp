@@ -1411,6 +1411,35 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   result.source = sourceAxisIdentity(mapping);
   result.dimensionId = mapping.getDimensionId();
 
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *owner = argument.getOwner()->getParentOp();
+    auto isSegmentSource = [&](uint64_t sourceCount, uint64_t axis,
+                               Block &region) {
+      return argument.getOwner() == &region &&
+             argument.getArgNumber() < sourceCount && fragmentAxis == axis;
+    };
+    bool segmentSource = false;
+    if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner))
+      segmentSource = isSegmentSource(fold.getSourceCount(), fold.getAxis(),
+                                      fold.getSummarize().front());
+    else if (auto scan = dyn_cast_or_null<RegionScanOp>(owner))
+      segmentSource =
+          isSegmentSource(scan.getSourceCount(), scan.getAxis(),
+                          scan.getSummarize().front()) ||
+          isSegmentSource(scan.getSourceCount(), scan.getAxis(),
+                          scan.getEmit().front());
+    if (segmentSource) {
+      // RegionFoldOp/RegionScanOp verification binds this exact block argument
+      // axis to the operation's segment parameter.  The slice extent is a
+      // first-class physical relation, not something to rediscover from the
+      // unsliced outer source range.
+      result.state = PhysicalFactState::Exact;
+      result.extentAuthority =
+          PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+      return result;
+    }
+  }
+
   if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
     auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
     if (source) {
@@ -1431,6 +1460,85 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
           }
         }
     }
+  }
+
+  if (auto reduce = value.getDefiningOp<ReduceOp>()) {
+    auto opResult = dyn_cast<OpResult>(value);
+    if (opResult && opResult.getResultNumber() < reduce.getSourceCount()) {
+      Value sourceValue = reduce.getInputs()[opResult.getResultNumber()];
+      auto source = dyn_cast<FragmentType>(sourceValue.getType());
+      if (source) {
+        llvm::SmallDenseSet<int64_t> reduced(reduce.getAxes().begin(),
+                                             reduce.getAxes().end());
+        SmallVector<unsigned> freeAxes;
+        for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+          if (!reduced.contains(axis))
+            freeAxes.push_back(axis);
+        if (fragmentAxis < freeAxes.size()) {
+          unsigned sourceAxis = freeAxes[fragmentAxis];
+          PhysicalAxisRealizationFact input =
+              axisRealization(sourceValue, sourceAxis);
+          if (input.hasExtentAuthority() &&
+              source.getShape()[sourceAxis] == extent) {
+            result.state = PhysicalFactState::Exact;
+            result.physicalized = input.physicalized;
+            result.extentAuthority =
+                PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+            return result;
+          }
+        }
+      }
+    }
+  }
+
+  if (auto contract = value.getDefiningOp<ContractOp>()) {
+    llvm::SmallDenseSet<int64_t> lhsReduced(
+        contract.getLhsReductionAxes().begin(),
+        contract.getLhsReductionAxes().end());
+    llvm::SmallDenseSet<int64_t> rhsReduced(
+        contract.getRhsReductionAxes().begin(),
+        contract.getRhsReductionAxes().end());
+    llvm::SmallDenseSet<int64_t> rhsBatched(
+        contract.getRhsBatchAxes().begin(), contract.getRhsBatchAxes().end());
+    SmallVector<std::pair<Value, unsigned>> resultSources;
+    auto lhs = dyn_cast<FragmentType>(contract.getLhs().getType());
+    auto rhs = dyn_cast<FragmentType>(contract.getRhs().getType());
+    if (lhs && rhs) {
+      for (unsigned axis = 0; axis < lhs.getShape().size(); ++axis)
+        if (!lhsReduced.contains(axis))
+          resultSources.emplace_back(contract.getLhs(), axis);
+      for (unsigned axis = 0; axis < rhs.getShape().size(); ++axis)
+        if (!rhsReduced.contains(axis) && !rhsBatched.contains(axis))
+          resultSources.emplace_back(contract.getRhs(), axis);
+      if (fragmentAxis < resultSources.size()) {
+        Value sourceValue = resultSources[fragmentAxis].first;
+        unsigned sourceAxis = resultSources[fragmentAxis].second;
+        auto source = cast<FragmentType>(sourceValue.getType());
+        PhysicalAxisRealizationFact input =
+            axisRealization(sourceValue, sourceAxis);
+        if (input.hasExtentAuthority() &&
+            source.getShape()[sourceAxis] == extent) {
+          result.state = PhysicalFactState::Exact;
+          result.physicalized = input.physicalized;
+          result.extentAuthority =
+              PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+          return result;
+        }
+      }
+    }
+  }
+
+  if (value.getDefiningOp<ExtractOp>()) {
+    // ExtractOp::verify requires the result type to equal the selected typed
+    // record field.  MakeRecord and structured fold/scan verifiers in turn
+    // require their field/result schemas to match the executable values at the
+    // region boundary.  The projected extent is therefore already a current-IR
+    // structural fact; treating it as unknown would make consumers rediscover
+    // the record schema from nearby arithmetic.
+    result.state = PhysicalFactState::Exact;
+    result.extentAuthority =
+        PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+    return result;
   }
 
   PhysicalRangeFact ranges = axisRanges(value, fragmentAxis);

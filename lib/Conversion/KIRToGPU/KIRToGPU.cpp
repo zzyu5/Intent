@@ -4685,6 +4685,9 @@ LogicalResult constructGPUProgram(ModuleOp module,
   if (dispatchLoweringFailed)
     return failure();
   builder.create<func::ReturnOp>(function.getLoc());
+  if (failed(gpu::alignPointwiseValueRelations(physical)))
+    return physical.emitError(
+        "initial physical value relations are incomplete");
   function.erase();
   module->setAttr("intent_gpu.physical", builder.getUnitAttr());
   return success();
