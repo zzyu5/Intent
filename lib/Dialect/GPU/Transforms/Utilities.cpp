@@ -1275,15 +1275,41 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
       if (!sourceAuthority[*sourceAxis])
         continue;
       Attribute extent = source.getShape()[*sourceAxis];
-      if (refined[targetAxis] && shape[targetAxis] != extent)
+      auto sourceMapping = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+      auto candidate = AxisMapAttr::get(
+          target.getContext(), sourceMapping.getSourceId(),
+          sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(),
+          targetAxis, sourceMapping.getDerived());
+      if (refined[targetAxis]) {
+        if (shape[targetAxis] != extent)
+          return failure();
+        auto selected = cast<AxisMapAttr>(mappings[targetAxis]);
+        if (selected == candidate)
+          continue;
+        // A derived axis only records a broadcast occurrence.  Once an exact
+        // non-derived source relation reaches the same physical axis, it is the
+        // unique coordinate authority.  Two unrelated direct sources (or two
+        // unrelated derived occurrences) remain ambiguous unless the canonical
+        // result already selected one of them.
+        if (selected.getDerived() != candidate.getDerived()) {
+          if (!candidate.getDerived()) {
+            mappings[targetAxis] = candidate;
+            changed = true;
+          }
+          continue;
+        }
+        auto canonical = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+        if (selected == canonical)
+          continue;
+        if (candidate == canonical) {
+          mappings[targetAxis] = candidate;
+          changed = true;
+          continue;
+        }
         return failure();
-      if (refined[targetAxis])
-        continue;
-      auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+      }
       shape[targetAxis] = extent;
-      mappings[targetAxis] = AxisMapAttr::get(
-          target.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), targetAxis, mapping.getDerived());
+      mappings[targetAxis] = candidate;
       refined[targetAxis] = true;
       changed = true;
     }
@@ -1318,6 +1344,20 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
       operation->emitOpError(
           "access result has no unique physical coordinate projection");
       return WalkResult::interrupt();
+    }
+    for (auto [axis, mapping] : llvm::enumerate((*refined).getAxisMaps())) {
+      if (axis >= current.getShape().size() ||
+          current.getShape()[axis] == (*refined).getShape()[axis])
+        continue;
+      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
+      if (dimension <= 0) {
+        operation->emitOpError(
+            "access result refinement has no logical dimension authority");
+        return WalkResult::interrupt();
+      }
+      retargetDimensionExtent(
+          result, dimension,
+          cast<PhysicalExprAttr>((*refined).getShape()[axis]));
     }
     result.setType(*refined);
     return WalkResult::advance();
@@ -1453,11 +1493,31 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
         diagnostic << "; operand=" << operand.getType();
       return WalkResult::interrupt();
     }
+    for (auto [axis, mapping] : llvm::enumerate((*refined).getAxisMaps())) {
+      if (axis >= target.getShape().size() ||
+          target.getShape()[axis] == (*refined).getShape()[axis])
+        continue;
+      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
+      if (dimension <= 0) {
+        operation->emitOpError(
+            "pointwise result refinement has no logical dimension authority");
+        return WalkResult::interrupt();
+      }
+      retargetDimensionExtent(
+          operation->getResult(0), dimension,
+          cast<PhysicalExprAttr>((*refined).getShape()[axis]));
+    }
     target = *refined;
     operation->getResult(0).setType(target);
     for (unsigned index = 0; index < operation->getNumOperands(); ++index)
-      if (failed(align(operation, index, target)))
+      if (failed(align(operation, index, target))) {
+        operation->emitOpError(
+            "pointwise operand cannot adopt the result relation")
+            << "; operand_index=" << index
+            << "; operand=" << operation->getOperand(index).getType()
+            << "; result=" << target;
         return WalkResult::interrupt();
+      }
     return WalkResult::advance();
   });
   return result.wasInterrupted() ? failure() : success();
@@ -1566,20 +1626,48 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
   for (StoreOp store : stores) {
     if (!store.getValid())
       continue;
-    auto valueType = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!valueType)
+    auto currentType = dyn_cast<FragmentType>(store.getValue().getType());
+    if (!currentType)
       continue;
     OpBuilder builder(store);
-    FailureOr<Value> valid = project(
-        builder, store.getLoc(), store.getValid(), predicateType(valueType));
-    if (failed(valid))
+    FailureOr<FragmentType> valueType =
+        refinePhysicalSchema(kernel, currentType, store.getCoordinates());
+    if (failed(valueType))
       return store.emitOpError(
+          "store value has no unique physical coordinate projection");
+    for (auto [axis, mapping] : llvm::enumerate((*valueType).getAxisMaps())) {
+      if (axis >= currentType.getShape().size() ||
+          currentType.getShape()[axis] == (*valueType).getShape()[axis])
+        continue;
+      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
+      if (dimension <= 0)
+        return store.emitOpError(
+            "store coordinate refinement has no logical dimension authority");
+      retargetDimensionExtent(
+          store.getValue(), dimension,
+          cast<PhysicalExprAttr>((*valueType).getShape()[axis]));
+    }
+    FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
+                                     *valueType);
+    if (failed(value))
+      return store.emitOpError(
+          "cannot align store value with its coordinate schema");
+    FailureOr<Value> valid = project(
+        builder, store.getLoc(), store.getValid(), predicateType(*valueType));
+    if (failed(valid)) {
+      InFlightDiagnostic diagnostic = store.emitOpError(
           "cannot align store validity with its value schema");
-    if (*valid == store.getValid())
+      diagnostic << "; value=" << *valueType
+                 << "; validity=" << store.getValid().getType();
+      if (Operation *producer = store.getValue().getDefiningOp())
+        diagnostic << "; value_producer=" << producer->getName();
+      return failure();
+    }
+    if (*value == store.getValue() && *valid == store.getValid())
       continue;
     auto replacement = builder.create<StoreOp>(
         store.getLoc(), store.getResource(), store.getCoordinates(),
-        store.getValue(), *valid, store.getSourceAxes());
+        *value, *valid, store.getSourceAxes());
     if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     store.erase();
@@ -1638,6 +1726,27 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
 }
 
 LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
+  PhysicalProgramAnalysis analysis(kernel);
+  std::function<unsigned(Value)> countExactPhysicalAxes =
+      [&](Value value) -> unsigned {
+    if (auto fragment = dyn_cast<FragmentType>(value.getType())) {
+      unsigned count = 0;
+      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+        PhysicalAxisRealizationFact fact = analysis.axisRealization(value, axis);
+        count += fact.isExact() && fact.physicalized &&
+                 !fact.constructionScalarSeed;
+      }
+      return count;
+    }
+    if (auto record = value.getDefiningOp<MakeRecordOp>()) {
+      unsigned count = 0;
+      for (Value field : record.getFields())
+        count += countExactPhysicalAxes(field);
+      return count;
+    }
+    return 0;
+  };
+
   kernel.walk([&](MakeRecordOp record) {
     RecordType current = record.getResult().getType();
     SmallVector<Attribute> fields;
@@ -1648,6 +1757,119 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
         kernel.getContext(), current.getFieldNames(),
         ArrayAttr::get(kernel.getContext(), fields), current.getOwner()));
   });
+  WalkResult result = kernel.walk([&](RegionFoldOp fold) {
+    if (!llvm::hasSingleElement(fold.getSummarize()) ||
+        !llvm::hasSingleElement(fold.getCombine()))
+      return WalkResult::interrupt();
+    auto summarizeYield =
+        dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+    if (!summarizeYield ||
+        summarizeYield.getValues().size() != fold.getIdentityCount())
+      return WalkResult::interrupt();
+    Block &combine = fold.getCombine().front();
+    if (combine.getNumArguments() != 2 * fold.getIdentityCount())
+      return WalkResult::interrupt();
+    OpBuilder builder(fold);
+    for (unsigned index = 0; index < fold.getIdentityCount(); ++index) {
+      Type target = summarizeYield.getValues()[index].getType();
+      SmallVector<std::pair<int64_t, PhysicalExprAttr>> dimensions;
+      std::function<LogicalResult(Type)> collectDimensions =
+          [&](Type type) -> LogicalResult {
+        if (auto fragment = dyn_cast<FragmentType>(type)) {
+          for (auto [axis, mapping] :
+               llvm::enumerate(fragment.getAxisMaps())) {
+            int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
+            if (dimension <= 0)
+              continue;
+            auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+            auto found = llvm::find_if(dimensions, [&](const auto &entry) {
+              return entry.first == dimension;
+            });
+            if (found != dimensions.end()) {
+              if (found->second != extent)
+                return failure();
+              continue;
+            }
+            dimensions.emplace_back(dimension, extent);
+          }
+          return success();
+        }
+        if (auto record = dyn_cast<RecordType>(type))
+          for (Attribute field : record.getFieldTypes())
+            if (failed(collectDimensions(cast<TypeAttr>(field).getValue())))
+              return failure();
+        return success();
+      };
+      if (failed(collectDimensions(target))) {
+        fold.emitOpError(
+            "region-fold summary has conflicting physical dimension extents");
+        return WalkResult::interrupt();
+      }
+      for (auto [dimension, extent] : dimensions)
+        retargetDimensionExtent(fold.getResult(index), dimension, extent);
+      unsigned identity = fold.getSourceCount() + index;
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, fold.getLoc(), fold.getInputs()[identity], target);
+      if (failed(projected)) {
+        fold.emitOpError(
+            "region-fold identity cannot adopt its summary relation");
+        return WalkResult::interrupt();
+      }
+      fold->setOperand(identity, *projected);
+      fold.getResult(index).setType(target);
+      combine.getArgument(index).setType(target);
+      combine.getArgument(fold.getIdentityCount() + index).setType(target);
+    }
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+  WalkResult loops = kernel.walk([&](scf::ForOp loop) {
+    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (!yield || yield.getResults().size() != loop.getInitArgs().size())
+      return WalkResult::interrupt();
+    for (unsigned index = 0; index < loop.getInitArgs().size(); ++index) {
+      Value init = loop.getInitArgs()[index];
+      Value yielded = yield.getResults()[index];
+      Type target = init.getType();
+      if (target != yielded.getType()) {
+        unsigned initAuthority = countExactPhysicalAxes(init);
+        unsigned yieldAuthority = countExactPhysicalAxes(yielded);
+        if (initAuthority == yieldAuthority) {
+          loop.emitOpError(
+              "loop-carried value has two equally authoritative physical relations")
+              << "; init=" << target << "; yield=" << yielded.getType()
+              << "; exact_physical_axes=" << initAuthority;
+          return WalkResult::interrupt();
+        }
+        if (initAuthority < yieldAuthority)
+          target = yielded.getType();
+      }
+      OpBuilder initBuilder(loop);
+      FailureOr<Value> projectedInit = projectPhysicalValueToSchema(
+          initBuilder, loop.getLoc(), init, target);
+      OpBuilder yieldBuilder(yield);
+      FailureOr<Value> projectedYield = projectPhysicalValueToSchema(
+          yieldBuilder, loop.getLoc(), yielded, target);
+      if (failed(projectedInit) || failed(projectedYield)) {
+        loop.emitOpError(
+            "loop-carried value cannot adopt its unique physical relation")
+            << "; init=" << init.getType() << "; yield=" << yielded.getType()
+            << "; target=" << target;
+        return WalkResult::interrupt();
+      }
+      loop.getInitArgsMutable()[index].assign(*projectedInit);
+      yield->setOperand(index, *projectedYield);
+      loop.getRegionIterArgs()[index].setType(target);
+      loop.getResult(index).setType(target);
+    }
+    return WalkResult::advance();
+  });
+  if (loops.wasInterrupted())
+    return failure();
+  // Structured arguments/results are the record-schema authority.  Refresh
+  // projections only after those schemas have been aligned; doing this before
+  // the region owner leaves combine-body fields one refinement behind.
   kernel.walk([&](ExtractOp extract) {
     RecordType record = extract.getRecord().getType();
     if (extract.getField() < record.getFieldTypes().size())
@@ -1666,14 +1888,8 @@ FailureOr<Value> resolveLogicalRangeEnd(func::FuncOp kernel,
 static void retargetExtent(Value root, AxisSelector selects,
                            PhysicalExprAttr extent,
                            bool followLogicalDimension) {
-  auto rootFragment = dyn_cast<FragmentType>(root.getType());
-  if (!rootFragment)
-    return;
   SmallVector<Attribute> previousExtents;
-  for (auto [axis, attribute] : llvm::enumerate(rootFragment.getAxisMaps()))
-    if (selects(cast<AxisMapAttr>(attribute)) &&
-        !llvm::is_contained(previousExtents, rootFragment.getShape()[axis]))
-      previousExtents.push_back(rootFragment.getShape()[axis]);
+  collectSelectedExtents(root.getType(), selects, previousExtents);
   if (previousExtents.empty())
     return;
   SmallVector<Attribute> connectedExtents(previousExtents.begin(),

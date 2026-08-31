@@ -617,9 +617,12 @@ LogicalResult MakeRecordOp::verify() {
   auto result = getResult().getType();
   if (result.getFieldTypes().size() != getFields().size())
     return emitOpError("record fields do not match its physical type");
-  for (auto [field, type] : llvm::zip(getFields(), result.getFieldTypes()))
+  for (auto [index, field, type] :
+       llvm::enumerate(getFields(), result.getFieldTypes()))
     if (field.getType() != cast<TypeAttr>(type).getValue())
-      return emitOpError("record field has the wrong physical type");
+      return emitOpError("record field has the wrong physical type")
+             << "; field=" << index << "; actual=" << field.getType()
+             << "; expected=" << cast<TypeAttr>(type).getValue();
   return success();
 }
 
@@ -749,8 +752,23 @@ LogicalResult verifyHelperRegion(Operation *owner, Region &region,
   if (!llvm::equal(block.getArgumentTypes(), argumentTypes) || block.empty())
     return owner->emitOpError("physical helper arguments disagree with its schema");
   auto yield = dyn_cast<YieldOp>(block.back());
-  if (!yield || !llvm::equal(yield.getOperandTypes(), resultTypes))
-    return owner->emitOpError("physical helper yield disagrees with its schema");
+  if (!yield || !llvm::equal(yield.getOperandTypes(), resultTypes)) {
+    InFlightDiagnostic diagnostic =
+        owner->emitOpError("physical helper yield disagrees with its schema");
+    diagnostic << "; expected=[";
+    for (Type type : resultTypes)
+      diagnostic << type << ", ";
+    diagnostic << "]";
+    if (yield) {
+      diagnostic << "; actual=[";
+      for (Type type : yield.getOperandTypes())
+        diagnostic << type << ", ";
+      diagnostic << "]";
+    } else {
+      diagnostic << "; actual=<no yield>";
+    }
+    return failure();
+  }
   WalkResult effects = region.walk([&](Operation *nested) {
     if (isa<YieldOp>(nested))
       return WalkResult::advance();
@@ -912,11 +930,32 @@ LogicalResult RegionFoldOp::verify() {
   }
   for (Value capture : getInputs().drop_front(sourceCount + identityCount))
     summarizeArguments.push_back(capture.getType());
+  auto summarizeYield = dyn_cast<YieldOp>(getSummarize().front().back());
+  if (!summarizeYield ||
+      !llvm::equal(summarizeYield.getOperandTypes(), summaries))
+    return emitOpError(
+        "region-fold summarizer yield disagrees with its summary schema");
   if (failed(verifyHelperRegion(getOperation(), getSummarize(), summarizeArguments,
                                 summaries)))
     return failure();
   SmallVector<Type> combineArguments(summaries);
   combineArguments.append(summaries);
+  auto combineYield = dyn_cast<YieldOp>(getCombine().front().back());
+  if (!combineYield || !llvm::equal(combineYield.getOperandTypes(), summaries)) {
+    InFlightDiagnostic diagnostic = emitOpError(
+        "region-fold combine yield disagrees with its summary schema");
+    diagnostic << "; expected=[";
+    for (Type type : summaries)
+      diagnostic << type << ", ";
+    diagnostic << "]";
+    if (combineYield) {
+      diagnostic << "; actual=[";
+      for (Type type : combineYield.getOperandTypes())
+        diagnostic << type << ", ";
+      diagnostic << "]";
+    }
+    return failure();
+  }
   return verifyHelperRegion(getOperation(), getCombine(), combineArguments,
                             summaries);
 }

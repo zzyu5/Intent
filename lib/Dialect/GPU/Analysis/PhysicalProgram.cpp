@@ -757,9 +757,29 @@ SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
   Block *block = argument.getOwner();
   Operation *owner = block ? block->getParentOp() : nullptr;
   if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner)) {
-    if (block == &fold.getSummarize().front() &&
-        argument.getArgNumber() < fold.getSourceCount())
-      sources.push_back(fold.getInputs()[argument.getArgNumber()]);
+    unsigned index = argument.getArgNumber();
+    if (block == &fold.getSummarize().front()) {
+      if (index < fold.getSourceCount())
+        sources.push_back(fold.getInputs()[index]);
+      else {
+        unsigned capture = index - fold.getSourceCount();
+        unsigned input = fold.getSourceCount() + fold.getIdentityCount() +
+                         capture;
+        if (input < fold.getInputs().size())
+          sources.push_back(fold.getInputs()[input]);
+      }
+      return sources;
+    }
+    if (block == &fold.getCombine().front() && fold.getIdentityCount() > 0) {
+      unsigned component = index % fold.getIdentityCount();
+      unsigned identity = fold.getSourceCount() + component;
+      if (identity < fold.getInputs().size())
+        sources.push_back(fold.getInputs()[identity]);
+      if (auto yield =
+              dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+          yield && component < yield.getValues().size())
+        sources.push_back(yield.getValues()[component]);
+    }
     return sources;
   }
   if (auto scan = dyn_cast_or_null<RegionScanOp>(owner)) {
@@ -1062,6 +1082,24 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       }
       collectAxisRanges(record.getFields()[extract.getField()], fragmentAxis,
                         result, visited);
+      return;
+    }
+    if (auto argument = dyn_cast<BlockArgument>(extract.getRecord())) {
+      bool followed = false;
+      for (Value related : structuredSourcesForArgument(argument)) {
+        auto record = related.getDefiningOp<MakeRecordOp>();
+        if (!record || extract.getField() >= record.getFields().size())
+          continue;
+        auto field = dyn_cast<FragmentType>(
+            record.getFields()[extract.getField()].getType());
+        if (!field || fragmentAxis >= field.getShape().size())
+          continue;
+        followed = true;
+        collectAxisRanges(record.getFields()[extract.getField()], fragmentAxis,
+                          result, visited);
+      }
+      if (!followed)
+        result.state = PhysicalFactState::Unknown;
       return;
     }
   }

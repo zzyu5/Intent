@@ -38,6 +38,10 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignAccessResultRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();

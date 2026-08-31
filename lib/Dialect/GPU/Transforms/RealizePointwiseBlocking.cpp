@@ -622,8 +622,16 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     FailureOr<Value> valid = accessValidity(
         builder, load.getLoc(), load.getCoordinates(), rangePredicates, valueType,
         load.getValid());
-    if (failed(valid))
-      return load.emitOpError("could not form pointwise tail validity");
+    if (failed(valid)) {
+      InFlightDiagnostic diagnostic =
+          load.emitOpError("could not form pointwise tail validity");
+      diagnostic << "; value=" << valueType;
+      if (load.getValid())
+        diagnostic << "; existing=" << load.getValid().getType();
+      else
+        diagnostic << "; existing=<none>";
+      return failure();
+    }
     Value fill;
     if (load.getFill()) {
       FailureOr<Value> broadcast =
@@ -1526,7 +1534,46 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
         source.getAxisMaps() != target.getAxisMaps())
       return owner->emitOpError(
           "pointwise ownership cannot preserve the contract accumulator relation");
-    accumulator.setType(target);
+    auto isUnit = [](Attribute attribute) {
+      auto expression = cast<PhysicalExprAttr>(attribute);
+      return expression.getKind() ==
+                 static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+             expression.getValue() == 1;
+    };
+    SmallVector<Attribute> shape(target.getShape().begin(),
+                                 target.getShape().end());
+    for (unsigned axis = 0; axis < shape.size(); ++axis) {
+      if (source.getShape()[axis] == target.getShape()[axis])
+        continue;
+      bool sourceUnit = isUnit(source.getShape()[axis]);
+      bool targetUnit = isUnit(target.getShape()[axis]);
+      if (sourceUnit == targetUnit)
+        return owner->emitOpError(
+            "pointwise ownership found two non-equivalent contract extents");
+      if (targetUnit)
+        shape[axis] = source.getShape()[axis];
+    }
+    auto aligned = FragmentType::get(
+        target.getContext(), target.getElementType(),
+        ArrayAttr::get(target.getContext(), shape), target.getAxisMaps(),
+        target.getValidity(), target.getOwner());
+    for (auto [axis, mapping] : llvm::enumerate(aligned.getAxisMaps())) {
+      if (source.getShape()[axis] == aligned.getShape()[axis] &&
+          target.getShape()[axis] == aligned.getShape()[axis])
+        continue;
+      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
+      if (dimension <= 0)
+        return owner->emitOpError(
+            "contract accumulator alignment has no dimension authority");
+      retargetDimensionExtent(
+          result, dimension,
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
+      retargetDimensionExtent(
+          accumulator, dimension,
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]));
+    }
+    accumulator.setType(aligned);
+    result.setType(aligned);
     return success();
   };
   WalkResult result = kernel.walk([&](Operation *operation) {
@@ -1703,7 +1750,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(alignAggregateValueRelations(kernel)) ||
         failed(alignPointwiseValueRelations(kernel)) ||
         failed(alignReductionYieldRelations(kernel)) ||
-        failed(alignAccessValueRelations(kernel)))
+        failed(alignAccessValueRelations(kernel)) ||
+        failed(alignAggregateValueRelations(kernel)) ||
+        failed(alignContractAccumulatorTypes(kernel)) ||
+        failed(alignAggregateValueRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();
@@ -2175,7 +2225,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     // Keeping the predicate only in a side map across later rewrites leaves it
     // without an IR use and lets dead-value cleanup invalidate the fact.
     if (!fixedRangePredicates.empty()) {
-      if (failed(addTailValidity(kernel, fixedRangePredicates,
+      if (failed(alignAccessResultRelations(kernel)) ||
+          failed(addTailValidity(kernel, fixedRangePredicates,
                                  /*includeStores=*/true)))
         return failure();
       fixedRangePredicates.clear();
@@ -2253,8 +2304,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   }
   if (dynamicRanges.empty()) {
     if (!ownershipOnly &&
-        failed(addTailValidity(kernel, fixedRangePredicates,
-                               /*includeStores=*/true)))
+        (failed(alignAccessResultRelations(kernel)) ||
+         failed(addTailValidity(kernel, fixedRangePredicates,
+                                /*includeStores=*/true))))
       return failure();
     if (!ownershipOnly && failed(realizeDistributedHistograms(kernel)))
       return failure();
@@ -3039,7 +3091,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     range.erase();
   }
 
-  if (failed(addTailValidity(kernel, rangePredicates,
+  if (failed(alignAccessResultRelations(kernel)) ||
+      failed(addTailValidity(kernel, rangePredicates,
                              /*includeStores=*/true)))
     return failure();
   if (failed(realizeDistributedHistograms(kernel)))
