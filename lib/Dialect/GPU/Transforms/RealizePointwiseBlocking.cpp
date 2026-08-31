@@ -1212,6 +1212,32 @@ traversalDimensionsForStores(ArrayRef<StoreOp> stores, MakeRangeOp range) {
   return dimensions;
 }
 
+FailureOr<int64_t> reuseTraversalDimension(func::FuncOp kernel,
+                                           ArrayRef<StoreOp> stores,
+                                           MakeRangeOp range) {
+  FailureOr<SmallVector<int64_t>> dimensions =
+      traversalDimensionsForStores(stores, range);
+  if (failed(dimensions))
+    return failure();
+  PhysicalSourceAxis source = sourceAxisIdentity(range);
+  SmallVector<int64_t> selected;
+  for (int64_t dimension : *dimensions) {
+    bool depends = false;
+    for (StoreOp store : stores) {
+      PhysicalReductionDependencyFact fact =
+          PhysicalProgramAnalysis(kernel).reductionDependency(
+              store.getValue(), source, dimension);
+      if (!fact.isExact())
+        return failure();
+      depends |= fact.depends;
+    }
+    if (depends)
+      selected.push_back(dimension);
+  }
+  return selected.size() == 1 ? FailureOr<int64_t>(selected.front())
+                              : FailureOr<int64_t>(failure());
+}
+
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              MakeRangeOp range) {
   SmallVector<StoreOp> stores;
@@ -1227,6 +1253,19 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   if (failed(traversalDimensions))
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no typed coordinate/data relation");
+  bool accessDependentSubregion =
+      hasAccessDependentSubregionBounds(kernel, range);
+  SmallVector<int64_t> payloadTraversalDimensions(*traversalDimensions);
+  std::optional<int64_t> payloadTraversalDimension;
+  if (accessDependentSubregion) {
+    FailureOr<int64_t> dimension =
+        reuseTraversalDimension(kernel, stores, range);
+    if (failed(dimension))
+      return range.emitOpError(
+          "reuse-sensitive pointwise traversal has no unique reduced output dimension");
+    payloadTraversalDimension = *dimension;
+    payloadTraversalDimensions.assign(1, *dimension);
+  }
 
   PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
@@ -1274,10 +1313,19 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   PhysicalExprAttr chunkExtent = expression(
       kernel.getContext(), PhysicalExprKind::Parameter, 0,
       chunk.getParameter().getName().getValue());
+  SmallVector<Attribute> blockedMappings(originalType.getAxisMaps().begin(),
+                                         originalType.getAxisMaps().end());
+  if (accessDependentSubregion) {
+    auto mapping = cast<AxisMapAttr>(blockedMappings[0]);
+    blockedMappings[0] = AxisMapAttr::get(
+        kernel.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        *payloadTraversalDimension, 0, mapping.getDerived());
+  }
   auto blockedType = FragmentType::get(
       kernel.getContext(), originalType.getElementType(),
       ArrayAttr::get(kernel.getContext(), {chunkExtent}),
-      originalType.getAxisMaps(), originalType.getValidity(),
+      ArrayAttr::get(kernel.getContext(), blockedMappings),
+      originalType.getValidity(),
       originalType.getOwner());
   // The original range remains the authority for the full reduction
   // traversal.  The internal writeback loop below owns a distinct blocked
@@ -1289,14 +1337,14 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   SmallVector<SmallVector<StoreOp>> storeGroups;
   PhysicalProgramAnalysis replayAnalysis(kernel);
   auto canReplayAt = [&](StoreOp store, Operation *anchor) {
-    auto replayable = [&](Value value) {
+    auto replayable = [&](Value value, ArrayRef<int64_t> dimensions) {
       if (!value)
         return true;
       SmallVector<int64_t> valueDimensions;
       collectTraversalDimensions(value.getType(), logicalSource,
                                  valueDimensions);
       for (int64_t dimension : valueDimensions)
-        if (llvm::is_contained(*traversalDimensions, dimension) &&
+        if (llvm::is_contained(dimensions, dimension) &&
             !replayAnalysis
                  .replayability(value, logicalSource,
                                 PhysicalReplayScope::ValueGraph,
@@ -1305,9 +1353,12 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           return false;
       return true;
     };
-    if (!replayable(store.getValue()) || !replayable(store.getValid()))
+    if (!replayable(store.getValue(), payloadTraversalDimensions) ||
+        !replayable(store.getValid(), payloadTraversalDimensions))
       return false;
-    return llvm::all_of(store.getCoordinates(), replayable);
+    return llvm::all_of(store.getCoordinates(), [&](Value coordinate) {
+      return replayable(coordinate, *traversalDimensions);
+    });
   };
   for (auto &entry : storesByBlock) {
     SmallVector<StoreOp> &blockStores = entry.second;
@@ -1356,7 +1407,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
         mapping.map(range.getResult(), blocked);
         for (StoreOp store : group) {
           FailureOr<Value> payload = replayPointwiseValue(
-              nested, store.getValue(), logicalSource, *traversalDimensions,
+              nested, store.getValue(), logicalSource,
+              payloadTraversalDimensions,
               chunkExtent,
               blocked, tail, loopInsertionAnchor, mapping);
           if (failed(payload)) {
@@ -1408,7 +1460,8 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
           }
           if (store.getValid()) {
             FailureOr<Value> existing = replayPointwiseValue(
-                nested, store.getValid(), logicalSource, *traversalDimensions,
+                nested, store.getValid(), logicalSource,
+                payloadTraversalDimensions,
                 chunkExtent,
                 blocked, tail, loopInsertionAnchor, mapping);
             if (failed(existing)) {
@@ -2177,23 +2230,28 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
-      PhysicalSourceAxis logicalSource{range.getSourceId(), range.getSourceAxis(),
-                                       range.getDerived()};
       if (structuredTraversalRanges.contains(range.getOperation()) &&
           !reductionTraversalRanges.contains(range.getOperation()))
         continue;
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
       if (!sourceAxis)
         continue;
-      std::optional<int64_t> sourceDimension;
-      if (FailureOr<uint64_t> dimension = rangeDimension(range);
-          succeeded(dimension))
-        sourceDimension = *dimension;
-      PhysicalReductionDependencyFact dependency =
-          PhysicalProgramAnalysis(kernel).reductionDependency(
-              store.getValue(), logicalSource, sourceDimension);
-      if (!dependency.isExact() || !dependency.depends)
-        continue;
+      if (hasAccessDependentSubregionBounds(kernel, range)) {
+        if (failed(reuseTraversalDimension(kernel, ArrayRef<StoreOp>{store},
+                                           range)))
+          continue;
+      } else {
+        std::optional<int64_t> sourceDimension;
+        if (FailureOr<uint64_t> dimension = rangeDimension(range);
+            succeeded(dimension))
+          sourceDimension = *dimension;
+        PhysicalReductionDependencyFact dependency =
+            PhysicalProgramAnalysis(kernel).reductionDependency(
+                store.getValue(), sourceAxisIdentity(range), sourceDimension);
+        if (!dependency.isExact() || !dependency.depends ||
+            dependency.throughStructuredReduction)
+          continue;
+      }
       candidates.emplace_back(range, *sourceAxis);
       innermostSourceAxis = std::max(innermostSourceAxis, *sourceAxis);
     }

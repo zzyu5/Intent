@@ -1954,6 +1954,15 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         }
       return exact;
     }
+    if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+      auto result = dyn_cast<OpResult>(current);
+      if (sourceDimension && result && result.getOwner() == fold &&
+          typeCarriesTraversal(current.getType(), source, *sourceDimension)) {
+        exact.depends = true;
+        exact.throughStructuredReduction = true;
+      }
+      return exact;
+    }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       auto traversal =
           loop->getAttrOfType<PhysicalSourceAttr>(reductionTraversalSourceAttr);

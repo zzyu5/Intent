@@ -188,6 +188,7 @@ struct PhysicalReplayFact {
 struct PhysicalReductionDependencyFact {
   PhysicalFactState state = PhysicalFactState::Unknown;
   bool depends = false;
+  bool throughStructuredReduction = false;
   llvm::SmallVector<mlir::Operation *, 2> blockers;
 
   bool isExact() const { return state == PhysicalFactState::Exact; }

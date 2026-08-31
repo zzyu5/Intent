@@ -1170,7 +1170,9 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
     if (failed(parameter))
       return reduce.emitOpError(
                  "reduction free axis has neither prior ownership nor exact full-coverage authority")
-             << "; dimension=" << dimension;
+             << "; dimension=" << dimension << "; source=" << source.getType()
+             << "; source_id=" << sourceAxis.sourceId
+             << "; source_axis=" << sourceAxis.sourceAxis;
     PhysicalProgramAnalysis analysis(kernel);
     PhysicalRangeFact ranges = analysis.sourceRanges(source, sourceAxis);
     if (ranges.roots.empty()) {
