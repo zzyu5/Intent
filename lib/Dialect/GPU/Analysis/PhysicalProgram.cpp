@@ -1411,6 +1411,28 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   result.source = sourceAxisIdentity(mapping);
   result.dimensionId = mapping.getDimensionId();
 
+  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+    auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    if (source) {
+      BroadcastProjection projection = queryAxisProjection(source, fragment);
+      if (projection.isExact() &&
+          fragmentAxis < projection.targetToSource.size())
+        if (std::optional<unsigned> sourceAxis =
+                projection.targetToSource[fragmentAxis];
+            sourceAxis && source.getShape()[*sourceAxis] == extent) {
+          PhysicalAxisRealizationFact input =
+              axisRealization(broadcast.getValue(), *sourceAxis);
+          if (input.hasExtentAuthority()) {
+            result.state = PhysicalFactState::Exact;
+            result.physicalized = input.physicalized;
+            result.extentAuthority =
+                PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+            return result;
+          }
+        }
+    }
+  }
+
   PhysicalRangeFact ranges = axisRanges(value, fragmentAxis);
   result.roots.append(ranges.roots.begin(), ranges.roots.end());
   result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
@@ -1426,6 +1448,17 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
       llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
          return valueMatchesExtent(range.getExtent(), extent);
        });
+  if (value.getDefiningOp<ReshapeOp>()) {
+    // A verified reshape carries its own row-major physical reassociation.  Its
+    // result extent remains exact even when no single pre-reshape range can be
+    // projected to one split/merged result axis.  Keep that extent fact
+    // separate from range provenance rather than turning a legal reshape into
+    // analysis unknown.
+    result.state = PhysicalFactState::Exact;
+    result.extentAuthority =
+        PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+    return result;
+  }
   if (ranges.state == PhysicalFactState::Unknown || !ranges.blockers.empty())
     return result;
   if (!ranges.roots.empty() && failed(queryExactLogicalRange(ranges))) {
@@ -1434,6 +1467,9 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   }
 
   result.state = PhysicalFactState::Exact;
+  if (result.physicalized)
+    result.extentAuthority =
+        PhysicalAxisRealizationFact::ExtentAuthority::Range;
   return result;
 }
 

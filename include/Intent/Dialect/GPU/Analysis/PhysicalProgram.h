@@ -110,6 +110,17 @@ struct PhysicalRangeFact {
 /// already been blocked.  Consumers use this fact instead of comparing shape
 /// attributes or range operands independently.
 struct PhysicalAxisRealizationFact {
+  enum class ExtentAuthority {
+    None,
+    /// The current axis is materialized by one exact physical range whose SSA
+    /// extent agrees with the fragment extent.
+    Range,
+    /// A verified value relation explicitly selects or preserves this physical
+    /// extent.  This includes reshape reassociation and an extent-preserving
+    /// projection of an already authoritative input.
+    Structural,
+  };
+
   PhysicalFactState state = PhysicalFactState::Unknown;
   PhysicalSourceAxis source;
   int64_t dimensionId = 0;
@@ -118,8 +129,12 @@ struct PhysicalAxisRealizationFact {
   llvm::SmallVector<mlir::Operation *, 2> blockers;
   bool constructionScalarSeed = false;
   bool physicalized = false;
+  ExtentAuthority extentAuthority = ExtentAuthority::None;
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
+  bool hasExtentAuthority() const {
+    return isExact() && extentAuthority != ExtentAuthority::None;
+  }
 };
 
 /// Exact fragment axes whose current coordinate provenance reaches one of a

@@ -1260,9 +1260,19 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
          ++sourceAxis) {
       PhysicalAxisRealizationFact realization =
           analysis.axisRealization(contributor, sourceAxis);
-      sourceAuthority[sourceAxis] = realization.isExact() &&
-                                    realization.physicalized &&
-                                    !realization.constructionScalarSeed;
+      auto sourceExtent =
+          cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
+      bool singleton =
+          sourceExtent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          sourceExtent.getValue() == 1;
+      // A singleton axis is an exact value relation but not an extent decision
+      // for a pointwise consumer: broadcast may legally expand it.  Treating a
+      // reshape-introduced unit axis as the winner made ordinary predicates
+      // compete with the consumer's blocked axis.
+      sourceAuthority[sourceAxis] = realization.hasExtentAuthority() &&
+                                    !realization.constructionScalarSeed &&
+                                    !singleton;
       hasAuthority |= sourceAuthority[sourceAxis];
     }
     if (!hasAuthority)
@@ -1480,7 +1490,14 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
             "broadcast result has no unique physical source projection");
         return WalkResult::interrupt();
       }
-      broadcast.getResult().setType(*refined);
+      // Broadcast has two independent typed relations: its input supplies the
+      // physical extents, while the result type supplies the logical occurrence
+      // seen by consumers.  Adopting the input's AxisMap would erase an explicit
+      // output/index relation (for example a reshaped value stored into a view)
+      // and force a later access pass to reconstruct it.
+      broadcast.getResult().setType(FragmentType::get(
+          kernel.getContext(), target.getElementType(), (*refined).getShape(),
+          target.getAxisMaps(), target.getValidity(), target.getOwner()));
       return WalkResult::advance();
     }
     FragmentType target;
@@ -1652,6 +1669,25 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
     auto currentType = dyn_cast<FragmentType>(store.getValue().getType());
     if (!currentType)
       continue;
+    // A value whose extent is already selected by an exact range or verified
+    // reshape is the physical data authority for the write.  Retarget the
+    // address relation to that extent before reconciling schemas.  This keeps
+    // extents and coordinate provenance separate: the value does not acquire
+    // the view's source identity, and the address does not overwrite a verified
+    // row-major reshape decision.
+    PhysicalProgramAnalysis analysis(kernel);
+    for (unsigned axis = 0; axis < currentType.getShape().size(); ++axis) {
+      PhysicalAxisRealizationFact realization =
+          analysis.axisRealization(store.getValue(), axis);
+      if (!realization.hasExtentAuthority())
+        continue;
+      auto mapping = cast<AxisMapAttr>(currentType.getAxisMaps()[axis]);
+      auto extent = cast<PhysicalExprAttr>(currentType.getShape()[axis]);
+      retargetDimensionExtent(store.getValue(), mapping.getDimensionId(), extent);
+      for (Value coordinate : store.getCoordinates())
+        retargetDimensionExtent(coordinate, mapping.getDimensionId(), extent);
+    }
+    currentType = cast<FragmentType>(store.getValue().getType());
     OpBuilder builder(store);
     FailureOr<FragmentType> valueType =
         refinePhysicalSchema(kernel, currentType, store.getCoordinates());
