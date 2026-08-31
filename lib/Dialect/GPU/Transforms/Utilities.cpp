@@ -2589,7 +2589,9 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (succeeded(declaration)) {
       auto covered = (*declaration)->getAttrOfType<IntegerAttr>(
           coverageDimensionAttr);
-      if (covered && covered.getInt() == dimension)
+      if (covered && covered.getInt() == dimension &&
+          (*declaration).getParameter().getRole() ==
+              static_cast<uint32_t>(ParameterRole::FullCoverage))
         parameter = *declaration;
     }
   }
@@ -2597,7 +2599,9 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     kernel.walk([&](ParameterOp candidate) {
       auto covered = candidate->getAttrOfType<IntegerAttr>(
           coverageDimensionAttr);
-      if (!covered || covered.getInt() != dimension)
+      if (!covered || covered.getInt() != dimension ||
+          candidate.getParameter().getRole() !=
+              static_cast<uint32_t>(ParameterRole::FullCoverage))
         return;
       if (parameter && parameter != candidate) {
         parameter = ParameterOp();
@@ -2605,6 +2609,23 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       }
       parameter = candidate;
     });
+  }
+  if (parameter &&
+      currentExtent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+      currentExtent.getSymbol() == parameter.getParameter().getName() &&
+      parameter.getParameter().getRole() ==
+          static_cast<uint32_t>(ParameterRole::FullCoverage)) {
+    PhysicalParameterBinding binding = queryParameterBinding(parameter);
+    if (!binding.isExact() || !binding.dimension ||
+        *binding.dimension != dimension)
+      return parameter.emitOpError(
+          "full-coverage parameter lost its typed dimension authority");
+    if (failed(bindFullCoverageDimension(kernel, dimension,
+                                         parameter.getResult())))
+      return kernel.emitError(
+          "existing full-coverage decision could not preserve access validity");
+    return success();
   }
   static constexpr int64_t candidates[] = {
       1,    2,    4,     8,     16,    32,    64,    128,   256,
@@ -2673,6 +2694,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
           "full-coverage source has no exact physical range authority");
       for (Operation *blocker : ranges.blockers)
         diagnostic << "; blocker=" << blocker->getName();
+      for (Operation *blocker : replay.blockers)
+        diagnostic << "; replay_blocker=" << blocker->getName();
       return failure();
     }
   }
