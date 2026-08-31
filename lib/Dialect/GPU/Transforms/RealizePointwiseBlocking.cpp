@@ -3032,7 +3032,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
              << ", fragment=" << range.getResult().getType();
     }
     Value tileCoordinate = tileCoordinates.lookup(*axisKey);
-    if (!tileCoordinate && internalAxes.contains(*axisKey))
+    // A coverage-bound parameter is the executable statement that this axis is
+    // traversed in full by one program.  It therefore has the canonical tile
+    // coordinate zero even if an earlier same-logical-range ownership probe
+    // classified another occurrence as a candidate program axis.  Read the
+    // current IR fact here instead of caching it while parameters are still
+    // being refined; ownership mapping removes coverage_dimension from axes it
+    // places on the program grid.
+    if (!tileCoordinate &&
+        (internalAxes.contains(*axisKey) ||
+         (*parameter)->hasAttr(coverageDimensionAttr)))
       tileCoordinate = builder.create<arith::ConstantIndexOp>(range.getLoc(), 0);
     if (!tileCoordinate)
       return range.emitOpError(
