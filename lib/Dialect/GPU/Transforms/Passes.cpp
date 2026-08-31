@@ -28,6 +28,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
     return failure();
   if (failed(realizePointwiseOwnership(module)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Establish every ownership/internal physical range while the structured
