@@ -201,34 +201,35 @@ LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
 
 } // namespace
 
-FailureOr<ArrayAttr>
-inferReshapeReassociation(FragmentType source, FragmentType result,
-                          unsigned sourcePrefix, unsigned resultPrefix) {
-  if (!source || !result || sourcePrefix > source.getShape().size() ||
-      resultPrefix > result.getShape().size())
-    return failure();
-  ArrayRef<Attribute> sourceShape =
-      source.getShape().getValue().drop_front(sourcePrefix);
-  ArrayRef<Attribute> resultShape =
-      result.getShape().getValue().drop_front(resultPrefix);
+static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
+    MLIRContext *context, ArrayRef<Attribute> sourceShape,
+    ArrayRef<Attribute> resultShape, ArrayRef<Attribute> sourceMappings,
+    ArrayRef<Attribute> resultMappings) {
   unsigned sourceRank = sourceShape.size();
   unsigned resultRank = resultShape.size();
   unsigned sourceBegin = 0;
   unsigned resultBegin = 0;
   SmallVector<Attribute> groups;
-  MLIRContext *context = source.getContext();
   auto relationScore = [&](unsigned sourceBegin, unsigned sourceEnd,
                            unsigned resultBegin, unsigned resultEnd) {
+    if (sourceMappings.size() != sourceShape.size() ||
+        resultMappings.size() != resultShape.size())
+      return 0u;
     unsigned score = 0;
     for (unsigned resultAxis = resultBegin; resultAxis < resultEnd;
          ++resultAxis) {
-      auto resultMap = cast<AxisMapAttr>(
-          result.getAxisMaps()[resultPrefix + resultAxis]);
+      if (sameElementCount(ArrayRef<Attribute>(),
+                           resultShape.slice(resultAxis, 1)))
+        continue;
+      auto resultMap = dyn_cast<AxisMapAttr>(resultMappings[resultAxis]);
+      if (!resultMap)
+        continue;
       unsigned best = 0;
       for (unsigned sourceAxis = sourceBegin; sourceAxis < sourceEnd;
            ++sourceAxis) {
-        auto sourceMap = cast<AxisMapAttr>(
-            source.getAxisMaps()[sourcePrefix + sourceAxis]);
+        auto sourceMap = dyn_cast<AxisMapAttr>(sourceMappings[sourceAxis]);
+        if (!sourceMap)
+          continue;
         if (sourceMap.getSourceId() == resultMap.getSourceId() &&
             sourceMap.getSourceAxis() == resultMap.getSourceAxis() &&
             sourceMap.getDerived() == resultMap.getDerived()) {
@@ -244,6 +245,32 @@ inferReshapeReassociation(FragmentType source, FragmentType result,
     return score;
   };
   while (sourceBegin < sourceRank && resultBegin < resultRank) {
+    bool sourceUnit = sameElementCount(
+        sourceShape.slice(sourceBegin, 1), ArrayRef<Attribute>());
+    bool resultUnit = sameElementCount(
+        ArrayRef<Attribute>(), resultShape.slice(resultBegin, 1));
+    // Unit axes are real row-major structure, not an ambiguous factor of the
+    // neighboring dynamic extent.  Preserve insertion/removal explicitly so a
+    // later physical extent refinement cannot turn `[N] -> [1, N]` into
+    // `[N] -> [N, N]` merely because both result axes carry the same logical
+    // dimension identity.
+    if (resultUnit && !sourceUnit) {
+      groups.push_back(ReshapeGroupAttr::get(
+          context, DenseI64ArrayAttr::get(context, {}),
+          DenseI64ArrayAttr::get(context,
+                                 {static_cast<int64_t>(resultBegin)})));
+      ++resultBegin;
+      continue;
+    }
+    if (sourceUnit && !resultUnit) {
+      groups.push_back(ReshapeGroupAttr::get(
+          context,
+          DenseI64ArrayAttr::get(context,
+                                 {static_cast<int64_t>(sourceBegin)}),
+          DenseI64ArrayAttr::get(context, {})));
+      ++sourceBegin;
+      continue;
+    }
     std::optional<std::pair<unsigned, unsigned>> match;
     unsigned bestScore = 0;
     for (unsigned sourceEnd = sourceBegin + 1;
@@ -303,6 +330,27 @@ inferReshapeReassociation(FragmentType source, FragmentType result,
   if (sourceBegin != sourceRank || resultBegin != resultRank)
     return failure();
   return ArrayAttr::get(context, groups);
+}
+
+FailureOr<ArrayAttr>
+inferReshapeReassociation(MLIRContext *context,
+                          ArrayRef<Attribute> sourceShape,
+                          ArrayRef<Attribute> resultShape) {
+  return inferReshapeReassociationImpl(context, sourceShape, resultShape, {},
+                                       {});
+}
+
+FailureOr<ArrayAttr>
+inferReshapeReassociation(FragmentType source, FragmentType result,
+                          unsigned sourcePrefix, unsigned resultPrefix) {
+  if (!source || !result || sourcePrefix > source.getShape().size() ||
+      resultPrefix > result.getShape().size())
+    return failure();
+  return inferReshapeReassociationImpl(
+      source.getContext(), source.getShape().getValue().drop_front(sourcePrefix),
+      result.getShape().getValue().drop_front(resultPrefix),
+      source.getAxisMaps().getValue().drop_front(sourcePrefix),
+      result.getAxisMaps().getValue().drop_front(resultPrefix));
 }
 
 LogicalResult ParameterOp::verify() {
@@ -513,7 +561,8 @@ LogicalResult ReshapeOp::verify() {
       source.getOwner() != result.getOwner() || !getReassociation() ||
       !sameElementCount(source, result)) {
     return emitOpError("reshape physical schema is invalid: source=")
-           << getValue().getType() << ", result=" << getResult().getType();
+           << getValue().getType() << ", result=" << getResult().getType()
+           << ", reassociation=" << getReassociation();
   }
   unsigned nextSource = 0;
   unsigned nextResult = 0;

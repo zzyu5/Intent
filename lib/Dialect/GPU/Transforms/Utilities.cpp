@@ -25,6 +25,37 @@ namespace {
 
 void collectParameterSymbols(Attribute attribute, llvm::StringSet<> &symbols);
 
+PhysicalExprAttr multiplyExtent(PhysicalExprAttr lhs, PhysicalExprAttr rhs) {
+  auto leftKind = static_cast<PhysicalExprKind>(lhs.getKind());
+  auto rightKind = static_cast<PhysicalExprKind>(rhs.getKind());
+  if (leftKind == PhysicalExprKind::Constant && lhs.getValue() == 1)
+    return rhs;
+  if (rightKind == PhysicalExprKind::Constant && rhs.getValue() == 1)
+    return lhs;
+  if (leftKind == PhysicalExprKind::Constant &&
+      rightKind == PhysicalExprKind::Constant)
+    return PhysicalExprAttr::get(
+        lhs.getContext(), static_cast<uint32_t>(PhysicalExprKind::Constant),
+        lhs.getValue() * rhs.getValue(), StringAttr::get(lhs.getContext()),
+        ArrayAttr::get(lhs.getContext(), {}));
+  return PhysicalExprAttr::get(
+      lhs.getContext(), static_cast<uint32_t>(PhysicalExprKind::Multiply), 0,
+      StringAttr::get(lhs.getContext()),
+      ArrayAttr::get(lhs.getContext(), {lhs, rhs}));
+}
+
+PhysicalExprAttr productExtent(MLIRContext *context,
+                               ArrayRef<Attribute> shape,
+                               ArrayRef<int64_t> axes, unsigned prefix) {
+  PhysicalExprAttr product = PhysicalExprAttr::get(
+      context, static_cast<uint32_t>(PhysicalExprKind::Constant), 1,
+      StringAttr::get(context), ArrayAttr::get(context, {}));
+  for (int64_t axis : axes)
+    product = multiplyExtent(
+        product, cast<PhysicalExprAttr>(shape[prefix + axis]));
+  return product;
+}
+
 PhysicalExprAttr replaceParameterSymbol(PhysicalExprAttr expression,
                                         StringAttr previous,
                                         StringAttr replacement) {
@@ -280,10 +311,40 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
     }
     return expanded;
   }
-  auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-  return !input || !llvm::any_of(input.getAxisMaps(), [&](Attribute attribute) {
-           return selects(cast<AxisMapAttr>(attribute));
-         });
+  return false;
+}
+
+bool isIntroducedReshapeUnitAxis(Value value, unsigned fragmentAxis) {
+  auto reshape = value.getDefiningOp<ReshapeOp>();
+  auto result = dyn_cast<FragmentType>(value.getType());
+  if (!reshape || !result || fragmentAxis >= result.getShape().size())
+    return false;
+  auto extent = cast<PhysicalExprAttr>(result.getShape()[fragmentAxis]);
+  if (extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+      extent.getValue() != 1)
+    return false;
+  unsigned logicalResultRank = 0;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
+    if (!group || group.getResultAxes().empty())
+      continue;
+    logicalResultRank =
+        std::max(logicalResultRank,
+                 static_cast<unsigned>(
+                     group.getResultAxes().asArrayRef().back() + 1));
+  }
+  if (logicalResultRank > result.getShape().size())
+    return false;
+  unsigned resultPrefix = result.getShape().size() - logicalResultRank;
+  if (fragmentAxis < resultPrefix)
+    return false;
+  int64_t logicalAxis = fragmentAxis - resultPrefix;
+  return llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
+    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
+    return group && group.getSourceAxes().empty() &&
+           llvm::is_contained(group.getResultAxes().asArrayRef(), logicalAxis);
+  });
 }
 
 bool selectsSegmentAxis(Type type, uint64_t axis, AxisSelector selects) {
@@ -1736,6 +1797,12 @@ LogicalResult alignAccessValueRelations(func::FuncOp kernel) {
 
 LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
   WalkResult result = kernel.walk([&](ReshapeOp reshape) {
+    // Reassociation is the typed row-major relation selected from canonical
+    // KIR.  Refinement passes may change physical extents, but they may not
+    // rediscover and replace that relation from the new shapes: doing so turns
+    // physical shape coincidence into a second algorithm authority.  Validate
+    // the preserved carrier here; the mutating pass that changed an extent is
+    // responsible for updating both sides of each existing group.
     auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
     auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
     if (!source || !target) {
@@ -1752,15 +1819,15 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
       if (!group.getSourceAxes().empty())
-        logicalSourceRank =
-            std::max(logicalSourceRank,
-                     static_cast<unsigned>(
-                         group.getSourceAxes().asArrayRef().back() + 1));
+        logicalSourceRank = std::max(
+            logicalSourceRank,
+            static_cast<unsigned>(
+                group.getSourceAxes().asArrayRef().back() + 1));
       if (!group.getResultAxes().empty())
-        logicalResultRank =
-            std::max(logicalResultRank,
-                     static_cast<unsigned>(
-                         group.getResultAxes().asArrayRef().back() + 1));
+        logicalResultRank = std::max(
+            logicalResultRank,
+            static_cast<unsigned>(
+                group.getResultAxes().asArrayRef().back() + 1));
     }
     if (logicalSourceRank > source.getShape().size() ||
         logicalResultRank > target.getShape().size()) {
@@ -1770,16 +1837,40 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
     }
     unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
     unsigned resultPrefix = target.getShape().size() - logicalResultRank;
-    FailureOr<ArrayAttr> reassociation = inferReshapeReassociation(
-        source, target, sourcePrefix, resultPrefix);
-    if (failed(reassociation)) {
-      reshape.emitOpError(
-          "current physical extents have no exact row-major reshape relation")
-          << "; source=" << source << "; target=" << target;
-      return WalkResult::interrupt();
+    SmallVector<Attribute> resultShape(target.getShape().begin(),
+                                       target.getShape().end());
+    for (Attribute attribute : reshape.getReassociation()) {
+      auto group = cast<ReshapeGroupAttr>(attribute);
+      ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
+      ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
+      if (resultAxes.size() == 1) {
+        resultShape[resultPrefix + resultAxes.front()] = productExtent(
+            kernel.getContext(), source.getShape().getValue(), sourceAxes,
+            sourcePrefix);
+        continue;
+      }
+      if (sourceAxes.size() != 1 || resultAxes.empty())
+        continue;
+      SmallVector<int64_t> nonUnitAxes;
+      for (int64_t axis : resultAxes) {
+        auto extent = cast<PhysicalExprAttr>(
+            resultShape[resultPrefix + axis]);
+        if (extent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+            extent.getValue() != 1)
+          nonUnitAxes.push_back(axis);
+      }
+      if (nonUnitAxes.size() == 1)
+        resultShape[resultPrefix + nonUnitAxes.front()] =
+            cast<PhysicalExprAttr>(
+                source.getShape()[sourcePrefix + sourceAxes.front()]);
     }
-    reshape->setAttr("reassociation", *reassociation);
-    return WalkResult::advance();
+    reshape.getResult().setType(FragmentType::get(
+        kernel.getContext(), target.getElementType(),
+        ArrayAttr::get(kernel.getContext(), resultShape), target.getAxisMaps(),
+        target.getValidity(), target.getOwner()));
+    return failed(reshape.verify()) ? WalkResult::interrupt()
+                                    : WalkResult::advance();
   });
   return result.wasInterrupted() ? failure() : success();
 }
@@ -1982,8 +2073,13 @@ static void retargetExtent(Value root, AxisSelector selects,
         replaceableExtents.clear();
         collectSelectedExtents(value.getType(), selects, replaceableExtents);
       }
-      Type replacement =
-          replaceExtent(value.getType(), selects, replaceableExtents, extent);
+      auto replaceableAxis = [&](AxisMapAttr mapping) {
+        return selects(mapping) &&
+               !isIntroducedReshapeUnitAxis(value,
+                                            mapping.getFragmentAxis());
+      };
+      Type replacement = replaceExtent(value.getType(), replaceableAxis,
+                                       replaceableExtents, extent);
       if (replacement != value.getType()) {
         value.setType(replacement);
         // A make_range owns both the fragment schema and the SSA extent used

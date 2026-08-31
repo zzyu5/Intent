@@ -19,6 +19,10 @@ mlir::FailureOr<mlir::ArrayAttr>
 inferReshapeReassociation(FragmentType source, FragmentType result,
                           unsigned sourcePrefix = 0,
                           unsigned resultPrefix = 0);
+mlir::FailureOr<mlir::ArrayAttr>
+inferReshapeReassociation(mlir::MLIRContext *context,
+                          llvm::ArrayRef<mlir::Attribute> sourceShape,
+                          llvm::ArrayRef<mlir::Attribute> resultShape);
 
 } // namespace intent::gpu
 

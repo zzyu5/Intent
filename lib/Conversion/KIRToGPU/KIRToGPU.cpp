@@ -81,6 +81,9 @@ PhysicalExprAttr binaryExpression(MLIRContext *context, PhysicalExprKind kind,
   auto rightKind = static_cast<PhysicalExprKind>(rhs.getKind());
   bool leftConstant = leftKind == PhysicalExprKind::Constant;
   bool rightConstant = rightKind == PhysicalExprKind::Constant;
+  if (kind == PhysicalExprKind::Multiply && leftConstant && rightConstant)
+    return expression(context, PhysicalExprKind::Constant,
+                      lhs.getValue() * rhs.getValue());
   if ((kind == PhysicalExprKind::Add ||
        kind == PhysicalExprKind::Subtract) &&
       rightConstant && rhs.getValue() == 0)
@@ -2758,9 +2761,32 @@ private:
       if (!relation || relation.size() != resultRank)
         return reshape.emitOpError(
             "reshape result has no complete canonical shape relation");
+      func::FuncOp function = operation->getParentOfType<func::FuncOp>();
+      DenseI64ArrayAttr logicalSourceDimensions = dimensionIds(logicalSource);
+      if (!function || !logicalSourceDimensions ||
+          logicalSourceDimensions.size() !=
+              static_cast<int64_t>(logicalSourceRank))
+        return reshape.emitOpError(
+            "reshape source has no complete logical extent relation");
+      SmallVector<PhysicalExprAttr> logicalSourceExtents;
+      for (unsigned axis = 0; axis < logicalSourceRank; ++axis) {
+        PhysicalExprAttr extent;
+        if (!logicalSource.isDynamicDim(axis)) {
+          extent = expression(operation->getContext(),
+                              PhysicalExprKind::Constant,
+                              logicalSource.getDimSize(axis));
+        } else if (logicalSourceDimensions[axis] > 0) {
+          extent = dimensionExpression(operation->getContext(),
+                                       logicalSourceDimensions[axis]);
+        } else {
+          return reshape.emitOpError(
+              "reshape source axis has no logical extent identity");
+        }
+        logicalSourceExtents.push_back(extent);
+      }
+
       SmallVector<PhysicalExprAttr> logicalResultExtents;
       std::optional<unsigned> inferredAxis;
-      SmallVector<unsigned> unresolvedAxes;
       PhysicalExprAttr knownResultProduct = expression(
           operation->getContext(), PhysicalExprKind::Constant, 1);
       for (auto [axis, attribute] : llvm::enumerate(relation)) {
@@ -2779,32 +2805,25 @@ private:
               operand >= static_cast<int64_t>(operation->getNumOperands()))
             return reshape.emitOpError(
                 "reshape shape relation references an invalid extent operand");
-          std::optional<PhysicalExprAttr> launched;
-          for (auto [sourceAxis, attribute] :
-               llvm::enumerate(source.getAxisMaps())) {
-            auto mapping = dyn_cast<gpu::AxisMapAttr>(attribute);
-            if (!mapping ||
-                mapping.getDimensionId() != extent.getDimension())
-              continue;
-            auto candidate =
-                cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
-            if (launched && *launched != candidate)
-              return reshape.emitOpError(
-                  "reshape dimension has ambiguous physical extents");
-            launched = candidate;
+          FailureOr<PhysicalExprAttr> launched = launchExpression(
+              operation->getOperand(operand), function);
+          if (succeeded(launched)) {
+            physical = *launched;
+          } else if (extent.getDimension() > 0) {
+            // Region-local extents are not launch expressions, but their
+            // canonical dimension identity is still an exact logical reshape
+            // relation.  This attribute never enters a fragment shape.
+            physical = dimensionExpression(operation->getContext(),
+                                           extent.getDimension());
+          } else {
+            return reshape.emitOpError(
+                "reshape result extent has no typed logical expression");
           }
-          if (!launched) {
-            unresolvedAxes.push_back(axis);
-            logicalResultExtents.push_back(PhysicalExprAttr());
-            continue;
-          }
-          physical = *launched;
         } else if (extent.getKind() == 2) {
           if (inferredAxis)
             return reshape.emitOpError(
-                "reshape has more than one inferred physical extent");
+                "reshape has more than one inferred logical extent");
           inferredAxis = axis;
-          unresolvedAxes.push_back(axis);
           logicalResultExtents.push_back(PhysicalExprAttr());
           continue;
         } else {
@@ -2816,80 +2835,147 @@ private:
             operation->getContext(), PhysicalExprKind::Multiply,
             knownResultProduct, physical);
       }
-      PhysicalExprAttr sourceProduct = expression(
+      PhysicalExprAttr logicalSourceProduct = expression(
           operation->getContext(), PhysicalExprKind::Constant, 1);
-      for (Attribute extent : llvm::drop_begin(source.getShape(), worksetRank))
-        sourceProduct = binaryExpression(
+      for (PhysicalExprAttr extent : logicalSourceExtents)
+        logicalSourceProduct = binaryExpression(
             operation->getContext(), PhysicalExprKind::Multiply,
-            sourceProduct, cast<PhysicalExprAttr>(extent));
-      if (!unresolvedAxes.empty()) {
-        if (unresolvedAxes.size() == 1) {
-          logicalResultExtents[unresolvedAxes.front()] = binaryExpression(
+            logicalSourceProduct, extent);
+      if (inferredAxis) {
+        logicalResultExtents[*inferredAxis] = binaryExpression(
               operation->getContext(), PhysicalExprKind::FloorDiv,
-              sourceProduct, knownResultProduct);
-        } else if (sourceProduct == knownResultProduct) {
-          for (unsigned axis : unresolvedAxes)
-            logicalResultExtents[axis] = expression(
-                operation->getContext(), PhysicalExprKind::Constant, 1);
-        } else {
-          return reshape.emitOpError(
-              "reshape has multiple result axes without an exact physical "
-              "extent relation");
-        }
+              logicalSourceProduct, knownResultProduct);
       }
-      for (auto [axis, extent] : llvm::enumerate(logicalResultExtents)) {
-        shape.push_back(extent);
-        FailureOr<Attribute> mapping = resultMapping(axis, worksetRank + axis);
+
+      FailureOr<ArrayAttr> reassociation = gpu::inferReshapeReassociation(
+          operation->getContext(),
+          SmallVector<Attribute>(logicalSourceExtents.begin(),
+                                 logicalSourceExtents.end()),
+          SmallVector<Attribute>(logicalResultExtents.begin(),
+                                 logicalResultExtents.end()));
+      if (failed(reassociation))
+        return reshape.emitOpError(
+            "canonical reshape has no exact row-major logical relation");
+
+      SmallVector<PhysicalExprAttr> physicalResultExtents(resultRank);
+      SmallVector<Attribute> physicalResultMappings;
+      physicalResultMappings.reserve(resultRank);
+      for (unsigned axis = 0; axis < resultRank; ++axis) {
+        FailureOr<Attribute> mapping =
+            resultMapping(axis, worksetRank + axis);
         if (failed(mapping))
           return reshape.emitOpError(
               "reshape result axis has no coordinate identity");
-        mappings.push_back(*mapping);
+        physicalResultMappings.push_back(*mapping);
       }
-
-      auto result = gpu::FragmentType::get(
-          operation->getContext(), source.getElementType(),
-          builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
-          source.getValidity(), source.getOwner());
-      FailureOr<ArrayAttr> reassociation = gpu::inferReshapeReassociation(
-          source, result, worksetRank, worksetRank);
-      if (failed(reassociation))
-        return reshape.emitOpError(
-            "canonical reshape relation cannot be decomposed into exact "
-            "row-major physical groups");
       for (Attribute attribute : *reassociation) {
         auto group = cast<gpu::ReshapeGroupAttr>(attribute);
+        PhysicalExprAttr sourceProduct = expression(
+            operation->getContext(), PhysicalExprKind::Constant, 1);
+        for (int64_t logicalSourceAxis :
+             group.getSourceAxes().asArrayRef())
+          sourceProduct = binaryExpression(
+              operation->getContext(), PhysicalExprKind::Multiply,
+              sourceProduct,
+              cast<PhysicalExprAttr>(
+                  source.getShape()[worksetRank + logicalSourceAxis]));
+        PhysicalExprAttr knownProduct = expression(
+            operation->getContext(), PhysicalExprKind::Constant, 1);
+        SmallVector<unsigned> unresolved;
         for (int64_t logicalResultAxis :
              group.getResultAxes().asArrayRef()) {
-          unsigned resultAxis = worksetRank + logicalResultAxis;
-          auto resultExtent =
-              cast<PhysicalExprAttr>(result.getShape()[resultAxis]);
-          if (resultExtent.getKind() ==
+          PhysicalExprAttr logicalExtent =
+              logicalResultExtents[logicalResultAxis];
+          if (logicalExtent.getKind() ==
                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-              resultExtent.getValue() == 1)
+              logicalExtent.getValue() == 1) {
+            physicalResultExtents[logicalResultAxis] = logicalExtent;
             continue;
+          }
           std::optional<unsigned> matchedSource;
           for (int64_t logicalSourceAxis :
                group.getSourceAxes().asArrayRef()) {
-            unsigned sourceAxis = worksetRank + logicalSourceAxis;
-            if (source.getShape()[sourceAxis] != resultExtent)
+            if (logicalSourceExtents[logicalSourceAxis] != logicalExtent)
               continue;
             if (matchedSource) {
               matchedSource.reset();
               break;
             }
-            matchedSource = sourceAxis;
+            matchedSource = logicalSourceAxis;
           }
-          if (!matchedSource)
+          if (!matchedSource) {
+            unresolved.push_back(logicalResultAxis);
             continue;
+          }
+          unsigned sourceAxis = worksetRank + *matchedSource;
+          PhysicalExprAttr physicalExtent = cast<PhysicalExprAttr>(
+              source.getShape()[sourceAxis]);
+          physicalResultExtents[logicalResultAxis] = physicalExtent;
+          knownProduct = binaryExpression(
+              operation->getContext(), PhysicalExprKind::Multiply,
+              knownProduct, physicalExtent);
           auto mapping = cast<gpu::AxisMapAttr>(
-              source.getAxisMaps()[*matchedSource]);
-          mappings[resultAxis] = gpu::AxisMapAttr::get(
+              source.getAxisMaps()[sourceAxis]);
+          physicalResultMappings[logicalResultAxis] = gpu::AxisMapAttr::get(
               operation->getContext(), mapping.getSourceId(),
-              mapping.getSourceAxis(), mapping.getDimensionId(), resultAxis,
-              mapping.getDerived());
+              mapping.getSourceAxis(), mapping.getDimensionId(),
+              worksetRank + logicalResultAxis, mapping.getDerived());
         }
+        if (unresolved.size() > 1) {
+          auto knownKind =
+              static_cast<PhysicalExprKind>(knownProduct.getKind());
+          bool allConstant = knownKind == PhysicalExprKind::Constant;
+          int64_t logicalConstantProduct =
+              allConstant ? knownProduct.getValue() : 0;
+          for (unsigned axis : unresolved) {
+            PhysicalExprAttr logicalExtent = logicalResultExtents[axis];
+            if (logicalExtent.getKind() !=
+                static_cast<uint32_t>(PhysicalExprKind::Constant)) {
+              allConstant = false;
+              continue;
+            }
+            if (allConstant)
+              logicalConstantProduct *= logicalExtent.getValue();
+          }
+          auto sourceKind = static_cast<PhysicalExprKind>(sourceProduct.getKind());
+          if (allConstant && sourceKind == PhysicalExprKind::Constant &&
+              logicalConstantProduct == sourceProduct.getValue()) {
+            for (unsigned axis : unresolved)
+              physicalResultExtents[axis] = logicalResultExtents[axis];
+            knownProduct = sourceProduct;
+            unresolved.clear();
+          } else if (sourceKind == PhysicalExprKind::Constant &&
+                     sourceProduct.getValue() == 1) {
+            PhysicalExprAttr one = expression(
+                operation->getContext(), PhysicalExprKind::Constant, 1);
+            for (unsigned axis : unresolved)
+              physicalResultExtents[axis] = one;
+            knownProduct = sourceProduct;
+            unresolved.clear();
+          } else {
+            return reshape.emitOpError(
+                "reshape physical group has more than one unbound result axis");
+          }
+        }
+        if (unresolved.size() == 1) {
+          physicalResultExtents[unresolved.front()] = binaryExpression(
+              operation->getContext(), PhysicalExprKind::FloorDiv,
+              sourceProduct, knownProduct);
+          knownProduct = sourceProduct;
+        }
+        if (knownProduct != sourceProduct)
+          return reshape.emitOpError(
+              "reshape physical group does not preserve row-major elements");
       }
-      result = gpu::FragmentType::get(
+      for (auto [axis, extent] : llvm::enumerate(physicalResultExtents)) {
+        if (!extent)
+          return reshape.emitOpError(
+              "reshape physical result axis has no extent decision");
+        shape.push_back(extent);
+        mappings.push_back(physicalResultMappings[axis]);
+      }
+
+      auto result = gpu::FragmentType::get(
           operation->getContext(), source.getElementType(),
           builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
           source.getValidity(), source.getOwner());
