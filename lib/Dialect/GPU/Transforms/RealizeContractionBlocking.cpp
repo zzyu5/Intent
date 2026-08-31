@@ -143,8 +143,9 @@ Value compare(OpBuilder &builder, Location location, Type result, Value lhs,
 
 void inheritRangeAuthority(Value derived, MakeRangeOp source) {
   Operation *operation = derived.getDefiningOp();
-  if (Attribute value = source->getAttr(sourceSubregionAttr))
-    operation->setAttr(sourceSubregionAttr, value);
+  for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+    if (Attribute value = source->getAttr(name))
+      operation->setAttr(name, value);
 }
 
 FailureOr<unsigned> uniqueFreeAxis(FragmentType fragment,
@@ -956,23 +957,9 @@ bool hasSelectedFreeAxes(ContractOp contract) {
 }
 
 bool freeAxesNeedRealization(ContractOp contract, func::FuncOp kernel) {
-  FragmentType lhs = contract.getLhs().getType();
-  FragmentType rhs = contract.getRhs().getType();
-  FailureOr<unsigned> lhsFree = uniqueFreeAxis(
-      lhs, contract.getLhsReductionAxes(), contract.getLhsBatchAxes());
-  FailureOr<unsigned> rhsFree = uniqueFreeAxis(
-      rhs, contract.getRhsReductionAxes(), contract.getRhsBatchAxes());
-  if (failed(lhsFree) || failed(rhsFree))
-    return true;
-  PhysicalProgramAnalysis analysis(kernel);
-  for (auto [value, axis] :
-       {std::pair<Value, unsigned>{contract.getLhs(), *lhsFree},
-        std::pair<Value, unsigned>{contract.getRhs(), *rhsFree}}) {
-    PhysicalAxisRealizationFact fact = analysis.axisRealization(value, axis);
-    if (!fact.isExact() || !fact.physicalized)
-      return true;
-  }
-  return false;
+  return PhysicalProgramAnalysis(kernel)
+      .contractFreeAxes(contract.getOperation())
+      .needsRealization();
 }
 
 bool hasCompleteStorePath(ContractOp contract) {
@@ -1644,10 +1631,20 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     return success();
   const bool required = requiresPhysicalRealization(contract);
   auto unhandled = [&](const Twine &reason) -> LogicalResult {
-    return required ? contract.emitOpError()
-                          << "cannot form a complete physical contraction: "
-                          << reason
-                    : success();
+    if (!required)
+      return success();
+    return contract.emitOpError()
+           << "cannot form a complete physical contraction: " << reason
+           << "; lhs=" << contract.getLhs().getType()
+           << "; rhs=" << contract.getRhs().getType()
+           << "; result=" << contract.getResult().getType()
+           << "; lhs_reduction=" << contract.getLhsReductionAxes()
+           << "; rhs_reduction=" << contract.getRhsReductionAxes()
+           << "; lhs_batch=" << contract.getLhsBatchAxes()
+           << "; rhs_batch=" << contract.getRhsBatchAxes()
+           << "; free_axes_need_realization="
+           << freeAxesNeedRealization(contract, kernel)
+           << "; selected_free_axes=" << hasSelectedFreeAxes(contract);
   };
   auto lhsLoad = matrixOperandLoad(contract.getLhs());
   auto rhsLoad = matrixOperandLoad(contract.getRhs());

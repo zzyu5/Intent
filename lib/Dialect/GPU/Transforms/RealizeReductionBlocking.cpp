@@ -21,7 +21,8 @@ namespace {
 
 void inheritRangeAuthority(Operation *target, MakeRangeOp source) {
   for (StringRef name :
-       {originAttr, sourceSubregionAttr, worksetCoordinateRangeAttr})
+       {originAttr, sourceSubregionAttr, sourceSubregionBoundAttr,
+        worksetCoordinateRangeAttr})
     if (Attribute value = source->getAttr(name))
       target->setAttr(name, value);
 }

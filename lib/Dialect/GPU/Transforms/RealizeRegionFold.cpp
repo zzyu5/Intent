@@ -162,8 +162,10 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
           range.getLogicalStart(), range.getLogicalStop(),
           segmentMapping.getSourceId(), segmentMapping.getSourceAxis(),
           segmentMapping.getDerived());
-      if (Attribute inherited = range->getAttr(sourceSubregionAttr))
-        value.getDefiningOp()->setAttr(sourceSubregionAttr, inherited);
+      for (StringRef name :
+           {sourceSubregionAttr, sourceSubregionBoundAttr})
+        if (Attribute inherited = range->getAttr(name))
+          value.getDefiningOp()->setAttr(name, inherited);
       Value stopFragment =
           builder.create<BroadcastOp>(location, blockedRange,
                                       range.getLogicalStop());

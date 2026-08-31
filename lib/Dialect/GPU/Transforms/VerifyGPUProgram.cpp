@@ -292,6 +292,16 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
         return WalkResult::interrupt();
       }
     }
+    if (operation->hasAttr(sourceSubregionBoundAttr)) {
+      auto bound =
+          operation->getAttrOfType<IntegerAttr>(sourceSubregionBoundAttr);
+      if (!operation->hasAttr(sourceSubregionAttr) || !bound ||
+          bound.getInt() <= 0) {
+        operation->emitOpError(
+            "physical subregion bound requires a positive typed subregion relation");
+        return WalkResult::interrupt();
+      }
+    }
     if (auto program = dyn_cast<ProgramIdOp>(operation)) {
       if (program.getAxis() >= static_cast<uint64_t>(gridRank) ||
           !programAxes.insert(program.getAxis()).second) {

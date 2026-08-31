@@ -10,6 +10,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <optional>
 #include <utility>
@@ -176,7 +177,9 @@ mlir::FailureOr<MakeRangeOp> queryExactLogicalRange(
 struct PhysicalReplayFact {
   PhysicalFactState state = PhysicalFactState::Unknown;
   bool crossesAccess = false;
+  bool crossesStructuredProgram = false;
   llvm::SmallVector<mlir::Operation *, 2> accesses;
+  llvm::SmallVector<mlir::Operation *, 2> contractions;
   llvm::SmallVector<mlir::Operation *, 2> blockers;
 
   bool isReplayable() const { return state == PhysicalFactState::Exact; }
@@ -192,6 +195,30 @@ struct PhysicalReductionDependencyFact {
   llvm::SmallVector<mlir::Operation *, 2> blockers;
 
   bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
+/// Current physical realizations of every non-batch, non-reduction operand
+/// axis of one contraction operation.  This is the single authority used by
+/// ownership and contraction transformations; neither consumer re-derives
+/// free axes from result shape or nearby stores.
+struct PhysicalContractFreeAxis {
+  mlir::Value operand;
+  unsigned operandAxis = 0;
+  PhysicalAxisRealizationFact realization;
+  PhysicalRangeFact ranges;
+};
+
+struct PhysicalContractFreeAxisFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  llvm::SmallVector<PhysicalContractFreeAxis, 4> axes;
+  llvm::SmallVector<mlir::Operation *, 2> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+  bool needsRealization() const {
+    return !isExact() || llvm::any_of(axes, [](const auto &axis) {
+             return !axis.realization.physicalized;
+           });
+  }
 };
 
 /// Typed logical relation carried by one physical parameter declaration.  The
@@ -276,6 +303,7 @@ public:
   PhysicalReductionDependencyFact reductionDependency(
       mlir::Value value, PhysicalSourceAxis source,
       std::optional<int64_t> sourceDimension = std::nullopt);
+  PhysicalContractFreeAxisFact contractFreeAxes(mlir::Operation *contract);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 

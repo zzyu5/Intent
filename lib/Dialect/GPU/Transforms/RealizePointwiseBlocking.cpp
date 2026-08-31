@@ -412,6 +412,24 @@ bool isZeroScanIdentity(Value value) {
   return false;
 }
 
+FailureOr<int64_t>
+exactSubregionStaticBound(const PhysicalRangeFact &ranges,
+                          PhysicalSourceAxis source) {
+  if (!ranges.isExact() || ranges.roots.empty())
+    return failure();
+  std::optional<int64_t> bound;
+  for (MakeRangeOp range : ranges.roots) {
+    auto current = range->getAttrOfType<IntegerAttr>(sourceSubregionBoundAttr);
+    if (!range->hasAttr(sourceSubregionAttr) || !current ||
+        current.getInt() <= 0 || !isUnitStepRange(range) ||
+        !(sourceAxisIdentity(range) == source) ||
+        (bound && *bound != current.getInt()))
+      return failure();
+    bound = current.getInt();
+  }
+  return *bound;
+}
+
 LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
                                       Value source, uint64_t axis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -451,9 +469,12 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
       return scan.emitOpError(
           "dynamic subregion scan has no proven tail-neutral combine");
     auto chunkExtent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    FailureOr<int64_t> bound =
+        exactSubregionStaticBound(sourceRanges,
+                                  sourceAxisIdentity(sourceMapping));
     if (chunkExtent.getKind() !=
             static_cast<uint32_t>(PhysicalExprKind::Constant) ||
-        chunkExtent.getValue() <= 0)
+        failed(bound) || chunkExtent.getValue() < *bound)
       return scan.emitOpError(
           "dynamic subregion scan has no static source bound");
     PhysicalSourceAxis sourceAxis = sourceAxisIdentity(sourceMapping);
@@ -520,6 +541,26 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
     return failure();
   if (hasExactStaticFullCoverage(kernel, source, axis))
     return success();
+  auto sourceMapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+  PhysicalProgramAnalysis analysis(kernel);
+  PhysicalRangeFact ranges = analysis.axisRanges(source, axis);
+  bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+    return range->hasAttr(sourceSubregionAttr);
+  });
+  if (subregion) {
+    PhysicalSourceAxis sourceAxis = sourceAxisIdentity(sourceMapping);
+    FailureOr<int64_t> bound = exactSubregionStaticBound(ranges, sourceAxis);
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    if (failed(bound) ||
+        extent.getKind() !=
+            static_cast<uint32_t>(PhysicalExprKind::Constant) ||
+        extent.getValue() < *bound)
+      return failure();
+    for (MakeRangeOp range : ranges.roots)
+      retargetSourceExtent(range.getResult(), sourceAxis, extent);
+    retargetSourceExtent(source, sourceAxis, extent);
+    return success();
+  }
   return realizeFullCoverageDimension(kernel, source, axis);
 }
 
@@ -1011,8 +1052,9 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         range.getLoc(), projectedType, blocked.getStart(), blocked.getExtent(),
         blocked.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
-    if (Attribute subregion = range->getAttr(sourceSubregionAttr))
-      projected.getDefiningOp()->setAttr(sourceSubregionAttr, subregion);
+    for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+      if (Attribute value = range->getAttr(name))
+        projected.getDefiningOp()->setAttr(name, value);
     mapping.map(value, projected);
     return projected;
   }
@@ -1239,12 +1281,9 @@ FailureOr<int64_t> reuseTraversalDimension(func::FuncOp kernel,
 }
 
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
-                                             MakeRangeOp range) {
-  SmallVector<StoreOp> stores;
-  kernel.walk([&](StoreOp store) {
-    if (storeUsesRange(store, range))
-      stores.push_back(store);
-  });
+                                             MakeRangeOp range,
+                                             ArrayRef<StoreOp> stores,
+                                             bool effectLocal) {
   if (stores.empty())
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no write effect");
@@ -1254,7 +1293,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no typed coordinate/data relation");
   bool accessDependentSubregion =
-      hasAccessDependentSubregionBounds(kernel, range);
+      !effectLocal && hasAccessDependentSubregionBounds(kernel, range);
   SmallVector<int64_t> payloadTraversalDimensions(*traversalDimensions);
   std::optional<int64_t> payloadTraversalDimension;
   if (accessDependentSubregion) {
@@ -1395,8 +1434,9 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             location, blockedType, tileStart, chunk.getResult(), range.getStep(),
             range.getLogicalStart(), range.getLogicalStop(), range.getSourceId(),
             range.getSourceAxis(), range.getDerived());
-        if (Attribute value = range->getAttr(sourceSubregionAttr))
-          blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
+        for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+          if (Attribute value = range->getAttr(name))
+            blocked.getDefiningOp()->setAttr(name, value);
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
         auto tailComparison = nested.create<CompareOp>(
             location, predicateType(blockedType), blocked, end,
@@ -2191,6 +2231,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         }))
       structuredTraversalRanges.insert(range.getOperation());
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
+  llvm::MapVector<Attribute, SmallVector<int64_t>> effectLocalOrigins;
+  llvm::MapVector<Attribute, MakeRangeOp> effectLocalAuthorities;
+  auto effectLocalKey = [&](MakeRangeOp range) -> FailureOr<Attribute> {
+    FailureOr<int64_t> dimension = queryRangeDimension(range);
+    if (failed(dimension))
+      return failure();
+    return ArrayAttr::get(
+        kernel.getContext(),
+        {sourceAxisKey(kernel.getContext(), sourceAxisIdentity(range)),
+         dimensionAxisKey(kernel.getContext(), *dimension)});
+  };
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
   SmallVector<SmallVector<Value, 4>> writeCoordinates;
@@ -2233,17 +2284,61 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return replay.isReplayable() && !replay.crossesAccess;
     });
   };
+  auto contractionFreeAxisNeedsRange = [&](Operation *operation,
+                                           MakeRangeOp range) {
+    PhysicalContractFreeAxisFact fact =
+        PhysicalProgramAnalysis(kernel).contractFreeAxes(operation);
+    return llvm::any_of(fact.axes, [&](const auto &axis) {
+      return !axis.realization.physicalized && axis.ranges.isExact() &&
+             llvm::any_of(axis.ranges.roots, [&](MakeRangeOp root) {
+               return sameLogicalRange(root, range);
+             });
+    });
+  };
   for (StoreOp store : candidateStores) {
     SmallVector<std::pair<MakeRangeOp, int64_t>> candidates;
     int64_t innermostSourceAxis = -1;
     for (MakeRangeOp range : allRanges) {
-      if (structuredTraversalRanges.contains(range.getOperation()) &&
-          !reductionTraversalRanges.contains(range.getOperation()))
-        continue;
+      bool structuredFreeAxis =
+          structuredTraversalRanges.contains(range.getOperation()) &&
+          !reductionTraversalRanges.contains(range.getOperation());
       std::optional<int64_t> sourceAxis = storeAxisForRange(store, range);
       if (!sourceAxis)
         continue;
-      if (hasAccessDependentSubregionBounds(kernel, range)) {
+      if (structuredFreeAxis) {
+        bool usedByEveryEffect = llvm::all_of(
+            writeCoordinates, [&](ArrayRef<Value> coordinates) {
+              return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
+                return sameLogicalRange(range, candidate) &&
+                       coordinatesUseRange(coordinates, candidate);
+              });
+            });
+        FailureOr<uint64_t> dimension = rangeDimension(range);
+        PhysicalReplayFact replay = failed(dimension)
+                                        ? PhysicalReplayFact()
+                                        : PhysicalProgramAnalysis(kernel)
+                                              .replayability(
+                                                  store.getValue(),
+                                                  sourceAxisIdentity(range),
+                                                  PhysicalReplayScope::ValueGraph,
+                                                  /*allowAccesses=*/true,
+                                                  store.getOperation(),
+                                                  static_cast<int64_t>(*dimension));
+        PhysicalAxisProjection valueProjection =
+            queryFragmentAxis(store.getValue().getType(),
+                              sourceAxisIdentity(range));
+        bool contractRequiresRange = llvm::any_of(
+            replay.contractions, [&](Operation *contract) {
+              return contractionFreeAxisNeedsRange(contract, range);
+            });
+        auto effectOrigin = store->getAttrOfType<IntegerAttr>(originAttr);
+        if (usedByEveryEffect || failed(dimension) ||
+            !valueProjection.isExact() ||
+            valueProjection.dimensionId != static_cast<int64_t>(*dimension) ||
+            !replay.isReplayable() || replay.crossesStructuredProgram ||
+            !contractRequiresRange || !effectOrigin)
+          continue;
+      } else if (hasAccessDependentSubregionBounds(kernel, range)) {
         if (failed(reuseTraversalDimension(kernel, ArrayRef<StoreOp>{store},
                                            range)))
           continue;
@@ -2266,7 +2361,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       internalTraversalRanges.insert(range.getOperation());
       if (sourceAxis != innermostSourceAxis)
         continue;
-      reuseTraversalRanges.insert(range.getOperation());
+      if (structuredTraversalRanges.contains(range.getOperation()) &&
+          !reductionTraversalRanges.contains(range.getOperation())) {
+        FailureOr<Attribute> key = effectLocalKey(range);
+        if (failed(key))
+          continue;
+        MakeRangeOp authority = range;
+        auto existing = effectLocalAuthorities.find(*key);
+        if (existing != effectLocalAuthorities.end())
+          authority = existing->second;
+        else
+          effectLocalAuthorities[*key] = authority;
+        reuseTraversalRanges.insert(authority.getOperation());
+        auto origin = store->getAttrOfType<IntegerAttr>(originAttr);
+        if (!origin)
+          continue;
+        SmallVector<int64_t> &selected = effectLocalOrigins[*key];
+        if (!llvm::is_contained(selected, origin.getInt()))
+          selected.push_back(origin.getInt());
+      } else {
+        reuseTraversalRanges.insert(range.getOperation());
+      }
     }
   }
   if (!ownershipOnly)
@@ -2362,8 +2477,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           range.getLoc(), fragment, range.getStart(), extent, range.getStep(),
           range.getLogicalStart(), range.getLogicalStop(), range.getSourceId(),
           range.getSourceAxis(), range.getDerived());
-      if (Attribute value = range->getAttr(sourceSubregionAttr))
-        blocked->setAttr(sourceSubregionAttr, value);
+      for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+        if (Attribute value = range->getAttr(name))
+          blocked->setAttr(name, value);
       Value endFragment =
           builder.create<BroadcastOp>(range.getLoc(), fragment,
                                       range.getLogicalStop());
@@ -2402,10 +2518,34 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         continue;
       bool replayable = true;
       SmallVector<StoreOp> currentStores;
-      kernel.walk([&](StoreOp store) {
-        if (storeUsesRange(store, range))
-          currentStores.push_back(store);
-      });
+      FailureOr<Attribute> effectKey = effectLocalKey(range);
+      auto effectLocal = succeeded(effectKey)
+                             ? effectLocalOrigins.find(*effectKey)
+                             : effectLocalOrigins.end();
+      if (effectLocal != effectLocalOrigins.end()) {
+        for (int64_t origin : effectLocal->second) {
+          StoreOp selected;
+          bool ambiguous = false;
+          kernel.walk([&](StoreOp store) {
+            auto current = store->getAttrOfType<IntegerAttr>(originAttr);
+            if (!current || current.getInt() != origin)
+              return;
+            if (selected)
+              ambiguous = true;
+            else
+              selected = store;
+          });
+          if (!selected || ambiguous)
+            return kernel.emitError(
+                "effect-local traversal has no unique current write-effect occurrence");
+          currentStores.push_back(selected);
+        }
+      } else {
+        kernel.walk([&](StoreOp store) {
+          if (storeUsesRange(store, range))
+            currentStores.push_back(store);
+        });
+      }
       if (currentStores.empty())
         continue;
       FailureOr<SmallVector<int64_t>> traversalDimensions =
@@ -2427,7 +2567,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           PhysicalReplayFact replay = analysis.replayability(
               store.getValue(), source, PhysicalReplayScope::ValueGraph,
               /*allowAccesses=*/true, store.getOperation(), dimension);
-          replayable &= replay.isReplayable();
+          replayable &= replay.isReplayable() &&
+                        (effectLocal == effectLocalOrigins.end() ||
+                         !replay.crossesStructuredProgram);
         }
       }
       // A value graph containing loop-carried or otherwise non-replayable
@@ -2439,7 +2581,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         nonReplayable.push_back(range);
         continue;
       }
-      if (failed(realizeReusePointwiseTraversal(kernel, range)))
+      if (failed(realizeReusePointwiseTraversal(
+              kernel, range, currentStores,
+              effectLocal != effectLocalOrigins.end())))
         return failure();
       realized.push_back(range);
     }
@@ -3242,8 +3386,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         range.getLoc(), blockedType, start, physicalExtent,
         range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
-    if (Attribute value = range->getAttr(sourceSubregionAttr))
-      blocked.getDefiningOp()->setAttr(sourceSubregionAttr, value);
+    for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+      if (Attribute value = range->getAttr(name))
+        blocked.getDefiningOp()->setAttr(name, value);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     auto validComparison = builder.create<CompareOp>(
         range.getLoc(), predicateType(blockedType), blocked, endFragment,

@@ -1905,10 +1905,10 @@ private:
             rangeType.getDimensionId(), rangeType.getDerived(), extent);
         if (failed(coordinate))
           return failure();
-        if (Attribute subregion =
-                (*range).getDefiningOp()->getAttr(gpu::sourceSubregionAttr))
-          coordinate->getDefiningOp()->setAttr(gpu::sourceSubregionAttr,
-                                               subregion);
+        for (StringRef name : {gpu::sourceSubregionAttr,
+                               gpu::sourceSubregionBoundAttr})
+          if (Attribute value = (*range).getDefiningOp()->getAttr(name))
+            coordinate->getDefiningOp()->setAttr(name, value);
         coordinates.push_back(*coordinate);
         ++sourceAxis;
         ++resultAxis;
@@ -2589,6 +2589,10 @@ private:
       target->setAttr(
           gpu::sourceSubregionAttr,
           builder.getI64IntegerAttr(sourceRange.getDimensionId()));
+      if (std::optional<int64_t> bound =
+              subregionStaticExtentBound(operation, extentDimension))
+        target->setAttr(gpu::sourceSubregionBoundAttr,
+                        builder.getI64IntegerAttr(*bound));
       mapResults(operation, target);
       bindExtentDimensions(subregion.getExtentDimensions(),
                            rangeExtent(location, start, stop, step));
@@ -2676,9 +2680,10 @@ private:
           location, resultType, start, *extent, step, start, stop,
           rangeType.getSourceId(), rangeType.getSourceAxis(),
           rangeType.getDerived());
-      if (Attribute subregion =
-              (*source).getDefiningOp()->getAttr(gpu::sourceSubregionAttr))
-        target->setAttr(gpu::sourceSubregionAttr, subregion);
+      for (StringRef name : {gpu::sourceSubregionAttr,
+                             gpu::sourceSubregionBoundAttr})
+        if (Attribute value = (*source).getDefiningOp()->getAttr(name))
+          target->setAttr(name, value);
       mapResults(operation, target);
       return success();
     }

@@ -30,6 +30,20 @@ bool isAccessNode(Operation *operation) {
   return isa<LoadOp, GatherOp>(operation);
 }
 
+bool dependsOnStructuredProgram(Value value,
+                                SmallPtrSetImpl<Operation *> &visited) {
+  Operation *operation = value.getDefiningOp();
+  if (!operation || !visited.insert(operation).second)
+    return false;
+  if (isa<RegionFoldOp, RegionScanOp>(operation))
+    return true;
+  if (isAccessNode(operation) || operation->getNumRegions() != 0)
+    return false;
+  return llvm::any_of(operation->getOperands(), [&](Value operand) {
+    return dependsOnStructuredProgram(operand, visited);
+  });
+}
+
 std::optional<int64_t> integerConstant(Value value) {
   auto constant = value.getDefiningOp<arith::ConstantOp>();
   auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
@@ -1581,6 +1595,77 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   return result;
 }
 
+PhysicalContractFreeAxisFact
+PhysicalProgramAnalysis::contractFreeAxes(Operation *operation) {
+  PhysicalContractFreeAxisFact result;
+  bool recognized = false;
+  auto appendOperand = [&](Value value, ArrayRef<int64_t> reduction,
+                           ArrayRef<int64_t> batch) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    if (!fragment) {
+      appendUnique(result.blockers, operation);
+      return false;
+    }
+    bool exact = true;
+    for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+      if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
+          llvm::is_contained(batch, static_cast<int64_t>(axis)))
+        continue;
+      PhysicalContractFreeAxis fact;
+      fact.operand = value;
+      fact.operandAxis = axis;
+      fact.realization = axisRealization(value, axis);
+      fact.ranges = axisRanges(value, axis);
+      result.blockers.append(fact.realization.blockers.begin(),
+                             fact.realization.blockers.end());
+      result.blockers.append(fact.ranges.blockers.begin(),
+                             fact.ranges.blockers.end());
+      if (!fact.realization.isExact()) {
+        appendUnique(result.blockers, operation);
+        exact = false;
+      }
+      result.axes.push_back(std::move(fact));
+    }
+    return exact;
+  };
+  bool exact = false;
+  if (auto contract = dyn_cast_or_null<ContractOp>(operation)) {
+    recognized = true;
+    bool lhsExact = appendOperand(contract.getLhs(),
+                                  contract.getLhsReductionAxes(),
+                                  contract.getLhsBatchAxes());
+    bool rhsExact = appendOperand(contract.getRhs(),
+                                  contract.getRhsReductionAxes(),
+                                  contract.getRhsBatchAxes());
+    exact = lhsExact && rhsExact;
+  } else if (auto contract = dyn_cast_or_null<ScaledContractOp>(operation)) {
+    recognized = true;
+    bool lhsExact = appendOperand(contract.getLhs(),
+                                  contract.getLhsReductionAxes(),
+                                  contract.getLhsBatchAxes());
+    bool rhsExact = appendOperand(contract.getRhs(),
+                                  contract.getRhsReductionAxes(),
+                                  contract.getRhsBatchAxes());
+    exact = lhsExact && rhsExact;
+  } else if (auto contract = dyn_cast_or_null<SparseContractOp>(operation)) {
+    recognized = true;
+    bool lhsExact = appendOperand(contract.getCompressed(),
+                                  contract.getLhsReductionAxes(),
+                                  contract.getLhsBatchAxes());
+    bool rhsExact = appendOperand(contract.getRhs(),
+                                  contract.getRhsReductionAxes(),
+                                  contract.getRhsBatchAxes());
+    exact = lhsExact && rhsExact;
+  }
+  if (!recognized || result.axes.empty()) {
+    appendUnique(result.blockers, operation);
+    return result;
+  }
+  if (exact)
+    result.state = PhysicalFactState::Exact;
+  return result;
+}
+
 PhysicalRangeAxisFact
 PhysicalProgramAnalysis::rangeAxes(Value value,
                                    ArrayRef<MakeRangeOp> selectedRoots) {
@@ -1707,8 +1792,12 @@ void PhysicalProgramAnalysis::analyzeReplay(
   }
   if (insertionAnchor && dominance &&
       dominance->dominates(value, insertionAnchor) &&
-      !carriesRequestedTraversal)
+      !carriesRequestedTraversal) {
+    SmallPtrSet<Operation *, 16> dependencyVisited;
+    result.crossesStructuredProgram |=
+        dependsOnStructuredProgram(value, dependencyVisited);
     return;
+  }
   if (auto extract = value.getDefiningOp<ExtractOp>()) {
     if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
       uint64_t field = extract.getField();
@@ -1750,6 +1839,8 @@ void PhysicalProgramAnalysis::analyzeReplay(
   Operation *operation = value.getDefiningOp();
   if (!operation || !visited.insert(operation).second)
     return;
+  if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
+    appendUnique(result.contractions, operation);
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
     if (insertionAnchor && source && sourceDimension) {
       FailureOr<int64_t> dimension = queryRangeDimension(range);
@@ -1784,6 +1875,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return;
     }
   } else if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+    result.crossesStructuredProgram = true;
     if (!source || !sourceDimension) {
       appendUnique(result.blockers, operation);
       result.state = PhysicalFactState::Unknown;
@@ -1812,6 +1904,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
                       sourceDimension, dominance, result, visited);
     return;
   } else if (auto scan = dyn_cast<RegionScanOp>(operation)) {
+    result.crossesStructuredProgram = true;
     if (!source || !sourceDimension) {
       appendUnique(result.blockers, operation);
       result.state = PhysicalFactState::Unknown;
