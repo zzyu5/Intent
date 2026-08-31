@@ -4875,6 +4875,9 @@ LogicalResult constructGPUProgram(ModuleOp module,
   if (failed(gpu::alignPointwiseValueRelations(physical)))
     return physical.emitError(
         "initial physical value relations are incomplete");
+  if (failed(gpu::alignContractValueRelations(physical)))
+    return physical.emitError(
+        "initial physical contract relations are incomplete");
   function.erase();
   module->setAttr("intent_gpu.physical", builder.getUnitAttr());
   return success();

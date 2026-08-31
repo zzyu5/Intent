@@ -2355,6 +2355,15 @@ static void retargetExtent(Value root, AxisSelector selects,
           worklist.push_back(loop.getRegionIterArgs()[index]);
           worklist.push_back(loop.getBody()->getTerminator()->getOperand(index));
         }
+    if (auto branch = value.getDefiningOp<scf::IfOp>())
+      for (auto [index, result] : llvm::enumerate(branch.getResults())) {
+        if (value != result)
+          continue;
+        auto thenYield = cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
+        auto elseYield = cast<scf::YieldOp>(branch.elseBlock()->getTerminator());
+        worklist.push_back(thenYield.getResults()[index]);
+        worklist.push_back(elseYield.getResults()[index]);
+      }
     appendStructuredResultRelations(value, worklist);
     for (Operation *user : value.getUsers()) {
       if (isa<RegionFoldOp, RegionScanOp>(user)) {
@@ -2369,7 +2378,7 @@ static void retargetExtent(Value root, AxisSelector selects,
             worklist.push_back(loop.getRegionIterArgs()[index]);
             worklist.push_back(loop.getResult(index));
           }
-      if (auto yield = dyn_cast<scf::YieldOp>(user))
+      if (auto yield = dyn_cast<scf::YieldOp>(user)) {
         if (auto loop = dyn_cast_or_null<scf::ForOp>(yield->getParentOp()))
           for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
             if (value == yielded) {
@@ -2377,6 +2386,11 @@ static void retargetExtent(Value root, AxisSelector selects,
               worklist.push_back(loop.getRegionIterArgs()[index]);
               worklist.push_back(loop.getResult(index));
             }
+        if (auto branch = dyn_cast_or_null<scf::IfOp>(yield->getParentOp()))
+          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
+            if (value == yielded)
+              worklist.push_back(branch.getResult(index));
+      }
       if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
               ContractOp, ScaledContractOp, SparseContractOp, ReduceOp,
               ScanOp, RandomBitsOp,

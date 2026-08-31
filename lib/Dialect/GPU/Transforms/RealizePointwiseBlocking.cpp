@@ -1576,10 +1576,11 @@ LogicalResult realizeDistributedHistograms(func::FuncOp kernel) {
 }
 
 LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
-  auto align = [](Operation *owner, Value accumulator,
-                  Value result) -> LogicalResult {
+  auto align = [](Operation *owner, Value accumulator, Value result,
+                  bool &changed) -> LogicalResult {
     if (accumulator.getType() == result.getType())
       return success();
+    changed = true;
     auto source = dyn_cast<FragmentType>(accumulator.getType());
     auto target = dyn_cast<FragmentType>(result.getType());
     if (!source || !target || source.getElementType() != target.getElementType() ||
@@ -1629,26 +1630,32 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
     result.setType(aligned);
     return success();
   };
-  WalkResult result = kernel.walk([&](Operation *operation) {
-    Value accumulator;
-    Value output;
-    if (auto contract = dyn_cast<ContractOp>(operation)) {
-      accumulator = contract.getAccumulator();
-      output = contract.getResult();
-    } else if (auto contract = dyn_cast<ScaledContractOp>(operation)) {
-      accumulator = contract.getAccumulator();
-      output = contract.getResult();
-    } else if (auto contract = dyn_cast<SparseContractOp>(operation)) {
-      accumulator = contract.getAccumulator();
-      output = contract.getResult();
-    } else {
-      return WalkResult::advance();
-    }
-    return failed(align(operation, accumulator, output))
-               ? WalkResult::interrupt()
-               : WalkResult::advance();
-  });
-  return result.wasInterrupted() ? failure() : success();
+  bool changed;
+  do {
+    changed = false;
+    WalkResult result = kernel.walk([&](Operation *operation) {
+      Value accumulator;
+      Value output;
+      if (auto contract = dyn_cast<ContractOp>(operation)) {
+        accumulator = contract.getAccumulator();
+        output = contract.getResult();
+      } else if (auto contract = dyn_cast<ScaledContractOp>(operation)) {
+        accumulator = contract.getAccumulator();
+        output = contract.getResult();
+      } else if (auto contract = dyn_cast<SparseContractOp>(operation)) {
+        accumulator = contract.getAccumulator();
+        output = contract.getResult();
+      } else {
+        return WalkResult::advance();
+      }
+      return failed(align(operation, accumulator, output, changed))
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return failure();
+  } while (changed);
+  return success();
 }
 
 LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {

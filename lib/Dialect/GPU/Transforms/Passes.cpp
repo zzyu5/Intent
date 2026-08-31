@@ -28,8 +28,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
     return failure();
   if (failed(realizePointwiseOwnership(module)) ||
       failed(refreshReshapeRelations(*kernel)) ||
-      failed(alignContractValueRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Establish every ownership/internal physical range while the structured
@@ -45,6 +45,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignAggregateValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionFolds(module)) ||
@@ -52,6 +53,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeRegionScans(module)) ||
@@ -59,6 +61,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeReductionBlocking(module)) ||
@@ -71,6 +74,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignAggregateValueRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   if (failed(realizeContractionBlocking(module)) ||
@@ -79,8 +83,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
-      failed(alignContractValueRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Structured realization replays source slices and may create new gathers.
@@ -91,6 +95,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   return success();
