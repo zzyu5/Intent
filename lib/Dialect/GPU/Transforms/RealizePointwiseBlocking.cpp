@@ -1753,7 +1753,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(alignAccessValueRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
         failed(alignContractAccumulatorTypes(kernel)) ||
-        failed(alignAggregateValueRelations(kernel)))
+        failed(alignAggregateValueRelations(kernel)) ||
+        failed(alignAccessValueRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();

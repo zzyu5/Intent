@@ -1726,27 +1726,6 @@ LogicalResult refreshReshapeRelations(func::FuncOp kernel) {
 }
 
 LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
-  PhysicalProgramAnalysis analysis(kernel);
-  std::function<unsigned(Value)> countExactPhysicalAxes =
-      [&](Value value) -> unsigned {
-    if (auto fragment = dyn_cast<FragmentType>(value.getType())) {
-      unsigned count = 0;
-      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
-        PhysicalAxisRealizationFact fact = analysis.axisRealization(value, axis);
-        count += fact.isExact() && fact.physicalized &&
-                 !fact.constructionScalarSeed;
-      }
-      return count;
-    }
-    if (auto record = value.getDefiningOp<MakeRecordOp>()) {
-      unsigned count = 0;
-      for (Value field : record.getFields())
-        count += countExactPhysicalAxes(field);
-      return count;
-    }
-    return 0;
-  };
-
   kernel.walk([&](MakeRecordOp record) {
     RecordType current = record.getResult().getType();
     SmallVector<Attribute> fields;
@@ -1831,20 +1810,11 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
     for (unsigned index = 0; index < loop.getInitArgs().size(); ++index) {
       Value init = loop.getInitArgs()[index];
       Value yielded = yield.getResults()[index];
-      Type target = init.getType();
-      if (target != yielded.getType()) {
-        unsigned initAuthority = countExactPhysicalAxes(init);
-        unsigned yieldAuthority = countExactPhysicalAxes(yielded);
-        if (initAuthority == yieldAuthority) {
-          loop.emitOpError(
-              "loop-carried value has two equally authoritative physical relations")
-              << "; init=" << target << "; yield=" << yielded.getType()
-              << "; exact_physical_axes=" << initAuthority;
-          return WalkResult::interrupt();
-        }
-        if (initAuthority < yieldAuthority)
-          target = yielded.getType();
-      }
+      // The loop-body update is the executable relation selected by the
+      // transformation that produced it.  The init value is an identity/seed
+      // at the structural boundary and must be projected to that relation; the
+      // boundary must not rank shapes or independently choose a competing one.
+      Type target = yielded.getType();
       OpBuilder initBuilder(loop);
       FailureOr<Value> projectedInit = projectPhysicalValueToSchema(
           initBuilder, loop.getLoc(), init, target);

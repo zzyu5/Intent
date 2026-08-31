@@ -1075,33 +1075,57 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     return;
   }
   if (auto extract = dyn_cast<ExtractOp>(operation)) {
-    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
-      if (extract.getField() >= record.getFields().size()) {
-        result.state = PhysicalFactState::Unknown;
+    bool followed = false;
+    llvm::SmallPtrSet<Value, 8> visitedRecords;
+    std::function<void(Value)> collectRecordField = [&](Value recordValue) {
+      if (!recordValue || !visitedRecords.insert(recordValue).second)
+        return;
+      if (auto record = recordValue.getDefiningOp<MakeRecordOp>()) {
+        if (extract.getField() >= record.getFields().size())
+          return;
+        Value field = record.getFields()[extract.getField()];
+        auto type = dyn_cast<FragmentType>(field.getType());
+        if (!type || fragmentAxis >= type.getShape().size())
+          return;
+        followed = true;
+        collectAxisRanges(field, fragmentAxis, result, visited);
         return;
       }
-      collectAxisRanges(record.getFields()[extract.getField()], fragmentAxis,
-                        result, visited);
-      return;
-    }
-    if (auto argument = dyn_cast<BlockArgument>(extract.getRecord())) {
-      bool followed = false;
-      for (Value related : structuredSourcesForArgument(argument)) {
-        auto record = related.getDefiningOp<MakeRecordOp>();
-        if (!record || extract.getField() >= record.getFields().size())
-          continue;
-        auto field = dyn_cast<FragmentType>(
-            record.getFields()[extract.getField()].getType());
-        if (!field || fragmentAxis >= field.getShape().size())
-          continue;
-        followed = true;
-        collectAxisRanges(record.getFields()[extract.getField()], fragmentAxis,
-                          result, visited);
+      if (auto argument = dyn_cast<BlockArgument>(recordValue)) {
+        for (Value related : structuredSourcesForArgument(argument))
+          collectRecordField(related);
+        return;
       }
-      if (!followed)
-        result.state = PhysicalFactState::Unknown;
-      return;
-    }
+      auto opResult = dyn_cast<OpResult>(recordValue);
+      if (!opResult)
+        return;
+      if (auto fold = dyn_cast<RegionFoldOp>(opResult.getOwner())) {
+        unsigned component = opResult.getResultNumber();
+        if (component >= fold.getIdentityCount())
+          return;
+        unsigned identity = fold.getSourceCount() + component;
+        if (identity < fold.getInputs().size())
+          collectRecordField(fold.getInputs()[identity]);
+        if (auto yield =
+                dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+            yield && component < yield.getValues().size())
+          collectRecordField(yield.getValues()[component]);
+        return;
+      }
+      if (auto loop = dyn_cast<scf::ForOp>(opResult.getOwner())) {
+        unsigned component = opResult.getResultNumber();
+        if (component < loop.getInitArgs().size())
+          collectRecordField(loop.getInitArgs()[component]);
+        if (auto yield =
+                dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+            yield && component < yield.getResults().size())
+          collectRecordField(yield.getResults()[component]);
+      }
+    };
+    collectRecordField(extract.getRecord());
+    if (!followed)
+      result.state = PhysicalFactState::Unknown;
+    return;
   }
   if (auto splat = dyn_cast<SplatOp>(operation))
     return;
