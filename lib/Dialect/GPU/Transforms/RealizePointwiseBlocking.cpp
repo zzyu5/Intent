@@ -430,6 +430,43 @@ exactSubregionStaticBound(const PhysicalRangeFact &ranges,
   return *bound;
 }
 
+FailureOr<int64_t>
+exactStaticTraversalExtent(const PhysicalRangeFact &ranges) {
+  if (!ranges.isExact() || ranges.roots.empty() ||
+      failed(queryExactLogicalRange(ranges)))
+    return failure();
+  std::optional<int64_t> extent;
+  std::optional<int64_t> logicalStart;
+  std::optional<int64_t> logicalStop;
+  std::optional<int64_t> logicalStep;
+  for (MakeRangeOp range : ranges.roots) {
+    auto start =
+        range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
+    auto stop = range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
+    auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    if (!start || !stop || !step || step.value() <= 0 ||
+        stop.value() < start.value())
+      return failure();
+    if ((logicalStart && *logicalStart != start.value()) ||
+        (logicalStop && *logicalStop != stop.value()) ||
+        (logicalStep && *logicalStep != step.value()))
+      return failure();
+    logicalStart = start.value();
+    logicalStop = stop.value();
+    logicalStep = step.value();
+    __int128 distance = static_cast<__int128>(stop.value()) - start.value();
+    __int128 current =
+        (distance + static_cast<__int128>(step.value()) - 1) / step.value();
+    if (current > std::numeric_limits<int64_t>::max())
+      return failure();
+    if (extent && *extent != current)
+      return failure();
+    extent = static_cast<int64_t>(current);
+  }
+  return extent ? FailureOr<int64_t>(*extent)
+                : FailureOr<int64_t>(failure());
+}
+
 LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
                                       Value source, uint64_t axis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
@@ -488,8 +525,28 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     retargetDimensionExtent(source, dimension, chunkExtent);
     return success();
   }
-  if (failed(dimensionArgument(kernel, dimension)))
-    return failure();
+  if (failed(dimensionArgument(kernel, dimension))) {
+    FailureOr<int64_t> staticExtent =
+        exactStaticTraversalExtent(sourceRanges);
+    if (failed(staticExtent))
+      return scan.emitOpError(
+                 "scan full-coverage dimension has neither runtime ABI nor exact static range authority")
+             << "; dimension=" << dimension
+             << "; source=" << source.getType();
+    PhysicalExprAttr covered = expression(
+        kernel.getContext(), PhysicalExprKind::Constant, *staticExtent);
+    for (MakeRangeOp range : sourceRanges.roots) {
+      FailureOr<uint64_t> rangeIdentity = rangeDimension(range);
+      if (failed(rangeIdentity) ||
+          *rangeIdentity != static_cast<uint64_t>(dimension) ||
+          range->hasAttr(sourceSubregionAttr))
+        return range.emitOpError(
+            "static scan source range does not match its logical dimension");
+      retargetDimensionExtent(range.getResult(), dimension, covered);
+    }
+    retargetDimensionExtent(source, dimension, covered);
+    return success();
+  }
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
   ParameterOp parameter;
   kernel.walk([&](ParameterOp candidate) {
