@@ -1246,6 +1246,8 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
   SmallVector<Attribute> mappings(target.getAxisMaps().begin(),
                                   target.getAxisMaps().end());
   SmallVector<bool> refined(shape.size(), false);
+  SmallVector<Value> authorities(shape.size());
+  SmallVector<unsigned> authorityAxes(shape.size(), 0);
   bool changed = false;
   PhysicalProgramAnalysis analysis(kernel);
   for (Value contributor : contributors) {
@@ -1294,6 +1296,8 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
         if (selected.getDerived() != candidate.getDerived()) {
           if (!candidate.getDerived()) {
             mappings[targetAxis] = candidate;
+            authorities[targetAxis] = contributor;
+            authorityAxes[targetAxis] = *sourceAxis;
             changed = true;
           }
           continue;
@@ -1306,10 +1310,29 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
           changed = true;
           continue;
         }
+        // Distinct coordinate SSA graphs may be lockstep occurrences of one
+        // result axis (for example row and column advanced indices driven by
+        // the same filter traversal).  Producer identity and the intermediate
+        // value's dimension are not enough to decide that relation.  Consume
+        // the shared range analysis and retain the result's canonical axis only
+        // when both current traversals are proven identical.
+        if (authorities[targetAxis]) {
+          SmallVector<Value> sources = {authorities[targetAxis], contributor};
+          SmallVector<unsigned> axes = {authorityAxes[targetAxis], *sourceAxis};
+          PhysicalLockstepTraversalFact lockstep =
+              analysis.lockstepTraversal(sources, axes);
+          if (lockstep.isExact()) {
+            mappings[targetAxis] = canonical;
+            changed = true;
+            continue;
+          }
+        }
         return failure();
       }
       shape[targetAxis] = extent;
       mappings[targetAxis] = candidate;
+      authorities[targetAxis] = contributor;
+      authorityAxes[targetAxis] = *sourceAxis;
       refined[targetAxis] = true;
       changed = true;
     }
