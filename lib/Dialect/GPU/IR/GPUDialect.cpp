@@ -251,11 +251,23 @@ LogicalResult PhysicalExprAttr::verify(
 
 LogicalResult ParameterAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr name,
-    uint32_t role, DenseI64ArrayAttr candidates) {
+    uint32_t role, uint32_t category, uint32_t elementBitWidth,
+    DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
       role > static_cast<uint32_t>(ParameterRole::FullCoverage) ||
+      category > static_cast<uint32_t>(ParameterCategory::Provider) ||
       !candidates || candidates.empty())
-    return emitError() << "physical parameter requires a name, role and candidates";
+    return emitError()
+           << "physical parameter requires a name, role, category and candidates";
+  auto typedCategory = static_cast<ParameterCategory>(category);
+  const bool carriesDataGranularity =
+      typedCategory == ParameterCategory::Pointwise ||
+      typedCategory == ParameterCategory::Reduction ||
+      typedCategory == ParameterCategory::Scan ||
+      typedCategory == ParameterCategory::Contraction;
+  if (carriesDataGranularity != (elementBitWidth > 0))
+    return emitError()
+           << "data-granularity parameter categories require an element bit width and non-data categories forbid one";
   llvm::DenseSet<int64_t> unique;
   for (int64_t candidate : candidates.asArrayRef())
     if (candidate <= 0 || !unique.insert(candidate).second)

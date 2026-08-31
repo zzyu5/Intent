@@ -40,7 +40,9 @@ gpu::ParameterOp getOrCreateStages(func::FuncOp kernel) {
   OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
   auto schema = gpu::ParameterAttr::get(
       kernel.getContext(), builder.getStringAttr("NUM_STAGES"),
-      static_cast<uint32_t>(gpu::ParameterRole::ProviderStages), candidates);
+      static_cast<uint32_t>(gpu::ParameterRole::ProviderStages),
+      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
+      /*elementBitWidth=*/0, candidates);
   return builder.create<gpu::ParameterOp>(kernel.getLoc(), builder.getIndexType(),
                                           schema);
 }

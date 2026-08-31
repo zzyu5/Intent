@@ -60,7 +60,9 @@ gpu::ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
   OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
   auto schema = gpu::ParameterAttr::get(
       kernel.getContext(), builder.getStringAttr(name),
-      static_cast<uint32_t>(role), expectedCandidates);
+      static_cast<uint32_t>(role),
+      static_cast<uint32_t>(gpu::ParameterCategory::Provider),
+      /*elementBitWidth=*/0, expectedCandidates);
   return builder.create<gpu::ParameterOp>(kernel.getLoc(), builder.getIndexType(),
                                           schema);
 }

@@ -54,6 +54,8 @@ LogicalResult realizeGroupedContractionMapping(
   auto schema = ParameterAttr::get(
       module.getContext(), parameterBuilder.getStringAttr("GROUP_SIZE_M"),
       static_cast<uint32_t>(ParameterRole::TraversalGroup),
+      static_cast<uint32_t>(ParameterCategory::Execution),
+      /*elementBitWidth=*/0,
       DenseI64ArrayAttr::get(module.getContext(), {1, 2, 4, 8}));
   Value groupSize = parameterBuilder.create<ParameterOp>(
       mapping.getLoc(), parameterBuilder.getIndexType(), schema);
@@ -169,6 +171,8 @@ LogicalResult refineProgramMapping(ModuleOp module) {
       module.getContext(),
       parameterBuilder.getStringAttr("RESIDENT_WORKERS"),
       static_cast<uint32_t>(ParameterRole::ResidentWorkers),
+      static_cast<uint32_t>(ParameterCategory::Execution),
+      /*elementBitWidth=*/0,
       DenseI64ArrayAttr::get(module.getContext(),
                              {capabilities.getComputeUnits()}));
   auto residentWorkers = parameterBuilder.create<ParameterOp>(

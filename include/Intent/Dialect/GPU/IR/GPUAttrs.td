@@ -66,13 +66,16 @@ def IntentGPU_PhysicalExprAttr : AttrDef<IntentGPU_Dialect, "PhysicalExpr"> {
 
 def IntentGPU_ParameterAttr : AttrDef<IntentGPU_Dialect, "Parameter"> {
   let mnemonic = "parameter";
-  let summary = "One compile-time physical parameter and its legal candidates";
+  let summary = "One typed compile-time physical parameter and its legal candidates";
   let parameters = (ins
     "::mlir::StringAttr":$name,
     "uint32_t":$role,
+    "uint32_t":$category,
+    "uint32_t":$elementBitWidth,
     "::mlir::DenseI64ArrayAttr":$candidates
   );
-  let assemblyFormat = "`<` $name `,` $role `,` $candidates `>`";
+  let assemblyFormat =
+      "`<` $name `,` $role `,` $category `,` $elementBitWidth `,` $candidates `>`";
   let genVerifyDecl = 1;
 }
 

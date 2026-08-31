@@ -1429,9 +1429,20 @@ private:
         ("SEGMENT_N" + Twine(fact.operationIdentity) + "_D" +
          Twine(fact.dimensionIdentity))
             .str();
+    Type sourceType = operation->getOperand(0).getType();
+    if (auto tensor = dyn_cast<RankedTensorType>(sourceType))
+      sourceType = tensor.getElementType();
+    if (!isa<IntegerType, FloatType>(sourceType))
+      return operation->emitOpError(
+          "region segment has no scalar element type for its physical parameter");
+    auto category = isa<intent::RegionScanOp>(operation)
+                        ? gpu::ParameterCategory::Scan
+                        : gpu::ParameterCategory::Reduction;
     auto schema = gpu::ParameterAttr::get(
         operation->getContext(), builder.getStringAttr(name),
         static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),
+        static_cast<uint32_t>(category),
+        sourceType.getIntOrFloatBitWidth(),
         builder.getDenseI64ArrayAttr(
             {16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
              32768, 65536}));

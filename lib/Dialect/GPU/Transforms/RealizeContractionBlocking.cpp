@@ -557,6 +557,7 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
         "parameter",
         ParameterAttr::get(
             kernel.getContext(), schema.getName(), schema.getRole(),
+            schema.getCategory(), schema.getElementBitWidth(),
             DenseI64ArrayAttr::get(kernel.getContext(), fullCoverageCandidates)));
     if (auto current =
             (*parameter)->getAttrOfType<IntegerAttr>(coverageDimensionAttr)) {
@@ -970,6 +971,7 @@ bool hasCompleteStorePath(ContractOp contract) {
 
 ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
                                  ParameterRole role,
+                                 uint32_t elementBitWidth,
                                  ArrayRef<int64_t> candidates) {
   ParameterOp existing;
   kernel.walk([&](ParameterOp parameter) {
@@ -981,6 +983,9 @@ ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
     auto expectedCandidates =
         DenseI64ArrayAttr::get(kernel.getContext(), candidates);
     if (schema.getRole() != static_cast<uint32_t>(role) ||
+        schema.getCategory() !=
+            static_cast<uint32_t>(ParameterCategory::Contraction) ||
+        schema.getElementBitWidth() != elementBitWidth ||
         schema.getCandidates() != expectedCandidates) {
       existing.emitOpError(
           "physical parameter name is reused with a different role or candidate domain")
@@ -996,6 +1001,7 @@ ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
   auto schema = ParameterAttr::get(
       kernel.getContext(), builder.getStringAttr(name),
       static_cast<uint32_t>(role),
+      static_cast<uint32_t>(ParameterCategory::Contraction), elementBitWidth,
       DenseI64ArrayAttr::get(kernel.getContext(), candidates));
   return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
                                      schema);
@@ -1545,7 +1551,8 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
        Twine(rhsMap->getSourceId()))
           .str();
   ParameterOp blockK = getOrCreateParameter(
-      kernel, "BLOCK_K" + suffix, ParameterRole::Reduction, {32, 64, 128});
+      kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
+      lhsType.getElementType().getIntOrFloatBitWidth(), {32, 64, 128});
   if (!blockK)
     return failure();
   FailureOr<int64_t> lhsDimension = queryRangeDimension(lhsRange);
@@ -1826,12 +1833,17 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           .str();
   ParameterOp blockM = getOrCreateParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
+      lhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
   ParameterOp blockN = getOrCreateParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
+      rhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
   ParameterOp blockK = getOrCreateParameter(
-      kernel, "BLOCK_K" + suffix, ParameterRole::Reduction, {32, 64, 128});
+      kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
+      std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
+               rhsType.getElementType().getIntOrFloatBitWidth()),
+      {32, 64, 128});
   if (!blockM || !blockN || !blockK)
     return failure();
   FailureOr<unsigned> existingRowAxis =
@@ -1861,6 +1873,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   if (runtimeRowTraversal)
     rowWorkers = getOrCreateParameter(
         kernel, "ROW_WORKERS" + suffix, ParameterRole::TraversalWorkers,
+        lhsType.getElementType().getIntOrFloatBitWidth(),
         {1, 2, 4, 8});
   if (runtimeRowTraversal && !rowWorkers)
     return failure();
@@ -2550,11 +2563,16 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
        Twine(columnMap->getSourceId()))
           .str();
   ParameterOp blockM = getOrCreateParameter(
-      kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM, {64, 128});
+      kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
+      lhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
   ParameterOp blockN = getOrCreateParameter(
-      kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN, {64, 128});
+      kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
+      rhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
   ParameterOp blockK = getOrCreateParameter(
-      kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction, {2, 4, 8});
+      kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction,
+      std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
+               rhsType.getElementType().getIntOrFloatBitWidth()),
+      {2, 4, 8});
   if (!blockM || !blockN || !blockK)
     return failure();
   FailureOr<unsigned> existingRowAxis =

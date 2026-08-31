@@ -111,6 +111,9 @@ LogicalResult runSharedGPUPasses(ModuleOp module) {
   if (failed(kernel))
     return failure();
   eraseUnusedPhysicalParameters(*kernel);
+  if (failed(materializeSharedConfigTuples(*kernel)) ||
+      failed(verifySharedConfigTuples(*kernel)))
+    return failure();
   return verifyGPUProgram(module);
 }
 

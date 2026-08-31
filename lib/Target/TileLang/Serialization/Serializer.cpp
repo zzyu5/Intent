@@ -200,6 +200,7 @@ private:
 
   void collectConfiguration() {
     llvm::StringSet<> names;
+    llvm::StringSet<> sharedParameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       auto role = static_cast<gpu::ParameterRole>(schema.getRole());
@@ -237,10 +238,46 @@ private:
         values[parameter.getResult()] = name.str();
         return;
       }
-      domains.push_back(
-          {name.str(), SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
+      parameterNames.push_back(name.str());
+      if (role == gpu::ParameterRole::ProviderThreads ||
+          role == gpu::ParameterRole::ProviderStages)
+        providerDomains.push_back(
+            {name.str(),
+             SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
+      else
+        sharedParameters.insert(name);
       values[parameter.getResult()] = name.str();
     });
+    if (failed)
+      return;
+    auto encoded =
+        kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
+    if (!encoded || encoded.empty()) {
+      kernel.emitError("TileLang source requires shared config tuples");
+      failed = true;
+      return;
+    }
+    for (Attribute attribute : encoded) {
+      auto tuple = dyn_cast<DictionaryAttr>(attribute);
+      if (!tuple || tuple.size() != sharedParameters.size()) {
+        kernel.emitError("contains a malformed shared config tuple");
+        failed = true;
+        return;
+      }
+      std::map<std::string, int64_t> config;
+      for (NamedAttribute binding : tuple) {
+        auto value = dyn_cast<IntegerAttr>(binding.getValue());
+        if (!sharedParameters.contains(binding.getName().getValue()) ||
+            !value) {
+          kernel.emitError(
+              "shared config tuple contains an invalid TileLang binding");
+          failed = true;
+          return;
+        }
+        config[binding.getName().strref().str()] = value.getInt();
+      }
+      sharedConfigurations.push_back(std::move(config));
+    }
   }
 
   void emitPreamble() {
@@ -249,7 +286,8 @@ private:
   }
 
   SmallVector<std::map<std::string, int64_t>> configurations() {
-    SmallVector<std::map<std::string, int64_t>> configs(1);
+    SmallVector<std::map<std::string, int64_t>> configs =
+        sharedConfigurations;
     auto expand = [&](StringRef name, ArrayRef<int64_t> candidates) {
       SmallVector<std::map<std::string, int64_t>> next;
       for (const auto &base : configs)
@@ -260,7 +298,7 @@ private:
         }
       configs = std::move(next);
     };
-    for (const ParameterDomain &domain : domains)
+    for (const ParameterDomain &domain : providerDomains)
       expand(domain.name, domain.candidates);
     SmallVector<std::map<std::string, int64_t>> legal;
     for (auto &config : configs)
@@ -373,8 +411,8 @@ private:
     for (const ScalarABI &scalar : scalars)
       if (scalar.kind == "constexpr")
         argument(scalar.name);
-    for (const ParameterDomain &domain : domains)
-      argument(domain.name);
+    for (const std::string &name : parameterNames)
+      argument(name);
     for (const auto &[name, coverage] : fullCoverageParameters)
       argument(name);
     output << "):\n";
@@ -923,7 +961,9 @@ private:
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
-  SmallVector<ParameterDomain> domains;
+  SmallVector<std::string> parameterNames;
+  SmallVector<ParameterDomain> providerDomains;
+  SmallVector<std::map<std::string, int64_t>> sharedConfigurations;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   std::map<std::string, uint32_t> parameterRoles;
   std::map<std::string, int64_t> parameterDimensions;

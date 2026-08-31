@@ -108,6 +108,8 @@ mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
+mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel);
+mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);
 mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module);
 

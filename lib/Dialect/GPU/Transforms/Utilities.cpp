@@ -2657,6 +2657,8 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     auto schema = ParameterAttr::get(
         kernel.getContext(), builder.getStringAttr(name),
         static_cast<uint32_t>(ParameterRole::FullCoverage),
+        static_cast<uint32_t>(ParameterCategory::Coverage),
+        /*elementBitWidth=*/0,
         DenseI64ArrayAttr::get(kernel.getContext(), candidates));
     parameter = builder.create<ParameterOp>(source.getLoc(),
                                             builder.getIndexType(), schema);
@@ -2666,6 +2668,7 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
         "parameter",
         ParameterAttr::get(
             kernel.getContext(), schema.getName(), schema.getRole(),
+            schema.getCategory(), schema.getElementBitWidth(),
             DenseI64ArrayAttr::get(kernel.getContext(), candidates)));
   }
   parameter->setAttr(

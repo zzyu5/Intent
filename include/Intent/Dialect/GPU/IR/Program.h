@@ -47,6 +47,8 @@ inline constexpr llvm::StringLiteral physicalTailAttr =
     "intent_gpu.physical_tail";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
+inline constexpr llvm::StringLiteral sharedConfigTuplesAttr =
+    "intent_gpu.shared.config_tuples";
 
 enum class PhysicalExprKind : uint32_t {
   Constant = 0,
@@ -77,6 +79,16 @@ enum class ParameterRole : uint32_t {
   TraversalGroup = 9,
   ResidentWorkers = 10,
   FullCoverage = 11,
+};
+
+enum class ParameterCategory : uint32_t {
+  Pointwise = 0,
+  Reduction = 1,
+  Scan = 2,
+  Contraction = 3,
+  Execution = 4,
+  Coverage = 5,
+  Provider = 6,
 };
 
 enum class CoordinateRole : int64_t {

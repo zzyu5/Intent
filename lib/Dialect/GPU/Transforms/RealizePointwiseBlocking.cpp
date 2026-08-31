@@ -13,6 +13,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -21,6 +22,24 @@ using namespace mlir;
 
 namespace intent::gpu {
 namespace {
+
+uint32_t physicalElementBitWidth(Type type) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    type = fragment.getElementType();
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    type = tensor.getElementType();
+  if (auto record = dyn_cast<RecordType>(type)) {
+    uint32_t width = 0;
+    for (Attribute field : record.getFieldTypes())
+      width = std::max(
+          width,
+          physicalElementBitWidth(cast<TypeAttr>(field).getValue()));
+    return width;
+  }
+  return isa<IntegerType, FloatType>(type)
+             ? type.getIntOrFloatBitWidth()
+             : 0;
+}
 
 Attribute dimensionAxisKey(MLIRContext *context, uint64_t dimension) {
   return IntegerAttr::get(IntegerType::get(context, 64), dimension);
@@ -562,6 +581,8 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     auto schema = ParameterAttr::get(
         kernel.getContext(), builder.getStringAttr(parameterName),
         static_cast<uint32_t>(ParameterRole::ScanChunk),
+        static_cast<uint32_t>(ParameterCategory::Coverage),
+        /*elementBitWidth=*/0,
         DenseI64ArrayAttr::get(kernel.getContext(), candidates));
     parameter = builder.create<ParameterOp>(source.getLoc(),
                                             builder.getIndexType(), schema);
@@ -1388,10 +1409,19 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   if (!chunk) {
     static constexpr int64_t candidates[] = {16, 32, 64, 128, 256, 512,
                                              1024, 2048, 4096};
+    uint32_t elementBitWidth = 0;
+    for (StoreOp store : stores)
+      elementBitWidth =
+          std::max(elementBitWidth,
+                   physicalElementBitWidth(store.getValue().getType()));
+    if (elementBitWidth == 0)
+      return range.emitOpError(
+          "pointwise traversal has no typed data width for its physical parameter");
     OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
     auto schema = ParameterAttr::get(
         kernel.getContext(), entry.getStringAttr(name),
         static_cast<uint32_t>(ParameterRole::OwnershipN),
+        static_cast<uint32_t>(ParameterCategory::Pointwise), elementBitWidth,
         DenseI64ArrayAttr::get(kernel.getContext(), candidates));
     chunk = entry.create<ParameterOp>(range.getLoc(), entry.getIndexType(), schema);
     chunk->setAttr(parameterSourceAttr,
@@ -2681,6 +2711,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<Value> payloads;
   };
   SmallVector<WriteEffectFacts> writeEffects;
+  uint32_t pointwiseElementBitWidth = 0;
   llvm::SmallDenseSet<PhysicalSourceAxis> ownershipSources;
   llvm::SmallDenseSet<PhysicalSourceAxis> directOwnershipSources;
   auto collectOwnership = [&](ValueRange coordinates, ValueRange payloads) {
@@ -2688,6 +2719,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     effect.coordinates.append(coordinates.begin(), coordinates.end());
     effect.payloads.append(payloads.begin(), payloads.end());
     writeEffects.push_back(std::move(effect));
+    for (Value payload : payloads)
+      pointwiseElementBitWidth =
+          std::max(pointwiseElementBitWidth,
+                   physicalElementBitWidth(payload.getType()));
     for (Value coordinate : coordinates) {
       auto fragment = dyn_cast<FragmentType>(coordinate.getType());
       if (!fragment)
@@ -2984,6 +3019,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                          "_A" + Twine(source.sourceAxis))
                                             .str()),
             static_cast<uint32_t>(ParameterRole::OwnershipN),
+            static_cast<uint32_t>(ParameterCategory::Pointwise),
+            pointwiseElementBitWidth,
             DenseI64ArrayAttr::get(module.getContext(), candidates));
         parameter = builder.create<ParameterOp>(
             range.getLoc(), builder.getIndexType(), schema);
@@ -3101,6 +3138,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
         static_cast<uint32_t>(ParameterRole::OwnershipN),
+        static_cast<uint32_t>(ParameterCategory::Pointwise),
+        pointwiseElementBitWidth,
         DenseI64ArrayAttr::get(module.getContext(),
                                {1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
                                 1024, 2048, 4096, 8192, 16384, 32768,
