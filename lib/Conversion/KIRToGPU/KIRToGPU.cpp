@@ -186,6 +186,45 @@ FailureOr<Value> retargetBroadcast(OpBuilder &builder, Location location,
   return replacement->getResult(0);
 }
 
+FailureOr<gpu::FragmentType>
+mergeBroadcastExtents(gpu::FragmentType source,
+                      gpu::FragmentType relationTarget) {
+  gpu::BroadcastProjection projection =
+      gpu::queryAxisProjection(source, relationTarget);
+  if (!projection.isExact() ||
+      source.getValidity() != relationTarget.getValidity() ||
+      source.getOwner() != relationTarget.getOwner())
+    return failure();
+  SmallVector<Attribute> shape(relationTarget.getShape().begin(),
+                               relationTarget.getShape().end());
+  for (auto [targetAxis, sourceAxis] :
+       llvm::enumerate(projection.targetToSource)) {
+    if (!sourceAxis || source.getShape()[*sourceAxis] == shape[targetAxis])
+      continue;
+    auto sourceExtent = cast<gpu::PhysicalExprAttr>(
+        source.getShape()[*sourceAxis]);
+    auto targetExtent = cast<gpu::PhysicalExprAttr>(shape[targetAxis]);
+    bool sourceUnit =
+        sourceExtent.getKind() ==
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+        sourceExtent.getValue() == 1;
+    bool targetUnit =
+        targetExtent.getKind() ==
+            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+        targetExtent.getValue() == 1;
+    if (sourceUnit)
+      continue;
+    if (!targetUnit)
+      return failure();
+    shape[targetAxis] = sourceExtent;
+  }
+  return gpu::FragmentType::get(
+      relationTarget.getContext(), relationTarget.getElementType(),
+      ArrayAttr::get(relationTarget.getContext(), shape),
+      relationTarget.getAxisMaps(), relationTarget.getValidity(),
+      relationTarget.getOwner());
+}
+
 bool carriesLogicalDimensions(gpu::FragmentType fragment,
                               RankedTensorType logical) {
   DenseI64ArrayAttr dimensions = dimensionIds(logical);
@@ -237,13 +276,20 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     bool leftMatches = carriesLogicalDimensions(left, leftLogical);
     bool rightMatches = carriesLogicalDimensions(right, rightLogical);
     if (leftMatches != rightMatches) {
-      Value &projected = leftMatches ? rhs : lhs;
-      gpu::FragmentType target = leftMatches ? left : right;
-      FailureOr<Value> aligned =
-          retargetBroadcast(builder, location, projected, target);
-      if (failed(aligned))
+      gpu::FragmentType relationTarget = leftMatches ? left : right;
+      gpu::FragmentType extentSource = leftMatches ? right : left;
+      FailureOr<gpu::FragmentType> target =
+          mergeBroadcastExtents(extentSource, relationTarget);
+      if (failed(target))
         return failure();
-      projected = *aligned;
+      FailureOr<Value> alignedLeft =
+          retargetBroadcast(builder, location, lhs, *target);
+      FailureOr<Value> alignedRight =
+          retargetBroadcast(builder, location, rhs, *target);
+      if (failed(alignedLeft) || failed(alignedRight))
+        return failure();
+      lhs = *alignedLeft;
+      rhs = *alignedRight;
       return success();
     }
   }
@@ -334,18 +380,23 @@ LogicalResult alignElementwiseOperands(OpBuilder &builder, Location location,
     rhs = *alignedRight;
     return success();
   }
-  if (isa_and_nonnull<gpu::BroadcastOp, gpu::SplatOp>(rhs.getDefiningOp())) {
-    FailureOr<Value> aligned = retargetBroadcast(builder, location, rhs, left);
+  // A common pointwise schema is selected by the typed broadcast relation,
+  // not by which operand happens to have a BroadcastOp producer.  In
+  // particular, a structured segment extent is authoritative over a
+  // construction-time singleton even when the segmented value is the operand
+  // being rematerialized.  Choosing the non-broadcast producer unconditionally
+  // would replace that extent with one and construct an invalid BroadcastOp.
+  bool leftToRight = gpu::queryBroadcastProjection(left, right).isExact();
+  bool rightToLeft = gpu::queryBroadcastProjection(right, left).isExact();
+  if (leftToRight || rightToLeft) {
+    bool projectLeft = leftToRight && !rightToLeft;
+    Value &projected = projectLeft ? lhs : rhs;
+    gpu::FragmentType target = projectLeft ? right : left;
+    FailureOr<Value> aligned =
+        retargetBroadcast(builder, location, projected, target);
     if (failed(aligned))
       return failure();
-    rhs = *aligned;
-    return success();
-  }
-  if (isa_and_nonnull<gpu::BroadcastOp, gpu::SplatOp>(lhs.getDefiningOp())) {
-    FailureOr<Value> aligned = retargetBroadcast(builder, location, lhs, right);
-    if (failed(aligned))
-      return failure();
-    lhs = *aligned;
+    projected = *aligned;
     return success();
   }
   // Result-axis identities are local provenance for a value produced by a
