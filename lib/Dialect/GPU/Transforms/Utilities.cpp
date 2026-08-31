@@ -1416,6 +1416,78 @@ FailureOr<FragmentType> refinePhysicalSchema(func::FuncOp kernel,
                            target.getValidity(), target.getOwner());
 }
 
+FailureOr<FragmentType> refineAccessResultSchema(
+    func::FuncOp kernel, FragmentType target, ValueRange coordinates) {
+  SmallVector<Attribute> shape(target.getShape().begin(),
+                               target.getShape().end());
+  SmallVector<bool> refined(shape.size(), false);
+  bool changed = false;
+  PhysicalProgramAnalysis analysis(kernel);
+  for (Value coordinate : coordinates) {
+    auto source = dyn_cast<FragmentType>(coordinate.getType());
+    if (!source)
+      continue;
+    for (unsigned sourceAxis = 0; sourceAxis < source.getShape().size();
+         ++sourceAxis) {
+      PhysicalAxisRealizationFact realization =
+          analysis.axisRealization(coordinate, sourceAxis);
+      auto extent = cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
+      bool singleton =
+          extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1;
+      if (!realization.hasExtentAuthority() ||
+          realization.constructionScalarSeed || singleton)
+        continue;
+
+      auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+      std::optional<unsigned> targetAxis;
+      for (auto [axis, attribute] : llvm::enumerate(target.getAxisMaps())) {
+        if (attribute != mapping)
+          continue;
+        if (targetAxis)
+          return failure();
+        targetAxis = axis;
+      }
+      if (!targetAxis) {
+        PhysicalAxisProjection sourceProjection =
+            queryFragmentAxis(target, sourceAxisIdentity(mapping));
+        if (sourceProjection.isExact())
+          targetAxis = sourceProjection.fragmentAxis;
+        else if (sourceProjection.state == PhysicalFactState::Ambiguous)
+          return failure();
+      }
+      if (!targetAxis) {
+        PhysicalDimensionProjection dimensionProjection =
+            queryFragmentDimension(target, mapping.getDimensionId());
+        if (dimensionProjection.isExact())
+          targetAxis = dimensionProjection.fragmentAxis;
+        else if (dimensionProjection.state == PhysicalFactState::Ambiguous)
+          return failure();
+      }
+      // A coordinate may carry an ownership axis that the indexed result does
+      // not expose.  Such an axis is not an access-result extent authority.
+      if (!targetAxis)
+        continue;
+      if (refined[*targetAxis] && shape[*targetAxis] != extent)
+        return failure();
+      shape[*targetAxis] = extent;
+      refined[*targetAxis] = true;
+      changed |= target.getShape()[*targetAxis] != extent;
+    }
+  }
+  if (!changed)
+    return target;
+  // The index relation selected the access-result coordinate identity during
+  // KIR-to-GPU construction.  Coordinates refine only its physical extents;
+  // replacing those axis maps from a rank-aligned broadcast would create a
+  // second, and potentially different, index relation.
+  return FragmentType::get(target.getContext(), target.getElementType(),
+                           ArrayAttr::get(target.getContext(), shape),
+                           target.getAxisMaps(), target.getValidity(),
+                           target.getOwner());
+}
+
 LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
   WalkResult result = kernel.walk([&](Operation *operation) {
     ValueRange coordinates;
@@ -1433,10 +1505,13 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
     if (!current)
       return WalkResult::advance();
     FailureOr<FragmentType> refined =
-        refinePhysicalSchema(kernel, current, coordinates);
+        refineAccessResultSchema(kernel, current, coordinates);
     if (failed(refined)) {
-      operation->emitOpError(
+      InFlightDiagnostic diagnostic = operation->emitOpError(
           "access result has no unique physical coordinate projection");
+      diagnostic << "; result=" << current;
+      for (Value coordinate : coordinates)
+        diagnostic << "; coordinate=" << coordinate.getType();
       return WalkResult::interrupt();
     }
     for (auto [axis, mapping] : llvm::enumerate((*refined).getAxisMaps())) {
