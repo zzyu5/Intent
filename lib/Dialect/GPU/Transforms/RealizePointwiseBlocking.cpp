@@ -2071,11 +2071,38 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::SmallPtrSet<Operation *, 16> reuseTraversalRanges;
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
-  auto storeDirectlyUsesRange = [&](StoreOp store, MakeRangeOp range) {
-    if (!storeUsesRange(store, range))
+  SmallVector<SmallVector<Value, 4>> writeCoordinates;
+  auto rememberWriteCoordinates = [&](ValueRange coordinates) {
+    writeCoordinates.emplace_back(coordinates.begin(), coordinates.end());
+  };
+  kernel.walk([&](StoreOp store) {
+    rememberWriteCoordinates(store.getCoordinates());
+  });
+  kernel.walk([&](AtomicStoreOp store) {
+    rememberWriteCoordinates(store.getCoordinates());
+  });
+  kernel.walk([&](AtomicRMWOp store) {
+    rememberWriteCoordinates(store.getCoordinates());
+  });
+  kernel.walk([&](AtomicCompareExchangeOp store) {
+    rememberWriteCoordinates(store.getCoordinates());
+  });
+  kernel.walk([&](ScatterReduceOp scatter) {
+    rememberWriteCoordinates(scatter.getCoordinates());
+  });
+  auto coordinatesUseRange = [&](ValueRange coordinates, MakeRangeOp range) {
+    return llvm::any_of(coordinates, [&](Value coordinate) {
+      llvm::SmallPtrSet<Operation *, 8> ranges;
+      collectCoordinateRanges(coordinate, ranges);
+      return ranges.contains(range.getOperation());
+    });
+  };
+  auto coordinatesDirectlyUseRange = [&](ValueRange coordinates,
+                                         MakeRangeOp range) {
+    if (!coordinatesUseRange(coordinates, range))
       return false;
     PhysicalSourceAxis source = sourceAxisIdentity(range);
-    return llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
+    return llvm::any_of(coordinates, [&](Value coordinate) {
       if (!queryFragmentAxis(coordinate.getType(), source).isExact())
         return false;
       PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
@@ -2124,12 +2151,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   for (Operation *operation : structuredTraversalRanges) {
     auto range = dyn_cast<MakeRangeOp>(operation);
     bool writeOwnership = range &&
-        llvm::any_of(candidateStores, [&](StoreOp store) {
+        llvm::any_of(writeCoordinates, [&](ArrayRef<Value> coordinates) {
           return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
             return sameLogicalRange(range, candidate) &&
                    (candidate->hasAttr(sourceSubregionAttr)
-                        ? storeDirectlyUsesRange(store, candidate)
-                        : storeUsesRange(store, candidate));
+                        ? coordinatesDirectlyUseRange(coordinates, candidate)
+                        : coordinatesUseRange(coordinates, candidate));
           });
         });
     if (writeOwnership)

@@ -1370,9 +1370,19 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
       failureReason = "a reduction pair uses independently materialized steps";
       return failure();
     }
-    Value stop = binary(builder, location, builder.getIndexType(),
-                        lhsRange.getStart(), lhsRange.getExtent(),
-                        BinaryOperator::Add);
+    PhysicalLockstepTraversalFact lockstep =
+        predicateAnalysis.lockstepRanges({lhsRange, rhsRange});
+    if (!lockstep.isExact()) {
+      failureReason =
+          "a reduction pair does not have one lockstep physical traversal";
+      return failure();
+    }
+    FailureOr<Value> logicalEnd = resolveLogicalRangeEnd(
+        contract->getParentOfType<func::FuncOp>(), lockstep.authority);
+    if (failed(logicalEnd)) {
+      failureReason = "a reduction pair has no exact logical end";
+      return failure();
+    }
 
     FragmentType nestedLhsType = eraseFragmentAxis(currentLhsType, lhsAxis);
     FragmentType nestedRhsType = eraseFragmentAxis(currentRhsType, rhsAxis);
@@ -1396,7 +1406,8 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
         eraseAxis(currentRhsBatch, rhsAxis);
 
     auto loop = builder.create<scf::ForOp>(
-        location, lhsRange.getStart(), stop, *lhsStep, ValueRange{accumulator},
+        location, lockstep.authority.getStart(), *logicalEnd, *lhsStep,
+        ValueRange{accumulator},
         [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
             ValueRange carries) {
           SmallVector<Value> nestedLhsCoordinates(currentLhsCoordinates);
