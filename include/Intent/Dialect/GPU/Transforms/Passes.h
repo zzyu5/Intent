@@ -38,6 +38,8 @@ alignAccessResultRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignAggregateValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
+alignContractValueRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
 alignAccessValueRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 refreshReshapeRelations(mlir::func::FuncOp kernel);

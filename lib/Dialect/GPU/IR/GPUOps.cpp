@@ -677,10 +677,17 @@ LogicalResult MakeRecordOp::verify() {
 
 LogicalResult ExtractOp::verify() {
   auto record = getRecord().getType();
-  if (getField() >= record.getFieldTypes().size() ||
-      getResult().getType() !=
-          cast<TypeAttr>(record.getFieldTypes()[getField()]).getValue())
-    return emitOpError("record projection is outside its physical schema");
+  if (getField() >= record.getFieldTypes().size())
+    return emitOpError("record projection is outside its physical schema")
+           << "; field=" << getField()
+           << "; field_count=" << record.getFieldTypes().size();
+  Type expected =
+      cast<TypeAttr>(record.getFieldTypes()[getField()]).getValue();
+  if (getResult().getType() != expected)
+    return emitOpError("record projection is outside its physical schema")
+           << "; field=" << getField()
+           << "; actual=" << getResult().getType()
+           << "; expected=" << expected;
   return success();
 }
 

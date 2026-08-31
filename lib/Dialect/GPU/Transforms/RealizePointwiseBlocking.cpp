@@ -1598,6 +1598,60 @@ LogicalResult alignContractAccumulatorTypes(func::FuncOp kernel) {
   return result.wasInterrupted() ? failure() : success();
 }
 
+LogicalResult alignOrdinaryContractOperandTypes(func::FuncOp kernel) {
+  auto isUnit = [](Attribute attribute) {
+    auto extent = cast<PhysicalExprAttr>(attribute);
+    return extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           extent.getValue() == 1;
+  };
+  WalkResult result = kernel.walk([&](ContractOp contract) {
+    auto alignPairs = [&](Value lhs, Value rhs, ArrayRef<int64_t> lhsAxes,
+                          ArrayRef<int64_t> rhsAxes) -> LogicalResult {
+      if (lhsAxes.size() != rhsAxes.size())
+        return failure();
+      for (auto [lhsAxis, rhsAxis] : llvm::zip(lhsAxes, rhsAxes)) {
+        auto lhsType = cast<FragmentType>(lhs.getType());
+        auto rhsType = cast<FragmentType>(rhs.getType());
+        if (lhsAxis < 0 || rhsAxis < 0 ||
+            lhsAxis >= static_cast<int64_t>(lhsType.getShape().size()) ||
+            rhsAxis >= static_cast<int64_t>(rhsType.getShape().size()))
+          return failure();
+        Attribute lhsExtent = lhsType.getShape()[lhsAxis];
+        Attribute rhsExtent = rhsType.getShape()[rhsAxis];
+        if (lhsExtent == rhsExtent)
+          continue;
+        bool lhsUnit = isUnit(lhsExtent);
+        bool rhsUnit = isUnit(rhsExtent);
+        if (lhsUnit == rhsUnit)
+          return contract.emitOpError(
+                     "ordinary contract paired axes have conflicting physical extents")
+                 << "; lhs_axis=" << lhsAxis << "; lhs_extent=" << lhsExtent
+                 << "; rhs_axis=" << rhsAxis << "; rhs_extent=" << rhsExtent;
+        if (lhsUnit) {
+          auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
+          retargetSourceExtent(lhs, sourceAxisIdentity(mapping),
+                               cast<PhysicalExprAttr>(rhsExtent));
+        } else {
+          auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
+          retargetSourceExtent(rhs, sourceAxisIdentity(mapping),
+                               cast<PhysicalExprAttr>(lhsExtent));
+        }
+      }
+      return success();
+    };
+    if (failed(alignPairs(contract.getLhs(), contract.getRhs(),
+                          contract.getLhsReductionAxes(),
+                          contract.getRhsReductionAxes())) ||
+        failed(alignPairs(contract.getLhs(), contract.getRhs(),
+                          contract.getLhsBatchAxes(),
+                          contract.getRhsBatchAxes())))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 bool isCartesianPointwiseValueOp(Operation *operation) {
   return isa<SplatOp, BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
              CastOp, BitcastOp, LoadOp, GatherOp, RandomBitsOp>(operation);
@@ -1738,6 +1792,13 @@ LogicalResult rankLiftPointwiseValueGraph(
 
 } // namespace
 
+LogicalResult alignContractValueRelations(func::FuncOp kernel) {
+  if (failed(alignOrdinaryContractOperandTypes(kernel)) ||
+      failed(alignContractAccumulatorTypes(kernel)))
+    return failure();
+  return success();
+}
+
 static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                                    bool ownershipOnly) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
@@ -1752,9 +1813,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         failed(alignReductionYieldRelations(kernel)) ||
         failed(alignAccessValueRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignContractAccumulatorTypes(kernel)) ||
+        failed(alignContractValueRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
-        failed(alignAccessValueRelations(kernel)))
+        failed(alignAccessValueRelations(kernel)) ||
+        failed(alignPointwiseValueRelations(kernel)))
       return failure();
     eraseDeadPhysicalValues(kernel);
     return success();
@@ -3134,7 +3196,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     return failure();
   if (failed(realizeDistributedHistograms(kernel)))
     return failure();
-  if (failed(alignContractAccumulatorTypes(kernel)))
+  if (failed(alignContractValueRelations(kernel)))
     return failure();
   if (failed(bindStructurallyRequiredStaticFragments(kernel)))
     return failure();

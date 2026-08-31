@@ -28,6 +28,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
     return failure();
   if (failed(realizePointwiseOwnership(module)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
@@ -67,6 +68,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignReductionYieldRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
@@ -76,6 +79,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignAccessValueRelations(*kernel)) ||
       failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Structured realization replays source slices and may create new gathers.

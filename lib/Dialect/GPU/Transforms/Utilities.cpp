@@ -1659,6 +1659,16 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
     }
     if (!target)
       return WalkResult::advance();
+    if (isa<UnaryOp, CastOp, BitcastOp>(operation) &&
+        operation->getNumOperands() == 1) {
+      auto source = dyn_cast<FragmentType>(operation->getOperand(0).getType());
+      if (source) {
+        operation->getResult(0).setType(FragmentType::get(
+            kernel.getContext(), target.getElementType(), source.getShape(),
+            source.getAxisMaps(), source.getValidity(), source.getOwner()));
+        return WalkResult::advance();
+      }
+    }
     FailureOr<FragmentType> refined =
         refinePhysicalSchema(kernel, target, operation->getOperands());
     if (failed(refined)) {
@@ -1961,6 +1971,117 @@ LogicalResult alignAggregateValueRelations(func::FuncOp kernel) {
         kernel.getContext(), current.getFieldNames(),
         ArrayAttr::get(kernel.getContext(), fields), current.getOwner()));
   });
+  std::function<FailureOr<Type>(Type, Type, Type)> joinTypes =
+      [&](Type current, Type lhs, Type rhs) -> FailureOr<Type> {
+    if (auto lhsFragment = dyn_cast<FragmentType>(lhs)) {
+      auto rhsFragment = dyn_cast<FragmentType>(rhs);
+      auto currentFragment = dyn_cast<FragmentType>(current);
+      if (!rhsFragment || !currentFragment ||
+          lhsFragment.getElementType() != rhsFragment.getElementType() ||
+          lhsFragment.getElementType() != currentFragment.getElementType() ||
+          lhsFragment.getShape().size() != rhsFragment.getShape().size() ||
+          lhsFragment.getShape().size() != currentFragment.getShape().size() ||
+          lhsFragment.getAxisMaps() != rhsFragment.getAxisMaps() ||
+          lhsFragment.getValidity() != rhsFragment.getValidity() ||
+          lhsFragment.getOwner() != rhsFragment.getOwner())
+        return failure();
+      SmallVector<Attribute> shape;
+      for (auto [left, right] :
+           llvm::zip(lhsFragment.getShape(), rhsFragment.getShape())) {
+        if (left == right) {
+          shape.push_back(left);
+          continue;
+        }
+        auto leftExtent = cast<PhysicalExprAttr>(left);
+        auto rightExtent = cast<PhysicalExprAttr>(right);
+        bool leftUnit =
+            leftExtent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            leftExtent.getValue() == 1;
+        bool rightUnit =
+            rightExtent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            rightExtent.getValue() == 1;
+        if (leftUnit == rightUnit)
+          return failure();
+        shape.push_back(leftUnit ? right : left);
+      }
+      return Type(FragmentType::get(
+          kernel.getContext(), lhsFragment.getElementType(),
+          ArrayAttr::get(kernel.getContext(), shape), lhsFragment.getAxisMaps(),
+          lhsFragment.getValidity(), lhsFragment.getOwner()));
+    }
+    auto lhsRecord = dyn_cast<RecordType>(lhs);
+    auto rhsRecord = dyn_cast<RecordType>(rhs);
+    auto currentRecord = dyn_cast<RecordType>(current);
+    if (lhsRecord || rhsRecord || currentRecord) {
+      if (!lhsRecord || !rhsRecord || !currentRecord ||
+          lhsRecord.getFieldNames() != rhsRecord.getFieldNames() ||
+          lhsRecord.getFieldNames() != currentRecord.getFieldNames() ||
+          lhsRecord.getFieldTypes().size() != rhsRecord.getFieldTypes().size() ||
+          lhsRecord.getFieldTypes().size() !=
+              currentRecord.getFieldTypes().size() ||
+          lhsRecord.getOwner() != rhsRecord.getOwner())
+        return failure();
+      SmallVector<Attribute> fields;
+      for (auto [base, left, right] :
+           llvm::zip(currentRecord.getFieldTypes(), lhsRecord.getFieldTypes(),
+                     rhsRecord.getFieldTypes())) {
+        FailureOr<Type> joined = joinTypes(
+            cast<TypeAttr>(base).getValue(), cast<TypeAttr>(left).getValue(),
+            cast<TypeAttr>(right).getValue());
+        if (failed(joined))
+          return failure();
+        fields.push_back(TypeAttr::get(*joined));
+      }
+      return Type(RecordType::get(
+          kernel.getContext(), lhsRecord.getFieldNames(),
+          ArrayAttr::get(kernel.getContext(), fields), lhsRecord.getOwner()));
+    }
+    return current == lhs && lhs == rhs ? FailureOr<Type>(current)
+                                        : FailureOr<Type>(failure());
+  };
+  WalkResult branches = kernel.walk([&](scf::IfOp branch) {
+    auto thenYield = dyn_cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
+    auto elseYield = dyn_cast<scf::YieldOp>(branch.elseBlock()->getTerminator());
+    if (!thenYield || !elseYield ||
+        thenYield.getResults().size() != branch.getNumResults() ||
+        elseYield.getResults().size() != branch.getNumResults())
+      return branch.getNumResults() == 0 ? WalkResult::advance()
+                                         : WalkResult::interrupt();
+    for (unsigned index = 0; index < branch.getNumResults(); ++index) {
+      FailureOr<Type> target = joinTypes(
+          branch.getResult(index).getType(),
+          thenYield.getResults()[index].getType(),
+          elseYield.getResults()[index].getType());
+      if (failed(target)) {
+        branch.emitOpError(
+            "control-flow branches have no unique physical result relation")
+            << "; result_index=" << index
+            << "; then=" << thenYield.getResults()[index].getType()
+            << "; else=" << elseYield.getResults()[index].getType();
+        return WalkResult::interrupt();
+      }
+      OpBuilder thenBuilder(thenYield);
+      FailureOr<Value> projectedThen = projectPhysicalValueToSchema(
+          thenBuilder, branch.getLoc(), thenYield.getResults()[index], *target);
+      OpBuilder elseBuilder(elseYield);
+      FailureOr<Value> projectedElse = projectPhysicalValueToSchema(
+          elseBuilder, branch.getLoc(), elseYield.getResults()[index], *target);
+      if (failed(projectedThen) || failed(projectedElse)) {
+        branch.emitOpError(
+            "control-flow branch cannot adopt its joined physical relation")
+            << "; result_index=" << index << "; target=" << *target;
+        return WalkResult::interrupt();
+      }
+      thenYield->setOperand(index, *projectedThen);
+      elseYield->setOperand(index, *projectedElse);
+      branch.getResult(index).setType(*target);
+    }
+    return WalkResult::advance();
+  });
+  if (branches.wasInterrupted())
+    return failure();
   WalkResult result = kernel.walk([&](RegionFoldOp fold) {
     if (!llvm::hasSingleElement(fold.getSummarize()) ||
         !llvm::hasSingleElement(fold.getCombine()))
@@ -2175,38 +2296,36 @@ static void retargetExtent(Value root, AxisSelector selects,
         }
       }
     }
-    if (followLogicalDimension) {
-      Operation *definition = value.getDefiningOp();
-      if (isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-                          BitcastOp, ReshapeOp>(definition)) {
-        worklist.append(definition->getOperands().begin(),
-                        definition->getOperands().end());
-      } else if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {
-        auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
-        auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
-        bool preserves = false;
-        if (source && result) {
-          BroadcastProjection projection = queryAxisProjection(source, result);
-          if (projection.isExact())
-            for (auto [targetAxis, sourceAxis] :
-                 llvm::enumerate(projection.targetToSource)) {
-              if (!sourceAxis ||
-                  !selects(cast<AxisMapAttr>(
-                      result.getAxisMaps()[targetAxis])))
-                continue;
-              auto sourceExtent = cast<PhysicalExprAttr>(
-                  source.getShape()[*sourceAxis]);
-              bool expandsSingleton =
-                  sourceExtent.getKind() ==
-                      static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-                  sourceExtent.getValue() == 1 &&
-                  source.getShape()[*sourceAxis] != result.getShape()[targetAxis];
-              preserves |= !expandsSingleton;
-            }
-        }
-        if (preserves)
-          worklist.push_back(broadcast.getValue());
+    Operation *definition = value.getDefiningOp();
+    if (isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
+                        BitcastOp, ReshapeOp>(definition)) {
+      worklist.append(definition->getOperands().begin(),
+                      definition->getOperands().end());
+    } else if (auto broadcast = dyn_cast_or_null<BroadcastOp>(definition)) {
+      auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
+      auto result = dyn_cast<FragmentType>(broadcast.getResult().getType());
+      bool preserves = false;
+      if (source && result) {
+        BroadcastProjection projection = queryAxisProjection(source, result);
+        if (projection.isExact())
+          for (auto [targetAxis, sourceAxis] :
+               llvm::enumerate(projection.targetToSource)) {
+            if (!sourceAxis ||
+                !selects(
+                    cast<AxisMapAttr>(result.getAxisMaps()[targetAxis])))
+              continue;
+            auto sourceExtent =
+                cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
+            bool expandsSingleton =
+                sourceExtent.getKind() ==
+                    static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+                sourceExtent.getValue() == 1 &&
+                source.getShape()[*sourceAxis] != result.getShape()[targetAxis];
+            preserves |= !expandsSingleton;
+          }
       }
+      if (preserves)
+        worklist.push_back(broadcast.getValue());
     }
     // Product fields and structured helper arguments are part of the same
     // physical value flow even though MLIR does not connect them with ordinary

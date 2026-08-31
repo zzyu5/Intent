@@ -1111,6 +1111,42 @@ FailureOr<FragmentType> convertSegmentSliceType(RankedTensorType tensor,
                            prototype.getOwner());
 }
 
+FailureOr<Type> regionAssemblyType(Type result, Type slice) {
+  if (auto resultFragment = dyn_cast<FragmentType>(result)) {
+    auto sliceFragment = dyn_cast<FragmentType>(slice);
+    if (!sliceFragment ||
+        resultFragment.getElementType() != sliceFragment.getElementType() ||
+        resultFragment.getShape().size() != sliceFragment.getShape().size() ||
+        resultFragment.getOwner() != sliceFragment.getOwner())
+      return failure();
+    return Type(FragmentType::get(
+        result.getContext(), resultFragment.getElementType(),
+        resultFragment.getShape(), sliceFragment.getAxisMaps(),
+        resultFragment.getValidity(), resultFragment.getOwner()));
+  }
+  auto resultRecord = dyn_cast<gpu::RecordType>(result);
+  auto sliceRecord = dyn_cast<gpu::RecordType>(slice);
+  if (!resultRecord || !sliceRecord ||
+      resultRecord.getFieldNames() != sliceRecord.getFieldNames() ||
+      resultRecord.getFieldTypes().size() !=
+          sliceRecord.getFieldTypes().size() ||
+      resultRecord.getOwner() != sliceRecord.getOwner())
+    return result == slice ? FailureOr<Type>(result)
+                           : FailureOr<Type>(failure());
+  SmallVector<Attribute> fields;
+  for (auto [whole, part] : llvm::zip(resultRecord.getFieldTypes(),
+                                      sliceRecord.getFieldTypes())) {
+    FailureOr<Type> field = regionAssemblyType(
+        cast<TypeAttr>(whole).getValue(), cast<TypeAttr>(part).getValue());
+    if (failed(field))
+      return failure();
+    fields.push_back(TypeAttr::get(*field));
+  }
+  return Type(gpu::RecordType::get(
+      result.getContext(), resultRecord.getFieldNames(),
+      ArrayAttr::get(result.getContext(), fields), resultRecord.getOwner()));
+}
+
 FailureOr<Type> convertDataType(Type type, Operation *origin,
                                 std::optional<Type> prototype = std::nullopt,
                                 uint64_t owner = 1,
@@ -3567,11 +3603,25 @@ private:
       SmallVector<Type> emitArguments(sliceTypes);
       emitArguments.append(stateTypes);
       emitArguments.append(captureTypes);
-      SmallVector<Type> emittedTypes(
-          results.begin(), results.begin() + scan.getOutputCount());
       if (failed(lowerPureRegion(scan.getEmit(), target.getEmit(),
-                                 emitArguments, emittedTypes)))
+                                 emitArguments)))
         return failure();
+      auto emitted = dyn_cast<gpu::YieldOp>(target.getEmit().front().back());
+      if (!emitted || emitted.getValues().size() != scan.getOutputCount())
+        return scan.emitOpError(
+            "region-scan emitter has no complete physical output schema");
+      for (unsigned index = 0; index < scan.getOutputCount(); ++index) {
+        FailureOr<Type> assembled = regionAssemblyType(
+            results[index], emitted.getValues()[index].getType());
+        if (failed(assembled))
+          return scan.emitOpError(
+                     "region-scan emitted slice cannot define its assembled output relation")
+                 << "; result_index=" << index
+                 << "; slice=" << emitted.getValues()[index].getType()
+                 << "; result=" << results[index];
+        results[index] = *assembled;
+        target.getResult(index).setType(*assembled);
+      }
       mapResults(operation, raw);
       return success();
     }
