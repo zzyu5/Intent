@@ -70,7 +70,7 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   llvm_unreachable("unknown physical parameter category");
 }
 
-SmallVector<TuningProfile, 4>
+SmallVector<TuningProfile, 5>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             bool twoAxisPointwise) {
   auto capabilities =
@@ -106,7 +106,8 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             {1, 1, 1, 1, 2, 4},
             {1, 1, 1, 1, 4, 2}};
   if (twoAxisPointwise)
-    return {{64, 64, 32, 128, 1, 8},
+    return {{1, narrow ? 512 : 256, 32, 128, 1, 8},
+            {64, 64, 32, 128, 1, 8},
             {16, 16, 32, 128, 1, 8},
             {8, 16, 32, 128, 1, 8},
             {8, 8, 32, 128, 1, 8}};
@@ -194,13 +195,13 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                schema.getRole() ==
                    static_cast<uint32_t>(ParameterRole::OwnershipM);
       });
-  unsigned profileCount = hasTwoAxisPointwiseOwnership ? 4 : 3;
+  unsigned profileCount = hasTwoAxisPointwiseOwnership ? 5 : 3;
   for (unsigned profileIndex = 0; profileIndex < profileCount; ++profileIndex) {
     SmallVector<NamedAttribute> bindings;
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
       auto role = static_cast<ParameterRole>(schema.getRole());
-      SmallVector<TuningProfile, 4> profiles = profilesFor(
+      SmallVector<TuningProfile, 5> profiles = profilesFor(
           kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
           hasTwoAxisPointwiseOwnership);
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
