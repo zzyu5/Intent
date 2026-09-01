@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
@@ -53,7 +54,8 @@ struct TritonLocalOptions {
 
 SmallVector<TritonLocalOptions, 4>
 localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
-                bool twoAxisPointwise) {
+                bool twoAxisPointwise,
+                bool blackwellRecurrentContraction) {
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionReduction))
     return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
@@ -61,8 +63,11 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
                          gpu::ParameterCategory::RegionContraction))
     return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
   if (llvm::is_contained(categories, gpu::ParameterCategory::Execution) &&
-      llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
+      llvm::is_contained(categories, gpu::ParameterCategory::Contraction)) {
+    if (blackwellRecurrentContraction)
+      return {{2, 1, 1}, {4, 1, 1}, {8, 1, 1}};
     return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
+  }
   if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
     return {{4, 2, 1}, {8, 3, 1}, {4, 4, 1}};
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
@@ -71,6 +76,99 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
   if (twoAxisPointwise)
     return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {2, 5, 1}};
   return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {4, 3, 1}};
+}
+
+bool valueDependsOn(Value value, Value root, scf::ForOp owner,
+                    llvm::SmallDenseSet<Value, 32> &visited) {
+  if (value == root)
+    return true;
+  if (!visited.insert(value).second)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !owner->isProperAncestor(definition))
+    return false;
+  if (auto nested = dyn_cast<scf::ForOp>(definition)) {
+    auto result = dyn_cast<OpResult>(value);
+    auto yield = dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator());
+    if (result && yield && result.getResultNumber() < nested.getInitArgs().size()) {
+      unsigned index = result.getResultNumber();
+      if (valueDependsOn(nested.getInitArgs()[index], root, owner, visited) ||
+          valueDependsOn(yield.getOperand(index), root, owner, visited))
+        return true;
+    }
+  }
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOn(operand, root, owner, visited);
+  });
+}
+
+bool valueDependsOnNestedContract(Value value, scf::ForOp owner,
+                                  llvm::SmallDenseSet<Value, 32> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || !owner->isProperAncestor(definition))
+    return false;
+  if (isa<gpu::ContractOp>(definition))
+    return true;
+  if (auto nested = dyn_cast<scf::ForOp>(definition)) {
+    auto result = dyn_cast<OpResult>(value);
+    auto yield = dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator());
+    if (result && yield && result.getResultNumber() < nested.getInitArgs().size()) {
+      unsigned index = result.getResultNumber();
+      if (valueDependsOnNestedContract(nested.getInitArgs()[index], owner,
+                                       visited) ||
+          valueDependsOnNestedContract(yield.getOperand(index), owner, visited))
+        return true;
+    }
+  }
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOnNestedContract(operand, owner, visited);
+  });
+}
+
+bool isDirectContractionAccumulator(Value value,
+                                    llvm::SmallDenseSet<Value, 8> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+  Operation *definition = value.getDefiningOp();
+  if (isa_and_nonnull<gpu::ContractOp>(definition))
+    return true;
+  auto nested = dyn_cast_or_null<scf::ForOp>(definition);
+  auto result = dyn_cast<OpResult>(value);
+  auto yield = nested
+                   ? dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator())
+                   : scf::YieldOp();
+  return nested && result && yield &&
+         result.getResultNumber() < nested.getInitArgs().size() &&
+         isDirectContractionAccumulator(
+             yield.getOperand(result.getResultNumber()), visited);
+}
+
+bool hasRecurrentContraction(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](scf::ForOp loop) {
+    if (found || loop.getInitArgs().empty())
+      return;
+    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != loop.getRegionIterArgs().size())
+      return;
+    for (auto [index, next] : llvm::enumerate(yield.getOperands())) {
+      llvm::SmallDenseSet<Value, 8> directVisited;
+      if (isDirectContractionAccumulator(next, directVisited))
+        continue;
+      llvm::SmallDenseSet<Value, 32> contractionVisited;
+      if (!valueDependsOnNestedContract(next, loop, contractionVisited))
+        continue;
+      llvm::SmallDenseSet<Value, 32> carryVisited;
+      if (valueDependsOn(next, loop.getRegionIterArgs()[index], loop,
+                         carryVisited)) {
+        found = true;
+        return;
+      }
+    }
+  });
+  return found;
 }
 
 std::optional<int64_t>
@@ -242,8 +340,14 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
   }
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  bool blackwell = capabilities &&
+                   (capabilities.getComputeCapabilityMajor() == 10 ||
+                    capabilities.getComputeCapabilityMajor() == 12);
   SmallVector<TritonLocalOptions, 4> localOptions =
-      localOptionsFor(categories, twoAxisPointwise);
+      localOptionsFor(categories, twoAxisPointwise,
+                      blackwell && hasRecurrentContraction(kernel));
   for (Attribute attribute : shared) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
     if (!tuple)
