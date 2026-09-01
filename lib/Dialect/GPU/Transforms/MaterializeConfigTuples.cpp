@@ -104,7 +104,7 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width) {
     return {{1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 2, 4},
             {1, 1, 1, 1, 4, 2}};
-  int64_t lane = narrow ? 256 : 128;
+  int64_t lane = narrow ? 512 : 256;
   return {{lane, lane, 32, 128, 1, 8},
           {lane / 2, lane / 2, 32, 128, 1, 8},
           {64, 64, 32, 128, 1, 8}};
