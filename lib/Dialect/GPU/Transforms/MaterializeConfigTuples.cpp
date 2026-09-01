@@ -72,7 +72,7 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
 
 SmallVector<TuningProfile, 5>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
-            bool twoAxisPointwise) {
+            bool twoAxisPointwise, bool fixedPointwiseLocal) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
@@ -106,12 +106,18 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 2, 4},
             {1, 1, 1, 1, 4, 2}};
+  if (twoAxisPointwise && fixedPointwiseLocal)
+    return {{8, 2, 32, 128, 1, 8},
+            {8, 4, 32, 128, 1, 8},
+            {4, 4, 32, 128, 1, 8},
+            {16, 2, 32, 128, 1, 8}};
   if (twoAxisPointwise)
     return {{1, narrow ? 512 : 256, 32, 128, 1, 8},
             {64, 64, 32, 128, 1, 8},
             {16, 16, 32, 128, 1, 8},
             {8, 16, 32, 128, 1, 8},
-            {8, 8, 32, 128, 1, 8}};
+            {8, 8, 32, 128, 1, 8},
+            {8, 2, 32, 128, 1, 8}};
   int64_t lane = narrow ? 512 : 256;
   return {{64, lane, 32, 128, 1, 8},
           {32, lane / 4, 32, 128, 1, 8},
@@ -195,7 +201,15 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
         return schema.getCategory() ==
                    static_cast<uint32_t>(ParameterCategory::Pointwise) &&
                schema.getRole() ==
-                   static_cast<uint32_t>(ParameterRole::OwnershipM);
+               static_cast<uint32_t>(ParameterRole::OwnershipM);
+      });
+  bool hasFixedPointwiseLocal = llvm::any_of(
+      parameters, [](ParameterOp parameter) {
+        ParameterAttr schema = parameter.getParameter();
+        return schema.getCategory() ==
+                   static_cast<uint32_t>(ParameterCategory::Pointwise) &&
+               schema.getCandidates().size() == 1 &&
+               parameter->hasAttr(pointwiseLocalAttr);
       });
   unsigned profileCount = 0;
   for (ParameterOp parameter : parameters) {
@@ -204,7 +218,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
         profileCount,
         profilesFor(kernel, tuningClass(kernel, parameter),
                     schema.getElementBitWidth(),
-                    hasTwoAxisPointwiseOwnership)
+                    hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal)
             .size());
   }
   if (profileCount == 0)
@@ -216,7 +230,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       auto role = static_cast<ParameterRole>(schema.getRole());
       SmallVector<TuningProfile, 5> profiles = profilesFor(
           kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership);
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
                                                      profiles.size() - 1);
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),

@@ -2018,9 +2018,38 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     SmallVector<MakeRangeOp> existingRanges;
     kernel.walk([&](MakeRangeOp range) { existingRanges.push_back(range); });
     SmallVector<WorksetCoordinateOp> lifted;
-    if (existingRanges.empty() &&
-        supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
-      lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
+    if (existingRanges.empty()) {
+      if (supportsCartesianPointwiseValueGraph(pointwiseCoordinates))
+        lifted.append(pointwiseCoordinates.begin(), pointwiseCoordinates.end());
+    } else {
+      SmallVector<std::pair<int64_t, WorksetCoordinateOp>> uncovered;
+      for (WorksetCoordinateOp coordinate : pointwiseCoordinates) {
+        PhysicalSourceAxis source{coordinate.getSourceId(),
+                                  coordinate.getSourceAxis(), false};
+        bool covered = llvm::any_of(existingRanges, [&](MakeRangeOp range) {
+          return sourceAxisIdentity(range) == source;
+        });
+        auto worksetAxis =
+            coordinate->getAttrOfType<IntegerAttr>(worksetAxisAttr);
+        if (!covered && worksetAxis && worksetAxis.getInt() >= 0)
+          uncovered.emplace_back(worksetAxis.getInt(), coordinate);
+      }
+      llvm::stable_sort(uncovered, [](const auto &lhs, const auto &rhs) {
+        return lhs.first < rhs.first;
+      });
+      // A blocked pointwise program can keep one existing local vector range
+      // while tiling the two innermost independent workset axes (for example
+      // sequence/head around a feature vector).  Lift only when both axes
+      // exist: a lone workset coordinate should remain the scalar program owner
+      // of the existing local range.
+      if (uncovered.size() >= 2) {
+        SmallVector<WorksetCoordinateOp> candidates{
+            uncovered[uncovered.size() - 2].second,
+            uncovered.back().second};
+        if (supportsCartesianPointwiseValueGraph(candidates))
+          lifted = std::move(candidates);
+      }
+    }
 
     SmallVector<MakeRangeOp> liftedRanges;
     for (WorksetCoordinateOp coordinate : lifted) {
@@ -3004,8 +3033,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (dynamicSubregion) {
           candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256});
         } else if (launchVisibleDimension) {
-          candidates.assign({8, 16, 32, 64, 128, 256, 512, 1024, 2048,
-                             4096});
+          candidates.assign({1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
+                             2048, 4096});
         } else {
           for (int64_t candidate : {8, 16, 32, 64, 128, 256, 512, 1024,
                                     2048, 4096})
@@ -3090,27 +3119,107 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ownershipAxes.clear();
 
   if (ownershipOnly) {
+    auto staticLogicalExtent = [](MakeRangeOp range) -> std::optional<int64_t> {
+      auto start =
+          range.getLogicalStart().getDefiningOp<arith::ConstantIndexOp>();
+      auto stop =
+          range.getLogicalStop().getDefiningOp<arith::ConstantIndexOp>();
+      auto step = range.getStep().getDefiningOp<arith::ConstantIndexOp>();
+      if (!start || !stop || !step || step.value() <= 0 ||
+          stop.value() < start.value())
+        return std::nullopt;
+      int64_t distance = stop.value() - start.value();
+      return (distance + step.value() - 1) / step.value();
+    };
     llvm::SmallDenseSet<Attribute> internalOwnershipAxes;
     for (Attribute axis : ownershipAxes) {
-      if (isSourceAxisKey(axis))
-        continue;
       if (llvm::any_of(axes.lookup(axis), [](MakeRangeOp range) {
             return !range->hasAttr(worksetCoordinateRangeAttr);
           }))
         internalOwnershipAxes.insert(axis);
     }
     if (!internalOwnershipAxes.empty()) {
-      SmallVector<Attribute> scalarWorksetAxes;
+      SmallVector<std::pair<int64_t, Attribute>> scalarWorksetAxes;
       for (Attribute axis : ownershipAxes) {
         if (isSourceAxisKey(axis) || internalOwnershipAxes.contains(axis))
           continue;
-        if (llvm::all_of(axes.lookup(axis), [](MakeRangeOp range) {
-              return range->hasAttr(worksetCoordinateRangeAttr);
-            }))
-          scalarWorksetAxes.push_back(axis);
+        std::optional<int64_t> worksetAxis;
+        bool exact = llvm::all_of(axes.lookup(axis), [&](MakeRangeOp range) {
+          if (!range->hasAttr(worksetCoordinateRangeAttr))
+            return false;
+          auto coordinate =
+              range.getStart().getDefiningOp<WorksetCoordinateOp>();
+          auto position = coordinate ? coordinate->getAttrOfType<IntegerAttr>(
+                                           worksetAxisAttr)
+                                     : IntegerAttr();
+          if (!position || position.getInt() < 0 ||
+              (worksetAxis && *worksetAxis != position.getInt()))
+            return false;
+          worksetAxis = position.getInt();
+          return true;
+        });
+        if (exact && worksetAxis)
+          scalarWorksetAxes.emplace_back(*worksetAxis, axis);
       }
-      for (Attribute axis : scalarWorksetAxes)
-        ownershipAxes.erase(axis);
+      llvm::stable_sort(scalarWorksetAxes,
+                        [](const auto &lhs, const auto &rhs) {
+                          return lhs.first < rhs.first;
+                        });
+
+      llvm::DenseMap<Attribute, int64_t> exactLocalExtents;
+      bool exactLocalCoverage = llvm::all_of(
+          internalOwnershipAxes, [&](Attribute axis) {
+            std::optional<int64_t> extent;
+            if (llvm::any_of(axes.lookup(axis), [&](MakeRangeOp range) {
+                  if (range->hasAttr(worksetCoordinateRangeAttr) ||
+                      range->hasAttr(sourceSubregionAttr))
+                    return true;
+                  std::optional<int64_t> current = staticLogicalExtent(range);
+                  if (!current || (extent && *extent != *current))
+                    return true;
+                  extent = *current;
+                  return false;
+                }) ||
+                !extent)
+              return false;
+            ParameterOp parameter = parameters.lookup(axis);
+            if (!parameter ||
+                !llvm::is_contained(
+                    parameter.getParameter().getCandidates().asArrayRef(),
+                    *extent))
+              return false;
+            exactLocalExtents[axis] = *extent;
+            return true;
+          });
+
+      if (scalarWorksetAxes.size() >= 2 && exactLocalCoverage) {
+        // The existing non-workset ranges are exact program-local vectors.  Fix
+        // them to full coverage and spend the two ownership dimensions on the
+        // innermost Cartesian workset axes.  This changes both the fragment
+        // schema and the launch mapping; no provider serializer inference is
+        // involved.
+        for (Attribute axis : internalOwnershipAxes) {
+          ParameterOp parameter = parameters.lookup(axis);
+          ParameterAttr schema = parameter.getParameter();
+          parameter->setAttr(
+              "parameter",
+              ParameterAttr::get(
+                  module.getContext(), schema.getName(), schema.getRole(),
+                  schema.getCategory(), schema.getElementBitWidth(),
+                  DenseI64ArrayAttr::get(module.getContext(),
+                                         {exactLocalExtents.lookup(axis)})));
+          parameter->setAttr(pointwiseLocalAttr,
+                             UnitAttr::get(module.getContext()));
+          ownershipAxes.erase(axis);
+          internalAxes.insert(axis);
+        }
+        for (auto [index, entry] : llvm::enumerate(scalarWorksetAxes))
+          if (index + 2 < scalarWorksetAxes.size())
+            ownershipAxes.erase(entry.second);
+      } else {
+        for (auto [_, axis] : scalarWorksetAxes)
+          ownershipAxes.erase(axis);
+      }
     }
   }
 
