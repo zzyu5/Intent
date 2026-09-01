@@ -2756,9 +2756,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value columnStop = binary(builder, location, builder.getIndexType(),
                             columnRange->getStart(), columnRange->getExtent(),
                             BinaryOperator::Add);
-  Value blockStop = binary(builder, location, builder.getIndexType(),
-                           blockRange->getStart(), blockRange->getExtent(),
-                           BinaryOperator::Add);
+  Value blockStop = *blockLogicalEnd;
 
   FragmentType rowIndexType = fragmentType(
       context, builder.getIndexType(), {unitM}, {*rowMap}, lhsType.getOwner());

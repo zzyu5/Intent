@@ -421,6 +421,13 @@ public:
       directContractOperands.insert(op.getLhs());
       directContractOperands.insert(op.getRhs());
     });
+    kernel.walk([&](gpu::ScaledContractOp op) {
+      for (Value operand :
+           {op.getLhs(), op.getLhsScale(), op.getRhs(), op.getRhsScale()})
+        if (auto load = operand.getDefiningOp<gpu::LoadOp>())
+          if (operand.hasOneUse())
+            deferredScaledLoads.insert(load);
+    });
     WalkResult contractShapes = kernel.walk([&](gpu::ContractOp op) {
       if (failed(recordContractPhysicalAxes(op)))
         return WalkResult::interrupt();
@@ -429,7 +436,8 @@ public:
     if (contractShapes.wasInterrupted())
       return failure();
     kernel.walk([&](Operation *operation) {
-      if (isa<gpu::ContractOp, gpu::ReduceOp, gpu::ScanOp>(operation))
+      if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::ReduceOp,
+              gpu::ScanOp>(operation))
         structuredComputations.push_back(operation);
     });
     kernel.walk([&](gpu::StoreOp op) { stores.push_back(op); });
@@ -438,6 +446,8 @@ public:
     });
 
     for (gpu::LoadOp load : loads) {
+      if (deferredScaledLoads.contains(load))
+        continue;
       llvm::DenseSet<Value> visited;
       if (failed(lowerLoad(
               load, feedsDirectContractOperand(load.getResult(), visited)
@@ -455,6 +465,9 @@ public:
     for (Operation *operation : structuredComputations) {
       if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
         if (failed(lowerContract(contract)))
+          return failure();
+      } else if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
+        if (failed(lowerScaledContract(contract)))
           return failure();
       } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
         if (failed(lowerReduce(reduce)))
@@ -1039,6 +1052,96 @@ private:
     return result;
   }
 
+  FailureOr<Value> externalLoadElement(gpu::LoadOp load,
+                                       gpu::FragmentType target,
+                                       ValueRange targetIndices,
+                                       OpBuilder &builder, Operation *owner) {
+    auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
+    if (!view || targetIndices.size() != target.getShape().size())
+      return owner->emitOpError(
+          "TileLang scaled load has no complete external-view index schema");
+    DenseMap<Value, Value> memo;
+    SmallVector<Value> indices(view.getRank());
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(load.getCoordinates(), load.getSourceAxes())) {
+      if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(view.getRank()))
+        return owner->emitOpError(
+            "TileLang scaled load source axis is outside its external view");
+      FailureOr<Value> scalar = scalarize(coordinate, target, targetIndices,
+                                          builder, owner, memo);
+      if (failed(scalar))
+        return failure();
+      indices[sourceAxis] = *scalar;
+    }
+    if (llvm::any_of(indices, [](Value value) { return !value; }))
+      return owner->emitOpError(
+          "TileLang scaled load source-axis mapping is incomplete");
+
+    Value valid;
+    Value fill;
+    if (load.getValid()) {
+      FailureOr<Value> scalarValid = scalarize(
+          load.getValid(), target, targetIndices, builder, owner, memo);
+      FailureOr<Value> scalarFill = scalarize(
+          load.getFill(), target, targetIndices, builder, owner, memo);
+      if (failed(scalarValid) || failed(scalarFill))
+        return failure();
+      valid = *scalarValid;
+      fill = *scalarFill;
+    }
+    return builder
+        .create<ViewLoadOp>(load.getLoc(), view.getElementType(),
+                            load.getResource(), indices, valid, fill)
+        .getResult();
+  }
+
+  LogicalResult stageScaledLoad(gpu::LoadOp load, Value destination,
+                                Value groupIndex, unsigned groupAxis,
+                                ArrayRef<unsigned> destinationAxes,
+                                Operation *before) {
+    auto fragment = dyn_cast<gpu::FragmentType>(load.getResult().getType());
+    auto buffer = dyn_cast<BufferType>(destination.getType());
+    if (!fragment || !buffer ||
+        fragment.getShape().size() != destinationAxes.size() + 1 ||
+        buffer.getShape().size() != destinationAxes.size() ||
+        groupAxis >= fragment.getShape().size())
+      return before->emitOpError(
+          "TileLang scaled staging has an invalid group projection");
+    SmallVector<bool> selected(fragment.getShape().size(), false);
+    selected[groupAxis] = true;
+    for (auto [bufferAxis, fragmentAxis] :
+         llvm::enumerate(destinationAxes)) {
+      if (fragmentAxis >= fragment.getShape().size() || selected[fragmentAxis] ||
+          buffer.getShape()[bufferAxis] != fragment.getShape()[fragmentAxis])
+        return before->emitOpError(
+            "TileLang scaled staging projection disagrees with its physical shape");
+      selected[fragmentAxis] = true;
+    }
+    if (llvm::any_of(selected, [](bool value) { return !value; }))
+      return before->emitOpError(
+          "TileLang scaled staging projection is incomplete");
+
+    FailureOr<ParallelOp> parallel =
+        createParallel(before, fragment, buffer.getShape());
+    if (failed(parallel))
+      return failure();
+    Block &body = parallel->getBody().front();
+    OpBuilder builder = OpBuilder::atBlockBegin(&body);
+    SmallVector<Value> targetIndices(fragment.getShape().size());
+    targetIndices[groupAxis] = groupIndex;
+    for (auto [bufferAxis, fragmentAxis] :
+         llvm::enumerate(destinationAxes))
+      targetIndices[fragmentAxis] = body.getArgument(bufferAxis);
+    FailureOr<Value> loaded = externalLoadElement(
+        load, fragment, targetIndices, builder, before);
+    if (failed(loaded))
+      return failure();
+    builder.create<BufferStoreOp>(load.getLoc(), destination,
+                                  body.getArguments(), *loaded);
+    builder.create<YieldOp>(load.getLoc());
+    return success();
+  }
+
   LogicalResult lowerLoad(gpu::LoadOp load, BufferSpace space) {
     auto fragment = dyn_cast<gpu::FragmentType>(load.getResult().getType());
     auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
@@ -1500,14 +1603,12 @@ private:
     return success();
   }
 
-  FailureOr<Value> contractAccumulator(gpu::ContractOp contract,
-                                       ArrayAttr shape) {
-    Value accumulator = contract.getAccumulator();
+  FailureOr<Value> structuredAccumulator(Operation *owner, Value accumulator,
+                                         Value result, ArrayAttr shape) {
     if (Value existing = fragmentBuffers.lookup(accumulator)) {
       if (cast<BufferType>(existing.getType()).getShape() == shape)
         return existing;
-      return materializePadded(accumulator, BufferSpace::Fragment, contract,
-                               shape);
+      return materializePadded(accumulator, BufferSpace::Fragment, owner, shape);
     }
     auto argument = dyn_cast<BlockArgument>(accumulator);
     auto loop = argument
@@ -1518,21 +1619,21 @@ private:
       unsigned index = argument.getArgNumber() - 1;
       auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
       if (index >= loop.getInitArgs().size() ||
-          yield.getOperand(index) != contract.getResult())
-        return contract.emitOpError(
+          yield.getOperand(index) != result)
+        return owner->emitOpError(
             "TileLang contract accumulator is not the loop-carried physical result");
       FailureOr<Value> initial = scalarSplat(loop.getInitArgs()[index]);
       if (failed(initial))
-        return contract.emitOpError(
+        return owner->emitOpError(
             "TileLang native GEMM requires a scalar-filled physical accumulator");
       FailureOr<Value> allocation =
-          allocateFor(contract.getResult(), BufferSpace::Fragment, loop, shape);
+          allocateFor(result, BufferSpace::Fragment, loop, shape);
       if (failed(allocation))
         return failure();
       OpBuilder builder(loop);
-      builder.create<FillOp>(contract.getLoc(), *allocation, *initial);
+      builder.create<FillOp>(owner->getLoc(), *allocation, *initial);
       fragmentBuffers[accumulator] = *allocation;
-      fragmentBuffers[contract.getResult()] = *allocation;
+      fragmentBuffers[result] = *allocation;
       fragmentBuffers[loop.getResult(index)] = *allocation;
       loopDrops[loop.getOperation()].push_back(index);
       return *allocation;
@@ -1540,18 +1641,16 @@ private:
     FailureOr<Value> initial = scalarSplat(accumulator);
     if (succeeded(initial)) {
       FailureOr<Value> allocation =
-          allocateFor(contract.getResult(), BufferSpace::Fragment, contract,
-                      shape);
+          allocateFor(result, BufferSpace::Fragment, owner, shape);
       if (failed(allocation))
         return failure();
-      OpBuilder builder(contract);
-      builder.create<FillOp>(contract.getLoc(), *allocation, *initial);
+      OpBuilder builder(owner);
+      builder.create<FillOp>(owner->getLoc(), *allocation, *initial);
       fragmentBuffers[accumulator] = *allocation;
-      fragmentBuffers[contract.getResult()] = *allocation;
+      fragmentBuffers[result] = *allocation;
       return *allocation;
     }
-    return materializePadded(accumulator, BufferSpace::Fragment, contract,
-                             shape);
+    return materializePadded(accumulator, BufferSpace::Fragment, owner, shape);
   }
 
   LogicalResult lowerContract(gpu::ContractOp contract) {
@@ -1591,7 +1690,8 @@ private:
                                : materialize(contract.getRhs(),
                                              BufferSpace::Shared, contract);
     FailureOr<Value> accumulator =
-        contractAccumulator(contract, accumulatorShape);
+        structuredAccumulator(contract, contract.getAccumulator(),
+                              contract.getResult(), accumulatorShape);
     if (failed(lhs) || failed(rhs) || failed(accumulator))
       return failure();
     auto transpose = [&](Value operand) -> FailureOr<bool> {
@@ -1616,6 +1716,151 @@ private:
     builder.create<GemmOp>(contract.getLoc(), *lhs, *rhs, *accumulator,
                            *transposeLhs, *transposeRhs);
     fragmentBuffers[contract.getResult()] = *accumulator;
+    lowered.insert(contract);
+    return success();
+  }
+
+  LogicalResult lowerScaledContract(gpu::ScaledContractOp contract) {
+    auto capabilities =
+        kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+    if (!capabilities)
+      return contract.emitOpError(
+          "TileLang scaled GEMM requires typed GPU capabilities");
+    int64_t major = capabilities.getComputeCapabilityMajor();
+    int64_t minor = capabilities.getComputeCapabilityMinor();
+    if (major < 8 || (major == 8 && minor < 9))
+      return contract.emitOpError(
+          "TileLang FP8 scaled GEMM requires CUDA compute capability 8.9 or newer");
+
+    auto lhsType = dyn_cast<gpu::FragmentType>(contract.getLhs().getType());
+    auto lhsScaleType =
+        dyn_cast<gpu::FragmentType>(contract.getLhsScale().getType());
+    auto rhsType = dyn_cast<gpu::FragmentType>(contract.getRhs().getType());
+    auto rhsScaleType =
+        dyn_cast<gpu::FragmentType>(contract.getRhsScale().getType());
+    auto resultType = dyn_cast<gpu::FragmentType>(contract.getResult().getType());
+    auto lhsLoad = contract.getLhs().getDefiningOp<gpu::LoadOp>();
+    auto lhsScaleLoad = contract.getLhsScale().getDefiningOp<gpu::LoadOp>();
+    auto rhsLoad = contract.getRhs().getDefiningOp<gpu::LoadOp>();
+    auto rhsScaleLoad = contract.getRhsScale().getDefiningOp<gpu::LoadOp>();
+    bool fixedAxes =
+        contract.getLhsReductionAxes() == ArrayRef<int64_t>{1, 2} &&
+        contract.getRhsReductionAxes() == ArrayRef<int64_t>{0, 1} &&
+        contract.getLhsBatchAxes().empty() &&
+        contract.getRhsBatchAxes().empty();
+    auto isCarrier128 = [](Attribute attribute) {
+      auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
+      return extent &&
+             extent.getKind() ==
+                 static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+             extent.getValue() == 128;
+    };
+    bool supported = lhsType && lhsScaleType && rhsType && rhsScaleType &&
+                     resultType && lhsLoad && lhsScaleLoad && rhsLoad &&
+                     rhsScaleLoad && contract.getLhs().hasOneUse() &&
+                     contract.getLhsScale().hasOneUse() &&
+                     contract.getRhs().hasOneUse() &&
+                     contract.getRhsScale().hasOneUse() && fixedAxes &&
+                     contract.getLhsFormat() == ScaledFormat::E4M3 &&
+                     contract.getRhsFormat() == ScaledFormat::E4M3 &&
+                     contract.getLhsGroupSize() == 128 &&
+                     contract.getRhsGroupSize() == 128 &&
+                     lhsType.getShape().size() == 3 &&
+                     lhsScaleType.getShape().size() == 2 &&
+                     rhsType.getShape().size() == 3 &&
+                     rhsScaleType.getShape().size() == 2 &&
+                     resultType.getShape().size() == 2 &&
+                     isCarrier128(lhsType.getShape()[2]) &&
+                     isCarrier128(rhsType.getShape()[1]) &&
+                     isa<Float8E4M3FNType>(lhsType.getElementType()) &&
+                     isa<Float8E4M3FNType>(rhsType.getElementType()) &&
+                     lhsScaleType.getElementType().isF32() &&
+                     rhsScaleType.getElementType().isF32() &&
+                     resultType.getElementType().isF32();
+    if (!supported)
+      return contract.emitOpError(
+          "has no TileLang E4M3 group-128 2xAcc provider form");
+
+    MLIRContext *context = kernel.getContext();
+    ArrayAttr lhsTileShape = ArrayAttr::get(
+        context, {lhsType.getShape()[0], lhsType.getShape()[2]});
+    // TileLang's FP8 MMA surface is TN: stage B as [N,K] and request
+    // transpose_B rather than materializing the shared tile as [K,N].
+    ArrayAttr rhsTileShape = ArrayAttr::get(
+        context, {rhsType.getShape()[2], rhsType.getShape()[1]});
+    ArrayAttr accumulatorShape = resultType.getShape();
+    FailureOr<Value> lhs = allocateFor(contract.getLhs(), BufferSpace::Shared,
+                                       contract, lhsTileShape);
+    FailureOr<Value> rhs = allocateFor(contract.getRhs(), BufferSpace::Shared,
+                                       contract, rhsTileShape);
+    FailureOr<Value> partial = allocateFor(
+        contract.getResult(), BufferSpace::Fragment, contract, accumulatorShape);
+    FailureOr<Value> accumulator = structuredAccumulator(
+        contract, contract.getAccumulator(), contract.getResult(),
+        accumulatorShape);
+    if (failed(lhs) || failed(rhs) || failed(partial) || failed(accumulator))
+      return failure();
+
+    OpBuilder builder(contract);
+    Value zero = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 0);
+    Value one = builder.create<arith::ConstantIndexOp>(contract.getLoc(), 1);
+    Value groups = builder.create<gpu::PhysicalExprOp>(
+        contract.getLoc(), builder.getIndexType(),
+        cast<gpu::PhysicalExprAttr>(lhsType.getShape()[1]));
+    auto loop = builder.create<scf::ForOp>(contract.getLoc(), zero, groups, one);
+    Operation *terminator = loop.getBody()->getTerminator();
+    Value group = loop.getInductionVar();
+    if (failed(stageScaledLoad(lhsLoad, *lhs, group, /*groupAxis=*/1,
+                               /*destinationAxes=*/{0, 2}, terminator)) ||
+        failed(stageScaledLoad(rhsLoad, *rhs, group, /*groupAxis=*/0,
+                               /*destinationAxes=*/{2, 1}, terminator)))
+      return failure();
+
+    OpBuilder bodyBuilder(terminator);
+    bodyBuilder.create<SyncOp>(contract.getLoc());
+    bodyBuilder.create<ClearOp>(contract.getLoc(), *partial);
+    bodyBuilder.create<GemmOp>(contract.getLoc(), *lhs, *rhs, *partial,
+                               /*transpose_lhs=*/false,
+                               /*transpose_rhs=*/true);
+
+    FailureOr<ParallelOp> accumulate =
+        createParallel(terminator, resultType, accumulatorShape);
+    if (failed(accumulate))
+      return failure();
+    Block &accumulateBody = accumulate->getBody().front();
+    OpBuilder accumulateBuilder = OpBuilder::atBlockBegin(&accumulateBody);
+    Value row = accumulateBody.getArgument(0);
+    Value column = accumulateBody.getArgument(1);
+    FailureOr<Value> lhsScale = externalLoadElement(
+        lhsScaleLoad, lhsScaleType, ValueRange{row, group}, accumulateBuilder,
+        contract);
+    FailureOr<Value> rhsScale = externalLoadElement(
+        rhsScaleLoad, rhsScaleType, ValueRange{column, group},
+        accumulateBuilder, contract);
+    if (failed(lhsScale) || failed(rhsScale))
+      return failure();
+    Value partialValue = accumulateBuilder.create<BufferLoadOp>(
+        contract.getLoc(), resultType.getElementType(), *partial,
+        accumulateBody.getArguments());
+    Value accumulatorValue = accumulateBuilder.create<BufferLoadOp>(
+        contract.getLoc(), resultType.getElementType(), *accumulator,
+        accumulateBody.getArguments());
+    Value scaledLhs = accumulateBuilder.create<gpu::BinaryOp>(
+        contract.getLoc(), resultType.getElementType(), partialValue, *lhsScale,
+        BinaryOperator::Multiply);
+    Value scaled = accumulateBuilder.create<gpu::BinaryOp>(
+        contract.getLoc(), resultType.getElementType(), scaledLhs, *rhsScale,
+        BinaryOperator::Multiply);
+    Value updated = accumulateBuilder.create<gpu::BinaryOp>(
+        contract.getLoc(), resultType.getElementType(), accumulatorValue, scaled,
+        BinaryOperator::Add);
+    accumulateBuilder.create<BufferStoreOp>(
+        contract.getLoc(), *accumulator, accumulateBody.getArguments(), updated);
+    accumulateBuilder.create<YieldOp>(contract.getLoc());
+
+    fragmentBuffers[contract.getResult()] = *accumulator;
+    for (gpu::LoadOp load : {lhsLoad, lhsScaleLoad, rhsLoad, rhsScaleLoad})
+      lowered.insert(load);
     lowered.insert(contract);
     return success();
   }
@@ -2046,6 +2291,7 @@ private:
   DenseMap<Value, Value> fragmentBuffers;
   DenseMap<Attribute, Attribute> nativeAxisExtents;
   llvm::DenseSet<Value> directContractOperands;
+  llvm::DenseSet<Operation *> deferredScaledLoads;
   DenseMap<Operation *, SmallVector<unsigned>> loopDrops;
   llvm::DenseSet<Operation *> lowered;
 };
