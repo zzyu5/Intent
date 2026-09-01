@@ -23,6 +23,7 @@ struct TuningProfile {
 
 enum class TuningClass {
   Pointwise,
+  PointwiseReduction,
   Reduction,
   RegionReduction,
   RegionContraction,
@@ -30,6 +31,54 @@ enum class TuningClass {
   Contraction,
   Execution,
 };
+
+bool expressionReferencesParameter(PhysicalExprAttr expression,
+                                   StringAttr parameter) {
+  if (expression.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+      expression.getSymbol() == parameter)
+    return true;
+  return llvm::any_of(expression.getOperands(), [&](Attribute operand) {
+    return expressionReferencesParameter(cast<PhysicalExprAttr>(operand),
+                                         parameter);
+  });
+}
+
+bool isFixedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
+  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+  if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
+    return false;
+  StringAttr name = parameter.getParameter().getName();
+  bool found = false;
+  kernel.walk([&](ReduceOp reduce) {
+    if (found || reduce.getAxes().empty() || reduce.getSourceCount() != 1 ||
+        reduce.getIdentityCount() != 1 || reduce.getNumResults() != 1)
+      return;
+    for (Value source :
+         reduce.getInputs().take_front(reduce.getSourceCount())) {
+      auto fragment = dyn_cast<FragmentType>(source.getType());
+      if (!fragment)
+        continue;
+      bool fixedReduction = llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
+        if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
+          return false;
+        auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+        return extent.getKind() ==
+                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               extent.getValue() > 0;
+      });
+      if (!fixedReduction)
+        continue;
+      for (auto [axis, extent] : llvm::enumerate(fragment.getShape())) {
+        if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
+          continue;
+        found |= expressionReferencesParameter(cast<PhysicalExprAttr>(extent),
+                                               name);
+      }
+    }
+  });
+  return found;
+}
 
 bool isProviderRole(ParameterRole role) {
   return role == ParameterRole::ProviderWarps ||
@@ -48,7 +97,6 @@ bool isSharedStaticParameter(ParameterOp parameter) {
 
 TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
-  (void)kernel;
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
   case ParameterCategory::Reduction:
     return TuningClass::Reduction;
@@ -63,6 +111,9 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Execution:
     return TuningClass::Execution;
   case ParameterCategory::Pointwise:
+    return isFixedReductionFreeAxis(kernel, parameter)
+               ? TuningClass::PointwiseReduction
+               : TuningClass::Pointwise;
   case ParameterCategory::Coverage:
   case ParameterCategory::Provider:
     return TuningClass::Pointwise;
@@ -106,6 +157,11 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 2, 4},
             {1, 1, 1, 1, 4, 2}};
+  if (kind == TuningClass::PointwiseReduction)
+    return {{64, 128, 32, 128, 1, 8},
+            {64, 64, 32, 128, 1, 8},
+            {64, 32, 32, 128, 1, 8},
+            {64, 16, 32, 128, 1, 8}};
   if (twoAxisPointwise && fixedPointwiseLocal)
     return {{8, 2, 32, 128, 1, 8},
             {8, 4, 32, 128, 1, 8},
