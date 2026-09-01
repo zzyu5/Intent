@@ -33,32 +33,8 @@ struct TritonConfig {
   int64_t ctas = 0;
 };
 
-int64_t providerDefault(gpu::ParameterRole role) {
-  switch (role) {
-  case gpu::ParameterRole::ProviderWarps:
-    return 4;
-  case gpu::ParameterRole::ProviderStages:
-    return 2;
-  case gpu::ParameterRole::ProviderCTAs:
-    return 1;
-  case gpu::ParameterRole::ProviderThreads:
-    return 128;
-  case gpu::ParameterRole::OwnershipM:
-  case gpu::ParameterRole::OwnershipN:
-  case gpu::ParameterRole::Reduction:
-  case gpu::ParameterRole::ScanChunk:
-  case gpu::ParameterRole::TraversalWorkers:
-  case gpu::ParameterRole::TraversalGroup:
-  case gpu::ParameterRole::ResidentWorkers:
-  case gpu::ParameterRole::FullCoverage:
-    llvm_unreachable("shared parameter entered Triton-local option selection");
-  }
-  llvm_unreachable("unknown physical parameter role");
-}
-
-int64_t selectProviderDefault(gpu::ParameterRole role,
-                              ArrayRef<int64_t> candidates) {
-  int64_t requested = providerDefault(role);
+int64_t selectProviderCandidate(int64_t requested,
+                                ArrayRef<int64_t> candidates) {
   int64_t selected = *std::min_element(candidates.begin(), candidates.end());
   for (int64_t candidate : candidates) {
     if (candidate == requested)
@@ -67,6 +43,27 @@ int64_t selectProviderDefault(gpu::ParameterRole role,
       selected = candidate;
   }
   return selected;
+}
+
+struct TritonLocalOptions {
+  int64_t warps;
+  int64_t stages;
+  int64_t ctas;
+};
+
+SmallVector<TritonLocalOptions, 3>
+localOptionsFor(ArrayRef<gpu::ParameterCategory> categories) {
+  if (llvm::is_contained(categories,
+                         gpu::ParameterCategory::RegionReduction))
+    return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
+  if (llvm::is_contained(categories,
+                         gpu::ParameterCategory::RegionContraction) ||
+      llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
+    return {{4, 2, 1}, {8, 3, 1}, {4, 4, 1}};
+  if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
+      llvm::is_contained(categories, gpu::ParameterCategory::Scan))
+    return {{8, 2, 1}, {4, 2, 1}, {16, 2, 1}};
+  return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}};
 }
 
 std::optional<int64_t>
@@ -187,6 +184,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
     bool coverage;
   };
   SmallVector<Domain> domains;
+  SmallVector<gpu::ParameterCategory> categories;
   llvm::StringSet<> names;
   WalkResult schema = kernel.walk([&](gpu::ParameterOp parameter) {
     auto definition = parameter.getParameter();
@@ -199,6 +197,12 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
                        static_cast<gpu::ParameterRole>(definition.getRole()),
                        definition.getCandidates().asArrayRef(),
                        parameter->hasAttr(gpu::coverageDimensionAttr)});
+    auto category =
+        static_cast<gpu::ParameterCategory>(definition.getCategory());
+    if (category != gpu::ParameterCategory::Coverage &&
+        category != gpu::ParameterCategory::Provider &&
+        !llvm::is_contained(categories, category))
+      categories.push_back(category);
     return WalkResult::advance();
   });
   if (schema.wasInterrupted())
@@ -210,40 +214,60 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
     return kernel.emitError(
         "Triton legalization requires shared config tuples");
   SmallVector<TritonConfig> configs;
+  const Domain *warps = nullptr;
+  const Domain *stages = nullptr;
+  const Domain *ctas = nullptr;
+  for (const Domain &domain : domains) {
+    if (domain.role == gpu::ParameterRole::ProviderWarps)
+      warps = &domain;
+    else if (domain.role == gpu::ParameterRole::ProviderStages)
+      stages = &domain;
+    else if (domain.role == gpu::ParameterRole::ProviderCTAs)
+      ctas = &domain;
+    else if (domain.role == gpu::ParameterRole::ProviderThreads)
+      return kernel.emitError(
+          "Triton program contains a foreign provider parameter");
+  }
+  if (!warps || !stages || !ctas)
+    return kernel.emitError("Triton provider parameter domains are incomplete");
+  SmallVector<TritonLocalOptions, 3> localOptions =
+      localOptionsFor(categories);
   for (Attribute attribute : shared) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
     if (!tuple)
       return kernel.emitError("shared config tuple is malformed");
-    TritonConfig config;
+    TritonConfig sharedConfig;
     for (const Domain &domain : domains) {
       if (domain.coverage)
         continue;
-      if (domain.role == gpu::ParameterRole::ProviderWarps) {
-        config.warps = selectProviderDefault(domain.role, domain.candidates);
+      if (domain.role == gpu::ParameterRole::ProviderWarps ||
+          domain.role == gpu::ParameterRole::ProviderStages ||
+          domain.role == gpu::ParameterRole::ProviderCTAs)
         continue;
-      }
-      if (domain.role == gpu::ParameterRole::ProviderStages) {
-        config.stages = selectProviderDefault(domain.role, domain.candidates);
-        continue;
-      }
-      if (domain.role == gpu::ParameterRole::ProviderCTAs) {
-        config.ctas = selectProviderDefault(domain.role, domain.candidates);
-        continue;
-      }
-      if (domain.role == gpu::ParameterRole::ProviderThreads)
-        return kernel.emitError(
-            "Triton program contains a foreign provider parameter");
       auto value = tuple.getAs<IntegerAttr>(domain.name);
       if (!value || !llvm::is_contained(domain.candidates, value.getInt()))
         return kernel.emitError(
                    "shared config tuple does not bind a Triton kernel parameter: ")
                << domain.name;
-      config.kernelParameters[domain.name.str()] = value.getInt();
+      sharedConfig.kernelParameters[domain.name.str()] = value.getInt();
     }
-    if (tuple.size() != config.kernelParameters.size())
+    if (tuple.size() != sharedConfig.kernelParameters.size())
       return kernel.emitError(
           "shared config tuple contains a non-kernel binding");
-    configs.push_back(std::move(config));
+    for (const TritonLocalOptions &options : localOptions) {
+      TritonConfig config = sharedConfig;
+      config.warps = selectProviderCandidate(options.warps, warps->candidates);
+      config.stages =
+          selectProviderCandidate(options.stages, stages->candidates);
+      config.ctas = selectProviderCandidate(options.ctas, ctas->candidates);
+      if (llvm::none_of(configs, [&](const TritonConfig &existing) {
+            return existing.kernelParameters == config.kernelParameters &&
+                   existing.warps == config.warps &&
+                   existing.stages == config.stages &&
+                   existing.ctas == config.ctas;
+          }))
+        configs.push_back(std::move(config));
+    }
   }
 
   SmallVector<Attribute> encoded;

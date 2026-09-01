@@ -1435,9 +1435,16 @@ private:
     if (!isa<IntegerType, FloatType>(sourceType))
       return operation->emitOpError(
           "region segment has no scalar element type for its physical parameter");
-    auto category = isa<intent::RegionScanOp>(operation)
-                        ? gpu::ParameterCategory::Scan
-                        : gpu::ParameterCategory::Reduction;
+    gpu::ParameterCategory category = gpu::ParameterCategory::Scan;
+    if (auto fold = dyn_cast<intent::RegionFoldOp>(operation)) {
+      bool contraction = false;
+      fold.getSummarize().walk([&](Operation *nested) {
+        contraction |= isa<intent::ContractOp, intent::ScaledContractOp,
+                           intent::SparseContractOp>(nested);
+      });
+      category = contraction ? gpu::ParameterCategory::RegionContraction
+                             : gpu::ParameterCategory::RegionReduction;
+    }
     auto schema = gpu::ParameterAttr::get(
         operation->getContext(), builder.getStringAttr(name),
         static_cast<uint32_t>(gpu::ParameterRole::ScanChunk),

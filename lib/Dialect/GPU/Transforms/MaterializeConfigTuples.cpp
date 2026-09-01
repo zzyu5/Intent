@@ -21,6 +21,16 @@ struct TuningProfile {
   int64_t traversalGroup;
 };
 
+enum class TuningClass {
+  Pointwise,
+  Reduction,
+  RegionReduction,
+  RegionContraction,
+  Scan,
+  Contraction,
+  Execution,
+};
+
 bool isProviderRole(ParameterRole role) {
   return role == ParameterRole::ProviderWarps ||
          role == ParameterRole::ProviderStages ||
@@ -36,29 +46,61 @@ bool isSharedStaticParameter(ParameterOp parameter) {
          !parameter->hasAttr(coverageDimensionAttr);
 }
 
+TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
+  ParameterAttr schema = parameter.getParameter();
+  (void)kernel;
+  switch (static_cast<ParameterCategory>(schema.getCategory())) {
+  case ParameterCategory::Reduction:
+    return TuningClass::Reduction;
+  case ParameterCategory::Scan:
+    return TuningClass::Scan;
+  case ParameterCategory::Contraction:
+    return TuningClass::Contraction;
+  case ParameterCategory::RegionReduction:
+    return TuningClass::RegionReduction;
+  case ParameterCategory::RegionContraction:
+    return TuningClass::RegionContraction;
+  case ParameterCategory::Execution:
+    return TuningClass::Execution;
+  case ParameterCategory::Pointwise:
+  case ParameterCategory::Coverage:
+  case ParameterCategory::Provider:
+    return TuningClass::Pointwise;
+  }
+  llvm_unreachable("unknown physical parameter category");
+}
+
 SmallVector<TuningProfile, 3>
-profilesFor(func::FuncOp kernel, ParameterCategory category, unsigned width) {
+profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
-  if (category == ParameterCategory::Contraction && matrix && narrow)
+  if (kind == TuningClass::Contraction && matrix && narrow)
     return {{128, 128, 32, 128, 1, 8},
             {64, 128, 64, 128, 1, 8},
             {128, 64, 32, 128, 1, 8}};
-  if (category == ParameterCategory::Contraction)
+  if (kind == TuningClass::Contraction)
     return {{64, 64, 32, 128, 1, 8},
             {32, 64, 64, 128, 1, 8},
             {64, 32, 32, 128, 1, 8}};
-  if (category == ParameterCategory::Scan)
+  if (kind == TuningClass::RegionContraction)
+    return {{128, 128, 64, 128, 1, 8},
+            {64, 128, 64, 64, 1, 8},
+            {128, 64, 32, 256, 1, 8}};
+  if (kind == TuningClass::RegionReduction)
+    return {{128, 128, 64, 32768, 1, 8},
+            {128, 128, 64, 16384, 1, 8},
+            {128, 128, 64, 8192, 1, 8}};
+  if (kind == TuningClass::Scan)
     return {{128, 256, 64, 256, 1, 8},
             {64, 128, 64, 128, 1, 8},
             {256, 512, 32, 512, 1, 8}};
-  if (category == ParameterCategory::Reduction)
+  if (kind == TuningClass::Reduction)
     return {{128, 128, 64, 128, 1, 8},
             {64, 128, 128, 128, 1, 8},
             {256, 64, 32, 128, 1, 8}};
-  if (category == ParameterCategory::Execution)
+  if (kind == TuningClass::Execution)
     return {{1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 2, 4},
             {1, 1, 1, 1, 4, 2}};
@@ -143,10 +185,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
       auto role = static_cast<ParameterRole>(schema.getRole());
-      auto category =
-          static_cast<ParameterCategory>(schema.getCategory());
       SmallVector<TuningProfile, 3> profiles = profilesFor(
-          kernel, category, schema.getElementBitWidth());
+          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth());
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
                                          requestedValue(profiles[profileIndex], role));
       bindings.push_back(builder.getNamedAttr(

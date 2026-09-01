@@ -89,6 +89,8 @@ enum class ParameterCategory : uint32_t {
   Execution = 4,
   Coverage = 5,
   Provider = 6,
+  RegionReduction = 7,
+  RegionContraction = 8,
 };
 
 enum class CoordinateRole : int64_t {
