@@ -1687,18 +1687,35 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (!master)
     return reduce.emitOpError(
         "multi-axis reduction has no load-rooted traversal authority");
+  auto sharesOuterTraversal = [&](MakeRangeOp range) {
+    FailureOr<int64_t> dimension = queryRangeDimension(range);
+    FailureOr<int64_t> masterDimension =
+        queryRangeDimension(master->range);
+    return range.getSourceId() == master->range.getSourceId() &&
+           range.getSourceAxis() == master->range.getSourceAxis() &&
+           range.getDerived() == master->range.getDerived() &&
+           succeeded(dimension) && succeeded(masterDimension) &&
+           *dimension == *masterDimension &&
+           samePhysicalScalarExpression(range.getStart(),
+                                        master->range.getStart()) &&
+           samePhysicalScalarExpression(range.getExtent(),
+                                        master->range.getExtent()) &&
+           sameScalarValue(range.getLogicalStart(),
+                           master->range.getLogicalStart()) &&
+           sameScalarValue(range.getLogicalStop(),
+                           master->range.getLogicalStop()) &&
+           sameScalarValue(range.getStep(), master->range.getStep());
+  };
   for (const auto &component : accesses)
     for (RootAccess access : component) {
-      if (access.range.getSourceId() != master->range.getSourceId() ||
-          access.range.getSourceAxis() != master->range.getSourceAxis() ||
-          !sameScalarValue(access.range.getLogicalStart(),
-                           master->range.getLogicalStart()) ||
-          !sameScalarValue(access.range.getLogicalStop(),
-                           master->range.getLogicalStop()) ||
-          !sameScalarValue(access.range.getStep(), master->range.getStep()))
+      if (!sharesOuterTraversal(access.range))
         return reduce.emitOpError(
             "multi-axis reduction components do not share one exact outer traversal");
     }
+  for (const SourcePlan &plan : plans)
+    if (plan.reductionRange && !sharesOuterTraversal(plan.reductionRange))
+      return reduce.emitOpError(
+          "multi-axis reduction sources do not share one exact outer traversal");
 
   FailureOr<bool> fullCoverage = decomposeFullCoverageMultiAxisReduce(
       reduce, kernel, outerAxis, master->range);
@@ -1707,10 +1724,12 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   if (*fullCoverage)
     return success();
 
+  SmallVector<int64_t> retainedInnerAxes;
   SmallVector<int64_t> innerAxes;
   for (int64_t axis : reduce.getAxes()) {
     if (axis == static_cast<int64_t>(outerAxis))
       continue;
+    retainedInnerAxes.push_back(axis);
     innerAxes.push_back(axis > static_cast<int64_t>(outerAxis) ? axis - 1
                                                                : axis);
   }
@@ -1729,29 +1748,113 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       reduce.getSourceCount() + reduce.getIdentityCount());
   PhysicalExprAttr unitExtent =
       expression(reduce.getContext(), PhysicalExprKind::Constant, 1);
+  bool outerHasSubregion = llvm::any_of(
+      accesses, [](ArrayRef<RootAccess> component) {
+        return llvm::any_of(component, [](RootAccess access) {
+          return access.range->hasAttr(sourceSubregionAttr);
+        });
+      });
+  for (const SourcePlan &plan : plans)
+    outerHasSubregion |= llvm::any_of(plan.ranges, [&](MakeRangeOp range) {
+      return sourceAxisIdentity(range) == sourceAxisIdentity(master->range) &&
+             range->hasAttr(sourceSubregionAttr);
+    });
+  bool blockOuterAxis = reduce.getAxes().size() == 2 &&
+                        !outerHasSubregion &&
+                        llvm::all_of(
+                            reduce.getCombine().front().without_terminator(),
+                            [](Operation &operation) {
+                              return canLiftCombineOperation(operation);
+                            });
+  ParameterOp outerChunk;
+  PhysicalExprAttr outerSliceExtent = unitExtent;
+  if (blockOuterAxis) {
+    std::string name =
+        ("REDUCE_CHUNK_" + Twine(master->range.getSourceId()) + "_A" +
+         Twine(master->range.getSourceAxis()) +
+         (master->range.getDerived() ? "_DERIVED" : ""))
+            .str();
+    SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
+                                    256, 512, 1024, 2048, 4096};
+    auto firstSource =
+        cast<FragmentType>(reduce.getInputs().front().getType());
+    outerChunk = getOrCreatePhysicalParameter(
+        kernel, name, ParameterRole::ReductionOuter,
+        ParameterCategory::Reduction,
+        firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
+    if (!outerChunk)
+      return reduce.emitOpError(
+          "multi-axis outer reduction has no physical chunk parameter");
+    if (FailureOr<int64_t> dimension =
+            queryRangeDimension(master->range);
+        succeeded(dimension))
+      outerChunk->setAttr(dimensionAttr,
+                          IntegerAttr::get(
+                              IntegerType::get(reduce.getContext(), 64),
+                              *dimension));
+    outerSliceExtent = expression(
+        reduce.getContext(), PhysicalExprKind::Parameter, 0,
+        outerChunk.getParameter().getName().getValue());
+  }
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
   bool bodyFailed = false;
   std::string failureReason;
+  Value outerLoopStep =
+      blockOuterAxis ? outerChunk.getResult() : master->range.getStep();
   auto loop = builder.create<scf::ForOp>(
       location, master->range.getLogicalStart(),
-      master->range.getLogicalStop(), master->range.getStep(), identities,
+      master->range.getLogicalStop(), outerLoopStep, identities,
       [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
           ValueRange carries) {
         SmallVector<Value> innerSources;
         for (auto [component, plan] : llvm::enumerate(plans)) {
           IRMapping mapping;
+          auto mapOuterRange = [&](MakeRangeOp range) -> FailureOr<Value> {
+            if (Value mapped = mapping.lookupOrNull(range.getResult()))
+              return mapped;
+            auto rangeType = dyn_cast<FragmentType>(range.getResult().getType());
+            if (!rangeType || rangeType.getShape().size() != 1)
+              return failure();
+            FragmentType blockedType =
+                replaceExtent(rangeType, 0, outerSliceExtent);
+            auto blocked = nested.create<MakeRangeOp>(
+                nestedLocation, blockedType, coordinate,
+                outerChunk.getResult(), range.getStep(),
+                range.getLogicalStart(), range.getLogicalStop(),
+                range.getSourceId(), range.getSourceAxis(), range.getDerived());
+            inheritRangeAuthority(blocked, range);
+            mapping.map(range.getResult(), blocked.getResult());
+            return blocked.getResult();
+          };
+          if (blockOuterAxis)
+            for (MakeRangeOp range : plan.ranges)
+              if (failed(mapOuterRange(range))) {
+                bodyFailed = true;
+                failureReason =
+                    "outer reduction range could not be blocked";
+                return;
+              }
           for (RootAccess access : accesses[component]) {
-            mapping.map(access.range.getResult(), coordinate);
+            if (blockOuterAxis) {
+              if (failed(mapOuterRange(access.range))) {
+                bodyFailed = true;
+                failureReason =
+                    "outer reduction load range could not be blocked";
+                return;
+              }
+            } else {
+              mapping.map(access.range.getResult(), coordinate);
+            }
             LoadOp load = access.load;
             auto sourceType = cast<FragmentType>(load.getResult().getType());
             FragmentType slicedType = replaceExtent(
-                sourceType, access.fragmentAxis, unitExtent);
+                sourceType, access.fragmentAxis, outerSliceExtent);
             SmallVector<Value> coordinates(load.getCoordinates());
             FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
-                plan.sourceIdentity, unitExtent, mapping);
+                plan.sourceIdentity, outerSliceExtent, mapping);
             if (failed(reducedCoordinate)) {
               bodyFailed = true;
               failureReason =
@@ -1762,8 +1865,11 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             using ReplayAxis =
                 std::tuple<PhysicalSourceAxis, PhysicalExprAttr, Value, Value>;
             SmallVector<ReplayAxis> replayAxes{{
-                plan.sourceIdentity, unitExtent, access.range.getResult(),
-                coordinate}};
+                plan.sourceIdentity, outerSliceExtent,
+                access.range.getResult(),
+                blockOuterAxis
+                    ? mapping.lookupOrNull(access.range.getResult())
+                    : coordinate}};
             for (auto [coordinateIndex, original] :
                  llvm::enumerate(load.getCoordinates())) {
               if (coordinateIndex == access.coordinateIndex)
@@ -1842,7 +1948,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
           }
           FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
-              unitExtent, mapping);
+              outerSliceExtent, mapping);
           if (failed(replayed)) {
             bodyFailed = true;
             failureReason = "outer-axis source graph could not be sliced";
@@ -1853,6 +1959,44 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             bodyFailed = true;
             failureReason = "outer-axis source lost its fragment schema";
             return;
+          }
+          if (blockOuterAxis) {
+            auto outerMap =
+                cast<AxisMapAttr>(sliced.getAxisMaps()[outerAxis]);
+            auto rangeType = FragmentType::get(
+                reduce.getContext(), nested.getIndexType(),
+                nested.getArrayAttr({outerSliceExtent}),
+                nested.getArrayAttr({AxisMapAttr::get(
+                    reduce.getContext(), outerMap.getSourceId(),
+                    outerMap.getSourceAxis(), outerMap.getDimensionId(),
+                    /*fragmentAxis=*/0, outerMap.getDerived())}),
+                sliced.getValidity(), sliced.getOwner());
+            Value physicalExtent = outerChunk.getResult();
+            auto outerRange = nested.create<MakeRangeOp>(
+                nestedLocation, rangeType, coordinate, physicalExtent,
+                master->range.getStep(), master->range.getLogicalStart(),
+                master->range.getLogicalStop(), outerMap.getSourceId(),
+                outerMap.getSourceAxis(), outerMap.getDerived());
+            Value logicalEnd = nested.create<BroadcastOp>(
+                nestedLocation, rangeType, master->range.getLogicalStop());
+            auto predicateType = withElementType(rangeType, nested.getI1Type());
+            Value active = nested.create<CompareOp>(
+                nestedLocation, predicateType, outerRange.getResult(),
+                logicalEnd, ComparePredicate::Lt);
+            FailureOr<Value> alignedActive = alignToExecutionSchema(
+                nested, nestedLocation, active, sliced);
+            FailureOr<Value> alignedIdentity = alignToExecutionSchema(
+                nested, nestedLocation, identities[component], sliced);
+            if (failed(alignedActive) || failed(alignedIdentity)) {
+              bodyFailed = true;
+              failureReason =
+                  "outer reduction tail could not be aligned to its source";
+              return;
+            }
+            innerSources.push_back(nested.create<SelectOp>(
+                nestedLocation, sliced, *alignedActive, *replayed,
+                *alignedIdentity));
+            continue;
           }
           FragmentType squeezed = eraseFragmentAxis(sliced, outerAxis);
           SmallVector<Attribute> reassociation;
@@ -1876,14 +2020,40 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         if (bodyFailed)
           return;
 
+        SmallVector<Type> innerResultTypes(reduce.getResultTypes().begin(),
+                                           reduce.getResultTypes().end());
+        SmallVector<Value> innerIdentities(identities);
+        ArrayRef<int64_t> selectedInnerAxes = innerAxes;
+        if (blockOuterAxis) {
+          innerResultTypes.clear();
+          innerIdentities.clear();
+          selectedInnerAxes = retainedInnerAxes;
+          for (auto [component, source] : llvm::enumerate(innerSources)) {
+            auto fragment = cast<FragmentType>(source.getType());
+            FragmentType result =
+                eraseFragmentAxes(fragment, retainedInnerAxes);
+            innerResultTypes.push_back(result);
+            FailureOr<Value> identity = alignToExecutionSchema(
+                nested, nestedLocation, identities[component], result);
+            if (failed(identity)) {
+              bodyFailed = true;
+              failureReason =
+                  "outer-block identity could not retain its fragment axis";
+              return;
+            }
+            innerIdentities.push_back(*identity);
+          }
+        }
+
         SmallVector<Value> innerInputs(innerSources);
-        innerInputs.append(identities.begin(), identities.end());
+        innerInputs.append(innerIdentities.begin(), innerIdentities.end());
         innerInputs.append(captures.begin(), captures.end());
         OperationState state(nestedLocation, ReduceOp::getOperationName());
         state.addOperands(innerInputs);
-        state.addTypes(reduce.getResultTypes());
-        state.addAttribute("axes",
-                           DenseI64ArrayAttr::get(reduce.getContext(), innerAxes));
+        state.addTypes(innerResultTypes);
+        state.addAttribute(
+            "axes",
+            DenseI64ArrayAttr::get(reduce.getContext(), selectedInnerAxes));
         state.addAttribute("source_count", reduce->getAttr("source_count"));
         state.addAttribute("identity_count", reduce->getAttr("identity_count"));
         state.addAttribute("capture_count", reduce->getAttr("capture_count"));
@@ -1891,15 +2061,61 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         auto innerReduce = cast<ReduceOp>(nested.create(state));
         if (Attribute origin = reduce->getAttr(originAttr))
           innerReduce->setAttr(originAttr, origin);
-        IRMapping regionMapping;
-        reduce.getCombine().cloneInto(&innerReduce.getCombine(), regionMapping);
+        if (blockOuterAxis) {
+          if (failed(cloneLiftedCombineRegion(
+                  reduce.getCombine(), innerReduce.getCombine(),
+                  innerResultTypes, failureReason))) {
+            bodyFailed = true;
+            return;
+          }
+        } else {
+          IRMapping regionMapping;
+          reduce.getCombine().cloneInto(&innerReduce.getCombine(),
+                                        regionMapping);
+        }
+
+        SmallVector<Value> summaries(innerReduce.getResults().begin(),
+                                     innerReduce.getResults().end());
+        if (blockOuterAxis) {
+          unsigned outerResultAxis = 0;
+          for (unsigned axis = 0; axis < outerAxis; ++axis)
+            if (!llvm::is_contained(retainedInnerAxes,
+                                    static_cast<int64_t>(axis)))
+              ++outerResultAxis;
+          SmallVector<Value> outerInputs(summaries);
+          outerInputs.append(identities.begin(), identities.end());
+          outerInputs.append(captures.begin(), captures.end());
+          OperationState outerState(nestedLocation,
+                                    ReduceOp::getOperationName());
+          outerState.addOperands(outerInputs);
+          outerState.addTypes(reduce.getResultTypes());
+          outerState.addAttribute(
+              "axes", DenseI64ArrayAttr::get(
+                          reduce.getContext(),
+                          ArrayRef<int64_t>{
+                              static_cast<int64_t>(outerResultAxis)}));
+          outerState.addAttribute("source_count",
+                                  reduce->getAttr("source_count"));
+          outerState.addAttribute("identity_count",
+                                  reduce->getAttr("identity_count"));
+          outerState.addAttribute("capture_count",
+                                  reduce->getAttr("capture_count"));
+          outerState.addRegion();
+          auto outerReduce = cast<ReduceOp>(nested.create(outerState));
+          if (Attribute origin = reduce->getAttr(originAttr))
+            outerReduce->setAttr(originAttr, origin);
+          IRMapping regionMapping;
+          reduce.getCombine().cloneInto(&outerReduce.getCombine(),
+                                        regionMapping);
+          summaries.assign(outerReduce.getResults().begin(),
+                           outerReduce.getResults().end());
+        }
 
         SmallVector<Value> combineArguments(carries.begin(), carries.end());
-        combineArguments.append(innerReduce.getResults().begin(),
-                                innerReduce.getResults().end());
+        combineArguments.append(summaries.begin(), summaries.end());
         combineArguments.append(captures.begin(), captures.end());
         FailureOr<SmallVector<Value>> combined = inlinePureRegion(
-            nested, innerReduce.getCombine(), combineArguments, failureReason);
+            nested, reduce.getCombine(), combineArguments, failureReason);
         if (failed(combined)) {
           bodyFailed = true;
           return;
@@ -1997,13 +2213,19 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     fullCoverage = fullCoverageParameter(kernel, sourceExtent);
   FailureOr<ParameterOp> selectedChunk =
       parameterForExtent(kernel, sourceExtent);
+  ParameterRole reductionRole = ParameterRole::Reduction;
+  if (auto parent = reduce->getParentOfType<scf::ForOp>())
+    if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
+        outer && outer.getParameter().getRole() ==
+                     static_cast<uint32_t>(ParameterRole::ReductionOuter))
+      reductionRole = ParameterRole::ReductionInner;
   ParameterOp chunk;
   if (!firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
     chunk = *fullCoverage;
   } else if (succeeded(selectedChunk) &&
              !(*selectedChunk)->hasAttr(coverageDimensionAttr) &&
              (*selectedChunk).getParameter().getRole() ==
-                 static_cast<uint32_t>(ParameterRole::Reduction)) {
+                 static_cast<uint32_t>(reductionRole)) {
     chunk = *selectedChunk;
   } else {
     std::string name =
@@ -2014,7 +2236,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
     chunk = getOrCreatePhysicalParameter(
-        kernel, name, ParameterRole::Reduction, ParameterCategory::Reduction,
+        kernel, name, reductionRole, ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
     if (chunk)
       if (FailureOr<int64_t> dimension = queryRangeDimension(firstRange);
@@ -2336,6 +2558,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         "runtime reduction could not be materialized in the chunk loop: ")
            << bodyFailure;
   }
+  loop->setAttr(reductionSourcesAttr, reductionSources(reduce));
 
   SmallVector<Value> realizedResults(loop.getResults().begin(),
                                      loop.getResults().end());

@@ -254,12 +254,18 @@ LogicalResult ParameterAttr::verify(
     uint32_t role, uint32_t category, uint32_t elementBitWidth,
     DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::FullCoverage) ||
+      role > static_cast<uint32_t>(ParameterRole::ReductionInner) ||
       category > static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
       !candidates || candidates.empty())
     return emitError()
            << "physical parameter requires a name, role, category and candidates";
   auto typedCategory = static_cast<ParameterCategory>(category);
+  auto typedRole = static_cast<ParameterRole>(role);
+  if ((typedRole == ParameterRole::ReductionOuter ||
+       typedRole == ParameterRole::ReductionInner) &&
+      typedCategory != ParameterCategory::Reduction)
+    return emitError()
+           << "multi-axis reduction parameter roles require the reduction category";
   const bool carriesDataGranularity =
       typedCategory == ParameterCategory::Pointwise ||
       typedCategory == ParameterCategory::Reduction ||

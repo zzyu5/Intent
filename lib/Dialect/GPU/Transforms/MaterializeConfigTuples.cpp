@@ -16,6 +16,7 @@ struct TuningProfile {
   int64_t ownershipM;
   int64_t ownershipN;
   int64_t reduction;
+  int64_t reductionOuter;
   int64_t scan;
   int64_t traversalWorkers;
   int64_t traversalGroup;
@@ -25,6 +26,7 @@ enum class TuningClass {
   Pointwise,
   PointwiseReduction,
   Reduction,
+  MultiAxisReduction,
   RegionReduction,
   RegionContraction,
   Scan,
@@ -99,7 +101,12 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
   case ParameterCategory::Reduction:
-    return TuningClass::Reduction;
+    return schema.getRole() ==
+                       static_cast<uint32_t>(ParameterRole::ReductionOuter) ||
+                   schema.getRole() == static_cast<uint32_t>(
+                                           ParameterRole::ReductionInner)
+               ? TuningClass::MultiAxisReduction
+               : TuningClass::Reduction;
   case ParameterCategory::Scan:
     return TuningClass::Scan;
   case ParameterCategory::Contraction:
@@ -129,56 +136,60 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
   if (kind == TuningClass::Contraction && matrix && narrow)
-    return {{128, 128, 32, 128, 1, 8},
-            {64, 128, 64, 128, 1, 8},
-            {128, 64, 32, 128, 1, 8},
-            {128, 256, 64, 128, 1, 8}};
+    return {{128, 128, 32, 1, 128, 1, 8},
+            {64, 128, 64, 1, 128, 1, 8},
+            {128, 64, 32, 1, 128, 1, 8},
+            {128, 256, 64, 1, 128, 1, 8}};
   if (kind == TuningClass::Contraction)
-    return {{64, 64, 32, 128, 1, 8},
-            {32, 64, 64, 128, 1, 8},
-            {64, 32, 32, 128, 1, 8}};
+    return {{64, 64, 32, 1, 128, 1, 8},
+            {32, 64, 64, 1, 128, 1, 8},
+            {64, 32, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::RegionContraction)
-    return {{128, 128, 64, 128, 1, 8},
-            {64, 128, 64, 64, 1, 8},
-            {128, 64, 32, 256, 1, 8}};
+    return {{128, 128, 64, 1, 128, 1, 8},
+            {64, 128, 64, 1, 64, 1, 8},
+            {128, 64, 32, 1, 256, 1, 8}};
   if (kind == TuningClass::RegionReduction)
-    return {{128, 128, 64, 32768, 1, 8},
-            {128, 128, 64, 16384, 1, 8},
-            {128, 128, 64, 8192, 1, 8}};
+    return {{128, 128, 64, 1, 32768, 1, 8},
+            {128, 128, 64, 1, 16384, 1, 8},
+            {128, 128, 64, 1, 8192, 1, 8}};
   if (kind == TuningClass::Scan)
-    return {{128, 256, 64, 256, 1, 8},
-            {64, 128, 64, 128, 1, 8},
-            {256, 512, 32, 512, 1, 8}};
+    return {{128, 256, 64, 1, 256, 1, 8},
+            {64, 128, 64, 1, 128, 1, 8},
+            {256, 512, 32, 1, 512, 1, 8}};
+  if (kind == TuningClass::MultiAxisReduction)
+    return {{128, 128, 512, 32, 128, 1, 8},
+            {128, 128, 1024, 16, 128, 1, 8},
+            {128, 128, 256, 64, 128, 1, 8}};
   if (kind == TuningClass::Reduction)
-    return {{128, 128, 64, 128, 1, 8},
-            {64, 128, 128, 128, 1, 8},
-            {256, 64, 32, 128, 1, 8}};
+    return {{128, 128, 64, 1, 128, 1, 8},
+            {64, 128, 128, 1, 128, 1, 8},
+            {256, 64, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::Execution)
-    return {{1, 1, 1, 1, 1, 8},
-            {1, 1, 1, 1, 2, 4},
-            {1, 1, 1, 1, 4, 2}};
+    return {{1, 1, 1, 1, 1, 1, 8},
+            {1, 1, 1, 1, 1, 2, 4},
+            {1, 1, 1, 1, 1, 4, 2}};
   if (kind == TuningClass::PointwiseReduction)
-    return {{64, 128, 32, 128, 1, 8},
-            {64, 64, 32, 128, 1, 8},
-            {64, 32, 32, 128, 1, 8},
-            {64, 16, 32, 128, 1, 8}};
+    return {{64, 128, 32, 1, 128, 1, 8},
+            {64, 64, 32, 1, 128, 1, 8},
+            {64, 32, 32, 1, 128, 1, 8},
+            {64, 16, 32, 1, 128, 1, 8}};
   if (twoAxisPointwise && fixedPointwiseLocal)
-    return {{8, 2, 32, 128, 1, 8},
-            {8, 4, 32, 128, 1, 8},
-            {4, 4, 32, 128, 1, 8},
-            {16, 2, 32, 128, 1, 8}};
+    return {{8, 2, 32, 1, 128, 1, 8},
+            {8, 4, 32, 1, 128, 1, 8},
+            {4, 4, 32, 1, 128, 1, 8},
+            {16, 2, 32, 1, 128, 1, 8}};
   if (twoAxisPointwise)
-    return {{1, narrow ? 512 : 256, 32, 128, 1, 8},
-            {64, 64, 32, 128, 1, 8},
-            {16, 16, 32, 128, 1, 8},
-            {8, 16, 32, 128, 1, 8},
-            {8, 8, 32, 128, 1, 8},
-            {8, 2, 32, 128, 1, 8}};
+    return {{1, narrow ? 512 : 256, 32, 1, 128, 1, 8},
+            {64, 64, 32, 1, 128, 1, 8},
+            {16, 16, 32, 1, 128, 1, 8},
+            {8, 16, 32, 1, 128, 1, 8},
+            {8, 8, 32, 1, 128, 1, 8},
+            {8, 2, 32, 1, 128, 1, 8}};
   int64_t lane = narrow ? 512 : 256;
-  return {{64, lane, 32, 128, 1, 8},
-          {32, lane / 4, 32, 128, 1, 8},
-          {64, std::max<int64_t>(lane / 16, 16), 32, 128, 1, 8},
-          {64, narrow ? 4096 : 8192, 32, 128, 1, 8}};
+  return {{64, lane, 32, 1, 128, 1, 8},
+          {32, lane / 4, 32, 1, 128, 1, 8},
+          {64, std::max<int64_t>(lane / 16, 16), 32, 1, 128, 1, 8},
+          {64, narrow ? 4096 : 8192, 32, 1, 128, 1, 8}};
 }
 
 int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
@@ -189,6 +200,10 @@ int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
     return profile.ownershipN;
   case ParameterRole::Reduction:
     return profile.reduction;
+  case ParameterRole::ReductionInner:
+    return profile.reduction;
+  case ParameterRole::ReductionOuter:
+    return profile.reductionOuter;
   case ParameterRole::ScanChunk:
     return profile.scan;
   case ParameterRole::TraversalWorkers:

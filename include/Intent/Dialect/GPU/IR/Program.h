@@ -83,6 +83,8 @@ enum class ParameterRole : uint32_t {
   TraversalGroup = 9,
   ResidentWorkers = 10,
   FullCoverage = 11,
+  ReductionOuter = 12,
+  ReductionInner = 13,
 };
 
 enum class ParameterCategory : uint32_t {

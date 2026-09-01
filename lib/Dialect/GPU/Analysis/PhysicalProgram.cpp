@@ -1491,6 +1491,50 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     }
   }
 
+  if (auto loop = value.getDefiningOp<scf::ForOp>()) {
+    auto reductions = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
+    auto opResult = dyn_cast<OpResult>(value);
+    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    bool preservesAxis = reductions && !reductions.empty() &&
+                         llvm::none_of(reductions, [&](Attribute attribute) {
+                           auto reduction = dyn_cast<PhysicalSourceAttr>(attribute);
+                           return reduction &&
+                                  PhysicalSourceAxis{reduction.getSourceId(),
+                                                     reduction.getSourceAxis(),
+                                                     reduction.getDerived()} ==
+                                      result.source;
+                         });
+    if (preservesAxis && opResult && yield &&
+        opResult.getResultNumber() < loop.getInitArgs().size() &&
+        loop.getInitArgs()[opResult.getResultNumber()].getType() == fragment &&
+        yield.getOperand(opResult.getResultNumber()).getType() == fragment) {
+      PhysicalRangeFact provenance =
+          sourceRanges(yield.getOperand(opResult.getResultNumber()), result.source);
+      auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+      bool physicalExtent =
+          kind != PhysicalExprKind::Dimension &&
+          kind != PhysicalExprKind::ScalarABI &&
+          !(kind == PhysicalExprKind::Constant && extent.getValue() == 1);
+      bool exactYield = provenance.isExact() && !provenance.roots.empty() &&
+                        llvm::all_of(provenance.roots, [&](MakeRangeOp range) {
+                          FailureOr<int64_t> dimension =
+                              queryRangeDimension(range);
+                          return sourceAxisIdentity(range) == result.source &&
+                                 succeeded(dimension) &&
+                                 *dimension == result.dimensionId &&
+                                 valueMatchesExtent(range.getExtent(), extent);
+                        });
+      if (physicalExtent && exactYield) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        result.roots.append(provenance.roots.begin(), provenance.roots.end());
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Range;
+        return result;
+      }
+    }
+  }
+
   if (auto reduce = value.getDefiningOp<ReduceOp>()) {
     auto opResult = dyn_cast<OpResult>(value);
     if (opResult && opResult.getResultNumber() < reduce.getSourceCount()) {
