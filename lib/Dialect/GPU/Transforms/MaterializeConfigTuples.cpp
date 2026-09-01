@@ -115,7 +115,8 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   int64_t lane = narrow ? 512 : 256;
   return {{64, lane, 32, 128, 1, 8},
           {32, lane / 4, 32, 128, 1, 8},
-          {64, std::max<int64_t>(lane / 16, 16), 32, 128, 1, 8}};
+          {64, std::max<int64_t>(lane / 16, 16), 32, 128, 1, 8},
+          {64, narrow ? 4096 : 8192, 32, 128, 1, 8}};
 }
 
 int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {

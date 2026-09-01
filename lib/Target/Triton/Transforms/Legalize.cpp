@@ -70,7 +70,7 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
     return {{8, 2, 1}, {4, 2, 1}, {16, 2, 1}};
   if (twoAxisPointwise)
     return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {2, 5, 1}};
-  return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}};
+  return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {4, 3, 1}};
 }
 
 std::optional<int64_t>
