@@ -69,6 +69,37 @@ bool isFullCoverageExtent(Operation *origin, Attribute attribute) {
   return fullCoverage;
 }
 
+bool isOwnershipExtent(Operation *origin, Attribute attribute) {
+  auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+  if (!origin || !extent ||
+      extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return false;
+  func::FuncOp kernel = origin->getParentOfType<func::FuncOp>();
+  if (!kernel)
+    return false;
+  bool ownership = false;
+  kernel.walk([&](ParameterOp parameter) {
+    if (parameter.getParameter().getName() != extent.getSymbol())
+      return;
+    auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+    ownership |= role == ParameterRole::OwnershipM ||
+                 role == ParameterRole::OwnershipN;
+  });
+  return ownership;
+}
+
+bool reductionUsesOwnershipExtent(Operation *origin, Value operand,
+                                  ArrayRef<int64_t> reductionAxes) {
+  auto fragment = dyn_cast<FragmentType>(operand.getType());
+  if (!fragment)
+    return false;
+  return llvm::any_of(reductionAxes, [&](int64_t axis) {
+    return axis >= 0 && axis < static_cast<int64_t>(fragment.getShape().size()) &&
+           isOwnershipExtent(origin, fragment.getShape()[axis]);
+  });
+}
+
 bool hasFragmentSchema(ContractOp contract) {
   return isa<FragmentType>(contract.getLhs().getType()) &&
          isa<FragmentType>(contract.getRhs().getType()) &&
@@ -108,6 +139,11 @@ bool requiresPhysicalRealization(ContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
+  if (reductionUsesOwnershipExtent(contract, contract.getLhs(),
+                                   contract.getLhsReductionAxes()) ||
+      reductionUsesOwnershipExtent(contract, contract.getRhs(),
+                                   contract.getRhsReductionAxes()))
+    return true;
   return hasUnrealizedPhysicalAxis(contract.getLhs()) ||
          hasUnrealizedPhysicalAxis(contract.getRhs());
 }
@@ -122,6 +158,11 @@ bool requiresPhysicalRealization(ScaledContractOp contract) {
                  isFullCoverageExtent(contract, extent);
         }))
       return true;
+  if (reductionUsesOwnershipExtent(contract, contract.getLhs(),
+                                   contract.getLhsReductionAxes()) ||
+      reductionUsesOwnershipExtent(contract, contract.getRhs(),
+                                   contract.getRhsReductionAxes()))
+    return true;
   return hasUnrealizedPhysicalAxis(contract.getLhs()) ||
          hasUnrealizedPhysicalAxis(contract.getLhsScale()) ||
          hasUnrealizedPhysicalAxis(contract.getRhs()) ||
@@ -300,9 +341,11 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
                                        IRMapping &mapping) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
-  if (llvm::any_of(roots,
-                   [&](MakeRangeOp range) { return value == range.getResult(); }))
-    return replacement;
+  if (auto range = value.getDefiningOp<MakeRangeOp>())
+    if (llvm::any_of(roots, [&](MakeRangeOp root) {
+          return range == root || sameLogicalRange(range, root);
+        }))
+      return replacement;
   auto originalResultType = dyn_cast<FragmentType>(value.getType());
   if (!originalResultType)
     return value;
@@ -400,6 +443,30 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
         return failure();
       }
       cloneMapping.map(accumulator, *projected);
+    }
+  }
+  if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
+    for (Value operand : producer->getOperands()) {
+      Value current = cloneMapping.lookupOrDefault(operand);
+      auto fragment = dyn_cast<FragmentType>(current.getType());
+      if (!fragment)
+        continue;
+      auto operandTarget = FragmentType::get(
+          targetType.getContext(), fragment.getElementType(),
+          targetType.getShape(), targetType.getAxisMaps(),
+          targetType.getValidity(), targetType.getOwner());
+      if (current.getType() == operandTarget)
+        continue;
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          builder, location, current, operandTarget);
+      if (failed(projected)) {
+        producer->emitOpError(
+            "replayed pointwise operand cannot adopt the selected range relation")
+            << "; operand=" << current.getType()
+            << "; target=" << operandTarget;
+        return failure();
+      }
+      cloneMapping.map(operand, *projected);
     }
   }
   Operation *clone = builder.clone(*producer, cloneMapping);
@@ -1539,7 +1606,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   bool bodyFailed = false;
   auto loop = builder.create<scf::ForOp>(
-      location, lhsRange.getStart(), *logicalEnd, blockK.getResult(),
+      location, lhsRange.getLogicalStart(), *logicalEnd, blockK.getResult(),
       ValueRange{contract.getAccumulator()},
       [&](OpBuilder &nested, Location nestedLocation, Value kStart,
           ValueRange carries) {
@@ -1551,10 +1618,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         inheritRangeAuthority(lhsK, lhsRange);
         Value rhsOffset = binary(
             nested, nestedLocation, nested.getIndexType(), kStart,
-            lhsRange.getStart(), BinaryOperator::Subtract);
+            lhsRange.getLogicalStart(), BinaryOperator::Subtract);
         Value rhsStart = binary(
             nested, nestedLocation, nested.getIndexType(),
-            rhsRange.getStart(), rhsOffset, BinaryOperator::Add);
+            rhsRange.getLogicalStart(), rhsOffset, BinaryOperator::Add);
         Value rhsK = nested.create<MakeRangeOp>(
             nestedLocation, rhsIndexType, rhsStart, blockK.getResult(), one,
             rhsRange.getLogicalStart(), rhsRange.getLogicalStop(),

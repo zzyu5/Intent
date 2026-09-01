@@ -1687,7 +1687,9 @@ PhysicalProgramAnalysis::rangeAxes(Value value,
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     PhysicalRangeFact ranges = axisRanges(value, axis);
     bool selected = llvm::any_of(ranges.roots, [&](MakeRangeOp range) {
-      return llvm::is_contained(selectedRoots, range);
+      return llvm::any_of(selectedRoots, [&](MakeRangeOp selectedRoot) {
+        return range == selectedRoot || sameLogicalRange(range, selectedRoot);
+      });
     });
     if (selected) {
       if (failed(queryExactLogicalRange(ranges))) {
