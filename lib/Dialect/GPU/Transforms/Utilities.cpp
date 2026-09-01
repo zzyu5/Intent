@@ -2865,6 +2865,16 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         range->hasAttr(sourceSubregionAttr) || !fragment ||
         fragment.getShape().size() != 1)
       return;
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+    if (extent.getKind() ==
+        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      FailureOr<ParameterOp> declaration =
+          queryParameterBySymbol(kernel, extent.getSymbol());
+      if (succeeded(declaration) && *declaration != parameter &&
+          (*declaration).getParameter().getRole() !=
+              static_cast<uint32_t>(ParameterRole::FullCoverage))
+        return;
+    }
     ranges.push_back(range);
   });
   bool alreadyBound = !ranges.empty() &&
