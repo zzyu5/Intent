@@ -257,8 +257,12 @@ LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
         "pointwise ownership axis has no typed blocking parameter to refine");
   if (*previous == replacement)
     return success();
-  if (previous->getParameter().getRole() !=
-      static_cast<uint32_t>(ParameterRole::OwnershipN))
+  ParameterAttr previousSchema = previous->getParameter();
+  auto previousRole = static_cast<ParameterRole>(previousSchema.getRole());
+  if (previousSchema.getCategory() !=
+          static_cast<uint32_t>(ParameterCategory::Pointwise) ||
+      (previousRole != ParameterRole::OwnershipM &&
+       previousRole != ParameterRole::OwnershipN))
     return previous->emitOpError(
         "contraction can only refine a provisional pointwise ownership parameter");
   for (StringRef attribute : {dimensionAttr, parameterSourceAttr,
