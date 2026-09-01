@@ -60,8 +60,16 @@ int main(int argc, char **argv) {
   llvm::cl::opt<int64_t> computeUnits("compute-units", llvm::cl::init(0));
   llvm::cl::opt<int64_t> sharedMemoryPerUnit("shared-memory-per-unit",
                                              llvm::cl::init(0));
+  llvm::cl::opt<int64_t> maxDynamicSharedMemoryPerBlock(
+      "max-dynamic-shared-memory-per-block", llvm::cl::init(0));
   llvm::cl::opt<int64_t> registersPerUnit("registers-per-unit",
                                           llvm::cl::init(0));
+  llvm::cl::opt<int64_t> maxThreadsPerBlock("max-threads-per-block",
+                                            llvm::cl::init(0));
+  llvm::cl::opt<int64_t> computeCapabilityMajor("compute-capability-major",
+                                                llvm::cl::init(0));
+  llvm::cl::opt<int64_t> computeCapabilityMinor("compute-capability-minor",
+                                                llvm::cl::init(-1));
   llvm::cl::opt<bool> matrixUnits("matrix-units", llvm::cl::init(false));
   llvm::cl::opt<bool> dynamicVectorWidth("dynamic-vector-width",
                                          llvm::cl::init(false));
@@ -93,7 +101,14 @@ int main(int argc, char **argv) {
   if (!module || mlir::failed(intent::verifyKernelModule(*module)))
     return exitCode(ExitCode::KernelIR);
   intent::GPUCapabilities capabilities{
-      computeUnits, sharedMemoryPerUnit, registersPerUnit, matrixUnits,
+      computeUnits,
+      sharedMemoryPerUnit,
+      maxDynamicSharedMemoryPerBlock,
+      registersPerUnit,
+      maxThreadsPerBlock,
+      computeCapabilityMajor,
+      computeCapabilityMinor,
+      matrixUnits,
       dynamicVectorWidth};
   if (mlir::failed(intent::lowerCanonicalKIRToGPU(*module, capabilities))) {
     llvm::errs() << "Intent KIR-to-GPU construction failed\n";

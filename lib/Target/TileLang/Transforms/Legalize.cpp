@@ -5,9 +5,12 @@
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "PassDetail.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 
@@ -61,15 +64,25 @@ evaluate(gpu::PhysicalExprAttr expression, const TileLangConfig &config) {
       return std::nullopt;
     operands.push_back(*value);
   }
+  int64_t result = 0;
   if (kind == gpu::PhysicalExprKind::Add)
-    return operands[0] + operands[1];
+    return __builtin_add_overflow(operands[0], operands[1], &result)
+               ? std::nullopt
+               : std::optional<int64_t>(result);
   if (kind == gpu::PhysicalExprKind::Subtract)
-    return operands[0] - operands[1];
+    return __builtin_sub_overflow(operands[0], operands[1], &result)
+               ? std::nullopt
+               : std::optional<int64_t>(result);
   if (kind == gpu::PhysicalExprKind::Multiply)
-    return operands[0] * operands[1];
-  if (kind == gpu::PhysicalExprKind::CeilDiv && operands[1] > 0)
-    return (operands[0] + operands[1] - 1) / operands[1];
-  if (kind == gpu::PhysicalExprKind::FloorDiv && operands[1] > 0)
+    return __builtin_mul_overflow(operands[0], operands[1], &result)
+               ? std::nullopt
+               : std::optional<int64_t>(result);
+  if (kind == gpu::PhysicalExprKind::CeilDiv && operands[0] >= 0 &&
+      operands[1] > 0)
+    return operands[0] / operands[1] +
+           static_cast<int64_t>(operands[0] % operands[1] != 0);
+  if (kind == gpu::PhysicalExprKind::FloorDiv && operands[0] >= 0 &&
+      operands[1] > 0)
     return operands[0] / operands[1];
   if (kind == gpu::PhysicalExprKind::Minimum)
     return std::min(operands[0], operands[1]);
@@ -78,9 +91,121 @@ evaluate(gpu::PhysicalExprAttr expression, const TileLangConfig &config) {
   return std::nullopt;
 }
 
-bool configurationIsLegal(func::FuncOp kernel,
-                          ArrayRef<ParameterDomain> domains,
-                          const TileLangConfig &config) {
+enum CandidateFailure : unsigned {
+  MissingThreads = 1u << 0,
+  ThreadLimit = 1u << 1,
+  MmaPartition = 1u << 2,
+  SharedMemory = 1u << 3,
+};
+
+struct FlatSharedLifetime {
+  Block *block;
+  Operation *first;
+  Operation *last;
+  uint64_t bytes;
+};
+
+std::optional<uint64_t> allocationStorageBytes(
+    AllocOp allocation, const TileLangConfig &config) {
+  BufferType buffer = allocation.getResult().getType();
+  unsigned bitWidth = 0;
+  if (auto integer = dyn_cast<IntegerType>(buffer.getElementType()))
+    bitWidth = integer.getWidth();
+  else if (auto floating = dyn_cast<FloatType>(buffer.getElementType()))
+    bitWidth = floating.getWidth();
+  else
+    return std::nullopt;
+  if (bitWidth == 0)
+    return std::nullopt;
+
+  uint64_t elements = 1;
+  for (Attribute attribute : buffer.getShape()) {
+    std::optional<int64_t> extent =
+        evaluate(cast<gpu::PhysicalExprAttr>(attribute), config);
+    if (!extent || *extent <= 0)
+      return std::nullopt;
+    uint64_t value = static_cast<uint64_t>(*extent);
+    if (elements > std::numeric_limits<uint64_t>::max() / value)
+      return std::nullopt;
+    elements *= value;
+  }
+  if (elements > std::numeric_limits<uint64_t>::max() / bitWidth)
+    return std::nullopt;
+  uint64_t bits = elements * bitWidth;
+  return bits / 8 + static_cast<uint64_t>(bits % 8 != 0);
+}
+
+std::optional<FlatSharedLifetime>
+exactFlatLifetime(AllocOp allocation, uint64_t bytes) {
+  Block *block = allocation->getBlock();
+  Operation *first = nullptr;
+  Operation *last = nullptr;
+  for (OpOperand &use : allocation.getResult().getUses()) {
+    Operation *user = use.getOwner();
+    if (user->getBlock() != block)
+      return std::nullopt;
+    if (!first || user->isBeforeInBlock(first))
+      first = user;
+    if (!last || last->isBeforeInBlock(user))
+      last = user;
+  }
+  if (!first)
+    return std::nullopt;
+  return FlatSharedLifetime{block, first, last, bytes};
+}
+
+bool isLiveAt(const FlatSharedLifetime &lifetime, Operation *operation) {
+  return lifetime.first == operation || lifetime.last == operation ||
+         (lifetime.first->isBeforeInBlock(operation) &&
+          operation->isBeforeInBlock(lifetime.last));
+}
+
+bool exactSharedMemoryIsLegal(func::FuncOp kernel,
+                              const TileLangConfig &config,
+                              uint64_t capacity) {
+  SmallVector<FlatSharedLifetime> exactLifetimes;
+  bool legal = true;
+  kernel.walk([&](AllocOp allocation) {
+    BufferType buffer = allocation.getResult().getType();
+    if (!legal || buffer.getSpace().getValue() != BufferSpace::Shared ||
+        allocation.getResult().use_empty())
+      return;
+    std::optional<uint64_t> bytes = allocationStorageBytes(allocation, config);
+    if (!bytes)
+      return;
+    if (*bytes > capacity) {
+      legal = false;
+      return;
+    }
+    if (std::optional<FlatSharedLifetime> lifetime =
+            exactFlatLifetime(allocation, *bytes))
+      exactLifetimes.push_back(*lifetime);
+  });
+  if (!legal)
+    return false;
+
+  // A flat same-block interval is an exact interference fact: distinct allocs
+  // whose first/last uses overlap must hold independent values concurrently.
+  // Nested-region, symbolic-size and cross-block cases stay unknown and are
+  // deliberately left to TileLang's own allocation planner.
+  for (const FlatSharedLifetime &anchor : exactLifetimes) {
+    uint64_t remaining = capacity;
+    for (const FlatSharedLifetime &candidate : exactLifetimes) {
+      if (candidate.block != anchor.block ||
+          !isLiveAt(candidate, anchor.first))
+        continue;
+      if (candidate.bytes > remaining)
+        return false;
+      remaining -= candidate.bytes;
+    }
+  }
+  return true;
+}
+
+unsigned configurationFailures(func::FuncOp kernel,
+                               ArrayRef<ParameterDomain> domains,
+                               const TileLangConfig &config,
+                               gpu::CapabilitiesAttr capabilities) {
   std::optional<int64_t> threads;
   for (const ParameterDomain &domain : domains) {
     if (domain.role != gpu::ParameterRole::ProviderThreads)
@@ -90,8 +215,10 @@ bool configurationIsLegal(func::FuncOp kernel,
       threads = found->second;
   }
   if (!threads)
-    return false;
-  bool legal = true;
+    return MissingThreads;
+  unsigned failures = 0;
+  if (*threads <= 0 || *threads > capabilities.getMaxThreadsPerBlock())
+    failures |= ThreadLimit;
   kernel.walk([&](GemmOp gemm) {
     auto lhs = gemm.getLhs().getType();
     auto rhs = gemm.getRhs().getType();
@@ -103,10 +230,15 @@ bool configurationIsLegal(func::FuncOp kernel,
         cast<gpu::PhysicalExprAttr>(
             rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]),
         config);
-    if (m && n)
-      legal &= isLegalMmaWarpPartition(*m, *n, *threads);
+    if (m && n && !isLegalMmaWarpPartition(*m, *n, *threads))
+      failures |= MmaPartition;
   });
-  return legal;
+  if (!exactSharedMemoryIsLegal(
+          kernel, config,
+          static_cast<uint64_t>(
+              capabilities.getMaxDynamicSharedMemoryPerBlock())))
+    failures |= SharedMemory;
+  return failures;
 }
 
 gpu::ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
@@ -169,6 +301,11 @@ SmallVector<int64_t> extentCandidates(func::FuncOp kernel, Attribute attribute) 
 }
 
 LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities)
+    return kernel.emitError(
+        "TileLang legalization requires typed GPU capabilities");
   SmallVector<ParameterDomain> domains;
   llvm::StringSet<> names;
   bool invalid = false;
@@ -249,18 +386,41 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
 
   Builder builder(kernel.getContext());
   SmallVector<Attribute> encoded;
+  unsigned rejected = 0;
   for (const TileLangConfig &config : configs) {
-    if (!configurationIsLegal(kernel, domains, config))
+    unsigned failures =
+        configurationFailures(kernel, domains, config, capabilities);
+    if (failures) {
+      rejected |= failures;
       continue;
+    }
     SmallVector<NamedAttribute> bindings;
     for (const auto &[name, value] : config)
       bindings.push_back(
           builder.getNamedAttr(name, builder.getI64IntegerAttr(value)));
     encoded.push_back(builder.getDictionaryAttr(bindings));
   }
-  if (encoded.empty())
-    return kernel.emitError(
-        "all TileLang parameter candidates violate typed MMA warp partition legality");
+  if (encoded.empty()) {
+    InFlightDiagnostic diagnostic =
+        kernel.emitError("all TileLang parameter candidates are provably illegal");
+    diagnostic << "; typed reasons=";
+    bool first = true;
+    auto appendReason = [&](StringRef reason) {
+      if (!first)
+        diagnostic << ",";
+      first = false;
+      diagnostic << reason;
+    };
+    if (rejected & MissingThreads)
+      appendReason("missing_threads");
+    if (rejected & ThreadLimit)
+      appendReason("threads_per_block");
+    if (rejected & MmaPartition)
+      appendReason("mma_warp_partition");
+    if (rejected & SharedMemory)
+      appendReason("exact_shared_memory");
+    return failure();
+  }
   kernel->setAttr(gpu::tileLangConfigsAttr, builder.getArrayAttr(encoded));
   return success();
 }
@@ -293,13 +453,20 @@ bool supportsThreads(func::FuncOp kernel, int64_t threads) {
 } // namespace
 
 LogicalResult materializeLaunchConfiguration(func::FuncOp kernel) {
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities)
+    return kernel.emitError(
+        "TileLang launch configuration requires typed GPU capabilities");
   SmallVector<int64_t> candidates;
   for (int64_t threads : {128, 256})
-    if (supportsThreads(kernel, threads))
+    if (threads <= capabilities.getMaxThreadsPerBlock() &&
+        supportsThreads(kernel, threads))
       candidates.push_back(threads);
   if (candidates.empty())
     for (int64_t threads : {64, 32})
-      if (supportsThreads(kernel, threads)) {
+      if (threads <= capabilities.getMaxThreadsPerBlock() &&
+          supportsThreads(kernel, threads)) {
         candidates.push_back(threads);
         break;
       }

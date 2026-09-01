@@ -338,11 +338,16 @@ LogicalResult ViewLayoutAttr::verify(
 
 LogicalResult CapabilitiesAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, int64_t computeUnits,
-    int64_t sharedMemoryPerUnit, int64_t registersPerUnit, bool matrixUnits,
-    bool dynamicVectorWidth) {
+    int64_t sharedMemoryPerUnit, int64_t maxDynamicSharedMemoryPerBlock,
+    int64_t registersPerUnit, int64_t maxThreadsPerBlock,
+    int64_t computeCapabilityMajor, int64_t computeCapabilityMinor,
+    bool matrixUnits, bool dynamicVectorWidth) {
   (void)matrixUnits;
   (void)dynamicVectorWidth;
-  if (computeUnits <= 0 || sharedMemoryPerUnit <= 0 || registersPerUnit <= 0)
+  if (computeUnits <= 0 || sharedMemoryPerUnit <= 0 ||
+      maxDynamicSharedMemoryPerBlock <= 0 || registersPerUnit <= 0 ||
+      maxThreadsPerBlock <= 0 || computeCapabilityMajor <= 0 ||
+      computeCapabilityMinor < 0)
     return emitError() << "selected GPU capabilities require positive resource limits";
   return success();
 }

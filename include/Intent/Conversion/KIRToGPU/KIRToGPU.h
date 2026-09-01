@@ -8,7 +8,11 @@ namespace intent {
 struct GPUCapabilities {
   int64_t computeUnits;
   int64_t sharedMemoryPerUnit;
+  int64_t maxDynamicSharedMemoryPerBlock;
   int64_t registersPerUnit;
+  int64_t maxThreadsPerBlock;
+  int64_t computeCapabilityMajor;
+  int64_t computeCapabilityMinor;
   bool matrixUnits;
   bool dynamicVectorWidth;
 };

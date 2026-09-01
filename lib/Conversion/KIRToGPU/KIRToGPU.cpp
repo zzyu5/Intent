@@ -4660,7 +4660,10 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                    workset.launchLength);
   auto capabilityAttr = gpu::CapabilitiesAttr::get(
       context, capabilities.computeUnits, capabilities.sharedMemoryPerUnit,
-      capabilities.registersPerUnit, capabilities.matrixUnits,
+      capabilities.maxDynamicSharedMemoryPerBlock,
+      capabilities.registersPerUnit,
+      capabilities.maxThreadsPerBlock, capabilities.computeCapabilityMajor,
+      capabilities.computeCapabilityMinor, capabilities.matrixUnits,
       capabilities.dynamicVectorWidth);
   SmallVector<NamedAttribute> functionAttrs{
       builder.getNamedAttr(gpu::kernelAttr, builder.getUnitAttr()),
@@ -4913,7 +4916,11 @@ LogicalResult lowerCanonicalKIRToGPU(ModuleOp module,
   if (failed(verifyKernelModule(module)))
     return failure();
   if (capabilities.computeUnits <= 0 || capabilities.sharedMemoryPerUnit <= 0 ||
-      capabilities.registersPerUnit <= 0)
+      capabilities.maxDynamicSharedMemoryPerBlock <= 0 ||
+      capabilities.registersPerUnit <= 0 ||
+      capabilities.maxThreadsPerBlock <= 0 ||
+      capabilities.computeCapabilityMajor <= 0 ||
+      capabilities.computeCapabilityMinor < 0)
     return module.emitError("selected GPU capabilities are incomplete");
   SmallVector<func::FuncOp> functions(module.getOps<func::FuncOp>());
   if (functions.size() != 1)
