@@ -21,9 +21,9 @@ knowledge:
   # 项目知识 Provider。
   # 可选值：local | remote
   provider: local
-  # 追加到 Comet 内置语料的项目 Markdown；`doc/` 保存设计规格，
-  # `AGENTS.md` 保存协作和验证边界。
+  # Local Provider 额外加载的项目相对 Markdown 路径。
   local:
+    # 每项填写一个项目相对 Markdown glob；会追加到内置语料。
     include:
       - doc/**/*.md
       - AGENTS.md

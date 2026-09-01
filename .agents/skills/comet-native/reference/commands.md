@@ -1,6 +1,6 @@
 # Native 命令与异常参考
 
-正常流程直接执行 Runtime 在 `continuation` 中给出的命令。本文件用于解释返回字段，以及处理以下情况：命令输入被拒绝、无法启动 Verifier、Verifier 任务执行出错、Verifier 因缺少外部信息无法判断，或 Runtime 要求用户确认降级验收。`continuation.disposition` 说明现在应继续、等待用户、处理阻塞还是结束。只有用户明确确认后，才执行含 `--confirmed` 的后续命令。
+正常流程直接执行 Runtime 在 `continuation` 中给出的命令。本文件用于解释返回字段，以及处理以下情况：命令输入被拒绝、无法启动 Verifier、Verifier 任务执行出错、Verifier 因缺少外部信息无法判断，或 Runtime 要求用户确认降级验收。`continuation.disposition` 说明现在应继续、等待用户、处理阻塞还是结束。只有用户明确确认后，才执行含 `--confirmed` 的后续命令。CLI 文本先给出用户可读的 `summary`、唯一 `NEXT:` 和可选的 `RELAY TO USER:`；用 `--json` 读取新增 Envelope，`--verbose` 仅用于机器状态排查。
 
 命令签名和当前参数始终以 CLI 为准：
 
@@ -12,18 +12,18 @@ comet native <group> <command> --help
 
 ## Runtime 返回的下一步
 
-- `disposition`：说明现在应该继续、等待用户、处理阻塞还是结束；
+- `disposition`：说明现在应该继续、等待用户、处理阻塞还是结束；`userCommunication.required` 为 true 时先转述消息并等待，再执行任何确认命令；
 - `commandArgs` / `commandAlternatives`：Runtime 要求执行的完整命令参数；每个备选操作对应一个互斥的用户决定，选择匹配项执行，不要合并多个备选操作；
 - `inputOptions`：这次命令需要填写的字段和 JSON 模板；
 - `workspace` / `preparation`：实际工作目录和 change 创建结果；
 - `stateVersion` / `loop`：当前状态版本和验收循环进度；
 - `acceptance` / `childSummary` / `readyChildren` / `supervisor` / `details.nextPageArgs`：验收计数、Supervisor Change 的子任务计数、当前可执行子任务、集成分支与当前任务包摘要，以及详情下一页命令；
-- `verifierDispatch`：启动独立 Verifier 所需的工作区与证据位置、当前 `scopeIds`、数量、正文引用、详情分页参数、复核摘要和检查结果；
+- `verifierDispatch`：启动独立 Verifier 所需的工作区与证据位置、当前 `scopeIds`、数量、正文引用、详情分页参数、复核摘要和检查结果；如果存在 `recoveryContext`，也要把它作为最近一次恢复或用户补充的信息直接传给 Verifier；
 - `workspaceFinishResult` / `recoveryArgs`：归档后的工作区收尾结果和恢复命令。
 
 模板中的尖括号表示需要填写的值。`await-user` 表示先等待用户决定，此时不执行推进命令。若 `commandArgs` 为 `null` 且返回了 `commandAlternatives`，先确认用户决定，再执行对应备选操作的完整 `commandArgs`，保留其中的 `--expected-state-version` 和 `--expected-action`。命令因状态过期或动作不匹配失败时，重新读取最新 `continuation`，按当前状态继续；不要自行拼接不带 guard 的命令。`localExecution: absent` 只表示这台机器当前没有正在运行的执行任务，不代表 change 已损坏。
 
-启动 Verifier 时原样传递 `verifierDispatch` 的定位信息：`projectRoot` 是运行 Native 命令的控制目录；`verificationRoot` 是验收实现的工作区，Supervisor 父级使用集成工作区；`changeDir` 是 `briefRef` 和 `specRefs[].ref` 的相对路径基准；`supervisorStateRef` 指向包含子任务验收与集成证据的本机状态，普通 change 为 `null`。`detailsPageArgs` 已包含 `--project-root`，从任何工作目录查询都应保留它。追加检查后，把返回的检查结果和交接信息交回当前 Verifier，继续等待最终结果。
+启动 Verifier 时原样传递 `verifierDispatch` 的定位信息：`projectRoot` 是运行 Native 命令的控制目录；`verificationRoot` 是验收实现的工作区，Supervisor 父级使用集成工作区；`changeDir` 是 `briefRef` 和 `specRefs[].ref` 的相对路径基准；`supervisorStateRef` 指向包含子任务验收与集成证据的本机状态，普通 change 为 `null`。如果存在 `recoveryContext`，也要原样交给 Verifier，作为最近一次恢复或用户补充的上下文。`detailsPageArgs` 已包含 `--project-root`，从任何工作目录查询都应保留它。追加检查后，把返回的检查结果和交接信息交回当前 Verifier，继续等待最终结果。
 
 ## 填写命令输入
 
