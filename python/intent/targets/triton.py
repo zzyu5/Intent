@@ -28,7 +28,9 @@ class ResolvedTritonTarget:
         module_text: str,
         entry_name: str,
     ) -> CompiledArtifact:
-        return materialize_triton_artifact(source, module_text, entry_name)
+        return materialize_triton_artifact(
+            source, module_text, entry_name, self.capabilities.device
+        )
 
 
 @dataclass(frozen=True, slots=True)

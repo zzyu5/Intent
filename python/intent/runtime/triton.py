@@ -16,11 +16,13 @@ def materialize_triton_artifact(
     source: str,
     module_text: str,
     entry_name: str,
+    device: int,
 ) -> CompiledArtifact:
     return materialize_python_source(
         target_name="triton",
         source=source,
         module_text=module_text,
         entry_name=entry_name,
+        device=device,
         backend_ir_collector=_collect_triton_ir,
     )

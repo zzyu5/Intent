@@ -47,6 +47,8 @@ inline constexpr llvm::StringLiteral physicalTailAttr =
     "intent_gpu.physical_tail";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
+inline constexpr llvm::StringLiteral tileLangConfigsAttr =
+    "intent_gpu.tilelang.configs";
 inline constexpr llvm::StringLiteral sharedConfigTuplesAttr =
     "intent_gpu.shared.config_tuples";
 

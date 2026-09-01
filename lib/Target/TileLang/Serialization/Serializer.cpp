@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -117,11 +118,6 @@ std::string literal(Attribute value) {
   return {};
 }
 
-struct ParameterDomain {
-  std::string name;
-  SmallVector<int64_t> candidates;
-};
-
 struct CoverageParameter {
   std::string dimension;
   SmallVector<int64_t> candidates;
@@ -200,7 +196,7 @@ private:
 
   void collectConfiguration() {
     llvm::StringSet<> names;
-    llvm::StringSet<> sharedParameters;
+    std::map<std::string, SmallVector<int64_t>> parameterCandidates;
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       auto role = static_cast<gpu::ParameterRole>(schema.getRole());
@@ -212,7 +208,6 @@ private:
         return;
       }
       StringRef name = schema.getName().getValue();
-      parameterRoles[name.str()] = schema.getRole();
       if (!names.insert(name).second) {
         parameter.emitOpError("duplicates a TileLang physical parameter");
         failed = true;
@@ -235,44 +230,39 @@ private:
         return;
       }
       parameterNames.push_back(name.str());
-      if (role == gpu::ParameterRole::ProviderThreads ||
-          role == gpu::ParameterRole::ProviderStages)
-        providerDomains.push_back(
-            {name.str(),
-             SmallVector<int64_t>(schema.getCandidates().asArrayRef())});
-      else
-        sharedParameters.insert(name);
+      parameterCandidates[name.str()] =
+          SmallVector<int64_t>(schema.getCandidates().asArrayRef());
       values[parameter.getResult()] = name.str();
     });
     if (failed)
       return;
-    auto encoded =
-        kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
+    auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::tileLangConfigsAttr);
     if (!encoded || encoded.empty()) {
-      kernel.emitError("TileLang source requires shared config tuples");
+      kernel.emitError("TileLang source requires closed provider configs");
       failed = true;
       return;
     }
     for (Attribute attribute : encoded) {
       auto tuple = dyn_cast<DictionaryAttr>(attribute);
-      if (!tuple || tuple.size() != sharedParameters.size()) {
-        kernel.emitError("contains a malformed shared config tuple");
+      if (!tuple || tuple.size() != parameterCandidates.size()) {
+        kernel.emitError("contains a malformed TileLang provider config");
         failed = true;
         return;
       }
       std::map<std::string, int64_t> config;
       for (NamedAttribute binding : tuple) {
+        auto domain = parameterCandidates.find(binding.getName().strref().str());
         auto value = dyn_cast<IntegerAttr>(binding.getValue());
-        if (!sharedParameters.contains(binding.getName().getValue()) ||
-            !value) {
+        if (domain == parameterCandidates.end() || !value ||
+            !llvm::is_contained(domain->second, value.getInt())) {
           kernel.emitError(
-              "shared config tuple contains an invalid TileLang binding");
+              "TileLang provider config contains an invalid binding");
           failed = true;
           return;
         }
         config[binding.getName().strref().str()] = value.getInt();
       }
-      sharedConfigurations.push_back(std::move(config));
+      configurations.push_back(std::move(config));
     }
   }
 
@@ -281,95 +271,9 @@ private:
               "from tilelang.autotuner import set_autotune_inputs\n\n";
   }
 
-  SmallVector<std::map<std::string, int64_t>> configurations() {
-    SmallVector<std::map<std::string, int64_t>> configs =
-        sharedConfigurations;
-    auto expand = [&](StringRef name, ArrayRef<int64_t> candidates) {
-      SmallVector<std::map<std::string, int64_t>> next;
-      for (const auto &base : configs)
-        for (int64_t candidate : candidates) {
-          auto value = base;
-          value[name.str()] = candidate;
-          next.push_back(std::move(value));
-        }
-      configs = std::move(next);
-    };
-    for (const ParameterDomain &domain : providerDomains)
-      expand(domain.name, domain.candidates);
-    SmallVector<std::map<std::string, int64_t>> legal;
-    for (auto &config : configs)
-      if (configurationIsLegal(config))
-        legal.push_back(std::move(config));
-    return legal;
-  }
-
-  std::optional<int64_t>
-  evaluate(gpu::PhysicalExprAttr expression,
-           const std::map<std::string, int64_t> &config) const {
-    auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-    if (kind == gpu::PhysicalExprKind::Constant)
-      return expression.getValue();
-    if (kind == gpu::PhysicalExprKind::Parameter) {
-      auto found = config.find(expression.getSymbol().getValue().str());
-      return found == config.end() ? std::nullopt
-                                   : std::optional<int64_t>(found->second);
-    }
-    SmallVector<int64_t> operands;
-    for (Attribute operand : expression.getOperands()) {
-      std::optional<int64_t> value =
-          evaluate(cast<gpu::PhysicalExprAttr>(operand), config);
-      if (!value)
-        return std::nullopt;
-      operands.push_back(*value);
-    }
-    if (kind == gpu::PhysicalExprKind::Add)
-      return operands[0] + operands[1];
-    if (kind == gpu::PhysicalExprKind::Subtract)
-      return operands[0] - operands[1];
-    if (kind == gpu::PhysicalExprKind::Multiply)
-      return operands[0] * operands[1];
-    if (kind == gpu::PhysicalExprKind::CeilDiv && operands[1] > 0)
-      return (operands[0] + operands[1] - 1) / operands[1];
-    if (kind == gpu::PhysicalExprKind::FloorDiv && operands[1] > 0)
-      return operands[0] / operands[1];
-    if (kind == gpu::PhysicalExprKind::Minimum)
-      return std::min(operands[0], operands[1]);
-    if (kind == gpu::PhysicalExprKind::Maximum)
-      return std::max(operands[0], operands[1]);
-    return std::nullopt;
-  }
-
-  bool configurationIsLegal(
-      const std::map<std::string, int64_t> &config) {
-    std::optional<int64_t> threads;
-    for (const auto &[name, role] : parameterRoles) {
-      if (role != static_cast<uint32_t>(gpu::ParameterRole::ProviderThreads))
-        continue;
-      auto found = config.find(name);
-      if (found != config.end())
-        threads = found->second;
-    }
-    if (!threads)
-      return true;
-    bool legal = true;
-    kernel.walk([&](GemmOp gemm) {
-      auto lhs = gemm.getLhs().getType();
-      auto rhs = gemm.getRhs().getType();
-      auto m = evaluate(cast<gpu::PhysicalExprAttr>(
-                            lhs.getShape()[gemm.getTransposeLhs() ? 1 : 0]),
-                        config);
-      auto n = evaluate(cast<gpu::PhysicalExprAttr>(
-                            rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]),
-                        config);
-      if (m && n)
-        legal &= isLegalMmaWarpPartition(*m, *n, *threads);
-    });
-    return legal;
-  }
-
   void emitBuilder() {
     output << "@tilelang.autotune(configs=[\n";
-    for (const auto &config : configurations()) {
+    for (const auto &config : configurations) {
       output << "    {";
       for (auto [index, item] : llvm::enumerate(config)) {
         if (index)
@@ -945,10 +849,8 @@ private:
   SmallVector<MetadataABI> metadataArguments;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   SmallVector<std::string> parameterNames;
-  SmallVector<ParameterDomain> providerDomains;
-  SmallVector<std::map<std::string, int64_t>> sharedConfigurations;
+  SmallVector<std::map<std::string, int64_t>> configurations;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
-  std::map<std::string, uint32_t> parameterRoles;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;

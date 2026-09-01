@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
 
 #include <optional>
@@ -733,7 +734,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 
 LogicalResult verifyCuTileProgram(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  return failed(kernel) ? failure() : verifyKernel(*kernel);
+  return failed(kernel) || failed(mlir::verify(module)) ? failure()
+                                                       : verifyKernel(*kernel);
 }
 
 LogicalResult legalizeGPUProgram(ModuleOp module) {

@@ -17,6 +17,7 @@ def materialize_python_source(
     source: str,
     module_text: str,
     entry_name: str,
+    device: int,
     backend_ir_collector: BackendIRCollector | None,
 ) -> CompiledArtifact:
     materialization_id = next(_MATERIALIZATION_IDS)
@@ -40,6 +41,7 @@ def materialize_python_source(
     return CompiledArtifact(
         source=source,
         mlir=module_text,
+        device=device,
         _launcher=launcher,
         _runner=runner,
         _backend_ir_collector=backend_ir_collector,

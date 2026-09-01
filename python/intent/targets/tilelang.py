@@ -28,7 +28,9 @@ class ResolvedTileLangTarget:
         module_text: str,
         entry_name: str,
     ) -> CompiledArtifact:
-        return materialize_tilelang_artifact(source, module_text, entry_name)
+        return materialize_tilelang_artifact(
+            source, module_text, entry_name, self.capabilities.device
+        )
 
 
 @dataclass(frozen=True, slots=True)

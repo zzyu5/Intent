@@ -730,10 +730,46 @@ def _sparse_contract(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
 
 
 def _sparse_contract_2to4(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
-    lowerer.error(
+    bound = bind_call(
+        lowerer,
         node,
-        "I.sparse_contract_2to4 requires the typed sparse metadata schema; use I.sparse_contract",
+        ("compressed_lhs", "metadata", "rhs", "acc_dtype"),
+        required=("compressed_lhs", "metadata", "rhs", "acc_dtype"),
     )
+    compressed = lowerer.read_value(
+        lowerer.lower_expression(bound["compressed_lhs"]),
+        bound["compressed_lhs"],
+    )
+    metadata = lowerer.read_value(
+        lowerer.lower_expression(bound["metadata"]), bound["metadata"]
+    )
+    rhs = lowerer.read_value(lowerer.lower_expression(bound["rhs"]), bound["rhs"])
+    if (
+        not isinstance(compressed.type, TensorType)
+        or not isinstance(rhs.type, TensorType)
+        or compressed.type.rank != 2
+        or rhs.type.rank != 2
+    ):
+        lowerer.error(node, "I.sparse_contract_2to4 requires rank-two data operands")
+    logical_extent = lowerer.materialize_dimension(
+        ShapeDimension(rhs.type.shape[0], rhs, 0), bound["rhs"]
+    )
+    return lowerer.emit(
+        OperationKind.SPARSE_CONTRACT,
+        lowerer.location(node),
+        operands=(compressed, metadata, rhs, logical_extent),
+        result_types=(
+            TensorType(
+                require_dtype(lowerer, bound["acc_dtype"]),
+                (compressed.type.shape[0], rhs.type.shape[1]),
+            ),
+        ),
+        attributes={
+            "format": SparseFormatAttribute(1, 1),
+            "reduce": ((1, 0),),
+            "batch": (),
+        },
+    ).results[0]
 
 
 def _histogram(lowerer: FunctionLowerer, node: ast.Call) -> MlirValue:
