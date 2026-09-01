@@ -51,8 +51,9 @@ struct TritonLocalOptions {
   int64_t ctas;
 };
 
-SmallVector<TritonLocalOptions, 3>
-localOptionsFor(ArrayRef<gpu::ParameterCategory> categories) {
+SmallVector<TritonLocalOptions, 4>
+localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
+                bool twoAxisPointwise) {
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionReduction))
     return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
@@ -67,6 +68,8 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories) {
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
       llvm::is_contained(categories, gpu::ParameterCategory::Scan))
     return {{8, 2, 1}, {4, 2, 1}, {16, 2, 1}};
+  if (twoAxisPointwise)
+    return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {2, 5, 1}};
   return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}};
 }
 
@@ -189,6 +192,7 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
   };
   SmallVector<Domain> domains;
   SmallVector<gpu::ParameterCategory> categories;
+  bool twoAxisPointwise = false;
   llvm::StringSet<> names;
   WalkResult schema = kernel.walk([&](gpu::ParameterOp parameter) {
     auto definition = parameter.getParameter();
@@ -203,6 +207,10 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
                        parameter->hasAttr(gpu::coverageDimensionAttr)});
     auto category =
         static_cast<gpu::ParameterCategory>(definition.getCategory());
+    twoAxisPointwise |=
+        category == gpu::ParameterCategory::Pointwise &&
+        static_cast<gpu::ParameterRole>(definition.getRole()) ==
+            gpu::ParameterRole::OwnershipM;
     if (category != gpu::ParameterCategory::Coverage &&
         category != gpu::ParameterCategory::Provider &&
         !llvm::is_contained(categories, category))
@@ -234,8 +242,8 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel) {
   }
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
-  SmallVector<TritonLocalOptions, 3> localOptions =
-      localOptionsFor(categories);
+  SmallVector<TritonLocalOptions, 4> localOptions =
+      localOptionsFor(categories, twoAxisPointwise);
   for (Attribute attribute : shared) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
     if (!tuple)

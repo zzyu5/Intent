@@ -3137,22 +3137,42 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
   }
 
-  for (Attribute axis : ownershipAxes) {
+  SmallVector<Attribute> pointwiseOwnershipAxes;
+  for (auto [axis, ranges] : axes) {
+    if (!ownershipAxes.contains(axis))
+      continue;
     ParameterOp parameter = parameters.lookup(axis);
-    if (!parameter || isSourceAxisKey(axis) ||
+    if (!parameter ||
         parameter.getParameter().getRole() ==
             static_cast<uint32_t>(ParameterRole::ScanChunk))
       continue;
+    pointwiseOwnershipAxes.push_back(axis);
+  }
+
+  for (Attribute axis : ownershipAxes) {
+    ParameterOp parameter = parameters.lookup(axis);
+    if (!parameter ||
+        parameter.getParameter().getRole() ==
+            static_cast<uint32_t>(ParameterRole::ScanChunk))
+      continue;
+    ParameterRole ownershipRole =
+        pointwiseOwnershipAxes.size() == 2 &&
+                axis == pointwiseOwnershipAxes.front()
+            ? ParameterRole::OwnershipM
+            : ParameterRole::OwnershipN;
     parameter->removeAttr(coverageDimensionAttr);
+    DenseI64ArrayAttr candidates =
+        isSourceAxisKey(axis)
+            ? parameter.getParameter().getCandidates()
+            : DenseI64ArrayAttr::get(
+                  module.getContext(),
+                  {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+                   4096, 8192, 16384, 32768, 65536});
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
-        static_cast<uint32_t>(ParameterRole::OwnershipN),
+        static_cast<uint32_t>(ownershipRole),
         static_cast<uint32_t>(ParameterCategory::Pointwise),
-        pointwiseElementBitWidth,
-        DenseI64ArrayAttr::get(module.getContext(),
-                               {1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
-                                1024, 2048, 4096, 8192, 16384, 32768,
-                                65536}));
+        pointwiseElementBitWidth, candidates);
     parameter->setAttr("parameter", schema);
   }
 
