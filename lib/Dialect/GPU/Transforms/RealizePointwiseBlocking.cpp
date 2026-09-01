@@ -2056,7 +2056,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       OpBuilder builder(coordinate);
       builder.setInsertionPointAfter(coordinate);
       Value extent = builder.create<arith::ConstantIndexOp>(coordinate.getLoc(), 1);
-      Value step = builder.create<arith::ConstantIndexOp>(coordinate.getLoc(), 1);
+      Value step = coordinate.getStep();
       PhysicalExprAttr unit = expression(module.getContext(),
                                          PhysicalExprKind::Constant, 1);
       int64_t dimension = coordinate.getDimensionId();
@@ -2072,7 +2072,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           /*validity=*/1, /*owner=*/1);
       Value logicalStop = builder.create<BinaryOp>(
           coordinate.getLoc(), builder.getIndexType(), coordinate.getResult(),
-          extent, BinaryOperator::Add);
+          step, BinaryOperator::Add);
       auto range = builder.create<MakeRangeOp>(
           coordinate.getLoc(), type, coordinate.getResult(), extent, step,
           coordinate.getResult(), logicalStop,
@@ -3312,6 +3312,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Attribute, Value> tileCoordinates;
   llvm::DenseMap<Attribute, Value> logicalDimensions;
   llvm::DenseMap<Attribute, unsigned> mappedAxes;
+  llvm::DenseMap<unsigned, Attribute> coordinateAxes;
   auto mappingAxis = [&](Attribute attribute) -> FailureOr<Attribute> {
     FailureOr<uint64_t> blocked = blockedDimension(attribute);
     if (succeeded(blocked))
@@ -3330,8 +3331,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   for (auto [axis, extent] : llvm::enumerate(mapping.getLaunchExtents())) {
     FailureOr<Attribute> mapped = mappingAxis(extent);
     if (succeeded(mapped) && axis < mapping.getCoordinates().size()) {
+      auto existing = mappedAxes.find(*mapped);
+      if (existing != mappedAxes.end() && existing->second != axis)
+        return kernel.emitError(
+            "one pointwise ownership axis maps to multiple program coordinates");
       tileCoordinates[*mapped] = mapping.getCoordinates()[axis];
       mappedAxes[*mapped] = axis;
+      coordinateAxes[axis] = *mapped;
     }
     auto physical = dyn_cast<PhysicalExprAttr>(extent);
     if (!reusableUnitAxis && axis < mapping.getCoordinates().size() &&
@@ -3356,11 +3362,45 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   };
   for (auto [axisKey, ranges] : axes) {
     MakeRangeOp range = ranges.front();
+    const bool worksetRange = range->hasAttr(worksetCoordinateRangeAttr);
+    std::optional<unsigned> worksetPosition;
+    if (worksetRange) {
+      auto coordinate = range.getStart().getDefiningOp<WorksetCoordinateOp>();
+      auto worksetAxis =
+          coordinate
+              ? coordinate->getAttrOfType<IntegerAttr>(worksetAxisAttr)
+              : IntegerAttr();
+      if (!worksetAxis || worksetAxis.getInt() < 0 ||
+          static_cast<size_t>(worksetAxis.getInt()) >=
+              mapping.getCoordinates().size())
+        return range.emitOpError(
+            "workset ownership has no corresponding program coordinate");
+      unsigned position = static_cast<unsigned>(worksetAxis.getInt());
+      worksetPosition = position;
+      auto existingCoordinate = coordinateAxes.find(position);
+      if (existingCoordinate != coordinateAxes.end() &&
+          existingCoordinate->second != axisKey)
+        return range.emitOpError(
+            "workset ownership conflicts with the existing program coordinate relation");
+      auto existingAxis = mappedAxes.find(axisKey);
+      if (existingAxis != mappedAxes.end() && existingAxis->second != position)
+        return range.emitOpError(
+            "workset ownership axis maps to multiple program coordinates");
+      mappedAxes[axisKey] = position;
+      coordinateAxes[position] = axisKey;
+    }
     ParameterOp parameter = parameters.lookup(axisKey);
     Value dimension;
     std::optional<int64_t> staticExtent;
     FailureOr<uint64_t> sourceDimension = ownershipDimension(kernel, range);
-    if (isSourceAxisKey(axisKey)) {
+    if (worksetPosition) {
+      // A workset coordinate is expressed in source-coordinate units, while
+      // ownership tiles the finite workset instance domain.  Reuse the
+      // Delinearize runtime cardinality here; its launch expression below is
+      // the exact same relation and may include non-zero starts or non-unit
+      // domain steps.
+      dimension = mapping.getExtents()[*worksetPosition];
+    } else if (isSourceAxisKey(axisKey)) {
       staticExtent = staticLogicalExtent(range);
       if (staticExtent)
         dimension = mappingBuilder.create<arith::ConstantIndexOp>(
@@ -3409,7 +3449,10 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         mapping.getLoc(), mappingBuilder.getIndexType(), adjusted,
         parameter.getResult(), BinaryOperator::FloorDivide);
     PhysicalExprAttr logical;
-    if (isSourceAxisKey(axisKey) && staticExtent) {
+    if (worksetPosition) {
+      logical = cast<PhysicalExprAttr>(
+          mapping.getLaunchExtents()[*worksetPosition]);
+    } else if (isSourceAxisKey(axisKey) && staticExtent) {
       logical = expression(module.getContext(), PhysicalExprKind::Constant,
                            *staticExtent);
     } else {
@@ -3489,10 +3532,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                  mapping.getCoordinates().size())))) {
       Value oldCoordinate = std::get<0>(pair);
       Value newCoordinate = std::get<1>(pair);
+      auto knownAxis = coordinateAxes.find(axis);
       FailureOr<Attribute> axisKey =
-          axis < mapping.getLaunchExtents().size()
-              ? mappingAxis(mapping.getLaunchExtents()[axis])
-              : FailureOr<Attribute>(failure());
+          knownAxis != coordinateAxes.end()
+              ? FailureOr<Attribute>(knownAxis->second)
+              : axis < mapping.getLaunchExtents().size()
+                    ? mappingAxis(mapping.getLaunchExtents()[axis])
+                    : FailureOr<Attribute>(failure());
       if (succeeded(axisKey) && ownershipAxes.contains(*axisKey)) {
         ParameterOp parameter = parameters.lookup(*axisKey);
         if (!parameter)

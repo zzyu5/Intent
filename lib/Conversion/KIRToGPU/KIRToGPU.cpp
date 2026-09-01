@@ -4733,6 +4733,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                     canonicalAnalysis);
   auto formWorksetCoordinate = [&](OpBuilder &nested, Location location,
                                    intent::DomainOp domain, Value coordinate,
+                                   Value step,
                                    unsigned worksetAxis) -> Value {
     auto domainType = cast<intent::DomainType>(domain.getResult().getType());
     std::optional<int64_t> dimension =
@@ -4743,7 +4744,8 @@ LogicalResult constructGPUProgram(ModuleOp module,
       return {};
     }
     auto mapped = nested.create<gpu::WorksetCoordinateOp>(
-        location, nested.getIndexType(), coordinate, domainType.getOriginId(),
+        location, nested.getIndexType(), coordinate, step,
+        domainType.getOriginId(),
         /*sourceAxis=*/0, /*sourceRank=*/1, *dimension);
     mapped->setAttr(gpu::worksetAxisAttr,
                     nested.getI64IntegerAttr(worksetAxis));
@@ -4822,7 +4824,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                         builder.getIndexType(), starts[axis],
                                         scaled, BinaryOperator::Add);
         childValues[workset.coordinateArguments[axis]] = formWorksetCoordinate(
-            builder, worksetLocation, workset.axes[axis], coordinate,
+            builder, worksetLocation, workset.axes[axis], coordinate, steps[axis],
             axis);
       }
       ScalarRegionLowering lowering(builder, std::move(childValues),
@@ -4879,7 +4881,7 @@ LogicalResult constructGPUProgram(ModuleOp module,
                                             BinaryOperator::Add);
             childValues[workset.coordinateArguments[axis]] =
                 formWorksetCoordinate(nested, location, workset.axes[axis],
-                                      coordinate, axis);
+                                      coordinate, steps[axis], axis);
           }
           ScalarRegionLowering lowering(nested, std::move(childValues),
                                         sourceArguments, dimensionValues,

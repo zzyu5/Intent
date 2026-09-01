@@ -32,6 +32,7 @@ def IntentGPU_ProgramIdOp : IntentGPU_Op<"program_id", [Pure]> {
 def IntentGPU_WorksetCoordinateOp : IntentGPU_Op<"workset_coordinate", [Pure]> {
   let summary = "Scalar logical coordinate owned by one physical program";
   let arguments = (ins Index:$coordinate,
+                       Index:$step,
                        I64Attr:$source_id,
                        I64Attr:$source_axis,
                        I64Attr:$source_rank,
