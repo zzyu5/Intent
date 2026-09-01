@@ -637,43 +637,6 @@ FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
                            source.getValidity(), source.getOwner());
 }
 
-ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
-                                 ParameterRole role, ParameterCategory category,
-                                 uint32_t elementBitWidth,
-                                 ArrayRef<int64_t> candidates) {
-  ParameterOp existing;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter.getParameter().getName().getValue() == name)
-      existing = parameter;
-  });
-  if (existing) {
-    ParameterAttr schema = existing.getParameter();
-    auto expectedCandidates =
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates);
-    if (schema.getRole() != static_cast<uint32_t>(role) ||
-        schema.getCategory() != static_cast<uint32_t>(category) ||
-        schema.getElementBitWidth() != elementBitWidth ||
-        schema.getCandidates() != expectedCandidates) {
-      existing.emitOpError(
-          "physical parameter name is reused with a different role or candidate domain")
-          << "; name=" << name << "; existing_role=" << schema.getRole()
-          << "; requested_role=" << static_cast<uint32_t>(role)
-          << "; existing_candidates=" << schema.getCandidates()
-          << "; requested_candidates=" << expectedCandidates;
-      return ParameterOp();
-    }
-    return existing;
-  }
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = ParameterAttr::get(
-      kernel.getContext(), builder.getStringAttr(name),
-      static_cast<uint32_t>(role),
-      static_cast<uint32_t>(category), elementBitWidth,
-      DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-  return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                     schema);
-}
-
 FailureOr<ParameterOp> fullCoverageParameter(func::FuncOp kernel,
                                              PhysicalExprAttr extent) {
   if (extent.getKind() !=
@@ -778,7 +741,7 @@ FailureOr<ParameterOp> fullCoverageParameterForDimension(func::FuncOp kernel,
   static constexpr int64_t candidates[] = {
       1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
       4096, 8192, 16384, 32768, 65536};
-  ParameterOp parameter = getOrCreateParameter(
+  ParameterOp parameter = getOrCreatePhysicalParameter(
       kernel, ("REDUCE_FULL_D" + Twine(dimension)).str(),
       ParameterRole::OwnershipN, ParameterCategory::Coverage,
       /*elementBitWidth=*/0, candidates);
@@ -2069,7 +2032,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
             .str();
     SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
                                     256, 512, 1024, 2048, 4096};
-    chunk = getOrCreateParameter(
+    chunk = getOrCreatePhysicalParameter(
         kernel, name, ParameterRole::Reduction, ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
     if (chunk)

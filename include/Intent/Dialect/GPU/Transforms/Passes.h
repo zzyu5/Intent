@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -23,6 +24,10 @@ struct ReplayMaterializationOptions {
 
 mlir::FailureOr<mlir::func::FuncOp>
 getPhysicalKernel(mlir::ModuleOp module);
+ParameterOp getOrCreatePhysicalParameter(
+    mlir::func::FuncOp kernel, llvm::StringRef name, ParameterRole role,
+    ParameterCategory category, uint32_t elementBitWidth,
+    llvm::ArrayRef<int64_t> candidates);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
 void retargetSourceExtent(mlir::Value root, PhysicalSourceAxis source,

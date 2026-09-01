@@ -21,6 +21,62 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+ParameterOp getOrCreatePhysicalParameter(
+    func::FuncOp kernel, StringRef name, ParameterRole role,
+    ParameterCategory category, uint32_t elementBitWidth,
+    ArrayRef<int64_t> candidates) {
+  ParameterOp existing;
+  bool ambiguous = false;
+  kernel.walk([&](ParameterOp parameter) {
+    if (parameter.getParameter().getName().getValue() != name)
+      return;
+    if (existing && existing != parameter)
+      ambiguous = true;
+    else
+      existing = parameter;
+  });
+  if (ambiguous) {
+    kernel.emitError("physical parameter symbol has multiple declarations")
+        << "; name=" << name;
+    return ParameterOp();
+  }
+  auto expectedCandidates =
+      DenseI64ArrayAttr::get(kernel.getContext(), candidates);
+  if (existing) {
+    ParameterAttr schema = existing.getParameter();
+    if (schema.getRole() != static_cast<uint32_t>(role) ||
+        schema.getCategory() != static_cast<uint32_t>(category) ||
+        schema.getCandidates() != expectedCandidates) {
+      existing.emitOpError(
+          "physical parameter symbol is reused with an incompatible decision domain")
+          << "; name=" << name << "; existing_role=" << schema.getRole()
+          << "; requested_role=" << static_cast<uint32_t>(role)
+          << "; existing_category=" << schema.getCategory()
+          << "; requested_category=" << static_cast<uint32_t>(category)
+          << "; existing_candidates=" << schema.getCandidates()
+          << "; requested_candidates=" << expectedCandidates;
+      return ParameterOp();
+    }
+    uint32_t aggregateWidth =
+        std::max(schema.getElementBitWidth(), elementBitWidth);
+    if (aggregateWidth != schema.getElementBitWidth())
+      existing->setAttr(
+          "parameter",
+          ParameterAttr::get(kernel.getContext(), schema.getName(),
+                             schema.getRole(), schema.getCategory(),
+                             aggregateWidth, schema.getCandidates()));
+    return existing;
+  }
+  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
+  auto schema = ParameterAttr::get(
+      kernel.getContext(), builder.getStringAttr(name),
+      static_cast<uint32_t>(role), static_cast<uint32_t>(category),
+      elementBitWidth, expectedCandidates);
+  return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
+                                     schema);
+}
+
 namespace {
 
 void collectParameterSymbols(Attribute attribute, llvm::StringSet<> &symbols);

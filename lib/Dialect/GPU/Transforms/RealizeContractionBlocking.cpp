@@ -969,44 +969,6 @@ bool hasCompleteStorePath(ContractOp contract) {
   return collectStorePaths(contract.getResult(), {}, paths, visited);
 }
 
-ParameterOp getOrCreateParameter(func::FuncOp kernel, StringRef name,
-                                 ParameterRole role,
-                                 uint32_t elementBitWidth,
-                                 ArrayRef<int64_t> candidates) {
-  ParameterOp existing;
-  kernel.walk([&](ParameterOp parameter) {
-    if (parameter.getParameter().getName().getValue() == name)
-      existing = parameter;
-  });
-  if (existing) {
-    ParameterAttr schema = existing.getParameter();
-    auto expectedCandidates =
-        DenseI64ArrayAttr::get(kernel.getContext(), candidates);
-    if (schema.getRole() != static_cast<uint32_t>(role) ||
-        schema.getCategory() !=
-            static_cast<uint32_t>(ParameterCategory::Contraction) ||
-        schema.getElementBitWidth() != elementBitWidth ||
-        schema.getCandidates() != expectedCandidates) {
-      existing.emitOpError(
-          "physical parameter name is reused with a different role or candidate domain")
-          << "; name=" << name << "; existing_role=" << schema.getRole()
-          << "; requested_role=" << static_cast<uint32_t>(role)
-          << "; existing_candidates=" << schema.getCandidates()
-          << "; requested_candidates=" << expectedCandidates;
-      return ParameterOp();
-    }
-    return existing;
-  }
-  OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
-  auto schema = ParameterAttr::get(
-      kernel.getContext(), builder.getStringAttr(name),
-      static_cast<uint32_t>(role),
-      static_cast<uint32_t>(ParameterCategory::Contraction), elementBitWidth,
-      DenseI64ArrayAttr::get(kernel.getContext(), candidates));
-  return builder.create<ParameterOp>(kernel.getLoc(), builder.getIndexType(),
-                                     schema);
-}
-
 FragmentType eraseFragmentAxis(FragmentType source, unsigned erasedAxis) {
   SmallVector<Attribute> shape;
   SmallVector<Attribute> mappings;
@@ -1550,8 +1512,9 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
       ("_" + Twine(lhsMap->getSourceId()) + "_" +
        Twine(rhsMap->getSourceId()))
           .str();
-  ParameterOp blockK = getOrCreateParameter(
+  ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
+      ParameterCategory::Contraction,
       lhsType.getElementType().getIntOrFloatBitWidth(), {32, 64, 128});
   if (!blockK)
     return failure();
@@ -1831,16 +1794,19 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       ("_" + Twine(rowMap->getSourceId()) + "_" +
        Twine(columnMap->getSourceId()))
           .str();
-  ParameterOp blockM = getOrCreateParameter(
+  ParameterOp blockM = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
+      ParameterCategory::Contraction,
       lhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
-  ParameterOp blockN = getOrCreateParameter(
+  ParameterOp blockN = getOrCreatePhysicalParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
+      ParameterCategory::Contraction,
       rhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
-  ParameterOp blockK = getOrCreateParameter(
+  ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
+      ParameterCategory::Contraction,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       {32, 64, 128});
@@ -1871,8 +1837,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                            *dimension));
   ParameterOp rowWorkers;
   if (runtimeRowTraversal)
-    rowWorkers = getOrCreateParameter(
+    rowWorkers = getOrCreatePhysicalParameter(
         kernel, "ROW_WORKERS" + suffix, ParameterRole::TraversalWorkers,
+        ParameterCategory::Contraction,
         lhsType.getElementType().getIntOrFloatBitWidth(),
         {1, 2, 4, 8});
   if (runtimeRowTraversal && !rowWorkers)
@@ -2562,14 +2529,17 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       ("_" + Twine(rowMap->getSourceId()) + "_" +
        Twine(columnMap->getSourceId()))
           .str();
-  ParameterOp blockM = getOrCreateParameter(
+  ParameterOp blockM = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
+      ParameterCategory::Contraction,
       lhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
-  ParameterOp blockN = getOrCreateParameter(
+  ParameterOp blockN = getOrCreatePhysicalParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
+      ParameterCategory::Contraction,
       rhsType.getElementType().getIntOrFloatBitWidth(), {64, 128});
-  ParameterOp blockK = getOrCreateParameter(
+  ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K_GROUPS" + suffix, ParameterRole::Reduction,
+      ParameterCategory::Contraction,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       {2, 4, 8});
