@@ -32,7 +32,8 @@ bool isSharedStaticParameter(ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   auto category = static_cast<ParameterCategory>(
       parameter.getParameter().getCategory());
-  return !isProviderRole(role) && category != ParameterCategory::Coverage;
+  return !isProviderRole(role) && category != ParameterCategory::Coverage &&
+         !parameter->hasAttr(coverageDimensionAttr);
 }
 
 SmallVector<TuningProfile, 3>
