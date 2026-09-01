@@ -2207,22 +2207,22 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       collectAxisInto(source, fold.getAxis(), structuredTraversalRanges);
     collectStructuredRegionRanges(fold, sources, fold.getAxis());
   });
+  auto recordScanTraversal = [&](Value source, uint64_t axis) {
+    collectAxisInto(source, axis, structuredTraversalRanges);
+    auto fragment = dyn_cast<FragmentType>(source.getType());
+    if (!fragment || axis >= fragment.getAxisMaps().size())
+      return;
+    auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+    int64_t dimension = mapping.getDimensionId();
+    if (dimension > 0)
+      scanSegmentDimensions.insert(static_cast<uint64_t>(dimension));
+    scanSegmentSources.insert({mapping.getSourceId(), mapping.getSourceAxis(),
+                               mapping.getDerived()});
+  };
   kernel.walk([&](RegionScanOp scan) {
     ValueRange sources = scan.getInputs().take_front(scan.getSourceCount());
-    for (Value source : sources) {
-      collectAxisInto(source, scan.getAxis(), structuredTraversalRanges);
-      auto fragment = dyn_cast<FragmentType>(source.getType());
-      if (fragment && scan.getAxis() < fragment.getAxisMaps().size()) {
-        auto mapping =
-            cast<AxisMapAttr>(fragment.getAxisMaps()[scan.getAxis()]);
-        int64_t dimension = mapping.getDimensionId();
-        if (dimension > 0)
-          scanSegmentDimensions.insert(static_cast<uint64_t>(dimension));
-        scanSegmentSources.insert(
-            {mapping.getSourceId(), mapping.getSourceAxis(),
-             mapping.getDerived()});
-      }
-    }
+    for (Value source : sources)
+      recordScanTraversal(source, scan.getAxis());
     collectStructuredRegionRanges(scan, sources, scan.getAxis());
   });
   kernel.walk([&](ReduceOp reduce) {
@@ -2262,7 +2262,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   bool scanCoverageFailed = false;
   kernel.walk([&](ScanOp scan) {
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
-      collectAxisInto(source, scan.getAxis(), structuredTraversalRanges);
+      recordScanTraversal(source, scan.getAxis());
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
       scanCoverageFailed |=
           failed(requireScanFullCoverage(kernel, scan, source, scan.getAxis()));
