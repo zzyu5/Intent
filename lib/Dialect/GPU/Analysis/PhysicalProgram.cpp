@@ -143,6 +143,27 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
                                 depth + 1) &&
            sameScalarExpression(leftBinary.getRhs(), rightBinary.getRhs(),
                                 depth + 1);
+  auto leftDim = lhs.getDefiningOp<DimOp>();
+  auto rightDim = rhs.getDefiningOp<DimOp>();
+  if (leftDim || rightDim) {
+    if (!leftDim || !rightDim)
+      return false;
+    auto leftView = cast<ViewType>(leftDim.getView().getType());
+    auto rightView = cast<ViewType>(rightDim.getView().getType());
+    int64_t leftAxis = leftDim.getAxis();
+    int64_t rightAxis = rightDim.getAxis();
+    if (leftAxis < 0 || rightAxis < 0 ||
+        leftAxis >= static_cast<int64_t>(
+                        leftView.getLayout().getDimensionIds().size()) ||
+        rightAxis >= static_cast<int64_t>(
+                         rightView.getLayout().getDimensionIds().size()))
+      return false;
+    int64_t leftDimension =
+        leftView.getLayout().getDimensionIds().asArrayRef()[leftAxis];
+    int64_t rightDimension =
+        rightView.getLayout().getDimensionIds().asArrayRef()[rightAxis];
+    return leftDimension > 0 && leftDimension == rightDimension;
+  }
   auto leftCast = lhs.getDefiningOp<CastOp>();
   auto rightCast = rhs.getDefiningOp<CastOp>();
   return leftCast && rightCast &&
@@ -555,14 +576,8 @@ bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
       lhs.getSourceAxis() != rhs.getSourceAxis() ||
       lhs.getDerived() != rhs.getDerived())
     return false;
-  FailureOr<int64_t> leftDimension = queryRangeDimension(lhs);
-  FailureOr<int64_t> rightDimension = queryRangeDimension(rhs);
-  if (!lhs->hasAttr(sourceSubregionAttr) &&
-      !rhs->hasAttr(sourceSubregionAttr) && succeeded(leftDimension) &&
-      succeeded(rightDimension) && *leftDimension == *rightDimension)
-    return true;
-  return sameScalarExpression(lhs.getStart(), rhs.getStart()) &&
-         sameScalarExpression(lhs.getExtent(), rhs.getExtent()) &&
+  return sameScalarExpression(lhs.getLogicalStart(), rhs.getLogicalStart()) &&
+         sameScalarExpression(lhs.getLogicalStop(), rhs.getLogicalStop()) &&
          sameScalarExpression(lhs.getStep(), rhs.getStep());
 }
 
@@ -1744,16 +1759,11 @@ PhysicalProgramAnalysis::lockstepRanges(ArrayRef<MakeRangeOp> ranges) {
   if (ranges.empty())
     return result;
   auto sameLogicalTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
-    FailureOr<int64_t> lhsDimension = queryRangeDimension(lhs);
-    FailureOr<int64_t> rhsDimension = queryRangeDimension(rhs);
-    if (!lhs->hasAttr(sourceSubregionAttr) &&
-        !rhs->hasAttr(sourceSubregionAttr) && succeeded(lhsDimension) &&
-        succeeded(rhsDimension) && *lhsDimension == *rhsDimension)
-      return true;
     return samePhysicalScalarExpression(lhs.getLogicalStart(),
                                         rhs.getLogicalStart()) &&
            samePhysicalScalarExpression(lhs.getLogicalStop(),
-                                        rhs.getLogicalStop());
+                                        rhs.getLogicalStop()) &&
+           samePhysicalScalarExpression(lhs.getStep(), rhs.getStep());
   };
   auto sameTraversal = [](MakeRangeOp lhs, MakeRangeOp rhs) {
     return samePhysicalScalarExpression(lhs.getStart(), rhs.getStart()) &&

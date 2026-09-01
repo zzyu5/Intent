@@ -1584,14 +1584,6 @@ FailureOr<FragmentType> refineAccessResultSchema(
         else if (sourceProjection.state == PhysicalFactState::Ambiguous)
           return failure();
       }
-      if (!targetAxis) {
-        PhysicalDimensionProjection dimensionProjection =
-            queryFragmentDimension(target, mapping.getDimensionId());
-        if (dimensionProjection.isExact())
-          targetAxis = dimensionProjection.fragmentAxis;
-        else if (dimensionProjection.state == PhysicalFactState::Ambiguous)
-          return failure();
-      }
       // A coordinate may carry an ownership axis that the indexed result does
       // not expose.  Such an axis is not an access-result extent authority.
       if (!targetAxis)
@@ -1645,14 +1637,8 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
       if (axis >= current.getShape().size() ||
           current.getShape()[axis] == (*refined).getShape()[axis])
         continue;
-      int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
-      if (dimension <= 0) {
-        operation->emitOpError(
-            "access result refinement has no logical dimension authority");
-        return WalkResult::interrupt();
-      }
-      retargetDimensionExtent(
-          result, dimension,
+      retargetSourceExtent(
+          result, sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]));
     }
     result.setType(*refined);
