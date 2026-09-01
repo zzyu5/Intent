@@ -255,7 +255,8 @@ LogicalResult ParameterAttr::verify(
     DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
       role > static_cast<uint32_t>(ParameterRole::ReductionInner) ||
-      category > static_cast<uint32_t>(ParameterCategory::RegionContraction) ||
+      category >
+          static_cast<uint32_t>(ParameterCategory::PersistentContraction) ||
       !candidates || candidates.empty())
     return emitError()
            << "physical parameter requires a name, role, category and candidates";
@@ -272,7 +273,8 @@ LogicalResult ParameterAttr::verify(
       typedCategory == ParameterCategory::Scan ||
       typedCategory == ParameterCategory::Contraction ||
       typedCategory == ParameterCategory::RegionReduction ||
-      typedCategory == ParameterCategory::RegionContraction;
+      typedCategory == ParameterCategory::RegionContraction ||
+      typedCategory == ParameterCategory::PersistentContraction;
   if (carriesDataGranularity != (elementBitWidth > 0))
     return emitError()
            << "data-granularity parameter categories require an element bit width and non-data categories forbid one";

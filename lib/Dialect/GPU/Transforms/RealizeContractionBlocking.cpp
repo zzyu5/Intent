@@ -1778,6 +1778,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   const bool runtimeRowTraversal =
       indirectRow || rowRange->hasAttr(sourceSubregionAttr) ||
       (rowSourceRange && rowSourceRange->hasAttr(sourceSubregionAttr));
+  const bool persistentRowTraversal = runtimeRowTraversal && !indirectRow;
+  const ParameterCategory contractionCategory =
+      persistentRowTraversal ? ParameterCategory::PersistentContraction
+                             : ParameterCategory::Contraction;
 
   if (!isUnitStepRange(rowRange) ||
       !isUnitStepRange(lhsReductionRange) ||
@@ -1867,17 +1871,17 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           .str();
   ParameterOp blockM = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
-      ParameterCategory::Contraction,
+      contractionCategory,
       lhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
   ParameterOp blockN = getOrCreatePhysicalParameter(
       kernel, "BLOCK_N" + suffix, ParameterRole::OwnershipN,
-      ParameterCategory::Contraction,
+      contractionCategory,
       rhsType.getElementType().getIntOrFloatBitWidth(),
       {32, 64, 128, 256});
   ParameterOp blockK = getOrCreatePhysicalParameter(
       kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
-      ParameterCategory::Contraction,
+      contractionCategory,
       std::max(lhsType.getElementType().getIntOrFloatBitWidth(),
                rhsType.getElementType().getIntOrFloatBitWidth()),
       {32, 64, 128});
@@ -1907,12 +1911,16 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
                            *dimension));
   ParameterOp rowWorkers;
-  if (runtimeRowTraversal)
+  if (runtimeRowTraversal) {
+    SmallVector<int64_t, 5> rowWorkerCandidates = {1, 2, 4, 8};
+    if (persistentRowTraversal)
+      rowWorkerCandidates.push_back(16);
     rowWorkers = getOrCreatePhysicalParameter(
         kernel, "ROW_WORKERS" + suffix, ParameterRole::TraversalWorkers,
-        ParameterCategory::Contraction,
+        contractionCategory,
         lhsType.getElementType().getIntOrFloatBitWidth(),
-        {1, 2, 4, 8});
+        rowWorkerCandidates);
+  }
   if (runtimeRowTraversal && !rowWorkers)
     return failure();
   PhysicalExprAttr unitM =

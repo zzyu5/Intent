@@ -62,8 +62,8 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionContraction))
     return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
-  if (llvm::is_contained(categories, gpu::ParameterCategory::Execution) &&
-      llvm::is_contained(categories, gpu::ParameterCategory::Contraction)) {
+  if (llvm::is_contained(categories,
+                         gpu::ParameterCategory::PersistentContraction)) {
     if (blackwellRecurrentContraction)
       return {{2, 1, 1}, {4, 1, 1}, {8, 1, 1}};
     return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};

@@ -31,6 +31,7 @@ enum class TuningClass {
   RegionContraction,
   Scan,
   Contraction,
+  PersistentContraction,
   Execution,
 };
 
@@ -111,6 +112,8 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
     return TuningClass::Scan;
   case ParameterCategory::Contraction:
     return TuningClass::Contraction;
+  case ParameterCategory::PersistentContraction:
+    return TuningClass::PersistentContraction;
   case ParameterCategory::RegionReduction:
     return TuningClass::RegionReduction;
   case ParameterCategory::RegionContraction:
@@ -135,6 +138,15 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
+  if (kind == TuningClass::PersistentContraction && matrix && narrow)
+    return {{128, 128, 32, 1, 128, 8, 8},
+            {64, 128, 64, 1, 128, 16, 8},
+            {128, 64, 32, 1, 128, 8, 8},
+            {128, 256, 64, 1, 128, 8, 8}};
+  if (kind == TuningClass::PersistentContraction)
+    return {{64, 64, 32, 1, 128, 8, 8},
+            {32, 64, 64, 1, 128, 16, 8},
+            {64, 32, 32, 1, 128, 8, 8}};
   if (kind == TuningClass::Contraction && matrix && narrow)
     return {{128, 128, 32, 1, 128, 1, 8},
             {64, 128, 64, 1, 128, 1, 8},

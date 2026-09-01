@@ -97,6 +97,7 @@ enum class ParameterCategory : uint32_t {
   Provider = 6,
   RegionReduction = 7,
   RegionContraction = 8,
+  PersistentContraction = 9,
 };
 
 enum class CoordinateRole : int64_t {
