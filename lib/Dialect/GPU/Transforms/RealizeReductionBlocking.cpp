@@ -87,6 +87,26 @@ bool requiresPhysicalRealization(ReduceOp reduce) {
   return false;
 }
 
+ArrayAttr reductionSources(ReduceOp reduce) {
+  SmallVector<Attribute> sources;
+  for (Value input : reduce.getInputs().take_front(reduce.getSourceCount())) {
+    auto fragment = dyn_cast<FragmentType>(input.getType());
+    if (!fragment)
+      continue;
+    for (int64_t axis : reduce.getAxes()) {
+      if (axis < 0 || axis >= static_cast<int64_t>(fragment.getAxisMaps().size()))
+        continue;
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      auto source = PhysicalSourceAttr::get(
+          reduce.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDerived());
+      if (!llvm::is_contained(sources, Attribute(source)))
+        sources.push_back(source);
+    }
+  }
+  return ArrayAttr::get(reduce.getContext(), sources);
+}
+
 bool hasNonUnitFreeAxis(ReduceOp reduce);
 
 LogicalResult realizeConstructionScalarReductionAxes(ReduceOp reduce,
@@ -1894,11 +1914,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   }
   if (Attribute origin = reduce->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
-  loop->setAttr(reductionTraversalSourceAttr,
-                PhysicalSourceAttr::get(builder.getContext(),
-                                        master->range.getSourceId(),
-                                        master->range.getSourceAxis(),
-                                        master->range.getDerived()));
+  loop->setAttr(reductionSourcesAttr, reductionSources(reduce));
   for (auto [oldResult, newResult] :
        llvm::zip(reduce.getResults(), loop.getResults()))
     oldResult.replaceAllUsesWith(newResult);

@@ -2059,12 +2059,14 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       return exact;
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-      auto traversal =
-          loop->getAttrOfType<PhysicalSourceAttr>(reductionTraversalSourceAttr);
-      if (traversal &&
-          PhysicalSourceAxis{traversal.getSourceId(),
-                             traversal.getSourceAxis(),
-                             traversal.getDerived()} == source) {
+      auto traversals = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
+      if (traversals && llvm::any_of(traversals, [&](Attribute attribute) {
+            auto traversal = dyn_cast<PhysicalSourceAttr>(attribute);
+            return traversal &&
+                   PhysicalSourceAxis{traversal.getSourceId(),
+                                      traversal.getSourceAxis(),
+                                      traversal.getDerived()} == source;
+          })) {
         exact.depends = true;
         return exact;
       }
