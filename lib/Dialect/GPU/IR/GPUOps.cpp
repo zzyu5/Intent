@@ -149,6 +149,51 @@ Type resourceElementType(Type type) {
   return {};
 }
 
+LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
+                                      ValueRange coordinates) {
+  auto fragment = dyn_cast<FragmentType>(payload);
+  if (!fragment)
+    return success();
+  for (auto [payloadAxis, payloadAttribute] :
+       llvm::enumerate(fragment.getAxisMaps())) {
+    auto payloadMapping = cast<AxisMapAttr>(payloadAttribute);
+    std::optional<Attribute> coordinateExtent;
+    for (Value coordinate : coordinates) {
+      auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+      if (!coordinateType)
+        continue;
+      for (auto [coordinateAxis, coordinateAttribute] :
+           llvm::enumerate(coordinateType.getAxisMaps())) {
+        auto coordinateMapping = cast<AxisMapAttr>(coordinateAttribute);
+        bool sameSource =
+            payloadMapping.getSourceId() == coordinateMapping.getSourceId() &&
+            payloadMapping.getSourceAxis() ==
+                coordinateMapping.getSourceAxis() &&
+            payloadMapping.getDerived() == coordinateMapping.getDerived();
+        if (!sameSource)
+          continue;
+        if (payloadMapping.getDimensionId() !=
+            coordinateMapping.getDimensionId())
+          return owner->emitOpError(
+              "access payload and coordinate disagree on logical dimension");
+        Attribute extent = coordinateType.getShape()[coordinateAxis];
+        if (coordinateExtent && *coordinateExtent != extent)
+          return owner->emitOpError(
+              "access payload axis has ambiguous coordinate extents");
+        coordinateExtent = extent;
+      }
+    }
+    if (coordinateExtent &&
+        *coordinateExtent != fragment.getShape()[payloadAxis])
+      return owner->emitOpError(
+                 "access payload and coordinate extents disagree")
+             << "; payload_axis=" << payloadAxis
+             << "; payload_extent=" << fragment.getShape()[payloadAxis]
+             << "; coordinate_extent=" << *coordinateExtent;
+  }
+  return success();
+}
+
 LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
                                  FragmentType rhs, FragmentType result,
                                  ArrayRef<int64_t> lhsReduction,
@@ -714,9 +759,10 @@ LogicalResult LoadOp::verify() {
   Type resourceElement = dyn_cast<ViewType>(getResource().getType())
                              ? cast<ViewType>(getResource().getType()).getElementType()
                              : cast<BufferType>(getResource().getType()).getElementType();
-  return resourceElement == elementType(getResult().getType())
-             ? success()
-             : emitOpError("load resource/result element types disagree");
+  if (resourceElement != elementType(getResult().getType()))
+    return emitOpError("load resource/result element types disagree");
+  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult GatherOp::verify() {
@@ -737,9 +783,10 @@ LogicalResult GatherOp::verify() {
                    !sameShape(getValid().getType(), getResult().getType()) ||
                    !sameShape(getFill().getType(), getResult().getType())))
     return emitOpError("gather validity/fill physical schema is invalid");
-  return source.getElementType() == elementType(getResult().getType())
-             ? success()
-             : emitOpError("gather source/result element types disagree");
+  if (source.getElementType() != elementType(getResult().getType()))
+    return emitOpError("gather source/result element types disagree");
+  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult AssumeInBoundsOp::verify() {
@@ -768,9 +815,10 @@ LogicalResult StoreOp::verify() {
   Type resourceElement = dyn_cast<ViewType>(getResource().getType())
                              ? cast<ViewType>(getResource().getType()).getElementType()
                              : cast<BufferType>(getResource().getType()).getElementType();
-  return resourceElement == elementType(getValue().getType())
-             ? success()
-             : emitOpError("store resource/value element types disagree");
+  if (resourceElement != elementType(getValue().getType()))
+    return emitOpError("store resource/value element types disagree");
+  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
+                                 getCoordinates());
 }
 
 void StoreOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -932,6 +980,52 @@ bool typeCarriesAxis(Type type, int64_t axis) {
          });
 }
 
+LogicalResult verifyReductionResultRelations(Operation *owner,
+                                              ValueRange sources,
+                                              ResultRange results,
+                                              ArrayRef<int64_t> axes) {
+  if (sources.size() != results.size())
+    return owner->emitOpError(
+        "physical reduction needs one result relation per source component");
+  llvm::SmallDenseSet<int64_t> reducedAxes(axes.begin(), axes.end());
+  for (auto [source, result] : llvm::zip_equal(sources, results)) {
+    auto sourceType = dyn_cast<FragmentType>(source.getType());
+    if (!sourceType)
+      return owner->emitOpError(
+                 "physical reduction source has no fragment result relation")
+             << "; source=" << source.getType();
+    SmallVector<Attribute> shape;
+    SmallVector<Attribute> mappings;
+    for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
+      if (reducedAxes.contains(static_cast<int64_t>(axis)))
+        continue;
+      shape.push_back(extent);
+      auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
+      mappings.push_back(AxisMapAttr::get(
+          owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), static_cast<uint32_t>(mappings.size()),
+          mapping.getDerived()));
+    }
+    auto resultType = dyn_cast<FragmentType>(result.getType());
+    if (shape.empty()) {
+      if (resultType)
+        return owner->emitOpError(
+            "fully reduced result must be a scalar physical value");
+      continue;
+    }
+    if (!resultType || resultType.getShape() !=
+                           ArrayAttr::get(owner->getContext(), shape) ||
+        resultType.getAxisMaps() !=
+            ArrayAttr::get(owner->getContext(), mappings) ||
+        resultType.getValidity() != sourceType.getValidity() ||
+        resultType.getOwner() != sourceType.getOwner())
+      return owner->emitOpError(
+                 "physical reduction result does not preserve source free axes")
+             << "; source=" << sourceType << "; result=" << result.getType();
+  }
+  return success();
+}
+
 } // namespace
 
 LogicalResult ReduceOp::verify() {
@@ -945,6 +1039,10 @@ LogicalResult ReduceOp::verify() {
       if (!typeCarriesAxis(source.getType(), axis))
         return emitOpError("physical reduce axis is outside a source schema");
   }
+  if (failed(verifyReductionResultRelations(
+          getOperation(), getInputs().take_front(getSourceCount()),
+          getResults(), getAxes())))
+    return failure();
   return verifyReduceLike(getOperation(), getInputs(), getResults(), getCombine(),
                           getSourceCount(), getIdentityCount(), getCaptureCount());
 }
@@ -1192,6 +1290,9 @@ LogicalResult ScatterReduceOp::verify() {
         !axes.insert(axis).second)
       return emitOpError(
           "scatter-reduce source-axis mapping is not a bijection");
+  if (failed(verifyAccessAxisExtents(getOperation(), getValue().getType(),
+                                     getCoordinates())))
+    return failure();
   SmallVector<Type> arguments{getValue().getType(), getValue().getType()};
   SmallVector<Type> results{getValue().getType()};
   return verifyHelperRegion(getOperation(), getCombine(), arguments, results);
@@ -1254,9 +1355,12 @@ LogicalResult AtomicLoadOp::verify() {
           elementType(getResult().getType()) ||
       (getValid() && !sameShape(getValid().getType(), getResult().getType())))
     return emitOpError("atomic-load resource/result element types disagree");
-  return verifyAtomicAddress(getOperation(), getResource().getType(),
-                             getCoordinates(), getValid(), getSourceAxes(),
-                             getOrdering(), getSharing());
+  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
+                                 getCoordinates(), getValid(), getSourceAxes(),
+                                 getOrdering(), getSharing())))
+    return failure();
+  return verifyAccessAxisExtents(getOperation(), getResult().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult AtomicStoreOp::verify() {
@@ -1264,9 +1368,12 @@ LogicalResult AtomicStoreOp::verify() {
           elementType(getValue().getType()) ||
       (getValid() && !sameShape(getValid().getType(), getValue().getType())))
     return emitOpError("atomic-store resource/value element types disagree");
-  return verifyAtomicAddress(getOperation(), getResource().getType(),
-                             getCoordinates(), getValid(), getSourceAxes(),
-                             getOrdering(), getSharing());
+  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
+                                 getCoordinates(), getValid(), getSourceAxes(),
+                                 getOrdering(), getSharing())))
+    return failure();
+  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult AtomicRMWOp::verify() {
@@ -1280,9 +1387,12 @@ LogicalResult AtomicRMWOp::verify() {
            << ", value=" << getValue().getType()
            << ", result=" << getResult().getType()
            << ", kind=" << stringifyAtomicRMWKind(getKind());
-  return verifyAtomicAddress(getOperation(), getResource().getType(),
-                             getCoordinates(), getValid(), getSourceAxes(),
-                             getOrdering(), getSharing());
+  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
+                                 getCoordinates(), getValid(), getSourceAxes(),
+                                 getOrdering(), getSharing())))
+    return failure();
+  return verifyAccessAxisExtents(getOperation(), getValue().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult AtomicCompareExchangeOp::verify() {
@@ -1297,9 +1407,12 @@ LogicalResult AtomicCompareExchangeOp::verify() {
       !elementType(cast<TypeAttr>(result.getFieldTypes()[1]).getValue())
            .isInteger(1))
     return emitOpError("compare-exchange physical result schema is invalid");
-  return verifyAtomicAddress(getOperation(), getResource().getType(),
-                             getCoordinates(), getValid(), getSourceAxes(),
-                             getOrdering(), getSharing());
+  if (failed(verifyAtomicAddress(getOperation(), getResource().getType(),
+                                 getCoordinates(), getValid(), getSourceAxes(),
+                                 getOrdering(), getSharing())))
+    return failure();
+  return verifyAccessAxisExtents(getOperation(), getExpected().getType(),
+                                 getCoordinates());
 }
 
 LogicalResult RandomBitsOp::verify() {

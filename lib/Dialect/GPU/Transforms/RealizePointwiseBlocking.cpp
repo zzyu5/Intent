@@ -1994,6 +1994,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   func::FuncOp kernel = *physicalKernel;
   auto finalizeValueRelations = [&]() -> LogicalResult {
     if (failed(alignStructuredCaptureRelations(kernel)) ||
+        failed(alignReductionResultRelations(kernel)) ||
         failed(alignReductionIdentityRelations(kernel)) ||
         failed(alignAggregateValueRelations(kernel)) ||
         failed(alignPointwiseValueRelations(kernel)) ||
@@ -2477,12 +2478,17 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           !llvm::is_contained(dynamicRanges, range))
         dynamicRanges.push_back(range);
   llvm::SmallPtrSet<Operation *, 16> writeTraversalRanges;
+  auto sharesLogicalTraversal = [&](MakeRangeOp lhs, MakeRangeOp rhs) {
+    if (sameLogicalRange(lhs, rhs))
+      return true;
+    return PhysicalProgramAnalysis(kernel).lockstepRanges({lhs, rhs}).isExact();
+  };
   for (Operation *operation : structuredTraversalRanges) {
     auto range = dyn_cast<MakeRangeOp>(operation);
     bool writeOwnership = range &&
         llvm::any_of(writeCoordinates, [&](ArrayRef<Value> coordinates) {
           return llvm::any_of(allRanges, [&](MakeRangeOp candidate) {
-            return sameLogicalRange(range, candidate) &&
+            return sharesLogicalTraversal(range, candidate) &&
                    (candidate->hasAttr(sourceSubregionAttr)
                         ? coordinatesDirectlyUseRange(coordinates, candidate)
                         : coordinatesUseRange(coordinates, candidate));
@@ -2829,9 +2835,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
-    return ownershipSources.contains(source) &&
+    bool effectOwned = ownershipSources.contains(source) ||
+                       writeTraversalRanges.contains(range.getOperation());
+    return effectOwned &&
            (!range->hasAttr(sourceSubregionAttr) ||
-            directOwnershipSources.contains(source)) &&
+            directOwnershipSources.contains(source) ||
+            writeTraversalRanges.contains(range.getOperation())) &&
            !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||

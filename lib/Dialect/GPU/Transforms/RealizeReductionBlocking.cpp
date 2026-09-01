@@ -1185,42 +1185,7 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << "; dimension=" << dimension;
   }
 
-  if (reduce.getSourceCount() != reduce.getResults().size())
-    return reduce.emitOpError(
-        "physical reduction needs one result schema per source component");
-  llvm::SmallDenseSet<int64_t> reducedAxes(reduce.getAxes().begin(),
-                                           reduce.getAxes().end());
-  for (auto [source, result] : llvm::zip_equal(
-           reduce.getInputs().take_front(reduce.getSourceCount()),
-           reduce.getResults())) {
-    auto sourceType = dyn_cast<FragmentType>(source.getType());
-    if (!sourceType)
-      continue;
-    SmallVector<Attribute> shape;
-    SmallVector<Attribute> mappings;
-    for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
-      if (reducedAxes.contains(static_cast<int64_t>(axis)))
-        continue;
-      shape.push_back(extent);
-      auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
-      mappings.push_back(AxisMapAttr::get(
-          reduce.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-          mapping.getDimensionId(), static_cast<uint32_t>(mappings.size()),
-          mapping.getDerived()));
-    }
-    Type element = result.getType();
-    if (auto current = dyn_cast<FragmentType>(element))
-      element = current.getElementType();
-    if (shape.empty()) {
-      result.setType(element);
-      continue;
-    }
-    result.setType(FragmentType::get(
-        reduce.getContext(), element, ArrayAttr::get(reduce.getContext(), shape),
-        ArrayAttr::get(reduce.getContext(), mappings), sourceType.getValidity(),
-        sourceType.getOwner()));
-  }
-  return success();
+  return alignReductionResultRelations(kernel);
 }
 
 FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &region,

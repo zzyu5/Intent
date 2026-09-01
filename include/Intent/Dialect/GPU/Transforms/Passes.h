@@ -52,6 +52,8 @@ mlir::FailureOr<mlir::Value>
 projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
                              mlir::Value value, mlir::Type target);
 mlir::LogicalResult
+alignReductionResultRelations(mlir::func::FuncOp kernel);
+mlir::LogicalResult
 alignReductionIdentityRelations(mlir::func::FuncOp kernel);
 mlir::LogicalResult
 alignReductionYieldRelations(mlir::func::FuncOp kernel);

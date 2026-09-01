@@ -1698,7 +1698,8 @@ LogicalResult realizeRegionScans(ModuleOp module) {
   // cloned graph.  Close every affected value relation here: a realized scan
   // is a complete physical program transformation, not an invalid intermediate
   // that a later, unrelated pipeline stage is expected to repair.
-  if (failed(alignReductionIdentityRelations(kernel)) ||
+  if (failed(alignReductionResultRelations(kernel)) ||
+      failed(alignReductionIdentityRelations(kernel)) ||
       failed(alignAggregateValueRelations(kernel)) ||
       failed(alignPointwiseValueRelations(kernel)) ||
       failed(alignReductionYieldRelations(kernel)))

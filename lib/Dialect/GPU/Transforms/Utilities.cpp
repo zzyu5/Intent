@@ -810,6 +810,71 @@ FailureOr<Value> projectPhysicalValueToSchema(OpBuilder &builder,
   return projected.getResult();
 }
 
+LogicalResult alignReductionResultRelations(func::FuncOp kernel) {
+  WalkResult result = kernel.walk([&](Operation *operation) {
+    SmallVector<Value> sources;
+    SmallVector<Value> results;
+    llvm::SmallDenseSet<int64_t> reducedAxes;
+    bool scan = false;
+    if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      sources.append(reduce.getInputs().begin(),
+                     reduce.getInputs().begin() + reduce.getSourceCount());
+      results.append(reduce.getResults().begin(), reduce.getResults().end());
+      reducedAxes.insert(reduce.getAxes().begin(), reduce.getAxes().end());
+    } else if (auto currentScan = dyn_cast<ScanOp>(operation)) {
+      sources.append(currentScan.getInputs().begin(),
+                     currentScan.getInputs().begin() +
+                         currentScan.getSourceCount());
+      results.append(currentScan.getResults().begin(),
+                     currentScan.getResults().end());
+      scan = true;
+    } else {
+      return WalkResult::advance();
+    }
+    if (sources.size() != results.size())
+      return WalkResult::interrupt();
+    for (auto [source, currentResult] : llvm::zip_equal(sources, results)) {
+      if (scan) {
+        currentResult.setType(source.getType());
+        continue;
+      }
+      auto sourceType = dyn_cast<FragmentType>(source.getType());
+      if (!sourceType) {
+        operation->emitOpError(
+            "physical reduction source has no fragment result relation")
+            << "; source=" << source.getType();
+        return WalkResult::interrupt();
+      }
+      SmallVector<Attribute> shape;
+      SmallVector<Attribute> mappings;
+      for (auto [axis, extent] : llvm::enumerate(sourceType.getShape())) {
+        if (reducedAxes.contains(static_cast<int64_t>(axis)))
+          continue;
+        shape.push_back(extent);
+        auto mapping = cast<AxisMapAttr>(sourceType.getAxisMaps()[axis]);
+        mappings.push_back(AxisMapAttr::get(
+            kernel.getContext(), mapping.getSourceId(),
+            mapping.getSourceAxis(), mapping.getDimensionId(),
+            static_cast<uint32_t>(mappings.size()), mapping.getDerived()));
+      }
+      Type element = currentResult.getType();
+      if (auto current = dyn_cast<FragmentType>(element))
+        element = current.getElementType();
+      if (shape.empty()) {
+        currentResult.setType(element);
+        continue;
+      }
+      currentResult.setType(FragmentType::get(
+          kernel.getContext(), element,
+          ArrayAttr::get(kernel.getContext(), shape),
+          ArrayAttr::get(kernel.getContext(), mappings),
+          sourceType.getValidity(), sourceType.getOwner()));
+    }
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted() ? failure() : success();
+}
+
 LogicalResult alignReductionIdentityRelations(func::FuncOp kernel) {
   WalkResult result = kernel.walk([&](Operation *operation) {
     auto align = [&](ValueRange inputs, ValueRange results, Region &combine,
@@ -878,8 +943,14 @@ LogicalResult alignReductionYieldRelations(func::FuncOp kernel) {
       FailureOr<Value> projected = projectPhysicalValueToSchema(
           builder, operation->getLoc(), yield.getValues()[index],
           target.getType());
-      if (failed(projected))
+      if (failed(projected)) {
+        operation->emitOpError(
+            "physical reduction yield cannot adopt its result relation")
+            << "; result_index=" << index
+            << "; yield_type=" << yield.getValues()[index].getType()
+            << "; result_type=" << target.getType();
         return WalkResult::interrupt();
+      }
       yield->setOperand(index, *projected);
     }
     return WalkResult::advance();

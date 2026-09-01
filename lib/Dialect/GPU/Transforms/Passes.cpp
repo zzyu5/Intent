@@ -67,6 +67,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   if (failed(realizeReductionBlocking(module)) ||
       failed(alignAggregateValueRelations(*kernel)) ||
       failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignReductionResultRelations(*kernel)) ||
       failed(alignReductionIdentityRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignReductionYieldRelations(*kernel)) ||
