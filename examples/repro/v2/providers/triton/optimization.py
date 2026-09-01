@@ -6,8 +6,6 @@ from kernels.optimization.adamw import adamw_update
 
 from ...loading import load_module
 from ...measurement import compile_single
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -24,14 +22,6 @@ def fused_adamw(context: Context) -> PreparedComparison:
     generated_first = initial_first.clone()
     generated_second = initial_second.clone()
     scalars = (1e-3, 0.9, 0.999, 1.0 - 0.9**10, 1.0 - 0.999**10, 1e-8, 0.01)
-    def source_candidate(config) -> bool:
-        return (
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N) == 4096
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        )
-
     _, generated_base = compile_single(
         context,
         adamw_update,
@@ -42,7 +32,6 @@ def fused_adamw(context: Context) -> PreparedComparison:
             generated_second,
             *scalars,
         ),
-        triton_config_filter=source_candidate,
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

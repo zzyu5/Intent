@@ -11,16 +11,12 @@ from kernels.streaming.mamba import mamba_state_passing_fwd
 from kernels.streaming.selective_scan import mamba_chunk_scan_bf16_fwd
 
 from ...loading import load_module
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import TRITON_PARAMETER_REDUCTION
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
-from .. import implementation_gap
 
 
 def _activate(context: Context, runtime_path: str, name: str):
@@ -87,11 +83,6 @@ def mamba3_step(context: Context) -> PreparedComparison:
         mamba3_siso_step,
         arguments,
         constexprs={"HEAD_GROUP": heads // qk_heads},
-        triton_config_filter=lambda config: (
-            config.num_warps in (2, 4, 8)
-            and config.num_stages in (1, 2, 3)
-            and config.num_ctas == 1
-        ),
     )
     _activate(
         context,
@@ -205,12 +196,6 @@ def mamba3_siso_forward(context: Context) -> PreparedComparison:
         mamba3_siso_forward_kernel,
         arguments,
         constexprs={"HEAD_GROUP": heads // qk_heads},
-        triton_config_filter=lambda config: (
-            config.kwargs.get("REDUCE_CHUNK_27") == 64
-            and config.num_warps in (2, 4, 8)
-            and config.num_stages == 1
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         generated_base.launch,
@@ -308,15 +293,6 @@ def state_passing(context: Context) -> PreparedComparison:
         context,
         mamba_state_passing_fwd,
         (chunk_states, decay, initial),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            in (64, 128, 256, 512, 1024, 2048)
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     _activate(
         context,
@@ -365,48 +341,11 @@ def chunk_scan(context: Context) -> PreparedComparison:
     ) * 0.01
     arguments = (cb, x, dt, decay, state_matrix, previous, residual)
 
-    def source_candidate(config) -> bool:
-        candidate = (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=8
-            ),
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            ),
-            triton_parameter_value(
-                config, TRITON_PARAMETER_REDUCTION, dimension=8
-            ),
-            config.num_warps,
-            config.num_stages,
-        )
-        source_candidates = {
-            (128, 256, 64, 8, 3),
-            (64, 256, 32, 4, 4),
-            (128, 128, 32, 4, 4),
-            (128, 64, 32, 4, 4),
-            (64, 128, 32, 4, 4),
-            (128, 64, 64, 4, 4),
-            (64, 128, 64, 4, 4),
-            (128, 32, 32, 4, 4),
-            (64, 32, 32, 2, 5),
-            (32, 64, 32, 2, 5),
-            (64, 64, 32, 2, 4),
-        }
-        return (
-            candidate in source_candidates
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_REDUCTION, dimension=5
-            )
-            == 128
-            and config.num_ctas == 1
-        )
-
     _, generated = compile_single(
         context,
         mamba_chunk_scan_bf16_fwd,
         arguments,
         constexprs={"HEADS_PER_GROUP": heads // groups},
-        triton_config_filter=source_candidate,
     )
     _activate(
         context,

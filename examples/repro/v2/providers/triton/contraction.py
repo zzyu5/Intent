@@ -12,37 +12,11 @@ from kernels.ragged.grouped_gemm import ragged_grouped_gemm
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_M
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import TRITON_PARAMETER_REDUCTION
-from ...measurement import TRITON_PARAMETER_RESIDENT_WORKERS
-from ...measurement import TRITON_PARAMETER_TRAVERSAL_GROUP
-from ...measurement import TRITON_PARAMETER_TRAVERSAL_WORKERS
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
 from ...model import Tolerance
 
-
-_DENSE_GEMM_CONFIGS = {
-    (128, 256, 64, 8, 3),
-    (64, 256, 32, 4, 4),
-    (128, 128, 32, 4, 4),
-    (128, 64, 32, 4, 4),
-    (64, 128, 32, 4, 4),
-    (128, 32, 32, 4, 4),
-    (64, 32, 32, 2, 5),
-    (32, 64, 32, 2, 5),
-    (128, 256, 128, 8, 3),
-    (256, 128, 128, 8, 3),
-    (256, 64, 128, 4, 4),
-    (64, 256, 128, 4, 4),
-    (128, 128, 128, 4, 4),
-    (128, 64, 64, 4, 4),
-    (64, 128, 64, 4, 4),
-    (128, 32, 64, 4, 4),
-}
 
 _QKV_PROJECTION_CONFIGS = (
     {
@@ -77,19 +51,6 @@ def dense_gemm(context: Context) -> PreparedComparison:
         gemm,
         (a, b),
         constexprs={"ACTIVATION": Activation.NONE},
-        triton_config_filter=lambda config: (
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_M),
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
-            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION),
-            config.num_warps,
-            config.num_stages,
-        )
-        in _DENSE_GEMM_CONFIGS
-        and triton_parameter_value(
-            config, TRITON_PARAMETER_TRAVERSAL_GROUP
-        )
-        == 8
-        and config.num_ctas == 1,
     )
     runtime = _runtime(
         context,
@@ -121,23 +82,6 @@ def grouped_gemm(context: Context) -> PreparedComparison:
         context,
         ragged_grouped_gemm,
         (x, offsets, weight),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_M),
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
-            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION),
-        )
-        in _GROUPED_GEMM_CONFIGS
-        and triton_parameter_value(
-            config, TRITON_PARAMETER_TRAVERSAL_WORKERS
-        )
-        == 8
-        and triton_parameter_value(
-            config, TRITON_PARAMETER_RESIDENT_WORKERS
-        )
-        == resident_workers
-        and config.num_warps == 4
-        and config.num_stages == 3
-        and config.num_ctas == 1,
     )
     runtime = _runtime(
         context,
@@ -232,15 +176,6 @@ def qkv_projection(context: Context) -> PreparedComparison:
         context,
         fused_qkv_projection,
         (x, packed_weights),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_M),
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
-            triton_parameter_value(config, TRITON_PARAMETER_REDUCTION),
-            config.num_warps,
-            config.num_stages,
-        )
-        in _QKV_PROJECTION_CONFIGS
-        and config.num_ctas == 1,
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -323,19 +258,6 @@ def scaled_fp8_splitk(context: Context) -> PreparedComparison:
         context,
         scaled_fp8_splitk_matmul,
         (lhs, rhs, generated_output, 1.0, 1.0),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == block_m
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=5
-            )
-            == block_n
-            and config.num_warps == 8
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

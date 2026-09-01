@@ -248,10 +248,6 @@ private:
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       std::string name = schema.getName().getValue().str();
-      parameterRoles[name] = schema.getRole();
-      if (auto logicalDimension =
-              parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr))
-        parameterDimensions[name] = logicalDimension.getInt();
       auto dimension =
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (!dimension)
@@ -263,7 +259,6 @@ private:
         failed = true;
         return;
       }
-      parameterDimensions[name] = dimension.getInt();
       fullCoverageParameters[name] = {
           binding->second.name,
           SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
@@ -423,27 +418,6 @@ private:
   }
 
   void emitLaunch() {
-    output << "_intent_parameter_roles = {";
-    bool firstRole = true;
-    for (const auto &[name, role] : parameterRoles) {
-      if (!firstRole)
-        output << ", ";
-      firstRole = false;
-      output << "\"" << name << "\": " << role;
-    }
-    output << "}\n";
-    output << "_intent_parameter_dimensions = {";
-    bool firstDimension = true;
-    for (const auto &[name, dimension] : parameterDimensions) {
-      if (!firstDimension)
-        output << ", ";
-      firstDimension = false;
-      output << "\"" << name << "\": " << dimension;
-    }
-    output << "}\n"
-              "for _intent_config in _intent_kernel.configs:\n"
-              "    _intent_config.intent_parameter_roles = _intent_parameter_roles\n"
-              "    _intent_config.intent_parameter_dimensions = _intent_parameter_dimensions\n\n";
     output << "def launch(";
     bool firstArgument = true;
     for (auto [index, view] : llvm::enumerate(views)) {
@@ -1263,8 +1237,6 @@ private:
   llvm::StringMap<MetadataABI> metadataByName;
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
-  std::map<std::string, uint32_t> parameterRoles;
-  std::map<std::string, int64_t> parameterDimensions;
   llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
   unsigned indent = 0;
   unsigned counter = 0;

@@ -213,9 +213,6 @@ private:
       }
       StringRef name = schema.getName().getValue();
       parameterRoles[name.str()] = schema.getRole();
-      if (auto dimension =
-              parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr))
-        parameterDimensions[name.str()] = dimension.getInt();
       if (!names.insert(name).second) {
         parameter.emitOpError("duplicates a TileLang physical parameter");
         failed = true;
@@ -224,7 +221,6 @@ private:
       auto coverage =
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (coverage) {
-        parameterDimensions[name.str()] = coverage.getInt();
         auto binding = dimensionBindings.find(coverage.getInt());
         if (binding == dimensionBindings.end()) {
           parameter.emitOpError(
@@ -372,19 +368,6 @@ private:
   }
 
   void emitBuilder() {
-    output << "_intent_parameter_roles = {";
-    for (auto [index, item] : llvm::enumerate(parameterRoles)) {
-      if (index)
-        output << ", ";
-      output << "\"" << item.first << "\": " << item.second;
-    }
-    output << "}\n_intent_parameter_dimensions = {";
-    for (auto [index, item] : llvm::enumerate(parameterDimensions)) {
-      if (index)
-        output << ", ";
-      output << "\"" << item.first << "\": " << item.second;
-    }
-    output << "}\n";
     output << "@tilelang.autotune(configs=[\n";
     for (const auto &config : configurations()) {
       output << "    {";
@@ -966,7 +949,6 @@ private:
   SmallVector<std::map<std::string, int64_t>> sharedConfigurations;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   std::map<std::string, uint32_t> parameterRoles;
-  std::map<std::string, int64_t> parameterDimensions;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;

@@ -377,32 +377,6 @@ private:
       failed = true;
       return;
     }
-    std::map<std::string, uint32_t> parameterRoles;
-    std::map<std::string, int64_t> parameterDimensions;
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto schema = parameter.getParameter();
-      std::string name = schema.getName().getValue().str();
-      parameterRoles[name] = schema.getRole();
-      if (auto dimension =
-              parameter->getAttrOfType<IntegerAttr>(gpu::dimensionAttr))
-        parameterDimensions[name] = dimension.getInt();
-      if (auto dimension = parameter->getAttrOfType<IntegerAttr>(
-              gpu::coverageDimensionAttr))
-        parameterDimensions[name] = dimension.getInt();
-    });
-    output << "_intent_parameter_roles = {";
-    for (auto [index, item] : llvm::enumerate(parameterRoles)) {
-      if (index)
-        output << ", ";
-      output << "\"" << item.first << "\": " << item.second;
-    }
-    output << "}\n_intent_parameter_dimensions = {";
-    for (auto [index, item] : llvm::enumerate(parameterDimensions)) {
-      if (index)
-        output << ", ";
-      output << "\"" << item.first << "\": " << item.second;
-    }
-    output << "}\n";
     output << "_CONFIGS = (\n";
     for (const auto &config : *configs) {
       output << "    SimpleNamespace(";

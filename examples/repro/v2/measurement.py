@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from collections.abc import Callable
-from collections.abc import Mapping
-from dataclasses import dataclass
 import statistics
 
 import torch
@@ -29,118 +26,7 @@ class NumericalComparisonError(RuntimeError):
     pass
 
 
-TRITON_PARAMETER_OWNERSHIP_M = 0
-TRITON_PARAMETER_OWNERSHIP_N = 1
-TRITON_PARAMETER_REDUCTION = 2
-TRITON_PARAMETER_SCAN_CHUNK = 3
-TRITON_PARAMETER_PROVIDER_WARPS = 4
-TRITON_PARAMETER_PROVIDER_STAGES = 5
-TRITON_PARAMETER_PROVIDER_CTAS = 6
-TRITON_PARAMETER_PROVIDER_THREADS = 7
-TRITON_PARAMETER_TRAVERSAL_WORKERS = 8
-TRITON_PARAMETER_TRAVERSAL_GROUP = 9
-TRITON_PARAMETER_RESIDENT_WORKERS = 10
 MEASUREMENT_REPETITIONS = 200
-
-
-@dataclass(frozen=True)
-class GeneratedCandidate:
-    values: Mapping[str, int]
-    roles: Mapping[str, int]
-    dimensions: Mapping[str, int]
-
-
-def candidate_parameter_values(
-    candidate: GeneratedCandidate, role: int, *, dimension: int | None = None
-) -> tuple[int, ...]:
-    return tuple(
-        candidate.values[name]
-        for name, parameter_role in candidate.roles.items()
-        if parameter_role == role
-        and name in candidate.values
-        and (dimension is None or candidate.dimensions.get(name) == dimension)
-    )
-
-
-def candidate_parameter_value(
-    candidate: GeneratedCandidate, role: int, *, dimension: int | None = None
-) -> int | None:
-    values = candidate_parameter_values(candidate, role, dimension=dimension)
-    return values[0] if len(values) == 1 else None
-
-
-def restrict_generated_candidates(
-    context: Context,
-    artifact,
-    predicate: Callable[[GeneratedCandidate], bool],
-) -> None:
-    roles = artifact._namespace.get("_intent_parameter_roles")
-    dimensions = artifact._namespace.get("_intent_parameter_dimensions")
-    if not isinstance(roles, dict) or not isinstance(dimensions, dict):
-        raise PipelineStageError(
-            "candidate_contract",
-            f"generated {context.provider} artifact exposes no typed parameter metadata",
-        )
-    if context.provider == "triton":
-        tuner = artifact._namespace.get("_intent_kernel")
-        configs = getattr(tuner, "configs", None)
-        values = lambda config: config.kwargs
-        replace = lambda selected: setattr(tuner, "configs", selected)
-    elif context.provider == "cutile":
-        configs = artifact._namespace.get("_CONFIGS")
-        values = vars
-        replace = lambda selected: artifact._namespace.__setitem__(
-            "_CONFIGS", tuple(selected)
-        )
-    elif context.provider == "tilelang":
-        tuner = artifact._namespace.get("_intent_kernel")
-        configs = getattr(tuner, "configs", None)
-        values = lambda config: config
-        replace = lambda selected: setattr(tuner, "configs", selected)
-    else:
-        raise PipelineStageError(
-            "candidate_contract",
-            f"provider {context.provider!r} exposes no generated candidate surface",
-        )
-    if configs is None:
-        raise PipelineStageError(
-            "candidate_contract",
-            f"generated {context.provider} artifact has no observable candidate set",
-        )
-    selected = [
-        config
-        for config in configs
-        if predicate(GeneratedCandidate(values(config), roles, dimensions))
-    ]
-    if not selected:
-        visible = [dict(values(config)) for config in configs[:16]]
-        raise PipelineStageError(
-            "candidate_contract",
-            "generated artifact has no candidate matching the source contract: "
-            + repr(visible),
-        )
-    replace(selected)
-
-
-def triton_parameter_value(
-    config, role: int, *, dimension: int | None = None
-) -> int | None:
-    values = triton_parameter_values(config, role, dimension=dimension)
-    return values[0] if len(values) == 1 else None
-
-
-def triton_parameter_values(
-    config, role: int, *, dimension: int | None = None
-) -> tuple[int, ...]:
-    roles = getattr(config, "intent_parameter_roles", {})
-    dimensions = getattr(config, "intent_parameter_dimensions", {})
-    return tuple(
-        config.kwargs[name]
-        for name, parameter_role in roles.items()
-        if parameter_role == role
-        and name in config.kwargs
-        and (dimension is None or dimensions.get(name) == dimension)
-    )
 
 
 def compile_single(
@@ -149,8 +35,6 @@ def compile_single(
     arguments: tuple[object, ...],
     *,
     constexprs: dict[str, object] | None = None,
-    triton_config_filter: Callable[[object], bool] | None = None,
-    generated_candidate_filter: Callable[[GeneratedCandidate], bool] | None = None,
 ) -> tuple[object, PreparedLaunch]:
     try:
         artifact = intent.compile(
@@ -161,39 +45,6 @@ def compile_single(
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(error.stage, str(error)) from error
-    if triton_config_filter is not None and generated_candidate_filter is not None:
-        raise PipelineStageError(
-            "candidate_contract",
-            "cannot combine Triton-specific and provider-neutral candidate filters",
-        )
-    if generated_candidate_filter is not None:
-        restrict_generated_candidates(context, artifact, generated_candidate_filter)
-    elif triton_config_filter is not None:
-        triton_autotuner = artifact._namespace.get("_intent_kernel")
-        configs = getattr(triton_autotuner, "configs", None)
-        if configs is None:
-            raise PipelineStageError(
-                "candidate_contract",
-                "generated Triton artifact has no observable autotune candidate set",
-            )
-        selected = [config for config in configs if triton_config_filter(config)]
-        if not selected:
-            raise PipelineStageError(
-                "candidate_contract",
-                "generated Triton artifact has no candidate matching the source contract: "
-                + repr(
-                    [
-                        (
-                            tuple(sorted(config.kwargs.items())),
-                            config.num_warps,
-                            config.num_stages,
-                            config.num_ctas,
-                        )
-                        for config in configs[:16]
-                    ]
-                ),
-            )
-        triton_autotuner.configs = selected
     try:
         result = artifact.run(*arguments)
     except Exception as error:

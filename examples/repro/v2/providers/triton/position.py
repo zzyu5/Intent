@@ -10,8 +10,6 @@ from kernels.position.rope_cache import padded_rope_cache_update
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -39,19 +37,6 @@ def rotary_embedding(context: Context) -> PreparedComparison:
         context,
         rotary_embedding_bf16,
         (x, cosine, sine),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
-            )
-            == 8
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=4
-            )
-            == 2
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     runtime = load_module(
         context.project_root
@@ -93,11 +78,6 @@ def padded_rope(context: Context) -> PreparedComparison:
             generated_storage,
             10000.0,
             1.0,
-        ),
-        triton_config_filter=lambda config: (
-            config.num_warps == 1
-            and config.num_stages == 3
-            and config.num_ctas == 1
         ),
     )
     position = cache_length
@@ -259,15 +239,6 @@ def rope_qk(context: Context) -> PreparedComparison:
         context,
         rotary_qk_inplace,
         (generated_query, generated_key, cosine, sine),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
-            )
-            == dimension // 2
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

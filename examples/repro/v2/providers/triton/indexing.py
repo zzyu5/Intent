@@ -10,8 +10,6 @@ from kernels.layout.transpose import matrix_transpose
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -38,19 +36,6 @@ def embedding_lookup(context: Context) -> PreparedComparison:
         context,
         embedding_forward_lookup_bf16,
         (table, indices.reshape(-1)),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 128
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
-            )
-            == 128
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -79,19 +64,6 @@ def flaggems_embedding_lookup(context: Context) -> PreparedComparison:
         context,
         embedding_forward_lookup_bf16,
         (table, indices.reshape(-1)),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 1
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
-            )
-            == hidden
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -133,19 +105,6 @@ def flaggems_transpose_copy(context: Context) -> PreparedComparison:
         context,
         matrix_transpose,
         (x,),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 512
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
-            )
-            == 1
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     runtime = _runtime(
         context,
@@ -168,15 +127,6 @@ def index_select(context: Context) -> PreparedComparison:
         context,
         index_select_rows,
         (source_tensor, indices),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 512
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     runtime = _runtime(
         context,
@@ -214,19 +164,6 @@ def scaled_index_add(context: Context) -> PreparedComparison:
         context,
         scaled_index_add_unique,
         arguments,
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 1
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
-            )
-            == 512
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

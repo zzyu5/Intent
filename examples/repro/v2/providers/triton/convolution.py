@@ -11,8 +11,6 @@ from kernels.convolution.varlen import varlen_aligned_causal_depthwise_conv1d
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -26,36 +24,11 @@ def causal_conv1d(context: Context) -> PreparedComparison:
     ).transpose(1, 2)
     weight = torch.randn((channels, width), device="cuda", dtype=torch.bfloat16)
     bias = torch.randn((channels,), device="cuda", dtype=torch.bfloat16)
-    source_tiles = {
-        (128, 256),
-        (128, 128),
-        (128, 64),
-        (128, 32),
-        (64, 128),
-        (64, 64),
-        (64, 32),
-        (32, 256),
-        (32, 128),
-        (32, 64),
-        (32, 32),
-    }
     _, generated = compile_single(
         context,
         causal_depthwise_conv1d_bf16,
         (x, weight, bias),
         constexprs={"SILU": True},
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            ),
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
-            ),
-        )
-        in source_tiles
-        and config.num_warps == 8
-        and config.num_stages == 3
-        and config.num_ctas == 1,
     )
     source_module = load_module(
         context.project_root
@@ -77,30 +50,10 @@ def flaggems_conv1d(context: Context) -> PreparedComparison:
     batch, length, width = 64, 16384, 5
     x = torch.randn((batch, length), device="cuda", dtype=torch.float16)
     weight = torch.randn((width,), device="cuda", dtype=torch.float16)
-    source_candidates = {
-        (32, 4, 2),
-        (64, 4, 2),
-        (128, 4, 2),
-        (32, 4, 3),
-        (64, 4, 3),
-        (128, 4, 3),
-        (256, 8, 3),
-        (64, 4, 4),
-        (128, 4, 4),
-        (256, 4, 4),
-        (64, 2, 5),
-    }
     _, generated = compile_single(
         context,
         conv1d_same,
         (x, weight),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(config, TRITON_PARAMETER_OWNERSHIP_N),
-            config.num_warps,
-            config.num_stages,
-        )
-        in source_candidates
-        and config.num_ctas == 1,
     )
     runtime = load_module(
         context.project_root
@@ -139,29 +92,11 @@ def varlen_causal_conv1d(context: Context) -> PreparedComparison:
         context,
         varlen_aligned_causal_depthwise_conv1d,
         (x, offsets, chunk_indices, weight, bias),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
-            )
-            in (16, 32, 64, 128)
-            and config.num_warps in (4, 8, 16, 32)
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     _, generated_state = compile_single(
         context,
         varlen_causal_conv1d_final_state,
         (x, offsets),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 256
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
 
     def generated_launch():
@@ -223,15 +158,6 @@ def causal_conv1d_update(context: Context) -> PreparedComparison:
         causal_depthwise_conv1d_update_bf16,
         (x, generated_state, weight, bias),
         constexprs={"SILU": True},
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            in (8, 16, 32, 64, 128, 256)
-            and config.num_warps in (4, 8, 16, 32)
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

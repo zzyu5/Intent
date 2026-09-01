@@ -9,9 +9,6 @@ from kernels.quantization.fp8 import bf16_groupwise_fp8_quantize
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import TRITON_PARAMETER_REDUCTION
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -26,19 +23,6 @@ def fp8_groupwise_quantize(context: Context) -> PreparedComparison:
         context,
         bf16_groupwise_fp8_quantize,
         (x, scales),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=3
-            )
-            == 128
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_REDUCTION, dimension=3
-            )
-            == 128
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,

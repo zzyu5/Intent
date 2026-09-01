@@ -8,11 +8,6 @@ from kernels.ragged.jagged_mean import jagged_mean
 from ...loading import load_module
 from ...measurement import compile_single
 from ...measurement import functional_launch
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_M
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import TRITON_PARAMETER_REDUCTION
-from ...measurement import TRITON_PARAMETER_TRAVERSAL_WORKERS
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -34,29 +29,10 @@ def jagged_mean_case(context: Context) -> PreparedComparison:
         dtype=torch.float32,
     )
 
-    def source_candidate(config) -> bool:
-        chunks = tuple(
-            value
-            for name, value in config.kwargs.items()
-            if name.startswith("REDUCE_CHUNK")
-        )
-        return (
-            len(chunks) == 1
-            and chunks[0] in (8, 128, 2048)
-            and triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=2
-            )
-            in (8, 64)
-            and config.num_warps in (4, 8)
-            and config.num_stages in (2, 4)
-            and config.num_ctas == 1
-        )
-
     _, generated = compile_single(
         context,
         jagged_mean,
         (values, offsets),
-        triton_config_filter=source_candidate,
     )
     runtime = load_module(
         context.project_root
@@ -121,47 +97,11 @@ def _moe_expert_projection(
     else:
         raise ValueError(variant)
 
-    source_block_m = (
-        config["BLOCK_SIZE_M"] if variant == "grouped" else config["block_m"]
-    )
-    source_block_k = (
-        config["BLOCK_SIZE_K"] if variant == "grouped" else config["block_k"]
-    )
-    source_block_n = (
-        config["BLOCK_SIZE_N"] if variant == "grouped" else config["block_n"]
-    )
-    source_num_warps = 4 if variant == "grouped" else 8
-    source_row_workers = 8 if variant == "grouped" else 1
-
-    def source_candidate(candidate) -> bool:
-        return (
-            triton_parameter_value(
-                candidate, TRITON_PARAMETER_OWNERSHIP_M
-            )
-            == source_block_m
-            and triton_parameter_value(
-                candidate, TRITON_PARAMETER_REDUCTION, dimension=1
-            )
-            == source_block_k
-            and triton_parameter_value(
-                candidate, TRITON_PARAMETER_OWNERSHIP_N
-            )
-            == source_block_n
-            and triton_parameter_value(
-                candidate, TRITON_PARAMETER_TRAVERSAL_WORKERS
-            )
-            == source_row_workers
-            and candidate.num_warps == source_num_warps
-            and candidate.num_stages == 3
-            and candidate.num_ctas == 1
-        )
-
     _, generated = compile_single(
         context,
         routed_expert_projection_bf16,
         (x, expert_offsets, member_routes, weight),
         constexprs={"TOP_K": topk},
-        triton_config_filter=source_candidate,
     )
     source_module = runtime.load_source(
         context.project_root / source_path,

@@ -32,11 +32,6 @@ def cross_entropy(context: Context) -> PreparedComparison:
         fused_cross_entropy_bf16,
         (generated_logits, labels),
         constexprs={"IGNORE_INDEX": -100},
-        triton_config_filter=lambda config: (
-            config.num_warps == 32
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
@@ -89,17 +84,6 @@ def flash_cross_entropy(context: Context) -> PreparedComparison:
         flash_cross_entropy_bf16,
         (logits, labels),
         constexprs={"IGNORE_INDEX": -100, "Z_LOSS_SCALE": 1.0e-4},
-        triton_config_filter=lambda config: (
-            tuple(
-                value
-                for name, value in config.kwargs.items()
-                if name.startswith("SEGMENT_N")
-            )
-            == (16384,)
-            and config.num_warps == 16
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     runtime = load_module(
         context.project_root

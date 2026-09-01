@@ -6,8 +6,6 @@ from kernels.statistics.histogram import histogram_256
 
 from ...loading import load_module
 from ...measurement import compile_single
-from ...measurement import TRITON_PARAMETER_OWNERSHIP_N
-from ...measurement import triton_parameter_value
 from ...model import Context
 from ...model import PreparedComparison
 from ...model import PreparedLaunch
@@ -26,15 +24,6 @@ def histogram(context: Context) -> PreparedComparison:
         context,
         histogram_256,
         (samples,),
-        triton_config_filter=lambda config: (
-            triton_parameter_value(
-                config, TRITON_PARAMETER_OWNERSHIP_N, dimension=1
-            )
-            == 1024
-            and config.num_warps == 4
-            and config.num_stages == 3
-            and config.num_ctas == 1
-        ),
     )
     generated = PreparedLaunch(
         launch=generated_base.launch,
