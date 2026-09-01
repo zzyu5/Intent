@@ -57,8 +57,9 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories) {
                          gpu::ParameterCategory::RegionReduction))
     return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
   if (llvm::is_contained(categories,
-                         gpu::ParameterCategory::RegionContraction) ||
-      llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
+                         gpu::ParameterCategory::RegionContraction))
+    return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
+  if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
     return {{4, 2, 1}, {8, 3, 1}, {4, 4, 1}};
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
       llvm::is_contained(categories, gpu::ParameterCategory::Scan))
