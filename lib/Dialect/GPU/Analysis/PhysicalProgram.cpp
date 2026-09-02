@@ -1784,6 +1784,13 @@ PhysicalLockstepTraversalFact PhysicalProgramAnalysis::lockstepTraversal(
   SmallVector<MakeRangeOp> authorities;
   for (auto [source, fragmentAxis] : llvm::zip(sources, fragmentAxes)) {
     PhysicalRangeFact ranges = axisRanges(source, fragmentAxis);
+    if (!ranges.isExact()) {
+      result.state = ranges.state == PhysicalFactState::Ambiguous
+                         ? PhysicalLockstepState::Inconsistent
+                         : PhysicalLockstepState::Unknown;
+      result.blockers.append(ranges.blockers.begin(), ranges.blockers.end());
+      return result;
+    }
     PhysicalLockstepTraversalFact sourceFact = lockstepRanges(ranges.roots);
     if (!sourceFact.isExact()) {
       result.state = sourceFact.state;
