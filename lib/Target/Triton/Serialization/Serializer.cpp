@@ -1043,11 +1043,13 @@ private:
       return;
     }
     if (auto histogram = dyn_cast<gpu::HistogramOp>(operation)) {
-      assign(histogram.getResult(), "tl.histogram(" +
-                                         valueString(histogram.getValues()) + ", " +
-                                         valueString(histogram.getBins()) +
-                                         ", mask=" + valueString(histogram.getValid()) +
-                                         ")");
+      std::string counts = "tl.histogram(" +
+                           valueString(histogram.getValues()) + ", " +
+                           valueString(histogram.getBins()) + ", mask=" +
+                           valueString(histogram.getValid()) + ")";
+      Type resultElement = histogram.getResult().getType().getElementType();
+      assign(histogram.getResult(),
+             "tl.cast(" + counts + ", " + pythonType(resultElement) + ")");
       return;
     }
     if (auto random = dyn_cast<gpu::RandomBitsOp>(operation)) {

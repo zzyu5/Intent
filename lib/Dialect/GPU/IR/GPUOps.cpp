@@ -1302,6 +1302,7 @@ LogicalResult SparseContractOp::verify() {
 LogicalResult HistogramOp::verify() {
   if (!getValues().getType().getElementType().isIntOrIndex() ||
       !getValid().getType().getElementType().isInteger(1) ||
+      !isa<IntegerType>(getResult().getType().getElementType()) ||
       getValues().getType().getShape() != getValid().getType().getShape() ||
       getResult().getType().getShape().size() != 1)
     return emitOpError("histogram physical schema is invalid");

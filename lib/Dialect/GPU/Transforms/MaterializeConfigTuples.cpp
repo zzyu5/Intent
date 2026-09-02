@@ -32,6 +32,7 @@ enum class TuningClass {
   Scan,
   Contraction,
   PersistentContraction,
+  Histogram,
   Execution,
 };
 
@@ -114,6 +115,8 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
     return TuningClass::Contraction;
   case ParameterCategory::PersistentContraction:
     return TuningClass::PersistentContraction;
+  case ParameterCategory::Histogram:
+    return TuningClass::Histogram;
   case ParameterCategory::RegionReduction:
     return TuningClass::RegionReduction;
   case ParameterCategory::RegionContraction:
@@ -173,6 +176,13 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{128, 128, 512, 32, 128, 1, 8},
             {128, 128, 1024, 16, 128, 1, 8},
             {128, 128, 256, 64, 128, 1, 8}};
+  if (kind == TuningClass::Histogram)
+    return {{64, 2, 8192, 1, 128, 1, 8},
+            {64, 4, 8192, 1, 128, 1, 8},
+            {64, 8, 8192, 1, 128, 1, 8},
+            {64, 2, 16384, 1, 128, 1, 8},
+            {64, 4, 16384, 1, 128, 1, 8},
+            {64, 4, 32768, 1, 128, 1, 8}};
   if (kind == TuningClass::Reduction)
     return {{128, 128, 64, 1, 128, 1, 8},
             {64, 128, 128, 1, 128, 1, 8},

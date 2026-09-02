@@ -752,6 +752,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       Operation *insertionAnchor,
                                       IRMapping &mapping);
 
+HistogramOp histogramSource(Value value);
+
 LogicalResult addTailValidity(func::FuncOp kernel,
                               llvm::DenseMap<Value, Value> &rangePredicates,
                               bool includeStores) {
@@ -888,6 +890,15 @@ LogicalResult addTailValidity(func::FuncOp kernel,
         auto rangeType = cast<FragmentType>(range.getResult().getType());
         auto blockedExtent =
             cast<PhysicalExprAttr>(rangeType.getShape()[0]);
+        if (HistogramOp histogram = histogramSource(payload)) {
+          retargetDimensionExtent(histogram.getResult(), *dimension,
+                                  blockedExtent);
+          payload = store.getValue();
+          valueType = dyn_cast<FragmentType>(payload.getType());
+          if (!valueType)
+            return store.emitOpError(
+                "histogram writeback lost its physical result schema");
+        }
         if (valueType.getShape()[projection.fragmentAxis] == blockedExtent)
           continue;
         IRMapping mapping;
@@ -1711,29 +1722,290 @@ HistogramOp histogramSource(Value value) {
   return HistogramOp();
 }
 
-LogicalResult realizeDistributedHistograms(func::FuncOp kernel) {
-  SmallVector<StoreOp> stores;
-  kernel.walk([&](StoreOp store) {
-    if (histogramSource(store.getValue()))
-      stores.push_back(store);
-  });
-  for (StoreOp store : stores) {
-    auto resource = dyn_cast<ViewType>(store.getResource().getType());
-    auto value = dyn_cast<FragmentType>(store.getValue().getType());
-    if (!resource || !value || resource.getElementType() != value.getElementType())
-      return store.emitOpError(
-          "distributed histogram requires an output view with the count element type");
-    OpBuilder builder(store);
-    auto atomic = builder.create<AtomicRMWOp>(
-        store.getLoc(), store.getValue().getType(), store.getResource(),
-        store.getCoordinates(), store.getValue(), store.getValid(),
-        AtomicRMWKind::Add, AtomicOrdering::Relaxed,
-        AtomicSharingDomain::KernelInvocation,
-        store.getSourceAxes());
-    if (Attribute origin = store->getAttr(originAttr))
-      atomic->setAttr(originAttr, origin);
-    store.erase();
+LogicalResult alignHistogramOutputOwnership(func::FuncOp kernel) {
+  SmallVector<HistogramOp> histograms;
+  kernel.walk([&](HistogramOp histogram) { histograms.push_back(histogram); });
+  for (HistogramOp histogram : histograms) {
+    SmallVector<StoreOp> stores;
+    kernel.walk([&](StoreOp store) {
+      if (histogramSource(store.getValue()) == histogram)
+        stores.push_back(store);
+    });
+    if (stores.empty())
+      return histogram.emitOpError(
+          "histogram result has no physical output ownership effect");
+    FailureOr<FragmentType> outputType = coordinateValueSchema(
+        histogram.getResult().getType().getElementType(),
+        stores.front().getCoordinates());
+    if (failed(outputType) || outputType->getShape().size() != 1)
+      return histogram.emitOpError(
+          "histogram output has no one-axis physical ownership schema");
+    for (StoreOp store : llvm::drop_begin(stores)) {
+      FailureOr<FragmentType> current = coordinateValueSchema(
+          histogram.getResult().getType().getElementType(),
+          store.getCoordinates());
+      if (failed(current) || *current != *outputType)
+        return histogram.emitOpError(
+            "histogram output effects do not share one physical ownership schema");
+    }
+    histogram.getResult().setType(*outputType);
   }
+  return success();
+}
+
+LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
+  SmallVector<HistogramOp> histograms;
+  kernel.walk([&](HistogramOp histogram) { histograms.push_back(histogram); });
+  for (HistogramOp histogram : histograms) {
+    SmallVector<StoreOp> stores;
+    kernel.walk([&](StoreOp store) {
+      if (histogramSource(store.getValue()) == histogram)
+        stores.push_back(store);
+    });
+    if (stores.empty())
+      return histogram.emitOpError(
+          "histogram result has no physical output ownership effect");
+
+    FailureOr<FragmentType> outputType = coordinateValueSchema(
+        histogram.getResult().getType().getElementType(),
+        stores.front().getCoordinates());
+    if (failed(outputType) || outputType->getShape().size() != 1)
+      return histogram.emitOpError(
+          "histogram output has no one-axis physical ownership schema");
+    for (StoreOp store : llvm::drop_begin(stores)) {
+      FailureOr<FragmentType> current = coordinateValueSchema(
+          histogram.getResult().getType().getElementType(),
+          store.getCoordinates());
+      if (failed(current) || *current != *outputType)
+        return histogram.emitOpError(
+            "histogram output effects do not share one physical ownership schema");
+    }
+
+    auto outputMapping = cast<AxisMapAttr>(outputType->getAxisMaps()[0]);
+    PhysicalSourceAxis outputSource{outputMapping.getSourceId(),
+                                    outputMapping.getSourceAxis(),
+                                    outputMapping.getDerived()};
+    llvm::SmallPtrSet<Operation *, 8> outputRoots;
+    for (Value coordinate : stores.front().getCoordinates())
+      collectCoordinateRanges(coordinate, outputRoots);
+    SmallVector<MakeRangeOp> outputRanges;
+    for (Operation *root : outputRoots)
+      if (auto range = dyn_cast<MakeRangeOp>(root);
+          range && sourceAxisIdentity(range) == outputSource)
+        outputRanges.push_back(range);
+    if (outputRanges.size() != 1 || !isUnitStepRange(outputRanges.front()))
+      return histogram.emitOpError(
+          "histogram output ownership has no unique unit-step bin range");
+    MakeRangeOp outputRange = outputRanges.front();
+    for (StoreOp store : llvm::drop_begin(stores)) {
+      llvm::SmallPtrSet<Operation *, 8> currentRoots;
+      for (Value coordinate : store.getCoordinates())
+        collectCoordinateRanges(coordinate, currentRoots);
+      SmallVector<MakeRangeOp> currentRanges;
+      for (Operation *root : currentRoots)
+        if (auto range = dyn_cast<MakeRangeOp>(root);
+            range && sourceAxisIdentity(range) == outputSource)
+          currentRanges.push_back(range);
+      if (currentRanges.size() != 1 ||
+          !PhysicalProgramAnalysis(kernel)
+               .lockstepRanges({outputRange, currentRanges.front()})
+               .isExact())
+        return histogram.emitOpError(
+            "histogram output effects do not share one physical bin traversal");
+    }
+    FailureOr<ParameterOp> outputParameter =
+        queryBlockingParameter(kernel, outputRange);
+    if (failed(outputParameter))
+      return histogram.emitOpError(
+          "histogram output ownership has no typed blocking parameter");
+    ParameterAttr outputSchema = outputParameter->getParameter();
+    SmallVector<int64_t> outputCandidates(
+        outputSchema.getCandidates().asArrayRef());
+    if (auto bins = histogram.getBins().getDefiningOp<arith::ConstantIndexOp>())
+      llvm::erase_if(outputCandidates,
+                     [&](int64_t candidate) { return candidate > bins.value(); });
+    if (outputCandidates.empty())
+      return histogram.emitOpError(
+          "histogram output ownership has no legal bin-tile candidate");
+    (*outputParameter)->setAttr(
+        "parameter",
+        ParameterAttr::get(
+            kernel.getContext(), outputSchema.getName(), outputSchema.getRole(),
+            outputSchema.getCategory(),
+            outputSchema.getElementBitWidth(),
+            DenseI64ArrayAttr::get(kernel.getContext(), outputCandidates)));
+
+    auto valuesType = dyn_cast<FragmentType>(histogram.getValues().getType());
+    if (!valuesType || valuesType.getShape().size() != 1)
+      return histogram.emitOpError(
+          "histogram input has no one-axis physical traversal schema");
+    PhysicalRangeFact inputFact =
+        PhysicalProgramAnalysis(kernel).axisRanges(histogram.getValues(), 0);
+    if (!inputFact.isUnique() || !isUnitStepRange(inputFact.roots.front()))
+      return histogram.emitOpError(
+          "histogram input has no unique unit-step physical traversal");
+    MakeRangeOp inputRange = inputFact.roots.front();
+    FailureOr<int64_t> inputDimension = queryRangeDimension(inputRange);
+    if (failed(inputDimension))
+      return histogram.emitOpError(
+          "histogram input traversal has no logical dimension identity");
+    PhysicalSourceAxis inputSource = sourceAxisIdentity(inputRange);
+
+    std::string chunkName =
+        ("HISTOGRAM_CHUNK_S" + Twine(inputSource.sourceId) + "_A" +
+         Twine(inputSource.sourceAxis) +
+         (inputSource.derived ? "_DERIVED" : ""))
+            .str();
+    ParameterOp chunk = getOrCreatePhysicalParameter(
+        kernel, chunkName, ParameterRole::Reduction,
+        ParameterCategory::Histogram,
+        valuesType.getElementType().getIntOrFloatBitWidth(),
+        {256, 512, 1024, 2048, 4096, 8192, 16384, 32768});
+    if (!chunk)
+      return failure();
+    chunk->setAttr(dimensionAttr,
+                   IntegerAttr::get(IntegerType::get(kernel.getContext(), 64),
+                                    *inputDimension));
+
+    PhysicalExprAttr chunkExtent = expression(
+        kernel.getContext(), PhysicalExprKind::Parameter, 0, chunkName);
+    auto inputRangeType = cast<FragmentType>(inputRange.getResult().getType());
+    auto blockedInputType = FragmentType::get(
+        kernel.getContext(), inputRangeType.getElementType(),
+        ArrayAttr::get(kernel.getContext(), {chunkExtent}),
+        inputRangeType.getAxisMaps(), inputRangeType.getValidity(),
+        inputRangeType.getOwner());
+
+    Block *outputBlock = stores.front()->getBlock();
+    if (llvm::any_of(stores, [&](StoreOp store) {
+          return store->getBlock() != outputBlock;
+        }))
+      return histogram.emitOpError(
+          "histogram output effects do not share one physical control block");
+    OpBuilder builder(stores.front());
+    auto countType = dyn_cast<IntegerType>(outputType->getElementType());
+    if (!countType)
+      return histogram.emitOpError(
+          "histogram count type has no integer zero identity");
+    Value zeroScalar = builder.create<arith::ConstantOp>(
+        histogram.getLoc(), countType, builder.getIntegerAttr(countType, 0));
+    Value zero = builder.create<SplatOp>(histogram.getLoc(), *outputType,
+                                         zeroScalar);
+    Value loopStep = builder.create<BinaryOp>(
+        histogram.getLoc(), builder.getIndexType(), chunk.getResult(),
+        inputRange.getStep(), BinaryOperator::Multiply);
+    bool bodyFailed = false;
+    std::string failureReason;
+    auto loop = builder.create<scf::ForOp>(
+        histogram.getLoc(), inputRange.getStart(), inputRange.getLogicalStop(),
+        loopStep, ValueRange{zero},
+        [&](OpBuilder &nested, Location location, Value tileStart,
+            ValueRange carries) {
+          Value blocked = nested.create<MakeRangeOp>(
+              location, blockedInputType, tileStart, chunk.getResult(),
+              inputRange.getStep(), inputRange.getLogicalStart(),
+              inputRange.getLogicalStop(), inputRange.getSourceId(),
+              inputRange.getSourceAxis(), inputRange.getDerived());
+          for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
+            if (Attribute value = inputRange->getAttr(name))
+              blocked.getDefiningOp()->setAttr(name, value);
+          Value inputEnd = nested.create<BroadcastOp>(
+              location, blockedInputType, inputRange.getLogicalStop());
+          auto tailComparison = nested.create<CompareOp>(
+              location, predicateType(blockedInputType), blocked, inputEnd,
+              ComparePredicate::Lt);
+          tailComparison->setAttr(physicalTailAttr, nested.getUnitAttr());
+          Value tail = tailComparison.getResult();
+
+          IRMapping mapping;
+          mapping.map(inputRange.getResult(), blocked);
+          SmallVector<int64_t> traversalDimensions{*inputDimension};
+          FailureOr<Value> values = replayPointwiseValue(
+              nested, histogram.getValues(), inputSource, traversalDimensions,
+              chunkExtent, blocked, tail, histogram.getOperation(), mapping);
+          FailureOr<Value> valid = replayPointwiseValue(
+              nested, histogram.getValid(), inputSource, traversalDimensions,
+              chunkExtent, blocked, tail, histogram.getOperation(), mapping);
+          if (failed(values) || failed(valid)) {
+            bodyFailed = true;
+            failureReason =
+                "input values cannot be replayed in the histogram traversal loop";
+            return;
+          }
+          auto blockedValuesType = dyn_cast<FragmentType>((*values).getType());
+          if (!blockedValuesType) {
+            bodyFailed = true;
+            failureReason =
+                "replayed histogram values lost their physical fragment schema";
+            return;
+          }
+          FragmentType predicate = predicateType(blockedValuesType);
+          FailureOr<Value> projectedValid = materializeBroadcastToFragment(
+              nested, location, *valid, predicate);
+          FailureOr<Value> projectedTail =
+              materializeBroadcastToFragment(nested, location, tail, predicate);
+          if (failed(projectedValid) || failed(projectedTail)) {
+            bodyFailed = true;
+            failureReason =
+                "histogram input validity cannot adopt its blocked traversal schema";
+            return;
+          }
+
+          Value outputOffset = nested.create<BinaryOp>(
+              location, nested.getIndexType(), outputRange.getStart(),
+              outputRange.getLogicalStart(), BinaryOperator::Subtract);
+          Value outputEnd = nested.create<BinaryOp>(
+              location, nested.getIndexType(), outputOffset,
+              outputRange.getExtent(), BinaryOperator::Add);
+          Type inputElement = blockedValuesType.getElementType();
+          Value typedStart = nested.create<CastOp>(
+              location, inputElement, outputOffset);
+          Value typedEnd =
+              nested.create<CastOp>(location, inputElement, outputEnd);
+          FailureOr<Value> start = materializeBroadcastToFragment(
+              nested, location, typedStart, blockedValuesType);
+          FailureOr<Value> end = materializeBroadcastToFragment(
+              nested, location, typedEnd, blockedValuesType);
+          if (failed(start) || failed(end)) {
+            bodyFailed = true;
+            failureReason =
+                "histogram bin ownership cannot project onto the input values";
+            return;
+          }
+          Value lower = nested.create<CompareOp>(
+              location, predicate, *values, *start, ComparePredicate::Ge);
+          Value upper = nested.create<CompareOp>(
+              location, predicate, *values, *end, ComparePredicate::Lt);
+          Value active = nested.create<BinaryOp>(
+              location, predicate, *projectedValid, *projectedTail,
+              BinaryOperator::LogicalAnd);
+          active = nested.create<BinaryOp>(location, predicate, active, lower,
+                                           BinaryOperator::LogicalAnd);
+          active = nested.create<BinaryOp>(location, predicate, active, upper,
+                                           BinaryOperator::LogicalAnd);
+          Value localValues = nested.create<BinaryOp>(
+              location, blockedValuesType, *values, *start,
+              BinaryOperator::Subtract);
+          auto partial = nested.create<HistogramOp>(
+              location, *outputType, localValues, outputRange.getExtent(),
+              active);
+          if (Attribute origin = histogram->getAttr(originAttr))
+            partial->setAttr(originAttr, origin);
+          Value accumulated = nested.create<BinaryOp>(
+              location, *outputType, carries.front(), partial.getResult(),
+              BinaryOperator::Add);
+          nested.create<scf::YieldOp>(location, accumulated);
+        });
+    if (bodyFailed) {
+      loop.erase();
+      return histogram.emitOpError(
+                 "histogram ownership could not be materialized: ")
+             << failureReason;
+    }
+    for (StoreOp store : stores)
+      store.getValueMutable().assign(loop.getResult(0));
+  }
+  eraseDeadPhysicalValues(kernel);
   return success();
 }
 
@@ -2293,7 +2565,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
     }
   });
-
   bool scanCoverageFailed = false;
   kernel.walk([&](ScanOp scan) {
     for (Value source : scan.getInputs().take_front(scan.getSourceCount()))
@@ -2337,8 +2608,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       return kernel.emitError(
           "structured reduction source has no exact full-coverage realization");
   kernel.walk([&](HistogramOp histogram) {
-    llvm::SmallPtrSet<Operation *, 16> visited;
-    collectStoreRanges(histogram.getResult(), internalTraversalRanges, visited);
+    llvm::SmallPtrSet<Operation *, 16> histogramRanges;
+    collectAllAxesInto(histogram.getValues(), histogramRanges);
+    structuredTraversalRanges.insert(histogramRanges.begin(),
+                                     histogramRanges.end());
+    reductionTraversalRanges.insert(histogramRanges.begin(),
+                                    histogramRanges.end());
   });
   llvm::SmallPtrSet<Operation *, 32> contractionTraversalRanges;
   kernel.walk([&](ContractOp contract) {
@@ -2759,12 +3034,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     });
   }
   if (dynamicRanges.empty()) {
+    if (ownershipOnly && failed(alignHistogramOutputOwnership(kernel)))
+      return failure();
+    if (!ownershipOnly && failed(realizeOwnedHistograms(kernel)))
+      return failure();
     if (!ownershipOnly &&
         (failed(alignAccessResultRelations(kernel)) ||
          failed(addTailValidity(kernel, fixedRangePredicates,
                                 /*includeStores=*/true))))
-      return failure();
-    if (!ownershipOnly && failed(realizeDistributedHistograms(kernel)))
       return failure();
     return finalizeValueRelations();
   }
@@ -2820,16 +3097,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   });
   kernel.walk([&](ScatterReduceOp scatter) {
     collectOwnership(scatter.getCoordinates(), ValueRange(scatter.getValue()));
-  });
-  kernel.walk([&](HistogramOp histogram) {
-    auto fragment = cast<FragmentType>(histogram.getValues().getType());
-    for (Attribute attribute : fragment.getAxisMaps()) {
-      auto mapping = cast<AxisMapAttr>(attribute);
-      PhysicalSourceAxis source{mapping.getSourceId(), mapping.getSourceAxis(),
-                                mapping.getDerived()};
-      ownershipSources.insert(source);
-      directOwnershipSources.insert(source);
-    }
   });
   for (const WriteEffectFacts &effect : writeEffects)
     for (Value coordinate : effect.coordinates) {
@@ -2916,6 +3183,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       }
     }
   });
+  kernel.walk([&](HistogramOp histogram) {
+    llvm::SmallDenseSet<uint64_t> resultDimensions;
+    collectPhysicalDimensions(histogram.getResult().getType(), resultDimensions);
+    for (uint64_t dimension : resultDimensions)
+      structuredOwnershipCategories.try_emplace(
+          dimension, ParameterCategory::Histogram);
+  });
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
@@ -2943,13 +3217,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     return false;
   };
-  auto dependsOnHistogramSource = [&](ValueRange values,
-                                      PhysicalSourceAxis source) {
-    return llvm::any_of(values, [&](Value value) {
-      HistogramOp histogram = histogramSource(value);
-      return histogram && containsSource(histogram.getValues(), source);
-    });
-  };
   llvm::DenseMap<PhysicalSourceAxis, uint64_t> sourceDimensions;
   llvm::MapVector<uint64_t, SmallVector<PhysicalSourceAxis>> dimensionSources;
   for (MakeRangeOp range : dynamicRanges) {
@@ -2966,8 +3233,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   auto effectDependsOn = [&](const WriteEffectFacts &effect,
                              PhysicalSourceAxis source) {
     return dependsOnSource(effect.coordinates, source) ||
-           dependsOnSource(effect.payloads, source) ||
-           dependsOnHistogramSource(effect.payloads, source);
+           dependsOnSource(effect.payloads, source);
   };
   llvm::SmallDenseSet<uint64_t> jointOwnershipDimensions;
   for (auto [dimensionId, sources] : dimensionSources) {
@@ -3363,8 +3629,11 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     axes = std::move(selectedAxes);
     dynamicRanges = std::move(selectedRanges);
-    if (dynamicRanges.empty())
+    if (dynamicRanges.empty()) {
+      if (failed(alignHistogramOutputOwnership(kernel)))
+        return failure();
       return finalizeValueRelations();
+    }
   }
 
   OpBuilder mappingBuilder(mapping);
@@ -3743,11 +4012,16 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     range.erase();
   }
 
-  if (failed(alignAccessResultRelations(kernel)) ||
-      failed(addTailValidity(kernel, rangePredicates,
-                             /*includeStores=*/true)))
+  if (failed(alignAccessResultRelations(kernel)))
     return failure();
-  if (failed(realizeDistributedHistograms(kernel)))
+  if (ownershipOnly) {
+    if (failed(alignHistogramOutputOwnership(kernel)))
+      return failure();
+  } else if (failed(realizeOwnedHistograms(kernel))) {
+    return failure();
+  }
+  if (failed(addTailValidity(kernel, rangePredicates,
+                             /*includeStores=*/true)))
     return failure();
   if (failed(alignContractValueRelations(kernel)))
     return failure();

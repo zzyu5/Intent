@@ -256,7 +256,7 @@ LogicalResult ParameterAttr::verify(
   if (!name || name.empty() ||
       role > static_cast<uint32_t>(ParameterRole::ReductionInner) ||
       category >
-          static_cast<uint32_t>(ParameterCategory::PersistentContraction) ||
+          static_cast<uint32_t>(ParameterCategory::Histogram) ||
       !candidates || candidates.empty())
     return emitError()
            << "physical parameter requires a name, role, category and candidates";
@@ -274,7 +274,8 @@ LogicalResult ParameterAttr::verify(
       typedCategory == ParameterCategory::Contraction ||
       typedCategory == ParameterCategory::RegionReduction ||
       typedCategory == ParameterCategory::RegionContraction ||
-      typedCategory == ParameterCategory::PersistentContraction;
+      typedCategory == ParameterCategory::PersistentContraction ||
+      typedCategory == ParameterCategory::Histogram;
   if (carriesDataGranularity != (elementBitWidth > 0))
     return emitError()
            << "data-granularity parameter categories require an element bit width and non-data categories forbid one";

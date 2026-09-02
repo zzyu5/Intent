@@ -98,6 +98,7 @@ enum class ParameterCategory : uint32_t {
   RegionReduction = 7,
   RegionContraction = 8,
   PersistentContraction = 9,
+  Histogram = 10,
 };
 
 enum class CoordinateRole : int64_t {
