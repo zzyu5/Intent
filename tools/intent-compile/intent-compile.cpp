@@ -57,7 +57,6 @@ int main(int argc, char **argv) {
 
   // Compile-call inputs are parsed but not interpreted before the shared
   // executable GPU Program exists.
-  llvm::cl::opt<int64_t> device("device", llvm::cl::init(0));
   llvm::cl::opt<int64_t> computeUnits("compute-units", llvm::cl::init(0));
   llvm::cl::opt<int64_t> sharedMemoryPerUnit("shared-memory-per-unit",
                                              llvm::cl::init(0));
@@ -85,7 +84,6 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Intent canonical KIR compiler boundary\n");
 
-  (void)device;
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,

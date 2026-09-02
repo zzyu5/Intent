@@ -19,7 +19,6 @@ class GpuDeviceCapabilities:
     @property
     def compiler_options(self) -> tuple[str, ...]:
         return (
-            f"--device={self.device}",
             f"--compute-units={self.compute_units}",
             f"--shared-memory-per-unit={self.shared_memory_per_unit}",
             f"--max-dynamic-shared-memory-per-block={self.max_dynamic_shared_memory_per_block}",
