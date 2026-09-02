@@ -2,6 +2,8 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -20,6 +22,12 @@ struct TuningProfile {
   int64_t scan;
   int64_t traversalWorkers;
   int64_t traversalGroup;
+};
+
+struct CorrelatedProfileParameters {
+  ParameterOp pointwise;
+  ParameterOp reduction;
+  ParameterOp contraction;
 };
 
 enum class TuningClass {
@@ -99,6 +107,74 @@ bool isSharedStaticParameter(ParameterOp parameter) {
          !parameter->hasAttr(coverageDimensionAttr);
 }
 
+bool axisReferencesParameter(FragmentType fragment, int64_t axis,
+                             StringAttr parameter) {
+  return axis >= 0 && axis < static_cast<int64_t>(fragment.getShape().size()) &&
+         expressionReferencesParameter(
+             cast<PhysicalExprAttr>(fragment.getShape()[axis]), parameter);
+}
+
+bool fragmentReferencesParameter(FragmentType fragment, StringAttr parameter) {
+  return llvm::any_of(fragment.getShape(), [&](Attribute extent) {
+    return expressionReferencesParameter(cast<PhysicalExprAttr>(extent),
+                                         parameter);
+  });
+}
+
+bool reducedAxesReferenceParameter(FragmentType fragment,
+                                   ArrayRef<int64_t> axes,
+                                   StringAttr parameter) {
+  return llvm::any_of(axes, [&](int64_t axis) {
+    return axisReferencesParameter(fragment, axis, parameter);
+  });
+}
+
+bool freeAxesReferenceParameter(FragmentType fragment, ArrayRef<int64_t> axes,
+                                StringAttr parameter) {
+  return llvm::any_of(llvm::enumerate(fragment.getShape()), [&](auto indexed) {
+    return !llvm::is_contained(axes, static_cast<int64_t>(indexed.index())) &&
+           expressionReferencesParameter(
+               cast<PhysicalExprAttr>(indexed.value()), parameter);
+  });
+}
+
+bool valueDependsOn(Value value, Value producer,
+                    llvm::DenseSet<Value> &visited) {
+  if (value == producer)
+    return true;
+  if (!visited.insert(value).second)
+    return false;
+
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (!loop || argument.getArgNumber() == 0)
+      return false;
+    unsigned resultIndex = argument.getArgNumber() - 1;
+    if (resultIndex >= loop.getInitArgs().size())
+      return false;
+    if (valueDependsOn(loop.getInitArgs()[resultIndex], producer, visited))
+      return true;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return valueDependsOn(yield.getOperand(resultIndex), producer, visited);
+  }
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return false;
+  if (auto loop = dyn_cast<scf::ForOp>(definition)) {
+    unsigned resultIndex = cast<OpResult>(value).getResultNumber();
+    if (resultIndex >= loop.getInitArgs().size())
+      return false;
+    if (valueDependsOn(loop.getInitArgs()[resultIndex], producer, visited))
+      return true;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return valueDependsOn(yield.getOperand(resultIndex), producer, visited);
+  }
+  return llvm::any_of(definition->getOperands(), [&](Value operand) {
+    return valueDependsOn(operand, producer, visited);
+  });
+}
+
 TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
@@ -132,6 +208,98 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
     return TuningClass::Pointwise;
   }
   llvm_unreachable("unknown physical parameter category");
+}
+
+SmallVector<CorrelatedProfileParameters>
+correlatedReductionContractionParameters(
+    func::FuncOp kernel, ArrayRef<ParameterOp> parameters,
+    bool twoAxisPointwise, bool fixedPointwiseLocal) {
+  SmallVector<CorrelatedProfileParameters> correlated;
+  auto capabilities =
+      kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || !capabilities.getMatrixUnits() || twoAxisPointwise ||
+      fixedPointwiseLocal)
+    return correlated;
+
+  SmallVector<ParameterOp> pointwise;
+  SmallVector<ParameterOp> reductions;
+  SmallVector<ParameterOp> contractions;
+  SmallVector<ContractOp> contracts;
+  for (ParameterOp parameter : parameters) {
+    ParameterAttr schema = parameter.getParameter();
+    auto role = static_cast<ParameterRole>(schema.getRole());
+    if (tuningClass(kernel, parameter) == TuningClass::Pointwise &&
+        (role == ParameterRole::OwnershipM ||
+         role == ParameterRole::OwnershipN) &&
+        schema.getElementBitWidth() > 16)
+      pointwise.push_back(parameter);
+    if (tuningClass(kernel, parameter) == TuningClass::Reduction &&
+        role == ParameterRole::Reduction)
+      reductions.push_back(parameter);
+    if (tuningClass(kernel, parameter) == TuningClass::Contraction &&
+        role == ParameterRole::Reduction &&
+        schema.getElementBitWidth() <= 16)
+      contractions.push_back(parameter);
+  }
+  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
+
+  kernel.walk([&](ReduceOp reduce) {
+    if (reduce.getSourceCount() != 1 || reduce.getNumResults() != 1 ||
+        reduce.getAxes().empty())
+      return;
+    Value source = reduce.getInputs().front();
+    auto sourceType = dyn_cast<FragmentType>(source.getType());
+    auto resultType = dyn_cast<FragmentType>(reduce.getResult(0).getType());
+    if (!sourceType || !resultType)
+      return;
+
+    for (ParameterOp pointwiseParameter : pointwise) {
+      StringAttr pointwiseName = pointwiseParameter.getParameter().getName();
+      if (!freeAxesReferenceParameter(sourceType, reduce.getAxes(),
+                                      pointwiseName) ||
+          !fragmentReferencesParameter(resultType, pointwiseName))
+        continue;
+      for (ParameterOp reductionParameter : reductions) {
+        StringAttr reductionName = reductionParameter.getParameter().getName();
+        if (!reducedAxesReferenceParameter(sourceType, reduce.getAxes(),
+                                           reductionName))
+          continue;
+        for (ContractOp contract : contracts) {
+          auto lhsType = dyn_cast<FragmentType>(contract.getLhs().getType());
+          auto rhsType = dyn_cast<FragmentType>(contract.getRhs().getType());
+          auto contractResultType =
+              dyn_cast<FragmentType>(contract.getResult().getType());
+          if (!lhsType || !rhsType || !contractResultType ||
+              !fragmentReferencesParameter(contractResultType,
+                                           pointwiseName) ||
+              !fragmentReferencesParameter(contractResultType, reductionName))
+            continue;
+          llvm::DenseSet<Value> visited;
+          if (!valueDependsOn(source, contract.getResult(), visited))
+            continue;
+          for (ParameterOp contractionParameter : contractions) {
+            StringAttr contractionName =
+                contractionParameter.getParameter().getName();
+            if (!reducedAxesReferenceParameter(
+                    lhsType, contract.getLhsReductionAxes(), contractionName) ||
+                !reducedAxesReferenceParameter(
+                    rhsType, contract.getRhsReductionAxes(), contractionName))
+              continue;
+            CorrelatedProfileParameters profile{pointwiseParameter,
+                                                reductionParameter,
+                                                contractionParameter};
+            if (!llvm::any_of(correlated, [&](const auto &existing) {
+                  return existing.pointwise == profile.pointwise &&
+                         existing.reduction == profile.reduction &&
+                         existing.contraction == profile.contraction;
+                }))
+              correlated.push_back(profile);
+          }
+        }
+      }
+    }
+  });
+  return correlated;
 }
 
 SmallVector<TuningProfile, 5>
@@ -305,6 +473,10 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                schema.getCandidates().size() == 1 &&
                parameter->hasAttr(pointwiseLocalAttr);
       });
+  SmallVector<CorrelatedProfileParameters> correlatedProfiles =
+      correlatedReductionContractionParameters(
+          kernel, parameters, hasTwoAxisPointwiseOwnership,
+          hasFixedPointwiseLocal);
   unsigned profileCount = 0;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
@@ -329,6 +501,26 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                                                      profiles.size() - 1);
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
                                          requestedValue(profiles[selectedProfile], role));
+      bindings.push_back(builder.getNamedAttr(
+          schema.getName(), builder.getI64IntegerAttr(selected)));
+    }
+    DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
+    if (!llvm::is_contained(tuples, Attribute(tuple)))
+      tuples.push_back(tuple);
+  }
+  for (const CorrelatedProfileParameters &correlated : correlatedProfiles) {
+    SmallVector<NamedAttribute> bindings;
+    for (ParameterOp parameter : parameters) {
+      ParameterAttr schema = parameter.getParameter();
+      auto role = static_cast<ParameterRole>(schema.getRole());
+      SmallVector<TuningProfile, 5> profiles = profilesFor(
+          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
+      const TuningProfile &profile =
+          parameter == correlated.reduction ? profiles.back()
+                                            : profiles.front();
+      int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
+                                         requestedValue(profile, role));
       bindings.push_back(builder.getNamedAttr(
           schema.getName(), builder.getI64IntegerAttr(selected)));
     }
