@@ -27,8 +27,8 @@ Canonical KIR lowering 产生一份 provider-neutral、可执行、可独立验�
 ## Triton 终端结果
 
 - 当前 registry 的每个 entry 按其完整 Python orchestration 运行；multi-kernel entry 不拆成独立通过项。
-- Generated artifact 必须真实完成 terminal serialization、Triton compile/JIT、launch 与 numerical comparison。Source baseline 必须真实运行其登记实现；compatibility、resource、adapter、timeout 或 measurement gap 均不能记为通过。
-- 性能使用 tuning table 的静态默认 generated config，以 source 实际耗时为分母。RTX 5090D 与 H100 上每个 entry 的 `generated_p50_ms / source_p50_ms` 不超过 1.1。
+- 每个 entry 的 generated/source workflow 必须真实执行并得到可归因的终端结果；双方完成 terminal serialization、Triton compile/JIT、launch 与 numerical comparison 且计时可比时，记录两侧实测 timing 与 ratio。Source resource/compatibility、整体 worker timeout、adapter 或 measurement gap 保留准确状态，不能记为通过或伪造 ratio，也不自动归因成 shared lowering 失败。
+- 性能使用 tuning table 的静态默认 generated config，以 source 实际耗时为分母，并以 RTX 5090D 与 H100 上 `generated_p50_ms / source_p50_ms` 不超过 1.1 为目标。明显超标或明显异常的可比结果优先从 current Physical Program、typed config 或 provider form 调查；目标本身不把不可比的 source/runtime 终端状态改写为 compiler correctness gate。
 - `report/baselinev2/triton-5090.csv` 与 `report/baselinev2/triton-h100.csv` 保存同一 current compiler state 的真实结果；不合并不同 compiler binary、重复运行挑最优值或修改 cuTile/TileLang 表。
 
 ## Acceptance scenarios
@@ -63,4 +63,4 @@ Given 当前 54-entry Triton registry、同一 current compiler state 与各 ent
 
 When 两台设备分别执行完整 generated/source numerical 与 timing workflow
 
-Then 54 个 entries 的全部 62 个 component references 均到达 terminal/JIT/launch，数值比较通过，每项具有真实 timing 且默认 generated ratio 不超过 1.1，两张 Triton CSV 完整记录这些结果
+Then 54 个 entries 的全部 62 个 component references 均得到可归因的真实终端结果；双方完成且计时可比的 entry 通过数值比较并记录实测 ratio，默认 config 以 1.1× 为目标且明显异常按结构调查；source resource/compatibility、整体 worker timeout 或 measurement gap 保留准确状态而不伪造 ratio，两张 Triton CSV 完整记录同一 compiler state

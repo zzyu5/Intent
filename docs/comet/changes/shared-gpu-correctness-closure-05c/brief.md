@@ -38,7 +38,7 @@
 - A1：受影响的 canonical kernels 经 shared construction 与 mutation 后形成可独立验证的完整 GPU Program；source occurrence、traversal、range、ownership、access、validity 与 effects 由 current typed facts 唯一决定，不再以 dimension equality 猜 exact relation。
 - A2：每个终端候选在 serialization 前都是完整的 shared tuple 与 provider-local options，resource filter 只删除可证明非法项；默认 config 使用同一候选 authority；compile device 进入 artifact/runtime binding，跨设备输入被明确拒绝，无 tensor 输入也显式使用绑定设备完成 allocation 与 launch。
 - A3：rank-2 `I.sparse_contract_2to4` 形成唯一 canonical sparse contract；受支持的 TileLang scaled contract 到达 provider-native form、不支持的 capability 在 serializer 前精确拒绝；cuTile rewrite 后 op schema 与 closed surface 均被验证；TileLang serializer 只打印已闭合 config 集合。
-- A4：当前 Triton registry 的 54 个 entries / 62 个 component references 在 RTX 5090D 与 H100 上真实完成 terminal source、JIT、launch 与数值比较；每项都有 source/generated 实测与 ratio，默认 config 均不超过 1.1×，两张 Triton CSV 记录同一当前代码状态。
+- A4：当前 Triton registry 的 54 个 entries / 62 个 component references 在 RTX 5090D 与 H100 上真实执行完整 generated/source workflow 并得到可归因的终端结果；双方完成且计时可比的 entry 记录实测数值与 ratio，默认 config 以 1.1× 为目标，明显超标项优先从 Physical Program、typed config 或 provider form 调查；source resource/compatibility、整体 worker timeout 或 measurement gap 保留准确状态而不伪造 ratio，两张 Triton CSV 记录同一当前代码状态。
 
 # 约束与不变量
 
@@ -58,7 +58,7 @@
 
 # 待解决问题
 
-无。
+- [blocking] CONFIRM: A1-A3 保持原确认范围；A4 恢复为双机完整真实运行与可归因终态，对可比项记录数值和 ratio、以默认 config 1.1× 为目标并调查明显异常，对 source resource/compatibility、整体 timeout 或 measurement gap 如实记录而不伪造 ratio；非目标不变。
 
 # 验证预期
 
