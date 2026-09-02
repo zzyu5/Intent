@@ -944,12 +944,13 @@ private:
       return;
     }
     if (auto store = dyn_cast<BlockStoreOp>(operation)) {
-      auto fragment = store.getValue().getType();
+      auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
       std::string call =
           "tl.store(" +
           blockPointer(store.getView(), store.getOffsets(),
                        store.getBlockAxes(), store.getOrder(), fragment) +
-          ", " + valueString(store.getValue());
+          ", tl.cast(" + valueString(store.getValue()) + ", " +
+          pythonType(fragment.getElementType()) + ")";
       if (!store.getBoundaryAxes().empty())
         call += ", boundary_check=" + axisTuple(store.getBoundaryAxes());
       line(call + ")");
