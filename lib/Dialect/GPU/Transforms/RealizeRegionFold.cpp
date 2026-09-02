@@ -114,6 +114,7 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
                                 ArrayRef<SourcePlan> plans,
                                 ArrayRef<FragmentType> sliceTypes, Value offset,
                                 Value segment, PhysicalExprAttr sliceExtent,
+                                bool fullSegment,
                                 SmallVectorImpl<Value> &slices,
                                 Value &segmentTail, IRMapping &sliceMapping,
                                 SmallVectorImpl<std::shared_ptr<IRMapping>>
@@ -166,14 +167,21 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
            {sourceSubregionAttr, sourceSubregionBoundAttr})
         if (Attribute inherited = range->getAttr(name))
           value.getDefiningOp()->setAttr(name, inherited);
-      Value stopFragment =
-          builder.create<BroadcastOp>(location, blockedRange,
-                                      range.getLogicalStop());
-      auto validComparison = builder.create<CompareOp>(
-          location, predicateType(blockedRange), value, stopFragment,
-          ComparePredicate::Lt);
-      validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
-      Value valid = validComparison.getResult();
+      Value valid;
+      if (fullSegment) {
+        Value truth = builder.create<arith::ConstantOp>(
+            location, builder.getI1Type(), builder.getBoolAttr(true));
+        valid = builder.create<SplatOp>(location, predicateType(blockedRange),
+                                        truth);
+      } else {
+        Value stopFragment = builder.create<BroadcastOp>(
+            location, blockedRange, range.getLogicalStop());
+        auto validComparison = builder.create<CompareOp>(
+            location, predicateType(blockedRange), value, stopFragment,
+            ComparePredicate::Lt);
+        validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
+        valid = validComparison.getResult();
+      }
       if (!tail)
         tail = valid;
       if (!segmentTail)
@@ -1366,7 +1374,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     SmallVector<std::shared_ptr<IRMapping>> sourceMappings;
     if (failed(buildSourceSlices(nested, nestedLocation, plans, sliceTypes,
                                  offset,
-                                 segment.getResult(), sliceExtent, slices,
+                                 segment.getResult(), sliceExtent,
+                                 predicateIsTrue, slices,
                                  segmentTail, sliceMapping, sourceMappings,
                                  failureReason)))
       return failure();
@@ -1590,7 +1599,8 @@ LogicalResult realizeScan(RegionScanOp scan, func::FuncOp kernel) {
         if (failed(buildSourceSlices(
                 nested, nestedLocation, plans, sliceTypes, offset,
                 segment.getResult(),
-                sliceExtent, slices, segmentTail, sliceMapping, sourceMappings,
+                sliceExtent, /*fullSegment=*/false, slices, segmentTail,
+                sliceMapping, sourceMappings,
                 failureReason))) {
           bodyFailed = true;
           return;
