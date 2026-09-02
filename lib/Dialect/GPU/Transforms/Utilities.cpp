@@ -2965,9 +2965,11 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
         kernel.getContext(), builder.getI1Type(), coordinate.getShape(),
         coordinate.getAxisMaps(), coordinate.getValidity(),
         coordinate.getOwner());
-    predicates[range.getOperation()] = builder.create<CompareOp>(
-        range.getLoc(), predicate, range.getResult(), stopFragment,
-        ComparePredicate::Lt);
+    auto tail = builder.create<CompareOp>(range.getLoc(), predicate,
+                                          range.getResult(), stopFragment,
+                                          ComparePredicate::Lt);
+    tail->setAttr(physicalTailAttr, builder.getUnitAttr());
+    predicates[range.getOperation()] = tail.getResult();
   }
 
   auto materializeTail = [&](OpBuilder &builder, Location location,
