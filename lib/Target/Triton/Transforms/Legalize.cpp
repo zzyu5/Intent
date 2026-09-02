@@ -1136,11 +1136,105 @@ FailureOr<Value> zeroLike(OpBuilder &builder, Location location, Type type) {
   return zero;
 }
 
+std::optional<int64_t> staticGatherCoordinate(gpu::GatherOp gather) {
+  if (gather.getCoordinates().size() != 1 ||
+      gather.getSourceAxes().size() != 1 || !gather.getValid() ||
+      !isTrueValue(gather.getValid()))
+    return std::nullopt;
+  Value coordinate = stripShapeOnly(gather.getCoordinates().front());
+  while (auto cast = coordinate.getDefiningOp<gpu::CastOp>())
+    coordinate = cast.getValue();
+  auto constant = coordinate.getDefiningOp<arith::ConstantOp>();
+  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                          : IntegerAttr();
+  if (!integer || (integer.getInt() != 0 && integer.getInt() != 1))
+    return std::nullopt;
+
+  auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
+  auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+  if (!source || !result || source.getShape().size() != result.getShape().size() + 1 ||
+      gather.getSourceAxes().front() !=
+          static_cast<int64_t>(source.getShape().size() - 1) ||
+      source.getElementType() != result.getElementType() ||
+      source.getValidity() != result.getValidity() ||
+      source.getOwner() != result.getOwner())
+    return std::nullopt;
+  auto trailing = dyn_cast<gpu::PhysicalExprAttr>(
+      source.getShape()[source.getShape().size() - 1]);
+  if (!trailing ||
+      trailing.getKind() !=
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+      trailing.getValue() != 2 ||
+      !std::equal(result.getShape().begin(), result.getShape().end(),
+                  source.getShape().begin()) ||
+      !std::equal(result.getAxisMaps().begin(), result.getAxisMaps().end(),
+                  source.getAxisMaps().begin()))
+    return std::nullopt;
+  return integer.getInt();
+}
+
+bool belongsToSplitGatherPair(gpu::GatherOp gather) {
+  std::optional<int64_t> coordinate = staticGatherCoordinate(gather);
+  if (!coordinate || !gather->getBlock())
+    return false;
+  for (Operation *user : gather.getSource().getUsers()) {
+    auto complement = dyn_cast<gpu::GatherOp>(user);
+    std::optional<int64_t> other = complement
+                                       ? staticGatherCoordinate(complement)
+                                       : std::optional<int64_t>();
+    if (complement && complement != gather &&
+        complement->getBlock() == gather->getBlock() && other &&
+        *other == 1 - *coordinate &&
+        complement.getResult().getType() == gather.getResult().getType())
+      return true;
+  }
+  return false;
+}
+
+LogicalResult legalizeSplitGatherPairs(func::FuncOp kernel) {
+  SmallVector<gpu::GatherOp> gathers;
+  kernel.walk([&](gpu::GatherOp gather) { gathers.push_back(gather); });
+  llvm::SmallPtrSet<Operation *, 8> rewritten;
+  bool changed = false;
+  for (gpu::GatherOp low : gathers) {
+    if (rewritten.contains(low.getOperation()) || !low->getBlock() ||
+        staticGatherCoordinate(low) != std::optional<int64_t>(0))
+      continue;
+    for (gpu::GatherOp high : gathers) {
+      if (rewritten.contains(high.getOperation()) || !high->getBlock() ||
+          high->getBlock() != low->getBlock() ||
+          high.getSource() != low.getSource() ||
+          high.getResult().getType() != low.getResult().getType() ||
+          staticGatherCoordinate(high) != std::optional<int64_t>(1))
+        continue;
+      Operation *anchor = low->isBeforeInBlock(high) ? low.getOperation()
+                                                    : high.getOperation();
+      OpBuilder builder(anchor);
+      auto split = builder.create<SplitOp>(
+          anchor->getLoc(), low.getResult().getType(), high.getResult().getType(),
+          low.getSource());
+      low.getResult().replaceAllUsesWith(split.getLow());
+      high.getResult().replaceAllUsesWith(split.getHigh());
+      rewritten.insert(low.getOperation());
+      rewritten.insert(high.getOperation());
+      changed = true;
+      break;
+    }
+  }
+  if (changed) {
+    for (gpu::GatherOp gather : gathers)
+      if (rewritten.contains(gather.getOperation()))
+        gather.erase();
+    gpu::eraseDeadPhysicalValues(kernel);
+  }
+  return success();
+}
+
 LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
   SmallVector<gpu::GatherOp> gathers;
   kernel.walk([&](gpu::GatherOp gather) { gathers.push_back(gather); });
   for (gpu::GatherOp gather : gathers) {
-    if (!gather.getValid())
+    if (!gather.getValid() || belongsToSplitGatherPair(gather))
       continue;
     auto scalarConstant = [](Value value) -> arith::ConstantOp {
       while (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
@@ -1707,7 +1801,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 
     if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
             TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
-            DescriptorStoreOp, gpu::ParameterOp,
+            DescriptorStoreOp, SplitOp, gpu::ParameterOp,
             gpu::PhysicalExprOp,
             gpu::ProgramIdOp,
             gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
@@ -1786,6 +1880,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ArrayRef<int64_t>{1});
   if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
     return failure();
   FailureOr<bool> tensorDescriptorForms =

@@ -7,6 +7,8 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
 
+#include <algorithm>
+
 using namespace mlir;
 
 namespace intent::triton {
@@ -318,6 +320,32 @@ LogicalResult DescriptorStoreOp::verify() {
 void DescriptorStoreOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   effects.emplace_back(MemoryEffects::Write::get());
+}
+
+LogicalResult SplitOp::verify() {
+  auto source = cast<gpu::FragmentType>(getSource().getType());
+  auto low = cast<gpu::FragmentType>(getLow().getType());
+  auto high = cast<gpu::FragmentType>(getHigh().getType());
+  if (low != high || source.getShape().size() != low.getShape().size() + 1 ||
+      source.getElementType() != low.getElementType() ||
+      source.getValidity() != low.getValidity() ||
+      source.getOwner() != low.getOwner())
+    return emitOpError(
+        "requires two equal prefix fragments from one trailing pair axis");
+  auto trailing = dyn_cast<gpu::PhysicalExprAttr>(
+      source.getShape()[source.getShape().size() - 1]);
+  if (!trailing ||
+      trailing.getKind() !=
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) ||
+      trailing.getValue() != 2)
+    return emitOpError("requires a constant trailing extent of two");
+  if (!std::equal(low.getShape().begin(), low.getShape().end(),
+                  source.getShape().begin()) ||
+      !std::equal(low.getAxisMaps().begin(), low.getAxisMaps().end(),
+                  source.getAxisMaps().begin()))
+    return emitOpError(
+        "results must preserve the source prefix shape and axis relations");
+  return success();
 }
 
 } // namespace intent::triton

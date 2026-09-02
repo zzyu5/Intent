@@ -868,6 +868,11 @@ private:
                                    valueString(join.getRhs()) + ")");
       return;
     }
+    if (auto split = dyn_cast<SplitOp>(operation)) {
+      assignResults(split.getResults(),
+                    "tl.split(" + valueString(split.getSource()) + ")");
+      return;
+    }
     if (auto record = dyn_cast<gpu::MakeRecordOp>(operation)) {
       std::string tuple = "(";
       for (auto [index, field] : llvm::enumerate(record.getFields())) {

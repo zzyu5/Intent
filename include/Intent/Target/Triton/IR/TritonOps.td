@@ -88,4 +88,11 @@ def IntentTriton_DescriptorStoreOp : IntentTriton_Op<"descriptor_store", [
   let hasVerifier = 1;
 }
 
+def IntentTriton_SplitOp : IntentTriton_Op<"split", [Pure]> {
+  let arguments = (ins IntentGPU_FragmentValue:$source);
+  let results = (outs IntentGPU_FragmentValue:$low,
+                      IntentGPU_FragmentValue:$high);
+  let hasVerifier = 1;
+}
+
 #endif
