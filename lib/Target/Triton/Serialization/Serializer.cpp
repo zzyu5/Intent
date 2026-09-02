@@ -27,6 +27,8 @@ namespace intent::triton {
 namespace {
 
 constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
+constexpr llvm::StringLiteral tensorDescriptorChoice =
+    "USE_TENSOR_DESCRIPTOR";
 
 std::string pythonType(Type type, bool torch = false) {
   if (type.isIndex())
@@ -143,9 +145,14 @@ FailureOr<SmallVector<Config>> parameterConfigs(func::FuncOp kernel) {
     config.warps = warps.getInt();
     config.stages = stages.getInt();
     config.ctas = ctas.getInt();
-    for (NamedAttribute parameter : parameters)
+    for (NamedAttribute parameter : parameters) {
+      auto value = dyn_cast<IntegerAttr>(parameter.getValue());
+      if (!value)
+        return kernel.emitError(
+            "contains a non-integer legalized Triton parameter binding");
       config.kernelParameters[parameter.getName().strref().str()] =
-          cast<IntegerAttr>(parameter.getValue()).getInt();
+          value.getInt();
+    }
     configs.push_back(std::move(config));
   }
   return configs;
@@ -182,6 +189,7 @@ public:
   LogicalResult emit() {
     bindArguments();
     emitPreamble();
+    emitDescriptorPruner();
     emitHelpers();
     emitKernel();
     emitLaunch();
@@ -208,6 +216,10 @@ private:
     std::string name;
     std::string kind;
     Type type;
+  };
+  struct DescriptorABI {
+    TensorDescriptorOp operation;
+    std::string name;
   };
 
   void bindArguments() {
@@ -264,11 +276,107 @@ private:
           binding->second.name,
           SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
     });
+    kernel.walk([&](TensorDescriptorChoiceOp choice) {
+      descriptorChoice = choice;
+      values[choice.getResult()] = tensorDescriptorChoice.str();
+    });
+    kernel.walk([&](TensorDescriptorAllocatorOp allocator) {
+      descriptorAllocator = allocator;
+    });
+    kernel.walk([&](TensorDescriptorOp descriptor) {
+      std::string name =
+          "_intent_descriptor_" + std::to_string(descriptors.size());
+      descriptors.push_back({descriptor, name});
+      values[descriptor.getResult()] = name;
+    });
+    if (descriptorChoice && !descriptorAllocator) {
+      kernel.emitError(
+          "tensor descriptor form has no declared allocator requirement");
+      failed = true;
+    }
   }
 
   void emitPreamble() {
     output << "import torch\nimport triton\nimport triton.language as tl\n"
-              "from triton.language.extra import libdevice\n\n";
+              "from triton.language.extra import libdevice\n"
+              "from triton.tools.tensor_descriptor import TensorDescriptor\n\n";
+  }
+
+  void emitDescriptorPruner() {
+    if (!descriptorChoice)
+      return;
+    output << "def _intent_tensor_descriptor_legal(tensor, minimum_contiguous_bytes):\n"
+              "    return (\n"
+              "        tensor.data_ptr() % 16 == 0\n"
+              "        and tensor.ndim >= 2\n"
+              "        and tensor.ndim <= 5\n"
+              "        and tensor.is_contiguous()\n"
+              "        and all(extent > 0 for extent in tensor.shape)\n"
+              "        and tensor.stride(-1) == 1\n"
+              "        and tensor.shape[-1] * tensor.element_size() >= minimum_contiguous_bytes\n"
+              "        and tensor.shape[-1] <= 2147483647\n"
+              "        and tensor.numel() // tensor.shape[-1] <= 2147483647\n"
+              "        and all((stride * tensor.element_size()) % 16 == 0 "
+              "for stride in tensor.stride()[:-1])\n"
+              "    )\n\n"
+              "def _intent_prune_tensor_descriptor_configs(configs, named_args, **kwargs):\n"
+              "    tensors = (";
+    for (DescriptorABI &descriptor : descriptors) {
+      TensorDescriptorOp operation = descriptor.operation;
+      output << "(named_args[\"" << valueString(operation.getBase())
+             << "\"], " << operation.getMinimumContiguousBytes() << "), ";
+    }
+    output << ")\n"
+              "    descriptor_legal = all(_intent_tensor_descriptor_legal(tensor, minimum_bytes) "
+              "for tensor, minimum_bytes in tensors)\n"
+              "    if not descriptor_legal:\n"
+              "        return [config for config in configs "
+              "if not config.kwargs[\"USE_TENSOR_DESCRIPTOR\"]]\n"
+              "    retained = []\n"
+              "    for config in configs:\n"
+              "        if not config.kwargs[\"USE_TENSOR_DESCRIPTOR\"]:\n"
+              "            retained.append(config)\n"
+              "            continue\n"
+              "        args = dict(named_args)\n"
+              "        args.update(config.kwargs)\n"
+              "        if _intent_tensor_descriptor_shapes_legal(args):\n"
+              "            retained.append(config)\n"
+              "    return retained\n\n"
+              "def _intent_tensor_descriptor_shapes_legal(args):\n"
+              "    descriptors = (\n";
+    for (const DescriptorABI &descriptor : descriptors) {
+      TensorDescriptorOp operation = descriptor.operation;
+      output << "        (" << descriptorBlockShape(descriptor)
+             << ", args[\"" << valueString(operation.getBase())
+             << "\"].element_size(), "
+             << operation.getMinimumContiguousBytes() << "),\n";
+    }
+    output << "    )\n"
+              "    for block_shape, element_size, minimum_bytes in descriptors:\n"
+              "        elements = 1\n"
+              "        for extent in block_shape:\n"
+              "            if extent <= 0 or extent & (extent - 1):\n"
+              "                return False\n"
+              "            elements *= extent\n"
+              "        if elements > 1048576:\n"
+              "            return False\n"
+              "        if block_shape[-1] * element_size < minimum_bytes:\n"
+              "            return False\n"
+              "    return True\n\n"
+              "def _intent_tensor_descriptor_allocator(size, alignment, stream):\n"
+              "    return torch.empty(size, dtype=torch.int8, device=\"cuda\")\n\n"
+              "def _intent_host_tensor_descriptor_pre_hook(args):\n";
+    if (!descriptors.empty())
+      output << "    if not _intent_tensor_descriptor_shapes_legal(args):\n"
+                "        return\n"
+                "    if not isinstance(args[\""
+             << descriptors.front().name
+             << "\"], TensorDescriptor):\n"
+                "        return\n";
+    for (const DescriptorABI &descriptor : descriptors)
+      output << "    args[\"" << descriptor.name << "\"].block_shape = "
+             << descriptorBlockShape(descriptor) << "\n";
+    output << "\n";
   }
 
   void emitHelper(Operation *owner, Region &region, StringRef role) {
@@ -354,7 +462,10 @@ private:
       }
       output << "}, num_warps=" << config.warps
              << ", num_stages=" << config.stages
-             << ", num_ctas=" << config.ctas
+             << ", num_ctas=" << config.ctas;
+      if (descriptorChoice)
+        output << ", pre_hook=_intent_host_tensor_descriptor_pre_hook";
+      output
              << "),\n";
     }
     output << "    ],\n    key=[";
@@ -368,6 +479,9 @@ private:
       output << "\"" << metadata.name << "\"";
     }
     output << "],\n";
+    if (descriptorChoice)
+      output << "    prune_configs_by={\"early_config_prune\": "
+                "_intent_prune_tensor_descriptor_configs},\n";
     output << ")\n";
     if (!fullCoverageParameters.empty()) {
       output << "@triton.heuristics({\n";
@@ -384,6 +498,12 @@ private:
       first = false;
       output << view.name;
     }
+    for (const DescriptorABI &descriptor : descriptors) {
+      if (!first)
+        output << ", ";
+      first = false;
+      output << descriptor.name;
+    }
     for (const ScalarABI &scalar : scalars) {
       if (!first)
         output << ", ";
@@ -397,6 +517,12 @@ private:
         output << ", ";
       first = false;
       output << metadata.name << ": tl.constexpr";
+    }
+    if (descriptorChoice) {
+      if (!first)
+        output << ", ";
+      first = false;
+      output << tensorDescriptorChoice << ": tl.constexpr";
     }
     SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
@@ -434,12 +560,37 @@ private:
       output << scalar.name;
     }
     output << "):\n";
+    if (descriptorAllocator)
+      line("triton.set_allocator(_intent_tensor_descriptor_allocator)", 1);
     for (const MetadataABI &metadata : metadataArguments) {
       const ViewABI &source = viewByABI(metadata.sourceABI);
       line(metadata.name + " = " + source.name +
            (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
            std::to_string(metadata.sourceAxis) +
            (metadata.kind == "dimension" ? "]" : ")"), 1);
+    }
+    for (const DescriptorABI &descriptor : descriptors) {
+      TensorDescriptorOp declaration = descriptor.operation;
+      std::string view = valueString(declaration.getBase());
+      SmallVector<std::string> shape;
+      SmallVector<std::string> strides;
+      SmallVector<std::string> initialBlockShape;
+      for (Value extent : declaration.getShape())
+        shape.push_back(descriptorLaunchValue(extent));
+      for (Value stride : declaration.getStrides())
+        strides.push_back(descriptorLaunchValue(stride));
+      for (int64_t extent : declaration.getInitialBlockShape())
+        initialBlockShape.push_back(std::to_string(extent));
+      line(descriptor.name + " = (TensorDescriptor(" + view +
+               ", shape=" + stringList(shape) + ", strides=" +
+               stringList(strides) + ", block_shape=" +
+               stringList(initialBlockShape) + ", padding=\"" +
+               declaration.getPadding().str() + "\") if " +
+               "_intent_tensor_descriptor_legal(" + view + ", " +
+               std::to_string(declaration.getMinimumContiguousBytes()) +
+               ") else " + view +
+               ")",
+           1);
     }
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
     std::string grid = "grid = lambda META: (";
@@ -458,6 +609,12 @@ private:
         call += ", ";
       first = false;
       call += view.name;
+    }
+    for (const DescriptorABI &descriptor : descriptors) {
+      if (!first)
+        call += ", ";
+      first = false;
+      call += descriptor.name;
     }
     for (const ScalarABI &scalar : scalars) {
       if (!first)
@@ -551,6 +708,9 @@ private:
   }
 
   void emitOperation(Operation &operation) {
+    if (isa<TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
+            TensorDescriptorOp>(operation))
+      return;
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       values[constant.getResult()] = literal(constant.getValue());
       return;
@@ -723,6 +883,12 @@ private:
     if (auto extract = dyn_cast<gpu::ExtractOp>(operation)) {
       assign(extract.getResult(), valueString(extract.getRecord()) + "[" +
                                        std::to_string(extract.getField()) + "]");
+      return;
+    }
+    if (auto load = dyn_cast<DescriptorLoadOp>(operation)) {
+      assign(load.getResult(),
+             valueString(load.getDescriptor()) + ".load(" +
+                 descriptorOffsets(load.getOffsets()) + ")");
       return;
     }
     if (auto load = dyn_cast<BlockLoadOp>(operation)) {
@@ -941,6 +1107,14 @@ private:
            atomicScope(atomic.getSharing()) + "\")");
       assign(atomic.getResult(), "(" + old + ", (" + old + " == " +
                                      valueString(atomic.getExpected()) + "))");
+      return;
+    }
+    if (auto store = dyn_cast<DescriptorStoreOp>(operation)) {
+      auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
+      line(valueString(store.getDescriptor()) + ".store(" +
+           descriptorOffsets(store.getOffsets()) +
+           ", tl.cast(" + valueString(store.getValue()) + ", " +
+           pythonType(fragment.getElementType()) + "))");
       return;
     }
     if (auto store = dyn_cast<BlockStoreOp>(operation)) {
@@ -1193,6 +1367,117 @@ private:
     return result + ")";
   }
 
+  std::string stringList(ArrayRef<std::string> values) const {
+    std::string result = "[";
+    for (auto [index, value] : llvm::enumerate(values)) {
+      if (index)
+        result += ", ";
+      result += value;
+    }
+    return result + "]";
+  }
+
+  std::string descriptorOffsets(ValueRange offsets) {
+    SmallVector<std::string> expressions;
+    for (Value offset : offsets)
+      expressions.push_back("tl.cast(" + valueString(offset) + ", tl.int32)");
+    return stringList(expressions);
+  }
+
+  std::string descriptorArgumentExpression(
+      gpu::PhysicalExprAttr expression) const {
+    auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+    if (kind == gpu::PhysicalExprKind::Constant)
+      return std::to_string(expression.getValue());
+    if (kind == gpu::PhysicalExprKind::Parameter) {
+      std::string name = expression.getSymbol().getValue().str();
+      if (fullCoverageParameters.count(name))
+        return "_intent_cover_" + name + "(args)";
+      return "args[\"" + name + "\"]";
+    }
+    if (kind == gpu::PhysicalExprKind::Dimension ||
+        kind == gpu::PhysicalExprKind::ScalarABI)
+      return ("args[\"" + expression.getSymbol().getValue() + "\"]").str();
+    SmallVector<std::string> operands;
+    for (Attribute operand : expression.getOperands())
+      operands.push_back(descriptorArgumentExpression(
+          cast<gpu::PhysicalExprAttr>(operand)));
+    if (kind == gpu::PhysicalExprKind::Add)
+      return "(" + operands[0] + " + " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::Subtract)
+      return "(" + operands[0] + " - " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::Multiply)
+      return "(" + operands[0] + " * " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::CeilDiv)
+      return "triton.cdiv(" + operands[0] + ", " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::Minimum)
+      return "min(" + operands[0] + ", " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::Maximum)
+      return "max(" + operands[0] + ", " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::FloorDiv)
+      return "(" + operands[0] + " // " + operands[1] + ")";
+    if (kind == gpu::PhysicalExprKind::Select)
+      return "(" + operands[1] + " if " + operands[0] + " else " +
+             operands[2] + ")";
+    if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
+      return "triton.next_power_of_2(" + operands[0] + ")";
+    return {};
+  }
+
+  std::string descriptorLaunchValue(Value value) {
+    if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
+      auto view = cast<gpu::ViewType>(dimension.getView().getType());
+      return expressionString(
+          cast<gpu::PhysicalExprAttr>(
+              view.getLayout().getExtents()[dimension.getAxis()]),
+          false);
+    }
+    if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
+      return expressionString(physical.getExpression(), false);
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>())
+      return literal(constant.getValue());
+    if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
+      std::string lhs = descriptorLaunchValue(binary.getLhs());
+      std::string rhs = descriptorLaunchValue(binary.getRhs());
+      auto infix = [&](StringRef spelling) {
+        return "(" + lhs + " " + spelling.str() + " " + rhs + ")";
+      };
+      switch (binary.getOperatorKind()) {
+      case BinaryOperator::Add:
+        return infix("+");
+      case BinaryOperator::Subtract:
+        return infix("-");
+      case BinaryOperator::Multiply:
+        return infix("*");
+      case BinaryOperator::FloorDivide:
+        return infix("//");
+      case BinaryOperator::Maximum:
+        return "max(" + lhs + ", " + rhs + ")";
+      case BinaryOperator::Minimum:
+        return "min(" + lhs + ", " + rhs + ")";
+      default:
+        break;
+      }
+    }
+    if (isa<BlockArgument>(value))
+      return valueString(value);
+    failed = true;
+    return "<unsupported-descriptor-launch-value>";
+  }
+
+  std::string descriptorBlockShape(const DescriptorABI &descriptor) const {
+    SmallVector<std::string> shape;
+    TensorDescriptorOp operation = descriptor.operation;
+    for (Value extent : operation.getBlockShape()) {
+      auto physical = extent.getDefiningOp<gpu::PhysicalExprOp>();
+      if (!physical)
+        return {};
+      shape.push_back(
+          descriptorArgumentExpression(physical.getExpression()));
+    }
+    return stringList(shape);
+  }
+
   std::string blockPointer(Value viewValue, ValueRange offsets,
                            ArrayRef<int64_t> blockAxes,
                            ArrayRef<int64_t> order,
@@ -1333,6 +1618,9 @@ private:
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
+  TensorDescriptorChoiceOp descriptorChoice;
+  TensorDescriptorAllocatorOp descriptorAllocator;
+  SmallVector<DescriptorABI> descriptors;
   unsigned indent = 0;
   unsigned counter = 0;
   unsigned helperCounter = 0;
