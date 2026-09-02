@@ -149,6 +149,37 @@ Type resourceElementType(Type type) {
   return {};
 }
 
+LogicalResult verifyReadableResource(Operation *owner, Type resource) {
+  auto view = dyn_cast<ViewType>(resource);
+  return !view || view.getAccess() != 1
+             ? success()
+             : owner->emitOpError("Out-only external view cannot be read");
+}
+
+LogicalResult verifyWritableResource(Operation *owner, Type resource) {
+  auto view = dyn_cast<ViewType>(resource);
+  return !view || view.getAccess() != 0
+             ? success()
+             : owner->emitOpError("In-only external view cannot be written");
+}
+
+LogicalResult verifyResourceSharing(Operation *owner, Type resource,
+                                    AtomicSharingDomain sharing) {
+  AtomicSharingDomain expected;
+  if (auto buffer = dyn_cast<BufferType>(resource))
+    expected = buffer.getScope().getValue() == BufferScope::InvocationWorkspace
+                   ? AtomicSharingDomain::KernelInvocation
+                   : AtomicSharingDomain::ProgramInstance;
+  else if (isa<ViewType>(resource))
+    expected = AtomicSharingDomain::KernelInvocation;
+  else
+    return owner->emitOpError("sharing requires a physical resource");
+  return sharing == expected
+             ? success()
+             : owner->emitOpError(
+                   "sharing domain disagrees with the physical resource scope");
+}
+
 LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
                                       ValueRange coordinates) {
   auto fragment = dyn_cast<FragmentType>(payload);
@@ -761,6 +792,8 @@ LogicalResult LoadOp::verify() {
                              : cast<BufferType>(getResource().getType()).getElementType();
   if (resourceElement != elementType(getResult().getType()))
     return emitOpError("load resource/result element types disagree");
+  if (failed(verifyReadableResource(getOperation(), getResource().getType())))
+    return failure();
   return verifyAccessAxisExtents(getOperation(), getResult().getType(),
                                  getCoordinates());
 }
@@ -817,6 +850,8 @@ LogicalResult StoreOp::verify() {
                              : cast<BufferType>(getResource().getType()).getElementType();
   if (resourceElement != elementType(getValue().getType()))
     return emitOpError("store resource/value element types disagree");
+  if (failed(verifyWritableResource(getOperation(), getResource().getType())))
+    return failure();
   return verifyAccessAxisExtents(getOperation(), getValue().getType(),
                                  getCoordinates());
 }
@@ -1293,6 +1328,10 @@ LogicalResult ScatterReduceOp::verify() {
   if (failed(verifyAccessAxisExtents(getOperation(), getValue().getType(),
                                      getCoordinates())))
     return failure();
+  if (failed(verifyWritableResource(getOperation(), getResource().getType())) ||
+      failed(verifyResourceSharing(getOperation(), getResource().getType(),
+                                   getSharing())))
+    return failure();
   SmallVector<Type> arguments{getValue().getType(), getValue().getType()};
   SmallVector<Type> results{getValue().getType()};
   return verifyHelperRegion(getOperation(), getCombine(), arguments, results);
@@ -1324,19 +1363,11 @@ LogicalResult verifyAtomicAddress(Operation *owner, Type resource,
   if (!orderingLegal)
     return owner->emitOpError(
         "atomic ordering is illegal for this physical operation");
-  if (auto buffer = dyn_cast<BufferType>(resource)) {
-    AtomicSharingDomain expected =
-        buffer.getScope().getValue() == BufferScope::InvocationWorkspace
-            ? AtomicSharingDomain::KernelInvocation
-            : AtomicSharingDomain::ProgramInstance;
-    if (sharing != expected)
-      return owner->emitOpError(
-          "atomic sharing domain disagrees with its physical allocation scope");
-  } else if (isa<ViewType>(resource) &&
-             sharing != AtomicSharingDomain::KernelInvocation) {
+  if (failed(verifyResourceSharing(owner, resource, sharing)))
+    return failure();
+  if (auto view = dyn_cast<ViewType>(resource); view && view.getAccess() != 2)
     return owner->emitOpError(
-        "external-view atomic must cover the kernel invocation");
-  }
+        "external atomic target must use InOut access semantics");
   if (valid && !elementType(valid.getType()).isInteger(1))
     return owner->emitOpError("atomic validity must be a predicate");
   llvm::DenseSet<int64_t> axes;
@@ -1435,6 +1466,12 @@ LogicalResult BufferOp::verify() {
   if (getInitialValue() &&
       elementType(getInitialValue().getType()) != getResult().getType().getElementType())
     return emitOpError("buffer initializer element type disagrees");
+  if (Value initialValue = getInitialValue())
+    if (auto initial = dyn_cast<FragmentType>(initialValue.getType());
+        initial && (initial.getShape() != type.getShape() ||
+                    initial.getOwner() != type.getOwner()))
+      return emitOpError(
+          "buffer full-value initializer must cover its physical shape and owner");
   return success();
 }
 
