@@ -1497,6 +1497,89 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
   return success();
 }
 
+scf::ForOp enclosingRegionContractionSegment(Operation *operation) {
+  for (Operation *parent = operation->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto loop = dyn_cast<scf::ForOp>(parent);
+    if (!loop)
+      continue;
+    auto segment = loop.getStep().getDefiningOp<ParameterOp>();
+    if (!segment ||
+        segment.getParameter().getRole() !=
+            static_cast<uint32_t>(ParameterRole::ScanChunk) ||
+        segment.getParameter().getCategory() !=
+            static_cast<uint32_t>(ParameterCategory::RegionContraction))
+      continue;
+    return loop;
+  }
+  return {};
+}
+
+FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
+                                              func::FuncOp kernel) {
+  if (contract.getLhsReductionAxes().size() != 1 ||
+      contract.getRhsReductionAxes().size() != 1)
+    return false;
+  scf::ForOp segmentLoop =
+      enclosingRegionContractionSegment(contract.getOperation());
+  if (!segmentLoop)
+    return false;
+  ParameterOp segment = segmentLoop.getStep().getDefiningOp<ParameterOp>();
+  StringAttr segmentName = segment.getParameter().getName();
+  auto usesSegment = [&](Value operand, int64_t axis) {
+    auto fragment = dyn_cast<FragmentType>(operand.getType());
+    if (!fragment || axis < 0 ||
+        axis >= static_cast<int64_t>(fragment.getShape().size()))
+      return false;
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    return extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+           extent.getSymbol() == segmentName;
+  };
+  if (!usesSegment(contract.getLhs(),
+                   contract.getLhsReductionAxes().front()) ||
+      !usesSegment(contract.getRhs(),
+                   contract.getRhsReductionAxes().front()))
+    return false;
+  if (failed(markNativeCoverage(kernel, contract)))
+    return failure();
+  return true;
+}
+
+FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
+                                                 func::FuncOp kernel) {
+  if (contract.getLhsReductionAxes().size() != 1 ||
+      contract.getRhsReductionAxes().size() != 1)
+    return false;
+  LoadOp lhsLoad = matrixOperandLoad(contract.getLhs());
+  LoadOp rhsLoad = matrixOperandLoad(contract.getRhs());
+  if (!lhsLoad || !rhsLoad)
+    return false;
+  scf::ForOp segmentLoop =
+      enclosingRegionContractionSegment(contract.getOperation());
+  if (!segmentLoop)
+    return false;
+
+  DominanceInfo dominance(kernel);
+  bool lhsInvariant = dominance.dominates(lhsLoad.getOperation(),
+                                          segmentLoop.getOperation());
+  bool rhsInvariant = dominance.dominates(rhsLoad.getOperation(),
+                                          segmentLoop.getOperation());
+  if (lhsInvariant == rhsInvariant)
+    return false;
+
+  Value invariant = lhsInvariant ? contract.getLhs() : contract.getRhs();
+  unsigned reductionAxis = static_cast<unsigned>(
+      lhsInvariant ? contract.getLhsReductionAxes().front()
+                   : contract.getRhsReductionAxes().front());
+  if (failed(realizeFullCoverageDimension(kernel, invariant, reductionAxis)))
+    return contract.emitOpError(
+        "structured contraction invariant has no exact full-coverage reduction realization");
+  if (failed(markNativeCoverage(kernel, contract)))
+    return failure();
+  return true;
+}
+
 /// Block only the reduction traversal of a contraction whose free axes have
 /// already been materialized by pointwise ownership.  This form is used when
 /// several contractions feed one pure output expression: each term keeps its
@@ -3049,6 +3132,18 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
           "shared scaled-contraction blocking requires fragment operands, accumulator, and result");
   for (ContractOp contract : contracts)
     if (requiresPhysicalRealization(contract)) {
+      FailureOr<bool> nativeSegment =
+          realizeSegmentNativeReduction(contract, kernel);
+      if (failed(nativeSegment))
+        return failure();
+      if (*nativeSegment)
+        continue;
+      FailureOr<bool> nativeStructured =
+          realizeStructuredNativeReduction(contract, kernel);
+      if (failed(nativeStructured))
+        return failure();
+      if (*nativeStructured)
+        continue;
       const bool rangeSingleReduction = hasRangeContractForm(contract);
       if (!rangeSingleReduction &&
           contract.getLhsReductionAxes().size() == 1 &&
