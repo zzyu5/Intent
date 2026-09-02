@@ -148,21 +148,8 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth = 0) {
   if (leftDim || rightDim) {
     if (!leftDim || !rightDim)
       return false;
-    auto leftView = cast<ViewType>(leftDim.getView().getType());
-    auto rightView = cast<ViewType>(rightDim.getView().getType());
-    int64_t leftAxis = leftDim.getAxis();
-    int64_t rightAxis = rightDim.getAxis();
-    if (leftAxis < 0 || rightAxis < 0 ||
-        leftAxis >= static_cast<int64_t>(
-                        leftView.getLayout().getDimensionIds().size()) ||
-        rightAxis >= static_cast<int64_t>(
-                         rightView.getLayout().getDimensionIds().size()))
-      return false;
-    int64_t leftDimension =
-        leftView.getLayout().getDimensionIds().asArrayRef()[leftAxis];
-    int64_t rightDimension =
-        rightView.getLayout().getDimensionIds().asArrayRef()[rightAxis];
-    return leftDimension > 0 && leftDimension == rightDimension;
+    return leftDim.getView() == rightDim.getView() &&
+           leftDim.getAxis() == rightDim.getAxis();
   }
   auto leftCast = lhs.getDefiningOp<CastOp>();
   auto rightCast = rhs.getDefiningOp<CastOp>();
@@ -2211,24 +2198,10 @@ bool PhysicalProgramAnalysis::isTailPredicate(
     Value expectedEnd = stripScalarIdentity(entry.second);
     if (lhs == expectedRange.getResult())
       return rhs == expectedEnd;
-    if (comparison->hasAttr(physicalTailAttr) && predicateRange &&
-        sameLogicalRange(predicateRange, expectedRange) &&
-        sameScalarExpression(rhs, expectedEnd))
-      return true;
     if (!predicateRange ||
         !(sourceAxisIdentity(predicateRange) ==
           sourceAxisIdentity(expectedRange)))
       return false;
-    FailureOr<int64_t> predicateDimension = querySourceDimension(
-        predicateRange.getResult().getType(), sourceAxisIdentity(predicateRange));
-    FailureOr<int64_t> expectedDimension = querySourceDimension(
-        expectedRange.getResult().getType(), sourceAxisIdentity(expectedRange));
-    if (!predicateRange->hasAttr(sourceSubregionAttr) &&
-        !expectedRange->hasAttr(sourceSubregionAttr) &&
-        succeeded(predicateDimension) && succeeded(expectedDimension) &&
-        *predicateDimension == *expectedDimension &&
-        sameScalarExpression(rhs, expectedEnd))
-      return true;
     return sameScalarExpression(rhs, expectedEnd) &&
            sameScalarExpression(predicateRange.getStart(),
                                 expectedRange.getStart()) &&
