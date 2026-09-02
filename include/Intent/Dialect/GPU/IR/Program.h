@@ -41,6 +41,8 @@ inline constexpr llvm::StringLiteral reductionSourcesAttr =
     "intent_gpu.reduction_sources";
 inline constexpr llvm::StringLiteral parameterSourceAttr =
     "intent_gpu.parameter_source";
+inline constexpr llvm::StringLiteral parameterGroupAttr =
+    "intent_gpu.parameter_group";
 inline constexpr llvm::StringLiteral pointwiseChunkAttr =
     "intent_gpu.pointwise_chunk";
 inline constexpr llvm::StringLiteral pointwiseLocalAttr =

@@ -477,6 +477,22 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       correlatedReductionContractionParameters(
           kernel, parameters, hasTwoAxisPointwiseOwnership,
           hasFixedPointwiseLocal);
+  SmallVector<Attribute> indirectRowGroups;
+  auto capabilities =
+      kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (capabilities && capabilities.getMatrixUnits())
+    for (ParameterOp parameter : parameters) {
+      ParameterAttr schema = parameter.getParameter();
+      Attribute group = parameter->getAttr(parameterGroupAttr);
+      if (schema.getCategory() !=
+              static_cast<uint32_t>(ParameterCategory::Contraction) ||
+          schema.getRole() !=
+              static_cast<uint32_t>(ParameterRole::TraversalWorkers) ||
+          !isa_and_nonnull<ArrayAttr>(group) ||
+          llvm::is_contained(indirectRowGroups, group))
+        continue;
+      indirectRowGroups.push_back(group);
+    }
   unsigned profileCount = 0;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
@@ -521,6 +537,33 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                                             : profiles.front();
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
                                          requestedValue(profile, role));
+      bindings.push_back(builder.getNamedAttr(
+          schema.getName(), builder.getI64IntegerAttr(selected)));
+    }
+    DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
+    if (!llvm::is_contained(tuples, Attribute(tuple)))
+      tuples.push_back(tuple);
+  }
+  if (!indirectRowGroups.empty()) {
+    constexpr TuningProfile indirectRowProfile{64, 64, 32, 1,
+                                               128, 8,  8};
+    SmallVector<NamedAttribute> bindings;
+    for (ParameterOp parameter : parameters) {
+      ParameterAttr schema = parameter.getParameter();
+      auto role = static_cast<ParameterRole>(schema.getRole());
+      SmallVector<TuningProfile, 5> profiles = profilesFor(
+          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
+      bool indirectContraction =
+          schema.getCategory() ==
+              static_cast<uint32_t>(ParameterCategory::Contraction) &&
+          llvm::is_contained(indirectRowGroups,
+                             parameter->getAttr(parameterGroupAttr));
+      int64_t selected = selectCandidate(
+          schema.getCandidates().asArrayRef(),
+          requestedValue(indirectContraction ? indirectRowProfile
+                                             : profiles.front(),
+                         role));
       bindings.push_back(builder.getNamedAttr(
           schema.getName(), builder.getI64IntegerAttr(selected)));
     }

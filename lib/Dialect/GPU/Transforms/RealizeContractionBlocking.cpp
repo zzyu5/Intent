@@ -2338,9 +2338,19 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   unsigned columnResourceAxis = rhsLoad.getSourceAxes()[*rhsColumnCoordinate];
   MLIRContext *context = kernel.getContext();
   Location location = contract.getLoc();
-  std::string suffix =
-      ("_" + Twine(rowMap->getSourceId()) + "_" +
-       Twine(columnMap->getSourceId()))
+  auto sourceSuffix = [](AxisMapAttr mapping) {
+    return ("_" + Twine(mapping.getSourceId()) + "_" +
+            Twine(mapping.getSourceAxis()) + "_" +
+            Twine(static_cast<unsigned>(mapping.getDerived())))
+        .str();
+  };
+  std::string suffix = sourceSuffix(*rowMap);
+  suffix += sourceSuffix(*lhsReductionMap);
+  suffix += sourceSuffix(*rhsReductionMap);
+  suffix += sourceSuffix(*columnMap);
+  suffix +=
+      ("_" + Twine(static_cast<unsigned>(contractionCategory)) + "_" +
+       Twine(static_cast<unsigned>(indirectRow)))
           .str();
   ParameterOp blockM = getOrCreatePhysicalParameter(
       kernel, "BLOCK_M" + suffix, ParameterRole::OwnershipM,
@@ -2396,6 +2406,26 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
   }
   if (runtimeRowTraversal && !rowWorkers)
     return failure();
+  ArrayAttr parameterGroup = ArrayAttr::get(
+      context,
+      {PhysicalSourceAttr::get(context, rowMap->getSourceId(),
+                               rowMap->getSourceAxis(), rowMap->getDerived()),
+       PhysicalSourceAttr::get(
+           context, lhsReductionMap->getSourceId(),
+           lhsReductionMap->getSourceAxis(), lhsReductionMap->getDerived()),
+       PhysicalSourceAttr::get(
+           context, rhsReductionMap->getSourceId(),
+           rhsReductionMap->getSourceAxis(), rhsReductionMap->getDerived()),
+       PhysicalSourceAttr::get(context, columnMap->getSourceId(),
+                               columnMap->getSourceAxis(),
+                               columnMap->getDerived()),
+       IntegerAttr::get(IntegerType::get(context, 32),
+                        static_cast<uint32_t>(contractionCategory)),
+       BoolAttr::get(context, indirectRow)});
+  for (ParameterOp parameter : {blockM, blockN, blockK})
+    parameter->setAttr(parameterGroupAttr, parameterGroup);
+  if (rowWorkers)
+    rowWorkers->setAttr(parameterGroupAttr, parameterGroup);
   PhysicalExprAttr unitM =
       parameterExpression(context, blockM.getParameter().getName().getValue());
   PhysicalExprAttr unitN =
