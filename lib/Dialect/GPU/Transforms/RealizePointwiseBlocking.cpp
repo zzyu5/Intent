@@ -1404,6 +1404,96 @@ FailureOr<int64_t> reuseTraversalDimension(func::FuncOp kernel,
                               : FailureOr<int64_t>(failure());
 }
 
+bool reachesDifferentStore(Value value, StoreOp current,
+                           PhysicalSourceAxis source, int64_t dimension,
+                           llvm::SmallPtrSetImpl<Operation *> &visited) {
+  for (Operation *user : value.getUsers()) {
+    if (auto store = dyn_cast<StoreOp>(user);
+        store && store != current && store.getValue() == value) {
+      PhysicalAxisProjection payload = queryFragmentAxis(value.getType(), source);
+      bool coordinateCarriesAxis =
+          llvm::any_of(store.getCoordinates(), [&](Value coordinate) {
+            PhysicalAxisProjection projection =
+                queryFragmentAxis(coordinate.getType(), source);
+            return projection.isExact() && projection.dimensionId == dimension;
+          });
+      if (payload.isExact() && payload.dimensionId == dimension &&
+          coordinateCarriesAxis)
+        return true;
+    }
+    if (!visited.insert(user).second || user->getNumRegions() != 0 ||
+        !isPhysicalReplayNode(user, PhysicalReplayScope::ValueGraph,
+                              /*allowAccesses=*/false))
+      continue;
+    for (Value result : user->getResults())
+      if (reachesDifferentStore(result, current, source, dimension, visited))
+        return true;
+  }
+  return false;
+}
+
+bool reachesReduction(Value value, PhysicalSourceAxis source,
+                      int64_t dimension,
+                      llvm::SmallPtrSetImpl<Operation *> &visited) {
+  for (Operation *user : value.getUsers()) {
+    if (auto reduce = dyn_cast<ReduceOp>(user)) {
+      for (Value input :
+           reduce.getInputs().take_front(reduce.getSourceCount())) {
+        if (input != value)
+          continue;
+        auto fragment = dyn_cast<FragmentType>(input.getType());
+        if (!fragment)
+          continue;
+        for (int64_t axis : reduce.getAxes()) {
+          if (axis < 0 ||
+              axis >= static_cast<int64_t>(fragment.getShape().size()))
+            continue;
+          PhysicalAxisProjection projection =
+              queryFragmentAxis(fragment, source);
+          if (projection.isExact() &&
+              projection.fragmentAxis == static_cast<unsigned>(axis) &&
+              projection.dimensionId == dimension)
+            return true;
+        }
+      }
+    }
+    if (!visited.insert(user).second || user->getNumRegions() != 0 ||
+        !isPhysicalReplayNode(user, PhysicalReplayScope::ValueGraph,
+                              /*allowAccesses=*/false))
+      continue;
+    for (Value result : user->getResults())
+      if (reachesReduction(result, source, dimension, visited))
+        return true;
+  }
+  return false;
+}
+
+bool hasMaterializedReductionStoreFork(
+    Value value, StoreOp current, PhysicalSourceAxis source, int64_t dimension,
+    llvm::SmallPtrSetImpl<Operation *> &visited) {
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (fragment) {
+    PhysicalAxisProjection projection = queryFragmentAxis(fragment, source);
+    if (projection.isExact() && projection.dimensionId == dimension) {
+      llvm::SmallPtrSet<Operation *, 16> storeVisited;
+      llvm::SmallPtrSet<Operation *, 16> reductionVisited;
+      if (reachesDifferentStore(value, current, source, dimension,
+                                storeVisited) &&
+          reachesReduction(value, source, dimension, reductionVisited))
+        return true;
+    }
+  }
+  Operation *producer = value.getDefiningOp();
+  if (!producer || !visited.insert(producer).second ||
+      !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+                            /*allowAccesses=*/true))
+    return false;
+  return llvm::any_of(producer->getOperands(), [&](Value operand) {
+    return hasMaterializedReductionStoreFork(operand, current, source,
+                                             dimension, visited);
+  });
+}
+
 LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              MakeRangeOp range,
                                              ArrayRef<StoreOp> stores,
@@ -2999,7 +3089,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           PhysicalReplayFact replay = analysis.replayability(
               store.getValue(), source, PhysicalReplayScope::ValueGraph,
               /*allowAccesses=*/true, store.getOperation(), dimension);
-          replayable &= replay.isReplayable() &&
+          llvm::SmallPtrSet<Operation *, 32> materializationVisited;
+          bool materializedFork =
+              replay.crossesAccess && hasMaterializedReductionStoreFork(
+                                          store.getValue(), store, source,
+                                          dimension, materializationVisited);
+          replayable &= replay.isReplayable() && !materializedFork &&
                         (effectLocal == effectLocalOrigins.end() ||
                          !replay.crossesStructuredProgram);
         }
