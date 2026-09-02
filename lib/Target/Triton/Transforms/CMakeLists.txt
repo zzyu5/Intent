@@ -9,4 +9,5 @@ add_mlir_library(MLIRIntentTritonTransforms
   MLIRSCFDialect
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
+  MLIRIntentTritonDialect
 )

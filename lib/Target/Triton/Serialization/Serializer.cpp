@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -724,6 +725,19 @@ private:
                                        std::to_string(extract.getField()) + "]");
       return;
     }
+    if (auto load = dyn_cast<BlockLoadOp>(operation)) {
+      auto fragment = load.getResult().getType();
+      std::string call = "tl.load(" +
+                         blockPointer(load.getView(), load.getOffsets(),
+                                      load.getBlockAxes(), load.getOrder(),
+                                      fragment);
+      if (!load.getBoundaryAxes().empty())
+        call += ", boundary_check=" + axisTuple(load.getBoundaryAxes()) +
+                ", padding_option=\"" + load.getPadding().str() + "\"";
+      call += ")";
+      assign(load.getResult(), call);
+      return;
+    }
     if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
       std::string call = "tl.load(" + pointer(load.getResource(),
                                                load.getCoordinates(),
@@ -927,6 +941,18 @@ private:
            atomicScope(atomic.getSharing()) + "\")");
       assign(atomic.getResult(), "(" + old + ", (" + old + " == " +
                                      valueString(atomic.getExpected()) + "))");
+      return;
+    }
+    if (auto store = dyn_cast<BlockStoreOp>(operation)) {
+      auto fragment = store.getValue().getType();
+      std::string call =
+          "tl.store(" +
+          blockPointer(store.getView(), store.getOffsets(),
+                       store.getBlockAxes(), store.getOrder(), fragment) +
+          ", " + valueString(store.getValue());
+      if (!store.getBoundaryAxes().empty())
+        call += ", boundary_check=" + axisTuple(store.getBoundaryAxes());
+      line(call + ")");
       return;
     }
     if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
@@ -1140,6 +1166,74 @@ private:
       result += selector;
     }
     return result + "]";
+  }
+
+  std::string axisTuple(ArrayRef<int64_t> axes) const {
+    std::string result = "(";
+    for (auto [index, axis] : llvm::enumerate(axes)) {
+      if (index)
+        result += ", ";
+      result += std::to_string(axis);
+    }
+    if (axes.size() == 1)
+      result += ",";
+    return result + ")";
+  }
+
+  std::string stringTuple(ArrayRef<std::string> values) const {
+    std::string result = "(";
+    for (auto [index, value] : llvm::enumerate(values)) {
+      if (index)
+        result += ", ";
+      result += value;
+    }
+    if (values.size() == 1)
+      result += ",";
+    return result + ")";
+  }
+
+  std::string blockPointer(Value viewValue, ValueRange offsets,
+                           ArrayRef<int64_t> blockAxes,
+                           ArrayRef<int64_t> order,
+                           gpu::FragmentType fragment) {
+    auto view = cast<gpu::ViewType>(viewValue.getType());
+    auto strides = view.getLayout().getStrides();
+    auto strideString = [&](int64_t axis) -> std::string {
+      Attribute stride = strides[axis];
+      if (auto symbol = dyn_cast<StringAttr>(stride))
+        return symbol.getValue().str();
+      if (auto integer = dyn_cast<IntegerAttr>(stride))
+        return std::to_string(integer.getInt());
+      failed = true;
+      return {};
+    };
+
+    std::string base = valueString(viewValue);
+    for (int64_t viewAxis = 0;
+         viewAxis < static_cast<int64_t>(view.getRank()); ++viewAxis) {
+      base += " + tl.cast(" + valueString(offsets[viewAxis]) +
+              ", tl.int64) * " + strideString(viewAxis);
+    }
+
+    SmallVector<std::string> shape;
+    SmallVector<std::string> blockStrides;
+    SmallVector<std::string> offsetExpressions;
+    for (int64_t viewAxis : blockAxes) {
+      shape.push_back(
+          "(" +
+          expressionString(cast<gpu::PhysicalExprAttr>(
+                               view.getLayout().getExtents()[viewAxis]),
+                           false) +
+          " - tl.cast(" + valueString(offsets[viewAxis]) + ", tl.int64))");
+      blockStrides.push_back(strideString(viewAxis));
+      offsetExpressions.push_back("0");
+    }
+    return "tl.make_block_ptr(base=(" + base + ")" +
+           ", shape=" + stringTuple(shape) +
+           ", strides=" + stringTuple(blockStrides) +
+           ", offsets=" + stringTuple(offsetExpressions) +
+           ", block_shape=" + fragmentShape(fragment) +
+           ", order=" + axisTuple(order) + ")";
   }
 
   std::string pointer(Value resource, ValueRange coordinates,

@@ -17,6 +17,7 @@ target_link_libraries(intent-compile PRIVATE
   MLIRIntentTileLangDialect
   MLIRIntentTileLangTransforms
   MLIRIntentTileLangSerialization
+  MLIRIntentTritonDialect
   MLIRIntentTritonTransforms
   MLIRIntentTritonSerialization
   MLIRIntentTransforms

@@ -8,6 +8,7 @@
 #include "Intent/Target/TileLang/IR/TileLangDialect.h"
 #include "Intent/Target/TileLang/Serialization/Serializer.h"
 #include "Intent/Target/TileLang/Transforms/Passes.h"
+#include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
 #include "Intent/Transforms/Passes.h"
@@ -89,11 +90,13 @@ int main(int argc, char **argv) {
   mlir::registerAllDialects(registry);
   registry.insert<intent::IntentDialect, intent::gpu::IntentGPUDialect,
                   intent::cutile::IntentCuTileDialect,
-                  intent::tilelang::IntentTileLangDialect>();
+                  intent::tilelang::IntentTileLangDialect,
+                  intent::triton::IntentTritonDialect>();
   mlir::MLIRContext context(registry);
   context.loadDialect<intent::IntentDialect, intent::gpu::IntentGPUDialect,
                       intent::cutile::IntentCuTileDialect,
                       intent::tilelang::IntentTileLangDialect,
+                      intent::triton::IntentTritonDialect,
                       mlir::arith::ArithDialect, mlir::func::FuncDialect,
                       mlir::scf::SCFDialect>();
 

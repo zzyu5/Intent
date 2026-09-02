@@ -5,9 +5,11 @@
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -249,6 +251,227 @@ bool isCompileTimeExpression(gpu::PhysicalExprAttr expression) {
   return llvm::all_of(expression.getOperands(), [](Attribute operand) {
     return isCompileTimeExpression(cast<gpu::PhysicalExprAttr>(operand));
   });
+}
+
+struct BlockAccessPlan {
+  SmallVector<Value> offsets;
+  SmallVector<int64_t> blockAxes;
+  SmallVector<int64_t> order;
+  SmallVector<int64_t> boundaryAxes;
+};
+
+bool isUnitStep(Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
+  return constant && constant.value() == 1;
+}
+
+Value stripShapeOnly(Value value) {
+  while (true) {
+    if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>()) {
+      value = broadcast.getValue();
+      continue;
+    }
+    if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>()) {
+      value = reshape.getValue();
+      continue;
+    }
+    if (auto splat = value.getDefiningOp<gpu::SplatOp>()) {
+      value = splat.getValue();
+      continue;
+    }
+    return value;
+  }
+}
+
+bool isTrueValue(Value value) {
+  auto constant = stripShapeOnly(value).getDefiningOp<arith::ConstantOp>();
+  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                          : IntegerAttr();
+  return integer && integer.getType().isInteger(1) && integer.getValue().isOne();
+}
+
+bool isZeroValue(Value value) {
+  value = stripShapeOnly(value);
+  while (auto cast = value.getDefiningOp<gpu::CastOp>())
+    value = cast.getValue();
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+    return integer.getValue().isZero();
+  if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
+    return floating.getValue().isZero();
+  return false;
+}
+
+bool collectBoundaryAxes(Value predicate, ValueRange coordinates,
+                         ArrayRef<int64_t> sourceAxes,
+                         llvm::SmallDenseSet<int64_t, 4> &axes) {
+  if (isTrueValue(predicate))
+    return true;
+  if (auto broadcast = predicate.getDefiningOp<gpu::BroadcastOp>())
+    return collectBoundaryAxes(broadcast.getValue(), coordinates, sourceAxes,
+                               axes);
+  if (auto reshape = predicate.getDefiningOp<gpu::ReshapeOp>())
+    return collectBoundaryAxes(reshape.getValue(), coordinates, sourceAxes,
+                               axes);
+  if (auto binary = predicate.getDefiningOp<gpu::BinaryOp>()) {
+    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd &&
+        binary.getOperatorKind() != BinaryOperator::BitwiseAnd)
+      return false;
+    return collectBoundaryAxes(binary.getLhs(), coordinates, sourceAxes, axes) &&
+           collectBoundaryAxes(binary.getRhs(), coordinates, sourceAxes, axes);
+  }
+  auto compare = predicate.getDefiningOp<gpu::CompareOp>();
+  if (!compare || !compare->hasAttr(gpu::physicalTailAttr) ||
+      compare.getPredicate() != ComparePredicate::Lt)
+    return false;
+  for (auto [index, coordinate] : llvm::enumerate(coordinates))
+    if (compare.getLhs() == coordinate &&
+        isa<gpu::FragmentType>(coordinate.getType())) {
+      axes.insert(sourceAxes[index]);
+      return true;
+    }
+  return false;
+}
+
+std::optional<BlockAccessPlan>
+planBlockAccess(Value resource, ValueRange coordinates,
+                ArrayRef<int64_t> sourceAxes, Type valueType, Value valid,
+                Value fill) {
+  auto view = dyn_cast<gpu::ViewType>(resource.getType());
+  auto fragment = dyn_cast<gpu::FragmentType>(valueType);
+  if (!view || !fragment || !isa<BlockArgument>(resource) ||
+      coordinates.size() != view.getRank() ||
+      sourceAxes.size() != view.getRank() ||
+      !view.getLayout().getHasStrides() ||
+      view.getLayout().getStrides().size() != view.getRank())
+    return std::nullopt;
+
+  BlockAccessPlan plan;
+  plan.offsets.resize(view.getRank());
+  plan.blockAxes.assign(fragment.getShape().size(), -1);
+  llvm::SmallBitVector seenViewAxes(view.getRank());
+  llvm::SmallBitVector seenFragmentAxes(fragment.getShape().size());
+  for (auto [coordinateIndex, coordinate] : llvm::enumerate(coordinates)) {
+    int64_t viewAxis = sourceAxes[coordinateIndex];
+    if (viewAxis < 0 || viewAxis >= static_cast<int64_t>(view.getRank()) ||
+        seenViewAxes.test(viewAxis))
+      return std::nullopt;
+    seenViewAxes.set(viewAxis);
+    if (coordinate.getType().isIndex()) {
+      plan.offsets[viewAxis] = coordinate;
+      continue;
+    }
+    auto coordinateType = dyn_cast<gpu::FragmentType>(coordinate.getType());
+    auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>();
+    if (!coordinateType || coordinateType.getShape().size() != 1 ||
+        !coordinateType.getElementType().isIndex() || !range ||
+        !isUnitStep(range.getStep()))
+      return std::nullopt;
+    auto coordinateMap =
+        cast<gpu::AxisMapAttr>(coordinateType.getAxisMaps()[0]);
+    std::optional<unsigned> selected;
+    for (auto [fragmentAxis, mapping] :
+         llvm::enumerate(fragment.getAxisMaps())) {
+      auto resultMap = cast<gpu::AxisMapAttr>(mapping);
+      if (resultMap.getSourceId() == coordinateMap.getSourceId() &&
+          resultMap.getSourceAxis() == coordinateMap.getSourceAxis() &&
+          resultMap.getDimensionId() == coordinateMap.getDimensionId() &&
+          resultMap.getDerived() == coordinateMap.getDerived()) {
+        if (selected)
+          return std::nullopt;
+        selected = fragmentAxis;
+      }
+    }
+    if (!selected || seenFragmentAxes.test(*selected) ||
+        coordinateType.getShape()[0] != fragment.getShape()[*selected])
+      return std::nullopt;
+    auto extent = cast<gpu::PhysicalExprAttr>(fragment.getShape()[*selected]);
+    if (!isCompileTimeExpression(extent))
+      return std::nullopt;
+    seenFragmentAxes.set(*selected);
+    plan.blockAxes[*selected] = viewAxis;
+    plan.offsets[viewAxis] = range.getStart();
+  }
+  if (seenViewAxes.count() != view.getRank() ||
+      seenFragmentAxes.count() != fragment.getShape().size() ||
+      llvm::any_of(plan.offsets, [](Value value) { return !value; }))
+    return std::nullopt;
+  for (Attribute stride : view.getLayout().getStrides())
+    if (!isa<IntegerAttr, StringAttr>(stride))
+      return std::nullopt;
+
+  llvm::SmallDenseSet<int64_t, 4> boundary;
+  if (valid) {
+    if (fill && !isZeroValue(fill))
+      return std::nullopt;
+    if (!collectBoundaryAxes(valid, coordinates, sourceAxes, boundary))
+      return std::nullopt;
+  } else if (fill) {
+    return std::nullopt;
+  }
+  for (int64_t viewAxis : boundary) {
+    auto found = llvm::find(plan.blockAxes, viewAxis);
+    if (found == plan.blockAxes.end())
+      return std::nullopt;
+    plan.boundaryAxes.push_back(
+        static_cast<int64_t>(std::distance(plan.blockAxes.begin(), found)));
+  }
+  llvm::sort(plan.boundaryAxes);
+  for (int64_t axis = 0;
+       axis < static_cast<int64_t>(fragment.getShape().size()); ++axis)
+    plan.order.push_back(axis);
+  llvm::sort(plan.order, [&](int64_t lhs, int64_t rhs) {
+    return plan.blockAxes[lhs] > plan.blockAxes[rhs];
+  });
+  return plan;
+}
+
+LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
+  SmallVector<std::pair<gpu::LoadOp, BlockAccessPlan>, 4> loads;
+  SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
+  kernel.walk([&](gpu::LoadOp load) {
+    if (std::optional<BlockAccessPlan> plan = planBlockAccess(
+            load.getResource(), load.getCoordinates(), load.getSourceAxes(),
+            load.getResult().getType(), load.getValid(), load.getFill()))
+      loads.emplace_back(load, std::move(*plan));
+  });
+  kernel.walk([&](gpu::StoreOp store) {
+    if (std::optional<BlockAccessPlan> plan = planBlockAccess(
+            store.getResource(), store.getCoordinates(), store.getSourceAxes(),
+            store.getValue().getType(), store.getValid(), Value()))
+      stores.emplace_back(store, std::move(*plan));
+  });
+  if (loads.empty() && stores.empty())
+    return success();
+
+  for (auto &[load, plan] : loads) {
+    OpBuilder builder(load);
+    auto block = builder.create<BlockLoadOp>(
+        load.getLoc(), load.getResult().getType(), load.getResource(),
+        plan.offsets,
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.boundaryAxes),
+        builder.getStringAttr("zero"));
+    if (Attribute origin = load->getAttr(gpu::originAttr))
+      block->setAttr(gpu::originAttr, origin);
+    load.getResult().replaceAllUsesWith(block.getResult());
+    load.erase();
+  }
+  for (auto &[store, plan] : stores) {
+    OpBuilder builder(store);
+    auto block = builder.create<BlockStoreOp>(
+        store.getLoc(), store.getResource(), plan.offsets, store.getValue(),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.blockAxes),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.order),
+        DenseI64ArrayAttr::get(kernel.getContext(), plan.boundaryAxes));
+    if (Attribute origin = store->getAttr(gpu::originAttr))
+      block->setAttr(gpu::originAttr, origin);
+    store.erase();
+  }
+  return success();
 }
 
 bool fragmentFitsTritonTensor(gpu::FragmentType fragment,
@@ -1110,7 +1333,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    if (isa<gpu::ParameterOp, gpu::PhysicalExprOp, gpu::ProgramIdOp,
+    if (isa<BlockLoadOp, BlockStoreOp, gpu::ParameterOp, gpu::PhysicalExprOp,
+            gpu::ProgramIdOp,
             gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
             gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
             gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
@@ -1134,6 +1358,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
 } // namespace
 
 LogicalResult verifyTritonProgram(ModuleOp module) {
+  if (failed(mlir::verify(module.getOperation())))
+    return failure();
   SmallVector<func::FuncOp> kernels;
   module.walk([&](func::FuncOp function) {
     if (function->hasAttr(gpu::kernelAttr))
@@ -1184,8 +1410,9 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
                            ArrayRef<int64_t>{1, 2, 3, 4, 5, 6});
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
                            ArrayRef<int64_t>{1});
-  if (failed(materializeLegalConfigs(kernel)) ||
-      failed(gpu::verifyGPUProgram(module)))
+  if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(materializeBlockPointerForms(kernel)) ||
+      failed(materializeLegalConfigs(kernel)))
     return failure();
   selectContractForms(kernel);
   if (failed(verifyTritonProgram(module)))
