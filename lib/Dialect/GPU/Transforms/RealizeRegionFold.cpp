@@ -516,14 +516,13 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     bindClonedOperationTypes(clone, extentBindings);
     for (auto [source, result] :
          llvm::zip(operation.getResults(), clone->getResults())) {
-      if (mapping.lookupOrNull(source))
-        continue;
       if (source == conjunctSource) {
-        FailureOr<Value> combined = conjoin(result);
+        Value mapped = mapping.lookupOrNull(source);
+        FailureOr<Value> combined = conjoin(mapped ? mapped : result);
         if (failed(combined))
           return failure();
         mapping.map(source, *combined);
-      } else {
+      } else if (!mapping.lookupOrNull(source)) {
         mapping.map(source, result);
       }
     }
@@ -1366,6 +1365,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   std::string failureReason;
   auto emitSummary = [&](OpBuilder &nested, Location nestedLocation,
                          Value offset,
+                         bool fullSegment,
                          bool predicateIsTrue)
       -> FailureOr<SmallVector<Value>> {
     SmallVector<Value> slices;
@@ -1375,7 +1375,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     if (failed(buildSourceSlices(nested, nestedLocation, plans, sliceTypes,
                                  offset,
                                  segment.getResult(), sliceExtent,
-                                 predicateIsTrue, slices,
+                                 fullSegment, slices,
                                  segmentTail, sliceMapping, sourceMappings,
                                  failureReason)))
       return failure();
@@ -1423,16 +1423,17 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     }
     return inlinePureRegion(nested, fold.getSummarize(), summarizeArguments,
                             failureReason, substituteSource, substituteTarget,
-                            memberPredicate, segmentTail);
+                            fullSegment ? Value() : memberPredicate,
+                            fullSegment ? Value() : segmentTail);
   };
   auto emitLoop = [&](Value lower, Value upper, ValueRange initial,
-                      bool predicateIsTrue) {
+                      bool fullSegment, bool predicateIsTrue) {
     auto loop = builder.create<scf::ForOp>(
       location, lower, upper, segment.getResult(), initial,
       [&](OpBuilder &nested, Location nestedLocation, Value offset,
           ValueRange carries) {
         FailureOr<SmallVector<Value>> summary = emitSummary(
-            nested, nestedLocation, offset, predicateIsTrue);
+            nested, nestedLocation, offset, fullSegment, predicateIsTrue);
         if (failed(summary)) {
           bodyFailed = true;
           return;
@@ -1462,7 +1463,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
   if (segment->hasAttr(coverageDimensionAttr)) {
     FailureOr<SmallVector<Value>> summary =
-        emitSummary(builder, location, zero, /*predicateIsTrue=*/false);
+        emitSummary(builder, location, zero, /*fullSegment=*/false,
+                    /*predicateIsTrue=*/false);
     if (failed(summary))
       return fold.emitOpError("region-fold physicalization failed: ")
              << failureReason;
@@ -1477,6 +1479,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   scf::ForOp allTrueLoop;
   if (succeeded(partition)) {
     allTrueLoop = emitLoop(zero, partition->allTrueStop, current,
+                           /*fullSegment=*/true,
                            /*predicateIsTrue=*/true);
     if (!bodyFailed)
       current.assign(allTrueLoop.getResults().begin(),
@@ -1484,20 +1487,37 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   }
   Value mixedStart = succeeded(partition) ? partition->allTrueStop : zero;
   stop = succeeded(partition) ? partition->effectiveStop : stop;
-  scf::ForOp mixedLoop;
+  Value fullMixedSegments = builder.create<BinaryOp>(
+      location, builder.getIndexType(), stop, segment.getResult(),
+      BinaryOperator::FloorDivide);
+  Value fullMixedStop = builder.create<BinaryOp>(
+      location, builder.getIndexType(), fullMixedSegments, segment.getResult(),
+      BinaryOperator::Multiply);
+  scf::ForOp fullMixedLoop;
   if (!bodyFailed)
-    mixedLoop = emitLoop(mixedStart, stop, current,
-                         /*predicateIsTrue=*/false);
+    fullMixedLoop = emitLoop(mixedStart, fullMixedStop, current,
+                             /*fullSegment=*/true,
+                             /*predicateIsTrue=*/false);
+  if (!bodyFailed)
+    current.assign(fullMixedLoop.getResults().begin(),
+                   fullMixedLoop.getResults().end());
+  scf::ForOp tailLoop;
+  if (!bodyFailed)
+    tailLoop = emitLoop(fullMixedStop, stop, current,
+                        /*fullSegment=*/false,
+                        /*predicateIsTrue=*/false);
   if (bodyFailed) {
     if (allTrueLoop && allTrueLoop->getBlock())
       allTrueLoop.erase();
-    if (mixedLoop && mixedLoop->getBlock())
-      mixedLoop.erase();
+    if (fullMixedLoop && fullMixedLoop->getBlock())
+      fullMixedLoop.erase();
+    if (tailLoop && tailLoop->getBlock())
+      tailLoop.erase();
     return fold.emitOpError("region-fold physicalization failed: ")
            << failureReason;
   }
   for (auto [oldResult, newResult] :
-       llvm::zip(fold.getResults(), mixedLoop.getResults()))
+       llvm::zip(fold.getResults(), tailLoop.getResults()))
     oldResult.replaceAllUsesWith(newResult);
   fold.erase();
   return finish();
