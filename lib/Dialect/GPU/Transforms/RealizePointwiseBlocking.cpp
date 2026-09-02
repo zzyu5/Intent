@@ -41,6 +41,41 @@ uint32_t physicalElementBitWidth(Type type) {
              : 0;
 }
 
+void collectPhysicalDimensions(Type type,
+                               llvm::SmallDenseSet<uint64_t> &dimensions) {
+  if (auto fragment = dyn_cast<FragmentType>(type)) {
+    for (Attribute attribute : fragment.getAxisMaps()) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      if (mapping.getDimensionId() > 0)
+        dimensions.insert(mapping.getDimensionId());
+    }
+    return;
+  }
+  if (auto record = dyn_cast<RecordType>(type))
+    for (Attribute field : record.getFieldTypes())
+      collectPhysicalDimensions(cast<TypeAttr>(field).getValue(), dimensions);
+}
+
+void collectPartiallyCarriedDimensions(
+    Type type, llvm::SmallDenseSet<uint64_t> &dimensions) {
+  auto record = dyn_cast<RecordType>(type);
+  if (!record)
+    return;
+
+  llvm::DenseMap<uint64_t, unsigned> fieldCounts;
+  for (Attribute field : record.getFieldTypes()) {
+    Type fieldType = cast<TypeAttr>(field).getValue();
+    llvm::SmallDenseSet<uint64_t> fieldDimensions;
+    collectPhysicalDimensions(fieldType, fieldDimensions);
+    for (uint64_t dimension : fieldDimensions)
+      ++fieldCounts[dimension];
+    collectPartiallyCarriedDimensions(fieldType, dimensions);
+  }
+  for (auto [dimension, count] : fieldCounts)
+    if (count < record.getFieldTypes().size())
+      dimensions.insert(dimension);
+}
+
 Attribute dimensionAxisKey(MLIRContext *context, uint64_t dimension) {
   return IntegerAttr::get(IntegerType::get(context, 64), dimension);
 }
@@ -2860,6 +2895,27 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   llvm::DenseMap<Attribute, ParameterOp> parameters;
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
+  llvm::SmallDenseSet<uint64_t> partiallyCarriedStructuredDimensions;
+  llvm::DenseMap<uint64_t, ParameterCategory> structuredOwnershipCategories;
+  kernel.walk([&](RegionFoldOp fold) {
+    auto category = static_cast<ParameterCategory>(
+        fold.getSegment().getCategory());
+    if (category != ParameterCategory::RegionContraction &&
+        category != ParameterCategory::RegionReduction)
+      return;
+    for (Value result : fold.getResults()) {
+      llvm::SmallDenseSet<uint64_t> resultDimensions;
+      collectPhysicalDimensions(result.getType(), resultDimensions);
+      collectPartiallyCarriedDimensions(
+          result.getType(), partiallyCarriedStructuredDimensions);
+      for (uint64_t dimension : resultDimensions) {
+        auto existing = structuredOwnershipCategories.find(dimension);
+        if (existing == structuredOwnershipCategories.end() ||
+            category == ParameterCategory::RegionContraction)
+          structuredOwnershipCategories[dimension] = category;
+      }
+    }
+  });
   auto hasPointwiseOwnership = [&](MakeRangeOp range) {
     FailureOr<uint64_t> dimension = ownershipDimension(kernel, range);
     PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
@@ -2873,7 +2929,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
            !reductionTraversalRanges.contains(range.getOperation()) &&
            !scanSegmentSources.contains(source) &&
            (failed(dimension) ||
-            !scanSegmentDimensions.contains(*dimension));
+            (!scanSegmentDimensions.contains(*dimension) &&
+             !partiallyCarriedStructuredDimensions.contains(*dimension)));
   };
   auto dependsOnSource = [&](ValueRange values, PhysicalSourceAxis source) {
     for (Value value : values) {
@@ -3047,6 +3104,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                           kernel.getBody().front().begin());
         PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
+        ParameterCategory category = ParameterCategory::Pointwise;
+        if (succeeded(sourceDimension)) {
+          auto structured = structuredOwnershipCategories.find(*sourceDimension);
+          if (structured != structuredOwnershipCategories.end())
+            category = structured->second;
+        }
         auto schema = ParameterAttr::get(
             module.getContext(),
             builder.getStringAttr(launchVisibleDimension
@@ -3057,7 +3120,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                                          "_A" + Twine(source.sourceAxis))
                                             .str()),
             static_cast<uint32_t>(ParameterRole::OwnershipN),
-            static_cast<uint32_t>(ParameterCategory::Pointwise),
+            static_cast<uint32_t>(category),
             pointwiseElementBitWidth,
             DenseI64ArrayAttr::get(module.getContext(), candidates));
         parameter = builder.create<ParameterOp>(
@@ -3280,7 +3343,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
         static_cast<uint32_t>(ownershipRole),
-        static_cast<uint32_t>(ParameterCategory::Pointwise),
+        parameter.getParameter().getCategory(),
         pointwiseElementBitWidth, candidates);
     parameter->setAttr("parameter", schema);
   }
