@@ -1801,12 +1801,18 @@ private:
         uint32_t logicalSourceAxis = sourceAxis;
         bool derived = false;
         if (view) {
-          stop = builder.create<gpu::DimOp>(operation->getLoc(),
-                                            builder.getIndexType(), *resource,
-                                            sourceAxis);
           sourceId = view.getSourceId();
           extent = cast<PhysicalExprAttr>(
               view.getLayout().getExtents()[sourceAxis]);
+          FailureOr<Value> physicalStop =
+              physicalExtentValue(operation->getLoc(), extent);
+          if (failed(physicalStop)) {
+            operation->emitOpError(
+                "view full-slice extent is not materialized in the current program: ")
+                << extent;
+            return failure();
+          }
+          stop = *physicalStop;
         } else {
           auto mapping =
               cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
@@ -1963,9 +1969,13 @@ private:
                   operation->getLoc(), 0));
             } else if (component == 1) {
               if (view) {
-                bounds.push_back(builder.create<gpu::DimOp>(
-                    operation->getLoc(), builder.getIndexType(), *resource,
-                    sourceAxis));
+                FailureOr<Value> physicalExtent = physicalExtentValue(
+                    operation->getLoc(),
+                    cast<PhysicalExprAttr>(
+                        view.getLayout().getExtents()[sourceAxis]));
+                if (failed(physicalExtent))
+                  return failure();
+                bounds.push_back(*physicalExtent);
               } else {
                 FailureOr<Value> physicalExtent = physicalExtentValue(
                     operation->getLoc(), cast<PhysicalExprAttr>(
