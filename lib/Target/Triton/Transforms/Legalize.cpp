@@ -54,7 +54,7 @@ struct TritonLocalOptions {
   int64_t ctas;
 };
 
-SmallVector<TritonLocalOptions, 4>
+SmallVector<TritonLocalOptions, 6>
 localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
                 bool twoAxisPointwise,
                 bool blackwellRecurrentContraction) {
@@ -63,7 +63,8 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
     return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionContraction))
-    return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
+    return {{4, 2, 1}, {8, 2, 1}, {4, 3, 1},
+            {8, 3, 1}, {4, 4, 1}, {8, 4, 1}};
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::PersistentContraction)) {
     if (blackwellRecurrentContraction)
