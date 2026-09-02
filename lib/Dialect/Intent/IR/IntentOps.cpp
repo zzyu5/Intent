@@ -1285,34 +1285,58 @@ LogicalResult verifyContract(Operation *operation) {
     if (!extentValueMatchesAxis(logicalExtent, rhs, reduction->second))
       return operation->emitOpError(
           "sparse logical extent must equal its paired dense reduction axis");
+    int64_t group = format.getKind() == 0 ? 2 : 4;
+    int64_t nonzeros = format.getKind() == 0 ? 1 : 2;
     if (auto constant = getConstantInteger(logicalExtent)) {
-      int64_t group = format.getKind() == 0 ? 2 : 4;
       if (*constant < 0 || *constant % group != 0)
         return operation->emitOpError(
             "sparse logical extent violates the closed format group size");
+      int64_t compressedExtent = lhs.getDimSize(format.getCompressionAxis());
+      if (!ShapedType::isDynamic(compressedExtent) &&
+          compressedExtent != *constant / group * nonzeros)
+        return operation->emitOpError(
+            "sparse compressed extent disagrees with its logical format");
     }
     Type metadata = operation->getOperand(1).getType();
+    RankedTensorType positions;
     if (format.getKind() == 0) {
-      auto positions = dyn_cast<RankedTensorType>(metadata);
+      positions = dyn_cast<RankedTensorType>(metadata);
       if (!positions || !isIntegerLike(positions.getElementType()))
         return operation->emitOpError(
             "one-of-two metadata must be a logical-index tensor");
     } else {
-      auto positions = dyn_cast<RecordType>(metadata);
-      if (!positions || positions.getFieldNames().size() != 2 ||
-          cast<StringAttr>(positions.getFieldNames()[0]).getValue() != "first" ||
-          cast<StringAttr>(positions.getFieldNames()[1]).getValue() != "second")
+      auto record = dyn_cast<RecordType>(metadata);
+      if (!record || record.getFieldNames().size() != 2 ||
+          cast<StringAttr>(record.getFieldNames()[0]).getValue() != "first" ||
+          cast<StringAttr>(record.getFieldNames()[1]).getValue() != "second")
         return operation->emitOpError(
             "two-of-four metadata must be the {first, second} record");
       auto first = dyn_cast<RankedTensorType>(
-          cast<TypeAttr>(positions.getFieldTypes()[0]).getValue());
+          cast<TypeAttr>(record.getFieldTypes()[0]).getValue());
       auto second = dyn_cast<RankedTensorType>(
-          cast<TypeAttr>(positions.getFieldTypes()[1]).getValue());
+          cast<TypeAttr>(record.getFieldTypes()[1]).getValue());
       if (!first || !second || !sameTensorShape(first, second) ||
           !isIntegerLike(first.getElementType()) ||
           !isIntegerLike(second.getElementType()))
         return operation->emitOpError(
             "two-of-four metadata fields must be shape-identical logical-index tensors");
+      positions = first;
+    }
+    if (!positions || positions.getRank() != lhs.getRank())
+      return operation->emitOpError(
+          "sparse metadata must preserve the compressed operand rank");
+    for (unsigned axis = 0; axis < lhs.getRank(); ++axis)
+      if (axis != format.getCompressionAxis() &&
+          !sameDimension(lhs, axis, positions, axis))
+        return operation->emitOpError(
+            "sparse metadata changed a non-compression operand axis");
+    if (auto constant = getConstantInteger(logicalExtent)) {
+      int64_t metadataExtent =
+          positions.getDimSize(format.getCompressionAxis());
+      if (!ShapedType::isDynamic(metadataExtent) &&
+          metadataExtent != *constant / group)
+        return operation->emitOpError(
+            "sparse metadata extent disagrees with its logical groups");
     }
   }
   return success();

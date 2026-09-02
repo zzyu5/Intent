@@ -115,6 +115,21 @@ bool hasFragmentSchema(ScaledContractOp contract) {
          isa<FragmentType>(contract.getResult().getType());
 }
 
+bool hasFragmentSchema(SparseContractOp contract) {
+  if (!isa<FragmentType>(contract.getCompressed().getType()) ||
+      !isa<FragmentType>(contract.getRhs().getType()) ||
+      !isa<FragmentType>(contract.getAccumulator().getType()) ||
+      !isa<FragmentType>(contract.getResult().getType()))
+    return false;
+  Type metadata = contract.getMetadata().getType();
+  if (isa<FragmentType>(metadata))
+    return true;
+  auto record = dyn_cast<RecordType>(metadata);
+  return record && llvm::all_of(record.getFieldTypes(), [](Attribute field) {
+           return isa<FragmentType>(cast<TypeAttr>(field).getValue());
+         });
+}
+
 bool hasUnrealizedPhysicalAxis(Value value) {
   auto fragment = dyn_cast<FragmentType>(value.getType());
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
@@ -523,6 +538,86 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
         ->emitError("coordinate replay could not rebuild the current value graph");
   return result;
+}
+
+FailureOr<Value> buildRangeTailPredicate(OpBuilder &builder, Location location,
+                                         Value range,
+                                         MakeRangeOp authority) {
+  auto rangeType = dyn_cast<FragmentType>(range.getType());
+  if (!rangeType || rangeType.getShape().size() != 1)
+    return failure();
+  Value logicalStop = builder.create<SplatOp>(
+      location, rangeType, authority.getLogicalStop());
+  auto predicateType = FragmentType::get(
+      rangeType.getContext(), builder.getI1Type(), rangeType.getShape(),
+      rangeType.getAxisMaps(), rangeType.getValidity(), rangeType.getOwner());
+  return builder
+      .create<CompareOp>(location, predicateType, range, logicalStop,
+                         ComparePredicate::Lt)
+      .getResult();
+}
+
+LogicalResult appendTailValidity(Location location, Value source,
+                                 Value tailPredicate,
+                                 IRMapping &mapping) {
+  SmallVector<Value> pending{source};
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    Operation *producer = value.getDefiningOp();
+    if (!producer)
+      continue;
+    if (auto originalLoad = dyn_cast<LoadOp>(producer)) {
+      Value mapped = mapping.lookupOrNull(originalLoad.getResult());
+      auto load = mapped ? mapped.getDefiningOp<LoadOp>() : LoadOp();
+      if (!load)
+        continue;
+      auto resultType = dyn_cast<FragmentType>(load.getResult().getType());
+      if (!resultType)
+        return load.emitOpError(
+            "blocked sparse tail requires a fragment load result");
+      auto predicateType = FragmentType::get(
+          resultType.getContext(), IntegerType::get(resultType.getContext(), 1),
+          resultType.getShape(),
+          resultType.getAxisMaps(), resultType.getValidity(),
+          resultType.getOwner());
+      OpBuilder validityBuilder(load);
+      FailureOr<Value> projected = projectPhysicalValueToSchema(
+          validityBuilder, location, tailPredicate, predicateType);
+      if (failed(projected))
+        return load.emitOpError(
+            "blocked sparse tail cannot project to its load coordinates");
+      Value valid = *projected;
+      if (load.getValid()) {
+        Value existing = load.getValid();
+        if (existing.getType() != predicateType) {
+          FailureOr<Value> projectedExisting = projectPhysicalValueToSchema(
+              validityBuilder, location, existing, predicateType);
+          if (failed(projectedExisting))
+            return load.emitOpError(
+                "blocked sparse tail cannot preserve existing load validity");
+          existing = *projectedExisting;
+        }
+        valid = validityBuilder.create<BinaryOp>(
+            location, predicateType, existing, valid,
+            BinaryOperator::LogicalAnd);
+      }
+      load.getValidMutable().assign(ValueRange{valid});
+      if (!load.getFill()) {
+        Type elementType = resultType.getElementType();
+        Value zero = validityBuilder.create<arith::ConstantOp>(
+            location, elementType, validityBuilder.getZeroAttr(elementType));
+        Value fill =
+            validityBuilder.create<SplatOp>(location, resultType, zero);
+        load.getFillMutable().assign(ValueRange{fill});
+      }
+      continue;
+    }
+    pending.append(producer->operand_begin(), producer->operand_end());
+  }
+  return success();
 }
 
 FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
@@ -1745,6 +1840,301 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
         "reduction-only contraction blocking could not replay its load graph");
   }
 
+  contract.getResult().replaceAllUsesWith(loop.getResult(0));
+  contract.erase();
+  return success();
+}
+
+LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
+                                              func::FuncOp kernel) {
+  if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
+      contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} ||
+      !contract.getLhsBatchAxes().empty() ||
+      !contract.getRhsBatchAxes().empty() ||
+      contract.getFormat().getCompressionAxis() != 1)
+    return contract.emitOpError(
+        "shared sparse blocking requires rank-two [M,KC] x [K,N] physical axes");
+  auto compressedType = dyn_cast<FragmentType>(contract.getCompressed().getType());
+  auto rhsType = dyn_cast<FragmentType>(contract.getRhs().getType());
+  auto resultType = dyn_cast<FragmentType>(contract.getResult().getType());
+  if (!compressedType || !rhsType || !resultType ||
+      compressedType.getShape().size() != 2 || rhsType.getShape().size() != 2 ||
+      resultType.getShape().size() != 2 ||
+      llvm::any_of(resultType.getShape(), [](Attribute extent) {
+        return !isCompileTimeExtent(cast<PhysicalExprAttr>(extent));
+      }))
+    return contract.emitOpError(
+        "shared sparse blocking requires selected rank-two free-axis fragments");
+
+  FailureOr<AxisMapAttr> compressedMap = queryAxisMap(compressedType, 1);
+  FailureOr<AxisMapAttr> denseMap = queryAxisMap(rhsType, 0);
+  if (failed(compressedMap) || failed(denseMap))
+    return contract.emitOpError(
+        "shared sparse blocking lost compressed/dense reduction provenance");
+
+  SmallVector<Value> metadataComponents;
+  RecordType metadataRecordType;
+  MakeRecordOp metadataRecord;
+  if (auto component = dyn_cast<FragmentType>(contract.getMetadata().getType())) {
+    (void)component;
+    metadataComponents.push_back(contract.getMetadata());
+  } else {
+    metadataRecordType = dyn_cast<RecordType>(contract.getMetadata().getType());
+    metadataRecord = contract.getMetadata().getDefiningOp<MakeRecordOp>();
+    if (!metadataRecordType || !metadataRecord ||
+        metadataRecord.getFields().size() !=
+            metadataRecordType.getFieldTypes().size())
+      return contract.emitOpError(
+          "shared sparse blocking requires materialized metadata components");
+    metadataComponents.append(metadataRecord.getFields().begin(),
+                              metadataRecord.getFields().end());
+  }
+  if (metadataComponents.empty())
+    return contract.emitOpError(
+        "shared sparse blocking requires at least one metadata component");
+  auto metadataComponentType =
+      dyn_cast<FragmentType>(metadataComponents.front().getType());
+  if (!metadataComponentType || metadataComponentType.getShape().size() != 2)
+    return contract.emitOpError(
+        "shared sparse blocking requires rank-two metadata fragments");
+  FailureOr<AxisMapAttr> metadataMap = queryAxisMap(metadataComponentType, 1);
+  if (failed(metadataMap))
+    return contract.emitOpError(
+        "shared sparse blocking lost metadata-group provenance");
+  for (Value component : llvm::drop_begin(metadataComponents)) {
+    auto type = dyn_cast<FragmentType>(component.getType());
+    FailureOr<AxisMapAttr> mapping =
+        type && type.getShape().size() == 2
+            ? queryAxisMap(type, 1)
+            : FailureOr<AxisMapAttr>(failure());
+    if (!type || failed(mapping) ||
+        !(sourceAxisIdentity(*mapping) == sourceAxisIdentity(*metadataMap)))
+      return contract.emitOpError(
+          "shared sparse metadata components do not traverse one group relation");
+  }
+
+  PhysicalProgramAnalysis physicalAnalysis(kernel);
+  auto rangesFor = [&](Value value, unsigned fragmentAxis, AxisMapAttr mapping,
+                       SmallVectorImpl<MakeRangeOp> &ranges) {
+    PhysicalRangeFact fact = physicalAnalysis.axisRanges(value, fragmentAxis);
+    if (failed(queryExactLogicalRange(fact)) &&
+        queryFragmentAxes(value.getType(), sourceAxisIdentity(mapping)).size() ==
+            1)
+      fact = physicalAnalysis.sourceRanges(value, sourceAxisIdentity(mapping));
+    if (failed(queryExactLogicalRange(fact)) || !fact.unitStep)
+      return failure();
+    ranges.assign(fact.roots.begin(), fact.roots.end());
+    return llvm::all_of(ranges, [&](MakeRangeOp range) {
+             return sourceAxisIdentity(range) == sourceAxisIdentity(mapping);
+           })
+               ? success()
+               : failure();
+  };
+  SmallVector<MakeRangeOp> compressedRanges;
+  SmallVector<MakeRangeOp> denseRanges;
+  SmallVector<MakeRangeOp> metadataRanges;
+  if (failed(rangesFor(contract.getCompressed(), 1, *compressedMap,
+                       compressedRanges)) ||
+      failed(rangesFor(contract.getRhs(), 0, *denseMap, denseRanges)))
+    return contract.emitOpError(
+        "shared sparse blocking requires explicit compressed and dense ranges");
+  for (Value component : metadataComponents) {
+    SmallVector<MakeRangeOp> componentRanges;
+    if (failed(rangesFor(component, 1, *metadataMap, componentRanges)))
+      return contract.emitOpError(
+          "shared sparse blocking requires an explicit metadata-group range");
+    for (MakeRangeOp range : componentRanges)
+      if (!llvm::is_contained(metadataRanges, range))
+        metadataRanges.push_back(range);
+  }
+
+  MakeRangeOp compressedRange = compressedRanges.front();
+  MakeRangeOp denseRange = denseRanges.front();
+  MakeRangeOp metadataRange = metadataRanges.front();
+  if (llvm::any_of(metadataRanges, [&](MakeRangeOp range) {
+        return !sameLogicalRange(range, metadataRange);
+      }))
+    return contract.emitOpError(
+        "shared sparse metadata components have different logical group ranges");
+  FailureOr<Value> denseLogicalEnd = resolveLogicalRangeEnd(kernel, denseRange);
+  FailureOr<Value> compressedStep = scalarSource(compressedRange.getStep());
+  FailureOr<Value> denseStep = scalarSource(denseRange.getStep());
+  FailureOr<Value> metadataStep = scalarSource(metadataRange.getStep());
+  if (failed(denseLogicalEnd) || failed(compressedStep) || failed(denseStep) ||
+      failed(metadataStep) || !isIntegerConstant(*compressedStep, 1) ||
+      !isIntegerConstant(*denseStep, 1) ||
+      !isIntegerConstant(*metadataStep, 1))
+    return contract.emitOpError(
+        "shared sparse blocking requires unit-step ranges with an exact dense K end");
+
+  MLIRContext *context = kernel.getContext();
+  const int64_t groupSize = contract.getFormat().getKind() == 0 ? 2 : 4;
+  std::string suffix =
+      ("_sparse_" + Twine(compressedMap->getSourceId()) + "_" +
+       Twine(denseMap->getSourceId()))
+          .str();
+  ParameterOp blockK = getOrCreatePhysicalParameter(
+      kernel, "BLOCK_K" + suffix, ParameterRole::Reduction,
+      ParameterCategory::Contraction,
+      std::max(compressedType.getElementType().getIntOrFloatBitWidth(),
+               rhsType.getElementType().getIntOrFloatBitWidth()),
+      {32, 64, 128});
+  if (!blockK)
+    return failure();
+  if (FailureOr<int64_t> dimension = queryRangeDimension(denseRange);
+      succeeded(dimension))
+    blockK->setAttr(
+        dimensionAttr,
+        IntegerAttr::get(IntegerType::get(context, 64), *dimension));
+
+  PhysicalExprAttr unitDenseK = parameterExpression(
+      context, blockK.getParameter().getName().getValue());
+  PhysicalExprAttr two = expression(context, PhysicalExprKind::Constant, 2);
+  PhysicalExprAttr group =
+      expression(context, PhysicalExprKind::Constant, groupSize);
+  PhysicalExprAttr unitCompressedK = binaryExpression(
+      context, PhysicalExprKind::FloorDiv, unitDenseK, two);
+  PhysicalExprAttr unitMetadataK = binaryExpression(
+      context, PhysicalExprKind::FloorDiv, unitDenseK, group);
+  FragmentType compressedIndexType = fragmentType(
+      context, IndexType::get(context), {unitCompressedK}, {*compressedMap},
+      compressedType.getOwner());
+  FragmentType denseIndexType = fragmentType(
+      context, IndexType::get(context), {unitDenseK}, {*denseMap},
+      rhsType.getOwner());
+  FragmentType metadataIndexType = fragmentType(
+      context, IndexType::get(context), {unitMetadataK}, {*metadataMap},
+      metadataComponentType.getOwner());
+
+  Location location = contract.getLoc();
+  OpBuilder builder(contract);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
+  Value twoValue = builder.create<arith::ConstantIndexOp>(location, 2);
+  Value groupValue =
+      builder.create<arith::ConstantIndexOp>(location, groupSize);
+  Value compressedExtent = builder.create<PhysicalExprOp>(
+      location, builder.getIndexType(), unitCompressedK);
+  Value metadataExtent = builder.create<PhysicalExprOp>(
+      location, builder.getIndexType(), unitMetadataK);
+  bool bodyFailed = false;
+  auto loop = builder.create<scf::ForOp>(
+      location, denseRange.getLogicalStart(), *denseLogicalEnd,
+      blockK.getResult(), ValueRange{contract.getAccumulator()},
+      [&](OpBuilder &nested, Location nestedLocation, Value denseStart,
+          ValueRange carries) {
+        Value denseOffset = binary(
+            nested, nestedLocation, nested.getIndexType(), denseStart,
+            denseRange.getLogicalStart(), BinaryOperator::Subtract);
+        Value compressedStart = binary(
+            nested, nestedLocation, nested.getIndexType(),
+            compressedRange.getLogicalStart(),
+            binary(nested, nestedLocation, nested.getIndexType(), denseOffset,
+                   twoValue, BinaryOperator::FloorDivide),
+            BinaryOperator::Add);
+        Value metadataStart = binary(
+            nested, nestedLocation, nested.getIndexType(),
+            metadataRange.getLogicalStart(),
+            binary(nested, nestedLocation, nested.getIndexType(), denseOffset,
+                   groupValue, BinaryOperator::FloorDivide),
+            BinaryOperator::Add);
+        Value compressedK = nested.create<MakeRangeOp>(
+            nestedLocation, compressedIndexType, compressedStart,
+            compressedExtent, one, compressedRange.getLogicalStart(),
+            compressedRange.getLogicalStop(), compressedMap->getSourceId(),
+            compressedMap->getSourceAxis(), compressedMap->getDerived());
+        inheritRangeAuthority(compressedK, compressedRange);
+        Value denseK = nested.create<MakeRangeOp>(
+            nestedLocation, denseIndexType, denseStart, blockK.getResult(), one,
+            denseRange.getLogicalStart(), denseRange.getLogicalStop(),
+            denseMap->getSourceId(), denseMap->getSourceAxis(),
+            denseMap->getDerived());
+        inheritRangeAuthority(denseK, denseRange);
+        Value metadataK = nested.create<MakeRangeOp>(
+            nestedLocation, metadataIndexType, metadataStart, metadataExtent,
+            one, metadataRange.getLogicalStart(), metadataRange.getLogicalStop(),
+            metadataMap->getSourceId(), metadataMap->getSourceAxis(),
+            metadataMap->getDerived());
+        inheritRangeAuthority(metadataK, metadataRange);
+
+        FailureOr<Value> compressedTail = buildRangeTailPredicate(
+            nested, nestedLocation, compressedK, compressedRange);
+        FailureOr<Value> denseTail = buildRangeTailPredicate(
+            nested, nestedLocation, denseK, denseRange);
+        FailureOr<Value> metadataTail = buildRangeTailPredicate(
+            nested, nestedLocation, metadataK, metadataRange);
+        if (failed(compressedTail) || failed(denseTail) ||
+            failed(metadataTail)) {
+          bodyFailed = true;
+          return;
+        }
+
+        IRMapping compressedReplay;
+        for (MakeRangeOp range : compressedRanges)
+          compressedReplay.map(range.getResult(), compressedK);
+        IRMapping denseReplay;
+        for (MakeRangeOp range : denseRanges)
+          denseReplay.map(range.getResult(), denseK);
+        IRMapping metadataReplay;
+        for (MakeRangeOp range : metadataRanges)
+          metadataReplay.map(range.getResult(), metadataK);
+        FailureOr<Value> compressed = replaySourceValue(
+            nested, nestedLocation, contract.getCompressed(), unitCompressedK,
+            compressedRanges, compressedK, compressedReplay);
+        FailureOr<Value> rhs = replaySourceValue(
+            nested, nestedLocation, contract.getRhs(), unitDenseK, denseRanges,
+            denseK, denseReplay);
+        SmallVector<Value> replayedMetadata;
+        for (Value component : metadataComponents) {
+          FailureOr<Value> replayed = replaySourceValue(
+              nested, nestedLocation, component, unitMetadataK, metadataRanges,
+              metadataK, metadataReplay);
+          if (failed(replayed)) {
+            bodyFailed = true;
+            return;
+          }
+          replayedMetadata.push_back(*replayed);
+        }
+        if (failed(compressed) || failed(rhs)) {
+          bodyFailed = true;
+          return;
+        }
+        if (failed(appendTailValidity(nestedLocation, contract.getCompressed(),
+                                      *compressedTail,
+                                      compressedReplay)) ||
+            failed(appendTailValidity(nestedLocation, contract.getRhs(),
+                                      *denseTail, denseReplay)) ||
+            failed(appendTailValidity(nestedLocation, contract.getMetadata(),
+                                      *metadataTail,
+                                      metadataReplay))) {
+          bodyFailed = true;
+          return;
+        }
+        Value metadata = replayedMetadata.front();
+        if (metadataRecordType) {
+          SmallVector<Attribute> fieldTypes;
+          for (Value component : replayedMetadata)
+            fieldTypes.push_back(TypeAttr::get(component.getType()));
+          auto blockedRecordType = RecordType::get(
+              context, metadataRecordType.getFieldNames(),
+              ArrayAttr::get(context, fieldTypes), metadataRecordType.getOwner());
+          metadata = nested.create<MakeRecordOp>(nestedLocation,
+                                                 blockedRecordType,
+                                                 replayedMetadata);
+        }
+        auto product = nested.create<SparseContractOp>(
+            nestedLocation, resultType, *compressed, metadata, *rhs,
+            contract.getLogicalExtent(), carries.front(), contract.getFormat(),
+            contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
+            contract.getLhsBatchAxes(), contract.getRhsBatchAxes());
+        if (Attribute origin = contract->getAttr(originAttr))
+          product->setAttr(originAttr, origin);
+        nested.create<scf::YieldOp>(nestedLocation, product.getResult());
+      });
+  if (bodyFailed) {
+    loop.erase();
+    return contract.emitOpError(
+        "shared sparse blocking could not replay its compressed/metadata/dense graphs");
+  }
   contract.getResult().replaceAllUsesWith(loop.getResult(0));
   contract.erase();
   return success();
@@ -3108,6 +3498,7 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
   SmallVector<ContractOp> contracts;
+  SmallVector<SparseContractOp> sparseContracts;
   SmallVector<ScaledContractOp> scaledContracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts)
@@ -3121,6 +3512,8 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   contracts.clear();
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   kernel.walk(
+      [&](SparseContractOp contract) { sparseContracts.push_back(contract); });
+  kernel.walk(
       [&](ScaledContractOp contract) { scaledContracts.push_back(contract); });
   for (ContractOp contract : contracts)
     if (!hasFragmentSchema(contract))
@@ -3130,6 +3523,10 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     if (!hasFragmentSchema(contract))
       return contract.emitOpError(
           "shared scaled-contraction blocking requires fragment operands, accumulator, and result");
+  for (SparseContractOp contract : sparseContracts)
+    if (!hasFragmentSchema(contract))
+      return contract.emitOpError(
+          "shared sparse-contraction blocking requires fragment operands, metadata, accumulator, and result");
   for (ContractOp contract : contracts)
     if (requiresPhysicalRealization(contract)) {
       FailureOr<bool> nativeSegment =
@@ -3175,6 +3572,9 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     } else if (failed(markNativeCoverage(kernel, contract))) {
       return failure();
     }
+  for (SparseContractOp contract : sparseContracts)
+    if (failed(realizeSparseReductionTraversal(contract, kernel)))
+      return failure();
   for (ScaledContractOp contract : scaledContracts)
     if (requiresPhysicalRealization(contract)) {
       if (failed(realizeScaledContract(contract, kernel)))

@@ -28,6 +28,39 @@ LogicalResult verifyCopyAxes(Operation *owner, ArrayRef<int64_t> axes,
   return success();
 }
 
+bool isConstantExtent(Attribute attribute, int64_t expected) {
+  auto expression = dyn_cast<gpu::PhysicalExprAttr>(attribute);
+  return expression &&
+         expression.getKind() ==
+             static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+         expression.getValue() == expected;
+}
+
+bool hasNoStaticQuotientConflict(Attribute quotientAttribute,
+                                 Attribute dividendAttribute,
+                                 int64_t divisor) {
+  auto quotient = dyn_cast<gpu::PhysicalExprAttr>(quotientAttribute);
+  auto dividend = dyn_cast<gpu::PhysicalExprAttr>(dividendAttribute);
+  if (!quotient || !dividend || divisor <= 0)
+    return false;
+  if (quotient.getKind() ==
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+      dividend.getKind() ==
+          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+    return dividend.getValue() > 0 && dividend.getValue() % divisor == 0 &&
+           quotient.getValue() == dividend.getValue() / divisor;
+  if (quotient.getKind() ==
+          static_cast<uint32_t>(gpu::PhysicalExprKind::FloorDiv) &&
+      quotient.getOperands().size() == 2 &&
+      quotient.getOperands()[0] == dividendAttribute &&
+      isConstantExtent(quotient.getOperands()[1], divisor))
+    return true;
+  // Symbolic extents are checked for every materialized provider config before
+  // serialization.  The local op verifier rejects only an already-known
+  // contradiction so a parameterized physical program remains well-formed.
+  return true;
+}
+
 } // namespace
 
 LogicalResult LaunchConfigOp::verify() {
@@ -305,6 +338,51 @@ LogicalResult GemmOp::verify() {
 }
 
 void GemmOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
+LogicalResult SparseGemmOp::verify() {
+  auto compressed = getCompressed().getType();
+  auto metadata = getMetadata().getType();
+  auto rhs = getRhs().getType();
+  auto accumulator = getAccumulator().getType();
+  if (compressed.getSpace().getValue() != BufferSpace::Shared ||
+      metadata.getSpace().getValue() != BufferSpace::Shared ||
+      rhs.getSpace().getValue() != BufferSpace::Shared ||
+      accumulator.getSpace().getValue() != BufferSpace::Fragment ||
+      compressed.getShape().size() != 2 || metadata.getShape().size() != 2 ||
+      rhs.getShape().size() != 2 || accumulator.getShape().size() != 2)
+    return emitOpError(
+        "requires compressed/metadata/dense shared tiles and one fragment accumulator");
+  Type dataType = compressed.getElementType();
+  if ((!dataType.isF16() && !dataType.isBF16()) ||
+      rhs.getElementType() != dataType ||
+      !metadata.getElementType().isInteger(16) ||
+      (accumulator.getElementType() != dataType &&
+       !accumulator.getElementType().isF32()))
+    return emitOpError(
+        "supports two-of-four f16/bf16 data, packed i16 metadata, and f16/bf16/f32 accumulation");
+
+  Attribute compressedM =
+      compressed.getShape()[getTransposeCompressed() ? 1 : 0];
+  Attribute compressedK =
+      compressed.getShape()[getTransposeCompressed() ? 0 : 1];
+  Attribute metadataM = metadata.getShape()[getTransposeMetadata() ? 1 : 0];
+  Attribute metadataK = metadata.getShape()[getTransposeMetadata() ? 0 : 1];
+  Attribute rhsK = rhs.getShape()[getTransposeRhs() ? 1 : 0];
+  Attribute rhsN = rhs.getShape()[getTransposeRhs() ? 0 : 1];
+  if (compressedM != metadataM || accumulator.getShape()[0] != compressedM ||
+      accumulator.getShape()[1] != rhsN ||
+      !hasNoStaticQuotientConflict(compressedK, rhsK, 2) ||
+      !hasNoStaticQuotientConflict(metadataK, rhsK, 16))
+    return emitOpError(
+        "two-of-four sparse GEMM tile extents disagree with the dense logical K");
+  return success();
+}
+
+void SparseGemmOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   effects.emplace_back(MemoryEffects::Read::get());
   effects.emplace_back(MemoryEffects::Write::get());

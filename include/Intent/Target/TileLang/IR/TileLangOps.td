@@ -159,4 +159,17 @@ def IntentTileLang_GemmOp : IntentTileLang_Op<"gemm", [
   let hasVerifier = 1;
 }
 
+def IntentTileLang_SparseGemmOp : IntentTileLang_Op<"sparse_gemm", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
+  let arguments = (ins IntentTileLang_BufferValue:$compressed,
+                       IntentTileLang_BufferValue:$metadata,
+                       IntentTileLang_BufferValue:$rhs,
+                       IntentTileLang_BufferValue:$accumulator,
+                       BoolAttr:$transpose_compressed,
+                       BoolAttr:$transpose_metadata,
+                       BoolAttr:$transpose_rhs);
+  let hasVerifier = 1;
+}
+
 #endif

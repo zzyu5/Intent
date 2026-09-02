@@ -96,6 +96,7 @@ enum CandidateFailure : unsigned {
   ThreadLimit = 1u << 1,
   MmaPartition = 1u << 2,
   SharedMemory = 1u << 3,
+  SparseShape = 1u << 4,
 };
 
 struct FlatSharedLifetime {
@@ -232,6 +233,37 @@ unsigned configurationFailures(func::FuncOp kernel,
         config);
     if (m && n && !isLegalMmaWarpPartition(*m, *n, *threads))
       failures |= MmaPartition;
+  });
+  kernel.walk([&](SparseGemmOp gemm) {
+    auto compressed = gemm.getCompressed().getType();
+    auto metadata = gemm.getMetadata().getType();
+    auto rhs = gemm.getRhs().getType();
+    std::optional<int64_t> m = evaluate(
+        cast<gpu::PhysicalExprAttr>(compressed.getShape()[
+            gemm.getTransposeCompressed() ? 1 : 0]),
+        config);
+    std::optional<int64_t> n = evaluate(
+        cast<gpu::PhysicalExprAttr>(
+            rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]),
+        config);
+    std::optional<int64_t> compressedK = evaluate(
+        cast<gpu::PhysicalExprAttr>(compressed.getShape()[
+            gemm.getTransposeCompressed() ? 0 : 1]),
+        config);
+    std::optional<int64_t> metadataK = evaluate(
+        cast<gpu::PhysicalExprAttr>(
+            metadata.getShape()[gemm.getTransposeMetadata() ? 0 : 1]),
+        config);
+    std::optional<int64_t> rhsK = evaluate(
+        cast<gpu::PhysicalExprAttr>(
+            rhs.getShape()[gemm.getTransposeRhs() ? 1 : 0]),
+        config);
+    if (m && n && !isLegalMmaWarpPartition(*m, *n, *threads))
+      failures |= MmaPartition;
+    if (compressedK && metadataK && rhsK &&
+        (*rhsK <= 0 || *rhsK % 16 != 0 || *compressedK * 2 != *rhsK ||
+         *metadataK * 16 != *rhsK))
+      failures |= SparseShape;
   });
   if (!exactSharedMemoryIsLegal(
           kernel, config,
@@ -419,6 +451,8 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
       appendReason("mma_warp_partition");
     if (rejected & SharedMemory)
       appendReason("exact_shared_memory");
+    if (rejected & SparseShape)
+      appendReason("two_of_four_tile_shape");
     return failure();
   }
   kernel->setAttr(gpu::tileLangConfigsAttr, builder.getArrayAttr(encoded));
@@ -434,6 +468,27 @@ bool supportsThreads(func::FuncOp kernel, int64_t threads) {
     auto rhs = gemm.getRhs().getType();
     Attribute mExtent = lhs.getShape()[gemm.getTransposeLhs() ? 1 : 0];
     Attribute nExtent = rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1];
+    SmallVector<int64_t> mCandidates = extentCandidates(kernel, mExtent);
+    SmallVector<int64_t> nCandidates = extentCandidates(kernel, nExtent);
+    if (mCandidates.empty() || nCandidates.empty()) {
+      supported = false;
+      return;
+    }
+    bool hasLegalShape = false;
+    for (int64_t m : mCandidates)
+      for (int64_t n : nCandidates)
+        hasLegalShape |= isLegalMmaWarpPartition(m, n, threads);
+    if (!hasLegalShape)
+      supported = false;
+  });
+  kernel.walk([&](SparseGemmOp gemm) {
+    sawGemm = true;
+    auto compressed = gemm.getCompressed().getType();
+    auto rhs = gemm.getRhs().getType();
+    Attribute mExtent = compressed.getShape()[
+        gemm.getTransposeCompressed() ? 1 : 0];
+    Attribute nExtent =
+        rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1];
     SmallVector<int64_t> mCandidates = extentCandidates(kernel, mExtent);
     SmallVector<int64_t> nCandidates = extentCandidates(kernel, nExtent);
     if (mCandidates.empty() || nCandidates.empty()) {

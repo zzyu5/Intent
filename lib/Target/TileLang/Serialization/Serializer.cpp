@@ -619,6 +619,16 @@ private:
            valueString(gemm.getAccumulator()) + ", transpose_A=" +
            (gemm.getTransposeLhs() ? "True" : "False") + ", transpose_B=" +
            (gemm.getTransposeRhs() ? "True" : "False") + ")");
+    } else if (auto gemm = dyn_cast<SparseGemmOp>(operation)) {
+      line("T.gemm_sp(" + valueString(gemm.getCompressed()) + ", " +
+           valueString(gemm.getMetadata()) + ", " +
+           valueString(gemm.getRhs()) + ", " +
+           valueString(gemm.getAccumulator()) + ", transpose_A=" +
+           (gemm.getTransposeCompressed() ? "True" : "False") +
+           ", transpose_E=" +
+           (gemm.getTransposeMetadata() ? "True" : "False") +
+           ", transpose_B=" +
+           (gemm.getTransposeRhs() ? "True" : "False") + ")");
     } else if (auto pipeline = dyn_cast<PipelineOp>(operation)) {
       auto loop = mlir::cast<scf::ForOp>(pipeline.getBody().front().front());
       std::string induction = "iv" + std::to_string(counter++);

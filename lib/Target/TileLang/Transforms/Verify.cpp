@@ -26,7 +26,7 @@ bool isAllowed(Operation *operation) {
   return isa<LaunchConfigOp, PipelineOp, ParallelOp, YieldOp, AllocOp, ClearOp,
              FillOp, SyncOp, CopyInOp, CopyOutOp, CastCopyOutOp, BufferLoadOp,
              BufferStoreOp,
-             ViewLoadOp, ViewStoreOp, ReduceOp, ScanOp, GemmOp,
+             ViewLoadOp, ViewStoreOp, ReduceOp, ScanOp, GemmOp, SparseGemmOp,
              gpu::ParameterOp, gpu::PhysicalExprOp, gpu::ProgramIdOp,
              gpu::WorksetCoordinateOp, gpu::DelinearizeOp, gpu::DimOp,
              gpu::RangeOp,

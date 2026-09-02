@@ -65,13 +65,18 @@ bool dependsOnSharedBuffer(Value value, llvm::DenseSet<Value> &active) {
 }
 
 bool hasPipelineableContract(scf::ForOp loop) {
-  SmallVector<GemmOp> contracts;
+  SmallVector<Operation *> contracts;
   bool transfer = false;
   llvm::DenseSet<Value> contractOperands;
   for (Operation &operation : loop.getBody()->without_terminator()) {
     if (auto gemm = dyn_cast<GemmOp>(operation)) {
-      contracts.push_back(gemm);
+      contracts.push_back(gemm.getOperation());
       contractOperands.insert(gemm.getLhs());
+      contractOperands.insert(gemm.getRhs());
+    } else if (auto gemm = dyn_cast<SparseGemmOp>(operation)) {
+      contracts.push_back(gemm.getOperation());
+      contractOperands.insert(gemm.getCompressed());
+      contractOperands.insert(gemm.getMetadata());
       contractOperands.insert(gemm.getRhs());
     }
     transfer |= isa<CopyInOp>(operation);
@@ -89,10 +94,20 @@ bool hasPipelineableContract(scf::ForOp loop) {
       transfer = true;
     }
   });
-  for (GemmOp gemm : contracts)
-    if (sharedRematerializedBuffers.contains(gemm.getLhs()) ||
-        sharedRematerializedBuffers.contains(gemm.getRhs()))
+  for (Operation *operation : contracts) {
+    SmallVector<Value> operands;
+    if (auto gemm = dyn_cast<GemmOp>(operation)) {
+      operands.append({gemm.getLhs(), gemm.getRhs()});
+    } else {
+      auto sparse = cast<SparseGemmOp>(operation);
+      operands.append(
+          {sparse.getCompressed(), sparse.getMetadata(), sparse.getRhs()});
+    }
+    if (llvm::any_of(operands, [&](Value operand) {
+          return sharedRematerializedBuffers.contains(operand);
+        }))
       return false;
+  }
   return transfer;
 }
 

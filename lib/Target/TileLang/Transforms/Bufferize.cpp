@@ -26,6 +26,19 @@ gpu::PhysicalExprAttr constantExtent(MLIRContext *context, int64_t value) {
       StringAttr::get(context), ArrayAttr::get(context, {}));
 }
 
+gpu::PhysicalExprAttr floorDivideExtent(gpu::PhysicalExprAttr dividend,
+                                        int64_t divisor) {
+  if (dividend.getKind() ==
+      static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+    return constantExtent(dividend.getContext(), dividend.getValue() / divisor);
+  auto divisorAttr = constantExtent(dividend.getContext(), divisor);
+  return gpu::PhysicalExprAttr::get(
+      dividend.getContext(),
+      static_cast<uint32_t>(gpu::PhysicalExprKind::FloorDiv), 0,
+      StringAttr::get(dividend.getContext()),
+      ArrayAttr::get(dividend.getContext(), {dividend, divisorAttr}));
+}
+
 bool isZero(Value value) {
   if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
     if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
@@ -416,11 +429,52 @@ public:
     SmallVector<Operation *> structuredComputations;
     SmallVector<gpu::StoreOp> stores;
     SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
+    llvm::DenseSet<Operation *> sparseMetadataGraph;
+    llvm::DenseSet<Operation *> sparseMetadataConsumers;
     kernel.walk([&](gpu::LoadOp op) { loads.push_back(op); });
     kernel.walk([&](gpu::ContractOp op) {
       directContractOperands.insert(op.getLhs());
       directContractOperands.insert(op.getRhs());
     });
+    kernel.walk([&](gpu::SparseContractOp op) {
+      directContractOperands.insert(op.getCompressed());
+      directContractOperands.insert(op.getRhs());
+      sparseMetadataConsumers.insert(op);
+      SmallVector<Value> pending{op.getMetadata()};
+      while (!pending.empty()) {
+        Value value = pending.pop_back_val();
+        Operation *producer = value.getDefiningOp();
+        if (!producer || !sparseMetadataGraph.insert(producer).second ||
+            isa<gpu::LoadOp>(producer))
+          continue;
+        pending.append(producer->operand_begin(), producer->operand_end());
+      }
+    });
+    for (Operation *operation : sparseMetadataGraph) {
+      auto load = dyn_cast<gpu::LoadOp>(operation);
+      if (!load)
+        continue;
+      bool exclusive = true;
+      SmallVector<Operation *> pending{load};
+      llvm::DenseSet<Operation *> visited;
+      while (exclusive && !pending.empty()) {
+        Operation *current = pending.pop_back_val();
+        if (!visited.insert(current).second)
+          continue;
+        for (Value result : current->getResults())
+          for (Operation *user : result.getUsers()) {
+            if (sparseMetadataConsumers.contains(user))
+              continue;
+            if (!sparseMetadataGraph.contains(user)) {
+              exclusive = false;
+              break;
+            }
+            pending.push_back(user);
+          }
+      }
+      if (exclusive)
+        deferredSparseMetadataLoads.insert(load);
+    }
     kernel.walk([&](gpu::ScaledContractOp op) {
       for (Value operand :
            {op.getLhs(), op.getLhsScale(), op.getRhs(), op.getRhsScale()})
@@ -436,8 +490,8 @@ public:
     if (contractShapes.wasInterrupted())
       return failure();
     kernel.walk([&](Operation *operation) {
-      if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::ReduceOp,
-              gpu::ScanOp>(operation))
+      if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp,
+              gpu::ReduceOp, gpu::ScanOp>(operation))
         structuredComputations.push_back(operation);
     });
     kernel.walk([&](gpu::StoreOp op) { stores.push_back(op); });
@@ -446,7 +500,8 @@ public:
     });
 
     for (gpu::LoadOp load : loads) {
-      if (deferredScaledLoads.contains(load))
+      if (deferredScaledLoads.contains(load) ||
+          deferredSparseMetadataLoads.contains(load))
         continue;
       llvm::DenseSet<Value> visited;
       if (failed(lowerLoad(
@@ -468,6 +523,9 @@ public:
           return failure();
       } else if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
         if (failed(lowerScaledContract(contract)))
+          return failure();
+      } else if (auto contract = dyn_cast<gpu::SparseContractOp>(operation)) {
+        if (failed(lowerSparseContract(contract)))
           return failure();
       } else if (auto reduce = dyn_cast<gpu::ReduceOp>(operation)) {
         if (failed(lowerReduce(reduce)))
@@ -896,28 +954,39 @@ private:
   FailureOr<Value> scalarize(Value value, gpu::FragmentType target,
                              ValueRange targetIndices, OpBuilder &builder,
                              Operation *owner,
-                             DenseMap<Value, Value> &memo) {
+                             DenseMap<Value, Value> &memo,
+                             bool preferSourceGraph = false) {
     if (!isa<gpu::FragmentType>(value.getType()))
       return value;
     if (Value cached = memo.lookup(value))
       return cached;
     auto source = cast<gpu::FragmentType>(value.getType());
-    if (Value buffer = findBuffer(value)) {
-      FailureOr<Value> loaded = loadBufferElement(
-          builder, buffer, source, target, targetIndices, owner);
-      if (succeeded(loaded))
-        memo[value] = *loaded;
-      return loaded;
+    if (!preferSourceGraph) {
+      if (Value buffer = findBuffer(value)) {
+        FailureOr<Value> loaded = loadBufferElement(
+            builder, buffer, source, target, targetIndices, owner);
+        if (succeeded(loaded))
+          memo[value] = *loaded;
+        return loaded;
+      }
     }
     Operation *producer = value.getDefiningOp();
     if (!producer)
       return owner->emitOpError(
           "TileLang scalarization encountered an unbufferized fragment argument");
     auto recurse = [&](Value operand) {
-      return scalarize(operand, target, targetIndices, builder, owner, memo);
+      return scalarize(operand, target, targetIndices, builder, owner, memo,
+                       preferSourceGraph);
     };
     Value result;
-    if (auto range = dyn_cast<gpu::MakeRangeOp>(producer)) {
+    if (auto load = dyn_cast<gpu::LoadOp>(producer);
+        preferSourceGraph && load) {
+      FailureOr<Value> loaded = externalLoadElement(
+          load, target, targetIndices, builder, owner);
+      if (failed(loaded))
+        return failure();
+      result = *loaded;
+    } else if (auto range = dyn_cast<gpu::MakeRangeOp>(producer)) {
       FailureOr<unsigned> targetAxis = failure();
       for (Attribute targetAttribute : target.getAxisMaps()) {
         auto mapping = cast<gpu::AxisMapAttr>(targetAttribute);
@@ -955,7 +1024,7 @@ private:
         // even when the structured helper's local provenance differs from the
         // producer's result provenance.
         input = scalarize(broadcast.getValue(), sourceType, targetIndices,
-                          builder, owner, memo);
+                          builder, owner, memo, preferSourceGraph);
       } else {
         input = recurse(broadcast.getValue());
       }
@@ -1865,6 +1934,173 @@ private:
     return success();
   }
 
+  LogicalResult lowerSparseContract(gpu::SparseContractOp contract) {
+    auto capabilities =
+        kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+    if (!capabilities)
+      return contract.emitOpError(
+          "TileLang sparse GEMM requires typed GPU capabilities");
+    if (capabilities.getComputeCapabilityMajor() < 8)
+      return contract.emitOpError(
+          "TileLang two-of-four sparse GEMM requires CUDA compute capability 8.0 or newer");
+
+    auto compressedType =
+        dyn_cast<gpu::FragmentType>(contract.getCompressed().getType());
+    auto rhsType = dyn_cast<gpu::FragmentType>(contract.getRhs().getType());
+    auto resultType = dyn_cast<gpu::FragmentType>(contract.getResult().getType());
+    auto metadataType = dyn_cast<gpu::RecordType>(contract.getMetadata().getType());
+    auto metadataRecord =
+        contract.getMetadata().getDefiningOp<gpu::MakeRecordOp>();
+    bool fixedAxes = contract.getLhsReductionAxes() == ArrayRef<int64_t>{1} &&
+                     contract.getRhsReductionAxes() == ArrayRef<int64_t>{0} &&
+                     contract.getLhsBatchAxes().empty() &&
+                     contract.getRhsBatchAxes().empty();
+    if (!compressedType || !rhsType || !resultType || !metadataType ||
+        !metadataRecord || metadataRecord.getFields().size() != 2 ||
+        contract.getFormat().getKind() != 1 ||
+        contract.getFormat().getCompressionAxis() != 1 || !fixedAxes ||
+        compressedType.getShape().size() != 2 ||
+        rhsType.getShape().size() != 2 || resultType.getShape().size() != 2 ||
+        (!compressedType.getElementType().isF16() &&
+         !compressedType.getElementType().isBF16()) ||
+        rhsType.getElementType() != compressedType.getElementType() ||
+        (resultType.getElementType() != compressedType.getElementType() &&
+         !resultType.getElementType().isF32()))
+      return contract.emitOpError(
+          "has no TileLang two-of-four f16/bf16 rank-two sparse GEMM provider form");
+
+    auto firstType = dyn_cast<gpu::FragmentType>(
+        metadataRecord.getFields()[0].getType());
+    auto secondType = dyn_cast<gpu::FragmentType>(
+        metadataRecord.getFields()[1].getType());
+    auto isPositionType = [](Type type) {
+      return type.isIndex() || isa<IntegerType>(type);
+    };
+    if (!firstType || !secondType || firstType != secondType ||
+        firstType.getShape().size() != 2 ||
+        !isPositionType(firstType.getElementType()))
+      return contract.emitOpError(
+          "TileLang sparse GEMM requires shape-identical logical first/second metadata fragments");
+
+    FailureOr<Value> compressed =
+        materialize(contract.getCompressed(), BufferSpace::Shared, contract);
+    FailureOr<Value> rhs =
+        materialize(contract.getRhs(), BufferSpace::Shared, contract);
+    FailureOr<Value> accumulator = structuredAccumulator(
+        contract, contract.getAccumulator(), contract.getResult(),
+        resultType.getShape());
+    if (failed(compressed) || failed(rhs) || failed(accumulator))
+      return failure();
+
+    auto transpose = [&](Value operand) -> FailureOr<bool> {
+      auto fragment = cast<gpu::FragmentType>(operand.getType());
+      SmallVector<unsigned> order = sharedBufferAxes.lookup(operand);
+      if (order.empty())
+        order = identityAxisOrder(fragment.getShape().size());
+      if (order.size() == 2 && order[0] == 0 && order[1] == 1)
+        return false;
+      if (order.size() == 2 && order[0] == 1 && order[1] == 0)
+        return true;
+      return contract.emitOpError(
+          "TileLang sparse GEMM operand has no native two-axis storage form");
+    };
+    FailureOr<bool> transposeCompressed = transpose(contract.getCompressed());
+    FailureOr<bool> transposeRhs = transpose(contract.getRhs());
+    if (failed(transposeCompressed) || failed(transposeRhs))
+      return failure();
+
+    MLIRContext *context = kernel.getContext();
+    auto logicalK =
+        cast<gpu::PhysicalExprAttr>(rhsType.getShape()[0]);
+    ArrayAttr packedMetadataShape = ArrayAttr::get(
+        context,
+        {firstType.getShape()[0], floorDivideExtent(logicalK, 16)});
+    auto packedMetadataType = BufferType::get(
+        context, IntegerType::get(context, 16), packedMetadataShape,
+        BufferSpaceAttr::get(context, BufferSpace::Shared));
+    OpBuilder allocationBuilder(allocationAnchor(contract));
+    Value packedMetadata = allocationBuilder.create<AllocOp>(
+        contract.getLoc(), packedMetadataType);
+
+    for (int64_t lane = 0; lane < 4; ++lane) {
+      FailureOr<ParallelOp> pack =
+          createParallel(contract, firstType, packedMetadataShape);
+      if (failed(pack))
+        return failure();
+      Block &packBody = pack->getBody().front();
+      OpBuilder packBuilder = OpBuilder::atBlockBegin(&packBody);
+      Type i16 = packBuilder.getI16Type();
+      auto i16Constant = [&](int64_t value) -> Value {
+        return packBuilder.create<arith::ConstantOp>(
+            contract.getLoc(), i16, packBuilder.getIntegerAttr(i16, value));
+      };
+      Value indexFour = packBuilder.create<arith::ConstantIndexOp>(
+          contract.getLoc(), 4);
+      Value groupBase = packBuilder.create<gpu::BinaryOp>(
+          contract.getLoc(), packBuilder.getIndexType(),
+          packBody.getArgument(1), indexFour, BinaryOperator::Multiply);
+      Value group = groupBase;
+      if (lane != 0) {
+        Value laneIndex = packBuilder.create<arith::ConstantIndexOp>(
+            contract.getLoc(), lane);
+        group = packBuilder.create<gpu::BinaryOp>(
+            contract.getLoc(), packBuilder.getIndexType(), groupBase, laneIndex,
+            BinaryOperator::Add);
+      }
+      SmallVector<Value> indices{packBody.getArgument(0), group};
+      DenseMap<Value, Value> memo;
+      FailureOr<Value> first = scalarize(metadataRecord.getFields()[0], firstType,
+                                         indices, packBuilder, contract, memo,
+                                         /*preferSourceGraph=*/true);
+      FailureOr<Value> second = scalarize(
+          metadataRecord.getFields()[1], secondType, indices, packBuilder,
+          contract, memo, /*preferSourceGraph=*/true);
+      if (failed(first) || failed(second))
+        return failure();
+      Value firstI16 = packBuilder.create<gpu::CastOp>(
+          contract.getLoc(), i16, *first);
+      Value secondI16 = packBuilder.create<gpu::CastOp>(
+          contract.getLoc(), i16, *second);
+      Value ordered = packBuilder.create<gpu::CompareOp>(
+          contract.getLoc(), packBuilder.getI1Type(), *first, *second,
+          ComparePredicate::Lt);
+      firstI16 = packBuilder.create<gpu::SelectOp>(
+          contract.getLoc(), i16, ordered, firstI16, i16Constant(0));
+      secondI16 = packBuilder.create<gpu::SelectOp>(
+          contract.getLoc(), i16, ordered, secondI16, i16Constant(1));
+      Value shiftedSecond = packBuilder.create<gpu::BinaryOp>(
+          contract.getLoc(), i16, secondI16, i16Constant(2),
+          BinaryOperator::LeftShift);
+      Value nibble = packBuilder.create<gpu::BinaryOp>(
+          contract.getLoc(), i16, firstI16, shiftedSecond,
+          BinaryOperator::BitwiseOr);
+      if (lane != 0) {
+        nibble = packBuilder.create<gpu::BinaryOp>(
+            contract.getLoc(), i16, nibble, i16Constant(4 * lane),
+            BinaryOperator::LeftShift);
+        Value encoded = packBuilder.create<BufferLoadOp>(
+            contract.getLoc(), i16, packedMetadata,
+            packBody.getArguments());
+        nibble = packBuilder.create<gpu::BinaryOp>(
+            contract.getLoc(), i16, encoded, nibble,
+            BinaryOperator::BitwiseOr);
+      }
+      packBuilder.create<BufferStoreOp>(contract.getLoc(), packedMetadata,
+                                        packBody.getArguments(), nibble);
+      packBuilder.create<YieldOp>(contract.getLoc());
+    }
+
+    OpBuilder builder(contract);
+    builder.create<SyncOp>(contract.getLoc());
+    builder.create<SparseGemmOp>(
+        contract.getLoc(), *compressed, packedMetadata, *rhs, *accumulator,
+        *transposeCompressed, /*transpose_metadata=*/false, *transposeRhs);
+    fragmentBuffers[contract.getResult()] = *accumulator;
+    lowered.insert(metadataRecord);
+    lowered.insert(contract);
+    return success();
+  }
+
   LogicalResult lowerReduce(gpu::ReduceOp reduce) {
     std::optional<BinaryOperator> kind = nativeCombineKind(reduce.getCombine());
     if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
@@ -2292,6 +2528,7 @@ private:
   DenseMap<Attribute, Attribute> nativeAxisExtents;
   llvm::DenseSet<Value> directContractOperands;
   llvm::DenseSet<Operation *> deferredScaledLoads;
+  llvm::DenseSet<Operation *> deferredSparseMetadataLoads;
   DenseMap<Operation *, SmallVector<unsigned>> loopDrops;
   llvm::DenseSet<Operation *> lowered;
 };
