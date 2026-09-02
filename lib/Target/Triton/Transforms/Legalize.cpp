@@ -83,7 +83,8 @@ localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
     return {{8, 2, 1}, {4, 2, 1}, {16, 2, 1}};
   if (twoAxisPointwise)
     return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {2, 5, 1}};
-  return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {4, 3, 1}};
+  return {{1, 3, 1}, {2, 1, 1}, {2, 2, 1}, {2, 3, 1},
+          {4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {4, 3, 1}};
 }
 
 bool valueDependsOn(Value value, Value root, scf::ForOp owner,
