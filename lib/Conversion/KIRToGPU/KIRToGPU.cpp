@@ -869,9 +869,12 @@ physicalAxisIdentity(Operation *origin, int64_t logicalIdentity,
 }
 
 std::optional<int64_t> integerConstant(Value value) {
-  auto constant = value.getDefiningOp<intent::ConstantOp>();
-  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                          : IntegerAttr();
+  Attribute attribute;
+  if (auto constant = value.getDefiningOp<intent::ConstantOp>())
+    attribute = constant.getValue();
+  else if (auto constant = value.getDefiningOp<arith::ConstantOp>())
+    attribute = constant.getValue();
+  auto integer = dyn_cast_or_null<IntegerAttr>(attribute);
   return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
 }
 
@@ -1540,6 +1543,8 @@ private:
   }
 
   Value rangeExtent(Location location, Value start, Value stop, Value step) {
+    if (integerConstant(start) == 0 && integerConstant(step) == 1)
+      return stop;
     Value one = builder.create<arith::ConstantIndexOp>(location, 1);
     Value distance = createBinary(builder, location, builder.getIndexType(), stop,
                                   start, BinaryOperator::Subtract);
