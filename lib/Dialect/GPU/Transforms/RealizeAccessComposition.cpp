@@ -8,6 +8,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
 
@@ -360,6 +361,51 @@ FailureOr<bool> projectFragmentGather(GatherOp gather) {
   return true;
 }
 
+bool sameImmutableLoad(LoadOp available, LoadOp current) {
+  auto view = dyn_cast<ViewType>(current.getResource().getType());
+  if (!view || view.getAccess() != 0 ||
+      available.getResource() != current.getResource() ||
+      available.getResult().getType() != current.getResult().getType() ||
+      available.getValid() != current.getValid() ||
+      available.getFill() != current.getFill() ||
+      available.getSourceAxes() != current.getSourceAxes() ||
+      available.getCoordinates().size() != current.getCoordinates().size())
+    return false;
+  return llvm::equal(available.getCoordinates(), current.getCoordinates());
+}
+
+bool deduplicateImmutableLoads(func::FuncOp kernel) {
+  SmallVector<LoadOp> loads;
+  kernel.walk([&](LoadOp load) { loads.push_back(load); });
+  bool changed = false;
+  for (LoadOp current : loads) {
+    if (!current->getBlock())
+      continue;
+    Block *block = current->getBlock();
+    auto cursor = current->getIterator();
+    while (cursor != block->begin()) {
+      --cursor;
+      Operation *candidate = &*cursor;
+      if (candidate->getNumRegions() != 0)
+        break;
+      if (auto available = dyn_cast<LoadOp>(candidate)) {
+        if (!sameImmutableLoad(available, current))
+          continue;
+        current.getResult().replaceAllUsesWith(available.getResult());
+        current.erase();
+        changed = true;
+        break;
+      }
+      // Different ABI views may alias by default.  A write or another
+      // side-effecting operation therefore ends the interval in which an
+      // immutable-view load is known to retain its value.
+      if (!isMemoryEffectFree(candidate))
+        break;
+    }
+  }
+  return changed;
+}
+
 } // namespace
 
 LogicalResult realizeAccessComposition(ModuleOp module) {
@@ -403,6 +449,7 @@ LogicalResult realizeAccessComposition(ModuleOp module) {
         return failure();
       changed |= *load;
     }
+    changed |= deduplicateImmutableLoads(*physicalKernel);
     eraseDeadPhysicalValues(*physicalKernel);
   } while (changed);
   return success();
