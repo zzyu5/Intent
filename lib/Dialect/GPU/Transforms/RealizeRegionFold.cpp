@@ -433,7 +433,9 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
                                                Value substituteSource = {},
                                                Value substituteTarget = {},
                                                Value conjunctSource = {},
-                                               Value conjunctPredicate = {}) {
+                                               Value conjunctPredicate = {},
+                                               Value additionalSource = {},
+                                               Value additionalTarget = {}) {
   if (region.empty() || !llvm::hasSingleElement(region) ||
       region.front().getNumArguments() != arguments.size()) {
     reason = "helper argument schema mismatch";
@@ -508,6 +510,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     }
     mapping.map(substituteSource, substituteTarget);
   }
+  if (additionalSource && additionalTarget)
+    mapping.map(additionalSource, additionalTarget);
   for (Operation &operation : region.front().without_terminator()) {
     if (operation.getNumResults() == 1 &&
         mapping.lookupOrNull(operation.getResult(0)))
@@ -805,6 +809,236 @@ Value summaryMembershipPredicate(RegionFoldOp fold, ValueRange identities,
     }
   }
   return candidate;
+}
+
+struct SummaryEmptinessPlan {
+  unsigned optionalField;
+  RecordType fullType;
+  RecordType payloadType;
+  Value summarizeValidity;
+};
+
+bool isRecordField(Value value, BlockArgument record, unsigned field) {
+  auto extract = value.getDefiningOp<ExtractOp>();
+  return extract && extract.getRecord() == record && extract.getField() == field;
+}
+
+bool isMembershipReduction(Value value, Value membershipPredicate) {
+  auto reduce = value.getDefiningOp<ReduceOp>();
+  auto result = dyn_cast<OpResult>(value);
+  if (!reduce || !result || reduce.getSourceCount() != 1 ||
+      reduce.getIdentityCount() != 1 || reduce.getCaptureCount() != 0 ||
+      reduce.getNumResults() != 1 || result.getResultNumber() != 0 ||
+      reduce.getInputs().size() != 2 ||
+      reduce.getInputs().front() != membershipPredicate ||
+      !llvm::hasSingleElement(reduce.getCombine()))
+    return false;
+  llvm::SmallPtrSet<Operation *, 16> visiting;
+  std::optional<bool> identity =
+      booleanConstant(reduce.getInputs().back(), Value(), visiting);
+  auto yield = dyn_cast<YieldOp>(reduce.getCombine().front().getTerminator());
+  auto merged = yield && yield.getValues().size() == 1
+                    ? yield.getValues().front().getDefiningOp<BinaryOp>()
+                    : BinaryOp();
+  if (!identity || *identity || !merged ||
+      (merged.getOperatorKind() != BinaryOperator::LogicalOr &&
+       merged.getOperatorKind() != BinaryOperator::BitwiseOr) ||
+      reduce.getCombine().front().getNumArguments() != 2)
+    return false;
+  Block &combine = reduce.getCombine().front();
+  return (merged.getLhs() == combine.getArgument(0) &&
+          merged.getRhs() == combine.getArgument(1)) ||
+         (merged.getRhs() == combine.getArgument(0) &&
+          merged.getLhs() == combine.getArgument(1));
+}
+
+std::optional<SummaryEmptinessPlan>
+summaryEmptinessPlan(RegionFoldOp fold, ValueRange identities,
+                     Value membershipPredicate) {
+  if (identities.size() != 1 || fold.getSummarize().empty() ||
+      fold.getCombine().empty())
+    return std::nullopt;
+  auto identity = identities.front().getDefiningOp<MakeRecordOp>();
+  auto summarizeYield =
+      dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+  auto combineYield =
+      dyn_cast<YieldOp>(fold.getCombine().front().getTerminator());
+  auto summary = summarizeYield && summarizeYield.getValues().size() == 1
+                     ? summarizeYield.getValues().front().getDefiningOp<MakeRecordOp>()
+                     : MakeRecordOp();
+  auto combined = combineYield && combineYield.getValues().size() == 1
+                      ? combineYield.getValues().front().getDefiningOp<MakeRecordOp>()
+                      : MakeRecordOp();
+  Block &combine = fold.getCombine().front();
+  if (!identity || !summary || !combined || combine.getNumArguments() != 2 ||
+      identity.getFields().size() != summary.getFields().size() ||
+      identity.getFields().size() != combined.getFields().size())
+    return std::nullopt;
+  auto fullType = dyn_cast<RecordType>(identities.front().getType());
+  if (!fullType || fullType.getFieldTypes().size() != identity.getFields().size())
+    return std::nullopt;
+
+  std::optional<unsigned> selected;
+  for (unsigned field = 0; field < identity.getFields().size(); ++field) {
+    llvm::SmallPtrSet<Operation *, 16> visiting;
+    std::optional<bool> identityValue =
+        booleanConstant(identity.getFields()[field], Value(), visiting);
+    auto summaryType = dyn_cast<FragmentType>(summary.getFields()[field].getType());
+    auto merged = combined.getFields()[field].getDefiningOp<BinaryOp>();
+    if (!identityValue || *identityValue || !summaryType ||
+        !summaryType.getElementType().isInteger(1) || !merged ||
+        !isMembershipReduction(summary.getFields()[field],
+                               membershipPredicate) ||
+        (merged.getOperatorKind() != BinaryOperator::LogicalOr &&
+         merged.getOperatorKind() != BinaryOperator::BitwiseOr))
+      continue;
+    BlockArgument lhs = combine.getArgument(0);
+    BlockArgument rhs = combine.getArgument(1);
+    bool fieldsMatch =
+        (isRecordField(merged.getLhs(), lhs, field) &&
+         isRecordField(merged.getRhs(), rhs, field)) ||
+        (isRecordField(merged.getRhs(), lhs, field) &&
+         isRecordField(merged.getLhs(), rhs, field));
+    if (!fieldsMatch || selected)
+      return std::nullopt;
+    selected = field;
+  }
+  if (!selected)
+    return std::nullopt;
+
+  SmallVector<Attribute> names;
+  SmallVector<Attribute> types;
+  for (unsigned field = 0; field < fullType.getFieldTypes().size(); ++field) {
+    if (field == *selected)
+      continue;
+    names.push_back(fullType.getFieldNames()[field]);
+    types.push_back(fullType.getFieldTypes()[field]);
+  }
+  auto payload = RecordType::get(
+      fold.getContext(), ArrayAttr::get(fold.getContext(), names),
+      ArrayAttr::get(fold.getContext(), types), fullType.getOwner());
+  return SummaryEmptinessPlan{*selected, fullType, payload,
+                              summary.getFields()[*selected]};
+}
+
+Value allTrueValue(OpBuilder &builder, Location location, Type type) {
+  Value truth = builder.create<arith::ConstantOp>(
+      location, builder.getI1Type(), builder.getBoolAttr(true));
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return builder.create<SplatOp>(location, fragment, truth);
+  return truth;
+}
+
+FailureOr<Value> stripOptionalRecord(OpBuilder &builder, Location location,
+                                     Value value,
+                                     const SummaryEmptinessPlan &plan) {
+  auto record = value.getDefiningOp<MakeRecordOp>();
+  SmallVector<Value> fields;
+  unsigned payloadField = 0;
+  for (unsigned field = 0; field < plan.fullType.getFieldTypes().size(); ++field) {
+    if (field == plan.optionalField)
+      continue;
+    Type type = cast<TypeAttr>(plan.payloadType.getFieldTypes()[payloadField++])
+                    .getValue();
+    fields.push_back(record ? record.getFields()[field]
+                            : Value(builder.create<ExtractOp>(location, type,
+                                                              value, field)));
+  }
+  return Value(builder.create<MakeRecordOp>(location, plan.payloadType, fields));
+}
+
+Value restoreOptionalRecord(OpBuilder &builder, Location location, Value payload,
+                            const SummaryEmptinessPlan &plan) {
+  SmallVector<Value> fields;
+  unsigned payloadField = 0;
+  for (unsigned field = 0; field < plan.fullType.getFieldTypes().size(); ++field) {
+    Type type = cast<TypeAttr>(plan.fullType.getFieldTypes()[field]).getValue();
+    if (field == plan.optionalField) {
+      fields.push_back(allTrueValue(builder, location, type));
+      continue;
+    }
+    fields.push_back(builder.create<ExtractOp>(location, type, payload,
+                                               payloadField++));
+  }
+  return builder.create<MakeRecordOp>(location, plan.fullType, fields);
+}
+
+void simplifyKnownRecordValues(func::FuncOp kernel) {
+  bool changed;
+  do {
+    changed = false;
+    SmallVector<Operation *> candidates;
+    kernel.walk([&](Operation *operation) {
+      if (isa<ExtractOp, SelectOp, BinaryOp>(operation))
+        candidates.push_back(operation);
+    });
+    for (Operation *operation : candidates) {
+      if (!operation->getBlock())
+        continue;
+      if (auto extract = dyn_cast<ExtractOp>(operation)) {
+        auto record = extract.getRecord().getDefiningOp<MakeRecordOp>();
+        if (!record || extract.getField() >= record.getFields().size())
+          continue;
+        extract.getResult().replaceAllUsesWith(
+            record.getFields()[extract.getField()]);
+        extract.erase();
+        changed = true;
+        continue;
+      }
+      if (auto select = dyn_cast<SelectOp>(operation)) {
+        llvm::SmallPtrSet<Operation *, 16> visiting;
+        std::optional<bool> condition =
+            booleanConstant(select.getCondition(), Value(), visiting);
+        if (!condition)
+          continue;
+        select.getResult().replaceAllUsesWith(
+            *condition ? select.getTrueValue() : select.getFalseValue());
+        select.erase();
+        changed = true;
+        continue;
+      }
+      auto binary = cast<BinaryOp>(operation);
+      BinaryOperator kind = binary.getOperatorKind();
+      if (kind != BinaryOperator::LogicalAnd &&
+          kind != BinaryOperator::BitwiseAnd &&
+          kind != BinaryOperator::LogicalOr &&
+          kind != BinaryOperator::BitwiseOr)
+        continue;
+      llvm::SmallPtrSet<Operation *, 16> visiting;
+      std::optional<bool> lhs =
+          booleanConstant(binary.getLhs(), Value(), visiting);
+      visiting.clear();
+      std::optional<bool> rhs =
+          booleanConstant(binary.getRhs(), Value(), visiting);
+      Value replacement;
+      bool conjunction = kind == BinaryOperator::LogicalAnd ||
+                         kind == BinaryOperator::BitwiseAnd;
+      if (conjunction) {
+        if (lhs && !*lhs)
+          replacement = binary.getLhs();
+        else if (rhs && !*rhs)
+          replacement = binary.getRhs();
+        else if (lhs && *lhs)
+          replacement = binary.getRhs();
+        else if (rhs && *rhs)
+          replacement = binary.getLhs();
+      } else {
+        if (lhs && *lhs)
+          replacement = binary.getLhs();
+        else if (rhs && *rhs)
+          replacement = binary.getRhs();
+        else if (lhs && !*lhs)
+          replacement = binary.getRhs();
+        else if (rhs && !*rhs)
+          replacement = binary.getLhs();
+      }
+      if (!replacement)
+        continue;
+      binary.getResult().replaceAllUsesWith(replacement);
+      binary.erase();
+      changed = true;
+    }
+  } while (changed);
 }
 
 bool isZeroWithSources(Value value, const llvm::SmallDenseSet<Value> &sources,
@@ -1169,6 +1403,7 @@ struct PredicatePartition {
   Value allTrueStop;
   Value effectiveStop;
   Value predicate;
+  bool firstMemberIsActive;
 };
 
 FailureOr<PredicatePartition>
@@ -1262,8 +1497,15 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     Value allTrueStop = builder.create<BinaryOp>(
         location, builder.getIndexType(), wholeSegments, segment,
         BinaryOperator::Multiply);
-    return PredicatePartition{allTrueStop, effectiveStop,
-                              compare.getResult()};
+    bool firstMemberIsActive =
+        samePhysicalScalarExpression(master.getStart(),
+                                     master.getLogicalStart()) &&
+        samePhysicalScalarExpression(captureRange.getLogicalStart(),
+                                     master.getStart()) &&
+        samePhysicalScalarExpression(comparedSource.getStart(),
+                                     master.getStart());
+    return PredicatePartition{allTrueStop, effectiveStop, compare.getResult(),
+                              firstMemberIsActive};
   }
   return failure();
 }
@@ -1360,13 +1602,16 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   if (!memberPredicate)
     return fold.emitOpError(
         "region-fold summarizer has no typed membership predicate that makes a physical tail equal to identity");
+  std::optional<SummaryEmptinessPlan> emptiness =
+      summaryEmptinessPlan(fold, identities, memberPredicate);
 
   bool bodyFailed = false;
   std::string failureReason;
   auto emitSummary = [&](OpBuilder &nested, Location nestedLocation,
                          Value offset,
                          bool fullSegment,
-                         bool predicateIsTrue)
+                         bool predicateIsTrue,
+                         bool summaryIsNonempty)
       -> FailureOr<SmallVector<Value>> {
     SmallVector<Value> slices;
     Value segmentTail;
@@ -1421,10 +1666,21 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       substituteTarget =
           nested.create<SplatOp>(nestedLocation, predicateType, truth);
     }
+    Value nonemptySource;
+    Value nonemptyTarget;
+    if (summaryIsNonempty && emptiness) {
+      nonemptySource = emptiness->summarizeValidity;
+      Type validityType =
+          cast<TypeAttr>(emptiness->fullType.getFieldTypes()[
+              emptiness->optionalField])
+              .getValue();
+      nonemptyTarget = allTrueValue(nested, nestedLocation, validityType);
+    }
     return inlinePureRegion(nested, fold.getSummarize(), summarizeArguments,
                             failureReason, substituteSource, substituteTarget,
                             fullSegment ? Value() : memberPredicate,
-                            fullSegment ? Value() : segmentTail);
+                            fullSegment ? Value() : segmentTail,
+                            nonemptySource, nonemptyTarget);
   };
   auto emitLoop = [&](Value lower, Value upper, ValueRange initial,
                       bool fullSegment, bool predicateIsTrue) {
@@ -1433,7 +1689,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       [&](OpBuilder &nested, Location nestedLocation, Value offset,
           ValueRange carries) {
         FailureOr<SmallVector<Value>> summary = emitSummary(
-            nested, nestedLocation, offset, fullSegment, predicateIsTrue);
+            nested, nestedLocation, offset, fullSegment, predicateIsTrue,
+            /*summaryIsNonempty=*/false);
         if (failed(summary)) {
           bodyFailed = true;
           return;
@@ -1457,6 +1714,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     for (SourceAssumption &sourceAssumption : sourceAssumptions)
       if (sourceAssumption.operation->getBlock())
         sourceAssumption.operation.erase();
+    simplifyKnownRecordValues(kernel);
     eraseDeadPhysicalValues(kernel);
     return success();
   };
@@ -1464,12 +1722,144 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   if (segment->hasAttr(coverageDimensionAttr)) {
     FailureOr<SmallVector<Value>> summary =
         emitSummary(builder, location, zero, /*fullSegment=*/false,
-                    /*predicateIsTrue=*/false);
+                    /*predicateIsTrue=*/false,
+                    /*summaryIsNonempty=*/false);
     if (failed(summary))
       return fold.emitOpError("region-fold physicalization failed: ")
              << failureReason;
     for (auto [oldResult, newResult] :
          llvm::zip(fold.getResults(), *summary))
+      oldResult.replaceAllUsesWith(newResult);
+    fold.erase();
+    return finish();
+  }
+
+  if (emptiness && succeeded(partition) && partition->firstMemberIsActive) {
+    stop = partition->effectiveStop;
+    Value nonempty = builder.create<CompareOp>(
+        location, builder.getI1Type(), stop, zero, ComparePredicate::Gt);
+    auto conditional = builder.create<scf::IfOp>(
+        location, fold.getResultTypes(), nonempty,
+        /*withElseRegion=*/true);
+    auto prepareBranch = [](Region &region) {
+      Block &block = region.front();
+      if (!block.empty() && isa<scf::YieldOp>(block.back()))
+        block.back().erase();
+      return OpBuilder(&block, block.end());
+    };
+
+    OpBuilder nonemptyBuilder = prepareBranch(conditional.getThenRegion());
+    FailureOr<SmallVector<Value>> first = emitSummary(
+        nonemptyBuilder, location, zero, /*fullSegment=*/false,
+        /*predicateIsTrue=*/false, /*summaryIsNonempty=*/true);
+    if (succeeded(first) && first->size() != 1) {
+      failureReason =
+          "summary-emptiness realization requires one summary record";
+      bodyFailed = true;
+    }
+    FailureOr<Value> payload = failure();
+    if (succeeded(first) && !bodyFailed)
+      payload = stripOptionalRecord(nonemptyBuilder, location, first->front(),
+                                    *emptiness);
+    if (failed(first) || failed(payload))
+      bodyFailed = true;
+
+    auto emitPayloadLoop = [&](OpBuilder &branchBuilder, Value lower, Value upper,
+                               Value initial, bool fullSegment,
+                               bool predicateIsTrue,
+                               bool summaryIsNonempty) -> scf::ForOp {
+      auto loop = branchBuilder.create<scf::ForOp>(
+          location, lower, upper, segment.getResult(), ValueRange{initial},
+          [&](OpBuilder &nested, Location nestedLocation, Value offset,
+              ValueRange carries) {
+            FailureOr<SmallVector<Value>> summary = emitSummary(
+                nested, nestedLocation, offset, fullSegment, predicateIsTrue,
+                summaryIsNonempty);
+            if (failed(summary) || summary->size() != 1 ||
+                carries.size() != 1) {
+              if (succeeded(summary))
+                failureReason =
+                    "summary-emptiness loop requires one summary and one payload carry";
+              bodyFailed = true;
+              return;
+            }
+            Value fullCarry = restoreOptionalRecord(
+                nested, nestedLocation, carries.front(), *emptiness);
+            FailureOr<SmallVector<Value>> combined = inlinePureRegion(
+                nested, fold.getCombine(),
+                ValueRange{fullCarry, summary->front()}, failureReason);
+            if (failed(combined) || combined->size() != 1) {
+              if (succeeded(combined))
+                failureReason =
+                    "summary-emptiness combine requires one summary record";
+              bodyFailed = true;
+              return;
+            }
+            FailureOr<Value> next = stripOptionalRecord(
+                nested, nestedLocation, combined->front(), *emptiness);
+            if (failed(next)) {
+              bodyFailed = true;
+              return;
+            }
+            nested.create<scf::YieldOp>(nestedLocation, *next);
+          });
+      if (Attribute origin = fold->getAttr(originAttr))
+        loop->setAttr(originAttr, origin);
+      return loop;
+    };
+
+    scf::ForOp allTrueLoop;
+    scf::ForOp fullMixedLoop;
+    scf::ForOp tailLoop;
+    Value current = succeeded(payload) ? *payload : Value();
+    if (!bodyFailed) {
+      allTrueLoop = emitPayloadLoop(
+          nonemptyBuilder, segment.getResult(), partition->allTrueStop, current,
+          /*fullSegment=*/true, /*predicateIsTrue=*/true,
+          /*summaryIsNonempty=*/true);
+      current = allTrueLoop.getResult(0);
+    }
+    Value mixedStart = nonemptyBuilder.create<BinaryOp>(
+        location, nonemptyBuilder.getIndexType(), partition->allTrueStop,
+        segment.getResult(), BinaryOperator::Maximum);
+    Value fullMixedSegments = nonemptyBuilder.create<BinaryOp>(
+        location, nonemptyBuilder.getIndexType(), stop, segment.getResult(),
+        BinaryOperator::FloorDivide);
+    Value fullMixedStop = nonemptyBuilder.create<BinaryOp>(
+        location, nonemptyBuilder.getIndexType(), fullMixedSegments,
+        segment.getResult(), BinaryOperator::Multiply);
+    if (!bodyFailed) {
+      fullMixedLoop = emitPayloadLoop(
+          nonemptyBuilder, mixedStart, fullMixedStop, current,
+          /*fullSegment=*/true, /*predicateIsTrue=*/false,
+          /*summaryIsNonempty=*/false);
+      current = fullMixedLoop.getResult(0);
+    }
+    Value tailStart = nonemptyBuilder.create<BinaryOp>(
+        location, nonemptyBuilder.getIndexType(), fullMixedStop,
+        segment.getResult(), BinaryOperator::Maximum);
+    if (!bodyFailed) {
+      tailLoop = emitPayloadLoop(
+          nonemptyBuilder, tailStart, stop, current,
+          /*fullSegment=*/false, /*predicateIsTrue=*/false,
+          /*summaryIsNonempty=*/false);
+      current = tailLoop.getResult(0);
+    }
+    if (!bodyFailed) {
+      Value result =
+          restoreOptionalRecord(nonemptyBuilder, location, current, *emptiness);
+      nonemptyBuilder.create<scf::YieldOp>(location, result);
+    }
+
+    OpBuilder emptyBuilder = prepareBranch(conditional.getElseRegion());
+    emptyBuilder.create<scf::YieldOp>(location, identities);
+    if (bodyFailed) {
+      conditional.erase();
+      return fold.emitOpError("region-fold physicalization failed: ")
+             << failureReason;
+    }
+    for (auto [oldResult, newResult] :
+         llvm::zip(fold.getResults(), conditional.getResults()))
       oldResult.replaceAllUsesWith(newResult);
     fold.erase();
     return finish();
