@@ -896,6 +896,17 @@ private:
       return "(" + valueString(binary.getLhs()) + " " + spelling.str() + " " +
              valueString(binary.getRhs()) + ")";
     };
+    auto nativeMinMax = [&](StringRef spelling) {
+      return spelling.str() + "(" + valueString(binary.getLhs()) + ", " +
+             valueString(binary.getRhs()) + ")";
+    };
+    auto propagatingMinMax = [&](StringRef spelling) {
+      std::string lhs = valueString(binary.getLhs());
+      std::string rhs = valueString(binary.getRhs());
+      std::string native = spelling.str() + "(" + lhs + ", " + rhs + ")";
+      return "ct.where(ct.isnan(" + lhs + "), " + lhs +
+             ", ct.where(ct.isnan(" + rhs + "), " + rhs + ", " + native + "))";
+    };
     switch (binary.getOperatorKind()) {
     case BinaryOperator::Add: return infix("+");
     case BinaryOperator::Subtract: return infix("-");
@@ -904,18 +915,16 @@ private:
     case BinaryOperator::FloorDivide: return infix("//");
     case BinaryOperator::Remainder: return infix("%");
     case BinaryOperator::Power: return infix("**");
-    case BinaryOperator::MaximumNum:
-      return "ct.maximum(" + valueString(binary.getLhs()) + ", " +
-             valueString(binary.getRhs()) + ")";
-    case BinaryOperator::MinimumNum:
-      return "ct.minimum(" + valueString(binary.getLhs()) + ", " +
-             valueString(binary.getRhs()) + ")";
+    case BinaryOperator::MaximumNum: return nativeMinMax("ct.maximum");
+    case BinaryOperator::MinimumNum: return nativeMinMax("ct.minimum");
     case BinaryOperator::Maximum:
+      return elementType(binary.getResult().getType()).isIntOrIndex()
+                 ? nativeMinMax("ct.maximum")
+                 : propagatingMinMax("ct.maximum");
     case BinaryOperator::Minimum:
-      binary.emitOpError(
-          "cuTile has no spelling that preserves Intent NaN-propagating min/max");
-      failed = true;
-      return "<unsupported-nan-propagating-minmax>";
+      return elementType(binary.getResult().getType()).isIntOrIndex()
+                 ? nativeMinMax("ct.minimum")
+                 : propagatingMinMax("ct.minimum");
     case BinaryOperator::LogicalAnd:
     case BinaryOperator::BitwiseAnd: return infix("&");
     case BinaryOperator::LogicalOr:
