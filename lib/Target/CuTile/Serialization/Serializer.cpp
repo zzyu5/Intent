@@ -795,12 +795,12 @@ private:
            tuple(store.getTileIndices()) + ", tile=" +
            valueString(store.getValue()) + ")");
     } else if (auto store = dyn_cast<ScalarStoreOp>(operation)) {
-      std::string call = "ct.store(" + valueString(store.getResource()) +
-                         ", index=" + tuple(store.getIndices()) + ", tile=" +
+      std::string call = "ct.scatter(" + valueString(store.getResource()) +
+                         ", " + tuple(store.getIndices()) + ", " +
                          valueString(store.getValue());
       if (store.getValid())
         call += ", mask=" + valueString(store.getValid());
-      line(call + ")");
+      line(call + ", check_bounds=True)");
     } else if (auto scatter = dyn_cast<ScatterStoreOp>(operation)) {
       std::string call = "ct.scatter(" + valueString(scatter.getResource()) +
                          ", " + tuple(scatter.getCoordinates()) +

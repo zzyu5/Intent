@@ -955,6 +955,21 @@ Value broadcast(OpBuilder &builder, Location location, FragmentType result,
   return builder.create<BroadcastOp>(location, result, value);
 }
 
+Value rangeBoundsValidity(OpBuilder &builder, Location location,
+                          FragmentType indexType,
+                          FragmentType predicateType, Value coordinate,
+                          Value logicalStop) {
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value lower = builder.create<CompareOp>(
+      location, predicateType, coordinate,
+      broadcast(builder, location, indexType, zero), ComparePredicate::Ge);
+  Value upper = compare(builder, location, predicateType, coordinate,
+                        broadcast(builder, location, indexType, logicalStop),
+                        ComparePredicate::Lt);
+  return binary(builder, location, predicateType, lower, upper,
+                BinaryOperator::LogicalAnd);
+}
+
 FailureOr<Value> retargetFill(OpBuilder &builder, Location location,
                               Value original, FragmentType result) {
   if (original) {
@@ -2619,10 +2634,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, columnRange);
-  Value columnEnd = broadcast(builder, location, columnIndexType, columnStop);
-  Value columnValid =
-      compare(builder, location, columnPredicateType, columns, columnEnd,
-              ComparePredicate::Lt);
+  Value columnValid = rangeBoundsValidity(
+      builder, location, columnIndexType, columnPredicateType, columns,
+      columnStop);
   auto emitRowBlock = [&](OpBuilder &rowBuilder,
                           Value rowStart) -> LogicalResult {
     Value rows = rowBuilder.create<MakeRangeOp>(
@@ -2630,10 +2644,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         rowRange.getLogicalStart(), rowRange.getLogicalStop(),
         rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
     inheritRangeAuthority(rows, rowRange);
-    Value rowEnd = broadcast(rowBuilder, location, rowIndexType, rowStop);
-    Value rowValid =
-        compare(rowBuilder, location, rowPredicateType, rows, rowEnd,
-                ComparePredicate::Lt);
+    Value rowValid = rangeBoundsValidity(rowBuilder, location, rowIndexType,
+                                         rowPredicateType, rows, rowStop);
     Value blockedLhsRowCoordinate = rows;
     SmallVector<SmallVector<Value>> replayedStoreCoordinates;
     SmallVector<Value> replayedStoreValidities;
@@ -2704,11 +2716,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               lhsReductionMap->getSourceId(), lhsReductionMap->getSourceAxis(),
               lhsReductionMap->getDerived());
           inheritRangeAuthority(reductions, lhsReductionRange);
-          Value reductionEnd =
-              broadcast(nested, nestedLocation, reductionIndexType, reductionStop);
-          Value reductionValid = compare(nested, nestedLocation,
-                                         reductionPredicateType, reductions,
-                                         reductionEnd, ComparePredicate::Lt);
+          Value reductionValid = rangeBoundsValidity(
+              nested, nestedLocation, reductionIndexType,
+              reductionPredicateType, reductions, reductionStop);
           Value lhsRows =
               broadcast(nested, nestedLocation, lhsPredicateType, rowValid);
           Value lhsReductions = broadcast(nested, nestedLocation,
@@ -3388,13 +3398,11 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, *columnRange);
-  Value rowValid = compare(
-      builder, location, rowPredicateType, rows,
-      broadcast(builder, location, rowIndexType, rowStop), ComparePredicate::Lt);
-  Value columnValid = compare(
-      builder, location, columnPredicateType, columns,
-      broadcast(builder, location, columnIndexType, columnStop),
-      ComparePredicate::Lt);
+  Value rowValid = rangeBoundsValidity(builder, location, rowIndexType,
+                                       rowPredicateType, rows, rowStop);
+  Value columnValid = rangeBoundsValidity(
+      builder, location, columnIndexType, columnPredicateType, columns,
+      columnStop);
   Value accumulator = builder.create<SplatOp>(
       location, blockedResultType, *initialAccumulator);
   bool loopBodyFailed = false;
@@ -3409,10 +3417,9 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
             lhsBlockMap->getSourceId(), lhsBlockMap->getSourceAxis(),
             lhsBlockMap->getDerived());
         inheritRangeAuthority(blocks, *blockRange);
-        Value blockValid = compare(
-            nested, nestedLocation, blockPredicateType, blocks,
-            broadcast(nested, nestedLocation, blockIndexType, blockStop),
-            ComparePredicate::Lt);
+        Value blockValid = rangeBoundsValidity(
+            nested, nestedLocation, blockIndexType, blockPredicateType, blocks,
+            blockStop);
         Value lhsRows = broadcast(nested, nestedLocation, lhsPredicateType,
                                   rowValid);
         Value lhsBlocks = broadcast(nested, nestedLocation, lhsPredicateType,
