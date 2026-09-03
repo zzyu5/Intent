@@ -6,8 +6,7 @@ build/
 dist/
 *.egg-info/
 /.codegraph/
-# >>> Comet managed project state >>>
-!/.comet/
-/.comet/*
-!/.comet/config.yaml
-# <<< Comet managed project state <<<
+/.agents/
+/.codex/
+/.comet/
+/autotuner.log
