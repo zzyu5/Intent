@@ -5,9 +5,11 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <functional>
+#include <limits>
 
 using namespace mlir;
 
@@ -47,11 +49,60 @@ void collectStructuredPrograms(Value value,
     collectStructuredPrograms(operand, visited, programs);
 }
 
-std::optional<int64_t> integerConstant(Value value) {
-  auto constant = value.getDefiningOp<arith::ConstantOp>();
-  auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                          : IntegerAttr();
-  return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+std::optional<int64_t> integerConstant(Value value, unsigned depth = 0) {
+  if (!value || depth >= 32)
+    return std::nullopt;
+  if (auto constant = value.getDefiningOp<arith::ConstantOp>())
+    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+      return integer.getInt();
+  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+    return integerConstant(broadcast.getValue(), depth + 1);
+  if (auto splat = value.getDefiningOp<SplatOp>())
+    return integerConstant(splat.getValue(), depth + 1);
+  if (auto cast = value.getDefiningOp<CastOp>())
+    return cast.getValue().getType() == cast.getResult().getType()
+               ? integerConstant(cast.getValue(), depth + 1)
+               : std::nullopt;
+  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
+    auto range = bound.getRange().getDefiningOp<RangeOp>();
+    if (!range)
+      return std::nullopt;
+    if (bound.getBound() == 0)
+      return integerConstant(range.getStart(), depth + 1);
+    if (bound.getBound() == 1)
+      return integerConstant(range.getStop(), depth + 1);
+    return integerConstant(range.getStep(), depth + 1);
+  }
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return std::nullopt;
+  std::optional<int64_t> lhs = integerConstant(binary.getLhs(), depth + 1);
+  std::optional<int64_t> rhs = integerConstant(binary.getRhs(), depth + 1);
+  if (!lhs || !rhs)
+    return std::nullopt;
+  __int128 evaluated;
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Add:
+    evaluated = static_cast<__int128>(*lhs) + *rhs;
+    break;
+  case BinaryOperator::Subtract:
+    evaluated = static_cast<__int128>(*lhs) - *rhs;
+    break;
+  case BinaryOperator::Multiply:
+    evaluated = static_cast<__int128>(*lhs) * *rhs;
+    break;
+  case BinaryOperator::FloorDivide:
+    if (*rhs != 1)
+      return std::nullopt;
+    evaluated = *lhs;
+    break;
+  default:
+    return std::nullopt;
+  }
+  if (evaluated < std::numeric_limits<int64_t>::min() ||
+      evaluated > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return static_cast<int64_t>(evaluated);
 }
 
 Value stripBroadcast(Value value) {
@@ -72,17 +123,18 @@ Value stripScalarIdentity(Value value) {
   value = stripBroadcast(value);
   while (true) {
     if (auto cast = value.getDefiningOp<CastOp>()) {
-      value = stripBroadcast(cast.getValue());
-      continue;
+      if (cast.getValue().getType() == cast.getResult().getType()) {
+        value = stripBroadcast(cast.getValue());
+        continue;
+      }
+      return value;
     }
     auto binary = value.getDefiningOp<BinaryOp>();
     if (!binary)
       return value;
     auto isInteger = [](Value operand, int64_t expected) {
-      auto constant = operand.getDefiningOp<arith::ConstantOp>();
-      auto integer =
-          constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
-      return integer && integer.getInt() == expected;
+      std::optional<int64_t> value = integerConstant(operand);
+      return value && *value == expected;
     };
     if (binary.getOperatorKind() == BinaryOperator::Add) {
       if (isInteger(binary.getLhs(), 0)) {
@@ -107,6 +159,16 @@ Value stripScalarIdentity(Value value) {
         value = stripBroadcast(binary.getLhs());
         continue;
       }
+    }
+    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
+        isInteger(binary.getRhs(), 0)) {
+      value = stripBroadcast(binary.getLhs());
+      continue;
+    }
+    if (binary.getOperatorKind() == BinaryOperator::FloorDivide &&
+        isInteger(binary.getRhs(), 1)) {
+      value = stripBroadcast(binary.getLhs());
+      continue;
     }
     return value;
   }
@@ -171,6 +233,78 @@ bool isUnitStepValue(Value value) {
     return range && bound.getBound() == 2 && isUnitStepValue(range.getStep());
   }
   return false;
+}
+
+bool matchesViewExtent(Value value, Value resource, unsigned axis) {
+  auto view = dyn_cast<ViewType>(resource.getType());
+  if (!view || axis >= view.getRank())
+    return false;
+  Value stripped = stripScalarIdentity(value);
+  if (stripped != value)
+    return matchesViewExtent(stripped, resource, axis);
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+    if (!function)
+      return false;
+    DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
+    auto kind = attrs.getAs<StringAttr>(abiKindAttr);
+    auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
+    auto extent = cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+    return kind && kind.getValue() == "dimension" && dimension &&
+           extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Dimension) &&
+           dimension.getInt() == extent.getValue();
+  }
+  if (auto dim = value.getDefiningOp<DimOp>())
+    return dim.getView() == resource && dim.getAxis() == axis;
+  if (auto expression = value.getDefiningOp<PhysicalExprOp>())
+    return expression.getExpression() ==
+           cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
+    auto range = bound.getRange().getDefiningOp<RangeOp>();
+    if (!range)
+      return false;
+    if (bound.getBound() == 0)
+      return matchesViewExtent(range.getStart(), resource, axis);
+    if (bound.getBound() == 1)
+      return matchesViewExtent(range.getStop(), resource, axis);
+    return matchesViewExtent(range.getStep(), resource, axis);
+  }
+  return false;
+}
+
+bool derivesFromAccessCoordinate(Value value, Value coordinate) {
+  if (value == coordinate)
+    return true;
+  value = stripBroadcast(value);
+  coordinate = stripBroadcast(coordinate);
+  if (value == coordinate)
+    return true;
+  auto valueRange = value.getDefiningOp<MakeRangeOp>();
+  auto coordinateRange = coordinate.getDefiningOp<MakeRangeOp>();
+  return valueRange && coordinateRange &&
+         sourceAxisIdentity(valueRange) == sourceAxisIdentity(coordinateRange) &&
+         sameScalarExpression(valueRange.getStart(),
+                              coordinateRange.getStart()) &&
+         sameScalarExpression(valueRange.getExtent(),
+                              coordinateRange.getExtent()) &&
+         sameScalarExpression(valueRange.getStep(), coordinateRange.getStep());
+}
+
+bool hasExactPhysicalRangeCoverage(Value coordinate, Value upperBound) {
+  coordinate = stripBroadcast(coordinate);
+  upperBound = stripScalarIdentity(upperBound);
+  auto range = coordinate.getDefiningOp<MakeRangeOp>();
+  auto add = upperBound.getDefiningOp<BinaryOp>();
+  if (!range || !add || add.getOperatorKind() != BinaryOperator::Add ||
+      !isUnitStepValue(range.getStep()))
+    return false;
+  Value extent;
+  if (sameScalarExpression(add.getLhs(), range.getStart()))
+    extent = add.getRhs();
+  else if (sameScalarExpression(add.getRhs(), range.getStart()))
+    extent = add.getLhs();
+  return extent && sameScalarExpression(extent, range.getExtent());
 }
 
 bool isProvablySingletonLogicalRange(MakeRangeOp range) {
@@ -2273,6 +2407,108 @@ PhysicalProgramAnalysis::footprint(Operation *access) {
             atomic.getValid(), {});
   else
     result.state = PhysicalFactState::Unknown;
+  return result;
+}
+
+PhysicalAccessBoundaryFact
+PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
+  PhysicalAccessBoundaryFact result;
+  PhysicalAccessFootprint accessFact = footprint(access);
+  result.blockers = accessFact.blockers;
+  auto view = accessFact.resource
+                  ? dyn_cast<ViewType>(accessFact.resource.getType())
+                  : ViewType();
+  if (accessFact.state != PhysicalFactState::Exact ||
+      accessFact.rangeState != PhysicalFactState::Exact || !view) {
+    if (result.blockers.empty())
+      appendUnique(result.blockers, access);
+    return result;
+  }
+  if (!accessFact.validity) {
+    result.state = PhysicalFactState::Exact;
+    return result;
+  }
+
+  llvm::DenseSet<int64_t> boundaryAxes;
+  std::function<PhysicalFactState(Value)> analyze =
+      [&](Value value) -> PhysicalFactState {
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+      return analyze(broadcast.getValue());
+    if (auto splat = value.getDefiningOp<SplatOp>())
+      return analyze(splat.getValue());
+    if (auto reshape = value.getDefiningOp<ReshapeOp>())
+      return analyze(reshape.getValue());
+    if (auto transpose = value.getDefiningOp<TransposeOp>())
+      return analyze(transpose.getValue());
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+      auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+      return integer && integer.getType().isInteger(1) &&
+                     integer.getValue().isOne()
+                 ? PhysicalFactState::Exact
+                 : PhysicalFactState::Unknown;
+    }
+    if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
+      Type element = conjunction.getResult().getType();
+      if (auto fragment = dyn_cast<FragmentType>(element))
+        element = fragment.getElementType();
+      bool logical =
+          conjunction.getOperatorKind() == BinaryOperator::LogicalAnd;
+      bool bitwiseI1 =
+          conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
+          element.isInteger(1);
+      if (!logical && !bitwiseI1) {
+        appendUnique(result.blockers, conjunction);
+        return PhysicalFactState::Unknown;
+      }
+      PhysicalFactState lhs = analyze(conjunction.getLhs());
+      PhysicalFactState rhs = analyze(conjunction.getRhs());
+      if (lhs == PhysicalFactState::Ambiguous ||
+          rhs == PhysicalFactState::Ambiguous)
+        return PhysicalFactState::Ambiguous;
+      return lhs == PhysicalFactState::Exact &&
+                     rhs == PhysicalFactState::Exact
+                 ? PhysicalFactState::Exact
+                 : PhysicalFactState::Unknown;
+    }
+    auto comparison = value.getDefiningOp<CompareOp>();
+    if (!comparison || comparison.getPredicate() != ComparePredicate::Lt) {
+      appendUnique(result.blockers, value.getDefiningOp());
+      return PhysicalFactState::Unknown;
+    }
+
+    std::optional<int64_t> matchedAxis;
+    bool requiresBoundary = false;
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
+      if (!derivesFromAccessCoordinate(comparison.getLhs(), coordinate))
+        continue;
+      bool viewBoundary = matchesViewExtent(comparison.getRhs(),
+                                            accessFact.resource, sourceAxis);
+      bool exactRange = hasExactPhysicalRangeCoverage(
+          coordinate, comparison.getRhs());
+      if (!viewBoundary && !exactRange)
+        continue;
+      if (matchedAxis) {
+        appendUnique(result.blockers, comparison);
+        return PhysicalFactState::Ambiguous;
+      }
+      matchedAxis = sourceAxis;
+      requiresBoundary = viewBoundary;
+    }
+    if (!matchedAxis) {
+      appendUnique(result.blockers, comparison);
+      return PhysicalFactState::Unknown;
+    }
+    if (requiresBoundary)
+      boundaryAxes.insert(*matchedAxis);
+    return PhysicalFactState::Exact;
+  };
+
+  result.state = analyze(accessFact.validity);
+  if (result.state == PhysicalFactState::Exact) {
+    result.boundaryAxes.append(boundaryAxes.begin(), boundaryAxes.end());
+    llvm::sort(result.boundaryAxes);
+  }
   return result;
 }
 

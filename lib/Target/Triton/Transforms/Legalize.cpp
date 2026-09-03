@@ -313,41 +313,11 @@ bool isZeroValue(Value value) {
   return false;
 }
 
-bool collectBoundaryAxes(Value predicate, ValueRange coordinates,
-                         ArrayRef<int64_t> sourceAxes,
-                         llvm::SmallDenseSet<int64_t, 4> &axes) {
-  if (isTrueValue(predicate))
-    return true;
-  if (auto broadcast = predicate.getDefiningOp<gpu::BroadcastOp>())
-    return collectBoundaryAxes(broadcast.getValue(), coordinates, sourceAxes,
-                               axes);
-  if (auto reshape = predicate.getDefiningOp<gpu::ReshapeOp>())
-    return collectBoundaryAxes(reshape.getValue(), coordinates, sourceAxes,
-                               axes);
-  if (auto binary = predicate.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd &&
-        binary.getOperatorKind() != BinaryOperator::BitwiseAnd)
-      return false;
-    return collectBoundaryAxes(binary.getLhs(), coordinates, sourceAxes, axes) &&
-           collectBoundaryAxes(binary.getRhs(), coordinates, sourceAxes, axes);
-  }
-  auto compare = predicate.getDefiningOp<gpu::CompareOp>();
-  if (!compare || !compare->hasAttr(gpu::physicalTailAttr) ||
-      compare.getPredicate() != ComparePredicate::Lt)
-    return false;
-  for (auto [index, coordinate] : llvm::enumerate(coordinates))
-    if (compare.getLhs() == coordinate &&
-        isa<gpu::FragmentType>(coordinate.getType())) {
-      axes.insert(sourceAxes[index]);
-      return true;
-    }
-  return false;
-}
-
 std::optional<BlockAccessPlan>
 planBlockAccess(Value resource, ValueRange coordinates,
                 ArrayRef<int64_t> sourceAxes, Type valueType, Value valid,
-                Value fill) {
+                Value fill,
+                const gpu::PhysicalAccessBoundaryFact &boundaryFact) {
   auto view = dyn_cast<gpu::ViewType>(resource.getType());
   auto fragment = dyn_cast<gpu::FragmentType>(valueType);
   if (!view || !fragment || !isa<BlockArgument>(resource) ||
@@ -411,16 +381,15 @@ planBlockAccess(Value resource, ValueRange coordinates,
     if (!isa<IntegerAttr, StringAttr>(stride))
       return std::nullopt;
 
-  llvm::SmallDenseSet<int64_t, 4> boundary;
+  if (!boundaryFact.isExact())
+    return std::nullopt;
   if (valid) {
     if (fill && !isZeroValue(fill))
-      return std::nullopt;
-    if (!collectBoundaryAxes(valid, coordinates, sourceAxes, boundary))
       return std::nullopt;
   } else if (fill) {
     return std::nullopt;
   }
-  for (int64_t viewAxis : boundary) {
+  for (int64_t viewAxis : boundaryFact.boundaryAxes) {
     auto found = llvm::find(plan.blockAxes, viewAxis);
     if (found == plan.blockAxes.end())
       return std::nullopt;
@@ -440,16 +409,22 @@ planBlockAccess(Value resource, ValueRange coordinates,
 LogicalResult materializeBlockPointerForms(func::FuncOp kernel) {
   SmallVector<std::pair<gpu::LoadOp, BlockAccessPlan>, 4> loads;
   SmallVector<std::pair<gpu::StoreOp, BlockAccessPlan>, 4> stores;
+  gpu::PhysicalProgramAnalysis analysis(kernel);
   kernel.walk([&](gpu::LoadOp load) {
+    gpu::PhysicalAccessBoundaryFact boundary =
+        analysis.boundaryValidity(load);
     if (std::optional<BlockAccessPlan> plan = planBlockAccess(
             load.getResource(), load.getCoordinates(), load.getSourceAxes(),
-            load.getResult().getType(), load.getValid(), load.getFill()))
+            load.getResult().getType(), load.getValid(), load.getFill(),
+            boundary))
       loads.emplace_back(load, std::move(*plan));
   });
   kernel.walk([&](gpu::StoreOp store) {
+    gpu::PhysicalAccessBoundaryFact boundary =
+        analysis.boundaryValidity(store);
     if (std::optional<BlockAccessPlan> plan = planBlockAccess(
             store.getResource(), store.getCoordinates(), store.getSourceAxes(),
-            store.getValue().getType(), store.getValid(), Value()))
+            store.getValue().getType(), store.getValid(), Value(), boundary))
       stores.emplace_back(store, std::move(*plan));
   });
   if (loads.empty() && stores.empty())

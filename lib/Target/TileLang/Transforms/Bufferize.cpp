@@ -59,23 +59,6 @@ bool isZero(Value value) {
   return false;
 }
 
-bool isTrue(Value value) {
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>())
-    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      return integer.getInt() == 1;
-  if (auto splat = value.getDefiningOp<gpu::SplatOp>())
-    return isTrue(splat.getValue());
-  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    return isTrue(broadcast.getValue());
-  if (auto reshape = value.getDefiningOp<gpu::ReshapeOp>())
-    return isTrue(reshape.getValue());
-  if (auto transpose = value.getDefiningOp<gpu::TransposeOp>())
-    return isTrue(transpose.getValue());
-  if (auto select = value.getDefiningOp<gpu::SelectOp>())
-    return isTrue(select.getTrueValue()) && isTrue(select.getFalseValue());
-  return false;
-}
-
 FailureOr<Value> scalarSplat(Value value) {
   if (!value)
     return failure();
@@ -224,140 +207,6 @@ bool sameProvableValue(Value lhs, Value rhs) {
     return rightCast &&
            sameProvableValue(leftCast.getValue(), rightCast.getValue());
   }
-  return false;
-}
-
-Value stripBroadcast(Value value) {
-  while (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    value = broadcast.getValue();
-  return value;
-}
-
-bool isViewExtent(Value value, Value resource, unsigned axis) {
-  value = stripBroadcast(value);
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-    if (!function)
-      return false;
-    DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
-    auto kind = attrs.getAs<StringAttr>(gpu::abiKindAttr);
-    auto dimension = attrs.getAs<IntegerAttr>(gpu::dimensionAttr);
-    auto view = cast<gpu::ViewType>(resource.getType());
-    auto extent =
-        cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-    return kind && kind.getValue() == "dimension" && dimension &&
-           extent.getKind() ==
-               static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension) &&
-           dimension.getInt() == extent.getValue();
-  }
-  if (auto dim = value.getDefiningOp<gpu::DimOp>())
-    return dim.getView() == resource && dim.getAxis() == axis;
-  if (auto expression = value.getDefiningOp<gpu::PhysicalExprOp>()) {
-    auto view = cast<gpu::ViewType>(resource.getType());
-    return expression.getExpression() ==
-           cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-  }
-  if (auto bound = value.getDefiningOp<gpu::RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<gpu::RangeOp>();
-    if (!range)
-      return false;
-    if (bound.getBound() == 0)
-      return isViewExtent(range.getStart(), resource, axis);
-    if (bound.getBound() == 1)
-      return isViewExtent(range.getStop(), resource, axis);
-    return isViewExtent(range.getStep(), resource, axis);
-  }
-  if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() == BinaryOperator::Add &&
-        isProvably(binary.getLhs(), 0))
-      return isViewExtent(binary.getRhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Add &&
-        isProvably(binary.getRhs(), 0))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
-        isProvably(binary.getRhs(), 0))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if ((binary.getOperatorKind() == BinaryOperator::Multiply ||
-         binary.getOperatorKind() == BinaryOperator::FloorDivide) &&
-        isProvably(binary.getRhs(), 1))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Multiply &&
-        isProvably(binary.getLhs(), 1))
-      return isViewExtent(binary.getRhs(), resource, axis);
-  }
-  return false;
-}
-
-bool derivesFromCoordinate(Value value, Value coordinate) {
-  if (value == coordinate)
-    return true;
-  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    return derivesFromCoordinate(broadcast.getValue(), coordinate);
-  value = stripBroadcast(value);
-  coordinate = stripBroadcast(coordinate);
-  auto lhsRange = value.getDefiningOp<gpu::MakeRangeOp>();
-  auto rhsRange = coordinate.getDefiningOp<gpu::MakeRangeOp>();
-  if (lhsRange && rhsRange &&
-      lhsRange.getSourceId() == rhsRange.getSourceId() &&
-      lhsRange.getSourceAxis() == rhsRange.getSourceAxis() &&
-      sameProvableValue(lhsRange.getStart(), rhsRange.getStart()) &&
-      sameProvableValue(lhsRange.getExtent(), rhsRange.getExtent()) &&
-      sameProvableValue(lhsRange.getStep(), rhsRange.getStep()))
-    return true;
-  return false;
-}
-
-bool hasExactRangeCoverage(Value coordinate, Value upperBound) {
-  coordinate = stripBroadcast(coordinate);
-  upperBound = stripBroadcast(upperBound);
-  auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>();
-  auto add = upperBound.getDefiningOp<gpu::BinaryOp>();
-  if (!range || !add || add.getOperatorKind() != BinaryOperator::Add ||
-      !isProvably(range.getStep(), 1))
-    return false;
-  Value extent;
-  if (sameProvableValue(add.getLhs(), range.getStart()))
-    extent = add.getRhs();
-  else if (sameProvableValue(add.getRhs(), range.getStart()))
-    extent = add.getLhs();
-  else
-    return false;
-  if (extent == range.getExtent())
-    return true;
-  std::optional<int64_t> actual = constantValue(extent);
-  std::optional<int64_t> physical = constantValue(range.getExtent());
-  return actual && physical && *actual == *physical;
-}
-
-bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
-                        ArrayRef<int64_t> sourceAxes) {
-  if (!valid)
-    return true;
-  valid = stripBroadcast(valid);
-  if (isTrue(valid))
-    return true;
-  if (auto reshape = valid.getDefiningOp<gpu::ReshapeOp>())
-    return isFullViewValidity(reshape.getValue(), resource, coordinates,
-                              sourceAxes);
-  if (auto transpose = valid.getDefiningOp<gpu::TransposeOp>())
-    return isFullViewValidity(transpose.getValue(), resource, coordinates,
-                              sourceAxes);
-  if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd)
-      return false;
-    return isFullViewValidity(binary.getLhs(), resource, coordinates,
-                              sourceAxes) &&
-           isFullViewValidity(binary.getRhs(), resource, coordinates,
-                              sourceAxes);
-  }
-  auto compare = valid.getDefiningOp<gpu::CompareOp>();
-  if (!compare || compare.getPredicate() != ComparePredicate::Lt)
-    return false;
-  for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
-    if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
-        (isViewExtent(compare.getRhs(), resource, sourceAxis) ||
-         hasExactRangeCoverage(coordinate, compare.getRhs())))
-      return true;
   return false;
 }
 
@@ -1258,10 +1107,10 @@ private:
     FailureOr<CopyLayout> layout =
         copyLayout(load.getCoordinates(), load.getSourceAxes(), view.getRank(),
                    fragment);
+    gpu::PhysicalAccessBoundaryFact boundary =
+        gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(load);
     bool directCopy = succeeded(offsets) && succeeded(layout) &&
-                      isFullViewValidity(load.getValid(), load.getResource(),
-                                         load.getCoordinates(),
-                                         load.getSourceAxes()) &&
+                      boundary.isExact() &&
                       (!load.getFill() || isZero(load.getFill()));
     SmallVector<Attribute> allocationShape;
     if (directCopy)
@@ -2301,10 +2150,11 @@ private:
                    fragment);
     SmallVector<unsigned> identity =
         identityAxisOrder(fragment.getShape().size());
+    gpu::PhysicalAccessBoundaryFact boundary =
+        gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(store);
     if (succeeded(offsets) && succeeded(layout) &&
         layout->bufferToFragment == identity &&
-        isFullViewValidity(store.getValid(), store.getResource(),
-                           store.getCoordinates(), store.getSourceAxes())) {
+        boundary.isExact()) {
       OpBuilder builder(store);
       DenseI64ArrayAttr destinationAxes =
           DenseI64ArrayAttr::get(kernel.getContext(), layout->viewAxes);

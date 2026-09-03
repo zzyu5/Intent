@@ -252,6 +252,19 @@ struct PhysicalAccessFootprint {
   mlir::Value fill;
 };
 
+/// Whether one access validity is either unconditional or is composed only of
+/// exact current-coordinate upper bounds that a provider-native boundary form
+/// can preserve.  `boundaryAxes` names the external-view axes whose bounds
+/// must remain active; exact physical-range bounds that are already true for
+/// every represented member do not add an axis.
+struct PhysicalAccessBoundaryFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  llvm::SmallVector<int64_t, 4> boundaryAxes;
+  llvm::SmallVector<mlir::Operation *, 4> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
 /// Current-IR initialization and resource-use legality for one physical
 /// mutable buffer.  Exact means every read is dominated either by a direct
 /// initializing write or by a proven full-domain loop/branch initialization.
@@ -306,6 +319,7 @@ public:
       std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalContractFreeAxisFact contractFreeAxes(mlir::Operation *contract);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
+  PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 
   /// Recognizes a predicate composed only from exact range-end comparisons,

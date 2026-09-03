@@ -9,7 +9,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
-#include "llvm/ADT/DenseSet.h"
 
 #include <optional>
 
@@ -67,111 +66,6 @@ bool isProvably(Value value, int64_t expected) {
   return actual && *actual == expected;
 }
 
-Value stripBroadcast(Value value) {
-  while (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    value = broadcast.getValue();
-  return value;
-}
-
-bool isViewExtent(Value value, Value resource, unsigned axis) {
-  value = stripBroadcast(value);
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-    if (!function)
-      return false;
-    DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
-    auto kind = attrs.getAs<StringAttr>(gpu::abiKindAttr);
-    auto view = cast<gpu::ViewType>(resource.getType());
-    auto dimension = attrs.getAs<IntegerAttr>(gpu::dimensionAttr);
-    auto extent = cast<gpu::PhysicalExprAttr>(
-        view.getLayout().getExtents()[axis]);
-    return kind && kind.getValue() == "dimension" && dimension &&
-           extent.getKind() ==
-               static_cast<uint32_t>(gpu::PhysicalExprKind::Dimension) &&
-           dimension.getInt() == extent.getValue();
-  }
-  if (auto dim = value.getDefiningOp<gpu::DimOp>())
-    return dim.getView() == resource && dim.getAxis() == axis;
-  if (auto expression = value.getDefiningOp<gpu::PhysicalExprOp>()) {
-    auto view = cast<gpu::ViewType>(resource.getType());
-    return expression.getExpression() ==
-           cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-  }
-  if (auto bound = value.getDefiningOp<gpu::RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<gpu::RangeOp>();
-    if (!range)
-      return false;
-    if (bound.getBound() == 0)
-      return isViewExtent(range.getStart(), resource, axis);
-    if (bound.getBound() == 1)
-      return isViewExtent(range.getStop(), resource, axis);
-    return isViewExtent(range.getStep(), resource, axis);
-  }
-  if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() == BinaryOperator::Add &&
-        isProvably(binary.getLhs(), 0))
-      return isViewExtent(binary.getRhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Add &&
-        isProvably(binary.getRhs(), 0))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
-        isProvably(binary.getRhs(), 0))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if ((binary.getOperatorKind() == BinaryOperator::Multiply ||
-         binary.getOperatorKind() == BinaryOperator::FloorDivide) &&
-        isProvably(binary.getRhs(), 1))
-      return isViewExtent(binary.getLhs(), resource, axis);
-    if (binary.getOperatorKind() == BinaryOperator::Multiply &&
-        isProvably(binary.getLhs(), 1))
-      return isViewExtent(binary.getRhs(), resource, axis);
-  }
-  return false;
-}
-
-bool derivesFromCoordinate(Value value, Value coordinate) {
-  if (value == coordinate)
-    return true;
-  if (auto broadcast = value.getDefiningOp<gpu::BroadcastOp>())
-    return derivesFromCoordinate(broadcast.getValue(), coordinate);
-  return false;
-}
-
-bool collectFullViewValidity(Value valid, Value resource, ValueRange coordinates,
-                             ArrayRef<int64_t> sourceAxes,
-                             llvm::DenseSet<int64_t> &coveredAxes) {
-  if (!valid)
-    return false;
-  valid = stripBroadcast(valid);
-  if (auto binary = valid.getDefiningOp<gpu::BinaryOp>()) {
-    if (binary.getOperatorKind() != BinaryOperator::LogicalAnd)
-      return false;
-    return collectFullViewValidity(binary.getLhs(), resource, coordinates,
-                                   sourceAxes, coveredAxes) &&
-           collectFullViewValidity(binary.getRhs(), resource, coordinates,
-                                   sourceAxes, coveredAxes);
-  }
-  auto compare = valid.getDefiningOp<gpu::CompareOp>();
-  if (!compare || compare.getPredicate() != ComparePredicate::Lt)
-    return false;
-  for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes))
-    if (derivesFromCoordinate(compare.getLhs(), coordinate) &&
-        isViewExtent(compare.getRhs(), resource, sourceAxis))
-      return coveredAxes.insert(sourceAxis).second;
-  return false;
-}
-
-bool isFullViewValidity(Value valid, Value resource, ValueRange coordinates,
-                        ArrayRef<int64_t> sourceAxes) {
-  auto view = cast<gpu::ViewType>(resource.getType());
-  if (coordinates.size() != view.getRank() ||
-      sourceAxes.size() != view.getRank())
-    return false;
-  llvm::DenseSet<int64_t> coveredAxes;
-  return collectFullViewValidity(valid, resource, coordinates, sourceAxes,
-                                 coveredAxes) &&
-         coveredAxes.size() == view.getRank();
-}
-
 FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
                            Value extent) {
   if (isProvably(start, 0))
@@ -182,6 +76,10 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
         return binary.getRhs();
       if (binary.getRhs() == extent)
         return binary.getLhs();
+      if (isProvably(binary.getLhs(), 1))
+        return tileIndex(builder, location, binary.getRhs(), extent);
+      if (isProvably(binary.getRhs(), 1))
+        return tileIndex(builder, location, binary.getLhs(), extent);
     }
     if (binary.getOperatorKind() == BinaryOperator::Add) {
       if (isProvably(binary.getLhs(), 0))
@@ -426,11 +324,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     auto result = cast<gpu::FragmentType>(load.getResult().getType());
     FailureOr<SmallVector<Value>> indices = tileIndices(
         builder, load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
+    gpu::PhysicalAccessBoundaryFact boundary =
+        gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(load);
     Value replacementResult;
     Operation *replacementOperation = nullptr;
-    if (succeeded(indices) &&
-        isFullViewValidity(load.getValid(), load.getResource(),
-                           load.getCoordinates(), load.getSourceAxes()) &&
+    if (succeeded(indices) && boundary.isExact() &&
         isZeroFill(load.getFill())) {
       auto replacement = builder.create<TileLoadOp>(
           load.getLoc(), result, load.getResource(), *indices);
@@ -649,10 +547,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     }
     FailureOr<SmallVector<Value>> indices = tileIndices(
         builder, store, store.getResource(), store.getCoordinates(), store.getSourceAxes());
+    gpu::PhysicalAccessBoundaryFact boundary =
+        gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(store);
     Operation *replacementOperation = nullptr;
-    if (succeeded(indices) &&
-        isFullViewValidity(store.getValid(), store.getResource(),
-                           store.getCoordinates(), store.getSourceAxes())) {
+    if (succeeded(indices) && boundary.isExact()) {
       replacementOperation = builder.create<TileStoreOp>(
           store.getLoc(), store.getResource(), *indices, store.getValue());
     } else {
