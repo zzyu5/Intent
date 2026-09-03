@@ -88,7 +88,7 @@ writeEffectProgramOrder(func::FuncOp kernel, gpu::DelinearizeOp mapping) {
   for (unsigned axis = 0; axis < rank; ++axis)
     order.push_back(axis);
   llvm::stable_sort(order, [&](unsigned lhs, unsigned rhs) {
-    return *resourceAxes[lhs] > *resourceAxes[rhs];
+    return *resourceAxes[lhs] < *resourceAxes[rhs];
   });
   return order;
 }
