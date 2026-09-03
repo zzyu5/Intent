@@ -1235,6 +1235,10 @@ LogicalResult ScaledContractOp::verify() {
     return lhsMap.getDimensionId() > 0 &&
            lhsMap.getDimensionId() == rhsMap.getDimensionId();
   };
+  auto samePhysicalAxis = [](FragmentType left, unsigned leftAxis,
+                             FragmentType right, unsigned rightAxis) {
+    return left.getShape()[leftAxis] == right.getShape()[rightAxis];
+  };
   auto constantExtent = [](FragmentType value,
                            unsigned axis) -> std::optional<int64_t> {
     auto extent = cast<PhysicalExprAttr>(value.getShape()[axis]);
@@ -1272,12 +1276,19 @@ LogicalResult ScaledContractOp::verify() {
   if (!lhsCarrier || !rhsCarrier || constantExtent(lhs, 2) != lhsCarrier ||
       constantExtent(rhs, 1) != rhsCarrier ||
       !sameLogicalAxis(lhs, 0, lhsScale, 0) ||
+      !samePhysicalAxis(lhs, 0, lhsScale, 0) ||
       !sameLogicalAxis(lhs, 1, lhsScale, 1) ||
+      !samePhysicalAxis(lhs, 1, lhsScale, 1) ||
       !sameLogicalAxis(lhs, 1, rhs, 0) ||
+      !samePhysicalAxis(lhs, 1, rhs, 0) ||
       !sameLogicalAxis(lhs, 1, rhsScale, 1) ||
+      !samePhysicalAxis(lhs, 1, rhsScale, 1) ||
       !sameLogicalAxis(rhs, 2, rhsScale, 0) ||
+      !samePhysicalAxis(rhs, 2, rhsScale, 0) ||
       !sameLogicalAxis(lhs, 0, result, 0) ||
-      !sameLogicalAxis(rhs, 2, result, 1))
+      !samePhysicalAxis(lhs, 0, result, 0) ||
+      !sameLogicalAxis(rhs, 2, result, 1) ||
+      !samePhysicalAxis(rhs, 2, result, 1))
     return emitOpError("scaled-contract physical scale-axis relation is invalid");
   return success();
 }

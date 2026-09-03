@@ -1152,7 +1152,7 @@ def _run_block_scaled_matmul(
     rhs_scale = torch.ones(
         (24, 512), device="cuda", dtype=torch.float32
     ).to(torch.float8_e8m0fnu)
-    if target_name == "Triton":
+    if target_name in {"Triton", "TileLang"}:
         lhs_scale = lhs_scale.view(torch.uint8)
         rhs_scale = rhs_scale.view(torch.uint8)
     artifact = intent.compile(

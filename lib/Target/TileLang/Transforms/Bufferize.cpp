@@ -1817,13 +1817,27 @@ private:
         contract.getRhsReductionAxes() == ArrayRef<int64_t>{0, 1} &&
         contract.getLhsBatchAxes().empty() &&
         contract.getRhsBatchAxes().empty();
-    auto isCarrier128 = [](Attribute attribute) {
+    auto constantCarrierExtent =
+        [](Attribute attribute) -> std::optional<int64_t> {
       auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
-      return extent &&
-             extent.getKind() ==
-                 static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
-             extent.getValue() == 128;
+      if (!extent ||
+          extent.getKind() !=
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant))
+        return std::nullopt;
+      return extent.getValue();
     };
+    std::optional<int64_t> lhsCarrier =
+        lhsType && lhsType.getShape().size() == 3
+            ? constantCarrierExtent(lhsType.getShape()[2])
+            : std::nullopt;
+    std::optional<int64_t> rhsCarrier =
+        rhsType && rhsType.getShape().size() == 3
+            ? constantCarrierExtent(rhsType.getShape()[1])
+            : std::nullopt;
+    auto isScaleType = [](Type type) {
+      return type.isF32() || type.isUnsignedInteger(8);
+    };
+    int64_t groupSize = static_cast<int64_t>(contract.getLhsGroupSize());
     bool supported = lhsType && lhsScaleType && rhsType && rhsScaleType &&
                      resultType && lhsLoad && lhsScaleLoad && rhsLoad &&
                      rhsScaleLoad && contract.getLhs().hasOneUse() &&
@@ -1832,23 +1846,23 @@ private:
                      contract.getRhsScale().hasOneUse() && fixedAxes &&
                      contract.getLhsFormat() == ScaledFormat::E4M3 &&
                      contract.getRhsFormat() == ScaledFormat::E4M3 &&
-                     contract.getLhsGroupSize() == 128 &&
-                     contract.getRhsGroupSize() == 128 &&
+                     groupSize > 0 && groupSize % 32 == 0 &&
+                     contract.getRhsGroupSize() ==
+                         contract.getLhsGroupSize() &&
                      lhsType.getShape().size() == 3 &&
                      lhsScaleType.getShape().size() == 2 &&
                      rhsType.getShape().size() == 3 &&
                      rhsScaleType.getShape().size() == 2 &&
                      resultType.getShape().size() == 2 &&
-                     isCarrier128(lhsType.getShape()[2]) &&
-                     isCarrier128(rhsType.getShape()[1]) &&
+                     lhsCarrier == groupSize && rhsCarrier == groupSize &&
                      isa<Float8E4M3FNType>(lhsType.getElementType()) &&
                      isa<Float8E4M3FNType>(rhsType.getElementType()) &&
-                     lhsScaleType.getElementType().isF32() &&
-                     rhsScaleType.getElementType().isF32() &&
+                     isScaleType(lhsScaleType.getElementType()) &&
+                     isScaleType(rhsScaleType.getElementType()) &&
                      resultType.getElementType().isF32();
     if (!supported)
       return contract.emitOpError(
-          "has no TileLang E4M3 group-128 2xAcc provider form");
+          "has no TileLang E4M3 K32-group 2xAcc provider form");
 
     MLIRContext *context = kernel.getContext();
     ArrayAttr lhsTileShape = ArrayAttr::get(
@@ -1908,6 +1922,52 @@ private:
         accumulateBuilder, contract);
     if (failed(lhsScale) || failed(rhsScale))
       return failure();
+    Type u32 = IntegerType::get(context, 32, IntegerType::Unsigned);
+    auto u32Constant = [&](uint64_t value) -> Value {
+      Type i32 = accumulateBuilder.getI32Type();
+      Value raw = accumulateBuilder.create<arith::ConstantOp>(
+          contract.getLoc(), i32,
+          accumulateBuilder.getIntegerAttr(i32, value));
+      return accumulateBuilder.create<gpu::CastOp>(contract.getLoc(), u32, raw);
+    };
+    Value zeroCode;
+    Value nanCode;
+    Value exponentShift;
+    Value minimumScaleBits;
+    Value nanScaleBits;
+    if (lhsScaleType.getElementType().isUnsignedInteger(8) ||
+        rhsScaleType.getElementType().isUnsignedInteger(8)) {
+      zeroCode = u32Constant(0);
+      nanCode = u32Constant(255);
+      exponentShift = u32Constant(23);
+      minimumScaleBits = u32Constant(0x00400000);
+      nanScaleBits = u32Constant(0x7fc00000);
+    }
+    auto decodeScale = [&](Value scale) -> Value {
+      if (scale.getType().isF32())
+        return scale;
+      // E8M0 codes 1..254 are exactly the corresponding f32 exponent bits;
+      // code 0 is 2^-127 and code 255 is the canonical NaN scale.
+      Value code = accumulateBuilder.create<gpu::CastOp>(contract.getLoc(), u32,
+                                                          scale);
+      Value isZero = accumulateBuilder.create<gpu::CompareOp>(
+          contract.getLoc(), accumulateBuilder.getI1Type(), code, zeroCode,
+          ComparePredicate::Eq);
+      Value isNaN = accumulateBuilder.create<gpu::CompareOp>(
+          contract.getLoc(), accumulateBuilder.getI1Type(), code, nanCode,
+          ComparePredicate::Eq);
+      Value normalBits = accumulateBuilder.create<gpu::BinaryOp>(
+          contract.getLoc(), u32, code, exponentShift,
+          BinaryOperator::LeftShift);
+      Value finiteBits = accumulateBuilder.create<gpu::SelectOp>(
+          contract.getLoc(), u32, isZero, minimumScaleBits, normalBits);
+      Value bits = accumulateBuilder.create<gpu::SelectOp>(
+          contract.getLoc(), u32, isNaN, nanScaleBits, finiteBits);
+      return accumulateBuilder.create<gpu::BitcastOp>(
+          contract.getLoc(), resultType.getElementType(), bits);
+    };
+    Value lhsScaleValue = decodeScale(*lhsScale);
+    Value rhsScaleValue = decodeScale(*rhsScale);
     Value partialValue = accumulateBuilder.create<BufferLoadOp>(
         contract.getLoc(), resultType.getElementType(), *partial,
         accumulateBody.getArguments());
@@ -1915,11 +1975,11 @@ private:
         contract.getLoc(), resultType.getElementType(), *accumulator,
         accumulateBody.getArguments());
     Value scaledLhs = accumulateBuilder.create<gpu::BinaryOp>(
-        contract.getLoc(), resultType.getElementType(), partialValue, *lhsScale,
-        BinaryOperator::Multiply);
+        contract.getLoc(), resultType.getElementType(), partialValue,
+        lhsScaleValue, BinaryOperator::Multiply);
     Value scaled = accumulateBuilder.create<gpu::BinaryOp>(
-        contract.getLoc(), resultType.getElementType(), scaledLhs, *rhsScale,
-        BinaryOperator::Multiply);
+        contract.getLoc(), resultType.getElementType(), scaledLhs,
+        rhsScaleValue, BinaryOperator::Multiply);
     Value updated = accumulateBuilder.create<gpu::BinaryOp>(
         contract.getLoc(), resultType.getElementType(), accumulatorValue, scaled,
         BinaryOperator::Add);
