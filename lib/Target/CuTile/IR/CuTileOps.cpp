@@ -67,13 +67,41 @@ LogicalResult verifySourceAxes(Operation *owner, ArrayRef<int64_t> sourceAxes,
   return success();
 }
 
+LogicalResult verifyResourceOrderedTile(Operation *owner, gpu::ViewType view,
+                                        gpu::FragmentType tile,
+                                        ValueRange tileIndices) {
+  const unsigned rank = view.getRank();
+  if (tileIndices.size() != rank || tile.getShape().size() != rank)
+    return owner->emitOpError(
+        "requires one resource-ordered tile axis and index per view axis");
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    auto mapping = dyn_cast<gpu::AxisMapAttr>(tile.getAxisMaps()[axis]);
+    if (!mapping || mapping.getFragmentAxis() != axis)
+      return owner->emitOpError(
+          "tile relation is not indexed in resource-axis order");
+    if (!tileIndices[axis].getType().isIndex())
+      return owner->emitOpError("tile-space indices must have index type");
+  }
+  return success();
+}
+
+LogicalResult verifySerializedCoordinateOrder(
+    Operation *owner, ArrayRef<int64_t> sourceAxes) {
+  for (auto [position, sourceAxis] : llvm::enumerate(sourceAxes))
+    if (position != static_cast<size_t>(sourceAxis))
+      return owner->emitOpError(
+          "serialized coordinates must be in resource-axis order");
+  return success();
+}
+
 } // namespace
 
 LogicalResult TileLoadOp::verify() {
   auto view = getResource().getType();
   auto result = getResult().getType();
-  if (getTileIndices().size() != view.getRank())
-    return emitOpError("requires one tile-space index per source axis");
+  if (failed(verifyResourceOrderedTile(*this, view, result,
+                                       getTileIndices())))
+    return failure();
   if (view.getElementType() != result.getElementType())
     return emitOpError("view and tile element types disagree");
   return success();
@@ -86,8 +114,9 @@ void TileLoadOp::getEffects(
 
 LogicalResult TileStoreOp::verify() {
   auto view = getResource().getType();
-  if (getTileIndices().size() != view.getRank())
-    return emitOpError("requires one tile-space index per destination axis");
+  if (failed(verifyResourceOrderedTile(*this, view, getValue().getType(),
+                                       getTileIndices())))
+    return failure();
   return view.getElementType() == getValue().getType().getElementType()
              ? success()
              : emitOpError("view and tile element types disagree");
@@ -139,6 +168,8 @@ LogicalResult GatherLoadOp::verify() {
     return emitOpError("requires one advanced coordinate per source axis");
   if (failed(verifySourceAxes(*this, getSourceAxes(), view.getRank())))
     return failure();
+  if (failed(verifySerializedCoordinateOrder(*this, getSourceAxes())))
+    return failure();
   if (failed(verifyCoordinateDomains(*this, getCoordinates(), getResult().getType())))
     return failure();
   if (static_cast<bool>(getValid()) != static_cast<bool>(getFill()))
@@ -166,6 +197,8 @@ LogicalResult ScatterStoreOp::verify() {
       view.getElementType() != getValue().getType().getElementType())
     return emitOpError("requires one advanced coordinate per destination axis");
   if (failed(verifySourceAxes(*this, getSourceAxes(), view.getRank())))
+    return failure();
+  if (failed(verifySerializedCoordinateOrder(*this, getSourceAxes())))
     return failure();
   if (failed(verifyCoordinateDomains(*this, getCoordinates(), getValue().getType())))
     return failure();
