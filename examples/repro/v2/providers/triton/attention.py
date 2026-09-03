@@ -66,7 +66,13 @@ def flash_attention_forward(context: Context) -> PreparedComparison:
     source_tuner = source_function.__self__.forward.__globals__.get("_attn_fwd")
     if source_tuner is None or source_tuner.best_config is None:
         raise RuntimeError("source FlashAttention did not expose its autotune winner")
-    return PreparedComparison(generated, source, Tolerance(atol=2e-2, rtol=2e-2), cuda_graph=True)
+    return PreparedComparison(
+        generated,
+        source,
+        Tolerance(atol=2e-2, rtol=2e-2),
+        cuda_graph=True,
+        status="source_abi_gap",
+    )
 
 
 def modern_flash_attention_forward(context: Context) -> PreparedComparison:
