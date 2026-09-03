@@ -2340,6 +2340,7 @@ LogicalResult rankLiftPointwiseValueGraph(
   };
 
   llvm::SmallDenseSet<Value> liftedValues;
+  SmallVector<SplatOp> rankLiftedSplats;
   for (MakeRangeOp range : liftedRanges)
     liftedValues.insert(range.getResult());
   WalkResult result = kernel.walk([&](Operation *operation) {
@@ -2359,6 +2360,9 @@ LogicalResult rankLiftPointwiseValueGraph(
     if (!isCartesianPointwiseValueOp(operation) ||
         operation->getNumRegions() != 0)
       return WalkResult::interrupt();
+    if (auto splat = dyn_cast<SplatOp>(operation);
+        splat && isa<FragmentType>(splat.getValue().getType()))
+      rankLiftedSplats.push_back(splat);
     for (Value value : operation->getResults()) {
       Type type = value.getType();
       if (auto fragment = dyn_cast<FragmentType>(type))
@@ -2371,7 +2375,86 @@ LogicalResult rankLiftPointwiseValueGraph(
     }
     return WalkResult::advance();
   });
-  return result.wasInterrupted() ? failure() : success();
+  if (result.wasInterrupted())
+    return failure();
+
+  // Rank lifting can turn the scalar producer of an existing splat into a
+  // fragment.  Preserve that newly explicit value relation as a fragment
+  // broadcast; SplatOp remains the scalar-to-fragment boundary.
+  for (SplatOp splat : rankLiftedSplats) {
+    auto source = dyn_cast<FragmentType>(splat.getValue().getType());
+    auto target = dyn_cast<FragmentType>(splat.getResult().getType());
+    if (!source || !target ||
+        source.getElementType() != target.getElementType() ||
+        source.getOwner() != target.getOwner()) {
+      splat.emitOpError(
+          "rank-lifted splat has incompatible fragment value relation");
+      return failure();
+    }
+
+    Value replacement = splat.getValue();
+    if (source != target) {
+      OpBuilder builder(splat);
+      Value broadcastSource = splat.getValue();
+      auto broadcastSourceType = source;
+
+      // Lifted workset axes are a physical execution prefix.  If the old splat
+      // had additional value axes, make their scalar expansion explicit as
+      // reshape-inserted unit axes before applying ordinary trailing broadcast
+      // semantics.  This keeps ownership axes out of the logical broadcast
+      // suffix and lets later extent retargeting distinguish the two relations.
+      bool sourceIsTargetPrefix =
+          source.getShape().size() < target.getShape().size();
+      for (unsigned axis = 0;
+           sourceIsTargetPrefix && axis < source.getShape().size(); ++axis)
+        sourceIsTargetPrefix =
+            source.getShape()[axis] == target.getShape()[axis] &&
+            source.getAxisMaps()[axis] == target.getAxisMaps()[axis];
+      if (sourceIsTargetPrefix) {
+        SmallVector<Attribute> shape(source.getShape().begin(),
+                                     source.getShape().end());
+        SmallVector<Attribute> mappings(source.getAxisMaps().begin(),
+                                        source.getAxisMaps().end());
+        PhysicalExprAttr unit = expression(
+            kernel.getContext(), PhysicalExprKind::Constant, 1);
+        for (unsigned axis = source.getShape().size();
+             axis < target.getShape().size(); ++axis) {
+          shape.push_back(unit);
+          mappings.push_back(target.getAxisMaps()[axis]);
+        }
+        broadcastSourceType = FragmentType::get(
+            kernel.getContext(), source.getElementType(),
+            ArrayAttr::get(kernel.getContext(), shape),
+            ArrayAttr::get(kernel.getContext(), mappings),
+            source.getValidity(), source.getOwner());
+        FailureOr<ArrayAttr> reassociation = inferReshapeReassociation(
+            source, broadcastSourceType,
+            /*sourcePrefix=*/source.getShape().size(),
+            /*resultPrefix=*/source.getShape().size());
+        if (failed(reassociation)) {
+          splat.emitOpError(
+              "rank-lifted splat cannot insert its broadcast suffix");
+          return failure();
+        }
+        broadcastSource = builder.create<ReshapeOp>(
+            splat.getLoc(), broadcastSourceType, splat.getValue(),
+            *reassociation);
+      }
+      if (!queryBroadcastProjection(broadcastSourceType, target).isExact()) {
+        splat.emitOpError(
+            "rank-lifted splat has no exact fragment broadcast relation");
+        return failure();
+      }
+      auto broadcast = builder.create<BroadcastOp>(
+          splat.getLoc(), target, broadcastSource);
+      if (Attribute origin = splat->getAttr(originAttr))
+        broadcast->setAttr(originAttr, origin);
+      replacement = broadcast.getResult();
+    }
+    splat.getResult().replaceAllUsesWith(replacement);
+    splat.erase();
+  }
+  return success();
 }
 
 } // namespace
