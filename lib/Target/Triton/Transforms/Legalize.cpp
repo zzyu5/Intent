@@ -1483,20 +1483,32 @@ bool isAddCombine(gpu::ScatterReduceOp scatter) {
          BinaryOperator::Add;
 }
 
-bool isNativeAddReduce(gpu::ReduceOp reduce) {
+std::optional<StringRef> nativeReduceForm(gpu::ReduceOp reduce) {
   if (reduce.getSourceCount() != 1 || reduce.getIdentityCount() != 1 ||
       reduce.getCaptureCount() != 0 || reduce.getResults().size() != 1 ||
       reduce.getCombine().empty() || reduce.getCombine().getBlocks().size() != 1)
-    return false;
-  return gpu::queryBinaryCombineKind(reduce.getCombine()) ==
-         BinaryOperator::Add;
+    return std::nullopt;
+  std::optional<BinaryOperator> combine =
+      gpu::queryBinaryCombineKind(reduce.getCombine());
+  if (!combine)
+    return std::nullopt;
+  if (*combine == BinaryOperator::Add)
+    return "sum";
+  auto source = dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
+  if (!source || !isa<IntegerType, IndexType>(source.getElementType()))
+    return std::nullopt;
+  if (*combine == BinaryOperator::Maximum)
+    return "max";
+  if (*combine == BinaryOperator::Minimum)
+    return "min";
+  return std::nullopt;
 }
 
 void selectNativeReduceForms(func::FuncOp kernel) {
   kernel.walk([&](gpu::ReduceOp reduce) {
-    if (isNativeAddReduce(reduce))
+    if (std::optional<StringRef> form = nativeReduceForm(reduce))
       reduce->setAttr(reduceFormAttr,
-                      StringAttr::get(kernel.getContext(), "sum"));
+                      StringAttr::get(kernel.getContext(), *form));
   });
 }
 

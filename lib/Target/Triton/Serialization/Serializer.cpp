@@ -1027,12 +1027,19 @@ private:
       }
       std::string call;
       if (auto form = reduce->getAttrOfType<StringAttr>(reduceFormAttr)) {
-        if (form.getValue() != "sum") {
+        StringRef primitive;
+        if (form.getValue() == "sum")
+          primitive = "tl.sum";
+        else if (form.getValue() == "max")
+          primitive = "tl.max";
+        else if (form.getValue() == "min")
+          primitive = "tl.min";
+        else {
           reduce.emitOpError("has an unknown Triton native reduction form");
           failed = true;
           return;
         }
-        call = "tl.sum(" + sources + ", axis=" +
+        call = primitive.str() + "(" + sources + ", axis=" +
                std::to_string(reduce.getAxes().front()) + ")";
       } else {
         call = "tl.reduce(" + sources + ", axis=" +
