@@ -3329,9 +3329,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         binary(builder, location, builder.getIndexType(), rowTile,
                blockM.getResult(), BinaryOperator::Multiply),
         BinaryOperator::Add);
-  Value rowStop = binary(builder, location, builder.getIndexType(),
-                         rowRange->getStart(), rowRange->getExtent(),
-                         BinaryOperator::Add);
+  Value rowStop = *rowLogicalEnd;
   Value columnStart = columnRange->getStart();
   if (failed(existingColumnAxis))
     columnStart = binary(
@@ -3339,9 +3337,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         binary(builder, location, builder.getIndexType(), columnTile,
                blockN.getResult(), BinaryOperator::Multiply),
         BinaryOperator::Add);
-  Value columnStop = binary(builder, location, builder.getIndexType(),
-                            columnRange->getStart(), columnRange->getExtent(),
-                            BinaryOperator::Add);
+  Value columnStop = *columnLogicalEnd;
   Value blockStop = *blockLogicalEnd;
 
   FragmentType rowIndexType = fragmentType(
