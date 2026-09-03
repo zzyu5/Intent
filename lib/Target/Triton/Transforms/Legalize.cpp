@@ -1852,8 +1852,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
             gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
-            gpu::ExtractOp, gpu::LoadOp, gpu::GatherOp,
-            gpu::AssumeInBoundsOp, gpu::StoreOp,
+            gpu::ExtractOp, gpu::LoadOp, gpu::GatherOp, gpu::StoreOp,
             gpu::ContractOp, gpu::ReduceOp, gpu::ScanOp,
             gpu::ScaledContractOp, gpu::HistogramOp, gpu::AtomicStoreOp,
             gpu::AtomicRMWOp, gpu::AtomicCompareExchangeOp,
@@ -1932,6 +1931,12 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms)))
     return failure();
   selectContractForms(kernel);
+  SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;
+  kernel.walk([&](gpu::AssumeInBoundsOp assumption) {
+    boundsAssumptions.push_back(assumption);
+  });
+  for (gpu::AssumeInBoundsOp assumption : boundsAssumptions)
+    assumption.erase();
   if (failed(verifyTritonProgram(module)))
     return failure();
   kernel->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

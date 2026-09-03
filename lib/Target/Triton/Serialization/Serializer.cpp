@@ -965,26 +965,6 @@ private:
       assign(gather.getResult(), call);
       return;
     }
-    if (auto assumption = dyn_cast<gpu::AssumeInBoundsOp>(operation)) {
-      auto view = cast<gpu::ViewType>(assumption.getResource().getType());
-      auto extent = cast<gpu::PhysicalExprAttr>(
-          view.getLayout().getExtents()[assumption.getAxis()]);
-      std::string predicate =
-          "((" + valueString(assumption.getIndex()) + " >= 0) & (" +
-          valueString(assumption.getIndex()) + " < " +
-          expressionString(extent, false) + "))";
-      if (auto fragment =
-              dyn_cast<gpu::FragmentType>(assumption.getIndex().getType())) {
-        predicate = "(" + predicate + ").to(tl.int32)";
-        for (int64_t axis = static_cast<int64_t>(fragment.getShape().size()) - 1;
-             axis >= 0; --axis)
-          predicate = "tl.min(" + predicate + ", axis=" +
-                      std::to_string(axis) + ")";
-        predicate = "(" + predicate + " != 0)";
-      }
-      line("tl.assume(" + predicate + ")");
-      return;
-    }
     if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
       auto form = contract->getAttrOfType<StringAttr>(
           "intent_gpu.triton.contract_form");
