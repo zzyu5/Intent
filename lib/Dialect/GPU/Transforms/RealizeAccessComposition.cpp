@@ -15,15 +15,11 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-bool isTrue(Value value) {
-  while (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    value = broadcast.getValue();
-  while (auto splat = value.getDefiningOp<SplatOp>())
-    value = splat.getValue();
+bool isZero(Value value) {
   auto constant = value.getDefiningOp<arith::ConstantOp>();
   auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
                           : IntegerAttr();
-  return integer && integer.getType().isInteger(1) && integer.getInt() != 0;
+  return integer && integer.getValue().isZero();
 }
 
 FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
@@ -335,9 +331,9 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
 FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
   auto source = dyn_cast<FragmentType>(gather.getSource().getType());
   auto result = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (!source || !result || gather.getCoordinates().size() != source.getShape().size() ||
-      gather.getSourceAxes().size() != source.getShape().size() ||
-      (gather.getValid() && !isTrue(gather.getValid())))
+  if (!source || !result || source.getOwner() != result.getOwner() ||
+      gather.getCoordinates().size() != source.getShape().size() ||
+      gather.getSourceAxes().size() != source.getShape().size())
     return false;
   SmallVector<bool> represented(result.getShape().size(), false);
   for (auto [coordinate, sourceAxis] :
@@ -356,10 +352,13 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
             ? dyn_cast<AxisMapAttr>(result.getAxisMaps()[resultAxis.fragmentAxis])
             : AxisMapAttr();
     auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+    auto coordinateRange = coordinate.getDefiningOp<MakeRangeOp>();
     if (!resultAxis.isExact() || !coordinateAxis.isExact() || !resultMapping ||
         resultMapping.getDimensionId() != expected.getDimensionId() ||
         coordinateAxis.dimensionId != expected.getDimensionId() ||
-        !coordinateType ||
+        !coordinateType || !coordinateRange ||
+        !isZero(coordinateRange.getStart()) ||
+        !isUnitStepRange(coordinateRange) ||
         source.getShape()[sourceAxis] !=
             result.getShape()[resultAxis.fragmentAxis] ||
         coordinateType.getShape().size() != 1 ||
@@ -379,11 +378,15 @@ FailureOr<bool> composeIdentityFragmentGather(GatherOp gather) {
       return false;
   }
   OpBuilder builder(gather);
-  auto replacement = builder.create<BroadcastOp>(
-      gather.getLoc(), result, gather.getSource());
+  Value replacement = builder.create<BroadcastOp>(gather.getLoc(), result,
+                                                   gather.getSource());
+  if (gather.getValid())
+    replacement = builder.create<SelectOp>(gather.getLoc(), result,
+                                           gather.getValid(), replacement,
+                                           gather.getFill());
   if (Attribute origin = gather->getAttr(originAttr))
-    replacement->setAttr(originAttr, origin);
-  gather.getResult().replaceAllUsesWith(replacement.getResult());
+    replacement.getDefiningOp()->setAttr(originAttr, origin);
+  gather.getResult().replaceAllUsesWith(replacement);
   gather.erase();
   return true;
 }
