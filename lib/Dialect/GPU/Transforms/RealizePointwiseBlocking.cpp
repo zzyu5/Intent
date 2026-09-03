@@ -23,6 +23,14 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+void inheritRangeAuthority(Operation *target, MakeRangeOp source) {
+  for (StringRef name :
+       {originAttr, sourceSubregionAttr, sourceSubregionBoundAttr,
+        worksetCoordinateRangeAttr})
+    if (Attribute value = source->getAttr(name))
+      target->setAttr(name, value);
+}
+
 uint32_t physicalElementBitWidth(Type type) {
   if (auto fragment = dyn_cast<FragmentType>(type))
     type = fragment.getElementType();
@@ -1176,9 +1184,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         range.getLoc(), projectedType, blocked.getStart(), blocked.getExtent(),
         blocked.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
-    for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
-      if (Attribute value = range->getAttr(name))
-        projected.getDefiningOp()->setAttr(name, value);
+    inheritRangeAuthority(projected.getDefiningOp(), range);
     mapping.map(value, projected);
     return projected;
   }
@@ -1657,9 +1663,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             location, blockedType, tileStart, chunk.getResult(), range.getStep(),
             range.getLogicalStart(), range.getLogicalStop(), range.getSourceId(),
             range.getSourceAxis(), range.getDerived());
-        for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
-          if (Attribute value = range->getAttr(name))
-            blocked.getDefiningOp()->setAttr(name, value);
+        inheritRangeAuthority(blocked.getDefiningOp(), range);
         Value end = nested.create<BroadcastOp>(location, blockedType, stop);
         auto tailComparison = nested.create<CompareOp>(
             location, predicateType(blockedType), blocked, end,
@@ -1996,9 +2000,7 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
               inputRange.getStep(), inputRange.getLogicalStart(),
               inputRange.getLogicalStop(), inputRange.getSourceId(),
               inputRange.getSourceAxis(), inputRange.getDerived());
-          for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
-            if (Attribute value = inputRange->getAttr(name))
-              blocked.getDefiningOp()->setAttr(name, value);
+          inheritRangeAuthority(blocked.getDefiningOp(), inputRange);
           Value inputEnd = nested.create<BroadcastOp>(
               location, blockedInputType, inputRange.getLogicalStop());
           auto tailComparison = nested.create<CompareOp>(
@@ -3121,9 +3123,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           range.getLoc(), fragment, range.getStart(), extent, range.getStep(),
           range.getLogicalStart(), range.getLogicalStop(), range.getSourceId(),
           range.getSourceAxis(), range.getDerived());
-      for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
-        if (Attribute value = range->getAttr(name))
-          blocked->setAttr(name, value);
+      inheritRangeAuthority(blocked, range);
       Value endFragment =
           builder.create<BroadcastOp>(range.getLoc(), fragment,
                                       range.getLogicalStop());
@@ -4215,9 +4215,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         range.getLoc(), blockedType, start, physicalExtent,
         range.getStep(), range.getLogicalStart(), range.getLogicalStop(),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
-    for (StringRef name : {sourceSubregionAttr, sourceSubregionBoundAttr})
-      if (Attribute value = range->getAttr(name))
-        blocked.getDefiningOp()->setAttr(name, value);
+    inheritRangeAuthority(blocked.getDefiningOp(), range);
     Value endFragment = builder.create<BroadcastOp>(range.getLoc(), blockedType, end);
     auto validComparison = builder.create<CompareOp>(
         range.getLoc(), predicateType(blockedType), blocked, endFragment,

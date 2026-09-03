@@ -2708,10 +2708,32 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
          llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
       if (!derivesFromAccessCoordinate(comparison.getLhs(), coordinate))
         continue;
+      bool worksetViewBoundary = false;
+      if (upperComparison && comparison->hasAttr(physicalTailAttr)) {
+        Value accessCoordinate = stripIntegerIndexCasts(coordinate);
+        auto range = accessCoordinate.getDefiningOp<MakeRangeOp>();
+        auto workset =
+            range ? range.getStart().getDefiningOp<WorksetCoordinateOp>()
+                  : WorksetCoordinateOp();
+        auto accessView = dyn_cast<ViewType>(accessFact.resource.getType());
+        if (range && range->hasAttr(worksetCoordinateRangeAttr) &&
+            !range->hasAttr(sourceSubregionAttr) && workset && accessView &&
+            sourceAxisIdentity(range) ==
+                PhysicalSourceAxis{workset.getSourceId(),
+                                   workset.getSourceAxis(), false} &&
+            sourceAxis >= 0 &&
+            sourceAxis < static_cast<int64_t>(accessView.getRank())) {
+          ArrayRef<int64_t> dimensions =
+              accessView.getLayout().getDimensionIds().asArrayRef();
+          worksetViewBoundary =
+              dimensions[sourceAxis] ==
+              static_cast<int64_t>(workset.getDimensionId());
+        }
+      }
       bool viewBoundary =
-          lowerComparison || matchesResourceExtent(
-                                 comparison.getRhs(), accessFact.resource,
-                                 sourceAxis);
+          lowerComparison || worksetViewBoundary ||
+          matchesResourceExtent(comparison.getRhs(), accessFact.resource,
+                                sourceAxis);
       bool exactRange =
           upperComparison && hasExactPhysicalRangeCoverage(
                                  coordinate, comparison.getRhs());
