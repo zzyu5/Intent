@@ -139,6 +139,24 @@ bool samePhysicalDomain(gpu::FragmentType lhs, gpu::FragmentType rhs) {
          lhs.getOwner() == rhs.getOwner();
 }
 
+gpu::FragmentType transposeRankTwo(gpu::FragmentType source) {
+  SmallVector<Attribute> shape = {source.getShape()[1], source.getShape()[0]};
+  SmallVector<Attribute> mappings;
+  mappings.reserve(2);
+  for (unsigned resultAxis = 0; resultAxis < 2; ++resultAxis) {
+    const unsigned sourceAxis = 1 - resultAxis;
+    auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+    mappings.push_back(gpu::AxisMapAttr::get(
+        source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        mapping.getDimensionId(), resultAxis, mapping.getDerived()));
+  }
+  return gpu::FragmentType::get(
+      source.getContext(), source.getElementType(),
+      ArrayAttr::get(source.getContext(), shape),
+      ArrayAttr::get(source.getContext(), mappings), source.getValidity(),
+      source.getOwner());
+}
+
 bool canBroadcastTo(gpu::FragmentType source, gpu::FragmentType target) {
   for (auto [sourceIndex, sourceAttribute] :
        llvm::enumerate(source.getAxisMaps())) {
@@ -500,9 +518,16 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
       return contract.emitOpError(
           "cuTile scaled MMA requires E4M3/E8M0 group-32 adjacent reduction axes");
     OpBuilder builder(contract);
+    auto rhsScale = builder.create<gpu::TransposeOp>(
+        contract.getLoc(),
+        transposeRankTwo(
+            cast<gpu::FragmentType>(contract.getRhsScale().getType())),
+        contract.getRhsScale(), ArrayRef<int64_t>{1, 0});
+    if (Attribute origin = contract->getAttr(gpu::originAttr))
+      rhsScale->setAttr(gpu::originAttr, origin);
     auto replacement = builder.create<ScaledMMAOp>(
         contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
-        contract.getLhsScale(), contract.getRhs(), contract.getRhsScale(),
+        contract.getLhsScale(), contract.getRhs(), rhsScale,
         contract.getAccumulator(), contract.getLhsFormat(),
         contract.getRhsFormat(), contract.getLhsGroupSize(),
         contract.getRhsGroupSize());
