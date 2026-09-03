@@ -143,6 +143,10 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
       roles && llvm::is_contained(roles.asArrayRef(), indirectTraversal);
   const bool hasTiledWorkset =
       roles && llvm::is_contained(roles.asArrayRef(), tiledWorkset);
+  const bool hasWorkset =
+      roles && llvm::is_contained(roles.asArrayRef(), workset);
+  const bool hasPointwiseOwnership =
+      roles && llvm::is_contained(roles.asArrayRef(), pointwiseOwnership);
 
   if (hasWorkerTraversal) {
     for (unsigned axis = 0; axis < rank; ++axis)
@@ -171,6 +175,13 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     for (unsigned axis = rank; axis > 0; --axis)
       if (roles[axis - 1] == tiledWorkset)
         programOrder.push_back(axis - 1);
+    for (unsigned axis = 0; axis < rank; ++axis)
+      if (!llvm::is_contained(programOrder, axis))
+        programOrder.push_back(axis);
+  } else if (hasWorkset && hasPointwiseOwnership) {
+    for (unsigned axis = 0; axis < rank; ++axis)
+      if (roles[axis] == pointwiseOwnership)
+        programOrder.push_back(axis);
     for (unsigned axis = 0; axis < rank; ++axis)
       if (!llvm::is_contained(programOrder, axis))
         programOrder.push_back(axis);
