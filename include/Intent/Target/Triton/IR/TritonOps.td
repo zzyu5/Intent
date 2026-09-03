@@ -11,7 +11,11 @@ class IntentTriton_Op<string mnemonic, list<Trait> traits = []> :
 
 def IntentTriton_TensorDescriptorChoiceOp :
     IntentTriton_Op<"tensor_descriptor_choice", [Pure]> {
-  let arguments = (ins StrAttr:$construction);
+  let arguments = (ins Variadic<IntentGPU_ViewValue>:$descriptors,
+                       StrAttr:$construction,
+                       StrAttr:$selection,
+                       StrAttr:$config_parameter,
+                       StrAttr:$eligibility_argument);
   let results = (outs I1:$result);
   let hasVerifier = 1;
 }
@@ -21,7 +25,8 @@ def IntentTriton_TensorDescriptorAllocatorOp :
   let arguments = (ins I64Attr:$size_argument,
                        I64Attr:$alignment_argument,
                        I64Attr:$stream_argument,
-                       StrAttr:$lifetime);
+                       StrAttr:$lifetime,
+                       StrAttr:$implementation);
   let hasVerifier = 1;
 }
 
@@ -37,8 +42,16 @@ def IntentTriton_TensorDescriptorOp : IntentTriton_Op<"tensor_descriptor", [
                        DenseI64ArrayAttr:$initial_block_shape,
                        StrAttr:$base_layout,
                        StrAttr:$padding,
+                       DenseI64ArrayAttr:$flattened_contiguous_axes,
+                       DenseI64ArrayAttr:$aligned_stride_axes,
+                       DenseI64ArrayAttr:$unit_stride_axes,
+                       BoolAttr:$require_positive_shape,
+                       BoolAttr:$require_positive_strides,
+                       BoolAttr:$require_power_of_two_block_shape,
                        I64Attr:$alignment,
-                       I64Attr:$minimum_contiguous_bytes);
+                       I64Attr:$minimum_contiguous_bytes,
+                       I64Attr:$maximum_shape_extent,
+                       I64Attr:$maximum_block_elements);
   let results = (outs IntentGPU_ViewValue:$result);
   let hasVerifier = 1;
 }

@@ -6,8 +6,10 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace mlir;
 
@@ -141,7 +143,29 @@ bool hasStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis) {
   return matches == 1;
 }
 
-bool hasContiguousDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
+bool matchesStrideBinding(func::FuncOp kernel, gpu::ViewType view, unsigned axis,
+                          Value value) {
+  Attribute stride = view.getLayout().getStrides()[axis];
+  if (auto constant = dyn_cast<IntegerAttr>(stride)) {
+    auto operation = value.getDefiningOp<arith::ConstantIndexOp>();
+    return operation && operation.value() == constant.getInt();
+  }
+  auto symbol = dyn_cast<StringAttr>(stride);
+  auto argument = dyn_cast<BlockArgument>(value);
+  if (!symbol || !argument || argument.getOwner() != &kernel.getBody().front())
+    return false;
+  unsigned index = argument.getArgNumber();
+  auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
+  auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
+  auto source = kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
+  auto sourceAxis =
+      kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
+  return name == symbol && kind && kind.getValue() == "stride" && source &&
+         source.getInt() == view.getAbiIndex() && sourceAxis &&
+         sourceAxis.getInt() == axis && argument.getType().isIndex();
+}
+
+bool hasFlattenableDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
   auto layout = view.getLayout();
   if (!layout.getHasStrides() || layout.getStrides().size() != view.getRank())
     return false;
@@ -153,7 +177,10 @@ bool hasContiguousDescriptorLayout(func::FuncOp kernel, gpu::ViewType view) {
       layout.getStrides()[layout.getStrides().size() - 1]);
   if (lastStride && lastStride.getInt() != 1)
     return false;
-  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
+  // The final two source axes become the descriptor row/column axes.  A padded
+  // row stride is representable directly; only axes flattened into the row
+  // coordinate must be mutually contiguous.
+  for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis) {
     auto stride = dyn_cast<IntegerAttr>(layout.getStrides()[axis]);
     auto nextStride = dyn_cast<IntegerAttr>(layout.getStrides()[axis + 1]);
     auto nextExtent =
@@ -183,6 +210,49 @@ LogicalResult TensorDescriptorChoiceOp::verify() {
         "requires exactly one tensor descriptor choice per physical kernel");
   if (getConstruction() != "host")
     return emitOpError("supports only explicit host descriptor binding");
+  if (getSelection() != "all_eligible")
+    return emitOpError(
+        "supports only an all-descriptor runtime eligibility contract");
+  if (getConfigParameter().empty() || getEligibilityArgument().empty() ||
+      getConfigParameter() == getEligibilityArgument())
+    return emitOpError(
+        "requires distinct non-empty config and runtime eligibility names");
+  if (getDescriptors().empty())
+    return emitOpError("requires a non-empty explicit descriptor set");
+  llvm::SmallPtrSet<Operation *, 8> declared;
+  for (Value value : getDescriptors()) {
+    auto descriptor = value.getDefiningOp<TensorDescriptorOp>();
+    if (!descriptor || descriptor->getParentOfType<func::FuncOp>() != kernel ||
+        !declared.insert(descriptor.getOperation()).second)
+      return emitOpError(
+          "descriptor operands must uniquely enumerate this physical kernel's declarations");
+  }
+  unsigned descriptors = 0;
+  bool completeDescriptorSet = true;
+  kernel.walk([&](TensorDescriptorOp descriptor) {
+    ++descriptors;
+    if (!declared.contains(descriptor.getOperation()))
+      completeDescriptorSet = false;
+  });
+  if (!completeDescriptorSet || descriptors != declared.size())
+    return emitOpError(
+        "descriptor operands must enumerate every descriptor declaration exactly once");
+  for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
+    auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
+    if (name && (name.getValue() == getConfigParameter() ||
+                 name.getValue() == getEligibilityArgument()))
+      return emitOpError(
+          "descriptor config and eligibility names must not collide with the physical ABI");
+  }
+  bool parameterCollision = false;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    StringRef name = parameter.getParameter().getName().getValue();
+    parameterCollision |= name == getConfigParameter() ||
+                          name == getEligibilityArgument();
+  });
+  if (parameterCollision)
+    return emitOpError(
+        "descriptor config and eligibility names must not collide with physical parameters");
   return success();
 }
 
@@ -203,6 +273,9 @@ LogicalResult TensorDescriptorAllocatorOp::verify() {
         "allocator ABI must bind runtime size, alignment, and stream in order");
   if (getLifetime() != "launch")
     return emitOpError("supports only launch-lifetime descriptor allocation");
+  if (getImplementation() != "torch_cuda_current_device")
+    return emitOpError(
+        "supports only the bound current-device Torch allocator implementation");
   return success();
 }
 
@@ -235,13 +308,32 @@ LogicalResult TensorDescriptorOp::verify() {
           static_cast<int64_t>(getMinimumContiguousBytes()))
     return emitOpError(
         "host tensor descriptor must declare a legal provider dummy block shape");
-  if (getBaseLayout() != "contiguous" || getPadding() != "zero" ||
-      getAlignment() != 16 || getMinimumContiguousBytes() != 16)
+  if (getBaseLayout() != "flattened_row_major" || getPadding() != "zero" ||
+      getAlignment() != 16 || getMinimumContiguousBytes() != 16 ||
+      !getRequirePositiveShape() || !getRequirePositiveStrides() ||
+      !getRequirePowerOfTwoBlockShape() ||
+      getMaximumShapeExtent() != std::numeric_limits<int32_t>::max() ||
+      getMaximumBlockElements() != (1 << 20))
     return emitOpError(
-        "host tensor descriptor requires contiguous base, zero padding, 16-byte alignment, and a 16-byte contiguous block");
-  if (!hasContiguousDescriptorLayout(kernel, base))
+        "host tensor descriptor requires the complete Triton 3.6 flattened-row-major runtime contract");
+  SmallVector<int64_t> expectedContiguousAxes;
+  for (unsigned axis = 0; axis + 2 < base.getRank(); ++axis)
+    expectedContiguousAxes.push_back(axis);
+  if (getFlattenedContiguousAxes() !=
+      ArrayRef<int64_t>(expectedContiguousAxes))
     return emitOpError(
-        "host tensor descriptor base must carry a complete row-major stride ABI");
+        "runtime contract must name every source axis flattened into descriptor rows");
+  if (getAlignedStrideAxes() != ArrayRef<int64_t>{
+                                    static_cast<int64_t>(base.getRank()) - 2})
+    return emitOpError(
+        "runtime contract must align the represented descriptor row stride");
+  if (getUnitStrideAxes() !=
+      ArrayRef<int64_t>{static_cast<int64_t>(base.getRank()) - 1})
+    return emitOpError(
+        "runtime contract must require the represented column stride to be one");
+  if (!hasFlattenableDescriptorLayout(kernel, base))
+    return emitOpError(
+        "host tensor descriptor base must carry a complete flattenable stride ABI");
   unsigned bitWidth = base.getElementType().getIntOrFloatBitWidth();
   if (bitWidth < 8 || bitWidth % 8 != 0)
     return emitOpError(
@@ -250,7 +342,8 @@ LogicalResult TensorDescriptorOp::verify() {
   SmallVector<unsigned> flattenedAxes;
   if (!lastDimension || lastDimension.getView() != getBase() ||
       lastDimension.getAxis() + 1 != base.getRank() ||
-      getStrides().front() != getShape().back() ||
+      !matchesStrideBinding(kernel, base, base.getRank() - 2,
+                            getStrides().front()) ||
       !collectFlattenedDimensions(getShape().front(), getBase(),
                                   flattenedAxes))
     return emitOpError(
@@ -270,11 +363,15 @@ LogicalResult TensorDescriptorOp::verify() {
           "descriptor block shape must use declared physical expressions");
   unsigned choices = 0;
   unsigned allocators = 0;
-  kernel.walk([&](TensorDescriptorChoiceOp) { ++choices; });
+  bool declaredByChoice = false;
+  kernel.walk([&](TensorDescriptorChoiceOp choice) {
+    ++choices;
+    declaredByChoice |= llvm::is_contained(choice.getDescriptors(), getResult());
+  });
   kernel.walk([&](TensorDescriptorAllocatorOp) { ++allocators; });
-  if (choices != 1 || allocators != 1)
+  if (choices != 1 || allocators != 1 || !declaredByChoice)
     return emitOpError(
-        "requires one descriptor choice and one allocator declaration");
+        "requires one explicit descriptor choice and one allocator declaration");
   return success();
 }
 

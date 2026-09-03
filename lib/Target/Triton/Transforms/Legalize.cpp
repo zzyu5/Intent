@@ -30,6 +30,8 @@ constexpr llvm::StringLiteral contractFormAttr =
     "intent_gpu.triton.contract_form";
 constexpr llvm::StringLiteral tensorDescriptorChoice =
     "USE_TENSOR_DESCRIPTOR";
+constexpr llvm::StringLiteral tensorDescriptorEligibility =
+    "TENSOR_DESCRIPTOR_ELIGIBLE";
 constexpr int64_t maxTritonTensorElements = 1048576;
 
 struct TritonConfig {
@@ -536,7 +538,10 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
   if (auto last = dyn_cast<IntegerAttr>(strides[strides.size() - 1]);
       last && last.getInt() != 1)
     return false;
-  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
+  // The final two axes become descriptor rows and columns.  A padded row
+  // stride is directly representable, while earlier source axes must flatten
+  // contiguously into that row coordinate.
+  for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis) {
     auto stride = dyn_cast<IntegerAttr>(strides[axis]);
     auto nextStride = dyn_cast<IntegerAttr>(strides[axis + 1]);
     auto nextExtent =
@@ -550,11 +555,9 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
     if (expected != stride.getInt())
       return false;
   }
-  for (unsigned axis = 0; axis + 1 < view.getRank(); ++axis) {
-    auto stride = dyn_cast<IntegerAttr>(strides[axis]);
-    if (stride && (stride.getInt() * *elementBytes) % 16 != 0)
-      return false;
-  }
+  auto rowStride = dyn_cast<IntegerAttr>(strides[view.getRank() - 2]);
+  if (rowStride && (rowStride.getInt() * *elementBytes) % 16 != 0)
+    return false;
   auto lastOffset =
       offsets[blockAxes.back()].getDefiningOp<arith::ConstantIndexOp>();
   return lastOffset && (lastOffset.value() * *elementBytes) % 16 == 0;
@@ -577,7 +580,14 @@ FailureOr<Value> descriptorStrideValue(OpBuilder &builder, func::FuncOp kernel,
     return failure();
   for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
     auto name = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiNameAttr);
-    if (name && name.getValue() == symbol.getValue() && argument.getType().isIndex())
+    auto kind = kernel.getArgAttrOfType<StringAttr>(index, gpu::abiKindAttr);
+    auto source =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceABIAttr);
+    auto sourceAxis =
+        kernel.getArgAttrOfType<IntegerAttr>(index, gpu::sourceAxisAttr);
+    if (name == symbol && kind && kind.getValue() == "stride" && source &&
+        source.getInt() == view.getAbiIndex() && sourceAxis &&
+        sourceAxis.getInt() == axis && argument.getType().isIndex())
       return argument;
   }
   return failure();
@@ -612,17 +622,18 @@ FailureOr<SmallVector<Value>> materializeDescriptorOffsets(
   return SmallVector<Value>{row, offsets.back()};
 }
 
-FailureOr<bool> materializeTensorDescriptorForms(func::FuncOp kernel) {
+FailureOr<TensorDescriptorChoiceOp>
+materializeTensorDescriptorForms(func::FuncOp kernel) {
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities || capabilities.getComputeCapabilityMajor() < 9)
-    return false;
+    return TensorDescriptorChoiceOp();
   bool hasContraction = false;
   kernel.walk([&](Operation *operation) {
     hasContraction |= isa<gpu::ContractOp, gpu::ScaledContractOp>(operation);
   });
   if (!hasContraction)
-    return false;
+    return TensorDescriptorChoiceOp();
 
   SmallVector<BlockLoadOp> loads;
   SmallVector<BlockStoreOp> stores;
@@ -637,14 +648,13 @@ FailureOr<bool> materializeTensorDescriptorForms(func::FuncOp kernel) {
       stores.push_back(store);
   });
   if (loads.empty() && stores.empty())
-    return false;
+    return TensorDescriptorChoiceOp();
 
   OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
   entry.create<TensorDescriptorAllocatorOp>(
       kernel.getLoc(), entry.getI64IntegerAttr(0), entry.getI64IntegerAttr(1),
-      entry.getI64IntegerAttr(2), entry.getStringAttr("launch"));
-  auto choice = entry.create<TensorDescriptorChoiceOp>(
-      kernel.getLoc(), entry.getI1Type(), entry.getStringAttr("host"));
+      entry.getI64IntegerAttr(2), entry.getStringAttr("launch"),
+      entry.getStringAttr("torch_cuda_current_device"));
   struct DescriptorPlan {
     Value view;
     gpu::FragmentType fragment;
@@ -671,7 +681,11 @@ FailureOr<bool> materializeTensorDescriptorForms(func::FuncOp kernel) {
                                         BinaryOperator::Multiply);
     Value one = entry.create<arith::ConstantIndexOp>(kernel.getLoc(), 1);
     SmallVector<Value> shape{rows, dimensions.back()};
-    SmallVector<Value> strides{dimensions.back(), one};
+    FailureOr<Value> rowStride = descriptorStrideValue(
+        entry, kernel, kernel.getLoc(), view, view.getRank() - 2);
+    if (failed(rowStride))
+      return failure();
+    SmallVector<Value> strides{*rowStride, one};
     SmallVector<Value> descriptorBlockShape;
     for (Attribute extent : fragment.getShape())
       descriptorBlockShape.push_back(entry.create<gpu::PhysicalExprOp>(
@@ -681,19 +695,45 @@ FailureOr<bool> materializeTensorDescriptorForms(func::FuncOp kernel) {
         descriptorElementBytes(view.getElementType());
     if (!elementBytes || 16 % *elementBytes != 0)
       return failure();
+    SmallVector<int64_t> flattenedContiguousAxes;
+    for (unsigned axis = 0; axis + 2 < view.getRank(); ++axis)
+      flattenedContiguousAxes.push_back(axis);
     auto descriptor = entry.create<TensorDescriptorOp>(
         kernel.getLoc(), viewValue.getType(), viewValue, shape, strides,
-        descriptorBlockShape,
-        DenseI64ArrayAttr::get(kernel.getContext(), blockAxes),
-        DenseI64ArrayAttr::get(kernel.getContext(),
-                               ArrayRef<int64_t>{1, 16 / *elementBytes}),
-        entry.getStringAttr("contiguous"), entry.getStringAttr("zero"),
-        entry.getI64IntegerAttr(16), entry.getI64IntegerAttr(16));
+        descriptorBlockShape, blockAxes,
+        ArrayRef<int64_t>{1, 16 / *elementBytes}, "flattened_row_major",
+        "zero", flattenedContiguousAxes,
+        ArrayRef<int64_t>{static_cast<int64_t>(view.getRank()) - 2},
+        ArrayRef<int64_t>{static_cast<int64_t>(view.getRank()) - 1},
+        /*requirePositiveShape=*/true,
+        /*requirePositiveStrides=*/true,
+        /*requirePowerOfTwoBlockShape=*/true, /*alignment=*/16,
+        /*minimumContiguousBytes=*/16,
+        /*maximumShapeExtent=*/std::numeric_limits<int32_t>::max(),
+        /*maximumBlockElements=*/maxTritonTensorElements);
     descriptors.push_back(
         {viewValue, fragment,
          SmallVector<int64_t>(blockAxes.begin(), blockAxes.end()), descriptor});
     return descriptor;
   };
+  for (BlockLoadOp load : loads)
+    if (failed(descriptorFor(load.getView(), load.getResult().getType(),
+                             load.getBlockAxes())))
+      return load.emitOpError(
+          "could not declare its tensor-descriptor runtime contract");
+  for (BlockStoreOp store : stores)
+    if (failed(descriptorFor(store.getView(), store.getValue().getType(),
+                             store.getBlockAxes())))
+      return store.emitOpError(
+          "could not declare its tensor-descriptor runtime contract");
+  SmallVector<Value> descriptorValues;
+  for (DescriptorPlan &plan : descriptors)
+    descriptorValues.push_back(plan.descriptor.getResult());
+  auto choice = entry.create<TensorDescriptorChoiceOp>(
+      kernel.getLoc(), entry.getI1Type(), descriptorValues,
+      entry.getStringAttr("host"), entry.getStringAttr("all_eligible"),
+      entry.getStringAttr(tensorDescriptorChoice),
+      entry.getStringAttr(tensorDescriptorEligibility));
   auto prepareBranch = [](Region &region) {
     Block &block = region.front();
     if (!block.empty() && isa<scf::YieldOp>(block.back()))
@@ -763,7 +803,7 @@ FailureOr<bool> materializeTensorDescriptorForms(func::FuncOp kernel) {
     blockBuilder.create<scf::YieldOp>(store.getLoc());
     store.erase();
   }
-  return true;
+  return choice;
 }
 
 bool fragmentFitsTritonTensor(gpu::FragmentType fragment,
@@ -849,7 +889,7 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
 }
 
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
-                                      bool hasTensorDescriptorForms) {
+                                      TensorDescriptorChoiceOp descriptorChoice) {
   struct Domain {
     StringRef name;
     gpu::ParameterRole role;
@@ -947,11 +987,12 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       return kernel.emitError(
           "shared config tuple contains a non-kernel binding");
     for (const TritonLocalOptions &options : localOptions) {
-      int64_t formCount = hasTensorDescriptorForms ? 2 : 1;
+      int64_t formCount = descriptorChoice ? 2 : 1;
       for (int64_t form = 0; form < formCount; ++form) {
         TritonConfig config = sharedConfig;
-        if (hasTensorDescriptorForms)
-          config.kernelParameters[tensorDescriptorChoice.str()] = form;
+        if (descriptorChoice)
+          config.kernelParameters[descriptorChoice.getConfigParameter().str()] =
+              form;
         config.warps = selectProviderCandidate(options.warps, warps->candidates);
         config.stages =
             selectProviderCandidate(options.stages, stages->candidates);
@@ -974,8 +1015,9 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       return kernel.emitError("Triton provider parameter domains are incomplete");
     bool legal = true;
     bool descriptorConfig =
-        hasTensorDescriptorForms &&
-        config.kernelParameters.at(tensorDescriptorChoice.str()) != 0;
+        descriptorChoice &&
+        config.kernelParameters.at(
+            descriptorChoice.getConfigParameter().str()) != 0;
     kernel.walk([&](Operation *operation) {
       if (!legal)
         return WalkResult::interrupt();
@@ -1884,7 +1926,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
       failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
     return failure();
-  FailureOr<bool> tensorDescriptorForms =
+  FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
       materializeTensorDescriptorForms(kernel);
   if (failed(tensorDescriptorForms) ||
       failed(materializeLegalConfigs(kernel, *tensorDescriptorForms)))

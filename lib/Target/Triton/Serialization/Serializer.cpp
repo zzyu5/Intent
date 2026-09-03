@@ -27,8 +27,6 @@ namespace intent::triton {
 namespace {
 
 constexpr llvm::StringLiteral reduceFormAttr = "intent_gpu.triton.reduce_form";
-constexpr llvm::StringLiteral tensorDescriptorChoice =
-    "USE_TENSOR_DESCRIPTOR";
 
 std::string pythonType(Type type, bool torch = false) {
   if (type.isIndex())
@@ -278,7 +276,7 @@ private:
     });
     kernel.walk([&](TensorDescriptorChoiceOp choice) {
       descriptorChoice = choice;
-      values[choice.getResult()] = tensorDescriptorChoice.str();
+      values[choice.getResult()] = choice.getConfigParameter().str();
     });
     kernel.walk([&](TensorDescriptorAllocatorOp allocator) {
       descriptorAllocator = allocator;
@@ -305,36 +303,58 @@ private:
   void emitDescriptorPruner() {
     if (!descriptorChoice)
       return;
-    output << "def _intent_tensor_descriptor_legal(tensor, minimum_contiguous_bytes):\n"
+    output << "def _intent_tensor_descriptor_legal(\n"
+              "    tensor, shape, strides, source_rank, flattened_contiguous_axes,\n"
+              "    aligned_stride_axes, unit_stride_axes, require_positive_shape,\n"
+              "    require_positive_strides, alignment, maximum_shape_extent,\n"
+              "):\n"
+              "    if tensor.ndim != source_rank:\n"
+              "        return False\n"
+              "    if tensor.data_ptr() % alignment != 0:\n"
+              "        return False\n"
+              "    if require_positive_shape and any(extent <= 0 for extent in shape):\n"
+              "        return False\n"
+              "    if any(extent > maximum_shape_extent for extent in shape):\n"
+              "        return False\n"
+              "    if require_positive_strides and any(stride <= 0 for stride in strides):\n"
+              "        return False\n"
+              "    if strides[-1] != 1:\n"
+              "        return False\n"
+              "    if any(tensor.stride(axis) != 1 for axis in unit_stride_axes):\n"
+              "        return False\n"
+              "    if any((tensor.stride(axis) * tensor.element_size()) % alignment != 0 "
+              "for axis in aligned_stride_axes):\n"
+              "        return False\n"
+              "    if any(tensor.stride(axis) != tensor.stride(axis + 1) * tensor.shape[axis + 1] "
+              "for axis in flattened_contiguous_axes):\n"
+              "        return False\n"
+              "    return True\n\n"
+              "def _intent_tensor_descriptor_block_shape_legal(\n"
+              "    block_shape, element_size, minimum_contiguous_bytes,\n"
+              "    require_power_of_two, maximum_block_elements,\n"
+              "):\n"
+              "    elements = 1\n"
+              "    for extent in block_shape:\n"
+              "        if extent <= 0 or (require_power_of_two and extent & (extent - 1)):\n"
+              "            return False\n"
+              "        elements *= extent\n"
               "    return (\n"
-              "        tensor.data_ptr() % 16 == 0\n"
-              "        and tensor.ndim >= 2\n"
-              "        and tensor.ndim <= 5\n"
-              "        and tensor.is_contiguous()\n"
-              "        and all(extent > 0 for extent in tensor.shape)\n"
-              "        and tensor.stride(-1) == 1\n"
-              "        and tensor.shape[-1] * tensor.element_size() >= minimum_contiguous_bytes\n"
-              "        and tensor.shape[-1] <= 2147483647\n"
-              "        and tensor.numel() // tensor.shape[-1] <= 2147483647\n"
-              "        and all((stride * tensor.element_size()) % 16 == 0 "
-              "for stride in tensor.stride()[:-1])\n"
+              "        elements <= maximum_block_elements\n"
+              "        and block_shape[-1] * element_size >= minimum_contiguous_bytes\n"
               "    )\n\n"
               "def _intent_prune_tensor_descriptor_configs(configs, named_args, **kwargs):\n"
-              "    tensors = (";
-    for (DescriptorABI &descriptor : descriptors) {
-      TensorDescriptorOp operation = descriptor.operation;
-      output << "(named_args[\"" << valueString(operation.getBase())
-             << "\"], " << operation.getMinimumContiguousBytes() << "), ";
-    }
-    output << ")\n"
-              "    descriptor_legal = all(_intent_tensor_descriptor_legal(tensor, minimum_bytes) "
-              "for tensor, minimum_bytes in tensors)\n"
-              "    if not descriptor_legal:\n"
+              "    if not named_args[\""
+           << descriptorChoice.getEligibilityArgument()
+           << "\"]:\n"
               "        return [config for config in configs "
-              "if not config.kwargs[\"USE_TENSOR_DESCRIPTOR\"]]\n"
+              "if not config.kwargs[\""
+           << descriptorChoice.getConfigParameter()
+           << "\"]]\n"
               "    retained = []\n"
               "    for config in configs:\n"
-              "        if not config.kwargs[\"USE_TENSOR_DESCRIPTOR\"]:\n"
+              "        if not config.kwargs[\""
+           << descriptorChoice.getConfigParameter()
+           << "\"]:\n"
               "            retained.append(config)\n"
               "            continue\n"
               "        args = dict(named_args)\n"
@@ -349,22 +369,20 @@ private:
       output << "        (" << descriptorBlockShape(descriptor)
              << ", args[\"" << valueString(operation.getBase())
              << "\"].element_size(), "
-             << operation.getMinimumContiguousBytes() << "),\n";
+             << operation.getMinimumContiguousBytes() << ", "
+             << (operation.getRequirePowerOfTwoBlockShape() ? "True" : "False")
+             << ", " << operation.getMaximumBlockElements() << "),\n";
     }
     output << "    )\n"
-              "    for block_shape, element_size, minimum_bytes in descriptors:\n"
-              "        elements = 1\n"
-              "        for extent in block_shape:\n"
-              "            if extent <= 0 or extent & (extent - 1):\n"
-              "                return False\n"
-              "            elements *= extent\n"
-              "        if elements > 1048576:\n"
-              "            return False\n"
-              "        if block_shape[-1] * element_size < minimum_bytes:\n"
+              "    for contract in descriptors:\n"
+              "        if not _intent_tensor_descriptor_block_shape_legal(*contract):\n"
               "            return False\n"
               "    return True\n\n"
               "def _intent_tensor_descriptor_allocator(size, alignment, stream):\n"
-              "    return torch.empty(size, dtype=torch.int8, device=\"cuda\")\n\n"
+              "    buffer = torch.empty(size, dtype=torch.int8, device=\"cuda\")\n"
+              "    if buffer.data_ptr() % alignment != 0:\n"
+              "        raise RuntimeError(\"Triton descriptor allocator returned a misaligned buffer\")\n"
+              "    return buffer\n\n"
               "def _intent_host_tensor_descriptor_pre_hook(args):\n";
     if (!descriptors.empty())
       output << "    if not _intent_tensor_descriptor_shapes_legal(args):\n"
@@ -478,6 +496,11 @@ private:
       firstKey = false;
       output << "\"" << metadata.name << "\"";
     }
+    if (descriptorChoice) {
+      if (!firstKey)
+        output << ", ";
+      output << "\"" << descriptorChoice.getEligibilityArgument() << "\"";
+    }
     output << "],\n";
     if (descriptorChoice)
       output << "    prune_configs_by={\"early_config_prune\": "
@@ -522,7 +545,9 @@ private:
       if (!first)
         output << ", ";
       first = false;
-      output << tensorDescriptorChoice << ": tl.constexpr";
+      output << descriptorChoice.getEligibilityArgument() << ": tl.constexpr";
+      output << ", " << descriptorChoice.getConfigParameter()
+             << ": tl.constexpr";
     }
     SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
@@ -569,6 +594,18 @@ private:
            std::to_string(metadata.sourceAxis) +
            (metadata.kind == "dimension" ? "]" : ")"), 1);
     }
+    if (descriptorChoice) {
+      std::string eligibility;
+      for (const DescriptorABI &descriptor : descriptors) {
+        if (!eligibility.empty())
+          eligibility += " and ";
+        eligibility += descriptorContractCall(descriptor,
+                                              /*argumentMap=*/false);
+      }
+      line(descriptorChoice.getEligibilityArgument().str() + " = (" +
+               eligibility + ")",
+           1);
+    }
     for (const DescriptorABI &descriptor : descriptors) {
       TensorDescriptorOp declaration = descriptor.operation;
       std::string view = valueString(declaration.getBase());
@@ -586,9 +623,7 @@ private:
                stringList(strides) + ", block_shape=" +
                stringList(initialBlockShape) + ", padding=\"" +
                declaration.getPadding().str() + "\") if " +
-               "_intent_tensor_descriptor_legal(" + view + ", " +
-               std::to_string(declaration.getMinimumContiguousBytes()) +
-               ") else " + view +
+               descriptorChoice.getEligibilityArgument().str() + " else " + view +
                ")",
            1);
     }
@@ -625,6 +660,8 @@ private:
     for (const MetadataABI &metadata : metadataArguments) {
       call += ", " + metadata.name;
     }
+    if (descriptorChoice)
+      call += ", " + descriptorChoice.getEligibilityArgument().str();
     line(call + ")", 1);
     output << "\n";
   }
@@ -1431,21 +1468,23 @@ private:
     return {};
   }
 
-  std::string descriptorLaunchValue(Value value) {
+  std::string descriptorHostValue(Value value, bool argumentMap) {
     if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
       auto view = cast<gpu::ViewType>(dimension.getView().getType());
-      return expressionString(
-          cast<gpu::PhysicalExprAttr>(
-              view.getLayout().getExtents()[dimension.getAxis()]),
-          false);
+      auto expression = cast<gpu::PhysicalExprAttr>(
+          view.getLayout().getExtents()[dimension.getAxis()]);
+      return argumentMap ? descriptorArgumentExpression(expression)
+                         : expressionString(expression, false);
     }
     if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
-      return expressionString(physical.getExpression(), false);
+      return argumentMap
+                 ? descriptorArgumentExpression(physical.getExpression())
+                 : expressionString(physical.getExpression(), false);
     if (auto constant = value.getDefiningOp<arith::ConstantOp>())
       return literal(constant.getValue());
     if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-      std::string lhs = descriptorLaunchValue(binary.getLhs());
-      std::string rhs = descriptorLaunchValue(binary.getRhs());
+      std::string lhs = descriptorHostValue(binary.getLhs(), argumentMap);
+      std::string rhs = descriptorHostValue(binary.getRhs(), argumentMap);
       auto infix = [&](StringRef spelling) {
         return "(" + lhs + " " + spelling.str() + " " + rhs + ")";
       };
@@ -1467,9 +1506,39 @@ private:
       }
     }
     if (isa<BlockArgument>(value))
-      return valueString(value);
+      return argumentMap ? "args[\"" + valueString(value) + "\"]"
+                         : valueString(value);
     failed = true;
     return "<unsupported-descriptor-launch-value>";
+  }
+
+  std::string descriptorLaunchValue(Value value) {
+    return descriptorHostValue(value, /*argumentMap=*/false);
+  }
+
+  std::string descriptorContractCall(const DescriptorABI &descriptor,
+                                     bool argumentMap) {
+    TensorDescriptorOp operation = descriptor.operation;
+    SmallVector<std::string> shape;
+    SmallVector<std::string> strides;
+    for (Value extent : operation.getShape())
+      shape.push_back(descriptorHostValue(extent, argumentMap));
+    for (Value stride : operation.getStrides())
+      strides.push_back(descriptorHostValue(stride, argumentMap));
+    std::string base = valueString(operation.getBase());
+    if (argumentMap)
+      base = "args[\"" + base + "\"]";
+    auto view = cast<gpu::ViewType>(operation.getBase().getType());
+    return "_intent_tensor_descriptor_legal(" + base + ", " +
+           stringList(shape) + ", " + stringList(strides) + ", " +
+           std::to_string(view.getRank()) + ", " +
+           axisTuple(operation.getFlattenedContiguousAxes()) + ", " +
+           axisTuple(operation.getAlignedStrideAxes()) + ", " +
+           axisTuple(operation.getUnitStrideAxes()) + ", " +
+           (operation.getRequirePositiveShape() ? "True" : "False") + ", " +
+           (operation.getRequirePositiveStrides() ? "True" : "False") +
+           ", " + std::to_string(operation.getAlignment()) + ", " +
+           std::to_string(operation.getMaximumShapeExtent()) + ")";
   }
 
   std::string descriptorBlockShape(const DescriptorABI &descriptor) const {
@@ -1541,8 +1610,16 @@ private:
     auto fragment = dyn_cast<gpu::FragmentType>(valueType);
     std::string result = values.lookup(resource);
     for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
-      auto stride =
-          cast<StringAttr>(strides[sourceAxes[axis]]).getValue().str();
+      Attribute strideAttribute = strides[sourceAxes[axis]];
+      std::string stride;
+      if (auto symbol = dyn_cast<StringAttr>(strideAttribute))
+        stride = symbol.getValue().str();
+      else if (auto constant = dyn_cast<IntegerAttr>(strideAttribute))
+        stride = std::to_string(constant.getInt());
+      else {
+        failed = true;
+        return {};
+      }
       std::string coordinateExpression =
           fragment ? broadcastValue(coordinate, fragment) : valueString(coordinate);
       result += " + (" + coordinateExpression + ") * " + stride;
