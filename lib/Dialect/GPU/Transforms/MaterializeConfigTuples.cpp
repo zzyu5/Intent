@@ -304,7 +304,8 @@ correlatedReductionContractionParameters(
 
 SmallVector<TuningProfile, 5>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
-            bool twoAxisPointwise, bool fixedPointwiseLocal) {
+            bool twoAxisPointwise, bool fixedPointwiseLocal,
+            bool pointwiseOnlyProgram) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
@@ -364,9 +365,14 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             {64, 64, 32, 1, 128, 1, 8},
             {64, 32, 32, 1, 128, 1, 8},
             {64, 16, 32, 1, 128, 1, 8}};
-  if (twoAxisPointwise && fixedPointwiseLocal)
+  if (twoAxisPointwise && fixedPointwiseLocal && pointwiseOnlyProgram)
     return {{1, 1, 32, 1, 128, 1, 8},
             {8, 2, 32, 1, 128, 1, 8},
+            {8, 4, 32, 1, 128, 1, 8},
+            {4, 4, 32, 1, 128, 1, 8},
+            {16, 2, 32, 1, 128, 1, 8}};
+  if (twoAxisPointwise && fixedPointwiseLocal)
+    return {{8, 2, 32, 1, 128, 1, 8},
             {8, 4, 32, 1, 128, 1, 8},
             {4, 4, 32, 1, 128, 1, 8},
             {16, 2, 32, 1, 128, 1, 8}};
@@ -474,6 +480,13 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                schema.getCandidates().size() == 1 &&
                parameter->hasAttr(pointwiseLocalAttr);
       });
+  bool pointwiseOnlyProgram = true;
+  kernel.walk([&](Operation *operation) {
+    pointwiseOnlyProgram &=
+        !isa<ContractOp, ReduceOp, ScanOp, RegionFoldOp, RegionScanOp,
+             ScaledContractOp, SparseContractOp, HistogramOp, ScatterReduceOp>(
+            operation);
+  });
   SmallVector<CorrelatedProfileParameters> correlatedProfiles =
       correlatedReductionContractionParameters(
           kernel, parameters, hasTwoAxisPointwiseOwnership,
@@ -501,7 +514,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
         profileCount,
         profilesFor(kernel, tuningClass(kernel, parameter),
                     schema.getElementBitWidth(),
-                    hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal)
+                    hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
+                    pointwiseOnlyProgram)
             .size());
   }
   if (profileCount == 0)
@@ -513,7 +527,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       auto role = static_cast<ParameterRole>(schema.getRole());
       SmallVector<TuningProfile, 5> profiles = profilesFor(
           kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
+          pointwiseOnlyProgram);
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
                                                      profiles.size() - 1);
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
@@ -532,7 +547,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       auto role = static_cast<ParameterRole>(schema.getRole());
       SmallVector<TuningProfile, 5> profiles = profilesFor(
           kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
+          pointwiseOnlyProgram);
       const TuningProfile &profile =
           parameter == correlated.reduction ? profiles.back()
                                             : profiles.front();
@@ -554,7 +570,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       auto role = static_cast<ParameterRole>(schema.getRole());
       SmallVector<TuningProfile, 5> profiles = profilesFor(
           kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal);
+          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
+          pointwiseOnlyProgram);
       bool indirectContraction =
           schema.getCategory() ==
               static_cast<uint32_t>(ParameterCategory::Contraction) &&
