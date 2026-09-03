@@ -563,8 +563,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
   if (failed(kernel) || failed(bufferizeGPUProgram(*kernel)) ||
       failed(materializeLaunchConfiguration(*kernel)) ||
       failed(formPipelines(*kernel)) ||
-      failed(materializeLegalConfigurations(*kernel)) ||
-      failed(verifyTileLangProgram(module)))
+      failed(materializeLegalConfigurations(*kernel)))
+    return failure();
+  (*kernel)->setAttr(lowerPredicatedLoadStoreAttr,
+                     BoolAttr::get(module.getContext(), true));
+  if (failed(verifyTileLangProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
   return success();

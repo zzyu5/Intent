@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
+#include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
@@ -39,6 +40,9 @@ bool isAllowed(Operation *operation) {
 } // namespace
 
 LogicalResult verifyTileLangKernel(func::FuncOp kernel) {
+  if (!kernel->getAttrOfType<BoolAttr>(lowerPredicatedLoadStoreAttr))
+    return kernel.emitError(
+        "TileLang provider program requires a typed predicated load/store pass selection");
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.size() != 1)
     return kernel.emitError(

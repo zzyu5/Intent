@@ -272,6 +272,8 @@ private:
   }
 
   void emitBuilder() {
+    auto lowerPredicatedLoadStore =
+        kernel->getAttrOfType<BoolAttr>(lowerPredicatedLoadStoreAttr);
     output << "@tilelang.autotune(configs=[\n";
     for (const auto &config : configurations) {
       output << "    {";
@@ -284,8 +286,9 @@ private:
     }
     output << "], warmup=3, rep=10)\n"
               "@tilelang.jit(pass_configs={"
-              "tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: True"
-              "})\ndef _intent_kernel(";
+              "tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: "
+           << (lowerPredicatedLoadStore.getValue() ? "True" : "False")
+           << "})\ndef _intent_kernel(";
     bool first = true;
     auto argument = [&](StringRef text) {
       if (!first)
