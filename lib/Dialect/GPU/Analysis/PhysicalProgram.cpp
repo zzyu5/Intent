@@ -30,18 +30,21 @@ bool isAccessNode(Operation *operation) {
   return isa<LoadOp, GatherOp>(operation);
 }
 
-bool dependsOnStructuredProgram(Value value,
-                                SmallPtrSetImpl<Operation *> &visited) {
+void collectStructuredPrograms(Value value,
+                               SmallPtrSetImpl<Operation *> &visited,
+                               SmallVectorImpl<Operation *> &programs) {
   Operation *operation = value.getDefiningOp();
   if (!operation || !visited.insert(operation).second)
-    return false;
-  if (isa<RegionFoldOp, RegionScanOp>(operation))
-    return true;
+    return;
+  if (isa<RegionFoldOp, RegionScanOp>(operation)) {
+    if (!llvm::is_contained(programs, operation))
+      programs.push_back(operation);
+    return;
+  }
   if (isAccessNode(operation) || operation->getNumRegions() != 0)
-    return false;
-  return llvm::any_of(operation->getOperands(), [&](Value operand) {
-    return dependsOnStructuredProgram(operand, visited);
-  });
+    return;
+  for (Value operand : operation->getOperands())
+    collectStructuredPrograms(operand, visited, programs);
 }
 
 std::optional<int64_t> integerConstant(Value value) {
@@ -1844,8 +1847,9 @@ void PhysicalProgramAnalysis::analyzeReplay(
       dominance->dominates(value, insertionAnchor) &&
       !carriesRequestedTraversal) {
     SmallPtrSet<Operation *, 16> dependencyVisited;
-    result.crossesStructuredProgram |=
-        dependsOnStructuredProgram(value, dependencyVisited);
+    collectStructuredPrograms(value, dependencyVisited,
+                              result.structuredPrograms);
+    result.crossesStructuredProgram |= !result.structuredPrograms.empty();
     return;
   }
   if (auto extract = value.getDefiningOp<ExtractOp>()) {
@@ -1926,6 +1930,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     }
   } else if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
     result.crossesStructuredProgram = true;
+    appendUnique(result.structuredPrograms, operation);
     if (!source || !sourceDimension) {
       appendUnique(result.blockers, operation);
       result.state = PhysicalFactState::Unknown;
@@ -1955,6 +1960,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     return;
   } else if (auto scan = dyn_cast<RegionScanOp>(operation)) {
     result.crossesStructuredProgram = true;
+    appendUnique(result.structuredPrograms, operation);
     if (!source || !sourceDimension) {
       appendUnique(result.blockers, operation);
       result.state = PhysicalFactState::Unknown;

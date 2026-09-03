@@ -180,6 +180,7 @@ struct PhysicalReplayFact {
   bool crossesStructuredProgram = false;
   llvm::SmallVector<mlir::Operation *, 2> accesses;
   llvm::SmallVector<mlir::Operation *, 2> contractions;
+  llvm::SmallVector<mlir::Operation *, 2> structuredPrograms;
   llvm::SmallVector<mlir::Operation *, 2> blockers;
 
   bool isReplayable() const { return state == PhysicalFactState::Exact; }

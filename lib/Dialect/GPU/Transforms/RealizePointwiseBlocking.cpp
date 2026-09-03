@@ -2761,6 +2761,34 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   };
   SmallVector<StoreOp> candidateStores;
   kernel.walk([&](StoreOp store) { candidateStores.push_back(store); });
+  SmallVector<Attribute> postStructuredWritebackKeys;
+  for (StoreOp store : candidateStores) {
+    for (MakeRangeOp range : allRanges) {
+      if (!storeAxisForRange(store, range))
+        continue;
+      FailureOr<int64_t> dimension = queryRangeDimension(range);
+      if (failed(dimension))
+        continue;
+      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+          store.getValue(), sourceAxisIdentity(range),
+          PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
+          store.getOperation(), *dimension);
+      bool regionReduction = !replay.structuredPrograms.empty() &&
+          llvm::all_of(replay.structuredPrograms, [](Operation *operation) {
+            auto fold = dyn_cast<RegionFoldOp>(operation);
+            return fold &&
+                   static_cast<ParameterCategory>(
+                       fold.getSegment().getCategory()) ==
+                       ParameterCategory::RegionReduction;
+          });
+      if (!replay.isReplayable() || !regionReduction)
+        continue;
+      FailureOr<Attribute> key = effectLocalKey(range);
+      if (succeeded(key) &&
+          !llvm::is_contained(postStructuredWritebackKeys, *key))
+        postStructuredWritebackKeys.push_back(*key);
+    }
+  }
   SmallVector<SmallVector<Value, 4>> writeCoordinates;
   auto rememberWriteCoordinates = [&](ValueRange coordinates) {
     writeCoordinates.emplace_back(coordinates.begin(), coordinates.end());
@@ -2864,12 +2892,23 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (FailureOr<uint64_t> dimension = rangeDimension(range);
             succeeded(dimension))
           sourceDimension = *dimension;
-        PhysicalReductionDependencyFact dependency =
-            PhysicalProgramAnalysis(kernel).reductionDependency(
-                store.getValue(), sourceAxisIdentity(range), sourceDimension);
-        if (!dependency.isExact() || !dependency.depends ||
-            dependency.throughStructuredReduction)
-          continue;
+        PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+            store.getValue(), sourceAxisIdentity(range),
+            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
+            store.getOperation(), sourceDimension);
+        FailureOr<Attribute> key = effectLocalKey(range);
+        bool postStructuredWriteback =
+            succeeded(key) &&
+            llvm::is_contained(postStructuredWritebackKeys, *key) &&
+            replay.isReplayable();
+        if (!postStructuredWriteback) {
+          PhysicalReductionDependencyFact dependency =
+              PhysicalProgramAnalysis(kernel).reductionDependency(
+                  store.getValue(), sourceAxisIdentity(range), sourceDimension);
+          if (!dependency.isExact() || !dependency.depends ||
+              dependency.throughStructuredReduction)
+            continue;
+        }
       }
       candidates.emplace_back(range, *sourceAxis);
       innermostSourceAxis = std::max(innermostSourceAxis, *sourceAxis);
