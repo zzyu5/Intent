@@ -353,11 +353,12 @@ FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source) {
 }
 
 FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
-                                       Value value,
+                                       func::FuncOp kernel, Value value,
                                        PhysicalExprAttr blockedExtent,
                                        ArrayRef<MakeRangeOp> roots,
-                                       Value replacement,
-                                       IRMapping &mapping) {
+                                       Value replacement, IRMapping &mapping,
+                                       Operation *insertionAnchor,
+                                       DominanceInfo *dominance) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
   if (auto range = value.getDefiningOp<MakeRangeOp>())
@@ -365,10 +366,32 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
           return range == root || sameLogicalRange(range, root);
         }))
       return replacement;
+  bool relocate = insertionAnchor && dominance &&
+                  !dominance->dominates(value, insertionAnchor);
   auto originalResultType = dyn_cast<FragmentType>(value.getType());
-  if (!originalResultType)
-    return value;
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!originalResultType) {
+    if (!relocate)
+      return value;
+    Operation *producer = value.getDefiningOp();
+    if (!producer || producer->getNumRegions() != 0 ||
+        producer->getNumResults() != 1 ||
+        (!isa<arith::ConstantOp, DimOp>(producer) &&
+         !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+                               /*allowAccesses=*/true)))
+      return failure();
+    for (Value operand : producer->getOperands()) {
+      FailureOr<Value> replayed = replaySourceValueImpl(
+          builder, location, kernel, operand, blockedExtent, roots,
+          replacement, mapping, insertionAnchor, dominance);
+      if (failed(replayed))
+        return failure();
+      if (*replayed != operand && !mapping.lookupOrNull(operand))
+        mapping.map(operand, *replayed);
+    }
+    Operation *clone = builder.clone(*producer, mapping);
+    mapping.map(value, clone->getResult(0));
+    return clone->getResult(0);
+  }
   if (!kernel)
     return failure();
   PhysicalRangeAxisFact selected =
@@ -387,16 +410,17 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
       diagnostic << "; broadcast_input_type=" << broadcast.getValue().getType();
     return failure();
   }
-  if (selected.fragmentAxes.empty())
+  if (selected.fragmentAxes.empty() && !relocate)
     return value;
   Operation *producer = value.getDefiningOp();
-  if (!producer || isa<MakeRangeOp>(producer)) {
+  if (!producer || (isa<MakeRangeOp>(producer) && !relocate)) {
     if (producer)
       producer->emitOpError(
           "selected range root was not bound to its blocked replacement");
     return failure();
   }
-  if (!isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
+  if (!isa<MakeRangeOp>(producer) &&
+      !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
                             /*allowAccesses=*/true)) {
     producer->emitOpError(
         "selected range value is not a replayable physical value node");
@@ -409,7 +433,8 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
   }
   for (Value operand : producer->getOperands()) {
     FailureOr<Value> replayed = replaySourceValueImpl(
-        builder, location, operand, blockedExtent, roots, replacement, mapping);
+        builder, location, kernel, operand, blockedExtent, roots, replacement,
+        mapping, insertionAnchor, dominance);
     if (failed(replayed)) {
       producer->emitOpError(
           "selected range value has an operand that cannot be replayed");
@@ -533,7 +558,8 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     return failure();
   }
   FailureOr<Value> result = replaySourceValueImpl(
-      builder, location, value, blockedExtent, roots, replacement, mapping);
+      builder, location, kernel, value, blockedExtent, roots, replacement,
+      mapping, /*insertionAnchor=*/nullptr, /*dominance=*/nullptr);
   if (failed(result))
     (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
         ->emitError("coordinate replay could not rebuild the current value graph");
@@ -621,11 +647,12 @@ LogicalResult appendTailValidity(Location location, Value source,
 }
 
 FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value, PhysicalSourceAxis source,
+                                   func::FuncOp kernel, Value value,
+                                   PhysicalSourceAxis source,
                                    PhysicalExprAttr blockedExtent,
                                    MakeRangeOp root, Value replacement,
-                                   IRMapping &mapping) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
+                                   IRMapping &mapping,
+                                   Operation *insertionAnchor = nullptr) {
   FailureOr<int64_t> dimension = queryRangeDimension(root);
   if (!kernel || !(sourceAxisIdentity(root) == source) || failed(dimension))
     return failure();
@@ -643,9 +670,13 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
       diagnostic << "; blocker=" << blocker->getName();
     return failure();
   }
-  return replaySourceValueImpl(builder, location, value, blockedExtent,
-                               ArrayRef<MakeRangeOp>(root), replacement,
-                               mapping);
+  std::optional<DominanceInfo> dominance;
+  if (insertionAnchor)
+    dominance.emplace(kernel);
+  return replaySourceValueImpl(
+      builder, location, kernel, value, blockedExtent,
+      ArrayRef<MakeRangeOp>(root), replacement, mapping, insertionAnchor,
+      dominance ? &*dominance : nullptr);
 }
 
 Value strippedBroadcast(Value value) {
@@ -2605,11 +2636,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                 ComparePredicate::Lt);
     Value blockedLhsRowCoordinate = rows;
     SmallVector<SmallVector<Value>> replayedStoreCoordinates;
+    SmallVector<Value> replayedStoreValidities;
     if (indirectRow) {
       IRMapping replay;
       replay.map(rowRange.getResult(), rows);
       FailureOr<Value> rowCoordinate = replaySourceValue(
-          rowBuilder, location, originalLhsRowCoordinate,
+          rowBuilder, location, kernel, originalLhsRowCoordinate,
           sourceAxisIdentity(*rowMap),
           unitM, rowRange, rows, replay);
       if (failed(rowCoordinate))
@@ -2618,7 +2650,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       blockedLhsRowCoordinate = *rowCoordinate;
       for (AssumeInBoundsOp assumption : rowAssumptions) {
         FailureOr<Value> index = replaySourceValue(
-            rowBuilder, location, assumption.getIndex(),
+            rowBuilder, location, kernel, assumption.getIndex(),
             sourceAxisIdentity(*rowMap),
             unitM, rowRange, rows, replay);
         if (failed(index))
@@ -2629,11 +2661,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         if (Attribute origin = assumption->getAttr(originAttr))
           replacement->setAttr(originAttr, origin);
       }
-      for (StorePath &path : paths) {
+      for (auto [pathIndex, path] : llvm::enumerate(paths)) {
         SmallVector<Value> coordinates;
         for (Value coordinate : path.store.getCoordinates()) {
           FailureOr<Value> replayed = replaySourceValue(
-              rowBuilder, location, coordinate,
+              rowBuilder, location, kernel, coordinate,
               sourceAxisIdentity(*rowMap),
               unitM, rowRange, rows, replay);
           if (failed(replayed))
@@ -2642,6 +2674,18 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           coordinates.push_back(*replayed);
         }
         replayedStoreCoordinates.push_back(std::move(coordinates));
+        Value validity;
+        if (path.store.getValid()) {
+          FailureOr<Value> replayed = replaySourceValue(
+              rowBuilder, location, kernel, path.store.getValid(),
+              sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
+              contract.getOperation());
+          if (failed(replayed))
+            return path.store.emitOpError(
+                "blocked contraction could not replay output validity");
+          validity = *replayed;
+        }
+        replayedStoreValidities.push_back(validity);
       }
     }
     Value accumulator = rowBuilder.create<SplatOp>(
@@ -2767,12 +2811,33 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       if (!indirectRow)
         coordinates[*storeRow] = rows;
       coordinates[*storeColumn] = columns;
-      FailureOr<Value> valid = materializeRetargetedValidity(
-          rowBuilder, location, path.store.getValid(), outputTailRanges,
-          outputValid, outputPredicateType);
+      FailureOr<Value> valid = failure();
+      if (indirectRow) {
+        Value replayed = replayedStoreValidities[pathIndex];
+        if (!replayed) {
+          valid = outputValid;
+        } else {
+          IRMapping columnReplay;
+          columnReplay.map(columnRange.getResult(), columns);
+          FailureOr<Value> columnValidity = replaySourceValue(
+              rowBuilder, location, kernel, replayed,
+              sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
+              columnReplay);
+          if (failed(columnValidity))
+            return path.store.emitOpError(
+                "blocked contraction could not replay output column validity");
+          valid = materializeValidityConjunction(
+              rowBuilder, location, outputValid, *columnValidity,
+              outputPredicateType);
+        }
+      } else {
+        valid = materializeRetargetedValidity(
+            rowBuilder, location, path.store.getValid(), outputTailRanges,
+            outputValid, outputPredicateType);
+      }
       if (failed(valid))
         return path.store.emitOpError(
-            "blocked contract output has non-scalar residual validity");
+            "blocked contract output validity could not be retargeted");
       auto replacement = rowBuilder.create<StoreOp>(
           location, path.store.getResource(), coordinates, output, *valid,
           path.store.getSourceAxes());
@@ -3413,7 +3478,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         IRMapping rhsScaleReplay;
         rhsScaleReplay.map(rhsScaleColumnRange->getResult(), columns);
         FailureOr<Value> rhsScaleColumn = replaySourceValue(
-            nested, nestedLocation,
+            nested, nestedLocation, kernel,
             rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
             sourceAxisIdentity(*columnMap),
             unitN, *rhsScaleColumnRange, columns,

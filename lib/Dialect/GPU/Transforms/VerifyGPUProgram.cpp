@@ -358,6 +358,28 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
           diagnostic << "; blocker=" << blocker->getName();
         return WalkResult::interrupt();
       }
+      PhysicalAccessBoundsFact bounds =
+          physicalAnalysis.accessBounds(operation);
+      if (!bounds.isExact()) {
+        InFlightDiagnostic diagnostic = operation->emitOpError(
+            "physical access is not proven within its resource bounds");
+        for (int64_t axis : bounds.unprovenAxes)
+          diagnostic << "; unproven_axis=" << axis;
+        for (int64_t axis : bounds.missingLowerAxes)
+          diagnostic << "; missing_lower_axis=" << axis;
+        for (int64_t axis : bounds.missingUpperAxes)
+          diagnostic << "; missing_upper_axis=" << axis;
+        diagnostic << "; resource=" << footprint.resource.getType();
+        for (auto [coordinate, sourceAxis] :
+             llvm::zip(footprint.coordinates, footprint.sourceAxes))
+          diagnostic << "; coordinate_axis=" << sourceAxis << ":"
+                     << coordinate;
+        if (footprint.validity)
+          diagnostic << "; validity=" << footprint.validity;
+        for (Operation *blocker : bounds.blockers)
+          diagnostic << "; blocker=" << blocker->getName();
+        return WalkResult::interrupt();
+      }
     }
     if (hasObservableEffect(operation)) {
       auto origin = operation->getAttrOfType<IntegerAttr>(originAttr);

@@ -54,7 +54,8 @@ def IntentTileLang_CopyInOp : IntentTileLang_Op<"copy_in", [
   let arguments = (ins IntentGPU_ViewValue:$source,
                        Variadic<Index>:$offsets,
                        IntentTileLang_BufferValue:$destination,
-                       DenseI64ArrayAttr:$source_axes);
+                       DenseI64ArrayAttr:$source_axes,
+                       DenseI64ArrayAttr:$boundary_axes);
   let hasVerifier = 1;
 }
 
@@ -64,7 +65,8 @@ def IntentTileLang_CopyOutOp : IntentTileLang_Op<"copy_out", [
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentGPU_ViewValue:$destination,
                        Variadic<Index>:$offsets,
-                       DenseI64ArrayAttr:$destination_axes);
+                       DenseI64ArrayAttr:$destination_axes,
+                       DenseI64ArrayAttr:$boundary_axes);
   let hasVerifier = 1;
 }
 
@@ -74,7 +76,8 @@ def IntentTileLang_CastCopyOutOp : IntentTileLang_Op<"cast_copy_out", [
   let arguments = (ins IntentTileLang_BufferValue:$source,
                        IntentGPU_ViewValue:$destination,
                        Variadic<Index>:$offsets,
-                       DenseI64ArrayAttr:$destination_axes);
+                       DenseI64ArrayAttr:$destination_axes,
+                       DenseI64ArrayAttr:$boundary_axes);
   let hasVerifier = 1;
 }
 

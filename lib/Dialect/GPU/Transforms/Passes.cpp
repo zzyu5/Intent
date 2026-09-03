@@ -11,11 +11,12 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   // source slices, helper regions, carry and result assembly are verified by
   // the operations themselves.  Subsequent realization rewrites one complete
   // program into another; it does not finish a construction-time shell.
-  if (failed(verifyGPUProgram(module)))
-    return failure();
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  // Access composition is the final construction step for indexed reads whose
+  // minimal fragment seed is not itself their logical source extent.  Complete
+  // those exact relations before applying the executable-program verifier.
   if (failed(realizeAccessComposition(module)) ||
       failed(verifyGPUProgram(module)))
     return failure();

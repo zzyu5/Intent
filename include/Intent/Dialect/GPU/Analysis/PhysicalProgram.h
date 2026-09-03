@@ -265,6 +265,21 @@ struct PhysicalAccessBoundaryFact {
   bool isExact() const { return state == PhysicalFactState::Exact; }
 };
 
+/// Resource-bounds legality for one current physical access.  Exact means
+/// every resource axis is covered by an access predicate, an exact current
+/// coordinate range, or a dominating typed in-bounds precondition.  Unlike
+/// PhysicalAccessBoundaryFact, unrelated logical predicates do not make this
+/// fact unknown: they can only further restrict the active member set.
+struct PhysicalAccessBoundsFact {
+  PhysicalFactState state = PhysicalFactState::Unknown;
+  llvm::SmallVector<int64_t, 4> unprovenAxes;
+  llvm::SmallVector<int64_t, 4> missingLowerAxes;
+  llvm::SmallVector<int64_t, 4> missingUpperAxes;
+  llvm::SmallVector<mlir::Operation *, 4> blockers;
+
+  bool isExact() const { return state == PhysicalFactState::Exact; }
+};
+
 /// Current-IR initialization and resource-use legality for one physical
 /// mutable buffer.  Exact means every read is dominated either by a direct
 /// initializing write or by a proven full-domain loop/branch initialization.
@@ -320,6 +335,7 @@ public:
   PhysicalContractFreeAxisFact contractFreeAxes(mlir::Operation *contract);
   PhysicalAccessFootprint footprint(mlir::Operation *access);
   PhysicalAccessBoundaryFact boundaryValidity(mlir::Operation *access);
+  PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 
   /// Recognizes a predicate composed only from exact range-end comparisons,

@@ -329,6 +329,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     Value replacementResult;
     Operation *replacementOperation = nullptr;
     if (succeeded(indices) && boundary.isExact() &&
+        boundary.boundaryAxes.empty() &&
         isZeroFill(load.getFill())) {
       auto replacement = builder.create<TileLoadOp>(
           load.getLoc(), result, load.getResource(), *indices);
@@ -550,7 +551,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     gpu::PhysicalAccessBoundaryFact boundary =
         gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(store);
     Operation *replacementOperation = nullptr;
-    if (succeeded(indices) && boundary.isExact()) {
+    if (succeeded(indices) && boundary.isExact() &&
+        boundary.boundaryAxes.empty()) {
       replacementOperation = builder.create<TileStoreOp>(
           store.getLoc(), store.getResource(), *indices, store.getValue());
     } else {

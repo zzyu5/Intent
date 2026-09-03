@@ -64,6 +64,54 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
   return result;
 }
 
+FailureOr<Value> replayScalarValue(OpBuilder &builder, Value value,
+                                   IRMapping &mapping,
+                                   PhysicalProgramAnalysis &analysis) {
+  if (!value)
+    return Value();
+  if (Value replacement = mapping.lookupOrNull(value))
+    return replacement;
+  auto fragment = dyn_cast<FragmentType>(value.getType());
+  if (!fragment)
+    return value;
+  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+    FailureOr<Value> scalar =
+        replayScalarValue(builder, broadcast.getValue(), mapping, analysis);
+    if (succeeded(scalar))
+      mapping.map(value, *scalar);
+    return scalar;
+  }
+  if (auto splat = value.getDefiningOp<SplatOp>()) {
+    FailureOr<Value> scalar =
+        replayScalarValue(builder, splat.getValue(), mapping, analysis);
+    if (succeeded(scalar))
+      mapping.map(value, *scalar);
+    return scalar;
+  }
+  PhysicalReplayFact replay = analysis.replayability(
+      value, std::nullopt, PhysicalReplayScope::Coordinate,
+      /*allowAccesses=*/false);
+  Operation *producer = value.getDefiningOp();
+  if (!producer || isa<MakeRangeOp>(producer) || !replay.isReplayable() ||
+      !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer))
+    return failure();
+  for (Value operand : producer->getOperands()) {
+    FailureOr<Value> replacement =
+        replayScalarValue(builder, operand, mapping, analysis);
+    if (failed(replacement))
+      return failure();
+    if (*replacement != operand && !mapping.lookupOrNull(operand))
+      mapping.map(operand, *replacement);
+  }
+  Operation *clone = builder.clone(*producer, mapping);
+  for (Value result : clone->getResults())
+    if (auto resultType = dyn_cast<FragmentType>(result.getType()))
+      result.setType(resultType.getElementType());
+  Value result = clone->getResult(0);
+  mapping.map(value, result);
+  return result;
+}
+
 FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,
                                    FragmentType valueType, Value lhs,
                                    Value rhs) {
@@ -178,12 +226,49 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   OpBuilder builder(gather);
   auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
   if (!resultType) {
-    if (sourceLoad.getValid() || sourceLoad.getFill() || gather.getValid() ||
-        gather.getFill())
-      return false;
+    FailureOr<Value> sourceValid = replayScalarValue(
+        builder, sourceLoad.getValid(), replay, analysis);
+    FailureOr<Value> sourceFill = replayScalarValue(
+        builder, sourceLoad.getFill(), replay, analysis);
+    if (failed(sourceValid) || failed(sourceFill)) {
+      gather.emitOpError(
+          "source access validity/fill cannot follow scalar composed coordinates");
+      return failure();
+    }
+    Value valid = *sourceValid;
+    if (gather.getValid()) {
+      if (!gather.getValid().getType().isInteger(1)) {
+        gather.emitOpError("scalar gather validity is not scalar i1");
+        return failure();
+      }
+      valid = valid ? Value(builder.create<BinaryOp>(
+                            gather.getLoc(), builder.getI1Type(), valid,
+                            gather.getValid(), BinaryOperator::LogicalAnd))
+                    : gather.getValid();
+    }
+    Value fill = *sourceFill;
+    if (sourceLoad.getValid() && gather.getValid()) {
+      if (!fill || !gather.getFill() ||
+          fill.getType() != gather.getResult().getType() ||
+          gather.getFill().getType() != gather.getResult().getType()) {
+        gather.emitOpError(
+            "scalar composed conditional access has incompatible fills");
+        return failure();
+      }
+      fill = builder.create<SelectOp>(
+          gather.getLoc(), gather.getResult().getType(), gather.getValid(), fill,
+          gather.getFill());
+    } else if (gather.getValid()) {
+      fill = gather.getFill();
+    }
+    if (static_cast<bool>(valid) != static_cast<bool>(fill)) {
+      gather.emitOpError(
+          "scalar composed access requires paired validity and fill");
+      return failure();
+    }
     auto replacement = builder.create<LoadOp>(
         gather.getLoc(), gather.getResult().getType(), sourceLoad.getResource(),
-        coordinates, Value(), Value(), sourceLoad.getSourceAxes());
+        coordinates, valid, fill, sourceLoad.getSourceAxes());
     if (Attribute origin = sourceLoad->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
     gather.getResult().replaceAllUsesWith(replacement.getResult());

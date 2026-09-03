@@ -536,19 +536,20 @@ private:
       line("T.copy(" + valueString(copy.getSource()) +
            regionIndex(copy.getOffsets(), copy.getSourceAxes(),
                        copy.getDestination().getType().getShape()) +
-           ", " + valueString(copy.getDestination()) + ")");
+           ", " + valueString(copy.getDestination()) +
+           (copy.getBoundaryAxes().empty() ? ")" : ", disable_tma=True)"));
     } else if (auto copy = dyn_cast<CopyOutOp>(operation)) {
       line("T.copy(" + valueString(copy.getSource()) + ", " +
            valueString(copy.getDestination()) +
            regionIndex(copy.getOffsets(), copy.getDestinationAxes(),
                        copy.getSource().getType().getShape()) +
-           ")");
+           (copy.getBoundaryAxes().empty() ? ")" : ", disable_tma=True)"));
     } else if (auto copy = dyn_cast<CastCopyOutOp>(operation)) {
       line("T.copy(" + valueString(copy.getSource()) + ", " +
            valueString(copy.getDestination()) +
            regionIndex(copy.getOffsets(), copy.getDestinationAxes(),
                        copy.getSource().getType().getShape()) +
-           ")");
+           (copy.getBoundaryAxes().empty() ? ")" : ", disable_tma=True)"));
     } else if (auto parallel = dyn_cast<ParallelOp>(operation)) {
       Block &body = parallel.getBody().front();
       std::string variables;

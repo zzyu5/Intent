@@ -235,13 +235,35 @@ bool isUnitStepValue(Value value) {
   return false;
 }
 
-bool matchesViewExtent(Value value, Value resource, unsigned axis) {
-  auto view = dyn_cast<ViewType>(resource.getType());
-  if (!view || axis >= view.getRank())
+PhysicalExprAttr resourceExtentExpression(Value resource, unsigned axis) {
+  if (auto view = dyn_cast<ViewType>(resource.getType())) {
+    if (axis < view.getRank())
+      return cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+    return {};
+  }
+  if (auto buffer = dyn_cast<BufferType>(resource.getType())) {
+    if (axis < buffer.getShape().size())
+      return cast<PhysicalExprAttr>(buffer.getShape()[axis]);
+    return {};
+  }
+  if (auto fragment = dyn_cast<FragmentType>(resource.getType())) {
+    if (axis < fragment.getShape().size())
+      return cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+  }
+  return {};
+}
+
+bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
+  PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
+  if (!extent)
     return false;
   Value stripped = stripScalarIdentity(value);
   if (stripped != value)
-    return matchesViewExtent(stripped, resource, axis);
+    return matchesResourceExtent(stripped, resource, axis);
+  if (std::optional<int64_t> constant = integerConstant(value))
+    return extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           *constant == extent.getValue();
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
     if (!function)
@@ -249,35 +271,80 @@ bool matchesViewExtent(Value value, Value resource, unsigned axis) {
     DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
     auto kind = attrs.getAs<StringAttr>(abiKindAttr);
     auto dimension = attrs.getAs<IntegerAttr>(dimensionAttr);
-    auto extent = cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
     return kind && kind.getValue() == "dimension" && dimension &&
            extent.getKind() ==
                static_cast<uint32_t>(PhysicalExprKind::Dimension) &&
            dimension.getInt() == extent.getValue();
   }
-  if (auto dim = value.getDefiningOp<DimOp>())
-    return dim.getView() == resource && dim.getAxis() == axis;
+  if (auto dim = value.getDefiningOp<DimOp>()) {
+    auto view = dyn_cast<ViewType>(resource.getType());
+    return view && dim.getView() == resource && dim.getAxis() == axis;
+  }
   if (auto expression = value.getDefiningOp<PhysicalExprOp>())
-    return expression.getExpression() ==
-           cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+    return expression.getExpression() == extent;
+  if (auto parameter = value.getDefiningOp<ParameterOp>())
+    return extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
+           parameter.getParameter().getName() == extent.getSymbol();
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     if (!range)
       return false;
     if (bound.getBound() == 0)
-      return matchesViewExtent(range.getStart(), resource, axis);
+      return matchesResourceExtent(range.getStart(), resource, axis);
     if (bound.getBound() == 1)
-      return matchesViewExtent(range.getStop(), resource, axis);
-    return matchesViewExtent(range.getStep(), resource, axis);
+      return matchesResourceExtent(range.getStop(), resource, axis);
+    return matchesResourceExtent(range.getStep(), resource, axis);
   }
   return false;
+}
+
+bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
+  if (matchesResourceExtent(value, resource, axis))
+    return true;
+  std::optional<int64_t> bound = integerConstant(value);
+  PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
+  if (!bound || *bound < 0 || !extent)
+    return false;
+  auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+  if (kind == PhysicalExprKind::Constant)
+    return *bound <= extent.getValue();
+  if (kind != PhysicalExprKind::Parameter)
+    return false;
+  func::FuncOp kernel = resource.getParentRegion()
+                            ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
+                            : func::FuncOp();
+  FailureOr<ParameterOp> parameter =
+      kernel ? queryParameterBySymbol(kernel, extent.getSymbol())
+             : FailureOr<ParameterOp>(failure());
+  return succeeded(parameter) &&
+         llvm::all_of(parameter->getParameter().getCandidates().asArrayRef(),
+                      [&](int64_t candidate) { return *bound <= candidate; });
+}
+
+Value stripIntegerIndexCasts(Value value) {
+  value = stripBroadcast(value);
+  while (auto cast = value.getDefiningOp<CastOp>()) {
+    auto element = [](Type type) {
+      if (auto fragment = dyn_cast<FragmentType>(type))
+        return fragment.getElementType();
+      return type;
+    };
+    Type source = element(cast.getValue().getType());
+    Type result = element(cast.getResult().getType());
+    if (!isa<IntegerType, IndexType>(source) ||
+        !isa<IntegerType, IndexType>(result))
+      break;
+    value = stripBroadcast(cast.getValue());
+  }
+  return value;
 }
 
 bool derivesFromAccessCoordinate(Value value, Value coordinate) {
   if (value == coordinate)
     return true;
-  value = stripBroadcast(value);
-  coordinate = stripBroadcast(coordinate);
+  value = stripIntegerIndexCasts(value);
+  coordinate = stripIntegerIndexCasts(coordinate);
   if (value == coordinate)
     return true;
   auto valueRange = value.getDefiningOp<MakeRangeOp>();
@@ -289,6 +356,151 @@ bool derivesFromAccessCoordinate(Value value, Value coordinate) {
          sameScalarExpression(valueRange.getExtent(),
                               coordinateRange.getExtent()) &&
          sameScalarExpression(valueRange.getStep(), coordinateRange.getStep());
+}
+
+bool valueKnownPositive(Value value, unsigned depth = 0) {
+  if (!value || depth >= 32)
+    return false;
+  value = stripIntegerIndexCasts(value);
+  if (std::optional<int64_t> constant = integerConstant(value))
+    return *constant > 0;
+  if (auto parameter = value.getDefiningOp<ParameterOp>())
+    return llvm::all_of(
+        parameter.getParameter().getCandidates().asArrayRef(),
+        [](int64_t candidate) { return candidate > 0; });
+  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
+    auto range = bound.getRange().getDefiningOp<RangeOp>();
+    return range && bound.getBound() == 2 &&
+           valueKnownPositive(range.getStep(), depth + 1);
+  }
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return false;
+  if (binary.getOperatorKind() == BinaryOperator::Multiply ||
+      binary.getOperatorKind() == BinaryOperator::Add)
+    return valueKnownPositive(binary.getLhs(), depth + 1) &&
+           valueKnownPositive(binary.getRhs(), depth + 1);
+  return false;
+}
+
+bool valueKnownNonNegative(Value value, unsigned depth = 0) {
+  if (!value || depth >= 32)
+    return false;
+  value = stripIntegerIndexCasts(value);
+  if (std::optional<int64_t> constant = integerConstant(value))
+    return *constant >= 0;
+  if (value.getDefiningOp<ProgramIdOp>())
+    return true;
+  if (auto parameter = value.getDefiningOp<ParameterOp>())
+    return llvm::all_of(
+        parameter.getParameter().getCandidates().asArrayRef(),
+        [](int64_t candidate) { return candidate >= 0; });
+  if (auto delinearize = value.getDefiningOp<DelinearizeOp>())
+    return valueKnownNonNegative(delinearize.getLinear(), depth + 1) &&
+           llvm::all_of(delinearize.getExtents(), [&](Value extent) {
+             return valueKnownNonNegative(extent, depth + 1);
+           });
+  if (value.getDefiningOp<DimOp>())
+    return true;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (auto function =
+            dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp())) {
+      DictionaryAttr attrs = function.getArgAttrDict(argument.getArgNumber());
+      auto kind = attrs.getAs<StringAttr>(abiKindAttr);
+      if (kind && kind.getValue() == "dimension")
+        return true;
+    }
+    auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+    if (loop && argument == loop.getInductionVar()) {
+      return valueKnownPositive(loop.getStep(), depth + 1) &&
+             valueKnownNonNegative(loop.getLowerBound(), depth + 1);
+    }
+  }
+  if (auto coordinate = value.getDefiningOp<WorksetCoordinateOp>())
+    return valueKnownNonNegative(coordinate.getCoordinate(), depth + 1);
+  if (auto range = value.getDefiningOp<MakeRangeOp>()) {
+    return valueKnownPositive(range.getStep(), depth + 1) &&
+           valueKnownNonNegative(range.getStart(), depth + 1);
+  }
+  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
+    auto range = bound.getRange().getDefiningOp<RangeOp>();
+    if (!range)
+      return false;
+    if (bound.getBound() == 0)
+      return valueKnownNonNegative(range.getStart(), depth + 1);
+    if (bound.getBound() == 1)
+      return valueKnownNonNegative(range.getStop(), depth + 1);
+    return valueKnownPositive(range.getStep(), depth + 1);
+  }
+  if (auto select = value.getDefiningOp<SelectOp>())
+    return valueKnownNonNegative(select.getTrueValue(), depth + 1) &&
+           valueKnownNonNegative(select.getFalseValue(), depth + 1);
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return false;
+  bool lhs = valueKnownNonNegative(binary.getLhs(), depth + 1);
+  bool rhs = valueKnownNonNegative(binary.getRhs(), depth + 1);
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Add:
+  case BinaryOperator::Multiply:
+  case BinaryOperator::Minimum:
+  case BinaryOperator::MinimumNum:
+    return lhs && rhs;
+  case BinaryOperator::Maximum:
+  case BinaryOperator::MaximumNum:
+    return lhs || rhs;
+  case BinaryOperator::Subtract: {
+    std::optional<int64_t> subtrahend = integerConstant(binary.getRhs());
+    if (!subtrahend)
+      return false;
+    if (*subtrahend <= 0)
+      return lhs;
+    Value minuend = stripIntegerIndexCasts(binary.getLhs());
+    auto parameter = minuend.getDefiningOp<ParameterOp>();
+    return parameter &&
+           llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                        [&](int64_t candidate) {
+                          return candidate >= *subtrahend;
+                        });
+  }
+  case BinaryOperator::FloorDivide: {
+    return lhs && valueKnownPositive(binary.getRhs(), depth + 1);
+  }
+  default:
+    return false;
+  }
+}
+
+bool coordinateKnownNonNegative(Value coordinate) {
+  return valueKnownNonNegative(coordinate);
+}
+
+bool coordinateRangeWithinResource(Value coordinate, Value resource,
+                                   unsigned axis) {
+  coordinate = stripIntegerIndexCasts(coordinate);
+  if (std::optional<int64_t> constant = integerConstant(coordinate)) {
+    PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
+    return extent &&
+           extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           *constant >= 0 && *constant < extent.getValue();
+  }
+  auto range = coordinate.getDefiningOp<MakeRangeOp>();
+  if (!range || !isUnitStepValue(range.getStep()) ||
+      !coordinateKnownNonNegative(coordinate))
+    return false;
+  if (integerConstant(range.getStart()) == 0 &&
+      matchesResourceExtent(range.getExtent(), resource, axis))
+    return true;
+  PhysicalExprAttr resourceExtent = resourceExtentExpression(resource, axis);
+  if (!resourceExtent ||
+      resourceExtent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Constant))
+    return false;
+  std::optional<int64_t> start = integerConstant(range.getStart());
+  std::optional<int64_t> extent = integerConstant(range.getExtent());
+  return start && extent && *start >= 0 && *extent >= 0 &&
+         static_cast<__int128>(*start) + *extent <= resourceExtent.getValue();
 }
 
 bool hasExactPhysicalRangeCoverage(Value coordinate, Value upperBound) {
@@ -2333,16 +2545,25 @@ bool PhysicalProgramAnalysis::isTailPredicate(
   Value lhs = stripBroadcast(comparison.getLhs());
   Value rhs = stripScalarIdentity(comparison.getRhs());
   MakeRangeOp predicateRange = lhs.getDefiningOp<MakeRangeOp>();
+  auto sameTailEnd = [&](Value current, Value expected) {
+    if (sameScalarExpression(current, expected))
+      return true;
+    if (auto dim = current.getDefiningOp<DimOp>())
+      return matchesResourceExtent(expected, dim.getView(), dim.getAxis());
+    if (auto dim = expected.getDefiningOp<DimOp>())
+      return matchesResourceExtent(current, dim.getView(), dim.getAxis());
+    return false;
+  };
   return llvm::any_of(ranges, [&](const auto &entry) {
     MakeRangeOp expectedRange = entry.first;
     Value expectedEnd = stripScalarIdentity(entry.second);
     if (lhs == expectedRange.getResult())
-      return rhs == expectedEnd;
+      return sameTailEnd(rhs, expectedEnd);
     if (!predicateRange ||
         !(sourceAxisIdentity(predicateRange) ==
           sourceAxisIdentity(expectedRange)))
       return false;
-    return sameScalarExpression(rhs, expectedEnd) &&
+    return sameTailEnd(rhs, expectedEnd) &&
            sameScalarExpression(predicateRange.getStart(),
                                 expectedRange.getStart()) &&
            sameScalarExpression(predicateRange.getExtent(),
@@ -2471,7 +2692,12 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
                  : PhysicalFactState::Unknown;
     }
     auto comparison = value.getDefiningOp<CompareOp>();
-    if (!comparison || comparison.getPredicate() != ComparePredicate::Lt) {
+    bool upperComparison =
+        comparison && comparison.getPredicate() == ComparePredicate::Lt;
+    bool lowerComparison =
+        comparison && comparison.getPredicate() == ComparePredicate::Ge &&
+        integerConstant(comparison.getRhs()) == 0;
+    if (!upperComparison && !lowerComparison) {
       appendUnique(result.blockers, value.getDefiningOp());
       return PhysicalFactState::Unknown;
     }
@@ -2482,10 +2708,13 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
          llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
       if (!derivesFromAccessCoordinate(comparison.getLhs(), coordinate))
         continue;
-      bool viewBoundary = matchesViewExtent(comparison.getRhs(),
-                                            accessFact.resource, sourceAxis);
-      bool exactRange = hasExactPhysicalRangeCoverage(
-          coordinate, comparison.getRhs());
+      bool viewBoundary =
+          lowerComparison || matchesResourceExtent(
+                                 comparison.getRhs(), accessFact.resource,
+                                 sourceAxis);
+      bool exactRange =
+          upperComparison && hasExactPhysicalRangeCoverage(
+                                 coordinate, comparison.getRhs());
       if (!viewBoundary && !exactRange)
         continue;
       if (matchedAxis) {
@@ -2493,7 +2722,9 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
         return PhysicalFactState::Ambiguous;
       }
       matchedAxis = sourceAxis;
-      requiresBoundary = viewBoundary;
+      requiresBoundary =
+          viewBoundary && !coordinateRangeWithinResource(
+                              coordinate, accessFact.resource, sourceAxis);
     }
     if (!matchedAxis) {
       appendUnique(result.blockers, comparison);
@@ -2509,6 +2740,150 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access) {
     result.boundaryAxes.append(boundaryAxes.begin(), boundaryAxes.end());
     llvm::sort(result.boundaryAxes);
   }
+  return result;
+}
+
+PhysicalAccessBoundsFact
+PhysicalProgramAnalysis::accessBounds(Operation *access) {
+  PhysicalAccessBoundsFact result;
+  PhysicalAccessFootprint accessFact = footprint(access);
+  result.blockers = accessFact.blockers;
+  if (accessFact.state != PhysicalFactState::Exact || !accessFact.resource ||
+      accessFact.coordinates.size() != accessFact.sourceAxes.size()) {
+    appendUnique(result.blockers, access);
+    return result;
+  }
+
+  unsigned rank = 0;
+  if (auto view = dyn_cast<ViewType>(accessFact.resource.getType()))
+    rank = view.getRank();
+  else if (auto buffer = dyn_cast<BufferType>(accessFact.resource.getType()))
+    rank = buffer.getShape().size();
+  else if (auto fragment =
+               dyn_cast<FragmentType>(accessFact.resource.getType()))
+    rank = fragment.getShape().size();
+  if (rank == 0 && !accessFact.coordinates.empty()) {
+    appendUnique(result.blockers, access);
+    return result;
+  }
+
+  struct AxisBounds {
+    bool lower = false;
+    bool upper = false;
+  };
+  SmallVector<AxisBounds> bounds(rank);
+  SmallVector<bool> required(rank, false);
+  for (auto [coordinate, sourceAxis] :
+       llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
+    if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(rank)) {
+      appendUnique(result.blockers, access);
+      return result;
+    }
+    required[sourceAxis] = true;
+    if (coordinateRangeWithinResource(coordinate, accessFact.resource,
+                                      sourceAxis)) {
+      bounds[sourceAxis].lower = true;
+      bounds[sourceAxis].upper = true;
+    } else if (coordinateKnownNonNegative(coordinate)) {
+      bounds[sourceAxis].lower = true;
+    }
+  }
+
+  DominanceInfo dominance(kernel);
+  kernel.walk([&](AssumeInBoundsOp assumption) {
+    if (assumption.getResource() != accessFact.resource ||
+        assumption.getAxis() >= rank ||
+        !dominance.properlyDominates(assumption.getOperation(), access))
+      return;
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
+      if (sourceAxis != static_cast<int64_t>(assumption.getAxis()) ||
+          !derivesFromAccessCoordinate(assumption.getIndex(), coordinate))
+        continue;
+      bounds[sourceAxis].lower = true;
+      bounds[sourceAxis].upper = true;
+    }
+  });
+
+  std::function<bool(Value)> analyze = [&](Value value) -> bool {
+    if (!value)
+      return false;
+    if (auto broadcast = value.getDefiningOp<BroadcastOp>())
+      return analyze(broadcast.getValue());
+    if (auto splat = value.getDefiningOp<SplatOp>())
+      return analyze(splat.getValue());
+    if (auto reshape = value.getDefiningOp<ReshapeOp>())
+      return analyze(reshape.getValue());
+    if (auto transpose = value.getDefiningOp<TransposeOp>())
+      return analyze(transpose.getValue());
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+      auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+      return integer && integer.getType().isInteger(1) &&
+             integer.getValue().isZero();
+    }
+    if (auto conjunction = value.getDefiningOp<BinaryOp>()) {
+      Type element = conjunction.getResult().getType();
+      if (auto fragment = dyn_cast<FragmentType>(element))
+        element = fragment.getElementType();
+      bool logical =
+          conjunction.getOperatorKind() == BinaryOperator::LogicalAnd;
+      bool bitwiseI1 =
+          conjunction.getOperatorKind() == BinaryOperator::BitwiseAnd &&
+          element.isInteger(1);
+      if (logical || bitwiseI1) {
+        bool lhsInactive = analyze(conjunction.getLhs());
+        bool rhsInactive = analyze(conjunction.getRhs());
+        return lhsInactive || rhsInactive;
+      }
+      return false;
+    }
+    auto comparison = value.getDefiningOp<CompareOp>();
+    if (!comparison)
+      return false;
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(accessFact.coordinates, accessFact.sourceAxes)) {
+      if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(rank))
+        continue;
+      bool lhsCoordinate =
+          derivesFromAccessCoordinate(comparison.getLhs(), coordinate);
+      bool rhsCoordinate =
+          derivesFromAccessCoordinate(comparison.getRhs(), coordinate);
+      if ((comparison.getPredicate() == ComparePredicate::Ge &&
+           lhsCoordinate && integerConstant(comparison.getRhs()) == 0) ||
+          (comparison.getPredicate() == ComparePredicate::Le &&
+           rhsCoordinate && integerConstant(comparison.getLhs()) == 0))
+        bounds[sourceAxis].lower = true;
+      if ((comparison.getPredicate() == ComparePredicate::Lt &&
+           lhsCoordinate && upperBoundWithinResource(
+                                comparison.getRhs(), accessFact.resource,
+                                sourceAxis)) ||
+          (comparison.getPredicate() == ComparePredicate::Gt &&
+           rhsCoordinate && upperBoundWithinResource(
+                                comparison.getLhs(), accessFact.resource,
+                                sourceAxis)))
+        bounds[sourceAxis].upper = true;
+    }
+    return false;
+  };
+
+  bool alwaysInactive = analyze(accessFact.validity);
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    if (!required[axis] || alwaysInactive)
+      continue;
+    if (!bounds[axis].lower)
+      result.missingLowerAxes.push_back(axis);
+    if (!bounds[axis].upper)
+      result.missingUpperAxes.push_back(axis);
+    if (!bounds[axis].lower || !bounds[axis].upper)
+      result.unprovenAxes.push_back(axis);
+  }
+  if (result.unprovenAxes.empty()) {
+    result.state = PhysicalFactState::Exact;
+    return result;
+  }
+  appendUnique(result.blockers,
+               accessFact.validity ? accessFact.validity.getDefiningOp()
+                                   : access);
   return result;
 }
 

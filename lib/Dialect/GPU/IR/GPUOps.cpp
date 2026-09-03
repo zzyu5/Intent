@@ -823,6 +823,8 @@ LogicalResult GatherOp::verify() {
 }
 
 LogicalResult AssumeInBoundsOp::verify() {
+  if (!isa<IntegerType, IndexType>(elementType(getIndex().getType())))
+    return emitOpError("in-bounds assumption requires an integer/index value");
   return getAxis() < rankOf(getResource().getType())
              ? success()
              : emitOpError("assumed source axis is outside the resource rank");

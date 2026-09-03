@@ -683,6 +683,28 @@ private:
     return result;
   }
 
+  bool copyPreservesBoundaryAxes(
+      const gpu::PhysicalAccessBoundaryFact &boundary,
+      const CopyLayout &layout, gpu::FragmentType fragment) {
+    for (int64_t boundaryAxis : boundary.boundaryAxes) {
+      std::optional<unsigned> bufferAxis;
+      for (auto [axis, viewAxis] : llvm::enumerate(layout.viewAxes))
+        if (viewAxis == boundaryAxis) {
+          bufferAxis = axis;
+          break;
+        }
+      if (!bufferAxis || *bufferAxis >= layout.bufferToFragment.size())
+        return false;
+      auto extent = cast<gpu::PhysicalExprAttr>(
+          fragment.getShape()[layout.bufferToFragment[*bufferAxis]]);
+      if (extent.getKind() ==
+              static_cast<uint32_t>(gpu::PhysicalExprKind::Constant) &&
+          extent.getValue() == 1)
+        return false;
+    }
+    return true;
+  }
+
   SmallVector<unsigned> identityAxisOrder(unsigned rank) {
     SmallVector<unsigned> result(rank);
     std::iota(result.begin(), result.end(), 0);
@@ -1111,6 +1133,7 @@ private:
         gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(load);
     bool directCopy = succeeded(offsets) && succeeded(layout) &&
                       boundary.isExact() &&
+                      copyPreservesBoundaryAxes(boundary, *layout, fragment) &&
                       (!load.getFill() || isZero(load.getFill()));
     SmallVector<Attribute> allocationShape;
     if (directCopy)
@@ -1129,7 +1152,9 @@ private:
       builder.create<CopyInOp>(load.getLoc(), load.getResource(), *offsets,
                                destination,
                                DenseI64ArrayAttr::get(kernel.getContext(),
-                                                      layout->viewAxes));
+                                                      layout->viewAxes),
+                               DenseI64ArrayAttr::get(
+                                   kernel.getContext(), boundary.boundaryAxes));
       if (space == BufferSpace::Shared)
         sharedBufferAxes[load.getResult()] = layout->bufferToFragment;
     } else {
@@ -2154,10 +2179,13 @@ private:
         gpu::PhysicalProgramAnalysis(kernel).boundaryValidity(store);
     if (succeeded(offsets) && succeeded(layout) &&
         layout->bufferToFragment == identity &&
-        boundary.isExact()) {
+        boundary.isExact() &&
+        copyPreservesBoundaryAxes(boundary, *layout, fragment)) {
       OpBuilder builder(store);
       DenseI64ArrayAttr destinationAxes =
           DenseI64ArrayAttr::get(kernel.getContext(), layout->viewAxes);
+      DenseI64ArrayAttr boundaryAxes =
+          DenseI64ArrayAttr::get(kernel.getContext(), boundary.boundaryAxes);
       if (auto cast = store.getValue().getDefiningOp<gpu::CastOp>()) {
         auto input = dyn_cast<gpu::FragmentType>(cast.getValue().getType());
         auto result = dyn_cast<gpu::FragmentType>(cast.getResult().getType());
@@ -2168,7 +2196,7 @@ private:
             input.getOwner() == result.getOwner()) {
           builder.create<CastCopyOutOp>(store.getLoc(), source,
                                         store.getResource(), *offsets,
-                                        destinationAxes);
+                                        destinationAxes, boundaryAxes);
           lowered.insert(cast);
           lowered.insert(store);
           return success();
@@ -2179,7 +2207,7 @@ private:
       if (failed(source))
         return failure();
       builder.create<CopyOutOp>(store.getLoc(), *source, store.getResource(),
-                                *offsets, destinationAxes);
+                                *offsets, destinationAxes, boundaryAxes);
     } else {
       FailureOr<Value> source =
           materialize(store.getValue(), BufferSpace::Fragment, store);

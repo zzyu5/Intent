@@ -14,6 +14,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -1685,6 +1686,93 @@ private:
                                              value));
   }
 
+  FailureOr<Value> asLogicalIndex(Location location, Value value) {
+    if (!isa<gpu::FragmentType>(value.getType()))
+      return asIndex(location, value);
+    auto source = cast<gpu::FragmentType>(value.getType());
+    if (source.getElementType().isIndex())
+      return value;
+    if (!isa<IntegerType>(source.getElementType()))
+      return failure();
+    auto target = gpu::FragmentType::get(
+        value.getContext(), builder.getIndexType(), source.getShape(),
+        source.getAxisMaps(), source.getValidity(), source.getOwner());
+    return Value(builder.create<gpu::CastOp>(location, target, value));
+  }
+
+  FailureOr<unsigned> physicalResourceAxis(Type logicalResource,
+                                           Type physicalResource,
+                                           unsigned logicalAxis) {
+    RankedTensorType logicalTensor;
+    if (auto view = dyn_cast<intent::ViewType>(logicalResource))
+      logicalTensor = dyn_cast<RankedTensorType>(view.getTensor());
+    else if (auto buffer = dyn_cast<intent::BufferType>(logicalResource))
+      logicalTensor = dyn_cast<RankedTensorType>(buffer.getTensor());
+    else
+      logicalTensor = dyn_cast<RankedTensorType>(logicalResource);
+    if (!logicalTensor || logicalAxis >= static_cast<unsigned>(logicalTensor.getRank()))
+      return failure();
+
+    unsigned physicalRank = 0;
+    if (auto view = dyn_cast<gpu::ViewType>(physicalResource))
+      physicalRank = view.getRank();
+    else if (auto buffer = dyn_cast<gpu::BufferType>(physicalResource))
+      physicalRank = buffer.getShape().size();
+    else if (auto fragment = dyn_cast<gpu::FragmentType>(physicalResource))
+      physicalRank = fragment.getShape().size();
+    else
+      return failure();
+    unsigned logicalRank = logicalTensor.getRank();
+    if (physicalRank < logicalRank)
+      return failure();
+    if (!isa<gpu::FragmentType>(physicalResource) && physicalRank != logicalRank)
+      return failure();
+    return physicalRank - logicalRank + logicalAxis;
+  }
+
+  FailureOr<Value> resourceExtent(Location location, Value resource,
+                                  unsigned axis) {
+    PhysicalExprAttr extent;
+    if (auto view = dyn_cast<gpu::ViewType>(resource.getType())) {
+      if (axis >= view.getRank())
+        return failure();
+      extent = cast<PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
+      if (extent.getKind() ==
+          static_cast<uint32_t>(PhysicalExprKind::Constant))
+        return physicalExtentValue(location, extent);
+      return Value(builder.create<gpu::DimOp>(location, builder.getIndexType(),
+                                              resource, axis));
+    } else if (auto buffer = dyn_cast<gpu::BufferType>(resource.getType())) {
+      if (axis >= buffer.getShape().size())
+        return failure();
+      extent = cast<PhysicalExprAttr>(buffer.getShape()[axis]);
+    } else if (auto fragment = dyn_cast<gpu::FragmentType>(resource.getType())) {
+      if (axis >= fragment.getShape().size())
+        return failure();
+      if (auto load = resource.getDefiningOp<gpu::LoadOp>()) {
+        auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
+        auto mapping = dyn_cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
+        if (view && mapping) {
+          FailureOr<unsigned> coordinate = gpu::queryCoordinatePosition(
+              load.getCoordinates(), gpu::sourceAxisIdentity(mapping));
+          if (succeeded(coordinate) &&
+              *coordinate < load.getSourceAxes().size()) {
+            int64_t sourceAxis = load.getSourceAxes()[*coordinate];
+            if (sourceAxis >= 0 &&
+                sourceAxis < static_cast<int64_t>(view.getRank()))
+              return Value(builder.create<gpu::DimOp>(
+                  location, builder.getIndexType(), load.getResource(),
+                  sourceAxis));
+          }
+        }
+      }
+      extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
+    } else {
+      return failure();
+    }
+    return physicalExtentValue(location, extent);
+  }
+
   void bindExtentDimensions(ArrayAttr identities, Value extent) {
     if (!identities || identities.size() != 1)
       return;
@@ -1784,12 +1872,17 @@ private:
         ++resultAxis;
         continue;
       }
+      FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
+          operation->getOperand(0).getType(), (*resource).getType(), sourceAxis);
+      if (failed(physicalSourceAxis))
+        return failure();
       if (term.getKind() == 0) {
         auto view = dyn_cast<gpu::ViewType>((*resource).getType());
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
         if ((!view && !fragment) ||
-            (view && sourceAxis >= view.getRank()) ||
-            (fragment && sourceAxis >= fragment.getShape().size())) {
+            (view && *physicalSourceAxis >= view.getRank()) ||
+            (fragment &&
+             *physicalSourceAxis >= fragment.getShape().size())) {
           operation->emitOpError(
               "full-slice term has no matching physical source axis");
           return failure();
@@ -1803,7 +1896,7 @@ private:
         if (view) {
           sourceId = view.getSourceId();
           extent = cast<PhysicalExprAttr>(
-              view.getLayout().getExtents()[sourceAxis]);
+              view.getLayout().getExtents()[*physicalSourceAxis]);
           FailureOr<Value> physicalStop =
               physicalExtentValue(operation->getLoc(), extent);
           if (failed(physicalStop)) {
@@ -1815,14 +1908,16 @@ private:
           stop = *physicalStop;
         } else {
           auto mapping =
-              cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
+              cast<gpu::AxisMapAttr>(
+                  fragment.getAxisMaps()[*physicalSourceAxis]);
           FailureOr<Value> physicalExtent = physicalExtentValue(
               operation->getLoc(),
-              cast<PhysicalExprAttr>(fragment.getShape()[sourceAxis]));
+              cast<PhysicalExprAttr>(
+                  fragment.getShape()[*physicalSourceAxis]));
           if (failed(physicalExtent)) {
             operation->emitOpError(
                 "fragment full-slice extent is not materialized in the current program: ")
-                << fragment.getShape()[sourceAxis];
+                << fragment.getShape()[*physicalSourceAxis];
             return failure();
           }
           stop = *physicalExtent;
@@ -1830,17 +1925,18 @@ private:
           logicalSourceAxis = mapping.getSourceAxis();
           derived = mapping.getDerived();
           extent =
-              cast<PhysicalExprAttr>(fragment.getShape()[sourceAxis]);
+              cast<PhysicalExprAttr>(
+                  fragment.getShape()[*physicalSourceAxis]);
         }
         int64_t dimension = 0;
         if (view) {
           auto dimensions = view.getLayout().getDimensionIds();
-          if (sourceAxis >= dimensions.size())
+          if (*physicalSourceAxis >= dimensions.size())
             return failure();
-          dimension = dimensions[sourceAxis];
+          dimension = dimensions[*physicalSourceAxis];
         } else {
           dimension = cast<gpu::AxisMapAttr>(
-                          fragment.getAxisMaps()[sourceAxis])
+                          fragment.getAxisMaps()[*physicalSourceAxis])
                           .getDimensionId();
         }
         if (dimension <= 0)
@@ -1867,8 +1963,20 @@ private:
         continue;
       }
       if (term.getKind() == 2) {
-        coordinates.push_back(builder.create<arith::ConstantIndexOp>(
-            operation->getLoc(), term.getStaticValues()[0]));
+        int64_t literal = term.getStaticValues()[0];
+        Value coordinate = builder.create<arith::ConstantIndexOp>(
+            operation->getLoc(), literal);
+        if (literal < 0) {
+          FailureOr<Value> extent =
+              resourceExtent(operation->getLoc(), *resource,
+                             *physicalSourceAxis);
+          if (failed(extent))
+            return failure();
+          coordinate = createBinary(builder, operation->getLoc(),
+                                    builder.getIndexType(), *extent, coordinate,
+                                    BinaryOperator::Add);
+        }
+        coordinates.push_back(coordinate);
         ++sourceAxis;
         continue;
       }
@@ -1907,7 +2015,11 @@ private:
             physicalCoordinate = builder.create<gpu::BroadcastOp>(
                 operation->getLoc(), target, physicalCoordinate);
         }
-        coordinates.push_back(physicalCoordinate);
+        FailureOr<Value> logicalIndex =
+            asLogicalIndex(operation->getLoc(), physicalCoordinate);
+        if (failed(logicalIndex))
+          return failure();
+        coordinates.push_back(*logicalIndex);
         ++sourceAxis;
         continue;
       }
@@ -1961,8 +2073,9 @@ private:
             auto view = dyn_cast<gpu::ViewType>((*resource).getType());
             auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
             if ((!view && !fragment) ||
-                (view && sourceAxis >= view.getRank()) ||
-                (fragment && sourceAxis >= fragment.getShape().size()))
+                (view && *physicalSourceAxis >= view.getRank()) ||
+                (fragment &&
+                 *physicalSourceAxis >= fragment.getShape().size()))
               return failure();
             if (component == 0) {
               bounds.push_back(builder.create<arith::ConstantIndexOp>(
@@ -1972,14 +2085,14 @@ private:
                 FailureOr<Value> physicalExtent = physicalExtentValue(
                     operation->getLoc(),
                     cast<PhysicalExprAttr>(
-                        view.getLayout().getExtents()[sourceAxis]));
+                        view.getLayout().getExtents()[*physicalSourceAxis]));
                 if (failed(physicalExtent))
                   return failure();
                 bounds.push_back(*physicalExtent);
               } else {
                 FailureOr<Value> physicalExtent = physicalExtentValue(
                     operation->getLoc(), cast<PhysicalExprAttr>(
-                                             fragment.getShape()[sourceAxis]));
+                                             fragment.getShape()[*physicalSourceAxis]));
                 if (failed(physicalExtent))
                   return failure();
                 bounds.push_back(*physicalExtent);
@@ -1993,13 +2106,15 @@ private:
         auto view = dyn_cast<gpu::ViewType>((*resource).getType());
         auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
         if ((!view && !fragment) ||
-            (view && sourceAxis >= view.getRank()) ||
-            (fragment && sourceAxis >= fragment.getShape().size()))
+            (view && *physicalSourceAxis >= view.getRank()) ||
+            (fragment &&
+             *physicalSourceAxis >= fragment.getShape().size()))
           return failure();
         PhysicalExprAttr fallback =
             view ? cast<PhysicalExprAttr>(
-                       view.getLayout().getExtents()[sourceAxis])
-                 : cast<PhysicalExprAttr>(fragment.getShape()[sourceAxis]);
+                       view.getLayout().getExtents()[*physicalSourceAxis])
+                 : cast<PhysicalExprAttr>(
+                       fragment.getShape()[*physicalSourceAxis]);
         FailureOr<PhysicalExprAttr> physicalExtent =
             resultExtent(resultAxis, fallback);
         if (failed(physicalExtent))
@@ -2012,12 +2127,13 @@ private:
         if (view) {
           sourceId = view.getSourceId();
           auto dimensions = view.getLayout().getDimensionIds();
-          if (sourceAxis >= dimensions.size())
+          if (*physicalSourceAxis >= dimensions.size())
             return failure();
-          dimension = dimensions[sourceAxis];
+          dimension = dimensions[*physicalSourceAxis];
         } else {
           auto mapping =
-              cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[sourceAxis]);
+              cast<gpu::AxisMapAttr>(
+                  fragment.getAxisMaps()[*physicalSourceAxis]);
           sourceId = mapping.getSourceId();
           logicalSourceAxis = mapping.getSourceAxis();
           dimension = mapping.getDimensionId();
@@ -2042,15 +2158,20 @@ private:
 
   FailureOr<SmallVector<int64_t>> sourceAxes(Operation *operation) {
     auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
-    if (!relation)
+    FailureOr<Value> resource = get(operation->getOperand(0));
+    if (!relation || failed(resource))
       return failure();
     SmallVector<int64_t> axes;
-    int64_t sourceAxis = 0;
+    unsigned sourceAxis = 0;
     for (Attribute attribute : relation.getTerms()) {
       auto term = cast<IndexTermAttr>(attribute);
       if (term.getKind() == 1)
         continue;
-      axes.push_back(sourceAxis++);
+      FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
+          operation->getOperand(0).getType(), (*resource).getType(), sourceAxis++);
+      if (failed(physicalSourceAxis))
+        return failure();
+      axes.push_back(*physicalSourceAxis);
     }
     return axes;
   }
@@ -2455,6 +2576,200 @@ private:
     if (!isa<gpu::FragmentType>(value.getType()))
       return Value(builder.create<gpu::SplatOp>(location, target, value));
     return retargetBroadcast(builder, location, value, target);
+  }
+
+  SmallVector<bool> canonicalAccessAxisProofs(Operation *operation,
+                                              Value resource) {
+    auto relation = operation->getAttrOfType<IndexRelationAttr>("index");
+    if (!relation || operation->getNumOperands() == 0 || !resource)
+      return {};
+
+    unsigned physicalRank = 0;
+    if (auto view = dyn_cast<gpu::ViewType>(resource.getType()))
+      physicalRank = view.getRank();
+    else if (auto buffer = dyn_cast<gpu::BufferType>(resource.getType()))
+      physicalRank = buffer.getShape().size();
+    else if (auto fragment = dyn_cast<gpu::FragmentType>(resource.getType()))
+      physicalRank = fragment.getShape().size();
+    else
+      return {};
+    SmallVector<bool> proven(physicalRank, false);
+
+    RankedTensorType source;
+    Type sourceType = operation->getOperand(0).getType();
+    if (auto view = dyn_cast<intent::ViewType>(sourceType))
+      source = dyn_cast<RankedTensorType>(view.getTensor());
+    else if (auto buffer = dyn_cast<intent::BufferType>(sourceType))
+      source = dyn_cast<RankedTensorType>(buffer.getTensor());
+    else
+      source = dyn_cast<RankedTensorType>(sourceType);
+
+    SmallVector<Value> indexedValues(proven.size());
+    unsigned sourceAxis = 0;
+    for (Attribute attribute : relation.getTerms()) {
+      auto term = cast<IndexTermAttr>(attribute);
+      if (term.getKind() == 1)
+        continue;
+      FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
+          operation->getOperand(0).getType(), resource.getType(), sourceAxis);
+      if (failed(physicalSourceAxis) || *physicalSourceAxis >= proven.size())
+        return {};
+      if (term.getKind() == 2 && source &&
+                 sourceAxis < static_cast<unsigned>(source.getRank()) &&
+                 !source.isDynamicDim(sourceAxis)) {
+        int64_t index = term.getStaticValues()[0];
+        int64_t extent = source.getDimSize(sourceAxis);
+        proven[*physicalSourceAxis] = -extent <= index && index < extent;
+      } else if (term.getKind() == 3 &&
+                 term.getOperandPositions().size() == 1) {
+        int64_t position = term.getOperandPositions()[0];
+        if (position >= 0 && position < operation->getNumOperands())
+          indexedValues[*physicalSourceAxis] = operation->getOperand(position);
+      }
+      ++sourceAxis;
+    }
+    if (sourceAxis != relation.getSourceRank())
+      return {};
+
+    func::FuncOp function = operation->getParentOfType<func::FuncOp>();
+    if (!function)
+      return proven;
+    DominanceInfo dominance(function);
+    function.walk([&](intent::AssumeInBoundsOp assumption) {
+      if (assumption.getView() != operation->getOperand(0))
+        return;
+      FailureOr<unsigned> axis = physicalResourceAxis(
+          assumption.getView().getType(), resource.getType(),
+          assumption.getAxis());
+      if (failed(axis) || *axis >= proven.size() || proven[*axis] ||
+          !indexedValues[*axis] ||
+          assumption.getIndex() != indexedValues[*axis] ||
+          !dominance.properlyDominates(assumption.getOperation(), operation))
+        return;
+      proven[*axis] = true;
+    });
+    return proven;
+  }
+
+  FailureOr<Value> materializeAccessValidity(
+      Operation *operation, Value resource, ArrayRef<Value> coordinates,
+      ArrayRef<int64_t> sourceAxes, Type payloadType, Value existing) {
+    if (coordinates.size() != sourceAxes.size())
+      return failure();
+    SmallVector<bool> proven = canonicalAccessAxisProofs(operation, resource);
+    if (proven.empty() && !coordinates.empty())
+      return failure();
+
+    auto payloadFragment = dyn_cast<gpu::FragmentType>(payloadType);
+    Type predicateType = builder.getI1Type();
+    if (payloadFragment)
+      predicateType = gpu::FragmentType::get(
+          operation->getContext(), builder.getI1Type(),
+          payloadFragment.getShape(), payloadFragment.getAxisMaps(),
+          payloadFragment.getValidity(), payloadFragment.getOwner());
+
+    if (existing) {
+      if (payloadFragment) {
+        FailureOr<Value> projected =
+            projectAccessOperand(operation->getLoc(), existing, payloadFragment);
+        if (failed(projected))
+          return failure();
+        existing = *projected;
+      }
+      if (existing.getType() != predicateType)
+        return failure();
+    }
+
+    Value valid = existing;
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(coordinates, sourceAxes)) {
+      if (sourceAxis < 0 ||
+          sourceAxis >= static_cast<int64_t>(proven.size()))
+        return failure();
+      if (proven[sourceAxis])
+        continue;
+      FailureOr<Value> extent =
+          resourceExtent(operation->getLoc(), resource, sourceAxis);
+      if (failed(extent))
+        return failure();
+
+      Value index = coordinate;
+      Value upper = *extent;
+      Value zero = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 0);
+      bool nonNegative = false;
+      if (std::optional<int64_t> constant = integerConstant(coordinate))
+        nonNegative = *constant >= 0;
+      if (auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>()) {
+        std::optional<int64_t> start = integerConstant(range.getStart());
+        std::optional<int64_t> step = integerConstant(range.getStep());
+        nonNegative = start && step && *start >= 0 && *step > 0;
+      }
+      FailureOr<Value> logicalIndex =
+          asLogicalIndex(operation->getLoc(), index);
+      if (failed(logicalIndex))
+        return failure();
+      index = *logicalIndex;
+
+      Type axisPredicateType = builder.getI1Type();
+      if (auto indexType = dyn_cast<gpu::FragmentType>(index.getType())) {
+        axisPredicateType = gpu::FragmentType::get(
+            operation->getContext(), builder.getI1Type(), indexType.getShape(),
+            indexType.getAxisMaps(), indexType.getValidity(),
+            indexType.getOwner());
+        upper = builder.create<gpu::SplatOp>(operation->getLoc(), indexType,
+                                             upper);
+        zero = builder.create<gpu::SplatOp>(operation->getLoc(), indexType,
+                                            zero);
+      }
+
+      Value upperBound = createCompare(
+          builder, operation->getLoc(), axisPredicateType, index, upper,
+          ComparePredicate::Lt);
+      Value axisValid = upperBound;
+      if (!nonNegative) {
+        Value lowerBound = createCompare(
+            builder, operation->getLoc(), axisPredicateType, index, zero,
+            ComparePredicate::Ge);
+        axisValid = createBinary(builder, operation->getLoc(), axisPredicateType,
+                                 lowerBound, upperBound,
+                                 BinaryOperator::LogicalAnd);
+      }
+      if (payloadFragment) {
+        FailureOr<Value> projected = projectAccessOperand(
+            operation->getLoc(), axisValid, payloadFragment);
+        if (failed(projected))
+          return failure();
+        axisValid = *projected;
+      }
+      if (axisValid.getType() != predicateType)
+        return failure();
+      valid = valid ? createBinary(builder, operation->getLoc(), predicateType,
+                                   valid, axisValid,
+                                   BinaryOperator::LogicalAnd)
+                    : axisValid;
+    }
+    return valid;
+  }
+
+  FailureOr<Value> zeroAccessFill(Location location, Type type) {
+    auto fragment = dyn_cast<gpu::FragmentType>(type);
+    Type element = fragment ? fragment.getElementType() : type;
+    TypedAttr zero;
+    if (auto integer = dyn_cast<IntegerType>(element))
+      zero = builder.getIntegerAttr(integer, 0);
+    else if (auto floating = dyn_cast<FloatType>(element))
+      zero = builder.getFloatAttr(floating, 0.0);
+    else if (isa<IndexType>(element))
+      zero = builder.getIndexAttr(0);
+    if (!zero)
+      return failure();
+    FailureOr<Value> scalar =
+        gpu::materializeScalarConstant(builder, location, zero, element);
+    if (failed(scalar))
+      return failure();
+    if (!fragment)
+      return *scalar;
+    return Value(builder.create<gpu::SplatOp>(location, fragment, *scalar));
   }
 
   LogicalResult lower(Operation *operation) {
@@ -3927,6 +4242,19 @@ private:
           *operand = *aligned;
         }
       }
+      FailureOr<Value> bounded = materializeAccessValidity(
+          operation, *source, *coordinates, *axes, *result, valid);
+      if (failed(bounded))
+        return gather.emitOpError(
+            "gather resource bounds cannot be materialized in its result relation");
+      valid = *bounded;
+      if (valid && !fill) {
+        FailureOr<Value> zero = zeroAccessFill(location, *result);
+        if (failed(zero))
+          return gather.emitOpError(
+              "gather resource-bounds validity has no typed fill");
+        fill = *zero;
+      }
       auto target = builder.create<gpu::GatherOp>(
           location, *result, *source, *coordinates, valid, fill, *axes);
       mapResults(operation, target);
@@ -3980,6 +4308,19 @@ private:
           *operand = *aligned;
         }
       }
+      FailureOr<Value> bounded = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, *result, valid);
+      if (failed(bounded))
+        return load.emitOpError(
+            "view-load resource bounds cannot be materialized in its result relation");
+      valid = *bounded;
+      if (valid && !fill) {
+        FailureOr<Value> zero = zeroAccessFill(location, *result);
+        if (failed(zero))
+          return load.emitOpError(
+              "view-load resource-bounds validity has no typed fill");
+        fill = *zero;
+      }
       auto target = builder.create<gpu::LoadOp>(
           location, *result, *resource, *coordinates, valid,
           fill, *axes);
@@ -3998,8 +4339,21 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(result))
         return load.emitOpError("buffer load physical relation is unavailable");
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, *result, Value());
+      if (failed(valid))
+        return load.emitOpError(
+            "buffer-load resource bounds cannot be materialized in its result relation");
+      Value fill;
+      if (*valid) {
+        FailureOr<Value> zero = zeroAccessFill(location, *result);
+        if (failed(zero))
+          return load.emitOpError(
+              "buffer-load resource-bounds validity has no typed fill");
+        fill = *zero;
+      }
       auto target = builder.create<gpu::LoadOp>(
-          location, *result, *resource, *coordinates, Value(), Value(), *axes);
+          location, *result, *resource, *coordinates, *valid, fill, *axes);
       mapResults(operation, target);
       return success();
     }
@@ -4024,8 +4378,13 @@ private:
       if (failed(value))
         return store.emitOpError(
             "view-store value cannot preserve its physical result relation");
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return store.emitOpError(
+            "view-store resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes);
+          location, *resource, *coordinates, *value, *valid, *axes);
       if (Attribute node = operation->getAttr("intent.node"))
         target->setAttr(gpu::originAttr, node);
       return success();
@@ -4043,8 +4402,13 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
         return store.emitOpError("buffer store physical relation is unavailable");
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return store.emitOpError(
+            "buffer-store resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes);
+          location, *resource, *coordinates, *value, *valid, *axes);
       attachOrigin(operation, target);
       return success();
     }
@@ -4061,8 +4425,13 @@ private:
       if (failed(resource) || failed(coordinates) || failed(axes) ||
           failed(value))
         return store.emitOpError("unique scatter is not a scalar physical access");
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return store.emitOpError(
+            "unique-scatter resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::StoreOp>(
-          location, *resource, *coordinates, *value, Value(), *axes);
+          location, *resource, *coordinates, *value, *valid, *axes);
       if (Attribute node = operation->getAttr("intent.node"))
         target->setAttr(gpu::originAttr, node);
       return success();
@@ -4081,10 +4450,17 @@ private:
           failed(value))
         return scatter.emitOpError(
             "scatter-reduce physical relation is unavailable");
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return scatter.emitOpError(
+            "scatter-reduce resource bounds cannot be materialized in its value relation");
       OperationState state(location, gpu::ScatterReduceOp::getOperationName());
       state.addOperands(*resource);
       state.addOperands(*coordinates);
       state.addOperands(*value);
+      if (*valid)
+        state.addOperands(*valid);
       state.addAttribute("source_axes", builder.getDenseI64ArrayAttr(*axes));
       state.addAttribute(
           "sharing", gpu::AtomicSharingDomainAttr::get(
@@ -4094,7 +4470,8 @@ private:
                              : gpu::AtomicSharingDomain::ProgramInstance));
       state.addAttribute("operandSegmentSizes",
                          builder.getDenseI32ArrayAttr(
-                             {1, static_cast<int32_t>(coordinates->size()), 1, 0}));
+                             {1, static_cast<int32_t>(coordinates->size()), 1,
+                              static_cast<int32_t>(static_cast<bool>(*valid))}));
       state.addRegion();
       Operation *raw = builder.create(state);
       auto target = cast<gpu::ScatterReduceOp>(raw);
@@ -4121,8 +4498,13 @@ private:
           isa<gpu::ViewType>((*resource).getType())
               ? gpu::AtomicSharingDomain::KernelInvocation
               : gpu::AtomicSharingDomain::ProgramInstance;
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, *result, Value());
+      if (failed(valid))
+        return atomic.emitOpError(
+            "atomic-load resource bounds cannot be materialized in its result relation");
       auto target = builder.create<gpu::AtomicLoadOp>(
-          location, *result, *resource, *coordinates, Value(),
+          location, *result, *resource, *coordinates, *valid,
           atomic.getOrdering(), sharing, *axes);
       mapResults(operation, target);
       return success();
@@ -4144,8 +4526,13 @@ private:
           isa<gpu::ViewType>((*resource).getType())
               ? gpu::AtomicSharingDomain::KernelInvocation
               : gpu::AtomicSharingDomain::ProgramInstance;
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return atomic.emitOpError(
+            "atomic-store resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::AtomicStoreOp>(
-          location, *resource, *coordinates, *value, Value(),
+          location, *resource, *coordinates, *value, *valid,
           atomic.getOrdering(), sharing, *axes);
       if (Attribute node = operation->getAttr("intent.node"))
         target->setAttr(gpu::originAttr, node);
@@ -4171,8 +4558,13 @@ private:
           isa<gpu::ViewType>((*resource).getType())
               ? gpu::AtomicSharingDomain::KernelInvocation
               : gpu::AtomicSharingDomain::ProgramInstance;
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      if (failed(valid))
+        return atomic.emitOpError(
+            "atomic-RMW resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::AtomicRMWOp>(
-          location, *result, *resource, *coordinates, *value, Value(),
+          location, *result, *resource, *coordinates, *value, *valid,
           atomic.getKind(), atomic.getOrdering(), sharing, *axes);
       mapResults(operation, target);
       return success();
@@ -4202,9 +4594,15 @@ private:
           isa<gpu::ViewType>((*resource).getType())
               ? gpu::AtomicSharingDomain::KernelInvocation
               : gpu::AtomicSharingDomain::ProgramInstance;
+      FailureOr<Value> valid = materializeAccessValidity(
+          operation, *resource, *coordinates, *axes, (*expected).getType(),
+          Value());
+      if (failed(valid))
+        return atomic.emitOpError(
+            "compare-exchange resource bounds cannot be materialized in its value relation");
       auto target = builder.create<gpu::AtomicCompareExchangeOp>(
           location, *result, *resource, *coordinates, *expected, *desired,
-          Value(), atomic.getOrdering(), sharing, *axes);
+          *valid, atomic.getOrdering(), sharing, *axes);
       mapResults(operation, target);
       return success();
     }
@@ -4533,8 +4931,18 @@ private:
       if (failed(index) || failed(resource))
         return assumption.emitOpError(
             "in-bounds assertion lost its physical value or resource");
+      index = asLogicalIndex(location, *index);
+      if (failed(index))
+        return assumption.emitOpError(
+            "in-bounds assertion index has no physical logical-index schema");
+      FailureOr<unsigned> axis = physicalResourceAxis(
+          assumption.getView().getType(), (*resource).getType(),
+          assumption.getAxis());
+      if (failed(axis))
+        return assumption.emitOpError(
+            "in-bounds assertion axis has no physical resource mapping");
       auto target = builder.create<gpu::AssumeInBoundsOp>(
-          location, *index, *resource, assumption.getAxis());
+          location, *index, *resource, *axis);
       attachOrigin(operation, target);
       return success();
     }

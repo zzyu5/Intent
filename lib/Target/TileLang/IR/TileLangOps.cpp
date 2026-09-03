@@ -36,6 +36,33 @@ bool isConstantExtent(Attribute attribute, int64_t expected) {
          expression.getValue() == expected;
 }
 
+LogicalResult verifyCopyBoundaryAxes(Operation *owner,
+                                     ArrayRef<int64_t> boundaryAxes,
+                                     ArrayRef<int64_t> copyAxes,
+                                     ArrayAttr bufferShape,
+                                     unsigned viewRank) {
+  llvm::SmallBitVector seen(viewRank);
+  for (int64_t boundaryAxis : boundaryAxes) {
+    if (boundaryAxis < 0 ||
+        boundaryAxis >= static_cast<int64_t>(viewRank) ||
+        seen.test(boundaryAxis))
+      return owner->emitOpError(
+          "boundary axes must be distinct external-view axes");
+    seen.set(boundaryAxis);
+    std::optional<unsigned> bufferAxis;
+    for (auto [axis, viewAxis] : llvm::enumerate(copyAxes))
+      if (viewAxis == boundaryAxis) {
+        bufferAxis = axis;
+        break;
+      }
+    if (!bufferAxis || *bufferAxis >= bufferShape.size() ||
+        isConstantExtent(bufferShape[*bufferAxis], 1))
+      return owner->emitOpError(
+          "boundary axes must be represented by non-unit copy regions");
+  }
+  return success();
+}
+
 bool hasNoStaticQuotientConflict(Attribute quotientAttribute,
                                  Attribute dividendAttribute,
                                  int64_t divisor) {
@@ -128,8 +155,11 @@ LogicalResult CopyInOp::verify() {
       view.getElementType() != buffer.getElementType())
     return emitOpError(
         "requires one source-ordered offset per external view axis");
-  return verifyCopyAxes(*this, getSourceAxes(), view.getRank(),
-                        buffer.getShape().size());
+  if (failed(verifyCopyAxes(*this, getSourceAxes(), view.getRank(),
+                            buffer.getShape().size())))
+    return failure();
+  return verifyCopyBoundaryAxes(*this, getBoundaryAxes(), getSourceAxes(),
+                                buffer.getShape(), view.getRank());
 }
 
 void CopyInOp::getEffects(
@@ -145,8 +175,11 @@ LogicalResult CopyOutOp::verify() {
       view.getElementType() != buffer.getElementType())
     return emitOpError(
         "requires one destination-ordered offset per external view axis");
-  return verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
-                        buffer.getShape().size());
+  if (failed(verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
+                            buffer.getShape().size())))
+    return failure();
+  return verifyCopyBoundaryAxes(*this, getBoundaryAxes(), getDestinationAxes(),
+                                buffer.getShape(), view.getRank());
 }
 
 void CopyOutOp::getEffects(
@@ -166,8 +199,11 @@ LogicalResult CastCopyOutOp::verify() {
       source == destination)
     return emitOpError(
         "requires a numeric dtype-changing copy with one destination offset per view axis");
-  return verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
-                        buffer.getShape().size());
+  if (failed(verifyCopyAxes(*this, getDestinationAxes(), view.getRank(),
+                            buffer.getShape().size())))
+    return failure();
+  return verifyCopyBoundaryAxes(*this, getBoundaryAxes(), getDestinationAxes(),
+                                buffer.getShape(), view.getRank());
 }
 
 void CastCopyOutOp::getEffects(
