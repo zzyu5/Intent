@@ -18,7 +18,7 @@ namespace {
 
 bool isCoordinateReplayNode(Operation *operation) {
   return isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
-             BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
+             BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp, DimOp,
              MakeRecordOp, ExtractOp, RandomBitsOp>(operation);
 }
 
@@ -2242,10 +2242,10 @@ void PhysicalProgramAnalysis::analyzeReplay(
   if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
     appendUnique(result.contractions, operation);
   if (auto range = dyn_cast<MakeRangeOp>(operation)) {
-    if (insertionAnchor && source && sourceDimension) {
+    if (insertionAnchor && source && sourceDimension &&
+        sourceAxisIdentity(range) == *source) {
       FailureOr<int64_t> dimension = queryRangeDimension(range);
-      if (!(sourceAxisIdentity(range) == *source) || failed(dimension) ||
-          *dimension != *sourceDimension) {
+      if (failed(dimension)) {
         appendUnique(result.blockers, operation);
         result.state = PhysicalFactState::Unknown;
       }

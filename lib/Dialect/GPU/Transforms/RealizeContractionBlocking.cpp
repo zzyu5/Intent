@@ -375,7 +375,7 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
     Operation *producer = value.getDefiningOp();
     if (!producer || producer->getNumRegions() != 0 ||
         producer->getNumResults() != 1 ||
-        (!isa<arith::ConstantOp, DimOp>(producer) &&
+        (!isa<arith::ConstantOp>(producer) &&
          !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
                                /*allowAccesses=*/true)))
       return failure();
@@ -658,7 +658,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     return failure();
   PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
       value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
+      /*allowAccesses=*/true, insertionAnchor, *dimension);
   if (!replay.isReplayable()) {
     InFlightDiagnostic diagnostic =
         value.getDefiningOp()
@@ -2841,8 +2841,21 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
               outputPredicateType);
         }
       } else {
+        Value originalValidity = path.store.getValid();
+        if (originalValidity) {
+          IRMapping replay;
+          replay.map(rowRange.getResult(), rows);
+          FailureOr<Value> replayed = replaySourceValue(
+              rowBuilder, location, kernel, originalValidity,
+              sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
+              contract.getOperation());
+          if (failed(replayed))
+            return path.store.emitOpError(
+                "blocked contraction could not relocate output validity");
+          originalValidity = *replayed;
+        }
         valid = materializeRetargetedValidity(
-            rowBuilder, location, path.store.getValid(), outputTailRanges,
+            rowBuilder, location, originalValidity, outputTailRanges,
             outputValid, outputPredicateType);
       }
       if (failed(valid))
@@ -3562,8 +3575,20 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
           "blocked scaled-contract output lost source coordinates");
     coordinates[*storeRow] = rows;
     coordinates[*storeColumn] = columns;
+    Value originalValidity = path.store.getValid();
+    if (originalValidity) {
+      IRMapping replay;
+      replay.map(rowRange->getResult(), rows);
+      FailureOr<Value> replayed = replaySourceValue(
+          builder, location, kernel, originalValidity,
+          sourceAxisIdentity(*rowMap), unitM, *rowRange, rows, replay,
+          contract.getOperation());
+      if (failed(replayed))
+        return reject("result store validity could not be relocated");
+      originalValidity = *replayed;
+    }
     FailureOr<Value> valid = materializeRetargetedValidity(
-        builder, location, path.store.getValid(), outputTailRanges,
+        builder, location, originalValidity, outputTailRanges,
         outputValid, outputPredicateType);
     if (failed(valid))
       return reject("result store residual validity could not be retargeted");
