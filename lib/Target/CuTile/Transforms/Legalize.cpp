@@ -198,9 +198,18 @@ FailureOr<SmallVector<Value>> materializeCoordinateDomains(
   return results;
 }
 
-FailureOr<Value> scalarFill(Operation *owner, Value fill) {
+bool sameScalarFill(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  auto lhsConstant = lhs.getDefiningOp<arith::ConstantOp>();
+  auto rhsConstant = rhs.getDefiningOp<arith::ConstantOp>();
+  return lhsConstant && rhsConstant && lhs.getType() == rhs.getType() &&
+         lhsConstant.getValue() == rhsConstant.getValue();
+}
+
+Value uniformScalarFill(Value fill) {
   if (!fill)
-    return Value();
+    return fill;
   while (isa<gpu::FragmentType>(fill.getType())) {
     if (auto splat = fill.getDefiningOp<gpu::SplatOp>()) {
       fill = splat.getValue();
@@ -210,10 +219,22 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
       fill = broadcast.getValue();
       continue;
     }
-    break;
+    if (auto select = fill.getDefiningOp<gpu::SelectOp>()) {
+      Value trueFill = uniformScalarFill(select.getTrueValue());
+      Value falseFill = uniformScalarFill(select.getFalseValue());
+      return trueFill && falseFill && sameScalarFill(trueFill, falseFill)
+                 ? trueFill
+                 : Value();
+    }
+    return Value();
   }
-  if (!isa<gpu::FragmentType>(fill.getType()))
-    return fill;
+  return fill;
+}
+
+FailureOr<Value> scalarFill(Operation *owner, Value fill) {
+  Value scalar = uniformScalarFill(fill);
+  if (!fill || scalar)
+    return scalar;
   return owner->emitOpError(
       "cuTile gather padding must be an explicit scalar or splat");
 }
