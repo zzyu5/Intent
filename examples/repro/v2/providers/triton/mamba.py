@@ -127,6 +127,7 @@ def mamba3_step(context: Context) -> PreparedComparison:
             Tolerance(atol=5e-3, rtol=5e-2),
         ),
         cuda_graph=False,
+        status="source_semantics_gap",
     )
 
 
@@ -231,6 +232,7 @@ def mamba3_siso_forward(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=1e-1, rtol=5e-2),
         cuda_graph=False,
+        status="source_semantics_gap",
     )
 
 

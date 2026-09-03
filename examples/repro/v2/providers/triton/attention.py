@@ -480,6 +480,7 @@ def paged_mla(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=5e-2),
         cuda_graph=False,
+        status="source_abi_gap",
     )
 
 
@@ -586,6 +587,7 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=5e-2),
         cuda_graph=False,
+        status="source_abi_gap",
     )
 
 

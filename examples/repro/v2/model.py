@@ -30,6 +30,7 @@ class PreparedComparison:
     source: PreparedLaunch
     tolerance: Tolerance | tuple[Tolerance, ...]
     cuda_graph: bool
+    status: str = "pass"
 
 
 @dataclass(frozen=True)

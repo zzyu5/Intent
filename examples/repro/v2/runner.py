@@ -120,7 +120,7 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
 
     ratio = generated_p50 / source_p50
     print(
-        f"{provider}:{entry.kernel}: pass "
+        f"{provider}:{entry.kernel}: {comparison.status} "
         f"generated={generated_p50:.6f} ms source={source_p50:.6f} ms ratio={ratio:.6f}"
     )
     return ResultRow(
@@ -129,7 +129,7 @@ def _run_entry(provider: str, compiler: str, entry) -> ResultRow:
         generated_p50,
         source_p50,
         ratio,
-        "pass",
+        comparison.status,
     )
 
 
