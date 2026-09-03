@@ -58,7 +58,7 @@
 
 # 待解决问题
 
-- [blocking] CONFIRM: A1-A3 保持原确认范围；A4 恢复为双机完整真实运行与可归因终态，对可比项记录数值和 ratio、以默认 config 1.1× 为目标并调查明显异常，对 source resource/compatibility、整体 timeout 或 measurement gap 如实记录而不伪造 ratio；非目标不变。
+无。
 
 # 验证预期
 
