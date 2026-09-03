@@ -50,14 +50,15 @@ std::string pythonType(Type type, bool torch = false) {
 
 std::string expressionString(gpu::PhysicalExprAttr expression,
                              bool configContext,
-                             const llvm::StringSet<> *fullCoverage = nullptr) {
+                             const llvm::StringSet<> *fullCoverage = nullptr,
+                             StringRef configName = "cfg") {
   auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
   if (kind == gpu::PhysicalExprKind::Constant)
     return std::to_string(expression.getValue());
   if (kind == gpu::PhysicalExprKind::Parameter) {
     StringRef name = expression.getSymbol().getValue();
     return configContext && (!fullCoverage || !fullCoverage->contains(name))
-               ? ("cfg." + name).str()
+               ? (Twine(configName) + "." + name).str()
                : name.str();
   }
   if (kind == gpu::PhysicalExprKind::Dimension ||
@@ -66,7 +67,8 @@ std::string expressionString(gpu::PhysicalExprAttr expression,
   SmallVector<std::string> operands;
   for (Attribute operand : expression.getOperands())
     operands.push_back(expressionString(cast<gpu::PhysicalExprAttr>(operand),
-                                        configContext, fullCoverage));
+                                        configContext, fullCoverage,
+                                        configName));
   if (kind == gpu::PhysicalExprKind::Add)
     return "(" + operands[0] + " + " + operands[1] + ")";
   if (kind == gpu::PhysicalExprKind::Subtract)
@@ -413,36 +415,61 @@ private:
                "\")",
            2);
     }
-    std::string key = "key = (";
+
+    llvm::StringSet<> occupiedNames;
+    for (const ViewABI &view : views)
+      occupiedNames.insert(view.name);
+    for (const ScalarABI &scalar : scalars)
+      occupiedNames.insert(scalar.name);
+    for (const MetadataABI &metadata : metadataArguments)
+      occupiedNames.insert(metadata.name);
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      occupiedNames.insert(parameter.getParameter().getName().getValue());
+    });
+    auto freshName = [&](StringRef stem) {
+      std::string candidate = stem.str();
+      unsigned suffix = 0;
+      while (!occupiedNames.insert(candidate).second)
+        candidate = (Twine(stem) + "_" + Twine(++suffix)).str();
+      return candidate;
+    };
+    std::string tuneKeyName = freshName("_intent_tune_key");
+    std::string streamName = freshName("_intent_stream");
+    std::string searchResultName = freshName("_intent_search_result");
+    std::string configName = freshName("_intent_cfg");
+
+    std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
       key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
              view.name + ".device), ";
     for (const ScalarABI &scalar : scalars)
       key += scalar.name + ", ";
     line(key + ")", 1);
-    line("stream = torch.cuda.current_stream()", 1);
-    line("if key not in _TUNE_CACHE:", 1);
+    line(streamName + " = torch.cuda.current_stream()", 1);
+    line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-    std::string grid = "lambda cfg: (";
+    std::string grid = "lambda " + configName + ": (";
     for (Attribute extent : space)
       grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
-                               &fullCoverageParameterNames) +
+                               &fullCoverageParameterNames, configName) +
               ", ";
     grid += "1, 1)";
-    line("result = exhaustive_search(_CONFIGS, stream, " + grid +
-             ", _intent_kernel, lambda cfg: (" + joinKernelArguments("cfg") +
-             "), quiet=True)",
+    line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
+             ", " + grid + ", _intent_kernel, lambda " + configName +
+             ": (" + joinKernelArguments(configName) + "), quiet=True)",
          2);
-    line("_TUNE_CACHE[key] = result.best.config", 2);
-    line("cfg = _TUNE_CACHE[key]", 1);
+    line("_TUNE_CACHE[" + tuneKeyName + "] = " + searchResultName +
+             ".best.config",
+         2);
+    line(configName + " = _TUNE_CACHE[" + tuneKeyName + "]", 1);
     std::string launchGrid = "(";
     for (Attribute extent : space)
       launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
-                                     &fullCoverageParameterNames) +
+                                     &fullCoverageParameterNames, configName) +
                     ", ";
     launchGrid += "1, 1)";
-    line("return ct.launch(stream, " + launchGrid + ", _intent_kernel, (" +
-             joinKernelArguments("cfg") + "))",
+    line("return ct.launch(" + streamName + ", " + launchGrid +
+             ", _intent_kernel, (" + joinKernelArguments(configName) + "))",
          1);
     output << "\n";
   }
