@@ -403,6 +403,11 @@ void bindClonedOperationTypes(Operation *root,
       result.setType(replacement);
     }
     if (auto range = dyn_cast<MakeRangeOp>(operation)) {
+      bool coveredItsLocalDomain =
+          samePhysicalScalarExpression(range.getStart(),
+                                       range.getLogicalStart()) &&
+          samePhysicalScalarExpression(range.getExtent(),
+                                       range.getLogicalStop());
       auto fragment = cast<FragmentType>(range.getResult().getType());
       auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
       OpBuilder builder(range);
@@ -415,6 +420,8 @@ void bindClonedOperationTypes(Operation *root,
         physicalExtent = builder.create<PhysicalExprOp>(
             range.getLoc(), builder.getIndexType(), extent);
       range.getExtentMutable().assign(physicalExtent);
+      if (coveredItsLocalDomain)
+        range->setOperand(4, physicalExtent);
     }
     for (Region &region : operation->getRegions())
       for (Block &block : region) {

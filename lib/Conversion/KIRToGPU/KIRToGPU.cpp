@@ -2614,7 +2614,14 @@ private:
           operation->getOperand(0).getType(), resource.getType(), sourceAxis);
       if (failed(physicalSourceAxis) || *physicalSourceAxis >= proven.size())
         return {};
-      if (term.getKind() == 2 && source &&
+      if (term.getKind() == 0 && isa<gpu::FragmentType>(resource.getType())) {
+        // A full slice of an already materialized fragment addresses its
+        // complete physical value. Any logical tail was resolved when that
+        // value was produced; rebuilding a resource bound from its
+        // construction-time extent creates a competing validity relation when
+        // pointwise ownership later widens the fragment.
+        proven[*physicalSourceAxis] = true;
+      } else if (term.getKind() == 2 && source &&
                  sourceAxis < static_cast<unsigned>(source.getRank()) &&
                  !source.isDynamicDim(sourceAxis)) {
         int64_t index = term.getStaticValues()[0];

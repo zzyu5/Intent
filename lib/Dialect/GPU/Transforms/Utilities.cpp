@@ -2396,6 +2396,11 @@ static void retargetExtent(Value root, AxisSelector selects,
         // decision; leaving the operand behind creates two executable
         // authorities for one traversal.
         if (auto range = value.getDefiningOp<MakeRangeOp>()) {
+          bool coveredItsLocalDomain =
+              samePhysicalScalarExpression(range.getStart(),
+                                           range.getLogicalStart()) &&
+              samePhysicalScalarExpression(range.getExtent(),
+                                           range.getLogicalStop());
           OpBuilder builder(range);
           Value physicalExtent;
           if (extent.getKind() ==
@@ -2406,6 +2411,8 @@ static void retargetExtent(Value root, AxisSelector selects,
             physicalExtent = builder.create<PhysicalExprOp>(
                 range.getLoc(), builder.getIndexType(), extent);
           range->setOperand(1, physicalExtent);
+          if (coveredItsLocalDomain)
+            range->setOperand(4, physicalExtent);
         }
       }
     }
