@@ -365,7 +365,8 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             {64, 32, 32, 1, 128, 1, 8},
             {64, 16, 32, 1, 128, 1, 8}};
   if (twoAxisPointwise && fixedPointwiseLocal)
-    return {{8, 2, 32, 1, 128, 1, 8},
+    return {{1, 1, 32, 1, 128, 1, 8},
+            {8, 2, 32, 1, 128, 1, 8},
             {8, 4, 32, 1, 128, 1, 8},
             {4, 4, 32, 1, 128, 1, 8},
             {16, 2, 32, 1, 128, 1, 8}};
