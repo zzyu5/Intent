@@ -33,8 +33,8 @@ bool sameLogicalAxis(gpu::FragmentType lhs, unsigned lhsAxis,
                      gpu::FragmentType rhs, unsigned rhsAxis) {
   auto left = dyn_cast<gpu::AxisMapAttr>(lhs.getAxisMaps()[lhsAxis]);
   auto right = dyn_cast<gpu::AxisMapAttr>(rhs.getAxisMaps()[rhsAxis]);
-  return left && right && left.getSourceId() == right.getSourceId() &&
-         left.getSourceAxis() == right.getSourceAxis();
+  return left && right && left.getDimensionId() > 0 &&
+         left.getDimensionId() == right.getDimensionId();
 }
 
 LogicalResult verifyCoordinateDomains(Operation *owner, ValueRange coordinates,
@@ -232,8 +232,13 @@ LogicalResult MMAOp::verify() {
       rhs.getShape()[1] != result.getShape()[1] ||
       !sameLogicalAxis(lhs, 0, result, 0) ||
       !sameLogicalAxis(lhs, 1, rhs, 0) ||
-      !sameLogicalAxis(rhs, 1, result, 1))
-    return emitOpError("requires a canonical [M,K] x [K,N] cuTile MMA form");
+      !sameLogicalAxis(rhs, 1, result, 1)) {
+    InFlightDiagnostic diagnostic =
+        emitOpError("requires a canonical [M,K] x [K,N] cuTile MMA form");
+    diagnostic << "; lhs=" << lhs << "; rhs=" << rhs
+               << "; accumulator=" << accumulator << "; result=" << result;
+    return failure();
+  }
   return success();
 }
 
