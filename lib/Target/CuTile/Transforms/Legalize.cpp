@@ -622,7 +622,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
             gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
             gpu::ExtractOp, gpu::YieldOp, arith::ConstantOp,
-            scf::ForOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(operation))
+            scf::ForOp, scf::IfOp, scf::YieldOp, func::FuncOp,
+            func::ReturnOp>(operation))
       return WalkResult::advance();
     operation->emitOpError("is outside the closed cuTile provider surface");
     return WalkResult::interrupt();

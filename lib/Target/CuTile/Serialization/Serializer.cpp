@@ -492,6 +492,40 @@ private:
     }
   }
 
+  void emitIfBranch(Block &block, ArrayRef<std::string> resultNames) {
+    bool emitted = false;
+    for (Operation &operation : block) {
+      if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
+        if (yield.getOperands().size() != resultNames.size()) {
+          yield.emitOpError(
+              "cuTile if yield/result arity changed after provider legalization");
+          failed = true;
+          continue;
+        }
+        if (resultNames.empty())
+          continue;
+        std::string names;
+        for (auto [index, name] : llvm::enumerate(resultNames)) {
+          if (index)
+            names += ", ";
+          names += name;
+        }
+        line(names + " = " +
+             (yield.getOperands().size() == 1
+                  ? valueString(yield.getOperands().front())
+                  : tuple(yield.getOperands())));
+        emitted = true;
+        continue;
+      }
+      if (isa<func::ReturnOp>(operation))
+        continue;
+      emitOperation(operation);
+      emitted = true;
+    }
+    if (!emitted)
+      line("pass");
+  }
+
   void emitOperation(Operation &operation) {
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       values[constant.getResult()] = literal(constant.getValue());
@@ -828,6 +862,23 @@ private:
       ++indent;
       emitBlock(*loop.getBody(), true, results);
       --indent;
+    } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+      SmallVector<std::string> results;
+      for (Value result : branch.getResults()) {
+        std::string name = newName();
+        values[result] = name;
+        results.push_back(name);
+      }
+      line("if " + valueString(branch.getCondition()) + ":");
+      ++indent;
+      emitIfBranch(branch.getThenRegion().front(), results);
+      --indent;
+      if (!branch.getElseRegion().empty()) {
+        line("else:");
+        ++indent;
+        emitIfBranch(branch.getElseRegion().front(), results);
+        --indent;
+      }
     } else {
       operation.emitOpError("has no terminal cuTile spelling");
       failed = true;
