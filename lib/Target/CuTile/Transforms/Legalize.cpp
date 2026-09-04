@@ -122,6 +122,8 @@ bool isProvably(Value value, int64_t expected) {
   return actual && *actual == expected;
 }
 
+bool valueIsMultipleOf(Value value, Value divisor, unsigned depth = 0);
+
 FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
                            Value extent) {
   std::optional<int64_t> startConstant = constantValue(start);
@@ -155,10 +157,13 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
     }
   }
   auto argument = dyn_cast<BlockArgument>(start);
-  auto loop = argument ? dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp())
-                       : scf::ForOp();
+  auto loop =
+      argument
+          ? dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp())
+          : scf::ForOp();
   if (loop && argument == loop.getInductionVar() &&
-      isProvably(loop.getLowerBound(), 0) && loop.getStep() == extent)
+      gpu::samePhysicalScalarExpression(loop.getStep(), extent) &&
+      valueIsMultipleOf(loop.getLowerBound(), extent))
     return Value(builder.create<gpu::BinaryOp>(
         location, builder.getIndexType(), start, extent,
         BinaryOperator::FloorDivide));
@@ -431,6 +436,36 @@ bool isKnownPositive(Value value) {
   return parameter &&
          llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
                       [](int64_t candidate) { return candidate > 0; });
+}
+
+bool valueIsMultipleOf(Value value, Value divisor, unsigned depth) {
+  if (!value || !divisor || depth >= 32 || !isKnownPositive(divisor))
+    return false;
+  value = stripIndexIdentities(value);
+  divisor = stripIndexIdentities(divisor);
+  if (gpu::samePhysicalScalarExpression(value, divisor) ||
+      isProvably(value, 0))
+    return true;
+  std::optional<int64_t> constant = constantValue(value);
+  std::optional<int64_t> divisorConstant = constantValue(divisor);
+  if (constant && divisorConstant)
+    return *constant % *divisorConstant == 0;
+  auto binary = value.getDefiningOp<gpu::BinaryOp>();
+  if (!binary)
+    return false;
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Add:
+  case BinaryOperator::Subtract:
+  case BinaryOperator::Minimum:
+  case BinaryOperator::Maximum:
+    return valueIsMultipleOf(binary.getLhs(), divisor, depth + 1) &&
+           valueIsMultipleOf(binary.getRhs(), divisor, depth + 1);
+  case BinaryOperator::Multiply:
+    return valueIsMultipleOf(binary.getLhs(), divisor, depth + 1) ||
+           valueIsMultipleOf(binary.getRhs(), divisor, depth + 1);
+  default:
+    return false;
+  }
 }
 
 bool valueUpperBoundedBy(Value value, Value bound, unsigned depth = 0) {
