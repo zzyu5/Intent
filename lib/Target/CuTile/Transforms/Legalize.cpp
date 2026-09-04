@@ -9,6 +9,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <optional>
 
@@ -24,6 +26,11 @@ constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
 constexpr int64_t occupancyCandidates[] = {1, 2, 4};
+
+bool isCuTileProviderRole(gpu::ParameterRole role) {
+  return role == gpu::ParameterRole::ProviderAccessForm ||
+         role == gpu::ParameterRole::ProviderOccupancy;
+}
 
 std::optional<int64_t>
 constantPhysicalExpression(gpu::PhysicalExprAttr expression,
@@ -1837,6 +1844,136 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   return success();
 }
 
+LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
+  struct Domain {
+    gpu::ParameterOp parameter;
+    bool provider;
+    bool coverage;
+  };
+
+  llvm::StringMap<gpu::ParameterOp> names;
+  SmallVector<Domain> domains;
+  WalkResult schema = kernel.walk([&](gpu::ParameterOp parameter) {
+    gpu::ParameterAttr definition = parameter.getParameter();
+    StringRef name = definition.getName().getValue();
+    if (!names.try_emplace(name, parameter).second) {
+      parameter.emitOpError("duplicates a cuTile physical parameter");
+      return WalkResult::interrupt();
+    }
+    auto role = static_cast<gpu::ParameterRole>(definition.getRole());
+    bool provider = definition.getCategory() ==
+                    static_cast<uint32_t>(gpu::ParameterCategory::Provider);
+    if (provider != isCuTileProviderRole(role)) {
+      parameter.emitOpError(
+          "cuTile program contains a foreign provider parameter");
+      return WalkResult::interrupt();
+    }
+    if (definition.getCandidates().empty()) {
+      parameter.emitOpError("has an empty cuTile parameter domain");
+      return WalkResult::interrupt();
+    }
+    domains.push_back(
+        {parameter, provider,
+         static_cast<bool>(
+             parameter->getAttr(gpu::coverageDimensionAttr))});
+    return WalkResult::advance();
+  });
+  if (schema.wasInterrupted())
+    return failure();
+
+  auto shared =
+      kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
+  if (!shared || shared.empty())
+    return kernel.emitError(
+        "cuTile legalization requires shared config tuples");
+
+  Builder builder(kernel.getContext());
+  SmallVector<SmallVector<NamedAttribute>> configurations;
+  for (Attribute attribute : shared) {
+    auto tuple = dyn_cast<DictionaryAttr>(attribute);
+    if (!tuple)
+      return kernel.emitError("shared config tuple is malformed");
+    SmallVector<NamedAttribute> bindings;
+    unsigned sharedParameters = 0;
+    for (Domain &domain : domains) {
+      if (domain.provider || domain.coverage)
+        continue;
+      ++sharedParameters;
+      gpu::ParameterAttr definition = domain.parameter.getParameter();
+      auto value = tuple.getAs<IntegerAttr>(definition.getName());
+      if (!value ||
+          !llvm::is_contained(definition.getCandidates().asArrayRef(),
+                              value.getInt()))
+        return kernel.emitError(
+                   "shared config tuple does not bind a cuTile kernel parameter: ")
+               << definition.getName().getValue();
+      bindings.push_back(builder.getNamedAttr(definition.getName(), value));
+    }
+    if (tuple.size() != sharedParameters)
+      return kernel.emitError(
+          "shared config tuple contains a non-kernel binding");
+    configurations.push_back(std::move(bindings));
+  }
+
+  for (Domain &domain : domains) {
+    if (!domain.provider)
+      continue;
+    SmallVector<SmallVector<NamedAttribute>> expanded;
+    gpu::ParameterAttr definition = domain.parameter.getParameter();
+    for (const auto &base : configurations)
+      for (int64_t candidate : definition.getCandidates().asArrayRef()) {
+        SmallVector<NamedAttribute> bindings(base);
+        bindings.push_back(builder.getNamedAttr(
+            definition.getName(), builder.getI64IntegerAttr(candidate)));
+        expanded.push_back(std::move(bindings));
+      }
+    configurations = std::move(expanded);
+  }
+
+  SmallVector<Attribute> encoded;
+  for (const auto &bindings : configurations) {
+    DictionaryAttr candidate = builder.getDictionaryAttr(bindings);
+    if (!llvm::is_contained(encoded, Attribute(candidate)))
+      encoded.push_back(candidate);
+  }
+  if (encoded.empty())
+    return kernel.emitError("cuTile legalization produced no provider config");
+  kernel->setAttr(gpu::cuTileConfigsAttr, builder.getArrayAttr(encoded));
+  return success();
+}
+
+LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
+  llvm::StringMap<gpu::ParameterOp> parameters;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    if (!parameter->hasAttr(gpu::coverageDimensionAttr))
+      parameters.try_emplace(parameter.getParameter().getName().getValue(),
+                             parameter);
+  });
+  auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
+  if (!encoded || encoded.empty())
+    return kernel.emitError(
+        "cuTile legalization did not materialize closed provider configs");
+  llvm::SmallDenseSet<Attribute, 8> unique;
+  for (Attribute attribute : encoded) {
+    auto tuple = dyn_cast<DictionaryAttr>(attribute);
+    if (!tuple || tuple.size() != parameters.size())
+      return kernel.emitError("contains a malformed cuTile provider config");
+    if (!unique.insert(attribute).second)
+      return kernel.emitError("contains a duplicate cuTile provider config");
+    for (NamedAttribute binding : tuple) {
+      auto found = parameters.find(binding.getName().getValue());
+      auto value = dyn_cast<IntegerAttr>(binding.getValue());
+      if (found == parameters.end() || !value ||
+          !llvm::is_contained(
+              found->second.getParameter().getCandidates().asArrayRef(),
+              value.getInt()))
+        return kernel.emitError(
+            "cuTile provider config contains an invalid binding");
+    }
+  }
+  return success();
+}
+
 bool isCuTileScalarType(Type type) {
   if (type.isIndex() ||
       isa<Float16Type, BFloat16Type, Float32Type, Float8E4M3FNType,
@@ -1862,8 +1999,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     auto category =
         static_cast<gpu::ParameterCategory>(schema.getCategory());
     bool provider = category == gpu::ParameterCategory::Provider;
-    bool cuTileProvider = role == gpu::ParameterRole::ProviderAccessForm ||
-                          role == gpu::ParameterRole::ProviderOccupancy;
+    bool cuTileProvider = isCuTileProviderRole(role);
     if (provider != cuTileProvider) {
       parameter.emitOpError(
           "cuTile program contains a foreign provider parameter");
@@ -1905,6 +2041,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     occupancy = parameter;
   });
   if (failed(parameterSchema))
+    return failure();
+  if (failed(verifyClosedConfigs(kernel)))
     return failure();
   if (hasLoopCarriedFragment(kernel) != static_cast<bool>(occupancy))
     return kernel.emitError(
@@ -1995,6 +2133,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel) || failed(formNativeTiles(*kernel)) ||
+      failed(materializeClosedConfigs(*kernel)) ||
       failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

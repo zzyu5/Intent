@@ -144,7 +144,6 @@ bool isOccupancyParameter(gpu::ParameterOp parameter) {
 FailureOr<SmallVector<std::map<std::string, int64_t>>>
 parameterConfigs(func::FuncOp kernel) {
   llvm::StringMap<gpu::ParameterOp> parameters;
-  SmallVector<gpu::ParameterOp> providerParameters;
   WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
     auto role = static_cast<gpu::ParameterRole>(schema.getRole());
@@ -161,60 +160,36 @@ parameterConfigs(func::FuncOp kernel) {
       parameter.emitOpError("duplicates a cuTile physical parameter");
       return WalkResult::interrupt();
     }
-    if (provider)
-      providerParameters.push_back(parameter);
-    if (parameter->hasAttr(gpu::coverageDimensionAttr))
-      return WalkResult::advance();
     return WalkResult::advance();
   });
   if (result.wasInterrupted())
     return failure();
   auto encoded =
-      kernel->getAttrOfType<ArrayAttr>(gpu::sharedConfigTuplesAttr);
+      kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
   if (!encoded || encoded.empty())
-    return kernel.emitError("cuTile source requires shared config tuples");
+    return kernel.emitError("cuTile source requires closed provider configs");
   SmallVector<std::map<std::string, int64_t>> configs;
   for (Attribute attribute : encoded) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
-    if (!tuple)
-      return kernel.emitError("contains a malformed shared config tuple");
+    size_t boundParameters = llvm::count_if(parameters, [](const auto &entry) {
+      return !entry.getValue()->hasAttr(gpu::coverageDimensionAttr);
+    });
+    if (!tuple || tuple.size() != boundParameters)
+      return kernel.emitError("contains a malformed cuTile provider config");
     std::map<std::string, int64_t> config;
     for (NamedAttribute binding : tuple) {
       auto found = parameters.find(binding.getName().getValue());
       auto value = dyn_cast<IntegerAttr>(binding.getValue());
       if (found == parameters.end() || !value ||
           found->second->hasAttr(gpu::coverageDimensionAttr) ||
-          found->second.getParameter().getCategory() ==
-              static_cast<uint32_t>(gpu::ParameterCategory::Provider) ||
           !llvm::is_contained(
               found->second.getParameter().getCandidates().asArrayRef(),
               value.getInt()))
         return kernel.emitError(
-            "shared config tuple contains an invalid cuTile binding");
+            "cuTile provider config contains an invalid binding");
       config[binding.getName().strref().str()] = value.getInt();
     }
-    size_t staticParameters = llvm::count_if(parameters, [](const auto &entry) {
-      gpu::ParameterOp parameter = entry.getValue();
-      return !parameter->hasAttr(gpu::coverageDimensionAttr) &&
-             parameter.getParameter().getCategory() !=
-                 static_cast<uint32_t>(gpu::ParameterCategory::Provider);
-    });
-    if (config.size() != staticParameters)
-      return kernel.emitError(
-          "shared config tuple omits a cuTile kernel parameter");
     configs.push_back(std::move(config));
-  }
-  for (gpu::ParameterOp parameter : providerParameters) {
-    SmallVector<std::map<std::string, int64_t>> expanded;
-    StringRef name = parameter.getParameter().getName().getValue();
-    for (const auto &base : configs)
-      for (int64_t candidate :
-           parameter.getParameter().getCandidates().asArrayRef()) {
-        std::map<std::string, int64_t> config = base;
-        config[name.str()] = candidate;
-        expanded.push_back(std::move(config));
-      }
-    configs = std::move(expanded);
   }
   return configs;
 }
