@@ -8,36 +8,115 @@ STREAMS = 4
 MIX_COMPONENTS = STREAMS * (STREAMS + 2)
 
 
+@intent.fn
+def empty_mhc_gemm_rms_summary(tokens, columns):
+    return I.record(
+        linear=I.zeros((tokens, columns), dtype=I.f32),
+        square_sum=I.zeros((tokens,), dtype=I.f32),
+    )
+
+
+@intent.fn
+def summarize_mhc_gemm_rms_chunk(x_chunk, weight_chunk, coordinates, stop):
+    values = I.transpose(x_chunk, permutation=(1, 0))
+    active = coordinates < stop
+    valid = I.full(values.shape, fill=True, dtype=I.bool) & active[None, :]
+    values = I.mask(values, valid=valid, fill=I.cast(0.0, I.bf16))
+    weight_chunk = I.mask(
+        weight_chunk,
+        valid=active[:, None],
+        fill=I.cast(0.0, I.bf16),
+    )
+    float_values = I.cast(values, I.f32)
+    return I.record(
+        linear=I.contract(
+            values,
+            weight_chunk,
+            reduce=((1, 0),),
+            acc_dtype=I.f32,
+        ),
+        square_sum=I.reduce.sum(
+            float_values * float_values,
+            axis=1,
+            identity=0.0,
+        ),
+    )
+
+
+@intent.fn
+def merge_mhc_gemm_rms_summaries(lhs, rhs):
+    return I.record(
+        linear=lhs.linear + rhs.linear,
+        square_sum=lhs.square_sum + rhs.square_sum,
+    )
+
+
 @intent.kernel
-def mhc_gemm_rms_scale(
+def mhc_gemm_rms_partial(
     x: I.In[I.bf16, ("T", "K")],
     weight: I.In[I.bf16, ("K", "N")],
+    partial_linear: I.Out[I.f32, ("P", "T", "N")],
+    partial_square_sum: I.Out[I.f32, ("P", "T")],
+    P: I.Constexpr[int],
+):
+    _, T, N = partial_linear.shape
+    K = x.shape[1]
+    tokens = I.domain(0, T)
+    columns = I.domain(0, N)
+    reduction_axis = I.domain(0, K)
+    parts = I.domain(0, P)
+    width = (K + P - 1) // P
+    for part in I.parallel(parts):
+        begin = I.minimum(part * width, K)
+        end = I.minimum((part + 1) * width, K)
+        reduction = reduction_axis[begin:end]
+        summary = I.region_fold(
+            source=(
+                I.transpose(x[tokens, reduction], permutation=(1, 0)),
+                weight[reduction, columns],
+                I.indices(reduction),
+            ),
+            axis=0,
+            summarize=summarize_mhc_gemm_rms_chunk,
+            combine=merge_mhc_gemm_rms_summaries,
+            identity=empty_mhc_gemm_rms_summary(T, N),
+            operands=(end,),
+        )
+        partial_linear[part, tokens, columns] = summary.linear
+        partial_square_sum[part, tokens] = summary.square_sum
+
+
+@intent.kernel
+def mhc_gemm_rms_finalize(
+    partial_linear: I.In[I.f32, ("P", "T", "N")],
+    partial_square_sum: I.In[I.f32, ("P", "T")],
     bias: I.In[I.bf16, ("N",)],
     mixed: I.Out[I.bf16, ("T", "N")],
     rms: I.Out[I.f32, ("T", 1)],
+    reduction_size: I.i64,
+    P: I.Constexpr[int],
     STREAMS: I.Constexpr[int],
     ALPHA_PRE: I.Constexpr[float],
     ALPHA_POST: I.Constexpr[float],
     ALPHA_RESIDUAL: I.Constexpr[float],
 ):
-    T, K = x.shape
-    N = weight.shape[1]
+    _, T, N = partial_linear.shape
+    parts = I.domain(0, P)
     tokens = I.domain(0, T)
     columns = I.domain(0, N)
-    reduction = I.domain(0, K)
-    values = I.cast(x[tokens, reduction], I.f32)
+    linear = I.reduce.sum(
+        partial_linear[parts, tokens, columns],
+        axis=0,
+        identity=0.0,
+    )
     square_sum = I.reduce.sum(
-        values * values,
-        axis=1,
-        identity=I.zeros((T,), dtype=I.f32),
+        partial_square_sum[parts, tokens],
+        axis=0,
+        identity=0.0,
     )
-    linear = I.contract(
-        x[tokens, reduction],
-        weight[reduction, columns],
-        reduce=((1, 0),),
-        acc_dtype=I.f32,
+    root_mean_square = I.rsqrt(
+        square_sum / I.cast(reduction_size, I.f32)
     )
-    root_mean_square = I.rsqrt(square_sum / I.cast(K, I.f32))
     column_index = I.indices(columns)
     pre = column_index < STREAMS
     post = (column_index >= STREAMS) & (column_index < 2 * STREAMS)

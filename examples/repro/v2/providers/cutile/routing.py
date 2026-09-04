@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import cuda.tile as ct
 import torch
 
 from kernels.routing.mhc import mhc_apply_residual
-from kernels.routing.mhc import mhc_gemm_rms_scale
+from kernels.routing.mhc import mhc_gemm_rms_finalize
+from kernels.routing.mhc import mhc_gemm_rms_partial
 from kernels.routing.mhc import mhc_sinkhorn
 
 from ...measurement import compile_single
@@ -33,36 +35,108 @@ def gemm_rms_scale(context: Context) -> PreparedComparison:
         (streams * hidden, width), device="cuda", dtype=torch.bfloat16
     )
     bias = torch.randn((width,), device="cuda", dtype=torch.bfloat16)
-    _, generated = compile_single(
+    split_count = 16
+    _, partial = compile_single(
         context,
-        mhc_gemm_rms_scale,
-        (x, weight, bias),
+        mhc_gemm_rms_partial,
+        (x, weight),
+        constexprs={"P": split_count},
+    )
+    partial_linear, partial_square_sum = partial.outputs()
+    _, finalize = compile_single(
+        context,
+        mhc_gemm_rms_finalize,
+        (partial_linear, partial_square_sum, bias, x.shape[1]),
         constexprs={
+            "P": split_count,
             "STREAMS": streams,
             "ALPHA_PRE": 1.0,
             "ALPHA_POST": 1.0,
             "ALPHA_RESIDUAL": 1.0,
         },
     )
+
+    def generated_launch():
+        partial.launch()
+        finalize.launch()
+
+    generated = PreparedLaunch(generated_launch, finalize.outputs)
     source_module = _source(context)
     config = {
         "TILE_SIZE_M": 64,
         "TILE_SIZE_N": 32,
         "TILE_SIZE_K": 64,
-        "SPLIT_K": 4,
+        "SPLIT_K": split_count,
         "GROUP_SIZE_M": 8,
     }
-    source = functional_launch(
-        lambda: source_module.mhc_gemm_rms_scale(
-            x,
-            weight,
-            streams,
-            1.0,
-            1.0,
-            1.0,
-            bias,
-            cfg=config,
+    tile_m = config["TILE_SIZE_M"]
+    tile_n = config["TILE_SIZE_N"]
+    tile_k = config["TILE_SIZE_K"]
+    group_m = config["GROUP_SIZE_M"]
+    row_tiles = (tokens + tile_m - 1) // tile_m
+    column_tiles = (width + tile_n - 1) // tile_n
+    source_partial_linear = torch.empty(
+        (tokens * split_count, width), device="cuda", dtype=torch.float32
+    )
+    source_partial_square_sum = torch.empty(
+        (tokens * split_count, column_tiles),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    source_mixed = torch.empty(
+        (tokens, width), device="cuda", dtype=torch.bfloat16
+    )
+    source_rms = torch.empty(
+        (tokens, 1), device="cuda", dtype=torch.float32
+    )
+
+    def source_launch():
+        ct.launch(
+            torch.cuda.current_stream(),
+            (row_tiles * column_tiles, split_count, 1),
+            source_module._mhc_split_gemm_rms_kernel,
+            (
+                x,
+                weight,
+                source_partial_linear,
+                source_partial_square_sum,
+                tokens,
+                width,
+                x.shape[1],
+                tile_m,
+                tile_n,
+                tile_k,
+                split_count,
+                group_m,
+            ),
         )
+        ct.launch(
+            torch.cuda.current_stream(),
+            (row_tiles, column_tiles, 1),
+            source_module._mhc_finalize_scale_bias_sigmoid_kernel,
+            (
+                source_partial_linear,
+                source_partial_square_sum,
+                source_mixed,
+                source_rms,
+                streams,
+                1.0,
+                1.0,
+                1.0,
+                bias,
+                tokens,
+                width,
+                x.shape[1],
+                tile_m,
+                tile_n,
+                split_count,
+            ),
+        )
+
+    source_launch()
+    source = PreparedLaunch(
+        source_launch,
+        lambda: (source_mixed, source_rms),
     )
     return PreparedComparison(
         generated,
