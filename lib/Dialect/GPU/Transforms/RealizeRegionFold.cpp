@@ -1811,14 +1811,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       fold.getSourceCount() + fold.getIdentityCount());
   FailureOr<PredicatePartition> partition = predicatePartition(
       builder, fold, plans, master, stop, identities, segment.getResult());
-  // The upper bound is valid for every structured fold.  Eliding the predicate
-  // over an all-true prefix clones the summarizer into another loop, so keep a
-  // contraction summarizer as one physical contraction program until its
-  // control-flow variants have a shared blocking realization.
   bool specializePredicatePrefix =
-      succeeded(partition) && partition->prefixSpecializable &&
-      static_cast<ParameterCategory>(fold.getSegment().getCategory()) !=
-          ParameterCategory::RegionContraction;
+      succeeded(partition) && partition->prefixSpecializable;
   Value memberPredicate =
       summaryMembershipPredicate(fold, identities, fold.getSegment());
   if (!memberPredicate)
@@ -1956,7 +1950,14 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   }
 
-  if (emptiness && specializePredicatePrefix &&
+  const bool regionContraction =
+      static_cast<ParameterCategory>(fold.getSegment().getCategory()) ==
+      ParameterCategory::RegionContraction;
+  // A first-member seed introduces a tail-aware access variant before the
+  // remaining contraction segments.  Keep it disabled until those variants
+  // share one native access realization; prefix predicate specialization itself
+  // preserves the segment-owned contraction form.
+  if (emptiness && specializePredicatePrefix && !regionContraction &&
       partition->firstMemberIsActive) {
     stop = partition->effectiveStop;
     Value nonempty = builder.create<CompareOp>(

@@ -1720,32 +1720,51 @@ scf::ForOp enclosingRegionContractionSegment(Operation *operation) {
   return {};
 }
 
+FailureOr<ParameterOp>
+regionContractionParameter(func::FuncOp kernel, PhysicalExprAttr extent) {
+  if (!extent ||
+      extent.getKind() !=
+          static_cast<uint32_t>(PhysicalExprKind::Parameter))
+    return failure();
+  FailureOr<ParameterOp> parameter =
+      queryParameterBySymbol(kernel, extent.getSymbol());
+  if (failed(parameter) ||
+      (*parameter).getParameter().getRole() !=
+          static_cast<uint32_t>(ParameterRole::ScanChunk) ||
+      (*parameter).getParameter().getCategory() !=
+          static_cast<uint32_t>(ParameterCategory::RegionContraction))
+    return failure();
+  return *parameter;
+}
+
 FailureOr<bool> realizeSegmentNativeReduction(ContractOp contract,
                                               func::FuncOp kernel) {
   if (contract.getLhsReductionAxes().size() != 1 ||
       contract.getRhsReductionAxes().size() != 1)
     return false;
-  scf::ForOp segmentLoop =
-      enclosingRegionContractionSegment(contract.getOperation());
-  if (!segmentLoop)
-    return false;
-  ParameterOp segment = segmentLoop.getStep().getDefiningOp<ParameterOp>();
-  StringAttr segmentName = segment.getParameter().getName();
-  auto usesSegment = [&](Value operand, int64_t axis) {
+  auto segmentParameter = [&](Value operand,
+                              int64_t axis) -> FailureOr<ParameterOp> {
     auto fragment = dyn_cast<FragmentType>(operand.getType());
     if (!fragment || axis < 0 ||
         axis >= static_cast<int64_t>(fragment.getShape().size()))
-      return false;
+      return failure();
     auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-    return extent.getKind() ==
-               static_cast<uint32_t>(PhysicalExprKind::Parameter) &&
-           extent.getSymbol() == segmentName;
+    return regionContractionParameter(kernel, extent);
   };
-  if (!usesSegment(contract.getLhs(),
-                   contract.getLhsReductionAxes().front()) ||
-      !usesSegment(contract.getRhs(),
-                   contract.getRhsReductionAxes().front()))
+  FailureOr<ParameterOp> lhsSegment = segmentParameter(
+      contract.getLhs(), contract.getLhsReductionAxes().front());
+  FailureOr<ParameterOp> rhsSegment = segmentParameter(
+      contract.getRhs(), contract.getRhsReductionAxes().front());
+  if (failed(lhsSegment) || failed(rhsSegment) ||
+      *lhsSegment != *rhsSegment)
     return false;
+  scf::ForOp segmentLoop =
+      enclosingRegionContractionSegment(contract.getOperation());
+  if (segmentLoop &&
+      segmentLoop.getStep().getDefiningOp<ParameterOp>() != *lhsSegment)
+    return contract.emitOpError(
+               "reduction extent disagrees with its enclosing region-contraction segment"),
+           failure();
   if (failed(markNativeCoverage(kernel, contract)))
     return failure();
   return true;
@@ -1760,18 +1779,56 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   LoadOp rhsLoad = matrixOperandLoad(contract.getRhs());
   if (!lhsLoad || !rhsLoad)
     return false;
+  bool inconsistentSegment = false;
+  auto operandSegment = [&](Value operand) {
+    ParameterOp result;
+    auto fragment = dyn_cast<FragmentType>(operand.getType());
+    if (!fragment)
+      return result;
+    for (Attribute attribute : fragment.getShape()) {
+      auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+      FailureOr<ParameterOp> parameter =
+          regionContractionParameter(kernel, extent);
+      if (failed(parameter))
+        continue;
+      if (result && result != *parameter) {
+        inconsistentSegment = true;
+        return ParameterOp();
+      }
+      result = *parameter;
+    }
+    return result;
+  };
+  ParameterOp lhsSegment = operandSegment(contract.getLhs());
+  ParameterOp rhsSegment = operandSegment(contract.getRhs());
+  if (inconsistentSegment)
+    return contract.emitOpError(
+               "operand carries multiple region-contraction segment parameters"),
+           failure();
+  if (static_cast<bool>(lhsSegment) == static_cast<bool>(rhsSegment))
+    return false;
+  ParameterOp segment = lhsSegment ? lhsSegment : rhsSegment;
   scf::ForOp segmentLoop =
       enclosingRegionContractionSegment(contract.getOperation());
-  if (!segmentLoop)
-    return false;
+  if (segmentLoop &&
+      segmentLoop.getStep().getDefiningOp<ParameterOp>() != segment)
+    return contract.emitOpError(
+               "operand extent disagrees with its enclosing region-contraction segment"),
+           failure();
 
-  DominanceInfo dominance(kernel);
-  bool lhsInvariant = dominance.dominates(lhsLoad.getOperation(),
-                                          segmentLoop.getOperation());
-  bool rhsInvariant = dominance.dominates(rhsLoad.getOperation(),
-                                          segmentLoop.getOperation());
-  if (lhsInvariant == rhsInvariant)
-    return false;
+  bool lhsInvariant = !lhsSegment;
+  bool rhsInvariant = !rhsSegment;
+  if (segmentLoop) {
+    DominanceInfo dominance(kernel);
+    bool lhsDominates = dominance.dominates(lhsLoad.getOperation(),
+                                            segmentLoop.getOperation());
+    bool rhsDominates = dominance.dominates(rhsLoad.getOperation(),
+                                            segmentLoop.getOperation());
+    if (lhsDominates != lhsInvariant || rhsDominates != rhsInvariant)
+      return contract.emitOpError(
+                 "typed segment ownership disagrees with lexical load invariance"),
+             failure();
+  }
 
   Value invariant = lhsInvariant ? contract.getLhs() : contract.getRhs();
   unsigned reductionAxis = static_cast<unsigned>(
