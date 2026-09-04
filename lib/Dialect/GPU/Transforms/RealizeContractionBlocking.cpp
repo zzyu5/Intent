@@ -877,6 +877,172 @@ LogicalResult normalizeMatrixContractForms(func::FuncOp kernel) {
     if (contract.getLhsReductionAxes().size() != 1 ||
         contract.getRhsReductionAxes().size() != 1)
       continue;
+    // A rank-lifted outer ownership axis can sit beside a logical unit free
+    // axis introduced by reshape (for example [H, 1, K]).  The unit carries no
+    // independent matrix work.  Squeeze it, perform the canonical matrix
+    // contraction, and restore the logical result shape afterwards.  This
+    // keeps the outer axis as M/N rather than degrading it into a batch of
+    // one-row contractions.
+    if (contract.getLhsBatchAxes().empty() &&
+        contract.getRhsBatchAxes().empty()) {
+      auto freeAxes = [](FragmentType type, ArrayRef<int64_t> reduction) {
+        SmallVector<unsigned> result;
+        for (unsigned axis = 0; axis < type.getShape().size(); ++axis)
+          if (!llvm::is_contained(reduction, static_cast<int64_t>(axis)))
+            result.push_back(axis);
+        return result;
+      };
+      auto unitAxis = [](Attribute attribute) {
+        auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+        return extent &&
+               extent.getKind() ==
+                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+               extent.getValue() == 1;
+      };
+      auto lhs = contract.getLhs().getType();
+      auto rhs = contract.getRhs().getType();
+      SmallVector<unsigned> lhsFree =
+          freeAxes(lhs, contract.getLhsReductionAxes());
+      SmallVector<unsigned> rhsFree =
+          freeAxes(rhs, contract.getRhsReductionAxes());
+      SmallVector<unsigned> lhsErased;
+      SmallVector<unsigned> rhsErased;
+      if (lhsFree.size() > 1)
+        for (unsigned axis : lhsFree)
+          if (unitAxis(lhs.getShape()[axis]))
+            lhsErased.push_back(axis);
+      if (rhsFree.size() > 1)
+        for (unsigned axis : rhsFree)
+          if (unitAxis(rhs.getShape()[axis]))
+            rhsErased.push_back(axis);
+      const size_t lhsRemaining = lhsFree.size() - lhsErased.size();
+      const size_t rhsRemaining = rhsFree.size() - rhsErased.size();
+      if ((!lhsErased.empty() || !rhsErased.empty()) && lhsRemaining == 1 &&
+          rhsRemaining == 1) {
+        auto eraseAxes = [&](FragmentType source,
+                             ArrayRef<unsigned> erased) {
+          SmallVector<Attribute> shape;
+          SmallVector<Attribute> mappings;
+          for (auto [axis, extent] : llvm::enumerate(source.getShape())) {
+            if (llvm::is_contained(erased, axis))
+              continue;
+            shape.push_back(extent);
+            auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[axis]);
+            mappings.push_back(AxisMapAttr::get(
+                source.getContext(), mapping.getSourceId(),
+                mapping.getSourceAxis(), mapping.getDimensionId(),
+                mappings.size(), mapping.getDerived()));
+          }
+          return FragmentType::get(
+              source.getContext(), source.getElementType(),
+              ArrayAttr::get(source.getContext(), shape),
+              ArrayAttr::get(source.getContext(), mappings),
+              source.getValidity(), source.getOwner());
+        };
+        auto remap = [](ArrayRef<int64_t> axes,
+                        ArrayRef<unsigned> erased) {
+          SmallVector<int64_t> result;
+          for (int64_t axis : axes) {
+            int64_t shift = llvm::count_if(erased, [&](unsigned removed) {
+              return removed < static_cast<unsigned>(axis);
+            });
+            result.push_back(axis - shift);
+          }
+          return result;
+        };
+        SmallVector<unsigned> resultErased;
+        for (auto [position, axis] : llvm::enumerate(lhsFree))
+          if (llvm::is_contained(lhsErased, axis))
+            resultErased.push_back(position);
+        for (auto [position, axis] : llvm::enumerate(rhsFree))
+          if (llvm::is_contained(rhsErased, axis))
+            resultErased.push_back(lhsFree.size() + position);
+
+        FragmentType originalResult = contract.getResult().getType();
+        FragmentType squeezedLhs = eraseAxes(lhs, lhsErased);
+        FragmentType squeezedRhs = eraseAxes(rhs, rhsErased);
+        FragmentType squeezedResult = eraseAxes(originalResult, resultErased);
+        OpBuilder builder(contract);
+        auto eraseRelation = [&](unsigned sourceRank,
+                                 ArrayRef<unsigned> erased) {
+          SmallVector<Attribute> groups;
+          unsigned resultAxis = 0;
+          for (unsigned sourceAxis = 0; sourceAxis < sourceRank; ++sourceAxis) {
+            SmallVector<int64_t> resultAxes;
+            if (!llvm::is_contained(erased, sourceAxis))
+              resultAxes.push_back(resultAxis++);
+            groups.push_back(ReshapeGroupAttr::get(
+                contract.getContext(),
+                DenseI64ArrayAttr::get(
+                    contract.getContext(),
+                    {static_cast<int64_t>(sourceAxis)}),
+                DenseI64ArrayAttr::get(contract.getContext(), resultAxes)));
+          }
+          return ArrayAttr::get(contract.getContext(), groups);
+        };
+        auto reshapeTo = [&](Value value, FragmentType target,
+                             ArrayRef<unsigned> erased) -> FailureOr<Value> {
+          auto source = dyn_cast<FragmentType>(value.getType());
+          if (!source)
+            return failure();
+          if (source == target)
+            return value;
+          auto reshape = builder.create<ReshapeOp>(
+              contract.getLoc(), target, value,
+              eraseRelation(source.getShape().size(), erased));
+          if (Attribute origin = contract->getAttr(originAttr))
+            reshape->setAttr(originAttr, origin);
+          return reshape.getResult();
+        };
+        FailureOr<Value> normalizedLhs =
+            reshapeTo(contract.getLhs(), squeezedLhs, lhsErased);
+        FailureOr<Value> normalizedRhs =
+            reshapeTo(contract.getRhs(), squeezedRhs, rhsErased);
+        FailureOr<Value> normalizedAccumulator =
+            reshapeTo(contract.getAccumulator(), squeezedResult, resultErased);
+        if (failed(normalizedLhs) || failed(normalizedRhs) ||
+            failed(normalizedAccumulator))
+          return contract.emitOpError(
+              "cannot squeeze logical unit free axes for matrix ownership");
+        contract->setOperand(0, *normalizedLhs);
+        contract->setOperand(1, *normalizedRhs);
+        contract->setOperand(2, *normalizedAccumulator);
+        contract->setAttr(
+            "lhs_reduction_axes",
+            builder.getDenseI64ArrayAttr(
+                remap(contract.getLhsReductionAxes(), lhsErased)));
+        contract->setAttr(
+            "rhs_reduction_axes",
+            builder.getDenseI64ArrayAttr(
+                remap(contract.getRhsReductionAxes(), rhsErased)));
+        contract.getResult().setType(squeezedResult);
+
+        SmallVector<Attribute> restoredGroups;
+        unsigned sourceAxis = 0;
+        for (unsigned resultAxis = 0;
+             resultAxis < originalResult.getShape().size(); ++resultAxis) {
+          SmallVector<int64_t> sourceAxes;
+          if (!llvm::is_contained(resultErased, resultAxis))
+            sourceAxes.push_back(sourceAxis++);
+          restoredGroups.push_back(ReshapeGroupAttr::get(
+              contract.getContext(),
+              DenseI64ArrayAttr::get(contract.getContext(), sourceAxes),
+              DenseI64ArrayAttr::get(
+                  contract.getContext(),
+                  {static_cast<int64_t>(resultAxis)})));
+        }
+        builder.setInsertionPointAfter(contract);
+        auto restored = builder.create<ReshapeOp>(
+            contract.getLoc(), originalResult, contract.getResult(),
+            ArrayAttr::get(contract.getContext(), restoredGroups));
+        if (Attribute origin = contract->getAttr(originAttr))
+          restored->setAttr(originAttr, origin);
+        contract.getResult().replaceUsesWithIf(
+            restored.getResult(), [&](OpOperand &use) {
+              return use.getOwner() != restored.getOperation();
+            });
+      }
+    }
     auto lhs = contract.getLhs().getType();
     auto rhs = contract.getRhs().getType();
     unsigned lhsRank = lhs.getShape().size();
@@ -1036,7 +1202,41 @@ bool collectStorePaths(Value value, SmallVector<CastOp> casts,
   return !paths.empty();
 }
 
+bool isTransparentMatrixReshape(ReshapeOp reshape) {
+  auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
+  auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
+  if (!source || !target || source.getElementType() != target.getElementType())
+    return false;
+  auto projectedAxes = [](FragmentType type) {
+    SmallVector<std::pair<PhysicalSourceAxis, Attribute>> axes;
+    for (auto [extent, mapping] :
+         llvm::zip(type.getShape(), type.getAxisMaps())) {
+      auto axis = cast<AxisMapAttr>(mapping);
+      auto expression = cast<PhysicalExprAttr>(extent);
+      bool introducedUnit =
+          axis.getDerived() &&
+          expression.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          expression.getValue() == 1;
+      if (!introducedUnit)
+        axes.emplace_back(sourceAxisIdentity(axis), extent);
+    }
+    return axes;
+  };
+  return projectedAxes(source) == projectedAxes(target);
+}
+
+Value stripTransparentMatrixReshapes(Value value) {
+  while (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+    if (!isTransparentMatrixReshape(reshape))
+      break;
+    value = reshape.getValue();
+  }
+  return value;
+}
+
 LoadOp matrixOperandLoad(Value value) {
+  value = stripTransparentMatrixReshapes(value);
   if (auto load = value.getDefiningOp<LoadOp>())
     return load;
   auto transpose = value.getDefiningOp<TransposeOp>();
@@ -1053,7 +1253,8 @@ LoadOp matrixOperandLoad(Value value) {
   if (permutation[penultimate] != static_cast<int64_t>(last) ||
       permutation[last] != static_cast<int64_t>(penultimate))
     return {};
-  return transpose.getValue().getDefiningOp<LoadOp>();
+  return stripTransparentMatrixReshapes(transpose.getValue())
+      .getDefiningOp<LoadOp>();
 }
 
 FailureOr<unsigned> accessCoordinatePosition(LoadOp load,
@@ -1779,45 +1980,74 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   LoadOp rhsLoad = matrixOperandLoad(contract.getRhs());
   if (!lhsLoad || !rhsLoad)
     return false;
-  bool inconsistentSegment = false;
-  auto operandSegment = [&](Value operand) {
-    ParameterOp result;
+  struct SegmentFact {
+    bool present = false;
+    ParameterOp parameter;
+    std::optional<PhysicalSourceAxis> source;
+  };
+  PhysicalProgramAnalysis analysis(kernel);
+  auto operandSegment = [&](Value operand,
+                            ArrayRef<int64_t> reductionAxes)
+      -> FailureOr<SegmentFact> {
+    SegmentFact result;
     auto fragment = dyn_cast<FragmentType>(operand.getType());
     if (!fragment)
-      return result;
-    for (Attribute attribute : fragment.getShape()) {
-      auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+      return failure();
+    for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
+      if (llvm::is_contained(reductionAxes, static_cast<int64_t>(axis)))
+        continue;
+      auto extent = cast<PhysicalExprAttr>(attribute);
       FailureOr<ParameterOp> parameter =
           regionContractionParameter(kernel, extent);
-      if (failed(parameter))
+      PhysicalRangeFact ranges = analysis.axisRanges(operand, axis);
+      bool subregion = llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+        return range->hasAttr(sourceSubregionAttr);
+      });
+      if (failed(parameter) && !subregion)
         continue;
-      if (result && result != *parameter) {
-        inconsistentSegment = true;
-        return ParameterOp();
+      auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+      PhysicalSourceAxis source = sourceAxisIdentity(mapping);
+      if (result.source && !(*result.source == source))
+        return failure();
+      if (succeeded(parameter) && result.parameter &&
+          result.parameter != *parameter)
+        return failure();
+      if (succeeded(parameter))
+        result.parameter = *parameter;
+      result.present = true;
+      result.source = source;
+      if (subregion &&
+          llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+            return !range->hasAttr(sourceSubregionAttr);
+          })) {
+        return failure();
       }
-      result = *parameter;
     }
     return result;
   };
-  ParameterOp lhsSegment = operandSegment(contract.getLhs());
-  ParameterOp rhsSegment = operandSegment(contract.getRhs());
-  if (inconsistentSegment)
+  FailureOr<SegmentFact> lhsSegment = operandSegment(
+      contract.getLhs(), contract.getLhsReductionAxes());
+  FailureOr<SegmentFact> rhsSegment = operandSegment(
+      contract.getRhs(), contract.getRhsReductionAxes());
+  if (failed(lhsSegment) || failed(rhsSegment))
     return contract.emitOpError(
-               "operand carries multiple region-contraction segment parameters"),
+               "operand carries an ambiguous region-contraction segment relation"),
            failure();
-  if (static_cast<bool>(lhsSegment) == static_cast<bool>(rhsSegment))
+  if (lhsSegment->present == rhsSegment->present)
     return false;
-  ParameterOp segment = lhsSegment ? lhsSegment : rhsSegment;
+  SegmentFact &segment = lhsSegment->present ? *lhsSegment : *rhsSegment;
   scf::ForOp segmentLoop =
       enclosingRegionContractionSegment(contract.getOperation());
   if (segmentLoop &&
-      segmentLoop.getStep().getDefiningOp<ParameterOp>() != segment)
+      (!segment.parameter ||
+       segmentLoop.getStep().getDefiningOp<ParameterOp>() !=
+           segment.parameter))
     return contract.emitOpError(
                "operand extent disagrees with its enclosing region-contraction segment"),
            failure();
 
-  bool lhsInvariant = !lhsSegment;
-  bool rhsInvariant = !rhsSegment;
+  bool lhsInvariant = !lhsSegment->present;
+  bool rhsInvariant = !rhsSegment->present;
   if (segmentLoop) {
     DominanceInfo dominance(kernel);
     bool lhsDominates = dominance.dominates(lhsLoad.getOperation(),
@@ -1834,7 +2064,16 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   unsigned reductionAxis = static_cast<unsigned>(
       lhsInvariant ? contract.getLhsReductionAxes().front()
                    : contract.getRhsReductionAxes().front());
-  if (failed(realizeFullCoverageDimension(kernel, invariant, reductionAxis)))
+  auto invariantType = cast<FragmentType>(invariant.getType());
+  auto reductionMapping =
+      cast<AxisMapAttr>(invariantType.getAxisMaps()[reductionAxis]);
+  LoadOp invariantLoad = lhsInvariant ? lhsLoad : rhsLoad;
+  PhysicalAxisProjection loadProjection = queryFragmentAxis(
+      invariantLoad.getResult().getType(),
+      sourceAxisIdentity(reductionMapping));
+  if (!loadProjection.isExact() ||
+      failed(realizeFullCoverageDimension(
+          kernel, invariantLoad.getResult(), loadProjection.fragmentAxis)))
     return contract.emitOpError(
         "structured contraction invariant has no exact full-coverage reduction realization");
   if (failed(markNativeCoverage(kernel, contract)))

@@ -87,6 +87,8 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(refreshReshapeRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignContractValueRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Structured realization replays source slices and may create new gathers.

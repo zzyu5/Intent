@@ -2243,6 +2243,20 @@ bool isCartesianPointwiseValueOp(Operation *operation) {
              CastOp, BitcastOp, LoadOp, GatherOp, RandomBitsOp>(operation);
 }
 
+bool isStructuredFreeAxisValueOp(Operation *operation) {
+  return isCartesianPointwiseValueOp(operation) ||
+         isa<ReshapeOp, TransposeOp, ContractOp, ReduceOp, MakeRecordOp,
+             ExtractOp>(operation);
+}
+
+bool isStaticUnitExtent(Attribute attribute) {
+  auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+  return extent &&
+         extent.getKind() ==
+             static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+         extent.getValue() == 1;
+}
+
 bool supportsCartesianPointwiseValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates) {
   llvm::SmallDenseSet<Value> dependent;
@@ -2278,6 +2292,79 @@ bool supportsCartesianPointwiseValueGraph(
     }
   }
   return true;
+}
+
+/// A structured free workset axis is still lane-wise: it may flow through
+/// pointwise operations, remain free across reductions, and occupy exactly one
+/// operand's free side of an ordinary contraction.  This is the physical form
+/// needed to group independent rows/columns while keeping invariant matrix
+/// operands shared by the group.  It deliberately excludes control flow,
+/// traversal construction, paired/batched dependence, and non-store effects.
+bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
+  llvm::SmallDenseSet<Value> dependent{coordinate.getResult()};
+  SmallVector<Value> worklist{coordinate.getResult()};
+  llvm::SmallPtrSet<Operation *, 32> visited;
+  SmallVector<Operation *> operations;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    for (Operation *user : value.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      operations.push_back(user);
+      if (user->getNumResults() == 0) {
+        if (!isa<StoreOp>(user) || user->getNumRegions() != 0)
+          return false;
+        continue;
+      }
+      if (!isStructuredFreeAxisValueOp(user))
+        return false;
+      for (Value result : user->getResults())
+        if (dependent.insert(result).second)
+          worklist.push_back(result);
+    }
+  }
+
+  auto depends = [&](Value value) { return dependent.contains(value); };
+  bool sawContract = false;
+  bool sawOwnedStore = false;
+  for (Operation *operation : operations) {
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      bool lhs = depends(contract.getLhs());
+      bool rhs = depends(contract.getRhs());
+      if (lhs == rhs || depends(contract.getAccumulator()))
+        return false;
+      sawContract = true;
+      continue;
+    }
+    if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      ValueRange sources =
+          reduce.getInputs().take_front(reduce.getSourceCount());
+      ValueRange boundaries =
+          reduce.getInputs().drop_front(reduce.getSourceCount());
+      if (!llvm::any_of(sources, depends) || llvm::any_of(boundaries, depends))
+        return false;
+      continue;
+    }
+    if (auto gather = dyn_cast<GatherOp>(operation)) {
+      auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+      if (!source || !depends(gather.getSource()) ||
+          llvm::any_of(gather.getCoordinates(), depends))
+        return false;
+      for (int64_t sourceAxis : gather.getSourceAxes())
+        if (sourceAxis < 0 ||
+            sourceAxis >= static_cast<int64_t>(source.getShape().size()) ||
+            !isStaticUnitExtent(source.getShape()[sourceAxis]))
+          return false;
+      continue;
+    }
+    if (auto store = dyn_cast<StoreOp>(operation)) {
+      bool ownedCoordinate = llvm::any_of(store.getCoordinates(), depends);
+      if (!ownedCoordinate || !depends(store.getValue()))
+        return false;
+      sawOwnedStore = true;
+    }
+  }
+  return sawContract && sawOwnedStore;
 }
 
 LogicalResult rankLiftPointwiseValueGraph(
@@ -2332,47 +2419,189 @@ LogicalResult rankLiftPointwiseValueGraph(
         ArrayAttr::get(kernel.getContext(), mappings), /*validity=*/1,
         /*owner=*/1);
   };
-  auto carriesLiftedAxis = [&](FragmentType fragment) {
-    return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
-      auto axis = cast<AxisMapAttr>(attribute);
-      return llvm::any_of(liftedAxes, [&](const auto &lifted) {
-        return sourceAxisIdentity(axis) == sourceAxisIdentity(lifted.second);
+  std::function<Type(Type)> liftedValueType = [&](Type original) -> Type {
+    if (auto fragment = dyn_cast<FragmentType>(original))
+      return liftedType(fragment);
+    if (auto record = dyn_cast<RecordType>(original)) {
+      SmallVector<Attribute> fields;
+      fields.reserve(record.getFieldTypes().size());
+      for (Attribute field : record.getFieldTypes())
+        fields.push_back(TypeAttr::get(
+            liftedValueType(cast<TypeAttr>(field).getValue())));
+      return RecordType::get(kernel.getContext(), record.getFieldNames(),
+                             ArrayAttr::get(kernel.getContext(), fields),
+                             record.getOwner());
+    }
+    if (isa<IntegerType, FloatType, IndexType>(original))
+      return scalarLiftedType(original);
+    return original;
+  };
+  std::function<bool(Type)> carriesLiftedAxis = [&](Type type) {
+    if (auto fragment = dyn_cast<FragmentType>(type))
+      return llvm::any_of(fragment.getAxisMaps(), [&](Attribute attribute) {
+        auto axis = cast<AxisMapAttr>(attribute);
+        return llvm::any_of(liftedAxes, [&](const auto &lifted) {
+          return sourceAxisIdentity(axis) == sourceAxisIdentity(lifted.second);
+        });
       });
-    });
+    if (auto record = dyn_cast<RecordType>(type))
+      return llvm::any_of(record.getFieldTypes(), [&](Attribute field) {
+        return carriesLiftedAxis(cast<TypeAttr>(field).getValue());
+      });
+    return false;
   };
 
   llvm::SmallDenseSet<Value> liftedValues;
   SmallVector<SplatOp> rankLiftedSplats;
+  SmallVector<GatherOp> rankLiftedUnitGathers;
+  auto rememberRankLiftedSplat = [&](SplatOp splat) {
+    if (!llvm::is_contained(rankLiftedSplats, splat))
+      rankLiftedSplats.push_back(splat);
+  };
   for (MakeRangeOp range : liftedRanges)
     liftedValues.insert(range.getResult());
+  auto dependsOnLiftedAxis = [&](Value value) {
+    return liftedValues.contains(value) || carriesLiftedAxis(value.getType());
+  };
+  auto shiftedAxes = [&](ArrayRef<int64_t> axes) {
+    SmallVector<int64_t> shifted;
+    shifted.reserve(axes.size());
+    for (int64_t axis : axes)
+      shifted.push_back(axis + static_cast<int64_t>(liftedAxes.size()));
+    return shifted;
+  };
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (isa<MakeRangeOp>(operation))
       return WalkResult::advance();
     bool dependsOnLiftedRange =
         llvm::any_of(operation->getOperands(), [&](Value operand) {
-          if (liftedValues.contains(operand))
-            return true;
-          auto fragment = dyn_cast<FragmentType>(operand.getType());
-          return fragment && carriesLiftedAxis(fragment);
+          return dependsOnLiftedAxis(operand);
         });
     if (!dependsOnLiftedRange)
       return WalkResult::advance();
     if (operation->getNumResults() == 0)
       return WalkResult::advance();
-    if (!isCartesianPointwiseValueOp(operation) ||
-        operation->getNumRegions() != 0)
+
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      bool lhs = dependsOnLiftedAxis(contract.getLhs());
+      bool rhs = dependsOnLiftedAxis(contract.getRhs());
+      if (lhs == rhs || dependsOnLiftedAxis(contract.getAccumulator()))
+        return WalkResult::interrupt();
+      OpBuilder builder(contract);
+      if (lhs) {
+        contract->setAttr(
+            "lhs_reduction_axes",
+            builder.getDenseI64ArrayAttr(
+                shiftedAxes(contract.getLhsReductionAxes())));
+        contract->setAttr(
+            "lhs_batch_axes",
+            builder.getDenseI64ArrayAttr(
+                shiftedAxes(contract.getLhsBatchAxes())));
+      } else {
+        contract->setAttr(
+            "rhs_reduction_axes",
+            builder.getDenseI64ArrayAttr(
+                shiftedAxes(contract.getRhsReductionAxes())));
+        contract->setAttr(
+            "rhs_batch_axes",
+            builder.getDenseI64ArrayAttr(
+                shiftedAxes(contract.getRhsBatchAxes())));
+      }
+      Type target = liftedValueType(contract.getResult().getType());
+      FailureOr<Value> accumulator = projectPhysicalValueToSchema(
+          builder, contract.getLoc(), contract.getAccumulator(), target);
+      if (failed(accumulator))
+        return WalkResult::interrupt();
+      contract->setOperand(2, *accumulator);
+      contract.getResult().setType(cast<FragmentType>(target));
+      liftedValues.insert(contract.getResult());
+      return WalkResult::advance();
+    }
+    if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      bool sourceDepends = llvm::any_of(
+          reduce.getInputs().take_front(reduce.getSourceCount()),
+          dependsOnLiftedAxis);
+      if (!sourceDepends)
+        return WalkResult::interrupt();
+      reduce->setAttr("axes", DenseI64ArrayAttr::get(
+                                  kernel.getContext(),
+                                  shiftedAxes(reduce.getAxes())));
+      if (!llvm::hasSingleElement(reduce.getCombine()) ||
+          reduce.getCombine().front().getNumArguments() <
+              2 * reduce.getIdentityCount())
+        return WalkResult::interrupt();
+      Block &combine = reduce.getCombine().front();
+      for (auto [index, value] : llvm::enumerate(reduce.getResults())) {
+        value.setType(liftedValueType(value.getType()));
+        combine.getArgument(index).setType(value.getType());
+        combine.getArgument(reduce.getIdentityCount() + index)
+            .setType(value.getType());
+        liftedValues.insert(value);
+      }
+      WalkResult helper = combine.walk([&](Operation *nested) {
+        if (isa<YieldOp>(nested))
+          return WalkResult::advance();
+        if (!isCartesianPointwiseValueOp(nested) ||
+            nested->getNumRegions() != 0)
+          return WalkResult::interrupt();
+        if (auto splat = dyn_cast<SplatOp>(nested);
+            splat && isa<FragmentType>(splat.getValue().getType()))
+          rememberRankLiftedSplat(splat);
+        for (Value value : nested->getResults()) {
+          value.setType(liftedValueType(value.getType()));
+          liftedValues.insert(value);
+        }
+        return WalkResult::advance();
+      });
+      if (helper.wasInterrupted())
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
+    if (auto record = dyn_cast<MakeRecordOp>(operation)) {
+      auto target = cast<RecordType>(liftedValueType(record.getResult().getType()));
+      OpBuilder builder(record);
+      for (auto [index, field] : llvm::enumerate(record.getFields())) {
+        Type fieldType =
+            cast<TypeAttr>(target.getFieldTypes()[index]).getValue();
+        FailureOr<Value> projected = projectPhysicalValueToSchema(
+            builder, record.getLoc(), field, fieldType);
+        if (failed(projected))
+          return WalkResult::interrupt();
+        record->setOperand(index, *projected);
+      }
+      record.getResult().setType(target);
+      liftedValues.insert(record.getResult());
+      return WalkResult::advance();
+    }
+    if (auto gather = dyn_cast<GatherOp>(operation)) {
+      if (dependsOnLiftedAxis(gather.getSource())) {
+        gather->setAttr(
+            "source_axes",
+            DenseI64ArrayAttr::get(
+                kernel.getContext(), shiftedAxes(gather.getSourceAxes())));
+        rankLiftedUnitGathers.push_back(gather);
+      }
+    } else if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+      SmallVector<int64_t> permutation;
+      for (unsigned axis = 0; axis < liftedAxes.size(); ++axis)
+        permutation.push_back(axis);
+      for (int64_t axis : transpose.getPermutation())
+        permutation.push_back(axis + liftedAxes.size());
+      transpose->setAttr(
+          "permutation",
+          DenseI64ArrayAttr::get(kernel.getContext(), permutation));
+    }
+    if (!isStructuredFreeAxisValueOp(operation))
       return WalkResult::interrupt();
     if (auto splat = dyn_cast<SplatOp>(operation);
         splat && isa<FragmentType>(splat.getValue().getType()))
-      rankLiftedSplats.push_back(splat);
+      rememberRankLiftedSplat(splat);
     for (Value value : operation->getResults()) {
-      Type type = value.getType();
-      if (auto fragment = dyn_cast<FragmentType>(type))
-        value.setType(liftedType(fragment));
-      else if (isa<IntegerType, FloatType, IndexType>(type))
-        value.setType(scalarLiftedType(type));
-      else
+      Type lifted = liftedValueType(value.getType());
+      if (lifted == value.getType() &&
+          !isa<FragmentType, RecordType>(lifted))
         return WalkResult::interrupt();
+      value.setType(lifted);
       liftedValues.insert(value);
     }
     return WalkResult::advance();
@@ -2456,7 +2685,112 @@ LogicalResult rankLiftPointwiseValueGraph(
     splat.getResult().replaceAllUsesWith(replacement);
     splat.erase();
   }
+
+  auto scalarIntegerConstant = [](Value value,
+                                  int64_t expected) -> bool {
+    while (true) {
+      if (auto splat = value.getDefiningOp<SplatOp>()) {
+        value = splat.getValue();
+        continue;
+      }
+      if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+        value = broadcast.getValue();
+        continue;
+      }
+      if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
+        value = reshape.getValue();
+        continue;
+      }
+      if (auto cast = value.getDefiningOp<CastOp>()) {
+        value = cast.getValue();
+        continue;
+      }
+      break;
+    }
+    auto constant = value.getDefiningOp<arith::ConstantOp>();
+    if (auto boolean =
+            constant ? dyn_cast<BoolAttr>(constant.getValue()) : BoolAttr())
+      return static_cast<int64_t>(boolean.getValue()) == expected;
+    auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                            : IntegerAttr();
+    return integer && integer.getInt() == expected;
+  };
+  // Gathering every logical unit suffix from a rank-lifted value is a typed
+  // squeeze of those suffix axes.  Keep that fact in shared IR as reshape so
+  // providers do not need a special partial-tile extraction convention.
+  for (GatherOp gather : rankLiftedUnitGathers) {
+    auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+    auto target = dyn_cast<FragmentType>(gather.getResult().getType());
+    if (!source || !target ||
+        (gather.getValid() &&
+         !scalarIntegerConstant(gather.getValid(), 1))) {
+      InFlightDiagnostic diagnostic = gather.emitOpError(
+          "rank-lifted unit gather has no unconditional squeeze relation");
+      diagnostic << "; source=" << gather.getSource().getType()
+                 << "; result=" << gather.getResult().getType();
+      if (gather.getValid()) {
+        diagnostic << "; valid=" << gather.getValid().getType();
+        if (Operation *producer = gather.getValid().getDefiningOp())
+          diagnostic << "; valid_producer=" << producer->getName();
+      }
+      return failure();
+    }
+    for (auto [coordinate, sourceAxis] :
+         llvm::zip(gather.getCoordinates(), gather.getSourceAxes()))
+      if (sourceAxis < 0 ||
+          sourceAxis >= static_cast<int64_t>(source.getShape().size()) ||
+          !isStaticUnitExtent(source.getShape()[sourceAxis]) ||
+          !scalarIntegerConstant(coordinate, 0))
+        return gather.emitOpError(
+            "rank-lifted unit gather selects a non-unit source axis");
+    FailureOr<ArrayAttr> reassociation =
+        inferReshapeReassociation(source, target);
+    if (failed(reassociation))
+      return gather.emitOpError(
+          "rank-lifted unit gather has no exact reshape projection");
+    OpBuilder builder(gather);
+    auto replacement = builder.create<ReshapeOp>(
+        gather.getLoc(), target, gather.getSource(), *reassociation);
+    if (Attribute origin = gather->getAttr(originAttr))
+      replacement->setAttr(originAttr, origin);
+    gather.getResult().replaceAllUsesWith(replacement.getResult());
+    gather.erase();
+  }
   return success();
+}
+
+enum ContractFreeAxisSide : unsigned {
+  ContractFreeAxisNone = 0,
+  ContractFreeAxisLhs = 1,
+  ContractFreeAxisRhs = 2,
+};
+
+unsigned contractFreeAxisSides(func::FuncOp kernel, MakeRangeOp range) {
+  unsigned sides = ContractFreeAxisNone;
+  PhysicalProgramAnalysis analysis(kernel);
+  kernel.walk([&](ContractOp contract) {
+    auto inspect = [&](Value operand, ArrayRef<int64_t> reduction,
+                       ArrayRef<int64_t> batch, unsigned side) {
+      auto fragment = dyn_cast<FragmentType>(operand.getType());
+      if (!fragment)
+        return;
+      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
+        if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
+            llvm::is_contained(batch, static_cast<int64_t>(axis)))
+          continue;
+        PhysicalRangeFact fact = analysis.axisRanges(operand, axis);
+        if (llvm::any_of(fact.roots, [&](MakeRangeOp root) {
+              return sameLogicalRange(root, range);
+            }))
+          sides |= side;
+      }
+    };
+    inspect(contract.getLhs(), contract.getLhsReductionAxes(),
+            contract.getLhsBatchAxes(), ContractFreeAxisLhs);
+    inspect(contract.getRhs(), contract.getRhsReductionAxes(),
+            contract.getRhsBatchAxes(), ContractFreeAxisRhs);
+  });
+  return sides;
 }
 
 } // namespace
@@ -2531,6 +2865,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (supportsCartesianPointwiseValueGraph(candidates))
           lifted = std::move(candidates);
       }
+      if (lifted.empty())
+        for (auto [_, coordinate] : llvm::reverse(uncovered))
+          if (supportsStructuredFreeAxisValueGraph(coordinate)) {
+            lifted.push_back(coordinate);
+            break;
+          }
     }
 
     SmallVector<MakeRangeOp> liftedRanges;
@@ -3711,6 +4051,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
                         [](const auto &lhs, const auto &rhs) {
                           return lhs.first < rhs.first;
                         });
+      llvm::SmallDenseSet<Attribute> structuredWorksetAxes;
+      for (auto [_, axis] : scalarWorksetAxes)
+        if (llvm::any_of(axes.lookup(axis), [&](MakeRangeOp range) {
+              return contractFreeAxisSides(kernel, range) !=
+                     ContractFreeAxisNone;
+            }))
+          structuredWorksetAxes.insert(axis);
 
       llvm::DenseMap<Attribute, int64_t> exactLocalExtents;
       bool exactLocalCoverage = llvm::all_of(
@@ -3738,12 +4085,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
             return true;
           });
 
-      if (scalarWorksetAxes.size() >= 2 && exactLocalCoverage) {
+      if ((scalarWorksetAxes.size() >= 2 ||
+           !structuredWorksetAxes.empty()) &&
+          exactLocalCoverage) {
         // The existing non-workset ranges are exact program-local vectors.  Fix
-        // them to full coverage and spend the two ownership dimensions on the
-        // innermost Cartesian workset axes.  This changes both the fragment
-        // schema and the launch mapping; no provider serializer inference is
-        // involved.
+        // them to full coverage and spend ownership dimensions on either the
+        // two innermost Cartesian workset axes or an explicitly proven
+        // contraction-free workset axis.  This changes both the fragment schema
+        // and the launch mapping; no provider serializer inference is involved.
         for (Attribute axis : internalOwnershipAxes) {
           ParameterOp parameter = parameters.lookup(axis);
           ParameterAttr schema = parameter.getParameter();
@@ -3760,7 +4109,8 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
           internalAxes.insert(axis);
         }
         for (auto [index, entry] : llvm::enumerate(scalarWorksetAxes))
-          if (index + 2 < scalarWorksetAxes.size())
+          if (index + 2 < scalarWorksetAxes.size() &&
+              !structuredWorksetAxes.contains(entry.second))
             ownershipAxes.erase(entry.second);
       } else {
         for (auto [_, axis] : scalarWorksetAxes)
@@ -3809,10 +4159,15 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     ParameterOp parameter = parameters.lookup(axis);
     const bool scalarGridAxis =
         ownershipIndex + 2 < pointwiseOwnershipAxes.size();
-    ParameterRole ownershipRole =
-        !scalarGridAxis && ownershipIndex + 2 == pointwiseOwnershipAxes.size()
-            ? ParameterRole::OwnershipM
-            : ParameterRole::OwnershipN;
+    unsigned contractSides = ContractFreeAxisNone;
+    for (MakeRangeOp range : axes.lookup(axis))
+      contractSides |= contractFreeAxisSides(kernel, range);
+    ParameterRole ownershipRole = ParameterRole::OwnershipN;
+    if (!scalarGridAxis && contractSides == ContractFreeAxisLhs)
+      ownershipRole = ParameterRole::OwnershipM;
+    else if (!scalarGridAxis &&
+             ownershipIndex + 2 == pointwiseOwnershipAxes.size())
+      ownershipRole = ParameterRole::OwnershipM;
     parameter->removeAttr(coverageDimensionAttr);
     DenseI64ArrayAttr candidates;
     if (scalarGridAxis)
