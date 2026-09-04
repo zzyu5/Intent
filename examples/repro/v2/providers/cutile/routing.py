@@ -125,7 +125,17 @@ def sinkhorn(context: Context) -> PreparedComparison:
     logits = torch.randn(
         (tokens, streams, streams), device="cuda", dtype=torch.float32
     )
-    _, generated = compile_single(context, mhc_sinkhorn, (logits,))
+    generated_values = logits.clone()
+    _, generated_call = compile_single(context, mhc_sinkhorn, (generated_values,))
+
+    def prepare_generated():
+        generated_values.copy_(logits)
+
+    generated = PreparedLaunch(
+        launch=generated_call.launch,
+        outputs=lambda: generated_values,
+        prepare=prepare_generated,
+    )
     source_module = _source(context)
     packed = torch.zeros(
         (tokens, streams * (streams + 2)), device="cuda", dtype=torch.float32

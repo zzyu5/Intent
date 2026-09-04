@@ -94,8 +94,7 @@ def mhc_apply_residual(
 
 @intent.kernel
 def mhc_sinkhorn(
-    logits: I.In[I.f32, ("T", "S", "S")],
-    normalized: I.Out[I.f32, ("T", "S", "S")],
+    logits: I.InOut[I.f32, ("T", "S", "S")],
 ):
     T, S, _ = logits.shape
     rows = I.domain(0, S)
@@ -107,7 +106,7 @@ def mhc_sinkhorn(
             matrix = matrix / row_sum[:, None]
             column_sum = I.reduce.sum(matrix, axis=0, identity=0.0)
             matrix = matrix / column_sum[None, :]
-        normalized[token, rows, columns] = matrix
+        logits[token, rows, columns] = matrix
 
 
 @intent.kernel
