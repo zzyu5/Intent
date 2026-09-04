@@ -99,6 +99,8 @@ LogicalResult verifySerializedCoordinateOrder(
 LogicalResult TileLoadOp::verify() {
   auto view = getResource().getType();
   auto result = getResult().getType();
+  if (!getAllowTma().getType().isInteger(1))
+    return emitOpError("allow_tma must be a compile-time i1 access decision");
   if (failed(verifyResourceOrderedTile(*this, view, result,
                                        getTileIndices())))
     return failure();
@@ -114,6 +116,8 @@ void TileLoadOp::getEffects(
 
 LogicalResult TileStoreOp::verify() {
   auto view = getResource().getType();
+  if (!getAllowTma().getType().isInteger(1))
+    return emitOpError("allow_tma must be a compile-time i1 access decision");
   if (failed(verifyResourceOrderedTile(*this, view, getValue().getType(),
                                        getTileIndices())))
     return failure();

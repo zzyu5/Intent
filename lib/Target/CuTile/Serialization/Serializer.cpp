@@ -692,7 +692,8 @@ private:
       std::string call = "ct.load(" + valueString(load.getResource()) +
                          ", index=" + tuple(load.getTileIndices()) +
                          ", shape=" + fragmentShape(load.getResult().getType()) +
-                         ", padding_mode=ct.PaddingMode.ZERO)";
+                         ", padding_mode=ct.PaddingMode.ZERO, allow_tma=" +
+                         valueString(load.getAllowTma()) + ")";
       assign(load.getResult(), call);
     } else if (auto load = dyn_cast<ScalarLoadOp>(operation)) {
       std::string call = "ct.gather(" + valueString(load.getResource()) + ", " +
@@ -875,7 +876,8 @@ private:
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
       line("ct.store(" + valueString(store.getResource()) + ", index=" +
            tuple(store.getTileIndices()) + ", tile=" +
-           valueString(store.getValue()) + ")");
+           valueString(store.getValue()) + ", allow_tma=" +
+           valueString(store.getAllowTma()) + ")");
     } else if (auto store = dyn_cast<ScalarStoreOp>(operation)) {
       std::string call = "ct.scatter(" + valueString(store.getResource()) +
                          ", " + tuple(store.getIndices()) + ", " +
