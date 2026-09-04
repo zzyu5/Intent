@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -1240,6 +1241,45 @@ bool isZeroFill(Value value) {
   return false;
 }
 
+bool isNativeReductionIdentity(BinaryOperator kind, Value identity) {
+  Attribute constant = scalarConstant(identity);
+  if (!constant)
+    return false;
+  if (auto integer = dyn_cast<IntegerAttr>(constant)) {
+    switch (kind) {
+    case BinaryOperator::Add:
+    case BinaryOperator::LogicalOr:
+      return integer.getValue().isZero();
+    case BinaryOperator::LogicalAnd:
+      return integer.getValue().isAllOnes();
+    default:
+      return false;
+    }
+  }
+  auto floating = dyn_cast<FloatAttr>(constant);
+  if (!floating)
+    return false;
+  const llvm::APFloat &value = floating.getValue();
+  if (kind == BinaryOperator::Add)
+    return value.isZero();
+  if (!value.isInfinity())
+    return false;
+  if (kind == BinaryOperator::MaximumNum || kind == BinaryOperator::Maximum)
+    return value.isNegative();
+  if (kind == BinaryOperator::MinimumNum || kind == BinaryOperator::Minimum)
+    return !value.isNegative();
+  return false;
+}
+
+Type withElementType(Type type, Type elementType) {
+  auto fragment = dyn_cast<gpu::FragmentType>(type);
+  if (!fragment)
+    return elementType;
+  return gpu::FragmentType::get(
+      fragment.getContext(), elementType, fragment.getShape(),
+      fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+}
+
 bool physicalExpressionUsesRole(gpu::PhysicalExprAttr expression,
                                 func::FuncOp kernel,
                                 gpu::ParameterRole role,
@@ -1601,7 +1641,9 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
                   reduce.getIdentityCount() == 1 &&
                   reduce.getCaptureCount() == 0 &&
                   reduce.getAxes().size() == 1 &&
-                  reduce.getNumResults() == 1 && kind.has_value();
+                  reduce.getNumResults() == 1 && kind.has_value() &&
+                  isNativeReductionIdentity(
+                      *kind, reduce.getInputs()[reduce.getSourceCount()]);
     if (native) {
       auto source =
           dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
@@ -1611,6 +1653,58 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
       auto replacement = builder.create<ReduceOp>(
           reduce.getLoc(), reduce.getResultTypes().front(),
           reduce.getInputs().front(), reduce.getAxes().front(), *kind);
+      if (Attribute origin = reduce->getAttr(gpu::originAttr))
+        replacement->setAttr(gpu::originAttr, origin);
+      reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
+      reduce.erase();
+      continue;
+    }
+
+    std::optional<BinaryOperator> canonicalKind =
+        gpu::queryBinaryCombineKind(reduce.getCombine());
+    bool propagatingMaximum =
+        reduce.getSourceCount() == 1 && reduce.getIdentityCount() == 1 &&
+        reduce.getCaptureCount() == 0 && reduce.getAxes().size() == 1 &&
+        reduce.getNumResults() == 1 && canonicalKind == BinaryOperator::Maximum &&
+        isNativeReductionIdentity(
+            BinaryOperator::Maximum,
+            reduce.getInputs()[reduce.getSourceCount()]);
+    if (propagatingMaximum) {
+      auto sourceType =
+          dyn_cast<gpu::FragmentType>(reduce.getInputs().front().getType());
+      if (!sourceType || !isa<FloatType>(sourceType.getElementType()))
+        return reduce.emitOpError(
+            "cuTile propagating maximum reduction requires a floating tile");
+      OpBuilder builder(reduce);
+      Location location = reduce.getLoc();
+      Type resultType = reduce.getResultTypes().front();
+      Type sourcePredicateType =
+          withElementType(sourceType, builder.getI1Type());
+      Type resultPredicateType =
+          withElementType(resultType, builder.getI1Type());
+      auto isNan = builder.create<gpu::CompareOp>(
+          location, sourcePredicateType, reduce.getInputs().front(),
+          reduce.getInputs().front(), ComparePredicate::Ne);
+      auto anyNan = builder.create<ReduceOp>(
+          location, resultPredicateType, isNan.getResult(),
+          reduce.getAxes().front(), BinaryOperator::LogicalOr);
+      auto numericMaximum = builder.create<ReduceOp>(
+          location, resultType, reduce.getInputs().front(),
+          reduce.getAxes().front(), BinaryOperator::MaximumNum);
+      auto floatType = cast<FloatType>(sourceType.getElementType());
+      auto nan = builder.create<arith::ConstantOp>(
+          location, floatType,
+          builder.getFloatAttr(
+              floatType,
+              llvm::APFloat::getNaN(floatType.getFloatSemantics())));
+      Value nanValue = nan.getResult();
+      if (isa<gpu::FragmentType>(resultType))
+        nanValue = builder.create<gpu::SplatOp>(location, resultType, nanValue);
+      auto replacement = builder.create<gpu::SelectOp>(
+          location, resultType, anyNan.getResult(), nanValue,
+          numericMaximum.getResult());
+      if (Attribute origin = reduce->getAttr(gpu::originAttr))
+        replacement->setAttr(gpu::originAttr, origin);
       reduce.getResults().front().replaceAllUsesWith(replacement.getResult());
       reduce.erase();
       continue;
