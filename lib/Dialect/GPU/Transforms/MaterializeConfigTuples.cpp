@@ -56,7 +56,7 @@ bool expressionReferencesParameter(PhysicalExprAttr expression,
   });
 }
 
-bool isFixedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
+bool isBlockedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
   auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
   if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
     return false;
@@ -71,15 +71,15 @@ bool isFixedReductionFreeAxis(func::FuncOp kernel, ParameterOp parameter) {
       auto fragment = dyn_cast<FragmentType>(source.getType());
       if (!fragment)
         continue;
-      bool fixedReduction = llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
+      bool blockedReduction = llvm::all_of(reduce.getAxes(), [&](int64_t axis) {
         if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
           return false;
         auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-        return extent.getKind() ==
-                   static_cast<uint32_t>(PhysicalExprKind::Constant) &&
-               extent.getValue() > 0;
+        auto kind = static_cast<PhysicalExprKind>(extent.getKind());
+        return (kind == PhysicalExprKind::Constant && extent.getValue() > 0) ||
+               kind == PhysicalExprKind::Parameter;
       });
-      if (!fixedReduction)
+      if (!blockedReduction)
         continue;
       for (auto [axis, extent] : llvm::enumerate(fragment.getShape())) {
         if (llvm::is_contained(reduce.getAxes(), static_cast<int64_t>(axis)))
@@ -200,7 +200,7 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Execution:
     return TuningClass::Execution;
   case ParameterCategory::Pointwise:
-    return isFixedReductionFreeAxis(kernel, parameter)
+    return isBlockedReductionFreeAxis(kernel, parameter)
                ? TuningClass::PointwiseReduction
                : TuningClass::Pointwise;
   case ParameterCategory::Coverage:
