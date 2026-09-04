@@ -361,6 +361,18 @@ FailureOr<Value> replaySourceValueImpl(OpBuilder &builder, Location location,
                                        DominanceInfo *dominance) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+      Value field = record.getFields()[extract.getField()];
+      FailureOr<Value> replayed = replaySourceValueImpl(
+          builder, location, kernel, field, blockedExtent, roots, replacement,
+          mapping, insertionAnchor, dominance);
+      if (failed(replayed))
+        return failure();
+      mapping.map(value, *replayed);
+      return *replayed;
+    }
+  }
   if (auto range = value.getDefiningOp<MakeRangeOp>())
     if (llvm::any_of(roots, [&](MakeRangeOp root) {
           return range == root || sameLogicalRange(range, root);
@@ -1179,17 +1191,30 @@ bool freeAxesReadyForReductionTraversal(ContractOp contract,
                                         func::FuncOp kernel) {
   PhysicalContractFreeAxisFact freeAxes =
       PhysicalProgramAnalysis(kernel).contractFreeAxes(contract.getOperation());
-  if (!freeAxes.isExact())
+  if (freeAxes.axes.empty())
     return false;
-  return llvm::all_of(freeAxes.axes, [](const PhysicalContractFreeAxis &axis) {
+  return llvm::all_of(freeAxes.axes, [&](const PhysicalContractFreeAxis &axis) {
     if (axis.realization.physicalized)
       return true;
     auto fragment = cast<FragmentType>(axis.operand.getType());
     auto extent = cast<PhysicalExprAttr>(
         fragment.getShape()[axis.operandAxis]);
+    if (extent.getKind() ==
+        static_cast<uint32_t>(PhysicalExprKind::Parameter)) {
+      FailureOr<ParameterOp> parameter =
+          queryParameterBySymbol(kernel, extent.getSymbol());
+      if (failed(parameter))
+        return false;
+      auto role = static_cast<ParameterRole>(
+          parameter->getParameter().getRole());
+      return role == ParameterRole::OwnershipM ||
+             role == ParameterRole::OwnershipN ||
+             role == ParameterRole::FullCoverage;
+    }
     return extent.getKind() ==
                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
            extent.getValue() == 1 &&
+           axis.realization.isExact() &&
            !axis.realization.constructionScalarSeed &&
            axis.realization.roots.empty();
   });
@@ -1760,19 +1785,18 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   return true;
 }
 
-/// Block only the reduction traversal of a contraction whose free axes have
+/// Block only the reduction traversal of a contraction whose result axes have
 /// already been materialized by pointwise ownership.  This form is used when
 /// several contractions feed one pure output expression: each term keeps its
-/// own K loop while the shared M/N tile and final store remain in the ordinary
-/// value graph.
+/// own K loop while the shared free/batch tile and final store remain in the
+/// ordinary value graph.
 LogicalResult realizeReductionTraversal(ContractOp contract,
-                                        func::FuncOp kernel) {
+                                        func::FuncOp kernel,
+                                        SmallVectorImpl<ContractOp> &replayed) {
   if (contract.getLhsReductionAxes().size() != 1 ||
-      contract.getRhsReductionAxes().size() != 1 ||
-      !contract.getLhsBatchAxes().empty() ||
-      !contract.getRhsBatchAxes().empty())
+      contract.getRhsReductionAxes().size() != 1)
     return contract.emitOpError(
-        "reduction-only contraction blocking requires one reduction pair and no batch axes");
+        "reduction-only contraction blocking requires one reduction pair");
 
   FragmentType lhsType = contract.getLhs().getType();
   FragmentType rhsType = contract.getRhs().getType();
@@ -1872,6 +1896,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   OpBuilder builder(contract);
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   bool bodyFailed = false;
+  SmallVector<ContractOp> nativeProducts;
   auto loop = builder.create<scf::ForOp>(
       location, lhsRange.getLogicalStart(), *logicalEnd, blockK.getResult(),
       ValueRange{contract.getAccumulator()},
@@ -1930,6 +1955,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             nestedLocation, resultType, *lhs, *rhs, carries.front(),
             contract.getLhsReductionAxes(), contract.getRhsReductionAxes(),
             contract.getLhsBatchAxes(), contract.getRhsBatchAxes());
+        nativeProducts.push_back(product);
         if (Attribute origin = contract->getAttr(originAttr))
           product->setAttr(originAttr, origin);
         nested.create<scf::YieldOp>(nestedLocation, product.getResult());
@@ -1939,6 +1965,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
     return contract.emitOpError(
         "reduction-only contraction blocking could not replay its load graph");
   }
+  loop.walk([&](ContractOp nested) {
+    if (!llvm::is_contained(nativeProducts, nested))
+      replayed.push_back(nested);
+  });
 
   contract.getResult().replaceAllUsesWith(loop.getResult(0));
   contract.erase();
@@ -3711,8 +3741,6 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
   SmallVector<ContractOp> contracts;
-  SmallVector<SparseContractOp> sparseContracts;
-  SmallVector<ScaledContractOp> scaledContracts;
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   for (ContractOp contract : contracts)
     if (contract.getLhsReductionAxes().size() > 1 &&
@@ -3722,25 +3750,12 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
   kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
   if (failed(normalizeMatrixContractForms(kernel)))
     return failure();
-  contracts.clear();
-  kernel.walk([&](ContractOp contract) { contracts.push_back(contract); });
-  kernel.walk(
-      [&](SparseContractOp contract) { sparseContracts.push_back(contract); });
-  kernel.walk(
-      [&](ScaledContractOp contract) { scaledContracts.push_back(contract); });
-  for (ContractOp contract : contracts)
+  for (size_t contractIndex = 0; contractIndex < contracts.size();
+       ++contractIndex) {
+    ContractOp contract = contracts[contractIndex];
     if (!hasFragmentSchema(contract))
       return contract.emitOpError(
           "shared contraction blocking requires fragment operands and result");
-  for (ScaledContractOp contract : scaledContracts)
-    if (!hasFragmentSchema(contract))
-      return contract.emitOpError(
-          "shared scaled-contraction blocking requires fragment operands, accumulator, and result");
-  for (SparseContractOp contract : sparseContracts)
-    if (!hasFragmentSchema(contract))
-      return contract.emitOpError(
-          "shared sparse-contraction blocking requires fragment operands, metadata, accumulator, and result");
-  for (ContractOp contract : contracts)
     if (requiresPhysicalRealization(contract)) {
       FailureOr<bool> nativeSegment =
           realizeSegmentNativeReduction(contract, kernel);
@@ -3758,14 +3773,14 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
       if (!rangeSingleReduction &&
           contract.getLhsReductionAxes().size() == 1 &&
           contract.getRhsReductionAxes().size() == 1 &&
-          contract.getLhsBatchAxes().empty() &&
-          contract.getRhsBatchAxes().empty() &&
           freeAxesReadyForReductionTraversal(contract, kernel) &&
           hasSelectedFreeAxes(contract) &&
           reductionAxesNeedTraversal(contract, kernel) &&
           hasExplicitPairedReductionRanges(contract)) {
-        if (failed(realizeReductionTraversal(contract, kernel)))
+        SmallVector<ContractOp> replayed;
+        if (failed(realizeReductionTraversal(contract, kernel, replayed)))
           return failure();
+        contracts.append(replayed.begin(), replayed.end());
       } else if (!rangeSingleReduction &&
                  contract.getLhsReductionAxes().size() == 1 &&
                  contract.getRhsReductionAxes().size() == 1 &&
@@ -3786,6 +3801,22 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     } else if (failed(markNativeCoverage(kernel, contract))) {
       return failure();
     }
+  }
+
+  SmallVector<SparseContractOp> sparseContracts;
+  SmallVector<ScaledContractOp> scaledContracts;
+  kernel.walk(
+      [&](SparseContractOp contract) { sparseContracts.push_back(contract); });
+  kernel.walk(
+      [&](ScaledContractOp contract) { scaledContracts.push_back(contract); });
+  for (ScaledContractOp contract : scaledContracts)
+    if (!hasFragmentSchema(contract))
+      return contract.emitOpError(
+          "shared scaled-contraction blocking requires fragment operands, accumulator, and result");
+  for (SparseContractOp contract : sparseContracts)
+    if (!hasFragmentSchema(contract))
+      return contract.emitOpError(
+          "shared sparse-contraction blocking requires fragment operands, metadata, accumulator, and result");
   for (SparseContractOp contract : sparseContracts)
     if (failed(realizeSparseReductionTraversal(contract, kernel)))
       return failure();
