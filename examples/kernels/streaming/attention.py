@@ -550,14 +550,22 @@ def grouped_flash_decode_partials(
                 begin = I.minimum(part * SPLIT_SIZE, K)
                 end = I.minimum(begin + SPLIT_SIZE, K)
                 part_keys = key_axis[begin:end]
-                summary = summarize_attention_chunk_bf16(
-                    k[batch, key_head, part_keys, :],
-                    v[batch, key_head, part_keys, :],
-                    I.indices(part_keys),
-                    query,
-                    I.full((HEAD_GROUP,), fill=0, dtype=I.index),
-                    scale,
-                    False,
+                summary = I.region_fold(
+                    source=(
+                        k[batch, key_head, part_keys, :],
+                        v[batch, key_head, part_keys, :],
+                        I.indices(part_keys),
+                    ),
+                    axis=0,
+                    summarize=summarize_attention_chunk_bf16,
+                    combine=merge_attention_summaries,
+                    identity=empty_attention_summary(local_query_heads, DV),
+                    operands=(
+                        query,
+                        I.full((HEAD_GROUP,), fill=0, dtype=I.index),
+                        scale,
+                        False,
+                    ),
                 )
                 safe_denominator = I.select(
                     summary.valid,
