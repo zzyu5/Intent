@@ -1942,8 +1942,25 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     // record field.  MakeRecord and structured fold/scan verifiers in turn
     // require their field/result schemas to match the executable values at the
     // region boundary.  The projected extent is therefore already a current-IR
-    // structural fact; treating it as unknown would make consumers rediscover
-    // the record schema from nearby arithmetic.
+    // structural fact.  Keep any exact producer ranges as independent traversal
+    // provenance: dropping them makes a reduction over an extracted record field
+    // look unrelated to the range that produced that field.
+    PhysicalRangeFact ranges = axisRanges(value, fragmentAxis);
+    if (ranges.isExact()) {
+      result.roots.append(ranges.roots.begin(), ranges.roots.end());
+      result.constructionScalarSeed =
+          extent.getKind() ==
+              static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+          extent.getValue() == 1 && !ranges.roots.empty() &&
+          llvm::any_of(ranges.roots, [](MakeRangeOp range) {
+            return !isProvablySingletonLogicalRange(range);
+          });
+      result.physicalized =
+          !result.constructionScalarSeed && !ranges.roots.empty() &&
+          llvm::all_of(ranges.roots, [&](MakeRangeOp range) {
+            return valueMatchesExtent(range.getExtent(), extent);
+          });
+    }
     result.state = PhysicalFactState::Exact;
     result.extentAuthority =
         PhysicalAxisRealizationFact::ExtentAuthority::Structural;
