@@ -1175,6 +1175,45 @@ bool freeAxesNeedRealization(ContractOp contract, func::FuncOp kernel) {
       .needsRealization();
 }
 
+bool freeAxesReadyForReductionTraversal(ContractOp contract,
+                                        func::FuncOp kernel) {
+  PhysicalContractFreeAxisFact freeAxes =
+      PhysicalProgramAnalysis(kernel).contractFreeAxes(contract.getOperation());
+  if (!freeAxes.isExact())
+    return false;
+  return llvm::all_of(freeAxes.axes, [](const PhysicalContractFreeAxis &axis) {
+    if (axis.realization.physicalized)
+      return true;
+    auto fragment = cast<FragmentType>(axis.operand.getType());
+    auto extent = cast<PhysicalExprAttr>(
+        fragment.getShape()[axis.operandAxis]);
+    return extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+           extent.getValue() == 1 &&
+           !axis.realization.constructionScalarSeed &&
+           axis.realization.roots.empty();
+  });
+}
+
+bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
+  PhysicalProgramAnalysis analysis(kernel);
+  auto operandNeedsTraversal = [&](Value operand, ArrayRef<int64_t> axes) {
+    auto fragment = cast<FragmentType>(operand.getType());
+    return llvm::any_of(axes, [&](int64_t axis) {
+      if (axis < 0 || axis >= static_cast<int64_t>(fragment.getShape().size()))
+        return false;
+      PhysicalAxisRealizationFact fact =
+          analysis.axisRealization(operand, static_cast<unsigned>(axis));
+      return fact.constructionScalarSeed ||
+             (fact.isExact() && !fact.physicalized);
+    });
+  };
+  return operandNeedsTraversal(contract.getLhs(),
+                               contract.getLhsReductionAxes()) ||
+         operandNeedsTraversal(contract.getRhs(),
+                               contract.getRhsReductionAxes());
+}
+
 bool hasCompleteStorePath(ContractOp contract) {
   SmallVector<StorePath> paths;
   llvm::SmallPtrSet<Operation *, 8> visited;
@@ -1856,6 +1895,14 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             rhsMap->getSourceId(), rhsMap->getSourceAxis(),
             rhsMap->getDerived());
         inheritRangeAuthority(rhsK, rhsRange);
+        FailureOr<Value> lhsTail = buildRangeTailPredicate(
+            nested, nestedLocation, lhsK, lhsRange);
+        FailureOr<Value> rhsTail = buildRangeTailPredicate(
+            nested, nestedLocation, rhsK, rhsRange);
+        if (failed(lhsTail) || failed(rhsTail)) {
+          bodyFailed = true;
+          return;
+        }
         IRMapping lhsReplay;
         IRMapping rhsReplay;
         for (MakeRangeOp range : lhsRanges)
@@ -1869,6 +1916,13 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
             nested, nestedLocation, contract.getRhs(), unitK, rhsRanges, rhsK,
             rhsReplay);
         if (failed(lhs) || failed(rhs)) {
+          bodyFailed = true;
+          return;
+        }
+        if (failed(appendTailValidity(nestedLocation, contract.getLhs(),
+                                      *lhsTail, lhsReplay)) ||
+            failed(appendTailValidity(nestedLocation, contract.getRhs(),
+                                      *rhsTail, rhsReplay))) {
           bodyFailed = true;
           return;
         }
@@ -3706,8 +3760,9 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
           contract.getRhsReductionAxes().size() == 1 &&
           contract.getLhsBatchAxes().empty() &&
           contract.getRhsBatchAxes().empty() &&
-          !freeAxesNeedRealization(contract, kernel) &&
+          freeAxesReadyForReductionTraversal(contract, kernel) &&
           hasSelectedFreeAxes(contract) &&
+          reductionAxesNeedTraversal(contract, kernel) &&
           hasExplicitPairedReductionRanges(contract)) {
         if (failed(realizeReductionTraversal(contract, kernel)))
           return failure();
