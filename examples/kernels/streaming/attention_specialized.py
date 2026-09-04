@@ -424,16 +424,24 @@ def gemma_gqa_decode_partials(
                 begin = I.minimum(part * width, K)
                 end = I.minimum((part + 1) * width, K)
                 keys = key_axis[begin:end]
-                summary = summarize_window_attention_bf16(
-                    k[batch, key_head, keys, :],
-                    v[batch, key_head, keys, :],
-                    I.indices(keys),
-                    query,
-                    I.full((HEAD_GROUP,), fill=K - 1, dtype=I.index),
-                    scale,
-                    WINDOW,
-                    True,
-                    SOFT_CAP,
+                summary = I.region_fold(
+                    source=(
+                        k[batch, key_head, keys, :],
+                        v[batch, key_head, keys, :],
+                        I.indices(keys),
+                    ),
+                    axis=0,
+                    summarize=summarize_window_attention_bf16,
+                    combine=merge_attention_summaries,
+                    identity=empty_attention_summary(local_heads, DV),
+                    operands=(
+                        query,
+                        I.full((HEAD_GROUP,), fill=K - 1, dtype=I.index),
+                        scale,
+                        WINDOW,
+                        True,
+                        SOFT_CAP,
+                    ),
                 )
                 safe_denominator = I.select(summary.valid, summary.denominator, 1.0)
                 I.scatter_unique(
