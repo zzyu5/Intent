@@ -2878,8 +2878,7 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                         return range.getExtent() == physicalExtent;
                       });
   for (MakeRangeOp range : ranges)
-    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                         parameterExtent);
+    retargetDimensionExtent(range.getResult(), dimension, parameterExtent);
   if (ranges.empty() || alreadyBound)
     return success();
 
