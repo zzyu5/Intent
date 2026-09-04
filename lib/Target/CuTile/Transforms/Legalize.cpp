@@ -407,16 +407,55 @@ Value stripIndexIdentities(Value value) {
 
 bool isKnownPositive(Value value);
 
+std::optional<int64_t> dimensionIdentity(BlockArgument argument) {
+  auto kernel = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
+  if (!kernel || argument.getOwner() != &kernel.getBody().front())
+    return std::nullopt;
+  DictionaryAttr attributes =
+      kernel.getArgAttrDict(argument.getArgNumber());
+  auto kind = attributes.getAs<StringAttr>(gpu::abiKindAttr);
+  auto identity = attributes.getAs<IntegerAttr>(gpu::dimensionAttr);
+  if (!kind || kind.getValue() != "dimension" || !identity)
+    return std::nullopt;
+  return identity.getInt();
+}
+
 bool isKnownNonNegative(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIndexIdentities(value);
   if (std::optional<int64_t> constant = constantValue(value))
     return *constant >= 0;
+  if (isa_and_nonnull<gpu::ProgramIdOp, gpu::WorksetCoordinateOp>(
+          value.getDefiningOp()))
+    return true;
+  if (auto result = dyn_cast<OpResult>(value))
+    if (isa<gpu::DelinearizeOp>(result.getOwner()))
+      return true;
+  if (auto argument = dyn_cast<BlockArgument>(value))
+    if (dimensionIdentity(argument))
+      return true;
   auto binary = value.getDefiningOp<gpu::BinaryOp>();
   if (!binary)
     return false;
   switch (binary.getOperatorKind()) {
+  case BinaryOperator::Add:
+    return isKnownNonNegative(binary.getLhs(), depth + 1) &&
+           isKnownNonNegative(binary.getRhs(), depth + 1);
+  case BinaryOperator::Subtract: {
+    std::optional<int64_t> rhs = constantValue(binary.getRhs());
+    auto lhs = binary.getLhs().getDefiningOp<gpu::BinaryOp>();
+    if (!rhs || *rhs < 0 || !lhs ||
+        lhs.getOperatorKind() != BinaryOperator::Add)
+      return false;
+    auto covers = [&](Value constant, Value remainder) {
+      std::optional<int64_t> amount = constantValue(constant);
+      return amount && *amount >= *rhs &&
+             isKnownNonNegative(remainder, depth + 1);
+    };
+    return covers(lhs.getLhs(), lhs.getRhs()) ||
+           covers(lhs.getRhs(), lhs.getLhs());
+  }
   case BinaryOperator::Maximum:
     return isKnownNonNegative(binary.getLhs(), depth + 1) ||
            isKnownNonNegative(binary.getRhs(), depth + 1);
@@ -512,9 +551,8 @@ bool valueIsDimension(Value value, int64_t dimension, func::FuncOp kernel) {
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     if (argument.getOwner() != &kernel.getBody().front())
       return false;
-    auto identity = kernel.getArgAttrDict(argument.getArgNumber())
-                        .getAs<IntegerAttr>(gpu::dimensionAttr);
-    return identity && identity.getInt() == dimension;
+    std::optional<int64_t> identity = dimensionIdentity(argument);
+    return identity && *identity == dimension;
   }
   if (auto dim = value.getDefiningOp<gpu::DimOp>()) {
     ArrayRef<int64_t> dimensions =
@@ -523,6 +561,67 @@ bool valueIsDimension(Value value, int64_t dimension, func::FuncOp kernel) {
            dimensions[dim.getAxis()] == dimension;
   }
   return false;
+}
+
+Value dimensionValue(func::FuncOp kernel, int64_t dimension) {
+  Value result;
+  for (BlockArgument argument : kernel.getArguments()) {
+    std::optional<int64_t> identity = dimensionIdentity(argument);
+    if (!identity || *identity != dimension)
+      continue;
+    if (result && result != argument)
+      return {};
+    result = argument;
+  }
+  return result;
+}
+
+bool isLogicalSubregionDistance(Value value, gpu::MakeRangeOp range) {
+  value = stripIndexIdentities(value);
+  auto distance = value.getDefiningOp<gpu::BinaryOp>();
+  if (distance && distance.getOperatorKind() == BinaryOperator::Subtract &&
+      gpu::samePhysicalScalarExpression(distance.getLhs(),
+                                        range.getLogicalStop()) &&
+      gpu::samePhysicalScalarExpression(distance.getRhs(),
+                                        range.getLogicalStart()))
+    return true;
+  auto multiply = value.getDefiningOp<gpu::BinaryOp>();
+  if (!multiply || multiply.getOperatorKind() != BinaryOperator::Multiply)
+    return false;
+  auto flooredDistance = [&](Value quotient, Value divisor) {
+    auto division = quotient.getDefiningOp<gpu::BinaryOp>();
+    return division &&
+           division.getOperatorKind() == BinaryOperator::FloorDivide &&
+           gpu::samePhysicalScalarExpression(division.getRhs(), divisor) &&
+           isKnownPositive(divisor) &&
+           isLogicalSubregionDistance(division.getLhs(), range);
+  };
+  return flooredDistance(multiply.getLhs(), multiply.getRhs()) ||
+         flooredDistance(multiply.getRhs(), multiply.getLhs());
+}
+
+bool rangeStartsInsideLogicalSubregion(gpu::MakeRangeOp range) {
+  Value start = stripIndexIdentities(range.getStart());
+  if (gpu::samePhysicalScalarExpression(start, range.getLogicalStart()))
+    return true;
+  auto add = start.getDefiningOp<gpu::BinaryOp>();
+  if (!add || add.getOperatorKind() != BinaryOperator::Add)
+    return false;
+  auto check = [&](Value base, Value offset) {
+    if (!gpu::samePhysicalScalarExpression(base, range.getLogicalStart()))
+      return false;
+    auto argument = dyn_cast<BlockArgument>(stripIndexIdentities(offset));
+    auto loop =
+        argument
+            ? dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp())
+            : scf::ForOp();
+    return loop && argument == loop.getInductionVar() &&
+           isKnownNonNegative(loop.getLowerBound()) &&
+           isKnownPositive(loop.getStep()) &&
+           isLogicalSubregionDistance(loop.getUpperBound(), range);
+  };
+  return check(add.getLhs(), add.getRhs()) ||
+         check(add.getRhs(), add.getLhs());
 }
 
 bool isBlockedWorksetOrigin(Value value, Value block, int64_t dimension) {
@@ -586,6 +685,12 @@ bool rangeOriginInView(gpu::MakeRangeOp range, ArrayRef<Value> offsets,
                        int64_t dimension, func::FuncOp kernel) {
   bool zeroOffset = llvm::all_of(
       offsets, [](Value offset) { return isProvably(offset, 0); });
+  Value logicalDimension = dimensionValue(kernel, dimension);
+  if (zeroOffset && range->hasAttr(gpu::sourceSubregionAttr) &&
+      logicalDimension && isKnownNonNegative(range.getLogicalStart()) &&
+      valueUpperBoundedBy(range.getLogicalStop(), logicalDimension) &&
+      rangeStartsInsideLogicalSubregion(range))
+    return true;
   if (zeroOffset && range->hasAttr(gpu::programBoundedOriginAttr) &&
       !range->hasAttr(gpu::sourceSubregionAttr) &&
       isProvably(range.getLogicalStart(), 0) &&
@@ -859,14 +964,20 @@ OpBuilder prepareBranch(Region &region) {
   return OpBuilder(&block, block.end());
 }
 
-FailureOr<SmallVector<Value>>
+struct MaterializedTileIndices {
+  SmallVector<Value> values;
+  Value alignment;
+};
+
+FailureOr<MaterializedTileIndices>
 materializeTileIndices(OpBuilder &builder, Operation *owner,
-                       const NativeTileAccessPlan &plan) {
-  SmallVector<Value> result;
-  result.reserve(plan.axes.size());
+                       const NativeTileAccessPlan &plan,
+                       bool allowDynamicAlignment) {
+  MaterializedTileIndices result;
+  result.values.reserve(plan.axes.size());
   for (const NativeTileAxisPlan &axis : plan.axes) {
     if (axis.scalarIndex) {
-      result.push_back(axis.scalarIndex);
+      result.values.push_back(axis.scalarIndex);
       continue;
     }
     gpu::MakeRangeOp range = axis.range;
@@ -877,9 +988,28 @@ materializeTileIndices(OpBuilder &builder, Operation *owner,
           BinaryOperator::Add);
     FailureOr<Value> index = tileIndex(builder, owner->getLoc(), start,
                                        range.getExtent());
-    if (failed(index))
+    if (succeeded(index)) {
+      result.values.push_back(*index);
+      continue;
+    }
+    if (!allowDynamicAlignment || !isKnownPositive(range.getExtent()))
       return failure();
-    result.push_back(*index);
+    result.values.push_back(builder.create<gpu::BinaryOp>(
+        owner->getLoc(), builder.getIndexType(), start, range.getExtent(),
+        BinaryOperator::FloorDivide));
+    Value remainder = builder.create<gpu::BinaryOp>(
+        owner->getLoc(), builder.getIndexType(), start, range.getExtent(),
+        BinaryOperator::Remainder);
+    Value zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
+    Value aligned = builder.create<gpu::CompareOp>(
+        owner->getLoc(), builder.getI1Type(), remainder, zero,
+        ComparePredicate::Eq);
+    result.alignment =
+        result.alignment
+            ? Value(builder.create<gpu::BinaryOp>(
+                  owner->getLoc(), builder.getI1Type(), result.alignment,
+                  aligned, BinaryOperator::LogicalAnd))
+            : aligned;
   }
   return result;
 }
@@ -1031,11 +1161,12 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
         load, kernel, analysis, view, load.getCoordinates(),
         load.getSourceAxes(), result);
-    FailureOr<SmallVector<Value>> indices = failure();
+    FailureOr<MaterializedTileIndices> indices = failure();
     FailureOr<Value> originGuard = failure();
     if (succeeded(plan) && boundary.isExact() &&
         (!load.getFill() || isZeroFill(load.getFill())))
-      indices = materializeTileIndices(builder, load, *plan);
+      indices = materializeTileIndices(builder, load, *plan,
+                                       /*allowDynamicAlignment=*/true);
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
           builder, load, load.getResource(), *plan, boundary);
@@ -1047,7 +1178,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     SmallVector<Operation *> createdOperations;
     auto emitNativeLoad = [&](OpBuilder &nested) {
       auto tile = nested.create<TileLoadOp>(
-          load.getLoc(), plan->resourceType, load.getResource(), *indices);
+          load.getLoc(), plan->resourceType, load.getResource(),
+          indices->values);
       Value value = tile.getResult();
       createdOperations.push_back(tile);
       if (plan->resourceToPacked) {
@@ -1065,8 +1197,26 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
       }
       return value;
     };
-    if (native && guardedNative) {
-      auto conditional = builder.create<scf::IfOp>(
+    auto emitGatherLoad = [&](OpBuilder &nested) -> FailureOr<Value> {
+      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
+          load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
+      FailureOr<Value> fill = scalarFill(load, load.getFill());
+      if (failed(coordinates) || failed(fill))
+        return failure();
+      FailureOr<SmallVector<Value>> materialized =
+          materializeCoordinateDomains(nested, load, *coordinates, result);
+      if (failed(materialized))
+        return failure();
+      auto replacement = nested.create<GatherLoadOp>(
+          load.getLoc(), result, load.getResource(), *materialized,
+          load.getValid(), *fill, identityAxes(view.getRank()));
+      createdOperations.push_back(replacement);
+      return replacement.getResult();
+    };
+    auto emitNativeOrFill = [&](OpBuilder &nested) -> Value {
+      if (!guardedNative)
+        return emitNativeLoad(nested);
+      auto conditional = nested.create<scf::IfOp>(
           load.getLoc(), TypeRange{result}, *originGuard,
           /*withElseRegion=*/true);
       createdOperations.push_back(conditional);
@@ -1075,24 +1225,31 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
       inBounds.create<scf::YieldOp>(load.getLoc(), value);
       OpBuilder outOfBounds = prepareBranch(conditional.getElseRegion());
       outOfBounds.create<scf::YieldOp>(load.getLoc(), load.getFill());
+      return conditional.getResult(0);
+    };
+    if (native && indices->alignment) {
+      auto conditional = builder.create<scf::IfOp>(
+          load.getLoc(), TypeRange{result}, indices->alignment,
+          /*withElseRegion=*/true);
+      createdOperations.push_back(conditional);
+      OpBuilder aligned = prepareBranch(conditional.getThenRegion());
+      Value value = emitNativeOrFill(aligned);
+      aligned.create<scf::YieldOp>(load.getLoc(), value);
+      OpBuilder unaligned = prepareBranch(conditional.getElseRegion());
+      FailureOr<Value> gathered = emitGatherLoad(unaligned);
+      if (failed(gathered))
+        return failure();
+      unaligned.create<scf::YieldOp>(load.getLoc(), *gathered);
       replacementResult = conditional.getResult(0);
+    } else if (native && guardedNative) {
+      replacementResult = emitNativeOrFill(builder);
     } else if (native) {
       replacementResult = emitNativeLoad(builder);
     } else {
-      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
-          load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
-      FailureOr<Value> fill = scalarFill(load, load.getFill());
-      if (failed(coordinates) || failed(fill))
+      FailureOr<Value> gathered = emitGatherLoad(builder);
+      if (failed(gathered))
         return failure();
-      FailureOr<SmallVector<Value>> materialized =
-          materializeCoordinateDomains(builder, load, *coordinates, result);
-      if (failed(materialized))
-        return failure();
-      auto replacement = builder.create<GatherLoadOp>(
-          load.getLoc(), result, load.getResource(), *materialized,
-          load.getValid(), *fill, identityAxes(view.getRank()));
-      replacementResult = replacement.getResult();
-      createdOperations.push_back(replacement);
+      replacementResult = *gathered;
     }
     for (Operation *operation : createdOperations)
       if (Attribute origin = load->getAttr(gpu::originAttr))
@@ -1302,10 +1459,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     FailureOr<NativeTileAccessPlan> plan = analyzeNativeTileAccess(
         store, kernel, analysis, view, store.getCoordinates(),
         store.getSourceAxes(), computationType);
-    FailureOr<SmallVector<Value>> indices = failure();
+    FailureOr<MaterializedTileIndices> indices = failure();
     FailureOr<Value> originGuard = failure();
     if (succeeded(plan) && boundary.isExact())
-      indices = materializeTileIndices(builder, store, *plan);
+      indices = materializeTileIndices(builder, store, *plan,
+                                       /*allowDynamicAlignment=*/false);
     if (succeeded(indices))
       originGuard = materializeTileOriginGuard(
           builder, store, store.getResource(), *plan, boundary);
@@ -1329,7 +1487,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
         createdOperations.push_back(reshape);
       }
       auto tile = nested.create<TileStoreOp>(
-          store.getLoc(), store.getResource(), *indices, nativeValue);
+          store.getLoc(), store.getResource(), indices->values, nativeValue);
       createdOperations.push_back(tile);
     };
     if (guardedNative) {
