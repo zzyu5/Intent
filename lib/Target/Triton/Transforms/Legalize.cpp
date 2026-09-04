@@ -925,7 +925,8 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
       stages = &domain;
     else if (domain.role == gpu::ParameterRole::ProviderCTAs)
       ctas = &domain;
-    else if (domain.role == gpu::ParameterRole::ProviderThreads)
+    else if (domain.role == gpu::ParameterRole::ProviderThreads ||
+             domain.role == gpu::ParameterRole::ProviderAccessForm)
       return kernel.emitError(
           "Triton program contains a foreign provider parameter");
   }
@@ -1609,10 +1610,18 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
     uint32_t role = parameter.getParameter().getRole();
+    auto category = static_cast<gpu::ParameterCategory>(
+        parameter.getParameter().getCategory());
     bool providerRole =
         role == static_cast<uint32_t>(gpu::ParameterRole::ProviderWarps) ||
         role == static_cast<uint32_t>(gpu::ParameterRole::ProviderStages) ||
         role == static_cast<uint32_t>(gpu::ParameterRole::ProviderCTAs);
+    if ((category == gpu::ParameterCategory::Provider) != providerRole) {
+      parameter.emitOpError(
+          "Triton program contains a foreign provider parameter");
+      parameterSchema = failure();
+      return;
+    }
     if (!providerRole)
       return;
     if (!providerRoles.insert(role).second) {

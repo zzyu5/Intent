@@ -89,6 +89,7 @@ enum class ParameterRole : uint32_t {
   FullCoverage = 11,
   ReductionOuter = 12,
   ReductionInner = 13,
+  ProviderAccessForm = 14,
 };
 
 enum class ParameterCategory : uint32_t {

@@ -254,7 +254,7 @@ LogicalResult ParameterAttr::verify(
     uint32_t role, uint32_t category, uint32_t elementBitWidth,
     DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::ReductionInner) ||
+      role > static_cast<uint32_t>(ParameterRole::ProviderAccessForm) ||
       category >
           static_cast<uint32_t>(ParameterCategory::Histogram) ||
       !candidates || candidates.empty())
@@ -262,6 +262,15 @@ LogicalResult ParameterAttr::verify(
            << "physical parameter requires a name, role, category and candidates";
   auto typedCategory = static_cast<ParameterCategory>(category);
   auto typedRole = static_cast<ParameterRole>(role);
+  const bool providerRole =
+      typedRole == ParameterRole::ProviderWarps ||
+      typedRole == ParameterRole::ProviderStages ||
+      typedRole == ParameterRole::ProviderCTAs ||
+      typedRole == ParameterRole::ProviderThreads ||
+      typedRole == ParameterRole::ProviderAccessForm;
+  if (providerRole != (typedCategory == ParameterCategory::Provider))
+    return emitError()
+           << "provider parameter roles require exactly the provider category";
   if ((typedRole == ParameterRole::ReductionOuter ||
        typedRole == ParameterRole::ReductionInner) &&
       typedCategory != ParameterCategory::Reduction)

@@ -134,13 +134,14 @@ struct CoverageParameter {
 FailureOr<SmallVector<std::map<std::string, int64_t>>>
 parameterConfigs(func::FuncOp kernel) {
   llvm::StringMap<gpu::ParameterOp> parameters;
+  SmallVector<gpu::ParameterOp> providerParameters;
   WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
     auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-    if (role == gpu::ParameterRole::ProviderWarps ||
-        role == gpu::ParameterRole::ProviderStages ||
-        role == gpu::ParameterRole::ProviderCTAs ||
-        role == gpu::ParameterRole::ProviderThreads) {
+    auto category =
+        static_cast<gpu::ParameterCategory>(schema.getCategory());
+    bool provider = category == gpu::ParameterCategory::Provider;
+    if (provider != (role == gpu::ParameterRole::ProviderAccessForm)) {
       parameter.emitOpError(
           "cuTile source cannot bind a foreign provider parameter role");
       return WalkResult::interrupt();
@@ -150,6 +151,8 @@ parameterConfigs(func::FuncOp kernel) {
       parameter.emitOpError("duplicates a cuTile physical parameter");
       return WalkResult::interrupt();
     }
+    if (provider)
+      providerParameters.push_back(parameter);
     if (parameter->hasAttr(gpu::coverageDimensionAttr))
       return WalkResult::advance();
     return WalkResult::advance();
@@ -171,6 +174,8 @@ parameterConfigs(func::FuncOp kernel) {
       auto value = dyn_cast<IntegerAttr>(binding.getValue());
       if (found == parameters.end() || !value ||
           found->second->hasAttr(gpu::coverageDimensionAttr) ||
+          found->second.getParameter().getCategory() ==
+              static_cast<uint32_t>(gpu::ParameterCategory::Provider) ||
           !llvm::is_contained(
               found->second.getParameter().getCandidates().asArrayRef(),
               value.getInt()))
@@ -179,12 +184,27 @@ parameterConfigs(func::FuncOp kernel) {
       config[binding.getName().strref().str()] = value.getInt();
     }
     size_t staticParameters = llvm::count_if(parameters, [](const auto &entry) {
-      return !entry.getValue()->hasAttr(gpu::coverageDimensionAttr);
+      gpu::ParameterOp parameter = entry.getValue();
+      return !parameter->hasAttr(gpu::coverageDimensionAttr) &&
+             parameter.getParameter().getCategory() !=
+                 static_cast<uint32_t>(gpu::ParameterCategory::Provider);
     });
     if (config.size() != staticParameters)
       return kernel.emitError(
           "shared config tuple omits a cuTile kernel parameter");
     configs.push_back(std::move(config));
+  }
+  for (gpu::ParameterOp parameter : providerParameters) {
+    SmallVector<std::map<std::string, int64_t>> expanded;
+    StringRef name = parameter.getParameter().getName().getValue();
+    for (const auto &base : configs)
+      for (int64_t candidate :
+           parameter.getParameter().getCandidates().asArrayRef()) {
+        std::map<std::string, int64_t> config = base;
+        config[name.str()] = candidate;
+        expanded.push_back(std::move(config));
+      }
+    configs = std::move(expanded);
   }
   return configs;
 }

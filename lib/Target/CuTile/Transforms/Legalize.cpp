@@ -18,6 +18,9 @@ namespace intent::cutile {
 namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_cutile.legalized";
+constexpr llvm::StringLiteral loadFormParameter = "CUTILE_LOAD_FORM";
+constexpr int64_t tileLoadForm = 1;
+constexpr int64_t gatherLoadForm = 2;
 
 std::optional<int64_t>
 constantPhysicalExpression(gpu::PhysicalExprAttr expression,
@@ -1128,6 +1131,38 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   kernel.walk([&](gpu::AtomicRMWOp op) { atomics.push_back(op); });
   kernel.walk([&](gpu::AssumeInBoundsOp op) { assumptions.push_back(op); });
   gpu::PhysicalProgramAnalysis analysis(kernel);
+  Value preferTileLoads;
+  auto loadFormCondition = [&]() -> FailureOr<Value> {
+    if (preferTileLoads)
+      return preferTileLoads;
+    bool nameCollision = false;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      nameCollision |= parameter.getParameter().getName().getValue() ==
+                       loadFormParameter;
+    });
+    if (nameCollision)
+      return kernel.emitError(
+          "cuTile load-form parameter name is already owned");
+    OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
+    auto schema = gpu::ParameterAttr::get(
+        kernel.getContext(), entry.getStringAttr(loadFormParameter),
+        static_cast<uint32_t>(gpu::ParameterRole::ProviderAccessForm),
+        static_cast<uint32_t>(gpu::ParameterCategory::Provider),
+        /*elementBitWidth=*/0,
+        DenseI64ArrayAttr::get(kernel.getContext(),
+                               ArrayRef<int64_t>{tileLoadForm,
+                                                 gatherLoadForm}));
+    Value parameter = entry
+                          .create<gpu::ParameterOp>(kernel.getLoc(),
+                                                    entry.getIndexType(), schema)
+                          .getResult();
+    Value tile = entry.create<arith::ConstantIndexOp>(kernel.getLoc(),
+                                                       tileLoadForm);
+    preferTileLoads = entry.create<gpu::CompareOp>(
+        kernel.getLoc(), entry.getI1Type(), parameter, tile,
+        ComparePredicate::Eq);
+    return preferTileLoads;
+  };
 
   for (gpu::LoadOp load : loads) {
     auto view = dyn_cast<gpu::ViewType>(load.getResource().getType());
@@ -1227,8 +1262,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
       outOfBounds.create<scf::YieldOp>(load.getLoc(), load.getFill());
       return conditional.getResult(0);
     };
-    if (native && indices->alignment) {
-      auto conditional = builder.create<scf::IfOp>(
+    auto emitAlignedNative = [&](OpBuilder &nested) -> FailureOr<Value> {
+      if (!indices->alignment)
+        return emitNativeOrFill(nested);
+      auto conditional = nested.create<scf::IfOp>(
           load.getLoc(), TypeRange{result}, indices->alignment,
           /*withElseRegion=*/true);
       createdOperations.push_back(conditional);
@@ -1240,11 +1277,27 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
       if (failed(gathered))
         return failure();
       unaligned.create<scf::YieldOp>(load.getLoc(), *gathered);
+      return conditional.getResult(0);
+    };
+    if (native) {
+      FailureOr<Value> condition = loadFormCondition();
+      if (failed(condition))
+        return failure();
+      auto conditional = builder.create<scf::IfOp>(
+          load.getLoc(), TypeRange{result}, *condition,
+          /*withElseRegion=*/true);
+      createdOperations.push_back(conditional);
+      OpBuilder tiled = prepareBranch(conditional.getThenRegion());
+      FailureOr<Value> tiledValue = emitAlignedNative(tiled);
+      if (failed(tiledValue))
+        return failure();
+      tiled.create<scf::YieldOp>(load.getLoc(), *tiledValue);
+      OpBuilder gathered = prepareBranch(conditional.getElseRegion());
+      FailureOr<Value> gatheredValue = emitGatherLoad(gathered);
+      if (failed(gatheredValue))
+        return failure();
+      gathered.create<scf::YieldOp>(load.getLoc(), *gatheredValue);
       replacementResult = conditional.getResult(0);
-    } else if (native && guardedNative) {
-      replacementResult = emitNativeOrFill(builder);
-    } else if (native) {
-      replacementResult = emitNativeLoad(builder);
     } else {
       FailureOr<Value> gathered = emitGatherLoad(builder);
       if (failed(gathered))
@@ -1544,6 +1597,38 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   if (!space || space.size() != 1)
     return kernel.emitError(
         "cuTile provider currently requires one explicit linear program space");
+  gpu::ParameterOp loadForm;
+  LogicalResult parameterSchema = success();
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    auto schema = parameter.getParameter();
+    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
+    auto category =
+        static_cast<gpu::ParameterCategory>(schema.getCategory());
+    bool provider = category == gpu::ParameterCategory::Provider;
+    if (provider != (role == gpu::ParameterRole::ProviderAccessForm)) {
+      parameter.emitOpError(
+          "cuTile program contains a foreign provider parameter");
+      parameterSchema = failure();
+      return;
+    }
+    if (!provider)
+      return;
+    if (loadForm) {
+      parameter.emitOpError("duplicates the cuTile load-form parameter");
+      parameterSchema = failure();
+      return;
+    }
+    ArrayRef<int64_t> candidates = schema.getCandidates().asArrayRef();
+    if (schema.getName().getValue() != loadFormParameter ||
+        candidates != ArrayRef<int64_t>{tileLoadForm, gatherLoadForm}) {
+      parameter.emitOpError("has an invalid cuTile load-form domain");
+      parameterSchema = failure();
+      return;
+    }
+    loadForm = parameter;
+  });
+  if (failed(parameterSchema))
+    return failure();
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (isa<gpu::LoadOp, gpu::StoreOp, gpu::ContractOp>(operation)) {
       operation->emitOpError(
