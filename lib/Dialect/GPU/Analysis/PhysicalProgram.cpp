@@ -2540,7 +2540,9 @@ bool PhysicalProgramAnalysis::isTailPredicate(
            isTailPredicate(conjunction.getRhs(), ranges);
   }
   auto comparison = value.getDefiningOp<CompareOp>();
-  if (!comparison || comparison.getPredicate() != ComparePredicate::Lt)
+  if (!comparison ||
+      (comparison.getPredicate() != ComparePredicate::Lt &&
+       comparison.getPredicate() != ComparePredicate::Ge))
     return false;
   Value lhs = stripBroadcast(comparison.getLhs());
   Value rhs = stripScalarIdentity(comparison.getRhs());
@@ -2557,19 +2559,21 @@ bool PhysicalProgramAnalysis::isTailPredicate(
   return llvm::any_of(ranges, [&](const auto &entry) {
     MakeRangeOp expectedRange = entry.first;
     Value expectedEnd = stripScalarIdentity(entry.second);
-    if (lhs == expectedRange.getResult())
-      return sameTailEnd(rhs, expectedEnd);
-    if (!predicateRange ||
-        !(sourceAxisIdentity(predicateRange) ==
-          sourceAxisIdentity(expectedRange)))
+    bool sameRange = lhs == expectedRange.getResult();
+    if (!sameRange && predicateRange &&
+        sourceAxisIdentity(predicateRange) ==
+            sourceAxisIdentity(expectedRange))
+      sameRange = sameScalarExpression(predicateRange.getStart(),
+                                       expectedRange.getStart()) &&
+                  sameScalarExpression(predicateRange.getExtent(),
+                                       expectedRange.getExtent()) &&
+                  sameScalarExpression(predicateRange.getStep(),
+                                       expectedRange.getStep());
+    if (!sameRange)
       return false;
-    return sameTailEnd(rhs, expectedEnd) &&
-           sameScalarExpression(predicateRange.getStart(),
-                                expectedRange.getStart()) &&
-           sameScalarExpression(predicateRange.getExtent(),
-                                expectedRange.getExtent()) &&
-           sameScalarExpression(predicateRange.getStep(),
-                                expectedRange.getStep());
+    if (comparison.getPredicate() == ComparePredicate::Ge)
+      return integerConstant(rhs) == 0;
+    return sameTailEnd(rhs, expectedEnd);
   });
 }
 

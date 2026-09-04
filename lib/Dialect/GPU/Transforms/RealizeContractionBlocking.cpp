@@ -2647,15 +2647,28 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
     Value rowValid = rangeBoundsValidity(rowBuilder, location, rowIndexType,
                                          rowPredicateType, rows, rowStop);
     Value blockedLhsRowCoordinate = rows;
+    IRMapping rowReplay;
+    Value replayedLhsRowValidity;
+    if (runtimeRowTraversal) {
+      rowReplay.map(rowRange.getResult(), rows);
+      if (lhsLoad.getValid()) {
+        FailureOr<Value> replayed = replaySourceValue(
+            rowBuilder, location, kernel, lhsLoad.getValid(),
+            sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
+            contract.getOperation());
+        if (failed(replayed))
+          return lhsLoad.emitOpError(
+              "blocked contraction could not replay row-dependent validity");
+        replayedLhsRowValidity = *replayed;
+      }
+    }
     SmallVector<SmallVector<Value>> replayedStoreCoordinates;
     SmallVector<Value> replayedStoreValidities;
     if (indirectRow) {
-      IRMapping replay;
-      replay.map(rowRange.getResult(), rows);
       FailureOr<Value> rowCoordinate = replaySourceValue(
           rowBuilder, location, kernel, originalLhsRowCoordinate,
           sourceAxisIdentity(*rowMap),
-          unitM, rowRange, rows, replay);
+          unitM, rowRange, rows, rowReplay);
       if (failed(rowCoordinate))
         return contract.emitOpError(
             "blocked contraction could not replay its row coordinate graph");
@@ -2664,7 +2677,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         FailureOr<Value> index = replaySourceValue(
             rowBuilder, location, kernel, assumption.getIndex(),
             sourceAxisIdentity(*rowMap),
-            unitM, rowRange, rows, replay);
+            unitM, rowRange, rows, rowReplay);
         if (failed(index))
           return assumption.emitOpError(
               "blocked contraction could not replay an in-bounds assertion");
@@ -2679,7 +2692,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, kernel, coordinate,
               sourceAxisIdentity(*rowMap),
-              unitM, rowRange, rows, replay);
+              unitM, rowRange, rows, rowReplay);
           if (failed(replayed))
             return path.store.emitOpError(
                 "blocked contraction could not replay an output coordinate graph");
@@ -2690,7 +2703,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         if (path.store.getValid()) {
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, kernel, path.store.getValid(),
-              sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
+              sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
               contract.getOperation());
           if (failed(replayed))
             return path.store.emitOpError(
@@ -2733,9 +2746,27 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
           Value rhsValid = binary(nested, nestedLocation, rhsPredicateType,
                                   rhsReductions, rhsColumns,
                                   BinaryOperator::LogicalAnd);
-          FailureOr<Value> retargetedLhs = materializeRetargetedValidity(
-              nested, nestedLocation, lhsLoad.getValid(), lhsTailRanges,
-              lhsValid, lhsPredicateType);
+          FailureOr<Value> retargetedLhs = failure();
+          if (replayedLhsRowValidity) {
+            IRMapping reductionReplay;
+            reductionReplay.map(lhsReductionRange.getResult(), reductions);
+            FailureOr<Value> replayed = replaySourceValue(
+                nested, nestedLocation, kernel, replayedLhsRowValidity,
+                sourceAxisIdentity(*lhsReductionMap), unitK,
+                lhsReductionRange, reductions, reductionReplay);
+            if (failed(replayed)) {
+              loopBodyFailure =
+                  "lhs row-dependent validity could not be replayed";
+              return;
+            }
+            retargetedLhs = materializeValidityConjunction(
+                nested, nestedLocation, lhsValid, *replayed,
+                lhsPredicateType);
+          } else {
+            retargetedLhs = materializeRetargetedValidity(
+                nested, nestedLocation, lhsLoad.getValid(), lhsTailRanges,
+                lhsValid, lhsPredicateType);
+          }
           FailureOr<Value> retargetedRhs = materializeRetargetedValidity(
               nested, nestedLocation, rhsLoad.getValid(), rhsTailRanges,
               rhsValid, rhsPredicateType);
@@ -2854,9 +2885,14 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
                 "blocked contraction could not relocate output validity");
           originalValidity = *replayed;
         }
-        valid = materializeRetargetedValidity(
-            rowBuilder, location, originalValidity, outputTailRanges,
-            outputValid, outputPredicateType);
+        if (runtimeRowTraversal && originalValidity)
+          valid = materializeValidityConjunction(
+              rowBuilder, location, outputValid, originalValidity,
+              outputPredicateType);
+        else
+          valid = materializeRetargetedValidity(
+              rowBuilder, location, originalValidity, outputTailRanges,
+              outputValid, outputPredicateType);
       }
       if (failed(valid))
         return path.store.emitOpError(

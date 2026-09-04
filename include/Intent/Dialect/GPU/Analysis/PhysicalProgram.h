@@ -338,7 +338,7 @@ public:
   PhysicalAccessBoundsFact accessBounds(mlir::Operation *access);
   PhysicalBufferDataflowFact bufferDataflow(BufferOp buffer);
 
-  /// Recognizes a predicate composed only from exact range-end comparisons,
+  /// Recognizes a predicate composed only from exact range-bound comparisons,
   /// predicate-preserving shape operations and boolean conjunction.  This is
   /// a pure query; it never invents or rewrites validity.
   bool isTailPredicate(
