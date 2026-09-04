@@ -723,7 +723,8 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   FragmentType target = predicateType(valueType);
   Value result;
   if (existing) {
-    FailureOr<Value> broadcast = materializeBroadcastToFragment(builder, location, existing, target);
+    FailureOr<Value> broadcast =
+        materializeBroadcastToFragment(builder, location, existing, target);
     if (failed(broadcast))
       return failure();
     result = *broadcast;
@@ -4788,7 +4789,13 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     range.erase();
   }
 
-  if (failed(alignAccessResultRelations(kernel)))
+  // Dynamic tail predicates are side-table facts until they are attached to
+  // accesses.  Materialize those SSA uses before histogram realization, whose
+  // dead-value cleanup would otherwise erase the unused comparisons and leave
+  // dangling Values in rangePredicates.
+  if (failed(alignAccessResultRelations(kernel)) ||
+      failed(addTailValidity(kernel, rangePredicates,
+                             /*includeStores=*/true)))
     return failure();
   if (ownershipOnly) {
     if (failed(alignHistogramOutputOwnership(kernel)))
@@ -4796,9 +4803,6 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
   } else if (failed(realizeOwnedHistograms(kernel))) {
     return failure();
   }
-  if (failed(addTailValidity(kernel, rangePredicates,
-                             /*includeStores=*/true)))
-    return failure();
   if (failed(alignContractValueRelations(kernel)))
     return failure();
   if (failed(bindStructurallyRequiredStaticFragments(kernel)))
