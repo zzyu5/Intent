@@ -1288,7 +1288,8 @@ bool hasLoopCarriedFragment(func::FuncOp kernel) {
   return found;
 }
 
-LogicalResult formNativeTiles(func::FuncOp kernel) {
+LogicalResult formNativeTiles(func::FuncOp kernel,
+                              bool &hasRequiredGatherAccess) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
   SmallVector<gpu::ContractOp> contracts;
@@ -1453,6 +1454,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
     bool native = succeeded(indices) && succeeded(originGuard) &&
                   (!guardedNative ||
                    (load.getFill() && load.getFill().getType() == result));
+    hasRequiredGatherAccess |= !native;
     FailureOr<Value> allowTMA = failure();
     if (native) {
       allowTMA = tmaCondition(plan->resourceType);
@@ -1844,7 +1846,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   return success();
 }
 
-LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
+LogicalResult materializeClosedConfigs(func::FuncOp kernel,
+                                       bool hasRequiredGatherAccess) {
   struct Domain {
     gpu::ParameterOp parameter;
     bool provider;
@@ -1922,6 +1925,15 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
     gpu::ParameterAttr definition = domain.parameter.getParameter();
     for (const auto &base : configurations)
       for (int64_t candidate : definition.getCandidates().asArrayRef()) {
+        auto role = static_cast<gpu::ParameterRole>(definition.getRole());
+        // A load with no native tile realization already fixes part of the
+        // program to the cuTile gather surface.  Keep the remaining regular
+        // accesses in their proven native form instead of turning the mixed
+        // program into another independent whole-kernel form search.
+        if (hasRequiredGatherAccess &&
+            role == gpu::ParameterRole::ProviderAccessForm &&
+            candidate != nativeAccessForm)
+          continue;
         SmallVector<NamedAttribute> bindings(base);
         bindings.push_back(builder.getNamedAttr(
             definition.getName(), builder.getI64IntegerAttr(candidate)));
@@ -2132,8 +2144,10 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  if (failed(kernel) || failed(formNativeTiles(*kernel)) ||
-      failed(materializeClosedConfigs(*kernel)) ||
+  bool hasRequiredGatherAccess = false;
+  if (failed(kernel) ||
+      failed(formNativeTiles(*kernel, hasRequiredGatherAccess)) ||
+      failed(materializeClosedConfigs(*kernel, hasRequiredGatherAccess)) ||
       failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

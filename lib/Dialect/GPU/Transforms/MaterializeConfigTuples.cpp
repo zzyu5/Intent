@@ -364,6 +364,13 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{1, 1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 1, 2, 8},
             {1, 1, 1, 1, 1, 4, 8}};
+  if (kind == TuningClass::PointwiseReduction && twoAxisPointwise)
+    return {{1, 512, 32, 1, 128, 1, 8},
+            {1, 64, 32, 1, 128, 1, 8},
+            {4, 16, 32, 1, 128, 1, 8},
+            {16, 16, 32, 1, 128, 1, 8},
+            {32, 8, 32, 1, 128, 1, 8},
+            {64, 2, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::PointwiseReduction)
     return {{64, 128, 32, 1, 128, 1, 8},
             {64, 64, 32, 1, 128, 1, 8},
@@ -486,6 +493,17 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                schema.getCandidates().size() == 1 &&
                parameter->hasAttr(pointwiseLocalAttr);
       });
+  bool hasJointPointwiseReduction =
+      hasTwoAxisPointwiseOwnership &&
+      llvm::any_of(parameters, [&](ParameterOp parameter) {
+        ParameterAttr schema = parameter.getParameter();
+        return schema.getCategory() ==
+                   static_cast<uint32_t>(ParameterCategory::Pointwise) &&
+               schema.getRole() ==
+                   static_cast<uint32_t>(ParameterRole::OwnershipM) &&
+               tuningClass(kernel, parameter) ==
+                   TuningClass::PointwiseReduction;
+      });
   bool pointwiseOnlyProgram = true;
   kernel.walk([&](Operation *operation) {
     pointwiseOnlyProgram &=
@@ -526,7 +544,14 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
   }
   if (profileCount == 0)
     profileCount = 1;
-  for (unsigned profileIndex = 0; profileIndex < profileCount; ++profileIndex) {
+  // A free axis that survives a blocked reduction and a second pointwise
+  // ownership axis form one live two-dimensional state.  Materialize the
+  // balanced row-wise profile as one correlated physical binding instead of
+  // pairing six independent one-dimensional requests into oversized states.
+  unsigned profileBegin = hasJointPointwiseReduction ? 1 : 0;
+  unsigned profileEnd = hasJointPointwiseReduction ? 2 : profileCount;
+  for (unsigned profileIndex = profileBegin; profileIndex < profileEnd;
+       ++profileIndex) {
     SmallVector<NamedAttribute> bindings;
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
