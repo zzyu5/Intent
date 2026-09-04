@@ -213,7 +213,14 @@ gpu::FragmentType transposeRankTwo(gpu::FragmentType source) {
       source.getOwner());
 }
 
-bool canBroadcastTo(gpu::FragmentType source, gpu::FragmentType target) {
+FailureOr<SmallVector<unsigned>>
+coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
+  if (source.getOwner() != target.getOwner() ||
+      source.getShape().size() > target.getShape().size())
+    return failure();
+  SmallVector<unsigned> result;
+  SmallVector<bool> usedTargetAxes(target.getShape().size(), false);
+  result.reserve(source.getShape().size());
   for (auto [sourceIndex, sourceAttribute] :
        llvm::enumerate(source.getAxisMaps())) {
     auto sourceMap = cast<gpu::AxisMapAttr>(sourceAttribute);
@@ -221,15 +228,18 @@ bool canBroadcastTo(gpu::FragmentType source, gpu::FragmentType target) {
     for (auto [index, targetAttribute] :
          llvm::enumerate(target.getAxisMaps())) {
       auto targetMap = cast<gpu::AxisMapAttr>(targetAttribute);
-      if (sourceMap.getSourceId() != targetMap.getSourceId() ||
-          sourceMap.getSourceAxis() != targetMap.getSourceAxis())
+      if (usedTargetAxes[index] ||
+          sourceMap.getSourceId() != targetMap.getSourceId() ||
+          sourceMap.getSourceAxis() != targetMap.getSourceAxis() ||
+          sourceMap.getDimensionId() != targetMap.getDimensionId() ||
+          sourceMap.getDerived() != targetMap.getDerived())
         continue;
       if (targetIndex)
-        return false;
+        return failure();
       targetIndex = index;
     }
     if (!targetIndex)
-      return false;
+      return failure();
     Attribute sourceExtent = source.getShape()[sourceIndex];
     Attribute targetExtent = target.getShape()[*targetIndex];
     auto constant = dyn_cast<gpu::PhysicalExprAttr>(sourceExtent);
@@ -238,9 +248,11 @@ bool canBroadcastTo(gpu::FragmentType source, gpu::FragmentType target) {
                                           gpu::PhysicalExprKind::Constant) &&
                 constant.getValue() == 1;
     if (!unit && sourceExtent != targetExtent)
-      return false;
+      return failure();
+    usedTargetAxes[*targetIndex] = true;
+    result.push_back(*targetIndex);
   }
-  return true;
+  return result;
 }
 
 FailureOr<SmallVector<Value>> materializeCoordinateDomains(
@@ -254,19 +266,90 @@ FailureOr<SmallVector<Value>> materializeCoordinateDomains(
       results.push_back(coordinate);
       continue;
     }
-    if (source.getOwner() != target.getOwner() ||
-        source.getShape().size() > target.getShape().size() ||
-        !canBroadcastTo(source, target))
+    FailureOr<SmallVector<unsigned>> targetAxes =
+        coordinateTargetAxes(source, target);
+    if (failed(targetAxes))
       return owner->emitOpError(
           "cuTile coordinate cannot adopt the selected physical domain");
+    auto preserveOrigin = [&](Operation *operation) {
+      if (Operation *definition = coordinate.getDefiningOp())
+        if (Attribute origin = definition->getAttr(gpu::originAttr))
+          operation->setAttr(gpu::originAttr, origin);
+    };
+
+    SmallVector<int64_t> permutation;
+    permutation.reserve(source.getShape().size());
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+      permutation.push_back(axis);
+    llvm::sort(permutation, [&](int64_t lhs, int64_t rhs) {
+      return (*targetAxes)[lhs] < (*targetAxes)[rhs];
+    });
+    bool identityPermutation = llvm::all_of(
+        llvm::enumerate(permutation), [](auto item) {
+          return static_cast<int64_t>(item.index()) == item.value();
+        });
+    if (!identityPermutation) {
+      SmallVector<Attribute> shape;
+      SmallVector<Attribute> mappings;
+      SmallVector<unsigned> reorderedTargetAxes;
+      shape.reserve(permutation.size());
+      mappings.reserve(permutation.size());
+      reorderedTargetAxes.reserve(permutation.size());
+      for (auto [resultAxis, sourceAxis] : llvm::enumerate(permutation)) {
+        shape.push_back(source.getShape()[sourceAxis]);
+        auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
+        mappings.push_back(gpu::AxisMapAttr::get(
+            owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), resultAxis, mapping.getDerived()));
+        reorderedTargetAxes.push_back((*targetAxes)[sourceAxis]);
+      }
+      auto transposedType = gpu::FragmentType::get(
+          owner->getContext(), source.getElementType(),
+          ArrayAttr::get(owner->getContext(), shape),
+          ArrayAttr::get(owner->getContext(), mappings), source.getValidity(),
+          source.getOwner());
+      auto transpose = builder.create<gpu::TransposeOp>(
+          owner->getLoc(), transposedType, coordinate, permutation);
+      preserveOrigin(transpose);
+      coordinate = transpose.getResult();
+      source = transposedType;
+      *targetAxes = std::move(reorderedTargetAxes);
+    }
+
+    auto unit = gpu::PhysicalExprAttr::get(
+        owner->getContext(),
+        static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+        StringAttr::get(owner->getContext()),
+        ArrayAttr::get(owner->getContext(), {}));
+    SmallVector<Attribute> expandedShape(target.getShape().size(), unit);
+    for (auto [sourceAxis, targetAxis] : llvm::enumerate(*targetAxes))
+      expandedShape[targetAxis] = source.getShape()[sourceAxis];
+    auto expandedType = gpu::FragmentType::get(
+        owner->getContext(), source.getElementType(),
+        ArrayAttr::get(owner->getContext(), expandedShape),
+        target.getAxisMaps(), target.getValidity(), target.getOwner());
+    if (!samePhysicalDomain(source, expandedType)) {
+      FailureOr<ArrayAttr> reassociation =
+          gpu::inferReshapeReassociation(source, expandedType);
+      if (failed(reassociation))
+        return owner->emitOpError(
+            "cuTile coordinate occurrence has no row-major domain expansion");
+      auto reshape = builder.create<gpu::ReshapeOp>(
+          owner->getLoc(), expandedType, coordinate, *reassociation);
+      preserveOrigin(reshape);
+      coordinate = reshape.getResult();
+      source = expandedType;
+    }
     auto resultType = gpu::FragmentType::get(
         owner->getContext(), source.getElementType(), target.getShape(),
         target.getAxisMaps(), target.getValidity(), target.getOwner());
+    if (samePhysicalDomain(source, resultType)) {
+      results.push_back(coordinate);
+      continue;
+    }
     auto broadcast = builder.create<gpu::BroadcastOp>(
         owner->getLoc(), resultType, coordinate);
-    if (Operation *definition = coordinate.getDefiningOp())
-      if (Attribute origin = definition->getAttr(gpu::originAttr))
-        broadcast->setAttr(gpu::originAttr, origin);
+    preserveOrigin(broadcast);
     results.push_back(broadcast.getResult());
   }
   return results;
