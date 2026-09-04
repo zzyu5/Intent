@@ -1028,13 +1028,16 @@ FailureOr<Value> stripOptionalRecord(OpBuilder &builder, Location location,
 }
 
 Value restoreOptionalRecord(OpBuilder &builder, Location location, Value payload,
-                            const SummaryEmptinessPlan &plan) {
+                            const SummaryEmptinessPlan &plan,
+                            Value optionalValidity = {}) {
   SmallVector<Value> fields;
   unsigned payloadField = 0;
   for (unsigned field = 0; field < plan.fullType.getFieldTypes().size(); ++field) {
     Type type = cast<TypeAttr>(plan.fullType.getFieldTypes()[field]).getValue();
     if (field == plan.optionalField) {
-      fields.push_back(allTrueValue(builder, location, type));
+      fields.push_back(optionalValidity
+                           ? optionalValidity
+                           : allTrueValue(builder, location, type));
       continue;
     }
     fields.push_back(builder.create<ExtractOp>(location, type, payload,
@@ -1950,20 +1953,13 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   }
 
-  const bool regionContraction =
-      static_cast<ParameterCategory>(fold.getSegment().getCategory()) ==
-      ParameterCategory::RegionContraction;
-  // A first-member seed introduces a tail-aware access variant before the
-  // remaining contraction segments.  Keep it disabled until those variants
-  // share one native access realization; prefix predicate specialization itself
-  // preserves the segment-owned contraction form.
-  if (emptiness && specializePredicatePrefix && !regionContraction &&
+  if (emptiness && specializePredicatePrefix &&
       partition->firstMemberIsActive) {
     stop = partition->effectiveStop;
     Value nonempty = builder.create<CompareOp>(
         location, builder.getI1Type(), stop, zero, ComparePredicate::Gt);
     auto conditional = builder.create<scf::IfOp>(
-        location, fold.getResultTypes(), nonempty,
+        location, TypeRange{emptiness->payloadType}, nonempty,
         /*withElseRegion=*/true);
     auto prepareBranch = [](Region &region) {
       Block &block = region.front();
@@ -1988,11 +1984,26 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     if (failed(first) || failed(payload))
       bodyFailed = true;
 
-    auto emitPayloadLoop = [&](OpBuilder &branchBuilder, Value lower, Value upper,
-                               Value initial, bool fullSegment,
+    if (!bodyFailed)
+      nonemptyBuilder.create<scf::YieldOp>(location, *payload);
+    OpBuilder emptyBuilder = prepareBranch(conditional.getElseRegion());
+    FailureOr<Value> emptyPayload = stripOptionalRecord(
+        emptyBuilder, location, identities.front(), *emptiness);
+    if (failed(emptyPayload))
+      bodyFailed = true;
+    else
+      emptyBuilder.create<scf::YieldOp>(location, *emptyPayload);
+    if (bodyFailed) {
+      conditional.erase();
+      return fold.emitOpError("region-fold physicalization failed: ")
+             << failureReason;
+    }
+
+    auto emitPayloadLoop = [&](Value lower, Value upper, Value initial,
+                               bool fullSegment,
                                bool predicateIsTrue,
                                bool summaryIsNonempty) -> scf::ForOp {
-      auto loop = branchBuilder.create<scf::ForOp>(
+      auto loop = builder.create<scf::ForOp>(
           location, lower, upper, segment.getResult(), ValueRange{initial},
           [&](OpBuilder &nested, Location nestedLocation, Value offset,
               ValueRange carries) {
@@ -2035,56 +2046,57 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     scf::ForOp allTrueLoop;
     scf::ForOp fullMixedLoop;
     scf::ForOp tailLoop;
-    Value current = succeeded(payload) ? *payload : Value();
-    if (!bodyFailed) {
-      allTrueLoop = emitPayloadLoop(
-          nonemptyBuilder, segment.getResult(), partition->allTrueStop, current,
-          /*fullSegment=*/true, /*predicateIsTrue=*/true,
-          /*summaryIsNonempty=*/true);
-      current = allTrueLoop.getResult(0);
-    }
-    Value mixedStart = nonemptyBuilder.create<BinaryOp>(
-        location, nonemptyBuilder.getIndexType(), partition->allTrueStop,
+    Value current = conditional.getResult(0);
+    allTrueLoop = emitPayloadLoop(
+        segment.getResult(), partition->allTrueStop, current,
+        /*fullSegment=*/true, /*predicateIsTrue=*/true,
+        /*summaryIsNonempty=*/true);
+    current = allTrueLoop.getResult(0);
+    Value mixedStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), partition->allTrueStop,
         segment.getResult(), BinaryOperator::Maximum);
-    Value fullMixedSegments = nonemptyBuilder.create<BinaryOp>(
-        location, nonemptyBuilder.getIndexType(), stop, segment.getResult(),
+    Value fullMixedSegments = builder.create<BinaryOp>(
+        location, builder.getIndexType(), stop, segment.getResult(),
         BinaryOperator::FloorDivide);
-    Value fullMixedStop = nonemptyBuilder.create<BinaryOp>(
-        location, nonemptyBuilder.getIndexType(), fullMixedSegments,
+    Value fullMixedStop = builder.create<BinaryOp>(
+        location, builder.getIndexType(), fullMixedSegments,
         segment.getResult(), BinaryOperator::Multiply);
     if (!bodyFailed) {
       fullMixedLoop = emitPayloadLoop(
-          nonemptyBuilder, mixedStart, fullMixedStop, current,
-          /*fullSegment=*/true, /*predicateIsTrue=*/false,
+          mixedStart, fullMixedStop, current, /*fullSegment=*/true,
+          /*predicateIsTrue=*/false,
           /*summaryIsNonempty=*/false);
       current = fullMixedLoop.getResult(0);
     }
-    Value tailStart = nonemptyBuilder.create<BinaryOp>(
-        location, nonemptyBuilder.getIndexType(), fullMixedStop,
+    Value tailStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), fullMixedStop,
         segment.getResult(), BinaryOperator::Maximum);
     if (!bodyFailed) {
       tailLoop = emitPayloadLoop(
-          nonemptyBuilder, tailStart, stop, current,
-          /*fullSegment=*/false, /*predicateIsTrue=*/false,
+          tailStart, stop, current, /*fullSegment=*/false,
+          /*predicateIsTrue=*/false,
           /*summaryIsNonempty=*/false);
       current = tailLoop.getResult(0);
     }
-    if (!bodyFailed) {
-      Value result =
-          restoreOptionalRecord(nonemptyBuilder, location, current, *emptiness);
-      nonemptyBuilder.create<scf::YieldOp>(location, result);
-    }
-
-    OpBuilder emptyBuilder = prepareBranch(conditional.getElseRegion());
-    emptyBuilder.create<scf::YieldOp>(location, identities);
     if (bodyFailed) {
-      conditional.erase();
+      if (allTrueLoop && allTrueLoop->getBlock())
+        allTrueLoop.erase();
+      if (fullMixedLoop && fullMixedLoop->getBlock())
+        fullMixedLoop.erase();
+      if (tailLoop && tailLoop->getBlock())
+        tailLoop.erase();
       return fold.emitOpError("region-fold physicalization failed: ")
              << failureReason;
     }
-    for (auto [oldResult, newResult] :
-         llvm::zip(fold.getResults(), conditional.getResults()))
-      oldResult.replaceAllUsesWith(newResult);
+    Type validityType = cast<TypeAttr>(emptiness->fullType.getFieldTypes()[
+                                           emptiness->optionalField])
+                            .getValue();
+    Value validity = nonempty;
+    if (isa<FragmentType>(validityType))
+      validity = builder.create<SplatOp>(location, validityType, validity);
+    Value result = restoreOptionalRecord(builder, location, current, *emptiness,
+                                         validity);
+    fold.getResult(0).replaceAllUsesWith(result);
     fold.erase();
     return finish();
   }
