@@ -562,6 +562,10 @@ ParameterOp findParameter(func::FuncOp kernel, ParameterAttr schema) {
   return result;
 }
 
+std::optional<bool> booleanConstant(
+    Value value, Value falsePredicate,
+    llvm::SmallPtrSetImpl<Operation *> &visiting);
+
 BlockArgument rootHelperArgument(Value value) {
   while (Operation *definition = value.getDefiningOp()) {
     if (auto broadcast = dyn_cast<BroadcastOp>(definition)) {
@@ -578,6 +582,19 @@ BlockArgument rootHelperArgument(Value value) {
     }
     if (auto transpose = dyn_cast<TransposeOp>(definition)) {
       value = transpose.getValue();
+      continue;
+    }
+    if (auto splat = dyn_cast<SplatOp>(definition)) {
+      value = splat.getValue();
+      continue;
+    }
+    if (auto select = dyn_cast<SelectOp>(definition)) {
+      llvm::SmallPtrSet<Operation *, 16> visiting;
+      std::optional<bool> condition =
+          booleanConstant(select.getCondition(), Value(), visiting);
+      if (!condition)
+        return {};
+      value = *condition ? select.getTrueValue() : select.getFalseValue();
       continue;
     }
     return {};
@@ -1607,6 +1624,14 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       fold.getSourceCount() + fold.getIdentityCount());
   FailureOr<PredicatePartition> partition = predicatePartition(
       builder, fold, plans, master, stop, identities, segment.getResult());
+  // The upper bound is valid for every structured fold.  Eliding the predicate
+  // over an all-true prefix clones the summarizer into another loop, so keep a
+  // contraction summarizer as one physical contraction program until its
+  // control-flow variants have a shared blocking realization.
+  bool specializePredicatePrefix =
+      succeeded(partition) &&
+      static_cast<ParameterCategory>(fold.getSegment().getCategory()) !=
+          ParameterCategory::RegionContraction;
   Value memberPredicate =
       summaryMembershipPredicate(fold, identities, fold.getSegment());
   if (!memberPredicate)
@@ -1744,7 +1769,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     return finish();
   }
 
-  if (emptiness && succeeded(partition) && partition->firstMemberIsActive) {
+  if (emptiness && specializePredicatePrefix &&
+      partition->firstMemberIsActive) {
     stop = partition->effectiveStop;
     Value nonempty = builder.create<CompareOp>(
         location, builder.getI1Type(), stop, zero, ComparePredicate::Gt);
@@ -1877,7 +1903,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
   SmallVector<Value> current(identities.begin(), identities.end());
   scf::ForOp allTrueLoop;
-  if (succeeded(partition)) {
+  if (specializePredicatePrefix) {
     allTrueLoop = emitLoop(zero, partition->allTrueStop, current,
                            /*fullSegment=*/true,
                            /*predicateIsTrue=*/true);
@@ -1885,7 +1911,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       current.assign(allTrueLoop.getResults().begin(),
                      allTrueLoop.getResults().end());
   }
-  Value mixedStart = succeeded(partition) ? partition->allTrueStop : zero;
+  Value mixedStart =
+      specializePredicatePrefix ? partition->allTrueStop : zero;
   stop = succeeded(partition) ? partition->effectiveStop : stop;
   Value fullMixedSegments = builder.create<BinaryOp>(
       location, builder.getIndexType(), stop, segment.getResult(),
