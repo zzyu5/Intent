@@ -1,41 +1,27 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
+#include "OnlineSummary.h"
+
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
-#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
 namespace intent::gpu {
 namespace {
 
-struct OnlineSummaryPattern {
-  MakeRecordOp record;
-  ReduceOp validity;
-  ReduceOp maximum;
-  ReduceOp mass;
-  ContractOp moment;
-  SelectOp maximumOrEmpty;
-  SelectOp maskedScore;
-  SelectOp probability;
-  UnaryOp exponential;
-  Value memberValidity;
-  Value score;
-  Value values;
-  unsigned validityField;
-  unsigned maximumField;
-  unsigned massField;
-  unsigned momentField;
-  unsigned reductionAxis;
-  unsigned valueReductionAxis;
-  PhysicalSourceAxis traversal;
+struct OnlineSummaryPattern : OnlineSummaryStructure {
+  OnlineSummaryPattern(OnlineSummaryStructure structure, MakeRangeOp authority,
+                       SmallVector<MakeRangeOp> ranges)
+      : OnlineSummaryStructure(std::move(structure)), authority(authority),
+        ranges(std::move(ranges)) {}
+
   MakeRangeOp authority;
   SmallVector<MakeRangeOp> ranges;
 };
@@ -85,193 +71,23 @@ Value scalarValue(Value value) {
   return {};
 }
 
-bool isBooleanConstant(Value value, bool expected) {
-  auto constant = scalarValue(value).getDefiningOp<arith::ConstantOp>();
-  auto attribute = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                            : IntegerAttr();
-  return attribute && attribute.getType().isInteger(1) &&
-         attribute.getValue().getBoolValue() == expected;
-}
-
-bool isZero(Value value) {
-  auto constant = scalarValue(value).getDefiningOp<arith::ConstantOp>();
-  if (!constant)
-    return false;
-  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-    return integer.getValue().isZero();
-  if (auto floating = dyn_cast<FloatAttr>(constant.getValue()))
-    return floating.getValue().isZero();
-  return false;
-}
-
-bool isNegativeInfinity(Value value) {
-  auto constant = scalarValue(value).getDefiningOp<arith::ConstantOp>();
-  auto floating = constant ? dyn_cast<FloatAttr>(constant.getValue())
-                           : FloatAttr();
-  return floating && floating.getValue().isInfinity() &&
-         floating.getValue().isNegative();
-}
-
-bool sameExecutionSchema(Type lhs, Type rhs) {
-  auto left = dyn_cast<FragmentType>(lhs);
-  auto right = dyn_cast<FragmentType>(rhs);
-  return left && right && left.getShape() == right.getShape() &&
-         left.getAxisMaps() == right.getAxisMaps() &&
-         left.getValidity() == right.getValidity() &&
-         left.getOwner() == right.getOwner();
-}
-
-bool isSingleBinaryReduction(ReduceOp reduce, BinaryOperator kind) {
-  return reduce && reduce.getNumResults() == 1 &&
-         reduce.getAxes().size() == 1 &&
-         reduce.getSourceCount() == 1 && reduce.getIdentityCount() == 1 &&
-         reduce.getCaptureCount() == 0 &&
-         queryBinaryCombineKind(reduce.getCombine()) == kind;
-}
-
-bool isProjectedFrom(Value value, Value source,
-                     SmallPtrSetImpl<Operation *> &visited) {
-  if (value == source)
-    return true;
-  Operation *producer = value.getDefiningOp();
-  if (!producer || !visited.insert(producer).second)
-    return false;
-  if (auto broadcast = dyn_cast<BroadcastOp>(producer))
-    return isProjectedFrom(broadcast.getValue(), source, visited);
-  if (auto select = dyn_cast<SelectOp>(producer))
-    return isBooleanConstant(select.getCondition(), true) &&
-           isZero(select.getFalseValue()) &&
-           isProjectedFrom(select.getTrueValue(), source, visited);
-  return false;
-}
-
-bool isProjectedFrom(Value value, Value source) {
-  SmallPtrSet<Operation *, 8> visited;
-  return isProjectedFrom(value, source, visited);
-}
-
 FailureOr<OnlineSummaryPattern> matchOnlineSummary(MakeRecordOp record,
                                                    func::FuncOp kernel) {
   if (record->getBlock() != &kernel.getBody().front())
     return failure();
-  if (record.getFields().size() != 4)
-    return failure();
-
-  SmallVector<std::pair<unsigned, ReduceOp>> validityCandidates;
-  SmallVector<std::pair<unsigned, ReduceOp>> massCandidates;
-  SmallVector<std::pair<unsigned, SelectOp>> maximumCandidates;
-  SmallVector<std::pair<unsigned, ContractOp>> momentCandidates;
-  for (auto [index, field] : llvm::enumerate(record.getFields())) {
-    if (auto reduce = field.getDefiningOp<ReduceOp>()) {
-      auto resultType = reduce.getNumResults() == 1
-                            ? dyn_cast<FragmentType>(reduce.getResult(0).getType())
-                            : FragmentType();
-      if (isSingleBinaryReduction(reduce, BinaryOperator::LogicalOr) &&
-          resultType && resultType.getElementType().isInteger(1))
-        validityCandidates.emplace_back(index, reduce);
-      if (isSingleBinaryReduction(reduce, BinaryOperator::Add))
-        massCandidates.emplace_back(index, reduce);
-      continue;
-    }
-    if (auto select = field.getDefiningOp<SelectOp>()) {
-      auto reduce = select.getTrueValue().getDefiningOp<ReduceOp>();
-      if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum))
-        maximumCandidates.emplace_back(index, select);
-      continue;
-    }
-    if (auto contract = field.getDefiningOp<ContractOp>())
-      momentCandidates.emplace_back(index, contract);
-  }
-  if (validityCandidates.size() != 1 || massCandidates.size() != 1 ||
-      maximumCandidates.size() != 1 || momentCandidates.size() != 1)
-    return failure();
-
-  auto [validityField, validity] = validityCandidates.front();
-  auto [maximumField, maximumOrEmpty] = maximumCandidates.front();
-  auto [massField, mass] = massCandidates.front();
-  auto [momentField, moment] = momentCandidates.front();
-  auto maximum = maximumOrEmpty.getTrueValue().getDefiningOp<ReduceOp>();
-  Value memberValidity = validity.getInputs().front();
-  if (maximumOrEmpty.getCondition() != validity.getResult(0) ||
-      !isZero(maximumOrEmpty.getFalseValue()) ||
-      !isBooleanConstant(validity.getInputs()[1], false) ||
-      !isNegativeInfinity(maximum.getInputs()[1]))
-    return failure();
-
-  auto maskedScore = maximum.getInputs().front().getDefiningOp<SelectOp>();
-  if (!maskedScore || maskedScore.getCondition() != memberValidity ||
-      !isNegativeInfinity(maskedScore.getFalseValue()))
-    return failure();
-  Value score = maskedScore.getTrueValue();
-
-  Value probabilityValue = mass.getInputs().front();
-  auto probability = probabilityValue.getDefiningOp<SelectOp>();
-  if (!probability || probability.getCondition() != memberValidity ||
-      !isZero(probability.getFalseValue()))
-    return failure();
-  auto exponential = probability.getTrueValue().getDefiningOp<UnaryOp>();
-  if (!exponential ||
-      (exponential.getOperatorKind() != UnaryOperator::Exp &&
-       exponential.getOperatorKind() != UnaryOperator::Exp2))
-    return failure();
-  auto shift = exponential.getInput().getDefiningOp<BinaryOp>();
-  if (!shift || shift.getOperatorKind() != BinaryOperator::Subtract ||
-      shift.getLhs() != maskedScore.getResult() ||
-      !isProjectedFrom(shift.getRhs(), maximumOrEmpty.getResult()))
-    return failure();
-
-  auto probabilityCast = moment.getLhs().getDefiningOp<CastOp>();
-  if (!probabilityCast || probabilityCast.getValue() != probabilityValue ||
-      !isZero(moment.getAccumulator()) ||
-      moment.getLhsReductionAxes().size() != 1 ||
-      moment.getRhsReductionAxes().size() != 1)
-    return failure();
-  Value values = moment.getRhs();
-
-  int64_t rawReductionAxis = validity.getAxes().front();
-  int64_t rawValueReductionAxis = moment.getRhsReductionAxes().front();
-  if (rawReductionAxis < 0 || rawValueReductionAxis < 0)
-    return failure();
-  unsigned reductionAxis = static_cast<unsigned>(rawReductionAxis);
-  if (validity.getAxes() != maximum.getAxes() ||
-      validity.getAxes() != mass.getAxes() ||
-      moment.getLhsReductionAxes().front() !=
-          static_cast<int64_t>(reductionAxis) ||
-      !sameExecutionSchema(validity.getResult(0).getType(),
-                           maximum.getResult(0).getType()) ||
-      !sameExecutionSchema(maximum.getResult(0).getType(),
-                           mass.getResult(0).getType()) ||
-      !sameExecutionSchema(memberValidity.getType(), score.getType()) ||
-      !sameExecutionSchema(score.getType(), probabilityValue.getType()))
-    return failure();
-  unsigned valueReductionAxis = static_cast<unsigned>(rawValueReductionAxis);
-
-  auto scoreType = dyn_cast<FragmentType>(score.getType());
-  auto validityType = dyn_cast<FragmentType>(memberValidity.getType());
-  auto valueType = dyn_cast<FragmentType>(values.getType());
-  if (!scoreType || !validityType || !valueType ||
-      reductionAxis >= scoreType.getShape().size() ||
-      reductionAxis >= validityType.getShape().size() ||
-      valueReductionAxis >= valueType.getShape().size())
-    return failure();
-  FailureOr<AxisMapAttr> scoreMap = queryAxisMap(scoreType, reductionAxis);
-  FailureOr<AxisMapAttr> validityMap =
-      queryAxisMap(validityType, reductionAxis);
-  FailureOr<AxisMapAttr> valueMap =
-      queryAxisMap(valueType, valueReductionAxis);
-  if (failed(scoreMap) || failed(validityMap) || failed(valueMap))
-    return failure();
-  PhysicalSourceAxis traversal = sourceAxisIdentity(*scoreMap);
-  if (!(sourceAxisIdentity(*validityMap) == traversal) ||
-      !(sourceAxisIdentity(*valueMap) == traversal))
+  FailureOr<OnlineSummaryStructure> summary =
+      matchOnlineSummaryStructure(record);
+  if (failed(summary))
     return failure();
 
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<MakeRangeOp> ranges;
   for (auto [value, axis] :
-       {std::pair<Value, unsigned>{memberValidity, reductionAxis},
-        std::pair<Value, unsigned>{score, reductionAxis},
-        std::pair<Value, unsigned>{values, valueReductionAxis}}) {
+       {std::pair<Value, unsigned>{summary->memberValidity,
+                                   summary->reductionAxis},
+        std::pair<Value, unsigned>{summary->score, summary->reductionAxis},
+        std::pair<Value, unsigned>{summary->values,
+                                   summary->valueReductionAxis}}) {
     PhysicalRangeFact fact = analysis.axisRanges(value, axis);
     if (fact.roots.empty())
       return failure();
@@ -282,61 +98,21 @@ FailureOr<OnlineSummaryPattern> matchOnlineSummary(MakeRecordOp record,
   PhysicalLockstepTraversalFact lockstep = analysis.lockstepRanges(ranges);
   if (!lockstep.isExact() || !lockstep.authority ||
       !llvm::all_of(ranges, [&](MakeRangeOp range) {
-        return sourceAxisIdentity(range) == traversal &&
+        return sourceAxisIdentity(range) == summary->traversal &&
                isUnitStepRange(range);
       }))
     return failure();
-  for (Value value : {memberValidity, score, values})
+  for (Value value :
+       {summary->memberValidity, summary->score, summary->values})
     if (!analysis
-             .replayability(value, traversal,
+             .replayability(value, summary->traversal,
                             PhysicalReplayScope::ValueGraph,
                             /*allowAccesses=*/true)
              .isReplayable())
       return failure();
 
-  return OnlineSummaryPattern{
-      record,
-      validity,
-      maximum,
-      mass,
-      moment,
-      maximumOrEmpty,
-      maskedScore,
-      probability,
-      exponential,
-      memberValidity,
-      score,
-      values,
-      validityField,
-      maximumField,
-      massField,
-      momentField,
-      reductionAxis,
-      valueReductionAxis,
-      traversal,
-      lockstep.authority,
-      std::move(ranges)};
-}
-
-ReduceOp cloneReduction(OpBuilder &builder, Location location, ReduceOp source,
-                        Value value) {
-  SmallVector<Value> inputs{value};
-  inputs.append(source.getInputs().drop_front(source.getSourceCount()).begin(),
-                source.getInputs().drop_front(source.getSourceCount()).end());
-  OperationState state(location, ReduceOp::getOperationName());
-  state.addOperands(inputs);
-  state.addTypes(source.getResultTypes());
-  state.addAttribute("axes", source->getAttr("axes"));
-  state.addAttribute("source_count", source->getAttr("source_count"));
-  state.addAttribute("identity_count", source->getAttr("identity_count"));
-  state.addAttribute("capture_count", source->getAttr("capture_count"));
-  state.addRegion();
-  auto result = cast<ReduceOp>(builder.create(state));
-  IRMapping mapping;
-  source.getCombine().cloneInto(&result.getCombine(), mapping);
-  if (Attribute origin = source->getAttr(originAttr))
-    result->setAttr(originAttr, origin);
-  return result;
+  return OnlineSummaryPattern(std::move(*summary), lockstep.authority,
+                              std::move(ranges));
 }
 
 LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
@@ -447,9 +223,9 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
         Value replayedMasked = nested.create<SelectOp>(
             nestedLocation, blockedScoreType, blockedValidity, *replayedScore,
             negativeInfinity);
-        ReduceOp chunkValidity = cloneReduction(
+        ReduceOp chunkValidity = cloneReductionWithSource(
             nested, nestedLocation, pattern.validity, blockedValidity);
-        ReduceOp chunkMaximum = cloneReduction(
+        ReduceOp chunkMaximum = cloneReductionWithSource(
             nested, nestedLocation, pattern.maximum, replayedMasked);
         Value currentMaximum = nested.create<SelectOp>(
             nestedLocation, pattern.maximumOrEmpty.getResult().getType(),
@@ -469,7 +245,7 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
         Value replayedProbability = nested.create<SelectOp>(
             nestedLocation, blockedScoreType, blockedValidity,
             unmaskedProbability, probabilityZero);
-        ReduceOp chunkMass = cloneReduction(
+        ReduceOp chunkMass = cloneReductionWithSource(
             nested, nestedLocation, pattern.mass, replayedProbability);
         auto originalWeightType =
             cast<FragmentType>(pattern.moment.getLhs().getType());

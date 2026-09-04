@@ -1,6 +1,8 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 
+#include "OnlineSummary.h"
+
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
@@ -445,7 +447,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
                                                Value conjunctSource = {},
                                                Value conjunctPredicate = {},
                                                Value additionalSource = {},
-                                               Value additionalTarget = {}) {
+                                               Value additionalTarget = {},
+                                               IRMapping *resultMapping = nullptr) {
   if (region.empty() || !llvm::hasSingleElement(region) ||
       region.front().getNumArguments() != arguments.size()) {
     reason = "helper argument schema mismatch";
@@ -456,7 +459,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     reason = "helper has no physical yield";
     return failure();
   }
-  IRMapping mapping;
+  IRMapping localMapping;
+  IRMapping &mapping = resultMapping ? *resultMapping : localMapping;
   SmallVector<ExtentBinding> extentBindings;
   for (auto [argument, value] :
        llvm::zip(region.front().getArguments(), arguments)) {
@@ -999,6 +1003,153 @@ summaryEmptinessPlan(RegionFoldOp fold, ValueRange identities,
       ArrayAttr::get(fold.getContext(), types), fullType.getOwner());
   return SummaryEmptinessPlan{*selected, fullType, payload,
                               summary.getFields()[*selected]};
+}
+
+struct OnlineRegionPlan {
+  OnlineSummaryStructure summary;
+  OnlineSummaryMerge merge;
+};
+
+std::optional<OnlineRegionPlan>
+onlineRegionPlan(RegionFoldOp fold,
+                 const std::optional<SummaryEmptinessPlan> &emptiness) {
+  if (!emptiness || fold.getSummarize().empty())
+    return std::nullopt;
+  auto yield = dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
+  auto record = yield && yield.getValues().size() == 1
+                    ? yield.getValues().front().getDefiningOp<MakeRecordOp>()
+                    : MakeRecordOp();
+  FailureOr<OnlineSummaryStructure> summary =
+      matchOnlineSummaryStructure(record);
+  if (failed(summary))
+    return std::nullopt;
+  if (summary->validityField != emptiness->optionalField ||
+      summary->record.getResult().getType() != emptiness->fullType)
+    return std::nullopt;
+  FailureOr<OnlineSummaryMerge> merge =
+      matchOnlineSummaryMerge(fold.getCombine(), *summary);
+  if (failed(merge))
+    return std::nullopt;
+  return OnlineRegionPlan{std::move(*summary), std::move(*merge)};
+}
+
+FailureOr<Value> coRealizeOnlineRegion(
+    OpBuilder &builder, Location location, OnlineRegionPlan &plan,
+    IRMapping &summaryMapping, IRMapping &mergeMapping) {
+  auto summaryValue = [&](Value value) {
+    return summaryMapping.lookupOrNull(value);
+  };
+  auto mergeValue = [&](Value value) {
+    return mergeMapping.lookupOrNull(value);
+  };
+
+  Value memberValidity = summaryValue(plan.summary.memberValidity);
+  Value maskedScore = summaryValue(plan.summary.maskedScore.getResult());
+  Value probability = summaryValue(plan.summary.probability.getResult());
+  Value probabilityZero =
+      summaryValue(plan.summary.probability.getFalseValue());
+  Value probabilityCast =
+      summaryValue(plan.summary.probabilityCast.getResult());
+  Value mass = summaryValue(plan.summary.mass.getResult(0));
+  Value moment = summaryValue(plan.summary.moment.getResult());
+  Value combinedMaximum = mergeValue(plan.merge.combinedMaximum);
+  Value leftMassTerm = mergeValue(plan.merge.leftMassTerm);
+  Value leftMomentTerm = mergeValue(plan.merge.leftMomentTerm);
+  Value mergedRecord = mergeValue(plan.merge.record.getResult());
+  if (!memberValidity || !maskedScore || !probability || !probabilityZero ||
+      !probabilityCast || !mass || !moment || !combinedMaximum ||
+      !leftMassTerm || !leftMomentTerm || !mergedRecord)
+    return failure();
+
+  auto mappedMass = mass.getDefiningOp<ReduceOp>();
+  auto mappedMoment = moment.getDefiningOp<ContractOp>();
+  if (!mappedMass || !mappedMoment)
+    return failure();
+  FailureOr<Value> projectedMaximum = projectPhysicalValueToSchema(
+      builder, location, combinedMaximum, maskedScore.getType());
+  FailureOr<Value> projectedZero = projectPhysicalValueToSchema(
+      builder, location, probabilityZero, probability.getType());
+  if (failed(projectedMaximum) || failed(projectedZero))
+    return failure();
+
+  // region_fold declares summarize/combine as an ordered homomorphism.  Keep
+  // the same maximum and left carry scale, but associate the right scale with
+  // each member before its mass/moment reductions.
+  auto shifted = builder.create<BinaryOp>(
+      location, maskedScore.getType(), maskedScore, *projectedMaximum,
+      BinaryOperator::Subtract);
+  auto directExponential = builder.create<UnaryOp>(
+      location, probability.getType(), shifted,
+      plan.summary.exponential.getOperatorKind());
+  auto directProbability = builder.create<SelectOp>(
+      location, probability.getType(), memberValidity, directExponential,
+      *projectedZero);
+  if (Attribute origin = plan.summary.exponential->getAttr(originAttr)) {
+    shifted->setAttr(originAttr, origin);
+    directExponential->setAttr(originAttr, origin);
+    directProbability->setAttr(originAttr, origin);
+  }
+
+  ReduceOp directMass = cloneReductionWithSource(
+      builder, location, mappedMass, directProbability.getResult());
+  auto directProbabilityCast = builder.create<CastOp>(
+      location, probabilityCast.getType(), directProbability.getResult());
+  if (Attribute origin = plan.summary.probabilityCast->getAttr(originAttr))
+    directProbabilityCast->setAttr(originAttr, origin);
+  auto directMoment = builder.create<ContractOp>(
+      location, mappedMoment.getResult().getType(), directProbabilityCast,
+      mappedMoment.getRhs(), mappedMoment.getAccumulator(),
+      mappedMoment.getLhsReductionAxes(), mappedMoment.getRhsReductionAxes(),
+      mappedMoment.getLhsBatchAxes(), mappedMoment.getRhsBatchAxes());
+  if (Attribute origin = mappedMoment->getAttr(originAttr))
+    directMoment->setAttr(originAttr, origin);
+
+  auto mappedRecord = mergedRecord.getDefiningOp<MakeRecordOp>();
+  if (!mappedRecord)
+    return failure();
+  Type massType = mappedRecord.getFields()[plan.summary.massField].getType();
+  Type momentType =
+      mappedRecord.getFields()[plan.summary.momentField].getType();
+  FailureOr<Value> projectedLeftMass = projectPhysicalValueToSchema(
+      builder, location, leftMassTerm, massType);
+  FailureOr<Value> projectedMass = projectPhysicalValueToSchema(
+      builder, location, directMass.getResult(0), massType);
+  FailureOr<Value> projectedLeftMoment = projectPhysicalValueToSchema(
+      builder, location, leftMomentTerm, momentType);
+  FailureOr<Value> projectedMoment = projectPhysicalValueToSchema(
+      builder, location, directMoment.getResult(), momentType);
+  if (failed(projectedLeftMass) || failed(projectedMass) ||
+      failed(projectedLeftMoment) || failed(projectedMoment))
+    return failure();
+  Value combinedMass = builder.create<BinaryOp>(
+      location, massType, *projectedLeftMass, *projectedMass,
+      BinaryOperator::Add);
+  Value combinedMoment = builder.create<BinaryOp>(
+      location, momentType, *projectedLeftMoment, *projectedMoment,
+      BinaryOperator::Add);
+
+  SmallVector<Value> fields;
+  fields.reserve(plan.merge.record.getFields().size());
+  for (auto [field, original] :
+       llvm::enumerate(plan.merge.record.getFields())) {
+    if (field == plan.summary.massField) {
+      fields.push_back(combinedMass);
+      continue;
+    }
+    if (field == plan.summary.momentField) {
+      fields.push_back(combinedMoment);
+      continue;
+    }
+    Value mapped = mergeValue(original);
+    if (!mapped)
+      return failure();
+    fields.push_back(mapped);
+  }
+  auto replacement = builder.create<MakeRecordOp>(
+      location, mappedRecord.getResult().getType(), fields);
+  if (Attribute origin = plan.merge.record->getAttr(originAttr))
+    replacement->setAttr(originAttr, origin);
+  return replacement.getResult();
 }
 
 Value allTrueValue(OpBuilder &builder, Location location, Type type) {
@@ -1823,6 +1974,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         "region-fold summarizer has no typed membership predicate that makes a physical tail equal to identity");
   std::optional<SummaryEmptinessPlan> emptiness =
       summaryEmptinessPlan(fold, identities, memberPredicate);
+  std::optional<OnlineRegionPlan> online = onlineRegionPlan(fold, emptiness);
 
   bool bodyFailed = false;
   std::string failureReason;
@@ -1830,7 +1982,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
                          Value offset,
                          bool fullSegment,
                          bool predicateIsTrue,
-                         bool summaryIsNonempty)
+                         bool summaryIsNonempty,
+                         IRMapping *summaryMapping)
       -> FailureOr<SmallVector<Value>> {
     SmallVector<Value> slices;
     Value segmentTail;
@@ -1899,7 +2052,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
                             failureReason, substituteSource, substituteTarget,
                             fullSegment ? Value() : memberPredicate,
                             fullSegment ? Value() : segmentTail,
-                            nonemptySource, nonemptyTarget);
+                            nonemptySource, nonemptyTarget, summaryMapping);
   };
   auto emitLoop = [&](Value lower, Value upper, ValueRange initial,
                       bool fullSegment, bool predicateIsTrue) {
@@ -1909,7 +2062,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           ValueRange carries) {
         FailureOr<SmallVector<Value>> summary = emitSummary(
             nested, nestedLocation, offset, fullSegment, predicateIsTrue,
-            /*summaryIsNonempty=*/false);
+            /*summaryIsNonempty=*/false, /*summaryMapping=*/nullptr);
         if (failed(summary)) {
           bodyFailed = true;
           return;
@@ -1942,7 +2095,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     FailureOr<SmallVector<Value>> summary =
         emitSummary(builder, location, zero, /*fullSegment=*/false,
                     /*predicateIsTrue=*/false,
-                    /*summaryIsNonempty=*/false);
+                    /*summaryIsNonempty=*/false,
+                    /*summaryMapping=*/nullptr);
     if (failed(summary))
       return fold.emitOpError("region-fold physicalization failed: ")
              << failureReason;
@@ -1971,7 +2125,8 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
     OpBuilder nonemptyBuilder = prepareBranch(conditional.getThenRegion());
     FailureOr<SmallVector<Value>> first = emitSummary(
         nonemptyBuilder, location, zero, /*fullSegment=*/false,
-        /*predicateIsTrue=*/false, /*summaryIsNonempty=*/true);
+        /*predicateIsTrue=*/false, /*summaryIsNonempty=*/true,
+        /*summaryMapping=*/nullptr);
     if (succeeded(first) && first->size() != 1) {
       failureReason =
           "summary-emptiness realization requires one summary record";
@@ -2007,9 +2162,11 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
           location, lower, upper, segment.getResult(), ValueRange{initial},
           [&](OpBuilder &nested, Location nestedLocation, Value offset,
               ValueRange carries) {
+            IRMapping summaryMapping;
             FailureOr<SmallVector<Value>> summary = emitSummary(
                 nested, nestedLocation, offset, fullSegment, predicateIsTrue,
-                summaryIsNonempty);
+                summaryIsNonempty,
+                online ? &summaryMapping : nullptr);
             if (failed(summary) || summary->size() != 1 ||
                 carries.size() != 1) {
               if (succeeded(summary))
@@ -2020,9 +2177,11 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
             }
             Value fullCarry = restoreOptionalRecord(
                 nested, nestedLocation, carries.front(), *emptiness);
+            IRMapping mergeMapping;
             FailureOr<SmallVector<Value>> combined = inlinePureRegion(
                 nested, fold.getCombine(),
-                ValueRange{fullCarry, summary->front()}, failureReason);
+                ValueRange{fullCarry, summary->front()}, failureReason,
+                {}, {}, {}, {}, {}, {}, online ? &mergeMapping : nullptr);
             if (failed(combined) || combined->size() != 1) {
               if (succeeded(combined))
                 failureReason =
@@ -2030,8 +2189,16 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
               bodyFailed = true;
               return;
             }
+            Value combinedValue = combined->front();
+            if (online) {
+              FailureOr<Value> direct = coRealizeOnlineRegion(
+                  nested, nestedLocation, *online, summaryMapping,
+                  mergeMapping);
+              if (succeeded(direct))
+                combinedValue = *direct;
+            }
             FailureOr<Value> next = stripOptionalRecord(
-                nested, nestedLocation, combined->front(), *emptiness);
+                nested, nestedLocation, combinedValue, *emptiness);
             if (failed(next)) {
               bodyFailed = true;
               return;

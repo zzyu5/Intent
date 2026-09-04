@@ -7,6 +7,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeReductionBlocking.cpp
   RefineProgramMapping.cpp
   MaterializeConfigTuples.cpp
+  OnlineSummary.cpp
   Passes.cpp
   Utilities.cpp
   VerifyGPUProgram.cpp
