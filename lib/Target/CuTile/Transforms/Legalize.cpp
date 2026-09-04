@@ -23,7 +23,7 @@ constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
-constexpr int64_t occupancyCandidates[] = {1, 2, 3, 4, 6};
+constexpr int64_t occupancyCandidates[] = {1, 2, 4};
 
 std::optional<int64_t>
 constantPhysicalExpression(gpu::PhysicalExprAttr expression,
@@ -1262,11 +1262,20 @@ bool fragmentUsesRole(gpu::FragmentType fragment, func::FuncOp kernel,
   });
 }
 
+bool containsFragment(Type type) {
+  if (isa<gpu::FragmentType>(type))
+    return true;
+  auto record = dyn_cast<gpu::RecordType>(type);
+  return record && llvm::any_of(record.getFieldTypes(), [](Attribute field) {
+           return containsFragment(cast<TypeAttr>(field).getValue());
+         });
+}
+
 bool hasLoopCarriedFragment(func::FuncOp kernel) {
   bool found = false;
   kernel.walk([&](scf::ForOp loop) {
     found |= llvm::any_of(loop.getInitArgs(), [](Value value) {
-      return isa<gpu::FragmentType>(value.getType());
+      return containsFragment(value.getType());
     });
   });
   return found;
