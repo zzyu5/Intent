@@ -303,7 +303,7 @@ FailureOr<Value> scalarFill(Operation *owner, Value fill) {
 }
 
 struct NativeTileAxisPlan {
-  unsigned computationAxis = 0;
+  std::optional<unsigned> computationAxis;
   Value scalarIndex;
   gpu::MakeRangeOp range;
   SmallVector<Value> offsets;
@@ -312,6 +312,9 @@ struct NativeTileAxisPlan {
 
 struct NativeTileAccessPlan {
   gpu::FragmentType resourceType;
+  gpu::FragmentType packedType;
+  ArrayAttr resourceToPacked;
+  ArrayAttr packedToResource;
   SmallVector<NativeTileAxisPlan> axes;
   SmallVector<int64_t> toComputation;
   SmallVector<int64_t> toResource;
@@ -357,6 +360,164 @@ bool collectTileOffsets(Value value, Value range,
   return false;
 }
 
+Value stripIndexIdentities(Value value) {
+  while (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::Add:
+      if (isProvably(binary.getLhs(), 0)) {
+        value = binary.getRhs();
+        continue;
+      }
+      if (isProvably(binary.getRhs(), 0)) {
+        value = binary.getLhs();
+        continue;
+      }
+      break;
+    case BinaryOperator::Subtract:
+      if (isProvably(binary.getRhs(), 0)) {
+        value = binary.getLhs();
+        continue;
+      }
+      break;
+    case BinaryOperator::Multiply:
+      if (isProvably(binary.getLhs(), 1)) {
+        value = binary.getRhs();
+        continue;
+      }
+      if (isProvably(binary.getRhs(), 1)) {
+        value = binary.getLhs();
+        continue;
+      }
+      break;
+    default:
+      break;
+    }
+    break;
+  }
+  return value;
+}
+
+bool isKnownPositive(Value value);
+
+bool isKnownNonNegative(Value value, unsigned depth = 0) {
+  if (!value || depth >= 32)
+    return false;
+  value = stripIndexIdentities(value);
+  if (std::optional<int64_t> constant = constantValue(value))
+    return *constant >= 0;
+  auto binary = value.getDefiningOp<gpu::BinaryOp>();
+  if (!binary)
+    return false;
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Maximum:
+    return isKnownNonNegative(binary.getLhs(), depth + 1) ||
+           isKnownNonNegative(binary.getRhs(), depth + 1);
+  case BinaryOperator::Minimum:
+  case BinaryOperator::Multiply:
+    return isKnownNonNegative(binary.getLhs(), depth + 1) &&
+           isKnownNonNegative(binary.getRhs(), depth + 1);
+  case BinaryOperator::FloorDivide:
+    return isKnownNonNegative(binary.getLhs(), depth + 1) &&
+           isKnownPositive(binary.getRhs());
+  default:
+    return false;
+  }
+}
+
+bool isKnownPositive(Value value) {
+  if (std::optional<int64_t> constant = constantValue(value))
+    return *constant > 0;
+  auto parameter = value.getDefiningOp<gpu::ParameterOp>();
+  return parameter &&
+         llvm::all_of(parameter.getParameter().getCandidates().asArrayRef(),
+                      [](int64_t candidate) { return candidate > 0; });
+}
+
+bool valueUpperBoundedBy(Value value, Value bound, unsigned depth = 0) {
+  if (!value || !bound || depth >= 32)
+    return false;
+  value = stripIndexIdentities(value);
+  bound = stripIndexIdentities(bound);
+  if (gpu::samePhysicalScalarExpression(value, bound))
+    return true;
+  auto binary = value.getDefiningOp<gpu::BinaryOp>();
+  if (!binary)
+    return false;
+  switch (binary.getOperatorKind()) {
+  case BinaryOperator::Minimum:
+    return valueUpperBoundedBy(binary.getLhs(), bound, depth + 1) ||
+           valueUpperBoundedBy(binary.getRhs(), bound, depth + 1);
+  case BinaryOperator::Maximum:
+    return valueUpperBoundedBy(binary.getLhs(), bound, depth + 1) &&
+           valueUpperBoundedBy(binary.getRhs(), bound, depth + 1);
+  case BinaryOperator::Subtract:
+    return isKnownNonNegative(binary.getRhs(), depth + 1) &&
+           valueUpperBoundedBy(binary.getLhs(), bound, depth + 1);
+  case BinaryOperator::Multiply: {
+    auto provesFlooredMultiple = [&](Value quotient, Value divisor) {
+      auto division = quotient.getDefiningOp<gpu::BinaryOp>();
+      return division &&
+             division.getOperatorKind() == BinaryOperator::FloorDivide &&
+             division.getRhs() == divisor && isKnownPositive(divisor) &&
+             valueUpperBoundedBy(division.getLhs(), bound, depth + 1);
+    };
+    return provesFlooredMultiple(binary.getLhs(), binary.getRhs()) ||
+           provesFlooredMultiple(binary.getRhs(), binary.getLhs());
+  }
+  default:
+    return false;
+  }
+}
+
+bool valueIsDimension(Value value, int64_t dimension, func::FuncOp kernel) {
+  value = stripIndexIdentities(value);
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (argument.getOwner() != &kernel.getBody().front())
+      return false;
+    auto identity = kernel.getArgAttrDict(argument.getArgNumber())
+                        .getAs<IntegerAttr>(gpu::dimensionAttr);
+    return identity && identity.getInt() == dimension;
+  }
+  if (auto dim = value.getDefiningOp<gpu::DimOp>()) {
+    ArrayRef<int64_t> dimensions =
+        dim.getView().getType().getLayout().getDimensionIds().asArrayRef();
+    return dim.getAxis() < dimensions.size() &&
+           dimensions[dim.getAxis()] == dimension;
+  }
+  return false;
+}
+
+bool isBlockedWorksetOrigin(Value value, Value block, int64_t dimension) {
+  auto multiply = value.getDefiningOp<gpu::BinaryOp>();
+  if (!multiply || multiply.getOperatorKind() != BinaryOperator::Multiply)
+    return false;
+  Value coordinate;
+  if (multiply.getLhs() == block)
+    coordinate = multiply.getRhs();
+  else if (multiply.getRhs() == block)
+    coordinate = multiply.getLhs();
+  else
+    return false;
+  auto result = dyn_cast<OpResult>(coordinate);
+  auto mapping =
+      result ? dyn_cast<gpu::DelinearizeOp>(result.getOwner())
+             : gpu::DelinearizeOp();
+  if (!mapping || result.getResultNumber() >= mapping.getLaunchExtents().size())
+    return false;
+  Attribute launchExtent = mapping.getLaunchExtents()[result.getResultNumber()];
+  FailureOr<uint64_t> blocked = gpu::blockedDimension(launchExtent);
+  auto expression = dyn_cast<gpu::PhysicalExprAttr>(launchExtent);
+  if (failed(blocked) || *blocked != static_cast<uint64_t>(dimension) ||
+      !expression || expression.getOperands().size() != 2)
+    return false;
+  auto parameterExpression =
+      dyn_cast<gpu::PhysicalExprAttr>(expression.getOperands()[1]);
+  auto parameter = block.getDefiningOp<gpu::ParameterOp>();
+  return parameterExpression && parameter &&
+         parameterExpression.getSymbol() ==
+             parameter.getParameter().getName();
+}
+
 std::optional<int64_t> constantTileOrigin(gpu::MakeRangeOp range,
                                           ArrayRef<Value> offsets) {
   std::optional<int64_t> result = constantValue(range.getStart());
@@ -387,13 +548,40 @@ bool rangeOriginInView(gpu::MakeRangeOp range, ArrayRef<Value> offsets,
                        int64_t dimension, func::FuncOp kernel) {
   bool zeroOffset = llvm::all_of(
       offsets, [](Value offset) { return isProvably(offset, 0); });
-  if (zeroOffset && range->hasAttr(gpu::worksetCoordinateRangeAttr) &&
-      !range->hasAttr(gpu::sourceSubregionAttr)) {
-    auto coordinate =
-        range.getStart().getDefiningOp<gpu::WorksetCoordinateOp>();
-    if (coordinate &&
-        coordinate.getDimensionId() == static_cast<uint64_t>(dimension))
+  if (zeroOffset && range->hasAttr(gpu::programBoundedOriginAttr) &&
+      !range->hasAttr(gpu::sourceSubregionAttr) &&
+      isProvably(range.getLogicalStart(), 0) &&
+      valueIsDimension(range.getLogicalStop(), dimension, kernel))
+    return true;
+  if (zeroOffset &&
+      valueIsDimension(range.getLogicalStop(), dimension, kernel)) {
+    Value start = stripIndexIdentities(range.getStart());
+    if (isProvably(range.getLogicalStart(), 0) &&
+        isBlockedWorksetOrigin(start, range.getExtent(), dimension))
       return true;
+    if (auto coordinate = start.getDefiningOp<gpu::WorksetCoordinateOp>())
+      if (coordinate.getDimensionId() == static_cast<uint64_t>(dimension))
+        return true;
+    if (auto argument = dyn_cast<BlockArgument>(start)) {
+      auto loop = dyn_cast_or_null<scf::ForOp>(
+          argument.getOwner()->getParentOp());
+      if (loop && argument == loop.getInductionVar() &&
+          isProvably(range.getLogicalStart(), 0) &&
+          isKnownNonNegative(loop.getLowerBound()) &&
+          valueUpperBoundedBy(loop.getUpperBound(), range.getLogicalStop()))
+        return true;
+    }
+    auto parameter = range.getExtent().getDefiningOp<gpu::ParameterOp>();
+    if (isProvably(start, 0) && isProvably(range.getLogicalStart(), 0) &&
+        parameter &&
+        parameter.getParameter().getRole() ==
+            static_cast<uint32_t>(gpu::ParameterRole::FullCoverage)) {
+      gpu::PhysicalParameterBinding binding =
+          gpu::queryParameterBinding(parameter);
+      if (binding.isExact() && binding.dimension &&
+          *binding.dimension == dimension)
+        return true;
+    }
   }
   std::optional<int64_t> origin = constantTileOrigin(range, offsets);
   return origin &&
@@ -416,42 +604,44 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     gpu::PhysicalProgramAnalysis &analysis, gpu::ViewType view,
     ValueRange coordinates, ArrayRef<int64_t> sourceAxes,
     gpu::FragmentType computationType) {
-  const unsigned rank = view.getRank();
-  if (coordinates.size() != rank || sourceAxes.size() != rank ||
-      computationType.getShape().size() != rank)
+  const unsigned resourceRank = view.getRank();
+  const unsigned computationRank = computationType.getShape().size();
+  if (coordinates.size() != resourceRank ||
+      sourceAxes.size() != resourceRank || computationRank == 0)
     return failure();
 
-  SmallVector<Value> resourceCoordinates(rank);
+  SmallVector<Value> resourceCoordinates(resourceRank);
   for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
-    if (sourceAxis < 0 || sourceAxis >= static_cast<int64_t>(rank) ||
+    if (sourceAxis < 0 ||
+        sourceAxis >= static_cast<int64_t>(resourceRank) ||
         resourceCoordinates[sourceAxis])
       return failure();
     resourceCoordinates[sourceAxis] = coordinate;
   }
 
   NativeTileAccessPlan plan;
-  plan.axes.resize(rank);
-  plan.toComputation.assign(rank, -1);
-  plan.toResource.assign(rank, -1);
-  SmallVector<bool> usedComputationAxis(rank, false);
+  plan.axes.resize(resourceRank);
+  plan.toComputation.assign(computationRank, -1);
+  plan.toResource.assign(computationRank, -1);
+  SmallVector<bool> usedComputationAxis(computationRank, false);
   SmallVector<unsigned> unresolvedScalarAxes;
   ArrayRef<int64_t> dimensions =
       view.getLayout().getDimensionIds().asArrayRef();
-  if (dimensions.size() != rank)
+  if (dimensions.size() != resourceRank)
     return failure();
 
   auto assignComputationAxis = [&](unsigned resourceAxis,
                                    unsigned computationAxis) {
-    if (computationAxis >= rank || usedComputationAxis[computationAxis])
+    if (computationAxis >= computationRank ||
+        usedComputationAxis[computationAxis])
       return false;
     usedComputationAxis[computationAxis] = true;
     plan.axes[resourceAxis].computationAxis = computationAxis;
-    plan.toComputation[computationAxis] = resourceAxis;
-    plan.toResource[resourceAxis] = computationAxis;
     return true;
   };
 
-  for (unsigned resourceAxis = 0; resourceAxis < rank; ++resourceAxis) {
+  for (unsigned resourceAxis = 0; resourceAxis < resourceRank;
+       ++resourceAxis) {
     NativeTileAxisPlan &axis = plan.axes[resourceAxis];
     Value coordinate = resourceCoordinates[resourceAxis];
     Value scalar = uniformScalarFill(coordinate);
@@ -468,7 +658,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
           !gpu::isUnitStepRange(axis.range) || !rangeType ||
           rangeType.getShape().size() != 1 ||
           rangeType.getShape()[0] !=
-              computationType.getShape()[axis.computationAxis] ||
+              computationType.getShape()[*axis.computationAxis] ||
           !collectTileOffsets(coordinate, axis.range.getResult(), axis.offsets))
         return failure();
       axis.originInBounds = rangeOriginInView(
@@ -484,10 +674,14 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
       gpu::PhysicalDimensionProjection projection =
           gpu::queryFragmentDimension(computationType,
                                       workset.getDimensionId());
-      if (!projection.isExact() ||
-          !assignComputationAxis(resourceAxis, projection.fragmentAxis) ||
-          !isUnitExtent(computationType.getShape()[axis.computationAxis]))
+      if (projection.state == gpu::PhysicalFactState::Ambiguous)
         return failure();
+      if (projection.isExact()) {
+        if (!assignComputationAxis(resourceAxis, projection.fragmentAxis) ||
+            !isUnitExtent(
+                computationType.getShape()[*axis.computationAxis]))
+          return failure();
+      }
       axis.scalarIndex = scalar;
       axis.originInBounds = scalarOriginInView(
           scalar, view, resourceAxis, dimensions[resourceAxis], kernel);
@@ -497,16 +691,14 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
   }
 
   SmallVector<unsigned> remainingUnitAxes;
-  for (unsigned computationAxis = 0; computationAxis < rank;
+  for (unsigned computationAxis = 0; computationAxis < computationRank;
        ++computationAxis)
     if (!usedComputationAxis[computationAxis] &&
         isUnitExtent(computationType.getShape()[computationAxis]))
       remainingUnitAxes.push_back(computationAxis);
-  if (unresolvedScalarAxes.size() != remainingUnitAxes.size() ||
-      unresolvedScalarAxes.size() > 1)
-    return failure();
-  for (auto [resourceAxis, computationAxis] :
-       llvm::zip(unresolvedScalarAxes, remainingUnitAxes)) {
+  if (unresolvedScalarAxes.size() == 1 && remainingUnitAxes.size() == 1) {
+    unsigned resourceAxis = unresolvedScalarAxes.front();
+    unsigned computationAxis = remainingUnitAxes.front();
     if (!assignComputationAxis(resourceAxis, computationAxis))
       return failure();
     NativeTileAxisPlan &axis = plan.axes[resourceAxis];
@@ -517,34 +709,116 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
   if (llvm::any_of(usedComputationAxis, [](bool used) { return !used; }))
     return failure();
 
-  SmallVector<Attribute> resourceShape(rank);
-  SmallVector<Attribute> resourceMappings(rank);
-  for (unsigned resourceAxis = 0; resourceAxis < rank; ++resourceAxis) {
-    unsigned computationAxis = plan.axes[resourceAxis].computationAxis;
-    resourceShape[resourceAxis] = computationType.getShape()[computationAxis];
+  MLIRContext *context = owner->getContext();
+  auto unit = gpu::PhysicalExprAttr::get(
+      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+      StringAttr::get(context), ArrayAttr::get(context, {}));
+  SmallVector<Attribute> resourceShape(resourceRank);
+  SmallVector<Attribute> resourceMappings(resourceRank);
+  SmallVector<Attribute> packedShape;
+  SmallVector<Attribute> packedMappings;
+  packedShape.reserve(computationRank);
+  packedMappings.reserve(computationRank);
+  for (unsigned resourceAxis = 0; resourceAxis < resourceRank;
+       ++resourceAxis) {
+    std::optional<unsigned> computationAxis =
+        plan.axes[resourceAxis].computationAxis;
+    if (!computationAxis) {
+      resourceShape[resourceAxis] = unit;
+      resourceMappings[resourceAxis] = gpu::AxisMapAttr::get(
+          context, view.getSourceId(), resourceAxis,
+          dimensions[resourceAxis], resourceAxis, false);
+      continue;
+    }
+    Attribute extent = computationType.getShape()[*computationAxis];
     auto mapping = cast<gpu::AxisMapAttr>(
-        computationType.getAxisMaps()[computationAxis]);
+        computationType.getAxisMaps()[*computationAxis]);
+    resourceShape[resourceAxis] = extent;
     resourceMappings[resourceAxis] = gpu::AxisMapAttr::get(
-        owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+        context, mapping.getSourceId(), mapping.getSourceAxis(),
         mapping.getDimensionId(), resourceAxis, mapping.getDerived());
+    unsigned packedAxis = packedShape.size();
+    packedShape.push_back(extent);
+    packedMappings.push_back(gpu::AxisMapAttr::get(
+        context, mapping.getSourceId(), mapping.getSourceAxis(),
+        mapping.getDimensionId(), packedAxis, mapping.getDerived()));
+    plan.toComputation[*computationAxis] = packedAxis;
+    plan.toResource[packedAxis] = *computationAxis;
   }
 
   plan.resourceType = gpu::FragmentType::get(
-      owner->getContext(), computationType.getElementType(),
-      ArrayAttr::get(owner->getContext(), resourceShape),
-      ArrayAttr::get(owner->getContext(), resourceMappings),
+      context, computationType.getElementType(),
+      ArrayAttr::get(context, resourceShape),
+      ArrayAttr::get(context, resourceMappings), computationType.getValidity(),
+      computationType.getOwner());
+  plan.packedType = gpu::FragmentType::get(
+      context, computationType.getElementType(),
+      ArrayAttr::get(context, packedShape),
+      ArrayAttr::get(context, packedMappings),
       computationType.getValidity(), computationType.getOwner());
+  if (plan.resourceType != plan.packedType) {
+    FailureOr<ArrayAttr> resourceToPacked =
+        gpu::inferReshapeReassociation(plan.resourceType, plan.packedType);
+    FailureOr<ArrayAttr> packedToResource =
+        gpu::inferReshapeReassociation(plan.packedType, plan.resourceType);
+    if (failed(resourceToPacked) || failed(packedToResource))
+      return failure();
+    plan.resourceToPacked = *resourceToPacked;
+    plan.packedToResource = *packedToResource;
+  }
   return plan;
 }
 
-bool boundaryCompatible(const NativeTileAccessPlan &plan,
-                        const gpu::PhysicalAccessBoundaryFact &boundary) {
-  if (!boundary.isExact())
-    return false;
-  return llvm::all_of(boundary.boundaryAxes, [&](int64_t axis) {
-    return axis >= 0 && axis < static_cast<int64_t>(plan.axes.size()) &&
-           plan.axes[axis].originInBounds;
-  });
+FailureOr<Value> materializeTileOriginGuard(
+    OpBuilder &builder, Operation *owner, Value resource,
+    NativeTileAccessPlan &plan,
+    const gpu::PhysicalAccessBoundaryFact &boundary) {
+  Value condition;
+  Value zero;
+  for (int64_t rawAxis : boundary.boundaryAxes) {
+    if (rawAxis < 0 || rawAxis >= static_cast<int64_t>(plan.axes.size()))
+      return failure();
+    unsigned axis = static_cast<unsigned>(rawAxis);
+    NativeTileAxisPlan &axisPlan = plan.axes[axis];
+    if (axisPlan.originInBounds)
+      continue;
+    Value origin = axisPlan.scalarIndex;
+    if (!origin) {
+      if (!axisPlan.range)
+        return failure();
+      origin = axisPlan.range.getStart();
+      for (Value offset : axisPlan.offsets)
+        origin = builder.create<gpu::BinaryOp>(
+            owner->getLoc(), builder.getIndexType(), origin, offset,
+            BinaryOperator::Add);
+    }
+    if (!zero)
+      zero = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
+    Value extent = builder.create<gpu::DimOp>(
+        owner->getLoc(), builder.getIndexType(), resource, axis);
+    Value nonNegative = builder.create<gpu::CompareOp>(
+        owner->getLoc(), builder.getI1Type(), origin, zero,
+        ComparePredicate::Ge);
+    Value belowExtent = builder.create<gpu::CompareOp>(
+        owner->getLoc(), builder.getI1Type(), origin, extent,
+        ComparePredicate::Lt);
+    Value axisCondition = builder.create<gpu::BinaryOp>(
+        owner->getLoc(), builder.getI1Type(), nonNegative, belowExtent,
+        BinaryOperator::LogicalAnd);
+    condition = condition
+                    ? Value(builder.create<gpu::BinaryOp>(
+                          owner->getLoc(), builder.getI1Type(), condition,
+                          axisCondition, BinaryOperator::LogicalAnd))
+                    : axisCondition;
+  }
+  return condition;
+}
+
+OpBuilder prepareBranch(Region &region) {
+  Block &block = region.front();
+  if (!block.empty() && isa<scf::YieldOp>(block.back()))
+    block.back().erase();
+  return OpBuilder(&block, block.end());
 }
 
 FailureOr<SmallVector<Value>>
@@ -720,23 +994,52 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
         load, kernel, analysis, view, load.getCoordinates(),
         load.getSourceAxes(), result);
     FailureOr<SmallVector<Value>> indices = failure();
-    if (succeeded(plan) && boundaryCompatible(*plan, boundary) &&
+    FailureOr<Value> originGuard = failure();
+    if (succeeded(plan) && boundary.isExact() &&
         (!load.getFill() || isZeroFill(load.getFill())))
       indices = materializeTileIndices(builder, load, *plan);
+    if (succeeded(indices))
+      originGuard = materializeTileOriginGuard(
+          builder, load, load.getResource(), *plan, boundary);
+    bool guardedNative = succeeded(originGuard) && *originGuard;
+    bool native = succeeded(indices) && succeeded(originGuard) &&
+                  (!guardedNative ||
+                   (load.getFill() && load.getFill().getType() == result));
     Value replacementResult;
-    Operation *replacementOperation = nullptr;
-    Operation *relationOperation = nullptr;
-    if (succeeded(indices)) {
-      auto replacement = builder.create<TileLoadOp>(
+    SmallVector<Operation *> createdOperations;
+    auto emitNativeLoad = [&](OpBuilder &nested) {
+      auto tile = nested.create<TileLoadOp>(
           load.getLoc(), plan->resourceType, load.getResource(), *indices);
-      replacementResult = replacement.getResult();
-      replacementOperation = replacement;
-      if (!isIdentityPermutation(plan->toComputation)) {
-        auto transpose = builder.create<gpu::TransposeOp>(
-            load.getLoc(), result, replacementResult, plan->toComputation);
-        replacementResult = transpose.getResult();
-        relationOperation = transpose;
+      Value value = tile.getResult();
+      createdOperations.push_back(tile);
+      if (plan->resourceToPacked) {
+        auto reshape = nested.create<gpu::ReshapeOp>(
+            load.getLoc(), plan->packedType, value,
+            plan->resourceToPacked);
+        value = reshape.getResult();
+        createdOperations.push_back(reshape);
       }
+      if (!isIdentityPermutation(plan->toComputation)) {
+        auto transpose = nested.create<gpu::TransposeOp>(
+            load.getLoc(), result, value, plan->toComputation);
+        value = transpose.getResult();
+        createdOperations.push_back(transpose);
+      }
+      return value;
+    };
+    if (native && guardedNative) {
+      auto conditional = builder.create<scf::IfOp>(
+          load.getLoc(), TypeRange{result}, *originGuard,
+          /*withElseRegion=*/true);
+      createdOperations.push_back(conditional);
+      OpBuilder inBounds = prepareBranch(conditional.getThenRegion());
+      Value value = emitNativeLoad(inBounds);
+      inBounds.create<scf::YieldOp>(load.getLoc(), value);
+      OpBuilder outOfBounds = prepareBranch(conditional.getElseRegion());
+      outOfBounds.create<scf::YieldOp>(load.getLoc(), load.getFill());
+      replacementResult = conditional.getResult(0);
+    } else if (native) {
+      replacementResult = emitNativeLoad(builder);
     } else {
       FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
           load, load.getResource(), load.getCoordinates(), load.getSourceAxes());
@@ -751,13 +1054,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
           load.getLoc(), result, load.getResource(), *materialized,
           load.getValid(), *fill, identityAxes(view.getRank()));
       replacementResult = replacement.getResult();
-      replacementOperation = replacement;
+      createdOperations.push_back(replacement);
     }
-    if (Attribute origin = load->getAttr(gpu::originAttr))
-      replacementOperation->setAttr(gpu::originAttr, origin);
-    if (relationOperation)
+    for (Operation *operation : createdOperations)
       if (Attribute origin = load->getAttr(gpu::originAttr))
-        relationOperation->setAttr(gpu::originAttr, origin);
+        operation->setAttr(gpu::originAttr, origin);
     load.getResult().replaceAllUsesWith(replacementResult);
     load.erase();
   }
@@ -964,21 +1265,47 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
         store, kernel, analysis, view, store.getCoordinates(),
         store.getSourceAxes(), computationType);
     FailureOr<SmallVector<Value>> indices = failure();
-    if (succeeded(plan) && boundaryCompatible(*plan, boundary))
+    FailureOr<Value> originGuard = failure();
+    if (succeeded(plan) && boundary.isExact())
       indices = materializeTileIndices(builder, store, *plan);
-    Operation *replacementOperation = nullptr;
-    Operation *relationOperation = nullptr;
-    if (succeeded(indices)) {
+    if (succeeded(indices))
+      originGuard = materializeTileOriginGuard(
+          builder, store, store.getResource(), *plan, boundary);
+    bool native = succeeded(indices) && succeeded(originGuard);
+    bool guardedNative = native && *originGuard;
+    SmallVector<Operation *> createdOperations;
+    auto emitNativeStore = [&](OpBuilder &nested) {
       Value nativeValue = store.getValue();
       if (!isIdentityPermutation(plan->toResource)) {
-        auto transpose = builder.create<gpu::TransposeOp>(
-            store.getLoc(), plan->resourceType, nativeValue,
+        auto transpose = nested.create<gpu::TransposeOp>(
+            store.getLoc(), plan->packedType, nativeValue,
             plan->toResource);
         nativeValue = transpose.getResult();
-        relationOperation = transpose;
+        createdOperations.push_back(transpose);
       }
-      replacementOperation = builder.create<TileStoreOp>(
+      if (plan->packedToResource) {
+        auto reshape = nested.create<gpu::ReshapeOp>(
+            store.getLoc(), plan->resourceType, nativeValue,
+            plan->packedToResource);
+        nativeValue = reshape.getResult();
+        createdOperations.push_back(reshape);
+      }
+      auto tile = nested.create<TileStoreOp>(
           store.getLoc(), store.getResource(), *indices, nativeValue);
+      createdOperations.push_back(tile);
+    };
+    if (guardedNative) {
+      auto conditional = builder.create<scf::IfOp>(
+          store.getLoc(), TypeRange{}, *originGuard,
+          /*withElseRegion=*/true);
+      createdOperations.push_back(conditional);
+      OpBuilder inBounds = prepareBranch(conditional.getThenRegion());
+      emitNativeStore(inBounds);
+      inBounds.create<scf::YieldOp>(store.getLoc());
+      OpBuilder outOfBounds = prepareBranch(conditional.getElseRegion());
+      outOfBounds.create<scf::YieldOp>(store.getLoc());
+    } else if (native) {
+      emitNativeStore(builder);
     } else {
       FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(
           store, store.getResource(), store.getCoordinates(), store.getSourceAxes());
@@ -989,19 +1316,19 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
           materializeCoordinateDomains(builder, store, *coordinates, target);
       if (failed(materialized))
         return failure();
-      replacementOperation = builder.create<ScatterStoreOp>(
+      auto replacement = builder.create<ScatterStoreOp>(
           store.getLoc(), store.getResource(), *materialized, store.getValue(),
           store.getValid(), identityAxes(view.getRank()));
+      createdOperations.push_back(replacement);
     }
-    if (Attribute origin = store->getAttr(gpu::originAttr))
-      replacementOperation->setAttr(gpu::originAttr, origin);
-    if (relationOperation)
+    for (Operation *operation : createdOperations)
       if (Attribute origin = store->getAttr(gpu::originAttr))
-        relationOperation->setAttr(gpu::originAttr, origin);
+        operation->setAttr(gpu::originAttr, origin);
     store.erase();
   }
   for (gpu::AssumeInBoundsOp assumption : assumptions)
     assumption.erase();
+  gpu::eraseDeadPhysicalValues(kernel);
   return success();
 }
 

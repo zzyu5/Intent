@@ -2718,6 +2718,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, columnRange);
+  if (!columnRange->hasAttr(sourceSubregionAttr))
+    columns.getDefiningOp()->setAttr(programBoundedOriginAttr,
+                                    builder.getUnitAttr());
   Value columnValid = rangeBoundsValidity(
       builder, location, columnIndexType, columnPredicateType, columns,
       columnStop);
@@ -2728,6 +2731,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel) {
         rowRange.getLogicalStart(), rowRange.getLogicalStop(),
         rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
     inheritRangeAuthority(rows, rowRange);
+    if (!runtimeRowTraversal && !rowRange->hasAttr(sourceSubregionAttr))
+      rows.getDefiningOp()->setAttr(programBoundedOriginAttr,
+                                   rowBuilder.getUnitAttr());
     Value rowValid = rangeBoundsValidity(rowBuilder, location, rowIndexType,
                                          rowPredicateType, rows, rowStop);
     Value blockedLhsRowCoordinate = rows;
@@ -3521,12 +3527,18 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       rowRange->getLogicalStart(), rowRange->getLogicalStop(),
       rowMap->getSourceId(), rowMap->getSourceAxis(), rowMap->getDerived());
   inheritRangeAuthority(rows, *rowRange);
+  if (!(*rowRange)->hasAttr(sourceSubregionAttr))
+    rows.getDefiningOp()->setAttr(programBoundedOriginAttr,
+                                 builder.getUnitAttr());
   Value columns = builder.create<MakeRangeOp>(
       location, columnIndexType, columnStart, blockN.getResult(), one,
       columnRange->getLogicalStart(), columnRange->getLogicalStop(),
       columnMap->getSourceId(), columnMap->getSourceAxis(),
       columnMap->getDerived());
   inheritRangeAuthority(columns, *columnRange);
+  if (!(*columnRange)->hasAttr(sourceSubregionAttr))
+    columns.getDefiningOp()->setAttr(programBoundedOriginAttr,
+                                    builder.getUnitAttr());
   Value rowValid = rangeBoundsValidity(builder, location, rowIndexType,
                                        rowPredicateType, rows, rowStop);
   Value columnValid = rangeBoundsValidity(

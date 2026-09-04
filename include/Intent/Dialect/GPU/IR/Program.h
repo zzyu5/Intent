@@ -49,6 +49,8 @@ inline constexpr llvm::StringLiteral pointwiseLocalAttr =
     "intent_gpu.pointwise_local";
 inline constexpr llvm::StringLiteral physicalTailAttr =
     "intent_gpu.physical_tail";
+inline constexpr llvm::StringLiteral programBoundedOriginAttr =
+    "intent_gpu.program_bounded_origin";
 inline constexpr llvm::StringLiteral tritonConfigsAttr =
     "intent_gpu.triton.configs";
 inline constexpr llvm::StringLiteral tileLangConfigsAttr =
