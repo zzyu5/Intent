@@ -322,6 +322,7 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   if (kind == TuningClass::Contraction && matrix && narrow)
     return {{128, 128, 32, 1, 128, 1, 8},
             {64, 128, 64, 1, 128, 1, 8},
+            {64, 64, 64, 1, 128, 1, 8},
             {128, 64, 32, 1, 128, 1, 8},
             {128, 256, 64, 1, 128, 1, 8}};
   if (kind == TuningClass::Contraction)
@@ -331,6 +332,7 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   if (kind == TuningClass::RegionContraction)
     return {{128, 128, 64, 1, 128, 1, 8},
             {64, 128, 64, 1, 64, 1, 8},
+            {64, 64, 64, 1, 64, 1, 8},
             {128, 64, 32, 1, 32, 1, 8},
             {128, 16, 32, 1, 32, 1, 8}};
   if (kind == TuningClass::RegionReduction)
@@ -358,8 +360,8 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             {256, 64, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::Execution)
     return {{1, 1, 1, 1, 1, 1, 8},
-            {1, 1, 1, 1, 1, 2, 4},
-            {1, 1, 1, 1, 1, 4, 2}};
+            {1, 1, 1, 1, 1, 2, 8},
+            {1, 1, 1, 1, 1, 4, 8}};
   if (kind == TuningClass::PointwiseReduction)
     return {{64, 128, 32, 1, 128, 1, 8},
             {64, 64, 32, 1, 128, 1, 8},
