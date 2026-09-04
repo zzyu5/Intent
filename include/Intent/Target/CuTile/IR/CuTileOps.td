@@ -35,7 +35,8 @@ def IntentCuTile_ScalarLoadOp : IntentCuTile_Op<"scalar_load", [
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        Variadic<Index>:$indices,
                        Optional<IntentGPU_ScalarValue>:$valid,
-                       Optional<IntentGPU_ScalarValue>:$fill);
+                       Optional<IntentGPU_ScalarValue>:$fill,
+                       OptionalAttr<UnitAttr>:$in_bounds);
   let results = (outs IntentGPU_ScalarValue:$result);
   let hasVerifier = 1;
 }
@@ -47,7 +48,8 @@ def IntentCuTile_ScalarStoreOp : IntentCuTile_Op<"scalar_store", [
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        Variadic<Index>:$indices,
                        IntentGPU_ScalarValue:$value,
-                       Optional<IntentGPU_ScalarValue>:$valid);
+                       Optional<IntentGPU_ScalarValue>:$valid,
+                       OptionalAttr<UnitAttr>:$in_bounds);
   let hasVerifier = 1;
 }
 

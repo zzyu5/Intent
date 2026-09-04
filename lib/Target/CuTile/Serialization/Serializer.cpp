@@ -700,7 +700,8 @@ private:
       if (load.getValid())
         call += ", mask=" + valueString(load.getValid()) +
                 ", padding_value=" + valueString(load.getFill());
-      call += ", check_bounds=True)";
+      call += load.getInBounds() ? ", check_bounds=False)"
+                                 : ", check_bounds=True)";
       assign(load.getResult(), call);
     } else if (auto gather = dyn_cast<GatherLoadOp>(operation)) {
       std::string call = "ct.gather(" + valueString(gather.getResource()) +
@@ -881,7 +882,8 @@ private:
                          valueString(store.getValue());
       if (store.getValid())
         call += ", mask=" + valueString(store.getValid());
-      line(call + ", check_bounds=True)");
+      line(call + (store.getInBounds() ? ", check_bounds=False)"
+                                       : ", check_bounds=True)"));
     } else if (auto scatter = dyn_cast<ScatterStoreOp>(operation)) {
       std::string call = "ct.scatter(" + valueString(scatter.getResource()) +
                          ", " + tuple(scatter.getCoordinates()) +

@@ -483,6 +483,12 @@ Value stripIndexIdentities(Value value) {
         continue;
       }
       break;
+    case BinaryOperator::FloorDivide:
+      if (isProvably(binary.getRhs(), 1)) {
+        value = binary.getLhs();
+        continue;
+      }
+      break;
     default:
       break;
     }
@@ -820,12 +826,36 @@ bool rangeOriginInView(gpu::MakeRangeOp range, ArrayRef<Value> offsets,
 bool scalarOriginInView(Value index, gpu::ViewType view,
                         unsigned resourceAxis, int64_t dimension,
                         func::FuncOp kernel) {
+  index = stripIndexIdentities(index);
   if (auto coordinate = index.getDefiningOp<gpu::WorksetCoordinateOp>())
     if (coordinate.getDimensionId() == static_cast<uint64_t>(dimension))
       return true;
+  if (auto argument = dyn_cast<BlockArgument>(index)) {
+    auto loop =
+        dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+    Value logicalDimension = dimensionValue(kernel, dimension);
+    if (loop && argument == loop.getInductionVar() && logicalDimension &&
+        isKnownNonNegative(loop.getLowerBound()) &&
+        isKnownPositive(loop.getStep()) &&
+        valueUpperBoundedBy(loop.getUpperBound(), logicalDimension))
+      return true;
+  }
   std::optional<int64_t> origin = constantValue(index);
   return origin &&
          constantOriginInView(*origin, view, resourceAxis, kernel);
+}
+
+bool scalarCoordinatesInView(ValueRange coordinates, gpu::ViewType view,
+                             func::FuncOp kernel) {
+  ArrayRef<int64_t> dimensions =
+      view.getLayout().getDimensionIds().asArrayRef();
+  if (coordinates.size() != view.getRank() ||
+      dimensions.size() != view.getRank())
+    return false;
+  for (auto [axis, coordinate] : llvm::enumerate(coordinates))
+    if (!scalarOriginInView(coordinate, view, axis, dimensions[axis], kernel))
+      return false;
+  return true;
 }
 
 FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
@@ -899,7 +929,11 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     if (!scalar || !scalar.getType().isIndex())
       return failure();
     axis.scalarIndex = scalar;
-    if (auto workset = scalar.getDefiningOp<gpu::WorksetCoordinateOp>()) {
+    axis.originInBounds = scalarOriginInView(
+        scalar, view, resourceAxis, dimensions[resourceAxis], kernel);
+    Value strippedScalar = stripIndexIdentities(scalar);
+    if (auto workset =
+            strippedScalar.getDefiningOp<gpu::WorksetCoordinateOp>()) {
       gpu::PhysicalDimensionProjection projection =
           gpu::queryFragmentDimension(computationType,
                                       workset.getDimensionId());
@@ -911,9 +945,6 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
                 computationType.getShape()[*axis.computationAxis]))
           return failure();
       }
-      axis.scalarIndex = scalar;
-      axis.originInBounds = scalarOriginInView(
-          scalar, view, resourceAxis, dimensions[resourceAxis], kernel);
     } else {
       unresolvedScalarAxes.push_back(resourceAxis);
     }
@@ -1264,9 +1295,19 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
           (load.getValid() && isa<gpu::FragmentType>(load.getValid().getType())))
         return load.emitOpError(
             "cuTile scalar load requires scalar indices and validity");
+      bool inBounds = scalarCoordinatesInView(*indices, view, kernel);
+      Value validity = load.getValid();
+      Value padding = *fill;
+      gpu::PhysicalAccessBoundaryFact boundary =
+          analysis.boundaryValidity(load);
+      if (inBounds && boundary.isExact()) {
+        validity = {};
+        padding = {};
+      }
       auto replacement = builder.create<ScalarLoadOp>(
           load.getLoc(), load.getResult().getType(), load.getResource(), *indices,
-          load.getValid(), *fill);
+          validity, padding,
+          inBounds ? builder.getUnitAttr() : UnitAttr());
       if (Attribute origin = load->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
       load.getResult().replaceAllUsesWith(replacement.getResult());
@@ -1580,9 +1621,15 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
           (store.getValid() && isa<gpu::FragmentType>(store.getValid().getType())))
         return store.emitOpError(
             "cuTile scalar store requires scalar indices and validity");
+      bool inBounds = scalarCoordinatesInView(*indices, view, kernel);
+      Value validity = store.getValid();
+      gpu::PhysicalAccessBoundaryFact boundary =
+          analysis.boundaryValidity(store);
+      if (inBounds && boundary.isExact())
+        validity = {};
       auto replacement = builder.create<ScalarStoreOp>(
           store.getLoc(), store.getResource(), *indices, store.getValue(),
-          store.getValid());
+          validity, inBounds ? builder.getUnitAttr() : UnitAttr());
       if (Attribute origin = store->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
       store.erase();
