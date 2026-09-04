@@ -97,7 +97,8 @@ bool isProviderRole(ParameterRole role) {
          role == ParameterRole::ProviderStages ||
          role == ParameterRole::ProviderCTAs ||
          role == ParameterRole::ProviderThreads ||
-         role == ParameterRole::ProviderAccessForm;
+         role == ParameterRole::ProviderAccessForm ||
+         role == ParameterRole::ProviderOccupancy;
 }
 
 bool isSharedStaticParameter(ParameterOp parameter) {
@@ -419,6 +420,7 @@ int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
   case ParameterRole::ProviderCTAs:
   case ParameterRole::ProviderThreads:
   case ParameterRole::ProviderAccessForm:
+  case ParameterRole::ProviderOccupancy:
     llvm_unreachable("non-static parameter entered shared tuning table");
   }
   llvm_unreachable("unknown physical parameter role");

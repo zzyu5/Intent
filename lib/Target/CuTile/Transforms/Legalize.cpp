@@ -19,9 +19,11 @@ namespace {
 
 constexpr llvm::StringLiteral legalizedAttr = "intent_cutile.legalized";
 constexpr llvm::StringLiteral accessFormParameter = "CUTILE_ACCESS_FORM";
+constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
+constexpr int64_t occupancyCandidates[] = {1, 2, 3, 4, 6};
 
 std::optional<int64_t>
 constantPhysicalExpression(gpu::PhysicalExprAttr expression,
@@ -1260,6 +1262,16 @@ bool fragmentUsesRole(gpu::FragmentType fragment, func::FuncOp kernel,
   });
 }
 
+bool hasLoopCarriedFragment(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](scf::ForOp loop) {
+    found |= llvm::any_of(loop.getInitArgs(), [](Value value) {
+      return isa<gpu::FragmentType>(value.getType());
+    });
+  });
+  return found;
+}
+
 LogicalResult formNativeTiles(func::FuncOp kernel) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
@@ -1280,6 +1292,24 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   kernel.walk([&](gpu::StoreOp op) { stores.push_back(op); });
   kernel.walk([&](gpu::AtomicRMWOp op) { atomics.push_back(op); });
   kernel.walk([&](gpu::AssumeInBoundsOp op) { assumptions.push_back(op); });
+  if (hasLoopCarriedFragment(kernel)) {
+    bool nameCollision = false;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      nameCollision |= parameter.getParameter().getName().getValue() ==
+                       occupancyParameter;
+    });
+    if (nameCollision)
+      return kernel.emitError(
+          "cuTile occupancy parameter name is already owned");
+    OpBuilder entry(&kernel.getBody().front(), kernel.getBody().front().begin());
+    auto schema = gpu::ParameterAttr::get(
+        kernel.getContext(), entry.getStringAttr(occupancyParameter),
+        static_cast<uint32_t>(gpu::ParameterRole::ProviderOccupancy),
+        static_cast<uint32_t>(gpu::ParameterCategory::Provider),
+        /*elementBitWidth=*/0,
+        DenseI64ArrayAttr::get(kernel.getContext(), occupancyCandidates));
+    entry.create<gpu::ParameterOp>(kernel.getLoc(), entry.getIndexType(), schema);
+  }
   gpu::PhysicalProgramAnalysis analysis(kernel);
   Value accessForm;
   Value preferTileLoads;
@@ -1815,6 +1845,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return kernel.emitError(
         "cuTile provider currently requires one explicit linear program space");
   gpu::ParameterOp accessForm;
+  gpu::ParameterOp occupancy;
   LogicalResult parameterSchema = success();
   kernel.walk([&](gpu::ParameterOp parameter) {
     auto schema = parameter.getParameter();
@@ -1822,7 +1853,9 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     auto category =
         static_cast<gpu::ParameterCategory>(schema.getCategory());
     bool provider = category == gpu::ParameterCategory::Provider;
-    if (provider != (role == gpu::ParameterRole::ProviderAccessForm)) {
+    bool cuTileProvider = role == gpu::ParameterRole::ProviderAccessForm ||
+                          role == gpu::ParameterRole::ProviderOccupancy;
+    if (provider != cuTileProvider) {
       parameter.emitOpError(
           "cuTile program contains a foreign provider parameter");
       parameterSchema = failure();
@@ -1830,23 +1863,43 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     }
     if (!provider)
       return;
-    if (accessForm) {
-      parameter.emitOpError("duplicates the cuTile access-form parameter");
-      parameterSchema = failure();
-      return;
-    }
     ArrayRef<int64_t> candidates = schema.getCandidates().asArrayRef();
-    if (schema.getName().getValue() != accessFormParameter ||
-        candidates != ArrayRef<int64_t>{nativeAccessForm, gatherAccessForm,
-                                        nativeBlockedNoTMAForm}) {
-      parameter.emitOpError("has an invalid cuTile access-form domain");
+    if (role == gpu::ParameterRole::ProviderAccessForm) {
+      if (accessForm) {
+        parameter.emitOpError("duplicates the cuTile access-form parameter");
+        parameterSchema = failure();
+        return;
+      }
+      if (schema.getName().getValue() != accessFormParameter ||
+          candidates != ArrayRef<int64_t>{nativeAccessForm, gatherAccessForm,
+                                          nativeBlockedNoTMAForm}) {
+        parameter.emitOpError("has an invalid cuTile access-form domain");
+        parameterSchema = failure();
+        return;
+      }
+      accessForm = parameter;
+      return;
+    }
+    if (occupancy) {
+      parameter.emitOpError("duplicates the cuTile occupancy parameter");
       parameterSchema = failure();
       return;
     }
-    accessForm = parameter;
+    if (schema.getName().getValue() != occupancyParameter ||
+        candidates != ArrayRef<int64_t>(occupancyCandidates) ||
+        !parameter.getResult().use_empty()) {
+      parameter.emitOpError(
+          "has an invalid cuTile occupancy hint schema");
+      parameterSchema = failure();
+      return;
+    }
+    occupancy = parameter;
   });
   if (failed(parameterSchema))
     return failure();
+  if (hasLoopCarriedFragment(kernel) != static_cast<bool>(occupancy))
+    return kernel.emitError(
+        "cuTile occupancy hint does not match the loop-carried fragment program");
   auto isTrue = [](Value value) {
     auto constant = value.getDefiningOp<arith::ConstantOp>();
     auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())

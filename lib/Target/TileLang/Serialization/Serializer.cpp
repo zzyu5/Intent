@@ -201,7 +201,9 @@ private:
       auto schema = parameter.getParameter();
       auto role = static_cast<gpu::ParameterRole>(schema.getRole());
       if (role == gpu::ParameterRole::ProviderWarps ||
-          role == gpu::ParameterRole::ProviderCTAs) {
+          role == gpu::ParameterRole::ProviderCTAs ||
+          role == gpu::ParameterRole::ProviderAccessForm ||
+          role == gpu::ParameterRole::ProviderOccupancy) {
         parameter.emitOpError(
             "TileLang source cannot bind a foreign provider parameter role");
         failed = true;

@@ -254,7 +254,7 @@ LogicalResult ParameterAttr::verify(
     uint32_t role, uint32_t category, uint32_t elementBitWidth,
     DenseI64ArrayAttr candidates) {
   if (!name || name.empty() ||
-      role > static_cast<uint32_t>(ParameterRole::ProviderAccessForm) ||
+      role > static_cast<uint32_t>(ParameterRole::ProviderOccupancy) ||
       category >
           static_cast<uint32_t>(ParameterCategory::Histogram) ||
       !candidates || candidates.empty())
@@ -267,7 +267,8 @@ LogicalResult ParameterAttr::verify(
       typedRole == ParameterRole::ProviderStages ||
       typedRole == ParameterRole::ProviderCTAs ||
       typedRole == ParameterRole::ProviderThreads ||
-      typedRole == ParameterRole::ProviderAccessForm;
+      typedRole == ParameterRole::ProviderAccessForm ||
+      typedRole == ParameterRole::ProviderOccupancy;
   if (providerRole != (typedCategory == ParameterCategory::Provider))
     return emitError()
            << "provider parameter roles require exactly the provider category";

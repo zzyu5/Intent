@@ -131,6 +131,16 @@ struct CoverageParameter {
   SmallVector<int64_t> candidates;
 };
 
+bool isCuTileProviderRole(gpu::ParameterRole role) {
+  return role == gpu::ParameterRole::ProviderAccessForm ||
+         role == gpu::ParameterRole::ProviderOccupancy;
+}
+
+bool isOccupancyParameter(gpu::ParameterOp parameter) {
+  return parameter.getParameter().getRole() ==
+         static_cast<uint32_t>(gpu::ParameterRole::ProviderOccupancy);
+}
+
 FailureOr<SmallVector<std::map<std::string, int64_t>>>
 parameterConfigs(func::FuncOp kernel) {
   llvm::StringMap<gpu::ParameterOp> parameters;
@@ -141,7 +151,7 @@ parameterConfigs(func::FuncOp kernel) {
     auto category =
         static_cast<gpu::ParameterCategory>(schema.getCategory());
     bool provider = category == gpu::ParameterCategory::Provider;
-    if (provider != (role == gpu::ParameterRole::ProviderAccessForm)) {
+    if (provider != isCuTileProviderRole(role)) {
       parameter.emitOpError(
           "cuTile source cannot bind a foreign provider parameter role");
       return WalkResult::interrupt();
@@ -279,6 +289,16 @@ private:
       }
     }
     kernel.walk([&](gpu::ParameterOp parameter) {
+      if (isOccupancyParameter(parameter)) {
+        if (!occupancyParameterName.empty()) {
+          parameter.emitOpError("duplicates the cuTile occupancy hint");
+          failed = true;
+          return;
+        }
+        occupancyParameterName =
+            parameter.getParameter().getName().getValue().str();
+        return;
+      }
       auto dimension =
           parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
       if (!dimension)
@@ -382,6 +402,8 @@ private:
     for (const MetadataABI &metadata : metadataArguments)
       argument(metadata.name + ": ConstInt");
     kernel.walk([&](gpu::ParameterOp parameter) {
+      if (isOccupancyParameter(parameter))
+        return;
       std::string name = parameter.getParameter().getName().getValue().str();
       values[parameter.getResult()] = name;
       argument(name + ": ConstInt");
@@ -457,6 +479,7 @@ private:
     std::string streamName = freshName("_intent_stream");
     std::string searchResultName = freshName("_intent_search_result");
     std::string configName = freshName("_intent_cfg");
+    std::string tunedKernelName = freshName("_intent_tuned_kernel");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
@@ -474,22 +497,33 @@ private:
                                &fullCoverageParameterNames, configName) +
               ", ";
     grid += "1, 1)";
+    std::string hints;
+    if (!occupancyParameterName.empty())
+      hints = ", lambda " + configName + ": {\"occupancy\": " +
+              configName + "." + occupancyParameterName + "}";
     line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
              ", " + grid + ", _intent_kernel, lambda " + configName +
-             ": (" + joinKernelArguments(configName) + "), quiet=True)",
+             ": (" + joinKernelArguments(configName) + ")" + hints +
+             ", quiet=True)",
          2);
-    line("_TUNE_CACHE[" + tuneKeyName + "] = " + searchResultName +
-             ".best.config",
+    std::string tunedKernel = "_intent_kernel";
+    if (!occupancyParameterName.empty())
+      tunedKernel += ".replace_hints(occupancy=" + searchResultName +
+                     ".best.config." + occupancyParameterName + ")";
+    line("_TUNE_CACHE[" + tuneKeyName + "] = (" + searchResultName +
+             ".best.config, " + tunedKernel + ")",
          2);
-    line(configName + " = _TUNE_CACHE[" + tuneKeyName + "]", 1);
+    line(configName + ", " + tunedKernelName + " = _TUNE_CACHE[" +
+             tuneKeyName + "]",
+         1);
     std::string launchGrid = "(";
     for (Attribute extent : space)
       launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
                                      &fullCoverageParameterNames, configName) +
                     ", ";
     launchGrid += "1, 1)";
-    line("return ct.launch(" + streamName + ", " + launchGrid +
-             ", _intent_kernel, (" + joinKernelArguments(configName) + "))",
+    line("return ct.launch(" + streamName + ", " + launchGrid + ", " +
+             tunedKernelName + ", (" + joinKernelArguments(configName) + "))",
          1);
     output << "\n";
   }
@@ -1115,6 +1149,8 @@ private:
       result += ", " + metadata.name;
     SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
+      if (isOccupancyParameter(parameter))
+        return;
       parameters.push_back(parameter.getParameter().getName().getValue().str());
     });
     for (StringRef parameter : parameters)
@@ -1191,6 +1227,7 @@ private:
   llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   std::map<std::string, CoverageParameter> fullCoverageParameters;
   llvm::StringSet<> fullCoverageParameterNames;
+  std::string occupancyParameterName;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;
