@@ -606,6 +606,27 @@ std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   return std::nullopt;
 }
 
+bool hasNativeMMAAxes(gpu::ContractOp contract) {
+  auto lhs = contract.getLhs().getType();
+  auto rhs = contract.getRhs().getType();
+  auto result = contract.getResult().getType();
+  const unsigned rank = lhs.getShape().size();
+  if (rank < 2 || rank > 3 || rhs.getShape().size() != rank ||
+      result.getShape().size() != rank)
+    return false;
+  const int64_t matrixAxis = rank - 2;
+  const bool canonicalBatch =
+      rank == 2 ? contract.getLhsBatchAxes().empty() &&
+                      contract.getRhsBatchAxes().empty()
+                : contract.getLhsBatchAxes() == ArrayRef<int64_t>{0} &&
+                      contract.getRhsBatchAxes() == ArrayRef<int64_t>{0};
+  return contract.getLhsReductionAxes() ==
+             ArrayRef<int64_t>{matrixAxis + 1} &&
+         contract.getRhsReductionAxes() ==
+             ArrayRef<int64_t>{matrixAxis} &&
+         canonicalBatch;
+}
+
 Attribute scalarConstant(Value value) {
   while (true) {
     if (auto cast = value.getDefiningOp<gpu::CastOp>()) {
@@ -835,12 +856,10 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   }
 
   for (gpu::ContractOp contract : contracts) {
-    if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
-        contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} ||
-        !contract.getLhsBatchAxes().empty() ||
-        !contract.getRhsBatchAxes().empty())
+    if (!hasNativeMMAAxes(contract))
       return contract.emitOpError(
-          "cuTile native MMA requires [M,K] x [K,N] physical axes");
+          "cuTile native MMA requires [M,K] x [K,N] or [B,M,K] x [B,K,N] "
+          "physical axes");
     OpBuilder builder(contract);
     auto replacement = builder.create<MMAOp>(
         contract.getLoc(), contract.getResult().getType(), contract.getLhs(),

@@ -256,18 +256,31 @@ LogicalResult MMAOp::verify() {
   auto rhs = getRhs().getType();
   auto accumulator = getAccumulator().getType();
   auto result = getResult().getType();
-  if (lhs.getShape().size() != 2 || rhs.getShape().size() != 2 ||
-      accumulator.getShape().size() != 2 || result != accumulator ||
-      lhs.getOwner() != rhs.getOwner() ||
-      lhs.getOwner() != accumulator.getOwner() ||
-      lhs.getShape()[0] != result.getShape()[0] ||
-      lhs.getShape()[1] != rhs.getShape()[0] ||
-      rhs.getShape()[1] != result.getShape()[1] ||
-      !sameLogicalAxis(lhs, 0, result, 0) ||
-      !sameLogicalAxis(lhs, 1, rhs, 0) ||
-      !sameLogicalAxis(rhs, 1, result, 1)) {
-    InFlightDiagnostic diagnostic =
-        emitOpError("requires a canonical [M,K] x [K,N] cuTile MMA form");
+  const unsigned rank = lhs.getShape().size();
+  bool valid = rank >= 2 && rank <= 3 && rhs.getShape().size() == rank &&
+               accumulator.getShape().size() == rank &&
+               result == accumulator && lhs.getOwner() == rhs.getOwner() &&
+               lhs.getOwner() == accumulator.getOwner();
+  for (unsigned axis = 0; valid && axis + 2 < rank; ++axis)
+    valid = lhs.getShape()[axis] == rhs.getShape()[axis] &&
+            lhs.getShape()[axis] == result.getShape()[axis] &&
+            sameLogicalAxis(lhs, axis, rhs, axis) &&
+            sameLogicalAxis(lhs, axis, result, axis);
+  if (valid) {
+    const unsigned matrixAxis = rank - 2;
+    valid = lhs.getShape()[matrixAxis] == result.getShape()[matrixAxis] &&
+            lhs.getShape()[matrixAxis + 1] ==
+                rhs.getShape()[matrixAxis] &&
+            rhs.getShape()[matrixAxis + 1] ==
+                result.getShape()[matrixAxis + 1] &&
+            sameLogicalAxis(lhs, matrixAxis, result, matrixAxis) &&
+            sameLogicalAxis(lhs, matrixAxis + 1, rhs, matrixAxis) &&
+            sameLogicalAxis(rhs, matrixAxis + 1, result, matrixAxis + 1);
+  }
+  if (!valid) {
+    InFlightDiagnostic diagnostic = emitOpError(
+        "requires a canonical [M,K] x [K,N] or [B,M,K] x [B,K,N] "
+        "cuTile MMA form");
     diagnostic << "; lhs=" << lhs << "; rhs=" << rhs
                << "; accumulator=" << accumulator << "; result=" << result;
     return failure();
