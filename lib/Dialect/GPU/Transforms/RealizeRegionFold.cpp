@@ -566,7 +566,7 @@ std::optional<bool> booleanConstant(
     Value value, Value falsePredicate,
     llvm::SmallPtrSetImpl<Operation *> &visiting);
 
-BlockArgument rootHelperArgument(Value value) {
+Value stripHelperForwarding(Value value) {
   while (Operation *definition = value.getDefiningOp()) {
     if (auto broadcast = dyn_cast<BroadcastOp>(definition)) {
       value = broadcast.getValue();
@@ -597,9 +597,62 @@ BlockArgument rootHelperArgument(Value value) {
       value = *condition ? select.getTrueValue() : select.getFalseValue();
       continue;
     }
-    return {};
+    return value;
   }
-  return dyn_cast<BlockArgument>(value);
+  return value;
+}
+
+BlockArgument rootHelperArgument(Value value) {
+  return dyn_cast_or_null<BlockArgument>(stripHelperForwarding(value));
+}
+
+struct HelperCoordinateExpression {
+  BlockArgument coordinate;
+  Value scalar;
+  bool subtractScalar = false;
+};
+
+bool isHelperScalar(Value value) {
+  value = stripHelperForwarding(value);
+  if (!value)
+    return false;
+  if (isa<BlockArgument>(value))
+    return value.getType().isIntOrIndex();
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  return constant && isa<IntegerAttr>(constant.getValue());
+}
+
+FailureOr<HelperCoordinateExpression>
+helperCoordinateExpression(Value value) {
+  value = stripHelperForwarding(value);
+  if (!value)
+    return failure();
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (!isa<FragmentType>(argument.getType()))
+      return failure();
+    return HelperCoordinateExpression{argument, Value(), false};
+  }
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return failure();
+  BinaryOperator kind = binary.getOperatorKind();
+  if (kind != BinaryOperator::Add && kind != BinaryOperator::Subtract)
+    return failure();
+  BlockArgument lhs = rootHelperArgument(binary.getLhs());
+  if (lhs && isa<FragmentType>(lhs.getType()) &&
+      isHelperScalar(binary.getRhs()))
+    return HelperCoordinateExpression{lhs,
+                                      stripHelperForwarding(binary.getRhs()),
+                                      kind == BinaryOperator::Subtract};
+  if (kind == BinaryOperator::Add) {
+    BlockArgument rhs = rootHelperArgument(binary.getRhs());
+    if (rhs && isa<FragmentType>(rhs.getType()) &&
+        isHelperScalar(binary.getLhs()))
+      return HelperCoordinateExpression{rhs,
+                                        stripHelperForwarding(binary.getLhs()),
+                                        false};
+  }
+  return failure();
 }
 
 bool isZeroConstant(Value value, Value falsePredicate,
@@ -1428,9 +1481,11 @@ LogicalResult cloneScanOutputConsumers(
 
 struct PredicatePartition {
   Value allTrueStop;
+  Value effectiveStart;
   Value effectiveStop;
   Value predicate;
-  bool firstMemberIsActive;
+  bool firstMemberIsActive = false;
+  bool prefixSpecializable = false;
 };
 
 FailureOr<PredicatePartition>
@@ -1449,92 +1504,224 @@ predicatePartition(OpBuilder &builder, RegionFoldOp fold,
     FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
     return succeeded(range) ? *range : MakeRangeOp();
   };
-  for (CompareOp compare : fold.getSummarize().front().getOps<CompareOp>()) {
-    BlockArgument lhs = rootHelperArgument(compare.getLhs());
-    BlockArgument rhs = rootHelperArgument(compare.getRhs());
-    if (!lhs || !rhs)
-      continue;
-    unsigned sourceCount = fold.getSourceCount();
-    bool lhsCapture = lhs.getArgNumber() >= sourceCount;
-    bool rhsCapture = rhs.getArgNumber() >= sourceCount;
-    if (lhsCapture == rhsCapture)
-      continue;
-    unsigned sourceArgument =
-        lhsCapture ? rhs.getArgNumber() : lhs.getArgNumber();
-    unsigned captureArgument =
-        lhsCapture ? lhs.getArgNumber() : rhs.getArgNumber();
-    bool sourceHasUpperBound =
-        (lhsCapture && compare.getPredicate() == ComparePredicate::Ge) ||
-        (rhsCapture && compare.getPredicate() == ComparePredicate::Le);
-    if (!sourceHasUpperBound || sourceArgument >= plans.size())
-      continue;
-    unsigned captureIndex = captureArgument - sourceCount;
-    ValueRange captures = fold.getInputs().drop_front(
-        fold.getSourceCount() + fold.getIdentityCount());
+  unsigned sourceCount = fold.getSourceCount();
+  ValueRange captures = fold.getInputs().drop_front(
+      fold.getSourceCount() + fold.getIdentityCount());
+  auto boundRanges = [&](BlockArgument source,
+                         BlockArgument capture)
+      -> std::optional<std::pair<MakeRangeOp, MakeRangeOp>> {
+    if (!source || !capture || source.getArgNumber() >= sourceCount ||
+        capture.getArgNumber() < sourceCount ||
+        source.getArgNumber() >= plans.size())
+      return std::nullopt;
+    unsigned captureIndex = capture.getArgNumber() - sourceCount;
     if (captureIndex >= captures.size())
-      continue;
+      return std::nullopt;
     MakeRangeOp captureRange = uniqueRange(captures[captureIndex]);
-    MakeRangeOp comparedSource = uniqueRange(plans[sourceArgument].source);
+    MakeRangeOp comparedSource =
+        uniqueRange(plans[source.getArgNumber()].source);
     auto comparedType = comparedSource
                             ? dyn_cast<FragmentType>(
                                   comparedSource.getResult().getType())
                             : FragmentType();
     auto masterType = dyn_cast<FragmentType>(master.getResult().getType());
     if (!captureRange || !comparedSource || !isUnitStepRange(captureRange) ||
-        !isUnitStepRange(comparedSource) ||
-        !comparedType || !masterType || comparedType.getShape().size() != 1 ||
+        !isUnitStepRange(comparedSource) || !comparedType || !masterType ||
+        comparedType.getShape().size() != 1 ||
         masterType.getShape().size() != 1 ||
         comparedType.getShape()[0] != masterType.getShape()[0])
-      continue;
+      return std::nullopt;
+    return std::make_pair(captureRange, comparedSource);
+  };
+  auto materializeHelperScalar = [&](Value helperScalar) -> FailureOr<Value> {
+    helperScalar = stripHelperForwarding(helperScalar);
+    if (!helperScalar)
+      return failure();
+    Value scalar;
+    if (auto argument = dyn_cast<BlockArgument>(helperScalar)) {
+      if (argument.getArgNumber() < sourceCount)
+        return failure();
+      unsigned captureIndex = argument.getArgNumber() - sourceCount;
+      if (captureIndex >= captures.size())
+        return failure();
+      scalar = captures[captureIndex];
+    } else if (auto constant =
+                   helperScalar.getDefiningOp<arith::ConstantOp>()) {
+      auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+      if (!integer)
+        return failure();
+      scalar = builder.create<arith::ConstantIndexOp>(fold.getLoc(),
+                                                       integer.getInt());
+    } else {
+      return failure();
+    }
+    if (!scalar.getType().isIntOrIndex())
+      return failure();
+    if (!isa<IndexType>(scalar.getType()))
+      scalar = builder.create<CastOp>(fold.getLoc(), builder.getIndexType(),
+                                      scalar);
+    return scalar;
+  };
+
+  Location location = fold.getLoc();
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value effectiveStart = zero;
+  Value effectiveStop = masterExtent;
+  Value allTrueStop = zero;
+  Value prefixPredicate;
+  bool firstMemberIsActive = false;
+  bool hasLowerBound = false;
+  unsigned upperBoundCount = 0;
+  bool foundBound = false;
+  for (CompareOp compare : fold.getSummarize().front().getOps<CompareOp>()) {
+    BlockArgument lhs = rootHelperArgument(compare.getLhs());
+    BlockArgument rhs = rootHelperArgument(compare.getRhs());
     bool identityOnly = true;
     for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
       identityOnly &=
           equalWhenPredicateIsFalse(summary, identity, compare.getResult());
     if (!identityOnly)
       continue;
-    Location location = fold.getLoc();
-    Value captureWidth = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureRange.getExtent(),
-        captureRange.getStep(), BinaryOperator::Multiply);
-    Value captureUpper = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureRange.getStart(), captureWidth,
-        BinaryOperator::Add);
-    Value relativeUpper = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureUpper, master.getStart(),
+
+    BlockArgument upperSource;
+    BlockArgument upperCapture;
+    bool strictUpper = false;
+    switch (compare.getPredicate()) {
+    case ComparePredicate::Le:
+    case ComparePredicate::Lt:
+      upperSource = lhs;
+      upperCapture = rhs;
+      strictUpper = compare.getPredicate() == ComparePredicate::Lt;
+      break;
+    case ComparePredicate::Ge:
+    case ComparePredicate::Gt:
+      upperSource = rhs;
+      upperCapture = lhs;
+      strictUpper = compare.getPredicate() == ComparePredicate::Gt;
+      break;
+    default:
+      break;
+    }
+    if (auto ranges = boundRanges(upperSource, upperCapture)) {
+      MakeRangeOp captureRange = ranges->first;
+      MakeRangeOp comparedSource = ranges->second;
+      Value captureWidth = builder.create<BinaryOp>(
+          location, builder.getIndexType(), captureRange.getExtent(),
+          captureRange.getStep(), BinaryOperator::Multiply);
+      Value captureUpper = builder.create<BinaryOp>(
+          location, builder.getIndexType(), captureRange.getStart(),
+          captureWidth, BinaryOperator::Add);
+      if (strictUpper)
+        captureUpper = builder.create<BinaryOp>(
+            location, builder.getIndexType(), captureUpper,
+            captureRange.getStep(), BinaryOperator::Subtract);
+      Value relativeUpper = builder.create<BinaryOp>(
+          location, builder.getIndexType(), captureUpper, master.getStart(),
+          BinaryOperator::Subtract);
+      Value nonNegative = builder.create<BinaryOp>(
+          location, builder.getIndexType(), relativeUpper, zero,
+          BinaryOperator::Maximum);
+      Value candidateStop = builder.create<BinaryOp>(
+          location, builder.getIndexType(), masterExtent, nonNegative,
+          BinaryOperator::Minimum);
+      effectiveStop = builder.create<BinaryOp>(
+          location, builder.getIndexType(), effectiveStop, candidateStop,
+          BinaryOperator::Minimum);
+      if (upperBoundCount++ == 0) {
+        Value relativeStart = builder.create<BinaryOp>(
+            location, builder.getIndexType(), captureRange.getStart(),
+            master.getStart(), BinaryOperator::Subtract);
+        Value nonNegativeStart = builder.create<BinaryOp>(
+            location, builder.getIndexType(), relativeStart, zero,
+            BinaryOperator::Maximum);
+        Value boundedStart = builder.create<BinaryOp>(
+            location, builder.getIndexType(), masterExtent, nonNegativeStart,
+            BinaryOperator::Minimum);
+        Value wholeSegments = builder.create<BinaryOp>(
+            location, builder.getIndexType(), boundedStart, segment,
+            BinaryOperator::FloorDivide);
+        allTrueStop = builder.create<BinaryOp>(
+            location, builder.getIndexType(), wholeSegments, segment,
+            BinaryOperator::Multiply);
+        prefixPredicate = compare.getResult();
+        firstMemberIsActive =
+            samePhysicalScalarExpression(master.getStart(),
+                                         master.getLogicalStart()) &&
+            samePhysicalScalarExpression(captureRange.getLogicalStart(),
+                                         master.getStart()) &&
+            samePhysicalScalarExpression(comparedSource.getStart(),
+                                         master.getStart());
+      }
+      foundBound = true;
+    }
+
+    BlockArgument lowerSource;
+    FailureOr<HelperCoordinateExpression> lowerCapture = failure();
+    bool strictLower = false;
+    switch (compare.getPredicate()) {
+    case ComparePredicate::Ge:
+    case ComparePredicate::Gt:
+      lowerSource = lhs;
+      lowerCapture = helperCoordinateExpression(compare.getRhs());
+      strictLower = compare.getPredicate() == ComparePredicate::Gt;
+      break;
+    case ComparePredicate::Le:
+    case ComparePredicate::Lt:
+      lowerSource = rhs;
+      lowerCapture = helperCoordinateExpression(compare.getLhs());
+      strictLower = compare.getPredicate() == ComparePredicate::Lt;
+      break;
+    default:
+      break;
+    }
+    if (failed(lowerCapture))
+      continue;
+    auto ranges = boundRanges(lowerSource, lowerCapture->coordinate);
+    if (!ranges)
+      continue;
+    MakeRangeOp captureRange = ranges->first;
+    MakeRangeOp comparedSource = ranges->second;
+    Value lower = captureRange.getStart();
+    if (lowerCapture->scalar) {
+      FailureOr<Value> scalar =
+          materializeHelperScalar(lowerCapture->scalar);
+      if (failed(scalar))
+        continue;
+      lower = builder.create<BinaryOp>(
+          location, builder.getIndexType(), lower, *scalar,
+          lowerCapture->subtractScalar ? BinaryOperator::Subtract
+                                       : BinaryOperator::Add);
+    }
+    if (strictLower)
+      lower = builder.create<BinaryOp>(
+          location, builder.getIndexType(), lower, comparedSource.getStep(),
+          BinaryOperator::Add);
+    Value relativeLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), lower, master.getStart(),
         BinaryOperator::Subtract);
-    Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-    Value nonNegative = builder.create<BinaryOp>(
-        location, builder.getIndexType(), relativeUpper, zero,
+    Value nonNegativeLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), relativeLower, zero,
         BinaryOperator::Maximum);
-    Value effectiveStop = builder.create<BinaryOp>(
-        location, builder.getIndexType(), masterExtent, nonNegative,
-        BinaryOperator::Minimum);
-    Value relativeStart = builder.create<BinaryOp>(
-        location, builder.getIndexType(), captureRange.getStart(),
-        master.getStart(), BinaryOperator::Subtract);
-    Value nonNegativeStart = builder.create<BinaryOp>(
-        location, builder.getIndexType(), relativeStart, zero,
-        BinaryOperator::Maximum);
-    Value boundedStart = builder.create<BinaryOp>(
-        location, builder.getIndexType(), masterExtent, nonNegativeStart,
+    Value boundedLower = builder.create<BinaryOp>(
+        location, builder.getIndexType(), masterExtent, nonNegativeLower,
         BinaryOperator::Minimum);
     Value wholeSegments = builder.create<BinaryOp>(
-        location, builder.getIndexType(), boundedStart, segment,
+        location, builder.getIndexType(), boundedLower, segment,
         BinaryOperator::FloorDivide);
-    Value allTrueStop = builder.create<BinaryOp>(
+    Value alignedLower = builder.create<BinaryOp>(
         location, builder.getIndexType(), wholeSegments, segment,
         BinaryOperator::Multiply);
-    bool firstMemberIsActive =
-        samePhysicalScalarExpression(master.getStart(),
-                                     master.getLogicalStart()) &&
-        samePhysicalScalarExpression(captureRange.getLogicalStart(),
-                                     master.getStart()) &&
-        samePhysicalScalarExpression(comparedSource.getStart(),
-                                     master.getStart());
-    return PredicatePartition{allTrueStop, effectiveStop, compare.getResult(),
-                              firstMemberIsActive};
+    effectiveStart = builder.create<BinaryOp>(
+        location, builder.getIndexType(), effectiveStart, alignedLower,
+        BinaryOperator::Maximum);
+    hasLowerBound = true;
+    foundBound = true;
   }
-  return failure();
+  if (!foundBound)
+    return failure();
+  return PredicatePartition{allTrueStop, effectiveStart, effectiveStop,
+                            prefixPredicate, firstMemberIsActive,
+                            upperBoundCount == 1 && !hasLowerBound};
 }
 
 LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
@@ -1629,7 +1816,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
   // contraction summarizer as one physical contraction program until its
   // control-flow variants have a shared blocking realization.
   bool specializePredicatePrefix =
-      succeeded(partition) &&
+      succeeded(partition) && partition->prefixSpecializable &&
       static_cast<ParameterCategory>(fold.getSegment().getCategory()) !=
           ParameterCategory::RegionContraction;
   Value memberPredicate =
@@ -1911,8 +2098,10 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       current.assign(allTrueLoop.getResults().begin(),
                      allTrueLoop.getResults().end());
   }
-  Value mixedStart =
-      specializePredicatePrefix ? partition->allTrueStop : zero;
+  Value mixedStart = specializePredicatePrefix
+                         ? partition->allTrueStop
+                         : succeeded(partition) ? partition->effectiveStart
+                                                : zero;
   stop = succeeded(partition) ? partition->effectiveStop : stop;
   Value fullMixedSegments = builder.create<BinaryOp>(
       location, builder.getIndexType(), stop, segment.getResult(),
