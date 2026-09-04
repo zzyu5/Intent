@@ -34,6 +34,8 @@ def recurrent_gated_delta_fwd(
     for batch in I.parallel(I.domain(0, B)):
         for value_head in I.parallel(I.domain(0, HV)):
             query_head = value_head // HEAD_GROUP
+            I.assume_in_bounds(query_head, query, axis=2)
+            I.assume_in_bounds(query_head, key, axis=2)
             state = I.zeros((K, V), dtype=I.f32)
             for position in positions:
                 query_vector = I.cast(

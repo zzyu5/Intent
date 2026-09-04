@@ -2845,6 +2845,8 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
         continue;
       bounds[sourceAxis].lower = true;
       bounds[sourceAxis].upper = true;
+      if (!llvm::is_contained(result.assumedAxes, sourceAxis))
+        result.assumedAxes.push_back(sourceAxis);
     }
   });
 

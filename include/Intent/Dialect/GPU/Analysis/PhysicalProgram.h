@@ -272,6 +272,8 @@ struct PhysicalAccessBoundaryFact {
 /// fact unknown: they can only further restrict the active member set.
 struct PhysicalAccessBoundsFact {
   PhysicalFactState state = PhysicalFactState::Unknown;
+  /// Resource axes closed by a dominating typed AssumeInBoundsOp.
+  llvm::SmallVector<int64_t, 4> assumedAxes;
   llvm::SmallVector<int64_t, 4> unprovenAxes;
   llvm::SmallVector<int64_t, 4> missingLowerAxes;
   llvm::SmallVector<int64_t, 4> missingUpperAxes;

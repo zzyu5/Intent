@@ -885,6 +885,7 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
   plan.toResource.assign(computationRank, -1);
   SmallVector<bool> usedComputationAxis(computationRank, false);
   SmallVector<unsigned> unresolvedScalarAxes;
+  gpu::PhysicalAccessBoundsFact accessBounds = analysis.accessBounds(owner);
   ArrayRef<int64_t> dimensions =
       view.getLayout().getDimensionIds().asArrayRef();
   if (dimensions.size() != resourceRank)
@@ -921,17 +922,20 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
               computationType.getShape()[*axis.computationAxis] ||
           !collectTileOffsets(coordinate, axis.range.getResult(), axis.offsets))
         return failure();
-      axis.originInBounds = rangeOriginInView(
-          axis.range, axis.offsets, view, resourceAxis,
-          dimensions[resourceAxis], kernel);
+      axis.originInBounds =
+          rangeOriginInView(axis.range, axis.offsets, view, resourceAxis,
+                            dimensions[resourceAxis], kernel) ||
+          llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
       continue;
     }
 
     if (!scalar || !scalar.getType().isIndex())
       return failure();
     axis.scalarIndex = scalar;
-    axis.originInBounds = scalarOriginInView(
-        scalar, view, resourceAxis, dimensions[resourceAxis], kernel);
+    axis.originInBounds =
+        scalarOriginInView(scalar, view, resourceAxis,
+                           dimensions[resourceAxis], kernel) ||
+        llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
     Value strippedScalar = stripIndexIdentities(scalar);
     if (auto workset =
             strippedScalar.getDefiningOp<gpu::WorksetCoordinateOp>()) {
@@ -963,8 +967,10 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     if (!assignComputationAxis(resourceAxis, computationAxis))
       return failure();
     NativeTileAxisPlan &axis = plan.axes[resourceAxis];
-    axis.originInBounds = scalarOriginInView(
-        axis.scalarIndex, view, resourceAxis, dimensions[resourceAxis], kernel);
+    axis.originInBounds =
+        scalarOriginInView(axis.scalarIndex, view, resourceAxis,
+                           dimensions[resourceAxis], kernel) ||
+        llvm::is_contained(accessBounds.assumedAxes, resourceAxis);
   }
 
   if (llvm::any_of(usedComputationAxis, [](bool used) { return !used; }))
