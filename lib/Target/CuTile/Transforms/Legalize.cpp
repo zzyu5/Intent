@@ -155,6 +155,9 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
       if (isProvably(binary.getRhs(), 0))
         return tileIndex(builder, location, binary.getLhs(), extent);
     }
+    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
+        isProvably(binary.getRhs(), 0))
+      return tileIndex(builder, location, binary.getLhs(), extent);
   }
   auto argument = dyn_cast<BlockArgument>(start);
   auto loop =
