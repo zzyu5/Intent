@@ -3804,25 +3804,26 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     pointwiseOwnershipAxes.push_back(axis);
   }
 
-  for (Attribute axis : ownershipAxes) {
+  for (auto [ownershipIndex, axis] :
+       llvm::enumerate(pointwiseOwnershipAxes)) {
     ParameterOp parameter = parameters.lookup(axis);
-    if (!parameter ||
-        parameter.getParameter().getRole() ==
-            static_cast<uint32_t>(ParameterRole::ScanChunk))
-      continue;
+    const bool scalarGridAxis =
+        ownershipIndex + 2 < pointwiseOwnershipAxes.size();
     ParameterRole ownershipRole =
-        pointwiseOwnershipAxes.size() == 2 &&
-                axis == pointwiseOwnershipAxes.front()
+        !scalarGridAxis && ownershipIndex + 2 == pointwiseOwnershipAxes.size()
             ? ParameterRole::OwnershipM
             : ParameterRole::OwnershipN;
     parameter->removeAttr(coverageDimensionAttr);
-    DenseI64ArrayAttr candidates =
-        isSourceAxisKey(axis)
-            ? parameter.getParameter().getCandidates()
-            : DenseI64ArrayAttr::get(
-                  module.getContext(),
-                  {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
-                   4096, 8192, 16384, 32768, 65536});
+    DenseI64ArrayAttr candidates;
+    if (scalarGridAxis)
+      candidates = DenseI64ArrayAttr::get(module.getContext(), {1});
+    else if (isSourceAxisKey(axis))
+      candidates = parameter.getParameter().getCandidates();
+    else
+      candidates = DenseI64ArrayAttr::get(
+          module.getContext(),
+          {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096,
+           8192, 16384, 32768, 65536});
     auto schema = ParameterAttr::get(
         module.getContext(), parameter.getParameter().getName(),
         static_cast<uint32_t>(ownershipRole),
