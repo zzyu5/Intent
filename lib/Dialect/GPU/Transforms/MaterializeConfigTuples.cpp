@@ -33,6 +33,7 @@ struct CorrelatedProfileParameters {
 enum class TuningClass {
   Pointwise,
   PointwiseReduction,
+  OnlineMoment,
   Reduction,
   MultiAxisReduction,
   RegionReduction,
@@ -177,6 +178,40 @@ bool valueDependsOn(Value value, Value producer,
   });
 }
 
+bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
+  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+  if (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN)
+    return false;
+  StringAttr name = parameter.getParameter().getName();
+  bool found = false;
+  kernel.walk([&](scf::ForOp loop) {
+    if (found || !loop->hasAttr(reductionSourcesAttr) ||
+        loop.getNumResults() < 3)
+      return;
+    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != loop.getNumResults())
+      return;
+    SmallVector<unsigned> carryingResults;
+    for (auto [index, result] : llvm::enumerate(loop.getResults())) {
+      auto fragment = dyn_cast<FragmentType>(result.getType());
+      if (fragment && fragmentReferencesParameter(fragment, name))
+        carryingResults.push_back(index);
+    }
+    if (carryingResults.size() != 1)
+      return;
+    unsigned carry = carryingResults.front();
+    loop.getBody()->walk([&](ContractOp contract) {
+      auto result = dyn_cast<FragmentType>(contract.getResult().getType());
+      if (found || !result || !fragmentReferencesParameter(result, name))
+        return;
+      llvm::DenseSet<Value> visited;
+      found = valueDependsOn(yield.getOperand(carry), contract.getResult(),
+                             visited);
+    });
+  });
+  return found;
+}
+
 TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
@@ -202,6 +237,8 @@ TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   case ParameterCategory::Execution:
     return TuningClass::Execution;
   case ParameterCategory::Pointwise:
+    if (isOnlineMomentOwnership(kernel, parameter))
+      return TuningClass::OnlineMoment;
     return isBlockedReductionFreeAxis(kernel, parameter)
                ? TuningClass::PointwiseReduction
                : TuningClass::Pointwise;
@@ -364,6 +401,10 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{1, 1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 1, 2, 8},
             {1, 1, 1, 1, 1, 4, 8}};
+  if (kind == TuningClass::OnlineMoment)
+    return {{64, 64, 32, 1, 128, 1, 8},
+            {128, 128, 32, 1, 128, 1, 8},
+            {256, 256, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::PointwiseReduction && twoAxisPointwise)
     return {{1, 512, 32, 1, 128, 1, 8},
             {1, 64, 32, 1, 128, 1, 8},
@@ -504,6 +545,10 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
                tuningClass(kernel, parameter) ==
                    TuningClass::PointwiseReduction;
       });
+  bool hasOnlineMomentOwnership = llvm::any_of(
+      parameters, [&](ParameterOp parameter) {
+        return tuningClass(kernel, parameter) == TuningClass::OnlineMoment;
+      });
   bool pointwiseOnlyProgram = true;
   kernel.walk([&](Operation *operation) {
     pointwiseOnlyProgram &=
@@ -545,11 +590,19 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
   if (profileCount == 0)
     profileCount = 1;
   // A free axis that survives a blocked reduction and a second pointwise
-  // ownership axis form one live two-dimensional state.  Materialize the
-  // balanced row-wise profile as one correlated physical binding instead of
-  // pairing six independent one-dimensional requests into oversized states.
-  unsigned profileBegin = hasJointPointwiseReduction ? 1 : 0;
-  unsigned profileEnd = hasJointPointwiseReduction ? 2 : profileCount;
+  // ownership axis form one live two-dimensional state.  Ordinary reductions
+  // use one balanced binding.  An online moment keeps its output-free axis in
+  // the loop carry, so retain the small correlated family that changes the
+  // actual number of program instances owning that state.
+  unsigned profileBegin = hasJointPointwiseReduction &&
+                                  !hasOnlineMomentOwnership
+                              ? 1
+                              : 0;
+  unsigned profileEnd = hasJointPointwiseReduction
+                            ? (hasOnlineMomentOwnership
+                                   ? std::min<unsigned>(3, profileCount)
+                                   : 2)
+                            : profileCount;
   for (unsigned profileIndex = profileBegin; profileIndex < profileEnd;
        ++profileIndex) {
     SmallVector<NamedAttribute> bindings;
