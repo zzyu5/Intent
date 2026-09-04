@@ -2,6 +2,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeContractionBlocking.cpp
   RealizeAccessComposition.cpp
   RealizePointwiseBlocking.cpp
+  RealizeOnlineReduction.cpp
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp
   RefineProgramMapping.cpp

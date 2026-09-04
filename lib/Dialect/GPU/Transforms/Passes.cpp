@@ -49,6 +49,21 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(alignContractValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
+  // A pointwise producer graph can feed a compatible max/normalization/moment
+  // summary over one traversal.  Co-realize that typed algebra before the
+  // individual structured passes split its shared producer into sibling loops.
+  if (failed(realizeOnlineReductions(module)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
+      failed(alignAccessResultRelations(*kernel)) ||
+      failed(alignReductionResultRelations(*kernel)) ||
+      failed(alignReductionIdentityRelations(*kernel)) ||
+      failed(alignPointwiseValueRelations(*kernel)) ||
+      failed(alignReductionYieldRelations(*kernel)) ||
+      failed(alignAccessValueRelations(*kernel)) ||
+      failed(refreshReshapeRelations(*kernel)) ||
+      failed(alignContractValueRelations(*kernel)) ||
+      failed(verifyGPUProgram(module)))
+    return failure();
   if (failed(realizeRegionFolds(module)) ||
       failed(alignAccessResultRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||

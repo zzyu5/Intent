@@ -111,6 +111,7 @@ mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult decomposeMultiAxisReductions(mlir::ModuleOp module);
+mlir::LogicalResult realizeOnlineReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
