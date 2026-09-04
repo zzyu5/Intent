@@ -613,16 +613,25 @@ def splitk_mla_decode_partials(
         for head in I.parallel(I.domain(0, H)):
             for split in I.parallel(split_keys.outer):
                 keys = split_keys[split]
-                summary = summarize_mla_chunk(
-                    latent_cache[batch, keys, :],
-                    rope_cache[batch, keys, :],
-                    latent_cache[batch, keys, :],
-                    I.indices(keys),
-                    I.reshape(q_latent[batch, head, :], (1, C)),
-                    I.reshape(q_rope[batch, head, :], (1, q_rope.shape[2])),
-                    I.full((1,), fill=0, dtype=I.index),
-                    scale,
-                    False,
+                latent_values = latent_cache[batch, keys, :]
+                summary = I.region_fold(
+                    source=(
+                        latent_values,
+                        rope_cache[batch, keys, :],
+                        latent_values,
+                        I.indices(keys),
+                    ),
+                    axis=0,
+                    summarize=summarize_mla_chunk,
+                    combine=merge_attention_summaries,
+                    identity=empty_attention_summary(1, C),
+                    operands=(
+                        I.reshape(q_latent[batch, head, :], (1, C)),
+                        I.reshape(q_rope[batch, head, :], (1, q_rope.shape[2])),
+                        I.full((1,), fill=0, dtype=I.index),
+                        scale,
+                        False,
+                    ),
                 )
                 safe_denominator = I.select(
                     summary.valid,

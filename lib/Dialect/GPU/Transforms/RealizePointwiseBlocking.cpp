@@ -2257,6 +2257,113 @@ bool isStaticUnitExtent(Attribute attribute) {
          extent.getValue() == 1;
 }
 
+bool analyzeStructuredFreeBlock(Block &block,
+                                ArrayRef<unsigned> dependentArguments,
+                                SmallVectorImpl<bool> &dependentResults,
+                                bool &sawContract) {
+  llvm::SmallDenseSet<Value> dependent;
+  for (unsigned index : dependentArguments) {
+    if (index >= block.getNumArguments())
+      return false;
+    dependent.insert(block.getArgument(index));
+  }
+  for (Operation &operation : block) {
+    if (auto yield = dyn_cast<YieldOp>(operation)) {
+      dependentResults.clear();
+      for (Value value : yield.getValues())
+        dependentResults.push_back(dependent.contains(value));
+      return true;
+    }
+    bool operationDepends =
+        llvm::any_of(operation.getOperands(), [&](Value operand) {
+          return dependent.contains(operand);
+        });
+    if (!operationDepends)
+      continue;
+    if (auto contract = dyn_cast<ContractOp>(operation)) {
+      bool lhs = dependent.contains(contract.getLhs());
+      bool rhs = dependent.contains(contract.getRhs());
+      if (lhs == rhs || dependent.contains(contract.getAccumulator()))
+        return false;
+      sawContract = true;
+    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
+      ValueRange sources =
+          reduce.getInputs().take_front(reduce.getSourceCount());
+      ValueRange boundaries =
+          reduce.getInputs().drop_front(reduce.getSourceCount());
+      if (!llvm::any_of(sources, [&](Value value) {
+            return dependent.contains(value);
+          }) ||
+          llvm::any_of(boundaries, [&](Value value) {
+            return dependent.contains(value);
+          }))
+        return false;
+    } else if (auto gather = dyn_cast<GatherOp>(operation)) {
+      auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+      if (!source || !dependent.contains(gather.getSource()) ||
+          llvm::any_of(gather.getCoordinates(), [&](Value value) {
+            return dependent.contains(value);
+          }))
+        return false;
+      for (int64_t sourceAxis : gather.getSourceAxes())
+        if (sourceAxis < 0 ||
+            sourceAxis >= static_cast<int64_t>(source.getShape().size()) ||
+            !isStaticUnitExtent(source.getShape()[sourceAxis]))
+          return false;
+    } else if (!isStructuredFreeAxisValueOp(&operation) ||
+               operation.getNumRegions() != 0) {
+      return false;
+    }
+    if (operation.getNumResults() == 0)
+      return false;
+    for (Value result : operation.getResults())
+      dependent.insert(result);
+  }
+  return false;
+}
+
+bool analyzeStructuredRegionFold(
+    RegionFoldOp fold, const std::function<bool(Value)> &depends,
+    SmallVectorImpl<bool> &dependentResults, bool &sawContract) {
+  if (!llvm::hasSingleElement(fold.getSummarize()) ||
+      !llvm::hasSingleElement(fold.getCombine()))
+    return false;
+  unsigned sourceCount = fold.getSourceCount();
+  unsigned identityCount = fold.getIdentityCount();
+  unsigned captureCount = fold.getCaptureCount();
+  ValueRange inputs = fold.getInputs();
+  if (inputs.size() != sourceCount + identityCount + captureCount)
+    return false;
+  if (llvm::any_of(inputs.take_front(sourceCount + identityCount), depends))
+    return false;
+
+  SmallVector<unsigned> summarizeArguments;
+  for (unsigned capture = 0; capture < captureCount; ++capture)
+    if (depends(inputs[sourceCount + identityCount + capture]))
+      summarizeArguments.push_back(sourceCount + capture);
+  if (summarizeArguments.empty())
+    return false;
+  if (!analyzeStructuredFreeBlock(fold.getSummarize().front(),
+                                  summarizeArguments, dependentResults,
+                                  sawContract) ||
+      dependentResults.size() != identityCount ||
+      !llvm::any_of(dependentResults, [](bool value) { return value; }))
+    return false;
+
+  SmallVector<unsigned> combineArguments;
+  for (auto [index, dependent] : llvm::enumerate(dependentResults))
+    if (dependent) {
+      combineArguments.push_back(index);
+      combineArguments.push_back(identityCount + index);
+    }
+  SmallVector<bool> combinedResults;
+  if (!analyzeStructuredFreeBlock(fold.getCombine().front(), combineArguments,
+                                  combinedResults, sawContract) ||
+      combinedResults != dependentResults)
+    return false;
+  return true;
+}
+
 bool supportsCartesianPointwiseValueGraph(
     ArrayRef<WorksetCoordinateOp> coordinates) {
   llvm::SmallDenseSet<Value> dependent;
@@ -2298,13 +2405,16 @@ bool supportsCartesianPointwiseValueGraph(
 /// pointwise operations, remain free across reductions, and occupy exactly one
 /// operand's free side of an ordinary contraction.  This is the physical form
 /// needed to group independent rows/columns while keeping invariant matrix
-/// operands shared by the group.  It deliberately excludes control flow,
-/// traversal construction, paired/batched dependence, and non-store effects.
+/// operands shared by the group.  A region fold may carry the axis through
+/// immutable captures and summaries, but its source traversal remains
+/// independent.  Control flow, paired/batched dependence, and non-store
+/// effects remain excluded.
 bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
   llvm::SmallDenseSet<Value> dependent{coordinate.getResult()};
   SmallVector<Value> worklist{coordinate.getResult()};
   llvm::SmallPtrSet<Operation *, 32> visited;
   SmallVector<Operation *> operations;
+  bool sawNestedContract = false;
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     for (Operation *user : value.getUsers()) {
@@ -2316,6 +2426,19 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
           return false;
         continue;
       }
+      if (auto fold = dyn_cast<RegionFoldOp>(user)) {
+        SmallVector<bool> resultDependencies;
+        if (!analyzeStructuredRegionFold(
+                fold,
+                [&](Value operand) { return dependent.contains(operand); },
+                resultDependencies, sawNestedContract))
+          return false;
+        for (auto [result, resultDepends] :
+             llvm::zip(fold.getResults(), resultDependencies))
+          if (resultDepends && dependent.insert(result).second)
+            worklist.push_back(result);
+        continue;
+      }
       if (!isStructuredFreeAxisValueOp(user))
         return false;
       for (Value result : user->getResults())
@@ -2325,9 +2448,11 @@ bool supportsStructuredFreeAxisValueGraph(WorksetCoordinateOp coordinate) {
   }
 
   auto depends = [&](Value value) { return dependent.contains(value); };
-  bool sawContract = false;
+  bool sawContract = sawNestedContract;
   bool sawOwnedStore = false;
   for (Operation *operation : operations) {
+    if (isa<RegionFoldOp>(operation))
+      continue;
     if (auto contract = dyn_cast<ContractOp>(operation)) {
       bool lhs = depends(contract.getLhs());
       bool rhs = depends(contract.getRhs());
@@ -2470,7 +2595,9 @@ LogicalResult rankLiftPointwiseValueGraph(
       shifted.push_back(axis + static_cast<int64_t>(liftedAxes.size()));
     return shifted;
   };
-  WalkResult result = kernel.walk([&](Operation *operation) {
+  llvm::SmallPtrSet<Operation *, 32> liftedOperations;
+  std::function<WalkResult(Operation *)> liftOperation;
+  liftOperation = [&](Operation *operation) {
     if (isa<MakeRangeOp>(operation))
       return WalkResult::advance();
     bool dependsOnLiftedRange =
@@ -2479,8 +2606,84 @@ LogicalResult rankLiftPointwiseValueGraph(
         });
     if (!dependsOnLiftedRange)
       return WalkResult::advance();
+    if (!liftedOperations.insert(operation).second)
+      return WalkResult::advance();
     if (operation->getNumResults() == 0)
       return WalkResult::advance();
+
+    if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
+      if (!llvm::hasSingleElement(fold.getSummarize()) ||
+          !llvm::hasSingleElement(fold.getCombine()))
+        return WalkResult::interrupt();
+      unsigned sourceCount = fold.getSourceCount();
+      unsigned identityCount = fold.getIdentityCount();
+      unsigned captureCount = fold.getCaptureCount();
+      ValueRange inputs = fold.getInputs();
+      if (inputs.size() != sourceCount + identityCount + captureCount ||
+          llvm::any_of(inputs.take_front(sourceCount + identityCount),
+                       dependsOnLiftedAxis))
+        return WalkResult::interrupt();
+
+      Block &summarize = fold.getSummarize().front();
+      bool dependentCapture = false;
+      for (unsigned capture = 0; capture < captureCount; ++capture) {
+        unsigned operand = sourceCount + identityCount + capture;
+        if (!dependsOnLiftedAxis(inputs[operand]))
+          continue;
+        dependentCapture = true;
+        BlockArgument argument = summarize.getArgument(sourceCount + capture);
+        argument.setType(inputs[operand].getType());
+        liftedValues.insert(argument);
+      }
+      if (!dependentCapture)
+        return WalkResult::interrupt();
+      for (Operation &nested : summarize.without_terminator())
+        if (liftOperation(&nested).wasInterrupted())
+          return WalkResult::interrupt();
+      auto summarizeYield = dyn_cast<YieldOp>(summarize.getTerminator());
+      if (!summarizeYield ||
+          summarizeYield.getValues().size() != identityCount)
+        return WalkResult::interrupt();
+
+      Block &combine = fold.getCombine().front();
+      if (combine.getNumArguments() != 2 * identityCount)
+        return WalkResult::interrupt();
+      SmallVector<Type> resultTypes;
+      SmallVector<bool> dependentResults;
+      OpBuilder builder(fold);
+      for (unsigned index = 0; index < identityCount; ++index) {
+        Value summary = summarizeYield.getValues()[index];
+        Type target = summary.getType();
+        bool dependent = dependsOnLiftedAxis(summary);
+        resultTypes.push_back(target);
+        dependentResults.push_back(dependent);
+        if (!dependent)
+          continue;
+        FailureOr<Value> identity = projectPhysicalValueToSchema(
+            builder, fold.getLoc(), inputs[sourceCount + index], target);
+        if (failed(identity))
+          return WalkResult::interrupt();
+        fold->setOperand(sourceCount + index, *identity);
+        fold.getResult(index).setType(target);
+        combine.getArgument(index).setType(target);
+        combine.getArgument(identityCount + index).setType(target);
+        liftedValues.insert(combine.getArgument(index));
+        liftedValues.insert(combine.getArgument(identityCount + index));
+        liftedValues.insert(fold.getResult(index));
+      }
+      if (!llvm::any_of(dependentResults, [](bool value) { return value; }))
+        return WalkResult::interrupt();
+      for (Operation &nested : combine.without_terminator())
+        if (liftOperation(&nested).wasInterrupted())
+          return WalkResult::interrupt();
+      auto combineYield = dyn_cast<YieldOp>(combine.getTerminator());
+      if (!combineYield || combineYield.getValues().size() != identityCount)
+        return WalkResult::interrupt();
+      for (auto [index, value] : llvm::enumerate(combineYield.getValues()))
+        if (value.getType() != resultTypes[index])
+          return WalkResult::interrupt();
+      return WalkResult::advance();
+    }
 
     if (auto contract = dyn_cast<ContractOp>(operation)) {
       bool lhs = dependsOnLiftedAxis(contract.getLhs());
@@ -2605,7 +2808,9 @@ LogicalResult rankLiftPointwiseValueGraph(
       liftedValues.insert(value);
     }
     return WalkResult::advance();
-  });
+  };
+  WalkResult result =
+      kernel.walk([&](Operation *operation) { return liftOperation(operation); });
   if (result.wasInterrupted())
     return failure();
 
@@ -2911,7 +3116,7 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
     }
     if (failed(rankLiftPointwiseValueGraph(kernel, liftedRanges)))
       return kernel.emitError(
-          "failed to rank-lift a legal Cartesian pointwise value graph");
+          "failed to rank-lift a legal pointwise ownership graph");
   }
 
   SmallVector<MakeRangeOp> dynamicRanges;
