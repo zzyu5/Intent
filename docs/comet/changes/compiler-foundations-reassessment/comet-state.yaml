@@ -1,9 +1,9 @@
 schema: comet.native.v4
 name: compiler-foundations-reassessment
 language: zh-CN
-phase: build
-status: active
-state_version: 2
+phase: verify
+status: await-user
+state_version: 5
 brief: brief.md
 spec_changes:
   - capability: compiler-foundations-reassessment
@@ -15,47 +15,172 @@ workspace:
   target_branch: main
   finish: null
 loop:
-  stage: building
+  stage: await-user
   goal_cycle: 1
   iteration: 1
-  attempt: 0
+  attempt: 1
   retry_epoch: 0
   failed_iteration_count: 0
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: submit-builder-candidate
+  next_action: confirm-skill-coordinated-pass
 acceptance:
   - id: A1
     source: brief.md
     text: A1：维护者能够从真实 DSL 调用与对应 canonical
       语义判断语言表面的合理性，获得有具体理由的保留项和局部改善候选；命名偏好、实现偏差与抽象缺陷有明确区分，重大抽象问题只在有可核验反例时提出。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 报告§2以真实 DSL 调用、frontend binding、canonical 语义及 Triton/TileLang 对照区分 generic
+        contract 的合理性、signature/固定参数的局部改善与 region state
+        复杂性的必要性；明确未提出可核验的核心抽象反例（report/compiler-foundations-reassessment.md:17-41）。
+      truncated: false
   - id: A2
     source: brief.md
     text: A2：维护者能够沿一条真实 kernel 编译过程理解各层和关键 pass 如何形成 executable GPU Program，并据实际
       IR/代码变化判断 Intent 已承担的编译能力与尚未闭合的职责；shared、provider 和 serializer
       的判断经过同类参考实现对照。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 报告§3给出真实 DSL→KIR→GPU Program→provider→外部 compiler→runtime 路径，并以 bf16_gemm
+        的实际 KIR/shared IR/source 及 ownership、reduction、persistent
+        mapping、TileLang bufferization 的具体代码位置说明实际改写；同时对照 Triton/TileLang 并区分
+        transformation 与只读
+        verifier（report/compiler-foundations-reassessment.md:43-108）。
+      truncated: false
   - id: A3
     source: brief.md
     text: A3：维护者能够区分性能变化中的 physical transformation、provider form/config
       和外部编译贡献，知道当前哪些数字可比较、哪些归因尚无证据；同时获得 config 数据与策略分离的具体可维护性选择及其行为、重编译和跨
       provider 影响。
-    result: pending
-    reason: null
+    result: passed
+    reason:
+      text: 报告§5-6明确区分 typed legality、shared tuples、provider options、runtime
+        winner，给出数据表/JSON/代码逻辑分离选择、重编译及跨 provider 影响；性能部分明确受控条件不足时不能拆分
+        shared/provider/external compiler 贡献，并核对具体 source/generated closure
+        差异（report/compiler-foundations-reassessment.md:154-225）。
+      truncated: false
   - id: A4
     source: brief.md
     text: A4：后续 cuTile、TileLang
       与其他硬件工作获得一份按实际影响整理的继续条件：已成立的基础、需要局部修复的阻塞、可延后的维护问题和必须讨论的核心分叉分别明确；结论保留未知项，不依赖新增限制或未经验证的“全部干净”承诺。
-    result: pending
-    reason: null
-builder_handoff: null
-blockers: []
-verification: null
-history: []
+    result: passed
+    reason:
+      text: 报告§7按已成立基础、已复现 correctness 缺口、策略边界、维护机会、未知项和新硬件边界整理后续条件；明确
+        TileLang/性能/新硬件未动态验证且不作泛化或“全部干净”承诺（report/compiler-foundations-reassessment.md:227-240,
+        242-307）。
+      truncated: false
+builder_handoff:
+  candidate_id: e570025c-8110-4464-aef7-8de828045cae
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:e8025102-f648-4851-9a2e-b6ca1ec7cdbe
+  iteration: 1
+  summary:
+    text: 完成只读编译基础调查，提交 55f3631。报告回答 DSL 表面、真实 GPU pipeline、config
+      组织与性能归因、后续后端阻塞四项结果；发现四类已复现生产语义缺口，未修改生产代码或 doc，也未继续 cuTile 性能实现。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+  checks:
+    - name:
+        text: 调查基线独立编译
+        truncated: false
+      result: passed
+      note:
+        text: a11b80a worktree 在 /tmp/intentdsl-foundations-build.GePTCn 完成 Release
+          构建，未改 compiler。
+        truncated: false
+    - name:
+        text: 现有 BF16 GEMM production 正向 repro
+        truncated: false
+      result: passed
+      note:
+        text: lower_to_mlir、compile_shared_gpu、compile、artifact.run；128x128 BF16 全一输入
+          max_abs=0。
+        truncated: false
+    - name:
+        text: 生产语义反例复现与记录
+        truncated: false
+      result: passed
+      note:
+        text: 成功复现并记录错误，而非宣称数值正确：Triton f32 输入 TF32 差异；Triton (-3,2) divrem=-1,-1；cuTile
+          一次 wide loop 输出 -2^31；cuTile InOut 首次+97、第二次+1。同一 f32 contract cuTile
+          正确。临时 repro 位于
+          /tmp/intentdsl-foundations-repro.h6uHVZ/numerics.py，报告保留定义、输入、命令及观察。
+        truncated: false
+    - name:
+        text: current/ref 静态对照与两路独立复核
+        truncated: false
+      result: passed
+      note:
+        text: 参考真实 /home/kingdom/phdworks/ref/triton、ref/tilelang 与 cuda.tile 安装源码。独立复核
+          /root/foundations_report_semantic_review 和
+          /root/foundations_report_scope_review 均通过。
+        truncated: false
+    - name:
+        text: 双机全量、性能消融、TileLang JIT、新硬件运行
+        truncated: false
+      result: not-run
+      note:
+        text: 本调查不以性能闭合作为验收；报告明确未知与可比性限制，未扩建测试体系。
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 调查通过不代表已修复四类语义缺陷；旧 cuTile change 继续暂停。
+      truncated: false
+    - text: Triton autotune effects、TileLang f32/alias/tuning
+        等部分同类路径只做静态核验，报告未泛化为动态失败。
+      truncated: false
+    - text: 没有受控证据可量化 shared/provider/external compiler 的性能贡献百分比，也不保证后续只改 leaf。
+      truncated: false
+  known_limits_truncated: false
+  review:
+    status: passed
+    summary:
+      text: 两位新的只读复核者完整检查报告、brief/spec 并抽查 current/ref。语义反例、真实 pipeline、occupancy 策略与
+        legality 区分、source closure/性能限制、config 建议与后端范围均无阻塞错误。
+      truncated: false
+    reviewer_execution_ref: /root/foundations_report_semantic_review
+  submitted_at: 2026-09-05T09:07:21.733Z
+blockers:
+  - owner: user
+    reason:
+      text: The generic Skill bridge cannot prove an independent Verifier execution;
+        user confirmation is required before Archive.
+      truncated: false
+    acceptance_ids: []
+    resolution_action: await-user
+verification:
+  candidate_id: e570025c-8110-4464-aef7-8de828045cae
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:a3040ab6-5df1-4dc1-b606-957f84bf61c7
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks: []
+  summary:
+    text: 四项验收均有报告内可回查的 current/ref 位置、实际 IR/运行事实和明确未知边界。调查通过不等于修复四类语义缺口；候选未修改
+      production 或 doc，符合本 change 的调查目标。
+    truncated: false
+  risks: []
+  risks_truncated: false
+  completed_at: 2026-09-05T09:11:08.049Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 四项验收均有报告内可回查的 current/ref 位置、实际 IR/运行事实和明确未知边界。调查通过不等于修复四类语义缺口；候选未修改
+        production 或 doc，符合本 change 的调查目标。
+      truncated: false
+    completed_at: 2026-09-05T09:11:08.049Z
 history_overflow:
   dropped_entries: 0
   first_dropped_at: null
@@ -66,7 +191,7 @@ history_overflow:
     blocked: 0
     execution-error: 0
     recovery: 0
-verification_result: pending
-verification_report: null
+verification_result: pass
+verification_report: verification.md
 archived: false
 created_at: 2026-09-05T08:05:48.925Z
