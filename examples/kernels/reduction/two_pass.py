@@ -23,7 +23,7 @@ def partitioned_max_partial(
             end = I.minimum((part + 1) * width, N)
             region = columns[begin:end]
             partial[row, part] = I.reduce.max(
-                x[row, region], axis=0, identity=-I.inf
+                x[row, region], axis=0
             )
 
 
@@ -36,5 +36,5 @@ def partitioned_max_reduce(
     parts = I.domain(0, P)
     for row in I.parallel(I.domain(0, M)):
         output[row] = I.reduce.max(
-            partial[row, parts], axis=0, identity=-I.inf
+            partial[row, parts], axis=0
         )

@@ -43,14 +43,14 @@ Python literal是untyped source literal，可以按直接使用位置的expected
 - comparison返回`bool`；
 - structured operation的accumulator/result dtype由operation显式给出或使用本文定义的固定builtin规则。
 
-`reduce.sum`在未显式给出accumulator dtype时使用：
+`reduce.sum`与`cumsum`在未显式给出accumulator dtype时使用：
 
 - `i8/i16 -> i32`，`u8/u16 -> u32`；
 - `i32/i64/u32/u64`保持输入dtype；
 - `f8e4m3fn/f8e5m2/f16/bf16 -> f32`；
 - `f32/f64`保持输入dtype。
 
-其它builtin reduce保持其输入dtype，除非surface明确要求另一result schema。
+其它builtin reduce与cummax默认保持输入dtype，除非surface明确要求另一result schema。Dot/matvec/vecmat/matmul保持与contract相同的显式accumulator/result dtype，不从provider推导输入精度；outer使用普通同dtype乘法。
 
 ## 4. Integer arithmetic
 
@@ -95,13 +95,13 @@ fixed-width integers使用二进制补码与modulo arithmetic：
 
 generic reduce/scan的combine按logical element order允许任意parenthesization，但不允许任意permutation。作者选择这些operations，即接受这种reassociation可能导致的finite-precision差异；要求严格left fold时使用ordinary loop。source component可以含被归约axes；删除这些axes后的component shape是accumulator、identity、combine参数与result shape。
 
-identity逐component显式给出：
+Generic reduce/scan的identity逐component显式给出；builtin reduce/prefix由操作定义产生同一canonical identity，不要求作者重复传入：
 
 - empty reduce返回identity；
 - empty scan返回empty tensor；
 - inclusive/exclusive与forward/reverse由scan参数决定。
 
-NaN与tie behavior来自明确combine。`reduce.max`使用propagating maximum；`arg_reduce.max`在values相等时选择lowest logical index，并传播NaN。其它策略必须通过不同typed combine明确写出。
+NaN与tie behavior来自明确combine。`reduce.max`与`cummax`使用propagating maximum；其identity为dtype最小值：有infinity的float取负无穷，f8e4m3fn取-448，signed integer/index取最小整数，unsigned integer取0。Sum/cumsum的identity为result dtype的加法零，bool any/all分别为false/true。`arg_reduce.max`在values相等时选择lowest logical index，并传播NaN。其它策略必须通过不同typed combine明确写出。
 
 Region fold/scan沿compiler-selected连续source slices允许同样的logical-order-preserving reassociation。它们另外要求region summarizer与summary combine满足：
 

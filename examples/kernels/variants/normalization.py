@@ -35,9 +35,9 @@ def weighted_layer_norm_second_moment(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = x[row, columns]
-        mean = I.reduce.sum(values, axis=0, identity=0.0) * inverse_features
+        mean = I.reduce.sum(values, axis=0) * inverse_features
         normalized = (values - mean) * I.rsqrt(
-            I.reduce.sum(values * values, axis=0, identity=0.0)
+            I.reduce.sum(values * values, axis=0)
             * inverse_features
             - mean * mean
             + epsilon

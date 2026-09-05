@@ -33,12 +33,10 @@ def summarize_attention_chunk(
     chunk_valid = I.reduce.any(
         valid,
         axis=1,
-        identity=False,
     )
     raw_maximum = I.reduce.max(
         masked_scores,
         axis=1,
-        identity=-I.inf,
     )
 
     # An all-masked row is the identity contribution. Use a finite temporary
@@ -52,7 +50,6 @@ def summarize_attention_chunk(
     denominator = I.reduce.sum(
         probabilities,
         axis=1,
-        identity=0.0,
     )
     accumulator = I.contract(
         probabilities,

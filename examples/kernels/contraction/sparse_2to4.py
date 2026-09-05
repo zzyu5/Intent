@@ -29,9 +29,10 @@ def sparse_2to4_gemm(
         first=I.cast(metadata_nibble & 0x3, I.index),
         second=I.cast((metadata_nibble >> 2) & 0x3, I.index),
     )
-    output[rows, columns] = I.sparse_contract_2to4(
+    output[rows, columns] = I.sparse_matmul(
         compressed[rows, compressed_axis],
         logical_positions,
         rhs[reduction, columns],
+        format=I.sparse.two_of_four(compression_axis=1, logical_extent=K),
         acc_dtype=I.f32,
     )

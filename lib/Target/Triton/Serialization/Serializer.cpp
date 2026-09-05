@@ -297,7 +297,8 @@ private:
   void emitPreamble() {
     output << "import torch\nimport triton\nimport triton.language as tl\n"
               "from triton.language.extra import libdevice\n"
-              "from triton.tools.tensor_descriptor import TensorDescriptor\n\n";
+              "from triton.tools.tensor_descriptor import TensorDescriptor\n"
+              "from intent.runtime.triton import TuningHooks\n\n";
   }
 
   void emitDescriptorPruner() {
@@ -467,7 +468,13 @@ private:
              << "    raise ValueError(\"no legal full-coverage extent for "
              << parameter << "\")\n\n";
     }
-    output << "@triton.autotune(\n    configs=[\n";
+    output << "_intent_tuning_hooks = TuningHooks((";
+    for (const ViewABI &view : views)
+      output << "\"" << view.name << "\", ";
+    output << "), (";
+    for (const ViewABI &view : views)
+      output << (view.type.getAccess() != 0 ? "True, " : "False, ");
+    output << "))\n\n@triton.autotune(\n    configs=[\n";
     for (const Config &config : *configs) {
       output << "        triton.Config({";
       bool first = true;
@@ -489,8 +496,6 @@ private:
     output << "    ],\n    key=[";
     bool firstKey = true;
     for (const MetadataABI &metadata : metadataArguments) {
-      if (metadata.kind != "dimension")
-        continue;
       if (!firstKey)
         output << ", ";
       firstKey = false;
@@ -502,6 +507,8 @@ private:
       output << "\"" << descriptorChoice.getEligibilityArgument() << "\"";
     }
     output << "],\n";
+    output << "    pre_hook=_intent_tuning_hooks.before,\n"
+              "    post_hook=_intent_tuning_hooks.after,\n";
     if (descriptorChoice)
       output << "    prune_configs_by={\"early_config_prune\": "
                 "_intent_prune_tensor_descriptor_configs},\n";
@@ -988,7 +995,7 @@ private:
       assign(contract.getResult(), "tl.dot(" + valueString(contract.getLhs()) +
                                       ", " + valueString(contract.getRhs()) +
                                       ", " + valueString(contract.getAccumulator()) +
-                                      ")");
+                                      ", input_precision=\"ieee\")");
       return;
     }
     if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
@@ -1268,8 +1275,22 @@ private:
     case BinaryOperator::Subtract: return infix("-");
     case BinaryOperator::Multiply: return infix("*");
     case BinaryOperator::TrueDivide: return infix("/");
-    case BinaryOperator::FloorDivide: return infix("//");
-    case BinaryOperator::Remainder: return infix("%");
+    case BinaryOperator::FloorDivide:
+    case BinaryOperator::Remainder: {
+      Type element = elementType(binary.getResult().getType());
+      auto integer = dyn_cast<IntegerType>(element);
+      bool remainder = binary.getOperatorKind() == BinaryOperator::Remainder;
+      if (integer && integer.isUnsigned())
+        return infix(remainder ? "%" : "//");
+      std::string rem = infix("%");
+      std::string rhs = valueString(binary.getRhs());
+      // Triton integer division truncates. A Python constexpr remainder already
+      // has the divisor's sign, so this correction also preserves constexprs.
+      std::string adjust = "((" + rem + " != 0) & ((" + rem +
+                           " < 0) != (" + rhs + " < 0)))";
+      return remainder ? "(" + rem + " + " + adjust + " * " + rhs + ")"
+                       : "(" + infix("//") + " - " + adjust + ")";
+    }
     case BinaryOperator::Power: return call("libdevice.pow");
     case BinaryOperator::Maximum: return call("tl.maximum", "ALL");
     case BinaryOperator::Minimum: return call("tl.minimum", "ALL");

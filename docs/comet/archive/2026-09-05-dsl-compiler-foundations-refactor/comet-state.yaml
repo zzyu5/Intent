@@ -1,0 +1,226 @@
+schema: comet.native.v4
+name: dsl-compiler-foundations-refactor
+language: zh-CN
+phase: archive
+status: done
+state_version: 8
+brief: brief.md
+spec_changes:
+  - capability: dsl-compiler-foundations-refactor
+    operation: create
+    source: specs/dsl-compiler-foundations-refactor/spec.md
+workspace:
+  isolation: worktree
+  change_branch: comet/dsl-compiler-foundations-refactor
+  target_branch: main
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：作者能通过已确认的具名计算接口编写对应运算，签名、shape/dtype/default
+      和诊断可发现；操作机械归一到已有语义，不要求重复填写可由操作定义确定的轴/组合规则。
+    result: passed
+    reason:
+      text: 具名
+        dot/matvec/vecmat/matmul/outer、cumsum/cummax、scaled_matmul、sparse_matmul
+        已注册并暴露完整签名，见 python/intent/language/signatures.py:22-60；矩阵操作统一生成 batch
+        broadcast 与 CONTRACT，见
+        python/intent/frontend/lowering/intrinsics/matrix.py:15-76。生产 author-ops
+        repro 已通过，生成源码中的签名与数值结果见
+        /mnt/hdd/tmp/intentdsl-foundations-refactor.YmotCl/author-ops.log:1-3,111,219,328-329。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：已有复杂算法仍能使用具名操作、typed helper、generic structured constructs 和普通
+      control/effects 组合；在本轮涉及的目标路径上形成可执行后端程序，不把局部形态差异误判为算法能力边界。
+    result: passed
+    reason:
+      text: generic reduce/scan、typed @intent.fn helper、region 与普通控制路径仍保留；helper
+        region 纯性和 schema postcondition 检查见
+        python/intent/frontend/lowering/intrinsics/structured.py:407-564,880-995。具名操作复用
+        emit_contract/emit_scaled_contract/emit_sparse_contract，见同文件:567-778。author-ops
+        与 batch Triton/cuTile 生产生成及执行均为 max_abs=0，见
+        /mnt/hdd/tmp/intentdsl-foundations-refactor.YmotCl/author-ops.log:111,219,328-329、batch-triton.log:203、batch-cutile.log:252-253。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：纳入本轮的已知数值/effect 问题兑现明确契约；f32 输入精度、signed floor/remainder、logical index
+      和一次调用的可观察 effect 不继承不等价的 provider 默认值。
+    result: passed
+    reason:
+      text: Triton contraction serializer 明确输出 input_precision="ieee"，见
+        lib/Target/Triton/Serialization/Serializer.cpp:977-999；Triton signed
+        floor/remainder 保持显式关系，见同文件:1278-1290；cuTile logical ABI 使用 int64，见
+        lib/Target/CuTile/Serialization/Serializer.cpp:27-30,374-381；autotune
+        writable alias 通过 TuningState 的 scratch/reset/restore 隔离并恢复，见
+        python/intent/runtime/tuning.py:13-77。既有 numeric/effect repro 已记录
+        f32=1.00146484375、signed quotient/remainder=-2/1、logical
+        loop=2147483648、三 provider inout 两次均 +1，见
+        docs/comet/changes/dsl-compiler-foundations-refactor/comet-state.yaml:85-95。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：纳入本轮的 transformation/config 重构具有清楚职责：完整阶段的 postconditions
+      可定位，有限候选数据与选择逻辑分离，合法性不被固定搜索预算冒充；保留既有 typed IR 权威。
+    result: passed
+    reason:
+      text: shared transformation groups 明确定义并在每组后执行 verifyGPUProgram postcondition，见
+        lib/Dialect/GPU/Transforms/Passes.cpp:8-25,137-173；有限 JSON
+        数据与选择逻辑分离，配置读取、字段/家族/类型/空表诊断及整组替换见
+        lib/Dialect/GPU/Transforms/TuningProfiles.cpp:12-146，typed domain
+        合法性过滤和结果写入 typed IR 见
+        lib/Dialect/GPU/Transforms/MaterializeConfigTuples.cpp:458-679；CLI/Python
+        tuning_config 入口贯通，见
+        tools/intent-compile/intent-compile.cpp:77-145、python/intent/compiler/pipeline.py:15-73。
+      truncated: false
+builder_handoff:
+  candidate_id: bb2996f3-0d23-47f3-92c7-168bade1007b
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:47b07ce4-ff12-4324-befb-0849307cb663
+  iteration: 1
+  summary:
+    text: 已实现具名 dot/matvec/vecmat/matmul/outer、prefix、scaled/sparse 接口和 builtin
+      identity；公开签名绑定与 typed helper 具名实参保持源码求值顺序。向量 contraction 共用 shared
+      realization，原复杂算法与 generic constructs 保留。shared transformation groups
+      各自关闭关系并检查 postcondition。有限 JSON profile 输入贯通 CLI/Python/shared/三
+      provider，provider legality 与搜索表分离。修复 Triton f32 precision、signed
+      floor/rem、cuTile signed64 logical loops 及三 provider autotune effects；同步稳定
+      doc 与必要作者示例。候选提交 a1b962d。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+  checks:
+    - name:
+        text: production DSL emit and numerical repro
+        truncated: false
+      result: passed
+      note:
+        text: 使用 intent.compile -> generated source -> provider JIT ->
+          artifact.run。author_ops.py 使用外部 tuning.json：matmul/cumsum 和非方阵线性注意力
+          summarizer 复用均 max_abs=0；dot/matvec/vecmat/outer 的
+          Triton/cuTile、direct batch 两路径、cuTile scaled、TileLang sparse 均
+          max_abs=0。临时脚本与输出位于
+          /tmp/intentdsl-foundations-refactor.YmotCl，未新增测试目录或 fixture。
+        truncated: false
+    - name:
+        text: numeric and effect repro
+        truncated: false
+      result: passed
+      note:
+        text: /tmp/intentdsl-foundations-repro.h6uHVZ/numerics.py：Triton
+          f32=1.00146484375、signed quotient/remainder=-2/1；cuTile logical
+          loop=2147483648；Triton/cuTile/TileLang inout 首次与第二次均只
+          +1。当前输出保存在同一临时目录的 f32-repro/divrem-repro/index-repro 及 provider-inout
+          logs。
+        truncated: false
+    - name:
+        text: current and reference source review
+        truncated: false
+      result: passed
+      note:
+        text: 对照 ref/triton 的 dot
+          precision/core.py:2216-2250、runtime/autotuner.py:59-80,150-166，以及
+          ref/tilelang profiler/bench.py:249-272 和 autotuner/tuner.py:370-393。当前
+          serializer 明确 ieee/floor relation；runtime 逐次恢复 view alias
+          storage；cuTile 底层 benchmark 单次 graph launch 亦已核实。
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 未运行 examples×provider 全量或性能追平，也未恢复旧 cuTile performance change；它们是明确非目标。
+      truncated: false
+    - text: 本轮涉及的 region helper 含真实 slice-level tensor algorithm，保留 region
+        语义；没有另扩展未触及的退化 region 形式或任意高阶 contraction 覆盖。
+      truncated: false
+    - text: 共享 profile 行仍按原职责表达粒度偏好并投影到 typed domain；默认与覆盖使用相同规则。provider
+        行表示实际值，非法候选过滤而不替换成附近值，文档已明确区分。
+      truncated: false
+  known_limits_truncated: false
+  review:
+    status: passed
+    summary:
+      text: 新只读执行独立核对 A1-A4 与当前源码、doc、实际 repro，确认无阻止 NativeVerify
+        的真实问题。小线程候选截断已修复；源码点验和非方阵执行排除了早先 reduce dtype、gather shape、transpose
+        三项误报。
+      truncated: false
+    reviewer_execution_ref: /root/review_final_candidate_check
+  submitted_at: 2026-09-05T18:11:58.656Z
+blockers: []
+verification:
+  candidate_id: bb2996f3-0d23-47f3-92c7-168bade1007b
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:e5832243-a0f8-432a-8a5d-33c702905bba
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: author-ops
+      name:
+        text: DSL operations and typed helper production repro
+        truncated: false
+      argv_display:
+        - text: PYTHONPATH=python:examples
+          truncated: false
+        - text: PYTHONDONTWRITEBYTECODE=1
+          truncated: false
+        - text: /home/kingdom/.venvs/intentdsl-cutile/bin/python
+          truncated: false
+        - text: /tmp/intentdsl-foundations-refactor.YmotCl/author_ops.py
+          truncated: false
+        - text: --tuning-config
+          truncated: false
+        - text: /tmp/intentdsl-foundations-refactor.YmotCl/tuning.json
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5110
+  summary:
+    text: 独立核对 brief/spec、当前源码、Triton/cuTile/TileLang reference 差异及已有 production
+      DSL→emit→backend→numerical repro；四项验收均满足。未运行新测试体系、未扩大到全量 examples/provider
+      或性能目标。
+    truncated: false
+  risks: []
+  risks_truncated: false
+  completed_at: 2026-09-05T18:19:30.980Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 独立核对 brief/spec、当前源码、Triton/cuTile/TileLang reference 差异及已有 production
+        DSL→emit→backend→numerical repro；四项验收均满足。未运行新测试体系、未扩大到全量
+        examples/provider 或性能目标。
+      truncated: false
+    completed_at: 2026-09-05T18:19:30.980Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-09-05T13:16:12.284Z

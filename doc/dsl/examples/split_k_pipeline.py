@@ -38,7 +38,7 @@ def split_k_combine(
     rows = I.domain(0, M)
     columns = I.domain(0, N)
     output[rows, columns] = I.cast(
-        I.reduce.sum(partial[parts, rows, columns], axis=0, identity=0.0),
+        I.reduce.sum(partial[parts, rows, columns], axis=0),
         I.f16,
     )
 

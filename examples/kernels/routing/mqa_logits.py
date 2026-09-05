@@ -36,7 +36,6 @@ def fp8_mqa_logits(
         logits = I.reduce.sum(
             weighted,
             axis=0,
-            identity=0.0,
         ) * kv_scale[key_axis]
         key_index = I.indices(key_axis)
         begin = I.cast(key_start[query], I.index)

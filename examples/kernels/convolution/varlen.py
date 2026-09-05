@@ -59,7 +59,6 @@ def varlen_aligned_causal_depthwise_conv1d(
         accumulation = I.reduce.sum(
             I.cast(value, I.f32) * tap_weight[None, :, :],
             axis=1,
-            identity=0.0,
         )
         accumulation = accumulation + I.cast(
             bias[channels], I.f32

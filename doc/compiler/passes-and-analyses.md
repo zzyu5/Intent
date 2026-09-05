@@ -58,11 +58,15 @@ Physical analyses可以通过origin map查询immutable KIR semantics，但不能
 
 Analysis默认在相关IR mutation后失效；只有证明保留的analysis才可缓存。
 
+Transformation group是完整的执行边界：group负责实际rewrite及其依赖的value/access/aggregate/accumulator relation维护；中间repair helper不是可单独对外运行的pass。每个group完成后验证同一current program，失败诊断指明rewrite或postcondition失败及group名称，不在verifier内修程序。
+
 ## 3. Canonical GPU pipeline
 
 ### 3.1 Construct executable program
 
 从KIR、canonical analyses与selected GPU capabilities建立[`kir-to-gpu.md`](kir-to-gpu.md)定义的完整initial program。Conversion同时完成types、regions、values、accesses与origin mapping，不产生等待emitter解释的holes。
+
+Construction仅关闭初始program及indexed-access composition。结构化source规范化、ownership/blocking、online summary与region/reduction/contraction realization属于随后明确的shared transformation groups，不隐藏在construction完成函数中。依赖顺序保证source relation在ownership变换前正规化，physical ranges在structured realization前形成，新产生的access在provider legalization前重新组合；mapping refinement与候选物化消费完成后的program。
 
 ### 3.2 Refine program mapping
 

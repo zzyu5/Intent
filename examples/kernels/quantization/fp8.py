@@ -34,7 +34,7 @@ def bf16_groupwise_fp8_quantize(
                 valid=columns < N,
                 fill=-I.inf,
             )
-            maximum = I.reduce.max(absolute, axis=0, identity=-I.inf)
+            maximum = I.reduce.max(absolute, axis=0)
             scale = I.maximum(maximum, 1.0e-12) / FP8_MAX
             normalized = I.minimum(I.maximum(values / scale, -FP8_MAX), FP8_MAX)
             quantized[row, columns] = I.cast(normalized, I.f8e4m3fn)
@@ -63,7 +63,7 @@ def f32_groupwise_fp8_quantize(
                 valid=columns < N,
                 fill=-I.inf,
             )
-            maximum = I.reduce.max(absolute, axis=0, identity=-I.inf)
+            maximum = I.reduce.max(absolute, axis=0)
             scale = I.maximum(maximum, 1.0e-4) / FP8_MAX
             normalized = I.minimum(I.maximum(values / scale, -FP8_MAX), FP8_MAX)
             quantized[row, columns] = I.cast(normalized, I.f8e4m3fn)

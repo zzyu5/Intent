@@ -26,7 +26,7 @@ namespace {
 
 std::string pythonType(Type type, bool torch = false) {
   if (type.isIndex())
-    return torch ? "torch.int64" : "ct.int32";
+    return torch ? "torch.int64" : "ct.int64";
   if (auto integer = dyn_cast<IntegerType>(type)) {
     if (integer.getWidth() == 1)
       return torch ? "torch.bool" : "ct.bool_";
@@ -297,7 +297,8 @@ private:
     output << "from types import SimpleNamespace\n"
               "import torch\n"
               "import cuda.tile as ct\n"
-              "from cuda.tile.tune import exhaustive_search\n\n"
+              "from cuda.tile.tune import exhaustive_search\n"
+              "from intent.runtime.tuning import TuningState\n\n"
               "ConstInt = ct.Constant[int]\n\n";
   }
 
@@ -371,9 +372,13 @@ private:
       output << text;
     };
     for (const ViewABI &view : views)
-      argument(view.name);
-    for (const ScalarABI &scalar : scalars)
-      argument(scalar.name + (scalar.kind == "constexpr" ? ": ConstInt" : ""));
+      argument(view.name + ": ct.IndexedWithInt64");
+    for (const ScalarABI &scalar : scalars) {
+      auto integer = dyn_cast<IntegerType>(scalar.type);
+      bool wide = scalar.type.isIndex() ||
+                  (integer && integer.getWidth() == 64);
+      argument(scalar.name + (wide ? ": ct.ScalarInt64" : ""));
+    }
     for (const MetadataABI &metadata : metadataArguments)
       argument(metadata.name + ": ConstInt");
     kernel.walk([&](gpu::ParameterOp parameter) {
@@ -455,16 +460,24 @@ private:
     std::string searchResultName = freshName("_intent_search_result");
     std::string configName = freshName("_intent_cfg");
     std::string tunedKernelName = freshName("_intent_tuned_kernel");
+    std::string trialStateName = freshName("_intent_trial_state");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
-      key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
+      key += "tuple(" + view.name + ".shape), tuple(" + view.name + ".stride()), " + view.name + ".dtype, str(" +
              view.name + ".device), ";
     for (const ScalarABI &scalar : scalars)
       key += scalar.name + ", ";
     line(key + ")", 1);
     line(streamName + " = torch.cuda.current_stream()", 1);
     line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
+    std::string trialState = trialStateName + " = TuningState((";
+    for (const ViewABI &view : views)
+      trialState += view.name + ", ";
+    trialState += "), (";
+    for (const ViewABI &view : views)
+      trialState += view.type.getAccess() != 0 ? "True, " : "False, ";
+    line(trialState + "))", 2);
     auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
     std::string grid = "lambda " + configName + ": (";
     for (Attribute extent : space)
@@ -478,7 +491,7 @@ private:
               configName + "." + occupancyParameterName + "}";
     line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
              ", " + grid + ", _intent_kernel, lambda " + configName +
-             ": (" + joinKernelArguments(configName) + ")" + hints +
+             ": " + trialStateName + ".arguments((" + joinKernelArguments(configName) + "))" + hints +
              ", quiet=True)",
          2);
     std::string tunedKernel = "_intent_kernel";
@@ -537,9 +550,18 @@ private:
                  ArrayRef<std::string> loopResults) {
     for (Operation &operation : block) {
       if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
-        if (isLoop)
-          for (auto [name, value] : llvm::zip(loopResults, yield.getOperands()))
-            line(name + " = " + valueString(value));
+        if (isLoop && !loopResults.empty()) {
+          std::string names;
+          for (auto [index, name] : llvm::enumerate(loopResults)) {
+            if (index)
+              names += ", ";
+            names += name;
+          }
+          line(names + " = " +
+               (yield.getOperands().size() == 1
+                    ? valueString(yield.getOperands().front())
+                    : tuple(yield.getOperands())));
+        }
         continue;
       }
       if (isa<func::ReturnOp>(operation))
@@ -591,7 +613,9 @@ private:
     } else if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
       assign(physical.getResult(), expressionString(physical.getExpression(), false));
     } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
-      assign(program.getResult(), "ct.bid(" + std::to_string(program.getAxis()) + ")");
+      assign(program.getResult(), "ct.astype(ct.bid(" +
+                                      std::to_string(program.getAxis()) + "), " +
+                                      pythonType(program.getResult().getType()) + ")");
     } else if (auto coordinate = dyn_cast<gpu::WorksetCoordinateOp>(operation)) {
       values[coordinate.getResult()] = valueString(coordinate.getCoordinate());
     } else if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
@@ -637,7 +661,8 @@ private:
     } else if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
       assign(range.getResult(), "(" + valueString(range.getStart()) +
                                     " + ct.arange(" + valueString(range.getExtent()) +
-                                    ", dtype=ct.int32) * " +
+                                    ", dtype=" +
+                                    pythonType(range.getResult().getType().getElementType()) + ") * " +
                                     valueString(range.getStep()) + ")");
     } else if (auto splat = dyn_cast<gpu::SplatOp>(operation)) {
       auto type = splat.getResult().getType();
@@ -915,12 +940,42 @@ private:
       values[loop.getInductionVar()] = induction;
       for (auto [argument, name] : llvm::zip(loop.getRegionIterArgs(), results))
         values[argument] = name;
+      std::string indexType = pythonType(loop.getInductionVar().getType());
       line("for " + induction + " in range(ct.astype(" +
-           valueString(loop.getLowerBound()) + ", ct.int32), ct.astype(" +
-           valueString(loop.getUpperBound()) + ", ct.int32), ct.astype(" +
-           valueString(loop.getStep()) + ", ct.int32)):");
+           valueString(loop.getLowerBound()) + ", " + indexType + "), ct.astype(" +
+           valueString(loop.getUpperBound()) + ", " + indexType + "), ct.astype(" +
+           valueString(loop.getStep()) + ", " + indexType + ")):");
       ++indent;
       emitBlock(*loop.getBody(), true, results);
+      --indent;
+    } else if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+      SmallVector<std::string> carries;
+      for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInits())) {
+        std::string name = newName();
+        values[result] = name;
+        std::string initialValue = valueString(initial);
+        if (initial.getType().isIntOrIndex())
+          initialValue = "ct.astype(" + initialValue + ", " +
+                         pythonType(initial.getType()) + ")";
+        line(name + " = " + initialValue);
+        carries.push_back(name);
+      }
+      Block &before = loop.getBefore().front();
+      for (auto [argument, name] : llvm::zip(before.getArguments(), carries))
+        values[argument] = name;
+      line("while True:");
+      ++indent;
+      for (Operation &nested : before.without_terminator())
+        emitOperation(nested);
+      auto condition = mlir::cast<scf::ConditionOp>(before.getTerminator());
+      line("if not " + valueString(condition.getCondition()) + ":");
+      ++indent;
+      line("break");
+      --indent;
+      Block &after = loop.getAfter().front();
+      for (auto [argument, forwarded] : llvm::zip(after.getArguments(), condition.getArgs()))
+        values[argument] = valueString(forwarded);
+      emitBlock(after, true, carries);
       --indent;
     } else if (auto branch = dyn_cast<scf::IfOp>(operation)) {
       SmallVector<std::string> results;
@@ -1022,7 +1077,10 @@ private:
 
   std::string broadcastValue(Value value, gpu::FragmentType target) {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
-    if (!source || source == target)
+    if (!source)
+      return "ct.full(" + fragmentShape(target) + ", " + valueString(value) +
+             ", dtype=" + pythonType(target.getElementType()) + ")";
+    if (source == target)
       return valueString(value);
     gpu::BroadcastProjection projection =
         gpu::queryBroadcastProjection(source, target);

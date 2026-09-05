@@ -78,6 +78,7 @@ class FunctionLowerer:
         self.source = source
         self.function = function
         self.environment: dict[str, Expression] = {}
+        self.call_arguments: dict[ast.AST, Expression] = {}
         self.current_block = function.body.blocks[0]
         self.loop_stack: list[LoopContext] = []
         self.view_kinds: dict[MlirValue, ViewKind] = {}
@@ -158,6 +159,8 @@ class FunctionLowerer:
     def lower_expression(self, node: ast.AST) -> Expression:
         from .expressions import lower_expression
 
+        if node in self.call_arguments:
+            return self.call_arguments[node]
         return lower_expression(self, node)
 
     def emit(

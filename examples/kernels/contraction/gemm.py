@@ -24,10 +24,9 @@ def gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    accumulator = I.contract(
+    accumulator = I.matmul(
         a[m_axis, k_axis],
         b[k_axis, n_axis],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     if ACTIVATION == Activation.RELU:
@@ -46,10 +45,9 @@ def bf16_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    accumulator = I.contract(
+    accumulator = I.matmul(
         a[m_axis, k_axis],
         b[k_axis, n_axis],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     c[m_axis, n_axis] = I.cast(accumulator, I.bf16)
@@ -69,10 +67,9 @@ def quantized_gemm(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    accumulator = I.contract(
+    accumulator = I.matmul(
         a[m_axis, k_axis],
         b[k_axis, n_axis],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     activated = I.maximum(accumulator + bias[n_axis], 0.0)

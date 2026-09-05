@@ -21,9 +21,9 @@ def stable_softmax(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = x[row, columns]
-        maximum = I.reduce.max(values, axis=0, identity=-I.inf)
+        maximum = I.reduce.max(values, axis=0)
         numerator = I.exp(values - maximum)
-        denominator = I.reduce.sum(numerator, axis=0, identity=0.0)
+        denominator = I.reduce.sum(numerator, axis=0)
         y[row, columns] = numerator / denominator
 
 
@@ -36,9 +36,9 @@ def stable_softmax_f16(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = I.cast(x[row, columns], I.f32)
-        maximum = I.reduce.max(values, axis=0, identity=-I.inf)
+        maximum = I.reduce.max(values, axis=0)
         numerator = I.exp(values - maximum)
-        denominator = I.reduce.sum(numerator, axis=0, identity=0.0)
+        denominator = I.reduce.sum(numerator, axis=0)
         y[row, columns] = I.cast(numerator / denominator, I.f16)
 
 

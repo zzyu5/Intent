@@ -111,10 +111,10 @@ def summarize_mla_chunk(
     if causal:
         valid = query_coordinates[:, None] >= key_coordinates[None, :]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -125,7 +125,7 @@ def summarize_mla_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,
@@ -163,10 +163,10 @@ def summarize_masked_mla_chunk(
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -177,7 +177,7 @@ def summarize_masked_mla_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,
@@ -215,10 +215,10 @@ def summarize_masked_mla_chunk_natural(
     ) * scale
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -229,7 +229,7 @@ def summarize_masked_mla_chunk_natural(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,
@@ -267,10 +267,10 @@ def sparse_mla_summary(
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[:, None, :]
     scores = I.select(valid, scores, -I.inf)
-    summary_valid = I.reduce.any(valid, axis=2, identity=False)
+    summary_valid = I.reduce.any(valid, axis=2)
     maximum = I.select(
         summary_valid,
-        I.reduce.max(scores, axis=2, identity=-I.inf),
+        I.reduce.max(scores, axis=2),
         0.0,
     )
     probability = I.select(
@@ -281,7 +281,7 @@ def sparse_mla_summary(
     return I.record(
         valid=summary_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=2, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=2),
         accumulator=I.contract(
             I.cast(probability, I.bf16),
             values,

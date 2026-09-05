@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseSet.h"
@@ -26,10 +27,13 @@ constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
-constexpr int64_t loopOccupancyCandidates[] = {1, 2, 4};
-constexpr int64_t persistentOccupancyCandidates[] = {1};
-constexpr int64_t legacyStraightLineOccupancy[] = {2};
-constexpr int64_t modernStraightLineOccupancy[] = {4};
+
+bool isLegalAccessForm(int64_t value) {
+  return value == nativeAccessForm || value == gatherAccessForm ||
+         value == nativeBlockedNoTMAForm;
+}
+
+bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
 
 bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities) {
   return capabilities && capabilities.getComputeCapabilityMajor() >= 10;
@@ -1369,6 +1373,11 @@ bool hasLoopCarriedFragment(func::FuncOp kernel) {
       return containsFragment(value.getType());
     });
   });
+  kernel.walk([&](scf::WhileOp loop) {
+    found |= llvm::any_of(loop.getInits(), [](Value value) {
+      return containsFragment(value.getType());
+    });
+  });
   return found;
 }
 
@@ -1390,24 +1399,18 @@ bool hasResidentWorkerTraversal(func::FuncOp kernel) {
   return found;
 }
 
-ArrayRef<int64_t> occupancyDomain(func::FuncOp kernel,
-                                  gpu::CapabilitiesAttr capabilities) {
-  if (!hasOccupancySensitiveTileCompute(kernel))
-    return {};
-  // A resident-worker program launches exactly the typed persistent worker
-  // count and covers the remaining virtual tasks with its grid-stride loop.
-  // An occupancy greater than one would describe additional resident CTAs
-  // that do not exist in that executable program space.
+StringRef occupancyFamily(func::FuncOp kernel,
+                          gpu::CapabilitiesAttr capabilities) {
   if (hasResidentWorkerTraversal(kernel))
-    return persistentOccupancyCandidates;
+    return "occupancy_persistent";
   if (hasLoopCarriedFragment(kernel))
-    return loopOccupancyCandidates;
+    return "occupancy_loop";
   return capabilities.getComputeCapabilityMajor() < 9
-             ? ArrayRef<int64_t>(legacyStraightLineOccupancy)
-             : ArrayRef<int64_t>(modernStraightLineOccupancy);
+             ? "occupancy_legacy" : "occupancy_modern";
 }
 
-LogicalResult formNativeTiles(func::FuncOp kernel) {
+LogicalResult formNativeTiles(func::FuncOp kernel,
+                              const gpu::TuningProfiles &profiles) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
   SmallVector<gpu::ContractOp> contracts;
@@ -1432,8 +1435,17 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   if (!scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
     return scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
-  ArrayRef<int64_t> occupancyCandidates = occupancyDomain(kernel, capabilities);
-  if (!occupancyCandidates.empty()) {
+  if (hasOccupancySensitiveTileCompute(kernel)) {
+    auto rows = profiles.get("cutile", occupancyFamily(kernel, capabilities),
+                             kernel.getLoc());
+    if (failed(rows))
+      return failure();
+    SmallVector<int64_t> occupancyCandidates;
+    for (const auto &row : *rows)
+      if (isLegalOccupancy(row[0]))
+        occupancyCandidates.push_back(row[0]);
+    if (occupancyCandidates.empty())
+      return kernel.emitError("cuTile tuning profile has no legal occupancy hints (1..32)");
     bool nameCollision = false;
     kernel.walk([&](gpu::ParameterOp parameter) {
       nameCollision |= parameter.getParameter().getName().getValue() ==
@@ -1459,6 +1471,15 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   auto accessFormValue = [&]() -> FailureOr<Value> {
     if (accessForm)
       return accessForm;
+    auto rows = profiles.get("cutile", "access_forms", kernel.getLoc());
+    if (failed(rows))
+      return failure();
+    SmallVector<int64_t> candidates;
+    for (const auto &row : *rows)
+      if (isLegalAccessForm(row[0]))
+        candidates.push_back(row[0]);
+    if (candidates.empty())
+      return kernel.emitError("cuTile tuning profile has no legal access forms (1, 2, 3)");
     bool nameCollision = false;
     kernel.walk([&](gpu::ParameterOp parameter) {
       nameCollision |= parameter.getParameter().getName().getValue() ==
@@ -1473,10 +1494,7 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
         static_cast<uint32_t>(gpu::ParameterRole::ProviderAccessForm),
         static_cast<uint32_t>(gpu::ParameterCategory::Provider),
         /*elementBitWidth=*/0,
-        DenseI64ArrayAttr::get(
-            kernel.getContext(),
-            ArrayRef<int64_t>{nativeAccessForm, gatherAccessForm,
-                              nativeBlockedNoTMAForm}));
+        DenseI64ArrayAttr::get(kernel.getContext(), candidates));
     accessForm = entry
                      .create<gpu::ParameterOp>(kernel.getLoc(),
                                                entry.getIndexType(), schema)
@@ -2222,7 +2240,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities)
     return kernel.emitError("cuTile provider requires selected GPU capabilities");
-  ArrayRef<int64_t> expectedOccupancy = occupancyDomain(kernel, capabilities);
   gpu::ParameterOp accessForm;
   gpu::ParameterOp occupancy;
   LogicalResult parameterSchema = success();
@@ -2249,8 +2266,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return;
       }
       if (schema.getName().getValue() != accessFormParameter ||
-          candidates != ArrayRef<int64_t>{nativeAccessForm, gatherAccessForm,
-                                          nativeBlockedNoTMAForm}) {
+          candidates.empty() || !llvm::all_of(candidates, isLegalAccessForm)) {
         parameter.emitOpError("has an invalid cuTile access-form domain");
         parameterSchema = failure();
         return;
@@ -2264,7 +2280,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       return;
     }
     if (schema.getName().getValue() != occupancyParameter ||
-        candidates != expectedOccupancy ||
+        candidates.empty() || !llvm::all_of(candidates, isLegalOccupancy) ||
         !parameter.getResult().use_empty()) {
       parameter.emitOpError(
           "has an invalid cuTile occupancy hint schema");
@@ -2277,7 +2293,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
   if (failed(verifyClosedConfigs(kernel)))
     return failure();
-  bool needsOccupancy = !expectedOccupancy.empty();
+  bool needsOccupancy = hasOccupancySensitiveTileCompute(kernel);
   if (needsOccupancy != static_cast<bool>(occupancy))
     return kernel.emitError(
         "cuTile occupancy hint does not match occupancy-sensitive tile compute");
@@ -2352,13 +2368,57 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
             gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
             gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
             gpu::ExtractOp, gpu::YieldOp, arith::ConstantOp,
-            scf::ForOp, scf::IfOp, scf::YieldOp, func::FuncOp,
+            scf::ForOp, scf::WhileOp, scf::ConditionOp, scf::IfOp, scf::YieldOp, func::FuncOp,
             func::ReturnOp>(operation))
       return WalkResult::advance();
     operation->emitOpError("is outside the closed cuTile provider surface");
     return WalkResult::interrupt();
   });
   return result.wasInterrupted() ? failure() : success();
+}
+
+void realizeWideLoops(func::FuncOp kernel) {
+  SmallVector<scf::ForOp> loops;
+  kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
+    Type type = loop.getInductionVar().getType();
+    if (type.isIndex() || type.isInteger(64))
+      loops.push_back(loop);
+  });
+  for (scf::ForOp loop : loops) {
+    // cuTile range has an i32 induction variable even with i64 bounds.
+    // Preserve the actual wide induction value as ordinary while-loop state.
+    OpBuilder builder(loop);
+    Location location = loop.getLoc();
+    SmallVector<Value> initial{loop.getLowerBound()};
+    llvm::append_range(initial, loop.getInitArgs());
+    SmallVector<Type> types;
+    for (Value value : initial)
+      types.push_back(value.getType());
+    SmallVector<Location> locations(types.size(), location);
+    auto replacement = builder.create<scf::WhileOp>(location, types, initial);
+    if (Attribute origin = loop->getAttr(gpu::originAttr))
+      replacement->setAttr(gpu::originAttr, origin);
+    Block *before = builder.createBlock(&replacement.getBefore(), {}, types, locations);
+    Value condition = builder.create<gpu::CompareOp>(
+        location, builder.getI1Type(), before->getArgument(0),
+        loop.getUpperBound(), ComparePredicate::Lt);
+    builder.create<scf::ConditionOp>(location, condition, before->getArguments());
+    Block *after = builder.createBlock(&replacement.getAfter(), {}, types, locations);
+    IRMapping mapping;
+    mapping.map(loop.getInductionVar(), after->getArgument(0));
+    mapping.map(loop.getRegionIterArgs(), after->getArguments().drop_front());
+    for (Operation &operation : loop.getBody()->without_terminator())
+      builder.clone(operation, mapping);
+    Value next = builder.create<gpu::BinaryOp>(
+        location, types.front(), after->getArgument(0), loop.getStep(),
+        BinaryOperator::Add);
+    SmallVector<Value> yielded{next};
+    for (Value value : cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperands())
+      yielded.push_back(mapping.lookupOrDefault(value));
+    builder.create<scf::YieldOp>(location, yielded);
+    loop.replaceAllUsesWith(replacement.getResults().drop_front());
+    loop.erase();
+  }
 }
 
 } // namespace
@@ -2369,13 +2429,15 @@ LogicalResult verifyCuTileProgram(ModuleOp module) {
                                                        : verifyKernel(*kernel);
 }
 
-LogicalResult legalizeGPUProgram(ModuleOp module) {
+LogicalResult legalizeGPUProgram(ModuleOp module,
+                                const gpu::TuningProfiles &profiles) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  if (failed(kernel) ||
-      failed(formNativeTiles(*kernel)) ||
-      failed(materializeClosedConfigs(*kernel)) ||
+  if (failed(kernel) || failed(formNativeTiles(*kernel, profiles)))
+    return failure();
+  realizeWideLoops(*kernel);
+  if (failed(materializeClosedConfigs(*kernel)) ||
       failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

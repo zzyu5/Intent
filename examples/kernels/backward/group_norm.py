@@ -33,18 +33,15 @@ def group_norm_backward_dx(
                 * I.cast(weight[channels, None], I.f32)
             )
             group_sum = I.reduce.sum(
-                I.reduce.sum(normalized_gradient, axis=1, identity=0.0),
+                I.reduce.sum(normalized_gradient, axis=1),
                 axis=0,
-                identity=0.0,
             )
             group_projection = I.reduce.sum(
                 I.reduce.sum(
                     normalized_gradient * normalized,
                     axis=1,
-                    identity=0.0,
                 ),
                 axis=0,
-                identity=0.0,
             )
             result = I.cast(rstd[batch, group], I.f32) * (
                 normalized_gradient
@@ -74,17 +71,15 @@ def group_norm_backward_weight_bias(
         ) * I.cast(rstd[batches, group, None], I.f32)
         grad_weight[channel] = I.cast(
             I.reduce.sum(
-                I.reduce.sum(gradient * normalized, axis=1, identity=0.0),
+                I.reduce.sum(gradient * normalized, axis=1),
                 axis=0,
-                identity=0.0,
             ),
             I.f16,
         )
         grad_bias[channel] = I.cast(
             I.reduce.sum(
-                I.reduce.sum(gradient, axis=1, identity=0.0),
+                I.reduce.sum(gradient, axis=1),
                 axis=0,
-                identity=0.0,
             ),
             I.f16,
         )

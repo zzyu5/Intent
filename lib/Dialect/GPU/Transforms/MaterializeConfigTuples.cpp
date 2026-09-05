@@ -364,108 +364,50 @@ correlatedReductionContractionParameters(
   return correlated;
 }
 
-SmallVector<TuningProfile, 5>
+FailureOr<SmallVector<TuningProfile, 5>>
 profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             bool twoAxisPointwise, bool fixedPointwiseLocal,
-            bool pointwiseOnlyProgram) {
+            bool pointwiseOnlyProgram, const TuningProfiles &tables) {
   auto capabilities =
       kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
-  if (kind == TuningClass::PersistentContraction && matrix && narrow)
-    return {{128, 128, 64, 1, 128, 8, 8},
-            {128, 128, 128, 1, 128, 8, 8},
-            {64, 128, 128, 1, 128, 16, 8},
-            {128, 256, 64, 1, 128, 8, 8}};
-  if (kind == TuningClass::PersistentContraction)
-    return {{64, 64, 32, 1, 128, 8, 8},
-            {32, 64, 64, 1, 128, 16, 8},
-            {64, 32, 32, 1, 128, 8, 8}};
-  if (kind == TuningClass::Contraction && matrix && narrow)
-    return {{128, 128, 32, 1, 128, 1, 8},
-            {64, 128, 64, 1, 128, 1, 8},
-            {64, 64, 64, 1, 128, 1, 8},
-            {128, 64, 32, 1, 128, 1, 8},
-            {128, 256, 64, 1, 128, 1, 8}};
-  if (kind == TuningClass::Contraction)
-    return {{64, 64, 32, 1, 128, 1, 8},
-            {32, 64, 64, 1, 128, 1, 8},
-            {64, 32, 32, 1, 128, 1, 8}};
-  if (kind == TuningClass::RegionContraction)
-    return {{128, 128, 64, 1, 128, 1, 8},
-            {64, 64, 64, 1, 64, 1, 8},
-            {16, 128, 64, 1, 128, 1, 8}};
-  if (kind == TuningClass::RegionReduction)
-    return {{128, 128, 64, 1, 32768, 1, 8},
-            {128, 128, 64, 1, 16384, 1, 8},
-            {128, 128, 64, 1, 8192, 1, 8}};
-  if (kind == TuningClass::Scan)
-    return {{128, 256, 64, 1, 256, 1, 8},
-            {64, 128, 64, 1, 128, 1, 8},
-            {256, 512, 32, 1, 512, 1, 8}};
-  if (kind == TuningClass::MultiAxisReduction)
-    return {{128, 128, 512, 32, 128, 1, 8},
-            {128, 128, 1024, 16, 128, 1, 8},
-            {128, 128, 256, 64, 128, 1, 8}};
-  if (kind == TuningClass::Histogram)
-    return {{64, 2, 8192, 1, 128, 1, 8},
-            {64, 4, 8192, 1, 128, 1, 8},
-            {64, 8, 8192, 1, 128, 1, 8},
-            {64, 2, 16384, 1, 128, 1, 8},
-            {64, 4, 16384, 1, 128, 1, 8},
-            {64, 4, 32768, 1, 128, 1, 8}};
-  if (kind == TuningClass::Reduction)
-    return {{128, 128, 64, 1, 128, 1, 8},
-            {64, 128, 128, 1, 128, 1, 8},
-            {256, 64, 32, 1, 128, 1, 8}};
-  if (kind == TuningClass::StatefulReduction)
-    return {{128, 128, 8192, 1, 128, 1, 8},
-            {128, 128, 4096, 1, 128, 1, 8},
-            {128, 128, 2048, 1, 128, 1, 8},
-            {128, 128, 1024, 1, 128, 1, 8}};
-  if (kind == TuningClass::Execution)
-    return {{1, 1, 1, 1, 1, 1, 8},
-            {1, 1, 1, 1, 1, 2, 8},
-            {1, 1, 1, 1, 1, 4, 8}};
-  if (kind == TuningClass::OnlineMoment)
-    return {{64, 64, 32, 1, 128, 1, 8},
-            {128, 128, 32, 1, 128, 1, 8},
-            {256, 256, 32, 1, 128, 1, 8}};
-  if (kind == TuningClass::PointwiseReduction && twoAxisPointwise)
-    return {{1, 512, 32, 1, 128, 1, 8},
-            {1, 64, 32, 1, 128, 1, 8},
-            {4, 16, 32, 1, 128, 1, 8},
-            {16, 16, 32, 1, 128, 1, 8},
-            {32, 8, 32, 1, 128, 1, 8},
-            {64, 2, 32, 1, 128, 1, 8}};
-  if (kind == TuningClass::PointwiseReduction)
-    return {{64, 128, 32, 1, 128, 1, 8},
-            {64, 64, 32, 1, 128, 1, 8},
-            {64, 32, 32, 1, 128, 1, 8},
-            {64, 16, 32, 1, 128, 1, 8}};
-  if (twoAxisPointwise && fixedPointwiseLocal && pointwiseOnlyProgram)
-    return {{1, 1, 32, 1, 128, 1, 8},
-            {8, 2, 32, 1, 128, 1, 8},
-            {8, 4, 32, 1, 128, 1, 8},
-            {4, 4, 32, 1, 128, 1, 8},
-            {16, 2, 32, 1, 128, 1, 8}};
-  if (twoAxisPointwise && fixedPointwiseLocal)
-    return {{8, 2, 32, 1, 128, 1, 8},
-            {8, 4, 32, 1, 128, 1, 8},
-            {4, 4, 32, 1, 128, 1, 8},
-            {16, 2, 32, 1, 128, 1, 8}};
-  if (twoAxisPointwise)
-    return {{1, narrow ? 512 : 256, 32, 1, 128, 1, 8},
-            {64, 64, 32, 1, 128, 1, 8},
-            {16, 16, 32, 1, 128, 1, 8},
-            {8, 16, 32, 1, 128, 1, 8},
-            {8, 8, 32, 1, 128, 1, 8},
-            {8, 2, 32, 1, 128, 1, 8}};
-  int64_t lane = narrow ? 512 : 256;
-  return {{64, lane, 32, 1, 128, 1, 8},
-          {32, lane / 4, 32, 1, 128, 1, 8},
-          {64, std::max<int64_t>(lane / 16, 16), 32, 1, 128, 1, 8},
-          {64, narrow ? 4096 : 8192, 32, 1, 128, 1, 8}};
+  StringRef family;
+  switch (kind) {
+  case TuningClass::PersistentContraction:
+    family = matrix && narrow ? "persistent_contraction_narrow" : "persistent_contraction";
+    break;
+  case TuningClass::Contraction:
+    family = matrix && narrow ? "contraction_narrow" : "contraction";
+    break;
+  case TuningClass::RegionContraction: family = "region_contraction"; break;
+  case TuningClass::RegionReduction: family = "region_reduction"; break;
+  case TuningClass::Scan: family = "scan"; break;
+  case TuningClass::MultiAxisReduction: family = "multi_axis_reduction"; break;
+  case TuningClass::Histogram: family = "histogram"; break;
+  case TuningClass::Reduction: family = "reduction"; break;
+  case TuningClass::StatefulReduction: family = "stateful_reduction"; break;
+  case TuningClass::Execution: family = "execution"; break;
+  case TuningClass::OnlineMoment: family = "online_moment"; break;
+  case TuningClass::PointwiseReduction:
+    family = twoAxisPointwise ? "pointwise_reduction_two_axis" : "pointwise_reduction";
+    break;
+  case TuningClass::Pointwise:
+    if (twoAxisPointwise && fixedPointwiseLocal)
+      family = pointwiseOnlyProgram ? "pointwise_only_fixed_local" : "pointwise_fixed_local";
+    else if (twoAxisPointwise)
+      family = narrow ? "pointwise_two_axis_narrow" : "pointwise_two_axis";
+    else
+      family = narrow ? "pointwise_narrow" : "pointwise";
+    break;
+  }
+  auto rows = tables.get("shared", family, kernel.getLoc());
+  if (failed(rows))
+    return failure();
+  SmallVector<TuningProfile, 5> profiles;
+  for (const TuningProfiles::Row &row : *rows)
+    profiles.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6]});
+  return profiles;
 }
 
 int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
@@ -513,7 +455,7 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
 
 } // namespace
 
-LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
+LogicalResult materializeSharedConfigTuples(func::FuncOp kernel, const TuningProfiles &tables) {
   SmallVector<ParameterOp> parameters;
   bool invalidParameter = false;
   kernel.walk([&](ParameterOp parameter) {
@@ -603,15 +545,16 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       indirectRowGroups.push_back(group);
     }
   unsigned profileCount = 0;
+  llvm::DenseMap<Operation *, SmallVector<TuningProfile, 5>> parameterProfiles;
   for (ParameterOp parameter : parameters) {
     ParameterAttr schema = parameter.getParameter();
-    profileCount = std::max<unsigned>(
-        profileCount,
-        profilesFor(kernel, tuningClass(kernel, parameter),
-                    schema.getElementBitWidth(),
-                    hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
-                    pointwiseOnlyProgram)
-            .size());
+    auto profiles = profilesFor(
+        kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
+        hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal, pointwiseOnlyProgram, tables);
+    if (failed(profiles))
+      return failure();
+    profileCount = std::max<unsigned>(profileCount, profiles->size());
+    parameterProfiles.try_emplace(parameter, std::move(*profiles));
   }
   if (profileCount == 0)
     profileCount = 1;
@@ -635,10 +578,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
       auto role = static_cast<ParameterRole>(schema.getRole());
-      SmallVector<TuningProfile, 5> profiles = profilesFor(
-          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
-          pointwiseOnlyProgram);
+      const auto &profiles = parameterProfiles.find(parameter)->second;
       unsigned selectedProfile = std::min<unsigned>(profileIndex,
                                                      profiles.size() - 1);
       int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(),
@@ -655,10 +595,7 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
       auto role = static_cast<ParameterRole>(schema.getRole());
-      SmallVector<TuningProfile, 5> profiles = profilesFor(
-          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
-          pointwiseOnlyProgram);
+      const auto &profiles = parameterProfiles.find(parameter)->second;
       const TuningProfile &profile =
           parameter == correlated.reduction ? profiles.back()
                                             : profiles.front();
@@ -672,32 +609,34 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       tuples.push_back(tuple);
   }
   if (!indirectRowGroups.empty()) {
-    constexpr TuningProfile indirectRowProfile{128, 128, 64, 1,
-                                               128, 8,   8};
-    SmallVector<NamedAttribute> bindings;
-    for (ParameterOp parameter : parameters) {
-      ParameterAttr schema = parameter.getParameter();
-      auto role = static_cast<ParameterRole>(schema.getRole());
-      SmallVector<TuningProfile, 5> profiles = profilesFor(
-          kernel, tuningClass(kernel, parameter), schema.getElementBitWidth(),
-          hasTwoAxisPointwiseOwnership, hasFixedPointwiseLocal,
-          pointwiseOnlyProgram);
-      bool indirectContraction =
-          schema.getCategory() ==
-              static_cast<uint32_t>(ParameterCategory::Contraction) &&
-          llvm::is_contained(indirectRowGroups,
-                             parameter->getAttr(parameterGroupAttr));
-      int64_t selected = selectCandidate(
-          schema.getCandidates().asArrayRef(),
-          requestedValue(indirectContraction ? indirectRowProfile
-                                             : profiles.front(),
-                         role));
-      bindings.push_back(builder.getNamedAttr(
-          schema.getName(), builder.getI64IntegerAttr(selected)));
+    auto rows = tables.get("shared", "indirect_row", kernel.getLoc());
+    if (failed(rows))
+      return failure();
+    for (const TuningProfiles::Row &row : *rows) {
+      const TuningProfile indirectRowProfile{
+          row[0], row[1], row[2], row[3], row[4], row[5], row[6]};
+      SmallVector<NamedAttribute> bindings;
+      for (ParameterOp parameter : parameters) {
+        ParameterAttr schema = parameter.getParameter();
+        auto role = static_cast<ParameterRole>(schema.getRole());
+        const auto &profiles = parameterProfiles.find(parameter)->second;
+        bool indirectContraction =
+            schema.getCategory() ==
+                static_cast<uint32_t>(ParameterCategory::Contraction) &&
+            llvm::is_contained(indirectRowGroups,
+                               parameter->getAttr(parameterGroupAttr));
+        int64_t selected = selectCandidate(
+            schema.getCandidates().asArrayRef(),
+            requestedValue(indirectContraction ? indirectRowProfile
+                                               : profiles.front(),
+                           role));
+        bindings.push_back(builder.getNamedAttr(
+            schema.getName(), builder.getI64IntegerAttr(selected)));
+      }
+      DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
+      if (!llvm::is_contained(tuples, Attribute(tuple)))
+        tuples.push_back(tuple);
     }
-    DictionaryAttr tuple = builder.getDictionaryAttr(bindings);
-    if (!llvm::is_contained(tuples, Attribute(tuple)))
-      tuples.push_back(tuple);
   }
   if (tuples.empty())
     tuples.push_back(builder.getDictionaryAttr({}));

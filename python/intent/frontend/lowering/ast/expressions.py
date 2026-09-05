@@ -19,6 +19,7 @@ from intent.language import DTypeCategory
 from intent.language import bool as intent_bool
 from intent.language.builtins import Intrinsic
 from intent.language.builtins import IntrinsicNamespace
+from intent.language.signatures import INTRINSIC_SIGNATURES
 
 from .indexing import lower_subscript
 from .model import ConstexprBinding
@@ -346,28 +347,47 @@ def _lower_call(lowerer: object, node: ast.Call) -> Expression:
     if isinstance(callee, (Intrinsic, IntrinsicNamespace)):
         from ..intrinsics import lower_intrinsic
 
+        if callee.name in INTRINSIC_SIGNATURES:
+            evaluated = {
+                argument: lowerer.lower_expression(argument)
+                for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+            }
+            previous = lowerer.call_arguments
+            lowerer.call_arguments = {**previous, **evaluated}
+            try:
+                return lower_intrinsic(lowerer, callee.name, node)
+            finally:
+                lowerer.call_arguments = previous
         return lower_intrinsic(lowerer, callee.name, node)
     if isinstance(callee, HelperDefinition):
-        if node.keywords:
-            lowerer.error(node, "direct @intent.fn calls use positional SSA arguments")
-        arguments: list[Expression] = []
-        for argument in node.args:
+        keywords = {}
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                lowerer.error(keyword, "**kwargs expansion is not supported in Intent source")
+            if keyword.arg in keywords:
+                lowerer.error(keyword, f"duplicate helper argument {keyword.arg!r}")
+            keywords[keyword.arg] = keyword.value
+        try:
+            bound = callee.signature.bind(*node.args, **keywords)
+        except TypeError as error:
+            lowerer.error(node, f"{callee.__name__}{callee.signature}: {error}")
+        lowered_arguments: dict[ast.AST, Expression] = {}
+        # Binding may reorder keyword operands; their effects retain source order.
+        for argument in (*node.args, *keywords.values()):
             expression = lowerer.lower_expression(argument)
             if isinstance(expression, ConstexprBinding):
-                arguments.append(expression)
+                lowered_arguments[argument] = expression
             elif isinstance(expression, Literal):
-                arguments.append(
-                    ConstexprBinding(
-                        expression.value,
-                        lowerer.materialize(expression, argument),
-                    )
+                lowered_arguments[argument] = ConstexprBinding(
+                    expression.value,
+                    lowerer.materialize(expression, argument),
                 )
             else:
-                arguments.append(lowerer.read_value(expression, argument))
+                lowered_arguments[argument] = lowerer.read_value(expression, argument)
         results = lowerer.compiler.lower_helper_inline(
             lowerer,
             callee,
-            tuple(arguments),
+            tuple(lowered_arguments[argument] for argument in bound.arguments.values()),
             lowerer.location(node),
         )
         if len(results) == 1:

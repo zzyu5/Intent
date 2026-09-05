@@ -5,10 +5,17 @@ from dataclasses import dataclass
 
 from intent.diagnostics import LanguageUseError
 
+from .signatures import INTRINSIC_SIGNATURES
+
 
 @dataclass(frozen=True, slots=True)
 class Intrinsic:
     name: str
+
+    def __getattr__(self, member: str):
+        if member == "__signature__":
+            return INTRINSIC_SIGNATURES.get(self.name)
+        raise AttributeError(member)
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise LanguageUseError(
@@ -87,8 +94,17 @@ scan = Intrinsic("scan")
 region_fold = Intrinsic("region_fold")
 region_scan = Intrinsic("region_scan")
 contract = Intrinsic("contract")
+dot = Intrinsic("dot")
+matvec = Intrinsic("matvec")
+vecmat = Intrinsic("vecmat")
+matmul = Intrinsic("matmul")
+outer = Intrinsic("outer")
+cumsum = Intrinsic("cumsum")
+cummax = Intrinsic("cummax")
 scaled_contract = Intrinsic("scaled_contract")
+scaled_matmul = Intrinsic("scaled_matmul")
 sparse_contract = Intrinsic("sparse_contract")
+sparse_matmul = Intrinsic("sparse_matmul")
 sparse_contract_2to4 = Intrinsic("sparse_contract_2to4")
 histogram = Intrinsic("histogram")
 
@@ -174,8 +190,17 @@ INTRINSICS = {
         region_fold,
         region_scan,
         contract,
+        dot,
+        matvec,
+        vecmat,
+        matmul,
+        outer,
+        cumsum,
+        cummax,
         scaled_contract,
+        scaled_matmul,
         sparse_contract,
+        sparse_matmul,
         sparse_contract_2to4,
         histogram,
         sparse,

@@ -16,6 +16,7 @@ from intent.frontend.semantics import SymbolDim
 from intent.frontend.semantics import is_integer
 from intent.frontend.mlir import MlirValue
 from intent.language import DType
+from intent.language.signatures import INTRINSIC_SIGNATURES
 
 from ..ast.expressions import compile_time_value
 from ..ast.model import Literal
@@ -62,6 +63,42 @@ def require_dtype(lowerer: FunctionLowerer, node: ast.AST) -> DType:
     value = lowerer.lower_expression(node)
     if not isinstance(value, DType):
         lowerer.error(node, "dtype argument must be an Intent dtype such as I.f32")
+    return value
+
+
+def bind_declared_call(
+    lowerer: FunctionLowerer, node: ast.Call, name: str
+) -> dict[str, ast.AST]:
+    keywords: dict[str, ast.AST] = {}
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            lowerer.error(keyword, "**kwargs expansion is not supported in Intent source")
+        if keyword.arg in keywords:
+            lowerer.error(keyword, f"duplicate I.{name} argument {keyword.arg!r}")
+        keywords[keyword.arg] = keyword.value
+    signature = INTRINSIC_SIGNATURES[name]
+    try:
+        arguments = signature.bind(*node.args, **keywords)
+    except TypeError as error:
+        lowerer.error(node, f"I.{name}{signature}: {error}")
+    arguments.apply_defaults()
+    return {
+        parameter: value
+        if isinstance(value, ast.AST)
+        else ast.copy_location(ast.Constant(value=value), node)
+        for parameter, value in arguments.arguments.items()
+        if value is not None
+    }
+
+
+def optional_dtype(
+    lowerer: FunctionLowerer, node: ast.AST | None
+) -> DType | None:
+    if node is None:
+        return None
+    value = lowerer.lower_expression(node)
+    if value is not None and not isinstance(value, DType):
+        lowerer.error(node, "acc_dtype must be an Intent dtype or None")
     return value
 
 

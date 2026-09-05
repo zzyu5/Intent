@@ -55,7 +55,6 @@ def recurrent_gated_delta_fwd(
                 remembered = I.reduce.sum(
                     decayed_state * key_vector[:, None],
                     axis=0,
-                    identity=0.0,
                 )
                 update = (value_vector - remembered) * I.cast(
                     beta[batch, position, value_head],
@@ -66,7 +65,6 @@ def recurrent_gated_delta_fwd(
                     I.reduce.sum(
                         state * query_vector[:, None],
                         axis=0,
-                        identity=0.0,
                     ),
                     I.bf16,
                 )
@@ -142,9 +140,8 @@ def chunk_gated_delta_prepare(
                 row_norm = I.reduce.sum(
                     I.abs(triangular),
                     axis=1,
-                    identity=0.0,
                 )
-                norm = I.reduce.max(row_norm, axis=0, identity=-I.inf)
+                norm = I.reduce.max(row_norm, axis=0)
                 inverse = triangular
                 if norm < 1.0:
                     inverse = identity + triangular
@@ -172,12 +169,10 @@ def chunk_gated_delta_prepare(
                                 fill=0.0,
                             ),
                             axis=0,
-                            identity=0.0,
                         )
                         correction = I.reduce.sum(
                             row[:, None] * inverse,
                             axis=0,
-                            identity=0.0,
                         )
                         inverse = inverse + I.mask(
                             correction[None, :],

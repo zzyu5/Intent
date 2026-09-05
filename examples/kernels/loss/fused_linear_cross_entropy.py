@@ -38,9 +38,9 @@ def cross_entropy_probability_chunk(
     vocabulary = I.domain(0, V)
     for row in I.parallel(I.domain(0, M)):
         values = I.cast(logits[row, vocabulary], I.f32)
-        maximum = I.reduce.max(values, axis=0, identity=-I.inf)
+        maximum = I.reduce.max(values, axis=0)
         exponentials = I.exp(values - maximum)
-        denominator = I.reduce.sum(exponentials, axis=0, identity=0.0)
+        denominator = I.reduce.sum(exponentials, axis=0)
         label = target[row]
         I.assume_in_bounds(label, logits, axis=1)
         target_logit = I.cast(I.gather(logits, index=(row, label)), I.f32)
@@ -56,6 +56,6 @@ def cross_entropy_mean(
     rows = I.domain(0, loss.shape[0])
     for singleton in I.parallel(I.domain(0, 1)):
         mean_loss[singleton] = (
-            I.reduce.sum(loss[rows], axis=0, identity=0.0)
+            I.reduce.sum(loss[rows], axis=0)
             / I.cast(loss.shape[0], I.f32)
         )

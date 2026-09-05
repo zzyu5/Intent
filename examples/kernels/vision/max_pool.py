@@ -47,11 +47,9 @@ def max_pool2d(
             column_maxima = I.reduce.max(
                 patch,
                 axis=3,
-                identity=-I.inf,
             )
             maxima = I.reduce.max(
                 column_maxima,
                 axis=2,
-                identity=-I.inf,
             )
             output[batch, channel, output_rows, output_columns] = maxima

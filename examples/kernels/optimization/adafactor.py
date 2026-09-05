@@ -20,7 +20,7 @@ def adafactor_update_rows(
     for row in I.parallel(I.domain(0, M)):
         values = gradient[row, columns]
         square_mean = (
-            I.reduce.sum(values * values, axis=0, identity=0.0)
+            I.reduce.sum(values * values, axis=0)
             * inverse_columns
         )
         updated = decay * row_state[row] + (1.0 - decay) * square_mean
@@ -45,7 +45,7 @@ def adafactor_update_columns(
     for column in I.parallel(I.domain(0, N)):
         values = gradient[rows, column]
         square_mean = (
-            I.reduce.sum(values * values, axis=0, identity=0.0) * inverse_rows
+            I.reduce.sum(values * values, axis=0) * inverse_rows
         )
         column_state[column] = (
             decay * column_state[column] + (1.0 - decay) * square_mean

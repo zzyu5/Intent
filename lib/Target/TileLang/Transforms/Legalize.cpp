@@ -507,24 +507,27 @@ bool supportsThreads(func::FuncOp kernel, int64_t threads) {
 
 } // namespace
 
-LogicalResult materializeLaunchConfiguration(func::FuncOp kernel) {
+LogicalResult materializeLaunchConfiguration(
+    func::FuncOp kernel, const gpu::TuningProfiles &profiles) {
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities)
     return kernel.emitError(
         "TileLang launch configuration requires typed GPU capabilities");
   SmallVector<int64_t> candidates;
-  for (int64_t threads : {128, 256})
-    if (threads <= capabilities.getMaxThreadsPerBlock() &&
-        supportsThreads(kernel, threads))
-      candidates.push_back(threads);
-  if (candidates.empty())
-    for (int64_t threads : {64, 32})
-      if (threads <= capabilities.getMaxThreadsPerBlock() &&
-          supportsThreads(kernel, threads)) {
-        candidates.push_back(threads);
-        break;
-      }
+  auto legalThreads = [&](int64_t threads) {
+    return threads % 32 == 0 &&
+           threads <= capabilities.getMaxThreadsPerBlock() &&
+           supportsThreads(kernel, threads);
+  };
+  bool smallPartition = !legalThreads(128) && !legalThreads(256);
+  auto rows = profiles.get("tilelang", smallPartition ? "small_threads" : "threads",
+                           kernel.getLoc());
+  if (failed(rows))
+    return failure();
+  for (const auto &row : *rows)
+    if (legalThreads(row[0]))
+      candidates.push_back(row[0]);
   if (candidates.empty())
     return kernel.emitError(
         "TileLang provider found no legal thread count for every native GEMM shape");
@@ -556,13 +559,14 @@ LogicalResult verifyTileLangProgram(ModuleOp module) {
              : verifyTileLangKernel(*kernel);
 }
 
-LogicalResult legalizeGPUProgram(ModuleOp module) {
+LogicalResult legalizeGPUProgram(ModuleOp module,
+                                const gpu::TuningProfiles &profiles) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel) || failed(bufferizeGPUProgram(*kernel)) ||
-      failed(materializeLaunchConfiguration(*kernel)) ||
-      failed(formPipelines(*kernel)) ||
+      failed(materializeLaunchConfiguration(*kernel, profiles)) ||
+      failed(formPipelines(*kernel, profiles)) ||
       failed(materializeLegalConfigurations(*kernel)))
     return failure();
   (*kernel)->setAttr(lowerPredicatedLoadStoreAttr,
