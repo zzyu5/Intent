@@ -26,7 +26,9 @@ constexpr llvm::StringLiteral occupancyParameter = "CUTILE_OCCUPANCY";
 constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
-constexpr int64_t occupancyCandidates[] = {1, 2, 4};
+constexpr int64_t loopOccupancyCandidates[] = {1, 2, 4};
+constexpr int64_t legacyStraightLineOccupancy[] = {2};
+constexpr int64_t modernStraightLineOccupancy[] = {4};
 
 bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities) {
   return capabilities && capabilities.getComputeCapabilityMajor() >= 10;
@@ -1369,6 +1371,26 @@ bool hasLoopCarriedFragment(func::FuncOp kernel) {
   return found;
 }
 
+bool hasOccupancySensitiveTileCompute(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](Operation *operation) {
+    found |= isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::ReduceOp,
+                 gpu::ScanOp, MMAOp, ScaledMMAOp, ReduceOp, ScanOp>(operation);
+  });
+  return found;
+}
+
+ArrayRef<int64_t> occupancyDomain(func::FuncOp kernel,
+                                  gpu::CapabilitiesAttr capabilities) {
+  if (hasLoopCarriedFragment(kernel))
+    return loopOccupancyCandidates;
+  if (!hasOccupancySensitiveTileCompute(kernel))
+    return {};
+  return capabilities.getComputeCapabilityMajor() < 9
+             ? ArrayRef<int64_t>(legacyStraightLineOccupancy)
+             : ArrayRef<int64_t>(modernStraightLineOccupancy);
+}
+
 LogicalResult formNativeTiles(func::FuncOp kernel) {
   SmallVector<gpu::LoadOp> loads;
   SmallVector<gpu::GatherOp> gathers;
@@ -1394,7 +1416,8 @@ LogicalResult formNativeTiles(func::FuncOp kernel) {
   if (!scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
     return scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
-  if (hasLoopCarriedFragment(kernel)) {
+  ArrayRef<int64_t> occupancyCandidates = occupancyDomain(kernel, capabilities);
+  if (!occupancyCandidates.empty()) {
     bool nameCollision = false;
     kernel.walk([&](gpu::ParameterOp parameter) {
       nameCollision |= parameter.getParameter().getName().getValue() ==
@@ -2183,6 +2206,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities)
     return kernel.emitError("cuTile provider requires selected GPU capabilities");
+  ArrayRef<int64_t> expectedOccupancy = occupancyDomain(kernel, capabilities);
   gpu::ParameterOp accessForm;
   gpu::ParameterOp occupancy;
   LogicalResult parameterSchema = success();
@@ -2224,7 +2248,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       return;
     }
     if (schema.getName().getValue() != occupancyParameter ||
-        candidates != ArrayRef<int64_t>(occupancyCandidates) ||
+        candidates != expectedOccupancy ||
         !parameter.getResult().use_empty()) {
       parameter.emitOpError(
           "has an invalid cuTile occupancy hint schema");
@@ -2237,9 +2261,10 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
   if (failed(verifyClosedConfigs(kernel)))
     return failure();
-  if (hasLoopCarriedFragment(kernel) != static_cast<bool>(occupancy))
+  bool needsOccupancy = !expectedOccupancy.empty();
+  if (needsOccupancy != static_cast<bool>(occupancy))
     return kernel.emitError(
-        "cuTile occupancy hint does not match the loop-carried fragment program");
+        "cuTile occupancy hint does not match occupancy-sensitive tile compute");
   auto isTrue = [](Value value) {
     auto constant = value.getDefiningOp<arith::ConstantOp>();
     auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
