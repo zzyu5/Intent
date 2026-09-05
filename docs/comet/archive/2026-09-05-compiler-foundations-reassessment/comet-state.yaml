@@ -1,0 +1,208 @@
+schema: comet.native.v4
+name: compiler-foundations-reassessment
+language: zh-CN
+phase: archive
+status: done
+state_version: 20
+brief: brief.md
+spec_changes:
+  - capability: compiler-foundations-reassessment
+    operation: create
+    source: specs/compiler-foundations-reassessment/spec.md
+workspace:
+  isolation: worktree
+  change_branch: comet/compiler-foundations-reassessment
+  target_branch: main
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 4
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：维护者能够从真实 DSL 调用与对应 canonical
+      语义判断语言表面的合理性，获得有具体理由的保留项和局部改善候选；命名偏好、实现偏差与抽象缺陷有明确区分，重大抽象问题只在有可核验反例时提出。
+    result: passed
+    reason:
+      text: 报告以真实复杂 kernel 证据说明 DSL 骨架成立，并区分具名 op、函数复用与 generic 构造；局部 cuTile 失败被准确限定。
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: A2：维护者能够沿一条真实 kernel 编译过程理解各层和关键 pass 如何形成 executable GPU Program，并据实际
+      IR/代码变化判断 Intent 已承担的编译能力与尚未闭合的职责；shared、provider 和 serializer
+      的判断经过同类参考实现对照。
+    result: passed
+    reason:
+      text: 报告完整还原 DSL→KIR→GPU/shared→provider→runtime 链，并有 current/ref 对照。
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: A3：维护者能够区分性能变化中的 physical transformation、provider form/config
+      和外部编译贡献，知道当前哪些数字可比较、哪些归因尚无证据；同时获得 config 数据与策略分离的具体可维护性选择及其行为、重编译和跨
+      provider 影响。
+    result: passed
+    reason:
+      text: 报告区分 shared transformation、provider/config 与外部 compiler，明确 CSV 与性能归因边界，并给出
+        config 分离选项。
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: A4：后续 cuTile、TileLang
+      与其他硬件工作获得一份按实际影响整理的继续条件：已成立的基础、需要局部修复的阻塞、可延后的维护问题和必须讨论的核心分叉分别明确；结论保留未知项，不依赖新增限制或未经验证的“全部干净”承诺。
+    result: passed
+    reason:
+      text: 报告明确已成立基础、局部阻塞、维护机会、未知项及后续 cuTile/TileLang/新硬件继续条件。
+      truncated: false
+builder_handoff:
+  candidate_id: 30a6d8a9-8630-47d3-a35b-fc919c05336e
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:d82e883f-994d-42e6-822b-3b44e9625de3
+  iteration: 4
+  summary:
+    text: 已将用户确认的最终DSL结论写入报告：实际复杂kernel证明可编程骨架成立，具名计算op与typed函数复用改善作者体验，generic构造保留算法组合，作者定算法/编译器定合法物理组织。补足已有Triton
+      CSV与真实adapter→kernel证据，准确限定cuTile最小形态失败，调整下一轮行动依据。只改报告及当前change正文，不改production/doc/CSV，未运行任何repro。
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+  checks:
+    - name:
+        text: 最终正文只读核对
+        truncated: false
+      result: passed
+      note:
+        text: /root/foundations_final_report_review核对报告、brief/spec、已有CSV及准确kernel/adapter出处，未发现必要修正；没有运行检查。
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: 旧CSV为既有运行事实，不是当前提交全量成绩。
+      truncated: false
+    - text: 此前已定位的数值/effect与局部lowering问题未修复；最终报告不把它们泛化为DSL整体能力不足。
+      truncated: false
+    - text: 具体新public API契约与实现留待下一轮，本轮不扩大范围。
+      truncated: false
+  known_limits_truncated: false
+  review:
+    status: passed
+    summary:
+      text: 实际FA/Mamba/Welford/MQA/triangular/cumsum表达、47/54 CSV事实、paged
+        GQA真实two-kernel路径与cuTile局部失败限定均准确；具名op/函数复用/generic构造分工及下一轮边界一致。
+      truncated: false
+    reviewer_execution_ref: /root/foundations_final_report_review
+  submitted_at: 2026-09-05T13:04:19.435Z
+blockers: []
+verification:
+  candidate_id: 30a6d8a9-8630-47d3-a35b-fc919c05336e
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:5848c929-9aba-499d-b88f-c6417651f724
+  iteration: 4
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks: []
+  summary:
+    text: 完整核对 brief/spec、最终报告、builder handoff 及必要 current/ref，A1–A4 全部通过，无需复跑或修改。
+    truncated: false
+  risks:
+    - text: 已知数值、effect 与局部 lowering 缺陷未修复，报告未将其泛化为 DSL 整体不足。
+      truncated: false
+    - text: CSV 与动态 repro 是既有事实，不是本次新增运行或当前提交全量。
+      truncated: false
+    - text: 只读核验；git diff --check 无输出。
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-09-05T13:07:36.271Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 四项验收均有报告内可回查的 current/ref 位置、实际 IR/运行事实和明确未知边界。调查通过不等于修复四类语义缺口；候选未修改
+        production 或 doc，符合本 change 的调查目标。
+      truncated: false
+    completed_at: 2026-09-05T09:11:08.049Z
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: 用户指出 A1 作者体验调查仍过窄：不能把 contract 简化为 GEMM/matmul 命名问题。保留已确认范围，补全
+        dot/GEMV/GEMM/batch/多轴收缩/outer 与 reduce/scan/region
+        的能力及人类使用方式，修订调查报告后重新验收；不改生产实现。
+      truncated: false
+    completed_at: 2026-09-05T11:07:11.905Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 独立只读核验通过。报告、brief/spec、A1–A4、实际 DSL/日志及关键 current/ref 对照一致；Builder
+        已知限制得到保留，未新增验收或把已发现缺陷标为修复。
+      truncated: false
+    completed_at: 2026-09-05T11:37:55.268Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: 用户确认以作者熟悉的具名 op 为主要 DSL 入口，要求想清其与统一轴/contract/region
+        的映射、新算法表达边界和实现条件，并修订报告供下一轮行动；仍是原 A1/A4 调查结论修订，不修改生产代码或 doc。
+      truncated: false
+    completed_at: 2026-09-05T11:56:29.878Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 独立只读复核通过。brief/spec、完整报告、current/ref 关键实现及 builder handoff 相互一致；A1-A4
+        均满足，未发现需要额外 runtime checks 的阻塞。
+      truncated: false
+    completed_at: 2026-09-05T12:12:12.085Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: 用户已同意以实际可运行kernel为依据的DSL结论，要求写入报告并准备收尾。最终修订补足已有算法表达事实、明确具名op/通用构造/作者库的分工，纠正把cuTile局部形态失败泛化为DSL能力不足；不再复跑，不新增测试记录，不改生产代码或doc。
+      truncated: false
+    completed_at: 2026-09-05T12:52:33.765Z
+  - goal_cycle: 1
+    iteration: 4
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: 完整核对 brief/spec、最终报告、builder handoff 及必要 current/ref，A1–A4 全部通过，无需复跑或修改。
+      truncated: false
+    completed_at: 2026-09-05T13:07:36.271Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-09-05T08:05:48.925Z
