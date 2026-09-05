@@ -4111,6 +4111,12 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
       const bool launchVisibleDimension =
           succeeded(sourceDimension) &&
           succeeded(dimensionArgument(kernel, *sourceDimension));
+      ParameterCategory category = ParameterCategory::Pointwise;
+      if (succeeded(sourceDimension)) {
+        auto structured = structuredOwnershipCategories.find(*sourceDimension);
+        if (structured != structuredOwnershipCategories.end())
+          category = structured->second;
+      }
       if (dynamicSubregion ||
           launchVisibleDimension ||
           (logicalExtent && physicalExtent.getKind() ==
@@ -4128,17 +4134,14 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
               candidates.push_back(candidate);
           if (candidates.empty() || candidates.back() != logicalExtent.value())
             candidates.push_back(logicalExtent.value());
+          if (category == ParameterCategory::RegionContraction &&
+              candidates.back() < 8)
+            candidates.push_back(8);
         }
         OpBuilder builder(&kernel.getBody().front(),
                           kernel.getBody().front().begin());
         PhysicalSourceAxis source{range.getSourceId(), range.getSourceAxis(),
                               range.getDerived()};
-        ParameterCategory category = ParameterCategory::Pointwise;
-        if (succeeded(sourceDimension)) {
-          auto structured = structuredOwnershipCategories.find(*sourceDimension);
-          if (structured != structuredOwnershipCategories.end())
-            category = structured->second;
-        }
         auto schema = ParameterAttr::get(
             module.getContext(),
             builder.getStringAttr(launchVisibleDimension
