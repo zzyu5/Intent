@@ -1648,6 +1648,12 @@ LogicalResult alignAccessResultRelations(func::FuncOp kernel) {
 }
 
 LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
+  auto isParameterExtent = [](Attribute attribute) {
+    auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+    return extent &&
+           extent.getKind() ==
+               static_cast<uint32_t>(PhysicalExprKind::Parameter);
+  };
   auto sameSchema = [](FragmentType lhs, FragmentType rhs) {
     return lhs.getShape() == rhs.getShape() &&
            lhs.getAxisMaps() == rhs.getAxisMaps() &&
@@ -1732,6 +1738,74 @@ LogicalResult alignPointwiseValueRelations(func::FuncOp kernel) {
       auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
       if (!target || !source)
         return WalkResult::advance();
+      BroadcastProjection projection = queryAxisProjection(source, target);
+      if (!projection.isExact()) {
+        broadcast.emitOpError(
+            projection.state == BroadcastProjectionState::Ambiguous
+                ? "broadcast has an ambiguous physical source projection"
+                : "broadcast has no physical source projection");
+        return WalkResult::interrupt();
+      }
+      // A non-singleton BroadcastOp is an explicit extent-preserving value
+      // relation even when its input and result use distinct canonical
+      // occurrence identities.  Pointwise ownership may first reach only one
+      // side of that relation (for example a RegionFold summary schema).  Close
+      // the already-selected parameter extent across the typed projection
+      // before asking the verifier to observe the intermediate program.  A true
+      // singleton broadcast remains an expansion and never acquires the
+      // consumer's extent.
+      for (auto [targetAxis, sourceAxis] :
+           llvm::enumerate(projection.targetToSource)) {
+        if (!sourceAxis ||
+            source.getShape()[*sourceAxis] == target.getShape()[targetAxis])
+          continue;
+        auto sourceExtent =
+            cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
+        bool singleton =
+            sourceExtent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            sourceExtent.getValue() == 1;
+        if (singleton)
+          continue;
+        auto targetExtent =
+            cast<PhysicalExprAttr>(target.getShape()[targetAxis]);
+        bool targetSingleton =
+            targetExtent.getKind() ==
+                static_cast<uint32_t>(PhysicalExprKind::Constant) &&
+            targetExtent.getValue() == 1;
+        if (targetSingleton) {
+          broadcast.emitOpError(
+              "broadcast cannot contract a non-singleton physical axis")
+              << "; input=" << source << "; result=" << target;
+          return WalkResult::interrupt();
+        }
+        bool sourceParameter =
+            isParameterExtent(source.getShape()[*sourceAxis]);
+        bool targetParameter = isParameterExtent(targetExtent);
+        if (sourceParameter == targetParameter) {
+          broadcast.emitOpError(
+              "broadcast has conflicting non-singleton physical extents")
+              << "; input=" << source << "; result=" << target;
+          return WalkResult::interrupt();
+        }
+        auto sourceMap =
+            cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+        auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
+        if (sourceMap.getDimensionId() <= 0 || targetMap.getDimensionId() <= 0) {
+          broadcast.emitOpError(
+              "broadcast extent refinement has no logical occurrence authority");
+          return WalkResult::interrupt();
+        }
+        if (targetParameter)
+          retargetDimensionExtent(
+              broadcast.getValue(), sourceMap.getDimensionId(),
+              cast<PhysicalExprAttr>(target.getShape()[targetAxis]));
+        else
+          retargetDimensionExtent(broadcast.getResult(),
+                                  targetMap.getDimensionId(), sourceExtent);
+        source = cast<FragmentType>(broadcast.getValue().getType());
+        target = cast<FragmentType>(broadcast.getResult().getType());
+      }
       FailureOr<FragmentType> refined =
           refinePhysicalSchema(kernel, target, ValueRange{broadcast.getValue()});
       if (failed(refined)) {

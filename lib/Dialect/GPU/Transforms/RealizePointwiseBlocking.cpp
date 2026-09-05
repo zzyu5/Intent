@@ -2971,32 +2971,41 @@ enum ContractFreeAxisSide : unsigned {
   ContractFreeAxisRhs = 2,
 };
 
-unsigned contractFreeAxisSides(func::FuncOp kernel, MakeRangeOp range) {
+struct ContractFreeAxisFacts {
   unsigned sides = ContractFreeAxisNone;
+  bool regionContraction = false;
+};
+
+ContractFreeAxisFacts contractFreeAxisFacts(func::FuncOp kernel,
+                                            MakeRangeOp range) {
+  ContractFreeAxisFacts facts;
   PhysicalProgramAnalysis analysis(kernel);
   kernel.walk([&](ContractOp contract) {
-    auto inspect = [&](Value operand, ArrayRef<int64_t> reduction,
-                       ArrayRef<int64_t> batch, unsigned side) {
-      auto fragment = dyn_cast<FragmentType>(operand.getType());
-      if (!fragment)
-        return;
-      for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
-        if (llvm::is_contained(reduction, static_cast<int64_t>(axis)) ||
-            llvm::is_contained(batch, static_cast<int64_t>(axis)))
-          continue;
-        PhysicalRangeFact fact = analysis.axisRanges(operand, axis);
-        if (llvm::any_of(fact.roots, [&](MakeRangeOp root) {
-              return sameLogicalRange(root, range);
-            }))
-          sides |= side;
-      }
-    };
-    inspect(contract.getLhs(), contract.getLhsReductionAxes(),
-            contract.getLhsBatchAxes(), ContractFreeAxisLhs);
-    inspect(contract.getRhs(), contract.getRhsReductionAxes(),
-            contract.getRhsBatchAxes(), ContractFreeAxisRhs);
+    PhysicalContractFreeAxisFact freeAxes =
+        analysis.contractFreeAxes(contract);
+    if (!freeAxes.isExact())
+      return;
+    for (const PhysicalContractFreeAxis &axis : freeAxes.axes) {
+      if (!llvm::any_of(axis.ranges.roots, [&](MakeRangeOp root) {
+            return sameLogicalRange(root, range);
+          }))
+        continue;
+      if (axis.operand == contract.getLhs())
+        facts.sides |= ContractFreeAxisLhs;
+      if (axis.operand == contract.getRhs())
+        facts.sides |= ContractFreeAxisRhs;
+      auto fold = contract->getParentOfType<RegionFoldOp>();
+      if (fold &&
+          fold.getSegment().getCategory() ==
+              static_cast<uint32_t>(ParameterCategory::RegionContraction))
+        facts.regionContraction = true;
+    }
   });
-  return sides;
+  return facts;
+}
+
+unsigned contractFreeAxisSides(func::FuncOp kernel, MakeRangeOp range) {
+  return contractFreeAxisFacts(kernel, range).sides;
 }
 
 } // namespace
@@ -4117,6 +4126,9 @@ static LogicalResult realizePointwiseBlockingImpl(ModuleOp module,
         if (structured != structuredOwnershipCategories.end())
           category = structured->second;
       }
+      if (category == ParameterCategory::Pointwise &&
+          contractFreeAxisFacts(kernel, range).regionContraction)
+        category = ParameterCategory::RegionContraction;
       if (dynamicSubregion ||
           launchVisibleDimension ||
           (logicalExtent && physicalExtent.getKind() ==

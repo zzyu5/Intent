@@ -31,6 +31,7 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
       failed(refreshReshapeRelations(*kernel)) ||
       failed(alignPointwiseValueRelations(*kernel)) ||
       failed(alignContractValueRelations(*kernel)) ||
+      failed(alignAggregateValueRelations(*kernel)) ||
       failed(verifyGPUProgram(module)))
     return failure();
   // Establish every ownership/internal physical range while the structured
