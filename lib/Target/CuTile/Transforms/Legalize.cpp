@@ -28,6 +28,10 @@ constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
 constexpr int64_t occupancyCandidates[] = {1, 2, 4};
 
+bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities) {
+  return capabilities && capabilities.getComputeCapabilityMajor() >= 10;
+}
+
 bool isCuTileProviderRole(gpu::ParameterRole role) {
   return role == gpu::ParameterRole::ProviderAccessForm ||
          role == gpu::ParameterRole::ProviderOccupancy;
@@ -1349,6 +1353,11 @@ LogicalResult formNativeTiles(func::FuncOp kernel,
   kernel.walk([&](gpu::StoreOp op) { stores.push_back(op); });
   kernel.walk([&](gpu::AtomicRMWOp op) { atomics.push_back(op); });
   kernel.walk([&](gpu::AssumeInBoundsOp op) { assumptions.push_back(op); });
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
+    return scaledContracts.front().emitOpError(
+        "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
   if (hasLoopCarriedFragment(kernel)) {
     bool nameCollision = false;
     kernel.walk([&](gpu::ParameterOp parameter) {
@@ -2096,6 +2105,10 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   if (!space || space.size() != 1)
     return kernel.emitError(
         "cuTile provider currently requires one explicit linear program space");
+  auto capabilities =
+      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  if (!capabilities)
+    return kernel.emitError("cuTile provider requires selected GPU capabilities");
   gpu::ParameterOp accessForm;
   gpu::ParameterOp occupancy;
   LogicalResult parameterSchema = success();
@@ -2192,6 +2205,13 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
           (!fullCoverage && !isBlockedTMACondition(store.getAllowTma()))) {
         store.emitOpError(
             "allow_tma is not the typed cuTile access-form decision");
+        return WalkResult::interrupt();
+      }
+    }
+    if (auto scaled = dyn_cast<ScaledMMAOp>(operation)) {
+      if (!supportsE8M0ScaledMMA(capabilities)) {
+        scaled.emitOpError(
+            "requires compute capability 10.0 or newer for E8M0 scaled MMA");
         return WalkResult::interrupt();
       }
     }
