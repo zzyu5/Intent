@@ -393,10 +393,8 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
             {64, 32, 32, 1, 128, 1, 8}};
   if (kind == TuningClass::RegionContraction)
     return {{128, 128, 64, 1, 128, 1, 8},
-            {64, 128, 64, 1, 64, 1, 8},
             {64, 64, 64, 1, 64, 1, 8},
-            {128, 64, 32, 1, 32, 1, 8},
-            {128, 16, 32, 1, 32, 1, 8}};
+            {16, 128, 64, 1, 128, 1, 8}};
   if (kind == TuningClass::RegionReduction)
     return {{128, 128, 64, 1, 32768, 1, 8},
             {128, 128, 64, 1, 16384, 1, 8},
