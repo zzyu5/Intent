@@ -2220,7 +2220,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                      static_cast<uint32_t>(ParameterRole::ReductionOuter))
       reductionRole = ParameterRole::ReductionInner;
   ParameterOp chunk;
-  if (!firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
+  if (reduce.getSourceCount() == 1 &&
+      !firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
     chunk = *fullCoverage;
   } else if (succeeded(selectedChunk) &&
              !(*selectedChunk)->hasAttr(coverageDimensionAttr) &&
@@ -2233,8 +2234,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
          "_A" + Twine(sourcePlans.front().sourceIdentity.sourceAxis) +
          (sourcePlans.front().sourceIdentity.derived ? "_DERIVED" : ""))
             .str();
-    SmallVector<int64_t> candidates{8, 16, 32, 64, 128,
-                                    256, 512, 1024, 2048, 4096};
+    SmallVector<int64_t> candidates{8,   16,   32,   64,   128,  256,
+                                    512, 1024, 2048, 4096, 8192};
     chunk = getOrCreatePhysicalParameter(
         kernel, name, reductionRole, ParameterCategory::Reduction,
         firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
@@ -2617,11 +2618,15 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
   // duplicate structured loop carries without adding a physical decision.
   if (!required)
     return success();
-  FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
-  if (failed(fullCoverage))
-    return failure();
-  if (*fullCoverage)
-    return success();
+  // A full-coverage fragment grows every component with the runtime axis.
+  // Keep coupled record/tuple accumulators bounded by a real chunk loop.
+  if (reduce.getSourceCount() == 1) {
+    FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
+    if (failed(fullCoverage))
+      return failure();
+    if (*fullCoverage)
+      return success();
+  }
   int64_t reductionAxis = reduce.getAxes().front();
   SmallVector<SourcePlan> sourcePlans;
   SmallVector<LoadOp> sourceLoads;

@@ -33,6 +33,7 @@ struct CorrelatedProfileParameters {
 enum class TuningClass {
   Pointwise,
   PointwiseReduction,
+  StatefulReduction,
   OnlineMoment,
   Reduction,
   MultiAxisReduction,
@@ -212,10 +213,32 @@ bool isOnlineMomentOwnership(func::FuncOp kernel, ParameterOp parameter) {
   return found;
 }
 
+bool isStatefulReduction(func::FuncOp kernel, ParameterOp parameter) {
+  auto role = static_cast<ParameterRole>(parameter.getParameter().getRole());
+  if (role != ParameterRole::Reduction)
+    return false;
+  bool found = false;
+  // A chunked multi-component reduction carries one coupled accumulator state.
+  // Its chunk controls that state directly, so it needs a profile distinct from
+  // ordinary scalar reductions even though both use the Reduction role.
+  kernel.walk([&](scf::ForOp loop) {
+    if (found || loop.getStep() != parameter.getResult() ||
+        !loop->hasAttr(reductionSourcesAttr) || loop.getNumResults() < 2)
+      return;
+    loop.getBody()->walk([&](ReduceOp reduce) {
+      found |= reduce.getSourceCount() > 1 &&
+               reduce.getNumResults() == loop.getNumResults();
+    });
+  });
+  return found;
+}
+
 TuningClass tuningClass(func::FuncOp kernel, ParameterOp parameter) {
   ParameterAttr schema = parameter.getParameter();
   switch (static_cast<ParameterCategory>(schema.getCategory())) {
   case ParameterCategory::Reduction:
+    if (isStatefulReduction(kernel, parameter))
+      return TuningClass::StatefulReduction;
     return schema.getRole() ==
                        static_cast<uint32_t>(ParameterRole::ReductionOuter) ||
                    schema.getRole() == static_cast<uint32_t>(
@@ -397,6 +420,11 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
     return {{128, 128, 64, 1, 128, 1, 8},
             {64, 128, 128, 1, 128, 1, 8},
             {256, 64, 32, 1, 128, 1, 8}};
+  if (kind == TuningClass::StatefulReduction)
+    return {{128, 128, 8192, 1, 128, 1, 8},
+            {128, 128, 4096, 1, 128, 1, 8},
+            {128, 128, 2048, 1, 128, 1, 8},
+            {128, 128, 1024, 1, 128, 1, 8}};
   if (kind == TuningClass::Execution)
     return {{1, 1, 1, 1, 1, 1, 8},
             {1, 1, 1, 1, 1, 2, 8},
