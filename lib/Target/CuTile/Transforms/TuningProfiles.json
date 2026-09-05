@@ -1,0 +1,24 @@
+{
+  "columns": ["value"],
+  "families": {
+    "access_forms": [
+      [1],
+      [2],
+      [3]
+    ],
+    "occupancy_loop": [
+      [1],
+      [2],
+      [4]
+    ],
+    "occupancy_persistent": [
+      [1]
+    ],
+    "occupancy_legacy": [
+      [2]
+    ],
+    "occupancy_modern": [
+      [4]
+    ]
+  }
+}

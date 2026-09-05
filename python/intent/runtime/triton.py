@@ -1,5 +1,21 @@
 from .artifact import CompiledArtifact
 from .source import materialize_python_source
+from .tuning import TuningState
+
+
+class TuningHooks:
+    def __init__(self, names: tuple[str, ...], writable: tuple[bool, ...]):
+        self.names = names
+        self.writable = writable
+
+    def before(self, arguments: dict, reset_only: bool = False) -> None:
+        if not reset_only:
+            self.state = TuningState(tuple(arguments[name] for name in self.names),
+                                     self.writable)
+
+    def after(self, arguments: dict, exception: Exception | None) -> None:
+        self.state.restore()
+        del self.state
 
 
 def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:

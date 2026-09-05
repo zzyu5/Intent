@@ -153,11 +153,6 @@ def lower_helper_parameters(
     source: SourceUnit,
     argument_types: tuple[ValueType, ...],
 ) -> tuple[ParameterSpec, ...]:
-    if source.function.args.kwonlyargs:
-        raise FrontendError(
-            "@intent.fn keyword-only parameters are unsupported",
-            source.location(source.function),
-        )
     if source.function.args.defaults or any(
         value is not None for value in source.function.args.kw_defaults
     ):
@@ -166,7 +161,8 @@ def lower_helper_parameters(
             source.location(source.function),
         )
     arguments = tuple(
-        (*source.function.args.posonlyargs, *source.function.args.args)
+        (*source.function.args.posonlyargs, *source.function.args.args,
+         *source.function.args.kwonlyargs)
     )
     if source.function.args.vararg is not None or source.function.args.kwarg is not None:
         raise FrontendError("@intent.fn does not accept variadic parameters", source.location(source.function))

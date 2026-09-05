@@ -70,10 +70,10 @@ def window_attention_values(
             lower = key_coordinates[None, :] > query_coordinates[:, None] - window
         valid = valid & lower
     scores = I.select(valid, scores * I.LOG2E, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -84,7 +84,7 @@ def window_attention_values(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         probability=probability,
     )
 
@@ -199,10 +199,10 @@ def summarize_block_causal_chunk(
         & key_clean[None, :]
     )
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -213,7 +213,7 @@ def summarize_block_causal_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,

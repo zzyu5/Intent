@@ -175,7 +175,7 @@ for part in I.parallel(parts):
     begin = I.minimum(part * width, N)
     end = I.minimum((part + 1) * width, N)
     region = source[begin:end]
-    partial[part] = I.reduce.sum(x[region], axis=0, identity=0.0)
+    partial[part] = I.reduce.sum(x[region], axis=0)
 ```
 
 `parallel` 表达 parts 无序独立；boundary arithmetic 定义算法采用的分割公式；source slicing定义 part 到成员集合的关系。空 part、tail 与 partial tensor shape都因此明确。

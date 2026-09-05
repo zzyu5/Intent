@@ -39,7 +39,7 @@ def dropout_residual_rms_norm_forward(
         residual_out[row, columns] = summed
         summed_f32 = I.cast(summed, I.f32)
         mean_square = (
-            I.reduce.sum(summed_f32 * summed_f32, axis=0, identity=0.0)
+            I.reduce.sum(summed_f32 * summed_f32, axis=0)
             * inverse_features
         )
         normalized[row, columns] = I.cast(
@@ -81,7 +81,7 @@ def dropout_residual_rms_norm_backward_data(
         )
         summed_f32 = I.cast(summed, I.f32)
         inverse_rms = I.rsqrt(
-            I.reduce.sum(summed_f32 * summed_f32, axis=0, identity=0.0)
+            I.reduce.sum(summed_f32 * summed_f32, axis=0)
             * inverse_features
             + epsilon
         )
@@ -91,7 +91,6 @@ def dropout_residual_rms_norm_backward_data(
         projection = I.reduce.sum(
             normalized_gradient * summed_f32,
             axis=0,
-            identity=0.0,
         ) * inverse_features
         summed_gradient = (
             normalized_gradient * inverse_rms

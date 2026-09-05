@@ -19,14 +19,13 @@ def batched_gemm_nn(
     m_axis = I.domain(0, M)
     n_axis = I.domain(0, N)
     k_axis = I.domain(0, K)
-    for batch in I.parallel(I.domain(0, Q)):
-        accumulator = I.contract(
-            a[batch, m_axis, k_axis],
-            b[batch, k_axis, n_axis],
-            reduce=((1, 0),),
-            acc_dtype=I.f32,
-        )
-        c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
+    batch = I.domain(0, Q)
+    accumulator = I.matmul(
+        a[batch, m_axis, k_axis],
+        b[batch, k_axis, n_axis],
+        acc_dtype=I.f32,
+    )
+    c[batch, m_axis, n_axis] = I.cast(accumulator, I.bf16)
 
 
 @intent.kernel

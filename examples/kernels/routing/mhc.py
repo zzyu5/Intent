@@ -38,7 +38,6 @@ def summarize_mhc_gemm_rms_chunk(x_chunk, weight_chunk, coordinates, stop):
         square_sum=I.reduce.sum(
             float_values * float_values,
             axis=1,
-            identity=0.0,
         ),
     )
 
@@ -107,12 +106,10 @@ def mhc_gemm_rms_finalize(
     linear = I.reduce.sum(
         partial_linear[parts, tokens, columns],
         axis=0,
-        identity=0.0,
     )
     square_sum = I.reduce.sum(
         partial_square_sum[parts, tokens],
         axis=0,
-        identity=0.0,
     )
     root_mean_square = I.rsqrt(
         square_sum / I.cast(reduction_size, I.f32)
@@ -181,9 +178,9 @@ def mhc_sinkhorn(
     for token in I.parallel(I.domain(0, T)):
         matrix = I.exp(logits[token, rows, columns])
         for _ in range(20):
-            row_sum = I.reduce.sum(matrix, axis=1, identity=0.0)
+            row_sum = I.reduce.sum(matrix, axis=1)
             matrix = matrix / row_sum[:, None]
-            column_sum = I.reduce.sum(matrix, axis=0, identity=0.0)
+            column_sum = I.reduce.sum(matrix, axis=0)
             matrix = matrix / column_sum[None, :]
         logits[token, rows, columns] = matrix
 
@@ -204,7 +201,6 @@ def mhc_pre_gemm_sqrsum(
     square_sum[tokens] = I.reduce.sum(
         values * values,
         axis=1,
-        identity=0.0,
     )
     mixes[tokens, components] = I.contract(
         residual_flat[tokens, reduction],
@@ -259,16 +255,16 @@ def mhc_pre_fuse(
             mixes[token, matrix_indices] * normalization * scale[2]
             + base[matrix_indices]
         )
-        row_maximum = I.reduce.max(matrix, axis=1, identity=-I.inf)
+        row_maximum = I.reduce.max(matrix, axis=1)
         matrix = I.exp(matrix - row_maximum[:, None])
-        row_sum = I.reduce.sum(matrix, axis=1, identity=0.0)
+        row_sum = I.reduce.sum(matrix, axis=1)
         matrix = matrix / row_sum[:, None] + SINKHORN_EPS
-        column_sum = I.reduce.sum(matrix, axis=0, identity=0.0)
+        column_sum = I.reduce.sum(matrix, axis=0)
         matrix = matrix / (column_sum[None, :] + SINKHORN_EPS)
         for _ in range(SINKHORN_REPEATS - 1):
-            row_sum = I.reduce.sum(matrix, axis=1, identity=0.0)
+            row_sum = I.reduce.sum(matrix, axis=1)
             matrix = matrix / (row_sum[:, None] + SINKHORN_EPS)
-            column_sum = I.reduce.sum(matrix, axis=0, identity=0.0)
+            column_sum = I.reduce.sum(matrix, axis=0)
             matrix = matrix / (column_sum[None, :] + SINKHORN_EPS)
         residual_mix[token, streams, streams] = matrix
         layer_input[token, hidden] = I.cast(
@@ -276,7 +272,6 @@ def mhc_pre_fuse(
                 I.cast(residual[token, streams, hidden], I.f32)
                 * pre[:, None],
                 axis=0,
-                identity=0.0,
             ),
             I.bf16,
         )

@@ -25,10 +25,10 @@ def summarize_linear_forward_slice(
     value_slice,
     token_coordinates,
 ):
-    return I.contract(
+    return I.matmul(
         key_slice,
         value_slice,
-        reduce=((0, 0),),
+        transpose_lhs=True,
         acc_dtype=I.f32,
     )
 
@@ -41,10 +41,10 @@ def emit_linear_forward_slice(
     token_coordinates,
     incoming_state,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         query_slice,
         key_slice,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     )
     scores = I.mask(
@@ -52,10 +52,9 @@ def emit_linear_forward_slice(
         valid=token_coordinates[:, None] >= token_coordinates[None, :],
         fill=0.0,
     )
-    intra = I.contract(
+    intra = I.matmul(
         I.cast(scores, I.f16),
         value_slice,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     inter = I.contract(
@@ -357,7 +356,6 @@ def chunk_retention_fwd(
             result = I.reduce.sum(
                 query[:, :, None] * I.cast(states.matrix, I.f16),
                 axis=1,
-                identity=I.zeros((S, DV), dtype=I.f32),
             )
             output[batch, positions, head, value_dimensions] = I.cast(
                 result,

@@ -270,13 +270,13 @@ private:
 
   void emitPreamble() {
     output << "import torch\nimport tilelang\nimport tilelang.language as T\n"
-              "from tilelang.autotuner import set_autotune_inputs\n\n";
+              "from intent.runtime.tilelang import tune_kernel\n\n";
   }
 
   void emitBuilder() {
     auto lowerPredicatedLoadStore =
         kernel->getAttrOfType<BoolAttr>(lowerPredicatedLoadStoreAttr);
-    output << "@tilelang.autotune(configs=[\n";
+    output << "_CONFIGS = [\n";
     for (const auto &config : configurations) {
       output << "    {";
       for (auto [index, item] : llvm::enumerate(config)) {
@@ -286,7 +286,7 @@ private:
       }
       output << "},\n";
     }
-    output << "], warmup=3, rep=10)\n"
+    output << "]\n\n"
               "@tilelang.jit(pass_configs={"
               "tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: "
            << (lowerPredicatedLoadStore.getValue() ? "True" : "False")
@@ -378,27 +378,28 @@ private:
     }
     std::string key = "key = (";
     for (const ViewABI &view : views)
-      key += "tuple(" + view.name + ".shape), " + view.name + ".dtype, str(" +
+      key += "tuple(" + view.name + ".shape), tuple(" + view.name + ".stride()), " + view.name + ".dtype, str(" +
              view.name + ".device), ";
     for (const ScalarABI &scalar : scalars)
       if (scalar.kind != "constexpr")
         key += scalar.name + ", ";
     line(key + ")", 1);
     line("if key not in _KERNEL_CACHE:", 1);
-    line("with set_autotune_inputs(" + joinKernelRuntimeArguments() + "):", 2);
-    std::string compile = "_KERNEL_CACHE[key] = _intent_kernel.compile(";
+    std::string compile = "_KERNEL_CACHE[key] = tune_kernel(_intent_kernel, _CONFIGS, {";
     for (auto [index, metadata] : llvm::enumerate(metadataArguments)) {
       if (index)
         compile += ", ";
-      compile += metadata.name + "=" + metadata.name;
+      compile += "\"" + metadata.name + "\": " + metadata.name;
     }
     for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      if (!metadataArguments.empty() || compile.back() != '(')
+      if (!metadataArguments.empty() || compile.back() != '{')
         compile += ", ";
-      compile += parameter + "=" + parameter;
+      compile += "\"" + parameter + "\": " + parameter;
     }
-    compile += ")";
-    line(compile, 3);
+    compile += "}, (" + joinKernelRuntimeArguments() + ",), (";
+    for (const ViewABI &view : views)
+      compile += view.type.getAccess() != 0 ? "True, " : "False, ";
+    line(compile + "))", 2);
     line("kernel = _KERNEL_CACHE[key]", 1);
     line("kernel(" + joinKernelRuntimeArguments() + ")", 1);
     line("return kernel", 1);

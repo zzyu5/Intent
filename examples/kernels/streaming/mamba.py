@@ -516,7 +516,6 @@ def mamba3_siso_forward(
                 decay_sum = I.reduce.sum(
                     decay_input,
                     axis=0,
-                    identity=0.0,
                 )
                 carried = I.contract(
                     query_block,

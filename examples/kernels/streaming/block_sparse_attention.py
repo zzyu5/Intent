@@ -134,7 +134,7 @@ def block_sparse_gqa_decode_combine(
     for batch in I.parallel(I.domain(0, B)):
         for query_head in I.parallel(I.domain(0, HQ)):
             lse = partial_lse[batch, query_head, splits]
-            maximum = I.reduce.max(lse, axis=0, identity=-I.inf)
+            maximum = I.reduce.max(lse, axis=0)
             safe_maximum = I.mask(
                 maximum,
                 valid=maximum != -I.inf,
@@ -142,7 +142,7 @@ def block_sparse_gqa_decode_combine(
             )
             weights = I.exp2(lse - safe_maximum)
             denominator = I.reduce.sum(
-                weights, axis=0, identity=0.0
+                weights, axis=0
             )
             safe_denominator = I.mask(
                 denominator,
@@ -156,7 +156,6 @@ def block_sparse_gqa_decode_combine(
                         batch, query_head, splits, dimensions
                     ],
                     axis=0,
-                    identity=0.0,
                 ),
                 (D,),
             )

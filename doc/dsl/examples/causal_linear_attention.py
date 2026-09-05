@@ -35,7 +35,6 @@ def summarize_linear_slice(
     key = I.reduce.sum(
         key_slice,
         axis=0,
-        identity=0.0,
     )
     return I.record(matrix=matrix, key=key)
 
@@ -93,7 +92,6 @@ def emit_linear_slice(
     intra_denominator = I.reduce.sum(
         local_scores,
         axis=1,
-        identity=0.0,
     )
 
     numerator = inter_numerator + intra_numerator

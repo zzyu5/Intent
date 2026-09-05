@@ -1,6 +1,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
@@ -21,6 +22,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
@@ -75,6 +77,9 @@ int main(int argc, char **argv) {
                                          llvm::cl::init(false));
   llvm::cl::opt<std::string> irOutputFilename("ir-output",
                                               llvm::cl::init(""));
+  llvm::cl::opt<std::string> tuningConfigFilename(
+      "tuning-config", llvm::cl::desc("JSON overrides of declared shared/provider profile families"),
+      llvm::cl::init(""));
   llvm::cl::opt<std::string> sourceOutputFilename("source-output",
                                                   llvm::cl::init(""));
   llvm::cl::opt<bool> stopAfterShared(
@@ -101,6 +106,29 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
   if (!module || mlir::failed(intent::verifyKernelModule(*module)))
     return exitCode(ExitCode::KernelIR);
+  llvm::SmallString<256> profilesDirectory(
+      llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
+  llvm::sys::path::remove_filename(profilesDirectory);
+  llvm::sys::path::append(profilesDirectory, "profiles");
+  auto profilePath = [&](llvm::StringRef name) {
+    llvm::SmallString<256> path(profilesDirectory);
+    llvm::sys::path::append(path, name);
+    return path.str().str();
+  };
+  const llvm::StringRef sharedColumns[] = {
+      "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
+      "traversal_workers", "traversal_group"};
+  const llvm::StringRef tritonColumns[] = {"warps", "stages", "ctas"};
+  const llvm::StringRef valueColumn[] = {"value"};
+  const intent::gpu::TuningProfileSource profileSources[] = {
+      {"shared", profilePath("shared.json"), sharedColumns},
+      {"triton", profilePath("triton.json"), tritonColumns},
+      {"cutile", profilePath("cutile.json"), valueColumn},
+      {"tilelang", profilePath("tilelang.json"), valueColumn}};
+  auto profiles = intent::gpu::TuningProfiles::read(
+      module->getLoc(), profileSources, tuningConfigFilename);
+  if (mlir::failed(profiles))
+    return exitCode(ExitCode::Invocation);
   intent::GPUCapabilities capabilities{
       computeUnits,
       sharedMemoryPerUnit,
@@ -115,7 +143,7 @@ int main(int argc, char **argv) {
     llvm::errs() << "Intent KIR-to-GPU construction failed\n";
     return exitCode(ExitCode::PhysicalProgram);
   }
-  if (mlir::failed(intent::gpu::runSharedGPUPasses(*module)))
+  if (mlir::failed(intent::gpu::runSharedGPUPasses(*module, *profiles)))
     return exitCode(ExitCode::PhysicalProgramVerification);
   if (stopAfterShared) {
     if (irOutputFilename.empty()) {
@@ -139,17 +167,17 @@ int main(int argc, char **argv) {
   mlir::LogicalResult serialized = mlir::failure();
   switch (target) {
   case TargetKind::Triton:
-    provider = intent::triton::legalizeGPUProgram(*module);
+    provider = intent::triton::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
       serialized = intent::triton::serializeProgram(*module, source);
     break;
   case TargetKind::CuTile:
-    provider = intent::cutile::legalizeGPUProgram(*module);
+    provider = intent::cutile::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
       serialized = intent::cutile::serializeProgram(*module, source);
     break;
   case TargetKind::TileLang:
-    provider = intent::tilelang::legalizeGPUProgram(*module);
+    provider = intent::tilelang::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
       serialized = intent::tilelang::serializeProgram(*module, source);
     break;

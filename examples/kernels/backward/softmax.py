@@ -19,7 +19,6 @@ def softmax_backward(
         projection = I.reduce.sum(
             row_probabilities * row_upstream,
             axis=0,
-            identity=0.0,
         )
         gradient[row, columns] = row_probabilities * (
             row_upstream - projection

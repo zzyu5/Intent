@@ -56,7 +56,6 @@ def conv1d_same(
         reduced = I.reduce.sum(
             products,
             axis=1,
-            identity=0.0,
         )
         output[batch, length] = I.cast(reduced, I.f16)
 
@@ -93,7 +92,6 @@ def causal_depthwise_conv1d(
             reduced = I.reduce.sum(
                 products,
                 axis=1,
-                identity=0.0,
             ) + I.cast(bias[channel], I.f32)
             if SILU:
                 reduced = reduced * I.sigmoid(reduced)
@@ -128,7 +126,6 @@ def causal_depthwise_conv1d_bf16(
             I.cast(patch, I.f32)
             * I.cast(weight[channels, taps], I.f32)[:, None, :],
             axis=2,
-            identity=0.0,
         ) + I.cast(bias[channels], I.f32)[:, None]
         if SILU:
             reduced = reduced * I.sigmoid(reduced)
@@ -201,7 +198,6 @@ def causal_depthwise_conv1d_update_bf16(
         accumulator = bias[channels] + I.reduce.sum(
             I.cast(cache, I.f32) * weight[channels, taps],
             axis=1,
-            identity=0.0,
         )
         if SILU:
             accumulator = accumulator * I.sigmoid(accumulator)
@@ -261,12 +257,10 @@ def conv2d_same(
         reduced_columns = I.reduce.sum(
             products,
             axis=3,
-            identity=0.0,
         )
         reduced = I.reduce.sum(
             reduced_columns,
             axis=2,
-            identity=0.0,
         )
         output[batch, height, width] = I.cast(
             reduced,

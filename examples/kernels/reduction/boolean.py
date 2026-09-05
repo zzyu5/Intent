@@ -17,11 +17,10 @@ def row_boolean_reduction(
         column_indices = I.indices(columns)
         contains_origin = column_indices == 0
         stays_nonnegative = column_indices >= 0
-        any_origin = I.reduce.any(contains_origin, axis=0, identity=False)
+        any_origin = I.reduce.any(contains_origin, axis=0)
         all_nonnegative = I.reduce.all(
             stays_nonnegative,
             axis=0,
-            identity=True,
         )
         encoded = I.cast(any_origin, I.i32) + 2 * I.cast(all_nonnegative, I.i32)
         output[row] = encoded

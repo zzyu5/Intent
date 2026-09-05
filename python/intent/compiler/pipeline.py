@@ -18,6 +18,7 @@ def compile(
     target: Target,
     compiler: str | Path,
     constexprs: dict[str, object] | None = None,
+    tuning_config: str | Path | None = None,
 ) -> CompiledArtifact:
     try:
         kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
@@ -30,7 +31,10 @@ def compile(
     source, realized_mlir = run_compiler(
         compiler,
         kernel_mlir,
-        resolved.compiler_options,
+        resolved.compiler_options + (
+            (f"--tuning-config={Path(tuning_config).resolve()}",)
+            if tuning_config is not None else ()
+        ),
         resolved.compiler_role,
     )
     try:
@@ -47,6 +51,7 @@ def compile_shared_gpu(
     target: Target,
     compiler: str | Path,
     constexprs: dict[str, object] | None = None,
+    tuning_config: str | Path | None = None,
 ) -> str:
     try:
         kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
@@ -59,6 +64,9 @@ def compile_shared_gpu(
     return run_shared_compiler(
         compiler,
         kernel_mlir,
-        resolved.compiler_options,
+        resolved.compiler_options + (
+            (f"--tuning-config={Path(tuning_config).resolve()}",)
+            if tuning_config is not None else ()
+        ),
         resolved.compiler_role,
     )

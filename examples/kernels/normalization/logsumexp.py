@@ -15,7 +15,7 @@ def row_logsumexp(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = x[row, columns]
-        maximum = I.reduce.max(values, axis=0, identity=-I.inf)
+        maximum = I.reduce.max(values, axis=0)
         shifted = I.exp(values - maximum)
-        denominator = I.reduce.sum(shifted, axis=0, identity=0.0)
+        denominator = I.reduce.sum(shifted, axis=0)
         y[row] = maximum + I.log(denominator)

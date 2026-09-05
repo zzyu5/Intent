@@ -41,22 +41,18 @@ def group_norm_silu_backward(
             reduced_positions = I.reduce.sum(
                 normalized_gradient,
                 axis=1,
-                identity=0.0,
             )
             group_sum = I.reduce.sum(
                 reduced_positions,
                 axis=0,
-                identity=0.0,
             )
             reduced_projection_positions = I.reduce.sum(
                 normalized_gradient * normalized,
                 axis=1,
-                identity=0.0,
             )
             group_projection = I.reduce.sum(
                 reduced_projection_positions,
                 axis=0,
-                identity=0.0,
             )
             dx_values = rstd[batch, group] * (
                 normalized_gradient
@@ -67,12 +63,12 @@ def group_norm_silu_backward(
             I.scatter_reduce(
                 dweight,
                 index=(channels,),
-                value=I.reduce.sum(gradient * normalized, axis=1, identity=0.0),
+                value=I.reduce.sum(gradient * normalized, axis=1),
                 combine=I.add,
             )
             I.scatter_reduce(
                 dbias,
                 index=(channels,),
-                value=I.reduce.sum(gradient, axis=1, identity=0.0),
+                value=I.reduce.sum(gradient, axis=1),
                 combine=I.add,
             )

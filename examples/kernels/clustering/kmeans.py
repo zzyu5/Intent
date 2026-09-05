@@ -27,7 +27,6 @@ def kmeans_assign(
             distance = I.reduce.sum(
                 difference * difference,
                 axis=0,
-                identity=0.0,
             )
             if distance < best_distance:
                 best_distance = distance

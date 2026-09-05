@@ -144,29 +144,28 @@ def summarize_attention_chunk_f16(
     scale,
     causal,
 ):
-    scores = I.contract(
+    scores = I.matmul(
         queries,
         key_chunk,
-        reduce=((1, 1),),
+        transpose_rhs=True,
         acc_dtype=I.f32,
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool)
     if causal:
         valid = query_coordinates[:, None] >= key_coordinates[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
-    raw_maximum = I.reduce.max(masked_scores, axis=1, identity=-I.inf)
+    chunk_valid = I.reduce.any(valid, axis=1)
+    raw_maximum = I.reduce.max(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
         I.exp2(masked_scores - maximum[:, None]),
         0.0,
     )
-    denominator = I.reduce.sum(probability, axis=1, identity=0.0)
-    accumulator = I.contract(
+    denominator = I.reduce.sum(probability, axis=1)
+    accumulator = I.matmul(
         I.cast(probability, I.f16),
         value_chunk,
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     return I.record(
@@ -197,8 +196,8 @@ def summarize_attention_chunk_bf16(
     if causal:
         valid = query_coordinates[:, None] >= key_coordinates[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
-    raw_maximum = I.reduce.max(masked_scores, axis=1, identity=-I.inf)
+    chunk_valid = I.reduce.any(valid, axis=1)
+    raw_maximum = I.reduce.max(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -208,7 +207,7 @@ def summarize_attention_chunk_bf16(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.bf16),
             value_chunk,
@@ -236,8 +235,8 @@ def summarize_masked_attention_chunk(
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active[None, :]
     masked_scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
-    raw_maximum = I.reduce.max(masked_scores, axis=1, identity=-I.inf)
+    chunk_valid = I.reduce.any(valid, axis=1)
+    raw_maximum = I.reduce.max(masked_scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -247,7 +246,7 @@ def summarize_masked_attention_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,
@@ -268,14 +267,13 @@ def summarize_masked_scalar_query_chunk(
     scores = I.reduce.sum(
         query[None, :] * key_chunk,
         axis=1,
-        identity=0.0,
     ) * (scale * I.LOG2E)
     valid = I.full(scores.shape, fill=True, dtype=I.bool) & active
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=0, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=0)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=0, identity=-I.inf),
+        I.reduce.max(scores, axis=0),
         0.0,
     )
     probability = I.select(
@@ -286,14 +284,13 @@ def summarize_masked_scalar_query_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=0, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=0),
         accumulator=I.reduce.sum(
             I.cast(
                 I.cast(probability, I.f16)[:, None] * value_chunk,
                 I.f32,
             ),
             axis=0,
-            identity=0.0,
         ),
     )
 
@@ -319,8 +316,8 @@ def summarize_biased_attention_chunk(
         + bias_chunk[None, :]
     ) * I.LOG2E
     valid = I.full(scores.shape, fill=True, dtype=I.bool)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
-    raw_maximum = I.reduce.max(scores, axis=1, identity=-I.inf)
+    chunk_valid = I.reduce.any(valid, axis=1)
+    raw_maximum = I.reduce.max(scores, axis=1)
     maximum = I.select(chunk_valid, raw_maximum, 0.0)
     probability = I.select(
         valid,
@@ -330,7 +327,7 @@ def summarize_biased_attention_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,
@@ -362,10 +359,10 @@ def summarize_mla_chunk(
     ) * (scale * I.LOG2E)
     valid = query_coordinates[:, None] >= key_coordinates[None, :]
     scores = I.select(valid, scores, -I.inf)
-    chunk_valid = I.reduce.any(valid, axis=1, identity=False)
+    chunk_valid = I.reduce.any(valid, axis=1)
     maximum = I.select(
         chunk_valid,
-        I.reduce.max(scores, axis=1, identity=-I.inf),
+        I.reduce.max(scores, axis=1),
         0.0,
     )
     probability = I.select(
@@ -376,7 +373,7 @@ def summarize_mla_chunk(
     return I.record(
         valid=chunk_valid,
         maximum=maximum,
-        denominator=I.reduce.sum(probability, axis=1, identity=0.0),
+        denominator=I.reduce.sum(probability, axis=1),
         accumulator=I.contract(
             I.cast(probability, I.f16),
             value_chunk,

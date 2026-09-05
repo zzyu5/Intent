@@ -17,7 +17,6 @@ def sparse_mla_backward_delta(
                     I.cast(output[batch, position, head, features], I.f32)
                     * I.cast(grad_output[batch, position, head, features], I.f32),
                     axis=0,
-                    identity=0.0,
                 )
 
 

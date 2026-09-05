@@ -30,7 +30,6 @@ def attention_backward_delta(
             delta[batch, query_head, query_axis] = I.reduce.sum(
                 output_block * grad_output_block,
                 axis=1,
-                identity=0.0,
             )
 
 

@@ -5,12 +5,15 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <limits>
+
 using namespace mlir;
 
 namespace intent::tilelang {
 namespace {
 
-gpu::ParameterOp getOrCreateStages(func::FuncOp kernel) {
+gpu::ParameterOp getOrCreateStages(func::FuncOp kernel,
+                                  const gpu::TuningProfiles &profiles) {
   gpu::ParameterOp existing;
   bool duplicate = false;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -21,7 +24,18 @@ gpu::ParameterOp getOrCreateStages(func::FuncOp kernel) {
     else
       existing = parameter;
   });
-  auto candidates = DenseI64ArrayAttr::get(kernel.getContext(), {2, 3, 4});
+  auto rows = profiles.get("tilelang", "stages", kernel.getLoc());
+  if (failed(rows))
+    return {};
+  SmallVector<int64_t> values;
+  for (const auto &row : *rows)
+    if (row[0] <= std::numeric_limits<int32_t>::max())
+      values.push_back(row[0]);
+  if (values.empty()) {
+    kernel.emitError("TileLang tuning profile has no legal pipeline stage counts");
+    return {};
+  }
+  auto candidates = DenseI64ArrayAttr::get(kernel.getContext(), values);
   if (duplicate) {
     kernel.emitError("duplicates the TileLang NUM_STAGES parameter");
     return {};
@@ -113,7 +127,8 @@ bool hasPipelineableContract(scf::ForOp loop) {
 
 } // namespace
 
-LogicalResult formPipelines(func::FuncOp kernel) {
+LogicalResult formPipelines(func::FuncOp kernel,
+                           const gpu::TuningProfiles &profiles) {
   SmallVector<scf::ForOp> candidates;
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
     if (loop.getNumResults() == 0 && hasPipelineableContract(loop) &&
@@ -137,7 +152,7 @@ LogicalResult formPipelines(func::FuncOp kernel) {
   }
   if (loops.empty())
     return success();
-  gpu::ParameterOp stages = getOrCreateStages(kernel);
+  gpu::ParameterOp stages = getOrCreateStages(kernel, profiles);
   if (!stages)
     return failure();
   for (scf::ForOp loop : loops) {

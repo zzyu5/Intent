@@ -20,12 +20,9 @@ def ordered_product_prefix(
         element = I.indices(elements)
         row = element // COLUMNS
         column = element % COLUMNS
-        prefix = I.scan(
+        prefix = I.cumsum(
             x[batch, row, column],
             axis=0,
-            identity=0.0,
-            combine=I.add,
-            inclusive=True,
         )
         I.scatter_unique(output, index=(batch, row, column), value=prefix)
 
@@ -38,10 +35,7 @@ def row_cumsum_f32(
     M, N = x.shape
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
-        output[row, columns] = I.scan(
+        output[row, columns] = I.cumsum(
             x[row, columns],
             axis=0,
-            identity=0.0,
-            combine=I.add,
-            inclusive=True,
         )

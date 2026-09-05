@@ -59,7 +59,6 @@ def summarize_cross_entropy_chunk(values, coordinates, empty_prediction):
     raw_maximum = I.reduce.max(
         I.select(members, values, -I.inf),
         axis=0,
-        identity=-I.inf,
     )
     denominator = I.reduce.sum(
         I.select(
@@ -68,7 +67,6 @@ def summarize_cross_entropy_chunk(values, coordinates, empty_prediction):
             0.0,
         ),
         axis=0,
-        identity=0.0,
     )
     chunk_valid = denominator > 0.0
     chunk_maximum = I.select(chunk_valid, raw_maximum, 0.0)

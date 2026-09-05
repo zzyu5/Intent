@@ -22,16 +22,14 @@ def block_scaled_matmul(
     columns = I.domain(0, N)
     k_blocks = I.domain(0, KB)
     k_inner = I.domain(0, KI)
-    output[rows, columns] = I.scaled_contract(
+    output[rows, columns] = I.scaled_matmul(
         lhs[rows, k_blocks, k_inner],
         lhs_scale[rows, k_blocks],
         rhs[k_blocks, k_inner, columns],
         I.transpose(rhs_scale[k_blocks, columns], (1, 0)),
         lhs_format=I.e4m3,
         rhs_format=I.e4m3,
-        lhs_group_size=32,
-        rhs_group_size=32,
-        reduce=((1, 0), (2, 1)),
+        group_size=32,
         acc_dtype=I.f32,
     )
 
@@ -49,10 +47,9 @@ def scaled_fp8_matmul(
     rows = I.domain(0, M)
     columns = I.domain(0, N)
     reduction = I.domain(0, K)
-    value = I.contract(
+    value = I.matmul(
         lhs[rows, reduction],
         rhs[reduction, columns],
-        reduce=((1, 0),),
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(
@@ -110,16 +107,14 @@ def deepgemm_fp8_2xacc(
     reduction = I.domain(0, KI)
     column_blocks = I.indices(columns) // 128
     I.assume_in_bounds(column_blocks, rhs_scale, axis=0)
-    result = I.scaled_contract(
+    result = I.scaled_matmul(
         lhs[rows, blocks, reduction],
         lhs_scale[rows, blocks],
         I.transpose(rhs[columns, blocks, reduction], (1, 2, 0)),
         rhs_scale[column_blocks, blocks],
         lhs_format=I.e4m3,
         rhs_format=I.e4m3,
-        lhs_group_size=128,
-        rhs_group_size=128,
-        reduce=((1, 0), (2, 1)),
+        group_size=128,
         acc_dtype=I.f32,
     )
     output[rows, columns] = I.cast(

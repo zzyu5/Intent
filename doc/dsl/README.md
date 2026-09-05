@@ -22,11 +22,12 @@ target 在编译调用中选择，不是 DSL value、类型、`Constexpr` 或控
 
 `I.Enum`是constexpr-only surface type，在specialization时归一为closed canonical enum，不进入runtime ABI。
 
-### Surface shorthand
+### 具名计算与 surface shorthand
 
-这些写法可以保留可编程性，但 frontend 必须机械归一到上面的唯一 canonical path：
+公开 DSL 以作者熟悉的具名计算为常用入口；通用 structured constructs 与 `@intent.fn` 继续支持算法组合。公开名字不必成为新的 canonical operation：下列写法由 frontend 完整、机械地归一到上面的唯一 canonical path：
 
-- `reduce.sum/max`、`any/all` 与 `arg_reduce.max`；
+- `dot/matvec/vecmat/matmul`、`outer`、`scaled_matmul/sparse_matmul`；
+- `reduce.sum/max/any/all`、`cumsum/cummax` 与 `arg_reduce.max`；
 - Python `range`、slice、条件表达式、`break`、`continue`；
 - `zeros`、常用 pointwise helper 与 value-level `mask`；
 - `indices`、endpoint、`ragged(...)`、`members(...)` 等 relation helpers；

@@ -19,10 +19,10 @@ def weighted_layer_norm(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = x[row, columns]
-        mean = I.reduce.sum(values, axis=0, identity=0.0) * inverse_features
+        mean = I.reduce.sum(values, axis=0) * inverse_features
         centered = values - mean
         second_moment = (
-            I.reduce.sum(values * values, axis=0, identity=0.0) * inverse_features
+            I.reduce.sum(values * values, axis=0) * inverse_features
         )
         variance = second_moment - mean * mean
         normalized = centered * I.rsqrt(variance + epsilon)
@@ -42,10 +42,10 @@ def layer_norm_f16(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = I.cast(x[row, columns], I.f32)
-        mean = I.reduce.sum(values, axis=0, identity=0.0) * inverse_features
+        mean = I.reduce.sum(values, axis=0) * inverse_features
         centered = values - mean
         variance = (
-            I.reduce.sum(centered * centered, axis=0, identity=0.0)
+            I.reduce.sum(centered * centered, axis=0)
             * inverse_features
         )
         y[row, columns] = I.cast(
@@ -70,10 +70,10 @@ def layer_norm_bf16(
     columns = I.domain(0, N)
     for row in I.parallel(I.domain(0, M)):
         values = I.cast(x[row, columns], I.f32)
-        mean = I.reduce.sum(values, axis=0, identity=0.0) * inverse_features
+        mean = I.reduce.sum(values, axis=0) * inverse_features
         centered = values - mean
         variance = (
-            I.reduce.sum(centered * centered, axis=0, identity=0.0)
+            I.reduce.sum(centered * centered, axis=0)
             * inverse_features
         )
         y[row, columns] = I.cast(

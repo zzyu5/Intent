@@ -23,13 +23,11 @@ def splitk_attention_reduce(
             maximum = I.reduce.max(
                 lse,
                 axis=0,
-                identity=-I.inf,
             )
             weights = I.exp2(lse - maximum)
             denominator = I.reduce.sum(
                 weights,
                 axis=0,
-                identity=0.0,
             )
             numerator = I.reshape(
                 I.contract(
@@ -63,13 +61,11 @@ def splitk_attention_reduce_f16(
             maximum = I.reduce.max(
                 lse,
                 axis=0,
-                identity=-I.inf,
             )
             weights = I.exp2(lse - maximum)
             denominator = I.reduce.sum(
                 weights,
                 axis=0,
-                identity=0.0,
             )
             numerator = I.reshape(
                 I.contract(
@@ -103,13 +99,11 @@ def splitk_attention_weighted_sum_reduce(
             maximum = I.reduce.max(
                 lse,
                 axis=0,
-                identity=-I.inf,
             )
             weights = I.exp2(lse - maximum)
             denominator = I.reduce.sum(
                 weights,
                 axis=0,
-                identity=0.0,
             )
             weighted = I.cast(
                 partial[batch, head, splits, dimensions], I.f32
@@ -117,7 +111,6 @@ def splitk_attention_weighted_sum_reduce(
             numerator = I.reduce.sum(
                 weighted,
                 axis=0,
-                identity=0.0,
             )
             output[batch, head, dimensions] = I.cast(
                 numerator / denominator,
@@ -140,13 +133,11 @@ def splitk_attention_bf16_to_f16_reduce(
             maximum = I.reduce.max(
                 lse,
                 axis=0,
-                identity=-I.inf,
             )
             weights = I.exp2(lse - maximum)
             denominator = I.reduce.sum(
                 weights,
                 axis=0,
-                identity=0.0,
             )
             weighted = I.cast(
                 partial[batch, head, splits, dimensions], I.f32
@@ -154,7 +145,6 @@ def splitk_attention_bf16_to_f16_reduce(
             numerator = I.reduce.sum(
                 weighted,
                 axis=0,
-                identity=0.0,
             )
             output[batch, head, dimensions] = I.cast(
                 numerator / denominator,
@@ -177,13 +167,11 @@ def splitk_attention_f32_to_f16_reduce(
             maximum = I.reduce.max(
                 lse,
                 axis=0,
-                identity=-I.inf,
             )
             weights = I.exp(lse - maximum)
             denominator = I.reduce.sum(
                 weights,
                 axis=0,
-                identity=0.0,
             )
             weighted = partial[batch, head, splits, dimensions] * I.reshape(
                 weights, (S, 1)
@@ -191,7 +179,6 @@ def splitk_attention_f32_to_f16_reduce(
             numerator = I.reduce.sum(
                 weighted,
                 axis=0,
-                identity=0.0,
             )
             output[batch, head, dimensions] = I.cast(
                 numerator / denominator,

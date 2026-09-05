@@ -20,6 +20,15 @@ from .builtins import buffer
 from .builtins import bitcast
 from .builtins import cast
 from .builtins import contract
+from .builtins import cummax
+from .builtins import cumsum
+from .builtins import dot
+from .builtins import matmul
+from .builtins import matvec
+from .builtins import outer
+from .builtins import scaled_matmul
+from .builtins import sparse_matmul
+from .builtins import vecmat
 from .builtins import cos
 from .builtins import e2m1
 from .builtins import e4m3
@@ -116,6 +125,15 @@ __all__ = [
     "cast",
     "constraints",
     "contract",
+    "cummax",
+    "cumsum",
+    "dot",
+    "matmul",
+    "matvec",
+    "outer",
+    "scaled_matmul",
+    "sparse_matmul",
+    "vecmat",
     "cos",
     "e2m1",
     "e4m3",

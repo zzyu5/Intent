@@ -28,7 +28,7 @@ def fused_add_rms_norm(
         residual_out[row, columns] = summed
         summed_f32 = I.cast(summed, I.f32)
         mean_square = (
-            I.reduce.sum(summed_f32 * summed_f32, axis=0, identity=0.0)
+            I.reduce.sum(summed_f32 * summed_f32, axis=0)
             * inverse_features
         )
         normalized[row, columns] = I.cast(

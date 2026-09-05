@@ -76,12 +76,10 @@ def conv2d_reduce_order(
         reduced_rows = I.reduce.sum(
             products,
             axis=2,
-            identity=0.0,
         )
         reduced = I.reduce.sum(
             reduced_rows,
             axis=2,
-            identity=0.0,
         )
         output[batch, height, width] = I.cast(
             reduced,

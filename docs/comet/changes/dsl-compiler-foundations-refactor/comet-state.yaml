@@ -1,0 +1,70 @@
+schema: comet.native.v4
+name: dsl-compiler-foundations-refactor
+language: zh-CN
+phase: build
+status: active
+state_version: 2
+brief: brief.md
+spec_changes:
+  - capability: dsl-compiler-foundations-refactor
+    operation: create
+    source: specs/dsl-compiler-foundations-refactor/spec.md
+workspace:
+  isolation: worktree
+  change_branch: comet/dsl-compiler-foundations-refactor
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: submit-builder-candidate
+acceptance:
+  - id: A1
+    source: brief.md
+    text: A1：作者能通过已确认的具名计算接口编写对应运算，签名、shape/dtype/default
+      和诊断可发现；操作机械归一到已有语义，不要求重复填写可由操作定义确定的轴/组合规则。
+    result: pending
+    reason: null
+  - id: A2
+    source: brief.md
+    text: A2：已有复杂算法仍能使用具名操作、typed helper、generic structured constructs 和普通
+      control/effects 组合；在本轮涉及的目标路径上形成可执行后端程序，不把局部形态差异误判为算法能力边界。
+    result: pending
+    reason: null
+  - id: A3
+    source: brief.md
+    text: A3：纳入本轮的已知数值/effect 问题兑现明确契约；f32 输入精度、signed floor/remainder、logical index
+      和一次调用的可观察 effect 不继承不等价的 provider 默认值。
+    result: pending
+    reason: null
+  - id: A4
+    source: brief.md
+    text: A4：纳入本轮的 transformation/config 重构具有清楚职责：完整阶段的 postconditions
+      可定位，有限候选数据与选择逻辑分离，合法性不被固定搜索预算冒充；保留既有 typed IR 权威。
+    result: pending
+    reason: null
+builder_handoff: null
+blockers: []
+verification: null
+history: []
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-09-05T13:16:12.284Z

@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -110,16 +111,19 @@ mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
+mlir::LogicalResult realizeVectorContractions(mlir::ModuleOp module);
 mlir::LogicalResult decomposeMultiAxisReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeOnlineReductions(mlir::ModuleOp module);
 mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
-mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel);
+mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel,
+                                                 const TuningProfiles &profiles);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);
-mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module);
+mlir::LogicalResult runSharedGPUPasses(mlir::ModuleOp module,
+                                      const TuningProfiles &profiles);
 
 } // namespace intent::gpu
 

@@ -41,52 +41,37 @@ struct TritonConfig {
   int64_t ctas = 0;
 };
 
-int64_t selectProviderCandidate(int64_t requested,
-                                ArrayRef<int64_t> candidates) {
-  int64_t selected = *std::min_element(candidates.begin(), candidates.end());
-  for (int64_t candidate : candidates) {
-    if (candidate == requested)
-      return candidate;
-    if (candidate <= requested && candidate > selected)
-      selected = candidate;
-  }
-  return selected;
-}
-
 struct TritonLocalOptions {
   int64_t warps;
   int64_t stages;
   int64_t ctas;
 };
 
-SmallVector<TritonLocalOptions, 6>
-localOptionsFor(ArrayRef<gpu::ParameterCategory> categories,
-                bool twoAxisPointwise,
-                bool blackwellRecurrentContraction) {
+StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
+                             bool twoAxisPointwise,
+                             bool blackwellRecurrentContraction) {
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionReduction))
-    return {{32, 2, 1}, {16, 2, 1}, {8, 2, 1}};
+    return "region_reduction";
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::RegionContraction))
-    return {{4, 2, 1}, {8, 2, 1}, {4, 3, 1},
-            {8, 3, 1}, {4, 4, 1}, {8, 4, 1}};
+    return "region_contraction";
   if (llvm::is_contained(categories,
                          gpu::ParameterCategory::PersistentContraction)) {
     if (blackwellRecurrentContraction)
-      return {{2, 1, 1}, {4, 1, 1}, {8, 1, 1}};
-    return {{4, 3, 1}, {8, 3, 1}, {4, 4, 1}};
+      return "blackwell_recurrent_contraction";
+    return "persistent_contraction";
   }
   if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction))
-    return {{4, 2, 1}, {8, 3, 1}, {4, 4, 1}};
+    return "contraction";
   if (llvm::is_contained(categories, gpu::ParameterCategory::Histogram))
-    return {{16, 2, 1}, {32, 2, 1}, {8, 2, 1}};
+    return "histogram";
   if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
       llvm::is_contained(categories, gpu::ParameterCategory::Scan))
-    return {{8, 2, 1}, {4, 2, 1}, {16, 2, 1}};
+    return "reduction_scan";
   if (twoAxisPointwise)
-    return {{4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {2, 5, 1}};
-  return {{1, 3, 1}, {2, 1, 1}, {2, 2, 1}, {2, 3, 1},
-          {4, 2, 1}, {8, 2, 1}, {4, 1, 1}, {4, 3, 1}};
+    return "pointwise_two_axis";
+  return "pointwise";
 }
 
 bool valueDependsOn(Value value, Value root, scf::ForOp owner,
@@ -320,7 +305,7 @@ planBlockAccess(Value resource, ValueRange coordinates,
                 const gpu::PhysicalAccessBoundaryFact &boundaryFact) {
   auto view = dyn_cast<gpu::ViewType>(resource.getType());
   auto fragment = dyn_cast<gpu::FragmentType>(valueType);
-  if (!view || !fragment || !isa<BlockArgument>(resource) ||
+  if (!view || !fragment || fragment.getShape().empty() || !isa<BlockArgument>(resource) ||
       coordinates.size() != view.getRank() ||
       sourceAxes.size() != view.getRank() ||
       !view.getLayout().getHasStrides() ||
@@ -864,7 +849,8 @@ bool descriptorFragmentFits(gpu::FragmentType fragment,
 }
 
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
-                                      TensorDescriptorChoiceOp descriptorChoice) {
+                                      TensorDescriptorChoiceOp descriptorChoice,
+                                      ArrayRef<TritonLocalOptions> localOptions) {
   struct Domain {
     StringRef name;
     gpu::ParameterRole role;
@@ -872,8 +858,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     bool coverage;
   };
   SmallVector<Domain> domains;
-  SmallVector<gpu::ParameterCategory> categories;
-  bool twoAxisPointwise = false;
   llvm::StringSet<> names;
   WalkResult schema = kernel.walk([&](gpu::ParameterOp parameter) {
     auto definition = parameter.getParameter();
@@ -886,16 +870,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
                        static_cast<gpu::ParameterRole>(definition.getRole()),
                        definition.getCandidates().asArrayRef(),
                        parameter->hasAttr(gpu::coverageDimensionAttr)});
-    auto category =
-        static_cast<gpu::ParameterCategory>(definition.getCategory());
-    twoAxisPointwise |=
-        category == gpu::ParameterCategory::Pointwise &&
-        static_cast<gpu::ParameterRole>(definition.getRole()) ==
-            gpu::ParameterRole::OwnershipM;
-    if (category != gpu::ParameterCategory::Coverage &&
-        category != gpu::ParameterCategory::Provider &&
-        !llvm::is_contained(categories, category))
-      categories.push_back(category);
     return WalkResult::advance();
   });
   if (schema.wasInterrupted())
@@ -932,14 +906,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   }
   if (!warps || !stages || !ctas)
     return kernel.emitError("Triton provider parameter domains are incomplete");
-  auto capabilities =
-      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  bool blackwell = capabilities &&
-                   (capabilities.getComputeCapabilityMajor() == 10 ||
-                    capabilities.getComputeCapabilityMajor() == 12);
-  SmallVector<TritonLocalOptions, 4> localOptions =
-      localOptionsFor(categories, twoAxisPointwise,
-                      blackwell && hasRecurrentContraction(kernel));
   for (Attribute attribute : shared) {
     auto tuple = dyn_cast<DictionaryAttr>(attribute);
     if (!tuple)
@@ -969,10 +935,9 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
         if (descriptorChoice)
           config.kernelParameters[descriptorChoice.getConfigParameter().str()] =
               form;
-        config.warps = selectProviderCandidate(options.warps, warps->candidates);
-        config.stages =
-            selectProviderCandidate(options.stages, stages->candidates);
-        config.ctas = selectProviderCandidate(options.ctas, ctas->candidates);
+        config.warps = options.warps;
+        config.stages = options.stages;
+        config.ctas = options.ctas;
         if (llvm::none_of(configs, [&](const TritonConfig &existing) {
               return existing.kernelParameters == config.kernelParameters &&
                      existing.warps == config.warps &&
@@ -1877,7 +1842,8 @@ LogicalResult verifyTritonProgram(ModuleOp module) {
   return verifyKernel(kernels.front());
 }
 
-LogicalResult legalizeGPUProgram(ModuleOp module) {
+LogicalResult legalizeGPUProgram(ModuleOp module,
+                                const gpu::TuningProfiles &profiles) {
   if (failed(gpu::verifyGPUProgram(module)))
     return failure();
   FailureOr<func::FuncOp> physicalKernel = gpu::getPhysicalKernel(module);
@@ -1892,6 +1858,42 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   selectNativeReduceForms(kernel);
+  SmallVector<gpu::ParameterCategory> categories;
+  bool twoAxisPointwise = false;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    auto schema = parameter.getParameter();
+    auto category = static_cast<gpu::ParameterCategory>(schema.getCategory());
+    twoAxisPointwise |= category == gpu::ParameterCategory::Pointwise &&
+                       schema.getRole() == static_cast<uint32_t>(gpu::ParameterRole::OwnershipM);
+    if (category != gpu::ParameterCategory::Coverage &&
+        category != gpu::ParameterCategory::Provider &&
+        !llvm::is_contained(categories, category))
+      categories.push_back(category);
+  });
+  auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+  bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
+                   capabilities.getComputeCapabilityMajor() == 12;
+  auto rows = profiles.get("triton", localOptionsFamily(
+      categories, twoAxisPointwise, blackwell && hasRecurrentContraction(kernel)), kernel.getLoc());
+  if (failed(rows))
+    return failure();
+  SmallVector<TritonLocalOptions> localOptions;
+  SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
+  for (const auto &row : *rows) {
+    int64_t warps = row[0], stages = row[1], ctas = row[2];
+    if ((warps & (warps - 1)) != 0 ||
+        warps > capabilities.getMaxThreadsPerBlock() / 32 ||
+        stages > std::numeric_limits<int32_t>::max() ||
+        (ctas & (ctas - 1)) != 0 || ctas > 16 ||
+        (ctas > 1 && capabilities.getComputeCapabilityMajor() < 9))
+      continue;
+    localOptions.push_back({warps, stages, ctas});
+    if (!llvm::is_contained(warpDomain, warps)) warpDomain.push_back(warps);
+    if (!llvm::is_contained(stageDomain, stages)) stageDomain.push_back(stages);
+    if (!llvm::is_contained(ctaDomain, ctas)) ctaDomain.push_back(ctas);
+  }
+  if (localOptions.empty())
+    return kernel.emitError("Triton tuning profile has no legal provider options");
   OpBuilder builder(&kernel.getBody().front(), kernel.getBody().front().begin());
   llvm::StringSet<> names;
   kernel.walk([&](gpu::ParameterOp parameter) {
@@ -1912,11 +1914,11 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
     names.insert(name);
   };
   declareProviderParameter("NUM_WARPS", gpu::ParameterRole::ProviderWarps,
-                           ArrayRef<int64_t>{1, 2, 4, 8, 16, 32});
+                           warpDomain);
   declareProviderParameter("NUM_STAGES", gpu::ParameterRole::ProviderStages,
-                           ArrayRef<int64_t>{1, 2, 3, 4, 5, 6});
+                           stageDomain);
   declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
-                           ArrayRef<int64_t>{1});
+                           ctaDomain);
   if (failed(gpu::verifyGPUProgram(module)) ||
       failed(legalizeSplitGatherPairs(kernel)) ||
       failed(materializeBlockPointerForms(kernel)))
@@ -1924,7 +1926,7 @@ LogicalResult legalizeGPUProgram(ModuleOp module) {
   FailureOr<TensorDescriptorChoiceOp> tensorDescriptorForms =
       materializeTensorDescriptorForms(kernel);
   if (failed(tensorDescriptorForms) ||
-      failed(materializeLegalConfigs(kernel, *tensorDescriptorForms)))
+      failed(materializeLegalConfigs(kernel, *tensorDescriptorForms, localOptions)))
     return failure();
   selectContractForms(kernel);
   SmallVector<gpu::AssumeInBoundsOp> boundsAssumptions;

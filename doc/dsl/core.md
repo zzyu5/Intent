@@ -16,6 +16,8 @@ def helper(...):
 
 helper可以返回 scalar、tensor、tuple或record，并可包含调用点本来允许的effects。runtime captures必须成为显式参数，只有不可变 `Constexpr` 可以被词法捕获；递归、target query与kernel launch非法。
 
+普通helper调用按公开Python签名绑定位置参数与具名参数，包括keyword-only参数；实参表达式仍按源码求值顺序执行，不能按形参顺序重排其中的reads/effects。每个实参只lower一次，绑定后的typed values进入同一helper body。具名计算op在普通helper与structured pure helper中使用相同的归一规则，pure调用点仍检查实际body effects。
+
 Helper边界不会把logical coordinate降级为无来源的integer tensor。传入或返回的tensor/tuple/record components若源自`I.indices`、subregion或indexed relation，canonical KIR必须保留它们的source identity、axis mapping与typed coordinate expression。Helper是否inline不得改变这些facts。
 
 ## 2. Parameters
@@ -138,7 +140,18 @@ source与accumulator都可以是scalar、tensor、tuple或typed record。source 
 
 作者选择reduce，即选择其允许的logical-order-preserving reassociation；不保证ordinary left fold。identity逐component显式给出，空reduction返回identity。
 
-`reduce.sum/max`、`any/all`与`arg_reduce.max`是surface shorthand，统一归一到generic reduce。`arg_reduce.max`固定lowest logical index tie-break。
+`reduce.sum/max/any/all`是具名计算入口，统一归一到generic reduce：
+
+```python
+I.reduce.sum(value, *, axis, acc_dtype=None)
+I.reduce.max(value, *, axis, acc_dtype=None)
+I.reduce.any(value, *, axis)
+I.reduce.all(value, *, axis)
+```
+
+它们接收ranked tensor，axis为一个axis或非空axis tuple；负axis按rank归一。sum使用加法零，max使用result dtype的最小值（有负无穷时为负无穷），any/all对bool input分别使用false/true。Builtin产生其固定combine与identity，作者不传`identity/combine/combine_operands`；custom summary使用generic reduce。Sum默认accumulator widening与max的NaN规则见数值章节。Empty reduce返回对应identity。
+
+`arg_reduce.max`同样归一到generic reduce，固定lowest logical index tie-break。
 
 ## 8. Scan
 
@@ -154,6 +167,15 @@ prefix = I.scan(
 ```
 
 scan使用与reduce相同的typed pure combine，定义每个logical prefix。`inclusive/exclusive`与forward/reverse是operation semantics。严格顺序、不可重结合的recurrence使用ordinary loop。
+
+常用prefix计算使用具名入口：
+
+```python
+I.cumsum(value, *, axis, inclusive=True, reverse=False, acc_dtype=None)
+I.cummax(value, *, axis, inclusive=True, reverse=False, acc_dtype=None)
+```
+
+Input为ranked tensor，axis为一个显式axis，允许负axis；result与input同shape，只有values，不隐含argmax indices。Cumsum使用add与零，默认使用reduce.sum的accumulator widening；cummax使用propagating maximum与result dtype的最小值，默认保持input dtype。显式acc_dtype按structured dtype转换规则处理。两者均机械归一到scan，empty input返回同shape的empty tensor；默认inclusive与forward，可显式改变，不承诺strict left fold。
 
 ## 9. Region fold 与 region scan
 
@@ -240,7 +262,35 @@ Ordinary scan是element-summary/element-output的受限形式；退化的region�
 
 完整region-scan写法见[`examples/causal_linear_attention.py`](examples/causal_linear_attention.py)；显式算法chunk的反例见[`examples/mamba_state_passing.py`](examples/mamba_state_passing.py)。前者的segment boundaries不可观察且满足summary/emit等价律；后者的chunk axis与per-chunk state进入ABI，因而使用ordinary ordered carry。
 
-## 10. Contract
+## 10. 具名乘法与 contract
+
+### 10.1 作者入口
+
+```python
+I.dot(lhs, rhs, *, acc_dtype)
+I.matvec(matrix, vector, *, acc_dtype, transpose=False)
+I.vecmat(vector, matrix, *, acc_dtype, transpose=False)
+I.matmul(lhs, rhs, *, acc_dtype, transpose_lhs=False, transpose_rhs=False)
+I.outer(lhs, rhs)
+```
+
+| Operation | Core input shapes | Result |
+|---|---|---|
+| dot | `[K]`, `[K]`，双方仅rank 1 | rank-0 tensor `[]` |
+| matvec | `[...,M,K]`, `[...,K]` | `[...,M]` |
+| vecmat | `[...,K]`, `[...,K,N]` | `[...,N]` |
+| matmul | `[...,M,K]`, `[...,K,N]` | `[...,M,N]` |
+| outer | `[M]`, `[N]`，双方仅rank 1 | `[M,N]` |
+
+矩阵末两轴、vector最后一轴是core axes，前导axes为batch。矩阵类batch按普通size-one broadcast规则右对齐；K extent必须相等，不在reduction axis广播。Transpose仅交换对应matrix最后两轴，默认false。Matmul的两侧最低rank 2，不暗中把vector升维或把result降维。Result先列broadcast后的batch axes，再列M/N。
+
+表中的M/K/N描述执行转置之后的运算形状。例如原始`lhs=[64,32]`、`rhs=[64,16]`配`transpose_lhs=True`得到`[32,16]`；原始matrix为`[64,32]`时，`matvec(..., transpose=True)`要求vector长度64，结果长度32。转置不取消inner-extent匹配要求。
+
+普通乘加要求同numeric dtype，异型operand由作者显式cast，accumulator/result dtype显式给出。没有隐式共轭、TF32、alpha/beta或mutable C初值；empty K返回accumulator dtype零。前端生成逻辑transpose/broadcast与paired axes并归一到contract，保存dynamic extent identity及运行时广播条件，不从provider matrix form反推public rank。
+
+Outer只增加size-one axes后执行普通broadcast multiply，保持input dtype与逐元素乘法数值规则；它不生成空reduction contract或隐含accumulator。更一般的轴关系使用下面的generic contract。
+
+### 10.2 Generic contract
 
 ```python
 acc = I.contract(
@@ -268,6 +318,15 @@ public surface不提供假的`multiply=`/`combine=`参数。其它semiring写成
 axis permutation、将多个free/reduction axes双射flatten为M/K/N、MMA选择与staging都是compiler工作，不是作者surface。
 
 ## 11. Scaled contract
+
+常用具名入口是：
+
+```python
+I.scaled_matmul(lhs, lhs_scale, rhs, rhs_scale, *,
+                lhs_format, rhs_format, group_size, acc_dtype)
+```
+
+它使用下述closed positional schema，由前端补齐固定reduce、空batch和双侧相同group size；format、scale relation与rounding不变，不隐含其它rank/batch convention。Generic入口继续提供相同canonical语义：
 
 ```python
 acc = I.scaled_contract(
@@ -297,6 +356,14 @@ scaled contract是first-class local tensor operation。它使用一个closed pos
 普通packed INT4/INT2不是scaled contract。作者使用carrier tensor、bit/index arithmetic、sign extension、zero-point与scale表达其logical values，再调用ordinary contract。
 
 ## 12. Sparse contract
+
+矩阵形式的具名入口为：
+
+```python
+I.sparse_matmul(compressed, metadata, rhs, *, format, acc_dtype)
+```
+
+Data operands为rank 2，compression axis为lhs的K axis；前端生成`reduce=((1,0),)`与空batch。Format与logical metadata仍显式给出，不猜测external packed encoding。一般配轴继续使用generic sparse contract：
 
 ```python
 acc = I.sparse_contract(
@@ -406,7 +473,7 @@ for part in I.parallel(parts):
     begin = I.minimum(part * width, N)
     end = I.minimum((part + 1) * width, N)
     region = source[begin:end]
-    partial[part] = I.reduce.sum(x[region], axis=0, identity=0.0)
+    partial[part] = I.reduce.sum(x[region], axis=0)
 ```
 
 part identity、boundary formula、empty/tail与partial tensor interface由普通constructs明确表达。`partition(auto/count/extent)`均不是public或canonical operation。
@@ -418,7 +485,7 @@ part identity、boundary formula、empty/tail与partial tensor interface由普�
 | definitions/interface | kernel、helper、`In/Out/InOut`、runtime/constexpr | Python decorators与type spelling | target selection、hidden launch、provider dispatch |
 | domain/control | domain、source subregion、`if/for/while`、unordered parallel、loop carry | slices、`indices`、`break/continue` | `auto`、partition、state_stream、ordered、program/lane id |
 | tensor values | arithmetic、compare/select、broadcast、reshape、transpose、join、tuple、record、full、cast/bitcast | zeros、activation helpers、value mask | physical tile/layout/padding |
-| structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、histogram | built-in reduces、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
+| structured ops | generic reduce、scan、region fold/scan、contract、scaled contract、sparse contract、histogram | dot/matvec/vecmat/matmul、scaled/sparse matmul、builtin reduces/prefixes、arg-reduce、format-specific sparse spelling | whole-operator softmax/attention/MoE |
 | relations | source subregion、index relation、sparse format schema | ragged/members/index helpers | target metadata layout、MMA hint |
 | memory/effects | external/buffer read-write、unique/reduction scatter、atomic ops、Philox bits | ordinary indexing/assignment、atomic convenience names | physical scope、storage、copy instruction、barrier/pipeline |
 

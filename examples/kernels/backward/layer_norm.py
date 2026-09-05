@@ -32,10 +32,10 @@ def layer_norm_backward_rows(
         normalized = (x_values - row_mean) * row_rstd
         weighted_dy = weight_values * dy_values
         mean_weighted_dy = (
-            I.reduce.sum(weighted_dy, axis=0, identity=0.0) * inverse_features
+            I.reduce.sum(weighted_dy, axis=0) * inverse_features
         )
         mean_weighted_dy_normalized = (
-            I.reduce.sum(weighted_dy * normalized, axis=0, identity=0.0)
+            I.reduce.sum(weighted_dy * normalized, axis=0)
             * inverse_features
         )
         dx[row, columns] = I.cast(
@@ -77,12 +77,10 @@ def layer_norm_backward_reduce(
     dw_value = I.reduce.sum(
         I.cast(dw_partial[rows, features], I.f32),
         axis=0,
-        identity=I.zeros((N,), dtype=I.f32),
     )
     db_value = I.reduce.sum(
         I.cast(db_partial[rows, features], I.f32),
         axis=0,
-        identity=I.zeros((N,), dtype=I.f32),
     )
     dw[features] = dw_value
     db[features] = db_value

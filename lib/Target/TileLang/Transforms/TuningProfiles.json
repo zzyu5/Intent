@@ -1,0 +1,18 @@
+{
+  "columns": ["value"],
+  "families": {
+    "threads": [
+      [128],
+      [256]
+    ],
+    "small_threads": [
+      [64],
+      [32]
+    ],
+    "stages": [
+      [2],
+      [3],
+      [4]
+    ]
+  }
+}

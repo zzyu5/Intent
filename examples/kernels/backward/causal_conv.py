@@ -41,12 +41,10 @@ def causal_conv1d_backward_partials(
             grad_weight_partial[batch, channel, taps] = I.reduce.sum(
                 I.cast(input_patch, I.f32) * output_gradient[:, None],
                 axis=0,
-                identity=I.zeros((W,), dtype=I.f32),
             )
             grad_bias_partial[batch, channel] = I.reduce.sum(
                 output_gradient,
                 axis=0,
-                identity=0.0,
             )
 
             contributing_output = position_index + (W - 1) - tap_index
@@ -62,7 +60,6 @@ def causal_conv1d_backward_partials(
                 I.cast(output_patch, I.f32)
                 * I.cast(weight[channel, taps], I.f32)[None, :],
                 axis=1,
-                identity=I.zeros((L,), dtype=I.f32),
             )
             grad_x[batch, channel, positions] = I.cast(
                 grad_x_value,
@@ -84,10 +81,8 @@ def causal_conv1d_backward_reduce(
         grad_bias[channel] = I.reduce.sum(
             grad_bias_partial[batches, channel],
             axis=0,
-            identity=0.0,
         )
         grad_weight[channel, taps] = I.reduce.sum(
             grad_weight_partial[batches, channel, taps],
             axis=0,
-            identity=0.0,
         )

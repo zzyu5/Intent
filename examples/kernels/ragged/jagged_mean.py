@@ -28,7 +28,6 @@ def jagged_mean(
         total = I.reduce.sum(
             values[rows[batch], features],
             axis=0,
-            identity=I.zeros((D,), dtype=I.f32),
         )
         count = I.cast(offsets[batch + 1] - offsets[batch], I.f32)
         output[batch, features] = total / count
