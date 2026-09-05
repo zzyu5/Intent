@@ -12,6 +12,10 @@
 
 surface 改善不得被默认升级成 canonical 重构。不同 transition/state schema、轴关系、effects、数值契约所要求的复杂性不能因写法冗长而删除。建议只作为后续选择，本 change 不实施 API 变化。
 
+按用户确认的调查方向，报告明确以具名常用计算 op 作为主要作者入口，并说明语义完整等价时如何复用当前统一表示，不把增加公开名字等同于增加独立 canonical/backend path。通用 contract/reduce/scan/region 与普通 control 保留为算法组合能力；报告区分新算法可由既有语义组合、已有语义的 lowering 未实现、以及确需新的 typed 语义三种情况，不承诺任意新算法都可 region 化或无需编译器扩展。
+
+该判断必须连接已有复杂 kernel 的实际表达与调用，保留 CSV 中的成功证据并说明其适用范围，不把单一 provider/form 失败泛化成算法或语言能力不足。具名计算与普通 typed helper 的算法复用共同改善作者体验；算法组织仍由作者表达，物理组织由编译器在语义允许范围内形成。
+
 ## 编译结构、权威与实际能力
 
 调查还原 production 的 DSL → canonical KIR → executable GPU Program → provider program/source → 外部 compiler → runtime 路径，说明 construction、mapping、blocking、structured realization、关系维护、合法性检查与 serialization 的实际位置。
@@ -32,10 +36,12 @@ provider-local grid、storage、copy、layout-related source form、precision �
 
 报告明确划分已成立基础、真实阻塞、局部维护机会、证据不足和需要用户决定的核心问题，并说明对恢复 cuTile、接入 TileLang 及其他硬件的实际影响。
 
+报告为下一轮行动给出 public 契约、canonical 映射、所需 lowering、数值/effect 修复及 production repro 的责任边界；具体尚未决定的 rank/batch/default 等 API 选择如实列出，不擅自写成已生效规格或触发生产实现。
+
 新硬件的判断区分 GPU provider/hardware 与 CPU/RVV 等 execution family，不要求把所有硬件塞入同一 GPU topology。本调查不实现新后端，不以缩小语言、禁止成熟 provider 能力或增加任意门禁获得“干净”结论。
 
 ## 验收与范围边界
 
 验收唯一采用 brief 的 A1—A4 四项结果，不重复派生内部线索、单个文件、命令或实现步骤为验收项。报告中的关键结论应给出 current/ref 对应位置及后果，运行事实和未知项如实区分。
 
-本 change 不修改生产代码或 `doc/`，不继续旧 cuTile 性能目标，不建设测试、兼容或长期 benchmark 框架。必要动态核验仅使用现有 production DSL emit/JIT/数值 repro，临时文件保存在工作区外。
+本 change 不修改生产代码或 `doc/`，不继续旧 cuTile 性能目标，不建设测试、兼容或长期 benchmark 框架。最终落稿只读核对已有代码、CSV、调用链及 ref，不再运行 repro 或新增验证记录。
