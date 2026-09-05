@@ -27,6 +27,7 @@ constexpr int64_t nativeAccessForm = 1;
 constexpr int64_t gatherAccessForm = 2;
 constexpr int64_t nativeBlockedNoTMAForm = 3;
 constexpr int64_t loopOccupancyCandidates[] = {1, 2, 4};
+constexpr int64_t persistentOccupancyCandidates[] = {1};
 constexpr int64_t legacyStraightLineOccupancy[] = {2};
 constexpr int64_t modernStraightLineOccupancy[] = {4};
 
@@ -1380,12 +1381,27 @@ bool hasOccupancySensitiveTileCompute(func::FuncOp kernel) {
   return found;
 }
 
+bool hasResidentWorkerTraversal(func::FuncOp kernel) {
+  bool found = false;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    found |= parameter.getParameter().getRole() ==
+             static_cast<uint32_t>(gpu::ParameterRole::ResidentWorkers);
+  });
+  return found;
+}
+
 ArrayRef<int64_t> occupancyDomain(func::FuncOp kernel,
                                   gpu::CapabilitiesAttr capabilities) {
-  if (hasLoopCarriedFragment(kernel))
-    return loopOccupancyCandidates;
   if (!hasOccupancySensitiveTileCompute(kernel))
     return {};
+  // A resident-worker program launches exactly the typed persistent worker
+  // count and covers the remaining virtual tasks with its grid-stride loop.
+  // An occupancy greater than one would describe additional resident CTAs
+  // that do not exist in that executable program space.
+  if (hasResidentWorkerTraversal(kernel))
+    return persistentOccupancyCandidates;
+  if (hasLoopCarriedFragment(kernel))
+    return loopOccupancyCandidates;
   return capabilities.getComputeCapabilityMajor() < 9
              ? ArrayRef<int64_t>(legacyStraightLineOccupancy)
              : ArrayRef<int64_t>(modernStraightLineOccupancy);

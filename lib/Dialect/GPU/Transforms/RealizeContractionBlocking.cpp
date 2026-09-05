@@ -2036,12 +2036,17 @@ FailureOr<bool> realizeStructuredNativeReduction(ContractOp contract,
   if (lhsSegment->present == rhsSegment->present)
     return false;
   SegmentFact &segment = lhsSegment->present ? *lhsSegment : *rhsSegment;
+  // A logical subregion only identifies the operand-local member relation; it
+  // is not itself an executable region-contraction segment.  Native segment
+  // coverage requires the typed parameter created by the structured traversal
+  // realization.  Otherwise leave the contract to ordinary M/N/K blocking,
+  // which materializes the subregion traversal explicitly.
+  if (!segment.parameter)
+    return false;
   scf::ForOp segmentLoop =
       enclosingRegionContractionSegment(contract.getOperation());
-  if (segmentLoop &&
-      (!segment.parameter ||
-       segmentLoop.getStep().getDefiningOp<ParameterOp>() !=
-           segment.parameter))
+  if (segmentLoop && segmentLoop.getStep().getDefiningOp<ParameterOp>() !=
+                         segment.parameter)
     return contract.emitOpError(
                "operand extent disagrees with its enclosing region-contraction segment"),
            failure();

@@ -373,9 +373,9 @@ profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
   if (kind == TuningClass::PersistentContraction && matrix && narrow)
-    return {{128, 128, 32, 1, 128, 8, 8},
-            {64, 128, 64, 1, 128, 16, 8},
-            {128, 64, 32, 1, 128, 8, 8},
+    return {{128, 128, 64, 1, 128, 8, 8},
+            {128, 128, 128, 1, 128, 8, 8},
+            {64, 128, 128, 1, 128, 16, 8},
             {128, 256, 64, 1, 128, 8, 8}};
   if (kind == TuningClass::PersistentContraction)
     return {{64, 64, 32, 1, 128, 8, 8},
@@ -672,8 +672,8 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
       tuples.push_back(tuple);
   }
   if (!indirectRowGroups.empty()) {
-    constexpr TuningProfile indirectRowProfile{64, 64, 32, 1,
-                                               128, 8,  8};
+    constexpr TuningProfile indirectRowProfile{128, 128, 64, 1,
+                                               128, 8,   8};
     SmallVector<NamedAttribute> bindings;
     for (ParameterOp parameter : parameters) {
       ParameterAttr schema = parameter.getParameter();
