@@ -2,7 +2,6 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -16,11 +15,6 @@ PhysicalExprAttr parameterExpression(MLIRContext *context, StringRef name) {
   return PhysicalExprAttr::get(
       context, static_cast<uint32_t>(PhysicalExprKind::Parameter), 0,
       StringAttr::get(context, name), ArrayAttr::get(context, {}));
-}
-
-Value multiply(OpBuilder &builder, Location location, Value lhs, Value rhs) {
-  return builder.create<BinaryOp>(location, builder.getIndexType(), lhs, rhs,
-                                  BinaryOperator::Multiply);
 }
 
 LogicalResult realizeGroupedContractionMapping(
@@ -126,11 +120,30 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     return failure();
   const int64_t traversalWorker =
       static_cast<int64_t>(CoordinateRole::TraversalWorker);
+  const int64_t workset = static_cast<int64_t>(CoordinateRole::Workset);
+  const int64_t contractionM =
+      static_cast<int64_t>(CoordinateRole::ContractionM);
+  const int64_t contractionN =
+      static_cast<int64_t>(CoordinateRole::ContractionN);
   SmallVector<unsigned> traversalAxes;
+  unsigned worksetAxes = 0;
+  unsigned contractionMAxes = 0;
+  unsigned contractionNAxes = 0;
+  bool onlyBatchedContractionRoles = true;
   for (auto [axis, role] : llvm::enumerate(roles.asArrayRef()))
-    if (role == traversalWorker)
+    if (role == traversalWorker) {
       traversalAxes.push_back(axis);
-  if (traversalAxes.empty())
+    } else {
+      worksetAxes += role == workset;
+      contractionMAxes += role == contractionM;
+      contractionNAxes += role == contractionN;
+      onlyBatchedContractionRoles &=
+          role == workset || role == contractionM || role == contractionN;
+    }
+  bool batchedContraction = traversalAxes.empty() &&
+                            onlyBatchedContractionRoles && worksetAxes > 0 &&
+                            contractionMAxes == 1 && contractionNAxes == 1;
+  if (traversalAxes.empty() && !batchedContraction)
     return success();
 
   auto program = mapping.getLinear().getDefiningOp<ProgramIdOp>();
@@ -165,6 +178,12 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   if (!capabilities || capabilities.getComputeUnits() <= 0)
     return kernel.emitError(
         "persistent traversal requires a positive compute-unit capability");
+  int64_t residentCount = capabilities.getComputeUnits();
+  // Independent contraction tiles need enough resident programs to occupy two
+  // workers per compute unit while the grid-stride loop preserves exact task
+  // coverage.  Ordered traversal keeps its existing one-worker policy.
+  if (batchedContraction)
+    residentCount *= 2;
   OpBuilder parameterBuilder(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
   auto residentSchema = ParameterAttr::get(
@@ -173,8 +192,7 @@ LogicalResult refineProgramMapping(ModuleOp module) {
       static_cast<uint32_t>(ParameterRole::ResidentWorkers),
       static_cast<uint32_t>(ParameterCategory::Execution),
       /*elementBitWidth=*/0,
-      DenseI64ArrayAttr::get(module.getContext(),
-                             {capabilities.getComputeUnits()}));
+      DenseI64ArrayAttr::get(module.getContext(), {residentCount}));
   auto residentWorkers = parameterBuilder.create<ParameterOp>(
       mapping.getLoc(), parameterBuilder.getIndexType(), residentSchema);
 
@@ -192,9 +210,8 @@ LogicalResult refineProgramMapping(ModuleOp module) {
         "persistent traversal requires a void physical kernel terminator");
 
   OpBuilder builder(mapping);
-  Value totalTasks = builder.create<arith::ConstantIndexOp>(mapping.getLoc(), 1);
-  for (Value extent : mapping.getExtents())
-    totalTasks = multiply(builder, mapping.getLoc(), totalTasks, extent);
+  Value totalTasks = builder.create<PhysicalExprOp>(
+      mapping.getLoc(), builder.getIndexType(), segmentLength);
   auto loop = builder.create<scf::ForOp>(
       mapping.getLoc(), program.getResult(), totalTasks,
       residentWorkers.getResult());
@@ -205,8 +222,12 @@ LogicalResult refineProgramMapping(ModuleOp module) {
 
   PhysicalExprAttr residentExtent = parameterExpression(
       module.getContext(), residentSchema.getName().getValue());
+  auto boundedResidentExtent = PhysicalExprAttr::get(
+      module.getContext(), static_cast<uint32_t>(PhysicalExprKind::Minimum), 0,
+      StringAttr::get(module.getContext()),
+      ArrayAttr::get(module.getContext(), {segmentLength, residentExtent}));
   kernel->setAttr(programSpaceAttr,
-                  ArrayAttr::get(module.getContext(), {residentExtent}));
+                  ArrayAttr::get(module.getContext(), {boundedResidentExtent}));
   kernel->setAttr(gridRankAttr,
                   IntegerAttr::get(IntegerType::get(module.getContext(), 64), 1));
   return success();
