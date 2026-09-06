@@ -837,6 +837,50 @@ LogicalResult markNativeCoverage(func::FuncOp kernel,
   return success();
 }
 
+LogicalResult neutralizeFullCoverageOperand(ContractOp contract,
+                                            OpOperand &operand,
+                                            ArrayRef<int64_t> axes,
+                                            func::FuncOp kernel) {
+  for (int64_t axis : axes) {
+    Value source = operand.get();
+    auto type = cast<FragmentType>(source.getType());
+    if (!isFullCoverageExtent(contract, type.getShape()[axis]))
+      continue;
+    PhysicalRangeFact fact = PhysicalProgramAnalysis(kernel).axisRanges(
+        source, static_cast<unsigned>(axis));
+    FailureOr<MakeRangeOp> range = queryExactLogicalRange(fact);
+    if (failed(range) || !isUnitStepRange(*range))
+      return contract.emitOpError(
+          "full-coverage contraction tail requires an exact unit-step range");
+    FailureOr<Value> stop = resolveLogicalRangeEnd(kernel, *range);
+    if (failed(stop))
+      return contract.emitOpError(
+          "full-coverage contraction tail has no logical bound");
+    OpBuilder builder(contract);
+    Location location = contract.getLoc();
+    auto coordinateType = range->getResult().getType();
+    auto predicateType = FragmentType::get(
+        kernel.getContext(), builder.getI1Type(), coordinateType.getShape(),
+        coordinateType.getAxisMaps(), coordinateType.getValidity(),
+        coordinateType.getOwner());
+    Value stopFragment =
+        builder.create<BroadcastOp>(location, coordinateType, *stop);
+    Value tail = builder.create<CompareOp>(
+        location, predicateType, range->getResult(), stopFragment,
+        ComparePredicate::Lt);
+    FailureOr<Value> valid = projectPredicateToFragment(
+        builder, location, tail, type, sourceAxisIdentity(*range));
+    FailureOr<Value> zero = materializeZeroFragment(builder, location, type);
+    if (failed(valid) || failed(zero))
+      return contract.emitOpError(
+          "could not materialize full-coverage contraction identity");
+    // Load padding is insufficient for derived operands: exp(padding) can be
+    // infinite, and multiplying it by the other operand's zero produces NaN.
+    operand.set(builder.create<SelectOp>(location, type, *valid, source, *zero));
+  }
+  return success();
+}
+
 FragmentType transposeLastTwo(FragmentType source) {
   const unsigned rank = source.getShape().size();
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
@@ -4143,6 +4187,19 @@ LogicalResult realizeContractionBlocking(ModuleOp module) {
     } else if (failed(markNativeCoverage(kernel, contract))) {
       return failure();
     }
+
+  WalkResult tails = kernel.walk([&](ContractOp contract) {
+    if (failed(neutralizeFullCoverageOperand(
+            contract, contract.getLhsMutable(), contract.getLhsReductionAxes(),
+            kernel)) ||
+        failed(neutralizeFullCoverageOperand(
+            contract, contract.getRhsMutable(), contract.getRhsReductionAxes(),
+            kernel)))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (tails.wasInterrupted())
+    return failure();
   eraseDeadPhysicalValues(kernel);
   return success();
 }

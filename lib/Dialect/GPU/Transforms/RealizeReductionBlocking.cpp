@@ -1041,6 +1041,12 @@ FailureOr<bool> realizeFullCoverageReduce(ReduceOp reduce,
   FailureOr<ParameterOp> parameter = fullCoverageParameter(kernel, extent);
   if (failed(parameter))
     return false;
+  if (llvm::any_of(ranges, [](const auto &entry) {
+        return !isUnitStepRange(entry.second);
+      }))
+    return reduce.emitOpError(
+               "full-coverage reduction tail requires unit-step coordinates"),
+           failure();
   Value logicalExtent = range.getExtent();
   if (isCompileTimeValue(logicalExtent)) {
     FailureOr<int64_t> sourceDimension = queryRangeDimension(range);
@@ -2613,12 +2619,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     eraseDeadPhysicalValues(kernel);
     return success();
   }
-  // A fixed fragment already gives the first-class reduction a complete
-  // physical axis. Replaying its producer graph into another chunk loop would
-  // duplicate structured loop carries without adding a physical decision.
-  if (!required)
-    return success();
   // A full-coverage fragment grows every component with the runtime axis.
+  // Its padding still needs the reduction identity after physicalization.
   // Keep coupled record/tuple accumulators bounded by a real chunk loop.
   if (reduce.getSourceCount() == 1) {
     FailureOr<bool> fullCoverage = realizeFullCoverageReduce(reduce, kernel);
@@ -2627,6 +2629,11 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (*fullCoverage)
       return success();
   }
+  // A fixed fragment already gives the first-class reduction a complete
+  // physical axis. Replaying its producer graph into another chunk loop would
+  // duplicate structured loop carries without adding a physical decision.
+  if (!required)
+    return success();
   int64_t reductionAxis = reduce.getAxes().front();
   SmallVector<SourcePlan> sourcePlans;
   SmallVector<LoadOp> sourceLoads;
