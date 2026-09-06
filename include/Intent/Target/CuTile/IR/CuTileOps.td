@@ -15,7 +15,7 @@ def IntentCuTile_TileLoadOp : IntentCuTile_Op<"tile_load", [
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        IntentGPU_ScalarValue:$allow_tma,
-                       Variadic<Index>:$tile_indices);
+                       Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }
@@ -25,7 +25,7 @@ def IntentCuTile_TileStoreOp : IntentCuTile_Op<"tile_store", [
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$resource,
                        IntentGPU_ScalarValue:$allow_tma,
-                       Variadic<Index>:$tile_indices,
+                       Variadic<AnyTypeOf<[Index, I32]>>:$tile_indices,
                        IntentGPU_FragmentValue:$value);
   let hasVerifier = 1;
 }

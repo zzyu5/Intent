@@ -2353,7 +2353,117 @@ bool isCuTileScalarType(Type type) {
                      integer.getWidth() == 64);
 }
 
+gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
+                                         func::FuncOp kernel) {
+  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
+  if (kind == gpu::PhysicalExprKind::Constant)
+    return expression.getValue() > 0 ? expression : gpu::PhysicalExprAttr();
+  if (kind == gpu::PhysicalExprKind::Parameter) {
+    auto parameter = gpu::queryParameterBySymbol(kernel, expression.getSymbol());
+    if (failed(parameter))
+      return {};
+    if ((*parameter)->hasAttr(gpu::coverageDimensionAttr))
+      return expression;
+    auto configurations = kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
+    if (!configurations || configurations.empty())
+      return {};
+    int64_t maximum = 0;
+    for (Attribute configuration : configurations) {
+      auto tuple = dyn_cast<DictionaryAttr>(configuration);
+      auto value = tuple ? tuple.getAs<IntegerAttr>(expression.getSymbol()) : IntegerAttr();
+      if (!value || value.getInt() <= 0)
+        return {};
+      maximum = std::max(maximum, value.getInt());
+    }
+    return gpu::PhysicalExprAttr::get(
+        kernel.getContext(), static_cast<uint32_t>(gpu::PhysicalExprKind::Constant),
+        maximum, StringAttr::get(kernel.getContext()),
+        ArrayAttr::get(kernel.getContext(), {}));
+  }
+  if (kind != gpu::PhysicalExprKind::Add &&
+      kind != gpu::PhysicalExprKind::Multiply &&
+      kind != gpu::PhysicalExprKind::Minimum &&
+      kind != gpu::PhysicalExprKind::Maximum)
+    return {};
+  SmallVector<Attribute> operands;
+  for (Attribute operand : expression.getOperands()) {
+    auto bound = arrayIndexTileBound(cast<gpu::PhysicalExprAttr>(operand), kernel);
+    if (!bound)
+      return {};
+    operands.push_back(bound);
+  }
+  return gpu::PhysicalExprAttr::get(
+      kernel.getContext(), expression.getKind(), expression.getValue(),
+      expression.getSymbol(), ArrayAttr::get(kernel.getContext(), operands));
+}
+
+ArrayAttr arrayIndexTileBounds(func::FuncOp kernel) {
+  MLIRContext *context = kernel.getContext();
+  auto one = gpu::PhysicalExprAttr::get(
+      context, static_cast<uint32_t>(gpu::PhysicalExprKind::Constant), 1,
+      StringAttr::get(context), ArrayAttr::get(context, {}));
+  SmallVector<SmallVector<Attribute>> bounds(kernel.getNumArguments());
+  for (BlockArgument argument : kernel.getArguments())
+    if (auto view = dyn_cast<gpu::ViewType>(argument.getType()))
+      bounds[argument.getArgNumber()].assign(view.getRank(), one);
+  bool hasNativeAccess = false;
+  auto result = kernel.walk([&](Operation *operation) {
+    Value resource;
+    gpu::FragmentType tile;
+    if (auto load = dyn_cast<TileLoadOp>(operation)) {
+      resource = load.getResource();
+      tile = load.getResult().getType();
+    } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
+      resource = store.getResource();
+      tile = store.getValue().getType();
+    } else {
+      return WalkResult::advance();
+    }
+    hasNativeAccess = true;
+    auto argument = dyn_cast<BlockArgument>(resource);
+    if (!argument || argument.getOwner() != &kernel.getBody().front())
+      return WalkResult::interrupt();
+    auto &viewBounds = bounds[argument.getArgNumber()];
+    if (tile.getShape().size() != viewBounds.size())
+      return WalkResult::interrupt();
+    for (auto [axis, extent] : llvm::enumerate(tile.getShape())) {
+      auto bound = arrayIndexTileBound(cast<gpu::PhysicalExprAttr>(extent), kernel);
+      if (!bound)
+        return WalkResult::interrupt();
+      if (viewBounds[axis] == one || viewBounds[axis] == bound)
+        viewBounds[axis] = bound;
+      else
+        viewBounds[axis] = gpu::PhysicalExprAttr::get(
+            context, static_cast<uint32_t>(gpu::PhysicalExprKind::Maximum), 0,
+            StringAttr::get(context), ArrayAttr::get(context, {viewBounds[axis], bound}));
+    }
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted() || !hasNativeAccess)
+    return {};
+  SmallVector<Attribute> encoded;
+  for (const auto &shape : bounds)
+    encoded.push_back(ArrayAttr::get(context, shape));
+  return ArrayAttr::get(context, encoded);
+}
+
+void preserveNativeIndexValues(func::FuncOp kernel) {
+  kernel.walk([](Operation *operation) {
+    if (!isa<TileLoadOp, TileStoreOp>(operation))
+      return;
+    for (OpOperand &operand : operation->getOpOperands()) {
+      auto cast = operand.get().getDefiningOp<gpu::CastOp>();
+      if (cast && cast.getResult().getType().isIndex() &&
+          cast.getValue().getType().isSignlessInteger(32))
+        operand.set(cast.getValue());
+    }
+  });
+}
+
 LogicalResult verifyKernel(func::FuncOp kernel) {
+  if (Attribute bounds = kernel->getAttr(arrayIndexTileBoundsAttr))
+    if (bounds != arrayIndexTileBounds(kernel))
+      return kernel.emitError("cuTile array-index bounds do not cover the current native accesses");
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.size() != 1)
     return kernel.emitError(
@@ -2823,8 +2933,12 @@ LogicalResult legalizeGPUProgram(ModuleOp module,
   if (failed(formNativeTiles(*kernel, profiles)))
     return failure();
   realizeWideLoops(*kernel);
-  if (failed(materializeClosedConfigs(*kernel)) ||
-      failed(verifyCuTileProgram(module)))
+  preserveNativeIndexValues(*kernel);
+  if (failed(materializeClosedConfigs(*kernel)))
+    return failure();
+  if (ArrayAttr bounds = arrayIndexTileBounds(*kernel))
+    (*kernel)->setAttr(arrayIndexTileBoundsAttr, bounds);
+  if (failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));
   return success();

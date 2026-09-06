@@ -221,6 +221,7 @@ private:
     unsigned argument;
     std::string name;
     gpu::ViewType type;
+    ArrayAttr indexTileBounds;
   };
   struct MetadataABI {
     unsigned argument;
@@ -238,6 +239,7 @@ private:
   };
 
   void bindArguments() {
+    auto indexBounds = kernel->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr);
     for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
       DictionaryAttr attrs = kernel.getArgAttrDict(index);
       std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
@@ -245,7 +247,8 @@ private:
       values[argument] = name;
       if (kind == "view") {
         views.push_back({static_cast<unsigned>(index), name,
-                         cast<gpu::ViewType>(argument.getType())});
+                         cast<gpu::ViewType>(argument.getType()),
+                         indexBounds ? cast<ArrayAttr>(indexBounds[index]) : ArrayAttr()});
       } else if (kind == "scalar" || kind == "constexpr" || kind == "value") {
         if (kind == "constexpr") {
           if (!argument.use_empty()) {
@@ -305,6 +308,7 @@ private:
               "import cuda.tile as ct\n"
               "from cuda.tile.tune import exhaustive_search\n"
               "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
+              "from intent.runtime.cutile import array_index_kernels, can_use_i32_array_indices\n"
               "from intent.runtime.tuning import TuningState\n\n"
               "ConstInt = ct.Constant[int]\n\n";
   }
@@ -375,7 +379,9 @@ private:
   }
 
   void emitKernel() {
-    output << "@ct.kernel\ndef _intent_kernel(";
+    if (!kernel->hasAttr(arrayIndexTileBoundsAttr))
+      output << "@ct.kernel\n";
+    output << "def _intent_kernel(";
     bool first = true;
     auto argument = [&](StringRef text) {
       if (!first)
@@ -404,6 +410,14 @@ private:
     indent = 1;
     emitBlock(kernel.getBody().front(), false, {});
     output << "\n";
+    if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
+      output << "_intent_i32_kernel, _intent_kernel = array_index_kernels(_intent_kernel, (";
+      for (const ViewABI &view : views) {
+        llvm::json::OStream(output).value(view.name);
+        output << ", ";
+      }
+      output << "))\n\n";
+    }
   }
 
   void emitArgumentBindings() {
@@ -538,6 +552,7 @@ private:
     std::string configName = freshName("_intent_cfg");
     std::string tunedKernelName = freshName("_intent_tuned_kernel");
     std::string trialStateName = freshName("_intent_trial_state");
+    std::string selectedKernelName = freshName("_intent_selected_kernel");
 
     std::string key = tuneKeyName + " = (";
     for (const ViewABI &view : views)
@@ -548,6 +563,21 @@ private:
     line(key + ")", 1);
     line(streamName + " = torch.cuda.current_stream()", 1);
     line("if " + tuneKeyName + " not in _TUNE_CACHE:", 1);
+    if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
+      std::string boundArguments = "(";
+      std::string viewArguments = "(";
+      for (const ViewABI &view : views) {
+        viewArguments += view.name + ", ";
+        boundArguments += "(";
+        for (Attribute bound : view.indexTileBounds)
+          boundArguments += expressionString(cast<gpu::PhysicalExprAttr>(bound), false) + ", ";
+        boundArguments += "), ";
+      }
+      line(selectedKernelName + " = _intent_i32_kernel if can_use_i32_array_indices(" +
+               viewArguments + "), " + boundArguments + ")) else _intent_kernel", 2);
+    } else {
+      line(selectedKernelName + " = _intent_kernel", 2);
+    }
     std::string trialState = trialStateName + " = TuningState((";
     for (const ViewABI &view : views)
       trialState += view.name + ", ";
@@ -566,11 +596,11 @@ private:
     if (!providerHintParameters.empty())
       hints = ", lambda " + configName + ": " + compilerHints(configName);
     line(searchResultName + " = exhaustive_search(_CONFIGS, " + streamName +
-             ", " + grid + ", _intent_kernel, lambda " + configName +
+             ", " + grid + ", " + selectedKernelName + ", lambda " + configName +
              ": " + trialStateName + ".arguments((" + joinKernelArguments(configName) + "))" + hints +
              ", quiet=True)",
          2);
-    std::string tunedKernel = "_intent_kernel";
+    std::string tunedKernel = selectedKernelName;
     if (!providerHintParameters.empty())
       tunedKernel += ".replace_hints(**" + compilerHints(searchResultName + ".best.config") + ")";
     line("_TUNE_CACHE[" + tuneKeyName + "] = (" + searchResultName +

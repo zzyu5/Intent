@@ -79,8 +79,9 @@ LogicalResult verifyResourceOrderedTile(Operation *owner, gpu::ViewType view,
     if (!mapping || mapping.getFragmentAxis() != axis)
       return owner->emitOpError(
           "tile relation is not indexed in resource-axis order");
-    if (!tileIndices[axis].getType().isIndex())
-      return owner->emitOpError("tile-space indices must have index type");
+    Type indexType = tileIndices[axis].getType();
+    if (!indexType.isIndex() && !indexType.isSignlessInteger(32))
+      return owner->emitOpError("tile-space indices must have index or i32 type");
   }
   return success();
 }
