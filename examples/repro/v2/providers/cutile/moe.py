@@ -129,6 +129,8 @@ def expert_projection(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
+        # Source receives precomputed block ownership; Intent receives CSR routing.
+        status="source_precomputed_block_ownership_contract_gap",
     )
 
 

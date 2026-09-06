@@ -38,6 +38,8 @@ def layer_norm(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
+        # Source uses reciprocal(sqrt) and also writes Mean/Rstd for backward.
+        status="source_rsqrt_and_auxiliary_outputs_contract_gap",
     )
 
 
@@ -57,6 +59,8 @@ def chunked_softmax(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
+        # Source is a max/denominator/output three-pass algorithm, not online merge.
+        status="source_three_pass_vs_online_summary_contract_gap",
     )
 
 
@@ -89,6 +93,8 @@ def rms_norm(context: Context) -> PreparedComparison:
         source,
         Tolerance(atol=2e-2, rtol=1e-2),
         cuda_graph=True,
+        # The selected source forward stores Rstd, absent from the Intent ABI.
+        status="source_auxiliary_rstd_output_contract_gap",
     )
 
 

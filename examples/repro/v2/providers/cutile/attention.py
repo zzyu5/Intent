@@ -253,11 +253,13 @@ def attention_sink(context: Context) -> PreparedComparison:
         )
 
     source = functional_launch(source_call)
+    # The source includes layout copies and FTZ/approximate normalization.
     return PreparedComparison(
         generated,
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
+        status="source_precision_and_timing_contract_gap",
     )
 
 
@@ -370,11 +372,13 @@ def sliding_window(context: Context) -> PreparedComparison:
             q, k, v, window_size=1024, is_causal=True
         )
     )
+    # The source repeats KV tensors inside the call and uses exp2 with FTZ.
     return PreparedComparison(
         generated,
         source,
         Tolerance(atol=5e-2, rtol=2e-2),
         cuda_graph=False,
+        status="source_precision_and_timing_contract_gap",
     )
 
 
@@ -442,6 +446,8 @@ def attention_backward(context: Context) -> PreparedComparison:
             Tolerance(atol=1.25e-1),
         ),
         cuda_graph=False,
+        # Both paths launch three kernels; only the source requests exp2 FTZ.
+        status="source_precision_contract_gap",
     )
 
 
