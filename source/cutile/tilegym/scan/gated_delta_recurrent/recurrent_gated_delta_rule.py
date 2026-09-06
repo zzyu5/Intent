@@ -20,6 +20,18 @@ from tilegym.ops.cutile.utils import next_power_of_2
 # - UPPER_CASE_SNAKE_NAMING: Compile-time constants
 # - CamelCaseNaming: Runtime vectors or tensors
 # - lower_case_snake_naming: Runtime scalars
+@ct.function
+def _load_recurrent_vector(array, batch, position, head, tile,
+                            BLOCK: ct.Constant[int], USE_TMA: ct.Constant[bool],
+                            ACCESS_FORM: ct.Constant[int]):
+    if ACCESS_FORM == 2:
+        offsets = tile * BLOCK + ct.arange(BLOCK, dtype=ct.int32)
+        return ct.gather(array, (batch, position, head, offsets), padding_value=0)
+    return ct.load(array, index=(batch, position, head, tile),
+                   shape=(1, 1, 1, BLOCK), padding_mode=ct.PaddingMode.ZERO,
+                   allow_tma=USE_TMA).reshape((BLOCK,))
+
+
 @ct.kernel(occupancy=2)
 def _recurrent_gated_delta_rule_fwd_kernel(
     Query,  # (B, T, H, QK)
@@ -39,6 +51,7 @@ def _recurrent_gated_delta_rule_fwd_kernel(
     SMALL_TILE_USE_TMA: ct.Constant[bool],
     LARGE_TILE_USE_TMA: ct.Constant[bool],
     T: ct.Constant[int],
+    ACCESS_FORM: ct.Constant[int],
 ):
     """Grid: (B * Hv, ceil(V / BLOCK_V), 1)."""
     idx_bhv = ct.bid(0)
@@ -63,22 +76,14 @@ def _recurrent_gated_delta_rule_fwd_kernel(
         State = ct.zeros((BLOCK_K, BLOCK_V), dtype=ct.float32)
 
     for idx_t in range(T):
-        QueryT = ct.load(
-            Query,
-            index=(idx_b, idx_t, idx_h, 0),
-            shape=(1, 1, 1, BLOCK_K),
-            padding_mode=ct.PaddingMode.ZERO,
-            allow_tma=LARGE_TILE_USE_TMA,
-        ).reshape((BLOCK_K,))
+        QueryT = _load_recurrent_vector(
+            Query, idx_b, idx_t, idx_h, 0, BLOCK_K, LARGE_TILE_USE_TMA, ACCESS_FORM,
+        )
         QueryT = ct.astype(QueryT, ct.float32)
 
-        KeyT = ct.load(
-            Key,
-            index=(idx_b, idx_t, idx_h, 0),
-            shape=(1, 1, 1, BLOCK_K),
-            padding_mode=ct.PaddingMode.ZERO,
-            allow_tma=LARGE_TILE_USE_TMA,
-        ).reshape((BLOCK_K,))
+        KeyT = _load_recurrent_vector(
+            Key, idx_b, idx_t, idx_h, 0, BLOCK_K, LARGE_TILE_USE_TMA, ACCESS_FORM,
+        )
         KeyT = ct.astype(KeyT, ct.float32)
 
         if USE_QK_L2NORM:
@@ -86,13 +91,9 @@ def _recurrent_gated_delta_rule_fwd_kernel(
             KeyT = KeyT * ct.rsqrt(ct.sum(KeyT * KeyT, axis=0) + 1e-6)
         QueryT = QueryT * scale
 
-        ValueT = ct.load(
-            Value,
-            index=(idx_b, idx_t, idx_hv, idx_v),
-            shape=(1, 1, 1, BLOCK_V),
-            padding_mode=ct.PaddingMode.ZERO,
-            allow_tma=SMALL_TILE_USE_TMA,
-        ).reshape((BLOCK_V,))
+        ValueT = _load_recurrent_vector(
+            Value, idx_b, idx_t, idx_hv, idx_v, BLOCK_V, SMALL_TILE_USE_TMA, ACCESS_FORM,
+        )
         ValueT = ct.astype(ValueT, ct.float32)
 
         gate_t = ct.astype(ct.gather(Gate, (idx_b, idx_t, idx_hv), check_bounds=False), ct.float32)
@@ -461,7 +462,7 @@ def _autotune(
     default_candidate = _KernelCandidate(
         kernel=_recurrent_gated_delta_rule_fwd_kernel,
         configs=list(_autotune_configs(V, B, Hv, num_sms)),
-        args_fn=lambda cfg: common_args_fn(cfg) + (T,),
+        args_fn=lambda cfg: common_args_fn(cfg) + (T, 0),
     )
     persistent_candidate = _KernelCandidate(
         kernel=_recurrent_gated_delta_rule_fwd_kernel_persistent,
@@ -503,12 +504,60 @@ def _autotune(
     return best_kernel, best_config
 
 
+_explicit_recurrent_tune_cache = {}
+
+
+def _autotune_explicit_recurrent(query, key, value, gate, beta, output, final_state,
+                                 scale, tuning_configs, compiler_timeout):
+    configs = tuple(tuning_configs)
+    for cfg in configs:
+        if vars(cfg).keys() != {"BLOCK_K", "BLOCK_V", "ACCESS_FORM", "occupancy"}:
+            raise ValueError("recurrent requires complete candidates without unconsumed fields")
+        if cfg.ACCESS_FORM not in (1, 2, 3):
+            raise ValueError("recurrent candidate has an unknown access form")
+        if cfg.BLOCK_K < query.shape[3]:
+            raise ValueError("recurrent candidate does not cover the full key state")
+    config_key = tuple(tuple(sorted(vars(cfg).items())) for cfg in configs)
+    layouts = tuple(
+        (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype,
+         str(tensor.device), tensor.storage_offset())
+        for tensor in (query, key, value, gate, beta, output, final_state)
+    )
+    cache_key = (layouts, scale, config_key, compiler_timeout)
+    if cache_key not in _explicit_recurrent_tune_cache:
+        dummy = torch.empty(1, 1, 1, 1, device=query.device, dtype=torch.float32)
+
+        def grid_fn(cfg):
+            return _grid(False, query.shape[0], value.shape[2], value.shape[3],
+                         cfg.BLOCK_V, query.device)
+
+        def args_fn(cfg):
+            return (query, key, value, gate, beta, output, dummy, final_state,
+                    scale, False, True, False, cfg.BLOCK_K, cfg.BLOCK_V,
+                    cfg.ACCESS_FORM != 3, True, query.shape[1], cfg.ACCESS_FORM)
+
+        with ct.compiler_timeout(compiler_timeout):
+            result = ct.tune.exhaustive_search(
+                configs, torch.cuda.current_stream(), grid_fn,
+                _recurrent_gated_delta_rule_fwd_kernel, args_fn,
+                lambda cfg: {"occupancy": cfg.occupancy}, quiet=True,
+            )
+        cfg = result.best.config
+        best = SimpleNamespace(KERNEL="standard", **vars(cfg),
+                               SMALL_TILE_USE_TMA=cfg.ACCESS_FORM != 3,
+                               LARGE_TILE_USE_TMA=True)
+        kernel = _recurrent_gated_delta_rule_fwd_kernel.replace_hints(occupancy=cfg.occupancy)
+        _explicit_recurrent_tune_cache[cache_key] = kernel, best
+    return _explicit_recurrent_tune_cache[cache_key]
+
+
 class _RecurrentGatedDeltaRuleCuTile(torch.autograd.Function):
     autotune_cache = {}
 
     @staticmethod
     def forward(
-        ctx, query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, persistent
+        ctx, query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, persistent,
+        tuning_configs, compiler_timeout,
     ):
         B, T, H, QK = query.shape
         HV, V = value.shape[-2:]
@@ -530,7 +579,18 @@ class _RecurrentGatedDeltaRuleCuTile(torch.autograd.Function):
         BLOCK_K = next_power_of_2(QK)
         scale = 1.0 / math.sqrt(QK)
 
-        if is_autotune_disabled():
+        if tuning_configs is not None:
+            if has_initial_state or not output_final_state or use_qk_l2norm_in_kernel or persistent:
+                raise NotImplementedError(
+                    "explicit recurrent candidates require zero initial state, final state output, "
+                    "unnormalized Q/K, and non-persistent ownership"
+                )
+            best_kernel, best_config = _autotune_explicit_recurrent(
+                query, key, value, g, beta, output, final_state, scale,
+                tuning_configs, compiler_timeout,
+            )
+            BLOCK_K = best_config.BLOCK_K
+        elif is_autotune_disabled():
             if T == 1 and 32 <= V:
                 best_kernel = _recurrent_gated_delta_rule_fwd_kernel_decode_vstream
                 best_config = SimpleNamespace(
@@ -625,6 +685,8 @@ class _RecurrentGatedDeltaRuleCuTile(torch.autograd.Function):
         )
         if best_config.KERNEL == "decode_vstream":
             kernel_args = common_args + (best_config.STREAM_V_TILE,)
+        elif best_config.KERNEL == "standard":
+            kernel_args = common_args + (T, 0 if tuning_configs is None else best_config.ACCESS_FORM)
         else:
             kernel_args = common_args + (T,)
 
@@ -647,6 +709,9 @@ def recurrent_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
+    *,
+    tuning_configs=None,
+    compiler_timeout=15,
     **kwargs,
 ):
     """Drop-in cuTile replacement for torch_recurrent_gated_delta_rule."""
@@ -660,4 +725,6 @@ def recurrent_gated_delta_rule(
         output_final_state,
         use_qk_l2norm_in_kernel,
         kwargs.get("persistent"),
+        tuning_configs,
+        compiler_timeout,
     )
