@@ -2551,24 +2551,67 @@ void realizeWideLoops(func::FuncOp kernel) {
     OpBuilder builder(loop);
     Location location = loop.getLoc();
     std::optional<int64_t> maximumStep = maximumNativeLoopStep(loop.getStep());
+    auto isInductionQuotient = [&](Operation &operation) {
+      auto binary = dyn_cast<gpu::BinaryOp>(operation);
+      return binary && binary.getOperatorKind() == BinaryOperator::FloorDivide &&
+             binary.getLhs() == loop.getInductionVar() &&
+             gpu::samePhysicalScalarExpression(binary.getRhs(), loop.getStep());
+    };
+    bool useTileCounter = maximumStep && *maximumStep > 1 &&
+                          isProvably(loop.getLowerBound(), 0) &&
+                          llvm::any_of(loop.getBody()->without_terminator(),
+                                       isInductionQuotient);
     auto nativeLoop = [&](OpBuilder &nested) {
+      Value upperBound = loop.getUpperBound();
+      if (useTileCounter) {
+        Type wideType = loop.getInductionVar().getType();
+        Value one = nested.create<arith::ConstantOp>(
+            location, wideType, nested.getIntegerAttr(wideType, 1));
+        Value positive = nested.create<gpu::CompareOp>(
+            location, nested.getI1Type(), upperBound, loop.getLowerBound(),
+            ComparePredicate::Gt);
+        Value distance = nested.create<gpu::SelectOp>(
+            location, wideType, positive, upperBound, loop.getLowerBound());
+        Value adjustment = nested.create<gpu::BinaryOp>(
+            location, wideType, loop.getStep(), one, BinaryOperator::Subtract);
+        Value rounded = nested.create<gpu::BinaryOp>(
+            location, wideType, distance, adjustment, BinaryOperator::Add);
+        upperBound = nested.create<gpu::BinaryOp>(
+            location, wideType, rounded, loop.getStep(), BinaryOperator::FloorDivide);
+      }
       Value lower = nested.create<gpu::CastOp>(
           location, nested.getI32Type(), loop.getLowerBound());
       Value upper = nested.create<gpu::CastOp>(
-          location, nested.getI32Type(), loop.getUpperBound());
+          location, nested.getI32Type(), upperBound);
       Value step = nested.create<gpu::CastOp>(
           location, nested.getI32Type(), loop.getStep());
+      if (useTileCounter)
+        step = nested.create<arith::ConstantIntOp>(location, 1, 32);
       auto replacement = nested.create<scf::ForOp>(
           location, lower, upper, step, loop.getInitArgs(),
           [&](OpBuilder &body, Location bodyLoc, Value induction,
               ValueRange carried) {
             IRMapping mapping;
-            Value wide = body.create<gpu::CastOp>(
+            Value counter = body.create<gpu::CastOp>(
                 bodyLoc, loop.getInductionVar().getType(), induction);
+            Value wide = counter;
+            if (useTileCounter)
+              wide = body.create<gpu::BinaryOp>(
+                  bodyLoc, wide.getType(), counter, loop.getStep(), BinaryOperator::Multiply);
             mapping.map(loop.getInductionVar(), wide);
             mapping.map(loop.getRegionIterArgs(), carried);
-            for (Operation &operation : loop.getBody()->without_terminator())
+            for (Operation &operation : loop.getBody()->without_terminator()) {
+              // IV = counter * step, so its exact tile quotient is the counter.
+              if (useTileCounter && isInductionQuotient(operation)) {
+                Value quotient = counter;
+                Type resultType = operation.getResult(0).getType();
+                if (quotient.getType() != resultType)
+                  quotient = body.create<gpu::CastOp>(bodyLoc, resultType, quotient);
+                mapping.map(operation.getResult(0), quotient);
+                continue;
+              }
               body.clone(operation, mapping);
+            }
             SmallVector<Value> yielded;
             for (Value value :
                  cast<scf::YieldOp>(loop.getBody()->getTerminator()).getOperands())
